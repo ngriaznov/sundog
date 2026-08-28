@@ -156,7 +156,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a working multicast loopback, absent in most CI containers"]
     async fn register_and_browse_round_trip() {
         let announcer = Mdns::new("smoke-test-cluster", "announcer-node");
         let addr: SocketAddr = "127.0.0.1:19999".parse().expect("valid addr");
