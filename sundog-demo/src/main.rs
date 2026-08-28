@@ -1,126 +1,100 @@
-//! `sundog-demo`: a plain CLI for exercising a live `sundog` cluster — join
-//! (mDNS by default, or a fixed seed list), open a replicated `String ->
-//! String` cache, put/get/del from stdin, and print cluster events as they
-//! arrive.
+//! `sundog-demo`: an interactive chaos-testing TUI for a `sundog` cluster —
+//! spawns N in-process nodes over static loopback seeds, drives a
+//! background write-load, and lets you kill/restart nodes to watch
+//! replication and anti-entropy repair the divergence live (plan §11.4).
+//! `--headless <SECS>` runs the same load without a terminal, for CI smoke
+//! checks.
 
-use std::net::SocketAddr;
+mod app;
+mod cli;
+mod convergence;
+mod headless;
+mod load;
+mod node;
+mod setup;
+mod ui;
 
-use anyhow::{Context as _, bail};
-use sundog::{Cluster, Event, Mode, Origin};
-use tokio::io::{AsyncBufReadExt as _, BufReader};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use crossterm::event::{self, Event as TermEvent};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    let args = cli::parse(std::env::args().skip(1))?;
 
-    let (cluster_name, seeds) = parse_args(std::env::args().skip(1))?;
-
-    let mut builder = Cluster::builder(cluster_name.clone());
-    if !seeds.is_empty() {
-        builder = builder.seeds(seeds);
+    if let Some(duration) = args.headless {
+        let code = headless::run(&args, duration).await?;
+        std::process::exit(code);
     }
-    let cluster = builder.build().await.context("failed to form cluster")?;
-    println!(
-        "joined cluster {cluster_name:?} as node {}",
-        cluster.node_id()
-    );
 
-    let cache = cluster
-        .cache::<String, String>("demo")
-        .mode(Mode::Replicated)
-        .open()
-        .await
-        .context("failed to open the demo cache")?;
+    run_tui(&args).await
+}
 
-    let mut events = cache.events();
-    tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            print_event(&event);
+async fn run_tui(args: &cli::Args) -> anyhow::Result<()> {
+    let demo = setup::bootstrap(args).await?;
+    let mut app = app::App::new(demo);
+
+    let mut terminal = ratatui::try_init()?;
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<TermEvent>();
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let input_thread = spawn_input_thread(input_tx, Arc::clone(&stop_input));
+
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut draw_error = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                app.drain_feed();
+                if let Err(error) = terminal.draw(|frame| ui::draw(frame, &app)) {
+                    draw_error = Some(error);
+                    break;
+                }
+            }
+            maybe_event = input_rx.recv() => {
+                match maybe_event {
+                    Some(event) => app.handle_term_event(&event),
+                    None => break,
+                }
+            }
         }
-    });
-
-    println!("commands: put <k> <v> | get <k> | del <k> | peers | quit");
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await.context("reading stdin")? {
-        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["put", key, value] => match cache.insert((*key).into(), (*value).into()).await {
-                Ok(()) => println!("ok"),
-                Err(error) => println!("error: {error}"),
-            },
-            ["get", key] => match cache.get(&(*key).to_string()).await {
-                Some(value) => println!("{value}"),
-                None => println!("(missing)"),
-            },
-            ["del", key] => match cache.remove(&(*key).to_string()).await {
-                Ok(()) => println!("ok"),
-                Err(error) => println!("error: {error}"),
-            },
-            ["peers"] => print_peers(&cluster),
-            ["quit"] => break,
-            [] => {}
-            _ => println!("commands: put <k> <v> | get <k> | del <k> | peers | quit"),
+        if app.quit {
+            break;
         }
     }
 
-    cluster.shutdown().await;
+    stop_input.store(true, Ordering::Relaxed);
+    ratatui::try_restore()?;
+    drop(input_thread);
+
+    app.demo.shutdown().await;
+    if let Some(error) = draw_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 
-fn print_peers(cluster: &Cluster) {
-    let peers = cluster.peers();
-    if peers.is_empty() {
-        println!("(no other live peers)");
-        return;
-    }
-    for peer in peers {
-        println!("{}  node={}  data={}", peer.name, peer.node, peer.data_addr);
-    }
-}
-
-fn print_event(event: &Event<String, String>) {
-    let origin = match event {
-        Event::Created { origin, .. }
-        | Event::Updated { origin, .. }
-        | Event::Removed { origin, .. } => describe_origin(*origin),
-    };
-    match event {
-        Event::Created { key, value, .. } => {
-            println!("[event] created {key:?}={value:?} ({origin})");
-        }
-        Event::Updated { key, value, .. } => {
-            println!("[event] updated {key:?}={value:?} ({origin})");
-        }
-        Event::Removed { key, .. } => println!("[event] removed {key:?} ({origin})"),
-    }
-}
-
-fn describe_origin(origin: Origin) -> String {
-    match origin {
-        Origin::Local => "local".to_owned(),
-        Origin::Remote(node) => format!("remote:{node}"),
-    }
-}
-
-/// Parses `--cluster <name>` and `--seeds <a,b,...>`; mDNS discovery is used
-/// when `--seeds` is absent.
-fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<(String, Vec<SocketAddr>)> {
-    let mut cluster_name = "sundog-demo".to_owned();
-    let mut seeds = Vec::new();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--cluster" => cluster_name = args.next().context("--cluster needs a value")?,
-            "--seeds" => {
-                let raw = args.next().context("--seeds needs a value")?;
-                for part in raw.split(',') {
-                    seeds.push(
-                        part.trim()
-                            .parse()
-                            .with_context(|| format!("invalid seed address {part:?}"))?,
-                    );
-                }
+fn spawn_input_thread(
+    tx: mpsc::UnboundedSender<TermEvent>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(term_event) => {
+                        if tx.send(term_event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
             }
-            other => bail!("unrecognized argument: {other}"),
         }
-    }
-    Ok((cluster_name, seeds))
+    })
 }

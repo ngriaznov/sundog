@@ -11,9 +11,21 @@
 //! connection starts with `Hello`, and the message that follows decides
 //! whether the connection is served once (a request) or looped indefinitely
 //! (the persistent link), per plan "own streams" for request/response.
+//!
+//! Feature `tls` (real-tokio transport only, see the private `tls`
+//! submodule's own docs): every connection this module opens or accepts is
+//! additionally wrapped in mutual TLS when `ClusterConfig::tls` is set (that
+//! field only exists when this feature is compiled in). The internal
+//! `MeshStream` and `TlsCtx` type aliases are the seam — they collapse to
+//! the non-TLS/`sim` types when the feature is off or `sim` is on, so
+//! `conn`'s framing code is written once and never branches on the feature
+//! itself.
 
 mod conn;
 mod outbox;
+mod tcp;
+#[cfg(all(feature = "tls", not(feature = "sim")))]
+mod tls;
 
 use std::collections::HashMap;
 use std::io;
@@ -25,7 +37,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use smol_str::SmolStr;
-use tokio::net::TcpListener;
+use tcp::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +48,64 @@ use crate::membership::Peer;
 use crate::node::NodeId;
 use crate::wire::{Msg, WireRecord};
 use outbox::DropOldestQueue;
+
+#[cfg(all(feature = "tls", not(feature = "sim")))]
+pub use tls::MESH_SERVER_NAME;
+
+/// The concrete stream type every dialed or accepted connection is framed
+/// over: `tcp::TcpStream` unmodified unless `tls` is active on the
+/// real-tokio transport, in which case it's [`tls::MeshStream`] (plain or
+/// TLS-wrapped, decided per connection by [`TlsCtx`]).
+#[cfg(all(feature = "tls", not(feature = "sim")))]
+pub(crate) type MeshStream = tls::MeshStream;
+#[cfg(not(all(feature = "tls", not(feature = "sim"))))]
+pub(crate) type MeshStream = tcp::TcpStream;
+
+/// This node's TLS context, if any: `Some` wraps every connection in mutual
+/// TLS, `None` stays plaintext.
+#[cfg(all(feature = "tls", not(feature = "sim")))]
+pub(crate) type TlsCtx = Option<Arc<tls::MeshTls>>;
+/// TLS isn't compiled in for this transport (feature off, or `sim` active):
+/// a zero-sized stand-in so `conn`'s dial/accept plumbing can still carry a
+/// `tls` parameter unconditionally, rather than forking every call site on
+/// the feature. A dedicated unit struct rather than a bare `()` — the latter
+/// trips clippy's unit-argument lint at every call site.
+#[cfg(not(all(feature = "tls", not(feature = "sim"))))]
+#[derive(Clone)]
+pub(crate) struct TlsCtx;
+
+#[cfg(all(feature = "tls", not(feature = "sim")))]
+fn build_tls_ctx(config: &ClusterConfig, bind_addr: SocketAddr) -> Result<TlsCtx, JoinError> {
+    config
+        .tls
+        .as_ref()
+        .map(|tls_config| tls::MeshTls::new(tls_config).map(Arc::new))
+        .transpose()
+        .map_err(|source| JoinError::Bind {
+            addr: bind_addr,
+            source: io::Error::other(source),
+        })
+}
+
+// Infallible on these two paths (TLS isn't even compiled in for this
+// transport), so — unlike the branch above — this returns `TlsCtx` bare
+// rather than `Result<TlsCtx, JoinError>`; `Mesh::spawn` picks the matching
+// call form per the same `cfg`.
+#[cfg(all(feature = "tls", feature = "sim"))]
+fn build_tls_ctx(config: &ClusterConfig) -> TlsCtx {
+    if config.tls.is_some() {
+        tracing::warn!(
+            "ClusterConfig::tls is set but the `sim` feature is active; TLS is not applied \
+             over the turmoil transport — see net::tls's module docs"
+        );
+    }
+    TlsCtx
+}
+
+#[cfg(not(feature = "tls"))]
+fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
+    TlsCtx
+}
 
 /// Capacity of the inbound-message channel and of each per-peer, per-class
 /// outbox absent a caller override — mirrors [`ClusterConfig::outbox_capacity`]'s
@@ -96,6 +166,7 @@ struct MeshInner {
     outbox_capacity: usize,
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
+    tls: TlsCtx,
 }
 
 /// A cheap-to-clone handle onto the running data-plane mesh.
@@ -141,6 +212,10 @@ impl Mesh {
             addr: bind_addr,
             source,
         })?;
+        #[cfg(all(feature = "tls", not(feature = "sim")))]
+        let tls = build_tls_ctx(config, bind_addr)?;
+        #[cfg(not(all(feature = "tls", not(feature = "sim"))))]
+        let tls = build_tls_ctx(config);
 
         let outbox_capacity = if config.outbox_capacity == 0 {
             DEFAULT_CHANNEL_CAPACITY
@@ -154,6 +229,7 @@ impl Mesh {
             inbound_tx,
             handler,
             accept_cancel.clone(),
+            tls.clone(),
         ));
 
         let inner = Arc::new(MeshInner {
@@ -162,6 +238,7 @@ impl Mesh {
             outbox_capacity,
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
+            tls,
         });
         Ok((Self { local_addr, inner }, inbound_rx))
     }
@@ -221,6 +298,7 @@ impl Mesh {
             Arc::clone(&invalidate),
             replicate_rx,
             cancel.clone(),
+            self.inner.tls.clone(),
         ));
         PeerHandle {
             data_addr,
@@ -313,8 +391,13 @@ impl Mesh {
         cache: SmolStr,
     ) -> Result<BoxStream<'static, Result<WireRecord, CodecError>>, CodecError> {
         let addr = self.peer_addr(donor)?;
-        let mut framed =
-            conn::dial_with_hello(addr, self.inner.node, self.inner.incarnation).await?;
+        let mut framed = conn::dial_with_hello(
+            addr,
+            self.inner.node,
+            self.inner.incarnation,
+            &self.inner.tls,
+        )
+        .await?;
         conn::send_msg(&mut framed, &Msg::StRequest { cache }).await?;
         Ok(conn::state_stream(framed))
     }
@@ -334,8 +417,13 @@ impl Mesh {
         local_buckets: Vec<(u16, u64)>,
     ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
         let addr = self.peer_addr(peer)?;
-        let mut framed =
-            conn::dial_with_hello(addr, self.inner.node, self.inner.incarnation).await?;
+        let mut framed = conn::dial_with_hello(
+            addr,
+            self.inner.node,
+            self.inner.incarnation,
+            &self.inner.tls,
+        )
+        .await?;
         conn::send_msg(
             &mut framed,
             &Msg::AeDigest {
@@ -361,8 +449,13 @@ impl Mesh {
         keys: Vec<Bytes>,
     ) -> Result<Vec<WireRecord>, CodecError> {
         let addr = self.peer_addr(peer)?;
-        let mut framed =
-            conn::dial_with_hello(addr, self.inner.node, self.inner.incarnation).await?;
+        let mut framed = conn::dial_with_hello(
+            addr,
+            self.inner.node,
+            self.inner.incarnation,
+            &self.inner.tls,
+        )
+        .await?;
         conn::send_msg(&mut framed, &Msg::AePull { cache, keys }).await?;
         conn::collect_pulled_records(framed).await
     }
@@ -393,7 +486,11 @@ impl Mesh {
     }
 }
 
-#[cfg(test)]
+// These tests dial real `tokio::net` sockets against a live `Mesh`, which
+// under `sim` binds through `tcp`'s turmoil seam instead — turmoil sockets
+// only work inside a driven `turmoil::Sim` (see `tests/sim.rs`), so this
+// module is real-transport-only, same restriction as the `tls` submodule.
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::sync::Mutex;
 

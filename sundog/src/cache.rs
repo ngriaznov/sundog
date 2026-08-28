@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 use crate::cluster::Cluster;
 use crate::error::CacheError;
-use crate::store::{Event, Mode, Shard, ShardOps};
+use crate::store::{ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher};
 
 /// Builds a [`Cache`]: own-and-return, per house style.
 #[must_use]
@@ -25,6 +25,8 @@ pub struct CacheBuilder<K, V> {
     max_capacity: u64,
     ttl: Option<Duration>,
     tti: Option<Duration>,
+    resolver: Arc<dyn ConflictResolver>,
+    weigher: Option<Weigher<K, V>>,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -41,6 +43,8 @@ where
             max_capacity: u64::MAX,
             ttl: None,
             tti: None,
+            resolver: Arc::new(LwwResolver),
+            weigher: None,
             marker: PhantomData,
         }
     }
@@ -68,6 +72,30 @@ where
     /// (plan §7, §13). Default: no idle expiry.
     pub fn tti(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
+        self
+    }
+
+    /// Overrides the [`ConflictResolver`] that decides, at the wire level,
+    /// which of two differently-versioned records for the same key wins —
+    /// consulted by every versioned apply (local write, replicated write,
+    /// state transfer, anti-entropy repair). Default: [`LwwResolver`]
+    /// (last-write-wins by [`crate::Hlc`]). See [`ConflictResolver::winner`]
+    /// for the correctness contract a custom resolver must satisfy for
+    /// cluster convergence to keep holding.
+    pub fn resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Sets a custom per-entry weigher for size-bounded eviction, passed
+    /// through to `moka`'s own weigher hook — `max_capacity` is then a
+    /// weight budget rather than an entry count. Default: every entry
+    /// weighs 1, so `max_capacity` counts entries (moka's own default).
+    pub fn weigher<W>(mut self, weigher: W) -> Self
+    where
+        W: Fn(&K, &V) -> u32 + Send + Sync + 'static,
+    {
+        self.weigher = Some(Box::new(weigher));
         self
     }
 
@@ -107,20 +135,26 @@ where
             max_capacity,
             ttl,
             tti,
+            resolver,
+            weigher,
             marker: _,
         } = self;
 
-        let shard = Arc::new(
-            Shard::<K, V>::new(
-                name.clone(),
-                mode,
-                cluster.node_id(),
-                max_capacity,
-                ttl,
-                tti,
-            )
-            .with_tombstone_ttl(cluster.config().tombstone_ttl),
-        );
+        let mut shard = Shard::<K, V>::new(
+            name.clone(),
+            mode,
+            cluster.node_id(),
+            max_capacity,
+            ttl,
+            tti,
+        )
+        .with_tombstone_ttl(cluster.config().tombstone_ttl)
+        .with_max_frame(cluster.config().max_frame)
+        .with_resolver(resolver);
+        if let Some(weigher) = weigher {
+            shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
+        }
+        let shard = Arc::new(shard);
 
         let registry = cluster.shards();
         {

@@ -23,10 +23,6 @@ use crate::config::ClusterConfig;
 use crate::error::JoinError;
 use crate::node::{NodeId, NodeName};
 
-/// Cadence of chitchat's own gossip rounds. Not exposed via [`ClusterConfig`]
-/// (the plan reserves that for anti-entropy); chosen for sub-5s failure
-/// detection on a LAN per the plan §12 M1 acceptance bar.
-const GOSSIP_INTERVAL: Duration = Duration::from_millis(200);
 /// How long `spawn` samples the `seeds` stream to build chitchat's initial
 /// static seed list, before handing the stream off to the continuous
 /// re-seeding task. A short window: convergence does not depend on it, only
@@ -34,14 +30,6 @@ const GOSSIP_INTERVAL: Duration = Duration::from_millis(200);
 const INITIAL_SEED_WINDOW: Duration = Duration::from_millis(200);
 /// Cap on how many distinct addresses the initial window collects.
 const MAX_INITIAL_SEEDS: usize = 16;
-/// How long a dead node's chitchat state is retained before that node is
-/// forgotten entirely. Bounded well below chitchat's own 24h default so a
-/// churning cluster doesn't grow this node's memory unboundedly.
-const DEAD_NODE_GRACE_PERIOD: Duration = Duration::from_secs(600);
-/// Grace period for tombstoned *chitchat key-values* (distinct from
-/// sundog's own cache tombstones, config.rs `tombstone_ttl`) — matches
-/// chitchat's own crate default.
-const KV_TOMBSTONE_GRACE_PERIOD: Duration = Duration::from_mins(15);
 
 const NODE_ID_KEY: &str = "node_id";
 const DATA_ADDR_KEY: &str = "data_addr";
@@ -141,17 +129,17 @@ impl Membership {
         let chitchat_config = ChitchatConfig {
             chitchat_id: chitchat_id.clone(),
             cluster_id: cluster_name.to_string(),
-            gossip_interval: GOSSIP_INTERVAL,
+            gossip_interval: config.gossip_interval,
             listen_addr,
             seed_nodes,
             failure_detector_config: FailureDetectorConfig {
-                phi_threshold: 6.0,
-                sampling_window_size: 1_000,
-                max_interval: Duration::from_secs(5),
-                initial_interval: Duration::from_millis(500),
-                dead_node_grace_period: DEAD_NODE_GRACE_PERIOD,
+                phi_threshold: config.phi_threshold,
+                sampling_window_size: config.phi_sampling_window_size,
+                max_interval: config.phi_max_interval,
+                initial_interval: config.phi_initial_interval,
+                dead_node_grace_period: config.dead_node_grace_period,
             },
-            marked_for_deletion_grace_period: KV_TOMBSTONE_GRACE_PERIOD,
+            marked_for_deletion_grace_period: config.kv_tombstone_grace_period,
             catchup_callback: None,
             extra_liveness_predicate: None,
             protocol_version: ProtocolVersion::V0,

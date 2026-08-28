@@ -32,6 +32,7 @@ tokio-rustls = { version = "0.26.4", optional = true }
 tokio-stream = "0.1.19"
 tokio-util = { version = "0.7.19", features = ["codec", "rt"] }
 tracing = "0.1.44"
+turmoil = { version = "0.7.2", optional = true }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [dev-dependencies]
@@ -40,8 +41,12 @@ proptest = "1.11.0"
 rcgen = "0.14.9"
 tokio = { version = "1.53.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
-turmoil = "0.7.2"
 
 [features]
 tls = ["dep:rustls", "dep:tokio-rustls"]
 prometheus = ["dep:metrics-exporter-prometheus"]
+# Turmoil deterministic-simulation seam (plan §11.2): swaps `net`'s transport
+# seam (`src/net/tcp.rs`) from `tokio::net` to `turmoil::net`, so the mesh can
+# be driven inside a turmoil `Sim`. Off by default — non-sim builds never pull
+# in turmoil at all. See `tests/sim.rs`.
+sim = ["dep:turmoil"]

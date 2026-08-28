@@ -81,6 +81,8 @@ pub struct ClusterBuilder {
     name: SmolStr,
     discovery: Option<DiscoveryKind>,
     config: ClusterConfig,
+    #[cfg(feature = "prometheus")]
+    prometheus_listen: Option<SocketAddr>,
 }
 
 impl Cluster {
@@ -91,6 +93,8 @@ impl Cluster {
             name: name.into(),
             discovery: None,
             config: ClusterConfig::default(),
+            #[cfg(feature = "prometheus")]
+            prometheus_listen: None,
         }
     }
 
@@ -197,6 +201,37 @@ impl ClusterBuilder {
         self
     }
 
+    /// Installs a Prometheus recorder and serves `GET /metrics` on `addr` for
+    /// the life of the process, once [`build`](Self::build) succeeds (plan
+    /// §12 M7; house rules: "Prometheus exporter implemented behind a
+    /// `prometheus` feature flag").
+    ///
+    /// `metrics`'s recorder is a single process-global slot: a second
+    /// `prometheus_listen` (on this or another `Cluster`), or a mix of
+    /// `prometheus_listen` and [`crate::telemetry::prometheus_handle`] in the
+    /// same process, fails `build()` with [`JoinError::Bind`] rather than
+    /// panicking — see `telemetry`'s module docs. For embedding the scrape
+    /// endpoint in an HTTP server the caller already runs, use
+    /// [`crate::telemetry::prometheus_handle`] instead of this method.
+    #[cfg(feature = "prometheus")]
+    pub fn prometheus_listen(mut self, addr: SocketAddr) -> Self {
+        self.prometheus_listen = Some(addr);
+        self
+    }
+
+    /// Enables mutual TLS on the data-plane mesh (feature `tls`; house rules
+    /// "Future plans pulled into v1"). Equivalent to setting
+    /// [`ClusterConfig::tls`] directly via [`Self::config`] — a dedicated
+    /// method for the common case of overriding only this one field. See
+    /// [`crate::config::TlsConfig`]'s docs for what this implies (mutual
+    /// auth, the fixed required certificate SAN, and why a TLS node and a
+    /// plaintext node cannot share a mesh).
+    #[cfg(feature = "tls")]
+    pub fn tls(mut self, tls: crate::config::TlsConfig) -> Self {
+        self.config.tls = Some(tls);
+        self
+    }
+
     /// Starts discovery, membership, and the data-plane mesh, and returns
     /// once this node has joined (or begun forming) the cluster.
     ///
@@ -214,7 +249,17 @@ impl ClusterBuilder {
             name,
             discovery,
             config,
+            #[cfg(feature = "prometheus")]
+            prometheus_listen,
         } = self;
+
+        #[cfg(feature = "prometheus")]
+        if let Some(addr) = prometheus_listen {
+            crate::telemetry::install_listener(addr).map_err(|source| JoinError::Bind {
+                addr,
+                source: std::io::Error::other(source),
+            })?;
+        }
 
         let node = NodeId::random();
         let hostname = local_hostname();
@@ -277,6 +322,10 @@ impl ClusterBuilder {
         cluster.spawn_tracked(inbound_loop(
             cluster.shards(),
             inbound_rx,
+            cluster.cancel_token(),
+        ));
+        cluster.spawn_tracked(open_cache_gauge_task(
+            cluster.shards(),
             cluster.cancel_token(),
         ));
 
@@ -394,7 +443,9 @@ async fn membership_to_mesh_task(
     mesh: Mesh,
     cancel: CancellationToken,
 ) {
-    mesh.update_peers(peers.borrow_and_update().clone());
+    let initial = peers.borrow_and_update().clone();
+    set_live_peers_gauge(initial.len());
+    mesh.update_peers(initial);
     loop {
         tokio::select! {
             biased;
@@ -405,7 +456,36 @@ async fn membership_to_mesh_task(
                 }
                 let current = peers.borrow_and_update().clone();
                 tracing::info!(peer_count = current.len(), "membership view changed");
+                set_live_peers_gauge(current.len());
                 mesh.update_peers(current);
+            }
+        }
+    }
+}
+
+fn set_live_peers_gauge(count: usize) {
+    metrics::gauge!("sundog_live_peers").set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
+}
+
+/// Periodically republishes the count of caches open in this process as the
+/// `sundog_open_caches` gauge. A gauge, not an event-driven update, because
+/// [`crate::cache::CacheBuilder::open`] — the only place a cache is ever
+/// added to the registry — lives outside this module's ownership and has no
+/// hook to call back into telemetry from.
+async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {
+                let count = shards
+                    .read()
+                    .expect("invariant: shard registry lock is never poisoned")
+                    .len();
+                metrics::gauge!("sundog_open_caches")
+                    .set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
             }
         }
     }
@@ -574,7 +654,10 @@ pub(crate) async fn tombstone_gc_task(
     }
 }
 
-#[cfg(test)]
+// Real-transport-only: these build a live `Cluster` (real `Mesh`, real
+// sockets), which panics under `sim` outside a driven `turmoil::Sim` — see
+// `net::mod`'s test-module comment for the full rationale.
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::net::Ipv4Addr;
 

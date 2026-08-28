@@ -132,7 +132,9 @@ async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, dono
     }
 }
 
-#[cfg(test)]
+// Real-transport-only, same reason as `net::mod`'s test module: this builds
+// a live `Cluster` with a real `Mesh`.
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
 

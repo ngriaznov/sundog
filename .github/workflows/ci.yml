@@ -27,5 +27,30 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
 
+      - name: cargo clippy (sim feature)
+        run: cargo clippy --package sundog --all-targets --features sim -- -D warnings -W clippy::pedantic
+
+      # `tls,prometheus` together: both are independent, real-tokio-only
+      # features (the `tls` module and its mesh-wrapping only compile under
+      # `not(feature = "sim")`, see `net::tls`'s module docs), so nothing
+      # about combining them is different from either alone.
+      - name: cargo clippy (tls,prometheus features)
+        run: cargo clippy --package sundog --all-targets --features tls,prometheus -- -D warnings -W clippy::pedantic
+
       - name: cargo test
         run: cargo test --workspace
+
+      - name: cargo test (turmoil simulation suite)
+        run: cargo test --package sundog --features sim --test 'sim*'
+
+      # Exercises tests/tls.rs and tests/prometheus_exporter.rs (silent no-ops
+      # otherwise, each `#![cfg(feature = "...")]`-gated) alongside the full
+      # default suite. Not `--all-features`: `sim` swaps the entire transport
+      # to turmoil (`net::tcp`'s seam), which every plain `#[tokio::test]`
+      # elsewhere in the crate — including these two features' own tests —
+      # dials real OS sockets against, so `sim` combined with anything else
+      # fails outside a turmoil `Sim`; `--all-features` compiles cleanly (see
+      # this crate's build-agent report) but is nonsensical to *test* against,
+      # which is why `sim` keeps its own lane above instead.
+      - name: cargo test (tls,prometheus features)
+        run: cargo test --package sundog --features tls,prometheus

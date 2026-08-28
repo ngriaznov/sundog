@@ -61,13 +61,19 @@ pub mod membership;
 pub mod net;
 pub mod node;
 pub mod store;
+#[cfg(feature = "prometheus")]
+pub mod telemetry;
 pub mod wire;
 
 pub use cache::{Cache, CacheBuilder};
 pub use cluster::{Cluster, ClusterBuilder};
 pub use config::ClusterConfig;
+#[cfg(feature = "tls")]
+pub use config::TlsConfig;
 pub use discovery::Discovery;
 pub use error::{CacheError, CodecError, JoinError};
 pub use hlc::{Hlc, HlcClock};
 pub use node::{NodeId, NodeName};
-pub use store::{Event, Mode, Origin};
+pub use store::{ConflictResolver, Event, LwwResolver, Mode, Origin, RecordView, Winner};
+#[cfg(feature = "prometheus")]
+pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};

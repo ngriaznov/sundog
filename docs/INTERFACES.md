@@ -1,5 +1,20 @@
 # sundog — module interfaces
 
+**Status: historical.** This document is the interface contract handed to
+the four build agents for the parallel implementation phase — it froze the
+public signatures below *before* `discovery`, `membership`, `net`, and
+`store` had bodies, so every module could be implemented independently
+without touching another's files. That phase is done: all four modules,
+plus `cluster.rs` and `cache.rs`, are fully implemented, tested, and green
+(`cargo check --workspace`, `cargo clippy --workspace --all-targets -W
+clippy::pedantic`, `cargo test --workspace`) — none of the `todo!()` bodies
+described below still exist. Kept as a reference for the signatures and
+ownership seams the implementation was built against; for the current state
+of the library, read the modules themselves (each carries `//!` docs) or
+`README.md`.
+
+---
+
 The workspace scaffold is in place. `node`, `hlc`, `wire`, `error`, `config`
 are **complete** (with unit tests) and stable — treat them as a library.
 `discovery`, `membership`, `net`, `store` are **stubs**: precise public

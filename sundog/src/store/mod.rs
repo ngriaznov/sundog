@@ -33,6 +33,12 @@ use crate::wire::{MAX_FRAME, WireRecord};
 /// Number of anti-entropy buckets per shard: `bucket(k) = xxh3(key_bytes) & (BUCKET_COUNT - 1)`.
 pub const BUCKET_COUNT: usize = 1024;
 
+/// A custom per-entry weigher for size-bounded eviction: `(key, value) ->
+/// weight`, passed through to `moka`'s own weigher hook. Boxed since
+/// [`crate::cache::CacheBuilder::weigher`] and [`Shard::with_weigher`] need
+/// to store one before its concrete closure type is nameable.
+pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
+
 /// Records per [`WireRecord`] batch yielded by [`ShardOps::snapshot_chunks`] (plan §9).
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
@@ -109,7 +115,12 @@ pub trait ShardOps: Send + Sync {
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
     /// Applies an inbound invalidation: drops the local copy of `key` iff
-    /// `ver` is newer than the locally stored version.
+    /// `ver` is newer than the locally stored version. Deliberately not
+    /// routed through [`ConflictResolver`]: an invalidation carries no value
+    /// (it is a "the entry changed, drop your copy" signal, not a record),
+    /// so there is nothing for a resolver to compare — `Hlc` order is the
+    /// only signal available here, in [`Mode::Invalidation`] as much as it
+    /// ever was.
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()>;
 
     /// Returns this shard's current per-bucket XOR digests, `(bucket, digest)`
@@ -134,6 +145,98 @@ pub trait ShardOps: Send + Sync {
     /// Garbage-collects tombstones older than the configured
     /// `tombstone_ttl`, keeping the digest and entry set consistent.
     fn gc_tombstones(&self) -> BoxFuture<'_, ()>;
+}
+
+/// One side of a [`ConflictResolver::winner`] comparison: everything a
+/// resolver needs to pick a winner, at the wire level — postcard-encoded
+/// value bytes rather than the typed value, matching the boundary described
+/// in this module's docs ("local reads never deserialize").
+#[derive(Debug, Clone, Copy)]
+pub struct RecordView<'a> {
+    /// The record's postcard-encoded value bytes, or `None` for a tombstone.
+    pub value: Option<&'a [u8]>,
+    /// The record's version.
+    pub ver: Hlc,
+    /// Absolute expiry in epoch milliseconds, or `None` for no TTL/no value.
+    pub expires_at_ms: Option<u64>,
+}
+
+/// The outcome of a [`ConflictResolver::winner`] call: which of the two
+/// argument records — by position, not by role — should be kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Winner {
+    /// The first record (`a`) wins; `b` is discarded.
+    A,
+    /// The second record (`b`) wins; `a` is discarded.
+    B,
+}
+
+/// Picks a winner between two differently-versioned records for the same
+/// key. A resolver **picks**, it never **merges**: synthesizing a combined
+/// value would make [`Shard::apply`]'s outcome depend on which two versions
+/// happened to collide locally, breaking digest equality between replicas
+/// that saw the same writes in a different order (plan §4, §14 pulled into
+/// v1 — see `docs/HOUSE_RULES.md`).
+///
+/// # Correctness contract — required for the permutation-convergence
+/// property
+///
+/// [`Shard::apply`]'s core guarantee is that applying any set of writes, in
+/// any order, any number of times, converges to the same state on every
+/// replica. That guarantee transfers to a custom resolver only if `winner`
+/// is:
+///
+/// - **Deterministic.** A pure function of `key`, `a`, and `b` alone — no
+///   clock reads, no randomness, no external state. The same three inputs
+///   must always produce the same [`Winner`].
+/// - **Antisymmetric (order-independent).** Swapping the two records must
+///   swap the answer: `winner(key, a, b) == A` if and only if
+///   `winner(key, b, a) == B`. A resolver that instead favors "whichever
+///   argument arrived as `b`" (or any other property of argument position
+///   rather than of the records themselves) breaks convergence outright —
+///   two replicas that apply the same pair of writes with `a`/`b` swapped
+///   (as happens constantly: which side is "stored" and which is
+///   "incoming" depends purely on arrival order) would disagree on the
+///   winner forever.
+/// - **Total and transitive.** Across any set of distinct-version records
+///   for one key, the induced "beats" relation must be a strict total
+///   order: never A beats B, B beats C, and C beats A. A cycle means there
+///   is no stable winner, and replicas that received the records in
+///   different orders can flap indefinitely instead of converging.
+///
+/// [`Shard::apply`] only ever calls `winner` when `a.ver != b.ver`; equal
+/// versions are always a no-op before `winner` is consulted (plan §4: a
+/// given `(wall_ms, logical, node)` triple is produced by at most one write
+/// ever, so equal versions imply identical records) — a resolver never has
+/// to, and never gets asked to, break that tie.
+///
+/// The default [`LwwResolver`] satisfies all three properties by comparing
+/// [`Hlc`] alone, which is already a deterministic, antisymmetric, total,
+/// transitive order — this is the behavior every `Shard` had before
+/// `ConflictResolver` existed, bit-for-bit.
+///
+/// A resolver that violates antisymmetry or transitivity is not safe to run
+/// on more than one replica: nothing in this crate detects the violation,
+/// convergence simply stops holding. Such a resolver is deliberately not
+/// covered by the permutation-convergence test in this module — the
+/// property cannot hold for it, only document the hazard.
+pub trait ConflictResolver: Send + Sync + 'static {
+    /// Decides which of `a`, `b` — two different versions of the record
+    /// stored at `key` (`key`'s wire-encoded bytes) — wins. See the trait
+    /// docs for the correctness contract this must satisfy.
+    fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner;
+}
+
+/// The default resolver: last-write-wins by [`Hlc`], ignoring value bytes
+/// and `expires_at_ms` entirely — the only comparison `Shard::apply` ever
+/// made before [`ConflictResolver`] became pluggable, preserved bit-for-bit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LwwResolver;
+
+impl ConflictResolver for LwwResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
+    }
 }
 
 /// A stored value paired with the version it was last written at — the
@@ -301,6 +404,13 @@ where
     digest: Arc<[AtomicU64]>,
     ttl: Option<Duration>,
     tombstone_ttl_ms: u64,
+    resolver: Arc<dyn ConflictResolver>,
+    max_frame: usize,
+    /// Remembered (alongside `tti` below) so [`Shard::with_weigher`] can
+    /// rebuild the `moka` cache from scratch — a weigher can only be
+    /// installed at `moka` build time, unlike `resolver`/`max_frame` above.
+    max_capacity: u64,
+    tti: Option<Duration>,
 }
 
 impl<K, V> Shard<K, V>
@@ -334,8 +444,36 @@ where
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into();
-        let digest_for_listener = Arc::clone(&digest);
+        let cache = Self::build_cache(max_capacity, tti, &digest, None);
 
+        Self {
+            name,
+            mode,
+            cache,
+            events: broadcast::channel(EVENTS_CAPACITY).0,
+            clock: StdMutex::new(HlcClock::new(node)),
+            tombstones: Arc::new(AsyncMutex::new(HashMap::new())),
+            digest,
+            ttl,
+            tombstone_ttl_ms: duration_ms(ClusterConfig::default().tombstone_ttl),
+            resolver: Arc::new(LwwResolver),
+            max_frame: MAX_FRAME,
+            max_capacity,
+            tti,
+        }
+    }
+
+    /// Builds the underlying `moka` cache with the digest-maintaining
+    /// eviction listener wired in (plan §8) and an optional custom weigher.
+    /// Shared by [`Shard::new`] and [`Shard::with_weigher`], which rebuilds
+    /// from scratch since `moka` only accepts a weigher at build time.
+    fn build_cache(
+        max_capacity: u64,
+        tti: Option<Duration>,
+        digest: &Arc<[AtomicU64]>,
+        weigher: Option<Weigher<K, V>>,
+    ) -> moka::future::Cache<K, Arc<Stored<V>>> {
+        let digest_for_listener = Arc::clone(digest);
         let mut builder = moka::future::Cache::<K, Arc<Stored<V>>>::builder()
             .max_capacity(max_capacity)
             .expire_after(AbsoluteExpiry)
@@ -360,21 +498,14 @@ where
                         .fetch_xor(entry_fingerprint(&key_bytes, value.ver), Ordering::Relaxed);
                 },
             );
+        if let Some(weigher) = weigher {
+            builder =
+                builder.weigher(move |key: &K, value: &Arc<Stored<V>>| weigher(key, &value.value));
+        }
         if let Some(tti) = tti {
             builder = builder.time_to_idle(tti);
         }
-
-        Self {
-            name,
-            mode,
-            cache: builder.build(),
-            events: broadcast::channel(EVENTS_CAPACITY).0,
-            clock: StdMutex::new(HlcClock::new(node)),
-            tombstones: Arc::new(AsyncMutex::new(HashMap::new())),
-            digest,
-            ttl,
-            tombstone_ttl_ms: duration_ms(ClusterConfig::default().tombstone_ttl),
-        }
+        builder.build()
     }
 
     /// Overrides the tombstone retention period used by
@@ -386,6 +517,47 @@ where
     #[must_use]
     pub fn with_tombstone_ttl(mut self, tombstone_ttl: Duration) -> Self {
         self.tombstone_ttl_ms = duration_ms(tombstone_ttl);
+        self
+    }
+
+    /// Overrides the [`ConflictResolver`] consulted by [`Shard::apply`]
+    /// whenever an incoming record's version differs from what's stored
+    /// (defaults to [`LwwResolver`]). Same fixed-`Shard::new`-signature,
+    /// follow-up-call pattern as [`Shard::with_tombstone_ttl`].
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Overrides the hard cap [`Shard::insert`] enforces before writing a
+    /// value (defaults to [`MAX_FRAME`]) — threaded from a live cluster's
+    /// configured `ClusterConfig::max_frame` the same way
+    /// [`Shard::with_tombstone_ttl`] threads `tombstone_ttl`.
+    #[must_use]
+    pub fn with_max_frame(mut self, max_frame: usize) -> Self {
+        self.max_frame = max_frame;
+        self
+    }
+
+    /// Installs a custom per-entry weigher for size-bounded eviction, in
+    /// place of the default of one weight unit per entry — threaded from
+    /// [`crate::cache::CacheBuilder::weigher`]. Rebuilds the underlying
+    /// `moka` cache (a weigher can only be installed at `moka` build time),
+    /// so this must be called immediately after [`Shard::new`], before any
+    /// reads or writes reach this shard — harmless at that call site, since
+    /// the cache is still empty there.
+    #[must_use]
+    pub fn with_weigher<W>(mut self, weigher: W) -> Self
+    where
+        W: Fn(&K, &V) -> u32 + Send + Sync + 'static,
+    {
+        self.cache = Self::build_cache(
+            self.max_capacity,
+            self.tti,
+            &self.digest,
+            Some(Box::new(weigher)),
+        );
         self
     }
 
@@ -419,11 +591,21 @@ where
         self.ttl.map(|d| now_ms().saturating_add(duration_ms(d)))
     }
 
-    /// The versioned-apply core (plan §4): applies `incoming` at `ver` iff it
-    /// is newer than whatever this shard currently holds for `key` (a live
-    /// entry or a tombstone), publishing the resulting [`Event`] on success.
-    /// Idempotent and commutative — the single path shared by local writes,
-    /// replicated writes, state transfer, and anti-entropy repair.
+    /// The versioned-apply core (plan §4): applies `incoming` at `ver` iff
+    /// the configured [`ConflictResolver`] picks it over whatever this shard
+    /// currently holds for `key` (a live entry or a tombstone), publishing
+    /// the resulting [`Event`] on success. Idempotent and commutative — the
+    /// single path shared by local writes, replicated writes, state
+    /// transfer, and anti-entropy repair. With the default [`LwwResolver`]
+    /// this is exactly "apply iff `ver` is newer than the stored version",
+    /// unchanged from before `ConflictResolver` existed.
+    ///
+    /// Equal versions are always a no-op, regardless of resolver: a given
+    /// `(wall_ms, logical, node)` triple is produced by at most one write
+    /// ever, so an equal-version incoming record is definitionally the
+    /// record already stored, and the resolver's correctness contract (see
+    /// [`ConflictResolver::winner`]) doesn't have to, and isn't asked to,
+    /// break that tie.
     async fn apply(
         &self,
         key: K,
@@ -435,12 +617,47 @@ where
         let mut tombstones = self.tombstones.lock().await;
 
         let prior_tombstone = tombstones.get(&key_bytes).copied();
-        let stored_ver = match prior_tombstone {
-            Some(t) => Some(t.ver),
-            None => self.cache.get(&key).await.map(|s| s.ver),
+        let stored_live = if prior_tombstone.is_none() {
+            self.cache.get(&key).await
+        } else {
+            None
         };
-        if stored_ver.is_some_and(|sv| ver <= sv) {
-            return;
+        let stored_ver = prior_tombstone
+            .map(|t| t.ver)
+            .or_else(|| stored_live.as_ref().map(|s| s.ver));
+
+        if let Some(sv) = stored_ver {
+            if sv == ver {
+                return;
+            }
+            let stored_value_bytes = stored_live.as_ref().map(|s| {
+                postcard::to_stdvec(&s.value)
+                    .expect("invariant: a value already resident in the cache postcard-encodes")
+            });
+            let stored_view = RecordView {
+                value: stored_value_bytes.as_deref(),
+                ver: sv,
+                expires_at_ms: stored_live.as_ref().and_then(|s| s.expires_at_ms),
+            };
+            let incoming_value_bytes = match &incoming {
+                Incoming::Put { value, .. } => Some(postcard::to_stdvec(value).expect(
+                    "invariant: value already validated to postcard-encode, by Shard::insert's \
+                     size check or by apply_remote's wire decode",
+                )),
+                Incoming::Tombstone => None,
+            };
+            let incoming_expires_at_ms = match &incoming {
+                Incoming::Put { expires_at_ms, .. } => *expires_at_ms,
+                Incoming::Tombstone => None,
+            };
+            let incoming_view = RecordView {
+                value: incoming_value_bytes.as_deref(),
+                ver,
+                expires_at_ms: incoming_expires_at_ms,
+            };
+            if self.resolver.winner(&key_bytes, stored_view, incoming_view) == Winner::A {
+                return;
+            }
         }
 
         let bucket = usize::from(bucket_of(&key_bytes));
@@ -571,15 +788,16 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the postcard-encoded value
-    /// exceeds [`MAX_FRAME`].
+    /// exceeds the configured frame cap (see [`Shard::with_max_frame`],
+    /// default [`MAX_FRAME`]).
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         let key_bytes = encode_key(&key)?;
         let value_bytes = postcard::to_stdvec(&value).map_err(CodecError::from)?;
-        if value_bytes.len() > MAX_FRAME {
+        if value_bytes.len() > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),
                 size: value_bytes.len(),
-                limit: MAX_FRAME,
+                limit: self.max_frame,
             });
         }
         let ver = self.stamp_local();
@@ -1205,4 +1423,221 @@ mod tests {
         }
         assert_digest_matches_full_recompute(&s).await;
     }
+
+    #[tokio::test]
+    async fn with_max_frame_overrides_the_default_cap() {
+        let s = shard::<u32, Vec<u8>>(1).with_max_frame(4);
+        let err = s
+            .insert(1, vec![0u8; 10])
+            .await
+            .expect_err("must reject a value over the overridden cap");
+        assert!(matches!(err, CacheError::ValueTooLarge { .. }));
+
+        s.insert(2, Vec::new())
+            .await
+            .expect("a small value still fits under the overridden cap");
+    }
+
+    #[tokio::test]
+    async fn with_weigher_drives_mokas_weighted_size() {
+        let s = shard::<u32, Vec<u8>>(1).with_weigher(|_key: &u32, value: &Vec<u8>| {
+            u32::try_from(value.len()).unwrap_or(u32::MAX)
+        });
+        s.insert(1, vec![0u8; 7]).await.expect("insert");
+        s.cache.run_pending_tasks().await;
+        assert_eq!(
+            s.cache.weighted_size(),
+            7,
+            "a custom weigher must drive moka's weighted size, not the default of 1 per entry"
+        );
+    }
+
+    /// A non-default resolver used to prove `ConflictResolver` actually
+    /// changes `Shard::apply`'s outcome (default LWW is exercised by every
+    /// test above, unchanged): whichever record has the longer value wins,
+    /// `Hlc` breaking ties on equal length. This is a proper total order —
+    /// `(len, ver)` compared lexicographically — so it satisfies the
+    /// determinism/antisymmetry/totality contract `ConflictResolver::winner`
+    /// documents.
+    #[derive(Debug, Clone, Copy)]
+    struct LongestValueWins;
+
+    impl ConflictResolver for LongestValueWins {
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            let len_a = a.value.map_or(0, <[u8]>::len);
+            let len_b = b.value.map_or(0, <[u8]>::len);
+            match len_a.cmp(&len_b) {
+                std::cmp::Ordering::Greater => Winner::A,
+                std::cmp::Ordering::Less => Winner::B,
+                std::cmp::Ordering::Equal => {
+                    if a.ver >= b.ver {
+                        Winner::A
+                    } else {
+                        Winner::B
+                    }
+                }
+            }
+        }
+    }
+
+    /// A resolver that always prefers whichever record is passed as `a` —
+    /// deliberately violates `ConflictResolver::winner`'s antisymmetry
+    /// requirement. Not exercised by a convergence test (the property
+    /// cannot hold for it, per the trait docs); this only demonstrates that
+    /// such a resolver is trivially distinguishable from `LongestValueWins`
+    /// above, so the doc's warning has a concrete referent.
+    #[derive(Debug, Clone, Copy)]
+    struct AlwaysA;
+
+    impl ConflictResolver for AlwaysA {
+        fn winner(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Winner {
+            Winner::A
+        }
+    }
+
+    #[test]
+    fn longest_value_wins_is_antisymmetric_over_sample_pairs() {
+        let resolver = LongestValueWins;
+        let samples = [
+            RecordView {
+                value: Some(b"a"),
+                ver: hlc(1, 1),
+                expires_at_ms: None,
+            },
+            RecordView {
+                value: Some(b"abc"),
+                ver: hlc(2, 2),
+                expires_at_ms: None,
+            },
+            RecordView {
+                value: None,
+                ver: hlc(3, 1),
+                expires_at_ms: None,
+            },
+            RecordView {
+                value: Some(b"ab"),
+                ver: hlc(1, 9),
+                expires_at_ms: None,
+            },
+        ];
+        for &a in &samples {
+            for &b in &samples {
+                if a.ver == b.ver {
+                    continue; // Shard::apply never asks about equal versions.
+                }
+                let ab = resolver.winner(b"k", a, b);
+                let ba = resolver.winner(b"k", b, a);
+                assert_ne!(ab, ba, "swapping the arguments must swap the winner");
+            }
+        }
+
+        // `AlwaysA` is exactly the antisymmetry violation the trait docs
+        // warn about: swapping the arguments does not swap the winner.
+        let broken = AlwaysA;
+        let (x, y) = (samples[0], samples[1]);
+        assert_eq!(broken.winner(b"k", x, y), Winner::A);
+        assert_eq!(broken.winner(b"k", y, x), Winner::A);
+    }
+
+    #[tokio::test]
+    async fn custom_resolver_overrides_plain_hlc_order() {
+        let s = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(LongestValueWins));
+
+        let long_but_old = WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&vec![0u8; 10]).expect("encode"),
+            )),
+            ver: hlc(100, 2),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, long_but_old).await;
+        assert_eq!(s.get(&1).await, Some(vec![0u8; 10]));
+
+        // Strictly newer by Hlc, but shorter: must lose under LongestValueWins.
+        let short_but_new = WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&vec![0u8; 3]).expect("encode"),
+            )),
+            ver: hlc(200, 3),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, short_but_new).await;
+        assert_eq!(
+            s.get(&1).await,
+            Some(vec![0u8; 10]),
+            "the default Hlc-only rule must not apply once a custom resolver is installed"
+        );
+
+        // Longer *and* newer: wins outright.
+        let long_and_new = WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&vec![0u8; 20]).expect("encode"),
+            )),
+            ver: hlc(300, 3),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, long_and_new).await;
+        assert_eq!(s.get(&1).await, Some(vec![0u8; 20]));
+    }
+
+    /// The permutation-convergence property (plan §4, §11), specialized to a
+    /// custom resolver: two independent shards, sharing the same
+    /// [`LongestValueWins`] resolver, apply the same set of writes/removes in
+    /// different orders with duplicates — and must land on identical state
+    /// and identical digests. This is the license for pluggability: the
+    /// property that makes replaying records in any order safe does not rely
+    /// on any specific resolver, only on the resolver's own contract.
+    #[tokio::test]
+    async fn custom_resolver_converges_across_permutations_and_duplicates() {
+        let a = shard::<u32, Vec<u8>>(10).with_resolver(Arc::new(LongestValueWins));
+        let b = shard::<u32, Vec<u8>>(20).with_resolver(Arc::new(LongestValueWins));
+
+        let mut records = Vec::new();
+        for i in 0..6u64 {
+            let key = u32::try_from(i % 3).expect("small");
+            let len = usize::try_from((i * 7) % 11).expect("small");
+            let value = vec![u8::try_from(i).expect("small"); len];
+            records.push(WireRecord {
+                key: key_bytes(&key),
+                value: Some(Bytes::from(postcard::to_stdvec(&value).expect("encode"))),
+                ver: hlc(1_000 + i * 3, i % 4 + 1),
+                expires_at_ms: None,
+            });
+        }
+        records.push(WireRecord {
+            key: key_bytes(&1u32),
+            value: None,
+            ver: hlc(1_100, 9),
+            expires_at_ms: None,
+        });
+
+        for rec in &records {
+            ShardOps::apply_remote(&a, rec.clone()).await;
+        }
+        // Reverse order, each record applied twice — reordering and
+        // duplication together, the two hazards anti-entropy must tolerate.
+        for rec in records.iter().rev() {
+            ShardOps::apply_remote(&b, rec.clone()).await;
+            ShardOps::apply_remote(&b, rec.clone()).await;
+        }
+
+        for key in 0..3u32 {
+            assert_eq!(
+                a.get(&key).await,
+                b.get(&key).await,
+                "key {key} diverged across permutations under a shared custom resolver"
+            );
+        }
+        assert_eq!(
+            ShardOps::digests(&a).await,
+            ShardOps::digests(&b).await,
+            "digests diverged between replicas under the same custom resolver"
+        );
+    }
 }
+
+#[cfg(test)]
+mod prop_tests;
