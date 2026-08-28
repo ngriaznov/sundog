@@ -1,9 +1,8 @@
-//! Container-backed multi-node scenarios (plan §11 layer 4), replacing the
-//! former in-process `tests/common`-based layer-3 suite for everything that
-//! genuinely needs real, separate processes on a real network: membership
+//! Container-backed multi-node scenarios for everything that genuinely
+//! needs real, separate processes on a real network: membership
 //! convergence, replication, tombstones, state transfer, and anti-entropy —
-//! exclusively through the `rightsize` crate, no docker CLI, no `bollard`
-//! (`docs/HOUSE_RULES.md`'s hard rule). See `tests/container_util` for the
+//! exclusively through the `rightsize` crate, no docker CLI, no `bollard`.
+//! See `tests/container_util` for the
 //! harness and `sundog-testnode` for the control protocol every [`Node`]
 //! drives.
 //!
