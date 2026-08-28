@@ -1,0 +1,20 @@
+[package]
+name = "sundog-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI demo for the sundog cache: join a cluster, put/get, watch events, print membership"
+publish = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+anyhow = "1.0.104"
+rand = "0.10.2"
+sundog = { version = "0.1.0", path = "../sundog" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
+tracing-subscriber = "0.3.23"

@@ -21,9 +21,10 @@ Binding for all code in this repo. Read alongside `docs/BUILD_PLAN.md`.
 
 - **HLC is hand-rolled**, not `uhlc`: `Hlc { wall_ms: u64, logical: u32, node: NodeId }`, derived lexicographic `Ord`, plus an `HlcClock` implementing the standard HLC send/receive update rules. Rationale: exact plan semantics, deterministic postcard encoding, trivially property-testable. (Plan §4 lists uhlc; this is the recorded deviation.)
 - **NodeId** is a compact `u64` generated per process incarnation (random), displayed as hex; the chitchat node id string is `{hostname}-{node_id_hex}`.
-- **turmoil simulation is deferred** past this build; testing layers 1 (proptest) and 3 (in-process integration over loopback with `Static` discovery) are in scope now.
-- **Demo bin** is a plain CLI (join cluster, put/get/watch events, print membership), not the TUI — TUI is M7 polish.
-- `metrics` counters as named in the plan (`sundog_backlog_dropped_total{peer}` etc.); Prometheus exporter behind a feature flag, off by default.
+- **All-in v1 scope**: all four testing layers from plan §11 are in scope, including **turmoil deterministic simulation** (the net layer gains a transport seam so turmoil can host the data plane; sim tests cover partition/heal convergence, loss/reorder/dup storms, donor crash mid-state-transfer).
+- **Demo bin** is the full chaos TUI from plan §11.4 (ratatui): N in-process nodes, cluster view, injectable faults (kill node, pause node, partition via a toggleable transport filter).
+- `metrics` counters as named in the plan (`sundog_backlog_dropped_total{peer}` etc.); **Prometheus exporter implemented** behind a `prometheus` feature flag (metrics-exporter-prometheus), off by default.
+- **Future plans pulled into v1** (from plan §14): a pluggable `ConflictResolver` trait (default LWW, resolver consulted on concurrent-version conflicts); TLS on the data plane behind a `tls` feature (rustls, pre-shared cert config). The rest of §14 (distribution mode, QUIC, IBLT set reconciliation, remote thin clients) ships as `ROADMAP.md` with design sketches, not code.
 - Dual license MIT OR Apache-2.0.
 
 ## Rules for build agents

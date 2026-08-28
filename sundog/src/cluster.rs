@@ -1,0 +1,777 @@
+//! The top-level public entry point: `Cluster::builder(name).build()` forms a
+//! working zeroconf cluster, and `cluster.cache(name)` opens named caches on
+//! it. Plan §10 — this exact shape is the project's acceptance test.
+//!
+//! Composition: `build()` resolves the data-plane's advertised address,
+//! starts [`Membership`] (gossip), announces via [`Discovery`], then starts
+//! [`Mesh`] (the TCP data plane) with a [`RequestHandler`] that answers
+//! inbound state-transfer/anti-entropy requests over this cluster's shard
+//! registry. Three background tasks, all stopped together by
+//! [`Cluster::shutdown`], keep the planes in sync: membership changes flow
+//! into `Mesh::update_peers`, inbound wire messages dispatch to shards by
+//! cache name, and — spawned per opened cache — local writes fan out over
+//! the mesh per [`Mode`].
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::hash::Hash;
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::stream::{self, BoxStream, StreamExt as _};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use smol_str::SmolStr;
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+use crate::cache::CacheBuilder;
+use crate::config::ClusterConfig;
+use crate::discovery::mdns::Mdns;
+use crate::discovery::statics::Static;
+use crate::discovery::{Discovery, DiscoveryKind};
+use crate::error::JoinError;
+use crate::hlc::Hlc;
+use crate::membership::{Membership, Peer};
+use crate::net::{InboundMsg, Mesh, MsgClass, RequestHandler};
+use crate::node::{NodeId, NodeName};
+use crate::store::{Event, Mode, Origin, Shard, ShardOps};
+use crate::wire::{Msg, WireRecord};
+
+/// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`
+/// (plan §7). Shared between [`Cluster`] itself and the [`RequestHandler`]
+/// handed to [`Mesh::spawn`], so a cache opened after the mesh starts is
+/// immediately visible to inbound state-transfer/anti-entropy requests.
+type ShardRegistry = Arc<RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>>>;
+
+/// A running cluster membership: the join point for opening named caches.
+///
+/// Cheap to `Clone`; every clone shares the same membership, mesh, and cache
+/// registry. Dropping every clone does not tear the cluster down — call
+/// [`Cluster::shutdown`] for a graceful leave.
+#[derive(Clone)]
+pub struct Cluster {
+    inner: Arc<ClusterInner>,
+}
+
+struct ClusterInner {
+    node: NodeId,
+    name: SmolStr,
+    membership: Membership,
+    mesh: Mesh,
+    shards: ShardRegistry,
+    config: ClusterConfig,
+    tracker: TaskTracker,
+    cancel: CancellationToken,
+}
+
+/// Builds a [`Cluster`]: own-and-return, per house style. Zero further calls
+/// beyond `.build()` must form a working LAN cluster (plan §10) — mDNS
+/// discovery, ephemeral ports, and the [`ClusterConfig`] defaults.
+#[must_use]
+pub struct ClusterBuilder {
+    name: SmolStr,
+    discovery: Option<DiscoveryKind>,
+    config: ClusterConfig,
+}
+
+impl Cluster {
+    /// Starts building a cluster named `name`. The cluster name is chitchat's
+    /// cluster id — wrong-cluster gossip is rejected for free.
+    pub fn builder(name: impl Into<SmolStr>) -> ClusterBuilder {
+        ClusterBuilder {
+            name: name.into(),
+            discovery: None,
+            config: ClusterConfig::default(),
+        }
+    }
+
+    /// This node's id.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.inner.node
+    }
+
+    /// Opens or joins a named cache. Returns a builder — call `.open().await`
+    /// to register it in the cluster's shard registry and get back a usable
+    /// [`crate::cache::Cache`] handle.
+    pub fn cache<K, V>(&self, name: impl Into<SmolStr>) -> CacheBuilder<K, V>
+    where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        CacheBuilder::new(self.clone(), name.into())
+    }
+
+    pub(crate) fn config(&self) -> &ClusterConfig {
+        &self.inner.config
+    }
+
+    pub(crate) fn shards(&self) -> ShardRegistry {
+        Arc::clone(&self.inner.shards)
+    }
+
+    pub(crate) fn mesh(&self) -> &Mesh {
+        &self.inner.mesh
+    }
+
+    /// The live peer set, as node ids only — what `Cache`'s write-fan-out
+    /// task iterates to decide who to send `Invalidate`/`Replicate` to.
+    pub(crate) fn live_peer_ids(&self) -> Vec<NodeId> {
+        self.inner
+            .membership
+            .peers()
+            .borrow()
+            .iter()
+            .map(|peer| peer.node)
+            .collect()
+    }
+
+    /// A child of this cluster's shutdown token: cancelled the moment
+    /// [`Cluster::shutdown`] is called on any clone of this handle.
+    pub(crate) fn cancel_token(&self) -> CancellationToken {
+        self.inner.cancel.child_token()
+    }
+
+    /// Spawns `fut` on this cluster's [`TaskTracker`], so
+    /// [`Cluster::shutdown`] waits for it to observe cancellation and exit.
+    pub(crate) fn spawn_tracked<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.inner.tracker.spawn(fut);
+    }
+
+    /// Leaves the cluster gracefully: background fan-out/dispatch tasks are
+    /// cancelled and joined first, then chitchat departs politely and the
+    /// data plane closes its connections. No more calls should be made on any
+    /// clone of this handle afterward.
+    ///
+    /// Cache handles opened before this call keep working for purely local
+    /// reads/writes afterward — `Shard` never depends on `Mesh` or
+    /// `Membership` directly — they just stop having anywhere to fan out to.
+    pub async fn shutdown(self) {
+        self.inner.cancel.cancel();
+        self.inner.tracker.close();
+        self.inner.tracker.wait().await;
+        self.inner.membership.clone().shutdown().await;
+        self.inner.mesh.clone().shutdown().await;
+        tracing::info!(node = %self.inner.node, cluster = %self.inner.name, "cluster shut down");
+    }
+}
+
+impl ClusterBuilder {
+    /// A fixed seed list, switching discovery from the zeroconf default
+    /// (`Mdns`) to [`Static`] — the escape hatch for environments where mDNS
+    /// doesn't reach (containers, isolated Wi-Fi) and the workhorse for tests.
+    pub fn seeds(mut self, seeds: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.discovery = Some(DiscoveryKind::Static(Static::new(seeds)));
+        self
+    }
+
+    /// Overrides the zeroconf default (`Mdns`) discovery mechanism, e.g. with
+    /// `DnsSrv` for Kubernetes, or a custom implementation.
+    pub fn discovery(mut self, discovery: impl Discovery + 'static) -> Self {
+        self.discovery = Some(DiscoveryKind::Custom(Box::new(discovery)));
+        self
+    }
+
+    /// Overrides the default [`ClusterConfig`].
+    pub fn config(mut self, config: ClusterConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Starts discovery, membership, and the data-plane mesh, and returns
+    /// once this node has joined (or begun forming) the cluster.
+    ///
+    /// mDNS finding nobody (a container with no multicast, a LAN of one) is
+    /// not an error — it is a healthy single-node cluster, exactly as
+    /// required for `Cluster::builder(name).build()` to be a working
+    /// zeroconf happy path on its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JoinError`] if the gossip or data-plane sockets cannot be
+    /// bound, or the membership backend fails to start.
+    pub async fn build(self) -> Result<Cluster, JoinError> {
+        let Self {
+            name,
+            discovery,
+            config,
+        } = self;
+
+        let node = NodeId::random();
+        let hostname = local_hostname();
+        let node_name = NodeName::new(&hostname, node);
+
+        let discovery = discovery
+            .unwrap_or_else(|| DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string())));
+
+        let data_bind_addr = reserve_data_bind_addr(config.data_bind_addr).await?;
+        let advertise_ip =
+            crate::membership::resolve_advertise_ip(data_bind_addr.ip()).map_err(|source| {
+                JoinError::Bind {
+                    addr: data_bind_addr,
+                    source,
+                }
+            })?;
+        let advertise_data_addr = SocketAddr::new(advertise_ip, data_bind_addr.port());
+
+        let membership = Membership::spawn(
+            name.clone(),
+            node,
+            &hostname,
+            advertise_data_addr,
+            &config,
+            discovery.candidates(),
+        )
+        .await?;
+
+        let gossip_addr = membership.local_peer().gossip_addr;
+        if let Err(error) = discovery.announce(gossip_addr).await {
+            tracing::warn!(%error, "discovery announce failed; continuing as a healthy single-node cluster");
+        }
+
+        let incarnation = membership.local_peer().incarnation;
+        let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
+            shards: Arc::clone(&shards),
+        });
+        let (mesh, inbound_rx) =
+            Mesh::spawn(data_bind_addr, node, incarnation, &config, handler).await?;
+
+        let cluster = Cluster {
+            inner: Arc::new(ClusterInner {
+                node,
+                name: name.clone(),
+                membership,
+                mesh,
+                shards,
+                config,
+                tracker: TaskTracker::new(),
+                cancel: CancellationToken::new(),
+            }),
+        };
+
+        cluster.spawn_tracked(membership_to_mesh_task(
+            cluster.inner.membership.peers(),
+            cluster.inner.mesh.clone(),
+            cluster.cancel_token(),
+        ));
+        cluster.spawn_tracked(inbound_loop(
+            cluster.shards(),
+            inbound_rx,
+            cluster.cancel_token(),
+        ));
+
+        tracing::info!(
+            %node,
+            cluster = %name,
+            data_addr = %advertise_data_addr,
+            gossip_addr = %gossip_addr,
+            "cluster formed"
+        );
+
+        Ok(cluster)
+    }
+}
+
+/// Resolves the concrete address `Mesh::spawn` should bind to, and that
+/// `Membership::spawn` advertises for it. A configured non-zero port is used
+/// as-is; the zeroconf default (port `0`) needs a real port *before*
+/// `Membership::spawn` so it can be gossiped, but only `Mesh::spawn` actually
+/// owns the listener — so a free port is claimed here and released for
+/// `Mesh::spawn` to rebind moments later. Same reserve-then-release trade-off
+/// `membership.rs` already accepts for its own gossip port (a vanishingly
+/// unlikely race against another process on a trusted LAN).
+async fn reserve_data_bind_addr(configured: SocketAddr) -> Result<SocketAddr, JoinError> {
+    if configured.port() != 0 {
+        return Ok(configured);
+    }
+    let probe = TcpListener::bind(configured)
+        .await
+        .map_err(|source| JoinError::Bind {
+            addr: configured,
+            source,
+        })?;
+    probe.local_addr().map_err(|source| JoinError::Bind {
+        addr: configured,
+        source,
+    })
+}
+
+fn local_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Answers inbound state-transfer/anti-entropy requests (`StRequest`,
+/// `AeDigest`, `AePull`) over this cluster's shard registry, for whichever
+/// cache a peer names. A cache name this node doesn't (yet) have degrades to
+/// an empty result rather than an error — a normal race, not a fault (see
+/// [`RequestHandler`]'s own docs).
+struct ClusterRequestHandler {
+    shards: ShardRegistry,
+}
+
+impl ClusterRequestHandler {
+    fn lookup(&self, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
+        self.shards
+            .read()
+            .expect("invariant: shard registry lock is never poisoned")
+            .get(cache)
+            .cloned()
+    }
+}
+
+impl RequestHandler for ClusterRequestHandler {
+    fn snapshot_chunks(&self, cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
+        match self.lookup(&cache) {
+            Some(shard) => shard.snapshot_chunks(),
+            None => stream::empty().boxed(),
+        }
+    }
+
+    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.digests().await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.bucket_entries(bucket).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn records_for(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.records_for(keys).await,
+                None => Vec::new(),
+            }
+        })
+    }
+}
+
+fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
+    shards
+        .read()
+        .expect("invariant: shard registry lock is never poisoned")
+        .get(cache)
+        .cloned()
+}
+
+/// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls,
+/// for the lifetime of the cluster (plan's composition sketch).
+async fn membership_to_mesh_task(
+    mut peers: watch::Receiver<Vec<Peer>>,
+    mesh: Mesh,
+    cancel: CancellationToken,
+) {
+    mesh.update_peers(peers.borrow_and_update().clone());
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            changed = peers.changed() => {
+                if changed.is_err() {
+                    return; // membership shut down
+                }
+                let current = peers.borrow_and_update().clone();
+                tracing::info!(peer_count = current.len(), "membership view changed");
+                mesh.update_peers(current);
+            }
+        }
+    }
+}
+
+/// The single consumer of `Mesh`'s inbound-message channel: dispatches
+/// `Invalidate`/`Replicate` to the named shard. A cache name with no
+/// registered shard is dropped with a trace event rather than an error — the
+/// opening side may simply not have called `open()` for it yet.
+async fn inbound_loop(
+    shards: ShardRegistry,
+    mut inbound: mpsc::Receiver<InboundMsg>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            received = inbound.recv() => {
+                let Some(InboundMsg { from, msg }) = received else { return };
+                match msg {
+                    Msg::Invalidate { cache, key, ver } => {
+                        if let Some(shard) = lookup_shard(&shards, &cache) {
+                            shard.invalidate(key, ver).await;
+                        } else {
+                            tracing::trace!(%cache, %from, "invalidate for unknown cache; dropped");
+                        }
+                    }
+                    Msg::Replicate { cache, rec } => {
+                        if let Some(shard) = lookup_shard(&shards, &cache) {
+                            shard.apply_remote(rec).await;
+                        } else {
+                            tracing::trace!(%cache, %from, "replicate for unknown cache; dropped");
+                        }
+                    }
+                    // `Hello` and the request/response messages never reach
+                    // this channel — `net::Mesh` handles those inline.
+                    Msg::Hello { .. }
+                    | Msg::StRequest { .. }
+                    | Msg::StChunk { .. }
+                    | Msg::AeDigest { .. }
+                    | Msg::AeBucket { .. }
+                    | Msg::AePull { .. } => {}
+                }
+            }
+        }
+    }
+}
+
+/// Subscribes to one opened cache's local-write events and fans each one out
+/// over the mesh per [`Mode`] — the composition-layer half of `Shard`'s
+/// design (`store::mod` docs: "`Shard` intentionally holds no handle to
+/// `net::Mesh`"). Every `Origin::Local` event fans out uniformly, including a
+/// `get_or_load` read-through fill: a fresh fill is itself a genuine
+/// versioned write (it carries a real `Hlc` stamp), and propagating it lets
+/// other `Replicated`-mode peers skip their own loader call — consistent with
+/// "a cache is re-derivable data" (plan §1), so under-propagating costs
+/// nothing but an extra loader call elsewhere, never correctness.
+pub(crate) async fn fan_out_task<K, V>(
+    shard: Arc<Shard<K, V>>,
+    cluster: Cluster,
+    mut events: broadcast::Receiver<Event<K, V>>,
+    cache_name: SmolStr,
+    mode: Mode,
+    cancel: CancellationToken,
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            received = events.recv() => {
+                let event = match received {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            cache = %cache_name,
+                            skipped,
+                            "cache fan-out lagged behind local writes; anti-entropy repairs the gap"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                fan_out_one(&shard, &cluster, &cache_name, mode, event).await;
+            }
+        }
+    }
+}
+
+async fn fan_out_one<K, V>(
+    shard: &Shard<K, V>,
+    cluster: &Cluster,
+    cache_name: &SmolStr,
+    mode: Mode,
+    event: Event<K, V>,
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let (key, origin) = match &event {
+        Event::Created { key, origin, .. }
+        | Event::Updated { key, origin, .. }
+        | Event::Removed { key, origin } => (key, *origin),
+    };
+    if !matches!(origin, Origin::Local) {
+        return;
+    }
+    let Ok(key_bytes) = postcard::to_stdvec(key) else {
+        return;
+    };
+    // Re-fetches through `ShardOps::records_for` rather than carrying the
+    // `Hlc`/wire bytes on `Event` itself (fixed by `docs/INTERFACES.md`): a
+    // benign race with a fast follow-up write/GC can make this come back
+    // empty, in which case there is nothing stale to fan out — a later event
+    // (or anti-entropy) covers the current state.
+    let records = ShardOps::records_for(shard, vec![Bytes::from(key_bytes)]).await;
+    let Some(rec) = records.into_iter().next() else {
+        return;
+    };
+
+    let peers = cluster.live_peer_ids();
+    match mode {
+        Mode::Local => {}
+        Mode::Invalidation => {
+            let msg = Msg::Invalidate {
+                cache: cache_name.clone(),
+                key: rec.key,
+                ver: rec.ver,
+            };
+            for peer in peers {
+                cluster.mesh().send(peer, MsgClass::Invalidate, msg.clone());
+            }
+        }
+        Mode::Replicated => {
+            let msg = Msg::Replicate {
+                cache: cache_name.clone(),
+                rec,
+            };
+            for peer in peers {
+                cluster.mesh().send(peer, MsgClass::Replicate, msg.clone());
+            }
+        }
+    }
+}
+
+/// Periodically garbage-collects one shard's expired tombstones (plan §4:
+/// tombstones must eventually be forgotten). Runs at a quarter of
+/// `tombstone_ttl` so a tombstone is never held much past its deadline.
+pub(crate) async fn tombstone_gc_task(
+    shard: Arc<dyn ShardOps>,
+    tombstone_ttl: Duration,
+    cancel: CancellationToken,
+) {
+    let period = (tombstone_ttl / 4).max(Duration::from_secs(1));
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => shard.gc_tombstones().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::error::CacheError;
+
+    /// Loopback-only config: skips the outbound-interface probe
+    /// `resolve_advertise_ip` would otherwise do for the zeroconf
+    /// `0.0.0.0`/`::` default, and keeps anti-entropy/tombstone timing tight
+    /// for fast, deterministic tests (plan §11 layer 3).
+    fn loopback_config() -> ClusterConfig {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        ClusterConfig {
+            gossip_bind_addr: loopback,
+            data_bind_addr: loopback,
+            ae_interval: Duration::from_millis(200),
+            tombstone_ttl: Duration::from_secs(2),
+            ..ClusterConfig::default()
+        }
+    }
+
+    async fn wait_for_peer_count(cluster: &Cluster, expected: usize) {
+        let mut peers = cluster.inner.membership.peers();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if peers.borrow().len() >= expected {
+                    return;
+                }
+                if peers.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("peers converge within the bound");
+    }
+
+    #[tokio::test]
+    async fn single_node_cluster_forms_with_no_seeds_and_local_cache_round_trips() {
+        let cluster = Cluster::builder("cluster-it-single")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds even with nobody else on the seed list");
+
+        let cache = cluster
+            .cache::<u32, String>("solo")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+        cache.insert(1, "a".into()).await.expect("insert");
+        assert_eq!(cache.get(&1).await, Some("a".to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reopening_the_same_cache_name_fails_cleanly() {
+        let cluster = Cluster::builder("cluster-it-reopen")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let _first = cluster
+            .cache::<u32, String>("dup")
+            .open()
+            .await
+            .expect("first open succeeds");
+        match cluster.cache::<u32, String>("dup").open().await {
+            Err(CacheError::AlreadyOpen { cache }) => assert_eq!(cache, "dup"),
+            other => panic!("expected AlreadyOpen, got {}", other.is_ok()),
+        }
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_handle_survives_shutdown_without_panicking() {
+        let cluster = Cluster::builder("cluster-it-shutdown")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("post-shutdown")
+            .open()
+            .await
+            .expect("open succeeds");
+
+        cluster.shutdown().await;
+
+        cache
+            .insert(1, "still local".into())
+            .await
+            .expect("a local insert after shutdown neither errors nor panics");
+        assert_eq!(cache.get(&1).await, Some("still local".to_string()));
+    }
+
+    async fn two_node_cluster(cluster_name: &str) -> (Cluster, Cluster) {
+        let cluster_a = Cluster::builder(cluster_name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+
+        let cluster_b = Cluster::builder(cluster_name)
+            .seeds([gossip_a])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+
+        wait_for_peer_count(&cluster_a, 1).await;
+        wait_for_peer_count(&cluster_b, 1).await;
+        (cluster_a, cluster_b)
+    }
+
+    #[tokio::test]
+    async fn replicated_mode_fans_a_local_insert_out_to_the_peer() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-replicate").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+        let mut events_b = cache_b.events();
+
+        cache_a.insert(1, "hello".into()).await.expect("a inserts");
+
+        let event = tokio::time::timeout(Duration::from_secs(10), events_b.recv())
+            .await
+            .expect("event arrives within the bound")
+            .expect("event channel stays open");
+        match event {
+            Event::Created {
+                key: 1,
+                value,
+                origin: Origin::Remote(_),
+            } => assert_eq!(value, "hello"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(cache_b.get(&1).await, Some("hello".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalidation_mode_drops_a_stale_remote_copy() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-invalidate").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("b opens");
+
+        // B warms its own local copy first (Invalidation mode never
+        // replicates values). A short sleep before A's write guarantees A's
+        // HLC wall-clock stamp is strictly later, so the outcome doesn't
+        // hinge on the two nodes' random tie-break `NodeId`s.
+        cache_b
+            .insert(1, "stale".into())
+            .await
+            .expect("b warms locally");
+        assert_eq!(cache_b.get(&1).await, Some("stale".to_string()));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        cache_a
+            .insert(1, "fresh".into())
+            .await
+            .expect("a writes a newer version");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cache_b.get(&1).await.is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b's stale copy is invalidated within the bound");
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+}

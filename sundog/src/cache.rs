@@ -1,0 +1,234 @@
+//! The typed public cache handle and its builder. Plan §7, §10: `Cache<K, V>`
+//! is a thin wrapper over `Arc<Shard<K, V>>` — serialization happens only at
+//! the wire boundary; local reads never deserialize.
+
+use std::hash::Hash;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use smol_str::SmolStr;
+use tokio::sync::broadcast;
+
+use crate::cluster::Cluster;
+use crate::error::CacheError;
+use crate::store::{Event, Mode, Shard, ShardOps};
+
+/// Builds a [`Cache`]: own-and-return, per house style.
+#[must_use]
+pub struct CacheBuilder<K, V> {
+    cluster: Cluster,
+    name: SmolStr,
+    mode: Mode,
+    max_capacity: u64,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    marker: PhantomData<fn() -> (K, V)>,
+}
+
+impl<K, V> CacheBuilder<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(cluster: Cluster, name: SmolStr) -> Self {
+        Self {
+            cluster,
+            name,
+            mode: Mode::Invalidation,
+            max_capacity: u64::MAX,
+            ttl: None,
+            tti: None,
+            marker: PhantomData,
+        }
+    }
+
+    /// Sets the cache's clustering mode. Default: [`Mode::Invalidation`].
+    pub fn mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Bounds local entry count. Default: unbounded.
+    pub fn max_capacity(mut self, max_capacity: u64) -> Self {
+        self.max_capacity = max_capacity;
+        self
+    }
+
+    /// Sets an absolute lifespan (TTL), replicated as `expires_at_ms`
+    /// (plan §7). Default: no expiry.
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Sets a local-only max-idle (TTI). Deliberately not cluster-replicated
+    /// (plan §7, §13). Default: no idle expiry.
+    pub fn tti(mut self, tti: Duration) -> Self {
+        self.tti = Some(tti);
+        self
+    }
+
+    /// Opens the cache: builds the local shard and registers it in the
+    /// cluster's shard registry, so inbound replication/invalidation and
+    /// anti-entropy/state-transfer requests for this name can find it from
+    /// this point on, and (unless `mode` is [`Mode::Local`]) starts fanning
+    /// this shard's own local writes out to the mesh per `mode`.
+    ///
+    /// State transfer from an existing cluster-wide copy on join (plan §9)
+    /// and anti-entropy scheduling (plan §8) are not triggered here yet — a
+    /// freshly opened cache starts from whatever live traffic and, once
+    /// wired up, anti-entropy bring it. `net::RequestHandler` (this cache's
+    /// serving side) is already live via [`Cluster::builder`]'s wiring, so
+    /// that follow-up only needs a requesting side.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::AlreadyOpen`] if a cache named `name` is already
+    /// open in this process — the shard registry is type-erased, so a second
+    /// `open()` under a different `K`/`V` can't be checked for compatibility
+    /// and is always rejected, even when the type happens to match.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shard registry lock is poisoned, which only happens if
+    /// an earlier call already panicked while holding it.
+    //
+    // `async` (with no `.await` yet) matches this method's documented shape
+    // (plan §10, `docs/INTERFACES.md`) and the state-transfer request this
+    // will make once wired up (see this method's doc comment) genuinely
+    // needs it — keeping the signature stable now avoids a breaking change
+    // for that follow-up.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn open(self) -> Result<Cache<K, V>, CacheError> {
+        let Self {
+            cluster,
+            name,
+            mode,
+            max_capacity,
+            ttl,
+            tti,
+            marker: _,
+        } = self;
+
+        let shard = Arc::new(
+            Shard::<K, V>::new(
+                name.clone(),
+                mode,
+                cluster.node_id(),
+                max_capacity,
+                ttl,
+                tti,
+            )
+            .with_tombstone_ttl(cluster.config().tombstone_ttl),
+        );
+
+        let registry = cluster.shards();
+        {
+            let mut guard = registry
+                .write()
+                .expect("invariant: shard registry lock is never poisoned");
+            if guard.contains_key(&name) {
+                return Err(CacheError::AlreadyOpen { cache: name });
+            }
+            guard.insert(name.clone(), Arc::clone(&shard) as Arc<dyn ShardOps>);
+        }
+
+        if !matches!(mode, Mode::Local) {
+            cluster.spawn_tracked(crate::cluster::fan_out_task(
+                Arc::clone(&shard),
+                cluster.clone(),
+                shard.events(),
+                name.clone(),
+                mode,
+                cluster.cancel_token(),
+            ));
+        }
+        cluster.spawn_tracked(crate::cluster::tombstone_gc_task(
+            Arc::clone(&shard) as Arc<dyn ShardOps>,
+            cluster.config().tombstone_ttl,
+            cluster.cancel_token(),
+        ));
+
+        Ok(Cache { shard })
+    }
+}
+
+/// A typed handle to one named, possibly-clustered cache.
+///
+/// Cheap to `Clone`; every clone shares the same underlying [`Shard`].
+#[derive(Clone)]
+pub struct Cache<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    shard: Arc<Shard<K, V>>,
+}
+
+impl<K, V> Cache<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// This cache's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.shard.name()
+    }
+
+    /// Reads `key`, without triggering read-through.
+    pub async fn get(&self, key: &K) -> Option<V> {
+        self.shard.get(key).await
+    }
+
+    /// Reads `key`, invoking `loader` on a miss; concurrent misses on the
+    /// same key are collapsed into one `loader` call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Loader`] if `loader` fails.
+    pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
+    where
+        F: AsyncFnOnce(&K) -> Result<V, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.shard.get_or_load(key, loader).await
+    }
+
+    /// Writes `key` = `value`: stamps an HLC version, applies locally, and
+    /// fans out per [`Mode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds the
+    /// configured frame cap.
+    pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.shard.insert(key, value).await
+    }
+
+    /// Removes `key`: writes a tombstone and fans it out per [`Mode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CacheError`] if the removal cannot be applied or fanned out.
+    pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
+        self.shard.remove(key).await
+    }
+
+    /// Drops the local copy of `key` without writing a tombstone or fanning
+    /// out — an escape hatch for tests and manual cache-busting; the entry
+    /// may reappear on the next replicated write or anti-entropy round.
+    pub async fn invalidate_local(&self, key: &K) {
+        self.shard.invalidate_local(key).await;
+    }
+
+    /// Subscribes to this cache's change events (created/updated/removed,
+    /// each tagged with its [`crate::store::Origin`]).
+    #[must_use]
+    pub fn events(&self) -> broadcast::Receiver<Event<K, V>> {
+        self.shard.events()
+    }
+}

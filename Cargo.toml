@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["sundog", "sundog-demo"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ngriaznov/sundog"
+authors = ["sundog contributors"]
+description = "An embedded, replicated, zeroconf cache for Rust, modeled on Infinispan's embedded mode"
