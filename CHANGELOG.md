@@ -27,27 +27,24 @@ name reservation, not a release.
   oldest, `Replicate` drops newest and marks the peer dirty for anti-entropy
   priority); `StRequest`/`AeDigest`/`AePull` request/response paths kept off
   the broadcast channel entirely.
-- **Store** (`sundog::store`): `moka`-backed typed shards with a hand-rolled
-  HLC (`Hlc`/`HlcClock`, deviating from the plan's `uhlc` in favor of exact,
-  deterministically-encoded, property-testable semantics), versioned apply
-  as the single path every write — local, replicated, state-transfer,
-  anti-entropy — funnels through, tombstones with independent TTL, and a
-  1,024-bucket incrementally-maintained XOR digest array for anti-entropy.
+- **Store** (`sundog::store`): `moka`-backed typed shards with a hybrid
+  logical clock (`Hlc`/`HlcClock`) whose stamps encode deterministically and
+  order lexicographically, versioned apply as the single path every write —
+  local, replicated, state-transfer, anti-entropy — funnels through,
+  tombstones with independent TTL, and a 1,024-bucket
+  incrementally-maintained XOR digest array for anti-entropy.
 - **Pluggable conflict resolution**: `ConflictResolver` trait, default
-  `LwwResolver` (last-write-wins by `Hlc`, bit-for-bit what the store always
-  did before the trait existed) — pulled forward from the plan's future-work
-  list into v1 per `docs/HOUSE_RULES.md`.
+  `LwwResolver` (last-write-wins by `Hlc`).
 - **`tls` feature** (off by default): mutual TLS on the data-plane mesh
   (`rustls`) — `ClusterConfig::tls`/`ClusterBuilder::tls` wraps every dialed
   and accepted connection, including the short-lived state-transfer/
-  anti-entropy ones; client certificates are verified too (mutual auth) —
-  pulled forward from the plan's future-work list into v1 per
-  `docs/HOUSE_RULES.md`.
+  anti-entropy ones; client certificates are verified too (mutual auth).
 - **Cluster/cache public API** (`sundog::cluster`, `sundog::cache`):
   `Cluster::builder(name).build()` as the zero-config zeroconf happy path;
   `Cluster::cache::<K, V>(name)` builder with `.mode()`, `.max_capacity()`,
   `.ttl()`, `.tti()`, `.resolver()`, `.weigher()`; `Cache<K, V>` with `get`,
   `get_or_load` (stampede-collapsing read-through), `insert`, `remove`,
+  `entry_count` (live local count, housekeeping flushed),
   `invalidate_local`, and an `events()` broadcast stream of
   `Created`/`Updated`/`Removed`, each tagged with its `Origin`.
 - **Three cache modes**: `Local` (no cluster traffic), `Invalidation`
@@ -84,14 +81,39 @@ name reservation, not a release.
 - **Test suite**: property tests (`proptest`) on HLC, wire encoding, and the
   store — including the permutation-convergence property that is the
   correctness license for the whole loss-tolerant design; the `turmoil`
-  simulation suite; in-process multi-node integration tests over real
-  `Cluster`s (invalidation/replication visibility, state-transfer warm join,
-  anti-entropy repair, TTL expiry, kill/restart, read-through stampede
-  collapse, local-mode isolation, Prometheus exporter); unit tests in every
-  module.
-- CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D
-  warnings -W clippy::pedantic` (plus a `sim`-feature clippy pass), `cargo
-  test --workspace`, and a dedicated job for the `turmoil` simulation suite.
+  simulation suite; a container-backed multi-node integration suite (see
+  next bullet); two-node loopback integration tests living as ordinary unit
+  tests next to the code they exercise (`sundog::cluster`'s
+  replication/invalidation/state-transfer/anti-entropy/local-mode tests,
+  `sundog::store`'s read-through stampede-collapse and TTL-expiry tests);
+  Prometheus-exporter and TLS integration tests; unit tests in every module.
+- **`sundog-testnode`** (new workspace member): a tiny static-musl binary
+  that opens one `Mode::Replicated` `sundog` cache and exposes it over a
+  line-based control protocol (`put`/`get`/`del`/`count`/`peers`/`quit`), so
+  external test harnesses can drive a real cluster member as a real, separate
+  process.
+- **Container-backed integration suite** (`sundog/tests/containers.rs`,
+  `sundog/tests/container_smoke.rs`, harness in `sundog/tests/container_util`):
+  multi-node scenarios run as real, separate `sundog-testnode` processes on
+  a real virtual network, exclusively through the
+  [`rightsize`](https://crates.io/crates/rightsize) crate — no Docker CLI,
+  no `bollard`. Covers three-node
+  convergence across distinct writers, tombstones reaching every node, a
+  warm join via state transfer into a populated cluster, and a killed node
+  catching back up via anti-entropy after restart under the same alias.
+  Gated on `SUNDOG_CONTAINER_TESTS=1` (checked first in every test, not
+  `#[ignore]`) so a plain `cargo test --workspace` still compiles and passes
+  the file trivially without a container backend or the musl target
+  installed; needs `RIGHTSIZE_BACKEND=docker` because sundog's gossip is UDP
+  and rightsize's microsandbox network emulation relays TCP only.
+- CI: the main `ci` job runs, in order, `cargo fmt --check`, `cargo clippy
+  --workspace --all-targets -D warnings -W clippy::pedantic` (plus a
+  `sim`-feature pass and a `tls,prometheus`-features pass), `cargo test
+  --workspace`, then the `turmoil` simulation suite and the `tls,prometheus`
+  feature tests as further steps in that same job. The container suite runs
+  as its own separate job (musl target + `musl-tools` installed,
+  `RIGHTSIZE_BACKEND=docker` and `SUNDOG_CONTAINER_TESTS=1` set, default base
+  image pulls fine on a hosted runner).
 
 ### Known gaps (tracked, not bugs)
 

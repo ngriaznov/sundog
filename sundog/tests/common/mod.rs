@@ -1,9 +1,15 @@
-//! Shared harness for sundog's in-process multi-node integration suite (plan
-//! §11.3): real [`Cluster`]s wired together with `Static` discovery over
-//! pre-reserved loopback addresses, plus a bounded-wait polling helper so no
-//! test ever asserts convergence after a fixed `sleep`.
+//! Shared harness for sundog's remaining in-process tests (`tests/tls.rs`,
+//! `tests/prometheus_exporter.rs`): a fast-cycling [`ClusterConfig`], a
+//! bounded-wait polling helper so no test ever asserts convergence after a
+//! fixed `sleep`, and the small [`Node`] bookkeeping struct both files build
+//! their own real, loopback-`Static`-discovery [`Cluster`]s around.
 //!
-//! Each `tests/*.rs` file is its own binary and pulls in only the helpers it
+//! The former general-purpose multi-node group builders (`spawn_cluster_group`,
+//! `join_node`, and their `_with` variants) moved to `tests/containers.rs`'s
+//! rightsize-based harness (`tests/container_util`) along with the tests that
+//! used them — see `docs/BUILD_PLAN.md` §11, layer 3 vs. layer 4.
+//!
+//! Each `tests/*.rs` file that uses this module pulls in only the helpers it
 //! needs — unused ones in any given binary are expected, hence the blanket
 //! `dead_code` allow.
 #![allow(dead_code)]
@@ -66,109 +72,6 @@ where
 pub struct Node {
     pub cluster: Cluster,
     pub gossip_addr: SocketAddr,
-}
-
-/// Reserves a loopback UDP port the same way `Membership::spawn` reserves its
-/// own zeroconf gossip port internally (probe-bind, read `local_addr`, drop):
-/// the only way, from outside the crate, to learn a concrete gossip address
-/// *before* a node exists — which every node in a `Static`-seeded group needs
-/// to know about every other node.
-async fn reserve_gossip_addr() -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind an ephemeral loopback udp port to reserve a gossip address");
-    socket
-        .local_addr()
-        .expect("a just-bound udp socket reports a local address")
-}
-
-/// Builds `n` nodes on cluster `name`, wired via `Static` discovery over
-/// pre-reserved loopback gossip addresses, and waits until every node has
-/// observed all `n - 1` others. Uses [`fast_config`]; see
-/// [`spawn_cluster_group_with`] to override it.
-///
-/// # Panics
-///
-/// Panics if any node fails to build, or membership does not converge within
-/// 20 seconds.
-pub async fn spawn_cluster_group(name: &str, n: usize) -> Vec<Node> {
-    spawn_cluster_group_with(name, n, fast_config).await
-}
-
-/// [`spawn_cluster_group`] with a caller-supplied [`ClusterConfig`] template
-/// (still overridden per node with its own reserved `gossip_bind_addr`).
-///
-/// # Panics
-///
-/// Panics if any node fails to build, or membership does not converge within
-/// 20 seconds.
-pub async fn spawn_cluster_group_with(
-    name: &str,
-    n: usize,
-    config: impl Fn() -> ClusterConfig,
-) -> Vec<Node> {
-    let mut addrs = Vec::with_capacity(n);
-    for _ in 0..n {
-        addrs.push(reserve_gossip_addr().await);
-    }
-
-    let mut nodes = Vec::with_capacity(n);
-    for &gossip_addr in &addrs {
-        let seeds: Vec<SocketAddr> = addrs
-            .iter()
-            .copied()
-            .filter(|addr| *addr != gossip_addr)
-            .collect();
-        let cluster = Cluster::builder(name)
-            .seeds(seeds)
-            .config(config().with(|c| c.gossip_bind_addr = gossip_addr))
-            .build()
-            .await
-            .expect("node builds");
-        nodes.push(Node {
-            cluster,
-            gossip_addr,
-        });
-    }
-
-    for node in &nodes {
-        wait_for_peer_count(&node.cluster, n.saturating_sub(1), Duration::from_secs(20)).await;
-    }
-    nodes
-}
-
-/// Joins one more node onto an already-running group, seeded from `seeds`
-/// (typically one or more survivors' [`Node::gossip_addr`]). Uses
-/// [`fast_config`]; see [`join_node_with`] to override it.
-///
-/// # Panics
-///
-/// Panics if the node fails to build.
-pub async fn join_node(name: &str, seeds: impl IntoIterator<Item = SocketAddr>) -> Node {
-    join_node_with(name, seeds, fast_config).await
-}
-
-/// [`join_node`] with a caller-supplied [`ClusterConfig`] template.
-///
-/// # Panics
-///
-/// Panics if the node fails to build.
-pub async fn join_node_with(
-    name: &str,
-    seeds: impl IntoIterator<Item = SocketAddr>,
-    config: impl Fn() -> ClusterConfig,
-) -> Node {
-    let gossip_addr = reserve_gossip_addr().await;
-    let cluster = Cluster::builder(name)
-        .seeds(seeds)
-        .config(config().with(|c| c.gossip_bind_addr = gossip_addr))
-        .build()
-        .await
-        .expect("joining node builds");
-    Node {
-        cluster,
-        gossip_addr,
-    }
 }
 
 /// Waits until `cluster` reports at least `expected` live peers.

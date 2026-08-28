@@ -787,6 +787,14 @@ where
         self.cache.get(key).await.map(|stored| stored.value.clone())
     }
 
+    /// The number of live entries this node currently holds, with `moka`'s
+    /// pending housekeeping flushed first so completed expirations and
+    /// evictions are reflected rather than estimated.
+    pub async fn entry_count(&self) -> u64 {
+        self.cache.run_pending_tasks().await;
+        self.cache.entry_count()
+    }
+
     /// Reads `key`, invoking `loader` on a miss. Concurrent callers racing on
     /// the same missing key are collapsed into one `loader` call (moka
     /// `get_with`'s stampede protection).
@@ -1348,6 +1356,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_load_stampede_collapses_to_one_loader_call() {
+        const CONCURRENCY: usize = 64;
+        let s = Arc::new(shard::<u32, String>(1));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENCY {
+            let s = Arc::clone(&s);
+            let calls = std::sync::Arc::clone(&calls);
+            tasks.spawn(async move {
+                s.get_or_load(&42, async move |_key: &u32| -> Result<String, BoomError> {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Widens the race window: every concurrent caller must
+                    // still be waiting on this single in-flight load.
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok("loaded-once".to_string())
+                })
+                .await
+                .expect("loader succeeds")
+            });
+        }
+
+        let mut results = Vec::with_capacity(CONCURRENCY);
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.expect("stampede task does not panic"));
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "loader must run exactly once under a stampede of {CONCURRENCY} concurrent misses"
+        );
+        assert!(results.iter().all(|value| value == "loaded-once"));
+        assert_eq!(results.len(), CONCURRENCY);
+    }
+
+    #[tokio::test]
     async fn value_too_large_is_rejected() {
         let s = shard::<u32, Vec<u8>>(1);
         let big = vec![0u8; MAX_FRAME + 1];
@@ -1420,6 +1465,45 @@ mod tests {
         assert!(recs[0].is_tombstone());
         ShardOps::apply_remote(&b, recs[0].clone()).await;
         assert_eq!(b.get(&42).await, None);
+    }
+
+    /// Plan §7: lifespan travels as an *absolute* `expires_at_ms`, computed
+    /// once at the origin. `a` is built with a TTL; `b` is not — proving the
+    /// deadline that ultimately expires `b`'s copy is the one baked into the
+    /// wire record `a` sent, not something `b` would derive from its own
+    /// (absent) local TTL config.
+    #[tokio::test]
+    async fn absolute_ttl_on_the_wire_expires_a_shard_configured_with_no_ttl_of_its_own() {
+        let a = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        let b = shard::<u32, String>(2); // no ttl configured here at all
+
+        a.insert(1, "short-lived".into()).await.expect("insert");
+        let recs = ShardOps::records_for(&a, vec![key_bytes(&1u32)]).await;
+        assert_eq!(recs.len(), 1);
+        assert!(
+            recs[0].expires_at_ms.is_some(),
+            "the wire record must carry the absolute deadline `a` computed"
+        );
+        ShardOps::apply_remote(&b, recs[0].clone()).await;
+        assert_eq!(b.get(&1).await, Some("short-lived".into()));
+
+        // See `run_pending_tasks_flushes_a_quiet_shards_stale_ttl_eviction_digest`
+        // for why this waits well past both the 50ms TTL and moka's timer
+        // wheel granularity floor.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(a.get(&1).await, None, "the origin's own copy must expire");
+        assert_eq!(
+            b.get(&1).await,
+            None,
+            "b must expire the entry from the wire-carried deadline alone"
+        );
     }
 
     #[tokio::test]

@@ -929,6 +929,47 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
+    /// Plan §11.3, layer 3, item 8 (relocated from the deleted
+    /// `tests/local_mode_isolation.rs`): `Mode::Local` publishes no wire
+    /// message at all — `fan_out_one`'s `match mode` above has no arm for it
+    /// — so there is no "delivered" event to await and no watch stream to
+    /// race against; the only observable proof is polling past a settle
+    /// window a real cross-node message would need, then asserting it never
+    /// showed.
+    #[tokio::test]
+    async fn local_mode_never_leaks_a_write_to_the_peer() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-local-no-fan-out").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("b opens");
+
+        cache_a
+            .insert(1, "only-on-a".into())
+            .await
+            .expect("a inserts");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            cache_b.get(&1).await,
+            None,
+            "Mode::Local must never fan a write out to peers"
+        );
+        assert_eq!(cache_a.get(&1).await, Some("only-on-a".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
     #[tokio::test]
     async fn invalidation_mode_drops_a_stale_remote_copy() {
         let (cluster_a, cluster_b) = two_node_cluster("cluster-it-invalidate").await;

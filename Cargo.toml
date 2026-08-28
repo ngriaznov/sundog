@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sundog", "sundog-demo"]
+members = ["sundog", "sundog-demo", "sundog-testnode"]
 
 [workspace.package]
 edition = "2024"

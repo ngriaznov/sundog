@@ -21,8 +21,9 @@ struct Handle {
     cache: Cache<String, String>,
 }
 
-/// Live counters for one node slot, updated from its event-feed listener and
-/// read by the UI (and the headless convergence check) with no polling.
+/// Live counters for one node slot: write/feed counters come from the
+/// event listener, `entry_count` from a periodic store read (the event
+/// stream can drop under lag, so it is not integrated into a count).
 #[derive(Debug, Default)]
 pub(crate) struct NodeStatus {
     pub(crate) alive: AtomicBool,
@@ -253,28 +254,32 @@ fn spawn_listener(
     feed_tx: UnboundedSender<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The broadcast receiver drops events under lag, so entry counts are
+        // read from the store on a timer rather than integrated from events.
+        let mut refresh = tokio::time::interval(Duration::from_millis(300));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match events.recv().await {
-                Ok(event) => {
-                    node.status.writes_applied.fetch_add(1, Ordering::Relaxed);
-                    match &event {
-                        Event::Created { .. } => {
-                            node.status.entry_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Event::Removed { .. } => {
-                            node.status.entry_count.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        Event::Updated { .. } => {}
+            tokio::select! {
+                received = events.recv() => match received {
+                    Ok(event) => {
+                        node.status.writes_applied.fetch_add(1, Ordering::Relaxed);
+                        let _ = feed_tx.send(describe_event(node.index, &event));
                     }
-                    let _ = feed_tx.send(describe_event(node.index, &event));
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _ = feed_tx.send(format!(
+                            "node{}: event feed lagged, skipped {skipped} events",
+                            node.index
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = refresh.tick() => {
+                    let Some(cache) = node.cache() else { break };
+                    let count = cache.entry_count().await;
+                    node.status
+                        .entry_count
+                        .store(i64::try_from(count).unwrap_or(i64::MAX), Ordering::Relaxed);
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = feed_tx.send(format!(
-                        "node{}: event feed lagged, skipped {skipped} events",
-                        node.index
-                    ));
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })

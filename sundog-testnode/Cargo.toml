@@ -1,0 +1,21 @@
+[package]
+name = "sundog-testnode"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Container test-node binary: embeds sundog behind a line-based control protocol, for the rightsize container-test harness"
+publish = false
+
+[[bin]]
+name = "sundog-testnode"
+path = "src/main.rs"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+sundog = { version = "0.1.0", path = "../sundog" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }

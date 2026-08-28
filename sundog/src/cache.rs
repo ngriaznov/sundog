@@ -250,6 +250,15 @@ where
         self.shard.get(key).await
     }
 
+    /// The number of live entries in this node's local copy of the cache.
+    ///
+    /// Counts only this node: in `Invalidation` mode nodes legitimately hold
+    /// different subsets, and even in `Replicated` mode replication lag means
+    /// two nodes may briefly disagree.
+    pub async fn entry_count(&self) -> u64 {
+        self.shard.entry_count().await
+    }
+
     /// Reads `key`, invoking `loader` on a miss; concurrent misses on the
     /// same key are collapsed into one `loader` call.
     ///

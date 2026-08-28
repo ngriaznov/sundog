@@ -7,23 +7,23 @@
 
 # sundog
 
-sundog is an embedded, replicated, zeroconf cache for Rust, modeled on
-[Infinispan](https://infinispan.org/)'s embedded mode. Instances of a service
-on the same network discover each other, form a cluster over gossip
-membership ([chitchat](https://github.com/quickwit-oss/chitchat)), and keep
-named caches coherent across nodes — either invalidation (every node caches
-independently; writes broadcast an invalidate) or full replication (every
-node holds every entry; writes broadcast the value). Consistency is AP:
-last-write-wins on a hybrid logical clock, healed by anti-entropy, with no
-consensus and no operator action on join, leave, crash, or partition. It is
-named for the [parhelion](https://en.wikipedia.org/wiki/Sun_dog) — the sky
-rendering simultaneous copies of the sun in ice crystals, a replicated cache
-drawn by the atmosphere.
+sundog is an embedded, replicated cache for Rust services. Drop it into a
+service, and every instance of that service on the network finds the others,
+forms a cluster over gossip, and keeps named caches coherent between them —
+no separate cache server, no config beyond a cluster name. It's modeled on
+[Infinispan](https://infinispan.org/)'s embedded mode: same two clustered
+cache shapes (invalidation and full replication), same "every node is a
+peer, nobody's special" architecture, just built for Rust instead of the
+JVM.
 
-Design rationale and every implementation decision are in
-[`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md); binding coding conventions are in
-[`docs/HOUSE_RULES.md`](docs/HOUSE_RULES.md). What v1 deliberately excludes,
-and when to revisit each cut, is in [`ROADMAP.md`](ROADMAP.md).
+It's named for the [parhelion](https://en.wikipedia.org/wiki/Sun_dog) — the
+optical effect where ice crystals in the sky render extra copies of the sun
+next to the real one. A replicated cache, drawn by the atmosphere.
+
+For the full design rationale — why gossip instead of a consensus protocol,
+why LWW, why anti-entropy exists — see [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md).
+Things we deliberately didn't build, and what would make us reconsider, are
+in [`ROADMAP.md`](ROADMAP.md).
 
 ## Quick start
 
@@ -56,141 +56,164 @@ while let Ok(ev) = events.recv().await {
 cluster.shutdown().await; // graceful leave (chitchat departs politely)
 ```
 
-`Cluster::builder(name).build()` with no further calls must form a working
-LAN cluster — this snippet, verbatim, is the project's acceptance test (see
-the crate-level doc example in `sundog/src/lib.rs`, which is compiled by
-`cargo test --doc`).
+That's the whole API surface for the common case. `Cluster::builder(name).build()`
+with nothing else chained is supposed to just work on a LAN — it's the
+project's actual acceptance test (see the doctest in `sundog/src/lib.rs`,
+which `cargo test --doc` runs for real).
 
-## Modes
+## Should you use this?
 
-| Mode | Local storage | On write | On read | Use it for |
+sundog is a cache, not a database. If you need durability, strong
+consistency, or a guarantee that a deleted key stays deleted, this isn't
+that tool.
+
+Concretely: writes are last-write-wins on a hybrid logical clock, so if two
+nodes write the same key at close to the same time, one write silently
+loses — there's no conflict error, no merge, the loser just vanishes.
+Deletes are tombstones, and tombstones expire (`tombstone_ttl`, 10 minutes
+by default). A node that's been partitioned away longer than that can come
+back with a stale copy of a key everyone else deleted, and that key comes
+back to life. For a cache — where the entry re-expires or gets overwritten
+on the next real write — that's a shrug. If a deleted key resurrecting is
+something your application can't tolerate, sundog is the wrong layer for
+that data.
+
+Where it's a good fit: read-through caching in front of a slower backing
+store, session or profile data that's fine being eventually consistent,
+anywhere you're currently running a per-instance in-memory cache and wish
+the instances agreed with each other without standing up Redis. It targets
+small clusters (2–30 nodes) and LAN latencies — it is not trying to be a
+distributed database, and there's no consistent-hashing / partitioning mode
+(every replicated node holds every entry; see `ROADMAP.md` for why, and when
+that might change).
+
+## The three modes
+
+| Mode | Each node stores | On write | On read | Pick this when |
 |---|---|---|---|---|
-| `Local` | yes | nothing broadcast | local only | a plain per-node cache with no cluster traffic |
-| `Invalidation` (default) | independent per node | broadcasts `Invalidate { key, ver }` | local; may be stale until invalidated | large or expensive-to-hold datasets where each node only needs its own working set kept honest |
-| `Replicated` | full copy per node | broadcasts the value (`Replicate { rec }`) | always local, never blocks on the network | smaller datasets where every node should answer reads without a network hop; the only mode that runs state transfer and anti-entropy |
+| `Local` | its own data, nothing shared | nothing sent | local only | you just want `moka` with less setup — no cluster traffic at all |
+| `Invalidation` (default) | its own working set | broadcasts "this key changed" | local, may be momentarily stale | the dataset is big or expensive to hold everywhere, and each node mostly cares about its own hot keys |
+| `Replicated` | a full copy of everything | broadcasts the value | always local, never waits on the network | the dataset is small enough to duplicate, and you want reads to never touch the network |
 
-`Invalidation` mode never replicates values between nodes — each node warms
-its own copy via `get_or_load`, and other nodes' writes only ever evict, never
-populate, a peer's local entry. `Replicated` mode is the only one where
-`open()` runs state transfer against an existing donor and then keeps a
-background anti-entropy scheduler running for the cache's lifetime.
+`Invalidation` never sends values between nodes — a write on A tells B "your
+copy of this key is stale," and B either drops it or reloads it on next
+access; B never gets A's value directly. `Replicated` is the only mode that
+runs state transfer on join (a new node pulls a full snapshot from an
+existing peer) and keeps a background anti-entropy loop running for as long
+as the cache is open.
 
-## Consistency model
+## How nodes find each other
 
-sundog is **AP, always** — both sides of a partition keep reading and
-writing; there is no quorum, no leader, no write path that blocks on
-membership. Correctness of concurrent, out-of-order, and re-delivered writes
-comes from one invariant: every write is stamped once, at its origin, with a
-hybrid logical clock version `(wall_ms, logical, node_id)`, and applied to
-the store iff that version is greater than what is already stored. That
-single rule makes applying any set of records — local, replicated,
-state-transfer chunk, or anti-entropy repair — in any order, any number of
-times, converge to the same state, which is what lets the data plane drop
-messages under load and rely on **anti-entropy** (a periodic, jittered,
-digest-diff round against a random peer) to repair the gap instead of
-guaranteeing delivery.
-
-Deletes are writes too: removing a key stores a tombstone rather than erasing
-it, so a stale replicated `insert` can't resurrect something that was
-deleted more recently. Tombstones are garbage-collected after
-`tombstone_ttl` (default 10 minutes, enforced to be at least
-3 × `ae_interval` so a lagging peer gets a few anti-entropy rounds to see the
-deletion first). **The dragon:** a node partitioned away for longer than
-`tombstone_ttl` can resurrect an entry it holds that was deleted everywhere
-else while it was gone. For a cache this is accepted rather than solved — the
-entry re-expires or gets re-invalidated on the next real write — but if a key
-must never come back from the dead, it does not belong in a cache.
-
-Reads can observe values that are stale by up to one replication hop in the
-normal case, or up to a partition's duration plus one anti-entropy round in
-the worst case. TTL (`.ttl(..)`) is replicated as an absolute
-`expires_at_ms` computed at the origin node, so **expiry trusts wall-clock
-sync across the cluster to within a few seconds (NTP)** — HLC's logical
-component absorbs clock skew for write *ordering*, but not for this. TTI
-(`.tti(..)`, max-idle) is deliberately local-only and never replicated —
-Infinispan's cluster-wide max-idle needs touch-propagation chatter and still
-has documented anomalies; sundog skips it on purpose (see `ROADMAP.md`).
-
-## Discovery
-
-| Mechanism | Default? | How it works | Use it when |
+| Mechanism | Default? | What it does | Use it for |
 |---|---|---|---|
-| `Mdns` | yes | registers `_sundog._udp.local.` (cluster name as a TXT property, instance = node id) and browses continuously via `mdns-sd` | a real LAN, office network, or edge deployment with multicast |
-| `Static` | no — `.seeds(..)` or `SUNDOG_SEEDS=host:port,host:port` | a fixed, periodically re-resolved seed list; each entry may be a hostname | tests, and anywhere mDNS can't reach |
-| `DnsSrv` | no — `.discovery(DnsSrv::new(..))` | polls SRV records for a headless service name on an interval, falling back to A/AAAA | Kubernetes: point it at a headless service, "zeroconf" there is the one line of config you already have |
+| `Mdns` | yes | registers `_sundog._udp.local.` and browses for it continuously, via `mdns-sd` | a real LAN, office network, or anywhere multicast works |
+| `Static` | no — `.seeds(..)` or `SUNDOG_SEEDS=host:port,host:port` | a fixed seed list, re-resolved periodically | tests, and anywhere mDNS can't reach |
+| `DnsSrv` | no — `.discovery(DnsSrv::new(..))` | polls SRV records for a service name, falls back to A/AAAA | Kubernetes — point it at a headless service and you're done |
 
-Discovery is a continuous stream, not a one-shot lookup at boot, by design:
-a fully restarted cluster (nobody remembers anybody) still re-forms because
-every node keeps browsing/polling. mDNS not finding anybody — a container
-with no multicast, or a LAN of exactly one node — is a healthy single-node
-cluster, not an error.
+Discovery keeps running after startup, not just once — if the whole cluster
+reboots at the same time and nobody remembers anybody, continuous mDNS
+browsing is what lets it find itself again. A node that finds no peers isn't
+broken; a single-node "cluster" is a normal, healthy state.
 
-**Docker caveat:** mDNS does not cross the default Docker bridge network (nor
-most AP-isolated Wi-Fi). Compose-based demos and CI use `Static`;
-host-network deployments can use the zeroconf `Mdns` default.
+**The Docker gotcha:** mDNS doesn't cross the default Docker bridge network
+(and usually not AP-isolated Wi-Fi either — multicast just doesn't route
+there). If you're demoing this with `docker compose`, use `Static` seeds;
+save `Mdns` for host networking or bare-metal LANs.
 
 ## Feature flags
 
-| Flag | Default | Adds | Status |
-|---|---|---|---|
-| `prometheus` | off | a Prometheus exporter (`metrics-exporter-prometheus`): `ClusterBuilder::prometheus_listen` serves `GET /metrics`, or `telemetry::prometheus_handle` installs a recorder into an HTTP server you already run | implemented |
-| `sim` | off | swaps the data plane's transport seam (`net::tcp`) from `tokio::net` to `turmoil::net`, so `net::Mesh` can be driven inside a deterministic `turmoil` simulation | implemented; used by `tests/sim.rs` only, never enable it in a real deployment |
-| `tls` | off | mutual TLS on the data-plane mesh (`rustls`): every dialed and accepted connection is wrapped when `ClusterConfig::tls`/`ClusterBuilder::tls` is set | implemented — see `net::tls`'s docs for the required certificate SAN and the same-CA constraint |
+| Flag | Default | What it adds |
+|---|---|---|
+| `tls` | off | mutual TLS on the data-plane mesh (`rustls`) — set `ClusterConfig::tls` / `ClusterBuilder::tls` and every connection, including state-transfer and anti-entropy, gets wrapped |
+| `prometheus` | off | a Prometheus exporter — `ClusterBuilder::prometheus_listen` serves `GET /metrics` directly, or grab a recorder via `telemetry::prometheus_handle` and mount it in your own server |
+| `sim` | off | swaps the data-plane transport for `turmoil`'s, so the net layer can run inside a deterministic simulation — this is a test-only knob, never turn it on in a real deployment |
 
-Metric *emission* (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
-`sundog_open_caches`, and friends) happens unconditionally throughout the
-crate regardless of features — without `prometheus`, those calls simply fall
-through to the `metrics` crate's own no-op default recorder.
+Metrics (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
+`sundog_open_caches`, and a few more) are emitted unconditionally regardless
+of features — without `prometheus`, they just fall into the `metrics`
+crate's no-op default recorder instead of going anywhere.
+
+## Testing
+
+Four layers, cheapest and highest-signal first:
+
+1. **Property tests** (`proptest`, alongside `hlc`, `wire`, and `store` in
+   `sundog/src`). The one that matters most is `store`'s
+   permutation-convergence property: take a random batch of writes and
+   removes, apply them in every sampled order, with drops and duplicates
+   thrown in, and check every run lands on the same final state. That
+   property is the whole reason it's safe for this design to drop messages
+   and repair later instead of guaranteeing delivery.
+2. **Deterministic simulation** (`turmoil`, `sundog/tests/sim.rs`, behind
+   the `sim` feature). Drives the real net layer and store against a
+   scripted membership feed with no actual sockets involved — partition
+   under load, heal, check convergence within a bounded number of rounds;
+   message loss, reordering, duplication; a donor dying mid-state-transfer.
+3. **Container integration** (`sundog/tests/containers.rs`, via
+   [`rightsize`](https://crates.io/crates/rightsize) — no Docker CLI, no
+   `bollard`, that's a hard rule in this repo). This is where multi-node
+   scenarios run as actual separate processes on a real virtual network:
+   three-node convergence, tombstones reaching every node, a cold node
+   warm-joining a populated cluster via state transfer, killing a node and
+   watching anti-entropy repair the gap when it comes back. Each node is a
+   tiny binary, `sundog-testnode`, built static/musl and driven over a
+   line-based control protocol. It's gated behind an env var rather than
+   `#[ignore]`, so a plain `cargo test --workspace` still compiles and
+   passes this file trivially without a container backend:
+
+   ```sh
+   SUNDOG_CONTAINER_TESTS=1 cargo test --release -p sundog --test containers -- --test-threads=1
+   ```
+
+   You'll also need `RIGHTSIZE_BACKEND=docker` — sundog's gossip is UDP, and
+   rightsize's lightweight microVM network emulation only relays TCP, so the
+   Docker backend is the one that actually carries chitchat's traffic. CI
+   has both KVM and Docker and pulls a real base image; locally, if registry
+   pulls aren't available, point `SUNDOG_TEST_BASE_IMAGE` at whatever
+   minimal image you've got pre-seeded.
+
+   Scenarios that genuinely only need one node, or two nodes on loopback
+   with real UDP membership, don't live in this file — they're ordinary
+   `#[cfg(test)]` unit tests next to the code they exercise (see
+   `sundog::store`'s stampede-collapse and TTL tests, `sundog::cluster`'s
+   two-node replication/invalidation/state-transfer/anti-entropy/local-mode
+   tests). Container tests are reserved for what actually requires separate
+   processes and a real network.
+4. **Chaos demo** (`sundog-demo`, headless mode) — see below.
+
+Plain `cargo test --workspace` runs everything except the `sim` and
+container suites, which need their feature/env var explicitly:
+
+```sh
+cargo test --workspace
+cargo test -p sundog --features sim --test 'sim*'
+SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
+    cargo test --release -p sundog --test containers -- --test-threads=1
+```
+
+`cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic`
+and `cargo fmt --all --check` are both enforced in CI.
 
 ## Chaos demo
 
-`sundog-demo` spawns N in-process nodes over static loopback seeds, drives a
-background write load across a shared key space, and lets you kill/restart
-individual nodes interactively to watch replication and anti-entropy repair
-the resulting divergence live, in a `ratatui` TUI:
+`sundog-demo` spins up N in-process nodes on loopback, runs a background
+write load against a shared key space, and lets you kill/restart nodes
+interactively while watching replication and anti-entropy repair the
+damage, live, in a `ratatui` TUI:
 
 ```sh
 cargo run -p sundog-demo -- --nodes 5
 ```
 
-Useful flags: `--cluster <NAME>`, `--key-space <N>`, `--write-interval-ms
-<N>`, `--gossip-base-port <PORT>`; `--help` lists all of them. In the TUI:
-arrow keys or `j`/`k` to move, `1`–`9`/Enter to select a node, `K` to kill
-it, `R` to restart it, `P` to pause/resume the write load, `q` to quit.
+Flags: `--cluster <NAME>`, `--key-space <N>`, `--write-interval-ms <N>`,
+`--gossip-base-port <PORT>`; `--help` lists everything. In the TUI: arrow
+keys or `j`/`k` to move, `1`–`9`/Enter to pick a node, `K` to kill it, `R` to
+restart it, `P` to pause the write load, `q` to quit.
 
-`--headless <SECS>` runs the same load with no terminal for a fixed
-duration, then prints a convergence report and exits nonzero on divergence —
-this is the manual soak-test rig (run it for 24h; memory should stay flat
-and digests should converge) and doubles as a CI-friendly smoke check.
-
-## Test suite
-
-Four layers, cheapest and highest-value first (`docs/BUILD_PLAN.md` §11):
-
-1. **Property tests** (`proptest`, in-module `prop_tests` submodules under
-   `hlc`, `wire`, `store`) on the pure core. The highest-value single test in
-   the project is `store`'s permutation-convergence property: apply the same
-   multiset of versioned writes/removes, in every sampled order, with
-   duplication and drops, and assert the final state is byte-identical —
-   that property is the license for the whole loss-tolerant design.
-2. **Deterministic simulation** (`turmoil`, `sundog/tests/sim.rs`, behind the
-   `sim` feature) drives the real `net::Mesh` and `store::Shard` against a
-   scripted membership feed with no real UDP/TCP: partition-during-load then
-   heal and assert bounded-round convergence, message loss/reorder/dup
-   storms, donor crash mid-state-transfer.
-3. **In-process integration** (`sundog/tests/*.rs`, plain `#[tokio::test]`):
-   real `Cluster`s wired together with `Static` discovery over loopback,
-   chitchat running real UDP — invalidation/replication visibility,
-   state-transfer warm join, anti-entropy repair, TTL expiry, kill/restart,
-   `get_or_load` stampede collapse, local-mode isolation.
-4. **Chaos demo** (`sundog-demo`, headless mode) as a soak/smoke rig — see
-   above.
-
-Run everything with `cargo test --workspace`; the simulation suite needs the
-feature explicitly: `cargo test -p sundog --features sim --test 'sim*'`
-(this is what CI's second test job runs). `cargo clippy --workspace
---all-targets -- -D warnings -W clippy::pedantic` is clean and enforced in
-CI alongside `cargo fmt --all --check`.
+`--headless <SECS>` runs the same thing with no terminal, for a fixed
+duration, then prints a convergence report and exits nonzero if anything
+diverged — that's the soak-test rig (run it for 24h, memory should stay
+flat) and it doubles as a CI-friendly smoke check.
 
 ## MSRV
 

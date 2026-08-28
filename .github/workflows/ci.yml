@@ -54,3 +54,33 @@ jobs:
       # which is why `sim` keeps its own lane above instead.
       - name: cargo test (tls,prometheus features)
         run: cargo test --package sundog --features tls,prometheus
+
+  # Container-backed multi-node suite (docs/BUILD_PLAN.md §11, layer 3),
+  # exclusively through the `rightsize` crate — no docker CLI, no bollard.
+  # Separate job because it needs the
+  # musl target/toolchain and a container backend that the other lanes
+  # don't. RIGHTSIZE_BACKEND=docker: sundog's gossip is UDP, and rightsize's
+  # microsandbox network emulation relays TCP only, so the docker backend is
+  # the one that actually carries chitchat's traffic. Hosted GitHub runners
+  # have both KVM and docker, so the default SUNDOG_TEST_BASE_IMAGE
+  # (alpine:3.22) pulls fine here.
+  containers:
+    runs-on: ubuntu-latest
+    env:
+      RIGHTSIZE_BACKEND: docker
+      SUNDOG_CONTAINER_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test containers
+        run: cargo test --release --package sundog --test containers -- --test-threads=1

@@ -26,10 +26,18 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
 
     tokio::time::sleep(duration).await;
     demo.paused.store(true, Ordering::Relaxed);
-    // Give a couple of anti-entropy rounds a chance to land before judging.
-    tokio::time::sleep(setup::AE_INTERVAL * 2).await;
 
-    let report = convergence::check(&demo.nodes);
+    // Convergence is eventual: random peer selection needs several rounds to
+    // pair every lagging node, so poll under a bound instead of judging one
+    // arbitrary instant.
+    let deadline = tokio::time::Instant::now() + setup::AE_INTERVAL * 10;
+    let report = loop {
+        let report = convergence::check(&demo.nodes);
+        if !report.is_diverged() || tokio::time::Instant::now() >= deadline {
+            break report;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     let exit_code = i32::from(report.is_diverged());
     let total_writes: u64 = demo
         .nodes

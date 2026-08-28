@@ -29,9 +29,10 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -105,6 +106,19 @@ pub(crate) struct MeshTls {
     acceptor: TlsAcceptor,
 }
 
+// `ServerConfig::builder()`/`ClientConfig::builder()` panic if the
+// process-default crypto provider is ambiguous, which it is the moment any
+// other dependency in the binary (e.g. a `ring`-based transitive dep pulled
+// in by an unrelated feature) unifies a second provider into the build
+// alongside aws-lc-rs. Install ours explicitly, once, so mesh TLS never
+// depends on what else happens to be linked in.
+fn ensure_crypto_provider() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+    });
+}
+
 impl MeshTls {
     /// # Errors
     ///
@@ -112,6 +126,7 @@ impl MeshTls {
     /// root CA material is malformed or internally inconsistent (e.g. the
     /// private key doesn't match the leaf certificate).
     pub(crate) fn new(config: &TlsConfig) -> Result<Self, rustls::Error> {
+        ensure_crypto_provider();
         let mut roots = RootCertStore::empty();
         for ca in &config.root_ca_certs {
             roots.add(ca.clone())?;

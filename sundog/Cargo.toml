@@ -39,6 +39,14 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 anyhow = "1.0.104"
 proptest = "1.11.0"
 rcgen = "0.14.9"
+# Container-based integration tests (`tests/container_util`): rightsize is
+# the only permitted way to run containers in this repo — no docker CLI, no
+# bollard (see docs/HOUSE_RULES.md). `rightsize-modules` pulls in both
+# backend crates by default; the container harness itself only drives plain
+# `rightsize::Container`s, but `register_default_backends` needs the
+# backends linked in.
+rightsize = "0.7.5"
+rightsize-modules = "0.7.5"
 tokio = { version = "1.53.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 
