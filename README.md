@@ -131,7 +131,9 @@ save `Mdns` for host networking or bare-metal LANs.
 Metrics (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
 `sundog_open_caches`, and a few more) are emitted unconditionally regardless
 of features — without `prometheus`, they just fall into the `metrics`
-crate's no-op default recorder instead of going anywhere.
+crate's no-op default recorder instead of going anywhere. A ready-made
+Grafana dashboard for them lives at
+[`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
 ## Testing
 

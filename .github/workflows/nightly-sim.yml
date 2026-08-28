@@ -1,0 +1,24 @@
+# Nightly turmoil run with a fresh seed (docs/BUILD_PLAN.md §11): the chosen
+# seed is printed before the suite runs, so a red night is replayed locally
+# with `SUNDOG_SIM_SEED=<seed> cargo test -p sundog --features sim --test sim`.
+name: nightly-sim
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  sim-fresh-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick and log tonight's seed
+        run: |
+          SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+          echo "SUNDOG_SIM_SEED=$SEED" >> "$GITHUB_ENV"
+          echo "::notice title=sim seed::replay with SUNDOG_SIM_SEED=$SEED"
+      - name: Run the simulation suite
+        run: cargo test --package sundog --features sim --test sim

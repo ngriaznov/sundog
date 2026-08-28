@@ -42,6 +42,20 @@ use turmoil::{Builder, Sim};
 type TestShard = Shard<u32, String>;
 type SimResult = turmoil::Result;
 
+/// Deterministic by default; the scheduled fresh-seed CI job overrides via
+/// `SUNDOG_SIM_SEED` and the chosen value is echoed so a red run names the
+/// seed to replay. `simulation_is_reproducible_for_a_fixed_seed` keeps its
+/// own fixed seeds regardless.
+fn sim_seed(default: u64) -> u64 {
+    std::env::var("SUNDOG_SIM_SEED").map_or(default, |raw| {
+        let seed: u64 = raw
+            .parse()
+            .expect("SUNDOG_SIM_SEED must be a u64 turmoil seed");
+        eprintln!("sim seed override: replay with SUNDOG_SIM_SEED={seed}");
+        seed
+    })
+}
+
 const CACHE: &str = "sim-users";
 /// Simulated time per `Sim::step()`: small relative to every interval below,
 /// so scheduling stays close to the nominal cadence without needing an
@@ -416,7 +430,7 @@ fn partition_during_writes_converges_within_five_ae_rounds() {
     let shard_b = Arc::new(new_shard(node_b));
 
     let mut sim = Builder::new()
-        .rng_seed(0xA11C_E001)
+        .rng_seed(sim_seed(0xA11C_E001))
         .tick_duration(TICK)
         .max_message_latency(Duration::from_millis(20))
         .build();
@@ -579,7 +593,7 @@ fn run_storm_scenario(seed: u64) -> StormStats {
 
 #[test]
 fn loss_reorder_duplicate_storm_still_converges() {
-    run_storm_scenario(0x5707_2201);
+    run_storm_scenario(sim_seed(0x5707_2201));
 }
 
 #[test]
@@ -737,7 +751,7 @@ fn donor_crash_mid_state_transfer_repicks_and_completes() {
     let done = Arc::new(AtomicBool::new(false));
 
     let mut sim = Builder::new()
-        .rng_seed(0xD0A0_5501)
+        .rng_seed(sim_seed(0xD0A0_5501))
         .tick_duration(TICK)
         .min_message_latency(Duration::from_millis(2))
         .max_message_latency(Duration::from_millis(30))

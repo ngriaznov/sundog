@@ -113,7 +113,12 @@ name reservation, not a release.
   feature tests as further steps in that same job. The container suite runs
   as its own separate job (musl target + `musl-tools` installed,
   `RIGHTSIZE_BACKEND=docker` and `SUNDOG_CONTAINER_TESTS=1` set, default base
-  image pulls fine on a hosted runner).
+  image pulls fine on a hosted runner). A nightly `nightly-sim` workflow runs
+  the simulation suite under a fresh random seed (`SUNDOG_SIM_SEED`), logging
+  the seed for local replay.
+- **Grafana dashboard** (`ops/grafana-dashboard.json`): panels for live
+  peers, open caches, per-peer backlog drops, anti-entropy repair rate, and
+  state-transfer throughput.
 
 ### Known gaps (tracked, not bugs)
 
