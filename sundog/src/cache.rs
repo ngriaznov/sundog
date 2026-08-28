@@ -74,15 +74,19 @@ where
     /// Opens the cache: builds the local shard and registers it in the
     /// cluster's shard registry, so inbound replication/invalidation and
     /// anti-entropy/state-transfer requests for this name can find it from
-    /// this point on, and (unless `mode` is [`Mode::Local`]) starts fanning
-    /// this shard's own local writes out to the mesh per `mode`.
+    /// this point on; unless `mode` is [`Mode::Local`], starts fanning this
+    /// shard's own local writes out to the mesh per `mode`.
     ///
-    /// State transfer from an existing cluster-wide copy on join (plan §9)
-    /// and anti-entropy scheduling (plan §8) are not triggered here yet — a
-    /// freshly opened cache starts from whatever live traffic and, once
-    /// wired up, anti-entropy bring it. `net::RequestHandler` (this cache's
-    /// serving side) is already live via [`Cluster::builder`]'s wiring, so
-    /// that follow-up only needs a requesting side.
+    /// For [`Mode::Replicated`], `open()` also runs state transfer (plan §9)
+    /// before returning: pulls a full snapshot from the lowest-node-id live
+    /// peer, applies it through the same versioned-apply path as live
+    /// traffic, then runs one immediate anti-entropy round against that
+    /// donor. This is bounded — an unresponsive or empty cluster does not
+    /// block `open()` forever, see `cluster::state_transfer`'s docs — and is
+    /// followed by a background anti-entropy scheduler for the life of the
+    /// cache. `Mode::Invalidation` gets neither: its nodes are meant to hold
+    /// independent subsets, so there is no cluster-wide snapshot to warm
+    /// from (see `cluster::anti_entropy`'s module docs).
     ///
     /// # Errors
     ///
@@ -95,13 +99,6 @@ where
     ///
     /// Panics if the shard registry lock is poisoned, which only happens if
     /// an earlier call already panicked while holding it.
-    //
-    // `async` (with no `.await` yet) matches this method's documented shape
-    // (plan §10, `docs/INTERFACES.md`) and the state-transfer request this
-    // will make once wired up (see this method's doc comment) genuinely
-    // needs it — keeping the signature stable now avoids a breaking change
-    // for that follow-up.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn open(self) -> Result<Cache<K, V>, CacheError> {
         let Self {
             cluster,
@@ -143,6 +140,17 @@ where
                 shard.events(),
                 name.clone(),
                 mode,
+                cluster.cancel_token(),
+            ));
+        }
+        if matches!(mode, Mode::Replicated) {
+            let shard_ops = Arc::clone(&shard) as Arc<dyn ShardOps>;
+            crate::cluster::state_transfer::run(&cluster, &shard_ops, &name).await;
+            cluster.spawn_tracked(crate::cluster::anti_entropy::scheduler_task(
+                cluster.clone(),
+                shard_ops,
+                name.clone(),
+                cluster.config().ae_interval,
                 cluster.cancel_token(),
             ));
         }

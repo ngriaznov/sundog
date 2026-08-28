@@ -631,6 +631,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_transfer_stream_reports_an_error_on_truncated_connection() {
+        // A hand-rolled "donor" that sends one non-final chunk then drops the
+        // connection without ever sending `done: true` — a donor crash
+        // mid-stream. The requester must see this as an error, not as a
+        // clean end of stream (state-transfer retry logic depends on the
+        // distinction).
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+
+        let donor = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut framed = LengthDelimitedCodec::builder()
+                .max_frame_length(MAX_FRAME)
+                .new_framed(stream);
+            let _hello = framed.next().await.expect("hello arrives");
+            let _request = framed.next().await.expect("st request arrives");
+            let chunk = Msg::StChunk {
+                cache: SmolStr::new("users"),
+                recs: vec![sample_record(1)],
+                done: false,
+            };
+            let encoded = wire::encode(&chunk).expect("encodes");
+            futures::SinkExt::send(&mut framed, Bytes::from(encoded))
+                .await
+                .expect("send partial chunk");
+            drop(framed); // connection closes: no `done: true` chunk ever sent
+        });
+
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), addr)]);
+
+        let mut stream = requester
+            .request_state(NodeId::from(1), SmolStr::new("users"))
+            .await
+            .expect("request accepted");
+        let first = stream.next().await.expect("first record arrives");
+        assert_eq!(first.expect("decodes"), sample_record(1));
+        let second = stream
+            .next()
+            .await
+            .expect("stream ends with an error, not silently");
+        assert!(second.is_err(), "truncated stream must surface as an error");
+
+        donor.await.expect("donor task did not panic");
+    }
+
+    #[tokio::test]
     async fn ae_round_returns_only_mismatched_buckets() {
         let entries = vec![(
             Bytes::from_static(b"k1"),

@@ -311,7 +311,19 @@ pub(super) fn state_stream(
                     }
                     Some(Ok(_)) => {} // unexpected message on this stream; keep reading
                     Some(Err(err)) => return Some((Err(err), (framed, buf, true))),
-                    None => return None,
+                    // The connection closed before a `done: true` chunk ever
+                    // arrived — a donor crash/close mid-stream. Surfacing
+                    // this as an error (rather than silently ending the
+                    // stream, indistinguishable from a clean completion) is
+                    // what lets the state-transfer retry logic tell a
+                    // truncated transfer from a finished one.
+                    None => {
+                        let err = CodecError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "state-transfer connection closed before the final chunk",
+                        ));
+                        return Some((Err(err), (framed, buf, true)));
+                    }
                 }
             }
         },

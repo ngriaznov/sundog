@@ -12,6 +12,9 @@
 //! cache name, and — spawned per opened cache — local writes fan out over
 //! the mesh per [`Mode`].
 
+pub(crate) mod anti_entropy;
+pub(crate) mod state_transfer;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
@@ -118,6 +121,13 @@ impl Cluster {
 
     pub(crate) fn mesh(&self) -> &Mesh {
         &self.inner.mesh
+    }
+
+    /// The live peer set, as membership currently reports it — for
+    /// diagnostics (the demo bin's `peers` command; `tracing`/logging).
+    #[must_use]
+    pub fn peers(&self) -> Vec<Peer> {
+        self.inner.membership.peers().borrow().clone()
     }
 
     /// The live peer set, as node ids only — what `Cache`'s write-fan-out
@@ -770,6 +780,104 @@ mod tests {
         })
         .await
         .expect("b's stale copy is invalidated within the bound");
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn state_transfer_warms_a_late_joiner_from_the_existing_donor() {
+        let cluster_a = Cluster::builder("cluster-it-state-transfer")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        cache_a
+            .insert(1, "pre-existing".into())
+            .await
+            .expect("a writes before b ever joins");
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-state-transfer")
+            .seeds([gossip_a])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        // `open()` blocks for state transfer, so B's copy of a key A wrote
+        // before B ever joined the cluster must already be warm — no
+        // waiting for a live write or an anti-entropy round.
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(15),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+
+        assert_eq!(cache_b.get(&1).await, Some("pre-existing".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_repairs_a_locally_dropped_entry() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-anti-entropy").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+
+        cache_a.insert(1, "hello".into()).await.expect("a inserts");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cache_b.get(&1).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("live fan-out delivers the insert to b");
+
+        // Simulate a dropped `Replicate` message: wipe B's local copy
+        // without a tombstone. Only anti-entropy (not live traffic) can
+        // bring this back, since nothing writes key 1 again.
+        cache_b.invalidate_local(&1).await;
+        assert_eq!(cache_b.get(&1).await, None);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cache_b.get(&1).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("anti-entropy repairs the dropped entry within a few rounds");
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;

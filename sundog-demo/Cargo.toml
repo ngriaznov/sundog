@@ -16,5 +16,5 @@ pedantic = { level = "warn", priority = -1 }
 anyhow = "1.0.104"
 rand = "0.10.2"
 sundog = { version = "0.1.0", path = "../sundog" }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "io-std", "signal"] }
 tracing-subscriber = "0.3.23"
