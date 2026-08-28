@@ -160,6 +160,15 @@ impl RequestHandler for ShardHandler {
         Box::pin(async move { ShardOps::bucket_entries(shard.as_ref(), bucket).await })
     }
 
+    fn entries_for_buckets(
+        &self,
+        _cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, sundog::store::BucketEntries> {
+        let shard = Arc::clone(&self.0);
+        Box::pin(async move { ShardOps::entries_for_buckets(shard.as_ref(), buckets).await })
+    }
+
     fn records_for(&self, _cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         let shard = Arc::clone(&self.0);
         Box::pin(async move { ShardOps::records_for(shard.as_ref(), keys).await })

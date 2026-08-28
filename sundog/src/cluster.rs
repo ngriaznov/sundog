@@ -143,6 +143,12 @@ impl Cluster {
         self.inner.membership.peers().borrow().clone()
     }
 
+    /// A fresh watch subscription on the live peer set — for tasks that
+    /// need to react to membership changes rather than sample them.
+    pub(crate) fn peers_watch(&self) -> tokio::sync::watch::Receiver<Vec<Peer>> {
+        self.inner.membership.peers()
+    }
+
     /// The live peer set, as node ids only — what `Cache`'s write-fan-out
     /// task iterates to decide who to send `Invalidate`/`Replicate` to.
     pub(crate) fn live_peer_ids(&self) -> Vec<NodeId> {
@@ -430,6 +436,19 @@ impl RequestHandler for ClusterRequestHandler {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.bucket_entries(bucket).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn entries_for_buckets(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, crate::store::BucketEntries> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.entries_for_buckets(buckets).await,
                 None => Vec::new(),
             }
         })

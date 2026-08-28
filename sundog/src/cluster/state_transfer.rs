@@ -33,11 +33,21 @@ const PER_DONOR_BUDGET: Duration = Duration::from_secs(8);
 /// failure (e.g. the mesh hasn't finished dialing it yet).
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
+/// How [`run`] ended — [`Outcome::NoPeers`] is the caller's cue to arm
+/// [`late_sync_task`], since `open()` racing gossip convergence is normal on
+/// a cold join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Completed,
+    NoPeers,
+    TimedOut,
+}
+
 /// Runs state transfer for `cache`, blocking until either a donor finishes
 /// (followed by one immediate anti-entropy round against it), no live peers
 /// remain to try, or `TOTAL_BUDGET` elapses.
 #[tracing::instrument(skip_all, fields(cache = %cache))]
-pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &SmolStr) {
+pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &SmolStr) -> Outcome {
     let started = tokio::time::Instant::now();
     match tokio::time::timeout(TOTAL_BUDGET, transfer_loop(cluster, shard, cache)).await {
         Ok(Some(donor)) => {
@@ -57,16 +67,53 @@ pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Sm
             {
                 tracing::debug!(%donor, "post-transfer anti-entropy sweep timed out; skipping");
             }
+            Outcome::Completed
         }
         Ok(None) => {
             tracing::debug!("no live peers at open; starting with an empty cache");
+            Outcome::NoPeers
         }
         Err(_) => {
             tracing::warn!(
                 budget = ?TOTAL_BUDGET,
                 "state transfer timed out before any donor finished; opening with a possibly partial cache"
             );
+            Outcome::TimedOut
         }
+    }
+}
+
+/// One-shot deferred warm-up for a cache opened before gossip had converged:
+/// waits until the first live peer appears (or `cancel`), then runs [`run`]
+/// once. Without this, a cold joiner's `open()` finds nobody, skips state
+/// transfer entirely, and the plan §9 warm join silently degrades into
+/// waiting out anti-entropy intervals.
+pub(crate) async fn late_sync_task(
+    cluster: Cluster,
+    shard: Arc<dyn ShardOps>,
+    cache: SmolStr,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let mut peers = cluster.peers_watch();
+    loop {
+        if !peers.borrow_and_update().is_empty() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            changed = peers.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    tracing::info!(cache = %cache, "first peer appeared after open; running deferred state transfer");
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {}
+        _outcome = run(&cluster, &shard, &cache) => {}
     }
 }
 

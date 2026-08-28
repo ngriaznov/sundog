@@ -59,6 +59,12 @@ pub(crate) async fn scheduler_task(
     }
 }
 
+/// Keys per push/pull batch within one round. Bounds each `ae_pull`
+/// request/response well under the frame cap and its request timeout, so a
+/// large divergence repairs incrementally across batches (and rounds)
+/// rather than betting everything on one oversized exchange.
+const REPAIR_BATCH: usize = 4096;
+
 /// A jittered delay around `interval` (uniformly in `[0.5, 1.5) * interval`,
 /// floored at 1ms) — avoids every node's anti-entropy rounds landing in
 /// lockstep across the cluster.
@@ -105,16 +111,32 @@ pub(crate) async fn run_round_against(
         return;
     }
 
+    // One local shard pass for every mismatched bucket (a mostly-divergent
+    // peer mismatches all 1,024; per-bucket scans would be quadratic here,
+    // exactly as on the serving side).
+    let local_entries = shard
+        .entries_for_buckets(mismatched.iter().map(|&(bucket, _)| bucket).collect())
+        .await;
+    let local_by_bucket: HashMap<u16, Vec<(Bytes, crate::hlc::Hlc)>> =
+        local_entries.into_iter().collect();
+
     let mut push_keys: Vec<Bytes> = Vec::new();
     let mut pull_keys: Vec<Bytes> = Vec::new();
     for (bucket, peer_entries) in mismatched {
-        diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
+        diff_bucket(
+            local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
+            &peer_entries,
+            &mut push_keys,
+            &mut pull_keys,
+        );
     }
 
     let mut repaired: u64 = 0;
-    if !push_keys.is_empty() {
-        let pushed = push_keys.len();
-        for rec in shard.records_for(push_keys).await {
+    // Batched so a large divergence makes durable incremental progress: each
+    // batch that lands raises local versions, shrinking the next round's
+    // diff, instead of one all-or-nothing exchange racing a request timeout.
+    for batch in push_keys.chunks(REPAIR_BATCH) {
+        for rec in shard.records_for(batch.to_vec()).await {
             mesh.send(
                 peer,
                 MsgClass::Replicate,
@@ -124,17 +146,20 @@ pub(crate) async fn run_round_against(
                 },
             );
         }
-        repaired += pushed as u64;
+        repaired += batch.len() as u64;
     }
-    if !pull_keys.is_empty() {
-        match mesh.ae_pull(peer, cache.clone(), pull_keys).await {
+    for batch in pull_keys.chunks(REPAIR_BATCH) {
+        match mesh.ae_pull(peer, cache.clone(), batch.to_vec()).await {
             Ok(records) => {
                 repaired += records.len() as u64;
                 for rec in records {
                     shard.apply_remote(rec).await;
                 }
             }
-            Err(error) => tracing::debug!(%error, "anti-entropy pull failed"),
+            Err(error) => {
+                tracing::debug!(%error, repaired, "anti-entropy pull failed; keeping progress");
+                break;
+            }
         }
     }
 
@@ -145,29 +170,28 @@ pub(crate) async fn run_round_against(
     tracing::debug!(repaired, "anti-entropy round complete");
 }
 
-async fn diff_bucket(
-    shard: &Arc<dyn ShardOps>,
-    bucket: u16,
+fn diff_bucket(
+    local_entries: &[(Bytes, crate::hlc::Hlc)],
     peer_entries: &[(Bytes, crate::hlc::Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
 ) {
-    let peer_by_key: HashMap<Bytes, crate::hlc::Hlc> =
-        peer_entries.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    let mut local_keys = HashSet::with_capacity(peer_by_key.len());
+    let peer_by_key: HashMap<&Bytes, crate::hlc::Hlc> =
+        peer_entries.iter().map(|(k, v)| (k, *v)).collect();
+    let mut local_keys = HashSet::with_capacity(local_entries.len());
 
-    for (key, local_ver) in shard.bucket_entries(bucket).await {
-        local_keys.insert(key.clone());
-        match peer_by_key.get(&key) {
-            Some(&peer_ver) if local_ver > peer_ver => push_keys.push(key),
-            Some(&peer_ver) if local_ver < peer_ver => pull_keys.push(key),
+    for (key, local_ver) in local_entries {
+        local_keys.insert(key);
+        match peer_by_key.get(key) {
+            Some(&peer_ver) if *local_ver > peer_ver => push_keys.push(key.clone()),
+            Some(&peer_ver) if *local_ver < peer_ver => pull_keys.push(key.clone()),
             Some(_) => {}
-            None => push_keys.push(key),
+            None => push_keys.push(key.clone()),
         }
     }
-    for key in peer_by_key.into_keys() {
-        if !local_keys.contains(&key) {
-            pull_keys.push(key);
+    for (key, _) in peer_entries {
+        if !local_keys.contains(key) {
+            pull_keys.push(key.clone());
         }
     }
 }

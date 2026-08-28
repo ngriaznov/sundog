@@ -169,6 +169,14 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>>;
     /// Returns the live key/version listing for one bucket of `cache`.
     fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
+    /// [`RequestHandler::bucket_entries`] for many buckets in one shard pass
+    /// (see `ShardOps::entries_for_buckets`); every requested bucket appears
+    /// in the result, empty lists included.
+    fn entries_for_buckets(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, crate::store::BucketEntries>;
     /// Returns full records for `keys` in `cache` that this node holds.
     fn records_for(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>>;
 }
@@ -544,6 +552,19 @@ mod tests {
             _bucket: u16,
         ) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
             Box::pin(async { self.bucket_entries.clone() })
+        }
+
+        fn entries_for_buckets(
+            &self,
+            _cache: SmolStr,
+            buckets: Vec<u16>,
+        ) -> BoxFuture<'_, crate::store::BucketEntries> {
+            Box::pin(async move {
+                buckets
+                    .into_iter()
+                    .map(|bucket| (bucket, self.bucket_entries.clone()))
+                    .collect()
+            })
         }
 
         fn records_for(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {

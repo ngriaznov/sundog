@@ -190,7 +190,15 @@ where
         }
         if matches!(mode, Mode::Replicated) {
             let shard_ops = Arc::clone(&shard) as Arc<dyn ShardOps>;
-            crate::cluster::state_transfer::run(&cluster, &shard_ops, &name).await;
+            let outcome = crate::cluster::state_transfer::run(&cluster, &shard_ops, &name).await;
+            if outcome == crate::cluster::state_transfer::Outcome::NoPeers {
+                cluster.spawn_tracked(crate::cluster::state_transfer::late_sync_task(
+                    cluster.clone(),
+                    Arc::clone(&shard_ops),
+                    name.clone(),
+                    cluster.cancel_token(),
+                ));
+            }
             cluster.spawn_tracked(crate::cluster::anti_entropy::scheduler_task(
                 cluster.clone(),
                 shard_ops,

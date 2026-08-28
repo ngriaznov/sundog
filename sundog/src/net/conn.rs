@@ -313,11 +313,19 @@ async fn serve_ae_digest(
 ) {
     let local: std::collections::HashMap<u16, u64> =
         handler.digests(cache.clone()).await.into_iter().collect();
-    for (bucket, remote_digest) in remote_buckets {
-        if local.get(&bucket).copied().unwrap_or(0) == remote_digest {
-            continue;
-        }
-        let entries = handler.bucket_entries(cache.clone(), bucket).await;
+    let mismatched: Vec<u16> = remote_buckets
+        .into_iter()
+        .filter(|&(bucket, remote_digest)| {
+            local.get(&bucket).copied().unwrap_or(0) != remote_digest
+        })
+        .map(|(bucket, _)| bucket)
+        .collect();
+    if mismatched.is_empty() {
+        return;
+    }
+    // One shard pass for every mismatched bucket at once: a mostly-divergent
+    // peer mismatches all 1,024, and per-bucket scans would be quadratic.
+    for (bucket, entries) in handler.entries_for_buckets(cache.clone(), mismatched).await {
         let msg = Msg::AeBucket {
             cache: cache.clone(),
             bucket,
@@ -517,6 +525,13 @@ mod tests {
                 _cache: SmolStr,
                 _bucket: u16,
             ) -> BoxFuture<'_, Vec<(bytes::Bytes, Hlc)>> {
+                Box::pin(async { Vec::new() })
+            }
+            fn entries_for_buckets(
+                &self,
+                _cache: SmolStr,
+                _buckets: Vec<u16>,
+            ) -> BoxFuture<'_, crate::store::BucketEntries> {
                 Box::pin(async { Vec::new() })
             }
             fn records_for(

@@ -276,3 +276,44 @@ async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
     n3.stop().await.expect("n3 stops");
     net.close().await.expect("network closes");
 }
+
+/// Plan §12 M5's acceptance bar: a cold node joining a populated cluster
+/// warms via state transfer in seconds, at 100k-entry scale. The elapsed
+/// bound below includes container boot and gossip convergence on top of the
+/// transfer itself, so it is deliberately generous; the printed duration is
+/// the number to watch.
+#[tokio::test]
+async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
+    const ENTRIES: u32 = 100_000;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "scale-cluster", "n1", &[]).await;
+    n1.fill(ENTRIES).await.expect("bulk fill succeeds");
+    assert_eq!(n1.count().await, Ok(ENTRIES as usize));
+
+    let started = std::time::Instant::now();
+    let n2 = Node::spawn(&net, "scale-cluster", "n2", &[&seed("n1")]).await;
+    // Observation window is wider than the pass bar so a slow run fails on
+    // the measured duration below, not on an opaque poll timeout.
+    eventually(Duration::from_secs(120), || async {
+        n2.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+    let warm = started.elapsed();
+    println!("cold join warmed {ENTRIES} entries in {warm:?} (incl. container boot)");
+    assert!(
+        warm < Duration::from_secs(30),
+        "cold join took {warm:?}, past the warm-in-seconds bar"
+    );
+    assert_eq!(n2.get("k0").await, Ok(Some("v0".to_string())));
+    assert_eq!(n2.get("k99999").await, Ok(Some("v99999".to_string())));
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    net.close().await.expect("network closes");
+}

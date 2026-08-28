@@ -7,7 +7,7 @@
 //! `Origin::Local` [`Event`] on [`Shard::events`]; correlating that stream to
 //! wire fan-out (`Mesh::send` per [`Mode`]) is the composition layer's job.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
@@ -142,6 +142,10 @@ pub enum Event<K, V> {
 /// Async methods return `BoxFuture` rather than using `async fn` in the
 /// trait, matching `Discovery`'s object-safety pattern (`dyn ShardOps` must
 /// be usable from a `HashMap<SmolStr, Arc<dyn ShardOps>>`).
+/// Entries per bucket, as an anti-entropy exchange reports them: every
+/// requested bucket present, empty lists included.
+pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
+
 pub trait ShardOps: Send + Sync {
     /// Applies an inbound replicated record iff its version is newer than
     /// what's stored — the versioned-apply rule that makes replication
@@ -166,6 +170,12 @@ pub trait ShardOps: Send + Sync {
     /// Returns `(key, version)` for every live entry and un-GC'd tombstone in
     /// `bucket`, for a peer that reported a digest mismatch there.
     fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
+
+    /// [`ShardOps::bucket_entries`] for many buckets in ONE pass over the
+    /// shard. An anti-entropy round against a mostly-divergent peer touches
+    /// up to all 1,024 buckets; per-bucket scans would make that quadratic
+    /// in shard size.
+    fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries>;
 
     /// Returns the full [`WireRecord`] for each of `keys` that this shard
     /// holds (present entries and tombstones alike), answering an `AePull`.
@@ -795,6 +805,34 @@ where
         self.cache.entry_count()
     }
 
+    /// One pass over tombstones and live entries, distributing each into the
+    /// requested buckets. Every requested bucket appears in the result, an
+    /// empty list included — an anti-entropy responder must report even the
+    /// buckets where it holds nothing, so the initiator learns to push.
+    async fn collect_buckets(&self, wanted: &HashSet<u16>) -> BucketEntries {
+        let mut by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> =
+            wanted.iter().map(|&bucket| (bucket, Vec::new())).collect();
+        {
+            let tombstones = self.tombstones.lock().await;
+            for (key, tomb) in tombstones.iter() {
+                if let Some(slot) = by_bucket.get_mut(&bucket_of(key)) {
+                    slot.push((key.clone(), tomb.ver));
+                }
+            }
+        }
+        for (key, stored) in &self.cache {
+            let Ok(key_bytes) = postcard::to_stdvec(&*key) else {
+                continue;
+            };
+            if let Some(slot) = by_bucket.get_mut(&bucket_of(&key_bytes)) {
+                slot.push((Bytes::from(key_bytes), stored.ver));
+            }
+        }
+        let mut out: Vec<_> = by_bucket.into_iter().collect();
+        out.sort_unstable_by_key(|&(bucket, _)| bucket);
+        out
+    }
+
     /// Reads `key`, invoking `loader` on a miss. Concurrent callers racing on
     /// the same missing key are collapsed into one `loader` call (moka
     /// `get_with`'s stampede protection).
@@ -1017,21 +1055,18 @@ where
 
     fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
         Box::pin(async move {
-            let mut out = Vec::new();
-            {
-                let tombstones = self.tombstones.lock().await;
-                out.extend(
-                    tombstones
-                        .iter()
-                        .filter(|(k, _)| bucket_of(k) == bucket)
-                        .map(|(k, t)| (k.clone(), t.ver)),
-                );
-            }
-            out.extend(self.cache.iter().filter_map(|(key, stored)| {
-                let key_bytes = postcard::to_stdvec(&*key).ok()?;
-                (bucket_of(&key_bytes) == bucket).then(|| (Bytes::from(key_bytes), stored.ver))
-            }));
-            out
+            self.collect_buckets(&HashSet::from([bucket]))
+                .await
+                .pop()
+                .map(|(_, entries)| entries)
+                .unwrap_or_default()
+        })
+    }
+
+    fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries> {
+        Box::pin(async move {
+            let wanted: HashSet<u16> = buckets.into_iter().collect();
+            self.collect_buckets(&wanted).await
         })
     }
 

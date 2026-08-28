@@ -194,6 +194,20 @@ impl Node {
             .map_err(|error| format!("bad count reply: {error}"))
     }
 
+    /// `fill n` — bulk-inserts `k0..kn` locally on the node, without paying a
+    /// control round trip per entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails or the node reports an
+    /// insert error.
+    pub async fn fill(&self, count: u32) -> Result<(), String> {
+        match self.command(&format!("fill {count}")).await?.as_str() {
+            "ok" => Ok(()),
+            other => Err(other.to_string()),
+        }
+    }
+
     /// `peers` — the node's live peer count, as membership currently reports it.
     ///
     /// # Errors

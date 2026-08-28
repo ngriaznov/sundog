@@ -11,19 +11,18 @@
 //!
 //! Control protocol, one command per line, one line-terminated reply each
 //! (`quit` excepted): `put k v` -> `ok`; `get k` -> `val <v>` | `none`;
-//! `del k` -> `ok`; `count` -> `<n>`; `peers` -> `<n>`; `quit` -> exits 0.
+//! `del k` -> `ok`; `count` -> `<n>` (live local entries, read from the
+//! store); `fill n` -> `ok` (bulk-inserts `k0..kn` = `v0..vn` locally);
+//! `peers` -> `<n>`; `quit` -> exits 0.
 
-use std::collections::HashSet;
 use std::env;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sundog::{Cache, Cluster, ClusterConfig, Event, Mode};
+use sundog::{Cache, Cluster, ClusterConfig, Mode};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
 
 const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
@@ -62,21 +61,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .open()
         .await?;
 
-    let known_keys = KnownKeys::default();
-    tokio::spawn(track_keys(cache.events(), known_keys.clone()));
-
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
     println!("testnode-ready");
     let _ = std::io::stdout().flush();
 
     loop {
         let (socket, _) = listener.accept().await?;
-        tokio::spawn(serve(
-            socket,
-            cache.clone(),
-            cluster.clone(),
-            known_keys.clone(),
-        ));
+        tokio::spawn(serve(socket, cache.clone(), cluster.clone()));
     }
 }
 
@@ -98,54 +89,12 @@ async fn resolve_seeds(spec: &str) -> Vec<SocketAddr> {
     seeds
 }
 
-/// Mirrors the cache's live key set from its own event stream: `Cache` has no
-/// public entry-count accessor (`docs/INTERFACES.md`), but the control
-/// protocol's `count` command needs one that reflects replicated writes too.
-#[derive(Clone, Default)]
-struct KnownKeys(Arc<Mutex<HashSet<String>>>);
-
-impl KnownKeys {
-    fn count(&self) -> usize {
-        self.0
-            .lock()
-            .expect("invariant: never held across an await point")
-            .len()
-    }
-}
-
-async fn track_keys(mut events: broadcast::Receiver<Event<String, String>>, known: KnownKeys) {
-    loop {
-        let event = match events.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => return,
-        };
-        let mut keys = known
-            .0
-            .lock()
-            .expect("invariant: never held across an await point");
-        match event {
-            Event::Created { key, .. } | Event::Updated { key, .. } => {
-                keys.insert(key);
-            }
-            Event::Removed { key, .. } => {
-                keys.remove(&key);
-            }
-        }
-    }
-}
-
 enum Reply {
     Line(String),
     Quit,
 }
 
-async fn dispatch(
-    cache: &Cache<String, String>,
-    cluster: &Cluster,
-    known: &KnownKeys,
-    line: &str,
-) -> Reply {
+async fn dispatch(cache: &Cache<String, String>, cluster: &Cluster, line: &str) -> Reply {
     let mut parts = line.trim().splitn(3, ' ');
     match parts.next().unwrap_or_default() {
         "put" => {
@@ -177,26 +126,32 @@ async fn dispatch(
                 Err(error) => format!("err {error}"),
             })
         }
-        "count" => Reply::Line(known.count().to_string()),
+        "count" => Reply::Line(cache.entry_count().await.to_string()),
+        "fill" => {
+            let Some(count) = parts.next().and_then(|raw| raw.parse::<u32>().ok()) else {
+                return Reply::Line("err fill needs a u32 count".to_string());
+            };
+            for i in 0..count {
+                if let Err(error) = cache.insert(format!("k{i}"), format!("v{i}")).await {
+                    return Reply::Line(format!("err {error}"));
+                }
+            }
+            Reply::Line("ok".to_string())
+        }
         "peers" => Reply::Line(cluster.peers().len().to_string()),
         "quit" => Reply::Quit,
         other => Reply::Line(format!("err unknown command {other:?}")),
     }
 }
 
-async fn serve(
-    socket: TcpStream,
-    cache: Cache<String, String>,
-    cluster: Cluster,
-    known: KnownKeys,
-) {
+async fn serve(socket: TcpStream, cache: Cache<String, String>, cluster: Cluster) {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
     loop {
         let Ok(Some(line)) = lines.next_line().await else {
             return;
         };
-        match dispatch(&cache, &cluster, &known, &line).await {
+        match dispatch(&cache, &cluster, &line).await {
             Reply::Line(reply) => {
                 if writer
                     .write_all(format!("{reply}\n").as_bytes())
