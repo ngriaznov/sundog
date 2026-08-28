@@ -217,13 +217,12 @@ fn config(
     ae_interval: Duration,
     tombstone_ttl: Duration,
 ) -> ClusterConfig {
-    ClusterConfig {
-        gossip_bind_addr: gossip_addr,
-        data_bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ae_interval,
-        tombstone_ttl,
-        ..ClusterConfig::default()
-    }
+    ClusterConfig::default().with(|c| {
+        c.gossip_bind_addr = gossip_addr;
+        c.data_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        c.ae_interval = ae_interval;
+        c.tombstone_ttl = tombstone_ttl;
+    })
 }
 
 async fn open(

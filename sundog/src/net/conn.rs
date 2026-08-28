@@ -181,6 +181,7 @@ pub(super) async fn accept_loop(
                     inbound_tx.clone(),
                     Arc::clone(&handler),
                     tls.clone(),
+                    cancel.clone(),
                 ));
             }
         }
@@ -196,11 +197,18 @@ pub(super) async fn accept_loop(
 /// handshake (a plaintext peer dialing a TLS-configured node, or a
 /// certificate that doesn't chain to the trusted root) drops the connection
 /// exactly like a missing `Hello` — a loud `tracing` event, no crash.
+///
+/// `cancel` is `accept_loop`'s own token: every read and write below races
+/// against it, so a slow/never-ending snapshot or AE reply gets torn down
+/// promptly on [`super::Mesh::shutdown`] instead of outliving it (the
+/// `handler` this task holds keeps the whole shard registry alive until the
+/// task actually returns).
 async fn handle_accepted(
     stream: TcpStream,
     inbound_tx: mpsc::Sender<InboundMsg>,
     handler: Arc<dyn RequestHandler>,
     tls: TlsCtx,
+    cancel: CancellationToken,
 ) {
     let stream = match establish_accept(stream, &tls).await {
         Ok(stream) => stream,
@@ -210,12 +218,22 @@ async fn handle_accepted(
         }
     };
     let mut framed = new_framed(stream);
-    let Some(Ok(Msg::Hello { node: from, .. })) = recv_msg(&mut framed).await else {
+    let hello = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        hello = recv_msg(&mut framed) => hello,
+    };
+    let Some(Ok(Msg::Hello { node: from, .. })) = hello else {
         return;
     };
 
     loop {
-        let Some(Ok(msg)) = recv_msg(&mut framed).await else {
+        let received = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            received = recv_msg(&mut framed) => received,
+        };
+        let Some(Ok(msg)) = received else {
             return;
         };
         match msg {
@@ -223,15 +241,15 @@ async fn handle_accepted(
                 let _ = inbound_tx.send(InboundMsg { from, msg }).await;
             }
             Msg::StRequest { cache } => {
-                serve_state_transfer(&mut framed, cache, handler.as_ref()).await;
+                serve_state_transfer(&mut framed, cache, handler.as_ref(), &cancel).await;
                 return;
             }
             Msg::AeDigest { cache, buckets } => {
-                serve_ae_digest(&mut framed, cache, buckets, handler.as_ref()).await;
+                serve_ae_digest(&mut framed, cache, buckets, handler.as_ref(), &cancel).await;
                 return;
             }
             Msg::AePull { cache, keys } => {
-                serve_ae_pull(&mut framed, cache, keys, handler.as_ref()).await;
+                serve_ae_pull(&mut framed, cache, keys, handler.as_ref(), &cancel).await;
                 return;
             }
             // A duplicate `Hello`, or `StChunk`/`AeBucket` — the latter only
@@ -242,19 +260,36 @@ async fn handle_accepted(
     }
 }
 
+/// Sends `msg`, racing the write against `cancel`. Returns `true` if the
+/// caller should stop serving this connection (cancelled, or the send failed).
+async fn send_or_cancelled(framed: &mut PeerFramed, msg: &Msg, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => true,
+        sent = send_msg(framed, msg) => sent.is_err(),
+    }
+}
+
 async fn serve_state_transfer(
     framed: &mut PeerFramed,
     cache: SmolStr,
     handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
 ) {
     let mut chunks = handler.snapshot_chunks(cache.clone());
-    while let Some(recs) = chunks.next().await {
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            next = chunks.next() => next,
+        };
+        let Some(recs) = next else { break };
         let msg = Msg::StChunk {
             cache: cache.clone(),
             recs,
             done: false,
         };
-        if send_msg(framed, &msg).await.is_err() {
+        if send_or_cancelled(framed, &msg, cancel).await {
             return;
         }
     }
@@ -274,6 +309,7 @@ async fn serve_ae_digest(
     cache: SmolStr,
     remote_buckets: Vec<(u16, u64)>,
     handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
 ) {
     let local: std::collections::HashMap<u16, u64> =
         handler.digests(cache.clone()).await.into_iter().collect();
@@ -287,7 +323,7 @@ async fn serve_ae_digest(
             bucket,
             entries,
         };
-        if send_msg(framed, &msg).await.is_err() {
+        if send_or_cancelled(framed, &msg, cancel).await {
             return;
         }
     }
@@ -298,13 +334,14 @@ async fn serve_ae_pull(
     cache: SmolStr,
     keys: Vec<Bytes>,
     handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
 ) {
     for rec in handler.records_for(cache.clone(), keys).await {
         let msg = Msg::Replicate {
             cache: cache.clone(),
             rec,
         };
-        if send_msg(framed, &msg).await.is_err() {
+        if send_or_cancelled(framed, &msg, cancel).await {
             return;
         }
     }
@@ -437,5 +474,91 @@ mod tests {
             .expect("no io error");
         let got = wire::decode(&frame).expect("decodes");
         assert_eq!(got, sent);
+    }
+
+    // `serve_state_transfer` takes `&mut PeerFramed` (`Framed<MeshStream,
+    // _>`), and `MeshStream` is a different concrete type per feature (a
+    // `turmoil` socket under `sim`, `tls::MeshStream` wrapping a plain
+    // `tokio` socket under `tls`) — this test exercises the real transport
+    // directly, so it's skipped under `sim` the same way `net::mod`'s and
+    // `state_transfer`'s own real-transport test modules are.
+    #[cfg(all(feature = "tls", not(feature = "sim")))]
+    fn as_mesh_stream(stream: tokio::net::TcpStream) -> super::MeshStream {
+        super::MeshStream::Plain(stream)
+    }
+    #[cfg(all(not(feature = "tls"), not(feature = "sim")))]
+    fn as_mesh_stream(stream: tokio::net::TcpStream) -> super::MeshStream {
+        stream
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn serve_state_transfer_stops_promptly_once_cancelled() {
+        use futures::future::BoxFuture;
+        use futures::stream::BoxStream;
+        use smol_str::SmolStr;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::hlc::Hlc;
+
+        struct NeverRespondingHandler;
+        impl super::RequestHandler for NeverRespondingHandler {
+            fn snapshot_chunks(
+                &self,
+                _cache: SmolStr,
+            ) -> BoxStream<'static, Vec<wire::WireRecord>> {
+                Box::pin(futures::stream::pending())
+            }
+            fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+                Box::pin(async { Vec::new() })
+            }
+            fn bucket_entries(
+                &self,
+                _cache: SmolStr,
+                _bucket: u16,
+            ) -> BoxFuture<'_, Vec<(bytes::Bytes, Hlc)>> {
+                Box::pin(async { Vec::new() })
+            }
+            fn records_for(
+                &self,
+                _cache: SmolStr,
+                _keys: Vec<bytes::Bytes>,
+            ) -> BoxFuture<'_, Vec<wire::WireRecord>> {
+                Box::pin(async { Vec::new() })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let _client = TcpStream::connect(addr).await.expect("connect");
+        let server_stream = accept.await.expect("accept task");
+
+        let framed = super::new_framed(as_mesh_stream(server_stream));
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        let served = tokio::spawn(async move {
+            let mut framed = framed;
+            super::serve_state_transfer(
+                &mut framed,
+                SmolStr::new("c"),
+                &NeverRespondingHandler,
+                &cancel_for_task,
+            )
+            .await;
+        });
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), served)
+            .await
+            .expect(
+                "an accepted-connection handler must observe cancellation instead of blocking \
+                 forever on a snapshot stream that never yields — otherwise Mesh::shutdown() \
+                 leaves it running with the shard registry Arc still held",
+            )
+            .expect("task must not panic");
     }
 }

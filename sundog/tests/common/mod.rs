@@ -21,13 +21,12 @@ use sundog::{Cluster, ClusterConfig};
 #[must_use]
 pub fn fast_config() -> ClusterConfig {
     let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-    ClusterConfig {
-        gossip_bind_addr: loopback,
-        data_bind_addr: loopback,
-        ae_interval: Duration::from_millis(150),
-        tombstone_ttl: Duration::from_secs(2),
-        ..ClusterConfig::default()
-    }
+    ClusterConfig::default().with(|c| {
+        c.gossip_bind_addr = loopback;
+        c.data_bind_addr = loopback;
+        c.ae_interval = Duration::from_millis(150);
+        c.tombstone_ttl = Duration::from_secs(2);
+    })
 }
 
 /// Polls `cond` on a short fixed cadence until it returns `true`, or panics
@@ -122,10 +121,7 @@ pub async fn spawn_cluster_group_with(
             .collect();
         let cluster = Cluster::builder(name)
             .seeds(seeds)
-            .config(ClusterConfig {
-                gossip_bind_addr: gossip_addr,
-                ..config()
-            })
+            .config(config().with(|c| c.gossip_bind_addr = gossip_addr))
             .build()
             .await
             .expect("node builds");
@@ -165,10 +161,7 @@ pub async fn join_node_with(
     let gossip_addr = reserve_gossip_addr().await;
     let cluster = Cluster::builder(name)
         .seeds(seeds)
-        .config(ClusterConfig {
-            gossip_bind_addr: gossip_addr,
-            ..config()
-        })
+        .config(config().with(|c| c.gossip_bind_addr = gossip_addr))
         .build()
         .await
         .expect("joining node builds");

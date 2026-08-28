@@ -51,9 +51,9 @@ latency-sensitive invalidation behind it.
 **Cost:** a second transport implementation behind the existing `net::tcp`
 seam (already the `sim`-feature swap point, so the shape exists), a TLS
 identity story for QUIC's mandatory encryption — which folds together with
-the `tls` feature flag already declared in `Cargo.toml` but not yet wired
-into the TCP path — and connection-migration semantics that don't currently
-matter to a same-LAN deployment.
+the mutual-TLS identity material the `tls` feature already wires into the
+TCP path (`net::tls`, `ClusterConfig::tls`) — and connection-migration
+semantics that don't currently matter to a same-LAN deployment.
 
 **Trigger:** head-of-line blocking between state-transfer/anti-entropy
 traffic and live broadcast traffic shows up as measured tail latency in

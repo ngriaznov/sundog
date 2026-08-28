@@ -44,7 +44,7 @@ use crate::membership::{Membership, Peer};
 use crate::net::{InboundMsg, Mesh, MsgClass, RequestHandler};
 use crate::node::{NodeId, NodeName};
 use crate::store::{Event, Mode, Origin, Shard, ShardOps};
-use crate::wire::{Msg, WireRecord};
+use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`
 /// (plan §7). Shared between [`Cluster`] itself and the [`RequestHandler`]
@@ -60,6 +60,15 @@ type ShardRegistry = Arc<RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>>>;
 #[derive(Clone)]
 pub struct Cluster {
     inner: Arc<ClusterInner>,
+}
+
+impl std::fmt::Debug for Cluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cluster")
+            .field("node", &self.inner.node)
+            .field("name", &self.inner.name)
+            .finish_non_exhaustive()
+    }
 }
 
 struct ClusterInner {
@@ -259,6 +268,14 @@ impl ClusterBuilder {
                 addr,
                 source: std::io::Error::other(source),
             })?;
+        }
+
+        if config.max_frame > wire::MAX_FRAME {
+            return Err(JoinError::InvalidConfig(format!(
+                "ClusterConfig::max_frame ({}) exceeds the wire codec's hard cap of {} bytes",
+                config.max_frame,
+                wire::MAX_FRAME
+            )));
         }
 
         let node = NodeId::random();
@@ -635,8 +652,11 @@ async fn fan_out_one<K, V>(
 }
 
 /// Periodically garbage-collects one shard's expired tombstones (plan §4:
-/// tombstones must eventually be forgotten). Runs at a quarter of
-/// `tombstone_ttl` so a tombstone is never held much past its deadline.
+/// tombstones must eventually be forgotten) and flushes `moka`'s own
+/// housekeeping (`ShardOps::run_pending_tasks`'s docs: without this, a shard
+/// that goes quiet right after a TTL/size eviction can keep a stale digest
+/// forever). Runs at a quarter of `tombstone_ttl` so a tombstone is never
+/// held much past its deadline.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     tombstone_ttl: Duration,
@@ -649,7 +669,10 @@ pub(crate) async fn tombstone_gc_task(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            _ = ticker.tick() => shard.gc_tombstones().await,
+            _ = ticker.tick() => {
+                shard.run_pending_tasks().await;
+                shard.gc_tombstones().await;
+            }
         }
     }
 }
@@ -712,6 +735,92 @@ mod tests {
             .expect("open succeeds");
         cache.insert(1, "a".into()).await.expect("insert");
         assert_eq!(cache.get(&1).await, Some("a".to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_rejects_replicated_mode_combined_with_a_finite_max_capacity() {
+        let cluster = Cluster::builder("cluster-it-replicated-capacity-guard")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        match cluster
+            .cache::<u32, String>("bounded")
+            .mode(Mode::Replicated)
+            .max_capacity(10)
+            .open()
+            .await
+        {
+            Err(CacheError::ReplicatedWithLocalEviction { cache }) => assert_eq!(cache, "bounded"),
+            other => panic!(
+                "expected ReplicatedWithLocalEviction, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_rejects_replicated_mode_combined_with_tti() {
+        let cluster = Cluster::builder("cluster-it-replicated-tti-guard")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let err = cluster
+            .cache::<u32, String>("idle-bounded")
+            .mode(Mode::Replicated)
+            .tti(Duration::from_secs(60))
+            .open()
+            .await
+            .expect_err("Replicated + tti must be rejected");
+        assert!(matches!(
+            err,
+            CacheError::ReplicatedWithLocalEviction { .. }
+        ));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_max_frame_above_the_wire_codec_cap() {
+        let mut config = loopback_config();
+        config.max_frame = crate::wire::MAX_FRAME + 1;
+
+        let err = Cluster::builder("cluster-it-max-frame-guard")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err("max_frame above the wire cap must be rejected at build() time");
+        assert!(matches!(err, JoinError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn cache_and_cluster_debug_impls_surface_identifying_fields() {
+        let cluster = Cluster::builder("cluster-it-debug-fmt")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("debug-fmt")
+            .open()
+            .await
+            .expect("open succeeds");
+
+        let cluster_fmt = format!("{cluster:?}");
+        assert!(cluster_fmt.contains("Cluster"));
+        let cache_fmt = format!("{cache:?}");
+        assert!(cache_fmt.contains("debug-fmt"));
 
         cluster.shutdown().await;
     }

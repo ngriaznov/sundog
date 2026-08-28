@@ -69,11 +69,10 @@ async fn reserve_gossip_addr() -> SocketAddr {
 }
 
 fn tls_node_config(gossip_bind_addr: SocketAddr, tls: TlsConfig) -> ClusterConfig {
-    ClusterConfig {
-        gossip_bind_addr,
-        tls: Some(tls),
-        ..common::fast_config()
-    }
+    common::fast_config().with(|c| {
+        c.gossip_bind_addr = gossip_bind_addr;
+        c.tls = Some(tls);
+    })
 }
 
 #[tokio::test]

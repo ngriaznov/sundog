@@ -48,6 +48,9 @@ pub enum JoinError {
     /// A zeroconf announce/browse operation failed.
     #[error("discovery error")]
     Discovery(#[source] io::Error),
+    /// A [`crate::config::ClusterConfig`] field failed validation.
+    #[error("invalid cluster config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Errors from operating on a named [`crate::cache::Cache`].
@@ -66,6 +69,12 @@ pub enum CacheError {
     },
     /// The named cache was opened locally with a [`crate::store::Mode`] that conflicts
     /// with how another live node already has it configured.
+    ///
+    /// Reserved: nothing in this crate constructs this variant yet — every
+    /// node currently opens a cache name under whatever `Mode` it chooses,
+    /// with no cross-node check (there is no cache-config fingerprint gossip
+    /// to check against); see `ROADMAP.md`'s cache-config fingerprint gossip
+    /// sketch.
     #[error("cache {cache:?} mode mismatch: local {local:?}, cluster has {remote:?}")]
     ModeMismatch {
         /// The cache name.
@@ -74,6 +83,20 @@ pub enum CacheError {
         local: crate::store::Mode,
         /// The mode observed elsewhere in the cluster.
         remote: crate::store::Mode,
+    },
+    /// The cache was opened as [`crate::store::Mode::Replicated`] with a
+    /// finite `max_capacity` or `tti`. Replicated mode expects every node to
+    /// hold every entry; anti-entropy would silently re-pull back any entry
+    /// evicted locally for capacity or idle reasons from a peer that still
+    /// holds it, defeating the bound. Use [`crate::store::Mode::Invalidation`]
+    /// for a bounded local cache, or leave `max_capacity`/`tti` unset for a
+    /// `Replicated` one.
+    #[error(
+        "cache {cache:?} combines Mode::Replicated with a finite max_capacity or tti, which anti-entropy would silently defeat"
+    )]
+    ReplicatedWithLocalEviction {
+        /// The cache name.
+        cache: SmolStr,
     },
     /// The named cache is already open in this process. Reopening under a
     /// different key/value type would be unsound (the registry is

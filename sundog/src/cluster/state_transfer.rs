@@ -38,9 +38,25 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 /// remain to try, or `TOTAL_BUDGET` elapses.
 #[tracing::instrument(skip_all, fields(cache = %cache))]
 pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &SmolStr) {
+    let started = tokio::time::Instant::now();
     match tokio::time::timeout(TOTAL_BUDGET, transfer_loop(cluster, shard, cache)).await {
         Ok(Some(donor)) => {
-            anti_entropy::run_round_against(cluster, shard, cache, donor).await;
+            // `run_round_against` already bounds its own network calls
+            // (`Mesh::ae_round`/`ae_pull`'s internal `REQUEST_TIMEOUT`), but
+            // this additionally keeps the belt-and-braces sweep inside the
+            // budget `open()`'s own docs promise end to end, rather than
+            // letting it run for however long that internal bound allows on
+            // top of the transfer loop's own elapsed time.
+            let remaining = TOTAL_BUDGET.saturating_sub(started.elapsed());
+            if tokio::time::timeout(
+                remaining,
+                anti_entropy::run_round_against(cluster, shard, cache, donor),
+            )
+            .await
+            .is_err()
+            {
+                tracing::debug!(%donor, "post-transfer anti-entropy sweep timed out; skipping");
+            }
         }
         Ok(None) => {
             tracing::debug!("no live peers at open; starting with an empty cache");

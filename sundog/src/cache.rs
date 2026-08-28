@@ -123,6 +123,13 @@ where
     /// `open()` under a different `K`/`V` can't be checked for compatibility
     /// and is always rejected, even when the type happens to match.
     ///
+    /// Returns [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
+    /// [`Mode::Replicated`] and `max_capacity`/`tti` was also set: every node
+    /// in `Replicated` mode is expected to hold every entry, so a local
+    /// capacity/idle eviction would just get silently re-pulled back by the
+    /// next anti-entropy round against a peer that still has it, defeating
+    /// the bound entirely.
+    ///
     /// # Panics
     ///
     /// Panics if the shard registry lock is poisoned, which only happens if
@@ -139,6 +146,10 @@ where
             weigher,
             marker: _,
         } = self;
+
+        if matches!(mode, Mode::Replicated) && (max_capacity != u64::MAX || tti.is_some()) {
+            return Err(CacheError::ReplicatedWithLocalEviction { cache: name });
+        }
 
         let mut shard = Shard::<K, V>::new(
             name.clone(),
@@ -210,6 +221,19 @@ where
     shard: Arc<Shard<K, V>>,
 }
 
+impl<K, V> std::fmt::Debug for Cache<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cache")
+            .field("name", &self.shard.name())
+            .field("mode", &self.shard.mode())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<K, V> Cache<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -231,7 +255,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::Loader`] if `loader` fails.
+    /// Returns [`CacheError::Loader`] if `loader` fails. Returns
+    /// [`CacheError::Codec`] if `key` fails to postcard-encode.
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
         F: AsyncFnOnce(&K) -> Result<V, E>,
@@ -246,7 +271,8 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds the
-    /// configured frame cap.
+    /// configured frame cap. Returns [`CacheError::Codec`] if `key` fails to
+    /// postcard-encode.
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.insert(key, value).await
     }

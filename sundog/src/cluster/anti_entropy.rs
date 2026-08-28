@@ -47,7 +47,15 @@ pub(crate) async fn scheduler_task(
         let Some(peer) = pick_peer(&cluster) else {
             continue;
         };
-        run_round_against(&cluster, &shard, &cache, peer).await;
+        // `run_round_against`'s own network calls carry an internal
+        // `REQUEST_TIMEOUT`, but racing the whole round against `cancel`
+        // too means a `Cluster::shutdown()` in progress never has to wait
+        // out that timeout for this task's `TaskTracker::wait()` to return.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = run_round_against(&cluster, &shard, &cache, peer) => {}
+        }
     }
 }
 

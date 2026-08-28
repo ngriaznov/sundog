@@ -37,6 +37,12 @@ name reservation, not a release.
   `LwwResolver` (last-write-wins by `Hlc`, bit-for-bit what the store always
   did before the trait existed) — pulled forward from the plan's future-work
   list into v1 per `docs/HOUSE_RULES.md`.
+- **`tls` feature** (off by default): mutual TLS on the data-plane mesh
+  (`rustls`) — `ClusterConfig::tls`/`ClusterBuilder::tls` wraps every dialed
+  and accepted connection, including the short-lived state-transfer/
+  anti-entropy ones; client certificates are verified too (mutual auth) —
+  pulled forward from the plan's future-work list into v1 per
+  `docs/HOUSE_RULES.md`.
 - **Cluster/cache public API** (`sundog::cluster`, `sundog::cache`):
   `Cluster::builder(name).build()` as the zero-config zeroconf happy path;
   `Cluster::cache::<K, V>(name)` builder with `.mode()`, `.max_capacity()`,
@@ -89,9 +95,6 @@ name reservation, not a release.
 
 ### Known gaps (tracked, not bugs)
 
-- `tls` feature flag and its `rustls`/`tokio-rustls` dependencies are
-  declared in `Cargo.toml` but not yet wired into the data plane — no
-  transport code currently reads the feature. See `ROADMAP.md`.
 - `CacheError::ModeMismatch` exists as a reserved error variant but nothing
   yet detects a real mode disagreement between nodes for the same cache name
   — see `ROADMAP.md`'s cache-config fingerprint gossip sketch.

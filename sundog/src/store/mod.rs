@@ -39,8 +39,43 @@ pub const BUCKET_COUNT: usize = 1024;
 /// to store one before its concrete closure type is nameable.
 pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
-/// Records per [`WireRecord`] batch yielded by [`ShardOps::snapshot_chunks`] (plan §9).
+/// Upper bound on records per [`WireRecord`] batch yielded by
+/// [`ShardOps::snapshot_chunks`] (plan §9) — a chunk breaks earlier than this
+/// if its cumulative encoded size approaches [`MAX_FRAME`] first (see
+/// [`chunk_records_for_snapshot`]), so this only caps chunk size for
+/// small-value caches.
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
+
+/// Headroom reserved below [`MAX_FRAME`] when sizing a snapshot chunk, for
+/// the `Msg::StChunk` envelope (cache name, `done` flag, and postcard's
+/// enum/`Vec` length-prefix overhead) around the records themselves.
+const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
+
+/// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in
+/// a `Msg::StChunk` (plan §9), splitting on cumulative postcard-encoded size
+/// as well as [`SNAPSHOT_CHUNK_SIZE`] — a fixed record count alone
+/// undercounts for caches whose average value is more than a few KiB, which
+/// the plan's own target scale ("values ≤ a few MiB") allows.
+fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
+    let budget = MAX_FRAME.saturating_sub(SNAPSHOT_CHUNK_ENVELOPE_HEADROOM);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size = 0usize;
+    for rec in records {
+        let rec_size = postcard::to_stdvec(&rec).map_or(0, |bytes| bytes.len());
+        let over_budget = current_size + rec_size > budget || current.len() >= SNAPSHOT_CHUNK_SIZE;
+        if over_budget && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_size = 0;
+        }
+        current_size += rec_size;
+        current.push(rec);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
 
 /// Capacity of each shard's [`Event`] broadcast channel. Slow subscribers that
 /// fall this far behind miss events (`broadcast::error::RecvError::Lagged`)
@@ -145,6 +180,15 @@ pub trait ShardOps: Send + Sync {
     /// Garbage-collects tombstones older than the configured
     /// `tombstone_ttl`, keeping the digest and entry set consistent.
     fn gc_tombstones(&self) -> BoxFuture<'_, ()>;
+
+    /// Flushes `moka`'s internal housekeeping. `moka` has no free-running
+    /// background sweep — the eviction listener that corrects the digest for
+    /// a TTL/size removal (plan §8) only fires as a side effect of a later
+    /// cache op, so a shard that goes quiet right after such a removal would
+    /// otherwise keep a stale digest forever (plan §13: "eviction is
+    /// advisory-timed"). Called periodically by `tombstone_gc_task`
+    /// independent of read/write traffic.
+    fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
 }
 
 /// One side of a [`ConflictResolver::winner`] comparison: everything a
@@ -173,7 +217,7 @@ pub enum Winner {
 
 /// Picks a winner between two differently-versioned records for the same
 /// key. A resolver **picks**, it never **merges**: synthesizing a combined
-/// value would make [`Shard::apply`]'s outcome depend on which two versions
+/// value would make `Shard::apply`'s outcome depend on which two versions
 /// happened to collide locally, breaking digest equality between replicas
 /// that saw the same writes in a different order (plan §4, §14 pulled into
 /// v1 — see `docs/HOUSE_RULES.md`).
@@ -181,7 +225,7 @@ pub enum Winner {
 /// # Correctness contract — required for the permutation-convergence
 /// property
 ///
-/// [`Shard::apply`]'s core guarantee is that applying any set of writes, in
+/// `Shard::apply`'s core guarantee is that applying any set of writes, in
 /// any order, any number of times, converges to the same state on every
 /// replica. That guarantee transfers to a custom resolver only if `winner`
 /// is:
@@ -204,7 +248,7 @@ pub enum Winner {
 ///   is no stable winner, and replicas that received the records in
 ///   different orders can flap indefinitely instead of converging.
 ///
-/// [`Shard::apply`] only ever calls `winner` when `a.ver != b.ver`; equal
+/// `Shard::apply` only ever calls `winner` when `a.ver != b.ver`; equal
 /// versions are always a no-op before `winner` is consulted (plan §4: a
 /// given `(wall_ms, logical, node)` triple is produced by at most one write
 /// ever, so equal versions imply identical records) — a resolver never has
@@ -261,7 +305,7 @@ struct Tombstone {
     gc_deadline_ms: u64,
 }
 
-/// What a versioned write carries into [`Shard::apply`]: a live value, or a
+/// What a versioned write carries into `Shard::apply`: a live value, or a
 /// deletion marker.
 enum Incoming<V> {
     Put {
@@ -274,7 +318,7 @@ enum Incoming<V> {
 /// Converts an absolute epoch-millisecond expiry into the remaining duration
 /// from now, for moka's [`Expiry`] hook. A deadline already in the past
 /// yields `Duration::ZERO`: expired-on-arrival records still went through
-/// version comparison in [`Shard::apply`] before reaching here (plan §7).
+/// version comparison in `Shard::apply` before reaching here (plan §7).
 fn remaining_from_absolute(expires_at_ms: Option<u64>) -> Option<Duration> {
     let expires_at_ms = expires_at_ms?;
     Some(Duration::from_millis(
@@ -520,7 +564,7 @@ where
         self
     }
 
-    /// Overrides the [`ConflictResolver`] consulted by [`Shard::apply`]
+    /// Overrides the [`ConflictResolver`] consulted by `Shard::apply`
     /// whenever an incoming record's version differs from what's stored
     /// (defaults to [`LwwResolver`]). Same fixed-`Shard::new`-signature,
     /// follow-up-call pattern as [`Shard::with_tombstone_ttl`].
@@ -724,7 +768,7 @@ where
     }
 
     /// Records the version of a fresh read-through fill for digest/tombstone
-    /// bookkeeping (the half of [`Shard::apply`]'s `Put` arm that isn't
+    /// bookkeeping (the half of `Shard::apply`'s `Put` arm that isn't
     /// "insert into moka", since moka does that itself inside
     /// `try_get_with_by_ref`). Called from within that call's stampede-
     /// collapsed init future, so it runs at most once per genuine miss.
@@ -787,21 +831,34 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] if the postcard-encoded value
-    /// exceeds the configured frame cap (see [`Shard::with_max_frame`],
-    /// default [`MAX_FRAME`]).
+    /// Returns [`CacheError::ValueTooLarge`] if the wire frame this write
+    /// would replicate as (key, value, version, and expiry together — not
+    /// just the value's own bytes) exceeds the configured frame cap (see
+    /// [`Shard::with_max_frame`], default [`MAX_FRAME`]).
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         let key_bytes = encode_key(&key)?;
         let value_bytes = postcard::to_stdvec(&value).map_err(CodecError::from)?;
-        if value_bytes.len() > self.max_frame {
+        let value_len = value_bytes.len();
+        let ver = self.stamp_local();
+        let expires_at_ms = self.ttl_expiry();
+        let wire_size = postcard::to_stdvec(&crate::wire::Msg::Replicate {
+            cache: self.name.clone(),
+            rec: WireRecord {
+                key: key_bytes.clone(),
+                value: Some(Bytes::from(value_bytes)),
+                ver,
+                expires_at_ms,
+            },
+        })
+        .map_err(CodecError::from)?
+        .len();
+        if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),
-                size: value_bytes.len(),
+                size: value_len,
                 limit: self.max_frame,
             });
         }
-        let ver = self.stamp_local();
-        let expires_at_ms = self.ttl_expiry();
         self.apply(
             key,
             key_bytes,
@@ -1032,10 +1089,7 @@ where
                         expires_at_ms: None,
                     }),
             );
-            records
-                .chunks(SNAPSHOT_CHUNK_SIZE)
-                .map(<[WireRecord]>::to_vec)
-                .collect::<Vec<_>>()
+            chunk_records_for_snapshot(records)
         };
         Box::pin(stream::once(fut).flat_map(stream::iter))
     }
@@ -1055,6 +1109,10 @@ where
                 keep
             });
         })
+    }
+
+    fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
+        Box::pin(self.cache.run_pending_tasks())
     }
 }
 
@@ -1315,6 +1373,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_chunks_splits_by_byte_size_not_just_record_count() {
+        let s = shard::<u32, Vec<u8>>(1);
+        let value_size = 100_000;
+        let record_count = 50u32;
+        for i in 0..record_count {
+            s.insert(i, vec![0u8; value_size]).await.expect("insert");
+        }
+
+        let mut stream = ShardOps::snapshot_chunks(&s);
+        let mut chunk_count = 0usize;
+        let mut total_records = 0usize;
+        while let Some(chunk) = stream.next().await {
+            chunk_count += 1;
+            total_records += chunk.len();
+            let encoded_size: usize = chunk
+                .iter()
+                .map(|rec| postcard::to_stdvec(rec).expect("test record encodes").len())
+                .sum();
+            assert!(
+                encoded_size < MAX_FRAME,
+                "a single snapshot chunk (as sent inside one Msg::StChunk) must stay under the wire frame cap"
+            );
+        }
+        assert_eq!(total_records, record_count as usize);
+        assert!(
+            chunk_count > 1,
+            "50 * 100KB records (5MB) must not fit in one wire-frame-bounded chunk"
+        );
+    }
+
+    #[tokio::test]
     async fn roundtrip_through_shard_ops_converges_two_shards() {
         let a = shard::<u32, String>(1);
         let b = shard::<u32, String>(2);
@@ -1358,6 +1447,41 @@ mod tests {
                 .await
                 .is_empty()
         );
+        assert_digest_matches_full_recompute(&s).await;
+    }
+
+    #[tokio::test]
+    async fn run_pending_tasks_flushes_a_quiet_shards_stale_ttl_eviction_digest() {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        s.insert(1, "value".into()).await.expect("insert");
+
+        // `moka`'s hierarchical timer wheel only sweeps a per-entry TTL
+        // expiry once real time has advanced roughly a full level-0 span
+        // (~1s) past scheduling it, regardless of how short the configured
+        // TTL itself is — so this waits past both the 50ms TTL and that
+        // wheel granularity floor before the single `run_pending_tasks`
+        // call below that this test exists to prove matters.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+
+        // Logical expiry is visible to reads immediately once it's past —
+        // before moka's eviction listener has run to correct the digest.
+        assert!(
+            ShardOps::bucket_entries(&s, bucket_of(&key_bytes(&1u32)))
+                .await
+                .is_empty()
+        );
+
+        // Without this periodic flush, moka's eviction listener would never
+        // fire on this now-quiet shard, and the digest would disagree with
+        // `bucket_entries` forever.
+        ShardOps::run_pending_tasks(&s).await;
         assert_digest_matches_full_recompute(&s).await;
     }
 
@@ -1426,9 +1550,9 @@ mod tests {
 
     #[tokio::test]
     async fn with_max_frame_overrides_the_default_cap() {
-        let s = shard::<u32, Vec<u8>>(1).with_max_frame(4);
+        let s = shard::<u32, Vec<u8>>(1).with_max_frame(64);
         let err = s
-            .insert(1, vec![0u8; 10])
+            .insert(1, vec![0u8; 100])
             .await
             .expect_err("must reject a value over the overridden cap");
         assert!(matches!(err, CacheError::ValueTooLarge { .. }));
@@ -1436,6 +1560,21 @@ mod tests {
         s.insert(2, Vec::new())
             .await
             .expect("a small value still fits under the overridden cap");
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_when_the_value_alone_fits_but_the_wire_frame_does_not() {
+        // The value's own postcard encoding (~21 bytes for a 20-byte Vec<u8>)
+        // fits under a 25-byte cap; the key, HLC version, expiry, cache name,
+        // and Msg::Replicate envelope around it do not. A check against the
+        // value's bytes alone (the pre-fix behavior) would wrongly accept
+        // this, then fail later when the wire codec actually encodes it.
+        let s = shard::<u32, Vec<u8>>(1).with_max_frame(25);
+        let err = s
+            .insert(1, vec![0u8; 20])
+            .await
+            .expect_err("the full wire frame, not just the value, must count toward the cap");
+        assert!(matches!(err, CacheError::ValueTooLarge { .. }));
     }
 
     #[tokio::test]

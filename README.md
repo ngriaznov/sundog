@@ -135,7 +135,7 @@ host-network deployments can use the zeroconf `Mdns` default.
 |---|---|---|---|
 | `prometheus` | off | a Prometheus exporter (`metrics-exporter-prometheus`): `ClusterBuilder::prometheus_listen` serves `GET /metrics`, or `telemetry::prometheus_handle` installs a recorder into an HTTP server you already run | implemented |
 | `sim` | off | swaps the data plane's transport seam (`net::tcp`) from `tokio::net` to `turmoil::net`, so `net::Mesh` can be driven inside a deterministic `turmoil` simulation | implemented; used by `tests/sim.rs` only, never enable it in a real deployment |
-| `tls` | off | pulls in `rustls`/`tokio-rustls` as dependencies for a future mTLS data plane (pre-shared cert config) | **declared, not yet wired** — no code path in `net` currently uses it; see `ROADMAP.md` |
+| `tls` | off | mutual TLS on the data-plane mesh (`rustls`): every dialed and accepted connection is wrapped when `ClusterConfig::tls`/`ClusterBuilder::tls` is set | implemented — see `net::tls`'s docs for the required certificate SAN and the same-CA constraint |
 
 Metric *emission* (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
 `sundog_open_caches`, and friends) happens unconditionally throughout the

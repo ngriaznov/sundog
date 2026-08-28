@@ -48,7 +48,14 @@ pub struct TlsConfig {
 /// Tunable knobs for a running cluster. Every field has a sane zeroconf
 /// default; `Cluster::builder` exposes setters only for the ones worth
 /// overriding day to day.
+///
+/// `#[non_exhaustive]`: a field added here in a future release must not
+/// break code that only overrides a few knobs. Construct one with
+/// [`ClusterConfig::default`] and [`ClusterConfig::with`] to change a subset
+/// of fields — the fully-public fields remain directly readable and
+/// writable on an existing value.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ClusterConfig {
     /// Base interval between a node's anti-entropy rounds. The actual delay
     /// is jittered around this value to avoid thundering-herd rounds across
@@ -61,7 +68,10 @@ pub struct ClusterConfig {
     pub tombstone_ttl: Duration,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
-    /// Hard cap on a single wire frame, in bytes.
+    /// Hard cap on a single wire frame, in bytes. Must not exceed
+    /// [`crate::wire::MAX_FRAME`] (the wire codec's own hard-coded cap) —
+    /// [`crate::cluster::ClusterBuilder::build`] rejects a config that sets
+    /// this higher with [`crate::error::JoinError::InvalidConfig`].
     pub max_frame: usize,
     /// Bind address for the gossip (membership) UDP socket. Port `0` picks an
     /// ephemeral port, which is the zeroconf default.
@@ -110,6 +120,17 @@ impl ClusterConfig {
     pub fn tombstone_ttl_is_safe(&self) -> bool {
         self.tombstone_ttl >= self.ae_interval.saturating_mul(3)
     }
+
+    /// Applies `f` to a mutable borrow of `self` and returns it — since
+    /// `ClusterConfig` is `#[non_exhaustive]`, this (rather than struct-update
+    /// syntax) is how code outside this crate overrides a subset of fields on
+    /// top of [`ClusterConfig::default`] without breaking when a new field is
+    /// added.
+    #[must_use]
+    pub fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
+        f(&mut self);
+        self
+    }
 }
 
 impl Default for ClusterConfig {
@@ -141,6 +162,18 @@ mod tests {
     #[test]
     fn defaults_satisfy_the_tombstone_ttl_rule() {
         assert!(ClusterConfig::default().tombstone_ttl_is_safe());
+    }
+
+    #[test]
+    fn with_overrides_only_the_touched_fields() {
+        let config = ClusterConfig::default().with(|c| {
+            c.ae_interval = Duration::from_millis(1);
+        });
+        assert_eq!(config.ae_interval, Duration::from_millis(1));
+        assert_eq!(
+            config.outbox_capacity,
+            ClusterConfig::default().outbox_capacity
+        );
     }
 
     #[test]

@@ -32,6 +32,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -112,6 +113,26 @@ fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
 /// default so a `Mesh` built directly against a default `ClusterConfig`
 /// behaves identically everywhere.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
+
+/// Bound on one request/response exchange over a fresh connection — dial,
+/// send, and read the response, end to end (state transfer's initial
+/// `StRequest` round-trip, or one full anti-entropy `ae_round`/`ae_pull`).
+/// Without this, a peer that accepts the TCP connection and then stalls
+/// (crashed without FIN/RST, a paused VM, a partition that black-holes the
+/// return path — precisely the failure modes this crate is designed around)
+/// blocks the caller forever: no read timeout exists anywhere below this,
+/// and AP semantics (plan §4) mean a stuck peer must never hang this node.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wraps a timed-out request/response exchange as a [`CodecError::Io`], the
+/// same error shape a genuine connection failure produces, so callers treat
+/// both uniformly.
+fn request_timeout_error(what: &str) -> CodecError {
+    CodecError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{what} did not complete within {REQUEST_TIMEOUT:?}"),
+    ))
+}
 
 /// Backpressure class for a fan-out message, selecting the per-class drop
 /// policy on outbox overflow (plan §6).
@@ -391,14 +412,14 @@ impl Mesh {
         cache: SmolStr,
     ) -> Result<BoxStream<'static, Result<WireRecord, CodecError>>, CodecError> {
         let addr = self.peer_addr(donor)?;
-        let mut framed = conn::dial_with_hello(
-            addr,
-            self.inner.node,
-            self.inner.incarnation,
-            &self.inner.tls,
-        )
-        .await?;
-        conn::send_msg(&mut framed, &Msg::StRequest { cache }).await?;
+        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
+        let framed = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let mut framed = conn::dial_with_hello(addr, node, incarnation, tls).await?;
+            conn::send_msg(&mut framed, &Msg::StRequest { cache }).await?;
+            Ok::<_, CodecError>(framed)
+        })
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("state transfer request")))?;
         Ok(conn::state_stream(framed))
     }
 
@@ -417,22 +438,21 @@ impl Mesh {
         local_buckets: Vec<(u16, u64)>,
     ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
         let addr = self.peer_addr(peer)?;
-        let mut framed = conn::dial_with_hello(
-            addr,
-            self.inner.node,
-            self.inner.incarnation,
-            &self.inner.tls,
-        )
-        .await?;
-        conn::send_msg(
-            &mut framed,
-            &Msg::AeDigest {
-                cache,
-                buckets: local_buckets,
-            },
-        )
-        .await?;
-        conn::collect_ae_buckets(framed).await
+        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let mut framed = conn::dial_with_hello(addr, node, incarnation, tls).await?;
+            conn::send_msg(
+                &mut framed,
+                &Msg::AeDigest {
+                    cache,
+                    buckets: local_buckets,
+                },
+            )
+            .await?;
+            conn::collect_ae_buckets(framed).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy digest exchange")))
     }
 
     /// Pulls full records for `keys` from `peer` (the `AePull` step of
@@ -449,15 +469,14 @@ impl Mesh {
         keys: Vec<Bytes>,
     ) -> Result<Vec<WireRecord>, CodecError> {
         let addr = self.peer_addr(peer)?;
-        let mut framed = conn::dial_with_hello(
-            addr,
-            self.inner.node,
-            self.inner.incarnation,
-            &self.inner.tls,
-        )
-        .await?;
-        conn::send_msg(&mut framed, &Msg::AePull { cache, keys }).await?;
-        conn::collect_pulled_records(framed).await
+        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let mut framed = conn::dial_with_hello(addr, node, incarnation, tls).await?;
+            conn::send_msg(&mut framed, &Msg::AePull { cache, keys }).await?;
+            conn::collect_pulled_records(framed).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull")))
     }
 
     /// Shuts down the mesh: stops accepting, and cancels every per-peer
@@ -493,6 +512,7 @@ impl Mesh {
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use futures::StreamExt as _;
     use tokio::net::{TcpListener, TcpStream};
@@ -805,6 +825,44 @@ mod tests {
             .expect("ae round succeeds");
 
         assert_eq!(result, vec![(1, entries)]);
+    }
+
+    #[tokio::test]
+    async fn ae_round_times_out_against_a_peer_that_accepts_but_never_responds() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let _stalled_peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut framed = LengthDelimitedCodec::builder()
+                .max_frame_length(MAX_FRAME)
+                .new_framed(stream);
+            let _hello = framed.next().await.expect("hello arrives");
+            let _digest = framed.next().await.expect("ae digest arrives");
+            // Accepts the connection and reads the request, then goes
+            // silent forever: never replies, never closes — exactly the
+            // failure mode (a crashed-without-FIN or partitioned peer)
+            // `REQUEST_TIMEOUT` exists to bound.
+            std::future::pending::<()>().await;
+        });
+
+        let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        mesh.update_peers(vec![peer_at(NodeId::from(2), addr)]);
+
+        let result = tokio::time::timeout(
+            super::REQUEST_TIMEOUT + Duration::from_secs(5),
+            mesh.ae_round(NodeId::from(2), SmolStr::new("users"), Vec::new()),
+        )
+        .await
+        .expect(
+            "ae_round must give up on its own internal REQUEST_TIMEOUT, well inside this \
+             generous outer bound — not hang forever",
+        );
+        assert!(
+            result.is_err(),
+            "a peer that accepts but never responds must surface as an error, not hang"
+        );
     }
 
     #[tokio::test]
