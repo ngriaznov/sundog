@@ -1,6 +1,6 @@
 //! The top-level public entry point: `Cluster::builder(name).build()` forms a
 //! working zeroconf cluster, and `cluster.cache(name)` opens named caches on
-//! it. Plan §10 — this exact shape is the project's acceptance test.
+//! it — zero further setup is required for a working LAN cluster.
 //!
 //! Composition: `build()` resolves the data-plane's advertised address,
 //! starts [`Membership`] (gossip), announces via [`Discovery`], then starts
@@ -46,8 +46,8 @@ use crate::node::{NodeId, NodeName};
 use crate::store::{Mode, Origin, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
 
-/// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`
-/// (plan §7). Shared between [`Cluster`] itself and the [`RequestHandler`]
+/// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
+/// Shared between [`Cluster`] itself and the [`RequestHandler`]
 /// handed to [`Mesh::spawn`], so a cache opened after the mesh starts is
 /// immediately visible to inbound state-transfer/anti-entropy requests.
 type ShardRegistry = Arc<RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>>>;
@@ -82,9 +82,9 @@ struct ClusterInner {
     cancel: CancellationToken,
 }
 
-/// Builds a [`Cluster`]: own-and-return, per house style. Zero further calls
-/// beyond `.build()` must form a working LAN cluster (plan §10) — mDNS
-/// discovery, ephemeral ports, and the [`ClusterConfig`] defaults.
+/// Builds a [`Cluster`]: own-and-return. Zero further calls beyond
+/// `.build()` form a working LAN cluster — mDNS discovery, ephemeral ports,
+/// and the [`ClusterConfig`] defaults.
 #[must_use]
 pub struct ClusterBuilder {
     name: SmolStr,
@@ -217,9 +217,7 @@ impl ClusterBuilder {
     }
 
     /// Installs a Prometheus recorder and serves `GET /metrics` on `addr` for
-    /// the life of the process, once [`build`](Self::build) succeeds (plan
-    /// §12 M7; house rules: "Prometheus exporter implemented behind a
-    /// `prometheus` feature flag").
+    /// the life of the process, once [`build`](Self::build) succeeds.
     ///
     /// `metrics`'s recorder is a single process-global slot: a second
     /// `prometheus_listen` (on this or another `Cluster`), or a mix of
@@ -234,9 +232,9 @@ impl ClusterBuilder {
         self
     }
 
-    /// Enables mutual TLS on the data-plane mesh (feature `tls`; house rules
-    /// "Future plans pulled into v1"). Equivalent to setting
-    /// [`ClusterConfig::tls`] directly via [`Self::config`] — a dedicated
+    /// Enables mutual TLS on the data-plane mesh, behind the `tls` feature.
+    /// Equivalent to setting [`ClusterConfig::tls`] directly via
+    /// [`Self::config`] — a dedicated
     /// method for the common case of overriding only this one field. See
     /// [`crate::config::TlsConfig`]'s docs for what this implies (mutual
     /// auth, the fixed required certificate SAN, and why a TLS node and a
@@ -473,7 +471,7 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
 }
 
 /// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls,
-/// for the lifetime of the cluster (plan's composition sketch).
+/// for the lifetime of the cluster.
 async fn membership_to_mesh_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     mesh: Mesh,
@@ -557,7 +555,7 @@ async fn apply_pending_replicate(
 /// The single consumer of `Mesh`'s inbound-message channel: dispatches
 /// `Invalidate`/`Replicate`/`ReplicateBatch` to the named shard. A cache name
 /// with no registered shard is dropped with a trace event rather than an
-/// error — the opening side may simply not have called `open()` for it yet.
+/// error — the opening side may not have called `open()` for it yet.
 ///
 /// Drains a bounded batch of already-queued messages per wake with
 /// `recv_many` (mirroring `fan_out_task`'s own drain-then-dispatch pattern)
@@ -658,9 +656,9 @@ const FAN_OUT_DRAIN_CAP: usize = 1024;
 /// `net::Mesh`"). Every `Origin::Local` event fans out uniformly, including a
 /// `get_or_load` read-through fill: a fresh fill is itself a genuine
 /// versioned write (it carries a real `Hlc` stamp), and propagating it lets
-/// other `Replicated`-mode peers skip their own loader call — consistent with
-/// "a cache is re-derivable data" (plan §1), so under-propagating costs
-/// nothing but an extra loader call elsewhere, never correctness.
+/// other `Replicated`-mode peers skip their own loader call — a cache is
+/// re-derivable data, so under-propagating costs nothing but an extra
+/// loader call elsewhere, never correctness.
 ///
 /// Micro-batches: after waiting for one event, drains whatever further
 /// events are already available (bounded by [`FAN_OUT_DRAIN_CAP`]) before
@@ -668,7 +666,7 @@ const FAN_OUT_DRAIN_CAP: usize = 1024;
 /// costs one `ShardOps::records_for` call and one round of per-peer sends for
 /// the whole burst, not one of each per write — `net::conn`'s per-peer
 /// writer then coalesces those sends into `Msg::ReplicateBatch` frames on the
-/// wire (plan §6).
+/// wire.
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
@@ -800,8 +798,8 @@ async fn fan_out_batch<K, V>(
     }
 }
 
-/// Periodically garbage-collects one shard's expired tombstones (plan §4:
-/// tombstones must eventually be forgotten) and flushes `moka`'s own
+/// Periodically garbage-collects one shard's expired tombstones (tombstones
+/// must eventually be forgotten) and flushes `moka`'s own
 /// housekeeping (`ShardOps::run_pending_tasks`'s docs: without this, a shard
 /// that goes quiet right after a TTL/size eviction can keep a stale digest
 /// forever). Runs at a quarter of `tombstone_ttl` so a tombstone is never
@@ -840,7 +838,7 @@ mod tests {
     /// Loopback-only config: skips the outbound-interface probe
     /// `resolve_advertise_ip` would otherwise do for the zeroconf
     /// `0.0.0.0`/`::` default, and keeps anti-entropy/tombstone timing tight
-    /// for fast, deterministic tests (plan §11 layer 3).
+    /// for fast, deterministic tests.
     fn loopback_config() -> ClusterConfig {
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
         ClusterConfig {
@@ -1079,13 +1077,11 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    /// Plan §11.3, layer 3, item 8 (relocated from the deleted
-    /// `tests/local_mode_isolation.rs`): `Mode::Local` publishes no wire
-    /// message at all — `fan_out_one`'s `match mode` above has no arm for it
-    /// — so there is no "delivered" event to await and no watch stream to
-    /// race against; the only observable proof is polling past a settle
-    /// window a real cross-node message would need, then asserting it never
-    /// showed.
+    /// `Mode::Local` publishes no wire message at all — `fan_out_batch`'s
+    /// `match mode` above has no arm for it — so there is no "delivered"
+    /// event to await and no watch stream to race against; the only
+    /// observable proof is polling past a settle window a real cross-node
+    /// message would need, then asserting it never showed.
     #[tokio::test]
     async fn local_mode_never_leaks_a_write_to_the_peer() {
         let (cluster_a, cluster_b) = two_node_cluster("cluster-it-local-no-fan-out").await;

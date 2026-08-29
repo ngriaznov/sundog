@@ -1,7 +1,6 @@
 //! Membership: chitchat-backed cluster view. Answers "who is alive right now"
 //! by gossiping each node's data-plane address and incarnation, and exposes
 //! the live set as a `watch` stream that drives the net and store layers.
-//! Plan §3, §6.
 
 use std::collections::HashSet;
 use std::io;
@@ -26,7 +25,8 @@ use crate::node::{NodeId, NodeName};
 /// How long `spawn` samples the `seeds` stream to build chitchat's initial
 /// static seed list, before handing the stream off to the continuous
 /// re-seeding task. A short window: convergence does not depend on it, only
-/// on the continuous forwarding below (plan §5's cold-restart requirement).
+/// on the continuous forwarding below, which is what lets a full-cluster
+/// cold restart still converge.
 const INITIAL_SEED_WINDOW: Duration = Duration::from_millis(200);
 /// Cap on how many distinct addresses the initial window collects.
 const MAX_INITIAL_SEEDS: usize = 16;
@@ -69,7 +69,7 @@ impl Membership {
     ///
     /// `seeds` is a continuous stream of candidate gossip addresses from a
     /// [`crate::discovery::Discovery`] implementation — continuous, not
-    /// one-shot, so a full-cluster cold restart still converges (plan §5). An
+    /// one-shot, so a full-cluster cold restart still converges. An
     /// initial window of it seeds chitchat's static seed list; every address
     /// it produces afterward is forwarded to chitchat's dynamic
     /// [`ChitchatHandle::gossip`] for the lifetime of this membership session
@@ -198,8 +198,8 @@ impl Membership {
         self.peers.clone()
     }
 
-    /// Leaves the cluster gracefully (chitchat departs politely, plan §10)
-    /// and stops the background gossip task.
+    /// Leaves the cluster gracefully (chitchat departs politely) and stops
+    /// the background gossip task.
     ///
     /// chitchat 0.13 has no protocol-level "leave" broadcast: departure means
     /// stopping the gossip loop cleanly (vs. an abrupt process death) so
@@ -284,9 +284,9 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
     let node = NodeId::from(node_id_value);
 
     // The node id string chitchat carries is exactly `{hostname}-{node_id}`
-    // (house rules: `NodeName::new` builds it, `spawn` above passes it as
-    // the chitchat node id). Strip the known suffix rather than splitting on
-    // the last `-`, so a hyphenated hostname round-trips correctly.
+    // — `NodeName::new` builds it, and `spawn` above passes it as the
+    // chitchat node id. Strip the known suffix rather than splitting on the
+    // last `-`, so a hyphenated hostname round-trips correctly.
     let suffix = format!("-{node}");
     let hostname = chitchat_id.node_id.strip_suffix(suffix.as_str())?;
     let name = NodeName::new(hostname, node);

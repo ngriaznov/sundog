@@ -1,6 +1,6 @@
-//! The typed public cache handle and its builder. Plan §7, §10: `Cache<K, V>`
-//! is a thin wrapper over `Arc<Shard<K, V>>` — serialization happens only at
-//! the wire boundary; local reads never deserialize.
+//! The typed public cache handle and its builder. `Cache<K, V>` is a thin
+//! wrapper over `Arc<Shard<K, V>>` — serialization happens only at the wire
+//! boundary; local reads never deserialize.
 
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -61,15 +61,15 @@ where
         self
     }
 
-    /// Sets an absolute lifespan (TTL), replicated as `expires_at_ms`
-    /// (plan §7). Default: no expiry.
+    /// Sets an absolute lifespan (TTL), replicated as `expires_at_ms`.
+    /// Default: no expiry.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
     }
 
-    /// Sets a local-only max-idle (TTI). Deliberately not cluster-replicated
-    /// (plan §7, §13). Default: no idle expiry.
+    /// Sets a local-only max-idle (TTI). Deliberately not cluster-replicated.
+    /// Default: no idle expiry.
     pub fn tti(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self
@@ -105,8 +105,8 @@ where
     /// this point on; unless `mode` is [`Mode::Local`], starts fanning this
     /// shard's own local writes out to the mesh per `mode`.
     ///
-    /// For [`Mode::Replicated`], `open()` also runs state transfer (plan §9)
-    /// before returning: pulls a full snapshot from the lowest-node-id live
+    /// For [`Mode::Replicated`], `open()` also runs state transfer before
+    /// returning: pulls a full snapshot from the lowest-node-id live
     /// peer, applies it through the same versioned-apply path as live
     /// traffic, then runs one immediate anti-entropy round against that
     /// donor. This is bounded — an unresponsive or empty cluster does not

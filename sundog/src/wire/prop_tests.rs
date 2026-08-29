@@ -1,4 +1,4 @@
-//! Property tests for the wire format (plan §11.1): encoding must be
+//! Property tests for the wire format: encoding must be
 //! deterministic for arbitrary [`WireRecord`]s and [`Msg`]s — encode, decode,
 //! re-encode always reproduces the exact same bytes, and decodes back to an
 //! equal value — for both the postcard-encoded control messages and the

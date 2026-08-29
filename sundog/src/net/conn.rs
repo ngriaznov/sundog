@@ -1,7 +1,7 @@
 //! TCP framing and connection tasks: the accept-side demux (persistent mesh
 //! traffic vs. pooled request/response, distinguished by the first message
-//! after `Hello`, plan §6) and the per-peer dial/write loop for the
-//! broadcast-class outboxes.
+//! after `Hello`) and the per-peer dial/write loop for the broadcast-class
+//! outboxes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -86,8 +86,8 @@ pub(super) async fn send_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), C
 
 /// Sends every message in `msgs` and flushes once at the end, rather than
 /// once per message — the "drain-many-then-flush-once" half of the per-peer
-/// writer's opportunistic batching (plan §6): several messages sharing one
-/// flush instead of one syscall-worthy flush each. Used for control-plane
+/// writer's opportunistic batching: several messages sharing one flush
+/// instead of one syscall-worthy flush each. Used for control-plane
 /// replies (`serve_ae_digest`/`serve_ae_pull`) and `Hello`-plus-first-request
 /// dials, which build their own `Msg`s in-process rather than reusing an
 /// already-encoded [`OutFrame`] — see [`send_frames`] for the broadcast path
@@ -182,8 +182,8 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
 
 /// Opportunistically coalesces consecutive same-cache `Msg::Replicate`
 /// entries in `drained` — messages the writer already had queued by the time
-/// it drained them, never delayed to wait for more (plan §6's Aeron-style
-/// smart batching: no timers, no added latency) — into
+/// it drained them, never delayed to wait for more (Aeron-style smart
+/// batching: no timers, no added latency) — into
 /// `Msg::ReplicateBatch` frames bounded by [`REPLICATE_BATCH_BUDGET`] and
 /// [`REPLICATE_BATCH_COUNT`]. A run of exactly one message stays a lone
 /// `Msg::Replicate` and reuses its already-encoded [`OutFrame::frame`] as-is
@@ -298,8 +298,7 @@ const REQ_CONN_MAX_REQUESTS: usize = 4096;
 /// reused across `Mesh::ae_round`/`ae_pull`/`request_state` calls instead of
 /// dialing fresh every time. Deliberately separate from the persistent
 /// per-peer writer connection (`run_peer_writer`), so a slow snapshot
-/// transfer can never back up live broadcast traffic (plan §6 "own
-/// streams").
+/// transfer can never back up live broadcast traffic.
 ///
 /// A connection only ever gets checked back in after a clean end-of-reply
 /// (`Msg::ReqDone`, or a state-transfer stream that reached its final
@@ -385,7 +384,8 @@ pub(super) async fn dial_with_hello_and(
 /// sends `Hello`, then drains both broadcast-class outboxes onto the wire
 /// until told to stop or the connection breaks, in which case it reconnects.
 /// Never reads from the connection — broadcast traffic is one-directional by
-/// design (plan: "both sides may hold a connection, that is fine in v1").
+/// design; each side dials the other independently, so two connections
+/// between the same pair of peers, one per direction, is normal.
 pub(super) async fn run_peer_writer(
     local_node: NodeId,
     incarnation: u64,
@@ -750,7 +750,7 @@ fn unexpected_close(what: &str) -> CodecError {
 /// Adapts a request-state connection into a lazy stream of record chunks,
 /// reading `StChunk`s off the wire only as the consumer polls for more, and
 /// yielding each `StChunk`'s records as one `Vec` — the donor's own chunk
-/// boundaries (~500 records, plan §9) preserved so the caller can apply a
+/// boundaries (~500 records) preserved so the caller can apply a
 /// whole chunk through `ShardOps::apply_remote_batch` under one lock
 /// acquisition instead of one per record. On reaching the final
 /// `done: true` chunk, checks the connection back into `pool` for reuse

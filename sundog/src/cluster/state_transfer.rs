@@ -1,4 +1,4 @@
-//! State transfer on cache open (plan §9): pulls a full snapshot of a
+//! State transfer on cache open: pulls a full snapshot of a
 //! cluster-wide [`Mode::Replicated`] cache from the lowest-live-node-id
 //! donor before `open()` returns, then runs one immediate anti-entropy round
 //! against that donor as a belt-and-braces sweep.
@@ -86,8 +86,8 @@ pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Sm
 /// One-shot deferred warm-up for a cache opened before gossip had converged:
 /// waits until the first live peer appears (or `cancel`), then runs [`run`]
 /// once. Without this, a cold joiner's `open()` finds nobody, skips state
-/// transfer entirely, and the plan §9 warm join silently degrades into
-/// waiting out anti-entropy intervals.
+/// transfer entirely, and the warm join silently degrades into waiting out
+/// anti-entropy intervals.
 pub(crate) async fn late_sync_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
@@ -120,7 +120,7 @@ pub(crate) async fn late_sync_task(
 /// Retries donors — always the current lowest-id live peer — until one
 /// completes a full snapshot, or the live peer set is empty (a healthy
 /// single-node cluster, or every donor has been excluded... except nothing
-/// is ever permanently excluded: a donor that fails is simply retried after
+/// is ever permanently excluded: a donor that fails is retried after
 /// `RETRY_BACKOFF`, re-reading the live set each time so a donor that died
 /// mid-stream is naturally replaced by the next-lowest survivor). Returns
 /// the donor that succeeded, or `None` if there was nobody to transfer from.
@@ -153,7 +153,7 @@ async fn transfer_loop(
 }
 
 /// Requests and applies one donor's full snapshot. Returns `true` iff the
-/// stream completed normally (a `done: true` chunk was observed, plan §9's
+/// stream completed normally (a `done: true` chunk was observed —
 /// `net::conn::state_stream` distinguishes this from a mid-stream close).
 async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, donor: NodeId) -> bool {
     let mut stream = match mesh.request_state(donor, cache.clone()).await {
@@ -168,8 +168,8 @@ async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, dono
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
-                // Weakly consistent donor-side iteration (plan §9/§13) is
-                // safe here because this is the same versioned-apply path
+                // Weakly consistent donor-side iteration is safe here
+                // because this is the same versioned-apply path
                 // live `Replicate` traffic uses — whatever the snapshot
                 // missed, concurrency delivers; whatever both deliver, the
                 // version check deduplicates. Applied as a whole donor chunk

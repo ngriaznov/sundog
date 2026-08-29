@@ -1,6 +1,6 @@
 //! `--headless <SECS>`: run the write load without a TUI for a fixed
 //! duration, then print a one-line convergence report and return a nonzero
-//! status on divergence — the CI-friendly smoke test for plan §11.4.
+//! status on divergence — the CI-friendly smoke test.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;

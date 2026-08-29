@@ -1,4 +1,4 @@
-//! Anti-entropy (plan §8): a per-cache, jittered-interval loop that
+//! Anti-entropy: a per-cache, jittered-interval loop that
 //! reconciles one shard against one live peer per round — a digest exchange
 //! followed by a bucket-diff push/pull, computed on the initiating side, so
 //! both a peer that is behind and a peer that is ahead of this node end up
@@ -7,8 +7,8 @@
 //! with `value: None`.
 //!
 //! Runs only for [`Mode::Replicated`] caches: `Invalidation` mode nodes
-//! deliberately hold different, independent subsets of a cache (plan §4),
-//! so a full-record digest reconciliation between them would defeat that
+//! deliberately hold different, independent subsets of a cache, so a
+//! full-record digest reconciliation between them would defeat that
 //! design rather than repair it.
 
 use std::collections::{HashMap, HashSet};
@@ -28,9 +28,9 @@ use crate::store::ShardOps;
 use crate::wire::Msg;
 
 /// Runs anti-entropy for one shard for as long as `cancel` stays live: every
-/// jittered `ae_interval`, picks one live peer (a dirty-marked one first,
-/// plan §8 — the target of a dropped `Replicate` message) and runs one round
-/// against it.
+/// jittered `ae_interval`, picks one live peer (a dirty-marked one first —
+/// the target of a dropped `Replicate` message) and runs one round against
+/// it.
 pub(crate) async fn scheduler_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,

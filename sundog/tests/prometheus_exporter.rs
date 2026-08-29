@@ -1,5 +1,5 @@
-//! Plan §12 M7: the `prometheus` feature installs a real Prometheus recorder
-//! and serves `GET /metrics` on the address given to
+//! The `prometheus` feature installs a real Prometheus recorder and serves
+//! `GET /metrics` on the address given to
 //! [`sundog::ClusterBuilder::prometheus_listen`].
 //!
 //! `metrics::set_global_recorder` is a single process-global slot (see

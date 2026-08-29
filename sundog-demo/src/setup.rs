@@ -18,7 +18,7 @@ use crate::node::{self, NodeSlot};
 /// demo's convergence indicator visibly settles within a handful of
 /// seconds instead of half a minute.
 pub(crate) const AE_INTERVAL: Duration = Duration::from_secs(3);
-/// `>= 3 * AE_INTERVAL`, per the tombstone-GC safety rule (plan §4).
+/// `>= 3 * AE_INTERVAL`, satisfying the tombstone-GC safety rule.
 pub(crate) const TOMBSTONE_TTL: Duration = Duration::from_secs(15);
 
 /// Everything one run of the demo needs: the node slots, the merged event

@@ -1,4 +1,4 @@
-//! Property tests for the hybrid logical clock (plan §11.1): strict
+//! Property tests for the hybrid logical clock: strict
 //! monotonicity under an arbitrary (possibly frozen or rewinding) wall clock,
 //! total order across nodes, `observe` never regressing, and skew absorption
 //! (logical growth while the wall clock stalls, reset once it advances).

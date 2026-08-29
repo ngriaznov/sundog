@@ -7,7 +7,7 @@
 //! The former general-purpose multi-node group builders (`spawn_cluster_group`,
 //! `join_node`, and their `_with` variants) moved to `tests/containers.rs`'s
 //! rightsize-based harness (`tests/container_util`) along with the tests that
-//! used them — see `docs/BUILD_PLAN.md` §11, layer 3 vs. layer 4.
+//! used them.
 //!
 //! Each `tests/*.rs` file that uses this module pulls in only the helpers it
 //! needs — unused ones in any given binary are expected, hence the blanket

@@ -1,6 +1,6 @@
 //! `DnsSrv`: resolves a headless-service name on an interval via
 //! `hickory-resolver`. The Kubernetes answer, equivalent to `JGroups`'
-//! `DNS_PING`. Plan §5.
+//! `DNS_PING`.
 
 use std::io;
 use std::net::SocketAddr;

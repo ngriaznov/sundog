@@ -1,6 +1,6 @@
 //! Discovery: "who might be out there" — the `JGroups` `PING` layer analog.
 //! Continuously produces candidate gossip addresses that feed
-//! [`crate::membership::Membership::spawn`]'s seed stream. Plan §5.
+//! [`crate::membership::Membership::spawn`]'s seed stream.
 
 pub mod dns;
 pub mod mdns;
@@ -17,8 +17,8 @@ use futures::stream::BoxStream;
 /// Object-safe by construction (`BoxStream`/`BoxFuture` return types rather
 /// than `impl Stream`/`impl Future`) so a `Cluster` can hold
 /// `Box<dyn Discovery>` and the builder can accept any implementation
-/// uniformly — plan §5 sketches this with RPITIT, which is not object-safe;
-/// this is the documented deviation.
+/// uniformly — RPITIT return types are not object-safe, so this trait
+/// returns boxed futures and streams instead.
 pub trait Discovery: Send + Sync + 'static {
     /// A continuous stream of candidate peer gossip addresses. Duplicates are
     /// fine and expected; the stream must never terminate on its own — a

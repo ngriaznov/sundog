@@ -1,4 +1,4 @@
-//! Transport seam (plan §11.2): the concrete `TcpListener`/`TcpStream` types
+//! Transport seam: the concrete `TcpListener`/`TcpStream` types
 //! the rest of `net` binds and dials through — real `tokio::net` normally,
 //! `turmoil::net` under the `sim` feature. Turmoil's networking types mirror
 //! `tokio::net`'s shapes exactly (`bind`/`connect` taking anything

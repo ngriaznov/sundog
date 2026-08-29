@@ -7,9 +7,9 @@ under `[0.1.0] – Unreleased` and will be split out once tags start.
 
 ## [0.1.0] – Unreleased
 
-Initial buildout of the core library described in `docs/BUILD_PLAN.md`.
-Nothing has been published to crates.io yet — `sundog 0.1.0` is a workspace
-name reservation, not a release.
+Initial buildout of the core library. Nothing has been published to
+crates.io yet — `sundog 0.1.0` is a workspace name reservation, not a
+release.
 
 ### Added
 
@@ -173,7 +173,7 @@ name reservation, not a release.
 - **Lean fan-out**: local and remote-origin writes notify the peer fan-out
   path over an internal `(key, origin)` channel, separate from the public
   `Cache::events()` broadcast channel. The app-facing `Event` — which owns a
-  clone of the value — is only built when `events()` actually has a
+  clone of the value — is only built when `events()` has a
   subscriber, so a cache with nothing subscribed to `events()` pays no
   per-write value clone for replication or invalidation fan-out.
 

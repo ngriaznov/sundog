@@ -1,4 +1,4 @@
-//! Rendering: node table, event feed, and status bar (plan §11.4).
+//! Rendering: node table, event feed, and status bar.
 
 use std::sync::atomic::Ordering;
 

@@ -1,5 +1,5 @@
 //! Store: moka-backed shards, versioned apply, and the digest machinery that
-//! makes anti-entropy cheap. Plan §3, §7, §8.
+//! makes anti-entropy cheap.
 //!
 //! `Shard` intentionally holds no handle to `net::Mesh` — its constructor
 //! signature is fixed by `docs/INTERFACES.md` and takes none. Every local
@@ -40,7 +40,7 @@ pub const BUCKET_COUNT: usize = 1024;
 pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
 /// Upper bound on records per [`WireRecord`] batch yielded by
-/// [`ShardOps::snapshot_chunks`] (plan §9) — a chunk breaks earlier than this
+/// [`ShardOps::snapshot_chunks`] — a chunk breaks earlier than this
 /// if its cumulative encoded size approaches [`MAX_FRAME`] first (see
 /// [`chunk_records_for_snapshot`]), so this only caps chunk size for
 /// small-value caches.
@@ -53,10 +53,10 @@ const SNAPSHOT_CHUNK_SIZE: usize = 500;
 const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 
 /// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in
-/// a `Msg::StChunk` (plan §9), splitting on cumulative wire-encoded size as
+/// a `Msg::StChunk`, splitting on cumulative wire-encoded size as
 /// well as [`SNAPSHOT_CHUNK_SIZE`] — a fixed record count alone undercounts
-/// for caches whose average value is more than a few KiB, which the plan's
-/// own target scale ("values ≤ a few MiB") allows. Each record's
+/// for caches whose average value is more than a few KiB, well within the
+/// supported value size (up to a few MiB). Each record's
 /// contribution (`wire::RECORD_HEADER_LEN` plus its key/value lengths) is
 /// exact, not approximated: the raw-record wire layout (`crate::wire`'s
 /// module docs) is a fixed-size header, unlike postcard's variable-length
@@ -88,7 +88,7 @@ fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> 
 /// rather than applying backpressure to writers.
 const EVENTS_CAPACITY: usize = 1024;
 
-/// A named cache's clustering behavior, mirroring Infinispan's cache modes.
+/// A named cache's clustering behavior: how writes fan out to other nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// No cluster traffic at all; a plain local `moka` cache.
@@ -140,10 +140,10 @@ pub enum Event<K, V> {
 }
 
 /// The type-erased surface the network layer drives a shard through, wire
-/// bytes in and out — the boundary where postcard (de)serialization actually
-/// happens (plan §7: "local reads never deserialize"). Implemented by
-/// `Shard<K, V>` for any `K`, `V` meeting its bounds; held as
-/// `Arc<dyn ShardOps>` in the cluster's cache registry.
+/// bytes in and out — the boundary where postcard (de)serialization happens.
+/// Local reads never deserialize; only wire traffic crossing this boundary
+/// does. Implemented by `Shard<K, V>` for any `K`, `V` meeting its bounds;
+/// held as `Arc<dyn ShardOps>` in the cluster's cache registry.
 ///
 /// Async methods return `BoxFuture` rather than using `async fn` in the
 /// trait, matching `Discovery`'s object-safety pattern (`dyn ShardOps` must
@@ -155,7 +155,7 @@ pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
 pub trait ShardOps: Send + Sync {
     /// Applies an inbound replicated record iff its version is newer than
     /// what's stored — the versioned-apply rule that makes replication
-    /// commutative (plan §4). The single path shared by local writes, live
+    /// commutative. The single path shared by local writes, live
     /// replication, state transfer, and anti-entropy repair.
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
@@ -179,7 +179,7 @@ pub trait ShardOps: Send + Sync {
 
     /// Returns this shard's current per-bucket XOR digests, `(bucket, digest)`
     /// for all [`BUCKET_COUNT`] buckets — the first step of an anti-entropy
-    /// round (plan §8).
+    /// round.
     fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>>;
 
     /// Returns `(key, version)` for every live entry and un-GC'd tombstone in
@@ -197,7 +197,7 @@ pub trait ShardOps: Send + Sync {
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>>;
 
     /// Streams the shard's full contents in ~500-record chunks for state
-    /// transfer to a joining node (plan §9). Iteration is weakly consistent —
+    /// transfer to a joining node. Iteration is weakly consistent —
     /// safe because every chunk is applied through the same versioned
     /// [`ShardOps::apply_remote`] path as live traffic.
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>>;
@@ -208,11 +208,12 @@ pub trait ShardOps: Send + Sync {
 
     /// Flushes `moka`'s internal housekeeping. `moka` has no free-running
     /// background sweep — the eviction listener that corrects the digest for
-    /// a TTL/size removal (plan §8) only fires as a side effect of a later
-    /// cache op, so a shard that goes quiet right after such a removal would
-    /// otherwise keep a stale digest forever (plan §13: "eviction is
-    /// advisory-timed"). Called periodically by `tombstone_gc_task`
-    /// independent of read/write traffic.
+    /// a TTL/size removal only fires as a side effect of a later cache op, so
+    /// a shard that goes quiet right after such a removal would otherwise
+    /// keep a stale digest forever. TTL/TTI eviction timing is inherently
+    /// advisory, not exact, which is why this flush has to be driven
+    /// explicitly. Called periodically by `tombstone_gc_task` independent of
+    /// read/write traffic.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
 }
 
@@ -244,8 +245,7 @@ pub enum Winner {
 /// key. A resolver **picks**, it never **merges**: synthesizing a combined
 /// value would make `Shard::apply`'s outcome depend on which two versions
 /// happened to collide locally, breaking digest equality between replicas
-/// that saw the same writes in a different order (plan §4, §14 pulled into
-/// v1 — see `docs/HOUSE_RULES.md`).
+/// that saw the same writes in a different order.
 ///
 /// # Correctness contract — required for the permutation-convergence
 /// property
@@ -274,10 +274,10 @@ pub enum Winner {
 ///   different orders can flap indefinitely instead of converging.
 ///
 /// `Shard::apply` only ever calls `winner` when `a.ver != b.ver`; equal
-/// versions are always a no-op before `winner` is consulted (plan §4: a
-/// given `(wall_ms, logical, node)` triple is produced by at most one write
-/// ever, so equal versions imply identical records) — a resolver never has
-/// to, and never gets asked to, break that tie.
+/// versions are always a no-op before `winner` is consulted — a given
+/// `(wall_ms, logical, node)` triple is produced by at most one write ever,
+/// so equal versions imply identical records, and a resolver never has to,
+/// and never gets asked to, break that tie.
 ///
 /// The default [`LwwResolver`] satisfies all three properties by comparing
 /// [`Hlc`] alone, which is already a deterministic, antisymmetric, total,
@@ -286,7 +286,7 @@ pub enum Winner {
 ///
 /// A resolver that violates antisymmetry or transitivity is not safe to run
 /// on more than one replica: nothing in this crate detects the violation,
-/// convergence simply stops holding. Such a resolver is deliberately not
+/// convergence stops holding. Such a resolver is deliberately not
 /// covered by the permutation-convergence test in this module — the
 /// property cannot hold for it, only document the hazard.
 pub trait ConflictResolver: Send + Sync + 'static {
@@ -323,9 +323,9 @@ impl ConflictResolver for LwwResolver {
 }
 
 /// A stored value paired with the version it was last written at — the
-/// per-key version table, folded into the cached value itself (plan §7) —
-/// and its absolute expiry, so every replica converts the same origin-stamped
-/// deadline into a local remaining duration (plan §7).
+/// per-key version table, folded into the cached value itself — and its
+/// absolute expiry, so every replica converts the same origin-stamped
+/// deadline into a local remaining duration.
 #[derive(Debug, Clone)]
 pub struct Stored<V> {
     /// The current value.
@@ -368,7 +368,7 @@ enum Incoming<V> {
 /// Converts an absolute epoch-millisecond expiry into the remaining duration
 /// from now, for moka's [`Expiry`] hook. A deadline already in the past
 /// yields `Duration::ZERO`: expired-on-arrival records still went through
-/// version comparison in `Shard::apply` before reaching here (plan §7).
+/// version comparison in `Shard::apply` before reaching here.
 fn remaining_from_absolute(expires_at_ms: Option<u64>) -> Option<Duration> {
     let expires_at_ms = expires_at_ms?;
     Some(Duration::from_millis(
@@ -377,8 +377,8 @@ fn remaining_from_absolute(expires_at_ms: Option<u64>) -> Option<Duration> {
 }
 
 /// Converts absolute per-entry expiry into moka's relative-duration `Expiry`
-/// hook (plan §7); TTI, by contrast, is configured directly on the
-/// `CacheBuilder` since it is local-only (plan §7, §13).
+/// hook; TTI, by contrast, is configured directly on the `CacheBuilder`
+/// since it is local-only.
 struct AbsoluteExpiry;
 
 impl<K, V> Expiry<K, Arc<Stored<V>>> for AbsoluteExpiry {
@@ -459,7 +459,7 @@ fn stripe_of(key_bytes: &[u8]) -> usize {
 const HLC_ENCODED_MAX: usize = 32;
 
 /// `xxh3(key_bytes ‖ postcard(ver))` — the digest contribution of one live
-/// entry or tombstone (plan §8). Encodes `ver` into a stack buffer rather
+/// entry or tombstone. Encodes `ver` into a stack buffer rather
 /// than a heap `Vec`: a few bytes, computed on every apply.
 fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
     let mut ver_buf = [0u8; HLC_ENCODED_MAX];
@@ -471,12 +471,12 @@ fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
     xxh3_64(&buf)
 }
 
-/// Postcard-encodes `key`, its wire form and digest-hash input alike (plan §7).
+/// Postcard-encodes `key`, its wire form and digest-hash input alike.
 ///
 /// Debug builds assert the encoding round-trips to itself: a key type whose
 /// `Serialize` impl isn't canonical (e.g. iteration-order-dependent, as a
 /// `HashMap`-typed key would be) would silently corrupt digests and break
-/// wire identity (plan §13).
+/// wire identity.
 fn encode_key<K>(key: &K) -> Result<Bytes, CodecError>
 where
     K: Serialize + DeserializeOwned,
@@ -487,7 +487,7 @@ where
             .ok()
             .and_then(|decoded| postcard::to_stdvec(&decoded).ok())
             .is_some_and(|re_encoded| re_encoded == bytes),
-        "key's postcard encoding must be canonical/deterministic — no map-typed keys (plan §13)"
+        "key's postcard encoding must be canonical/deterministic — no map-typed keys"
     );
     Ok(Bytes::from(bytes))
 }
@@ -501,7 +501,7 @@ where
 /// # Bounds
 ///
 /// `K`'s postcard encoding doubles as its wire form and its digest-hash
-/// input, so it must encode deterministically — no map-typed keys (plan §13).
+/// input, so it must encode deterministically — no map-typed keys.
 pub struct Shard<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -603,7 +603,7 @@ where
     }
 
     /// Builds the underlying `moka` cache with the digest-maintaining
-    /// eviction listener wired in (plan §8) and an optional custom weigher.
+    /// eviction listener wired in and an optional custom weigher.
     /// Shared by [`Shard::new`] and [`Shard::with_weigher`], which rebuilds
     /// from scratch since `moka` only accepts a weigher at build time.
     fn build_cache(
@@ -620,7 +620,7 @@ where
                 move |key: Arc<K>, value: Arc<Stored<V>>, cause: RemovalCause| {
                     // Only moka-decided removals land here: TTL/TTI expiry and
                     // size eviction, both driven by housekeeping this function
-                    // has no visibility into (plan §8, §13). Anything *we*
+                    // has no visibility into. Anything *we*
                     // cause — a replace or an explicit remove inside `apply`,
                     // `invalidate_local`, or `ShardOps::invalidate` — is already
                     // subtracted there directly, using the value that call
@@ -730,7 +730,7 @@ where
         self.ttl.map(|d| now_ms().saturating_add(duration_ms(d)))
     }
 
-    /// The versioned-apply core (plan §4): applies `incoming` at `ver` iff
+    /// The versioned-apply core: applies `incoming` at `ver` iff
     /// the configured [`ConflictResolver`] picks it over whatever this shard
     /// currently holds for `key` (a live entry or a tombstone), publishing
     /// the resulting [`Event`] on success. Idempotent and commutative — the
@@ -810,9 +810,10 @@ where
     /// The versioned-apply core, operating under a tombstone-map lock the
     /// caller already holds — shared by [`Shard::apply`] (one record, one
     /// acquisition) and [`ShardOps::apply_remote_batch`] (many records, one
-    /// acquisition held across the whole batch, per plan §4's "amortized
-    /// lock path"). See [`Shard::apply`]'s docs for the correctness contract;
-    /// identical here, just parameterized on the lock the caller supplies.
+    /// acquisition held across the whole batch — the amortized-lock path a
+    /// bulk apply wants). See [`Shard::apply`]'s docs for the correctness
+    /// contract; identical here, parameterized on the lock the caller
+    /// supplies.
     async fn apply_locked(
         &self,
         tombstones: &mut HashMap<Bytes, Tombstone>,
@@ -922,7 +923,7 @@ where
     }
 
     /// Reads `key`, without triggering read-through. Tombstones never enter
-    /// `moka`, so a deleted key simply isn't present here.
+    /// `moka`, so a deleted key isn't present here.
     pub async fn get(&self, key: &K) -> Option<V> {
         self.cache.get(key).await.map(|stored| stored.value.clone())
     }
@@ -1878,7 +1879,7 @@ mod tests {
         }
     }
 
-    /// Plan §7: lifespan travels as an *absolute* `expires_at_ms`, computed
+    /// Lifespan travels as an *absolute* `expires_at_ms`, computed
     /// once at the origin. `a` is built with a TTL; `b` is not — proving the
     /// deadline that ultimately expires `b`'s copy is the one baked into the
     /// wire record `a` sent, not something `b` would derive from its own
@@ -2220,7 +2221,7 @@ mod tests {
         assert_eq!(s.get(&1).await, Some(vec![0u8; 20]));
     }
 
-    /// The permutation-convergence property (plan §4, §11), specialized to a
+    /// The permutation-convergence property, specialized to a
     /// custom resolver: two independent shards, sharing the same
     /// [`LongestValueWins`] resolver, apply the same set of writes/removes in
     /// different orders with duplicates — and must land on identical state

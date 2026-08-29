@@ -1,6 +1,6 @@
 //! The `Invalidate`-class per-peer outbox: a bounded FIFO that drops the
-//! *oldest* queued entry on overflow (plan §6) rather than rejecting the
-//! newest, because an invalidation storm on a dead peer must never stall
+//! *oldest* queued entry on overflow rather than rejecting the newest,
+//! because an invalidation storm on a dead peer must never stall
 //! writers. `Replicate`-class traffic uses a plain `tokio::sync::mpsc`
 //! channel instead (see `net::conn`), since its overflow policy — drop the
 //! new entry — is exactly what `try_send` already gives for free.

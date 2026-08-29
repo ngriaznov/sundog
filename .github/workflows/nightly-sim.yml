@@ -1,5 +1,5 @@
-# Nightly turmoil run with a fresh seed (docs/BUILD_PLAN.md §11): the chosen
-# seed is printed before the suite runs, so a red night is replayed locally
+# Nightly turmoil run with a fresh seed: the chosen seed is printed before
+# the suite runs, so a red night is replayed locally
 # with `SUNDOG_SIM_SEED=<seed> cargo test -p sundog --features sim --test sim`.
 name: nightly-sim
 

@@ -1,5 +1,7 @@
 //! Hybrid logical clock: version stamps that give total order to writes across
-//! nodes even under clock skew, per house rules (hand-rolled, not `uhlc`).
+//! nodes even under clock skew. Hand-rolled rather than built on an existing
+//! HLC crate, for exact control over the semantics, deterministic postcard
+//! encoding, and a clock that's trivially property-testable on its own.
 
 use serde::{Deserialize, Serialize};
 

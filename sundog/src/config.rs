@@ -13,9 +13,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::wire::MAX_FRAME;
 
-/// Mutual-TLS material for the data-plane mesh (feature `tls`; house rules
-/// "Future plans pulled into v1": plan §14's "mTLS on the data plane
-/// (rustls)"). Set [`ClusterConfig::tls`] (or use
+/// Mutual-TLS material for the data-plane mesh (feature `tls`). Set
+/// [`ClusterConfig::tls`] (or use
 /// [`crate::cluster::ClusterBuilder::tls`]) to wrap every accepted and
 /// dialed data-plane connection — including the short-lived
 /// request/response ones (state transfer, anti-entropy) — in TLS; client
@@ -62,9 +61,8 @@ pub struct ClusterConfig {
     /// the cluster.
     pub ae_interval: Duration,
     /// How long a tombstone is retained before garbage collection. Must be at
-    /// least `3 * ae_interval` (documented rule, plan §4) so a lagging peer
-    /// gets at least a few anti-entropy rounds to observe the deletion before
-    /// it is forgotten.
+    /// least `3 * ae_interval` so a lagging peer gets at least a few
+    /// anti-entropy rounds to observe the deletion before it is forgotten.
     pub tombstone_ttl: Duration,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
@@ -82,7 +80,7 @@ pub struct ClusterConfig {
     /// Cadence of chitchat's own SWIM gossip rounds — distinct from
     /// [`ae_interval`](Self::ae_interval), which paces this crate's own
     /// anti-entropy, not chitchat's membership gossip. Chosen for sub-5s
-    /// failure detection on a LAN per plan §12 M1's acceptance bar.
+    /// failure detection on a LAN.
     pub gossip_interval: Duration,
     /// Phi-accrual failure-detector suspicion threshold: a peer is flagged
     /// faulty once its accrual value crosses this. Higher tolerates more
@@ -115,7 +113,7 @@ pub struct ClusterConfig {
 
 impl ClusterConfig {
     /// Returns `true` if `tombstone_ttl` satisfies the `>= 3 * ae_interval`
-    /// rule from plan §4.
+    /// rule.
     #[must_use]
     pub fn tombstone_ttl_is_safe(&self) -> bool {
         self.tombstone_ttl >= self.ae_interval.saturating_mul(3)

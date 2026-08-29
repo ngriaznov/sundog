@@ -1,6 +1,6 @@
-//! Property tests for the store (plan §11.1). This is the highest-value
+//! Property tests for the store. This is the highest-value
 //! suite in the project: [`permutation_convergence`] is the direct test of
-//! the license for the whole loss-tolerant design (plan §4) — applying the
+//! the license for the whole loss-tolerant design — applying the
 //! same multiset of versioned writes, in any order, with any duplication,
 //! converges to byte-identical state. Alongside it: a focused tombstone/put
 //! race property, and incremental-digest-vs-full-recompute across arbitrary
@@ -18,7 +18,8 @@ const NUM_NODES: u8 = 3;
 /// sampled permutation and duplication.
 const NUM_REPLICAS: usize = 4;
 /// Keyspace size: small on purpose, so puts/removes from different origins
-/// collide on the same key and race — the case that matters for plan §4.
+/// collide on the same key and race — the case that exercises versioned-apply
+/// convergence.
 const KEYSPACE: u8 = 8;
 
 #[derive(Debug, Clone, Copy)]
@@ -217,7 +218,7 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// The permutation-convergence property (plan §4, §11.1): apply the same
+    /// The permutation-convergence property: apply the same
     /// multiset of writes/removes across several interleaved-clock origin
     /// nodes to multiple fresh shards, each in its own sampled permutation
     /// with random duplication — the converged state (live entries,
@@ -392,8 +393,8 @@ proptest! {
     /// After an arbitrary sequence of local writes, remote applies,
     /// invalidations, and tombstone GC, the incrementally-maintained digest
     /// must always equal a full recompute from the live entries and
-    /// un-GC'd tombstones (plan §8, §11.1) — and immediately after a GC pass
-    /// (with `tombstone_ttl` zeroed), every tombstone must actually be gone.
+    /// un-GC'd tombstones — and immediately after a GC pass
+    /// (with `tombstone_ttl` zeroed), every tombstone must be gone.
     #[test]
     fn digest_matches_recompute_after_arbitrary_ops_and_gc(
         ops in proptest::collection::vec(digest_op_strategy(), 4..60),

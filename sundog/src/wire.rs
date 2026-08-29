@@ -1,5 +1,5 @@
-//! The wire format: what actually crosses the data-plane TCP mesh, and the
-//! encode/decode helpers every connection uses. Plan §6.
+//! The wire format: what crosses the data-plane TCP mesh, and the
+//! encode/decode helpers every connection uses.
 //!
 //! Every frame starts with a one-byte discriminant. Control messages
 //! (`Hello`, `StRequest`, `AeDigest`, `AeBucket`, `AePull`, `ReqDone`) carry
@@ -49,7 +49,7 @@ use crate::node::NodeId;
 
 /// Hard cap on any single wire frame, in bytes (4 MiB). Oversized values are
 /// rejected at the API boundary (`CacheError::ValueTooLarge`) rather than
-/// fragmented — plan §6, §13.
+/// fragmented across multiple frames.
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 
 /// One versioned key/value record as it travels the wire: a live entry when
@@ -74,7 +74,7 @@ impl WireRecord {
     }
 }
 
-/// Every message exchanged on the data-plane mesh. Plan §6.
+/// Every message exchanged on the data-plane mesh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Sent once a new connection is established: identifies the sender.
@@ -111,7 +111,7 @@ pub enum Msg {
     StChunk {
         /// The cache being transferred.
         cache: SmolStr,
-        /// A batch of records (~500 per plan §9).
+        /// A batch of records (~500 per chunk).
         recs: Vec<WireRecord>,
         /// `true` on the final chunk of the stream.
         done: bool,
@@ -142,10 +142,10 @@ pub enum Msg {
     /// Replication-mode fan-out, batched: several records to apply together.
     /// Never built at enqueue time — `net::conn`'s per-peer writer
     /// opportunistically coalesces consecutive same-cache queued
-    /// [`Msg::Replicate`] messages into this on the wire (plan §6's smart
-    /// batching), applied under one acquisition of the store's apply
-    /// serialization lock (`store::ShardOps::apply_remote_batch`). Wire-encoded
-    /// via the raw-record layout (this module's docs), not postcard.
+    /// [`Msg::Replicate`] messages into this on the wire, applied under one
+    /// acquisition of the store's apply serialization lock
+    /// (`store::ShardOps::apply_remote_batch`). Wire-encoded via the
+    /// raw-record layout (this module's docs), not postcard.
     ReplicateBatch {
         /// The target cache's name.
         cache: SmolStr,
@@ -153,13 +153,12 @@ pub enum Msg {
         recs: Vec<WireRecord>,
     },
     /// Marks the end of one reply on a request/response connection kept
-    /// open for reuse (plan §6 request/response pooling): sent once after
-    /// the last `AeBucket`/`Replicate` reply to an `AeDigest`/`AePull`
-    /// request, so the requester knows the reply is complete without
-    /// relying on the connection closing. `StRequest`'s reply already has
-    /// its own per-chunk `done` flag on `StChunk` and needs no analogous
-    /// marker. Appended after every pre-existing variant so their
-    /// encodings are unchanged.
+    /// open for reuse: sent once after the last `AeBucket`/`Replicate`
+    /// reply to an `AeDigest`/`AePull` request, so the requester knows the
+    /// reply is complete without relying on the connection closing.
+    /// `StRequest`'s reply already has its own per-chunk `done` flag on
+    /// `StChunk` and needs no analogous marker. Appended after every
+    /// pre-existing variant so their encodings are unchanged.
     ReqDone,
 }
 
@@ -249,7 +248,7 @@ fn check_frame_len(len: usize) -> Result<(), CodecError> {
 /// general), or [`CodecError::MalformedFrame`] if a raw-record frame's cache
 /// name or record count doesn't fit the layout's fixed-width fields (a
 /// cache name over 64 KiB, or a batch of billions of records — never hit at
-/// this crate's target scale, plan §1).
+/// this crate's target scale of clusters and cache sizes).
 pub fn encode(msg: &Msg) -> Result<Bytes, CodecError> {
     match msg {
         Msg::Replicate { cache, rec } => {

@@ -1,6 +1,5 @@
-//! Dev-only harness for driving `sundog-testnode` inside real containers
-//! (plan §11 layer 4), exclusively through the `rightsize` crate — no
-//! docker CLI, no `bollard`, per `docs/HOUSE_RULES.md`'s hard rule.
+//! Dev-only harness for driving `sundog-testnode` inside real containers,
+//! exclusively through the `rightsize` crate — no docker CLI, no `bollard`.
 //!
 //! `RIGHTSIZE_BACKEND=docker` is required for the multi-node suite: sundog's
 //! gossip is UDP, and rightsize's microsandbox network emulation relays TCP

@@ -227,8 +227,8 @@ async fn kill_one_node_and_replace_it_under_the_same_alias() {
 /// did via `Cache::invalidate_local`. Stopping and restarting a member under
 /// the same alias is the closest honest equivalent reachable through this
 /// harness: the restarted node's `open()` runs state transfer *and* one
-/// immediate anti-entropy round against its donor (plan §9) before
-/// `testnode-ready` ever prints, so this exercises the same repair path
+/// immediate anti-entropy round against its donor before `testnode-ready`
+/// ever prints, so this exercises the same repair path
 /// anti-entropy exists for — a member that missed writes catching back up —
 /// even though it can't isolate the periodic scheduler from the join-time
 /// sweep. The tight bound below (a handful of `sundog-testnode`'s 2s
@@ -277,8 +277,8 @@ async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
     net.close().await.expect("network closes");
 }
 
-/// Plan §12 M5's acceptance bar: a cold node joining a populated cluster
-/// warms via state transfer in seconds, at 100k-entry scale. The elapsed
+/// A cold node joining a populated cluster warms via state transfer in
+/// seconds, at 100k-entry scale. The elapsed
 /// bound below includes container boot and gossip convergence on top of the
 /// transfer itself, so it is deliberately generous; the printed duration is
 /// the number to watch.

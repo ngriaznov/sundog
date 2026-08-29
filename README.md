@@ -10,18 +10,18 @@
 sundog is an embedded, replicated cache for Rust services. Drop it into a
 service, and every instance of that service on the network finds the others,
 forms a cluster over gossip, and keeps named caches coherent between them —
-no separate cache server, no config beyond a cluster name. It's modeled on
-[Infinispan](https://infinispan.org/)'s embedded mode: same two clustered
-cache shapes (invalidation and full replication), same "every node is a
-peer, nobody's special" architecture, just built for Rust instead of the
-JVM.
+no separate cache server, no config beyond a cluster name. Every node is a
+peer: no coordinator, no special role, nothing else to run. Caches open in
+one of two clustered shapes — invalidation or full replication — or in a
+local, unclustered mode when you don't want cluster traffic at all.
 
 It's named for the [parhelion](https://en.wikipedia.org/wiki/Sun_dog) — the
 optical effect where ice crystals in the sky render extra copies of the sun
 next to the real one. A replicated cache, drawn by the atmosphere.
 
-For the full design rationale — why gossip instead of a consensus protocol,
-why LWW, why anti-entropy exists — see [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md).
+Consistency is best-effort on purpose: gossip membership and last-write-wins
+skip the cost of running a consensus protocol for cache data, and
+anti-entropy repairs whatever gossip's fire-and-forget delivery drops.
 Things we deliberately didn't build, and what would make us reconsider, are
 in [`ROADMAP.md`](ROADMAP.md).
 
@@ -57,12 +57,12 @@ cluster.shutdown().await; // graceful leave (chitchat departs politely)
 ```
 
 That's the whole API surface for the common case. `Cluster::builder(name).build()`
-with nothing else chained is supposed to just work on a LAN — it's the
-project's actual acceptance test (see the doctest in `sundog/src/lib.rs`,
+with nothing else chained is supposed to work on a LAN — it's the
+project's acceptance test (see the doctest in `sundog/src/lib.rs`,
 which `cargo test --doc` runs for real). Filling a cache in bulk — a cold
 load from a backing store, say — can use `users.insert_many(entries).await?`
 instead of a loop of `insert` calls: every entry still gets its own HLC
-stamp and its own event, just applied under one acquisition of the store's
+stamp and its own event, applied under one acquisition of the store's
 lock rather than one per entry.
 
 ## Should you use this?
@@ -73,7 +73,7 @@ that tool.
 
 Concretely: writes are last-write-wins on a hybrid logical clock, so if two
 nodes write the same key at close to the same time, one write silently
-loses — there's no conflict error, no merge, the loser just vanishes.
+loses — there's no conflict error, no merge, the loser vanishes.
 Deletes are tombstones, and tombstones expire (`tombstone_ttl`, 10 minutes
 by default). A node that's been partitioned away longer than that can come
 back with a stale copy of a key everyone else deleted, and that key comes
@@ -103,7 +103,7 @@ requests reuse pooled connections instead of dialing fresh every round.
 
 | Mode | Each node stores | On write | On read | Pick this when |
 |---|---|---|---|---|
-| `Local` | its own data, nothing shared | nothing sent | local only | you just want `moka` with less setup — no cluster traffic at all |
+| `Local` | its own data, nothing shared | nothing sent | local only | you want `moka` with less setup — no cluster traffic at all |
 | `Invalidation` (default) | its own working set | broadcasts "this key changed" | local, may be momentarily stale | the dataset is big or expensive to hold everywhere, and each node mostly cares about its own hot keys |
 | `Replicated` | a full copy of everything | broadcasts the value | always local, never waits on the network | the dataset is small enough to duplicate, and you want reads to never touch the network |
 
@@ -128,7 +128,7 @@ browsing is what lets it find itself again. A node that finds no peers isn't
 broken; a single-node "cluster" is a normal, healthy state.
 
 **The Docker gotcha:** mDNS doesn't cross the default Docker bridge network
-(and usually not AP-isolated Wi-Fi either — multicast just doesn't route
+(and usually not AP-isolated Wi-Fi either — multicast doesn't route
 there). If you're demoing this with `docker compose`, use `Static` seeds;
 save `Mdns` for host networking or bare-metal LANs.
 
@@ -142,7 +142,7 @@ save `Mdns` for host networking or bare-metal LANs.
 
 Metrics (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
 `sundog_open_caches`, and a few more) are emitted unconditionally regardless
-of features — without `prometheus`, they just fall into the `metrics`
+of features — without `prometheus`, they fall into the `metrics`
 crate's no-op default recorder instead of going anywhere. A ready-made
 Grafana dashboard for them lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
@@ -181,7 +181,7 @@ Four layers, cheapest and highest-signal first:
 
    You'll also need `RIGHTSIZE_BACKEND=docker` — sundog's gossip is UDP, and
    rightsize's lightweight microVM network emulation only relays TCP, so the
-   Docker backend is the one that actually carries chitchat's traffic. CI
+   Docker backend is the one that carries chitchat's traffic. CI
    has both KVM and Docker and pulls a real base image; locally, if registry
    pulls aren't available, point `SUNDOG_TEST_BASE_IMAGE` at whatever
    minimal image you've got pre-seeded.
@@ -191,7 +191,7 @@ Four layers, cheapest and highest-signal first:
    `#[cfg(test)]` unit tests next to the code they exercise (see
    `sundog::store`'s stampede-collapse and TTL tests, `sundog::cluster`'s
    two-node replication/invalidation/state-transfer/anti-entropy/local-mode
-   tests). Container tests are reserved for what actually requires separate
+   tests). Container tests are reserved for what requires separate
    processes and a real network.
 4. **Chaos demo** (`sundog-demo`, headless mode) — see below.
 

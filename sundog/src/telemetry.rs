@@ -1,5 +1,5 @@
-//! Prometheus metrics export (plan §12 M7 hardening; house rules: "Prometheus
-//! exporter implemented behind a `prometheus` feature flag, off by default").
+//! Prometheus metrics export, behind a `prometheus` feature flag, off by
+//! default.
 //!
 //! Metric *emission* — the `metrics::counter!`/`metrics::gauge!` calls spread
 //! across the crate (`sundog_backlog_dropped_total`, `sundog_live_peers`,

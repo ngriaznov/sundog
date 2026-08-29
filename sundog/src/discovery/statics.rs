@@ -1,5 +1,5 @@
 //! `Static`: a fixed seed list, from the builder or `SUNDOG_SEEDS=host:port,…`.
-//! The escape hatch and the test-suite workhorse. Plan §5.
+//! The escape hatch and the test-suite workhorse.
 
 use std::collections::HashSet;
 use std::io;
@@ -22,7 +22,7 @@ const DEFAULT_REDISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 /// re-resolved through the OS resolver on every rediscovery tick, so DNS
 /// changes are picked up. The candidate stream never ends: it re-yields the
 /// whole (de-duplicated) seed set on a slow interval, which is what lets a
-/// fully restarted cluster re-find itself (plan §5).
+/// fully restarted cluster re-find itself.
 pub struct Static {
     specs: Arc<[String]>,
     rediscover_interval: Duration,

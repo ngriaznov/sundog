@@ -1,6 +1,6 @@
-//! Replication-cost baseline (plan §11 layer 3 shape: in-process, real
-//! `Static`-discovery loopback nodes, public API only) — the honest "before"
-//! numbers an optimization phase is judged against. Not a correctness
+//! Replication-cost baseline — in-process, real `Static`-discovery loopback
+//! nodes, public API only — the honest "before" numbers an optimization
+//! phase is judged against. Not a correctness
 //! suite: nothing here asserts a performance bound, it only measures and
 //! prints.
 //!
@@ -86,14 +86,14 @@ fn bench_value(i: u32) -> String {
     format!("value-{i:07}-the-quick-brown-fox")
 }
 
-/// Plan §4/§6 in the shape that matters for a bulk-write baseline: 100k
-/// sequential local inserts on one node of a 3-node `Replicated` cluster,
+/// The shape that matters for a bulk-write baseline: 100k sequential local
+/// inserts on one node of a 3-node `Replicated` cluster,
 /// timing (a) the insert loop itself — local apply plus a non-blocking
 /// fan-out push, per `net::PeerHandle::send`'s docs — and (b) wall time
 /// until the other two nodes' local copies both fully catch up, which in
 /// the steady default config (`outbox_capacity` 8,192 against 100k writes)
 /// leans heavily on anti-entropy repair rather than the live fan-out path,
-/// exactly as the drop-policy semantics in plan §6 predict.
+/// exactly as the crate's drop-policy semantics predict.
 #[tokio::test]
 async fn bulk_insert_replication() {
     const ENTRIES: u32 = 100_000;

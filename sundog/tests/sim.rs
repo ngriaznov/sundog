@@ -1,4 +1,4 @@
-//! Deterministic simulation suite (plan §11.2): drives `net::Mesh` and
+//! Deterministic simulation suite: drives `net::Mesh` and
 //! `store::Shard`/`ShardOps` directly inside a `turmoil` simulation, against
 //! a hand-scripted membership feed built from `Peer` values — no chitchat,
 //! no real UDP/TCP. `cluster.rs`'s composition (membership-driven
@@ -15,7 +15,7 @@
 //! builds each node's `Shard` up front and hands an `Arc` clone to both that
 //! node's host future (for wiring into a `Mesh`-backed `RequestHandler` and
 //! for applying inbound/state-transfer records) and to the test function
-//! itself (for assertions) — see `docs/BUILD_PLAN.md` §7, §8, §9.
+//! itself (for assertions).
 
 #![cfg(feature = "sim")]
 
@@ -180,7 +180,7 @@ impl RequestHandler for ShardHandler {
 /// Fans `key`'s current record out to `peers`, `dup_factor` times each — the
 /// harness stand-in for `cluster::fan_out_one`'s `Mode::Replicated` arm.
 /// Sending the same record repeatedly is this suite's "duplicate storm":
-/// idempotent apply (plan §4) must make it a no-op past the first delivery.
+/// idempotent apply must make it a no-op past the first delivery.
 async fn fan_out(shard: &TestShard, mesh: &Mesh, peers: &[NodeId], key: u32, dup_factor: usize) {
     let Some(rec) = ShardOps::records_for(shard, vec![key_bytes(key)])
         .await
@@ -466,8 +466,7 @@ fn partition_during_writes_converges_within_five_ae_rounds() {
     );
 
     // Partition first, so the whole write burst on both sides happens while
-    // split — plan §11.2 scenario 1's "partition during write load on both
-    // sides" — then heal and bound convergence to five AE-round intervals.
+    // split, then heal and bound convergence to five AE-round intervals.
     sim.partition("node-a", "node-b");
     run_steps(&mut sim, steps_for(Duration::from_millis(750)));
     sim.repair("node-a", "node-b");
@@ -503,9 +502,9 @@ struct StormStats {
 }
 
 /// Message loss + a wide latency spread (reorder) + a deliberate per-write
-/// duplicate storm, all running concurrently with live writes on both sides
-/// — plan §11.2 scenario 2. No partition here: `fail_rate` alone breaks and
-/// re-establishes individual links throughout the run.
+/// duplicate storm, all running concurrently with live writes on both
+/// sides. No partition here: `fail_rate` alone breaks and re-establishes
+/// individual links throughout the run.
 fn run_storm_scenario(seed: u64) -> StormStats {
     let node_a = NodeId::from(11);
     let node_b = NodeId::from(12);
@@ -524,8 +523,8 @@ fn run_storm_scenario(seed: u64) -> StormStats {
         // Turmoil's `fail_rate` has no TCP-segment retransmission (its own
         // documented limitation): a single dropped chunk can break a whole
         // in-flight connection outright, and a large message — the ~10 KiB
-        // full-digest array plan §8 sends every round — crosses many chunks,
-        // so its odds of a break compound per chunk. A rate that reads as
+        // full-digest array sent every anti-entropy round — crosses many
+        // chunks, so its odds of a break compound per chunk. A rate that reads as
         // "occasional loss" for one small message is "nearly every AE round
         // breaks" for this one; kept low enough that rounds still routinely
         // succeed within a handful of `ae_period` retries.
@@ -717,7 +716,7 @@ async fn receiver_software(
 /// the next donor the moment the stream reports an error — the same
 /// "a crashed donor surfaces as a stream error, not a clean end" contract
 /// `net::conn::state_stream` guarantees and the production retry loop relies
-/// on (plan §9: "the receiver notices ... re-picks, re-requests").
+/// on: the receiver notices the failure, re-picks a donor, and re-requests.
 async fn warm_up(mesh: &Mesh, shard: &TestShard, donors: &[NodeId], applied: &AtomicUsize) -> bool {
     for &donor in donors {
         let Ok(Ok(mut stream)) =

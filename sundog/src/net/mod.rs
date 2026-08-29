@@ -1,6 +1,6 @@
 //! Data plane: a lazily-dialed TCP mesh between live peers, carrying
 //! invalidations, replications, state transfer, and anti-entropy. Losing a
-//! message here is acceptable by design — anti-entropy repairs it. Plan §3, §6.
+//! message here is acceptable by design — anti-entropy repairs it.
 //!
 //! Every live peer gets one persistent, unidirectional writer connection
 //! (`Hello` then a stream of `Invalidate`/`Replicate`, drained from bounded
@@ -182,7 +182,7 @@ pub fn bytes_sent_total() -> u64 {
 /// (crashed without FIN/RST, a paused VM, a partition that black-holes the
 /// return path — precisely the failure modes this crate is designed around)
 /// blocks the caller forever: no read timeout exists anywhere below this,
-/// and AP semantics (plan §4) mean a stuck peer must never hang this node.
+/// and AP semantics mean a stuck peer must never hang this node.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wraps a timed-out request/response exchange as a [`CodecError::Io`], the
@@ -196,7 +196,7 @@ fn request_timeout_error(what: &str) -> CodecError {
 }
 
 /// Backpressure class for a fan-out message, selecting the per-class drop
-/// policy on outbox overflow (plan §6).
+/// policy on outbox overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MsgClass {
     /// Overflow drops the oldest queued invalidation for that peer: an
@@ -224,9 +224,9 @@ pub struct InboundMsg {
 /// donor that doesn't (yet) have the cache is a normal race, not a fault.
 pub trait RequestHandler: Send + Sync + 'static {
     /// Streams a full snapshot of `cache` in write-sized chunks, for state
-    /// transfer on join (plan §9).
+    /// transfer on join.
     fn snapshot_chunks(&self, cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>>;
-    /// Returns `cache`'s current per-bucket digest array (plan §8).
+    /// Returns `cache`'s current per-bucket digest array.
     fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>>;
     /// Returns the live key/version listing for one bucket of `cache`.
     fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
@@ -282,10 +282,8 @@ impl Mesh {
     /// `incarnation` is embedded in every `Hello` this node sends; `handler`
     /// answers `StRequest`/`AeDigest`/`AePull` from peers dialing in.
     ///
-    /// Deviates from the original stub signature (`spawn(bind_addr, node)`):
-    /// adds `incarnation`, `config` (for `outbox_capacity`), and `handler`,
-    /// all needed to serve the request/response side and drive the drop
-    /// policy — see this crate's build-agent report for the rationale.
+    /// `incarnation`, `config` (for `outbox_capacity`), and `handler` are all
+    /// needed to serve the request/response side and drive the drop policy.
     ///
     /// # Errors
     ///
@@ -407,7 +405,7 @@ impl Mesh {
 
     /// Best-effort, non-blocking fan-out of `msg` to `peer` on the outbox
     /// selected by `class`. Never blocks the caller; overflow is handled per
-    /// `class`'s drop policy (plan §6) rather than propagated as an error. A
+    /// `class`'s drop policy rather than propagated as an error. A
     /// `peer` the mesh doesn't currently know about (not live, or not yet
     /// reconciled by [`Mesh::update_peers`]) is silently a no-op.
     ///
@@ -423,7 +421,7 @@ impl Mesh {
     /// the peer-table lock **once** for the whole batch rather than once per
     /// message — the anti-entropy-repair call site sends a batch of messages
     /// to one peer at a time, so this turns an O(batch size) lock
-    /// reacquisition into O(1). Per-message drop-policy semantics (plan §6)
+    /// reacquisition into O(1). Per-message drop-policy semantics
     /// are unchanged: each message in `msgs` still gets its own independent
     /// overflow decision, exactly as a loop of individual [`Mesh::send`]
     /// calls would. Encodes each message here, once per call — for a
@@ -493,7 +491,7 @@ impl Mesh {
 
     /// Returns every peer whose `Replicate` outbox has dropped a message
     /// since the last call, clearing their dirty mark — the anti-entropy
-    /// scheduler should target these peers before picking randomly (plan §8).
+    /// scheduler should target these peers before picking randomly.
     ///
     /// # Panics
     ///
@@ -565,7 +563,7 @@ impl Mesh {
     }
 
     /// Requests a full snapshot of `cache` from `donor` (state transfer on
-    /// join, plan §9) and returns a stream of its `StChunk`s, each yielded as
+    /// join) and returns a stream of its `StChunk`s, each yielded as
     /// one `Vec<WireRecord>` (the donor's own chunk boundaries, ~500 records)
     /// so the caller can apply a whole chunk through
     /// `ShardOps::apply_remote_batch` under one lock acquisition, read lazily

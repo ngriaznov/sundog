@@ -1,5 +1,4 @@
-//! Mutual TLS for the data plane (feature `tls`; house rules "Future plans
-//! pulled into v1": plan §14's "mTLS on the data plane (rustls)"). Every
+//! Mutual TLS for the data plane, behind the `tls` feature. Every
 //! persistent and short-lived connection — accepted and dialed alike, so the
 //! request/response ones (state transfer, anti-entropy) too — is wrapped
 //! once this node's [`ClusterConfig::tls`](crate::config::ClusterConfig::tls)

@@ -55,9 +55,8 @@ jobs:
       - name: cargo test (tls,prometheus features)
         run: cargo test --package sundog --features tls,prometheus
 
-  # Container-backed multi-node suite (docs/BUILD_PLAN.md §11, layer 3),
-  # exclusively through the `rightsize` crate — no docker CLI, no bollard.
-  # Separate job because it needs the
+  # Container-backed multi-node suite, exclusively through the `rightsize`
+  # crate — no docker CLI, no bollard. Separate job because it needs the
   # musl target/toolchain and a container backend that the other lanes
   # don't. RIGHTSIZE_BACKEND=docker: sundog's gossip is UDP, and rightsize's
   # microsandbox network emulation relays TCP only, so the docker backend is

@@ -1,5 +1,4 @@
-//! Feature `tls`: mutual TLS on the data-plane mesh (plan §14 pulled into
-//! v1, house rules "Future plans pulled into v1"). Two throwaway-CA
+//! Feature `tls`: mutual TLS on the data-plane mesh. Two throwaway-CA
 //! scenarios: nodes sharing a root CA replicate normally over TLS; nodes
 //! whose certificates chain to *different* CAs never manage to fan a write
 //! out to each other, even though they still see each other via gossip

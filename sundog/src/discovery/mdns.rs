@@ -1,7 +1,7 @@
 //! `Mdns`: the zeroconf default. Registers `_sundog._udp.local.` (cluster
 //! name as a TXT property, instance = node id) and browses continuously via
-//! `mdns-sd`. Plan §5. Does not cross the default Docker bridge — compose
-//! demos use `Static` instead (plan §13).
+//! `mdns-sd`. Does not cross the default Docker bridge — compose demos use
+//! `Static` instead.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -34,8 +34,8 @@ pub struct Mdns {
 }
 
 impl Mdns {
-    /// `instance_name` becomes the mDNS instance label (plan §5: the node
-    /// name); `cluster_name` is both the TXT filter applied to browse
+    /// `instance_name` becomes the mDNS instance label — typically the node
+    /// name; `cluster_name` is both the TXT filter applied to browse
     /// results and the value this node advertises on announce.
     #[must_use]
     pub fn new(cluster_name: impl Into<SmolStr>, instance_name: impl Into<String>) -> Self {
@@ -106,8 +106,8 @@ fn build_service_info(
 }
 
 /// Extracts a candidate address from a resolved event, filtering out
-/// services from any other cluster. Prefers an IPv4 address (plan §5:
-/// "handle IPv4 primary"), falling back to whatever the peer advertised.
+/// services from any other cluster. Prefers an IPv4 address, falling back
+/// to whatever the peer advertised.
 fn resolved_addr(event: &ServiceEvent, cluster_name: &str) -> Option<SocketAddr> {
     let ServiceEvent::ServiceResolved(resolved) = event else {
         return None;

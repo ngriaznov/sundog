@@ -1,16 +1,16 @@
-//! sundog: an embedded, replicated, zeroconf cache for Rust, modeled on
-//! Infinispan's embedded mode.
+//! sundog: an embedded, replicated, zeroconf cache for Rust. It runs inside
+//! your process — no separate cache server to deploy or operate.
 //!
 //! Instances of a service on the same network discover each other, form a
 //! cluster over gossip membership, and keep named caches coherent across
 //! nodes — invalidation or full replication, last-write-wins on a hybrid
 //! logical clock, healed by anti-entropy. No consensus, no operator action on
-//! join, leave, crash, or partition. See `docs/BUILD_PLAN.md` for the design.
+//! join, leave, crash, or partition.
 //!
 //! # Examples
 //!
 //! The zeroconf happy path — this exact snippet is the project's acceptance
-//! test (plan §10):
+//! test:
 //!
 //! ```no_run
 //! use std::time::Duration;
