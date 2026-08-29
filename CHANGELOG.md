@@ -136,11 +136,46 @@ name reservation, not a release.
   already a deliberately-sized application-level batch, so nothing is
   gained by leaving Nagle's algorithm to hold small frames back.
 - **Replication-cost benchmark suite** (`sundog/tests/replication_bench.rs`,
-  gated on `SUNDOG_BENCH=1`): a 100k bulk-insert-then-converge scenario and a
-  5k steady-write scenario against real loopback clusters, printing wall
-  time and the process-wide `sundog::net::frames_sent_total`/
-  `bytes_sent_total` wire-frame counters as the baseline an optimization
-  phase is judged against.
+  gated on `SUNDOG_BENCH=1`): a 100k bulk-insert-then-converge scenario, a 5k
+  steady-write scenario, and a 5k-write/16-concurrent-writer scenario against
+  real loopback clusters, printing wall time and the process-wide
+  `sundog::net::frames_sent_total`/`bytes_sent_total` wire-frame counters.
+- **Zero-copy record frames**: `Msg::Replicate`, `Msg::ReplicateBatch`, and
+  `Msg::StChunk` — the wire messages that carry actual key/value bytes —
+  use a fixed-width layout (`zerocopy`'s safe views, no `unsafe`) instead of
+  postcard. Encoding writes straight from already-owned key/value `Bytes`
+  with no intermediate buffer; decoding slices `Bytes` views directly out of
+  the received frame with no payload copy. A stored record keeps its
+  encoded wire bytes (`store::Stored::encoded`) alongside its typed value,
+  so answering a replication or anti-entropy request clones an existing
+  `Bytes` handle rather than re-serializing. Control messages (`Hello`,
+  `StRequest`, `AeDigest`, `AeBucket`, `AePull`, `ReqDone`) still encode as
+  postcard.
+- **Connection reuse for anti-entropy and state transfer**: `Mesh::ae_round`,
+  `ae_pull`, and `request_state` check out an idle, already-`Hello`'d
+  connection from a small per-peer pool instead of dialing fresh (and, under
+  `tls`, completing a fresh mutual-cert handshake) on every call, falling
+  back to a fresh dial when the pool is empty or a pooled connection turns
+  out dead. The accept side serves multiple requests per connection instead
+  of exactly one, torn down after an idle timeout or a request-count cap.
+  This pool is separate from the persistent per-peer broadcast connection,
+  so a slow snapshot transfer can't back up live replication traffic. A
+  connection is only ever returned to the pool after a clean end-of-reply —
+  one left in an unknown framing state after an error, timeout, or
+  cancellation is dropped instead of reused.
+- **Striped apply lock**: each shard's tombstone map and write-serialization
+  lock is split into 64 independent key-hash stripes instead of one lock
+  per shard. Writes to keys in different stripes apply fully concurrently;
+  writes to the same key stay serialized against each other exactly as a
+  single shard-wide lock would. Remote batch applies and local bulk inserts
+  group their entries by stripe and apply each stripe's sub-batch under one
+  acquisition of that stripe's lock.
+- **Lean fan-out**: local and remote-origin writes notify the peer fan-out
+  path over an internal `(key, origin)` channel, separate from the public
+  `Cache::events()` broadcast channel. The app-facing `Event` — which owns a
+  clone of the value — is only built when `events()` actually has a
+  subscriber, so a cache with nothing subscribed to `events()` pays no
+  per-write value clone for replication or invalidation fan-out.
 
 ### Known gaps (tracked, not bugs)
 

@@ -1,11 +1,12 @@
-//! Smoke validation for the rightsize container harness (plan §11 layer 4):
-//! one `sundog-testnode` container boots for real and answers `count` over
-//! its mapped control port. `#[ignore]`d — needs a container backend
-//! (`RIGHTSIZE_BACKEND=docker` locally; both KVM and docker in CI) and a
-//! musl toolchain, neither of which every `cargo test --workspace` run has.
+//! Smoke validation for the rightsize container harness: one
+//! `sundog-testnode` container boots for real and answers `count` over its
+//! mapped control port. Gated on `SUNDOG_CONTAINER_TESTS=1` like the rest of
+//! the container suite — it needs a container backend
+//! (`RIGHTSIZE_BACKEND=docker`) and a musl toolchain.
 //!
-//! Run explicitly: `SUNDOG_TEST_BASE_IMAGE=rz-base:local RIGHTSIZE_BACKEND=docker
-//! cargo test --release -p sundog --test container_smoke -- --ignored --nocapture`.
+//! Run: `SUNDOG_CONTAINER_TESTS=1 SUNDOG_TEST_BASE_IMAGE=rz-base:local
+//! RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test
+//! container_smoke -- --nocapture`.
 
 mod container_util;
 
@@ -15,8 +16,12 @@ use std::time::Duration;
 use rightsize::Network;
 
 #[tokio::test]
-#[ignore = "needs a container backend and the musl toolchain"]
 async fn single_node_boots_and_answers_count_over_the_control_port() {
+    if !container_util::container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
     let net = Arc::new(Network::new_network());
 
     let node = container_util::Node::spawn(&net, "smoke-cluster", "n1", &[]).await;

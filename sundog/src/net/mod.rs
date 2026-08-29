@@ -4,13 +4,15 @@
 //!
 //! Every live peer gets one persistent, unidirectional writer connection
 //! (`Hello` then a stream of `Invalidate`/`Replicate`, drained from bounded
-//! per-class outboxes) plus, on demand, a fresh short-lived connection per
-//! request/response exchange (state transfer, anti-entropy) — kept off the
-//! broadcast path so a slow snapshot never backs up live traffic. On the
-//! accept side, both kinds of connection share one listener: every
-//! connection starts with `Hello`, and the message that follows decides
-//! whether the connection is served once (a request) or looped indefinitely
-//! (the persistent link), per plan "own streams" for request/response.
+//! per-class outboxes) plus a small pool of reused connections for
+//! request/response exchanges (state transfer, anti-entropy): checked out
+//! of the pool when idle, dialed fresh only when the pool is empty or every
+//! pooled connection is dead — kept off the broadcast path so a slow
+//! snapshot never backs up live traffic. On the accept side, both kinds of
+//! connection share one listener: every connection starts with `Hello`, and
+//! the message that follows decides whether the connection loops serving
+//! further requests until it goes idle or hits its request cap, or loops
+//! indefinitely as the persistent link.
 //!
 //! Feature `tls` (real-tokio transport only, see the private `tls`
 //! submodule's own docs): every connection this module opens or accepts is
@@ -47,8 +49,30 @@ use crate::error::{CodecError, JoinError};
 use crate::hlc::Hlc;
 use crate::membership::Peer;
 use crate::node::NodeId;
-use crate::wire::{Msg, WireRecord};
+use crate::wire::{self, Msg, WireRecord};
 use outbox::DropOldestQueue;
+
+/// A queued outbound message paired with its already-encoded wire frame.
+/// Built once per logical send — typically shared across every live peer in
+/// a fan-out (`cluster::fan_out_batch`) — and cheaply cloned (a
+/// `Bytes` refcount bump) into each peer's outbox, so `net::conn`'s per-peer
+/// writer never re-encodes byte-identical broadcast content once per peer.
+/// `msg` stays alongside `frame` because `Replicate`-class traffic still
+/// needs the typed message to decide how to opportunistically coalesce
+/// consecutive queued entries (`net::conn::coalesce_replicate`); when a run
+/// turns out not to be merged with anything, `frame` is reused as-is.
+#[derive(Debug, Clone)]
+pub(crate) struct OutFrame {
+    pub(crate) msg: Msg,
+    pub(crate) frame: Bytes,
+}
+
+impl OutFrame {
+    pub(crate) fn new(msg: Msg) -> Result<Self, CodecError> {
+        let frame = wire::encode(&msg)?;
+        Ok(Self { msg, frame })
+    }
+}
 
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 pub use tls::MESH_SERVER_NAME;
@@ -220,10 +244,15 @@ pub trait RequestHandler: Send + Sync + 'static {
 
 struct PeerHandle {
     data_addr: SocketAddr,
-    invalidate: Arc<DropOldestQueue>,
-    replicate_tx: mpsc::Sender<Msg>,
+    invalidate: Arc<DropOldestQueue<OutFrame>>,
+    replicate_tx: mpsc::Sender<OutFrame>,
     dirty: Arc<AtomicBool>,
     cancel: CancellationToken,
+    /// Pooled request/response connections for this peer — dialed
+    /// on demand by `Mesh::ae_round`/`ae_pull`/`request_state` instead of
+    /// fresh every call, and dropped (closing every pooled socket) along
+    /// with the rest of this handle when the peer departs.
+    req_pool: Arc<conn::ReqPool>,
 }
 
 struct MeshInner {
@@ -372,6 +401,7 @@ impl Mesh {
             replicate_tx,
             dirty: Arc::new(AtomicBool::new(false)),
             cancel,
+            req_pool: Arc::new(conn::ReqPool::new()),
         }
     }
 
@@ -386,6 +416,54 @@ impl Mesh {
     /// Panics if the internal peer-table lock is poisoned, which only
     /// happens if an earlier call already panicked while holding it.
     pub fn send(&self, peer: NodeId, class: MsgClass, msg: Msg) {
+        self.send_many(peer, class, std::iter::once(msg));
+    }
+
+    /// [`Mesh::send`] for many messages to the same `peer`/`class`, resolving
+    /// the peer-table lock **once** for the whole batch rather than once per
+    /// message — the anti-entropy-repair call site sends a batch of messages
+    /// to one peer at a time, so this turns an O(batch size) lock
+    /// reacquisition into O(1). Per-message drop-policy semantics (plan §6)
+    /// are unchanged: each message in `msgs` still gets its own independent
+    /// overflow decision, exactly as a loop of individual [`Mesh::send`]
+    /// calls would. Encodes each message here, once per call — for a
+    /// multi-peer fan-out where the same content is shared across every live
+    /// peer, encode once up front instead and use [`Mesh::send_frames`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal peer-table lock is poisoned, which only
+    /// happens if an earlier call already panicked while holding it.
+    pub fn send_many(&self, peer: NodeId, class: MsgClass, msgs: impl IntoIterator<Item = Msg>) {
+        let frames = msgs.into_iter().filter_map(|msg| match OutFrame::new(msg) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode outbound message; dropped");
+                None
+            }
+        });
+        self.send_frames(peer, class, frames);
+    }
+
+    /// [`Mesh::send_many`], but for already-encoded [`OutFrame`]s — the
+    /// multi-peer fan-out path (`cluster::fan_out_batch`) builds
+    /// these once per message and calls this once per live peer, so
+    /// byte-identical broadcast content is encoded exactly once regardless
+    /// of how many peers it fans out to (each peer just gets a cheap
+    /// `Bytes` clone of the same frame). Otherwise identical to
+    /// [`Mesh::send_many`]: one peer-table lock acquisition, per-message
+    /// independent drop-policy semantics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal peer-table lock is poisoned, which only
+    /// happens if an earlier call already panicked while holding it.
+    pub(crate) fn send_frames(
+        &self,
+        peer: NodeId,
+        class: MsgClass,
+        frames: impl IntoIterator<Item = OutFrame>,
+    ) {
         let table = self
             .inner
             .peers
@@ -394,13 +472,20 @@ impl Mesh {
         let Some(handle) = table.get(&peer) else {
             return;
         };
-        match class {
-            MsgClass::Invalidate => handle.invalidate.push(msg),
-            MsgClass::Replicate => {
-                if let Err(mpsc::error::TrySendError::Full(_)) = handle.replicate_tx.try_send(msg) {
-                    handle.dirty.store(true, Ordering::Relaxed);
-                    metrics::counter!("sundog_backlog_dropped_total", "peer" => peer.to_string())
+        for frame in frames {
+            match class {
+                MsgClass::Invalidate => handle.invalidate.push(frame),
+                MsgClass::Replicate => {
+                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                        handle.replicate_tx.try_send(frame)
+                    {
+                        handle.dirty.store(true, Ordering::Relaxed);
+                        metrics::counter!(
+                            "sundog_backlog_dropped_total",
+                            "peer" => peer.to_string()
+                        )
                         .increment(1);
+                    }
                 }
             }
         }
@@ -428,19 +513,55 @@ impl Mesh {
             .collect()
     }
 
-    fn peer_addr(&self, peer: NodeId) -> Result<SocketAddr, CodecError> {
+    fn peer_req_pool(&self, peer: NodeId) -> Result<(SocketAddr, Arc<conn::ReqPool>), CodecError> {
         self.inner
             .peers
             .read()
             .expect("invariant: peers lock is never poisoned")
             .get(&peer)
-            .map(|handle| handle.data_addr)
+            .map(|handle| (handle.data_addr, Arc::clone(&handle.req_pool)))
             .ok_or_else(|| {
                 CodecError::Io(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("peer {peer} is not a known mesh member"),
                 ))
             })
+    }
+
+    /// Checks a pooled, already-`Hello`'d connection out of `peer`'s
+    /// request pool and sends `first` on it, or — if the pool is empty or
+    /// every pooled connection turns out to be dead — dials a fresh one,
+    /// coalescing `Hello` and `first` into one flush via
+    /// [`conn::dial_with_hello_and`] exactly as an unpooled call would.
+    /// Returns the connection together with the pool it came from, so the
+    /// caller can check it back in once the exchange completes cleanly.
+    async fn acquire_conn(
+        &self,
+        peer: NodeId,
+        first: Msg,
+    ) -> Result<(conn::PeerFramed, Arc<conn::ReqPool>), CodecError> {
+        let (addr, pool) = self.peer_req_pool(peer)?;
+        while let Some(mut framed) = pool.checkout() {
+            // A fresh dial's own `TcpStream::connect().await` is a real
+            // yield point; a reused connection has none, and every op on
+            // it below tends to resolve immediately on an already-warm
+            // socket. Without this explicit yield, an anti-entropy loop
+            // that skips dialing can hog a single-threaded runtime turn
+            // after turn — measured as the entire cause of a 3-4x
+            // `bulk_insert_replication` regression (many in-process nodes
+            // sharing one executor, as in that benchmark and the chaos-TUI
+            // demo) before this line was added.
+            tokio::task::yield_now().await;
+            if conn::send_msg(&mut framed, &first).await.is_ok() {
+                return Ok((framed, pool));
+            }
+            // Stale/broken pooled connection (the peer closed it, or it
+            // died while idle): drop it and try the next pooled one, or
+            // fall through to a fresh dial below if none are left.
+        }
+        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
+        let framed = conn::dial_with_hello_and(addr, node, incarnation, tls, first).await?;
+        Ok((framed, pool))
     }
 
     /// Requests a full snapshot of `cache` from `donor` (state transfer on
@@ -459,16 +580,17 @@ impl Mesh {
         donor: NodeId,
         cache: SmolStr,
     ) -> Result<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>, CodecError> {
-        let addr = self.peer_addr(donor)?;
-        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
-        let framed = tokio::time::timeout(REQUEST_TIMEOUT, async {
-            let mut framed = conn::dial_with_hello(addr, node, incarnation, tls).await?;
-            conn::send_msg(&mut framed, &Msg::StRequest { cache }).await?;
-            Ok::<_, CodecError>(framed)
-        })
+        // Only the checkout-or-dial step is bounded by `REQUEST_TIMEOUT`,
+        // matching the pre-pooling behavior: a snapshot itself may
+        // legitimately take longer than one request's timeout to stream in
+        // full (`try_donor`'s own `PER_DONOR_BUDGET` governs that instead).
+        let (framed, pool) = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.acquire_conn(donor, Msg::StRequest { cache }),
+        )
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("state transfer request")))?;
-        Ok(conn::state_stream(framed))
+        Ok(conn::state_stream(framed, pool))
     }
 
     /// Runs one anti-entropy digest exchange against `peer`: sends
@@ -485,19 +607,17 @@ impl Mesh {
         cache: SmolStr,
         local_buckets: Vec<(u16, u64)>,
     ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
-        let addr = self.peer_addr(peer)?;
-        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
         tokio::time::timeout(REQUEST_TIMEOUT, async {
-            let mut framed = conn::dial_with_hello(addr, node, incarnation, tls).await?;
-            conn::send_msg(
-                &mut framed,
-                &Msg::AeDigest {
-                    cache,
-                    buckets: local_buckets,
-                },
-            )
-            .await?;
-            conn::collect_ae_buckets(framed).await
+            let (framed, pool) = self
+                .acquire_conn(
+                    peer,
+                    Msg::AeDigest {
+                        cache,
+                        buckets: local_buckets,
+                    },
+                )
+                .await?;
+            conn::collect_ae_buckets(framed, &pool).await
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy digest exchange")))
@@ -516,12 +636,9 @@ impl Mesh {
         cache: SmolStr,
         keys: Vec<Bytes>,
     ) -> Result<Vec<WireRecord>, CodecError> {
-        let addr = self.peer_addr(peer)?;
-        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
         tokio::time::timeout(REQUEST_TIMEOUT, async {
-            let mut framed = conn::dial_with_hello(addr, node, incarnation, tls).await?;
-            conn::send_msg(&mut framed, &Msg::AePull { cache, keys }).await?;
-            conn::collect_pulled_records(framed).await
+            let (framed, pool) = self.acquire_conn(peer, Msg::AePull { cache, keys }).await?;
+            conn::collect_pulled_records(framed, &pool).await
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull")))
@@ -677,7 +794,7 @@ mod tests {
             .await
             .expect("frame arrives")
             .expect("no io error");
-        let msg = wire::decode(&frame).expect("decodes");
+        let msg = wire::decode(&frame.freeze()).expect("decodes");
         assert_eq!(
             msg,
             Msg::Hello {
@@ -730,8 +847,8 @@ mod tests {
         };
         let first = invalidate.pop().await;
         let second = invalidate.pop().await;
-        assert_eq!(first, msg(2));
-        assert_eq!(second, msg(3));
+        assert_eq!(first.msg, msg(2));
+        assert_eq!(second.msg, msg(3));
     }
 
     #[tokio::test]
@@ -833,7 +950,7 @@ mod tests {
                 done: false,
             };
             let encoded = wire::encode(&chunk).expect("encodes");
-            futures::SinkExt::send(&mut framed, Bytes::from(encoded))
+            futures::SinkExt::send(&mut framed, encoded)
                 .await
                 .expect("send partial chunk");
             drop(framed); // connection closes: no `done: true` chunk ever sent
@@ -970,7 +1087,7 @@ mod tests {
             incarnation: 1,
         })
         .expect("encodes");
-        futures::SinkExt::send(&mut framed, Bytes::from(hello))
+        futures::SinkExt::send(&mut framed, hello)
             .await
             .expect("send hello");
 
@@ -984,7 +1101,7 @@ mod tests {
             },
         };
         let encoded = wire::encode(&invalidate).expect("encodes");
-        futures::SinkExt::send(&mut framed, Bytes::from(encoded))
+        futures::SinkExt::send(&mut framed, encoded)
             .await
             .expect("send invalidate");
 

@@ -28,7 +28,7 @@ use crate::config::ClusterConfig;
 use crate::error::{CacheError, CodecError};
 use crate::hlc::{Hlc, HlcClock};
 use crate::node::NodeId;
-use crate::wire::{MAX_FRAME, WireRecord};
+use crate::wire::{self, MAX_FRAME, WireRecord};
 
 /// Number of anti-entropy buckets per shard: `bucket(k) = xxh3(key_bytes) & (BUCKET_COUNT - 1)`.
 pub const BUCKET_COUNT: usize = 1024;
@@ -47,22 +47,28 @@ pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
 /// Headroom reserved below [`MAX_FRAME`] when sizing a snapshot chunk, for
-/// the `Msg::StChunk` envelope (cache name, `done` flag, and postcard's
-/// enum/`Vec` length-prefix overhead) around the records themselves.
+/// the `Msg::StChunk` envelope (the raw-record frame's discriminant byte,
+/// fixed header, and cache name — `crate::wire`'s module docs) around the
+/// records themselves.
 const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 
 /// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in
-/// a `Msg::StChunk` (plan §9), splitting on cumulative postcard-encoded size
-/// as well as [`SNAPSHOT_CHUNK_SIZE`] — a fixed record count alone
-/// undercounts for caches whose average value is more than a few KiB, which
-/// the plan's own target scale ("values ≤ a few MiB") allows.
+/// a `Msg::StChunk` (plan §9), splitting on cumulative wire-encoded size as
+/// well as [`SNAPSHOT_CHUNK_SIZE`] — a fixed record count alone undercounts
+/// for caches whose average value is more than a few KiB, which the plan's
+/// own target scale ("values ≤ a few MiB") allows. Each record's
+/// contribution (`wire::RECORD_HEADER_LEN` plus its key/value lengths) is
+/// exact, not approximated: the raw-record wire layout (`crate::wire`'s
+/// module docs) is a fixed-size header, unlike postcard's variable-length
+/// framing this used to re-derive per record just to measure it.
 fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
     let budget = MAX_FRAME.saturating_sub(SNAPSHOT_CHUNK_ENVELOPE_HEADROOM);
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut current_size = 0usize;
     for rec in records {
-        let rec_size = postcard::to_stdvec(&rec).map_or(0, |bytes| bytes.len());
+        let rec_size =
+            wire::RECORD_HEADER_LEN + rec.key.len() + rec.value.as_ref().map_or(0, Bytes::len);
         let over_budget = current_size + rec_size > budget || current.len() >= SNAPSHOT_CHUNK_SIZE;
         if over_budget && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
@@ -153,13 +159,13 @@ pub trait ShardOps: Send + Sync {
     /// replication, state transfer, and anti-entropy repair.
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
-    /// [`ShardOps::apply_remote`] for a whole batch, applied under ONE
-    /// acquisition of the store's apply serialization lock rather than one
-    /// per record — per-record version checks and digest bookkeeping are
-    /// otherwise identical, and an [`crate::store::Event`] is still emitted
-    /// per record. The path `net::conn`'s coalesced [`crate::wire::Msg::ReplicateBatch`]
-    /// frames, state-transfer chunks, and anti-entropy pull batches all
-    /// apply through.
+    /// [`ShardOps::apply_remote`] for a whole batch, grouped by key stripe
+    /// (see [`stripe_of`]) and applied under one acquisition per touched
+    /// stripe rather than one per record — per-record version checks and digest
+    /// bookkeeping are otherwise identical, and an [`crate::store::Event`] is
+    /// still emitted per record. The path `net::conn`'s coalesced
+    /// [`crate::wire::Msg::ReplicateBatch`] frames, state-transfer chunks,
+    /// and anti-entropy pull batches all apply through.
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
 
     /// Applies an inbound invalidation: drops the local copy of `key` iff
@@ -288,6 +294,16 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// stored at `key` (`key`'s wire-encoded bytes) — wins. See the trait
     /// docs for the correctness contract this must satisfy.
     fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner;
+
+    /// Whether `winner` reads `RecordView::value`. Defaults to `true`,
+    /// preserving behavior for any resolver written before this method
+    /// existed. Override to `false` for a resolver — like [`LwwResolver`] —
+    /// that only ever compares `ver`/`expires_at_ms`: `Shard::apply_locked`
+    /// then skips postcard-encoding both records' values on every apply,
+    /// work such a resolver never uses.
+    fn needs_value_bytes(&self) -> bool {
+        true
+    }
 }
 
 /// The default resolver: last-write-wins by [`Hlc`], ignoring value bytes
@@ -300,6 +316,10 @@ impl ConflictResolver for LwwResolver {
     fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
         if a.ver >= b.ver { Winner::A } else { Winner::B }
     }
+
+    fn needs_value_bytes(&self) -> bool {
+        false
+    }
 }
 
 /// A stored value paired with the version it was last written at — the
@@ -310,6 +330,14 @@ impl ConflictResolver for LwwResolver {
 pub struct Stored<V> {
     /// The current value.
     pub value: V,
+    /// `value`'s postcard-encoded bytes, cached once at construction rather
+    /// than re-derived on every wire send: on the local-origin path (`insert`/
+    /// `insert_many`/`get_or_load`'s fill), the bytes produced by that first
+    /// encode; on the replica-apply path (`apply_remote_batch`), the
+    /// verbatim bytes received off the wire — never re-encoded from `value`.
+    /// Invariant: always equal to `postcard::to_stdvec(&value)`, or wire
+    /// bytes that decode to a `value` structurally equal to it.
+    pub encoded: Bytes,
     /// The version this value was written at.
     pub ver: Hlc,
     /// Absolute expiry in epoch milliseconds, or `None` for no TTL.
@@ -330,6 +358,9 @@ enum Incoming<V> {
     Put {
         value: V,
         expires_at_ms: Option<u64>,
+        /// `value`'s postcard-encoded bytes — see [`Stored::encoded`] for
+        /// which bytes this is on each apply path.
+        encoded: Bytes,
     },
     Tombstone,
 }
@@ -404,14 +435,39 @@ fn bucket_of(key_bytes: &[u8]) -> u16 {
     u16::try_from(bucket).expect("invariant: masked to BUCKET_COUNT - 1, always fits in u16")
 }
 
+/// Number of independent tombstone-map/apply-serialization lock stripes per
+/// shard: a fixed power-of-two smaller than [`BUCKET_COUNT`], big enough to
+/// let unrelated keys' writes proceed fully concurrently, small enough to
+/// avoid one-mutex-per-bucket overkill. Divides `BUCKET_COUNT` evenly, which
+/// [`stripe_of`] relies on.
+const TOMBSTONE_STRIPES: usize = 64;
+
+/// A key's tombstone-map/apply-serialization stripe. Reuses [`bucket_of`]'s
+/// hash rather than rehashing independently — the entire correctness
+/// argument for striping is that a given key always lands in the same
+/// stripe, exactly as it always lands in the same digest bucket, so two
+/// writes to the same key stay serialized against each other while writes to
+/// different keys may now interleave (never a correctness requirement — only
+/// same-key mutual exclusion is, see [`Shard::apply_locked`]'s docs).
+fn stripe_of(key_bytes: &[u8]) -> usize {
+    usize::from(bucket_of(key_bytes)) % TOMBSTONE_STRIPES
+}
+
+/// Worst-case postcard-encoded size of an [`Hlc`]: `wall_ms: u64` (up to 10
+/// LEB128 bytes) + `logical: u32` (up to 5) + `node: NodeId` (a `u64`, up to
+/// 10) = 25, rounded up for headroom.
+const HLC_ENCODED_MAX: usize = 32;
+
 /// `xxh3(key_bytes ‖ postcard(ver))` — the digest contribution of one live
-/// entry or tombstone (plan §8).
+/// entry or tombstone (plan §8). Encodes `ver` into a stack buffer rather
+/// than a heap `Vec`: a few bytes, computed on every apply.
 fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
-    let mut buf = Vec::with_capacity(key_bytes.len() + 20);
+    let mut ver_buf = [0u8; HLC_ENCODED_MAX];
+    let ver_bytes = postcard::to_slice(&ver, &mut ver_buf)
+        .expect("invariant: Hlc always postcard-encodes within HLC_ENCODED_MAX bytes");
+    let mut buf = Vec::with_capacity(key_bytes.len() + ver_bytes.len());
     buf.extend_from_slice(key_bytes);
-    buf.extend_from_slice(
-        &postcard::to_stdvec(&ver).expect("invariant: Hlc always postcard-encodes"),
-    );
+    buf.extend_from_slice(ver_bytes);
     xxh3_64(&buf)
 }
 
@@ -455,15 +511,31 @@ where
     mode: Mode,
     cache: moka::future::Cache<K, Arc<Stored<V>>>,
     events: broadcast::Sender<Event<K, V>>,
+    /// Internal-only notification channel: just `(key, origin)`, no value
+    /// clone, fed by every versioned write regardless of whether anyone is
+    /// subscribed to `events` (`fan_out_task`'s sole source of truth for
+    /// "what changed" — it re-fetches fresh wire bytes through
+    /// `records_for_typed` rather than reading a value off this channel, so
+    /// there is nothing here for it to be stale about). Kept separate from
+    /// `events` so the app-facing broadcast's `receiver_count()` reflects
+    /// only real external subscribers, making the "skip the value clone
+    /// when nobody's listening" guard on `events` meaningful.
+    fan_out: broadcast::Sender<(K, Origin)>,
     /// Guards only the synchronous HLC bump itself, never held across `.await`.
     clock: StdMutex<HlcClock>,
-    /// Also the apply-serialization lock: every versioned write holds this
-    /// for its whole read-decide-mutate sequence, moka calls included, so
-    /// concurrent applies to the shard can't interleave a stale decision.
-    /// Safe to hold across those `.await`s because the eviction listener
+    /// Also the apply-serialization lock, striped by key ([`stripe_of`]):
+    /// every versioned write holds only its key's stripe for that write's
+    /// whole read-decide-mutate sequence, moka calls included, so concurrent
+    /// applies to the *same* key can't interleave a stale decision — applies
+    /// to different keys can interleave freely, which is not a correctness
+    /// requirement (see [`Shard::apply_locked`]'s docs). Safe to hold a
+    /// stripe across those `.await`s because the eviction listener
     /// (which may fire synchronously from inside them) never touches this
-    /// lock — it only does lock-free atomic digest updates.
-    tombstones: Arc<AsyncMutex<HashMap<Bytes, Tombstone>>>,
+    /// lock — it only does lock-free atomic digest updates. A boxed slice of
+    /// [`TOMBSTONE_STRIPES`] independent maps rather than one
+    /// `Arc<AsyncMutex<_>>`, so no single acquisition ever spans more than
+    /// one stripe.
+    tombstones: Arc<[AsyncMutex<HashMap<Bytes, Tombstone>>]>,
     digest: Arc<[AtomicU64]>,
     ttl: Option<Duration>,
     tombstone_ttl_ms: u64,
@@ -514,8 +586,12 @@ where
             mode,
             cache,
             events: broadcast::channel(EVENTS_CAPACITY).0,
+            fan_out: broadcast::channel(EVENTS_CAPACITY).0,
             clock: StdMutex::new(HlcClock::new(node)),
-            tombstones: Arc::new(AsyncMutex::new(HashMap::new())),
+            tombstones: (0..TOMBSTONE_STRIPES)
+                .map(|_| AsyncMutex::new(HashMap::new()))
+                .collect::<Vec<_>>()
+                .into(),
             digest,
             ttl,
             tombstone_ttl_ms: duration_ms(ClusterConfig::default().tombstone_ttl),
@@ -677,9 +753,58 @@ where
         incoming: Incoming<V>,
         origin: Origin,
     ) {
-        let mut tombstones = self.tombstones.lock().await;
+        let mut tombstones = self.tombstones[stripe_of(&key_bytes)].lock().await;
         self.apply_locked(&mut tombstones, key, key_bytes, ver, incoming, origin)
             .await;
+    }
+
+    /// Whether `incoming` (at `ver`) loses to what's already stored at `sv`
+    /// (a live entry's value is `stored_live`, `None` if the current record
+    /// is a tombstone) — the [`ConflictResolver`]-consultation half of
+    /// [`Shard::apply_locked`]'s decision, factored out only to keep that
+    /// function's line count in check; behavior is identical to inlining it.
+    /// An equal version is always a loss (see [`Shard::apply`]'s docs), so
+    /// this only builds [`RecordView`]s and consults the resolver when
+    /// versions actually differ. Value bytes are populated only if
+    /// [`ConflictResolver::needs_value_bytes`] says the resolver reads them
+    /// — the built-in [`LwwResolver`] never does. Both sides borrow straight
+    /// from an already-cached [`Stored::encoded`]/`Incoming::Put`'s `encoded`,
+    /// so this never allocates or re-encodes.
+    fn incoming_loses(
+        &self,
+        key_bytes: &Bytes,
+        sv: Hlc,
+        stored_live: Option<&Stored<V>>,
+        ver: Hlc,
+        incoming: &Incoming<V>,
+    ) -> bool {
+        if sv == ver {
+            return true;
+        }
+        let needs_value_bytes = self.resolver.needs_value_bytes();
+        let stored_view = RecordView {
+            value: stored_live
+                .filter(|_| needs_value_bytes)
+                .map(|s| s.encoded.as_ref()),
+            ver: sv,
+            expires_at_ms: stored_live.and_then(|s| s.expires_at_ms),
+        };
+        let (incoming_encoded, incoming_expires_at_ms) = match incoming {
+            Incoming::Put {
+                encoded,
+                expires_at_ms,
+                ..
+            } => (Some(encoded), *expires_at_ms),
+            Incoming::Tombstone => (None, None),
+        };
+        let incoming_view = RecordView {
+            value: incoming_encoded
+                .filter(|_| needs_value_bytes)
+                .map(Bytes::as_ref),
+            ver,
+            expires_at_ms: incoming_expires_at_ms,
+        };
+        self.resolver.winner(key_bytes, stored_view, incoming_view) == Winner::A
     }
 
     /// The versioned-apply core, operating under a tombstone-map lock the
@@ -707,38 +832,10 @@ where
             .map(|t| t.ver)
             .or_else(|| stored_live.as_ref().map(|s| s.ver));
 
-        if let Some(sv) = stored_ver {
-            if sv == ver {
-                return;
-            }
-            let stored_value_bytes = stored_live.as_ref().map(|s| {
-                postcard::to_stdvec(&s.value)
-                    .expect("invariant: a value already resident in the cache postcard-encodes")
-            });
-            let stored_view = RecordView {
-                value: stored_value_bytes.as_deref(),
-                ver: sv,
-                expires_at_ms: stored_live.as_ref().and_then(|s| s.expires_at_ms),
-            };
-            let incoming_value_bytes = match &incoming {
-                Incoming::Put { value, .. } => Some(postcard::to_stdvec(value).expect(
-                    "invariant: value already validated to postcard-encode, by Shard::insert's \
-                     size check or by apply_remote's wire decode",
-                )),
-                Incoming::Tombstone => None,
-            };
-            let incoming_expires_at_ms = match &incoming {
-                Incoming::Put { expires_at_ms, .. } => *expires_at_ms,
-                Incoming::Tombstone => None,
-            };
-            let incoming_view = RecordView {
-                value: incoming_value_bytes.as_deref(),
-                ver,
-                expires_at_ms: incoming_expires_at_ms,
-            };
-            if self.resolver.winner(&key_bytes, stored_view, incoming_view) == Winner::A {
-                return;
-            }
+        if let Some(sv) = stored_ver
+            && self.incoming_loses(&key_bytes, sv, stored_live.as_deref(), ver, &incoming)
+        {
+            return;
         }
 
         let bucket = usize::from(bucket_of(&key_bytes));
@@ -763,27 +860,32 @@ where
             Incoming::Put {
                 value,
                 expires_at_ms,
+                encoded,
             } => {
                 let stored = Arc::new(Stored {
                     value,
+                    encoded,
                     ver,
                     expires_at_ms,
                 });
                 self.cache.insert(key.clone(), Arc::clone(&stored)).await;
-                let event = if had_live {
-                    Event::Updated {
-                        key,
-                        value: stored.value.clone(),
-                        origin,
-                    }
-                } else {
-                    Event::Created {
-                        key,
-                        value: stored.value.clone(),
-                        origin,
-                    }
-                };
-                let _ = self.events.send(event);
+                let _ = self.fan_out.send((key.clone(), origin));
+                if self.events.receiver_count() > 0 {
+                    let event = if had_live {
+                        Event::Updated {
+                            key,
+                            value: stored.value.clone(),
+                            origin,
+                        }
+                    } else {
+                        Event::Created {
+                            key,
+                            value: stored.value.clone(),
+                            origin,
+                        }
+                    };
+                    let _ = self.events.send(event);
+                }
             }
             Incoming::Tombstone => {
                 let deadline_ms = now_ms().saturating_add(self.tombstone_ttl_ms);
@@ -797,7 +899,10 @@ where
                 if had_live {
                     let _ = self.cache.remove(&key).await;
                 }
-                let _ = self.events.send(Event::Removed { key, origin });
+                let _ = self.fan_out.send((key.clone(), origin));
+                if self.events.receiver_count() > 0 {
+                    let _ = self.events.send(Event::Removed { key, origin });
+                }
             }
         }
     }
@@ -808,7 +913,7 @@ where
     /// `try_get_with_by_ref`). Called from within that call's stampede-
     /// collapsed init future, so it runs at most once per genuine miss.
     async fn record_fresh_load(&self, key_bytes: &Bytes, ver: Hlc) {
-        let mut tombstones = self.tombstones.lock().await;
+        let mut tombstones = self.tombstones[stripe_of(key_bytes)].lock().await;
         let bucket = usize::from(bucket_of(key_bytes));
         if let Some(t) = tombstones.remove(key_bytes) {
             self.digest[bucket].fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
@@ -837,9 +942,9 @@ where
     async fn collect_buckets(&self, wanted: &HashSet<u16>) -> BucketEntries {
         let mut by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> =
             wanted.iter().map(|&bucket| (bucket, Vec::new())).collect();
-        {
-            let tombstones = self.tombstones.lock().await;
-            for (key, tomb) in tombstones.iter() {
+        for stripe in self.tombstones.iter() {
+            let stripe = stripe.lock().await;
+            for (key, tomb) in stripe.iter() {
                 if let Some(slot) = by_bucket.get_mut(&bucket_of(key)) {
                     slot.push((key.clone(), tomb.ver));
                 }
@@ -865,6 +970,12 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a value the loader just returned fails to postcard-encode
+    /// (unexpected — the same bound `Shard::insert` already relies on to
+    /// build a wire frame from any `V`).
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
         F: AsyncFnOnce(&K) -> Result<V, E>,
@@ -877,16 +988,24 @@ where
                 let value = loader(key).await?;
                 let ver = self.stamp_local();
                 self.record_fresh_load(&key_bytes, ver).await;
+                let encoded = Bytes::from(
+                    postcard::to_stdvec(&value)
+                        .expect("invariant: a value returned by the loader postcard-encodes"),
+                );
                 let stored = Arc::new(Stored {
                     value,
+                    encoded,
                     ver,
                     expires_at_ms: self.ttl_expiry(),
                 });
-                let _ = self.events.send(Event::Created {
-                    key: key.clone(),
-                    value: stored.value.clone(),
-                    origin: Origin::Local,
-                });
+                let _ = self.fan_out.send((key.clone(), Origin::Local));
+                if self.events.receiver_count() > 0 {
+                    let _ = self.events.send(Event::Created {
+                        key: key.clone(),
+                        value: stored.value.clone(),
+                        origin: Origin::Local,
+                    });
+                }
                 Ok(stored)
             })
             .await
@@ -908,25 +1027,14 @@ where
     /// [`Shard::with_max_frame`], default [`MAX_FRAME`]).
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         let key_bytes = encode_key(&key)?;
-        let value_bytes = postcard::to_stdvec(&value).map_err(CodecError::from)?;
-        let value_len = value_bytes.len();
+        let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let ver = self.stamp_local();
         let expires_at_ms = self.ttl_expiry();
-        let wire_size = postcard::to_stdvec(&crate::wire::Msg::Replicate {
-            cache: self.name.clone(),
-            rec: WireRecord {
-                key: key_bytes.clone(),
-                value: Some(Bytes::from(value_bytes)),
-                ver,
-                expires_at_ms,
-            },
-        })
-        .map_err(CodecError::from)?
-        .len();
+        let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
                 cache: self.name.clone(),
-                size: value_len,
+                size: encoded.len(),
                 limit: self.max_frame,
             });
         }
@@ -937,6 +1045,7 @@ where
             Incoming::Put {
                 value,
                 expires_at_ms,
+                encoded,
             },
             Origin::Local,
         )
@@ -944,14 +1053,16 @@ where
         Ok(())
     }
 
-    /// [`Shard::insert`] for many entries, applied under one acquisition of
-    /// the apply serialization lock rather than one per entry — the
-    /// "amortized lock path" a bulk local fill wants. Each entry still gets
-    /// its own [`Hlc`] stamp and its own [`Event`]; this is not a
-    /// transaction, just a cheaper way to apply many independent writes:
-    /// entries validated before an oversized one are applied regardless of
-    /// the error this returns, and fan-out to the wire happens exactly as
-    /// for individual inserts (per-event, coalesced into
+    /// [`Shard::insert`] for many entries, grouped by key stripe
+    /// ([`stripe_of`]) and applied under one acquisition per touched stripe
+    /// rather than one per entry — the "amortized lock path" a bulk local
+    /// fill wants, bounded to a single stripe at a time so unrelated local
+    /// writers and inbound applies to other stripes aren't blocked for the
+    /// whole batch. Each entry still gets its own [`Hlc`] stamp and its own
+    /// [`Event`]; this is not a transaction, just a cheaper way to apply many
+    /// independent writes: entries validated before an oversized one are
+    /// applied regardless of the error this returns, and fan-out to the wire
+    /// happens exactly as for individual inserts (per-event, coalesced into
     /// [`crate::wire::Msg::ReplicateBatch`] frames by `net::conn`'s writer,
     /// never as one wire message here).
     ///
@@ -966,45 +1077,45 @@ where
         let mut prepared = Vec::new();
         for (key, value) in entries {
             let key_bytes = encode_key(&key)?;
-            let value_bytes = postcard::to_stdvec(&value).map_err(CodecError::from)?;
-            let value_len = value_bytes.len();
+            let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
             let ver = self.stamp_local();
             let expires_at_ms = self.ttl_expiry();
-            let wire_size = postcard::to_stdvec(&crate::wire::Msg::Replicate {
-                cache: self.name.clone(),
-                rec: WireRecord {
-                    key: key_bytes.clone(),
-                    value: Some(Bytes::from(value_bytes)),
-                    ver,
-                    expires_at_ms,
-                },
-            })
-            .map_err(CodecError::from)?
-            .len();
+            let wire_size =
+                wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
             if wire_size > self.max_frame {
                 return Err(CacheError::ValueTooLarge {
                     cache: self.name.clone(),
-                    size: value_len,
+                    size: encoded.len(),
                     limit: self.max_frame,
                 });
             }
-            prepared.push((key, key_bytes, ver, value, expires_at_ms));
+            prepared.push((key, key_bytes, ver, value, expires_at_ms, encoded));
         }
 
-        let mut tombstones = self.tombstones.lock().await;
-        for (key, key_bytes, ver, value, expires_at_ms) in prepared {
-            self.apply_locked(
-                &mut tombstones,
-                key,
-                key_bytes,
-                ver,
-                Incoming::Put {
-                    value,
-                    expires_at_ms,
-                },
-                Origin::Local,
-            )
-            .await;
+        let mut by_stripe: Vec<Vec<_>> = (0..TOMBSTONE_STRIPES).map(|_| Vec::new()).collect();
+        for entry in prepared {
+            by_stripe[stripe_of(&entry.1)].push(entry);
+        }
+        for (stripe_idx, group) in by_stripe.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let mut tombstones = self.tombstones[stripe_idx].lock().await;
+            for (key, key_bytes, ver, value, expires_at_ms, encoded) in group {
+                self.apply_locked(
+                    &mut tombstones,
+                    key,
+                    key_bytes,
+                    ver,
+                    Incoming::Put {
+                        value,
+                        expires_at_ms,
+                        encoded,
+                    },
+                    Origin::Local,
+                )
+                .await;
+            }
         }
         Ok(())
     }
@@ -1036,11 +1147,11 @@ where
         let Ok(key_bytes) = postcard::to_stdvec(key) else {
             return;
         };
-        // Serializes against `apply` on the same key; `remove` (not
-        // `invalidate`) so the departing version comes back directly rather
-        // than through the eviction listener, which may batch its
+        // Serializes against `apply` on the same key (same stripe); `remove`
+        // (not `invalidate`) so the departing version comes back directly
+        // rather than through the eviction listener, which may batch its
         // notification arbitrarily far past this call.
-        let _guard = self.tombstones.lock().await;
+        let _guard = self.tombstones[stripe_of(&key_bytes)].lock().await;
         if let Some(old) = self.cache.remove(key).await {
             let bucket = usize::from(bucket_of(&key_bytes));
             self.digest[bucket]
@@ -1052,6 +1163,77 @@ where
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event<K, V>> {
         self.events.subscribe()
+    }
+
+    /// Subscribes to this shard's lightweight `(key, origin)` fan-out
+    /// notifications — `fan_out_task`'s cheaper alternative to
+    /// subscribing on [`Shard::events`] directly, since it never reads
+    /// `Event`'s `value` at all.
+    pub(crate) fn fan_out_events(&self) -> broadcast::Receiver<(K, Origin)> {
+        self.fan_out.subscribe()
+    }
+
+    /// [`ShardOps::records_for`], but for callers that already hold typed
+    /// `K`s (`cluster::fan_out_batch`, re-fetching for keys it just read off
+    /// its own `Event<K, V>`s) — skips the postcard-decode-back-to-`K` step
+    /// the `Bytes`-keyed trait method needs, since there is no encode/decode
+    /// round trip to begin with.
+    pub(crate) async fn records_for_typed(&self, keys: &[K]) -> Vec<WireRecord> {
+        let mut pairs = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Ok(key_bytes) = encode_key(key) {
+                pairs.push((key.clone(), key_bytes));
+            }
+        }
+        self.records_for_pairs(pairs).await
+    }
+
+    /// Shared implementation of [`ShardOps::records_for`] and
+    /// [`Shard::records_for_typed`]: snapshots the tombstone entries for
+    /// `pairs`' keys grouped by stripe ([`stripe_of`]), one acquisition per
+    /// touched stripe (rather than one per key, and never
+    /// more than one stripe locked at a time), then reads live entries via
+    /// `moka`'s own concurrent-safe `get` outside any lock — mirroring
+    /// [`Shard::collect_buckets`]'s per-stripe scan pattern.
+    async fn records_for_pairs(&self, pairs: Vec<(K, Bytes)>) -> Vec<WireRecord> {
+        let mut by_stripe: Vec<Vec<usize>> = (0..TOMBSTONE_STRIPES).map(|_| Vec::new()).collect();
+        for (idx, (_, key_bytes)) in pairs.iter().enumerate() {
+            by_stripe[stripe_of(key_bytes)].push(idx);
+        }
+        let mut tomb_snapshot: HashMap<Bytes, Tombstone> = HashMap::new();
+        for (stripe_idx, indices) in by_stripe.into_iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let stripe = self.tombstones[stripe_idx].lock().await;
+            for idx in indices {
+                let key_bytes = &pairs[idx].1;
+                if let Some(t) = stripe.get(key_bytes) {
+                    tomb_snapshot.insert(key_bytes.clone(), *t);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(pairs.len());
+        for (key, key_bytes) in pairs {
+            if let Some(t) = tomb_snapshot.get(&key_bytes) {
+                out.push(WireRecord {
+                    key: key_bytes,
+                    value: None,
+                    ver: t.ver,
+                    expires_at_ms: None,
+                });
+                continue;
+            }
+            if let Some(stored) = self.cache.get(&key).await {
+                out.push(WireRecord {
+                    key: key_bytes,
+                    value: Some(stored.encoded.clone()),
+                    ver: stored.ver,
+                    expires_at_ms: stored.expires_at_ms,
+                });
+            }
+        }
+        out
     }
 }
 
@@ -1066,46 +1248,68 @@ where
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            let mut tombstones = self.tombstones.lock().await;
+            // Grouping by raw key bytes' stripe needs no decode: `stripe_of`
+            // reuses `bucket_of`'s hash, which only ever looks at the wire
+            // bytes. Preserves each group's relative order (same key always
+            // lands in the same stripe, in the order it appeared in `recs`),
+            // which is all `apply_locked`'s per-key serialization needs —
+            // order between different keys was never a requirement.
+            let mut by_stripe: Vec<Vec<WireRecord>> =
+                (0..TOMBSTONE_STRIPES).map(|_| Vec::new()).collect();
             for rec in recs {
                 self.observe_remote(rec.ver);
-                let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
-                    tracing::warn!(cache = %self.name, "apply_remote_batch: undecodable key bytes");
+                by_stripe[stripe_of(&rec.key)].push(rec);
+            }
+            for (stripe_idx, group) in by_stripe.into_iter().enumerate() {
+                if group.is_empty() {
                     continue;
-                };
-                let origin = Origin::Remote(rec.ver.node);
-                match rec.value {
-                    Some(value_bytes) => {
-                        let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
-                            tracing::warn!(
-                                cache = %self.name,
-                                "apply_remote_batch: undecodable value bytes"
-                            );
-                            continue;
-                        };
-                        self.apply_locked(
-                            &mut tombstones,
-                            key,
-                            rec.key,
-                            rec.ver,
-                            Incoming::Put {
-                                value,
-                                expires_at_ms: rec.expires_at_ms,
-                            },
-                            origin,
-                        )
-                        .await;
-                    }
-                    None => {
-                        self.apply_locked(
-                            &mut tombstones,
-                            key,
-                            rec.key,
-                            rec.ver,
-                            Incoming::Tombstone,
-                            origin,
-                        )
-                        .await;
+                }
+                let mut tombstones = self.tombstones[stripe_idx].lock().await;
+                for rec in group {
+                    let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
+                        tracing::warn!(cache = %self.name, "apply_remote_batch: undecodable key bytes");
+                        continue;
+                    };
+                    let origin = Origin::Remote(rec.ver.node);
+                    match rec.value {
+                        Some(value_bytes) => {
+                            let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
+                                tracing::warn!(
+                                    cache = %self.name,
+                                    "apply_remote_batch: undecodable value bytes"
+                                );
+                                continue;
+                            };
+                            self.apply_locked(
+                                &mut tombstones,
+                                key,
+                                rec.key,
+                                rec.ver,
+                                Incoming::Put {
+                                    value,
+                                    expires_at_ms: rec.expires_at_ms,
+                                    // The verbatim bytes just received off
+                                    // the wire, not a fresh re-encode of
+                                    // `value` — decoded once above only to
+                                    // satisfy the resolver/typed-cache
+                                    // boundary.
+                                    encoded: value_bytes,
+                                },
+                                origin,
+                            )
+                            .await;
+                        }
+                        None => {
+                            self.apply_locked(
+                                &mut tombstones,
+                                key,
+                                rec.key,
+                                rec.ver,
+                                Incoming::Tombstone,
+                                origin,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -1120,7 +1324,7 @@ where
                 return;
             };
 
-            let tombstones = self.tombstones.lock().await;
+            let tombstones = self.tombstones[stripe_of(&key)].lock().await;
             let prior_tombstone = tombstones.get(&key).copied();
             let stored_ver = match prior_tombstone {
                 Some(t) => Some(t.ver),
@@ -1180,34 +1384,15 @@ where
 
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         Box::pin(async move {
-            let mut out = Vec::with_capacity(keys.len());
-            for key_bytes in keys {
-                let Ok(key) = postcard::from_bytes::<K>(&key_bytes) else {
-                    continue;
-                };
-                let tomb = self.tombstones.lock().await.get(&key_bytes).copied();
-                if let Some(t) = tomb {
-                    out.push(WireRecord {
-                        key: key_bytes,
-                        value: None,
-                        ver: t.ver,
-                        expires_at_ms: None,
-                    });
-                    continue;
-                }
-                if let Some(stored) = self.cache.get(&key).await {
-                    let Ok(value_bytes) = postcard::to_stdvec(&stored.value) else {
-                        continue;
-                    };
-                    out.push(WireRecord {
-                        key: key_bytes,
-                        value: Some(Bytes::from(value_bytes)),
-                        ver: stored.ver,
-                        expires_at_ms: stored.expires_at_ms,
-                    });
-                }
-            }
-            out
+            let pairs: Vec<(K, Bytes)> = keys
+                .into_iter()
+                .filter_map(|key_bytes| {
+                    postcard::from_bytes::<K>(&key_bytes)
+                        .ok()
+                        .map(|key| (key, key_bytes))
+                })
+                .collect();
+            self.records_for_pairs(pairs).await
         })
     }
 
@@ -1219,27 +1404,22 @@ where
                 .iter()
                 .filter_map(|(key, stored)| {
                     let key_bytes = postcard::to_stdvec(&*key).ok()?;
-                    let value_bytes = postcard::to_stdvec(&stored.value).ok()?;
                     Some(WireRecord {
                         key: Bytes::from(key_bytes),
-                        value: Some(Bytes::from(value_bytes)),
+                        value: Some(stored.encoded.clone()),
                         ver: stored.ver,
                         expires_at_ms: stored.expires_at_ms,
                     })
                 })
                 .collect();
-            records.extend(
-                tombstones
-                    .lock()
-                    .await
-                    .iter()
-                    .map(|(key_bytes, t)| WireRecord {
-                        key: key_bytes.clone(),
-                        value: None,
-                        ver: t.ver,
-                        expires_at_ms: None,
-                    }),
-            );
+            for stripe in tombstones.iter() {
+                records.extend(stripe.lock().await.iter().map(|(key_bytes, t)| WireRecord {
+                    key: key_bytes.clone(),
+                    value: None,
+                    ver: t.ver,
+                    expires_at_ms: None,
+                }));
+            }
             chunk_records_for_snapshot(records)
         };
         Box::pin(stream::once(fut).flat_map(stream::iter))
@@ -1248,17 +1428,18 @@ where
     fn gc_tombstones(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let now = now_ms();
-            let mut tombstones = self.tombstones.lock().await;
             let digest = &self.digest;
-            tombstones.retain(|key_bytes, t| {
-                let keep = t.gc_deadline_ms > now;
-                if !keep {
-                    let bucket = usize::from(bucket_of(key_bytes));
-                    digest[bucket]
-                        .fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
-                }
-                keep
-            });
+            for stripe in self.tombstones.iter() {
+                stripe.lock().await.retain(|key_bytes, t| {
+                    let keep = t.gc_deadline_ms > now;
+                    if !keep {
+                        let bucket = usize::from(bucket_of(key_bytes));
+                        digest[bucket]
+                            .fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
+                    }
+                    keep
+                });
+            }
         })
     }
 
@@ -1610,6 +1791,93 @@ mod tests {
         assert_eq!(b.get(&42).await, None);
     }
 
+    /// The first `u32` from `1` on whose stripe differs from key `0`'s —
+    /// used by the striping tests below to get two real keys guaranteed to
+    /// serialize independently, without depending on any hash's exact
+    /// output.
+    fn two_keys_in_different_stripes() -> (u32, u32) {
+        let a = 0u32;
+        let a_stripe = stripe_of(&key_bytes(&a));
+        let b = (1u32..10_000)
+            .find(|b| stripe_of(&key_bytes(b)) != a_stripe)
+            .expect("some key among the first 10,000 lands in a different stripe from key 0");
+        (a, b)
+    }
+
+    /// Direct proof of the striping property: an `insert` for a key in one
+    /// stripe must not block on another stripe's lock being held.
+    /// Would fail if the striping regressed back to a single global mutex —
+    /// see the companion `_blocks_` test below for the negative control that
+    /// confirms this held lock is the very one `apply_locked` acquires.
+    #[tokio::test]
+    async fn insert_to_a_different_stripe_proceeds_while_another_stripe_is_locked() {
+        let s = shard::<u32, String>(1);
+        let (key_a, key_b) = two_keys_in_different_stripes();
+        let stripe_a = stripe_of(&key_bytes(&key_a));
+
+        let _guard = s.tombstones[stripe_a].lock().await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), s.insert(key_b, "b".into())).await;
+        assert!(
+            result.is_ok(),
+            "an insert to a different stripe must not block on another stripe's held lock"
+        );
+    }
+
+    /// Negative control for the test above: an `insert` for a key *in* the
+    /// held stripe must block until that stripe's lock is released, proving
+    /// the held guard exercises the same lock `apply_locked` acquires (so
+    /// the "proceeds" test above is actually exercising cross-stripe
+    /// concurrency, not just a no-op lock).
+    #[tokio::test]
+    async fn insert_to_the_same_stripe_blocks_while_that_stripe_is_locked() {
+        let s = shard::<u32, String>(1);
+        let (key_a, _) = two_keys_in_different_stripes();
+        let stripe_a = stripe_of(&key_bytes(&key_a));
+
+        let _guard = s.tombstones[stripe_a].lock().await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), s.insert(key_a, "a".into())).await;
+        assert!(
+            result.is_err(),
+            "an insert to a key whose stripe is already held must block until released"
+        );
+    }
+
+    /// Spawns concurrent `insert` tasks against keys chosen to land in
+    /// distinct stripes and confirms every one lands — the end-to-end
+    /// counterpart to the lock-holding tests above, exercising real
+    /// concurrent scheduling (not just a manually held guard) across
+    /// [`TOMBSTONE_STRIPES`]-many independent stripes at once.
+    #[tokio::test]
+    async fn concurrent_inserts_across_many_stripes_all_land() {
+        let s = Arc::new(shard::<u32, String>(1));
+        let mut keys = vec![0u32];
+        let mut seen_stripes = HashSet::from([stripe_of(&key_bytes(&0u32))]);
+        let mut candidate = 1u32;
+        while seen_stripes.len() < TOMBSTONE_STRIPES.min(16) {
+            if seen_stripes.insert(stripe_of(&key_bytes(&candidate))) {
+                keys.push(candidate);
+            }
+            candidate += 1;
+        }
+
+        let handles: Vec<_> = keys
+            .iter()
+            .copied()
+            .map(|k| {
+                let s = Arc::clone(&s);
+                tokio::spawn(async move { s.insert(k, format!("v{k}")).await })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.expect("task did not panic").expect("insert");
+        }
+        for k in keys {
+            assert_eq!(s.get(&k).await, Some(format!("v{k}")));
+        }
+    }
+
     /// Plan §7: lifespan travels as an *absolute* `expires_at_ms`, computed
     /// once at the origin. `a` is built with a TTL; `b` is not — proving the
     /// deadline that ultimately expires `b`'s copy is the one baked into the
@@ -1662,7 +1930,8 @@ mod tests {
         // Force the tombstone already recorded to read as expired.
         s.tombstone_ttl_ms = 0;
         {
-            let mut tombstones = s.tombstones.lock().await;
+            let stripe = stripe_of(&key_bytes(&1u32));
+            let mut tombstones = s.tombstones[stripe].lock().await;
             for t in tombstones.values_mut() {
                 t.gc_deadline_ms = 0;
             }
@@ -1726,8 +1995,10 @@ mod tests {
             expected[usize::from(bucket_of(&key_bytes))] ^=
                 entry_fingerprint(&key_bytes, stored.ver);
         }
-        for (key_bytes, t) in s.tombstones.lock().await.iter() {
-            expected[usize::from(bucket_of(key_bytes))] ^= entry_fingerprint(key_bytes, t.ver);
+        for stripe in s.tombstones.iter() {
+            for (key_bytes, t) in stripe.lock().await.iter() {
+                expected[usize::from(bucket_of(key_bytes))] ^= entry_fingerprint(key_bytes, t.ver);
+            }
         }
         for (bucket, digest) in ShardOps::digests(s).await {
             assert_eq!(

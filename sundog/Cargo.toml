@@ -34,6 +34,7 @@ tokio-util = { version = "0.7.19", features = ["codec", "rt"] }
 tracing = "0.1.44"
 turmoil = { version = "0.7.2", optional = true }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+zerocopy = { version = "0.8.56", features = ["derive"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"
@@ -41,12 +42,12 @@ proptest = "1.11.0"
 rcgen = "0.14.9"
 # Container-based integration tests (`tests/container_util`): rightsize is
 # the only permitted way to run containers in this repo — no docker CLI, no
-# bollard (see docs/HOUSE_RULES.md). `rightsize-modules` pulls in both
-# backend crates by default; the container harness itself only drives plain
-# `rightsize::Container`s, but `register_default_backends` needs the
-# backends linked in.
+# bollard. Docker backend only: this repo never selects the msb backend
+# (RIGHTSIZE_BACKEND=docker throughout), and backend-msb's ureq dependency
+# requests rustls's `ring` provider, which collides with the `tls` feature's
+# aws-lc-rs under feature unification (rustls panics when both are present).
 rightsize = "0.7.5"
-rightsize-modules = "0.7.5"
+rightsize-modules = { version = "0.7.5", default-features = false, features = ["backend-docker"] }
 tokio = { version = "1.53.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 

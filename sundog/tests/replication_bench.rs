@@ -10,10 +10,9 @@
 //! compiles and "passes" this binary without spending the wall-clock a
 //! 100k-entry replication run costs.
 //!
-//! Both scenarios below share the process-wide wire counters in
+//! All scenarios below share the process-wide wire counters in
 //! `sundog::net` (`frames_sent_total`/`bytes_sent_total`), so run this
-//! binary single-threaded or the two scenarios' deltas bleed into each
-//! other:
+//! binary single-threaded or the scenarios' deltas bleed into each other:
 //!
 //! ```text
 //! SUNDOG_BENCH=1 cargo test --release -p sundog --test replication_bench \
@@ -208,6 +207,86 @@ async fn steady_small_writes() {
     let per_write_micros = elapsed.as_secs_f64() * 1_000_000.0 / f64::from(ENTRIES);
     println!(
         "BENCH steady_small_writes entries={ENTRIES} wall_secs={:.3} \
+         per_write_micros={per_write_micros:.1} frames_sent_total={frames} bytes_sent_total={bytes}",
+        elapsed.as_secs_f64(),
+    );
+
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+}
+
+/// [`steady_small_writes`]'s single-task baseline, but driven by `WRITERS`
+/// concurrent tasks writing disjoint keys to the same node's cache handle at
+/// once — the shape the apply-serialization lock's per-key-bucket striping
+/// exists for, which `steady_small_writes`' single-task loop can never
+/// exercise regardless of how cheap a single `insert` call is. A single
+/// global apply lock would serialize every concurrent writer here no matter
+/// which keys they touch; striping lets writers whose keys land in different
+/// stripes proceed independently, so this scenario's `per_write_micros` is
+/// the number a striped lock should visibly improve, unlike
+/// `steady_small_writes`' or `bulk_insert_replication`'s (both single-task,
+/// sequential inserts).
+///
+/// Multi-threaded runtime, unlike every other test in this binary — the
+/// point is real cross-core parallelism putting actual lock contention on
+/// the apply-serialization stripe(s), which a single-threaded runtime's
+/// cooperative task interleaving can't produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_small_writes() {
+    const ENTRIES: u32 = 5_000;
+    const WRITERS: u32 = 16;
+
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let clusters = peer_group("bench-concurrent-writes", 2).await;
+    let [cluster_a, cluster_b] = <[Cluster; 2]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 2) returns exactly 2 clusters"));
+
+    let (cache_a, cache_b) = tokio::join!(
+        cluster_a
+            .cache::<u32, String>("concurrent")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_b
+            .cache::<u32, String>("concurrent")
+            .mode(Mode::Replicated)
+            .open(),
+    );
+    let cache_a = cache_a.expect("a opens");
+    let _cache_b = cache_b.expect("b opens");
+
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+
+    let writers = usize::try_from(WRITERS).expect("WRITERS fits in usize");
+    let started = Instant::now();
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let cache_a = cache_a.clone();
+            tokio::spawn(async move {
+                for i in (writer..ENTRIES).step_by(writers) {
+                    cache_a
+                        .insert(i, bench_value(i))
+                        .await
+                        .expect("insert succeeds");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.await.expect("writer task did not panic");
+    }
+    let elapsed = started.elapsed();
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+
+    let per_write_micros = elapsed.as_secs_f64() * 1_000_000.0 / f64::from(ENTRIES);
+    println!(
+        "BENCH concurrent_small_writes entries={ENTRIES} writers={WRITERS} wall_secs={:.3} \
          per_write_micros={per_write_micros:.1} frames_sent_total={frames} bytes_sent_total={bytes}",
         elapsed.as_secs_f64(),
     );

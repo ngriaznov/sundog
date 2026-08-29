@@ -136,16 +136,17 @@ pub(crate) async fn run_round_against(
     // batch that lands raises local versions, shrinking the next round's
     // diff, instead of one all-or-nothing exchange racing a request timeout.
     for batch in push_keys.chunks(REPAIR_BATCH) {
-        for rec in shard.records_for(batch.to_vec()).await {
-            mesh.send(
-                peer,
-                MsgClass::Replicate,
-                Msg::Replicate {
-                    cache: cache.clone(),
-                    rec,
-                },
-            );
-        }
+        let msgs = shard
+            .records_for(batch.to_vec())
+            .await
+            .into_iter()
+            .map(|rec| Msg::Replicate {
+                cache: cache.clone(),
+                rec,
+            });
+        // One peer-table lock acquisition for the whole batch rather than
+        // one per record (see `Mesh::send_many`'s docs).
+        mesh.send_many(peer, MsgClass::Replicate, msgs);
         repaired += batch.len() as u64;
     }
     for batch in pull_keys.chunks(REPAIR_BATCH) {

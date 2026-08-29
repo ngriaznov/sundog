@@ -137,7 +137,8 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
         | Msg::StChunk { .. }
         | Msg::AeDigest { .. }
         | Msg::AeBucket { .. }
-        | Msg::AePull { .. } => {}
+        | Msg::AePull { .. }
+        | Msg::ReqDone => {}
     }
 }
 

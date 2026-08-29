@@ -8,6 +8,12 @@ Binding for all code in this repo. Read alongside `docs/BUILD_PLAN.md`.
 - Must pass, in order: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -W clippy::pedantic`, `cargo test --workspace`.
 - No `unsafe`. No `unwrap()`/`expect()` in library paths except with an `expect("invariant: …")` stating why it cannot fail. Tests may unwrap freely.
 
+## Hard rules (owner-set)
+
+- **No plan projection into product documentation.** README, ROADMAP, CHANGELOG, rustdoc (`///` and `//!`), and CI/config comments never cite `docs/BUILD_PLAN.md`, `docs/HOUSE_RULES.md`, or "plan §N". Where a citation carried rationale, state the rationale inline in the doc's own voice; otherwise drop it. The plan documents stay in `docs/` as internal records only.
+- **No Infinispan mentions** in product documentation or code — sundog is described on its own terms.
+- Product prose is plain and frictionless: no marketing adjectives, no hedges or filler, no process narration ("previously", "replaced", "pulled forward") — everything described as-is.
+
 ## Style
 
 - **Minimal comments.** Comment only invariants and constraints the code cannot express (e.g. "moka iteration is weakly consistent — safe because apply is idempotent"). No narration, no section banners, no "what the next line does".

@@ -182,7 +182,7 @@ where
             cluster.spawn_tracked(crate::cluster::fan_out_task(
                 Arc::clone(&shard),
                 cluster.clone(),
-                shard.events(),
+                shard.fan_out_events(),
                 name.clone(),
                 mode,
                 cluster.cancel_token(),

@@ -94,7 +94,10 @@ that might change).
 A burst of writes — `insert_many`, or plain back-to-back `insert` calls —
 fans out over the wire as coalesced `Replicate` batches rather than one
 frame per key, so replication throughput scales with the burst instead of
-the per-message overhead.
+the per-message overhead. Record-carrying frames encode and decode without
+copying key/value bytes, writes to different keys apply concurrently (only
+same-key writes serialize against each other), and anti-entropy/state-transfer
+requests reuse pooled connections instead of dialing fresh every round.
 
 ## The three modes
 

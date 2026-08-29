@@ -1,28 +1,31 @@
 //! The `Invalidate`-class per-peer outbox: a bounded FIFO that drops the
-//! *oldest* queued message on overflow (plan §6) rather than rejecting the
+//! *oldest* queued entry on overflow (plan §6) rather than rejecting the
 //! newest, because an invalidation storm on a dead peer must never stall
 //! writers. `Replicate`-class traffic uses a plain `tokio::sync::mpsc`
 //! channel instead (see `net::conn`), since its overflow policy — drop the
-//! new message — is exactly what `try_send` already gives for free.
+//! new entry — is exactly what `try_send` already gives for free.
+//!
+//! Generic over the queued element type `T` (`super::OutFrame` in
+//! production: a message paired with its already-encoded wire frame)
+//! purely so this drop-policy logic is provably independent of what is
+//! actually being queued; see this module's tests.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use tokio::sync::Notify;
 
-use crate::wire::Msg;
-
 /// A bounded queue that discards its oldest entry rather than rejecting a
 /// push once full. `push` is synchronous and non-blocking, matching
 /// [`super::Mesh::send`]'s fire-and-forget contract; `pop` is the async side
 /// the per-peer writer task awaits.
-pub(super) struct DropOldestQueue {
-    inner: Mutex<VecDeque<Msg>>,
+pub(super) struct DropOldestQueue<T> {
+    inner: Mutex<VecDeque<T>>,
     notify: Notify,
     capacity: usize,
 }
 
-impl DropOldestQueue {
+impl<T> DropOldestQueue<T> {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
@@ -31,9 +34,9 @@ impl DropOldestQueue {
         }
     }
 
-    /// Enqueues `msg`, dropping the oldest queued message first if already
+    /// Enqueues `item`, dropping the oldest queued entry first if already
     /// at capacity. Never blocks.
-    pub(super) fn push(&self, msg: Msg) {
+    pub(super) fn push(&self, item: T) {
         let mut queue = self
             .inner
             .lock()
@@ -41,25 +44,25 @@ impl DropOldestQueue {
         if queue.len() >= self.capacity {
             queue.pop_front();
         }
-        queue.push_back(msg);
+        queue.push_back(item);
         drop(queue);
         self.notify.notify_one();
     }
 
-    /// Removes and returns the oldest queued message if one is present,
+    /// Removes and returns the oldest queued entry if one is present,
     /// without waiting — the non-blocking counterpart to
     /// [`DropOldestQueue::pop`], for draining whatever is already queued
     /// once the writer has been woken (Aeron-style smart batching: coalesce
     /// only what's already there, never wait for more).
-    pub(super) fn try_pop(&self) -> Option<Msg> {
+    pub(super) fn try_pop(&self) -> Option<T> {
         self.inner
             .lock()
             .expect("invariant: outbox mutex is never held across a panic")
             .pop_front()
     }
 
-    /// Waits for and removes the oldest queued message.
-    pub(super) async fn pop(&self) -> Msg {
+    /// Waits for and removes the oldest queued entry.
+    pub(super) async fn pop(&self) -> T {
         loop {
             let notified = self.notify.notified();
             {
@@ -67,8 +70,8 @@ impl DropOldestQueue {
                     .inner
                     .lock()
                     .expect("invariant: outbox mutex is never held across a panic");
-                if let Some(msg) = queue.pop_front() {
-                    return msg;
+                if let Some(item) = queue.pop_front() {
+                    return item;
                 }
             }
             notified.await;
@@ -79,49 +82,26 @@ impl DropOldestQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::NodeId;
-    use smol_str::SmolStr;
-
-    fn sample(n: u64) -> Msg {
-        Msg::Invalidate {
-            cache: SmolStr::new("users"),
-            key: bytes::Bytes::from(n.to_be_bytes().to_vec()),
-            ver: crate::hlc::Hlc {
-                wall_ms: n,
-                logical: 0,
-                node: NodeId::from(n),
-            },
-        }
-    }
-
-    fn key_of(msg: &Msg) -> u64 {
-        match msg {
-            Msg::Invalidate { key, .. } => {
-                u64::from_be_bytes(key.as_ref().try_into().expect("8-byte key"))
-            }
-            _ => unreachable!("test only pushes Invalidate messages"),
-        }
-    }
 
     #[tokio::test]
     async fn overflow_drops_the_oldest_entry() {
         let queue = DropOldestQueue::new(2);
-        queue.push(sample(1));
-        queue.push(sample(2));
-        queue.push(sample(3)); // 1 should be dropped, not 3
+        queue.push(1u64);
+        queue.push(2u64);
+        queue.push(3u64); // 1 should be dropped, not 3
 
-        assert_eq!(key_of(&queue.pop().await), 2);
-        assert_eq!(key_of(&queue.pop().await), 3);
+        assert_eq!(queue.pop().await, 2);
+        assert_eq!(queue.pop().await, 3);
     }
 
     #[test]
     fn try_pop_drains_without_waiting_then_returns_none() {
         let queue = DropOldestQueue::new(4);
         assert!(queue.try_pop().is_none());
-        queue.push(sample(1));
-        queue.push(sample(2));
-        assert_eq!(key_of(&queue.try_pop().expect("first queued")), 1);
-        assert_eq!(key_of(&queue.try_pop().expect("second queued")), 2);
+        queue.push(1u64);
+        queue.push(2u64);
+        assert_eq!(queue.try_pop().expect("first queued"), 1);
+        assert_eq!(queue.try_pop().expect("second queued"), 2);
         assert!(queue.try_pop().is_none());
     }
 
@@ -133,8 +113,8 @@ mod tests {
             async move { queue.pop().await }
         });
         tokio::task::yield_now().await;
-        queue.push(sample(42));
+        queue.push(42u64);
         let got = waiter.await.expect("task did not panic");
-        assert_eq!(key_of(&got), 42);
+        assert_eq!(got, 42);
     }
 }

@@ -22,6 +22,13 @@ pub enum CodecError {
     /// postcard failed to serialize or deserialize a value.
     #[error("postcard codec error")]
     Postcard(#[from] postcard::Error),
+    /// A raw-record frame (`Replicate`/`ReplicateBatch`/`StChunk`, see
+    /// `crate::wire`'s module docs) failed to parse: a header didn't fit,
+    /// a length field pointed past the frame's end, the cache name wasn't
+    /// valid UTF-8, or a length exceeded what the layout's fixed-width
+    /// fields can hold.
+    #[error("malformed record frame: {0}")]
+    MalformedFrame(&'static str),
     /// The underlying I/O stream failed.
     #[error("i/o error on the data-plane connection")]
     Io(#[from] io::Error),

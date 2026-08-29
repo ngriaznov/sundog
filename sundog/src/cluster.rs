@@ -41,9 +41,9 @@ use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{Membership, Peer};
-use crate::net::{InboundMsg, Mesh, MsgClass, RequestHandler};
+use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler};
 use crate::node::{NodeId, NodeName};
-use crate::store::{Event, Mode, Origin, Shard, ShardOps};
+use crate::store::{Mode, Origin, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`
@@ -527,53 +527,121 @@ async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken)
     }
 }
 
+/// Cap on how many already-queued inbound messages [`inbound_loop`] drains
+/// per wake — bounds one iteration's work under a multi-peer burst rather
+/// than draining an unbounded backlog before dispatching anything (mirrors
+/// [`FAN_OUT_DRAIN_CAP`]'s role on the outbound side).
+const INBOUND_DRAIN_CAP: usize = 1024;
+
+/// Applies one accumulated same-cache run of `Replicate`/`ReplicateBatch`
+/// records under one `apply_remote_batch` call, looking `cache` up in
+/// `shard_cache` first (memoized per drained batch by [`inbound_loop`]) so a
+/// run's cache name costs at most one `shards` registry lock acquisition no
+/// matter how many runs land on it.
+async fn apply_pending_replicate(
+    shards: &ShardRegistry,
+    shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
+    cache: SmolStr,
+    recs: Vec<WireRecord>,
+) {
+    let shard = shard_cache
+        .entry(cache.clone())
+        .or_insert_with(|| lookup_shard(shards, &cache));
+    if let Some(shard) = shard {
+        shard.apply_remote_batch(recs).await;
+    } else {
+        tracing::trace!(%cache, "replicate batch for unknown cache; dropped");
+    }
+}
+
 /// The single consumer of `Mesh`'s inbound-message channel: dispatches
-/// `Invalidate`/`Replicate` to the named shard. A cache name with no
-/// registered shard is dropped with a trace event rather than an error — the
-/// opening side may simply not have called `open()` for it yet.
+/// `Invalidate`/`Replicate`/`ReplicateBatch` to the named shard. A cache name
+/// with no registered shard is dropped with a trace event rather than an
+/// error — the opening side may simply not have called `open()` for it yet.
+///
+/// Drains a bounded batch of already-queued messages per wake with
+/// `recv_many` (mirroring `fan_out_task`'s own drain-then-dispatch pattern)
+/// rather than one `shards` registry lookup per message: within one drained
+/// batch, a cache name is looked up at most once, and a run of consecutive
+/// same-cache `Replicate`/`ReplicateBatch` messages is coalesced into one
+/// `apply_remote_batch` call. `Invalidate` has no batched form, so it is
+/// still applied one message at a time, and — like any message that isn't
+/// part of the current run — ends whatever replicate run was in progress
+/// first. This changes nothing about *what* gets applied or in what order
+/// relative to today (every message is still applied exactly once, in the
+/// order it was drained): only how many times the registry lock and the
+/// per-record apply lock are acquired to do it.
 async fn inbound_loop(
     shards: ShardRegistry,
     mut inbound: mpsc::Receiver<InboundMsg>,
     cancel: CancellationToken,
 ) {
+    let mut drained: Vec<InboundMsg> = Vec::with_capacity(INBOUND_DRAIN_CAP);
     loop {
+        drained.clear();
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            received = inbound.recv() => {
-                let Some(InboundMsg { from, msg }) = received else { return };
-                match msg {
-                    Msg::Invalidate { cache, key, ver } => {
-                        if let Some(shard) = lookup_shard(&shards, &cache) {
-                            shard.invalidate(key, ver).await;
-                        } else {
-                            tracing::trace!(%cache, %from, "invalidate for unknown cache; dropped");
-                        }
-                    }
-                    Msg::Replicate { cache, rec } => {
-                        if let Some(shard) = lookup_shard(&shards, &cache) {
-                            shard.apply_remote(rec).await;
-                        } else {
-                            tracing::trace!(%cache, %from, "replicate for unknown cache; dropped");
-                        }
-                    }
-                    Msg::ReplicateBatch { cache, recs } => {
-                        if let Some(shard) = lookup_shard(&shards, &cache) {
-                            shard.apply_remote_batch(recs).await;
-                        } else {
-                            tracing::trace!(%cache, %from, "replicate batch for unknown cache; dropped");
-                        }
-                    }
-                    // `Hello` and the request/response messages never reach
-                    // this channel — `net::Mesh` handles those inline.
-                    Msg::Hello { .. }
-                    | Msg::StRequest { .. }
-                    | Msg::StChunk { .. }
-                    | Msg::AeDigest { .. }
-                    | Msg::AeBucket { .. }
-                    | Msg::AePull { .. } => {}
+            received = inbound.recv_many(&mut drained, INBOUND_DRAIN_CAP) => {
+                if received == 0 {
+                    return; // channel closed, nothing left to drain
                 }
             }
+        }
+
+        let mut shard_cache: HashMap<SmolStr, Option<Arc<dyn ShardOps>>> = HashMap::new();
+        let mut pending: Option<(SmolStr, Vec<WireRecord>)> = None;
+        for InboundMsg { from, msg } in drained.drain(..) {
+            match msg {
+                Msg::Replicate { cache, rec } => match &mut pending {
+                    Some((pending_cache, recs)) if *pending_cache == cache => recs.push(rec),
+                    _ => {
+                        if let Some((old_cache, old_recs)) = pending.take() {
+                            apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
+                                .await;
+                        }
+                        pending = Some((cache, vec![rec]));
+                    }
+                },
+                Msg::ReplicateBatch { cache, mut recs } => match &mut pending {
+                    Some((pending_cache, pending_recs)) if *pending_cache == cache => {
+                        pending_recs.append(&mut recs);
+                    }
+                    _ => {
+                        if let Some((old_cache, old_recs)) = pending.take() {
+                            apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
+                                .await;
+                        }
+                        pending = Some((cache, recs));
+                    }
+                },
+                Msg::Invalidate { cache, key, ver } => {
+                    if let Some((old_cache, old_recs)) = pending.take() {
+                        apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
+                            .await;
+                    }
+                    let shard = shard_cache
+                        .entry(cache.clone())
+                        .or_insert_with(|| lookup_shard(&shards, &cache));
+                    if let Some(shard) = shard {
+                        shard.invalidate(key, ver).await;
+                    } else {
+                        tracing::trace!(%cache, %from, "invalidate for unknown cache; dropped");
+                    }
+                }
+                // `Hello` and the request/response messages never reach
+                // this channel — `net::Mesh` handles those inline.
+                Msg::Hello { .. }
+                | Msg::StRequest { .. }
+                | Msg::StChunk { .. }
+                | Msg::AeDigest { .. }
+                | Msg::AeBucket { .. }
+                | Msg::AePull { .. }
+                | Msg::ReqDone => {}
+            }
+        }
+        if let Some((cache, recs)) = pending.take() {
+            apply_pending_replicate(&shards, &mut shard_cache, cache, recs).await;
         }
     }
 }
@@ -604,7 +672,7 @@ const FAN_OUT_DRAIN_CAP: usize = 1024;
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
-    mut events: broadcast::Receiver<Event<K, V>>,
+    mut notices: broadcast::Receiver<(K, Origin)>,
     cache_name: SmolStr,
     mode: Mode,
     cancel: CancellationToken,
@@ -616,10 +684,10 @@ pub(crate) async fn fan_out_task<K, V>(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            received = events.recv() => {
+            received = notices.recv() => {
                 let mut batch = Vec::new();
                 match received {
-                    Ok(event) => batch.push(event),
+                    Ok(notice) => batch.push(notice),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             cache = %cache_name,
@@ -631,8 +699,8 @@ pub(crate) async fn fan_out_task<K, V>(
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
                 while batch.len() < FAN_OUT_DRAIN_CAP {
-                    match events.try_recv() {
-                        Ok(event) => batch.push(event),
+                    match notices.try_recv() {
+                        Ok(notice) => batch.push(notice),
                         Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                             tracing::warn!(
                                 cache = %cache_name,
@@ -655,64 +723,80 @@ async fn fan_out_batch<K, V>(
     cluster: &Cluster,
     cache_name: &SmolStr,
     mode: Mode,
-    events: Vec<Event<K, V>>,
+    notices: Vec<(K, Origin)>,
 ) where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let mut seen = HashSet::new();
-    let mut keys = Vec::new();
-    for event in &events {
-        let (key, origin) = match event {
-            Event::Created { key, origin, .. }
-            | Event::Updated { key, origin, .. }
-            | Event::Removed { key, origin } => (key, *origin),
-        };
+    let mut seen: HashSet<&K> = HashSet::new();
+    let mut keys: Vec<K> = Vec::new();
+    for (key, origin) in &notices {
         if !matches!(origin, Origin::Local) {
             continue;
         }
-        let Ok(key_bytes) = postcard::to_stdvec(key) else {
-            continue;
-        };
-        let key_bytes = Bytes::from(key_bytes);
-        if seen.insert(key_bytes.clone()) {
-            keys.push(key_bytes);
+        if seen.insert(key) {
+            keys.push(key.clone());
         }
     }
     if keys.is_empty() {
         return;
     }
 
-    // Re-fetches through `ShardOps::records_for` rather than carrying the
+    // Re-fetches through `Shard::records_for_typed` rather than carrying the
     // `Hlc`/wire bytes on `Event` itself (fixed by `docs/INTERFACES.md`): a
     // benign race with a fast follow-up write/GC can make a key come back
     // missing, in which case there is nothing stale to fan out for it — a
-    // later event (or anti-entropy) covers its current state.
-    let records = ShardOps::records_for(shard, keys).await;
+    // later event (or anti-entropy) covers its current state. Typed keys are
+    // already in hand from the events above, so this skips the
+    // encode-then-decode round trip `ShardOps::records_for`'s `Bytes`-keyed
+    // signature would otherwise need.
+    let records = shard.records_for_typed(&keys).await;
     let peers = cluster.live_peer_ids();
-    for rec in records {
-        match mode {
-            Mode::Local => {}
-            Mode::Invalidation => {
-                let msg = Msg::Invalidate {
+    let (class, msgs): (MsgClass, Vec<Msg>) = match mode {
+        Mode::Local => return,
+        Mode::Invalidation => (
+            MsgClass::Invalidate,
+            records
+                .into_iter()
+                .map(|rec| Msg::Invalidate {
                     cache: cache_name.clone(),
                     key: rec.key,
                     ver: rec.ver,
-                };
-                for &peer in &peers {
-                    cluster.mesh().send(peer, MsgClass::Invalidate, msg.clone());
-                }
-            }
-            Mode::Replicated => {
-                let msg = Msg::Replicate {
+                })
+                .collect(),
+        ),
+        Mode::Replicated => (
+            MsgClass::Replicate,
+            records
+                .into_iter()
+                .map(|rec| Msg::Replicate {
                     cache: cache_name.clone(),
                     rec,
-                };
-                for &peer in &peers {
-                    cluster.mesh().send(peer, MsgClass::Replicate, msg.clone());
-                }
+                })
+                .collect(),
+        ),
+    };
+    // Encodes each message exactly once here, before the per-peer loop,
+    // rather than once per peer — every live peer then gets a cheap
+    // `Bytes` clone of the same frame instead of `net::conn`'s writer
+    // independently re-deriving byte-identical content for each of them.
+    let frames: Vec<OutFrame> = msgs
+        .into_iter()
+        .filter_map(|msg| match OutFrame::new(msg) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode outbound message; dropped");
+                None
             }
-        }
+        })
+        .collect();
+    // Resolves each peer's handle once and reuses it for every message in
+    // this batch, rather than `Mesh::send`'s per-message peer-table lock
+    // acquisition (up to records × peers times per drained fan-out burst).
+    for &peer in &peers {
+        cluster
+            .mesh()
+            .send_frames(peer, class, frames.iter().cloned());
     }
 }
 
@@ -751,6 +835,7 @@ mod tests {
 
     use super::*;
     use crate::error::CacheError;
+    use crate::store::Event;
 
     /// Loopback-only config: skips the outbound-interface probe
     /// `resolve_advertise_ip` would otherwise do for the zeroconf

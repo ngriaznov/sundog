@@ -120,13 +120,16 @@ where
         .collect();
     live.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut tomb: Vec<(Bytes, Hlc)> = shard
-        .tombstones
-        .lock()
-        .await
-        .iter()
-        .map(|(key_bytes, t)| (key_bytes.clone(), t.ver))
-        .collect();
+    let mut tomb: Vec<(Bytes, Hlc)> = Vec::new();
+    for stripe in shard.tombstones.iter() {
+        tomb.extend(
+            stripe
+                .lock()
+                .await
+                .iter()
+                .map(|(key_bytes, t)| (key_bytes.clone(), t.ver)),
+        );
+    }
     tomb.sort_by(|a, b| a.0.cmp(&b.0));
 
     let digest: Vec<u64> = shard
@@ -168,6 +171,42 @@ where
     }
 }
 
+/// Applies `records` (already permuted and duplicated by
+/// [`shuffled_with_duplicates`]) via real concurrent task scheduling rather
+/// than [`apply_mixed`]'s sequential run-grouping: splits into a handful of
+/// partitions and drives them all through [`tokio::spawn`] at once (each
+/// partition itself applied via [`apply_mixed`]'s single/batch mix). Two
+/// records for the same key landing in different partitions is exactly the
+/// stress case per-key stripe serialization exists for — the stripe's own
+/// lock, not program order, is what must keep concurrently scheduled applies
+/// to that key from racing — so this must still converge to the identical
+/// state [`apply_mixed`] alone always has.
+async fn apply_concurrent<K, V>(shard: &Arc<Shard<K, V>>, records: Vec<WireRecord>, seed: u64)
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    const PARTITIONS: u64 = 4;
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xC0FF_EE01);
+    let mut parts: Vec<Vec<WireRecord>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
+    for rec in records {
+        let idx = usize::try_from(rng.random_range(0..PARTITIONS)).expect("small");
+        parts[idx].push(rec);
+    }
+    let handles: Vec<_> = parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let shard = Arc::clone(shard);
+            let part_seed = seed ^ (i as u64).wrapping_mul(0x9E37_79B9);
+            tokio::spawn(async move { apply_mixed(&shard, part, part_seed).await })
+        })
+        .collect();
+    for handle in handles {
+        handle.await.expect("apply_mixed task did not panic");
+    }
+}
+
 fn current_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -183,6 +222,13 @@ proptest! {
     /// nodes to multiple fresh shards, each in its own sampled permutation
     /// with random duplication — the converged state (live entries,
     /// tombstones, and all 1024 digests) must be byte-identical everywhere.
+    /// Alternates, by seed parity, between [`apply_mixed`]'s sequential
+    /// single/batch mix and [`apply_concurrent`]'s real concurrent task
+    /// scheduling across stripes — striping the apply-serialization lock by
+    /// key bucket (see [`stripe_of`]) makes cross-stripe interleaving a
+    /// genuine runtime possibility rather than a purely theoretical one, so
+    /// this property must hold under actual concurrent scheduling, not just
+    /// sampled sequential orderings.
     #[test]
     fn permutation_convergence(
         ops in proptest::collection::vec(op_strategy(), 4..40),
@@ -194,22 +240,27 @@ proptest! {
         rt.block_on(async {
             let mut states = Vec::with_capacity(seeds.len());
             for &seed in &seeds {
-                let shard = Shard::<u8, u16>::new(
+                let shard = Arc::new(Shard::<u8, u16>::new(
                     SmolStr::new("perm-conv"),
                     Mode::Replicated,
                     NodeId::from(1000),
                     10_000,
                     None,
                     None,
-                );
-                apply_mixed(&shard, shuffled_with_duplicates(&records, seed), seed).await;
+                ));
+                let permuted = shuffled_with_duplicates(&records, seed);
+                if seed % 2 == 0 {
+                    apply_mixed(&shard, permuted, seed).await;
+                } else {
+                    apply_concurrent(&shard, permuted, seed).await;
+                }
                 states.push(canonical_state(&shard).await);
             }
             for state in &states[1..] {
                 assert_eq!(
                     &states[0], state,
-                    "permutation, duplication, and mixing single/batch applies must not change \
-                     the converged state"
+                    "permutation, duplication, and mixing single/batch/concurrent applies must \
+                     not change the converged state"
                 );
             }
         });
@@ -302,8 +353,10 @@ where
         let key_bytes = postcard::to_stdvec(&*key).expect("test key encodes");
         expected[usize::from(bucket_of(&key_bytes))] ^= entry_fingerprint(&key_bytes, stored.ver);
     }
-    for (key_bytes, t) in shard.tombstones.lock().await.iter() {
-        expected[usize::from(bucket_of(key_bytes))] ^= entry_fingerprint(key_bytes, t.ver);
+    for stripe in shard.tombstones.iter() {
+        for (key_bytes, t) in stripe.lock().await.iter() {
+            expected[usize::from(bucket_of(key_bytes))] ^= entry_fingerprint(key_bytes, t.ver);
+        }
     }
     let actual: Vec<u64> = shard
         .digest
@@ -392,10 +445,12 @@ proptest! {
                     }
                     DigestOp::Gc => {
                         ShardOps::gc_tombstones(&shard).await;
-                        assert!(
-                            shard.tombstones.lock().await.is_empty(),
-                            "zero tombstone_ttl means every tombstone is GC-eligible immediately"
-                        );
+                        for stripe in shard.tombstones.iter() {
+                            assert!(
+                                stripe.lock().await.is_empty(),
+                                "zero tombstone_ttl means every tombstone is GC-eligible immediately"
+                            );
+                        }
                     }
                 }
                 assert!(
