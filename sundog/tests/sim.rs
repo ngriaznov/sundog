@@ -131,6 +131,7 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
     match msg {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
+        Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
         Msg::Hello { .. }
         | Msg::StRequest { .. }
         | Msg::StChunk { .. }
@@ -726,9 +727,9 @@ async fn warm_up(mesh: &Mesh, shard: &TestShard, donors: &[NodeId], applied: &At
         let mut broke = false;
         loop {
             match tokio::time::timeout(NET_TIMEOUT, stream.next()).await {
-                Ok(Some(Ok(rec))) => {
-                    ShardOps::apply_remote(shard, rec).await;
-                    applied.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(Ok(chunk))) => {
+                    applied.fetch_add(chunk.len(), Ordering::Relaxed);
+                    ShardOps::apply_remote_batch(shard, chunk).await;
                 }
                 Ok(Some(Err(_))) | Err(_) => {
                     broke = true;

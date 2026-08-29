@@ -15,7 +15,7 @@
 pub(crate) mod anti_entropy;
 pub(crate) mod state_transfer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
@@ -557,6 +557,13 @@ async fn inbound_loop(
                             tracing::trace!(%cache, %from, "replicate for unknown cache; dropped");
                         }
                     }
+                    Msg::ReplicateBatch { cache, recs } => {
+                        if let Some(shard) = lookup_shard(&shards, &cache) {
+                            shard.apply_remote_batch(recs).await;
+                        } else {
+                            tracing::trace!(%cache, %from, "replicate batch for unknown cache; dropped");
+                        }
+                    }
                     // `Hello` and the request/response messages never reach
                     // this channel — `net::Mesh` handles those inline.
                     Msg::Hello { .. }
@@ -571,7 +578,13 @@ async fn inbound_loop(
     }
 }
 
-/// Subscribes to one opened cache's local-write events and fans each one out
+/// Cap on how many further events [`fan_out_task`] drains in one go past the
+/// one it just woke on — bounds one iteration's work under sustained load
+/// (e.g. `Cache::insert_many`) rather than draining an unbounded backlog
+/// before ever sending anything.
+const FAN_OUT_DRAIN_CAP: usize = 1024;
+
+/// Subscribes to one opened cache's local-write events and fans them out
 /// over the mesh per [`Mode`] — the composition-layer half of `Shard`'s
 /// design (`store::mod` docs: "`Shard` intentionally holds no handle to
 /// `net::Mesh`"). Every `Origin::Local` event fans out uniformly, including a
@@ -580,6 +593,14 @@ async fn inbound_loop(
 /// other `Replicated`-mode peers skip their own loader call — consistent with
 /// "a cache is re-derivable data" (plan §1), so under-propagating costs
 /// nothing but an extra loader call elsewhere, never correctness.
+///
+/// Micro-batches: after waiting for one event, drains whatever further
+/// events are already available (bounded by [`FAN_OUT_DRAIN_CAP`]) before
+/// doing any work, so a burst of local writes (e.g. `Cache::insert_many`)
+/// costs one `ShardOps::records_for` call and one round of per-peer sends for
+/// the whole burst, not one of each per write — `net::conn`'s per-peer
+/// writer then coalesces those sends into `Msg::ReplicateBatch` frames on the
+/// wire (plan §6).
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
@@ -596,8 +617,9 @@ pub(crate) async fn fan_out_task<K, V>(
             biased;
             () = cancel.cancelled() => return,
             received = events.recv() => {
-                let event = match received {
-                    Ok(event) => event,
+                let mut batch = Vec::new();
+                match received {
+                    Ok(event) => batch.push(event),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             cache = %cache_name,
@@ -607,64 +629,88 @@ pub(crate) async fn fan_out_task<K, V>(
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
-                };
-                fan_out_one(&shard, &cluster, &cache_name, mode, event).await;
+                }
+                while batch.len() < FAN_OUT_DRAIN_CAP {
+                    match events.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                cache = %cache_name,
+                                skipped,
+                                "cache fan-out lagged mid-drain; anti-entropy repairs the gap"
+                            );
+                            break;
+                        }
+                        Err(_) => break, // Empty (nothing more queued) or Closed (next recv() handles it)
+                    }
+                }
+                fan_out_batch(&shard, &cluster, &cache_name, mode, batch).await;
             }
         }
     }
 }
 
-async fn fan_out_one<K, V>(
+async fn fan_out_batch<K, V>(
     shard: &Shard<K, V>,
     cluster: &Cluster,
     cache_name: &SmolStr,
     mode: Mode,
-    event: Event<K, V>,
+    events: Vec<Event<K, V>>,
 ) where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let (key, origin) = match &event {
-        Event::Created { key, origin, .. }
-        | Event::Updated { key, origin, .. }
-        | Event::Removed { key, origin } => (key, *origin),
-    };
-    if !matches!(origin, Origin::Local) {
+    let mut seen = HashSet::new();
+    let mut keys = Vec::new();
+    for event in &events {
+        let (key, origin) = match event {
+            Event::Created { key, origin, .. }
+            | Event::Updated { key, origin, .. }
+            | Event::Removed { key, origin } => (key, *origin),
+        };
+        if !matches!(origin, Origin::Local) {
+            continue;
+        }
+        let Ok(key_bytes) = postcard::to_stdvec(key) else {
+            continue;
+        };
+        let key_bytes = Bytes::from(key_bytes);
+        if seen.insert(key_bytes.clone()) {
+            keys.push(key_bytes);
+        }
+    }
+    if keys.is_empty() {
         return;
     }
-    let Ok(key_bytes) = postcard::to_stdvec(key) else {
-        return;
-    };
+
     // Re-fetches through `ShardOps::records_for` rather than carrying the
     // `Hlc`/wire bytes on `Event` itself (fixed by `docs/INTERFACES.md`): a
-    // benign race with a fast follow-up write/GC can make this come back
-    // empty, in which case there is nothing stale to fan out — a later event
-    // (or anti-entropy) covers the current state.
-    let records = ShardOps::records_for(shard, vec![Bytes::from(key_bytes)]).await;
-    let Some(rec) = records.into_iter().next() else {
-        return;
-    };
-
+    // benign race with a fast follow-up write/GC can make a key come back
+    // missing, in which case there is nothing stale to fan out for it — a
+    // later event (or anti-entropy) covers its current state.
+    let records = ShardOps::records_for(shard, keys).await;
     let peers = cluster.live_peer_ids();
-    match mode {
-        Mode::Local => {}
-        Mode::Invalidation => {
-            let msg = Msg::Invalidate {
-                cache: cache_name.clone(),
-                key: rec.key,
-                ver: rec.ver,
-            };
-            for peer in peers {
-                cluster.mesh().send(peer, MsgClass::Invalidate, msg.clone());
+    for rec in records {
+        match mode {
+            Mode::Local => {}
+            Mode::Invalidation => {
+                let msg = Msg::Invalidate {
+                    cache: cache_name.clone(),
+                    key: rec.key,
+                    ver: rec.ver,
+                };
+                for &peer in &peers {
+                    cluster.mesh().send(peer, MsgClass::Invalidate, msg.clone());
+                }
             }
-        }
-        Mode::Replicated => {
-            let msg = Msg::Replicate {
-                cache: cache_name.clone(),
-                rec,
-            };
-            for peer in peers {
-                cluster.mesh().send(peer, MsgClass::Replicate, msg.clone());
+            Mode::Replicated => {
+                let msg = Msg::Replicate {
+                    cache: cache_name.clone(),
+                    rec,
+                };
+                for &peer in &peers {
+                    cluster.mesh().send(peer, MsgClass::Replicate, msg.clone());
+                }
             }
         }
     }

@@ -294,6 +294,30 @@ where
         self.shard.insert(key, value).await
     }
 
+    /// Writes many entries at once: each is stamped with its own HLC version
+    /// and applied locally under one acquisition of the store's apply lock
+    /// (the "amortized lock path" a bulk fill wants), emitting one [`Event`]
+    /// per entry exactly as [`Cache::insert`] would. **Not a transaction** —
+    /// there is no single version or all-or-nothing outcome for the batch:
+    /// if an entry partway through fails to encode or is too large, the
+    /// entries before it are still applied. Replication to peers happens the
+    /// same way individual inserts do (one `Msg::Replicate`-class send per
+    /// entry); this call itself never builds a batched wire message —
+    /// `net::conn`'s per-peer writer opportunistically coalesces whatever
+    /// lands in the outbox into `Msg::ReplicateBatch` frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] if any entry's encoded wire
+    /// frame exceeds the configured frame cap. Returns [`CacheError::Codec`]
+    /// if a key fails to postcard-encode.
+    pub async fn insert_many(
+        &self,
+        entries: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<(), CacheError> {
+        self.shard.insert_many(entries).await
+    }
+
     /// Removes `key`: writes a tombstone and fans it out per [`Mode`].
     ///
     /// # Errors

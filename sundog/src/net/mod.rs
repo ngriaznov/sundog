@@ -30,7 +30,7 @@ mod tls;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -113,6 +113,43 @@ fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
 /// default so a `Mesh` built directly against a default `ClusterConfig`
 /// behaves identically everywhere.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
+
+/// Process-wide wire-frame counters, incremented at [`conn::send_msg`] — the
+/// single choke point every outbound frame (`Hello`, fan-out traffic, state
+/// transfer, anti-entropy) passes through. Deliberately process- rather than
+/// per-`Mesh`-scoped: a cheap diagnostic for benchmarking replication cost
+/// (`tests/replication_bench.rs`), not part of the per-cluster metrics
+/// surface — [`frames_sent_total`]/[`bytes_sent_total`] sum every `Mesh` in
+/// this process.
+static FRAMES_SENT: AtomicU64 = AtomicU64::new(0);
+static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Records one frame of `len` bytes just written to the wire: bumps the
+/// process-wide [`frames_sent_total`]/[`bytes_sent_total`] counters and
+/// mirrors them to `metrics` as `sundog_frames_sent_total`/
+/// `sundog_bytes_sent_total` for a live Prometheus scrape.
+pub(super) fn record_frame_sent(len: usize) {
+    FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
+    BYTES_SENT.fetch_add(len as u64, Ordering::Relaxed);
+    metrics::counter!("sundog_frames_sent_total").increment(1);
+    metrics::counter!("sundog_bytes_sent_total").increment(len as u64);
+}
+
+/// Total wire frames sent by this process since start, across every
+/// [`Mesh`] it has ever spawned. A cheap diagnostic for benchmarking
+/// replication cost; see [`record_frame_sent`].
+#[must_use]
+pub fn frames_sent_total() -> u64 {
+    FRAMES_SENT.load(Ordering::Relaxed)
+}
+
+/// Total wire-frame bytes sent by this process since start, across every
+/// [`Mesh`] it has ever spawned. A cheap diagnostic for benchmarking
+/// replication cost; see [`record_frame_sent`].
+#[must_use]
+pub fn bytes_sent_total() -> u64 {
+    BYTES_SENT.load(Ordering::Relaxed)
+}
 
 /// Bound on one request/response exchange over a fresh connection — dial,
 /// send, and read the response, end to end (state transfer's initial
@@ -407,8 +444,11 @@ impl Mesh {
     }
 
     /// Requests a full snapshot of `cache` from `donor` (state transfer on
-    /// join, plan §9) and returns a stream of its `StChunk` records, read
-    /// lazily off a fresh connection as the caller polls.
+    /// join, plan §9) and returns a stream of its `StChunk`s, each yielded as
+    /// one `Vec<WireRecord>` (the donor's own chunk boundaries, ~500 records)
+    /// so the caller can apply a whole chunk through
+    /// `ShardOps::apply_remote_batch` under one lock acquisition, read lazily
+    /// off a fresh connection as the caller polls.
     ///
     /// # Errors
     ///
@@ -418,7 +458,7 @@ impl Mesh {
         &self,
         donor: NodeId,
         cache: SmolStr,
-    ) -> Result<BoxStream<'static, Result<WireRecord, CodecError>>, CodecError> {
+    ) -> Result<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>, CodecError> {
         let addr = self.peer_addr(donor)?;
         let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
         let framed = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -762,8 +802,8 @@ mod tests {
             .await
             .expect("request accepted");
         let mut got = Vec::new();
-        while let Some(rec) = stream.next().await {
-            got.push(rec.expect("record decodes"));
+        while let Some(chunk) = stream.next().await {
+            got.extend(chunk.expect("chunk decodes"));
         }
         assert_eq!(got, records);
     }
@@ -806,8 +846,8 @@ mod tests {
             .request_state(NodeId::from(1), SmolStr::new("users"))
             .await
             .expect("request accepted");
-        let first = stream.next().await.expect("first record arrives");
-        assert_eq!(first.expect("decodes"), sample_record(1));
+        let first = stream.next().await.expect("first chunk arrives");
+        assert_eq!(first.expect("decodes"), vec![sample_record(1)]);
         let second = stream
             .next()
             .await

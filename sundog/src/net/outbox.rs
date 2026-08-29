@@ -46,6 +46,18 @@ impl DropOldestQueue {
         self.notify.notify_one();
     }
 
+    /// Removes and returns the oldest queued message if one is present,
+    /// without waiting — the non-blocking counterpart to
+    /// [`DropOldestQueue::pop`], for draining whatever is already queued
+    /// once the writer has been woken (Aeron-style smart batching: coalesce
+    /// only what's already there, never wait for more).
+    pub(super) fn try_pop(&self) -> Option<Msg> {
+        self.inner
+            .lock()
+            .expect("invariant: outbox mutex is never held across a panic")
+            .pop_front()
+    }
+
     /// Waits for and removes the oldest queued message.
     pub(super) async fn pop(&self) -> Msg {
         loop {
@@ -100,6 +112,17 @@ mod tests {
 
         assert_eq!(key_of(&queue.pop().await), 2);
         assert_eq!(key_of(&queue.pop().await), 3);
+    }
+
+    #[test]
+    fn try_pop_drains_without_waiting_then_returns_none() {
+        let queue = DropOldestQueue::new(4);
+        assert!(queue.try_pop().is_none());
+        queue.push(sample(1));
+        queue.push(sample(2));
+        assert_eq!(key_of(&queue.try_pop().expect("first queued")), 1);
+        assert_eq!(key_of(&queue.try_pop().expect("second queued")), 2);
+        assert!(queue.try_pop().is_none());
     }
 
     #[tokio::test]

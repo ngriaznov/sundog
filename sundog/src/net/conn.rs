@@ -19,9 +19,23 @@ use super::tcp::{TcpListener, TcpStream};
 use super::{InboundMsg, MeshStream, RequestHandler, TlsCtx};
 use crate::error::CodecError;
 use crate::node::NodeId;
-use crate::wire::{self, MAX_FRAME, Msg};
+use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
 pub(super) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
+
+/// Disables Nagle's algorithm on a freshly dialed/accepted socket. Every
+/// wire message here is already a deliberately-sized, application-level
+/// batch (`net::conn`'s own coalescing, or a lone small message that should
+/// go out now) — nothing is ever gained by the kernel holding it back to
+/// wait for more, and Nagle's interaction with the peer's delayed-ACK timer
+/// is a classic multi-millisecond stall on exactly this small-frequent-write
+/// traffic shape. Best-effort: a failure here (a socket already gone) is
+/// harmless and surfaces on the next real read/write instead.
+fn disable_nagle(stream: &TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "set_nodelay failed; leaving Nagle's algorithm enabled");
+    }
+}
 
 pub(super) fn new_framed(stream: MeshStream) -> PeerFramed {
     LengthDelimitedCodec::builder()
@@ -64,10 +78,104 @@ async fn establish_accept(stream: TcpStream, _tls: &TlsCtx) -> std::io::Result<M
 
 pub(super) async fn send_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), CodecError> {
     let bytes = wire::encode(msg)?;
+    let len = bytes.len();
     framed
         .send(Bytes::from(bytes))
         .await
-        .map_err(CodecError::Io)
+        .map_err(CodecError::Io)?;
+    super::record_frame_sent(len);
+    Ok(())
+}
+
+/// Sends every message in `msgs` and flushes once at the end, rather than
+/// once per message — the "drain-many-then-flush-once" half of the per-peer
+/// writer's opportunistic batching (plan §6): several `Msg::Invalidate`s (or
+/// the coalesced [`coalesce_replicate`] output) sharing one flush instead of
+/// one syscall-worthy flush each.
+async fn send_batch(framed: &mut PeerFramed, msgs: &[Msg]) -> Result<(), CodecError> {
+    for msg in msgs {
+        let bytes = wire::encode(msg)?;
+        let len = bytes.len();
+        framed
+            .feed(Bytes::from(bytes))
+            .await
+            .map_err(CodecError::Io)?;
+        super::record_frame_sent(len);
+    }
+    framed.flush().await.map_err(CodecError::Io)?;
+    Ok(())
+}
+
+/// Byte budget for one coalesced [`Msg::ReplicateBatch`] frame — well under
+/// [`MAX_FRAME`], so opportunistic coalescing never risks tripping the wire
+/// frame cap even for large-valued caches.
+const REPLICATE_BATCH_BUDGET: usize = 256 * 1024;
+
+/// Count cap alongside [`REPLICATE_BATCH_BUDGET`], so a long run of tiny
+/// records doesn't grow one batch frame without bound.
+const REPLICATE_BATCH_COUNT: usize = 4096;
+
+/// Flushes `pending` (if any) into `out`: a run of exactly one accumulated
+/// record becomes a lone `Msg::Replicate`, more than one a
+/// `Msg::ReplicateBatch` — the shared close-off step [`coalesce_replicate`]
+/// calls both mid-run (a cache change, or a budget/count cap hit) and at the
+/// end of `drained`.
+fn flush_pending_replicate(
+    pending: &mut Option<(SmolStr, Vec<WireRecord>, usize)>,
+    out: &mut Vec<Msg>,
+) {
+    let Some((cache, mut recs, _)) = pending.take() else {
+        return;
+    };
+    out.push(if recs.len() == 1 {
+        Msg::Replicate {
+            cache,
+            rec: recs.pop().expect("invariant: length checked above"),
+        }
+    } else {
+        Msg::ReplicateBatch { cache, recs }
+    });
+}
+
+/// Opportunistically coalesces consecutive same-cache `Msg::Replicate`
+/// entries in `drained` — messages the writer already had queued by the time
+/// it drained them, never delayed to wait for more (plan §6's Aeron-style
+/// smart batching: no timers, no added latency) — into
+/// `Msg::ReplicateBatch` frames bounded by [`REPLICATE_BATCH_BUDGET`] and
+/// [`REPLICATE_BATCH_COUNT`]. A run of exactly one message stays a lone
+/// `Msg::Replicate`, so a lone queued write under light load carries no
+/// wrapping overhead. Anything other than `Msg::Replicate` passes through
+/// unchanged (the replicate-class outbox never actually carries anything
+/// else, but this stays honest rather than assuming it).
+fn coalesce_replicate(drained: Vec<Msg>) -> Vec<Msg> {
+    let mut out = Vec::with_capacity(drained.len());
+    let mut pending: Option<(SmolStr, Vec<WireRecord>, usize)> = None;
+
+    for msg in drained {
+        let Msg::Replicate { cache, rec } = msg else {
+            flush_pending_replicate(&mut pending, &mut out);
+            out.push(msg);
+            continue;
+        };
+        let rec_size = postcard::to_stdvec(&rec).map_or(0, |bytes| bytes.len());
+        let fits_pending = pending.as_ref().is_some_and(|(pending_cache, recs, size)| {
+            *pending_cache == cache
+                && recs.len() < REPLICATE_BATCH_COUNT
+                && size + rec_size <= REPLICATE_BATCH_BUDGET
+        });
+        if fits_pending {
+            let (_, recs, size) = pending
+                .as_mut()
+                .expect("invariant: fits_pending implies Some");
+            recs.push(rec);
+            *size += rec_size;
+        } else {
+            flush_pending_replicate(&mut pending, &mut out);
+            pending = Some((cache, vec![rec], rec_size));
+        }
+    }
+    flush_pending_replicate(&mut pending, &mut out);
+    out
 }
 
 async fn recv_msg(framed: &mut PeerFramed) -> Option<Result<Msg, CodecError>> {
@@ -89,6 +197,7 @@ pub(super) async fn dial_with_hello(
     tls: &TlsCtx,
 ) -> Result<PeerFramed, CodecError> {
     let stream = TcpStream::connect(addr).await?;
+    disable_nagle(&stream);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
     send_msg(&mut framed, &Msg::Hello { node, incarnation }).await?;
@@ -124,13 +233,21 @@ pub(super) async fn run_peer_writer(
                 biased;
                 () = cancel.cancelled() => return,
                 msg = invalidate.pop() => {
-                    if send_msg(&mut framed, &msg).await.is_err() {
+                    let mut drained = vec![msg];
+                    while let Some(msg) = invalidate.try_pop() {
+                        drained.push(msg);
+                    }
+                    if send_batch(&mut framed, &drained).await.is_err() {
                         continue 'reconnect;
                     }
                 }
                 received = replicate_rx.recv() => {
-                    let Some(msg) = received else { return }; // sender dropped: peer was removed
-                    if send_msg(&mut framed, &msg).await.is_err() {
+                    let Some(first) = received else { return }; // sender dropped: peer was removed
+                    let mut drained = vec![first];
+                    while let Ok(msg) = replicate_rx.try_recv() {
+                        drained.push(msg);
+                    }
+                    if send_batch(&mut framed, &coalesce_replicate(drained)).await.is_err() {
                         continue 'reconnect;
                     }
                 }
@@ -176,6 +293,7 @@ pub(super) async fn accept_loop(
             () = cancel.cancelled() => return,
             accepted = listener.accept() => {
                 let Ok((stream, _peer_addr)) = accepted else { continue };
+                disable_nagle(&stream);
                 tokio::spawn(handle_accepted(
                     stream,
                     inbound_tx.clone(),
@@ -190,8 +308,8 @@ pub(super) async fn accept_loop(
 
 /// Serves one accepted connection: layers TLS on per `tls` if configured,
 /// requires `Hello` first, then dispatches each subsequent message.
-/// `Invalidate`/`Replicate` keep the connection open and forward to
-/// `inbound_tx` (the persistent mesh-link case); a request message
+/// `Invalidate`/`Replicate`/`ReplicateBatch` keep the connection open and
+/// forward to `inbound_tx` (the persistent mesh-link case); a request message
 /// (`StRequest`/`AeDigest`/`AePull`) is served once and the connection is
 /// then closed, per plan "own streams" for request/response. A failed TLS
 /// handshake (a plaintext peer dialing a TLS-configured node, or a
@@ -237,7 +355,7 @@ async fn handle_accepted(
             return;
         };
         match msg {
-            Msg::Invalidate { .. } | Msg::Replicate { .. } => {
+            Msg::Invalidate { .. } | Msg::Replicate { .. } | Msg::ReplicateBatch { .. } => {
                 let _ = inbound_tx.send(InboundMsg { from, msg }).await;
             }
             Msg::StRequest { cache } => {
@@ -384,52 +502,49 @@ pub(super) async fn collect_pulled_records(
     Ok(result)
 }
 
-/// Adapts a request-state connection into a lazy stream of records, reading
-/// `StChunk`s off the wire only as the consumer polls for more.
+/// Adapts a request-state connection into a lazy stream of record chunks,
+/// reading `StChunk`s off the wire only as the consumer polls for more, and
+/// yielding each `StChunk`'s records as one `Vec` — the donor's own chunk
+/// boundaries (~500 records, plan §9) preserved so the caller can apply a
+/// whole chunk through `ShardOps::apply_remote_batch` under one lock
+/// acquisition instead of one per record.
 pub(super) fn state_stream(
     framed: PeerFramed,
-) -> futures::stream::BoxStream<'static, Result<crate::wire::WireRecord, CodecError>> {
-    use std::collections::VecDeque;
-
-    let state = (framed, VecDeque::<crate::wire::WireRecord>::new(), false);
-    Box::pin(futures::stream::unfold(
-        state,
-        |(mut framed, mut buf, mut done)| async move {
-            loop {
-                if let Some(rec) = buf.pop_front() {
-                    return Some((Ok(rec), (framed, buf, done)));
-                }
-                if done {
-                    return None;
-                }
-                match recv_msg(&mut framed).await {
-                    Some(Ok(Msg::StChunk {
-                        recs,
-                        done: is_done,
-                        ..
-                    })) => {
-                        buf = recs.into();
-                        done = is_done;
+) -> futures::stream::BoxStream<'static, Result<Vec<WireRecord>, CodecError>> {
+    Box::pin(futures::stream::unfold(Some(framed), |state| async move {
+        let mut framed = state?;
+        loop {
+            match recv_msg(&mut framed).await {
+                Some(Ok(Msg::StChunk { recs, done, .. })) => {
+                    if recs.is_empty() {
+                        // Either the trailing `recs: []` marker chunk
+                        // (done) or a no-op chunk (not done): nothing to
+                        // yield either way.
+                        if done {
+                            return None;
+                        }
+                        continue;
                     }
-                    Some(Ok(_)) => {} // unexpected message on this stream; keep reading
-                    Some(Err(err)) => return Some((Err(err), (framed, buf, true))),
-                    // The connection closed before a `done: true` chunk ever
-                    // arrived — a donor crash/close mid-stream. Surfacing
-                    // this as an error (rather than silently ending the
-                    // stream, indistinguishable from a clean completion) is
-                    // what lets the state-transfer retry logic tell a
-                    // truncated transfer from a finished one.
-                    None => {
-                        let err = CodecError::Io(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "state-transfer connection closed before the final chunk",
-                        ));
-                        return Some((Err(err), (framed, buf, true)));
-                    }
+                    return Some((Ok(recs), (!done).then_some(framed)));
+                }
+                Some(Ok(_)) => {} // unexpected message on this stream; keep reading
+                Some(Err(err)) => return Some((Err(err), None)),
+                // The connection closed before a `done: true` chunk ever
+                // arrived — a donor crash/close mid-stream. Surfacing
+                // this as an error (rather than silently ending the
+                // stream, indistinguishable from a clean completion) is
+                // what lets the state-transfer retry logic tell a
+                // truncated transfer from a finished one.
+                None => {
+                    let err = CodecError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "state-transfer connection closed before the final chunk",
+                    ));
+                    return Some((Err(err), None));
                 }
             }
-        },
-    ))
+        }
+    }))
 }
 
 #[cfg(test)]

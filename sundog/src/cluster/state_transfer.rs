@@ -167,14 +167,16 @@ async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, dono
     let mut applied: u64 = 0;
     loop {
         match stream.next().await {
-            Some(Ok(rec)) => {
+            Some(Ok(chunk)) => {
                 // Weakly consistent donor-side iteration (plan §9/§13) is
                 // safe here because this is the same versioned-apply path
                 // live `Replicate` traffic uses — whatever the snapshot
                 // missed, concurrency delivers; whatever both deliver, the
-                // version check deduplicates.
-                shard.apply_remote(rec).await;
-                applied += 1;
+                // version check deduplicates. Applied as a whole donor chunk
+                // (~500 records) under one lock acquisition rather than one
+                // per record.
+                applied += chunk.len() as u64;
+                shard.apply_remote_batch(chunk).await;
             }
             Some(Err(error)) => {
                 tracing::warn!(

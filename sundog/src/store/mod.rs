@@ -153,6 +153,15 @@ pub trait ShardOps: Send + Sync {
     /// replication, state transfer, and anti-entropy repair.
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
+    /// [`ShardOps::apply_remote`] for a whole batch, applied under ONE
+    /// acquisition of the store's apply serialization lock rather than one
+    /// per record — per-record version checks and digest bookkeeping are
+    /// otherwise identical, and an [`crate::store::Event`] is still emitted
+    /// per record. The path `net::conn`'s coalesced [`crate::wire::Msg::ReplicateBatch`]
+    /// frames, state-transfer chunks, and anti-entropy pull batches all
+    /// apply through.
+    fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
+
     /// Applies an inbound invalidation: drops the local copy of `key` iff
     /// `ver` is newer than the locally stored version. Deliberately not
     /// routed through [`ConflictResolver`]: an invalidation carries no value
@@ -669,7 +678,25 @@ where
         origin: Origin,
     ) {
         let mut tombstones = self.tombstones.lock().await;
+        self.apply_locked(&mut tombstones, key, key_bytes, ver, incoming, origin)
+            .await;
+    }
 
+    /// The versioned-apply core, operating under a tombstone-map lock the
+    /// caller already holds — shared by [`Shard::apply`] (one record, one
+    /// acquisition) and [`ShardOps::apply_remote_batch`] (many records, one
+    /// acquisition held across the whole batch, per plan §4's "amortized
+    /// lock path"). See [`Shard::apply`]'s docs for the correctness contract;
+    /// identical here, just parameterized on the lock the caller supplies.
+    async fn apply_locked(
+        &self,
+        tombstones: &mut HashMap<Bytes, Tombstone>,
+        key: K,
+        key_bytes: Bytes,
+        ver: Hlc,
+        incoming: Incoming<V>,
+        origin: Origin,
+    ) {
         let prior_tombstone = tombstones.get(&key_bytes).copied();
         let stored_live = if prior_tombstone.is_none() {
             self.cache.get(&key).await
@@ -743,7 +770,6 @@ where
                     expires_at_ms,
                 });
                 self.cache.insert(key.clone(), Arc::clone(&stored)).await;
-                drop(tombstones);
                 let event = if had_live {
                     Event::Updated {
                         key,
@@ -771,7 +797,6 @@ where
                 if had_live {
                     let _ = self.cache.remove(&key).await;
                 }
-                drop(tombstones);
                 let _ = self.events.send(Event::Removed { key, origin });
             }
         }
@@ -919,6 +944,71 @@ where
         Ok(())
     }
 
+    /// [`Shard::insert`] for many entries, applied under one acquisition of
+    /// the apply serialization lock rather than one per entry — the
+    /// "amortized lock path" a bulk local fill wants. Each entry still gets
+    /// its own [`Hlc`] stamp and its own [`Event`]; this is not a
+    /// transaction, just a cheaper way to apply many independent writes:
+    /// entries validated before an oversized one are applied regardless of
+    /// the error this returns, and fan-out to the wire happens exactly as
+    /// for individual inserts (per-event, coalesced into
+    /// [`crate::wire::Msg::ReplicateBatch`] frames by `net::conn`'s writer,
+    /// never as one wire message here).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] if any entry's wire frame
+    /// exceeds the configured frame cap (see [`Shard::insert`]).
+    pub async fn insert_many(
+        &self,
+        entries: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<(), CacheError> {
+        let mut prepared = Vec::new();
+        for (key, value) in entries {
+            let key_bytes = encode_key(&key)?;
+            let value_bytes = postcard::to_stdvec(&value).map_err(CodecError::from)?;
+            let value_len = value_bytes.len();
+            let ver = self.stamp_local();
+            let expires_at_ms = self.ttl_expiry();
+            let wire_size = postcard::to_stdvec(&crate::wire::Msg::Replicate {
+                cache: self.name.clone(),
+                rec: WireRecord {
+                    key: key_bytes.clone(),
+                    value: Some(Bytes::from(value_bytes)),
+                    ver,
+                    expires_at_ms,
+                },
+            })
+            .map_err(CodecError::from)?
+            .len();
+            if wire_size > self.max_frame {
+                return Err(CacheError::ValueTooLarge {
+                    cache: self.name.clone(),
+                    size: value_len,
+                    limit: self.max_frame,
+                });
+            }
+            prepared.push((key, key_bytes, ver, value, expires_at_ms));
+        }
+
+        let mut tombstones = self.tombstones.lock().await;
+        for (key, key_bytes, ver, value, expires_at_ms) in prepared {
+            self.apply_locked(
+                &mut tombstones,
+                key,
+                key_bytes,
+                ver,
+                Incoming::Put {
+                    value,
+                    expires_at_ms,
+                },
+                Origin::Local,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`]
     /// (see [`Shard::insert`]'s note on how fan-out actually happens).
     ///
@@ -971,34 +1061,52 @@ where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()> {
+        Box::pin(async move { self.apply_remote_batch(vec![rec]).await })
+    }
+
+    fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.observe_remote(rec.ver);
-            let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
-                tracing::warn!(cache = %self.name, "apply_remote: undecodable key bytes");
-                return;
-            };
-            let origin = Origin::Remote(rec.ver.node);
-            match rec.value {
-                Some(value_bytes) => {
-                    let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
-                        tracing::warn!(cache = %self.name, "apply_remote: undecodable value bytes");
-                        return;
-                    };
-                    self.apply(
-                        key,
-                        rec.key,
-                        rec.ver,
-                        Incoming::Put {
-                            value,
-                            expires_at_ms: rec.expires_at_ms,
-                        },
-                        origin,
-                    )
-                    .await;
-                }
-                None => {
-                    self.apply(key, rec.key, rec.ver, Incoming::Tombstone, origin)
+            let mut tombstones = self.tombstones.lock().await;
+            for rec in recs {
+                self.observe_remote(rec.ver);
+                let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
+                    tracing::warn!(cache = %self.name, "apply_remote_batch: undecodable key bytes");
+                    continue;
+                };
+                let origin = Origin::Remote(rec.ver.node);
+                match rec.value {
+                    Some(value_bytes) => {
+                        let Ok(value) = postcard::from_bytes::<V>(&value_bytes) else {
+                            tracing::warn!(
+                                cache = %self.name,
+                                "apply_remote_batch: undecodable value bytes"
+                            );
+                            continue;
+                        };
+                        self.apply_locked(
+                            &mut tombstones,
+                            key,
+                            rec.key,
+                            rec.ver,
+                            Incoming::Put {
+                                value,
+                                expires_at_ms: rec.expires_at_ms,
+                            },
+                            origin,
+                        )
                         .await;
+                    }
+                    None => {
+                        self.apply_locked(
+                            &mut tombstones,
+                            key,
+                            rec.key,
+                            rec.ver,
+                            Incoming::Tombstone,
+                            origin,
+                        )
+                        .await;
+                    }
                 }
             }
         })

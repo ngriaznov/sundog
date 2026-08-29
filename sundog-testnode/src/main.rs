@@ -131,12 +131,11 @@ async fn dispatch(cache: &Cache<String, String>, cluster: &Cluster, line: &str) 
             let Some(count) = parts.next().and_then(|raw| raw.parse::<u32>().ok()) else {
                 return Reply::Line("err fill needs a u32 count".to_string());
             };
-            for i in 0..count {
-                if let Err(error) = cache.insert(format!("k{i}"), format!("v{i}")).await {
-                    return Reply::Line(format!("err {error}"));
-                }
-            }
-            Reply::Line("ok".to_string())
+            let entries = (0..count).map(|i| (format!("k{i}"), format!("v{i}")));
+            Reply::Line(match cache.insert_many(entries).await {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("err {error}"),
+            })
         }
         "peers" => Reply::Line(cluster.peers().len().to_string()),
         "quit" => Reply::Quit,

@@ -59,7 +59,11 @@ cluster.shutdown().await; // graceful leave (chitchat departs politely)
 That's the whole API surface for the common case. `Cluster::builder(name).build()`
 with nothing else chained is supposed to just work on a LAN — it's the
 project's actual acceptance test (see the doctest in `sundog/src/lib.rs`,
-which `cargo test --doc` runs for real).
+which `cargo test --doc` runs for real). Filling a cache in bulk — a cold
+load from a backing store, say — can use `users.insert_many(entries).await?`
+instead of a loop of `insert` calls: every entry still gets its own HLC
+stamp and its own event, just applied under one acquisition of the store's
+lock rather than one per entry.
 
 ## Should you use this?
 
@@ -86,6 +90,11 @@ small clusters (2–30 nodes) and LAN latencies — it is not trying to be a
 distributed database, and there's no consistent-hashing / partitioning mode
 (every replicated node holds every entry; see `ROADMAP.md` for why, and when
 that might change).
+
+A burst of writes — `insert_many`, or plain back-to-back `insert` calls —
+fans out over the wire as coalesced `Replicate` batches rather than one
+frame per key, so replication throughput scales with the burst instead of
+the per-message overhead.
 
 ## The three modes
 

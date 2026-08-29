@@ -152,9 +152,7 @@ pub(crate) async fn run_round_against(
         match mesh.ae_pull(peer, cache.clone(), batch.to_vec()).await {
             Ok(records) => {
                 repaired += records.len() as u64;
-                for rec in records {
-                    shard.apply_remote(rec).await;
-                }
+                shard.apply_remote_batch(records).await;
             }
             Err(error) => {
                 tracing::debug!(%error, repaired, "anti-entropy pull failed; keeping progress");

@@ -137,6 +137,37 @@ where
     (live, tomb, digest)
 }
 
+/// Applies `records` (already permuted and duplicated by
+/// [`shuffled_with_duplicates`]) as a mix of single and batch applies:
+/// `seed`-derived contiguous run lengths (1..=4) decide, for each run,
+/// whether it goes through [`ShardOps::apply_remote`] (length 1) or
+/// [`ShardOps::apply_remote_batch`] (length > 1, one lock acquisition for
+/// the whole run) — mirroring how live traffic actually arrives (a
+/// coalesced `Msg::ReplicateBatch` next to individual `Msg::Replicate`s).
+/// Consuming `records` in order and only choosing how to *group* the calls
+/// keeps the effective application order identical to always calling
+/// `apply_remote` one record at a time, so this must converge to the same
+/// state the single-apply path always has.
+async fn apply_mixed<K, V>(shard: &Shard<K, V>, records: Vec<WireRecord>, seed: u64)
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let mut rng = StdRng::seed_from_u64(seed ^ 0xBA7C_11ED);
+    let mut records = records.into_iter();
+    loop {
+        let run_len = rng.random_range(1..=4usize);
+        let run: Vec<WireRecord> = records.by_ref().take(run_len).collect();
+        match run.len() {
+            0 => break,
+            1 => {
+                ShardOps::apply_remote(shard, run.into_iter().next().expect("len checked")).await;
+            }
+            _ => ShardOps::apply_remote_batch(shard, run).await,
+        }
+    }
+}
+
 fn current_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -171,15 +202,14 @@ proptest! {
                     None,
                     None,
                 );
-                for rec in shuffled_with_duplicates(&records, seed) {
-                    ShardOps::apply_remote(&shard, rec).await;
-                }
+                apply_mixed(&shard, shuffled_with_duplicates(&records, seed), seed).await;
                 states.push(canonical_state(&shard).await);
             }
             for state in &states[1..] {
                 assert_eq!(
                     &states[0], state,
-                    "permutation and duplication must not change the converged state"
+                    "permutation, duplication, and mixing single/batch applies must not change \
+                     the converged state"
                 );
             }
         });
@@ -243,13 +273,12 @@ proptest! {
                     None,
                     None,
                 );
-                for rec in shuffled_with_duplicates(&records, seed) {
-                    ShardOps::apply_remote(&shard, rec).await;
-                }
+                apply_mixed(&shard, shuffled_with_duplicates(&records, seed), seed).await;
                 assert_eq!(
                     shard.get(&key).await,
                     expected_live,
-                    "the newer of {{put, tombstone}} must win regardless of application order"
+                    "the newer of {{put, tombstone}} must win regardless of application order \
+                     or whether it went through a single or batch apply"
                 );
                 states.push(canonical_state(&shard).await);
             }

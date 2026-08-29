@@ -99,6 +99,19 @@ pub enum Msg {
         /// The keys the requester is missing or holds an older version of.
         keys: Vec<Bytes>,
     },
+    /// Replication-mode fan-out, batched: several records to apply together.
+    /// Never built at enqueue time — `net::conn`'s per-peer writer
+    /// opportunistically coalesces consecutive same-cache queued
+    /// [`Msg::Replicate`] messages into this on the wire (plan §6's smart
+    /// batching), applied under one acquisition of the store's apply
+    /// serialization lock (`store::ShardOps::apply_remote_batch`). Appended
+    /// after every pre-existing variant so their encodings are unchanged.
+    ReplicateBatch {
+        /// The target cache's name.
+        cache: SmolStr,
+        /// The records to apply, in order.
+        recs: Vec<WireRecord>,
+    },
 }
 
 /// Encodes a message to its postcard wire form.
@@ -240,6 +253,14 @@ mod tests {
         roundtrip(&Msg::AePull {
             cache: SmolStr::new("users"),
             keys: vec![Bytes::from_static(b"k1"), Bytes::from_static(b"k2")],
+        });
+    }
+
+    #[test]
+    fn roundtrip_replicate_batch() {
+        roundtrip(&Msg::ReplicateBatch {
+            cache: SmolStr::new("users"),
+            recs: vec![sample_record(Some("v1")), sample_record(None)],
         });
     }
 

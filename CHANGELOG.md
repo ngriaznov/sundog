@@ -119,6 +119,28 @@ name reservation, not a release.
 - **Grafana dashboard** (`ops/grafana-dashboard.json`): panels for live
   peers, open caches, per-peer backlog drops, anti-entropy repair rate, and
   state-transfer throughput.
+- **`Cache::insert_many`/`Shard::insert_many`**: bulk local writes applied
+  under one acquisition of the store's apply lock rather than one per entry;
+  each entry still gets its own `Hlc` stamp and its own `Event`, and fans out
+  the same way individual inserts do.
+- **Batched replication on the wire**: `net::conn`'s per-peer writer
+  opportunistically coalesces consecutive same-cache queued `Replicate`
+  messages into a `Msg::ReplicateBatch` frame (budget- and count-capped, no
+  added latency — only what's already queued by the time the writer drains),
+  and `fan_out_task` micro-batches a burst of local write events before
+  re-fetching and sending. `ShardOps::apply_remote_batch` applies a whole
+  batch — a coalesced wire frame, a state-transfer chunk, or an
+  anti-entropy pull — under one lock acquisition; the permutation-convergence
+  property test mixes single and batch applies as part of its coverage.
+  `TCP_NODELAY` is set on every mesh connection: every wire message is
+  already a deliberately-sized application-level batch, so nothing is
+  gained by leaving Nagle's algorithm to hold small frames back.
+- **Replication-cost benchmark suite** (`sundog/tests/replication_bench.rs`,
+  gated on `SUNDOG_BENCH=1`): a 100k bulk-insert-then-converge scenario and a
+  5k steady-write scenario against real loopback clusters, printing wall
+  time and the process-wide `sundog::net::frames_sent_total`/
+  `bytes_sent_total` wire-frame counters as the baseline an optimization
+  phase is judged against.
 
 ### Known gaps (tracked, not bugs)
 
