@@ -204,7 +204,15 @@ pub trait ShardOps: Send + Sync {
 
     /// Garbage-collects tombstones older than the configured
     /// `tombstone_ttl`, keeping the digest and entry set consistent.
-    fn gc_tombstones(&self) -> BoxFuture<'_, ()>;
+    ///
+    /// `any_member_absent` defers collecting a tombstone once it is past
+    /// `tombstone_ttl` but not yet past `tombstone_max_ttl`: while `true`, a
+    /// tombstone in that window is left in place — collected only once
+    /// `false` again, or once it ages past `tombstone_max_ttl` regardless.
+    /// The composition layer (`cluster::tombstone_gc_task`) is the only
+    /// caller and the only place that decides this — see its docs for how
+    /// it's derived from cluster membership.
+    fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()>;
 
     /// Flushes `moka`'s internal housekeeping. `moka` has no free-running
     /// background sweep — the eviction listener that corrects the digest for
@@ -344,12 +352,16 @@ pub struct Stored<V> {
     pub expires_at_ms: Option<u64>,
 }
 
-/// A tombstone: the version of the delete that created it, and when it
-/// becomes eligible for garbage collection.
+/// A tombstone: the version of the delete that created it, and its two GC
+/// deadlines. `ttl_deadline_ms` is when it becomes eligible for ordinary
+/// collection; `max_deadline_ms` is the hard cap (`tombstone_max_ttl`) past
+/// which it is collected regardless of member absence — see
+/// [`ShardOps::gc_tombstones`]'s docs.
 #[derive(Debug, Clone, Copy)]
 struct Tombstone {
     ver: Hlc,
-    gc_deadline_ms: u64,
+    ttl_deadline_ms: u64,
+    max_deadline_ms: u64,
 }
 
 /// What a versioned write carries into `Shard::apply`: a live value, or a
@@ -539,6 +551,7 @@ where
     digest: Arc<[AtomicU64]>,
     ttl: Option<Duration>,
     tombstone_ttl_ms: u64,
+    tombstone_max_ttl_ms: u64,
     resolver: Arc<dyn ConflictResolver>,
     max_frame: usize,
     /// Remembered (alongside `tti` below) so [`Shard::with_weigher`] can
@@ -595,6 +608,7 @@ where
             digest,
             ttl,
             tombstone_ttl_ms: duration_ms(ClusterConfig::default().tombstone_ttl),
+            tombstone_max_ttl_ms: duration_ms(ClusterConfig::default().tombstone_max_ttl),
             resolver: Arc::new(LwwResolver),
             max_frame: MAX_FRAME,
             max_capacity,
@@ -656,6 +670,16 @@ where
     #[must_use]
     pub fn with_tombstone_ttl(mut self, tombstone_ttl: Duration) -> Self {
         self.tombstone_ttl_ms = duration_ms(tombstone_ttl);
+        self
+    }
+
+    /// Overrides the hard cap on tombstone retention used by
+    /// [`ShardOps::gc_tombstones`] (defaults to [`ClusterConfig::default`]'s
+    /// value). Same fixed-`Shard::new`-signature, follow-up-call pattern as
+    /// [`Shard::with_tombstone_ttl`].
+    #[must_use]
+    pub fn with_tombstone_max_ttl(mut self, tombstone_max_ttl: Duration) -> Self {
+        self.tombstone_max_ttl_ms = duration_ms(tombstone_max_ttl);
         self
     }
 
@@ -889,12 +913,13 @@ where
                 }
             }
             Incoming::Tombstone => {
-                let deadline_ms = now_ms().saturating_add(self.tombstone_ttl_ms);
+                let now = now_ms();
                 tombstones.insert(
                     key_bytes,
                     Tombstone {
                         ver,
-                        gc_deadline_ms: deadline_ms,
+                        ttl_deadline_ms: now.saturating_add(self.tombstone_ttl_ms),
+                        max_deadline_ms: now.saturating_add(self.tombstone_max_ttl_ms),
                     },
                 );
                 if had_live {
@@ -1426,19 +1451,21 @@ where
         Box::pin(stream::once(fut).flat_map(stream::iter))
     }
 
-    fn gc_tombstones(&self) -> BoxFuture<'_, ()> {
+    fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let now = now_ms();
             let digest = &self.digest;
             for stripe in self.tombstones.iter() {
                 stripe.lock().await.retain(|key_bytes, t| {
-                    let keep = t.gc_deadline_ms > now;
-                    if !keep {
+                    let past_ttl = now >= t.ttl_deadline_ms;
+                    let past_max = now >= t.max_deadline_ms;
+                    let collect = past_ttl && (!any_member_absent || past_max);
+                    if collect {
                         let bucket = usize::from(bucket_of(key_bytes));
                         digest[bucket]
                             .fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
                     }
-                    keep
+                    !collect
                 });
             }
         })
@@ -1918,6 +1945,78 @@ mod tests {
         );
     }
 
+    /// The absolute-expiry guarantee, stated directly: a record whose
+    /// `expires_at_ms` is already in the past when it arrives never becomes
+    /// readable, whether it lands through [`ShardOps::apply_remote`] or
+    /// [`ShardOps::apply_remote_batch`] — and it doesn't matter whether the
+    /// key already held a value that expired here for real (gone from
+    /// `moka`, no stored version left to compare against) or never existed
+    /// at all: `remaining_from_absolute` floors a past deadline at
+    /// `Duration::ZERO`, so `moka` marks the entry expired the instant it's
+    /// inserted, before version comparison could ever be the reason it's
+    /// unreadable.
+    #[tokio::test]
+    async fn dead_on_arrival_ttl_record_never_resurrects_a_locally_expired_entry() {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        s.insert(1, "original".into()).await.expect("insert");
+        assert_eq!(s.get(&1).await, Some("original".into()));
+
+        // Let it expire locally for real, past both the 50ms TTL and moka's
+        // timer wheel granularity floor (see
+        // `absolute_ttl_on_the_wire_expires_a_shard_configured_with_no_ttl_of_its_own`).
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(
+            s.get(&1).await,
+            None,
+            "sanity: the original entry must actually be gone before this test means anything"
+        );
+
+        let doa = WireRecord {
+            key: key_bytes(&1u32),
+            // Clearly newer than anything this shard's clock has stamped, so
+            // nothing about version comparison could be why this is
+            // rejected — only the absolute deadline can be.
+            ver: hlc(now_ms() + 10_000, 2),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&"resurrected".to_string()).expect("test value encodes"),
+            )),
+            expires_at_ms: Some(now_ms().saturating_sub(60_000)),
+        };
+
+        ShardOps::apply_remote(&s, doa.clone()).await;
+        assert_eq!(
+            s.get(&1).await,
+            None,
+            "a dead-on-arrival record must never resurrect a locally-expired entry, via apply_remote"
+        );
+
+        let s2 = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        s2.insert(1, "original".into()).await.expect("insert");
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(s2.get(&1).await, None, "sanity: gone here too");
+
+        ShardOps::apply_remote_batch(&s2, vec![doa]).await;
+        assert_eq!(
+            s2.get(&1).await,
+            None,
+            "same guarantee via apply_remote_batch"
+        );
+    }
+
     #[tokio::test]
     async fn gc_tombstones_drops_expired_entries_and_updates_digest() {
         let mut s = shard::<u32, String>(1);
@@ -1934,15 +2033,100 @@ mod tests {
             let stripe = stripe_of(&key_bytes(&1u32));
             let mut tombstones = s.tombstones[stripe].lock().await;
             for t in tombstones.values_mut() {
-                t.gc_deadline_ms = 0;
+                t.ttl_deadline_ms = 0;
             }
         }
 
-        ShardOps::gc_tombstones(&s).await;
+        ShardOps::gc_tombstones(&s, false).await;
         assert!(
             ShardOps::records_for(&s, vec![key_bytes(&1u32)])
                 .await
                 .is_empty()
+        );
+        assert_digest_matches_full_recompute(&s).await;
+    }
+
+    /// Forces one tombstone's `ttl_deadline_ms` (and, for
+    /// [`gc_tombstones_hard_cap_overrides_deferral`], `max_deadline_ms`) into
+    /// the past, exactly as [`gc_tombstones_drops_expired_entries_and_updates_digest`]
+    /// does for the plain (no-absence) case.
+    async fn force_tombstone_past_ttl<K, V>(s: &Shard<K, V>, key_bytes: &Bytes, past_max: bool)
+    where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let stripe = stripe_of(key_bytes);
+        let mut tombstones = s.tombstones[stripe].lock().await;
+        for t in tombstones.values_mut() {
+            t.ttl_deadline_ms = 0;
+            if past_max {
+                t.max_deadline_ms = 0;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_tombstones_defers_collection_while_a_member_is_absent() {
+        let mut s = shard::<u32, String>(1);
+        s.remove(&1).await.expect("remove creates a tombstone");
+        s.tombstone_ttl_ms = 0;
+        force_tombstone_past_ttl(&s, &key_bytes(&1u32), false).await;
+
+        ShardOps::gc_tombstones(&s, true).await;
+        assert!(
+            !ShardOps::records_for(&s, vec![key_bytes(&1u32)])
+                .await
+                .is_empty(),
+            "a tombstone past tombstone_ttl but not tombstone_max_ttl must survive \
+             collection while a member is absent"
+        );
+        assert_digest_matches_full_recompute(&s).await;
+    }
+
+    /// Also the digest/tombstone-set consistency check across a
+    /// deferred-then-collected cycle: the digest must agree with a full
+    /// recompute both right after the deferred pass (tombstone still
+    /// present) and right after the pass that finally collects it.
+    #[tokio::test]
+    async fn gc_tombstones_proceeds_once_no_member_is_absent() {
+        let mut s = shard::<u32, String>(1);
+        s.remove(&1).await.expect("remove creates a tombstone");
+        s.tombstone_ttl_ms = 0;
+        force_tombstone_past_ttl(&s, &key_bytes(&1u32), false).await;
+
+        ShardOps::gc_tombstones(&s, true).await;
+        assert!(
+            !ShardOps::records_for(&s, vec![key_bytes(&1u32)])
+                .await
+                .is_empty(),
+            "deferred while the member was absent"
+        );
+        assert_digest_matches_full_recompute(&s).await;
+
+        ShardOps::gc_tombstones(&s, false).await;
+        assert!(
+            ShardOps::records_for(&s, vec![key_bytes(&1u32)])
+                .await
+                .is_empty(),
+            "collected once the member returned (no member absent any more)"
+        );
+        assert_digest_matches_full_recompute(&s).await;
+    }
+
+    #[tokio::test]
+    async fn gc_tombstones_hard_cap_overrides_deferral() {
+        let mut s = shard::<u32, String>(1);
+        s.remove(&1).await.expect("remove creates a tombstone");
+        s.tombstone_ttl_ms = 0;
+        s.tombstone_max_ttl_ms = 0;
+        force_tombstone_past_ttl(&s, &key_bytes(&1u32), true).await;
+
+        ShardOps::gc_tombstones(&s, true).await;
+        assert!(
+            ShardOps::records_for(&s, vec![key_bytes(&1u32)])
+                .await
+                .is_empty(),
+            "a tombstone past tombstone_max_ttl must be collected even while a member is absent"
         );
         assert_digest_matches_full_recompute(&s).await;
     }

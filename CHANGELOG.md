@@ -176,6 +176,16 @@ release.
   clone of the value — is only built when `events()` has a
   subscriber, so a cache with nothing subscribed to `events()` pays no
   per-write value clone for replication or invalidation fan-out.
+- **Partition-aware tombstone retention**: `ClusterConfig::tombstone_max_ttl`
+  (24 hours by default) bounds a new deferral in the tombstone GC sweep — a
+  tombstone past `tombstone_ttl` is kept, not collected, while any recently
+  known cluster member is currently absent, up to the hard cap. This closes
+  the resurrection window where a member absent longer than `tombstone_ttl`
+  could bring a manually deleted key back to life on the nodes that stayed
+  up; a member gone longer than `tombstone_max_ttl` is the one case that can
+  still resurrect a key. Deferred tombstones stay counted in the anti-entropy
+  digest until they're actually collected, so digests and the tombstone set
+  never drift out of sync.
 
 ### Known gaps (tracked, not bugs)
 

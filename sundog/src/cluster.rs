@@ -6,12 +6,14 @@
 //! starts [`Membership`] (gossip), announces via [`Discovery`], then starts
 //! [`Mesh`] (the TCP data plane) with a [`RequestHandler`] that answers
 //! inbound state-transfer/anti-entropy requests over this cluster's shard
-//! registry. Three background tasks, all stopped together by
-//! [`Cluster::shutdown`], keep the planes in sync: membership changes flow
-//! into `Mesh::update_peers`, inbound wire messages dispatch to shards by
-//! cache name, and — spawned per opened cache — local writes fan out over
-//! the mesh per [`Mode`].
+//! registry. Background tasks, all stopped together by [`Cluster::shutdown`],
+//! keep the planes in sync: membership changes flow into `Mesh::update_peers`
+//! and into `absence`'s partition-aware tombstone-retention tracker, inbound
+//! wire messages dispatch to shards by cache name, and — spawned per opened
+//! cache — local writes fan out over the mesh per [`Mode`] and expired
+//! tombstones are garbage-collected (`tombstone_gc_task`).
 
+pub(crate) mod absence;
 pub(crate) mod anti_entropy;
 pub(crate) mod state_transfer;
 
@@ -78,6 +80,7 @@ struct ClusterInner {
     mesh: Mesh,
     shards: ShardRegistry,
     config: ClusterConfig,
+    absence: absence::AbsenceTracker,
     tracker: TaskTracker,
     cancel: CancellationToken,
 }
@@ -130,6 +133,13 @@ impl Cluster {
 
     pub(crate) fn shards(&self) -> ShardRegistry {
         Arc::clone(&self.inner.shards)
+    }
+
+    /// This cluster's partition-aware tombstone-retention view — see
+    /// `cluster::absence`'s module docs. Cheap to clone; shared by every
+    /// opened cache's `tombstone_gc_task`.
+    pub(crate) fn absence_tracker(&self) -> absence::AbsenceTracker {
+        self.inner.absence.clone()
     }
 
     pub(crate) fn mesh(&self) -> &Mesh {
@@ -330,6 +340,7 @@ impl ClusterBuilder {
                 mesh,
                 shards,
                 config,
+                absence: absence::AbsenceTracker::default(),
                 tracker: TaskTracker::new(),
                 cancel: CancellationToken::new(),
             }),
@@ -338,6 +349,11 @@ impl ClusterBuilder {
         cluster.spawn_tracked(membership_to_mesh_task(
             cluster.inner.membership.peers(),
             cluster.inner.mesh.clone(),
+            cluster.cancel_token(),
+        ));
+        cluster.spawn_tracked(absence::tracking_task(
+            cluster.inner.membership.peers(),
+            cluster.absence_tracker(),
             cluster.cancel_token(),
         ));
         cluster.spawn_tracked(inbound_loop(
@@ -803,10 +819,22 @@ async fn fan_out_batch<K, V>(
 /// housekeeping (`ShardOps::run_pending_tasks`'s docs: without this, a shard
 /// that goes quiet right after a TTL/size eviction can keep a stale digest
 /// forever). Runs at a quarter of `tombstone_ttl` so a tombstone is never
-/// held much past its deadline.
+/// held much past its deadline once nothing defers it.
+///
+/// `mode` and `absence` together decide, on every tick, whether collection
+/// past `tombstone_ttl` is deferred this round (`absence::should_defer_gc`):
+/// while any recently-known member is absent from the live peer set, a
+/// `Mode::Replicated` cache's tombstone survives past `tombstone_ttl` — up to
+/// the hard cap `tombstone_max_ttl` — so that member can't resurrect the
+/// deleted entry via anti-entropy once it returns. `Mode::Local` and
+/// `Mode::Invalidation` caches are never deferred, and a cluster whose live
+/// peer set never shrinks defers nothing either way.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
+    mode: Mode,
     tombstone_ttl: Duration,
+    tombstone_max_ttl: Duration,
+    absence: absence::AbsenceTracker,
     cancel: CancellationToken,
 ) {
     let period = (tombstone_ttl / 4).max(Duration::from_secs(1));
@@ -818,7 +846,8 @@ pub(crate) async fn tombstone_gc_task(
             () = cancel.cancelled() => return,
             _ = ticker.tick() => {
                 shard.run_pending_tasks().await;
-                shard.gc_tombstones().await;
+                let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl);
+                shard.gc_tombstones(defer).await;
             }
         }
     }

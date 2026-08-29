@@ -160,6 +160,7 @@ where
             tti,
         )
         .with_tombstone_ttl(cluster.config().tombstone_ttl)
+        .with_tombstone_max_ttl(cluster.config().tombstone_max_ttl)
         .with_max_frame(cluster.config().max_frame)
         .with_resolver(resolver);
         if let Some(weigher) = weigher {
@@ -209,7 +210,10 @@ where
         }
         cluster.spawn_tracked(crate::cluster::tombstone_gc_task(
             Arc::clone(&shard) as Arc<dyn ShardOps>,
+            mode,
             cluster.config().tombstone_ttl,
+            cluster.config().tombstone_max_ttl,
+            cluster.absence_tracker(),
             cluster.cancel_token(),
         ));
 

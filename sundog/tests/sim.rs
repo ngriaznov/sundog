@@ -745,6 +745,196 @@ async fn warm_up(mesh: &Mesh, shard: &TestShard, donors: &[NodeId], applied: &At
     false
 }
 
+fn new_shard_with_tombstone_ttl(
+    node: NodeId,
+    tombstone_ttl: Duration,
+    tombstone_max_ttl: Duration,
+) -> TestShard {
+    Shard::new(cache_name(), Mode::Replicated, node, 100_000, None, None)
+        .with_tombstone_ttl(tombstone_ttl)
+        .with_tombstone_max_ttl(tombstone_max_ttl)
+}
+
+/// Runs the scenario that motivates partition-aware tombstone retention: two
+/// nodes converged on a key, a partition, the survivor deleting the key,
+/// real time passing well past `tombstone_ttl` while still partitioned, a
+/// heal, then anti-entropy rounds. Returns the key's value on each side
+/// once digests converge (or the budget runs out), plus whether they did.
+///
+/// `defer_while_absent` is handed straight to the real
+/// [`ShardOps::gc_tombstones`] — the production GC path — standing in for
+/// `cluster::absence::should_defer_gc`'s decision, which is `pub(crate)` and
+/// unreachable from this external test binary (this suite's own "needs"
+/// note, module docs). `true` exercises the fix; `false` exercises the old
+/// unconditional-GC rule it replaced, with node-a's continued absence
+/// (the partition is still up) hand-supplied instead of read from a live
+/// `AbsenceTracker`. Anti-entropy itself is not mirrored here — `ae_round_once`
+/// drives the real `net::Mesh`/`ShardOps` wire path, same as every other
+/// scenario in this suite.
+fn run_partition_delete_scenario(
+    seed: u64,
+    port: u16,
+    defer_while_absent: bool,
+) -> (Option<String>, Option<String>, bool) {
+    let node_a = NodeId::from(u64::from(port) * 10 + 1);
+    let node_b = NodeId::from(u64::from(port) * 10 + 2);
+    let key = 555u32;
+    let tombstone_ttl = Duration::from_millis(30);
+    let tombstone_max_ttl = Duration::from_secs(60);
+
+    let shard_a = Arc::new(new_shard_with_tombstone_ttl(
+        node_a,
+        tombstone_ttl,
+        tombstone_max_ttl,
+    ));
+    let shard_b = Arc::new(new_shard_with_tombstone_ttl(
+        node_b,
+        tombstone_ttl,
+        tombstone_max_ttl,
+    ));
+
+    block_on(shard_a.insert(key, "original".to_string())).expect("insert");
+    let rec = block_on(ShardOps::records_for(
+        shard_a.as_ref(),
+        vec![key_bytes(key)],
+    ))
+    .into_iter()
+    .next()
+    .expect("just-inserted key has a record");
+    block_on(ShardOps::apply_remote(shard_b.as_ref(), rec));
+    assert_eq!(value_of(&shard_a, key), Some("original".to_string()));
+    assert_eq!(value_of(&shard_b, key), Some("original".to_string()));
+    assert_eq!(
+        digests_of(&shard_a),
+        digests_of(&shard_b),
+        "both sides start converged"
+    );
+
+    let mut sim = Builder::new()
+        .rng_seed(seed)
+        .tick_duration(TICK)
+        .max_message_latency(Duration::from_millis(20))
+        .build();
+
+    let ae_period = Duration::from_millis(100);
+    spawn_symmetric_pair(
+        &mut sim,
+        PairSpec {
+            host_a: "resurrect-a",
+            host_b: "resurrect-b",
+            node_a,
+            node_b,
+            port,
+            keys_a: vec![],
+            keys_b: vec![],
+            // No automatic writes in this scenario — the delete below is
+            // applied directly, the way a real survivor's own `remove` call
+            // would be.
+            write_period: Duration::from_secs(3600),
+            ae_period,
+            dup_factor: 1,
+        },
+        Arc::clone(&shard_a),
+        Arc::clone(&shard_b),
+        None,
+    );
+
+    sim.partition("resurrect-a", "resurrect-b");
+    run_steps(&mut sim, steps_for(Duration::from_millis(200)));
+
+    block_on(shard_b.remove(&key)).expect("remove creates a tombstone");
+    assert_eq!(
+        value_of(&shard_b, key),
+        None,
+        "the survivor's own read must reflect its delete immediately"
+    );
+
+    // Tombstone deadlines are stamped from real `SystemTime`
+    // (`store::now_ms`), not turmoil's virtual clock, so this needs actual
+    // wall-clock time to pass — well past `tombstone_ttl`, mirroring
+    // `absolute_ttl_on_the_wire_expires_a_shard_configured_with_no_ttl_of_its_own`'s
+    // same real-sleep necessity in `src/store`'s own tests.
+    std::thread::sleep(tombstone_ttl * 10);
+
+    block_on(ShardOps::gc_tombstones(
+        shard_b.as_ref(),
+        defer_while_absent,
+    ));
+
+    sim.repair("resurrect-a", "resurrect-b");
+    let budget = steps_for(ae_period * 10);
+    let converged = run_until(&mut sim, budget, || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+    })
+    .is_some();
+
+    (value_of(&shard_a, key), value_of(&shard_b, key), converged)
+}
+
+/// The owner's semantic goal, proven directly: a member absent past
+/// `tombstone_ttl` must not be able to resurrect a manually deleted entry on
+/// heal. `run_partition_delete_scenario(.., true)` is the deferral fix in
+/// effect — `gc_tombstones` defers collecting node-b's tombstone the whole
+/// time node-a is absent, so there's still a tombstone (not silence) for
+/// anti-entropy to converge node-a onto once healed.
+#[test]
+fn partition_survivor_delete_does_not_resurrect_after_heal() {
+    let (value_a, value_b, converged) =
+        run_partition_delete_scenario(sim_seed(0x2E1E_7A01), 4400, true);
+    assert!(
+        converged,
+        "digests must converge within the AE-round budget after healing"
+    );
+    assert_eq!(
+        value_a, None,
+        "node-a must not resurrect the deleted key after heal + AE"
+    );
+    assert_eq!(value_b, None, "node-b must keep the key deleted");
+}
+
+/// The counter-case that motivates the fix, proving the deferral is
+/// load-bearing rather than incidental: the *same* scenario — same
+/// partition, same delete, same real time elapsed past `tombstone_ttl` while
+/// node-a stays absent — but with the old unconditional-GC rule
+/// (`defer_while_absent: false`) in the one spot that decides whether to
+/// collect. Node-b forgets the tombstone entirely while node-a is still
+/// unreachable and never learned of the delete; once healed, anti-entropy
+/// sees node-a's still-live stale copy as something node-b is simply
+/// missing and pulls it back. Run back to back with the deferred case so the
+/// contrast — not a standalone claim about old behavior — is what the
+/// assertions rest on.
+#[test]
+fn tombstone_deferral_is_load_bearing_against_resurrection() {
+    let (_, value_b_unconditional, converged_unconditional) =
+        run_partition_delete_scenario(sim_seed(0x2E1E_7A02), 4410, false);
+    assert!(
+        converged_unconditional,
+        "digests must converge (onto the wrong, resurrected state) within the budget"
+    );
+    assert_eq!(
+        value_b_unconditional,
+        Some("original".to_string()),
+        "counter-case: collecting the tombstone unconditionally while node-a is still absent \
+         lets anti-entropy resurrect the deleted key on node-b once healed"
+    );
+
+    let (deferred_value_a, deferred_value_b, converged_deferred) =
+        run_partition_delete_scenario(sim_seed(0x2E1E_7A03), 4420, true);
+    assert!(
+        converged_deferred,
+        "digests must converge under deferral too"
+    );
+    assert_eq!(
+        deferred_value_a, None,
+        "same scenario, deferred: node-a stays deleted"
+    );
+    assert_eq!(
+        deferred_value_b, None,
+        "same scenario, deferred: node-b stays deleted — the fix closes exactly \
+         the gap the unconditional rule above just demonstrated"
+    );
+}
+
 #[test]
 fn donor_crash_mid_state_transfer_repicks_and_completes() {
     let donor1 = NodeId::from(21);

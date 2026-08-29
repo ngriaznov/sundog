@@ -67,20 +67,31 @@ lock rather than one per entry.
 
 ## Should you use this?
 
-sundog is a cache, not a database. If you need durability, strong
-consistency, or a guarantee that a deleted key stays deleted, this isn't
-that tool.
+sundog is a cache, not a database. If you need durability or strong
+consistency, this isn't that tool.
 
 Concretely: writes are last-write-wins on a hybrid logical clock, so if two
 nodes write the same key at close to the same time, one write silently
 loses — there's no conflict error, no merge, the loser vanishes.
-Deletes are tombstones, and tombstones expire (`tombstone_ttl`, 10 minutes
-by default). A node that's been partitioned away longer than that can come
-back with a stale copy of a key everyone else deleted, and that key comes
-back to life. For a cache — where the entry re-expires or gets overwritten
-on the next real write — that's a shrug. If a deleted key resurrecting is
-something your application can't tolerate, sundog is the wrong layer for
-that data.
+
+Deletes and expiries behave differently, and it's worth being precise about
+each. A TTL-expired entry can never reappear anywhere: every record carries
+its own absolute `expires_at_ms`, so once a key is past that timestamp no
+peer will accept a stale copy of it back in, partition or not. A manually
+removed key is a tombstone, and tombstones are kept — not GC'd on the usual
+`tombstone_ttl` schedule — for as long as any member the cluster has
+recently known about is absent, so a partitioned node can't come back with a
+pre-delete copy and resurrect the key on the nodes that stayed up. That
+deferral is bounded: past `tombstone_max_ttl` (24 hours by default) the
+tombstone is collected regardless of who's still missing. So the one case
+that can still happen is a member that comes back after being gone longer
+than `tombstone_max_ttl`, carrying data from before the delete — it can
+resurrect that key. Even then, a cache TTL caps the damage: the stale copy
+still carries its original `expires_at_ms`, so it can only reappear if its
+own lifetime hasn't elapsed — and a member gone more than 24 hours has
+outlived any typical cache TTL many times over. In practice: set a TTL and
+deleted keys stay deleted; without one, raise `tombstone_max_ttl` or treat
+sundog as the wrong layer for that key.
 
 Where it's a good fit: read-through caching in front of a slower backing
 store, session or profile data that's fine being eventually consistent,

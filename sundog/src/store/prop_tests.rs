@@ -445,7 +445,7 @@ proptest! {
                         ShardOps::invalidate(&shard, key_bytes, ver).await;
                     }
                     DigestOp::Gc => {
-                        ShardOps::gc_tombstones(&shard).await;
+                        ShardOps::gc_tombstones(&shard, false).await;
                         for stripe in shard.tombstones.iter() {
                             assert!(
                                 stripe.lock().await.is_empty(),

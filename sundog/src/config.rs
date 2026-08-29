@@ -60,10 +60,24 @@ pub struct ClusterConfig {
     /// is jittered around this value to avoid thundering-herd rounds across
     /// the cluster.
     pub ae_interval: Duration,
-    /// How long a tombstone is retained before garbage collection. Must be at
+    /// How long a tombstone is retained before garbage collection, once
+    /// every recently-known cluster member is accounted for. Must be at
     /// least `3 * ae_interval` so a lagging peer gets at least a few
     /// anti-entropy rounds to observe the deletion before it is forgotten.
+    ///
+    /// While a member is absent from the live peer set, a `Replicated`-mode
+    /// cache defers collection past this point — up to
+    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) — so that member can't
+    /// resurrect the deleted entry via anti-entropy once it returns. The
+    /// trade-off: during a member outage, tombstones for deletes accumulate
+    /// (tens of bytes each) until the member returns or `tombstone_max_ttl`
+    /// expires.
     pub tombstone_ttl: Duration,
+    /// Hard cap on tombstone retention: once a tombstone is older than this,
+    /// it is garbage-collected regardless of any member's absence. Bounds
+    /// the memory trade described on [`tombstone_ttl`](Self::tombstone_ttl)
+    /// against a member that never comes back.
+    pub tombstone_max_ttl: Duration,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
     /// Hard cap on a single wire frame, in bytes. Must not exceed
@@ -136,6 +150,7 @@ impl Default for ClusterConfig {
         Self {
             ae_interval: Duration::from_secs(30),
             tombstone_ttl: Duration::from_mins(10),
+            tombstone_max_ttl: Duration::from_hours(24),
             outbox_capacity: 8_192,
             max_frame: MAX_FRAME,
             gossip_bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -160,6 +175,12 @@ mod tests {
     #[test]
     fn defaults_satisfy_the_tombstone_ttl_rule() {
         assert!(ClusterConfig::default().tombstone_ttl_is_safe());
+    }
+
+    #[test]
+    fn default_tombstone_max_ttl_bounds_the_default_tombstone_ttl() {
+        let config = ClusterConfig::default();
+        assert!(config.tombstone_max_ttl > config.tombstone_ttl);
     }
 
     #[test]
