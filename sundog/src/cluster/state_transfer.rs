@@ -19,19 +19,19 @@ use crate::net::Mesh;
 use crate::node::NodeId;
 use crate::store::ShardOps;
 
-/// Overall wall-clock budget for the whole state-transfer attempt (across
-/// every donor retry) before `open()` gives up waiting and proceeds with
-/// whatever this node already has. Live traffic and the periodic
-/// anti-entropy loop repair the gap afterward, so this is a startup-latency
-/// bound, not a correctness one.
-const TOTAL_BUDGET: Duration = Duration::from_secs(20);
-/// Per-donor budget: how long a single donor gets to keep the stream moving
-/// before this node gives up on it and re-picks (the lowest-id live peer may
-/// by then be a different node, if this donor died in the meantime).
-const PER_DONOR_BUDGET: Duration = Duration::from_secs(8);
 /// Delay between retrying the same still-live donor after a transient
 /// failure (e.g. the mesh hasn't finished dialing it yet).
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Per-donor slice of the overall budget: how long a single donor gets to
+/// keep the stream moving before this node gives up on it and re-picks (the
+/// lowest-id live peer may by then be a different node, if this donor died
+/// in the meantime). Two fifths of the total, so a wedged first donor still
+/// leaves the retry loop room for a second full attempt plus the
+/// belt-and-braces anti-entropy sweep inside the same overall budget.
+fn per_donor_budget(total: Duration) -> Duration {
+    total * 2 / 5
+}
 
 /// How [`run`] ended — [`Outcome::NoPeers`] is the caller's cue to arm
 /// [`late_sync_task`], since `open()` racing gossip convergence is normal on
@@ -45,11 +45,13 @@ pub(crate) enum Outcome {
 
 /// Runs state transfer for `cache`, blocking until either a donor finishes
 /// (followed by one immediate anti-entropy round against it), no live peers
-/// remain to try, or `TOTAL_BUDGET` elapses.
+/// remain to try, or [`crate::config::ClusterConfig::state_transfer_budget`]
+/// elapses.
 #[tracing::instrument(skip_all, fields(cache = %cache))]
 pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &SmolStr) -> Outcome {
+    let budget = cluster.config().state_transfer_budget;
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(TOTAL_BUDGET, transfer_loop(cluster, shard, cache)).await {
+    match tokio::time::timeout(budget, transfer_loop(cluster, shard, cache)).await {
         Ok(Some(donor)) => {
             // `run_round_against` already bounds its own network calls
             // (`Mesh::ae_round`/`ae_pull`'s internal `REQUEST_TIMEOUT`), but
@@ -57,7 +59,7 @@ pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Sm
             // budget `open()`'s own docs promise end to end, rather than
             // letting it run for however long that internal bound allows on
             // top of the transfer loop's own elapsed time.
-            let remaining = TOTAL_BUDGET.saturating_sub(started.elapsed());
+            let remaining = budget.saturating_sub(started.elapsed());
             if tokio::time::timeout(
                 remaining,
                 anti_entropy::run_round_against(cluster, shard, cache, donor),
@@ -75,7 +77,7 @@ pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Sm
         }
         Err(_) => {
             tracing::warn!(
-                budget = ?TOTAL_BUDGET,
+                budget = ?budget,
                 "state transfer timed out before any donor finished; opening with a possibly partial cache"
             );
             Outcome::TimedOut
@@ -130,6 +132,7 @@ async fn transfer_loop(
     cache: &SmolStr,
 ) -> Option<NodeId> {
     let local_node = cluster.node_id();
+    let per_donor = per_donor_budget(cluster.config().state_transfer_budget);
     loop {
         let mut candidates: Vec<NodeId> = cluster
             .live_peer_ids()
@@ -139,11 +142,7 @@ async fn transfer_loop(
         candidates.sort_unstable();
         let donor = *candidates.first()?;
 
-        match tokio::time::timeout(
-            PER_DONOR_BUDGET,
-            try_donor(shard, cluster.mesh(), cache, donor),
-        )
-        .await
+        match tokio::time::timeout(per_donor, try_donor(shard, cluster.mesh(), cache, donor)).await
         {
             Ok(true) => return Some(donor),
             Ok(false) => tokio::time::sleep(RETRY_BACKOFF).await,
@@ -202,6 +201,15 @@ async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, dono
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_donor_budget_keeps_the_twenty_second_default_ratio() {
+        assert_eq!(
+            per_donor_budget(Duration::from_secs(20)),
+            Duration::from_secs(8)
+        );
+        assert_eq!(per_donor_budget(Duration::ZERO), Duration::ZERO);
+    }
 
     #[tokio::test]
     async fn transfer_loop_returns_none_immediately_with_no_live_peers() {

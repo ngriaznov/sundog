@@ -109,8 +109,11 @@ where
     /// returning: pulls a full snapshot from the lowest-node-id live
     /// peer, applies it through the same versioned-apply path as live
     /// traffic, then runs one immediate anti-entropy round against that
-    /// donor. This is bounded — an unresponsive or empty cluster does not
-    /// block `open()` forever, see `cluster::state_transfer`'s docs — and is
+    /// donor. This is bounded by
+    /// [`ClusterConfig::state_transfer_budget`](crate::config::ClusterConfig::state_transfer_budget)
+    /// — an unresponsive or empty cluster does not block `open()` forever,
+    /// and a cache too large to finish inside the budget opens with a
+    /// partial copy that anti-entropy tops up — and is
     /// followed by a background anti-entropy scheduler for the life of the
     /// cache. `Mode::Invalidation` gets neither: its nodes are meant to hold
     /// independent subsets, so there is no cluster-wide snapshot to warm

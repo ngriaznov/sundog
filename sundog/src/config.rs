@@ -118,6 +118,22 @@ pub struct ClusterConfig {
     /// crate's own cache tombstones, [`tombstone_ttl`](Self::tombstone_ttl)
     /// above) before chitchat garbage-collects them.
     pub kv_tombstone_grace_period: Duration,
+    /// Wall-clock budget for the state transfer a [`Mode::Replicated`] cache
+    /// runs inside `open()` (and inside the deferred warm-up when `open()`
+    /// raced gossip convergence): how long a joining node keeps pulling a
+    /// snapshot from donors before giving up and proceeding with whatever it
+    /// has. A startup-latency bound, not a correctness one — anti-entropy
+    /// repairs whatever the cut-off transfer didn't deliver — so size it for
+    /// how long you are willing to have `open()` block, not for safety.
+    /// Transfer moves roughly tens of thousands of small entries per second
+    /// on a LAN; the default comfortably covers caches into the
+    /// hundreds of thousands of entries, while a million-entry cache warms
+    /// fully inside `open()` only if this is raised to match. Zero is
+    /// honored: `open()` skips waiting entirely and leaves all warming to
+    /// anti-entropy.
+    ///
+    /// [`Mode::Replicated`]: crate::Mode::Replicated
+    pub state_transfer_budget: Duration,
     /// Mutual-TLS material for the data-plane mesh (feature `tls`); `None`
     /// (the default) means the mesh runs plaintext. See [`TlsConfig`]'s own
     /// docs for what setting this implies.
@@ -162,6 +178,7 @@ impl Default for ClusterConfig {
             phi_initial_interval: Duration::from_millis(500),
             dead_node_grace_period: Duration::from_secs(600),
             kv_tombstone_grace_period: Duration::from_mins(15),
+            state_transfer_budget: Duration::from_secs(20),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -192,6 +209,14 @@ mod tests {
         assert_eq!(
             config.outbox_capacity,
             ClusterConfig::default().outbox_capacity
+        );
+    }
+
+    #[test]
+    fn default_state_transfer_budget_is_twenty_seconds() {
+        assert_eq!(
+            ClusterConfig::default().state_transfer_budget,
+            Duration::from_secs(20)
         );
     }
 

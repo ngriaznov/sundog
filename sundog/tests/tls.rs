@@ -139,15 +139,28 @@ async fn nodes_with_certs_from_different_cas_never_replicate() {
     let gossip_a = reserve_gossip_addr().await;
     let gossip_b = reserve_gossip_addr().await;
 
+    // Every state-transfer attempt in this test is doomed (that's the
+    // point), so shrink the budget each `open()` burns failing TLS
+    // handshakes from the 20s default — which also exercises the knob:
+    // `open()` must return once *this* budget elapses, not the default.
+    let doomed_transfer = |config: sundog::ClusterConfig| {
+        config.with(|c| c.state_transfer_budget = Duration::from_secs(2))
+    };
     let cluster_a = Cluster::builder("it-tls-mismatched-ca")
         .seeds([gossip_b])
-        .config(tls_node_config(gossip_a, generate_node_tls(&ca_a)))
+        .config(doomed_transfer(tls_node_config(
+            gossip_a,
+            generate_node_tls(&ca_a),
+        )))
         .build()
         .await
         .expect("node a builds with tls");
     let cluster_b = Cluster::builder("it-tls-mismatched-ca")
         .seeds([gossip_a])
-        .config(tls_node_config(gossip_b, generate_node_tls(&ca_b)))
+        .config(doomed_transfer(tls_node_config(
+            gossip_b,
+            generate_node_tls(&ca_b),
+        )))
         .build()
         .await
         .expect("node b builds with tls");
@@ -159,9 +172,9 @@ async fn nodes_with_certs_from_different_cas_never_replicate() {
     common::wait_for_peer_count(&cluster_b, 1, Duration::from_secs(15)).await;
 
     // Concurrent: each side's own state-transfer attempt against the other
-    // (Mode::Replicated always tries a donor on open) burns its own ~20s
-    // budget failing every TLS handshake — run them in parallel rather than
-    // paying that cost twice over.
+    // (Mode::Replicated always tries a donor on open) burns its own
+    // `state_transfer_budget` failing every TLS handshake — run them in
+    // parallel rather than paying that cost twice over.
     let (cache_a, cache_b) = tokio::join!(
         cluster_a
             .cache::<u32, String>("users")

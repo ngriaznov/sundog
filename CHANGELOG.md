@@ -54,7 +54,10 @@ release.
   snapshot from the lowest-node-id live donor before `open()` returns, then
   runs one immediate anti-entropy round against that donor as a
   belt-and-braces sweep; donor death mid-stream is recovered by re-picking
-  and re-requesting, made free by idempotent apply.
+  and re-requesting, made free by idempotent apply. The time `open()` spends
+  on this is bounded by `ClusterConfig::state_transfer_budget` (default 20s)
+  — a startup-latency knob, not a correctness one, since anti-entropy tops
+  up whatever a cut-off transfer didn't deliver.
 - **Anti-entropy**: a jittered background scheduler per `Replicated` cache,
   targeting dirty (backlog-dropped) peers first, reconciling via digest
   compare → bucket pull → push/pull the actual diff.
