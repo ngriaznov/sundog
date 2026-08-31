@@ -282,6 +282,13 @@ async fn diff_bucket(
 /// One symmetric peer's whole role in scenarios 1 and 2: write its own key
 /// range on a timer (fanning each out), run anti-entropy against its peer on
 /// a separate timer, and dispatch inbound traffic — forever.
+///
+/// `remove_on_repeat` turns the key plan into a lifecycle plan: the first
+/// occurrence of a key inserts it, any repeat occurrence removes it (fanning
+/// the tombstone out the same way), so a plan listing a key twice churns it
+/// through insert-then-delete. `ops_issued` counts every issued operation —
+/// the only externally observable "the write plan finished" signal once
+/// removes make value-presence checks useless.
 #[derive(Clone)]
 struct NodeParams {
     node: NodeId,
@@ -293,6 +300,8 @@ struct NodeParams {
     ae_period: Duration,
     dup_factor: usize,
     ae_failures: Option<Arc<AtomicUsize>>,
+    remove_on_repeat: bool,
+    ops_issued: Option<Arc<AtomicUsize>>,
 }
 
 async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
@@ -312,6 +321,7 @@ async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
     let peer_ids: Vec<NodeId> = peer_list.iter().map(|peer| peer.node).collect();
 
     let mut keys = params.keys.into_iter();
+    let mut seen: HashSet<u32> = HashSet::new();
     let mut write_tick = tokio::time::interval(params.write_period);
     write_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ae_tick = tokio::time::interval(params.ae_period);
@@ -325,9 +335,16 @@ async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
             }
             _ = write_tick.tick() => {
                 if let Some(key) = keys.next() {
-                    let value = format!("{}:{key}", params.label);
-                    let _ = shard.insert(key, value).await;
+                    if params.remove_on_repeat && !seen.insert(key) {
+                        let _ = shard.remove(&key).await;
+                    } else {
+                        let value = format!("{}:{key}", params.label);
+                        let _ = shard.insert(key, value).await;
+                    }
                     fan_out(shard.as_ref(), &mesh, &peer_ids, key, params.dup_factor).await;
+                    if let Some(counter) = params.ops_issued.as_ref() {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             _ = ae_tick.tick() => {
@@ -375,6 +392,8 @@ fn spawn_symmetric_pair(
         ae_period: spec.ae_period,
         dup_factor: spec.dup_factor,
         ae_failures: ae_failures.clone(),
+        remove_on_repeat: false,
+        ops_issued: None,
     };
     sim.host(spec.host_a, move || {
         let shard = Arc::clone(&shard_a);
@@ -392,6 +411,8 @@ fn spawn_symmetric_pair(
         ae_period: spec.ae_period,
         dup_factor: spec.dup_factor,
         ae_failures,
+        remove_on_repeat: false,
+        ops_issued: None,
     };
     sim.host(spec.host_b, move || {
         let shard = Arc::clone(&shard_b);
@@ -1149,6 +1170,115 @@ fn sustained_high_latency_still_converges() {
             value_of(&shard_b, key),
             "both sides must agree on key {key} under sustained high latency"
         );
+    }
+}
+
+/// High-frequency entry lifecycle under loss: both nodes run overlapping
+/// insert-then-remove plans (`remove_on_repeat`) over a shared key range on
+/// a lossy, reordering link, so the same key is inserted on one side,
+/// removed on the other, and the tombstone fan-out itself can be dropped and
+/// left for anti-entropy to repair. The end state is fully determined by
+/// the plans — every even key was removed by every writer that touched it,
+/// every odd key's last operation was an insert — so the assertions check
+/// the converged state is the *correct* one, not merely a shared one:
+/// removed keys stay removed on both sides, surviving keys agree.
+#[test]
+fn add_remove_churn_under_loss_converges_to_the_correct_state() {
+    let node_a = NodeId::from(61);
+    let node_b = NodeId::from(62);
+    let port = 4800;
+    // First pass inserts the range, second pass removes its even keys.
+    let plan_a: Vec<u32> = (0..16).chain((0..16).step_by(2)).collect();
+    let plan_b: Vec<u32> = (8..24).chain((8..24).step_by(2)).collect();
+
+    let shard_a = Arc::new(new_shard(node_a));
+    let shard_b = Arc::new(new_shard(node_b));
+    let ops_a = Arc::new(AtomicUsize::new(0));
+    let ops_b = Arc::new(AtomicUsize::new(0));
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0xC4B4_A901))
+        .tick_duration(TICK)
+        // Same order of loss as the storm scenario, for the same reason its
+        // comment gives: turmoil loss breaks whole in-flight connections, so
+        // this rate is "AE rounds routinely fail and retry", not "packets
+        // occasionally vanish".
+        .fail_rate(0.03)
+        .repair_rate(0.75)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(60))
+        .build();
+
+    let params_a = NodeParams {
+        node: node_a,
+        label: "a",
+        port,
+        peers: vec![(node_b, "churn-b", port)],
+        keys: plan_a.clone(),
+        write_period: Duration::from_millis(25),
+        ae_period: Duration::from_millis(150),
+        dup_factor: 2,
+        ae_failures: None,
+        remove_on_repeat: true,
+        ops_issued: Some(Arc::clone(&ops_a)),
+    };
+    let shard = Arc::clone(&shard_a);
+    sim.host("churn-a", move || {
+        let shard = Arc::clone(&shard);
+        let params = params_a.clone();
+        async move { node_loop(params, shard).await }
+    });
+
+    let params_b = NodeParams {
+        node: node_b,
+        label: "b",
+        port,
+        peers: vec![(node_a, "churn-a", port)],
+        keys: plan_b.clone(),
+        write_period: Duration::from_millis(25),
+        ae_period: Duration::from_millis(150),
+        dup_factor: 2,
+        ae_failures: None,
+        remove_on_repeat: true,
+        ops_issued: Some(Arc::clone(&ops_b)),
+    };
+    let shard = Arc::clone(&shard_b);
+    sim.host("churn-b", move || {
+        let shard = Arc::clone(&shard);
+        let params = params_b.clone();
+        async move { node_loop(params, shard).await }
+    });
+
+    run_until(&mut sim, steps_for(Duration::from_secs(15)), || {
+        ops_a.load(Ordering::Relaxed) >= plan_a.len()
+            && ops_b.load(Ordering::Relaxed) >= plan_b.len()
+    })
+    .expect("both churn plans finish issuing within the budget");
+
+    run_until(&mut sim, steps_for(Duration::from_secs(20)), || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+    })
+    .expect("churned shards converge despite loss within the budget");
+
+    for key in (0..24u32).step_by(2) {
+        assert_eq!(
+            value_of(&shard_a, key),
+            None,
+            "removed key {key} must stay removed on node-a"
+        );
+        assert_eq!(
+            value_of(&shard_b, key),
+            None,
+            "removed key {key} must stay removed on node-b"
+        );
+    }
+    for key in (1..24u32).step_by(2) {
+        let (on_a, on_b) = (value_of(&shard_a, key), value_of(&shard_b, key));
+        assert!(
+            on_a.is_some(),
+            "surviving key {key} must be present once converged"
+        );
+        assert_eq!(on_a, on_b, "both sides must agree on surviving key {key}");
     }
 }
 
