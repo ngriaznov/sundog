@@ -935,6 +935,223 @@ fn tombstone_deferral_is_load_bearing_against_resurrection() {
     );
 }
 
+/// A link that flaps — six partition/heal cycles in quick succession, each
+/// shorter than an AE interval, while both sides keep writing throughout.
+/// No single heal window is long enough to guarantee a full repair, so this
+/// checks that progress made in one window is never undone by the next
+/// break: once the flapping stops, convergence completes within the same
+/// five-AE-round bound the clean-partition test uses.
+#[test]
+fn link_flapping_under_writes_converges_after_final_heal() {
+    let node_a = NodeId::from(31);
+    let node_b = NodeId::from(32);
+    let ae_period = Duration::from_millis(250);
+    let keys_a: Vec<u32> = (0..12).collect();
+    let keys_b: Vec<u32> = (300..312).collect();
+
+    let shard_a = Arc::new(new_shard(node_a));
+    let shard_b = Arc::new(new_shard(node_b));
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0xF1A9_9001))
+        .tick_duration(TICK)
+        .max_message_latency(Duration::from_millis(20))
+        .build();
+
+    spawn_symmetric_pair(
+        &mut sim,
+        PairSpec {
+            host_a: "flap-a",
+            host_b: "flap-b",
+            node_a,
+            node_b,
+            port: 4500,
+            keys_a: keys_a.clone(),
+            keys_b: keys_b.clone(),
+            write_period: Duration::from_millis(40),
+            ae_period,
+            dup_factor: 1,
+        },
+        Arc::clone(&shard_a),
+        Arc::clone(&shard_b),
+        None,
+    );
+
+    // 6 × (300ms down + 200ms up) = 3s of flapping; both write plans
+    // (12 keys × 40ms = 480ms) finish while the link is still unstable.
+    for _ in 0..6 {
+        sim.partition("flap-a", "flap-b");
+        run_steps(&mut sim, steps_for(Duration::from_millis(300)));
+        sim.repair("flap-a", "flap-b");
+        run_steps(&mut sim, steps_for(Duration::from_millis(200)));
+    }
+
+    let budget = steps_for(ae_period * 5 + Duration::from_millis(500));
+    let converged = run_until(&mut sim, budget, || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+    });
+    assert!(
+        converged.is_some(),
+        "digests must converge within five AE-round intervals of the final heal"
+    );
+    for &key in keys_a.iter().chain(keys_b.iter()) {
+        assert!(
+            value_of(&shard_a, key).is_some() && value_of(&shard_b, key).is_some(),
+            "both sides must hold key {key} after the flapping stops"
+        );
+    }
+}
+
+/// An asymmetric fault: `partition_oneway` drops everything node-a sends to
+/// node-b (data, AE responses, connection handshakes) while node-b's
+/// established path to node-a keeps delivering. Both properties matter: the
+/// healthy direction must keep replicating *during* the fault — node-a ends
+/// up holding every key node-b wrote — and the broken direction's backlog
+/// must repair via anti-entropy once the link heals. The initial settle
+/// window exists because turmoil connection setup needs both directions
+/// (SYN one way, accept the other), so the meshes must dial each other
+/// before the one-way drop begins.
+#[test]
+fn one_way_partition_delivers_the_healthy_direction_and_heals() {
+    let node_a = NodeId::from(41);
+    let node_b = NodeId::from(42);
+    let ae_period = Duration::from_millis(200);
+    let keys_a: Vec<u32> = (0..8).collect();
+    let keys_b: Vec<u32> = (400..408).collect();
+
+    let shard_a = Arc::new(new_shard(node_a));
+    let shard_b = Arc::new(new_shard(node_b));
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x0E1A_A701))
+        .tick_duration(TICK)
+        .max_message_latency(Duration::from_millis(20))
+        .build();
+
+    spawn_symmetric_pair(
+        &mut sim,
+        PairSpec {
+            host_a: "oneway-a",
+            host_b: "oneway-b",
+            node_a,
+            node_b,
+            port: 4600,
+            keys_a: keys_a.clone(),
+            keys_b: keys_b.clone(),
+            write_period: Duration::from_millis(100),
+            ae_period,
+            dup_factor: 1,
+        },
+        Arc::clone(&shard_a),
+        Arc::clone(&shard_b),
+        None,
+    );
+
+    // Let connections establish and the first few writes cross, then break
+    // the a→b direction only. The 8-key × 100ms write plans keep issuing
+    // well past this point, so some of node-a's writes are guaranteed to
+    // happen entirely under the fault.
+    run_steps(&mut sim, steps_for(Duration::from_millis(300)));
+    sim.partition_oneway("oneway-a", "oneway-b");
+
+    // The healthy direction keeps working: node-a ends up with every key
+    // node-b wrote, with the fault still up the whole time.
+    let fault_budget = steps_for(Duration::from_secs(10));
+    run_until(&mut sim, fault_budget, || {
+        keys_b.iter().all(|&key| value_of(&shard_a, key).is_some())
+    })
+    .expect("node-b's writes must keep replicating to node-a during the one-way fault");
+
+    // And the broken direction really is broken: node-a wrote keys after the
+    // drop began that node-b cannot have seen (fan-out dropped, AE responses
+    // dropped), so the two sides must still disagree.
+    assert_ne!(
+        digests_of(&shard_a),
+        digests_of(&shard_b),
+        "node-b must be missing node-a's post-fault writes while a→b is down"
+    );
+
+    sim.repair_oneway("oneway-a", "oneway-b");
+    let budget = steps_for(ae_period * 10 + Duration::from_millis(500));
+    let converged = run_until(&mut sim, budget, || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+    });
+    assert!(
+        converged.is_some(),
+        "digests must converge within ten AE-round intervals of repairing a→b"
+    );
+    for &key in keys_a.iter().chain(keys_b.iter()) {
+        assert!(
+            value_of(&shard_a, key).is_some() && value_of(&shard_b, key).is_some(),
+            "both sides must hold key {key} after the one-way fault heals"
+        );
+    }
+}
+
+/// A permanently slow link — every message takes 50–150ms one way, an order
+/// of magnitude above the other scenarios — with live writes on both sides.
+/// Nothing is lost, just late: replication and anti-entropy must still
+/// converge within a bounded number of rounds, and no request path may sit
+/// closer to `NET_TIMEOUT` than one full round trip (~300ms worst case)
+/// allows.
+#[test]
+fn sustained_high_latency_still_converges() {
+    let node_a = NodeId::from(51);
+    let node_b = NodeId::from(52);
+    let ae_period = Duration::from_millis(400);
+    let keys_a: Vec<u32> = (0..8).collect();
+    let keys_b: Vec<u32> = (500..508).collect();
+
+    let shard_a = Arc::new(new_shard(node_a));
+    let shard_b = Arc::new(new_shard(node_b));
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x51_0111))
+        .tick_duration(TICK)
+        .min_message_latency(Duration::from_millis(50))
+        .max_message_latency(Duration::from_millis(150))
+        .build();
+
+    spawn_symmetric_pair(
+        &mut sim,
+        PairSpec {
+            host_a: "slow-a",
+            host_b: "slow-b",
+            node_a,
+            node_b,
+            port: 4700,
+            keys_a: keys_a.clone(),
+            keys_b: keys_b.clone(),
+            write_period: Duration::from_millis(50),
+            ae_period,
+            dup_factor: 1,
+        },
+        Arc::clone(&shard_a),
+        Arc::clone(&shard_b),
+        None,
+    );
+
+    let budget = steps_for(Duration::from_secs(30));
+    let converged = run_until(&mut sim, budget, || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+            && keys_a
+                .iter()
+                .chain(keys_b.iter())
+                .all(|&key| value_of(&shard_a, key).is_some())
+    });
+    assert!(
+        converged.is_some(),
+        "a slow-but-lossless link must still converge within the budget"
+    );
+    for &key in keys_a.iter().chain(keys_b.iter()) {
+        assert_eq!(
+            value_of(&shard_a, key),
+            value_of(&shard_b, key),
+            "both sides must agree on key {key} under sustained high latency"
+        );
+    }
+}
+
 #[test]
 fn donor_crash_mid_state_transfer_repicks_and_completes() {
     let donor1 = NodeId::from(21);
