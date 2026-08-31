@@ -2459,9 +2459,9 @@ checksum = "1e061d1b48cb8d38042de4ae0a7a6401009d6143dc80d2e2d6f31f0bdd6470c7"
 
 [[package]]
 name = "rightsize"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5c2b171771bacf614ddc3b9173d79a4ec81caf0f8f6bb1d1acb0d34112a9a75"
+checksum = "afe5f6d1b2bf8680e2b10dec7adf4c38694fdedc986c626e0d38a79b8ee62ded"
 dependencies = [
  "async-trait",
  "regex-lite",
@@ -2474,9 +2474,9 @@ dependencies = [
 
 [[package]]
 name = "rightsize-docker"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5314608394ac3e1d90788eb3ef345e8a03dcd11c311f0787557b5b07a3f4dba9"
+checksum = "3310441e51bbde67d7cce6a8f023fff514e620312c97157517582a46495cd489"
 dependencies = [
  "async-trait",
  "rightsize",
@@ -2488,9 +2488,9 @@ dependencies = [
 
 [[package]]
 name = "rightsize-modules"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a6b28bbd915b8a5a014cedb7c3db4cb842efb8b4369f5536776550d399e3c0"
+checksum = "7839556e98b9d22f537dfbb84872ae908236c413f1e856dabeb733cdcfecd984"
 dependencies = [
  "async-trait",
  "rightsize",

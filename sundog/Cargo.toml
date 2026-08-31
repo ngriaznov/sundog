@@ -46,8 +46,8 @@ rcgen = "0.14.9"
 # (RIGHTSIZE_BACKEND=docker throughout), and backend-msb's ureq dependency
 # requests rustls's `ring` provider, which collides with the `tls` feature's
 # aws-lc-rs under feature unification (rustls panics when both are present).
-rightsize = "0.7.5"
-rightsize-modules = { version = "0.7.5", default-features = false, features = ["backend-docker"] }
+rightsize = "0.7.6"
+rightsize-modules = { version = "0.7.6", default-features = false, features = ["backend-docker"] }
 tokio = { version = "1.53.1", features = ["test-util"] }
 tracing-subscriber = "0.3.23"
 
