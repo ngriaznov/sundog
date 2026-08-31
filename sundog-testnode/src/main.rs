@@ -14,6 +14,12 @@
 //! `del k` -> `ok`; `count` -> `<n>` (live local entries, read from the
 //! store); `fill n` -> `ok` (bulk-inserts `k0..kn` = `v0..vn` locally);
 //! `peers` -> `<n>`; `quit` -> exits 0.
+//!
+//! A second `Mode::Replicated` cache named `"churn"` carries a short TTL
+//! (`CHURN_TTL`) for high-frequency lifecycle tests: `churn n` -> `ok` runs
+//! `n` back-to-back operations over a fixed `CHURN_KEYSPACE`-key space —
+//! three inserts to every remove, full speed, no pacing — and `ccount` ->
+//! `<n>` reads that cache's live-entry count.
 
 use std::env;
 use std::io::Write as _;
@@ -27,6 +33,14 @@ use tokio::net::{TcpListener, TcpStream};
 const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
 const CACHE_NAME: &str = "it";
+const CHURN_CACHE_NAME: &str = "churn";
+/// Short enough that entries written early in a `churn` run expire while the
+/// run is still writing — replication of already-expired records is part of
+/// what the churn suite exists to exercise.
+const CHURN_TTL: Duration = Duration::from_secs(2);
+/// `churn` wraps keys modulo this, so concurrent churners on different nodes
+/// keep colliding on the same keys instead of writing disjoint ranges.
+const CHURN_KEYSPACE: u32 = 512;
 
 #[tokio::main]
 async fn main() {
@@ -60,6 +74,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .mode(Mode::Replicated)
         .open()
         .await?;
+    let churn = cluster
+        .cache::<String, String>(CHURN_CACHE_NAME)
+        .mode(Mode::Replicated)
+        .ttl(CHURN_TTL)
+        .open()
+        .await?;
 
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
     println!("testnode-ready");
@@ -67,7 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (socket, _) = listener.accept().await?;
-        tokio::spawn(serve(socket, cache.clone(), cluster.clone()));
+        tokio::spawn(serve(socket, cache.clone(), churn.clone(), cluster.clone()));
     }
 }
 
@@ -94,7 +114,12 @@ enum Reply {
     Quit,
 }
 
-async fn dispatch(cache: &Cache<String, String>, cluster: &Cluster, line: &str) -> Reply {
+async fn dispatch(
+    cache: &Cache<String, String>,
+    churn: &Cache<String, String>,
+    cluster: &Cluster,
+    line: &str,
+) -> Reply {
     let mut parts = line.trim().splitn(3, ' ');
     match parts.next().unwrap_or_default() {
         "put" => {
@@ -137,20 +162,43 @@ async fn dispatch(cache: &Cache<String, String>, cluster: &Cluster, line: &str) 
                 Err(error) => format!("err {error}"),
             })
         }
+        "churn" => {
+            let Some(ops) = parts.next().and_then(|raw| raw.parse::<u32>().ok()) else {
+                return Reply::Line("err churn needs a u32 op count".to_string());
+            };
+            for i in 0..ops {
+                let key = format!("c{}", i % CHURN_KEYSPACE);
+                let result = if i % 4 == 3 {
+                    churn.remove(&key).await
+                } else {
+                    churn.insert(key, format!("v{i}")).await
+                };
+                if let Err(error) = result {
+                    return Reply::Line(format!("err {error}"));
+                }
+            }
+            Reply::Line("ok".to_string())
+        }
+        "ccount" => Reply::Line(churn.entry_count().await.to_string()),
         "peers" => Reply::Line(cluster.peers().len().to_string()),
         "quit" => Reply::Quit,
         other => Reply::Line(format!("err unknown command {other:?}")),
     }
 }
 
-async fn serve(socket: TcpStream, cache: Cache<String, String>, cluster: Cluster) {
+async fn serve(
+    socket: TcpStream,
+    cache: Cache<String, String>,
+    churn: Cache<String, String>,
+    cluster: Cluster,
+) {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
     loop {
         let Ok(Some(line)) = lines.next_line().await else {
             return;
         };
-        match dispatch(&cache, &cluster, &line).await {
+        match dispatch(&cache, &churn, &cluster, &line).await {
             Reply::Line(reply) => {
                 if writer
                     .write_all(format!("{reply}\n").as_bytes())

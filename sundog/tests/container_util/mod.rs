@@ -207,6 +207,35 @@ impl Node {
         }
     }
 
+    /// `churn n` — runs `n` back-to-back insert/remove operations (3:1 mix)
+    /// on the node's short-TTL `"churn"` cache, over a fixed shared key
+    /// space, full speed. Returns once the whole run has been issued.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails or the node reports an
+    /// operation error mid-run.
+    pub async fn churn(&self, ops: u32) -> Result<(), String> {
+        match self.command(&format!("churn {ops}")).await?.as_str() {
+            "ok" => Ok(()),
+            other => Err(other.to_string()),
+        }
+    }
+
+    /// `ccount` — the live-entry count of the node's short-TTL `"churn"`
+    /// cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails, or the reply doesn't
+    /// parse as a number.
+    pub async fn churn_count(&self) -> Result<usize, String> {
+        self.command("ccount")
+            .await?
+            .parse()
+            .map_err(|error| format!("bad ccount reply: {error}"))
+    }
+
     /// `peers` — the node's live peer count, as membership currently reports it.
     ///
     /// # Errors

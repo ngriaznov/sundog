@@ -277,6 +277,75 @@ async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
     net.close().await.expect("network closes");
 }
 
+/// High-frequency entry lifecycle: three nodes concurrently hammer the same
+/// 512-key space on a 2s-TTL replicated cache — 100k operations each, three
+/// inserts to every remove, no pacing — so the same key is constantly
+/// inserted, removed, re-inserted, and TTL-expired across writers, and some
+/// records replicate after they are already dead on arrival. The end-state
+/// claims are what make it a test rather than a stress toy: every replica
+/// must agree, then drain to zero on its own once the writes stop (TTL
+/// deadlines are absolute and travel with records), and must *stay* at zero
+/// across further anti-entropy rounds — nothing may resurrect an expired
+/// entry or a tombstone.
+#[tokio::test]
+async fn high_churn_of_adds_removes_and_ttl_expiry_drains_cleanly() {
+    const OPS: u32 = 100_000;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "churn-cluster", "n1", &[]).await;
+    let n2 = Node::spawn(&net, "churn-cluster", "n2", &[&seed("n1")]).await;
+    let n3 = Node::spawn(&net, "churn-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
+    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+
+    let (r1, r2, r3) = tokio::join!(n1.churn(OPS), n2.churn(OPS), n3.churn(OPS));
+    r1.expect("n1 churn completes");
+    r2.expect("n2 churn completes");
+    r3.expect("n3 churn completes");
+
+    // Counts drift downward together as TTL keeps expiring what the churn
+    // wrote — agreement at a sampled instant is the invariant here, not any
+    // particular value.
+    eventually(CONVERGE_WAIT, || async {
+        let (a, b, c) = (
+            n1.churn_count().await,
+            n2.churn_count().await,
+            n3.churn_count().await,
+        );
+        a.is_ok() && a == b && b == c
+    })
+    .await;
+
+    // With the writers stopped, everything ages past the 2s TTL and every
+    // replica must empty out on its own.
+    eventually(Duration::from_secs(30), || async {
+        n1.churn_count().await == Ok(0)
+            && n2.churn_count().await == Ok(0)
+            && n3.churn_count().await == Ok(0)
+    })
+    .await;
+
+    // Several of the testnode's 2s anti-entropy intervals later, still
+    // empty: no round has pulled an expired entry or tombstone back.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    for (node, name) in [(&n1, "n1"), (&n2, "n2"), (&n3, "n3")] {
+        assert_eq!(
+            node.churn_count().await,
+            Ok(0),
+            "{name} must stay empty after the churn cache drains"
+        );
+    }
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    n3.stop().await.expect("n3 stops");
+    net.close().await.expect("network closes");
+}
+
 /// The 100k scenario, an order of magnitude up: a cold node joins a
 /// three-node cluster already holding a million entries and must warm to a
 /// full copy — and the donors must agree it stayed a full copy — inside a
