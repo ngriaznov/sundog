@@ -277,6 +277,58 @@ async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
     net.close().await.expect("network closes");
 }
 
+/// The 100k scenario, an order of magnitude up: a cold node joins a
+/// three-node cluster already holding a million entries and must warm to a
+/// full copy — and the donors must agree it stayed a full copy — inside a
+/// bound that still reads as "startup", not "outage". A million small
+/// entries is roughly 300 MiB of process footprint per node, so this also
+/// exercises snapshot chunking and the anti-entropy top-up at a data volume
+/// where any accidentally quadratic path would blow straight through the
+/// window.
+#[tokio::test]
+async fn cold_join_warms_a_million_entry_cluster() {
+    const ENTRIES: u32 = 1_000_000;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "million-cluster", "n1", &[]).await;
+    let n2 = Node::spawn(&net, "million-cluster", "n2", &[&seed("n1")]).await;
+    wait_for_peers(&[&n1, &n2], 1).await;
+
+    n1.fill(ENTRIES).await.expect("bulk fill succeeds");
+    assert_eq!(n1.count().await, Ok(ENTRIES as usize));
+    // n2 warms from live replication fan-out, so the joiner below has two
+    // donors holding the full set, not one.
+    eventually(Duration::from_secs(180), || async {
+        n2.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    let n3 = Node::spawn(&net, "million-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
+    eventually(Duration::from_secs(300), || async {
+        n3.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+    let warm = started.elapsed();
+    println!("cold join warmed {ENTRIES} entries in {warm:?} (incl. container boot)");
+    assert!(
+        warm < Duration::from_secs(120),
+        "cold join took {warm:?}, past the million-entry bar"
+    );
+    assert_eq!(n3.get("k0").await, Ok(Some("v0".to_string())));
+    assert_eq!(n3.get("k999999").await, Ok(Some("v999999".to_string())));
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    n3.stop().await.expect("n3 stops");
+    net.close().await.expect("network closes");
+}
+
 /// A cold node joining a populated cluster warms via state transfer in
 /// seconds, at 100k-entry scale. The elapsed
 /// bound below includes container boot and gossip convergence on top of the
