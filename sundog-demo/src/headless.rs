@@ -16,7 +16,13 @@ use crate::setup;
 ///
 /// Returns an error if the cluster fails to bootstrap.
 pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> {
-    let demo = setup::bootstrap(args).await?;
+    let mut demo = setup::bootstrap(args).await?;
+    // The event feed is unbounded and only the TUI reads it; with no drain,
+    // a long headless run accumulates every event string ever sent.
+    let (drained_tx, drained_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut feed = std::mem::replace(&mut demo.feed_rx, drained_rx);
+    drop(drained_tx);
+    tokio::spawn(async move { while feed.recv().await.is_some() {} });
     println!(
         "sundog-demo headless: {} nodes, cluster {:?}, running for {}s",
         args.nodes,
