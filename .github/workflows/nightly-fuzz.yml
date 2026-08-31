@@ -1,0 +1,37 @@
+# Nightly fuzz smoke over the wire decoder: five minutes per target,
+# starting from the generated seed corpus. A crash uploads its artifact for
+# local reproduction with `cargo +nightly fuzz run <target> <artifact>`.
+name: nightly-fuzz
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz-wire-decoder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sundog/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed the corpus
+        working-directory: sundog/fuzz
+        run: cargo +nightly run --bin gen_seeds
+      - name: Fuzz decode_never_panics
+        working-directory: sundog/fuzz
+        run: cargo +nightly fuzz run decode_never_panics -- -max_total_time=300 -max_len=65536
+      - name: Fuzz decode_encode_roundtrip
+        working-directory: sundog/fuzz
+        run: cargo +nightly fuzz run decode_encode_roundtrip -- -max_total_time=300 -max_len=65536
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: sundog/fuzz/artifacts/
+          if-no-files-found: ignore
