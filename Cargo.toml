@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["sundog", "sundog-demo", "sundog-testnode"]
+# The fuzz crate builds with its own profiles under cargo-fuzz's nightly
+# toolchain; it stands alone rather than joining the workspace build graph.
+exclude = ["sundog/fuzz"]
 
 [workspace.package]
 edition = "2024"

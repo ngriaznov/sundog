@@ -1,0 +1,40 @@
+[package]
+name = "sundog-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sundog]
+path = ".."
+
+[dependencies.bytes]
+version = "1"
+
+[[bin]]
+name = "decode_never_panics"
+path = "fuzz_targets/decode_never_panics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_encode_roundtrip"
+path = "fuzz_targets/decode_encode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+[[bin]]
+name = "gen_seeds"
+path = "fuzz_targets/gen_seeds.rs"
+test = false
+doc = false
+bench = false
