@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,6 +55,33 @@ jobs:
       # which is why `sim` keeps its own lane above instead.
       - name: cargo test (tls,prometheus features)
         run: cargo test --package sundog --features tls,prometheus
+
+  # Portability lane: the crate claims no OS-specific behavior, but mDNS,
+  # socket handling, and timers all differ per platform — this proves the
+  # workspace builds and its default-feature test suite (plus the turmoil
+  # sim lane) passes on macOS and Windows, not just Linux. The container/
+  # musl and tls,prometheus lanes stay Linux-only: containers need a Linux
+  # docker host, and the `tls` feature's aws-lc-rs build wants NASM on
+  # Windows — a separate decision from plain portability.
+  os-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo test (turmoil simulation suite)
+        run: cargo test --package sundog --features sim --test 'sim*'
 
   # Container-backed multi-node suite, exclusively through the `rightsize`
   # crate — no docker CLI, no bollard. Separate job because it needs the
