@@ -9,6 +9,35 @@ None of what follows is scheduled. A section moves from here into actual
 code only once its trigger condition is observed in a real deployment, not
 because it would be interesting to build.
 
+## Bespoke store engine (sub-200ns reads)
+
+The store rides on [`moka`](https://crates.io/crates/moka), which supplies
+TTL/TTI expiry, size- and weight-bounded TinyLFU eviction, and the
+stampede-collapsed `get_or_load` path — battle-tested semantics the whole
+verification stack leans on. It also sets the performance floor: a `moka`
+`get` costs ~600ns of the ~700ns a `Shard::get` measures end to end, and
+its async insert path is the largest single slice of a ~3.4µs replicated
+write. State-of-the-art concurrent cache reads (Caffeine-class designs)
+land in the 50–150ns range, so a purpose-built engine — our own concurrent
+map, TTL wheel, eviction policy, and stampede collapse behind the existing
+`ShardOps` seam — is worth roughly 5× on reads and ~3× on writes, and
+speeds up bulk remote apply in proportion. Nothing above the store (wire,
+fan-out batching, anti-entropy) needs to change; the replication pipeline
+already converges within a fraction of a second of the writes landing.
+
+**Cost:** a multi-week engine build whose hardest parts are exactly the
+semantics `moka` currently guarantees for free — expiry correctness under
+concurrent writes, eviction that can't resurrect stale entries, and
+stampede collapse without deadlock — all of which the permutation
+proptests, TTL-guarantee ladder, and churn suites must hold green through
+the swap.
+
+**Trigger:** a benchmark against a competing embedded cache where the read
+path is the measured, deciding gap — or read latency showing up as the
+binding constraint in a real deployment. Until then the current numbers
+already lead the embedded-replicated category, and the risk budget is
+better spent on real-workload mileage.
+
 ## Distribution mode
 
 A consistent-hash ring over the live member set, `numOwners` primary+backup
