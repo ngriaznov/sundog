@@ -23,6 +23,23 @@ anti-entropy repairs whatever gossip's fire-and-forget delivery drops.
 Things we deliberately didn't build, and what would make us reconsider, are
 in [`ROADMAP.md`](ROADMAP.md).
 
+## Getting it
+
+```sh
+cargo add sundog
+```
+
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+sundog = "0.1"
+```
+
+sundog is async and runs on [tokio](https://tokio.rs) — the examples below
+assume a tokio runtime. The optional [feature flags](#feature-flags) are
+additive: `cargo add sundog --features tls,prometheus`.
+
 ## Quick start
 
 ```rust
