@@ -7,6 +7,19 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description.workspace = true
+homepage = "https://github.com/ngriaznov/sundog"
+readme = "../README.md"
+keywords = ["cache", "distributed", "replication", "gossip", "embedded"]
+categories = ["caching", "asynchronous", "network-programming"]
+# The fuzz crate ships in-tree but stands outside the workspace (see the
+# root manifest); it has no place in the published package.
+exclude = ["fuzz/"]
+
+# docs.rs builds with the additive features on, so the `tls` and
+# `prometheus` APIs show up in hosted docs. `sim` stays off: it swaps the
+# transport to turmoil's and is a test-only knob.
+[package.metadata.docs.rs]
+features = ["tls", "prometheus"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

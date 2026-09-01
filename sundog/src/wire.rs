@@ -3,9 +3,9 @@
 //!
 //! Every frame starts with a one-byte discriminant. Control messages
 //! (`Hello`, `StRequest`, `AeDigest`, `AeBucket`, `AePull`, `ReqDone`) carry
-//! [`FRAME_KIND_POSTCARD`] and are postcard-encoded exactly as before. The
+//! `FRAME_KIND_POSTCARD` and are postcard-encoded exactly as before. The
 //! three record-carrying variants — [`Msg::Replicate`], [`Msg::ReplicateBatch`],
-//! [`Msg::StChunk`] — carry [`FRAME_KIND_RAW_RECORD`] and use a dedicated
+//! [`Msg::StChunk`] — carry `FRAME_KIND_RAW_RECORD` and use a dedicated
 //! length-prefixed layout instead: a fixed-size header (read via the
 //! `zerocopy` crate's safe [`FromBytes`]/[`IntoBytes`] views, never
 //! `unsafe`) followed by each record's key and value bytes back to back.

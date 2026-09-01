@@ -181,7 +181,7 @@ pub trait ShardOps: Send + Sync {
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
     /// [`ShardOps::apply_remote`] for a whole batch, grouped by key stripe
-    /// (see [`stripe_of`]) and applied under one acquisition per touched
+    /// (see `stripe_of`) and applied under one acquisition per touched
     /// stripe rather than one per record — per-record version checks and digest
     /// bookkeeping are otherwise identical, and an [`crate::store::Event`] is
     /// still emitted per record. The path `net::conn`'s coalesced
@@ -472,7 +472,7 @@ fn bucket_of(key_bytes: &[u8]) -> u16 {
 /// shard: a fixed power-of-two smaller than [`BUCKET_COUNT`], big enough to
 /// let unrelated keys' writes proceed fully concurrently, small enough to
 /// avoid one-mutex-per-bucket overkill. Divides `BUCKET_COUNT` evenly, which
-/// [`stripe_of`] relies on.
+/// `stripe_of` relies on.
 const TOMBSTONE_STRIPES: usize = 64;
 
 /// A key's tombstone-map/apply-serialization stripe. Reuses [`bucket_of`]'s
@@ -558,7 +558,7 @@ where
     fan_out: broadcast::Sender<FanOutNotice<K>>,
     /// Guards only the synchronous HLC bump itself, never held across `.await`.
     clock: StdMutex<HlcClock>,
-    /// Also the apply-serialization lock, striped by key ([`stripe_of`]):
+    /// Also the apply-serialization lock, striped by key (`stripe_of`):
     /// every versioned write holds only its key's stripe for that write's
     /// whole read-decide-mutate sequence, moka calls included, so concurrent
     /// applies to the *same* key can't interleave a stale decision — applies
@@ -1115,7 +1115,7 @@ where
     }
 
     /// [`Shard::insert`] for many entries, grouped by key stripe
-    /// ([`stripe_of`]) and applied under one acquisition per touched stripe
+    /// (`stripe_of`) and applied under one acquisition per touched stripe
     /// rather than one per entry — the "amortized lock path" a bulk local
     /// fill wants, bounded to a single stripe at a time so unrelated local
     /// writers and inbound applies to other stripes aren't blocked for the
@@ -1265,7 +1265,7 @@ where
 
     /// Shared implementation of [`ShardOps::records_for`] and
     /// [`Shard::records_for_typed`]: snapshots the tombstone entries for
-    /// `pairs`' keys grouped by stripe ([`stripe_of`]), one acquisition per
+    /// `pairs`' keys grouped by stripe (`stripe_of`), one acquisition per
     /// touched stripe (rather than one per key, and never
     /// more than one stripe locked at a time), then reads live entries via
     /// `moka`'s own concurrent-safe `get` outside any lock — mirroring

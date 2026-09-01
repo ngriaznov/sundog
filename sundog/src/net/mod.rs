@@ -163,7 +163,7 @@ pub(super) fn record_frame_sent(len: usize) {
 
 /// Total wire frames sent by this process since start, across every
 /// [`Mesh`] it has ever spawned. A cheap diagnostic for benchmarking
-/// replication cost; see [`record_frame_sent`].
+/// replication cost; see `record_frame_sent`.
 #[must_use]
 pub fn frames_sent_total() -> u64 {
     FRAMES_SENT.load(Ordering::Relaxed)
@@ -171,7 +171,7 @@ pub fn frames_sent_total() -> u64 {
 
 /// Total wire-frame bytes sent by this process since start, across every
 /// [`Mesh`] it has ever spawned. A cheap diagnostic for benchmarking
-/// replication cost; see [`record_frame_sent`].
+/// replication cost; see `record_frame_sent`.
 #[must_use]
 pub fn bytes_sent_total() -> u64 {
     BYTES_SENT.load(Ordering::Relaxed)
@@ -428,7 +428,7 @@ impl Mesh {
     /// overflow decision, exactly as a loop of individual [`Mesh::send`]
     /// calls would. Encodes each message here, once per call — for a
     /// multi-peer fan-out where the same content is shared across every live
-    /// peer, encode once up front instead and use [`Mesh::send_frames`].
+    /// peer, encode once up front instead and use `Mesh::send_frames`.
     ///
     /// # Panics
     ///
