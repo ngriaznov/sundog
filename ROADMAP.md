@@ -20,7 +20,7 @@ its async insert path is the largest single slice of a ~3.4µs replicated
 write. State-of-the-art concurrent cache reads (Caffeine-class designs)
 land in the 50–150ns range, so a purpose-built engine — our own concurrent
 map, TTL wheel, eviction policy, and stampede collapse behind the existing
-`ShardOps` seam — is worth roughly 5× on reads and ~3× on writes, and
+`ShardOps` seam — is worth an estimated 5× on reads and 3× on writes, and
 speeds up bulk remote apply in proportion. Nothing above the store (wire,
 fan-out batching, anti-entropy) needs to change; the replication pipeline
 already converges within a fraction of a second of the writes landing.

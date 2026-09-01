@@ -91,10 +91,11 @@ release.
   `sundog::store`'s read-through stampede-collapse and TTL-expiry tests);
   Prometheus-exporter and TLS integration tests; unit tests in every module.
 - **`sundog-testnode`** (new workspace member): a tiny static-musl binary
-  that opens one `Mode::Replicated` `sundog` cache and exposes it over a
-  line-based control protocol (`put`/`get`/`del`/`count`/`peers`/`quit`), so
-  external test harnesses can drive a real cluster member as a real, separate
-  process.
+  that opens `Mode::Replicated` `sundog` caches and exposes them over a
+  line-based control protocol — `put`/`get`/`del`/`count`/`peers`/`quit`,
+  plus bulk-fill, high-frequency churn, and large-value content-check
+  commands — so external test harnesses can drive a real cluster member as
+  a real, separate process.
 - **Container-backed integration suite** (`sundog/tests/containers.rs`,
   `sundog/tests/container_smoke.rs`, harness in `sundog/tests/container_util`):
   multi-node scenarios run as real, separate `sundog-testnode` processes on
@@ -102,8 +103,12 @@ release.
   [`rightsize`](https://crates.io/crates/rightsize) crate — no Docker CLI,
   no `bollard`. Covers three-node
   convergence across distinct writers, tombstones reaching every node, a
-  warm join via state transfer into a populated cluster, and a killed node
-  catching back up via anti-entropy after restart under the same alias.
+  warm join via state transfer into a populated cluster, a killed node
+  catching back up via anti-entropy after restart under the same alias,
+  cold joins at 100k- and million-entry scale, a three-writer high-churn
+  add/remove/TTL scenario that must drain to zero and stay there, and
+  realistic 64 KiB values with in-node content verification plus both sides
+  of the frame-cap boundary.
   Gated on `SUNDOG_CONTAINER_TESTS=1` (checked first in every test, not
   `#[ignore]`) so a plain `cargo test --workspace` still compiles and passes
   the file trivially without a container backend or the musl target
@@ -184,12 +189,14 @@ release.
   single shard-wide lock would. Remote batch applies and local bulk inserts
   group their entries by stripe and apply each stripe's sub-batch under one
   acquisition of that stripe's lock.
-- **Lean fan-out**: local and remote-origin writes notify the peer fan-out
-  path over an internal `(key, origin)` channel, separate from the public
-  `Cache::events()` broadcast channel. The app-facing `Event` — which owns a
-  clone of the value — is only built when `events()` has a
-  subscriber, so a cache with nothing subscribed to `events()` pays no
-  per-write value clone for replication or invalidation fan-out.
+- **Lean fan-out**: local writes notify the peer fan-out path over an
+  internal keys-only channel (`store::FanOutNotice` — single keys for
+  ordinary writes, per-stripe key batches for bulk fills; remote applies
+  never notify), separate from the public `Cache::events()` broadcast
+  channel. The app-facing `Event` — which owns a clone of the value — is
+  only built when `events()` has a subscriber, so a cache with nothing
+  subscribed to `events()` pays no per-write value clone for replication or
+  invalidation fan-out.
 - **Partition-aware tombstone retention**: `ClusterConfig::tombstone_max_ttl`
   (24 hours by default) bounds a new deferral in the tombstone GC sweep — a
   tombstone past `tombstone_ttl` is kept, not collected, while any recently

@@ -74,8 +74,8 @@ Concretely: writes are last-write-wins on a hybrid logical clock, so if two
 nodes write the same key at close to the same time, one write silently
 loses — there's no conflict error, no merge, the loser vanishes.
 
-Deletes and expiries behave differently, and it's worth being precise about
-each. A TTL-expired entry can never reappear anywhere: every record carries
+Deletes and expiries behave differently. A TTL-expired entry can never
+reappear anywhere: every record carries
 its own absolute `expires_at_ms`, so once a key is past that timestamp no
 peer will accept a stale copy of it back in, partition or not. A manually
 removed key is a tombstone, and tombstones are kept — not GC'd on the usual
@@ -176,7 +176,7 @@ Four layers, cheapest and highest-signal first:
    message loss, reordering, duplication; a donor dying mid-state-transfer.
 3. **Container integration** (`sundog/tests/containers.rs`, via
    [`rightsize`](https://crates.io/crates/rightsize) — no Docker CLI, no
-   `bollard`, that's a hard rule in this repo). This is where multi-node
+   `bollard`). This is where multi-node
    scenarios run as actual separate processes on a real virtual network:
    three-node convergence, tombstones reaching every node, a cold node
    warm-joining a populated cluster via state transfer, killing a node and
@@ -197,7 +197,7 @@ Four layers, cheapest and highest-signal first:
    pulls aren't available, point `SUNDOG_TEST_BASE_IMAGE` at whatever
    minimal image you've got pre-seeded.
 
-   Scenarios that genuinely only need one node, or two nodes on loopback
+   Scenarios that only need one node, or two nodes on loopback
    with real UDP membership, don't live in this file — they're ordinary
    `#[cfg(test)]` unit tests next to the code they exercise (see
    `sundog::store`'s stampede-collapse and TTL tests, `sundog::cluster`'s
