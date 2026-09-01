@@ -94,7 +94,13 @@ fn bench_value(i: u32) -> String {
 /// the steady default config (`outbox_capacity` 8,192 against 100k writes)
 /// leans heavily on anti-entropy repair rather than the live fan-out path,
 /// exactly as the crate's drop-policy semantics predict.
-#[tokio::test]
+///
+/// Multi-threaded runtime: an embedded cache's host application overwhelmingly
+/// runs one, and on a current-thread runtime the insert loop, both peers'
+/// coalescers, the TCP writers, and any concurrent anti-entropy rounds all
+/// serialize onto one core — charging the whole replication engine's CPU time
+/// to the caller's insert loop and making `insert_secs` a fiction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_insert_replication() {
     const ENTRIES: u32 = 100_000;
 
@@ -159,11 +165,197 @@ async fn bulk_insert_replication() {
     }
 }
 
+/// [`bulk_insert_replication`]'s counterpart through the batch API: the same
+/// 100k entries on the same 3-node cluster, but handed to `insert_many` as
+/// one call — the path a bulk loader should actually use. Amortizes
+/// per-call overhead and lets the store apply under far fewer lock
+/// acquisitions, so the spread between this scenario's `insert_secs` and the
+/// sequential loop's is the price of writing bulk data one `insert` at a
+/// time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bulk_insert_many_replication() {
+    const ENTRIES: u32 = 100_000;
+
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let clusters = peer_group("bench-bulk-insert-many", 3).await;
+    let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 3) returns exactly 3 clusters"));
+
+    let (cache_a, cache_b, cache_c) = tokio::join!(
+        cluster_a
+            .cache::<u32, String>("bulk-many")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_b
+            .cache::<u32, String>("bulk-many")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_c
+            .cache::<u32, String>("bulk-many")
+            .mode(Mode::Replicated)
+            .open(),
+    );
+    let cache_a = cache_a.expect("a opens");
+    let cache_b = cache_b.expect("b opens");
+    let cache_c = cache_c.expect("c opens");
+
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+
+    let started = Instant::now();
+    cache_a
+        .insert_many((0..ENTRIES).map(|i| (i, bench_value(i))))
+        .await
+        .expect("insert_many succeeds");
+    let insert_elapsed = started.elapsed();
+
+    common::eventually(Duration::from_secs(300), || async {
+        cache_b.entry_count().await == u64::from(ENTRIES)
+            && cache_c.entry_count().await == u64::from(ENTRIES)
+    })
+    .await;
+    let converge_elapsed = started.elapsed();
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+
+    println!(
+        "BENCH bulk_insert_many_replication entries={ENTRIES} insert_secs={:.3} \
+         converge_secs={:.3} frames_sent_total={frames} bytes_sent_total={bytes}",
+        insert_elapsed.as_secs_f64(),
+        converge_elapsed.as_secs_f64(),
+    );
+
+    for cluster in [cluster_a, cluster_b, cluster_c] {
+        cluster.shutdown().await;
+    }
+}
+
+/// The read path, which no other scenario measures: 1M `get` calls against a
+/// warm 100k-entry cache on a live 2-node `Replicated` cluster. Reads are
+/// pure local lookups — no network hop, by design — so `per_read_nanos` is
+/// the number that justifies "embedded": it should sit orders of magnitude
+/// under any networked cache's round trip. The cost measured is the honest
+/// public-API cost, value clone and `async` machinery included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_read_latency() {
+    const ENTRIES: u32 = 100_000;
+    const READS: u32 = 1_000_000;
+
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let clusters = peer_group("bench-local-reads", 2).await;
+    let [cluster_a, cluster_b] = <[Cluster; 2]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 2) returns exactly 2 clusters"));
+
+    let (cache_a, cache_b) = tokio::join!(
+        cluster_a
+            .cache::<u32, String>("reads")
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_b
+            .cache::<u32, String>("reads")
+            .mode(Mode::Replicated)
+            .open(),
+    );
+    let cache_a = cache_a.expect("a opens");
+    let _cache_b = cache_b.expect("b opens");
+
+    cache_a
+        .insert_many((0..ENTRIES).map(|i| (i, bench_value(i))))
+        .await
+        .expect("warm fill succeeds");
+
+    let started = Instant::now();
+    let mut hits = 0u32;
+    for i in 0..READS {
+        if cache_a.get(&(i % ENTRIES)).await.is_some() {
+            hits += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(hits, READS, "every read targets a present key");
+
+    let per_read_nanos = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(READS);
+    println!(
+        "BENCH local_read_latency entries={ENTRIES} reads={READS} wall_secs={:.3} \
+         per_read_nanos={per_read_nanos:.0}",
+        elapsed.as_secs_f64(),
+    );
+
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+}
+
+/// [`local_read_latency`]'s quiet-path control: the same 1M reads against
+/// the same warm 100k entries, but on a [`Mode::Local`] cache — no
+/// anti-entropy loop attaches to it, so nothing iterates the store behind
+/// the reader's back. The spread between this number and
+/// [`local_read_latency`]'s is the ambient cost of *being* a live
+/// `Replicated` member (background digest scans and bucket iteration
+/// sharing the machine), not of the read path itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_mode_read_latency() {
+    const ENTRIES: u32 = 100_000;
+    const READS: u32 = 1_000_000;
+
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let clusters = peer_group("bench-local-mode-reads", 2).await;
+    let [cluster_a, cluster_b] = <[Cluster; 2]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 2) returns exactly 2 clusters"));
+
+    let cache_a = cluster_a
+        .cache::<u32, String>("local-reads")
+        .mode(Mode::Local)
+        .open()
+        .await
+        .expect("a opens");
+
+    cache_a
+        .insert_many((0..ENTRIES).map(|i| (i, bench_value(i))))
+        .await
+        .expect("warm fill succeeds");
+
+    let started = Instant::now();
+    let mut hits = 0u32;
+    for i in 0..READS {
+        if cache_a.get(&(i % ENTRIES)).await.is_some() {
+            hits += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(hits, READS, "every read targets a present key");
+
+    let per_read_nanos = elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(READS);
+    println!(
+        "BENCH local_mode_read_latency entries={ENTRIES} reads={READS} wall_secs={:.3} \
+         per_read_nanos={per_read_nanos:.0}",
+        elapsed.as_secs_f64(),
+    );
+
+    cluster_a.shutdown().await;
+    cluster_b.shutdown().await;
+}
+
 /// Per-write overhead signal at a scale small enough to run every commit:
 /// 5,000 sequential inserts on one node of a live 2-node `Replicated`
 /// cluster, wall time only — no convergence wait, since the point is the
 /// caller-observed cost of `insert` itself under real (if idle) fan-out.
-#[tokio::test]
+/// Multi-threaded runtime for the same representativeness reason as
+/// [`bulk_insert_replication`]: the fan-out machinery must not share the
+/// insert loop's core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steady_small_writes() {
     const ENTRIES: u32 = 5_000;
 

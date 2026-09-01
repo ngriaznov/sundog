@@ -45,7 +45,7 @@ use crate::hlc::Hlc;
 use crate::membership::{Membership, Peer};
 use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler};
 use crate::node::{NodeId, NodeName};
-use crate::store::{Mode, Origin, Shard, ShardOps};
+use crate::store::{FanOutNotice, Mode, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
@@ -666,27 +666,26 @@ async fn inbound_loop(
 /// before ever sending anything.
 const FAN_OUT_DRAIN_CAP: usize = 1024;
 
-/// Subscribes to one opened cache's local-write events and fans them out
+/// Subscribes to one opened cache's local-write notices and fans them out
 /// over the mesh per [`Mode`] — the composition-layer half of `Shard`'s
 /// design (`store::mod` docs: "`Shard` intentionally holds no handle to
-/// `net::Mesh`"). Every `Origin::Local` event fans out uniformly, including a
+/// `net::Mesh`"). Every local write fans out uniformly, including a
 /// `get_or_load` read-through fill: a fresh fill is itself a genuine
 /// versioned write (it carries a real `Hlc` stamp), and propagating it lets
 /// other `Replicated`-mode peers skip their own loader call — a cache is
 /// re-derivable data, so under-propagating costs nothing but an extra
 /// loader call elsewhere, never correctness.
 ///
-/// Micro-batches: after waiting for one event, drains whatever further
-/// events are already available (bounded by [`FAN_OUT_DRAIN_CAP`]) before
-/// doing any work, so a burst of local writes (e.g. `Cache::insert_many`)
-/// costs one `ShardOps::records_for` call and one round of per-peer sends for
-/// the whole burst, not one of each per write — `net::conn`'s per-peer
-/// writer then coalesces those sends into `Msg::ReplicateBatch` frames on the
-/// wire.
+/// Micro-batches: after waiting for one notice, drains whatever further
+/// notices are already available (bounded by [`FAN_OUT_DRAIN_CAP`] notices —
+/// one [`FanOutNotice::Many`] carries a whole chunk of keys and still counts
+/// as one) before doing any work, so a burst of local writes costs one
+/// `ShardOps::records_for` call and one round of per-peer sends for the
+/// whole burst, not one of each per write.
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
-    mut notices: broadcast::Receiver<(K, Origin)>,
+    mut notices: broadcast::Receiver<FanOutNotice<K>>,
     cache_name: SmolStr,
     mode: Mode,
     cancel: CancellationToken,
@@ -694,14 +693,18 @@ pub(crate) async fn fan_out_task<K, V>(
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    let push_keys = |keys: &mut Vec<K>, notice: FanOutNotice<K>| match notice {
+        FanOutNotice::One(key) => keys.push(key),
+        FanOutNotice::Many(chunk) => keys.extend(chunk),
+    };
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
             received = notices.recv() => {
-                let mut batch = Vec::new();
+                let mut keys = Vec::new();
                 match received {
-                    Ok(notice) => batch.push(notice),
+                    Ok(notice) => push_keys(&mut keys, notice),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             cache = %cache_name,
@@ -712,9 +715,13 @@ pub(crate) async fn fan_out_task<K, V>(
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
-                while batch.len() < FAN_OUT_DRAIN_CAP {
+                let mut drained = 1usize;
+                while drained < FAN_OUT_DRAIN_CAP {
                     match notices.try_recv() {
-                        Ok(notice) => batch.push(notice),
+                        Ok(notice) => {
+                            push_keys(&mut keys, notice);
+                            drained += 1;
+                        }
                         Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                             tracing::warn!(
                                 cache = %cache_name,
@@ -726,7 +733,7 @@ pub(crate) async fn fan_out_task<K, V>(
                         Err(_) => break, // Empty (nothing more queued) or Closed (next recv() handles it)
                     }
                 }
-                fan_out_batch(&shard, &cluster, &cache_name, mode, batch).await;
+                fan_out_batch(&shard, &cluster, &cache_name, mode, keys).await;
             }
         }
     }
@@ -737,17 +744,16 @@ async fn fan_out_batch<K, V>(
     cluster: &Cluster,
     cache_name: &SmolStr,
     mode: Mode,
-    notices: Vec<(K, Origin)>,
+    notified: Vec<K>,
 ) where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    // The channel carries local writes only (see `store::FanOutNotice`), so
+    // no origin filter remains here — just dedup within the drained burst.
     let mut seen: HashSet<&K> = HashSet::new();
     let mut keys: Vec<K> = Vec::new();
-    for (key, origin) in &notices {
-        if !matches!(origin, Origin::Local) {
-            continue;
-        }
+    for key in &notified {
         if seen.insert(key) {
             keys.push(key.clone());
         }
@@ -779,16 +785,16 @@ async fn fan_out_batch<K, V>(
                 })
                 .collect(),
         ),
-        Mode::Replicated => (
-            MsgClass::Replicate,
-            records
-                .into_iter()
-                .map(|rec| Msg::Replicate {
-                    cache: cache_name.clone(),
-                    rec,
-                })
-                .collect(),
-        ),
+        // Pre-batched by the same budget/count rules `net::conn`'s writer
+        // uses for opportunistic coalescing: a drained burst (e.g. an
+        // `insert_many` fill) leaves here as a handful of
+        // `Msg::ReplicateBatch` frames instead of one `Msg::Replicate` per
+        // record — one outbox slot and one encode per ~budget of records,
+        // rather than per record, so a bulk burst can't flood the outbox
+        // into drop-newest and the anti-entropy repair that follows. The
+        // writer-side coalescer still catches what this can't: trickle
+        // writes that arrive one drained event at a time.
+        Mode::Replicated => (MsgClass::Replicate, batch_replicate(cache_name, records)),
     };
     // Encodes each message exactly once here, before the per-peer loop,
     // rather than once per peer — every live peer then gets a cheap
@@ -812,6 +818,54 @@ async fn fan_out_batch<K, V>(
             .mesh()
             .send_frames(peer, class, frames.iter().cloned());
     }
+}
+
+/// Splits one fan-out burst's records into `Msg::ReplicateBatch` chunks by
+/// the same byte budget and count cap `net::conn`'s opportunistic coalescer
+/// enforces ([`crate::net::REPLICATE_BATCH_BUDGET`]/
+/// [`crate::net::REPLICATE_BATCH_COUNT`]) — sized by each record's
+/// single-`Replicate` wire length, the same estimate the coalescer's own
+/// budget check runs on. A chunk of exactly one record stays a plain
+/// [`Msg::Replicate`], so trickle writes keep their uncoalesced shape.
+fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
+    let mut chunks: Vec<Vec<WireRecord>> = Vec::new();
+    let mut current: Vec<WireRecord> = Vec::new();
+    let mut current_bytes = 0usize;
+    for rec in records {
+        let rec_bytes = wire::replicate_frame_len(
+            cache_name.len(),
+            rec.key.len(),
+            rec.value.as_ref().map_or(0, Bytes::len),
+        );
+        if !current.is_empty()
+            && (current.len() >= crate::net::REPLICATE_BATCH_COUNT
+                || current_bytes + rec_bytes > crate::net::REPLICATE_BATCH_BUDGET)
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += rec_bytes;
+        current.push(rec);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+        .into_iter()
+        .map(|mut recs| {
+            if recs.len() == 1 {
+                Msg::Replicate {
+                    cache: cache_name.clone(),
+                    rec: recs.pop().expect("invariant: length checked above"),
+                }
+            } else {
+                Msg::ReplicateBatch {
+                    cache: cache_name.clone(),
+                    recs,
+                }
+            }
+        })
+        .collect()
 }
 
 /// Periodically garbage-collects one shard's expired tombstones (tombstones
@@ -862,7 +916,7 @@ mod tests {
 
     use super::*;
     use crate::error::CacheError;
-    use crate::store::Event;
+    use crate::store::{Event, Origin};
 
     /// Loopback-only config: skips the outbound-interface probe
     /// `resolve_advertise_ip` would otherwise do for the zeroconf

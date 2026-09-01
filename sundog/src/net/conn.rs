@@ -122,20 +122,26 @@ async fn send_frames(
 
 /// Byte budget for one coalesced [`Msg::ReplicateBatch`] frame — well under
 /// [`MAX_FRAME`], so opportunistic coalescing never risks tripping the wire
-/// frame cap even for large-valued caches.
-const REPLICATE_BATCH_BUDGET: usize = 256 * 1024;
+/// frame cap even for large-valued caches. Shared with the fan-out layer
+/// (`cluster::fan_out_batch`), which pre-batches drained write bursts by the
+/// same rules before they ever reach a per-peer outbox.
+pub(crate) const REPLICATE_BATCH_BUDGET: usize = 256 * 1024;
 
 /// Count cap alongside [`REPLICATE_BATCH_BUDGET`], so a long run of tiny
 /// records doesn't grow one batch frame without bound.
-const REPLICATE_BATCH_COUNT: usize = 4096;
+pub(crate) const REPLICATE_BATCH_COUNT: usize = 4096;
 
-/// A run of consecutive same-cache `Msg::Replicate` [`OutFrame`]s being
-/// considered for merging into one `Msg::ReplicateBatch`, tracked alongside
-/// their cumulative frame byte size for the [`REPLICATE_BATCH_BUDGET`] check.
+/// A run of consecutive same-cache `Msg::Replicate`/`Msg::ReplicateBatch`
+/// [`OutFrame`]s being considered for merging into one `Msg::ReplicateBatch`,
+/// tracked alongside their cumulative frame byte size for the
+/// [`REPLICATE_BATCH_BUDGET`] check and their cumulative *record* count for
+/// the [`REPLICATE_BATCH_COUNT`] check (one already-batched item can carry
+/// many records).
 struct PendingRun {
     cache: SmolStr,
     items: Vec<OutFrame>,
     size: usize,
+    records: usize,
 }
 
 /// Flushes `pending` (if any) into `out`: a run of exactly one accumulated
@@ -161,14 +167,16 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
         );
         return;
     }
-    let recs = run
-        .items
-        .into_iter()
-        .map(|item| match item.msg {
-            Msg::Replicate { rec, .. } => rec,
-            _ => unreachable!("invariant: PendingRun only ever accumulates Msg::Replicate items"),
-        })
-        .collect();
+    let mut recs = Vec::with_capacity(run.records);
+    for item in run.items {
+        match item.msg {
+            Msg::Replicate { rec, .. } => recs.push(rec),
+            Msg::ReplicateBatch { recs: batch, .. } => recs.extend(batch),
+            _ => unreachable!(
+                "invariant: PendingRun only ever accumulates Replicate/ReplicateBatch items"
+            ),
+        }
+    }
     match wire::encode(&Msg::ReplicateBatch {
         cache: run.cache,
         recs,
@@ -180,33 +188,36 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
     }
 }
 
-/// Opportunistically coalesces consecutive same-cache `Msg::Replicate`
-/// entries in `drained` — messages the writer already had queued by the time
-/// it drained them, never delayed to wait for more (Aeron-style smart
-/// batching: no timers, no added latency) — into
+/// Opportunistically coalesces consecutive same-cache `Msg::Replicate` *and*
+/// `Msg::ReplicateBatch` entries in `drained` — messages the writer already
+/// had queued by the time it drained them, never delayed to wait for more
+/// (Aeron-style smart batching: no timers, no added latency) — into
 /// `Msg::ReplicateBatch` frames bounded by [`REPLICATE_BATCH_BUDGET`] and
-/// [`REPLICATE_BATCH_COUNT`]. A run of exactly one message stays a lone
-/// `Msg::Replicate` and reuses its already-encoded [`OutFrame::frame`] as-is
-/// rather than re-encoding — only an actual merge (more than one
-/// record combined into a `Msg::ReplicateBatch`) pays for a fresh encode.
-/// Anything other than
-/// `Msg::Replicate` passes its frame through unchanged (the replicate-class
-/// outbox never actually carries anything else, but this stays honest rather
-/// than assuming it).
+/// [`REPLICATE_BATCH_COUNT`] (counting *records*, not queue items — one
+/// pre-batched item from `cluster::fan_out_batch` can carry many). A run of
+/// exactly one item reuses its already-encoded [`OutFrame::frame`] as-is
+/// rather than re-encoding — only an actual merge (more than one item
+/// combined) pays for a fresh encode. Anything else passes its frame through
+/// unchanged (the replicate-class outbox never actually carries anything
+/// else, but this stays honest rather than assuming it).
 fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
     let mut out = Vec::with_capacity(drained.len());
     let mut pending: Option<PendingRun> = None;
 
     for item in drained {
-        let Msg::Replicate { cache, .. } = &item.msg else {
-            flush_pending_replicate(&mut pending, &mut out);
-            out.push(item.frame);
-            continue;
+        let (cache, item_records) = match &item.msg {
+            Msg::Replicate { cache, .. } => (cache, 1),
+            Msg::ReplicateBatch { cache, recs } => (cache, recs.len()),
+            _ => {
+                flush_pending_replicate(&mut pending, &mut out);
+                out.push(item.frame);
+                continue;
+            }
         };
         let rec_size = item.frame.len();
         let fits_pending = pending.as_ref().is_some_and(|run| {
             run.cache == *cache
-                && run.items.len() < REPLICATE_BATCH_COUNT
+                && run.records + item_records <= REPLICATE_BATCH_COUNT
                 && run.size + rec_size <= REPLICATE_BATCH_BUDGET
         });
         if fits_pending {
@@ -215,6 +226,7 @@ fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
                 .expect("invariant: fits_pending implies Some");
             run.items.push(item);
             run.size += rec_size;
+            run.records += item_records;
         } else {
             flush_pending_replicate(&mut pending, &mut out);
             let cache = cache.clone();
@@ -222,6 +234,7 @@ fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
                 cache,
                 items: vec![item],
                 size: rec_size,
+                records: item_records,
             });
         }
     }

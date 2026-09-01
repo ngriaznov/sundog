@@ -25,7 +25,6 @@ use super::Cluster;
 use crate::net::MsgClass;
 use crate::node::NodeId;
 use crate::store::ShardOps;
-use crate::wire::Msg;
 
 /// Runs anti-entropy for one shard for as long as `cancel` stays live: every
 /// jittered `ae_interval`, picks one live peer (a dirty-marked one first —
@@ -136,18 +135,16 @@ pub(crate) async fn run_round_against(
     // batch that lands raises local versions, shrinking the next round's
     // diff, instead of one all-or-nothing exchange racing a request timeout.
     for batch in push_keys.chunks(REPAIR_BATCH) {
-        let msgs = shard
-            .records_for(batch.to_vec())
-            .await
-            .into_iter()
-            .map(|rec| Msg::Replicate {
-                cache: cache.clone(),
-                rec,
-            });
+        let records = shard.records_for(batch.to_vec()).await;
+        repaired += records.len() as u64;
+        // The same budgeted `Msg::ReplicateBatch` chunking the live fan-out
+        // uses (`cluster::batch_replicate`): a large repair travels as a
+        // handful of full frames and outbox slots, not one `Msg::Replicate`
+        // per record.
+        let msgs = super::batch_replicate(cache, records);
         // One peer-table lock acquisition for the whole batch rather than
         // one per record (see `Mesh::send_many`'s docs).
         mesh.send_many(peer, MsgClass::Replicate, msgs);
-        repaired += batch.len() as u64;
     }
     for batch in pull_keys.chunks(REPAIR_BATCH) {
         match mesh.ae_pull(peer, cache.clone(), batch.to_vec()).await {

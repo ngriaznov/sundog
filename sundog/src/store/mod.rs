@@ -88,6 +88,27 @@ fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> 
 /// rather than applying backpressure to writers.
 const EVENTS_CAPACITY: usize = 1024;
 
+/// How many keys one [`FanOutNotice::Many`] carries at most — aligned with
+/// `net::conn`'s `REPLICATE_BATCH_COUNT` so one notice's worth of records
+/// coalesces into at most one full wire batch. A bulk burst of `n` writes
+/// occupies `n / 4096` fan-out channel slots instead of `n`, which is what
+/// keeps `Cache::insert_many` from lagging the channel and degrading its
+/// whole burst to anti-entropy repair.
+const FAN_OUT_MANY_CHUNK: usize = 4096;
+
+/// One fan-out notification: "these locally-written keys need replicating".
+/// Only local writes ever notify — remote applies would just re-broadcast
+/// what a peer already sent — so no origin travels here.
+#[derive(Clone)]
+pub(crate) enum FanOutNotice<K> {
+    /// A single write ([`Shard::insert`], [`Shard::remove`], a read-through
+    /// fill).
+    One(K),
+    /// A bulk burst ([`Shard::insert_many`]), chunked to
+    /// [`FAN_OUT_MANY_CHUNK`].
+    Many(Vec<K>),
+}
+
 /// A named cache's clustering behavior: how writes fan out to other nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -523,16 +544,18 @@ where
     mode: Mode,
     cache: moka::future::Cache<K, Arc<Stored<V>>>,
     events: broadcast::Sender<Event<K, V>>,
-    /// Internal-only notification channel: just `(key, origin)`, no value
-    /// clone, fed by every versioned write regardless of whether anyone is
-    /// subscribed to `events` (`fan_out_task`'s sole source of truth for
-    /// "what changed" — it re-fetches fresh wire bytes through
-    /// `records_for_typed` rather than reading a value off this channel, so
-    /// there is nothing here for it to be stale about). Kept separate from
-    /// `events` so the app-facing broadcast's `receiver_count()` reflects
-    /// only real external subscribers, making the "skip the value clone
-    /// when nobody's listening" guard on `events` meaningful.
-    fan_out: broadcast::Sender<(K, Origin)>,
+    /// Internal-only notification channel: keys only, no value clone, fed by
+    /// every *local* versioned write — remote applies never notify, they'd
+    /// only re-broadcast what a peer already sent (`fan_out_task`'s sole
+    /// source of truth for "what changed" — it re-fetches fresh wire bytes
+    /// through `records_for_typed` rather than reading a value off this
+    /// channel, so there is nothing here for it to be stale about). A bulk
+    /// burst notifies as [`FanOutNotice::Many`] chunks so it can never lag
+    /// the channel. Kept separate from `events` so the app-facing
+    /// broadcast's `receiver_count()` reflects only real external
+    /// subscribers, making the "skip the value clone when nobody's
+    /// listening" guard on `events` meaningful.
+    fan_out: broadcast::Sender<FanOutNotice<K>>,
     /// Guards only the synchronous HLC bump itself, never held across `.await`.
     clock: StdMutex<HlcClock>,
     /// Also the apply-serialization lock, striped by key ([`stripe_of`]):
@@ -778,7 +801,7 @@ where
         origin: Origin,
     ) {
         let mut tombstones = self.tombstones[stripe_of(&key_bytes)].lock().await;
-        self.apply_locked(&mut tombstones, key, key_bytes, ver, incoming, origin)
+        self.apply_locked(&mut tombstones, key, key_bytes, ver, incoming, origin, true)
             .await;
     }
 
@@ -838,6 +861,13 @@ where
     /// bulk apply wants). See [`Shard::apply`]'s docs for the correctness
     /// contract; identical here, parameterized on the lock the caller
     /// supplies.
+    ///
+    /// `notify_fan_out: false` is [`Shard::insert_many`]'s bulk path opting
+    /// out of the per-write [`FanOutNotice::One`] here in favor of its own
+    /// [`FanOutNotice::Many`] chunks after the batch — same notifications,
+    /// thousands of times fewer channel slots. (A local origin is what makes
+    /// a notice happen at all; remote applies never notify.)
+    #[allow(clippy::too_many_arguments)]
     async fn apply_locked(
         &self,
         tombstones: &mut HashMap<Bytes, Tombstone>,
@@ -846,6 +876,7 @@ where
         ver: Hlc,
         incoming: Incoming<V>,
         origin: Origin,
+        notify_fan_out: bool,
     ) {
         let prior_tombstone = tombstones.get(&key_bytes).copied();
         let stored_live = if prior_tombstone.is_none() {
@@ -894,7 +925,9 @@ where
                     expires_at_ms,
                 });
                 self.cache.insert(key.clone(), Arc::clone(&stored)).await;
-                let _ = self.fan_out.send((key.clone(), origin));
+                if notify_fan_out && matches!(origin, Origin::Local) {
+                    let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
+                }
                 if self.events.receiver_count() > 0 {
                     let event = if had_live {
                         Event::Updated {
@@ -925,7 +958,9 @@ where
                 if had_live {
                     let _ = self.cache.remove(&key).await;
                 }
-                let _ = self.fan_out.send((key.clone(), origin));
+                if notify_fan_out && matches!(origin, Origin::Local) {
+                    let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
+                }
                 if self.events.receiver_count() > 0 {
                     let _ = self.events.send(Event::Removed { key, origin });
                 }
@@ -1024,7 +1059,7 @@ where
                     ver,
                     expires_at_ms: self.ttl_expiry(),
                 });
-                let _ = self.fan_out.send((key.clone(), Origin::Local));
+                let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
                 if self.events.receiver_count() > 0 {
                     let _ = self.events.send(Event::Created {
                         key: key.clone(),
@@ -1126,8 +1161,10 @@ where
             if group.is_empty() {
                 continue;
             }
+            let mut applied_keys: Vec<K> = Vec::with_capacity(group.len());
             let mut tombstones = self.tombstones[stripe_idx].lock().await;
             for (key, key_bytes, ver, value, expires_at_ms, encoded) in group {
+                applied_keys.push(key.clone());
                 self.apply_locked(
                     &mut tombstones,
                     key,
@@ -1139,8 +1176,19 @@ where
                         encoded,
                     },
                     Origin::Local,
+                    false,
                 )
                 .await;
+            }
+            drop(tombstones);
+            // One `Many` notice per chunk instead of one `One` per entry
+            // (see `apply_locked`'s `notify_fan_out` docs), sent per stripe
+            // as it lands rather than after the whole batch: replication
+            // streams concurrently with the remaining stripes, so peers
+            // start catching up mid-fill instead of anti-entropy racing a
+            // silent bulk and re-shipping it record by record.
+            for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
+                let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
             }
         }
         Ok(())
@@ -1191,11 +1239,12 @@ where
         self.events.subscribe()
     }
 
-    /// Subscribes to this shard's lightweight `(key, origin)` fan-out
+    /// Subscribes to this shard's lightweight keys-only fan-out
     /// notifications — `fan_out_task`'s cheaper alternative to
     /// subscribing on [`Shard::events`] directly, since it never reads
-    /// `Event`'s `value` at all.
-    pub(crate) fn fan_out_events(&self) -> broadcast::Receiver<(K, Origin)> {
+    /// `Event`'s `value` at all. Carries local writes only; see
+    /// [`FanOutNotice`].
+    pub(crate) fn fan_out_events(&self) -> broadcast::Receiver<FanOutNotice<K>> {
         self.fan_out.subscribe()
     }
 
@@ -1322,6 +1371,7 @@ where
                                     encoded: value_bytes,
                                 },
                                 origin,
+                                true,
                             )
                             .await;
                         }
@@ -1333,6 +1383,7 @@ where
                                 rec.ver,
                                 Incoming::Tombstone,
                                 origin,
+                                true,
                             )
                             .await;
                         }

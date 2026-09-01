@@ -24,6 +24,8 @@
 //! itself.
 
 mod conn;
+
+pub(crate) use conn::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 mod outbox;
 mod tcp;
 #[cfg(all(feature = "tls", not(feature = "sim")))]
