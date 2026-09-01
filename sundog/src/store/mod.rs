@@ -1048,39 +1048,6 @@ where
         F: AsyncFnOnce(&K) -> Result<V, E>,
         E: std::error::Error + Send + Sync + 'static,
     {
-        self.load_expiring(key, None, loader).await
-    }
-
-    /// [`Shard::get_or_load`] whose fill, if `loader` runs, gets `ttl` as
-    /// its lifespan instead of the shard's default — see
-    /// [`Shard::insert_with_ttl`]. A hit returns the existing entry untouched.
-    ///
-    /// # Errors
-    ///
-    /// As [`Shard::get_or_load`].
-    pub async fn get_or_load_with_ttl<F, E>(
-        &self,
-        key: &K,
-        ttl: Duration,
-        loader: F,
-    ) -> Result<V, CacheError>
-    where
-        F: AsyncFnOnce(&K) -> Result<V, E>,
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        self.load_expiring(key, Some(ttl), loader).await
-    }
-
-    async fn load_expiring<F, E>(
-        &self,
-        key: &K,
-        ttl: Option<Duration>,
-        loader: F,
-    ) -> Result<V, CacheError>
-    where
-        F: AsyncFnOnce(&K) -> Result<V, E>,
-        E: std::error::Error + Send + Sync + 'static,
-    {
         let key_bytes = encode_key(key)?;
         let stored = self
             .cache
@@ -1096,7 +1063,7 @@ where
                     value,
                     encoded,
                     ver,
-                    expires_at_ms: self.expiry_for(ttl),
+                    expires_at_ms: self.expiry_for(None),
                 });
                 let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
                 if self.events.receiver_count() > 0 {
@@ -2081,12 +2048,10 @@ mod tests {
 
     /// A per-write TTL overrides the shard default in both directions and
     /// travels as the record's own absolute deadline: `a` defaults to a long
-    /// TTL, writes one entry with a short override and one with the default,
-    /// and `b` (no TTL configured at all) expires exactly the short one from
-    /// the wire-carried deadline. Every entry point that stamps a write —
-    /// `insert`, `insert_many`, and a `get_or_load` fill — gets the same
-    /// override, and a `get_or_load_with_ttl` *hit* leaves the existing
-    /// entry's lifespan alone.
+    /// TTL, writes entries with a short override (single and batch) and one
+    /// with the default, and `b` (no TTL configured at all) expires exactly
+    /// the short ones from the wire-carried deadline. Reads stay out of it:
+    /// a `get_or_load` fill takes the default, and a hit changes nothing.
     #[tokio::test]
     async fn per_entry_ttl_overrides_the_shard_default_and_replicates() {
         let a = Shard::<u32, String>::new(
@@ -2107,19 +2072,15 @@ mod tests {
         a.insert_many_with_ttl([(3, "short-batch".to_string())], short)
             .await
             .expect("insert_many with ttl");
-        a.get_or_load_with_ttl(&4, short, async |_| {
-            Ok::<_, std::io::Error>("short-fill".into())
-        })
-        .await
-        .expect("fill with ttl");
-        // A hit must not re-stamp: key 2 keeps its 30s default.
+        a.get_or_load(&4, async |_| Ok::<_, std::io::Error>("default-fill".into()))
+            .await
+            .expect("fill");
+        // A hit must not re-stamp: key 1 keeps its short override.
         let hit = a
-            .get_or_load_with_ttl(&2, short, async |_| {
-                Ok::<_, std::io::Error>("never-called".into())
-            })
+            .get_or_load(&1, async |_| Ok::<_, std::io::Error>("never-called".into()))
             .await
             .expect("hit");
-        assert_eq!(hit, "default");
+        assert_eq!(hit, "short");
 
         let recs = ShardOps::records_for(&a, (1..=4u32).map(|k| key_bytes(&k)).collect()).await;
         assert_eq!(recs.len(), 4);
@@ -2140,11 +2101,15 @@ mod tests {
         for (shard, name) in [(&a, "a"), (&b, "b")] {
             assert_eq!(shard.get(&1).await, None, "{name}: short insert expires");
             assert_eq!(shard.get(&3).await, None, "{name}: short batch expires");
-            assert_eq!(shard.get(&4).await, None, "{name}: short fill expires");
             assert_eq!(
                 shard.get(&2).await.as_deref(),
                 Some("default"),
                 "{name}: the default-TTL entry outlives the overrides"
+            );
+            assert_eq!(
+                shard.get(&4).await.as_deref(),
+                Some("default-fill"),
+                "{name}: a read-through fill takes the default, never an override"
             );
         }
     }

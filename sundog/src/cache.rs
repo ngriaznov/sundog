@@ -65,10 +65,11 @@ where
     /// an absolute `expires_at_ms` that replicates with the record, so an
     /// entry expires at the same instant on every node. Default: no expiry.
     ///
-    /// Individual writes can override it — [`Cache::insert_with_ttl`],
-    /// [`Cache::insert_many_with_ttl`], and [`Cache::get_or_load_with_ttl`]
-    /// give one entry (or one batch) its own lifespan, shorter or longer than
-    /// this default, and work on a cache with no default at all.
+    /// Individual writes can override it — [`Cache::insert_with_ttl`] and
+    /// [`Cache::insert_many_with_ttl`] give one entry (or one batch) its own
+    /// lifespan, shorter or longer than this default, and work on a cache
+    /// with no default at all. Reads never touch expiry: a `get_or_load`
+    /// fill takes the cache default.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
@@ -293,26 +294,6 @@ where
         E: std::error::Error + Send + Sync + 'static,
     {
         self.shard.get_or_load(key, loader).await
-    }
-
-    /// [`Cache::get_or_load`], but a fill (a miss that runs `loader`) gets
-    /// `ttl` as its lifespan instead of the cache's default. A hit returns
-    /// the existing entry as-is, whatever its lifespan.
-    ///
-    /// # Errors
-    ///
-    /// As [`Cache::get_or_load`].
-    pub async fn get_or_load_with_ttl<F, E>(
-        &self,
-        key: &K,
-        ttl: Duration,
-        loader: F,
-    ) -> Result<V, CacheError>
-    where
-        F: AsyncFnOnce(&K) -> Result<V, E>,
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        self.shard.get_or_load_with_ttl(key, ttl, loader).await
     }
 
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
