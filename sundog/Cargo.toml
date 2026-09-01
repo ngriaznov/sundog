@@ -40,16 +40,22 @@ zerocopy = { version = "0.8.56", features = ["derive"] }
 anyhow = "1.0.104"
 proptest = "1.11.0"
 rcgen = "0.14.9"
+tokio = { version = "1.53.1", features = ["test-util"] }
+tracing-subscriber = "0.3.23"
+
 # Container-based integration tests (`tests/container_util`): rightsize is
 # the only permitted way to run containers in this repo — no docker CLI, no
 # bollard. Docker backend only: this repo never selects the msb backend
 # (RIGHTSIZE_BACKEND=docker throughout), and backend-msb's ureq dependency
 # requests rustls's `ring` provider, which collides with the `tls` feature's
 # aws-lc-rs under feature unification (rustls panics when both are present).
+# Unix-only: rightsize-docker speaks to the daemon over a Unix socket
+# (`std::os::unix::net::UnixStream`) and does not build on Windows; the
+# container test binaries carry a matching `#![cfg(unix)]`, which is no loss
+# of coverage — running them needs a Unix docker host regardless.
+[target.'cfg(unix)'.dev-dependencies]
 rightsize = "0.7.6"
 rightsize-modules = { version = "0.7.6", default-features = false, features = ["backend-docker"] }
-tokio = { version = "1.53.1", features = ["test-util"] }
-tracing-subscriber = "0.3.23"
 
 [features]
 tls = ["dep:rustls", "dep:tokio-rustls"]
