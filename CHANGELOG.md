@@ -3,6 +3,14 @@
 All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] – 2026-09-01
+
+### Fixed
+
+- The README shipped in the crate no longer links to `ROADMAP.md`, which
+  isn't part of the package — on crates.io that link was dead. The roadmap
+  lives in the repository.
+
 ## [0.1.0] – 2026-09-01
 
 The first release: the full buildout of the core library.

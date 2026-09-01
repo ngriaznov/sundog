@@ -20,8 +20,6 @@ the real one. A replicated cache, drawn by the atmosphere.
 Consistency is best-effort on purpose: gossip membership and last-write-wins
 skip the cost of running a consensus protocol for cache data, and
 anti-entropy repairs whatever gossip's fire-and-forget delivery drops.
-Things we deliberately didn't build, and what would make us reconsider, are
-in [`ROADMAP.md`](ROADMAP.md).
 
 ## Getting it
 
@@ -112,7 +110,7 @@ anywhere you're currently running a per-instance in-memory cache and wish
 the instances agreed with each other without standing up Redis. It targets
 small clusters (2–30 nodes) and LAN latencies. There's no
 consistent-hashing / partitioning mode — every replicated node holds every
-entry; `ROADMAP.md` covers why and what would change it.
+entry.
 
 A burst of writes — `insert_many` or back-to-back `insert` calls — fans out
 as coalesced `Replicate` batches rather than one frame per key, so
