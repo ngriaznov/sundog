@@ -277,6 +277,94 @@ async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
     net.close().await.expect("network closes");
 }
 
+/// Realistic value sizes: every other scenario replicates values a few bytes
+/// long, so this is the one where *bytes*, not entry count, dominate — 4,096
+/// entries of 64 KiB each, ~256 MiB of payload per replica. It proves live
+/// replication and a bytes-heavy cold-join snapshot both move that volume,
+/// and — via node-side regeneration — that the content arrives intact, not
+/// merely counted. The tail asserts the frame-cap boundary end to end: a
+/// single 3 MiB value replicates fine, and an over-cap value is rejected at
+/// `insert` with an error rather than accepted locally and silently dropped
+/// on the wire.
+#[tokio::test]
+async fn replication_and_cold_join_carry_realistic_value_sizes() {
+    const ENTRIES: u32 = 4_096;
+    const VALUE_BYTES: usize = 64 * 1024;
+    const NEAR_CAP_BYTES: usize = 3 * 1024 * 1024;
+    const OVER_CAP_BYTES: usize = 5 * 1024 * 1024;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "bigval-cluster", "n1", &[]).await;
+    let n2 = Node::spawn(&net, "bigval-cluster", "n2", &[&seed("n1")]).await;
+    wait_for_peers(&[&n1, &n2], 1).await;
+
+    n1.big_fill(ENTRIES, VALUE_BYTES)
+        .await
+        .expect("bulk large-value fill succeeds");
+    assert_eq!(n1.count().await, Ok(ENTRIES as usize));
+    eventually(Duration::from_secs(120), || async {
+        n2.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+
+    let spot_checks = [0, ENTRIES / 2, ENTRIES - 1];
+    for index in spot_checks {
+        assert_eq!(
+            n2.big_check(index, VALUE_BYTES).await,
+            Ok("ok".to_string()),
+            "replicated value big{index} must arrive byte-identical on n2"
+        );
+    }
+
+    let started = std::time::Instant::now();
+    let n3 = Node::spawn(&net, "bigval-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
+    eventually(Duration::from_secs(180), || async {
+        n3.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+    println!(
+        "cold join warmed {ENTRIES} x {VALUE_BYTES}-byte entries in {:?} (incl. container boot)",
+        started.elapsed()
+    );
+    for index in spot_checks {
+        assert_eq!(
+            n3.big_check(index, VALUE_BYTES).await,
+            Ok("ok".to_string()),
+            "state-transferred value big{index} must arrive byte-identical on n3"
+        );
+    }
+
+    assert_eq!(
+        n1.big_put(NEAR_CAP_BYTES).await,
+        Ok("ok".to_string()),
+        "a single near-frame-cap value must insert cleanly"
+    );
+    eventually(CONVERGE_WAIT, || async {
+        n2.big_verify(NEAR_CAP_BYTES).await == Ok("ok".to_string())
+            && n3.big_verify(NEAR_CAP_BYTES).await == Ok("ok".to_string())
+    })
+    .await;
+
+    let over_cap = n1
+        .big_put(OVER_CAP_BYTES)
+        .await
+        .expect("control round trip succeeds");
+    assert!(
+        over_cap.starts_with("err"),
+        "an over-frame-cap insert must be rejected with an error, got {over_cap:?}"
+    );
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    n3.stop().await.expect("n3 stops");
+    net.close().await.expect("network closes");
+}
+
 /// High-frequency entry lifecycle: three nodes concurrently hammer the same
 /// 512-key space on a 2s-TTL replicated cache — 100k operations each, three
 /// inserts to every remove, no pacing — so the same key is constantly

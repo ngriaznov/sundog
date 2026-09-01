@@ -236,6 +236,56 @@ impl Node {
             .map_err(|error| format!("bad ccount reply: {error}"))
     }
 
+    /// `bigfill n bytes` — bulk-inserts `big0..bign`, each with a
+    /// deterministic `bytes`-sized value generated on the node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails or the node reports an
+    /// insert error.
+    pub async fn big_fill(&self, count: u32, bytes: usize) -> Result<(), String> {
+        match self
+            .command(&format!("bigfill {count} {bytes}"))
+            .await?
+            .as_str()
+        {
+            "ok" => Ok(()),
+            other => Err(other.to_string()),
+        }
+    }
+
+    /// `bigcheck i bytes` — the node regenerates `bigi`'s expected
+    /// `bytes`-sized value and byte-compares its stored copy, replying
+    /// `ok`, `bad …`, or `none`; the raw reply is returned for asserting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails.
+    pub async fn big_check(&self, index: u32, bytes: usize) -> Result<String, String> {
+        self.command(&format!("bigcheck {index} {bytes}")).await
+    }
+
+    /// `bigput bytes` — inserts one `bytes`-sized value under the fixed
+    /// large-value key, returning the raw reply: `ok`, or `err …` — the
+    /// latter being the expected outcome for an over-frame-cap size.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails.
+    pub async fn big_put(&self, bytes: usize) -> Result<String, String> {
+        self.command(&format!("bigput {bytes}")).await
+    }
+
+    /// `bigverify bytes` — content-checks the fixed large-value key the way
+    /// [`Node::big_check`] does for `bigi` keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the control connection fails.
+    pub async fn big_verify(&self, bytes: usize) -> Result<String, String> {
+        self.command(&format!("bigverify {bytes}")).await
+    }
+
     /// `peers` — the node's live peer count, as membership currently reports it.
     ///
     /// # Errors

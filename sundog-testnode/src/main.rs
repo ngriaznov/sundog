@@ -20,6 +20,16 @@
 //! `n` back-to-back operations over a fixed `CHURN_KEYSPACE`-key space —
 //! three inserts to every remove, full speed, no pacing — and `ccount` ->
 //! `<n>` reads that cache's live-entry count.
+//!
+//! Large-value commands work on the `"it"` cache with deterministic content
+//! ([`big_value`]), so a value is generated on the writing node and verified
+//! on a reading node without ever crossing the control connection:
+//! `bigfill n bytes` -> `ok` bulk-inserts `big0..bign` with `bytes`-sized
+//! values; `bigcheck i bytes` -> `ok` | `bad` | `none` regenerates and
+//! compares `bigi`'s value; `bigput bytes` -> `ok` | `err …` inserts one
+//! `bytes`-sized value under a fixed key (the `err` reply is the point for
+//! over-frame-cap sizes); `bigverify bytes` -> `ok` | `bad` | `none` checks
+//! that fixed key.
 
 use std::env;
 use std::io::Write as _;
@@ -41,6 +51,28 @@ const CHURN_TTL: Duration = Duration::from_secs(2);
 /// `churn` wraps keys modulo this, so concurrent churners on different nodes
 /// keep colliding on the same keys instead of writing disjoint ranges.
 const CHURN_KEYSPACE: u32 = 512;
+/// The fixed key `bigput`/`bigverify` operate on, with [`BIG_ONE_INDEX`] as
+/// its content seed.
+const BIG_ONE_KEY: &str = "bigone";
+const BIG_ONE_INDEX: u32 = u32::MAX;
+
+/// Deterministic large-value content: `index`'s hex digits cycled out to
+/// `len` bytes. Any node can regenerate and byte-compare a value locally, so
+/// content-integrity checks never ship the value itself over the control
+/// connection.
+fn big_value(index: u32, len: usize) -> String {
+    format!("{index:08x}").chars().cycle().take(len).collect()
+}
+
+/// `ok` if `stored` matches [`big_value`]`(index, len)` exactly, `bad` (with
+/// a length hint) otherwise.
+fn verdict(stored: &str, index: u32, len: usize) -> String {
+    if stored == big_value(index, len) {
+        "ok".to_string()
+    } else {
+        format!("bad len={} want={len}", stored.len())
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -121,7 +153,8 @@ async fn dispatch(
     line: &str,
 ) -> Reply {
     let mut parts = line.trim().splitn(3, ' ');
-    match parts.next().unwrap_or_default() {
+    let command = parts.next().unwrap_or_default();
+    match command {
         "put" => {
             let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
                 return Reply::Line("err put needs a key and a value".to_string());
@@ -180,10 +213,63 @@ async fn dispatch(
             Reply::Line("ok".to_string())
         }
         "ccount" => Reply::Line(churn.entry_count().await.to_string()),
+        "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
+            big_command(cache, command, &mut parts).await
+        }
         "peers" => Reply::Line(cluster.peers().len().to_string()),
         "quit" => Reply::Quit,
         other => Reply::Line(format!("err unknown command {other:?}")),
     }
+}
+
+/// The `big*` command family (see the module docs): every variant parses a
+/// trailing `usize` size, `bigfill`/`bigcheck` an index or count before it.
+async fn big_command(
+    cache: &Cache<String, String>,
+    command: &str,
+    parts: &mut std::str::SplitN<'_, char>,
+) -> Reply {
+    let index = if matches!(command, "bigfill" | "bigcheck") {
+        match parts.next().and_then(|raw| raw.parse::<u32>().ok()) {
+            Some(index) => index,
+            None => return Reply::Line(format!("err {command} needs a u32 before the size")),
+        }
+    } else {
+        BIG_ONE_INDEX
+    };
+    let Some(bytes) = parts.next().and_then(|raw| raw.parse::<usize>().ok()) else {
+        return Reply::Line(format!("err {command} needs a usize size"));
+    };
+
+    Reply::Line(match command {
+        "bigfill" => {
+            let entries = (0..index).map(|i| (format!("big{i}"), big_value(i, bytes)));
+            match cache.insert_many(entries).await {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("err {error}"),
+            }
+        }
+        "bigput" => match cache
+            .insert(BIG_ONE_KEY.to_string(), big_value(BIG_ONE_INDEX, bytes))
+            .await
+        {
+            Ok(()) => "ok".to_string(),
+            Err(error) => format!("err {error}"),
+        },
+        // `bigcheck big{index}` or `bigverify`'s fixed key: regenerate and
+        // byte-compare locally.
+        _ => {
+            let key = if command == "bigcheck" {
+                format!("big{index}")
+            } else {
+                BIG_ONE_KEY.to_string()
+            };
+            match cache.get(&key).await {
+                Some(value) => verdict(&value, index, bytes),
+                None => "none".to_string(),
+            }
+        }
+    })
 }
 
 async fn serve(
