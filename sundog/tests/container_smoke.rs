@@ -8,10 +8,6 @@
 //! RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test
 //! container_smoke -- --nocapture`.
 
-// Unix-only for the same reason as `tests/containers.rs`: the rightsize
-// dev-dependencies are `cfg(unix)`-gated in `Cargo.toml`.
-#![cfg(unix)]
-
 mod container_util;
 
 use std::sync::Arc;

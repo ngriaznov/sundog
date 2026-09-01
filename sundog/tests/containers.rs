@@ -16,12 +16,6 @@
 //!     cargo test --release -p sundog --test containers -- --test-threads=1
 //! ```
 
-// Unix-only alongside the rightsize dev-dependencies themselves (see
-// `Cargo.toml`): rightsize-docker reaches the daemon over a Unix socket, so
-// neither it nor this binary builds on Windows — and running the suite needs
-// a Unix docker host regardless.
-#![cfg(unix)]
-
 mod container_util;
 
 use std::sync::Arc;
