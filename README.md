@@ -8,16 +8,14 @@
 # sundog
 
 sundog is an embedded, replicated cache for Rust services. Drop it into a
-service, and every instance of that service on the network finds the others,
-forms a cluster over gossip, and keeps named caches coherent between them —
-no separate cache server, no config beyond a cluster name. Every node is a
-peer: no coordinator, no special role, nothing else to run. Caches open in
-one of two clustered shapes — invalidation or full replication — or in a
-local, unclustered mode when you don't want cluster traffic at all.
+service, and every instance on the network finds the others, forms a
+cluster over gossip, and keeps named caches coherent between them — no
+cache server, no coordinator, no config beyond a cluster name. Caches run
+in one of three modes: invalidation, full replication, or local-only.
 
 It's named for the [parhelion](https://en.wikipedia.org/wiki/Sun_dog) — the
-optical effect where ice crystals in the sky render extra copies of the sun
-next to the real one. A replicated cache, drawn by the atmosphere.
+optical effect where ice crystals render extra copies of the sun next to
+the real one. A replicated cache, drawn by the atmosphere.
 
 Consistency is best-effort on purpose: gossip membership and last-write-wins
 skip the cost of running a consensus protocol for cache data, and
@@ -56,58 +54,55 @@ while let Ok(ev) = events.recv().await {
 cluster.shutdown().await; // graceful leave (chitchat departs politely)
 ```
 
-That's the whole API surface for the common case. `Cluster::builder(name).build()`
-with nothing else chained is supposed to work on a LAN — it's the
-project's acceptance test (see the doctest in `sundog/src/lib.rs`,
-which `cargo test --doc` runs for real). Filling a cache in bulk — a cold
-load from a backing store, say — can use `users.insert_many(entries).await?`
-instead of a loop of `insert` calls: every entry still gets its own HLC
-stamp and its own event, applied under one acquisition of the store's
-lock rather than one per entry.
+That's the whole API surface for the common case.
+`Cluster::builder(name).build()` with nothing else chained works on a LAN —
+that's the project's acceptance test, run for real by the doctest in
+`sundog/src/lib.rs`. For bulk fills — a cold load from a backing store —
+use `users.insert_many(entries).await?`: every entry still gets its own HLC
+stamp and its own event, applied under one lock acquisition instead of one
+per entry.
 
 ## Should you use this?
 
 sundog is a cache, not a database. If you need durability or strong
 consistency, this isn't that tool.
 
-Concretely: writes are last-write-wins on a hybrid logical clock, so if two
-nodes write the same key at close to the same time, one write silently
-loses — there's no conflict error, no merge, the loser vanishes.
+Writes are last-write-wins on a hybrid logical clock: if two nodes write
+the same key at nearly the same time, one write silently loses — no
+conflict error, no merge, the loser vanishes.
 
 Deletes and expiries behave differently. A TTL-expired entry can never
-reappear anywhere: every record carries
-its own absolute `expires_at_ms`, so once a key is past that timestamp no
-peer will accept a stale copy of it back in, partition or not. A manually
+reappear anywhere: every record carries its own absolute `expires_at_ms`,
+so once a key is past that timestamp no peer will accept a stale copy of it
+back in, partition or not. A manually
 removed key is a tombstone, and tombstones are kept — not GC'd on the usual
-`tombstone_ttl` schedule — for as long as any member the cluster has
-recently known about is absent, so a partitioned node can't come back with a
-pre-delete copy and resurrect the key on the nodes that stayed up. That
-deferral is bounded: past `tombstone_max_ttl` (24 hours by default) the
-tombstone is collected regardless of who's still missing. So the one case
-that can still happen is a member that comes back after being gone longer
-than `tombstone_max_ttl`, carrying data from before the delete — it can
-resurrect that key. Even then, a cache TTL caps the damage: the stale copy
-still carries its original `expires_at_ms`, so it can only reappear if its
-own lifetime hasn't elapsed — and a member gone more than 24 hours has
-outlived any typical cache TTL many times over. In practice: set a TTL and
-deleted keys stay deleted; without one, raise `tombstone_max_ttl` or treat
-sundog as the wrong layer for that key.
+`tombstone_ttl` schedule — for as long as any recently known member is
+absent, so a partitioned node can't come back with a pre-delete copy and
+resurrect the key on the nodes that stayed up. The deferral is bounded:
+past `tombstone_max_ttl` (24 hours by default) the tombstone is collected
+regardless of who's still missing. That leaves one hole: a member gone
+longer than `tombstone_max_ttl` can return carrying pre-delete data and
+resurrect the key. Even then a cache TTL caps the damage — the stale copy
+keeps its original `expires_at_ms` and can only reappear inside its own
+lifetime, and a node gone 24+ hours has outlived any typical cache TTL many
+times over. In practice: set a TTL and deleted keys stay deleted; without
+one, raise `tombstone_max_ttl` or treat sundog as the wrong layer for that
+key.
 
 Where it's a good fit: read-through caching in front of a slower backing
 store, session or profile data that's fine being eventually consistent,
 anywhere you're currently running a per-instance in-memory cache and wish
 the instances agreed with each other without standing up Redis. It targets
-small clusters (2–30 nodes) and LAN latencies — it is not trying to be a
-distributed database, and there's no consistent-hashing / partitioning mode
-(every replicated node holds every entry; see `ROADMAP.md` for why, and when
-that might change).
+small clusters (2–30 nodes) and LAN latencies. There's no
+consistent-hashing / partitioning mode — every replicated node holds every
+entry; `ROADMAP.md` covers why and what would change it.
 
-A burst of writes — `insert_many`, or plain back-to-back `insert` calls —
-fans out over the wire as coalesced `Replicate` batches rather than one
-frame per key, so replication throughput scales with the burst instead of
-the per-message overhead. Record-carrying frames encode and decode without
-copying key/value bytes, writes to different keys apply concurrently (only
-same-key writes serialize against each other), and anti-entropy/state-transfer
+A burst of writes — `insert_many` or back-to-back `insert` calls — fans out
+as coalesced `Replicate` batches rather than one frame per key, so
+replication throughput scales with the burst instead of the per-message
+overhead. Record-carrying frames encode and decode without copying
+key/value bytes, writes to different keys apply concurrently (only same-key
+writes serialize against each other), and anti-entropy/state-transfer
 requests reuse pooled connections instead of dialing fresh every round.
 
 ## The three modes
@@ -120,10 +115,9 @@ requests reuse pooled connections instead of dialing fresh every round.
 
 `Invalidation` never sends values between nodes — a write on A tells B "your
 copy of this key is stale," and B either drops it or reloads it on next
-access; B never gets A's value directly. `Replicated` is the only mode that
-runs state transfer on join (a new node pulls a full snapshot from an
-existing peer) and keeps a background anti-entropy loop running for as long
-as the cache is open.
+access. `Replicated` is the only mode that runs state transfer on join (a
+new node pulls a full snapshot from an existing peer) and keeps a
+background anti-entropy loop running for as long as the cache is open.
 
 ## How nodes find each other
 
@@ -149,14 +143,13 @@ save `Mdns` for host networking or bare-metal LANs.
 |---|---|---|
 | `tls` | off | mutual TLS on the data-plane mesh (`rustls`) — set `ClusterConfig::tls` / `ClusterBuilder::tls` and every connection, including state-transfer and anti-entropy, gets wrapped |
 | `prometheus` | off | a Prometheus exporter — `ClusterBuilder::prometheus_listen` serves `GET /metrics` directly, or grab a recorder via `telemetry::prometheus_handle` and mount it in your own server |
-| `sim` | off | swaps the data-plane transport for `turmoil`'s, so the net layer can run inside a deterministic simulation — this is a test-only knob, never turn it on in a real deployment |
+| `sim` | off | swaps the data-plane transport for `turmoil`'s, so the net layer can run inside a deterministic simulation — test-only, never enable it in a real deployment |
 
 Metrics (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
-`sundog_open_caches`, and a few more) are emitted unconditionally regardless
-of features — without `prometheus`, they fall into the `metrics`
-crate's no-op default recorder instead of going anywhere. A ready-made
-Grafana dashboard for them lives at
-[`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
+`sundog_open_caches`, and a few more) are emitted regardless of features —
+without `prometheus`, they fall into the `metrics` crate's no-op default
+recorder instead of going anywhere. A ready-made Grafana dashboard for them
+lives at [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
 ## Testing
 
@@ -176,12 +169,13 @@ Four layers, cheapest and highest-signal first:
    message loss, reordering, duplication; a donor dying mid-state-transfer.
 3. **Container integration** (`sundog/tests/containers.rs`, via
    [`rightsize`](https://crates.io/crates/rightsize) — no Docker CLI, no
-   `bollard`). This is where multi-node
-   scenarios run as actual separate processes on a real virtual network:
-   three-node convergence, tombstones reaching every node, a cold node
-   warm-joining a populated cluster via state transfer, killing a node and
-   watching anti-entropy repair the gap when it comes back. Each node is a
-   tiny binary, `sundog-testnode`, built static/musl and driven over a
+   `bollard`). This is where multi-node scenarios run as separate processes
+   on a real virtual network: three-node convergence, tombstones reaching
+   every node, cold joins into populated clusters at up to a million
+   entries, killing a node and watching anti-entropy repair the gap when it
+   comes back, high-churn add/remove/TTL workloads that must drain to zero,
+   and 64 KiB values verified byte-for-byte on arrival. Each node is a tiny
+   binary, `sundog-testnode`, built static/musl and driven over a
    line-based control protocol. It's gated behind an env var rather than
    `#[ignore]`, so a plain `cargo test --workspace` still compiles and
    passes this file trivially without a container backend:
@@ -190,20 +184,18 @@ Four layers, cheapest and highest-signal first:
    SUNDOG_CONTAINER_TESTS=1 cargo test --release -p sundog --test containers -- --test-threads=1
    ```
 
-   You'll also need `RIGHTSIZE_BACKEND=docker` — sundog's gossip is UDP, and
-   rightsize's lightweight microVM network emulation only relays TCP, so the
-   Docker backend is the one that carries chitchat's traffic. CI
+   You'll also need `RIGHTSIZE_BACKEND=docker` — sundog's gossip is UDP,
+   rightsize's lightweight microVM network emulation only relays TCP, and
+   only the Docker backend carries chitchat's traffic. CI
    has both KVM and Docker and pulls a real base image; locally, if registry
    pulls aren't available, point `SUNDOG_TEST_BASE_IMAGE` at whatever
    minimal image you've got pre-seeded.
 
    Scenarios that only need one node, or two nodes on loopback
-   with real UDP membership, don't live in this file — they're ordinary
-   `#[cfg(test)]` unit tests next to the code they exercise (see
-   `sundog::store`'s stampede-collapse and TTL tests, `sundog::cluster`'s
-   two-node replication/invalidation/state-transfer/anti-entropy/local-mode
-   tests). Container tests are reserved for what requires separate
-   processes and a real network.
+   with real UDP membership, are ordinary `#[cfg(test)]` unit tests next to
+   the code they exercise — `sundog::store`'s stampede-collapse and TTL
+   tests, `sundog::cluster`'s two-node
+   replication/invalidation/state-transfer/anti-entropy/local-mode tests.
 4. **Chaos demo** (`sundog-demo`, headless mode) — see below.
 
 Plain `cargo test --workspace` runs everything except the `sim` and
