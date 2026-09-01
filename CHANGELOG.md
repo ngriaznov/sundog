@@ -1,15 +1,11 @@
 # Changelog
 
 All notable changes to this project are documented in this file. Format
-follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this
-project has not yet made a versioned release, so everything below lives
-under `[0.1.0] – Unreleased` and will be split out once tags start.
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] – Unreleased
+## [0.1.0] – 2026-09-01
 
-Initial buildout of the core library. Nothing has been published to
-crates.io yet — `sundog 0.1.0` is a workspace name reservation, not a
-release.
+The first release: the full buildout of the core library.
 
 ### Added
 
