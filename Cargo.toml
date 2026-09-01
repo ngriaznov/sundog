@@ -11,4 +11,4 @@ rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ngriaznov/sundog"
 authors = ["sundog contributors"]
-description = "An embedded, replicated, zeroconf cache for Rust"
+description = "Embedded, replicated, zeroconf cache: no server, no coordinator, no config beyond a cluster name"
