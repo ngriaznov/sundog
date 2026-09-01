@@ -61,8 +61,14 @@ where
         self
     }
 
-    /// Sets an absolute lifespan (TTL), replicated as `expires_at_ms`.
-    /// Default: no expiry.
+    /// Sets the cache's default lifespan (TTL): every write is stamped with
+    /// an absolute `expires_at_ms` that replicates with the record, so an
+    /// entry expires at the same instant on every node. Default: no expiry.
+    ///
+    /// Individual writes can override it — [`Cache::insert_with_ttl`],
+    /// [`Cache::insert_many_with_ttl`], and [`Cache::get_or_load_with_ttl`]
+    /// give one entry (or one batch) its own lifespan, shorter or longer than
+    /// this default, and work on a cache with no default at all.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
@@ -289,8 +295,29 @@ where
         self.shard.get_or_load(key, loader).await
     }
 
+    /// [`Cache::get_or_load`], but a fill (a miss that runs `loader`) gets
+    /// `ttl` as its lifespan instead of the cache's default. A hit returns
+    /// the existing entry as-is, whatever its lifespan.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::get_or_load`].
+    pub async fn get_or_load_with_ttl<F, E>(
+        &self,
+        key: &K,
+        ttl: Duration,
+        loader: F,
+    ) -> Result<V, CacheError>
+    where
+        F: AsyncFnOnce(&K) -> Result<V, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.shard.get_or_load_with_ttl(key, ttl, loader).await
+    }
+
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
-    /// fans out per [`Mode`].
+    /// fans out per [`Mode`]. The entry gets the cache's default TTL, if
+    /// one is configured — [`Cache::insert_with_ttl`] gives it its own.
     ///
     /// # Errors
     ///
@@ -299,6 +326,20 @@ where
     /// postcard-encode.
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.insert(key, value).await
+    }
+
+    /// [`Cache::insert`] with a lifespan for this entry alone: `ttl`
+    /// overrides the cache's default (shorter or longer), and gives an entry
+    /// an expiry on a cache configured with none. The absolute deadline
+    /// travels with the record, so the entry expires at the same instant on
+    /// every node, and a stale copy can't outlive it anywhere — the same
+    /// guarantee a default-TTL entry has.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::insert`].
+    pub async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
+        self.shard.insert_with_ttl(key, value, ttl).await
     }
 
     /// Writes many entries at once: each is stamped with its own HLC version
@@ -323,6 +364,21 @@ where
         entries: impl IntoIterator<Item = (K, V)>,
     ) -> Result<(), CacheError> {
         self.shard.insert_many(entries).await
+    }
+
+    /// [`Cache::insert_many`] with one lifespan applied to every entry in
+    /// the batch, overriding the cache's default — see
+    /// [`Cache::insert_with_ttl`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::insert_many`].
+    pub async fn insert_many_with_ttl(
+        &self,
+        entries: impl IntoIterator<Item = (K, V)>,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.shard.insert_many_with_ttl(entries, ttl).await
     }
 
     /// Removes `key`: writes a tombstone and fans it out per [`Mode`].

@@ -773,8 +773,14 @@ where
             .observe(now_ms(), remote);
     }
 
-    fn ttl_expiry(&self) -> Option<u64> {
-        self.ttl.map(|d| now_ms().saturating_add(duration_ms(d)))
+    /// The absolute expiry a write stamped now should carry: the per-write
+    /// `ttl` if the caller gave one, else the shard's configured default,
+    /// else none. Only this stamp is ever per-cache — everything downstream
+    /// (the wire, moka's expiry policy, anti-entropy, state transfer) reads
+    /// each record's own `expires_at_ms`.
+    fn expiry_for(&self, ttl: Option<Duration>) -> Option<u64> {
+        ttl.or(self.ttl)
+            .map(|d| now_ms().saturating_add(duration_ms(d)))
     }
 
     /// The versioned-apply core: applies `incoming` at `ver` iff
@@ -1042,6 +1048,39 @@ where
         F: AsyncFnOnce(&K) -> Result<V, E>,
         E: std::error::Error + Send + Sync + 'static,
     {
+        self.load_expiring(key, None, loader).await
+    }
+
+    /// [`Shard::get_or_load`] whose fill, if `loader` runs, gets `ttl` as
+    /// its lifespan instead of the shard's default — see
+    /// [`Shard::insert_with_ttl`]. A hit returns the existing entry untouched.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::get_or_load`].
+    pub async fn get_or_load_with_ttl<F, E>(
+        &self,
+        key: &K,
+        ttl: Duration,
+        loader: F,
+    ) -> Result<V, CacheError>
+    where
+        F: AsyncFnOnce(&K) -> Result<V, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        self.load_expiring(key, Some(ttl), loader).await
+    }
+
+    async fn load_expiring<F, E>(
+        &self,
+        key: &K,
+        ttl: Option<Duration>,
+        loader: F,
+    ) -> Result<V, CacheError>
+    where
+        F: AsyncFnOnce(&K) -> Result<V, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
         let key_bytes = encode_key(key)?;
         let stored = self
             .cache
@@ -1057,7 +1096,7 @@ where
                     value,
                     encoded,
                     ver,
-                    expires_at_ms: self.ttl_expiry(),
+                    expires_at_ms: self.expiry_for(ttl),
                 });
                 let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
                 if self.events.receiver_count() > 0 {
@@ -1087,10 +1126,31 @@ where
     /// just the value's own bytes) exceeds the configured frame cap (see
     /// [`Shard::with_max_frame`], default [`MAX_FRAME`]).
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.insert_expiring(key, value, None).await
+    }
+
+    /// [`Shard::insert`] with a lifespan for this entry alone, overriding
+    /// the shard's default TTL (or giving an entry one on a shard configured
+    /// with none). The absolute deadline replicates with the record exactly
+    /// as a default-TTL stamp does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::insert`].
+    pub async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
+        self.insert_expiring(key, value, Some(ttl)).await
+    }
+
+    async fn insert_expiring(
+        &self,
+        key: K,
+        value: V,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let ver = self.stamp_local();
-        let expires_at_ms = self.ttl_expiry();
+        let expires_at_ms = self.expiry_for(ttl);
         let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
         if wire_size > self.max_frame {
             return Err(CacheError::ValueTooLarge {
@@ -1135,12 +1195,35 @@ where
         &self,
         entries: impl IntoIterator<Item = (K, V)>,
     ) -> Result<(), CacheError> {
+        self.insert_many_expiring(entries, None).await
+    }
+
+    /// [`Shard::insert_many`] with one lifespan applied to every entry in the
+    /// batch, overriding the shard's default TTL — see
+    /// [`Shard::insert_with_ttl`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::insert_many`].
+    pub async fn insert_many_with_ttl(
+        &self,
+        entries: impl IntoIterator<Item = (K, V)>,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.insert_many_expiring(entries, Some(ttl)).await
+    }
+
+    async fn insert_many_expiring(
+        &self,
+        entries: impl IntoIterator<Item = (K, V)>,
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
         let mut prepared = Vec::new();
         for (key, value) in entries {
             let key_bytes = encode_key(&key)?;
             let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
             let ver = self.stamp_local();
-            let expires_at_ms = self.ttl_expiry();
+            let expires_at_ms = self.expiry_for(ttl);
             let wire_size =
                 wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
             if wire_size > self.max_frame {
@@ -1994,6 +2077,76 @@ mod tests {
             None,
             "b must expire the entry from the wire-carried deadline alone"
         );
+    }
+
+    /// A per-write TTL overrides the shard default in both directions and
+    /// travels as the record's own absolute deadline: `a` defaults to a long
+    /// TTL, writes one entry with a short override and one with the default,
+    /// and `b` (no TTL configured at all) expires exactly the short one from
+    /// the wire-carried deadline. Every entry point that stamps a write —
+    /// `insert`, `insert_many`, and a `get_or_load` fill — gets the same
+    /// override, and a `get_or_load_with_ttl` *hit* leaves the existing
+    /// entry's lifespan alone.
+    #[tokio::test]
+    async fn per_entry_ttl_overrides_the_shard_default_and_replicates() {
+        let a = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_secs(30)),
+            None,
+        );
+        let b = shard::<u32, String>(2);
+        let short = Duration::from_millis(50);
+
+        a.insert_with_ttl(1, "short".into(), short)
+            .await
+            .expect("insert with ttl");
+        a.insert(2, "default".into()).await.expect("insert");
+        a.insert_many_with_ttl([(3, "short-batch".to_string())], short)
+            .await
+            .expect("insert_many with ttl");
+        a.get_or_load_with_ttl(&4, short, async |_| {
+            Ok::<_, std::io::Error>("short-fill".into())
+        })
+        .await
+        .expect("fill with ttl");
+        // A hit must not re-stamp: key 2 keeps its 30s default.
+        let hit = a
+            .get_or_load_with_ttl(&2, short, async |_| {
+                Ok::<_, std::io::Error>("never-called".into())
+            })
+            .await
+            .expect("hit");
+        assert_eq!(hit, "default");
+
+        let recs = ShardOps::records_for(&a, (1..=4u32).map(|k| key_bytes(&k)).collect()).await;
+        assert_eq!(recs.len(), 4);
+        for rec in &recs {
+            assert!(
+                rec.expires_at_ms.is_some(),
+                "every record carries a deadline"
+            );
+        }
+        ShardOps::apply_remote_batch(&b, recs).await;
+        for key in 1..=4u32 {
+            assert!(b.get(&key).await.is_some(), "b holds key {key} on arrival");
+        }
+
+        // Past the short TTL and moka's timer-wheel floor, short of the 30s
+        // default.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        for (shard, name) in [(&a, "a"), (&b, "b")] {
+            assert_eq!(shard.get(&1).await, None, "{name}: short insert expires");
+            assert_eq!(shard.get(&3).await, None, "{name}: short batch expires");
+            assert_eq!(shard.get(&4).await, None, "{name}: short fill expires");
+            assert_eq!(
+                shard.get(&2).await.as_deref(),
+                Some("default"),
+                "{name}: the default-TTL entry outlives the overrides"
+            );
+        }
     }
 
     /// The absolute-expiry guarantee, stated directly: a record whose

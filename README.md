@@ -58,6 +58,7 @@ let users = cluster
     .await?; // triggers state transfer if the cache exists cluster-wide
 
 users.insert(id.clone(), Profile).await?; // stamp HLC -> local apply -> fan out
+users.insert_with_ttl(token, Session, Duration::from_secs(30)).await?; // this entry's own TTL
 let profile = users.get_or_load(&id, async |id| load_profile(id).await).await?;
 users.remove(&id).await?; // tombstone write
 
@@ -89,7 +90,11 @@ conflict error, no merge, the loser vanishes.
 Deletes and expiries behave differently. A TTL-expired entry can never
 reappear anywhere: every record carries its own absolute `expires_at_ms`,
 so once a key is past that timestamp no peer will accept a stale copy of it
-back in, partition or not. A manually
+back in, partition or not. The cache's `.ttl(..)` is the default lifespan;
+`insert_with_ttl`, `insert_many_with_ttl`, and `get_or_load_with_ttl` give
+one entry (or one batch) its own, longer or shorter, and work on a cache
+with no default at all — the per-entry deadline replicates exactly like the
+default one. A manually
 removed key is a tombstone, and tombstones are kept — not GC'd on the usual
 `tombstone_ttl` schedule — for as long as any recently known member is
 absent, so a partitioned node can't come back with a pre-delete copy and

@@ -1160,6 +1160,57 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
+    /// End to end over the real mesh: a per-entry TTL set on node a expires
+    /// the replica on node b at the deadline a stamped, while a sibling
+    /// entry written with the cache's (absent) default lives on. Neither
+    /// cache is opened with a TTL — the override is the only expiry in play.
+    #[tokio::test]
+    async fn per_entry_ttl_replicates_and_expires_on_the_peer() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-per-entry-ttl").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("sessions")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("sessions")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+
+        cache_a
+            .insert_with_ttl(1, "ephemeral".into(), Duration::from_millis(300))
+            .await
+            .expect("a inserts with ttl");
+        cache_a
+            .insert(2, "durable".into())
+            .await
+            .expect("a inserts");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_b.get(&1).await.is_none() || cache_b.get(&2).await.is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both entries replicate to b within the bound");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(cache_a.get(&1).await, None, "origin expires its own copy");
+        assert_eq!(
+            cache_b.get(&1).await,
+            None,
+            "the replica expires from the deadline a stamped, with no TTL of its own"
+        );
+        assert_eq!(cache_b.get(&2).await.as_deref(), Some("durable"));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
     /// `Mode::Local` publishes no wire message at all — `fan_out_batch`'s
     /// `match mode` above has no arm for it — so there is no "delivered"
     /// event to await and no watch stream to race against; the only

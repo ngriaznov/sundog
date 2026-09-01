@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2] – 2026-09-01
+
+### Added
+
+- **Per-entry TTL**: `Cache::insert_with_ttl`, `Cache::insert_many_with_ttl`,
+  and `Cache::get_or_load_with_ttl` give one write (or one batch, or one
+  read-through fill) its own lifespan, overriding the cache's `.ttl(..)`
+  default in either direction and working on a cache configured with no
+  default. The per-entry deadline is stamped as the record's absolute
+  `expires_at_ms` and replicates exactly as a default-TTL stamp does, so the
+  entry expires at the same instant on every node and carries the same
+  can't-resurrect guarantee. A `get_or_load_with_ttl` hit leaves the
+  existing entry's lifespan untouched. The `Shard` API gains the same three
+  methods.
+
 ## [0.1.1] – 2026-09-01
 
 ### Fixed
