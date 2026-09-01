@@ -763,7 +763,7 @@ async fn fan_out_batch<K, V>(
     }
 
     // Re-fetches through `Shard::records_for_typed` rather than carrying the
-    // `Hlc`/wire bytes on `Event` itself (fixed by `docs/INTERFACES.md`): a
+    // `Hlc`/wire bytes on `Event` itself: a
     // benign race with a fast follow-up write/GC can make a key come back
     // missing, in which case there is nothing stale to fan out for it — a
     // later event (or anti-entropy) covers its current state. Typed keys are

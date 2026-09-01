@@ -2,7 +2,7 @@
 //! makes anti-entropy cheap.
 //!
 //! `Shard` intentionally holds no handle to `net::Mesh` — its constructor
-//! signature is fixed by `docs/INTERFACES.md` and takes none. Every local
+//! takes none, by design. Every local
 //! mutation (`insert`, `remove`, and `get_or_load`'s fill) publishes an
 //! `Origin::Local` [`Event`] on [`Shard::events`]; correlating that stream to
 //! wire fan-out (`Mesh::send` per [`Mode`]) is the composition layer's job.
@@ -592,10 +592,10 @@ where
     /// Builds a new shard. `node` stamps this shard's local writes.
     ///
     /// Tombstone GC uses [`ClusterConfig::default`]'s `tombstone_ttl` until
-    /// overridden via [`Shard::with_tombstone_ttl`]: `Shard::new`'s signature
-    /// is fixed by `docs/INTERFACES.md` and takes no `ClusterConfig`, so a
-    /// live cluster's configured value reaches this shard through that
-    /// follow-up call instead.
+    /// overridden via [`Shard::with_tombstone_ttl`]: `Shard::new` takes no
+    /// `ClusterConfig` (the store layer stays independent of cluster
+    /// wiring), so a live cluster's configured value reaches this shard
+    /// through that follow-up call instead.
     ///
     /// # Panics
     ///
