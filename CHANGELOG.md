@@ -256,5 +256,5 @@ The first release: the full buildout of the core library.
 ### Known gaps (tracked, not bugs)
 
 - `CacheError::ModeMismatch` exists as a reserved error variant but nothing
-  yet detects a real mode disagreement between nodes for the same cache name
-  — see `ROADMAP.md`'s cache-config fingerprint gossip sketch.
+  detects a real mode disagreement between nodes for the same cache name.
+  Closed in 0.2.0 by cache-config fingerprint gossip.
