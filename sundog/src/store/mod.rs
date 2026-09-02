@@ -88,7 +88,7 @@ fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> 
 /// rather than applying backpressure to writers.
 const EVENTS_CAPACITY: usize = 1024;
 
-/// How many keys one [`FanOutNotice::Many`] carries at most — aligned with
+/// How many keys one `FanOutNotice::Many` carries at most — aligned with
 /// `net::conn`'s `REPLICATE_BATCH_COUNT` so one notice's worth of records
 /// coalesces into at most one full wire batch. A bulk burst of `n` writes
 /// occupies `n / 4096` fan-out channel slots instead of `n`, which is what
@@ -587,7 +587,7 @@ where
     /// source of truth for "what changed" — it re-fetches fresh wire bytes
     /// through `records_for_typed` rather than reading a value off this
     /// channel, so there is nothing here for it to be stale about). A bulk
-    /// burst notifies as [`FanOutNotice::Many`] chunks so it can never lag
+    /// burst notifies as `FanOutNotice::Many` chunks so it can never lag
     /// the channel. Kept separate from `events` so the app-facing
     /// broadcast's `receiver_count()` reflects only real external
     /// subscribers, making the "skip the value clone when nobody's
@@ -920,7 +920,7 @@ where
     ///
     /// `notify_fan_out: false` is [`Shard::insert_many`]'s bulk path opting
     /// out of the per-write [`FanOutNotice::One`] here in favor of its own
-    /// [`FanOutNotice::Many`] chunks after the batch — same notifications,
+    /// `FanOutNotice::Many` chunks after the batch — same notifications,
     /// thousands of times fewer channel slots. (A local origin is what makes
     /// a notice happen at all; remote applies never notify.)
     #[allow(clippy::too_many_arguments)]
@@ -1389,7 +1389,7 @@ where
     /// caveat as [`Shard::insert_many`], read "written" as "tombstoned": if
     /// a key partway through fails to encode, the keys before it are still
     /// tombstoned. Emits one [`Event::Removed`] per key and fans out in
-    /// [`FanOutNotice::Many`] chunks exactly as [`Shard::insert_many`]
+    /// `FanOutNotice::Many` chunks exactly as [`Shard::insert_many`]
     /// describes.
     ///
     /// # Errors

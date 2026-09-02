@@ -3,8 +3,8 @@
 //! the live set as a `watch` stream that drives the net and store layers.
 //!
 //! Alongside identity, each node also gossips a per-cache config fingerprint:
-//! [`Membership::set_cache_mode`] sets a `cache:<name>` key to the opened
-//! [`Mode`]'s wire token, and [`parse_peer`] reads every such key back off a
+//! `Membership::set_cache_mode` sets a `cache:<name>` key to the opened
+//! [`Mode`]'s wire token, and `parse_peer` reads every such key back off a
 //! live peer's state into [`Peer::caches`] — the data `cluster` compares
 //! against this node's own shard registry (at `open()` time, and again on
 //! every membership-view change) to catch two nodes disagreeing about a
@@ -45,7 +45,7 @@ const NODE_ID_KEY: &str = "node_id";
 const DATA_ADDR_KEY: &str = "data_addr";
 const INCARNATION_KEY: &str = "incarnation";
 /// Prefix for the per-cache config fingerprint keys set by
-/// [`Membership::set_cache_mode`]: the full key is `cache:<name>`.
+/// `Membership::set_cache_mode`: the full key is `cache:<name>`.
 const CACHE_KEY_PREFIX: &str = "cache:";
 
 /// Builds the gossip key one cache's mode is set/read under.
@@ -85,7 +85,7 @@ pub struct Membership {
     local: Peer,
     shutdown_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
     /// Captured from [`ChitchatHandle::chitchat`] before the handle itself
-    /// moves into the background [`run`] task, so [`Membership::set_cache_mode`]
+    /// moves into the background [`run`] task, so `Membership::set_cache_mode`
     /// can keep setting keys on this node's own state after startup without
     /// needing a round trip through that task.
     chitchat: Arc<AsyncMutex<Chitchat>>,
@@ -234,7 +234,7 @@ impl Membership {
     }
 
     /// Advertises `mode` as this node's [`Mode`] for cache `name`, under the
-    /// `cache:<name>` gossip key — read back by every peer's [`parse_peer`]
+    /// `cache:<name>` gossip key — read back by every peer's `parse_peer`
     /// into [`Peer::caches`]. Setting the same value twice is a no-op on the
     /// wire (chitchat only bumps a key's version when the value changes), so
     /// this is safe to call unconditionally after every successful `open()`.
@@ -356,7 +356,7 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
 /// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
 /// map. A key whose value isn't a recognized [`Mode`] token (a peer running
 /// a build that added a mode this one doesn't know, or plain corruption) is
-/// logged and skipped — it never fails [`parse_peer`] for the whole node.
+/// logged and skipped — it never fails `parse_peer` for the whole node.
 fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
     node_state
         .iter_prefix(CACHE_KEY_PREFIX)
