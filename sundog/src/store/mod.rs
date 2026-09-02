@@ -1057,7 +1057,9 @@ where
     /// cloning the stored value — `moka`'s own `get`, not its `contains_key`
     /// (which reports a not-yet-swept expired entry as present). Reads never
     /// take a TTL argument at this API surface: this asks about the entry as
-    /// it was written, not against some other deadline.
+    /// it was written, not against some other deadline. An existence check,
+    /// not a read: it moves neither `sundog_cache_hits_total` nor
+    /// `sundog_cache_misses_total`.
     pub async fn contains_key(&self, key: &K) -> bool {
         self.cache.get(key).await.is_some()
     }
