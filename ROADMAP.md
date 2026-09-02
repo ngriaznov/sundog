@@ -38,6 +38,31 @@ binding constraint in a real deployment. Until then the current numbers
 already lead the embedded-replicated category, and the risk budget is
 better spent on real-workload mileage.
 
+## Stateful fuzzing of the apply path
+
+The wire decoder is fuzzed (`sundog/fuzz`: arbitrary bytes must never panic
+the decoder, and every decodable frame must re-encode to a fixed point).
+What that leaves uncovered is everything *after* a successful decode: the
+versioned apply, the digest bookkeeping, tombstone retention, and the
+resolver, driven by arbitrary *sequences* of valid records rather than
+arbitrary bytes. A stateful fuzz target would feed a shard a generated
+sequence of applies, removes, batch applies, GC ticks, and clock moves, and
+check the invariants the property tests already state — permutation
+convergence, digest consistency with the entry set, no tombstone
+resurrection, no expired entry readable — under libFuzzer's coverage
+guidance instead of proptest's random sampling.
+
+**Cost:** an `Arbitrary` model of the operation sequence, a harness that
+drives `ShardOps` without a runtime (the sim suite's `block_on` pattern),
+and a way to make wall-clock-stamped TTLs deterministic inside the target,
+which the current `store::now_ms` (real `SystemTime`) does not allow —
+the one piece of real design work here.
+
+**Trigger:** the first store-level bug that the property tests missed and a
+sequence-driven fuzzer would have found — or the bespoke store engine
+above landing, whose new invariants deserve exactly this kind of hammer
+before they carry production data.
+
 ## Distribution mode
 
 A consistent-hash ring over the live member set, `numOwners` primary+backup
@@ -113,31 +138,6 @@ rare exception it's designed to be.
 cache in the ~10⁶-entries-and-up range, i.e. `BUCKET_COUNT` (1,024, fixed
 today) is no longer coarse enough to keep bucket pulls rare. Below that scale
 the current design is simpler and already convergence-bounded.
-
-## Cache-config fingerprint gossip
-
-Every node in a sundog cluster opens caches independently — nothing stops
-node A from opening `"users"` as `Mode::Replicated` while node B opens the
-same name as `Mode::Invalidation`, or with a different TTL. Today that's
-silently inconsistent: `CacheError::ModeMismatch` already exists in
-`sundog/src/error.rs` as a reserved variant, but nothing in the cluster
-constructs it — there is no code path that would ever detect the mismatch,
-let alone reject or warn about it. The fix is gossiping a per-cache config
-fingerprint (name, mode, and whatever else needs to agree) as part of
-membership state — chitchat already carries a per-node key/value bag for
-`data_addr`/`incarnation` that a `caches` entry could extend — and comparing
-a locally-`open()`ed cache's fingerprint against what peers advertise.
-
-**Cost:** a wire format for the fingerprint, a decision about what "mismatch"
-means for fields it's fine to disagree on (`max_capacity` is a local knob;
-`mode` is not) versus fields that must agree, and a decision about what
-happens on mismatch — reject `open()`, or just warn loudly and let LWW/AE
-paper over the semantic disagreement as best they can.
-
-**Trigger:** a real incident, or even a near-miss, where two nodes ran a
-cache under different modes without anyone noticing until behavior diverged.
-This is cheap enough (a few gossiped bytes, checked at `open()`) that it may
-get pulled forward even without one, but it's not blocking anything today.
 
 ## Cluster-wide max-idle
 
