@@ -3,8 +3,13 @@
 //! the license for the whole loss-tolerant design — applying the
 //! same multiset of versioned writes, in any order, with any duplication,
 //! converges to byte-identical state. Alongside it: a focused tombstone/put
-//! race property, and incremental-digest-vs-full-recompute across arbitrary
-//! op sequences including anti-entropy-style repairs and tombstone GC.
+//! race property, incremental-digest-vs-full-recompute across arbitrary op
+//! sequences including anti-entropy-style repairs and tombstone GC, and a
+//! clock-driven property that puts [`Shard::with_clock`] through its actual
+//! job — TTL expiry and sweep correctness — on a manual clock instead of
+//! real time.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
 use rand::seq::SliceRandom as _;
@@ -100,44 +105,20 @@ fn shuffled_with_duplicates(records: &[WireRecord], seed: u64) -> Vec<WireRecord
 
 /// The full observable state of a shard, canonicalized (sorted by key) so two
 /// shards that converged to the same content compare equal regardless of
-/// internal (e.g. moka iteration) order: live entries as `(key, value, ver)`,
-/// the tombstone set as `(key, ver)`, and all [`BUCKET_COUNT`] digests.
+/// internal (per-stripe) iteration order: live entries as `(key, value,
+/// ver)`, the tombstone set as `(key, ver)`, and all [`BUCKET_COUNT`]
+/// digests.
 type CanonicalState = (Vec<(Bytes, Bytes, Hlc)>, Vec<(Bytes, Hlc)>, Vec<u64>);
 
-async fn canonical_state<K, V>(shard: &Shard<K, V>) -> CanonicalState
+fn canonical_state<K, V>(shard: &Shard<K, V>) -> CanonicalState
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let mut live: Vec<(Bytes, Bytes, Hlc)> = shard
-        .cache
-        .iter()
-        .map(|(key, stored)| {
-            let key_bytes = Bytes::from(postcard::to_stdvec(&*key).expect("test key encodes"));
-            let value_bytes =
-                Bytes::from(postcard::to_stdvec(&stored.value).expect("test value encodes"));
-            (key_bytes, value_bytes, stored.ver)
-        })
-        .collect();
+    let (mut live, mut tomb) = shard.engine.debug_snapshot();
     live.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut tomb: Vec<(Bytes, Hlc)> = Vec::new();
-    for stripe in shard.tombstones.iter() {
-        tomb.extend(
-            stripe
-                .lock()
-                .await
-                .iter()
-                .map(|(key_bytes, t)| (key_bytes.clone(), t.ver)),
-        );
-    }
     tomb.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let digest: Vec<u64> = shard
-        .digest
-        .iter()
-        .map(|d| d.load(Ordering::Relaxed))
-        .collect();
+    let digest: Vec<u64> = shard.engine.digests().into_iter().map(|(_, d)| d).collect();
     (live, tomb, digest)
 }
 
@@ -225,11 +206,11 @@ proptest! {
     /// tombstones, and all 1024 digests) must be byte-identical everywhere.
     /// Alternates, by seed parity, between [`apply_mixed`]'s sequential
     /// single/batch mix and [`apply_concurrent`]'s real concurrent task
-    /// scheduling across stripes — striping the apply-serialization lock by
-    /// key bucket (see [`stripe_of`]) makes cross-stripe interleaving a
-    /// genuine runtime possibility rather than a purely theoretical one, so
-    /// this property must hold under actual concurrent scheduling, not just
-    /// sampled sequential orderings.
+    /// scheduling across stripes — striping the apply lock by key bucket
+    /// (one engine stripe per anti-entropy bucket) makes cross-stripe
+    /// interleaving a genuine runtime possibility rather than a purely
+    /// theoretical one, so this property must hold under actual concurrent
+    /// scheduling, not just sampled sequential orderings.
     #[test]
     fn permutation_convergence(
         ops in proptest::collection::vec(op_strategy(), 4..40),
@@ -255,7 +236,7 @@ proptest! {
                 } else {
                     apply_concurrent(&shard, permuted, seed).await;
                 }
-                states.push(canonical_state(&shard).await);
+                states.push(canonical_state(&shard));
             }
             for state in &states[1..] {
                 assert_eq!(
@@ -332,7 +313,7 @@ proptest! {
                     "the newer of {{put, tombstone}} must win regardless of application order \
                      or whether it went through a single or batch apply"
                 );
-                states.push(canonical_state(&shard).await);
+                states.push(canonical_state(&shard));
             }
             for state in &states[1..] {
                 assert_eq!(&states[0], state);
@@ -341,29 +322,15 @@ proptest! {
     }
 }
 
-/// One full pass over live entries + tombstones — same technique as the
-/// hand-rolled version in `mod tests`, duplicated here since that helper is
-/// private to its own sibling module.
-async fn digest_matches_full_recompute<K, V>(shard: &Shard<K, V>) -> bool
+/// Compares the engine's incrementally-maintained digest against
+/// [`engine::Engine::recompute_digests`]'s full pass over every stripe.
+fn digest_matches_full_recompute<K, V>(shard: &Shard<K, V>) -> bool
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let mut expected = vec![0u64; BUCKET_COUNT];
-    for (key, stored) in &shard.cache {
-        let key_bytes = postcard::to_stdvec(&*key).expect("test key encodes");
-        expected[usize::from(bucket_of(&key_bytes))] ^= entry_fingerprint(&key_bytes, stored.ver);
-    }
-    for stripe in shard.tombstones.iter() {
-        for (key_bytes, t) in stripe.lock().await.iter() {
-            expected[usize::from(bucket_of(key_bytes))] ^= entry_fingerprint(key_bytes, t.ver);
-        }
-    }
-    let actual: Vec<u64> = shard
-        .digest
-        .iter()
-        .map(|d| d.load(Ordering::Relaxed))
-        .collect();
+    let expected = shard.engine.recompute_digests();
+    let actual: Vec<u64> = shard.engine.digests().into_iter().map(|(_, d)| d).collect();
     actual == expected
 }
 
@@ -446,18 +413,163 @@ proptest! {
                     }
                     DigestOp::Gc => {
                         ShardOps::gc_tombstones(&shard, false).await;
-                        for stripe in shard.tombstones.iter() {
-                            assert!(
-                                stripe.lock().await.is_empty(),
-                                "zero tombstone_ttl means every tombstone is GC-eligible immediately"
-                            );
-                        }
+                        assert!(
+                            shard.engine.debug_snapshot().1.is_empty(),
+                            "zero tombstone_ttl means every tombstone is GC-eligible immediately"
+                        );
                     }
                 }
                 assert!(
-                    digest_matches_full_recompute(&shard).await,
+                    digest_matches_full_recompute(&shard),
                     "incremental digest diverged from full recompute after {op:?}"
                 );
+            }
+        });
+    }
+}
+
+/// One op in [`clock_driven_sweep_keeps_digest_and_readability_consistent`]'s
+/// workload: a TTL'd local insert, a remove, a remote apply carrying its own
+/// (possibly already-past) absolute deadline, a manual-clock advance, a
+/// sweep, or a tombstone GC pass.
+#[derive(Debug, Clone, Copy)]
+enum ClockOp {
+    InsertTtl(u8, u16, u16),
+    Remove(u8),
+    ApplyRemote(u8, Option<u16>, u8, u32),
+    Advance(u16),
+    Sweep,
+    Gc,
+}
+
+fn clock_op_strategy() -> impl Strategy<Value = ClockOp> {
+    prop_oneof![
+        (0..KEYSPACE, any::<u16>(), 0u16..500)
+            .prop_map(|(k, v, ttl_ms)| ClockOp::InsertTtl(k, v, ttl_ms)),
+        (0..KEYSPACE).prop_map(ClockOp::Remove),
+        (0..KEYSPACE, proptest::option::of(any::<u16>()), 0..3u8, 0u32..500)
+            .prop_map(|(k, v, o, ttl_ms)| ClockOp::ApplyRemote(k, v, o, ttl_ms)),
+        (0u16..300).prop_map(ClockOp::Advance),
+        Just(ClockOp::Sweep),
+        Just(ClockOp::Gc),
+    ]
+}
+
+/// [`ShardOps::digests`] must equal a full recompute over
+/// [`ShardOps::entries_for_buckets`] — the same check anti-entropy itself
+/// would make, using only the public trait surface (no reach into engine
+/// internals, unlike [`digest_matches_full_recompute`] above).
+async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
+    let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
+    let mut expected = vec![0u64; BUCKET_COUNT];
+    for (bucket, entries) in ShardOps::entries_for_buckets(shard, all_buckets).await {
+        for (key_bytes, ver) in entries {
+            expected[usize::from(bucket)] ^= entry_fingerprint(&key_bytes, ver);
+        }
+    }
+    let actual: Vec<u64> = ShardOps::digests(shard).await.into_iter().map(|(_, d)| d).collect();
+    actual == expected
+}
+
+/// For every key in the small keyspace that currently reads as present, its
+/// own record's `expires_at_ms` (fetched through the public
+/// [`ShardOps::records_for`], not engine internals) must not yet be past
+/// `now_ms` — the direct statement of "no readable entry is expired".
+async fn assert_no_readable_entry_is_expired(shard: &Shard<u8, u16>, now_ms: u64) {
+    for k in 0..KEYSPACE {
+        if shard.get(&k).await.is_none() {
+            continue;
+        }
+        let key_bytes = Bytes::from(postcard::to_stdvec(&k).expect("u8 key encodes"));
+        let recs = ShardOps::records_for(shard, vec![key_bytes]).await;
+        let rec = recs
+            .first()
+            .expect("a key that reads as present must have a record");
+        if let Some(deadline) = rec.expires_at_ms {
+            assert!(
+                deadline > now_ms,
+                "key {k} reads as present but its own record's deadline {deadline} \
+                 is already past the current clock ({now_ms})"
+            );
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Drives a shard through random TTL'd inserts, remote applies (each
+    /// carrying its own absolute, possibly already-past deadline), removes,
+    /// manual-clock advances, sweeps, and tombstone GC — all timestamped by
+    /// a manual clock installed via [`Shard::with_clock`], never real time,
+    /// so this runs fast and deterministically and exercises exactly what
+    /// that hook exists for. After every [`ClockOp::Sweep`], the digest must
+    /// equal a full recompute over [`ShardOps::entries_for_buckets`], and no
+    /// readable entry may be past its own deadline.
+    #[test]
+    fn clock_driven_sweep_keeps_digest_and_readability_consistent(
+        ops in proptest::collection::vec(clock_op_strategy(), 4..80),
+    ) {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+            let now = Arc::new(AtomicU64::new(1_000_000));
+            let reader = Arc::clone(&now);
+            let clock_fn: Arc<dyn Fn() -> u64 + Send + Sync> =
+                Arc::new(move || reader.load(Ordering::Relaxed));
+            let shard = Shard::<u8, u16>::new(
+                SmolStr::new("clock-prop"),
+                Mode::Replicated,
+                NodeId::from(500),
+                10_000,
+                None,
+                None,
+            )
+            .with_tombstone_ttl(Duration::from_millis(200))
+            .with_clock(Arc::clone(&clock_fn));
+            let mut remote_clocks: Vec<HlcClock> = (0u8..3)
+                .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
+                .collect();
+
+            for op in &ops {
+                match *op {
+                    ClockOp::InsertTtl(k, v, ttl_ms) => {
+                        let _ = shard
+                            .insert_with_ttl(k, v, Duration::from_millis(u64::from(ttl_ms)))
+                            .await;
+                    }
+                    ClockOp::Remove(k) => {
+                        let _ = shard.remove(&k).await;
+                    }
+                    ClockOp::ApplyRemote(k, v, origin, ttl_ms) => {
+                        let idx = usize::from(origin) % remote_clocks.len();
+                        let current = now.load(Ordering::Relaxed);
+                        let ver = remote_clocks[idx].now(current);
+                        let rec = WireRecord {
+                            key: Bytes::from(postcard::to_stdvec(&k).expect("u8 key encodes")),
+                            value: v.map(|value| {
+                                Bytes::from(postcard::to_stdvec(&value).expect("u16 value encodes"))
+                            }),
+                            ver,
+                            expires_at_ms: Some(current + u64::from(ttl_ms)),
+                        };
+                        ShardOps::apply_remote(&shard, rec).await;
+                    }
+                    ClockOp::Advance(delta_ms) => {
+                        now.fetch_add(u64::from(delta_ms), Ordering::Relaxed);
+                    }
+                    ClockOp::Sweep => {
+                        ShardOps::run_pending_tasks(&shard).await;
+                        assert!(
+                            digest_matches_entries_for_buckets(&shard).await,
+                            "digest diverged from a full recompute over entries_for_buckets \
+                             after a sweep"
+                        );
+                        assert_no_readable_entry_is_expired(&shard, now.load(Ordering::Relaxed)).await;
+                    }
+                    ClockOp::Gc => {
+                        ShardOps::gc_tombstones(&shard, false).await;
+                    }
+                }
             }
         });
     }

@@ -1275,23 +1275,27 @@ mod tests {
         };
         let guard = engine.guard_inflight(kb.clone(), hash, Arc::clone(&inflight));
 
-        // A second caller joins the same in-flight load.
+        // A second caller joins the same in-flight load and registers for a
+        // wakeup (`enable()`) synchronously, before anything can notify it —
+        // exactly as `Shard::get_or_load`'s real `Join` arm does, before its
+        // first `.await`. Doing this inline rather than inside a spawned
+        // task matters: `Notify::notify_waiters` only wakes waiters already
+        // registered at the moment it's called, so a registration deferred
+        // into a not-yet-polled spawned task would race `fail_inflight`
+        // below and hang forever.
         let JoinOutcome::Join(joined) = engine.miss_or_join(&kb, hash, 0) else {
             panic!("second caller must join the existing load");
         };
-        let waiter = tokio::spawn(async move {
-            let notified = joined.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            notified.await;
-            joined.error.get().is_some()
-        });
+        let notified = joined.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
         let boom: Arc<dyn std::error::Error + Send + Sync> = Arc::new(std::io::Error::other("boom"));
         engine.fail_inflight(&kb, hash, &inflight, boom);
         guard.complete();
 
-        assert!(waiter.await.expect("waiter task does not panic"), "the joined waiter must see the error");
+        notified.await;
+        assert!(joined.error.get().is_some(), "the joined waiter must see the error");
         assert_eq!(engine.get(&key, 0), None, "a failed load never installs a value");
     }
 
