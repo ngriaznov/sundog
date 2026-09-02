@@ -447,7 +447,12 @@ fn clock_op_strategy() -> impl Strategy<Value = ClockOp> {
         (0..KEYSPACE, any::<u16>(), 0u16..500)
             .prop_map(|(k, v, ttl_ms)| ClockOp::InsertTtl(k, v, ttl_ms)),
         (0..KEYSPACE).prop_map(ClockOp::Remove),
-        (0..KEYSPACE, proptest::option::of(any::<u16>()), 0..3u8, 0u32..500)
+        (
+            0..KEYSPACE,
+            proptest::option::of(any::<u16>()),
+            0..3u8,
+            0u32..500
+        )
             .prop_map(|(k, v, o, ttl_ms)| ClockOp::ApplyRemote(k, v, o, ttl_ms)),
         (0u16..300).prop_map(ClockOp::Advance),
         Just(ClockOp::Sweep),
@@ -467,7 +472,11 @@ async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
             expected[usize::from(bucket)] ^= entry_fingerprint(&key_bytes, ver);
         }
     }
-    let actual: Vec<u64> = ShardOps::digests(shard).await.into_iter().map(|(_, d)| d).collect();
+    let actual: Vec<u64> = ShardOps::digests(shard)
+        .await
+        .into_iter()
+        .map(|(_, d)| d)
+        .collect();
     actual == expected
 }
 

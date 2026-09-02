@@ -170,7 +170,11 @@ impl<K, V> Stripe<K, V> {
 /// Removes the live entry at `key_bytes` (already known to hash to `hash`)
 /// if present, returning its weight and version for the caller's digest/
 /// weight bookkeeping.
-fn remove_live<K, V>(table: &mut HashTable<Live<K, V>>, hash: u64, key_bytes: &[u8]) -> Option<(u32, Hlc)> {
+fn remove_live<K, V>(
+    table: &mut HashTable<Live<K, V>>,
+    hash: u64,
+    key_bytes: &[u8],
+) -> Option<(u32, Hlc)> {
     match table.entry(hash, |l| l.key_bytes.as_ref() == key_bytes, hasher_for) {
         Entry::Occupied(occ) => {
             let (removed, _vacant) = occ.remove();
@@ -266,7 +270,13 @@ where
         stripe
             .live
             .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
-            .map(|l| (l.stored.ver, l.stored.encoded.clone(), l.stored.expires_at_ms))
+            .map(|l| {
+                (
+                    l.stored.ver,
+                    l.stored.encoded.clone(),
+                    l.stored.expires_at_ms,
+                )
+            })
     } else {
         None
     };
@@ -298,7 +308,10 @@ where
     // for a `Replaced` cause (it never did — this bookkeeping has always
     // happened here, synchronously, on the write itself).
     if let Some(t) = prior_tombstone {
-        digest_bucket.fetch_xor(entry_fingerprint(key_bytes.as_ref(), t.ver), Ordering::Relaxed);
+        digest_bucket.fetch_xor(
+            entry_fingerprint(key_bytes.as_ref(), t.ver),
+            Ordering::Relaxed,
+        );
         stripe.tombstones.remove(key_bytes.as_ref());
     } else if let Some(sv) = stored_ver {
         digest_bucket.fetch_xor(entry_fingerprint(key_bytes.as_ref(), sv), Ordering::Relaxed);
@@ -348,7 +361,8 @@ where
         }
         Incoming::Tombstone => {
             if had_live
-                && let Some((old_weight, _)) = remove_live(&mut stripe.live, hash, key_bytes.as_ref())
+                && let Some((old_weight, _)) =
+                    remove_live(&mut stripe.live, hash, key_bytes.as_ref())
             {
                 total_weight.fetch_sub(u64::from(old_weight), Ordering::Relaxed);
             }
@@ -434,7 +448,11 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    pub(crate) fn new(max_capacity: u64, tti: Option<Duration>, weigher: Option<Weigher<K, V>>) -> Self {
+    pub(crate) fn new(
+        max_capacity: u64,
+        tti: Option<Duration>,
+        weigher: Option<Weigher<K, V>>,
+    ) -> Self {
         Self {
             stripes: (0..BUCKET_COUNT)
                 .map(|_| RwLock::new(Stripe::new()))
@@ -489,7 +507,9 @@ where
         let key_bytes = key_buf.as_slice();
         let hash = hash_key_bytes(key_bytes);
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
-        let live = stripe.live.find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
+        let live = stripe
+            .live
+            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
         if self.is_absent(live, now_ms) {
             return None;
         }
@@ -505,7 +525,10 @@ where
         let key_bytes = key_buf.as_slice();
         let hash = hash_key_bytes(key_bytes);
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
-        let Some(live) = stripe.live.find(hash, |l| l.key_bytes.as_ref() == key_bytes) else {
+        let Some(live) = stripe
+            .live
+            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)
+        else {
             return false;
         };
         if self.is_absent(live, now_ms) {
@@ -545,7 +568,9 @@ where
                 expires_at_ms: None,
             });
         }
-        let live = stripe.live.find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
+        let live = stripe
+            .live
+            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
         if self.is_absent(live, now_ms) {
             return None;
         }
@@ -565,8 +590,7 @@ where
             .iter()
             .map(|&bucket| {
                 let stripe = self.stripes[usize::from(bucket)].read();
-                let mut entries =
-                    Vec::with_capacity(stripe.live.len() + stripe.tombstones.len());
+                let mut entries = Vec::with_capacity(stripe.live.len() + stripe.tombstones.len());
                 entries.extend(
                     stripe
                         .live
@@ -604,14 +628,18 @@ where
         let mut out = Vec::new();
         for stripe_lock in &self.stripes {
             let stripe = stripe_lock.read();
-            out.extend(stripe.live.iter().filter(|live| !self.is_absent(live, now_ms)).map(
-                |live| WireRecord {
-                    key: live.key_bytes.clone(),
-                    value: Some(live.stored.encoded.clone()),
-                    ver: live.stored.ver,
-                    expires_at_ms: live.stored.expires_at_ms,
-                },
-            ));
+            out.extend(
+                stripe
+                    .live
+                    .iter()
+                    .filter(|live| !self.is_absent(live, now_ms))
+                    .map(|live| WireRecord {
+                        key: live.key_bytes.clone(),
+                        value: Some(live.stored.encoded.clone()),
+                        ver: live.stored.ver,
+                        expires_at_ms: live.stored.expires_at_ms,
+                    }),
+            );
             out.extend(stripe.tombstones.iter().map(|(key_bytes, t)| WireRecord {
                 key: key_bytes.clone(),
                 value: None,
@@ -657,8 +685,10 @@ where
             let mut new_next = u64::MAX;
             stripe.live.retain(|live| {
                 if self.is_absent(live, now_ms) {
-                    digest_bucket
-                        .fetch_xor(entry_fingerprint(&live.key_bytes, live.stored.ver), Ordering::Relaxed);
+                    digest_bucket.fetch_xor(
+                        entry_fingerprint(&live.key_bytes, live.stored.ver),
+                        Ordering::Relaxed,
+                    );
                     removed_weight += u64::from(live.weight);
                     false
                 } else {
@@ -671,7 +701,8 @@ where
             stripe.next_expiry_ms = new_next;
             drop(stripe);
             if removed_weight > 0 {
-                self.total_weight.fetch_sub(removed_weight, Ordering::Relaxed);
+                self.total_weight
+                    .fetch_sub(removed_weight, Ordering::Relaxed);
             }
         }
     }
@@ -709,15 +740,18 @@ where
             return;
         };
         let hash = hash_key_bytes(victim_bytes.as_ref());
-        if let Entry::Occupied(occ) =
-            stripe
-                .live
-                .entry(hash, |l| l.key_bytes.as_ref() == victim_bytes.as_ref(), hasher_for)
-        {
+        if let Entry::Occupied(occ) = stripe.live.entry(
+            hash,
+            |l| l.key_bytes.as_ref() == victim_bytes.as_ref(),
+            hasher_for,
+        ) {
             let (removed, _vacant) = occ.remove();
-            self.digest[bucket]
-                .fetch_xor(entry_fingerprint(&removed.key_bytes, removed.stored.ver), Ordering::Relaxed);
-            self.total_weight.fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
+            self.digest[bucket].fetch_xor(
+                entry_fingerprint(&removed.key_bytes, removed.stored.ver),
+                Ordering::Relaxed,
+            );
+            self.total_weight
+                .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
         }
     }
 
@@ -850,7 +884,9 @@ where
     pub(crate) fn miss_or_join(&self, key_bytes: &Bytes, hash: u64, now_ms: u64) -> JoinOutcome<V> {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
-        if let Some(live) = stripe.live.find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+        if let Some(live) = stripe
+            .live
+            .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
             && !self.is_absent(live, now_ms)
         {
             self.touch(live, now_ms);
@@ -860,7 +896,9 @@ where
             return JoinOutcome::Join(Arc::clone(existing));
         }
         let inflight = Arc::new(Inflight::new());
-        stripe.inflight.insert(key_bytes.clone(), Arc::clone(&inflight));
+        stripe
+            .inflight
+            .insert(key_bytes.clone(), Arc::clone(&inflight));
         JoinOutcome::Owner(inflight)
     }
 
@@ -919,15 +957,25 @@ where
             let digest_bucket = &self.digest[bucket];
             let mut had_live = false;
             if let Some(t) = stripe.tombstones.remove(key_bytes.as_ref()) {
-                digest_bucket.fetch_xor(entry_fingerprint(key_bytes.as_ref(), t.ver), Ordering::Relaxed);
+                digest_bucket.fetch_xor(
+                    entry_fingerprint(key_bytes.as_ref(), t.ver),
+                    Ordering::Relaxed,
+                );
             } else if let Some((old_weight, old_ver)) =
                 remove_live(&mut stripe.live, hash, key_bytes.as_ref())
             {
                 had_live = true;
-                digest_bucket.fetch_xor(entry_fingerprint(key_bytes.as_ref(), old_ver), Ordering::Relaxed);
-                self.total_weight.fetch_sub(u64::from(old_weight), Ordering::Relaxed);
+                digest_bucket.fetch_xor(
+                    entry_fingerprint(key_bytes.as_ref(), old_ver),
+                    Ordering::Relaxed,
+                );
+                self.total_weight
+                    .fetch_sub(u64::from(old_weight), Ordering::Relaxed);
             }
-            digest_bucket.fetch_xor(entry_fingerprint(key_bytes.as_ref(), ver), Ordering::Relaxed);
+            digest_bucket.fetch_xor(
+                entry_fingerprint(key_bytes.as_ref(), ver),
+                Ordering::Relaxed,
+            );
             let weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
             stripe.live.insert_unique(
                 hash,
@@ -948,7 +996,8 @@ where
             if let Some(exp) = expires_at_ms {
                 stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
             }
-            self.total_weight.fetch_add(u64::from(weight), Ordering::Relaxed);
+            self.total_weight
+                .fetch_add(u64::from(weight), Ordering::Relaxed);
             had_live
         };
         inflight.notify.notify_waiters();
@@ -1003,7 +1052,11 @@ where
         for stripe_lock in &self.stripes {
             let stripe = stripe_lock.read();
             for live in stripe.live.iter() {
-                live_out.push((live.key_bytes.clone(), live.stored.encoded.clone(), live.stored.ver));
+                live_out.push((
+                    live.key_bytes.clone(),
+                    live.stored.encoded.clone(),
+                    live.stored.ver,
+                ));
             }
             for (key_bytes, t) in &stripe.tombstones {
                 tomb_out.push((key_bytes.clone(), t.ver));
@@ -1015,7 +1068,10 @@ where
     /// Test-only: total live entries and current total weight, for capacity
     /// eviction tests.
     pub(crate) fn debug_totals(&self) -> (u64, u64) {
-        (self.live_entry_count(), self.total_weight.load(Ordering::Relaxed))
+        (
+            self.live_entry_count(),
+            self.total_weight.load(Ordering::Relaxed),
+        )
     }
 
     /// Test-only: forces the tombstone at `key_bytes` (if any) to read as
@@ -1116,7 +1172,11 @@ mod tests {
         let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), Some(50), 0);
         assert_eq!(engine.get(&1, 0), Some("a".to_string()));
         // Past the deadline, but no sweep has run yet.
-        assert_eq!(engine.get(&1, 100), None, "an expired entry reads as absent immediately");
+        assert_eq!(
+            engine.get(&1, 100),
+            None,
+            "an expired entry reads as absent immediately"
+        );
     }
 
     #[test]
@@ -1153,8 +1213,16 @@ mod tests {
     fn tti_idle_eviction() {
         let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
         let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 0);
-        assert_eq!(engine.get(&1, 50), Some("a".to_string()), "read at 50ms refreshes idle clock");
-        assert_eq!(engine.get(&1, 140), Some("a".to_string()), "90ms since the last read, still alive");
+        assert_eq!(
+            engine.get(&1, 50),
+            Some("a".to_string()),
+            "read at 50ms refreshes idle clock"
+        );
+        assert_eq!(
+            engine.get(&1, 140),
+            Some("a".to_string()),
+            "90ms since the last read, still alive"
+        );
         assert_eq!(engine.get(&1, 400), None, "idle past the 100ms TTI");
     }
 
@@ -1169,18 +1237,29 @@ mod tests {
         let mut same_bucket_keys = vec![0u32];
         let mut candidate = 1u32;
         while same_bucket_keys.len() < 5 {
-            if stripe_index_from_hash(hash_key_bytes(key_bytes(candidate).as_ref())) == target_bucket {
+            if stripe_index_from_hash(hash_key_bytes(key_bytes(candidate).as_ref()))
+                == target_bucket
+            {
                 same_bucket_keys.push(candidate);
             }
             candidate += 1;
         }
 
-        let weigher: Weigher<u32, String> = Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+        let weigher: Weigher<u32, String> =
+            Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
         // Five 5-unit entries under a 20-unit cap: exactly one must go.
         let engine = Engine::<u32, String>::new(20, None, Some(weigher));
         for (i, &k) in same_bucket_keys.iter().enumerate() {
             let now = u64::try_from(i).expect("small") * 100;
-            let _ = put(&engine, k, key_bytes(k), "x".repeat(5), hlc(u64::from(k) + 1, 1), None, now);
+            let _ = put(
+                &engine,
+                k,
+                key_bytes(k),
+                "x".repeat(5),
+                hlc(u64::from(k) + 1, 1),
+                None,
+                now,
+            );
         }
         let (entries_before, weight_before) = engine.debug_totals();
         assert_eq!(entries_before, 5);
@@ -1189,15 +1268,24 @@ mod tests {
         engine.enforce_capacity(target_bucket);
 
         let (entries_after, weight_after) = engine.debug_totals();
-        assert!(weight_after <= 20, "total weight {weight_after} must stay within the 20-unit cap");
-        assert_eq!(entries_after, 4, "exactly one 5-unit entry must be evicted to clear a 5-unit overage");
+        assert!(
+            weight_after <= 20,
+            "total weight {weight_after} must stay within the 20-unit cap"
+        );
+        assert_eq!(
+            entries_after, 4,
+            "exactly one 5-unit entry must be evicted to clear a 5-unit overage"
+        );
         assert_eq!(
             engine.get(&same_bucket_keys[0], 1_000),
             None,
             "the coldest (first-inserted) entry must be the one evicted"
         );
         for &k in &same_bucket_keys[1..] {
-            assert!(engine.get(&k, 1_000).is_some(), "hotter entries must survive");
+            assert!(
+                engine.get(&k, 1_000).is_some(),
+                "hotter entries must survive"
+            );
         }
     }
 
@@ -1231,7 +1319,8 @@ mod tests {
                             continue;
                         }
                         JoinOutcome::Owner(inflight) => {
-                            let guard = engine.guard_inflight(kb.clone(), hash, Arc::clone(&inflight));
+                            let guard =
+                                engine.guard_inflight(kb.clone(), hash, Arc::clone(&inflight));
                             calls.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             let value = "loaded-once".to_string();
@@ -1259,7 +1348,11 @@ mod tests {
         while let Some(r) = tasks.join_next().await {
             results.push(r.expect("task does not panic"));
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one loader call under a stampede");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one loader call under a stampede"
+        );
         assert!(results.iter().all(|v| v == "loaded-once"));
     }
 
@@ -1290,13 +1383,21 @@ mod tests {
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        let boom: Arc<dyn std::error::Error + Send + Sync> = Arc::new(std::io::Error::other("boom"));
+        let boom: Arc<dyn std::error::Error + Send + Sync> =
+            Arc::new(std::io::Error::other("boom"));
         engine.fail_inflight(&kb, hash, &inflight, boom);
         guard.complete();
 
         notified.await;
-        assert!(joined.error.get().is_some(), "the joined waiter must see the error");
-        assert_eq!(engine.get(&key, 0), None, "a failed load never installs a value");
+        assert!(
+            joined.error.get().is_some(),
+            "the joined waiter must see the error"
+        );
+        assert_eq!(
+            engine.get(&key, 0),
+            None,
+            "a failed load never installs a value"
+        );
     }
 
     #[tokio::test]
@@ -1316,7 +1417,14 @@ mod tests {
         }
 
         // A waiter registered before cancellation must be woken...
-        assert!(engine.stripe_lock(stripe_index_from_hash(hash)).read().inflight.get(kb.as_ref()).is_none());
+        assert!(
+            engine
+                .stripe_lock(stripe_index_from_hash(hash))
+                .read()
+                .inflight
+                .get(kb.as_ref())
+                .is_none()
+        );
         // ...and a fresh caller must be able to become the new owner rather
         // than perpetually join a dead entry.
         match engine.miss_or_join(&kb, hash, 0) {
@@ -1394,7 +1502,10 @@ mod tests {
             "the held stripe's lock must still be contended"
         );
         handle.join().expect("lock holder thread does not panic");
-        assert!(engine.stripe_lock(bucket_a).try_write().is_some(), "released after the holder finishes");
+        assert!(
+            engine.stripe_lock(bucket_a).try_write().is_some(),
+            "released after the holder finishes"
+        );
     }
 
     #[test]
@@ -1420,10 +1531,23 @@ mod tests {
                     let mut stripe = engine.stripe_lock(bucket).write();
                     let resolver = LwwResolver;
                     let _ = apply_locked(
-                        &mut stripe, &engine.digest[bucket], &engine.total_weight, engine.weigher.as_ref(),
-                        hash, key, kb, ver,
-                        Incoming::Put { value, expires_at_ms: Some(now + 500), encoded },
-                        &resolver, 1_000, 10_000, now,
+                        &mut stripe,
+                        &engine.digest[bucket],
+                        &engine.total_weight,
+                        engine.weigher.as_ref(),
+                        hash,
+                        key,
+                        kb,
+                        ver,
+                        Incoming::Put {
+                            value,
+                            expires_at_ms: Some(now + 500),
+                            encoded,
+                        },
+                        &resolver,
+                        1_000,
+                        10_000,
+                        now,
                     );
                     drop(stripe);
                     engine.enforce_capacity(bucket);
@@ -1433,15 +1557,30 @@ mod tests {
                     let mut stripe = engine.stripe_lock(bucket).write();
                     let resolver = LwwResolver;
                     let _ = apply_locked(
-                        &mut stripe, &engine.digest[bucket], &engine.total_weight, engine.weigher.as_ref(),
-                        hash, key, kb, ver, Incoming::Tombstone, &resolver, 1_000, 10_000, now,
+                        &mut stripe,
+                        &engine.digest[bucket],
+                        &engine.total_weight,
+                        engine.weigher.as_ref(),
+                        hash,
+                        key,
+                        kb,
+                        ver,
+                        Incoming::Tombstone,
+                        &resolver,
+                        1_000,
+                        10_000,
+                        now,
                     );
                 }
                 2 => engine.sweep(now),
                 _ => engine.gc_tombstones(false, now),
             }
             if i % 15 == 0 {
-                assert_eq!(engine.digests(), engine.recompute_digests_paired(), "iteration {i}");
+                assert_eq!(
+                    engine.digests(),
+                    engine.recompute_digests_paired(),
+                    "iteration {i}"
+                );
             }
         }
         assert_eq!(engine.digests(), engine.recompute_digests_paired());

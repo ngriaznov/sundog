@@ -735,10 +735,19 @@ where
     /// notifications, thousands of times fewer channel slots. (A local
     /// origin is what makes a notice happen at all; remote applies never
     /// notify.)
-    fn handle_apply_outcome(&self, outcome: ApplyOutcome<K, V>, origin: Origin, notify_fan_out: bool) {
+    fn handle_apply_outcome(
+        &self,
+        outcome: ApplyOutcome<K, V>,
+        origin: Origin,
+        notify_fan_out: bool,
+    ) {
         match outcome {
             ApplyOutcome::Rejected => {}
-            ApplyOutcome::Put { key, value, created } => {
+            ApplyOutcome::Put {
+                key,
+                value,
+                created,
+            } => {
                 if notify_fan_out && matches!(origin, Origin::Local) {
                     let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
                 }
@@ -889,9 +898,9 @@ where
                     notified.as_mut().enable();
                     notified.await;
                     if let Some(err) = inflight.error.get() {
-                        return Err(CacheError::Loader(Box::new(SharedLoaderFailure(Arc::clone(
-                            err,
-                        )))));
+                        return Err(CacheError::Loader(Box::new(SharedLoaderFailure(
+                            Arc::clone(err),
+                        ))));
                     }
                     // The fresh value (or its absence, if the fill raced with
                     // an expiry) is picked up by the fast-path read at the
@@ -899,15 +908,15 @@ where
                     // "counts as a hit" for a joined caller means.
                 }
                 JoinOutcome::Owner(inflight) => {
-                    let guard = self.engine.guard_inflight(key_bytes.clone(), hash, Arc::clone(&inflight));
+                    let guard =
+                        self.engine
+                            .guard_inflight(key_bytes.clone(), hash, Arc::clone(&inflight));
                     return match loader(key).await {
                         Ok(value) => {
                             let ver = self.stamp_local();
-                            let encoded = Bytes::from(
-                                postcard::to_stdvec(&value).expect(
-                                    "invariant: a value returned by the loader postcard-encodes",
-                                ),
-                            );
+                            let encoded = Bytes::from(postcard::to_stdvec(&value).expect(
+                                "invariant: a value returned by the loader postcard-encodes",
+                            ));
                             let expires_at_ms = self.expiry_for(None);
                             self.engine.complete_fresh_load(
                                 key,
@@ -934,8 +943,12 @@ where
                         }
                         Err(err) => {
                             let err: Arc<dyn std::error::Error + Send + Sync> = Arc::new(err);
-                            self.engine
-                                .fail_inflight(&key_bytes, hash, &inflight, Arc::clone(&err));
+                            self.engine.fail_inflight(
+                                &key_bytes,
+                                hash,
+                                &inflight,
+                                Arc::clone(&err),
+                            );
                             guard.complete();
                             Err(CacheError::Loader(Box::new(SharedLoaderFailure(err))))
                         }
@@ -1100,20 +1113,22 @@ where
             let mut applied_keys: Vec<K> = Vec::with_capacity(group.len());
             let entries: Vec<_> = group
                 .into_iter()
-                .map(|(hash, key, key_bytes, ver, value, expires_at_ms, encoded)| {
-                    applied_keys.push(key.clone());
-                    (
-                        hash,
-                        key,
-                        key_bytes,
-                        ver,
-                        Incoming::Put {
-                            value,
-                            expires_at_ms,
-                            encoded,
-                        },
-                    )
-                })
+                .map(
+                    |(hash, key, key_bytes, ver, value, expires_at_ms, encoded)| {
+                        applied_keys.push(key.clone());
+                        (
+                            hash,
+                            key,
+                            key_bytes,
+                            ver,
+                            Incoming::Put {
+                                value,
+                                expires_at_ms,
+                                encoded,
+                            },
+                        )
+                    },
+                )
                 .collect();
             let outcomes = self.engine.apply_many(
                 bucket,
@@ -1393,7 +1408,11 @@ where
         // Every requested bucket exactly once, ascending — an anti-entropy
         // responder must report even the buckets where it holds nothing, so
         // the initiator learns to push.
-        let mut wanted: Vec<u16> = buckets.into_iter().collect::<HashSet<_>>().into_iter().collect();
+        let mut wanted: Vec<u16> = buckets
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         wanted.sort_unstable();
         let entries = self.engine.collect_buckets(&wanted, now);
         Box::pin(async move { entries })
