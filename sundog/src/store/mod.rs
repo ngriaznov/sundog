@@ -562,6 +562,14 @@ where
     misses: metrics::Counter,
 }
 
+// The engine backing every method here is fully synchronous — no `.await`
+// anywhere in this impl block — but the public API constraint is that these
+// stay `async fn`: existing callers (`Cache`'s own async wrappers, and every
+// downstream `.await` site) must not have to change, and a later backend
+// swap should not have to change them back. `clippy::unused_async` and
+// `clippy::unused_async_trait_impl` would otherwise ask to turn every one of
+// them into a plain `fn` returning `impl Future`.
+#[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
 impl<K, V> Shard<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -1308,7 +1316,8 @@ where
             // in the same stripe, in the order it appeared in `recs`), which
             // is all per-key serialization needs — order between different
             // keys was never a requirement.
-            let mut by_stripe: Vec<Vec<(u64, K, Bytes, Hlc, Incoming<V>, Origin)>> =
+            type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
+            let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
                 (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
             for rec in recs {
                 self.observe_remote(rec.ver);

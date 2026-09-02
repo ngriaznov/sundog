@@ -323,60 +323,129 @@ where
             value,
             expires_at_ms,
             encoded,
-        } => {
-            let weight = weigher.map_or(1, |w| w(&key, &value));
-            let old_weight = if had_live {
-                remove_live(&mut stripe.live, hash, key_bytes.as_ref()).map(|(w, _)| w)
-            } else {
-                None
-            };
-            stripe.live.insert_unique(
-                hash,
-                Live {
-                    key_bytes,
-                    key: key.clone(),
-                    stored: Stored {
-                        value: value.clone(),
-                        encoded,
-                        ver,
-                        expires_at_ms,
-                    },
-                    weight,
-                    last_access_ms: AtomicU64::new(now_ms),
-                },
-                hasher_for,
-            );
-            if let Some(exp) = expires_at_ms {
-                stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
-            }
-            total_weight.fetch_add(u64::from(weight), Ordering::Relaxed);
-            if let Some(ow) = old_weight {
-                total_weight.fetch_sub(u64::from(ow), Ordering::Relaxed);
-            }
-            ApplyOutcome::Put {
-                key,
-                value,
-                created: !had_live,
-            }
-        }
-        Incoming::Tombstone => {
-            if had_live
-                && let Some((old_weight, _)) =
-                    remove_live(&mut stripe.live, hash, key_bytes.as_ref())
-            {
-                total_weight.fetch_sub(u64::from(old_weight), Ordering::Relaxed);
-            }
-            stripe.tombstones.insert(
-                key_bytes,
-                Tombstone {
-                    ver,
-                    ttl_deadline_ms: now_ms.saturating_add(tombstone_ttl_ms),
-                    max_deadline_ms: now_ms.saturating_add(tombstone_max_ttl_ms),
-                },
-            );
-            ApplyOutcome::Tombstoned { key }
-        }
+        } => apply_put(
+            stripe,
+            total_weight,
+            weigher,
+            hash,
+            key,
+            key_bytes,
+            ver,
+            value,
+            expires_at_ms,
+            encoded,
+            had_live,
+            now_ms,
+        ),
+        Incoming::Tombstone => apply_tombstone(
+            stripe,
+            total_weight,
+            hash,
+            key,
+            key_bytes,
+            ver,
+            had_live,
+            tombstone_ttl_ms,
+            tombstone_max_ttl_ms,
+            now_ms,
+        ),
     }
+}
+
+/// The `Incoming::Put` half of [`apply_locked`]'s write, factored out only
+/// to keep that function under clippy's line-count lint — behavior is
+/// identical to inlining it: installs the new value, corrects total weight
+/// for whatever it displaced, and reports whether this created a fresh
+/// entry or replaced a live one.
+#[allow(clippy::too_many_arguments)]
+fn apply_put<K, V>(
+    stripe: &mut Stripe<K, V>,
+    total_weight: &AtomicU64,
+    weigher: Option<&Weigher<K, V>>,
+    hash: u64,
+    key: K,
+    key_bytes: Bytes,
+    ver: Hlc,
+    value: V,
+    expires_at_ms: Option<u64>,
+    encoded: Bytes,
+    had_live: bool,
+    now_ms: u64,
+) -> ApplyOutcome<K, V>
+where
+    K: Hash + Eq + Clone,
+    V: Clone,
+{
+    let weight = weigher.map_or(1, |w| w(&key, &value));
+    let old_weight = if had_live {
+        remove_live(&mut stripe.live, hash, key_bytes.as_ref()).map(|(w, _)| w)
+    } else {
+        None
+    };
+    stripe.live.insert_unique(
+        hash,
+        Live {
+            key_bytes,
+            key: key.clone(),
+            stored: Stored {
+                value: value.clone(),
+                encoded,
+                ver,
+                expires_at_ms,
+            },
+            weight,
+            last_access_ms: AtomicU64::new(now_ms),
+        },
+        hasher_for,
+    );
+    if let Some(exp) = expires_at_ms {
+        stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
+    }
+    total_weight.fetch_add(u64::from(weight), Ordering::Relaxed);
+    if let Some(ow) = old_weight {
+        total_weight.fetch_sub(u64::from(ow), Ordering::Relaxed);
+    }
+    ApplyOutcome::Put {
+        key,
+        value,
+        created: !had_live,
+    }
+}
+
+/// The `Incoming::Tombstone` half of [`apply_locked`]'s write, factored out
+/// for the same reason as [`apply_put`]: removes the displaced live entry
+/// (if any) from total weight, then records the tombstone with its two GC
+/// deadlines.
+#[allow(clippy::too_many_arguments)]
+fn apply_tombstone<K, V>(
+    stripe: &mut Stripe<K, V>,
+    total_weight: &AtomicU64,
+    hash: u64,
+    key: K,
+    key_bytes: Bytes,
+    ver: Hlc,
+    had_live: bool,
+    tombstone_ttl_ms: u64,
+    tombstone_max_ttl_ms: u64,
+    now_ms: u64,
+) -> ApplyOutcome<K, V>
+where
+    K: Hash + Eq,
+{
+    if had_live
+        && let Some((old_weight, _)) = remove_live(&mut stripe.live, hash, key_bytes.as_ref())
+    {
+        total_weight.fetch_sub(u64::from(old_weight), Ordering::Relaxed);
+    }
+    stripe.tombstones.insert(
+        key_bytes,
+        Tombstone {
+            ver,
+            ttl_deadline_ms: now_ms.saturating_add(tombstone_ttl_ms),
+            max_deadline_ms: now_ms.saturating_add(tombstone_max_ttl_ms),
+        },
+    );
+    ApplyOutcome::Tombstoned { key }
 }
 
 /// The outcome of [`Engine::miss_or_join`]: a fast-path re-check hit
@@ -904,12 +973,12 @@ where
 
     /// Builds the [`InflightGuard`] that frees `inflight` if the loader
     /// future this call is about to run is dropped before finishing.
-    pub(crate) fn guard_inflight<'e>(
-        &'e self,
+    pub(crate) fn guard_inflight(
+        &self,
         key_bytes: Bytes,
         hash: u64,
         inflight: Arc<Inflight<V>>,
-    ) -> InflightGuard<'e, K, V> {
+    ) -> InflightGuard<'_, K, V> {
         InflightGuard {
             engine: self,
             key_bytes,
@@ -1021,6 +1090,16 @@ where
     }
 }
 
+/// One live entry as [`Engine::debug_snapshot`] reports it: key bytes, its
+/// encoded value, and its version.
+#[cfg(test)]
+type DebugLive = (Bytes, Bytes, Hlc);
+
+/// One tombstone as [`Engine::debug_snapshot`] reports it: key bytes and its
+/// version.
+#[cfg(test)]
+type DebugTombstone = (Bytes, Hlc);
+
 #[cfg(test)]
 impl<K, V> Engine<K, V>
 where
@@ -1034,7 +1113,7 @@ where
         let mut out = vec![0u64; BUCKET_COUNT];
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let stripe = stripe_lock.read();
-            for live in stripe.live.iter() {
+            for live in &stripe.live {
                 out[idx] ^= entry_fingerprint(&live.key_bytes, live.stored.ver);
             }
             for (key_bytes, t) in &stripe.tombstones {
@@ -1046,12 +1125,12 @@ where
 
     /// Test-only: every stripe's raw contents, for building a canonical
     /// state to compare across replicas.
-    pub(crate) fn debug_snapshot(&self) -> (Vec<(Bytes, Bytes, Hlc)>, Vec<(Bytes, Hlc)>) {
+    pub(crate) fn debug_snapshot(&self) -> (Vec<DebugLive>, Vec<DebugTombstone>) {
         let mut live_out = Vec::new();
         let mut tomb_out = Vec::new();
         for stripe_lock in &self.stripes {
             let stripe = stripe_lock.read();
-            for live in stripe.live.iter() {
+            for live in &stripe.live {
                 live_out.push((
                     live.key_bytes.clone(),
                     live.stored.encoded.clone(),
@@ -1316,7 +1395,6 @@ mod tests {
                             if let Some(e) = inflight.error.get() {
                                 panic!("unexpected loader failure: {e}");
                             }
-                            continue;
                         }
                         JoinOutcome::Owner(inflight) => {
                             let guard =
@@ -1418,12 +1496,11 @@ mod tests {
 
         // A waiter registered before cancellation must be woken...
         assert!(
-            engine
+            !engine
                 .stripe_lock(stripe_index_from_hash(hash))
                 .read()
                 .inflight
-                .get(kb.as_ref())
-                .is_none()
+                .contains_key(kb.as_ref())
         );
         // ...and a fresh caller must be able to become the new owner rather
         // than perpetually join a dead entry.
@@ -1518,7 +1595,7 @@ mod tests {
         let mut clock = HlcClock::new(NodeId::from(1));
 
         for i in 0..300u64 {
-            let key = u32::try_from(rng.random_range(0..24u32)).expect("small");
+            let key = rng.random_range(0..24u32);
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
             let bucket = stripe_index_from_hash(hash);
