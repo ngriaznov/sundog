@@ -34,18 +34,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Removed
 
 - `Cache::get_or_load_with_ttl` and `Shard::get_or_load_with_ttl`, which
-  shipped in the yanked 0.1.2. Reads are TTL-blind: `get_or_load` fills take
-  the cache default, and only writes (`insert_with_ttl`,
-  `insert_many_with_ttl`) carry a per-entry lifespan. Every other 0.1.x API
-  is unchanged in 0.2.0.
+  shipped in 0.1.2. Reads are TTL-blind: `get_or_load` fills take the cache
+  default, and only writes (`insert_with_ttl`, `insert_many_with_ttl`) carry
+  a per-entry lifespan. Every other 0.1.x API is unchanged in 0.2.0.
 
 ## [0.1.2] – 2026-09-01
 
-**Yanked.** The crate published under this version also carries
-`Cache::get_or_load_with_ttl`/`Shard::get_or_load_with_ttl`, a read-side TTL
-parameter that contradicts the design below (reads never touch expiry); it
-was removed before this changelog entry was written but after the upload
-had already landed. 0.2.0 carries everything else from 0.1.2 without it.
+The crate published under this version also carries
+`Cache::get_or_load_with_ttl` and `Shard::get_or_load_with_ttl`, a read-side
+TTL parameter at odds with the design below (reads never touch expiry).
+0.2.0 removes it and keeps everything else from 0.1.2.
 
 ### Added
 
