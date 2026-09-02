@@ -77,12 +77,40 @@ subsystem — a rebalancing coordinator, conflict resolution during
 rebalance, and partial-rebalance-on-partition logic are the hardest part of
 building a distribution mode at all.
 
-**Cost:** a consistent-hash ring, an owner-set computation that stays stable
-under single-node churn, a rebalance protocol that can be interrupted by a
-second membership change mid-flight, and a decision about what a read does
-while its key's ownership is in motion. Every one of those interacts with
-the anti-entropy and state-transfer machinery already built, not in addition
-to it.
+**Feasibility, assessed against the code:** feasible with restrictions.
+Ownership belongs at the anti-entropy bucket (`xxh3(key) & 1023`), not the
+key: the 1,024 buckets already have digests, entry enumeration, and
+chunked streaming, so "who owns bucket b" is the only new question.
+Rendezvous (highest-random-weight) hashing answers it as a pure function
+of the live `Peer` list — no ring to maintain, adding or losing one node
+moves about `1/n` of the buckets, and `owners = k` is "the top k scores".
+The mesh's per-peer outboxes and pooled request/response path carry a
+non-owner read as one more request shape. What changes shape rather than
+grows: fan-out must group records by owner set instead of broadcasting;
+anti-entropy must pair only peers that share a bucket; state transfer must
+run on every membership change, scoped to newly owned buckets, not once at
+`open()`; and tombstone-GC deferral must ask whether an *owner* of the
+bucket is absent, not whether any member is.
+
+Three gaps are real, not paperwork. `NodeId` is generated fresh per
+process, so a rolling restart with no capacity change would rehash nearly
+every bucket — a persisted node identity is a prerequisite. Gossip
+membership has no quorum, so a partition lets each side compute its own
+owner set and both accept writes; convergence after the heal is by version,
+and the design must state that plainly. Nothing tracks an ownership epoch,
+so a transfer can complete against a stale owner set when membership
+changes twice mid-flight. Restrictions that keep the mode honest:
+`owners >= 2` always (a single owner lost is a bucket lost), no finite
+`max_capacity` on a distributed cache (the same guard `Replicated` has,
+for the same reason), and a non-owner read as a separately typed operation
+rather than a silent network hop inside `get`.
+
+**Cost:** roughly 3,000–5,000 lines plus a comparable volume of sim and
+property coverage, and a new invariant class for the test stack — "the
+union across owners converges, and a non-owner never applies a record it
+was not sent" — alongside rebalance-under-churn and partition-then-heal
+scenarios that reconcile ownership, not only versions. On the order of
+8–14 weeks for one engineer at this repository's verification bar.
 
 **Trigger:** replicated memory footprint (every node holding every entry)
 becomes the binding constraint on cluster size or value volume — not "it
