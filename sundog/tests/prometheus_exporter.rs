@@ -91,8 +91,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // A known hit/miss sequence on its own cache, so its counters are exact
     // rather than shared with `users`' own traffic above:
     // 2 inserts, 3 gets that hit, 2 gets that miss, one `get_or_load` miss
-    // that fills, one `get_or_load` hit on the now-filled key ->
-    // hits = 3 + 1 = 4, misses = 2 + 1 = 3.
+    // that fills, one `get_or_load` hit on the now-filled key, two
+    // `contains_key` checks that count nothing, one `get_or_insert_with`
+    // miss and one hit, and four concurrent `get_or_load`s of one missing
+    // key (one miss, three hits) ->
+    // hits = 3 + 1 + 1 + 3 = 8, misses = 2 + 1 + 1 + 1 = 5.
     let counted = cluster
         .cache::<u32, String>("counted")
         .mode(Mode::Local)
@@ -121,6 +124,37 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         .expect("loader succeeds");
     assert_eq!(cached, "loaded");
 
+    // An existence check moves neither counter.
+    assert!(counted.contains_key(&1).await);
+    assert!(!counted.contains_key(&9).await);
+    // get_or_insert_with: one miss to fill, one hit to read back.
+    let made = counted
+        .get_or_insert_with(&6, async |_key| "made".to_string())
+        .await
+        .expect("make succeeds");
+    assert_eq!(made, "made");
+    let kept = counted
+        .get_or_insert_with(&6, async |_key| "unused".to_string())
+        .await
+        .expect("make succeeds");
+    assert_eq!(kept, "made");
+    // Four concurrent loads of one missing key collapse into a single loader
+    // run: one miss for the run, three hits for the callers that joined it.
+    let loads = futures::future::join_all((0..4).map(|_| {
+        let counted = counted.clone();
+        async move {
+            counted
+                .get_or_load(&7, async |_key| {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok::<_, std::convert::Infallible>("joined".to_string())
+                })
+                .await
+                .expect("loader succeeds")
+        }
+    }))
+    .await;
+    assert!(loads.iter().all(|value| value == "joined"));
+
     // `sundog_open_caches` is only set by a periodic background task (see
     // `cluster::open_cache_gauge_task`'s docs on why it can't be
     // event-driven), so this polls until every metric checked below has been
@@ -145,13 +179,13 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
 
     assert_eq!(
         scraped_metric_value(&body, "sundog_cache_hits_total", ("cache", "counted")),
-        Some(4.0),
-        "expected 4 hits on the 'counted' cache; got body:\n{body}"
+        Some(8.0),
+        "expected 8 hits on the 'counted' cache; got body:\n{body}"
     );
     assert_eq!(
         scraped_metric_value(&body, "sundog_cache_misses_total", ("cache", "counted")),
-        Some(3.0),
-        "expected 3 misses on the 'counted' cache; got body:\n{body}"
+        Some(5.0),
+        "expected 5 misses on the 'counted' cache; got body:\n{body}"
     );
     assert!(
         scraped_metric_value(&body, "sundog_cache_entries", ("cache", "counted")).is_some(),

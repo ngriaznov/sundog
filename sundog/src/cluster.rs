@@ -541,7 +541,7 @@ async fn membership_to_mesh_task(
 }
 
 /// The cache-mode-mismatch late-detection sweep (see
-/// [`check_mode_conflicts`]): `open()`'s own check is best-effort (two nodes
+/// [`report_mode_conflicts`]): `open()`'s own check is best-effort (two nodes
 /// opening the same name under different `Mode`s concurrently can both pass
 /// it), so this re-checks every live peer's advertised cache modes against
 /// this node's own open caches whenever membership publishes a new view —
@@ -552,7 +552,7 @@ async fn membership_to_mesh_task(
 async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
     let mut modes = cluster.inner.membership.cache_modes();
     let mut warned: HashSet<(NodeId, SmolStr)> = HashSet::new();
-    check_mode_conflicts(&modes.borrow_and_update(), &cluster, &mut warned);
+    report_mode_conflicts(&modes.borrow_and_update(), &cluster, &mut warned);
     loop {
         tokio::select! {
             biased;
@@ -562,21 +562,57 @@ async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
                     return;
                 }
                 let current = modes.borrow_and_update().clone();
-                check_mode_conflicts(&current, &cluster, &mut warned);
+                report_mode_conflicts(&current, &cluster, &mut warned);
             }
         }
     }
 }
 
-/// Logs a `tracing::error!` once per (peer, cache-name) pair where a live
-/// peer advertises a cache this node also has open, under a different
-/// [`Mode`] — the background backstop for what [`CacheBuilder::open`]'s
-/// own check can miss under a race. `warned` accumulates for the life of
-/// the cluster rather than clearing entries that stop conflicting: this is
-/// a diagnostic trail, not a live status board, and a genuine mismatch is a
+/// One (peer, cache) pair where a live peer advertises a cache this node
+/// also has open, under a different [`Mode`].
+#[derive(Debug, PartialEq, Eq)]
+struct ModeConflict {
+    peer: NodeId,
+    cache: SmolStr,
+    local: Mode,
+    remote: Mode,
+}
+
+/// The conflicts in `advertised` against `local_modes` that `warned` has
+/// not seen yet; each is recorded in `warned`, so a later view reports only
+/// pairs new since the last sweep. `warned` accumulates for the life of the
+/// cluster rather than clearing entries that stop conflicting: this is a
+/// diagnostic trail, not a live status board, and a genuine mismatch is a
 /// standing misconfiguration on one side that a re-`open()` (a fresh
 /// process, hence a fresh [`NodeId`]) is the normal way to clear.
-fn check_mode_conflicts(
+fn new_mode_conflicts(
+    advertised: &CacheModes,
+    local_modes: &HashMap<SmolStr, Mode>,
+    warned: &mut HashSet<(NodeId, SmolStr)>,
+) -> Vec<ModeConflict> {
+    let mut found = Vec::new();
+    for (&peer, caches) in advertised {
+        for (cache, &remote) in caches {
+            let Some(&local) = local_modes.get(cache) else {
+                continue;
+            };
+            if local != remote && warned.insert((peer, cache.clone())) {
+                found.push(ModeConflict {
+                    peer,
+                    cache: cache.clone(),
+                    local,
+                    remote,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Logs a `tracing::error!` for every conflict [`new_mode_conflicts`] finds
+/// — the background backstop for what [`CacheBuilder::open`]'s own check
+/// can miss under a race.
+fn report_mode_conflicts(
     advertised: &CacheModes,
     cluster: &Cluster,
     warned: &mut HashSet<(NodeId, SmolStr)>,
@@ -586,21 +622,20 @@ fn check_mode_conflicts(
         .local_modes
         .read()
         .expect("invariant: local cache-mode map lock is never poisoned");
-    for (&peer, caches) in advertised {
-        for (cache, &remote_mode) in caches {
-            let Some(&local_mode) = local_modes.get(cache) else {
-                continue;
-            };
-            if local_mode != remote_mode && warned.insert((peer, cache.clone())) {
-                tracing::error!(
-                    %cache,
-                    %peer,
-                    local = ?local_mode,
-                    remote = ?remote_mode,
-                    "cache mode mismatch detected against a live peer"
-                );
-            }
-        }
+    for ModeConflict {
+        peer,
+        cache,
+        local,
+        remote,
+    } in new_mode_conflicts(advertised, &local_modes, warned)
+    {
+        tracing::error!(
+            %cache,
+            %peer,
+            local = ?local,
+            remote = ?remote,
+            "cache mode mismatch detected against a live peer"
+        );
     }
 }
 
@@ -1372,6 +1407,152 @@ mod tests {
     /// the replica on node b at the deadline a stamped, while a sibling
     /// entry written with the cache's (absent) default lives on. Neither
     /// cache is opened with a TTL — the override is the only expiry in play.
+    #[test]
+    fn mode_conflicts_are_reported_once_per_peer_and_cache() {
+        let peer_a = NodeId::from(1);
+        let peer_b = NodeId::from(2);
+        let local: HashMap<SmolStr, Mode> = [
+            (SmolStr::new("users"), Mode::Replicated),
+            (SmolStr::new("orders"), Mode::Invalidation),
+        ]
+        .into_iter()
+        .collect();
+        let mut advertised: CacheModes = HashMap::new();
+        advertised.insert(
+            peer_a,
+            [
+                (SmolStr::new("users"), Mode::Invalidation),
+                (SmolStr::new("orders"), Mode::Invalidation),
+                (SmolStr::new("unrelated"), Mode::Replicated),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        advertised.insert(
+            peer_b,
+            [(SmolStr::new("users"), Mode::Replicated)]
+                .into_iter()
+                .collect(),
+        );
+        let mut warned = HashSet::new();
+
+        assert_eq!(
+            new_mode_conflicts(&advertised, &local, &mut warned),
+            vec![ModeConflict {
+                peer: peer_a,
+                cache: SmolStr::new("users"),
+                local: Mode::Replicated,
+                remote: Mode::Invalidation,
+            }],
+            "only the pair whose modes differ counts; matching and unknown caches are ignored"
+        );
+        assert!(
+            new_mode_conflicts(&advertised, &local, &mut warned).is_empty(),
+            "the same view again reports nothing new"
+        );
+
+        advertised
+            .get_mut(&peer_b)
+            .expect("peer b advertised")
+            .insert(SmolStr::new("users"), Mode::Invalidation);
+        assert_eq!(
+            new_mode_conflicts(&advertised, &local, &mut warned),
+            vec![ModeConflict {
+                peer: peer_b,
+                cache: SmolStr::new("users"),
+                local: Mode::Replicated,
+                remote: Mode::Invalidation,
+            }],
+            "a peer that flips later is reported once, without repeating peer a"
+        );
+        assert!(new_mode_conflicts(&advertised, &local, &mut warned).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_api_batch_writes_and_reads_replicate_across_nodes() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-cache-api").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("catalog")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("catalog")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+
+        cache_a
+            .insert_many([
+                (1, "one".to_string()),
+                (2, "two".into()),
+                (3, "three".into()),
+            ])
+            .await
+            .expect("a inserts a batch");
+        cache_a
+            .insert_many_with_ttl(
+                [(4, "brief".to_string()), (5, "brief".into())],
+                Duration::from_millis(300),
+            )
+            .await
+            .expect("a inserts an expiring batch");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !(cache_b.contains_key(&3).await && cache_b.contains_key(&5).await) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both batches replicate to b within the bound");
+        let mut keys_b = cache_b.keys();
+        keys_b.sort_unstable();
+        assert_eq!(keys_b, [1, 2, 3, 4, 5]);
+
+        let made = cache_b
+            .get_or_insert_with(&6, async |_key| "six".to_string())
+            .await
+            .expect("b fills on miss");
+        assert_eq!(made, "six");
+        let kept = cache_b
+            .get_or_insert_with(&6, async |_key| "never".to_string())
+            .await
+            .expect("b reads on hit");
+        assert_eq!(kept, "six", "a hit never runs make");
+
+        cache_a
+            .remove_many([1, 2])
+            .await
+            .expect("a removes a batch");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let removed_on_b =
+                    !cache_b.contains_key(&1).await && !cache_b.contains_key(&2).await;
+                if removed_on_b && cache_a.contains_key(&6).await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the removal reaches b and the fill reaches a within the bound");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for cache in [&cache_a, &cache_b] {
+            let mut keys = cache.keys();
+            keys.sort_unstable();
+            assert_eq!(keys, [3, 6], "the expiring batch is gone on both nodes");
+            assert_eq!(cache.entry_count().await, 2);
+        }
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
     #[tokio::test]
     async fn per_entry_ttl_replicates_and_expires_on_the_peer() {
         let (cluster_a, cluster_b) = two_node_cluster("cluster-it-per-entry-ttl").await;
