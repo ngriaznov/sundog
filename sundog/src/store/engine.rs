@@ -21,7 +21,9 @@
 //!
 //! [`super::Shard::get_or_load`]'s stampede collapse is built on the
 //! primitives here too: a per-stripe `inflight` map of in-progress loads,
-//! joined by concurrent callers via a [`tokio::sync::Notify`], with a drop
+//! joined by concurrent callers through a [`tokio::sync::watch`] channel
+//! subscribed under the stripe lock (so a completion can never slip between
+//! a waiter's lookup and its wait), with a drop
 //! guard ([`InflightGuard`]) that frees a cancelled load so a waiter can
 //! take over rather than hang.
 
@@ -38,7 +40,7 @@ use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::CodecError;
@@ -55,6 +57,10 @@ use super::{
 /// A key that doesn't fit falls back to one heap allocation — a read never
 /// allocates for the key in the common case.
 const KEY_STACK_BUF: usize = 128;
+
+/// How many live entries one capacity-eviction pass weighs before evicting
+/// the least recently read of them.
+const EVICTION_SAMPLE: usize = 8;
 
 /// Holds one postcard-encoded key: on the stack when it fits
 /// [`KEY_STACK_BUF`], on the heap otherwise.
@@ -120,10 +126,11 @@ struct Live<K, V> {
 /// visible to joined waiters by re-reading the stripe once notified: only a
 /// failure needs to travel through here explicitly.
 pub(crate) struct Inflight<V> {
-    /// Wakes every joined waiter once the fill finishes, one way or another
-    /// — `pub(crate)` rather than engine-private: `Shard::get_or_load` (in
-    /// the parent module) waits on this directly.
-    pub(crate) notify: Notify,
+    /// Flips to `true` once the fill finishes, one way or another. A waiter
+    /// subscribes in [`Engine::miss_or_join`], under the same stripe lock
+    /// that removes a finished fill from the map, so a receiver always
+    /// exists before the flip it waits for: the wakeup cannot be lost.
+    done: watch::Sender<bool>,
     /// Set iff the fill failed; a joined waiter that finds this populated
     /// after being woken returns the same [`crate::error::CacheError::Loader`]
     /// the owner did. Same cross-module visibility reason as `notify`.
@@ -134,10 +141,16 @@ pub(crate) struct Inflight<V> {
 impl<V> Inflight<V> {
     fn new() -> Self {
         Self {
-            notify: Notify::new(),
+            done: watch::channel(false).0,
             error: OnceLock::new(),
             _marker: PhantomData,
         }
+    }
+
+    /// Wakes every subscribed waiter; a receiver subscribed before this call
+    /// observes the change even if it only starts waiting afterwards.
+    fn finish(&self) {
+        self.done.send_replace(true);
     }
 }
 
@@ -454,7 +467,10 @@ where
 /// call becoming the one that runs the loader.
 pub(crate) enum JoinOutcome<V> {
     Hit(V),
-    Join(Arc<Inflight<V>>),
+    /// An in-flight load to wait on, with a receiver subscribed under the
+    /// stripe lock: `changed()` resolves once the owner finishes, and
+    /// resolves immediately if that already happened.
+    Join(Arc<Inflight<V>>, watch::Receiver<bool>),
     Owner(Arc<Inflight<V>>),
 }
 
@@ -494,7 +510,7 @@ where
     fn drop(&mut self) {
         if !self.completed {
             self.engine.finish_inflight(&self.key_bytes, self.hash);
-            self.inflight.notify.notify_waiters();
+            self.inflight.finish();
         }
     }
 }
@@ -785,24 +801,44 @@ where
             .fold(0u64, u64::saturating_add)
     }
 
-    fn next_pseudo_random_bucket(&self) -> usize {
-        // xorshift64*: fast, allocation-free, plenty uniform for sampling
-        // which stripe to look at next — no correctness property depends on
-        // its output, only that it spreads eviction pressure around.
+    /// xorshift64: fast, allocation-free, plenty uniform for choosing which
+    /// stripe to look at next and where inside it to start sampling — no
+    /// correctness property depends on its output, only that it spreads
+    /// eviction pressure around.
+    fn next_random(&self) -> u64 {
         let mut x = self.evict_cursor.load(Ordering::Relaxed);
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.evict_cursor.store(x, Ordering::Relaxed);
-        stripe_index_from_hash(x)
+        x
+    }
+
+    fn next_pseudo_random_bucket(&self) -> usize {
+        stripe_index_from_hash(self.next_random())
+    }
+
+    /// Where in a stripe of `len` entries the next sample starts. Rotating
+    /// the start keeps every entry reachable: a sample anchored at the
+    /// table's first slots would only ever weigh those, leaving colder
+    /// entries further along untouched for as long as the first ones last.
+    fn sample_offset(&self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            usize::try_from(self.next_random() % len as u64).unwrap_or(0)
+        }
     }
 
     fn evict_one_sampled(&self, bucket: usize) {
         let mut stripe = self.stripes[bucket].write();
+        let offset = self.sample_offset(stripe.live.len());
         let Some(victim_bytes) = stripe
             .live
             .iter()
-            .take(8)
+            .skip(offset)
+            .chain(stripe.live.iter().take(offset))
+            .take(EVICTION_SAMPLE)
             .min_by_key(|live| live.last_access_ms.load(Ordering::Relaxed))
             .map(|live| live.key_bytes.clone())
         else {
@@ -962,7 +998,7 @@ where
             return JoinOutcome::Hit(live.stored.value.clone());
         }
         if let Some(existing) = stripe.inflight.get(key_bytes.as_ref()) {
-            return JoinOutcome::Join(Arc::clone(existing));
+            return JoinOutcome::Join(Arc::clone(existing), existing.done.subscribe());
         }
         let inflight = Arc::new(Inflight::new());
         stripe
@@ -1069,7 +1105,7 @@ where
                 .fetch_add(u64::from(weight), Ordering::Relaxed);
             had_live
         };
-        inflight.notify.notify_waiters();
+        inflight.finish();
         self.enforce_capacity(bucket);
         had_live
     }
@@ -1086,7 +1122,7 @@ where
     ) {
         let _ = inflight.error.set(error);
         self.finish_inflight(key_bytes, hash);
-        inflight.notify.notify_waiters();
+        inflight.finish();
     }
 }
 
@@ -1387,11 +1423,8 @@ mod tests {
                     }
                     match engine.miss_or_join(&kb, hash, 0) {
                         JoinOutcome::Hit(v) => return v,
-                        JoinOutcome::Join(inflight) => {
-                            let notified = inflight.notify.notified();
-                            tokio::pin!(notified);
-                            notified.as_mut().enable();
-                            notified.await;
+                        JoinOutcome::Join(inflight, mut done) => {
+                            let _ = done.changed().await;
                             if let Some(e) = inflight.error.get() {
                                 panic!("unexpected loader failure: {e}");
                             }
@@ -1446,27 +1479,19 @@ mod tests {
         };
         let guard = engine.guard_inflight(kb.clone(), hash, Arc::clone(&inflight));
 
-        // A second caller joins the same in-flight load and registers for a
-        // wakeup (`enable()`) synchronously, before anything can notify it —
-        // exactly as `Shard::get_or_load`'s real `Join` arm does, before its
-        // first `.await`. Doing this inline rather than inside a spawned
-        // task matters: `Notify::notify_waiters` only wakes waiters already
-        // registered at the moment it's called, so a registration deferred
-        // into a not-yet-polled spawned task would race `fail_inflight`
-        // below and hang forever.
-        let JoinOutcome::Join(joined) = engine.miss_or_join(&kb, hash, 0) else {
+        // A second caller joins the same in-flight load; its receiver is
+        // subscribed under the stripe lock, so the failure below is observed
+        // no matter how late the waiter actually starts waiting.
+        let JoinOutcome::Join(joined, mut done) = engine.miss_or_join(&kb, hash, 0) else {
             panic!("second caller must join the existing load");
         };
-        let notified = joined.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
 
         let boom: Arc<dyn std::error::Error + Send + Sync> =
             Arc::new(std::io::Error::other("boom"));
         engine.fail_inflight(&kb, hash, &inflight, boom);
         guard.complete();
 
-        notified.await;
+        done.changed().await.expect("the owner finished the fill");
         assert!(
             joined.error.get().is_some(),
             "the joined waiter must see the error"
@@ -1508,6 +1533,55 @@ mod tests {
             JoinOutcome::Owner(_) => {}
             _ => panic!("a cancelled load's key must be free for a new owner"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_waiter_that_starts_waiting_after_the_owner_finished_still_wakes() {
+        let engine = Arc::new(engine_u32_string(u64::MAX, None));
+        let key = 13u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+
+        let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+            panic!("first caller must become the owner");
+        };
+        let JoinOutcome::Join(_, mut done) = engine.miss_or_join(&kb, hash, 0) else {
+            panic!("second caller must join the existing load");
+        };
+        // The owner completes before the waiter polls its receiver at all.
+        let encoded = Bytes::from(postcard::to_stdvec("late").expect("encode"));
+        engine.complete_fresh_load(
+            &key,
+            &kb,
+            hash,
+            hlc(1, 1),
+            "late".to_string(),
+            encoded,
+            None,
+            0,
+            &inflight,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), done.changed())
+            .await
+            .expect("a completion that preceded the wait is not lost")
+            .expect("the owner finished the fill");
+        assert_eq!(engine.get(&key, 0), Some("late".to_string()));
+    }
+
+    #[test]
+    fn eviction_sampling_starts_from_rotating_offsets() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let offsets: std::collections::HashSet<usize> =
+            (0..64).map(|_| engine.sample_offset(40)).collect();
+        assert!(
+            offsets.iter().all(|&o| o < 40),
+            "an offset always lies inside the stripe"
+        );
+        assert!(
+            offsets.iter().any(|&o| o >= EVICTION_SAMPLE),
+            "sampling reaches past the first {EVICTION_SAMPLE} slots: {offsets:?}"
+        );
+        assert_eq!(engine.sample_offset(0), 0, "an empty stripe has one offset");
     }
 
     #[tokio::test]

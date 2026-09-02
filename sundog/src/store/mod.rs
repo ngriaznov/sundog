@@ -900,11 +900,10 @@ where
                     self.hits.increment(1);
                     return Ok(value);
                 }
-                JoinOutcome::Join(inflight) => {
-                    let notified = inflight.notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    notified.await;
+                JoinOutcome::Join(inflight, mut done) => {
+                    // `Err` means the owner's `Inflight` was dropped without
+                    // finishing; the next iteration takes over the load.
+                    let _ = done.changed().await;
                     if let Some(err) = inflight.error.get() {
                         return Err(CacheError::Loader(Box::new(SharedLoaderFailure(
                             Arc::clone(err),
@@ -1114,11 +1113,11 @@ where
             by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
         }
         let now = self.now_ms();
+        let mut applied_keys: Vec<K> = Vec::new();
         for (bucket, group) in by_stripe.into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
-            let mut applied_keys: Vec<K> = Vec::with_capacity(group.len());
             let entries: Vec<_> = group
                 .into_iter()
                 .map(
@@ -1149,15 +1148,13 @@ where
             for outcome in outcomes {
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-            // One `Many` notice per chunk instead of one `One` per entry
-            // (see `handle_apply_outcome`'s `notify_fan_out` docs), sent per
-            // stripe as it lands rather than after the whole batch:
-            // replication streams concurrently with the remaining stripes,
-            // so peers start catching up mid-fill instead of anti-entropy
-            // racing a silent bulk and re-shipping it record by record.
-            for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
-                let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
-            }
+        }
+        // One `Many` notice per chunk after the whole batch (see
+        // `handle_apply_outcome`'s `notify_fan_out` docs): a notice per
+        // stripe would hand the fan-out task a thousand slivers of a bulk
+        // fill, each shipped as its own undersized frame.
+        for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
+            let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
         }
         Ok(())
     }
@@ -1209,11 +1206,11 @@ where
             by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
         }
         let now = self.now_ms();
+        let mut applied_keys: Vec<K> = Vec::new();
         for (bucket, group) in by_stripe.into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
-            let mut applied_keys: Vec<K> = Vec::with_capacity(group.len());
             let entries: Vec<_> = group
                 .into_iter()
                 .map(|(hash, key, key_bytes, ver)| {
@@ -1232,9 +1229,9 @@ where
             for outcome in outcomes {
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-            for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
-                let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
-            }
+        }
+        for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
+            let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
         }
         Ok(())
     }
@@ -2508,6 +2505,37 @@ mod tests {
         assert!(ttl_shard.contains_key(&2).await, "present before expiry");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ttl_shard.contains_key(&2).await, "gone after ttl expiry");
+    }
+
+    #[tokio::test]
+    async fn bulk_writes_notify_fan_out_in_whole_batch_chunks_not_per_stripe() {
+        let s = shard::<u32, String>(1);
+        let mut notices = s.fan_out_events();
+        s.insert_many((0..10_000u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("bulk insert");
+        let mut chunks = Vec::new();
+        while let Ok(notice) = notices.try_recv() {
+            match notice {
+                FanOutNotice::Many(keys) => chunks.push(keys.len()),
+                FanOutNotice::One(_) => panic!("a bulk write never notifies per key"),
+            }
+        }
+        assert_eq!(
+            chunks.len(),
+            10_000usize.div_ceil(FAN_OUT_MANY_CHUNK),
+            "one notice per FAN_OUT_MANY_CHUNK keys, not one per stripe: {chunks:?}"
+        );
+        assert_eq!(chunks.iter().sum::<usize>(), 10_000);
+        assert!(chunks.iter().all(|&n| n <= FAN_OUT_MANY_CHUNK));
+
+        s.remove_many(0..10_000u32).await.expect("bulk remove");
+        let mut removals = 0;
+        while let Ok(FanOutNotice::Many(keys)) = notices.try_recv() {
+            removals += 1;
+            assert!(keys.len() <= FAN_OUT_MANY_CHUNK);
+        }
+        assert_eq!(removals, 10_000usize.div_ceil(FAN_OUT_MANY_CHUNK));
     }
 
     #[tokio::test]
