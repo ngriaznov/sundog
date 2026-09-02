@@ -153,6 +153,15 @@ impl Cluster {
         self.inner.membership.peers().borrow().clone()
     }
 
+    /// Gossips `mode` as this node's [`Mode`] for cache `name`, so peers can
+    /// compare it against their own choice for the same name (see
+    /// `membership`'s cache-mode fingerprint docs). Called once by
+    /// [`crate::cache::CacheBuilder::open`] right after a cache is
+    /// registered in this cluster's shard registry.
+    pub(crate) async fn advertise_cache_mode(&self, name: &SmolStr, mode: Mode) {
+        self.inner.membership.set_cache_mode(name, mode).await;
+    }
+
     /// A fresh watch subscription on the live peer set — for tasks that
     /// need to react to membership changes rather than sample them.
     pub(crate) fn peers_watch(&self) -> tokio::sync::watch::Receiver<Vec<Peer>> {
@@ -349,6 +358,7 @@ impl ClusterBuilder {
         cluster.spawn_tracked(membership_to_mesh_task(
             cluster.inner.membership.peers(),
             cluster.inner.mesh.clone(),
+            cluster.shards(),
             cluster.cancel_token(),
         ));
         cluster.spawn_tracked(absence::tracking_task(
@@ -487,14 +497,25 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
 }
 
 /// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls,
-/// for the lifetime of the cluster.
+/// for the lifetime of the cluster. Also the home of the cache-mode-mismatch
+/// late-detection sweep (see [`check_mode_conflicts`]): `open()`'s own check
+/// is best-effort (two nodes opening the same name under different `Mode`s
+/// concurrently can both pass it), so this re-checks the full live peer set
+/// against this node's shard registry on every membership-view change,
+/// including a change caused only by this node's own later `open()`
+/// advertising a new `cache:<name>` key (self is part of the fingerprint
+/// gossip drives `live_nodes_watch_stream` off, so a local-only fingerprint
+/// change still wakes this loop).
 async fn membership_to_mesh_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     mesh: Mesh,
+    shards: ShardRegistry,
     cancel: CancellationToken,
 ) {
+    let mut warned: HashSet<(NodeId, SmolStr)> = HashSet::new();
     let initial = peers.borrow_and_update().clone();
     set_live_peers_gauge(initial.len());
+    check_mode_conflicts(&initial, &shards, &mut warned);
     mesh.update_peers(initial);
     loop {
         tokio::select! {
@@ -507,7 +528,45 @@ async fn membership_to_mesh_task(
                 let current = peers.borrow_and_update().clone();
                 tracing::info!(peer_count = current.len(), "membership view changed");
                 set_live_peers_gauge(current.len());
+                check_mode_conflicts(&current, &shards, &mut warned);
                 mesh.update_peers(current);
+            }
+        }
+    }
+}
+
+/// Logs a `tracing::error!` once per (peer, cache-name) pair where a live
+/// peer advertises a cache this node also has open, under a different
+/// [`Mode`] — the background backstop for what [`CacheBuilder::open`]'s
+/// own check can miss under a race. `warned` accumulates for the life of
+/// the cluster rather than clearing entries that stop conflicting: this is
+/// a diagnostic trail, not a live status board, and a genuine mismatch is a
+/// standing misconfiguration on one side that a re-`open()` (a fresh
+/// process, hence a fresh [`NodeId`]) is the normal way to clear.
+fn check_mode_conflicts(
+    peers: &[Peer],
+    shards: &ShardRegistry,
+    warned: &mut HashSet<(NodeId, SmolStr)>,
+) {
+    let local_modes: HashMap<SmolStr, Mode> = shards
+        .read()
+        .expect("invariant: shard registry lock is never poisoned")
+        .iter()
+        .map(|(name, shard)| (name.clone(), shard.mode()))
+        .collect();
+    for peer in peers {
+        for (cache, &remote_mode) in &peer.caches {
+            let Some(&local_mode) = local_modes.get(cache) else {
+                continue;
+            };
+            if local_mode != remote_mode && warned.insert((peer.node, cache.clone())) {
+                tracing::error!(
+                    %cache,
+                    peer = %peer.node,
+                    local = ?local_mode,
+                    remote = ?remote_mode,
+                    "cache mode mismatch detected against a live peer"
+                );
             }
         }
     }
@@ -1120,6 +1179,85 @@ mod tests {
         wait_for_peer_count(&cluster_a, 1).await;
         wait_for_peer_count(&cluster_b, 1).await;
         (cluster_a, cluster_b)
+    }
+
+    /// Polls `cluster`'s peer set until it sees a live peer advertising
+    /// `cache` under some [`Mode`] — the gossip-convergence wait every
+    /// mode-mismatch test needs before its second `open()`, since otherwise
+    /// that `open()` could race the first node's `cache:<name>` key still in
+    /// flight and see no peer advertisement at all.
+    async fn wait_for_cache_advertised(cluster: &Cluster, cache: &str) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cluster
+                    .peers()
+                    .iter()
+                    .any(|peer| peer.caches.contains_key(cache))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer's cache-mode advertisement converges within the bound");
+    }
+
+    #[tokio::test]
+    async fn open_rejects_a_cache_mode_that_conflicts_with_a_live_peer() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-mode-mismatch").await;
+
+        let _cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens as Replicated");
+        wait_for_cache_advertised(&cluster_b, "users").await;
+
+        match cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+        {
+            Err(CacheError::ModeMismatch {
+                cache,
+                local,
+                remote,
+            }) => {
+                assert_eq!(cache, "users");
+                assert_eq!(local, Mode::Invalidation);
+                assert_eq!(remote, Mode::Replicated);
+            }
+            other => panic!("expected ModeMismatch, got {:?}", other.map(|_| ())),
+        }
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_allows_matching_modes_across_nodes() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-mode-match").await;
+
+        let _cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("a opens as Invalidation");
+        wait_for_cache_advertised(&cluster_b, "users").await;
+
+        let _cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("b opens under the same mode a already advertises");
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
     }
 
     #[tokio::test]

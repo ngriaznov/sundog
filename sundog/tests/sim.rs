@@ -123,6 +123,7 @@ fn peer_list_of(peers: &[(NodeId, &'static str, u16)]) -> Vec<Peer> {
             gossip_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             data_addr: SocketAddr::new(turmoil::lookup(host), port),
             incarnation: 1,
+            caches: HashMap::new(),
         })
         .collect()
 }

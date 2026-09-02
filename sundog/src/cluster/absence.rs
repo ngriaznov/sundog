@@ -117,6 +117,7 @@ mod tests {
             gossip_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)),
             data_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8000)),
             incarnation: 1,
+            caches: std::collections::HashMap::new(),
         }
     }
 
