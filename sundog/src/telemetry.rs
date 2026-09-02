@@ -3,7 +3,9 @@
 //!
 //! Metric *emission* — the `metrics::counter!`/`metrics::gauge!` calls spread
 //! across the crate (`sundog_backlog_dropped_total`, `sundog_live_peers`,
-//! `sundog_open_caches`, ...) — is unconditional and feature-independent: a
+//! `sundog_open_caches`, `sundog_cache_hits_total`,
+//! `sundog_cache_misses_total`, `sundog_cache_entries`, ...) — is
+//! unconditional and feature-independent: a
 //! build without this feature simply never installs a recorder, so those
 //! calls fall through to `metrics`'s own no-op default. This module only
 //! wires an actual Prometheus recorder into the process, two ways:

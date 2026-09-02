@@ -84,6 +84,34 @@
           "legendFormat": "{{instance}}"
         }
       ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Hit ratio (per cache)",
+      "description": "get/get_or_load hit rate per named cache. A get_or_load counts once as a miss per loader execution and as a hit on every other call, including collapsed-stampede waiters. A sustained drop means the working set stopped fitting local capacity or a TTL is too short for the access pattern.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 0, "y": 13, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "sum by (cache) (rate(sundog_cache_hits_total[5m])) / (sum by (cache) (rate(sundog_cache_hits_total[5m])) + sum by (cache) (rate(sundog_cache_misses_total[5m])))",
+          "legendFormat": "{{cache}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Entries (per cache)",
+      "description": "This node's live local entry count per named cache, sampled every 5s. In Replicated mode this should track the same value across nodes once replication catches up.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "x": 12, "y": 13, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "expr": "sundog_cache_entries",
+          "legendFormat": "{{instance}} {{cache}}"
+        }
+      ]
     }
   ]
 }

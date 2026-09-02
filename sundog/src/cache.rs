@@ -226,6 +226,11 @@ where
             cluster.absence_tracker(),
             cluster.cancel_token(),
         ));
+        cluster.spawn_tracked(crate::cluster::cache_entries_gauge_task(
+            Arc::clone(&shard) as Arc<dyn ShardOps>,
+            name.clone(),
+            cluster.cancel_token(),
+        ));
 
         Ok(Cache { shard })
     }
