@@ -966,6 +966,41 @@ pub(crate) async fn tombstone_gc_task(
     }
 }
 
+/// Publishes `sundog_cache_entries{cache}` for one opened cache: set once
+/// immediately, then refreshed on a fixed 5-second cadence from
+/// [`ShardOps::entry_count`] for as long as the cache stays open. Unlike
+/// [`open_cache_gauge_task`], this could in principle be event-driven — but
+/// `moka`'s own entry count is itself only advisory until pending
+/// housekeeping is flushed, so a fixed sampling cadence is what
+/// [`ShardOps::entry_count`] is built around either way.
+pub(crate) async fn cache_entries_gauge_task(
+    shard: Arc<dyn ShardOps>,
+    name: SmolStr,
+    cancel: CancellationToken,
+) {
+    let gauge = metrics::gauge!("sundog_cache_entries", "cache" => name.to_string());
+    gauge.set(entry_count_f64(shard.entry_count().await));
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {
+                gauge.set(entry_count_f64(shard.entry_count().await));
+            }
+        }
+    }
+}
+
+/// Saturating `u64` -> `f64` conversion for gauge values, matching
+/// [`set_live_peers_gauge`] and [`open_cache_gauge_task`]'s own count-to-gauge
+/// conversions.
+fn entry_count_f64(count: u64) -> f64 {
+    f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 // Real-transport-only: these build a live `Cluster` (real `Mesh`, real
 // sockets), which panics under `sim` outside a driven `turmoil::Sim` — see
 // `net::mod`'s test-module comment for the full rationale.

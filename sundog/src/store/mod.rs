@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -276,6 +276,11 @@ pub trait ShardOps: Send + Sync {
     /// explicitly. Called periodically by `tombstone_gc_task` independent of
     /// read/write traffic.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
+
+    /// This shard's live local entry count, `moka`'s pending housekeeping
+    /// flushed first — see [`Shard::entry_count`]. Sampled periodically by
+    /// `cluster::cache_entries_gauge_task` to publish `sundog_cache_entries`.
+    fn entry_count(&self) -> BoxFuture<'_, u64>;
 }
 
 /// One side of a [`ConflictResolver::winner`] comparison: everything a
@@ -614,6 +619,15 @@ where
     /// installed at `moka` build time, unlike `resolver`/`max_frame` above.
     max_capacity: u64,
     tti: Option<Duration>,
+    /// Handle for `sundog_cache_hits_total{cache}`, created once here rather
+    /// than resolved by `metrics::counter!` on every call — label resolution
+    /// has a per-call cost the read path can't afford. See [`Shard::get`] and
+    /// [`Shard::get_or_load`] for exactly what counts as a hit.
+    hits: metrics::Counter,
+    /// Handle for `sundog_cache_misses_total{cache}`, created once for the
+    /// same reason as the `hits` counter above. See [`Shard::get`] and
+    /// [`Shard::get_or_load`] for exactly what counts as a miss.
+    misses: metrics::Counter,
 }
 
 impl<K, V> Shard<K, V>
@@ -648,6 +662,8 @@ where
             .collect::<Vec<_>>()
             .into();
         let cache = Self::build_cache(max_capacity, tti, &digest, None);
+        let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
+        let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
 
         Self {
             name,
@@ -668,6 +684,8 @@ where
             max_frame: MAX_FRAME,
             max_capacity,
             tti,
+            hits,
+            misses,
         }
     }
 
@@ -1022,8 +1040,17 @@ where
 
     /// Reads `key`, without triggering read-through. Tombstones never enter
     /// `moka`, so a deleted key isn't present here.
+    ///
+    /// Counts `sundog_cache_hits_total{cache}` on `Some`,
+    /// `sundog_cache_misses_total{cache}` on `None`.
     pub async fn get(&self, key: &K) -> Option<V> {
-        self.cache.get(key).await.map(|stored| stored.value.clone())
+        if let Some(stored) = self.cache.get(key).await {
+            self.hits.increment(1);
+            Some(stored.value.clone())
+        } else {
+            self.misses.increment(1);
+            None
+        }
     }
 
     /// Reads whether `key` has a live entry, honoring expiry, without
@@ -1037,7 +1064,9 @@ where
 
     /// The number of live entries this node currently holds, with `moka`'s
     /// pending housekeeping flushed first so completed expirations and
-    /// evictions are reflected rather than estimated.
+    /// evictions are reflected rather than estimated. Sampled periodically
+    /// by `cluster::cache_entries_gauge_task` to publish
+    /// `sundog_cache_entries{cache}`.
     pub async fn entry_count(&self) -> u64 {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count()
@@ -1091,6 +1120,12 @@ where
     /// the same missing key are collapsed into one `loader` call (moka
     /// `get_with`'s stampede protection).
     ///
+    /// Counts `sundog_cache_misses_total{cache}` exactly once per `loader`
+    /// execution, from inside the stampede-collapsed init future — every
+    /// other call to this method, whether the key was already cached or it
+    /// was one of the collapsed callers waiting on the same fill, counts
+    /// `sundog_cache_hits_total{cache}` instead.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails.
@@ -1106,6 +1141,7 @@ where
         E: std::error::Error + Send + Sync + 'static,
     {
         let key_bytes = encode_key(key)?;
+        let ran_loader = AtomicBool::new(false);
         let stored = self
             .cache
             .try_get_with_by_ref(key, async {
@@ -1130,10 +1166,15 @@ where
                         origin: Origin::Local,
                     });
                 }
+                ran_loader.store(true, Ordering::Relaxed);
+                self.misses.increment(1);
                 Ok(stored)
             })
             .await
             .map_err(|err: Arc<E>| CacheError::Loader(Box::new(LoaderFailure(err))))?;
+        if !ran_loader.load(Ordering::Relaxed) {
+            self.hits.increment(1);
+        }
         Ok(stored.value.clone())
     }
 
@@ -1723,6 +1764,10 @@ where
 
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.cache.run_pending_tasks())
+    }
+
+    fn entry_count(&self) -> BoxFuture<'_, u64> {
+        Box::pin(self.entry_count())
     }
 }
 
