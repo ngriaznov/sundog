@@ -1,0 +1,26 @@
+# Yanks one published sundog version from crates.io. Manual only; requires
+# the CARGO_REGISTRY_TOKEN repository secret. Yanking hides a version from
+# new resolutions without deleting it — existing lockfiles keep working.
+name: yank
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to yank (e.g. 0.1.2)"
+        required: true
+        type: string
+
+jobs:
+  yank:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo yank
+        run: cargo yank sundog --version "${{ inputs.version }}"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

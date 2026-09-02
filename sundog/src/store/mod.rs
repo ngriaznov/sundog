@@ -201,11 +201,6 @@ pub enum Event<K, V> {
 pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
 
 pub trait ShardOps: Send + Sync {
-    /// This shard's clustering mode — read by `cluster`'s membership-change
-    /// sweep to compare against what a peer advertises for the same cache
-    /// name (see `membership`'s cache-mode fingerprint).
-    fn mode(&self) -> Mode;
-
     /// Applies an inbound replicated record iff its version is newer than
     /// what's stored — the versioned-apply rule that makes replication
     /// commutative. The single path shared by local writes, live
@@ -276,11 +271,6 @@ pub trait ShardOps: Send + Sync {
     /// explicitly. Called periodically by `tombstone_gc_task` independent of
     /// read/write traffic.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
-
-    /// This shard's live local entry count, `moka`'s pending housekeeping
-    /// flushed first — see [`Shard::entry_count`]. Sampled periodically by
-    /// `cluster::cache_entries_gauge_task` to publish `sundog_cache_entries`.
-    fn entry_count(&self) -> BoxFuture<'_, u64>;
 }
 
 /// One side of a [`ConflictResolver::winner`] comparison: everything a
@@ -1555,10 +1545,6 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    fn mode(&self) -> Mode {
-        self.mode
-    }
-
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()> {
         Box::pin(async move { self.apply_remote_batch(vec![rec]).await })
     }
@@ -1766,10 +1752,6 @@ where
 
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
         Box::pin(self.cache.run_pending_tasks())
-    }
-
-    fn entry_count(&self) -> BoxFuture<'_, u64> {
-        Box::pin(self.entry_count())
     }
 }
 

@@ -42,7 +42,7 @@ use crate::discovery::statics::Static;
 use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
 use crate::hlc::Hlc;
-use crate::membership::{Membership, Peer};
+use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler};
 use crate::node::{NodeId, NodeName};
 use crate::store::{FanOutNotice, Mode, Shard, ShardOps};
@@ -79,6 +79,10 @@ struct ClusterInner {
     membership: Membership,
     mesh: Mesh,
     shards: ShardRegistry,
+    /// The [`Mode`] each cache open in this process was opened under — the
+    /// local half of the cache-config fingerprint that
+    /// [`mode_conflict_task`] compares peers' advertisements against.
+    local_modes: RwLock<HashMap<SmolStr, Mode>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
     tracker: TaskTracker,
@@ -153,13 +157,25 @@ impl Cluster {
         self.inner.membership.peers().borrow().clone()
     }
 
-    /// Gossips `mode` as this node's [`Mode`] for cache `name`, so peers can
-    /// compare it against their own choice for the same name (see
-    /// `membership`'s cache-mode fingerprint docs). Called once by
+    /// Records `mode` as this node's [`Mode`] for cache `name` and gossips
+    /// it, so peers can compare it against their own choice for the same
+    /// name (see `membership`'s cache-mode fingerprint docs). Called once by
     /// [`crate::cache::CacheBuilder::open`] right after a cache is
     /// registered in this cluster's shard registry.
-    pub(crate) async fn advertise_cache_mode(&self, name: &SmolStr, mode: Mode) {
-        self.inner.membership.set_cache_mode(name, mode).await;
+    pub(crate) fn advertise_cache_mode(&self, name: &SmolStr, mode: Mode) {
+        self.inner
+            .local_modes
+            .write()
+            .expect("invariant: local cache-mode map lock is never poisoned")
+            .insert(name.clone(), mode);
+        self.inner.membership.set_cache_mode(name, mode);
+    }
+
+    /// Every live peer's advertised cache modes, as membership currently
+    /// reports them — what [`crate::cache::CacheBuilder::open`] checks a
+    /// requested mode against.
+    pub(crate) fn advertised_cache_modes(&self) -> CacheModes {
+        self.inner.membership.cache_modes().borrow().clone()
     }
 
     /// A fresh watch subscription on the live peer set — for tasks that
@@ -348,6 +364,7 @@ impl ClusterBuilder {
                 membership,
                 mesh,
                 shards,
+                local_modes: RwLock::new(HashMap::new()),
                 config,
                 absence: absence::AbsenceTracker::default(),
                 tracker: TaskTracker::new(),
@@ -358,9 +375,9 @@ impl ClusterBuilder {
         cluster.spawn_tracked(membership_to_mesh_task(
             cluster.inner.membership.peers(),
             cluster.inner.mesh.clone(),
-            cluster.shards(),
             cluster.cancel_token(),
         ));
+        cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
         cluster.spawn_tracked(absence::tracking_task(
             cluster.inner.membership.peers(),
             cluster.absence_tracker(),
@@ -497,25 +514,14 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
 }
 
 /// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls,
-/// for the lifetime of the cluster. Also the home of the cache-mode-mismatch
-/// late-detection sweep (see [`check_mode_conflicts`]): `open()`'s own check
-/// is best-effort (two nodes opening the same name under different `Mode`s
-/// concurrently can both pass it), so this re-checks the full live peer set
-/// against this node's shard registry on every membership-view change,
-/// including a change caused only by this node's own later `open()`
-/// advertising a new `cache:<name>` key (self is part of the fingerprint
-/// gossip drives `live_nodes_watch_stream` off, so a local-only fingerprint
-/// change still wakes this loop).
+/// for the lifetime of the cluster.
 async fn membership_to_mesh_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     mesh: Mesh,
-    shards: ShardRegistry,
     cancel: CancellationToken,
 ) {
-    let mut warned: HashSet<(NodeId, SmolStr)> = HashSet::new();
     let initial = peers.borrow_and_update().clone();
     set_live_peers_gauge(initial.len());
-    check_mode_conflicts(&initial, &shards, &mut warned);
     mesh.update_peers(initial);
     loop {
         tokio::select! {
@@ -528,8 +534,35 @@ async fn membership_to_mesh_task(
                 let current = peers.borrow_and_update().clone();
                 tracing::info!(peer_count = current.len(), "membership view changed");
                 set_live_peers_gauge(current.len());
-                check_mode_conflicts(&current, &shards, &mut warned);
                 mesh.update_peers(current);
+            }
+        }
+    }
+}
+
+/// The cache-mode-mismatch late-detection sweep (see
+/// [`check_mode_conflicts`]): `open()`'s own check is best-effort (two nodes
+/// opening the same name under different `Mode`s concurrently can both pass
+/// it), so this re-checks every live peer's advertised cache modes against
+/// this node's own open caches whenever membership publishes a new view —
+/// including a view change caused only by this node's own later `open()`
+/// advertising a new `cache:<name>` key (self is part of the fingerprint
+/// gossip drives `live_nodes_watch_stream` off, so a local-only fingerprint
+/// change still wakes this loop).
+async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
+    let mut modes = cluster.inner.membership.cache_modes();
+    let mut warned: HashSet<(NodeId, SmolStr)> = HashSet::new();
+    check_mode_conflicts(&modes.borrow_and_update(), &cluster, &mut warned);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            changed = modes.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let current = modes.borrow_and_update().clone();
+                check_mode_conflicts(&current, &cluster, &mut warned);
             }
         }
     }
@@ -544,25 +577,24 @@ async fn membership_to_mesh_task(
 /// standing misconfiguration on one side that a re-`open()` (a fresh
 /// process, hence a fresh [`NodeId`]) is the normal way to clear.
 fn check_mode_conflicts(
-    peers: &[Peer],
-    shards: &ShardRegistry,
+    advertised: &CacheModes,
+    cluster: &Cluster,
     warned: &mut HashSet<(NodeId, SmolStr)>,
 ) {
-    let local_modes: HashMap<SmolStr, Mode> = shards
+    let local_modes = cluster
+        .inner
+        .local_modes
         .read()
-        .expect("invariant: shard registry lock is never poisoned")
-        .iter()
-        .map(|(name, shard)| (name.clone(), shard.mode()))
-        .collect();
-    for peer in peers {
-        for (cache, &remote_mode) in &peer.caches {
+        .expect("invariant: local cache-mode map lock is never poisoned");
+    for (&peer, caches) in advertised {
+        for (cache, &remote_mode) in caches {
             let Some(&local_mode) = local_modes.get(cache) else {
                 continue;
             };
-            if local_mode != remote_mode && warned.insert((peer.node, cache.clone())) {
+            if local_mode != remote_mode && warned.insert((peer, cache.clone())) {
                 tracing::error!(
                     %cache,
-                    peer = %peer.node,
+                    %peer,
                     local = ?local_mode,
                     remote = ?remote_mode,
                     "cache mode mismatch detected against a live peer"
@@ -968,16 +1000,19 @@ pub(crate) async fn tombstone_gc_task(
 
 /// Publishes `sundog_cache_entries{cache}` for one opened cache: set once
 /// immediately, then refreshed on a fixed 5-second cadence from
-/// [`ShardOps::entry_count`] for as long as the cache stays open. Unlike
+/// [`Shard::entry_count`] for as long as the cache stays open. Unlike
 /// [`open_cache_gauge_task`], this could in principle be event-driven — but
 /// `moka`'s own entry count is itself only advisory until pending
 /// housekeeping is flushed, so a fixed sampling cadence is what
-/// [`ShardOps::entry_count`] is built around either way.
-pub(crate) async fn cache_entries_gauge_task(
-    shard: Arc<dyn ShardOps>,
+/// [`Shard::entry_count`] is built around either way.
+pub(crate) async fn cache_entries_gauge_task<K, V>(
+    shard: Arc<Shard<K, V>>,
     name: SmolStr,
     cancel: CancellationToken,
-) {
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
     let gauge = metrics::gauge!("sundog_cache_entries", "cache" => name.to_string());
     gauge.set(entry_count_f64(shard.entry_count().await));
 
@@ -1225,9 +1260,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if cluster
-                    .peers()
-                    .iter()
-                    .any(|peer| peer.caches.contains_key(cache))
+                    .advertised_cache_modes()
+                    .values()
+                    .any(|caches| caches.contains_key(cache))
                 {
                     return;
                 }

@@ -184,9 +184,9 @@ where
         // `cluster::check_mode_conflicts` for the background sweep that
         // catches what this race lets through.
         if let Some(remote) = cluster
-            .peers()
-            .iter()
-            .find_map(|peer| peer.caches.get(&name).filter(|&&m| m != mode).copied())
+            .advertised_cache_modes()
+            .values()
+            .find_map(|caches| caches.get(&name).filter(|&&m| m != mode).copied())
         {
             return Err(CacheError::ModeMismatch {
                 cache: name,
@@ -226,7 +226,7 @@ where
         // `open()`'s docs mean by "successful": from here, gossip advertises
         // `mode` for `name` so other nodes' opens (and the background sweep)
         // can compare against it.
-        cluster.advertise_cache_mode(&name, mode).await;
+        cluster.advertise_cache_mode(&name, mode);
 
         if !matches!(mode, Mode::Local) {
             cluster.spawn_tracked(crate::cluster::fan_out_task(
@@ -266,7 +266,7 @@ where
             cluster.cancel_token(),
         ));
         cluster.spawn_tracked(crate::cluster::cache_entries_gauge_task(
-            Arc::clone(&shard) as Arc<dyn ShardOps>,
+            Arc::clone(&shard),
             name.clone(),
             cluster.cancel_token(),
         ));

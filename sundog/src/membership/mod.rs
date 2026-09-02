@@ -4,27 +4,26 @@
 //!
 //! Alongside identity, each node also gossips a per-cache config fingerprint:
 //! `Membership::set_cache_mode` sets a `cache:<name>` key to the opened
-//! [`Mode`]'s wire token, and `parse_peer` reads every such key back off a
-//! live peer's state into [`Peer::caches`] — the data `cluster` compares
-//! against this node's own shard registry (at `open()` time, and again on
-//! every membership-view change) to catch two nodes disagreeing about a
-//! cache name's mode.
+//! [`Mode`]'s wire token, and every such key on a live peer's state is read
+//! back into the `CacheModes` view published next to the peer set — the
+//! data `cluster` compares against this node's own open caches (at `open()`
+//! time, and again on every membership-view change) to catch two nodes
+//! disagreeing about a cache name's mode.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chitchat::transport::UdpTransport;
 use chitchat::{
-    Chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState,
-    ProtocolVersion, spawn_chitchat,
+    ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState, ProtocolVersion,
+    spawn_chitchat,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use smol_str::SmolStr;
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
 
 use crate::config::ClusterConfig;
@@ -67,11 +66,20 @@ pub struct Peer {
     /// Incremented each time this node leaves and rejoins the cluster;
     /// distinguishes a restarted process from a still-live one.
     pub incarnation: u64,
-    /// Every cache this peer advertises as open, and the [`Mode`] it opened
-    /// each one under — read off its `cache:<name>` gossip keys. A cache
-    /// name this peer hasn't opened (or whose mode token this build doesn't
-    /// recognize) is simply absent, never a placeholder value.
-    pub caches: HashMap<SmolStr, Mode>,
+}
+
+/// Every cache each live peer advertises as open, keyed by peer, with the
+/// [`Mode`] it opened each one under — read off the peers' `cache:<name>`
+/// gossip keys and published alongside the peer set. A cache a peer hasn't
+/// opened (or whose mode token this build doesn't recognize) is simply
+/// absent, never a placeholder value.
+pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
+
+/// A request to the background gossip task, which is the only owner of the
+/// chitchat handle.
+enum Command {
+    SetCacheMode(SmolStr, Mode),
+    Shutdown(oneshot::Sender<()>),
 }
 
 /// A cheap-to-clone handle onto a running membership session.
@@ -82,13 +90,9 @@ pub struct Peer {
 #[derive(Clone)]
 pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
+    cache_modes: watch::Receiver<CacheModes>,
     local: Peer,
-    shutdown_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
-    /// Captured from [`ChitchatHandle::chitchat`] before the handle itself
-    /// moves into the background [`run`] task, so `Membership::set_cache_mode`
-    /// can keep setting keys on this node's own state after startup without
-    /// needing a round trip through that task.
-    chitchat: Arc<AsyncMutex<Chitchat>>,
+    commands: mpsc::UnboundedSender<Command>,
 }
 
 impl Membership {
@@ -197,24 +201,26 @@ impl Membership {
             gossip_addr: gossip_advertise_addr,
             data_addr,
             incarnation,
-            caches: HashMap::new(),
         };
 
-        // Captured before `handle` moves into `run` below — `run` owns the
-        // handle for the graceful-shutdown call, but `Membership` itself
-        // still needs a way to set keys on this node's own state afterward.
-        let chitchat = handle.chitchat();
-
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
-        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        let (cache_modes_tx, cache_modes_rx) = watch::channel(HashMap::new());
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
-        tokio::spawn(run(handle, seeds, peers_tx, chitchat_id, shutdown_rx));
+        tokio::spawn(run(
+            handle,
+            seeds,
+            peers_tx,
+            cache_modes_tx,
+            chitchat_id,
+            commands_rx,
+        ));
 
         Ok(Self {
             peers: peers_rx,
+            cache_modes: cache_modes_rx,
             local,
-            shutdown_tx,
-            chitchat,
+            commands: commands_tx,
         })
     }
 
@@ -233,17 +239,21 @@ impl Membership {
         self.peers.clone()
     }
 
+    /// A live-updating view of every live peer's advertised cache modes —
+    /// see [`CacheModes`]. Published in lockstep with [`Membership::peers`].
+    pub(crate) fn cache_modes(&self) -> watch::Receiver<CacheModes> {
+        self.cache_modes.clone()
+    }
+
     /// Advertises `mode` as this node's [`Mode`] for cache `name`, under the
-    /// `cache:<name>` gossip key — read back by every peer's `parse_peer`
-    /// into [`Peer::caches`]. Setting the same value twice is a no-op on the
+    /// `cache:<name>` gossip key — read back by every peer into its
+    /// [`CacheModes`] view. Setting the same value twice is a no-op on the
     /// wire (chitchat only bumps a key's version when the value changes), so
     /// this is safe to call unconditionally after every successful `open()`.
-    pub(crate) async fn set_cache_mode(&self, name: &str, mode: Mode) {
-        self.chitchat
-            .lock()
-            .await
-            .self_node_state()
-            .set(cache_key(name), mode.as_token());
+    pub(crate) fn set_cache_mode(&self, name: &str, mode: Mode) {
+        let _ = self
+            .commands
+            .send(Command::SetCacheMode(SmolStr::new(name), mode));
     }
 
     /// Leaves the cluster gracefully (chitchat departs politely) and stops
@@ -255,7 +265,7 @@ impl Membership {
     /// detector reclaims it after the usual grace period.
     pub async fn shutdown(self) {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.shutdown_tx.send(reply_tx).is_ok() {
+        if self.commands.send(Command::Shutdown(reply_tx)).is_ok() {
             let _ = reply_rx.await;
         }
     }
@@ -341,7 +351,6 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
 
     let data_addr: SocketAddr = node_state.get(DATA_ADDR_KEY)?.parse().ok()?;
     let incarnation: u64 = node_state.get(INCARNATION_KEY)?.parse().ok()?;
-    let caches = parse_cache_modes(node_state);
 
     Some(Peer {
         node,
@@ -349,7 +358,6 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
         gossip_addr: chitchat_id.gossip_advertise_addr,
         data_addr,
         incarnation,
-        caches,
     })
 }
 
@@ -387,16 +395,13 @@ async fn run(
     handle: ChitchatHandle,
     seeds: BoxStream<'static, SocketAddr>,
     peers_tx: watch::Sender<Vec<Peer>>,
+    cache_modes_tx: watch::Sender<CacheModes>,
     self_chitchat_id: ChitchatId,
-    mut shutdown_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    mut commands_rx: mpsc::UnboundedReceiver<Command>,
 ) {
     let mut seeds = seeds.fuse();
-    let mut live_nodes = handle
-        .chitchat()
-        .lock()
-        .await
-        .live_nodes_watch_stream()
-        .fuse();
+    let chitchat = handle.chitchat();
+    let mut live_nodes = chitchat.lock().await.live_nodes_watch_stream().fuse();
 
     loop {
         tokio::select! {
@@ -406,22 +411,36 @@ async fn run(
                 }
             }
             live = live_nodes.select_next_some() => {
-                let peers: Vec<Peer> = live
-                    .iter()
-                    .filter(|(id, _)| *id != &self_chitchat_id)
-                    .filter_map(|(id, state)| parse_peer(id, state))
-                    .collect();
+                let mut peers: Vec<Peer> = Vec::new();
+                let mut cache_modes: CacheModes = HashMap::new();
+                for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
+                    let Some(peer) = parse_peer(id, state) else { continue };
+                    cache_modes.insert(peer.node, parse_cache_modes(state));
+                    peers.push(peer);
+                }
                 tracing::debug!(count = peers.len(), "membership view updated");
+                let _ = cache_modes_tx.send(cache_modes);
                 let _ = peers_tx.send(peers);
             }
-            reply = shutdown_rx.recv() => {
-                let Some(reply) = reply else { return };
-                if let Err(error) = handle.shutdown().await {
-                    tracing::warn!(%error, "chitchat shutdown reported an error");
+            command = commands_rx.recv() => {
+                match command {
+                    Some(Command::SetCacheMode(name, mode)) => {
+                        chitchat
+                            .lock()
+                            .await
+                            .self_node_state()
+                            .set(cache_key(&name), mode.as_token());
+                    }
+                    Some(Command::Shutdown(reply)) => {
+                        if let Err(error) = handle.shutdown().await {
+                            tracing::warn!(%error, "chitchat shutdown reported an error");
+                        }
+                        tracing::info!("membership stopped");
+                        let _ = reply.send(());
+                        return;
+                    }
+                    None => return,
                 }
-                tracing::info!("membership stopped");
-                let _ = reply.send(());
-                return;
             }
         }
     }
@@ -547,12 +566,16 @@ mod tests {
             ("cache:bogus", "not-a-real-mode"),
         ]);
 
-        let peer = parse_peer(&id, &state).expect("well-formed state parses");
-        assert_eq!(peer.caches.len(), 3, "the malformed token is skipped");
-        assert_eq!(peer.caches.get("users"), Some(&Mode::Replicated));
-        assert_eq!(peer.caches.get("sessions"), Some(&Mode::Invalidation));
-        assert_eq!(peer.caches.get("scratch"), Some(&Mode::Local));
-        assert!(!peer.caches.contains_key("bogus"));
+        assert!(
+            parse_peer(&id, &state).is_some(),
+            "well-formed state parses"
+        );
+        let caches = parse_cache_modes(&state);
+        assert_eq!(caches.len(), 3, "the malformed token is skipped");
+        assert_eq!(caches.get("users"), Some(&Mode::Replicated));
+        assert_eq!(caches.get("sessions"), Some(&Mode::Invalidation));
+        assert_eq!(caches.get("scratch"), Some(&Mode::Local));
+        assert!(!caches.contains_key("bogus"));
     }
 
     #[tokio::test]
