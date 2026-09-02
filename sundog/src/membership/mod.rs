@@ -1,26 +1,36 @@
 //! Membership: chitchat-backed cluster view. Answers "who is alive right now"
 //! by gossiping each node's data-plane address and incarnation, and exposes
 //! the live set as a `watch` stream that drives the net and store layers.
+//!
+//! Alongside identity, each node also gossips a per-cache config fingerprint:
+//! [`Membership::set_cache_mode`] sets a `cache:<name>` key to the opened
+//! [`Mode`]'s wire token, and [`parse_peer`] reads every such key back off a
+//! live peer's state into [`Peer::caches`] — the data `cluster` compares
+//! against this node's own shard registry (at `open()` time, and again on
+//! every membership-view change) to catch two nodes disagreeing about a
+//! cache name's mode.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chitchat::transport::UdpTransport;
 use chitchat::{
-    ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState, ProtocolVersion,
-    spawn_chitchat,
+    Chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, NodeState,
+    ProtocolVersion, spawn_chitchat,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use smol_str::SmolStr;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::time;
 
 use crate::config::ClusterConfig;
 use crate::error::JoinError;
 use crate::node::{NodeId, NodeName};
+use crate::store::Mode;
 
 /// How long `spawn` samples the `seeds` stream to build chitchat's initial
 /// static seed list, before handing the stream off to the continuous
@@ -34,6 +44,14 @@ const MAX_INITIAL_SEEDS: usize = 16;
 const NODE_ID_KEY: &str = "node_id";
 const DATA_ADDR_KEY: &str = "data_addr";
 const INCARNATION_KEY: &str = "incarnation";
+/// Prefix for the per-cache config fingerprint keys set by
+/// [`Membership::set_cache_mode`]: the full key is `cache:<name>`.
+const CACHE_KEY_PREFIX: &str = "cache:";
+
+/// Builds the gossip key one cache's mode is set/read under.
+fn cache_key(name: &str) -> String {
+    format!("{CACHE_KEY_PREFIX}{name}")
+}
 
 /// One live cluster member as seen through gossip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +67,11 @@ pub struct Peer {
     /// Incremented each time this node leaves and rejoins the cluster;
     /// distinguishes a restarted process from a still-live one.
     pub incarnation: u64,
+    /// Every cache this peer advertises as open, and the [`Mode`] it opened
+    /// each one under — read off its `cache:<name>` gossip keys. A cache
+    /// name this peer hasn't opened (or whose mode token this build doesn't
+    /// recognize) is simply absent, never a placeholder value.
+    pub caches: HashMap<SmolStr, Mode>,
 }
 
 /// A cheap-to-clone handle onto a running membership session.
@@ -61,6 +84,11 @@ pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
     local: Peer,
     shutdown_tx: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    /// Captured from [`ChitchatHandle::chitchat`] before the handle itself
+    /// moves into the background [`run`] task, so [`Membership::set_cache_mode`]
+    /// can keep setting keys on this node's own state after startup without
+    /// needing a round trip through that task.
+    chitchat: Arc<AsyncMutex<Chitchat>>,
 }
 
 impl Membership {
@@ -169,7 +197,13 @@ impl Membership {
             gossip_addr: gossip_advertise_addr,
             data_addr,
             incarnation,
+            caches: HashMap::new(),
         };
+
+        // Captured before `handle` moves into `run` below — `run` owns the
+        // handle for the graceful-shutdown call, but `Membership` itself
+        // still needs a way to set keys on this node's own state afterward.
+        let chitchat = handle.chitchat();
 
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
@@ -180,6 +214,7 @@ impl Membership {
             peers: peers_rx,
             local,
             shutdown_tx,
+            chitchat,
         })
     }
 
@@ -196,6 +231,19 @@ impl Membership {
     #[must_use]
     pub fn peers(&self) -> watch::Receiver<Vec<Peer>> {
         self.peers.clone()
+    }
+
+    /// Advertises `mode` as this node's [`Mode`] for cache `name`, under the
+    /// `cache:<name>` gossip key — read back by every peer's [`parse_peer`]
+    /// into [`Peer::caches`]. Setting the same value twice is a no-op on the
+    /// wire (chitchat only bumps a key's version when the value changes), so
+    /// this is safe to call unconditionally after every successful `open()`.
+    pub(crate) async fn set_cache_mode(&self, name: &str, mode: Mode) {
+        self.chitchat
+            .lock()
+            .await
+            .self_node_state()
+            .set(cache_key(name), mode.as_token());
     }
 
     /// Leaves the cluster gracefully (chitchat departs politely) and stops
@@ -293,6 +341,7 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
 
     let data_addr: SocketAddr = node_state.get(DATA_ADDR_KEY)?.parse().ok()?;
     let incarnation: u64 = node_state.get(INCARNATION_KEY)?.parse().ok()?;
+    let caches = parse_cache_modes(node_state);
 
     Some(Peer {
         node,
@@ -300,7 +349,32 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
         gossip_addr: chitchat_id.gossip_advertise_addr,
         data_addr,
         incarnation,
+        caches,
     })
+}
+
+/// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
+/// map. A key whose value isn't a recognized [`Mode`] token (a peer running
+/// a build that added a mode this one doesn't know, or plain corruption) is
+/// logged and skipped — it never fails [`parse_peer`] for the whole node.
+fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
+    node_state
+        .iter_prefix(CACHE_KEY_PREFIX)
+        .filter_map(|(key, versioned_value)| {
+            let name = key
+                .strip_prefix(CACHE_KEY_PREFIX)
+                .expect("invariant: iter_prefix only yields keys starting with the prefix");
+            let mode = Mode::from_token(&versioned_value.value);
+            if mode.is_none() {
+                tracing::warn!(
+                    cache = %name,
+                    token = %versioned_value.value,
+                    "unrecognized cache mode token in gossip state; skipped"
+                );
+            }
+            mode.map(|mode| (SmolStr::new(name), mode))
+        })
+        .collect()
 }
 
 /// Owns the chitchat handle for the lifetime of one membership session:
@@ -456,6 +530,29 @@ mod tests {
             (INCARNATION_KEY, "1"),
         ]);
         assert!(parse_peer(&id, &state).is_none());
+    }
+
+    #[test]
+    fn parse_peer_collects_cache_mode_keys_and_skips_a_malformed_one() {
+        let node = NodeId::from(3u64);
+        let name = NodeName::new("host-a", node);
+        let id = chitchat_id(name.as_str(), 7000);
+        let state = state_with(&[
+            (NODE_ID_KEY, &node.to_string()),
+            (DATA_ADDR_KEY, "127.0.0.1:8000"),
+            (INCARNATION_KEY, "1"),
+            ("cache:users", "replicated"),
+            ("cache:sessions", "invalidation"),
+            ("cache:scratch", "local"),
+            ("cache:bogus", "not-a-real-mode"),
+        ]);
+
+        let peer = parse_peer(&id, &state).expect("well-formed state parses");
+        assert_eq!(peer.caches.len(), 3, "the malformed token is skipped");
+        assert_eq!(peer.caches.get("users"), Some(&Mode::Replicated));
+        assert_eq!(peer.caches.get("sessions"), Some(&Mode::Invalidation));
+        assert_eq!(peer.caches.get("scratch"), Some(&Mode::Local));
+        assert!(!peer.caches.contains_key("bogus"));
     }
 
     #[tokio::test]

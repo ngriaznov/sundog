@@ -120,6 +120,33 @@ pub enum Mode {
     Replicated,
 }
 
+impl Mode {
+    /// The wire token gossiped for this mode under a `cache:<name>` chitchat
+    /// key (`membership`'s cache-mode fingerprint) — a stable string rather
+    /// than a `Debug`/`Display` impl, so renaming a variant doesn't silently
+    /// change what's on the wire.
+    pub(crate) const fn as_token(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Invalidation => "invalidation",
+            Self::Replicated => "replicated",
+        }
+    }
+
+    /// Parses [`Mode::as_token`]'s output back into a `Mode`, or `None` for
+    /// anything else — a peer running a newer/older version that gossips an
+    /// unrecognized token is skipped by the caller, not treated as a parse
+    /// failure of the whole peer.
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "local" => Some(Self::Local),
+            "invalidation" => Some(Self::Invalidation),
+            "replicated" => Some(Self::Replicated),
+            _ => None,
+        }
+    }
+}
+
 /// Who caused a cache [`Event`]: this node's own API call, or a message
 /// received from a remote peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,6 +201,11 @@ pub enum Event<K, V> {
 pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
 
 pub trait ShardOps: Send + Sync {
+    /// This shard's clustering mode — read by `cluster`'s membership-change
+    /// sweep to compare against what a peer advertises for the same cache
+    /// name (see `membership`'s cache-mode fingerprint).
+    fn mode(&self) -> Mode;
+
     /// Applies an inbound replicated record iff its version is newer than
     /// what's stored — the versioned-apply rule that makes replication
     /// commutative. The single path shared by local writes, live
@@ -1367,6 +1399,10 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    fn mode(&self) -> Mode {
+        self.mode
+    }
+
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()> {
         Box::pin(async move { self.apply_remote_batch(vec![rec]).await })
     }

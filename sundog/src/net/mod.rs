@@ -772,6 +772,7 @@ mod tests {
             gossip_addr: addr,
             data_addr: addr,
             incarnation: 1,
+            caches: std::collections::HashMap::new(),
         }
     }
 

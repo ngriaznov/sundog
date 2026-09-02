@@ -1,6 +1,12 @@
 //! The typed public cache handle and its builder. `Cache<K, V>` is a thin
 //! wrapper over `Arc<Shard<K, V>>` — serialization happens only at the wire
 //! boundary; local reads never deserialize.
+//!
+//! `CacheBuilder::open` checks the requested [`Mode`] against what live
+//! peers already advertise for the same cache name (`membership`'s
+//! cache-mode fingerprint gossip) before registering the shard, and
+//! advertises its own choice on success — see [`CacheBuilder::open`]'s docs
+//! for what this catches and what it can't.
 
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -140,6 +146,17 @@ where
     /// next anti-entropy round against a peer that still has it, defeating
     /// the bound entirely.
     ///
+    /// Returns [`CacheError::ModeMismatch`] if a live peer already
+    /// advertises `name` under a different [`Mode`] than the one requested
+    /// here. This check is best-effort — it only sees gossip that has
+    /// already converged, so two nodes opening the same name under
+    /// different modes at nearly the same moment can both pass it; a
+    /// background sweep in `cluster` logs (but does not tear anything down
+    /// for) whatever mismatch this misses.
+    ///
+    /// On success, this node's [`Mode`] for `name` is itself gossiped, so
+    /// the next node to open (or reopen) `name` sees it.
+    ///
     /// # Panics
     ///
     /// Panics if the shard registry lock is poisoned, which only happens if
@@ -159,6 +176,23 @@ where
 
         if matches!(mode, Mode::Replicated) && (max_capacity != u64::MAX || tti.is_some()) {
             return Err(CacheError::ReplicatedWithLocalEviction { cache: name });
+        }
+
+        // Best-effort: catches a mismatch against whatever gossip has
+        // already converged on, but two nodes opening the same name under
+        // different `Mode`s at the same moment can both pass this — see
+        // `cluster::check_mode_conflicts` for the background sweep that
+        // catches what this race lets through.
+        if let Some(remote) = cluster
+            .peers()
+            .iter()
+            .find_map(|peer| peer.caches.get(&name).filter(|&&m| m != mode).copied())
+        {
+            return Err(CacheError::ModeMismatch {
+                cache: name,
+                local: mode,
+                remote,
+            });
         }
 
         let mut shard = Shard::<K, V>::new(
@@ -188,6 +222,11 @@ where
             }
             guard.insert(name.clone(), Arc::clone(&shard) as Arc<dyn ShardOps>);
         }
+        // Every possible early return is behind us now — this is the point
+        // `open()`'s docs mean by "successful": from here, gossip advertises
+        // `mode` for `name` so other nodes' opens (and the background sweep)
+        // can compare against it.
+        cluster.advertise_cache_mode(&name, mode).await;
 
         if !matches!(mode, Mode::Local) {
             cluster.spawn_tracked(crate::cluster::fan_out_task(
