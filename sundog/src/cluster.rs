@@ -1395,4 +1395,48 @@ mod tests {
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn clear_fans_tombstones_out_to_an_empty_peer() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-clear").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+
+        cache_a
+            .insert_many((0..10u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("a inserts");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_b.entry_count().await < 10 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b observes all ten entries within the bound");
+
+        cache_a.clear().await.expect("a clears");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_b.entry_count().await != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b's copy converges to empty within the bound");
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
 }

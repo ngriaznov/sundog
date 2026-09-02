@@ -272,6 +272,12 @@ where
         self.shard.get(key).await
     }
 
+    /// Reads whether `key` has a live entry, honoring expiry, without
+    /// cloning the stored value.
+    pub async fn contains_key(&self, key: &K) -> bool {
+        self.shard.contains_key(key).await
+    }
+
     /// The number of live entries in this node's local copy of the cache.
     ///
     /// Counts only this node: in `Invalidation` mode nodes legitimately hold
@@ -279,6 +285,14 @@ where
     /// two nodes may briefly disagree.
     pub async fn entry_count(&self) -> u64 {
         self.shard.entry_count().await
+    }
+
+    /// A weakly consistent, point-in-time snapshot of this node's local live
+    /// keys — not a cluster view, and no guarantee about a key inserted
+    /// concurrently with the scan. Cost is O(entries).
+    #[must_use]
+    pub fn keys(&self) -> Vec<K> {
+        self.shard.keys()
     }
 
     /// Reads `key`, invoking `loader` on a miss; concurrent misses on the
@@ -294,6 +308,21 @@ where
         E: std::error::Error + Send + Sync + 'static,
     {
         self.shard.get_or_load(key, loader).await
+    }
+
+    /// [`Cache::get_or_load`] for a loader that never fails: same stampede
+    /// collapse on concurrent misses, same fan-out of the fill. The
+    /// `Result` remains only for [`CacheError::Codec`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to postcard-encode.
+    pub async fn get_or_insert_with(
+        &self,
+        key: &K,
+        make: impl AsyncFnOnce(&K) -> V,
+    ) -> Result<V, CacheError> {
+        self.shard.get_or_insert_with(key, make).await
     }
 
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
@@ -369,6 +398,34 @@ where
     /// Returns a [`CacheError`] if the removal cannot be applied or fanned out.
     pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
         self.shard.remove(key).await
+    }
+
+    /// [`Cache::remove`] for many keys at once: each is stamped with its own
+    /// tombstone version and applied under one lock acquisition per touched
+    /// stripe — the tombstone counterpart of [`Cache::insert_many`]. **Not a
+    /// transaction** — same caveat as [`Cache::insert_many`], read "written"
+    /// as "tombstoned". Emits one [`Event::Removed`] per key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CacheError`] if any key fails to encode for the wire.
+    pub async fn remove_many(&self, keys: impl IntoIterator<Item = K>) -> Result<(), CacheError> {
+        self.shard.remove_many(keys).await
+    }
+
+    /// Tombstones every key this node currently holds — "remove every key I
+    /// currently hold", not a coordinated cluster-wide reset. An entry a
+    /// peer holds that never reached this node, or a concurrent write that
+    /// outraces the snapshot's tombstone on the HLC, survives; in
+    /// [`crate::store::Mode::Replicated`], where every node holds every
+    /// entry, that makes it a cluster-wide clear once the fanned-out
+    /// tombstones converge. Cost is O(entries).
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::remove_many`].
+    pub async fn clear(&self) -> Result<(), CacheError> {
+        self.shard.clear().await
     }
 
     /// Drops the local copy of `key` without writing a tombstone or fanning

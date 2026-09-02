@@ -994,12 +994,37 @@ where
         self.cache.get(key).await.map(|stored| stored.value.clone())
     }
 
+    /// Reads whether `key` has a live entry, honoring expiry, without
+    /// cloning the stored value — `moka`'s own `get`, not its `contains_key`
+    /// (which reports a not-yet-swept expired entry as present). Reads never
+    /// take a TTL argument at this API surface: this asks about the entry as
+    /// it was written, not against some other deadline.
+    pub async fn contains_key(&self, key: &K) -> bool {
+        self.cache.get(key).await.is_some()
+    }
+
     /// The number of live entries this node currently holds, with `moka`'s
     /// pending housekeeping flushed first so completed expirations and
     /// evictions are reflected rather than estimated.
     pub async fn entry_count(&self) -> u64 {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count()
+    }
+
+    /// A weakly consistent, point-in-time snapshot of this node's local live
+    /// keys, taken via `moka`'s own iteration — not a cluster view. `moka`'s
+    /// `iter` already excludes an entry once it is expired (it re-checks
+    /// each candidate through its own `scanning_get`, the same expiry check
+    /// `get` uses, rather than trusting a stale sweep), so no separate
+    /// `Stored::expires_at_ms` filter is layered on top here. It offers no
+    /// guarantee about a key inserted concurrently with the scan (`moka`'s
+    /// own iterator docs). Cost is O(entries).
+    #[must_use]
+    pub fn keys(&self) -> Vec<K> {
+        self.cache
+            .iter()
+            .map(|(key, _)| key.as_ref().clone())
+            .collect()
     }
 
     /// One pass over tombstones and live entries, distributing each into the
@@ -1078,6 +1103,24 @@ where
             .await
             .map_err(|err: Arc<E>| CacheError::Loader(Box::new(LoaderFailure(err))))?;
         Ok(stored.value.clone())
+    }
+
+    /// [`Shard::get_or_load`] for a loader that never fails: same stampede
+    /// collapse on concurrent misses, same fan-out of the fill. The
+    /// `Result` remains only for [`CacheError::Codec`] — `make` itself has
+    /// no way to fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to postcard-encode.
+    pub async fn get_or_insert_with<F>(&self, key: &K, make: F) -> Result<V, CacheError>
+    where
+        F: AsyncFnOnce(&K) -> V,
+    {
+        self.get_or_load(key, async move |k| {
+            Ok::<V, std::convert::Infallible>(make(k).await)
+        })
+        .await
     }
 
     /// Stamps and applies a local write, then fans it out per [`Mode`]
@@ -1262,6 +1305,76 @@ where
         )
         .await;
         Ok(())
+    }
+
+    /// [`Shard::remove`] for many keys at once: each is stamped with its own
+    /// tombstone version, grouped by key stripe (`stripe_of`), and applied
+    /// under one lock acquisition per touched stripe — the tombstone
+    /// counterpart of [`Shard::insert_many`]. **Not a transaction** — same
+    /// caveat as [`Shard::insert_many`], read "written" as "tombstoned": if
+    /// a key partway through fails to encode, the keys before it are still
+    /// tombstoned. Emits one [`Event::Removed`] per key and fans out in
+    /// [`FanOutNotice::Many`] chunks exactly as [`Shard::insert_many`]
+    /// describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CacheError`] if any key fails to encode for the wire.
+    pub async fn remove_many(&self, keys: impl IntoIterator<Item = K>) -> Result<(), CacheError> {
+        let mut prepared = Vec::new();
+        for key in keys {
+            let key_bytes = encode_key(&key)?;
+            let ver = self.stamp_local();
+            prepared.push((key, key_bytes, ver));
+        }
+
+        let mut by_stripe: Vec<Vec<_>> = (0..TOMBSTONE_STRIPES).map(|_| Vec::new()).collect();
+        for entry in prepared {
+            by_stripe[stripe_of(&entry.1)].push(entry);
+        }
+        for (stripe_idx, group) in by_stripe.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let mut applied_keys: Vec<K> = Vec::with_capacity(group.len());
+            let mut tombstones = self.tombstones[stripe_idx].lock().await;
+            for (key, key_bytes, ver) in group {
+                applied_keys.push(key.clone());
+                self.apply_locked(
+                    &mut tombstones,
+                    key,
+                    key_bytes,
+                    ver,
+                    Incoming::Tombstone,
+                    Origin::Local,
+                    false,
+                )
+                .await;
+            }
+            drop(tombstones);
+            for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
+                let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tombstones every key this node currently holds, via
+    /// [`Shard::remove_many`] over a snapshot of [`Shard::keys`]. This is
+    /// "remove every key I currently hold" — an entry a peer holds that
+    /// never reached this node, or a concurrent write that outraces the
+    /// snapshot's tombstone on the [`Hlc`], is untouched and survives. In
+    /// [`Mode::Replicated`], where every node holds every entry, that makes
+    /// it a cluster-wide clear once the fanned-out tombstones converge; in
+    /// [`Mode::Invalidation`] or [`Mode::Local`] it only ever empties this
+    /// node's own working set. Cost is O(entries) — a full scan of the local
+    /// cache.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::remove_many`].
+    pub async fn clear(&self) -> Result<(), CacheError> {
+        self.remove_many(self.keys()).await
     }
 
     /// Drops the local copy of `key` without writing a tombstone or fanning
@@ -2627,6 +2740,138 @@ mod tests {
             ShardOps::digests(&b).await,
             "digests diverged between replicas under the same custom resolver"
         );
+    }
+
+    #[tokio::test]
+    async fn contains_key_reflects_insert_remove_and_ttl_expiry() {
+        let s = shard::<u32, String>(1);
+        assert!(!s.contains_key(&1).await, "missing key");
+
+        s.insert(1, "a".into()).await.expect("insert");
+        assert!(s.contains_key(&1).await, "present after insert");
+
+        s.remove(&1).await.expect("remove");
+        assert!(!s.contains_key(&1).await, "gone after remove");
+
+        let ttl_shard = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            Some(Duration::from_millis(50)),
+            None,
+        );
+        ttl_shard
+            .insert(2, "short-lived".into())
+            .await
+            .expect("insert with default ttl");
+        assert!(ttl_shard.contains_key(&2).await, "present before expiry");
+        // Past the 50ms TTL and moka's timer-wheel granularity floor — see
+        // `run_pending_tasks_flushes_a_quiet_shards_stale_ttl_eviction_digest`.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(!ttl_shard.contains_key(&2).await, "gone after ttl expiry");
+    }
+
+    #[tokio::test]
+    async fn remove_many_tombstones_every_key_and_leaves_others_untouched() {
+        let s = shard::<u32, String>(1);
+        for k in 0..5u32 {
+            s.insert(k, k.to_string()).await.expect("insert");
+        }
+
+        let mut events = s.events();
+        s.remove_many([0u32, 1, 2]).await.expect("remove_many");
+
+        for k in 0..3u32 {
+            assert_eq!(s.get(&k).await, None, "key {k} must be tombstoned");
+            let recs = ShardOps::records_for(&s, vec![key_bytes(&k)]).await;
+            assert_eq!(recs.len(), 1);
+            assert!(
+                recs[0].is_tombstone(),
+                "key {k} must read back as a tombstone"
+            );
+        }
+        for k in 3..5u32 {
+            assert_eq!(
+                s.get(&k).await,
+                Some(k.to_string()),
+                "key {k} was not in the batch and must survive"
+            );
+        }
+
+        let mut removed = HashSet::new();
+        for _ in 0..3 {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("event arrives")
+                .expect("channel open")
+            {
+                Event::Removed { key, .. } => {
+                    removed.insert(key);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(removed, HashSet::from([0u32, 1, 2]));
+    }
+
+    #[tokio::test]
+    async fn clear_empties_a_populated_shard_and_leaves_tombstones() {
+        let s = shard::<u32, String>(1);
+        for k in 0..10u32 {
+            s.insert(k, k.to_string()).await.expect("insert");
+        }
+        assert_eq!(s.entry_count().await, 10);
+
+        s.clear().await.expect("clear");
+        assert_eq!(s.entry_count().await, 0);
+
+        for k in 0..10u32 {
+            let recs = ShardOps::records_for(&s, vec![key_bytes(&k)]).await;
+            assert_eq!(recs.len(), 1, "key {k} must leave a tombstone");
+            assert!(recs[0].is_tombstone());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_or_insert_with_fills_on_miss_and_skips_make_on_hit() {
+        let s = shard::<u32, String>(1);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let c1 = std::sync::Arc::clone(&calls);
+        let filled = s
+            .get_or_insert_with(&1, async move |_key: &u32| {
+                c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "loaded".to_string()
+            })
+            .await
+            .expect("fill succeeds");
+        assert_eq!(filled, "loaded");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let c2 = std::sync::Arc::clone(&calls);
+        let hit = s
+            .get_or_insert_with(&1, async move |_key: &u32| {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                "should-not-run".to_string()
+            })
+            .await
+            .expect("hit succeeds");
+        assert_eq!(hit, "loaded");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keys_returns_exactly_the_live_keys() {
+        let s = shard::<u32, String>(1);
+        for k in 0..5u32 {
+            s.insert(k, k.to_string()).await.expect("insert");
+        }
+        s.remove(&2).await.expect("remove");
+
+        let mut keys = s.keys();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![0, 1, 3, 4]);
     }
 }
 
