@@ -3,6 +3,34 @@
 All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] – Unreleased
+
+### Added
+
+- **Cache-config fingerprint gossip**: every node advertises the mode of
+  each open cache in its membership state. `open()` on a name a live peer
+  already runs under a different `Mode` fails with
+  `CacheError::ModeMismatch { cache, local, remote }` (`Mode::Local`
+  included — a private cache and a replicated one can't share a name), and
+  a conflict that slips past the open-time check (two nodes opening at the
+  same instant) is reported loudly when the peer's advertisement arrives.
+  TTL and capacity stay local knobs.
+- **API surface**: `Cache::contains_key` (expiry-aware, not counted as a
+  read), `Cache::keys` (a point-in-time local snapshot), `Cache::remove_many`
+  (the tombstone counterpart of `insert_many`: one lock acquisition per
+  stripe, one `Removed` event per key, batched fan-out), `Cache::clear`
+  (tombstones every key this node holds and fans them out — O(entries), and
+  in `Replicated` mode a cluster-wide clear once tombstones land), and
+  `Cache::get_or_insert_with` (an infallible-loader `get_or_load` with the
+  same stampede collapse). The `Shard` API gains the same methods.
+- **Per-cache metrics**: `sundog_cache_hits_total{cache}` and
+  `sundog_cache_misses_total{cache}` (a miss is one loader execution or one
+  empty `get`; collapsed waiters count as hits; `contains_key` counts as
+  neither), and a `sundog_cache_entries{cache}` gauge refreshed every five
+  seconds per open cache. Counter handles are created once per shard so the
+  read path pays an atomic increment, not label resolution. Two matching
+  Grafana panels (hit ratio, entries per cache).
+
 ## [0.1.2] – 2026-09-01
 
 ### Added

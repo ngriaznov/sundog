@@ -31,7 +31,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-sundog = "0.1"
+sundog = "0.2"
 ```
 
 sundog is async and runs on [tokio](https://tokio.rs) — the examples below
@@ -76,7 +76,11 @@ that's the project's acceptance test, run for real by the doctest in
 `sundog/src/lib.rs`. For bulk fills — a cold load from a backing store —
 use `users.insert_many(entries).await?`: every entry still gets its own HLC
 stamp and its own event, applied under one lock acquisition instead of one
-per entry.
+per entry. The rest of the surface: `contains_key`, `keys` (a local
+snapshot), `get_or_insert_with` (an infallible `get_or_load`),
+`remove_many`, and `clear` — which tombstones every key this node holds
+and fans the tombstones out, so in `Replicated` mode it empties the whole
+cluster once they land.
 
 ## Should you use this?
 
@@ -139,6 +143,12 @@ access. `Replicated` is the only mode that runs state transfer on join (a
 new node pulls a full snapshot from an existing peer) and keeps a
 background anti-entropy loop running for as long as the cache is open.
 
+Every node gossips the mode of each cache it has open. Opening a name
+under a different mode than a live peer already runs it in fails with
+`CacheError::ModeMismatch` — two nodes can't quietly disagree about
+whether `"users"` is replicated or invalidated. TTL and capacity are local
+knobs and are free to differ.
+
 ## How nodes find each other
 
 | Mechanism | Default? | What it does | Use it for |
@@ -165,8 +175,10 @@ save `Mdns` for host networking or bare-metal LANs.
 | `prometheus` | off | a Prometheus exporter — `ClusterBuilder::prometheus_listen` serves `GET /metrics` directly, or grab a recorder via `telemetry::prometheus_handle` and mount it in your own server |
 | `sim` | off | swaps the data-plane transport for `turmoil`'s, so the net layer can run inside a deterministic simulation — test-only, never enable it in a real deployment |
 
-Metrics (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
-`sundog_open_caches`, and a few more) are emitted regardless of features —
+Metrics (`sundog_cache_hits_total{cache}` / `sundog_cache_misses_total{cache}`,
+`sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,
+`sundog_live_peers`, `sundog_open_caches`, and a few more) are emitted
+regardless of features —
 without `prometheus`, they fall into the `metrics` crate's no-op default
 recorder instead of going anywhere. A ready-made Grafana dashboard for them
 lives at [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
