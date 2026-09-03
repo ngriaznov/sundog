@@ -72,7 +72,8 @@ where
         self
     }
 
-    /// Sets a local-only max-idle (TTI), not cluster-replicated. Default: no idle expiry.
+    /// Sets a local-only max-idle (TTI), not cluster-replicated. Default: no
+    /// idle expiry.
     pub fn tti(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self
@@ -267,7 +268,8 @@ where
         self.shard.get(key).await
     }
 
-    /// Reads whether `key` has a live entry, honoring expiry, without cloning it.
+    /// Reads whether `key` has a live entry, honoring expiry, without cloning
+    /// it.
     pub async fn contains_key(&self, key: &K) -> bool {
         self.shard.contains_key(key).await
     }
@@ -278,13 +280,15 @@ where
         self.shard.entry_count().await
     }
 
-    /// A weakly consistent snapshot of this node's local live keys, not a cluster view. O(entries).
+    /// A weakly consistent snapshot of this node's local live keys, not a
+    /// cluster view. O(entries).
     #[must_use]
     pub fn keys(&self) -> Vec<K> {
         self.shard.keys()
     }
 
-    /// Reads `key`, invoking `loader` on a miss; concurrent misses collapse into one `loader` call.
+    /// Reads `key`, invoking `loader` on a miss; concurrent misses collapse
+    /// into one `loader` call.
     ///
     /// # Errors
     ///
@@ -298,7 +302,8 @@ where
         self.shard.get_or_load(key, loader).await
     }
 
-    /// [`Cache::get_or_load`] for a loader that never fails; `Result` remains only for [`CacheError::Codec`].
+    /// [`Cache::get_or_load`] for a loader that never fails; `Result` remains
+    /// only for [`CacheError::Codec`].
     ///
     /// # Errors
     ///
@@ -370,7 +375,8 @@ where
         self.shard.remove(key).await
     }
 
-    /// [`Cache::remove`] for many keys at once, the tombstone counterpart of [`Cache::insert_many`].
+    /// [`Cache::remove`] for many keys at once, the tombstone counterpart of
+    /// [`Cache::insert_many`].
     ///
     /// # Errors
     ///
@@ -396,7 +402,8 @@ where
         self.shard.invalidate_local(key).await;
     }
 
-    /// Subscribes to this cache's change events, each tagged with its [`crate::store::Origin`].
+    /// Subscribes to this cache's change events, each tagged with its
+    /// [`crate::store::Origin`].
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event<K, V>> {
         self.shard.events()

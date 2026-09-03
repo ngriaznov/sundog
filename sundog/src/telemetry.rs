@@ -4,10 +4,10 @@
 //! no-op default recorder. This module wires an actual Prometheus recorder
 //! into the process, two ways:
 //!
-//! - [`crate::cluster::ClusterBuilder::prometheus_listen`] installs a
-//!   recorder and serves `GET /metrics` itself.
-//! - [`prometheus_handle`] installs a recorder with no listener, for a
-//!   process that serves `/metrics` from its own HTTP server.
+//! - [`crate::cluster::ClusterBuilder::prometheus_listen`] installs a recorder
+//!   and serves `GET /metrics` itself.
+//! - [`prometheus_handle`] installs a recorder with no listener, for a process
+//!   that serves `/metrics` from its own HTTP server.
 //!
 //! Both call `metrics::set_global_recorder`, a single process-global slot:
 //! whichever runs second fails rather than replacing the first recorder.

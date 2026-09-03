@@ -7,7 +7,8 @@ use smol_str::SmolStr;
 
 use crate::node::NodeId;
 
-/// Errors from encoding or decoding a [`crate::wire::Msg`] or [`crate::wire::WireRecord`].
+/// Errors from encoding or decoding a [`crate::wire::Msg`] or
+/// [`crate::wire::WireRecord`].
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     /// The frame exceeded [`crate::wire::MAX_FRAME`].

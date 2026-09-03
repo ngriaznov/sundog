@@ -167,7 +167,8 @@ impl Model {
     }
 
     /// [`super::ShardOps::gc_tombstones`]'s rule: drops tombstones past
-    /// `tombstone_ttl`, and past `tombstone_max_ttl` while any member is absent.
+    /// `tombstone_ttl`, and past `tombstone_max_ttl` while any member is
+    /// absent.
     pub fn gc(&mut self, any_member_absent: bool) {
         let now = self.now_ms();
         self.entries.retain(|_, entry| match entry {
@@ -477,7 +478,8 @@ fn assert_reads_match_model(shard: &Shard<u8, u8>, model: &Model) {
 }
 
 /// [`ShardOps::digests`] equals the XOR of [`entry_fingerprint`] over
-/// [`Model::entries`], and [`ShardOps::entries_for_buckets`] matches it as sets.
+/// [`Model::entries`], and [`ShardOps::entries_for_buckets`] matches it as
+/// sets.
 fn assert_digest_and_entries_match_model(shard: &Shard<u8, u8>, model: &Model) {
     let model_entries: HashSet<(Bytes, Hlc)> = model.entries().into_iter().collect();
 

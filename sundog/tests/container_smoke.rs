@@ -3,7 +3,8 @@
 //! port. Gated on `SUNDOG_CONTAINER_TESTS=1`.
 //!
 //! Run `SUNDOG_CONTAINER_TESTS=1 SUNDOG_TEST_BASE_IMAGE=rz-base:local
-//! RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test container_smoke -- --nocapture`.
+//! RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test
+//! container_smoke -- --nocapture`.
 
 mod container_util;
 

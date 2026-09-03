@@ -19,7 +19,8 @@ use crate::wire::MAX_FRAME;
 /// A node with `tls: None` and one with `tls: Some(_)` cannot join the same
 /// mesh: every connection between them fails outright rather than silently
 /// downgrading. Every certificate must carry [`crate::net::MESH_SERVER_NAME`]
-/// as a DNS SAN. A `sim`-feature build stays plaintext regardless of this field.
+/// as a DNS SAN. A `sim`-feature build stays plaintext regardless of this
+/// field.
 #[cfg(feature = "tls")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsConfig {
@@ -64,9 +65,11 @@ pub struct ClusterConfig {
     /// [`crate::wire::MAX_FRAME`]; `build()` rejects a higher value with
     /// [`crate::error::JoinError::InvalidConfig`].
     pub max_frame: usize,
-    /// Bind address for the gossip (membership) UDP socket. Port `0` picks the zeroconf default.
+    /// Bind address for the gossip (membership) UDP socket. Port `0` picks the
+    /// zeroconf default.
     pub gossip_bind_addr: SocketAddr,
-    /// Bind address for the data-plane TCP listener. Port `0` picks the zeroconf default.
+    /// Bind address for the data-plane TCP listener. Port `0` picks the
+    /// zeroconf default.
     pub data_bind_addr: SocketAddr,
     /// Cadence of chitchat's own SWIM gossip rounds, distinct from
     /// [`ae_interval`](Self::ae_interval). Chosen for sub-5s failure

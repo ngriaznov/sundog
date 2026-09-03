@@ -104,6 +104,7 @@ impl NodeSlot {
     /// Starts this node for the first time: opens the cluster and cache,
     /// and installs the event-feed listener that keeps `status` current.
     /// # Errors
+    ///
     /// Returns an error if the cluster fails to form or the cache to open.
     pub(crate) async fn start(
         self: &Arc<Self>,

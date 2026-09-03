@@ -43,6 +43,7 @@ impl Demo {
 /// Builds `args.nodes` node slots, starts every one, and spawns the
 /// background write-load routine.
 /// # Errors
+///
 /// Returns an error if any node fails to form its cluster or open the cache.
 pub(crate) async fn bootstrap(args: &Args) -> anyhow::Result<Demo> {
     let base_port = args

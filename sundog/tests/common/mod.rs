@@ -28,6 +28,7 @@ pub fn fast_config() -> ClusterConfig {
 /// snapshots, never a change stream, so bounded polling is the only
 /// race-free way to assert convergence from here.
 /// # Panics
+///
 /// Panics if `cond` has not returned `true` by `timeout`.
 pub async fn eventually<F, Fut>(timeout: Duration, mut cond: F)
 where
@@ -56,6 +57,7 @@ pub struct Node {
 
 /// Waits until `cluster` reports at least `expected` live peers.
 /// # Panics
+///
 /// Panics if the bound is not reached within `timeout`.
 pub async fn wait_for_peer_count(cluster: &Cluster, expected: usize, timeout: Duration) {
     eventually(timeout, || async { cluster.peers().len() >= expected }).await;

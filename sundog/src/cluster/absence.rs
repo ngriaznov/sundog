@@ -24,7 +24,8 @@ struct AbsenceState {
 /// Cheap-to-clone, cluster-wide view of which recently-known members are
 /// currently absent, fed by [`tracking_task`] and sampled by
 /// `tombstone_gc_task` via [`should_defer_gc`]. On a single-node cluster the
-/// live peer set is always empty, so [`AbsenceTracker::any_absent`] stays `false`.
+/// live peer set is always empty, so [`AbsenceTracker::any_absent`] stays
+/// `false`.
 #[derive(Clone, Default)]
 pub(crate) struct AbsenceTracker {
     state: Arc<StdMutex<AbsenceState>>,

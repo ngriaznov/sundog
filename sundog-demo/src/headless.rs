@@ -12,6 +12,7 @@ use crate::setup;
 /// Runs the headless smoke check, returning `0` if the live nodes
 /// converged on the same entry count and `1` if they diverged.
 /// # Errors
+///
 /// Returns an error if the cluster fails to bootstrap.
 pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> {
     let mut demo = setup::bootstrap(args).await?;

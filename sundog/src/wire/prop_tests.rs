@@ -45,7 +45,8 @@ fn wire_record_strategy() -> impl Strategy<Value = WireRecord> {
         })
 }
 
-/// The three raw-record-layout variants: `Replicate`, `ReplicateBatch`, `StChunk`.
+/// The three raw-record-layout variants: `Replicate`, `ReplicateBatch`,
+/// `StChunk`.
 fn raw_record_msg_strategy() -> impl Strategy<Value = Msg> {
     prop_oneof![
         (smol_str_strategy(), wire_record_strategy())

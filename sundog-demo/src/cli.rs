@@ -31,6 +31,7 @@ impl Default for Args {
 
 /// Parses `std::env::args()`, minus `argv[0]`, into [`Args`].
 /// # Errors
+///
 /// Returns an error for an unknown flag, a missing value, or a bad value.
 pub(crate) fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Args> {
     let mut parsed = Args::default();

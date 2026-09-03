@@ -12,7 +12,8 @@ use crate::setup::Demo;
 
 const FEED_CAPACITY: usize = 400;
 
-/// The TUI's mutable state for one run: node handles under `demo`, the rest presentation state.
+/// The TUI's mutable state for one run: node handles under `demo`, the rest
+/// presentation state.
 pub(crate) struct App {
     pub(crate) demo: Demo,
     pub(crate) cursor: usize,

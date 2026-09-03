@@ -26,7 +26,8 @@ fn per_donor_budget(total: Duration) -> Duration {
 }
 
 /// How [`run`] ended. [`Outcome::NoPeers`] is the caller's cue to arm
-/// [`late_sync_task`], since racing gossip convergence is normal on a cold join.
+/// [`late_sync_task`], since racing gossip convergence is normal on a cold
+/// join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Completed,
@@ -70,7 +71,8 @@ pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Sm
 }
 
 /// One-shot deferred warm-up for a cache opened before gossip converged:
-/// waits until the first live peer appears, or `cancel`, then runs [`run`] once.
+/// waits until the first live peer appears, or `cancel`, then runs [`run`]
+/// once.
 pub(crate) async fn late_sync_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,

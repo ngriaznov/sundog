@@ -1,9 +1,9 @@
-//! Typed shards over the store engine: versioned apply, conflict resolution, tombstones, and
-//! the per-bucket digests anti-entropy compares.
+//! Typed shards over the store engine: versioned apply, conflict resolution,
+//! tombstones, and the per-bucket digests anti-entropy compares.
 //!
-//! A `Shard` holds no network handle. Every local write pushes its key onto the shard's fan-out
-//! queue and publishes an `Origin::Local` [`Event`]; the cluster layer turns those into wire
-//! traffic.
+//! A `Shard` holds no network handle. Every local write pushes its key onto the
+//! shard's fan-out queue and publishes an `Origin::Local` [`Event`]; the
+//! cluster layer turns those into wire traffic.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -28,33 +28,36 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
-/// A sequential, single-threaded reference model of everything downstream of a successful wire
-/// decode. Shared by `sundog-fuzz`'s fuzz targets and `store::prop_tests`, so the semantics are
-/// written once. `#[doc(hidden)]`: a testing/fuzzing seam, not API.
+/// A sequential, single-threaded reference model of everything downstream of a
+/// successful wire decode. Shared by `sundog-fuzz`'s fuzz targets and
+/// `store::prop_tests`, so the semantics are written once. `#[doc(hidden)]`: a
+/// testing/fuzzing seam, not API.
 #[cfg(any(test, feature = "fuzzing"))]
 #[doc(hidden)]
 pub mod model;
 
-/// Number of anti-entropy buckets per shard: `bucket(k) = xxh3(key_bytes) & (BUCKET_COUNT - 1)`.
+/// Number of anti-entropy buckets per shard: `bucket(k) = xxh3(key_bytes) &
+/// (BUCKET_COUNT - 1)`.
 pub const BUCKET_COUNT: usize = 1024;
 
-/// A custom per-entry weigher for size-bounded eviction: `(key, value) -> weight`. Boxed so
-/// [`crate::cache::CacheBuilder::weigher`] and [`Shard::with_weigher`] can store one before its
-/// closure type is nameable.
+/// A custom per-entry weigher for size-bounded eviction: `(key, value) ->
+/// weight`. Boxed so [`crate::cache::CacheBuilder::weigher`] and
+/// [`Shard::with_weigher`] can store one before its closure type is nameable.
 pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
-/// Upper bound on records per [`WireRecord`] batch yielded by [`ShardOps::snapshot_chunks`],
-/// caps chunk size only for small-value caches: a chunk breaks earlier once its encoded size
-/// approaches [`MAX_FRAME`].
+/// Upper bound on records per [`WireRecord`] batch yielded by
+/// [`ShardOps::snapshot_chunks`], caps chunk size only for small-value caches:
+/// a chunk breaks earlier once its encoded size approaches [`MAX_FRAME`].
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
-/// Headroom reserved below [`MAX_FRAME`] for the `Msg::StChunk` envelope around a snapshot
-/// chunk's records.
+/// Headroom reserved below [`MAX_FRAME`] for the `Msg::StChunk` envelope around
+/// a snapshot chunk's records.
 const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 
-/// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in a `Msg::StChunk`.
-/// Splits on cumulative wire-encoded size as well as [`SNAPSHOT_CHUNK_SIZE`], since a fixed
-/// record count alone undercounts caches whose average value exceeds a few KiB.
+/// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in a
+/// `Msg::StChunk`. Splits on cumulative wire-encoded size as well as
+/// [`SNAPSHOT_CHUNK_SIZE`], since a fixed record count alone undercounts caches
+/// whose average value exceeds a few KiB.
 fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
     let budget = MAX_FRAME.saturating_sub(SNAPSHOT_CHUNK_ENVELOPE_HEADROOM);
     let mut chunks = Vec::new();
@@ -77,14 +80,15 @@ fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> 
     chunks
 }
 
-/// Capacity of each shard's [`Event`] broadcast channel. A subscriber that falls this far
-/// behind misses events (`broadcast::error::RecvError::Lagged`) instead of applying
-/// backpressure to writers.
+/// Capacity of each shard's [`Event`] broadcast channel. A subscriber that
+/// falls this far behind misses events (`broadcast::error::RecvError::Lagged`)
+/// instead of applying backpressure to writers.
 const EVENTS_CAPACITY: usize = 1024;
 
-/// Keys this node wrote locally and has not yet fanned out to `cluster::fan_out_task`. A write
-/// appends its key; a drain takes the whole backlog at once, so no channel ever drops a write.
-/// Holds keys, not values: `records_for_typed` re-fetches fresh wire bytes.
+/// Keys this node wrote locally and has not yet fanned out to
+/// `cluster::fan_out_task`. A write appends its key; a drain takes the whole
+/// backlog at once, so no channel ever drops a write. Holds keys, not values:
+/// `records_for_typed` re-fetches fresh wire bytes.
 pub(crate) struct FanOutQueue<K> {
     pending: StdMutex<Vec<K>>,
     notify: tokio::sync::Notify,
@@ -119,8 +123,8 @@ impl<K> FanOutQueue<K> {
         std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Resolves once the queue holds at least one key. A push that lands before the wait stores
-    /// a permit, so nothing is ever missed.
+    /// Resolves once the queue holds at least one key. A push that lands before
+    /// the wait stores a permit, so nothing is ever missed.
     pub(crate) async fn wait_nonempty(&self) {
         loop {
             if !self
@@ -149,15 +153,18 @@ impl<K> FanOutQueue<K> {
 pub enum Mode {
     /// No cluster traffic; entries live only on this node.
     Local,
-    /// Every node caches independently; writes broadcast an [`crate::wire::Msg::Invalidate`].
+    /// Every node caches independently; writes broadcast an
+    /// [`crate::wire::Msg::Invalidate`].
     Invalidation,
-    /// Every node holds every entry; writes broadcast the full [`crate::wire::Msg::Replicate`].
+    /// Every node holds every entry; writes broadcast the full
+    /// [`crate::wire::Msg::Replicate`].
     Replicated,
 }
 
 impl Mode {
-    /// The wire token gossiped for this mode under a `cache:<name>` chitchat key. A stable
-    /// string, not a `Debug`/`Display` impl, so renaming a variant never changes the wire.
+    /// The wire token gossiped for this mode under a `cache:<name>` chitchat
+    /// key. A stable string, not a `Debug`/`Display` impl, so renaming a
+    /// variant never changes the wire.
     pub(crate) const fn as_token(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -166,8 +173,9 @@ impl Mode {
         }
     }
 
-    /// Parses [`Mode::as_token`]'s output back into a `Mode`, or `None` for anything else, so an
-    /// unrecognized token skips that peer rather than failing the whole gossip round.
+    /// Parses [`Mode::as_token`]'s output back into a `Mode`, or `None` for
+    /// anything else, so an unrecognized token skips that peer rather than
+    /// failing the whole gossip round.
     pub(crate) fn from_token(token: &str) -> Option<Self> {
         match token {
             "local" => Some(Self::Local),
@@ -178,8 +186,8 @@ impl Mode {
     }
 }
 
-/// Who caused a cache [`Event`]: this node's own API call, or a message received from a remote
-/// peer.
+/// Who caused a cache [`Event`]: this node's own API call, or a message
+/// received from a remote peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Origin {
     /// Caused by a local `insert`/`remove`/`get_or_load` call.
@@ -199,64 +207,69 @@ pub enum Event<K, V> {
     Removed { key: K, origin: Origin },
 }
 
-/// Entries per bucket, as an anti-entropy exchange reports them: every requested bucket
-/// present, empty lists included.
+/// Entries per bucket, as an anti-entropy exchange reports them: every
+/// requested bucket present, empty lists included.
 pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
 
-/// The type-erased surface the network layer drives a shard through, wire bytes in and out.
-/// This is the boundary where postcard (de)serialization happens; local reads never
-/// deserialize. Implemented by `Shard<K, V>` for any `K`, `V` meeting its bounds, and held as
-/// `Arc<dyn ShardOps>` in the cluster's cache registry.
+/// The type-erased surface the network layer drives a shard through, wire bytes
+/// in and out. This is the boundary where postcard (de)serialization happens;
+/// local reads never deserialize. Implemented by `Shard<K, V>` for any `K`, `V`
+/// meeting its bounds, and held as `Arc<dyn ShardOps>` in the cluster's cache
+/// registry.
 ///
-/// Async methods return `BoxFuture` rather than `async fn` so `dyn ShardOps` stays usable from a
-/// `HashMap<SmolStr, Arc<dyn ShardOps>>`.
+/// Async methods return `BoxFuture` rather than `async fn` so `dyn ShardOps`
+/// stays usable from a `HashMap<SmolStr, Arc<dyn ShardOps>>`.
 pub trait ShardOps: Send + Sync {
-    /// Applies an inbound replicated record iff its version is newer than what's stored, the
-    /// versioned-apply rule that makes replication commutative.
+    /// Applies an inbound replicated record iff its version is newer than
+    /// what's stored, the versioned-apply rule that makes replication
+    /// commutative.
     fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()>;
 
-    /// [`ShardOps::apply_remote`] for a whole batch, one lock acquisition per touched stripe
-    /// rather than one per record.
+    /// [`ShardOps::apply_remote`] for a whole batch, one lock acquisition per
+    /// touched stripe rather than one per record.
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()>;
 
-    /// Drops the local copy of `key` iff `ver` is newer than the locally stored version. Not
-    /// routed through [`ConflictResolver`]: an invalidation carries no value, so `Hlc` order is
-    /// the only signal.
+    /// Drops the local copy of `key` iff `ver` is newer than the locally stored
+    /// version. Not routed through [`ConflictResolver`]: an invalidation
+    /// carries no value, so `Hlc` order is the only signal.
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()>;
 
-    /// This shard's current per-bucket XOR digests, `(bucket, digest)` for all [`BUCKET_COUNT`]
-    /// buckets. The first step of an anti-entropy round.
+    /// This shard's current per-bucket XOR digests, `(bucket, digest)` for all
+    /// [`BUCKET_COUNT`] buckets. The first step of an anti-entropy round.
     fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>>;
 
-    /// `(key, version)` for every live entry and un-GC'd tombstone in `bucket`, for a peer that
-    /// reported a digest mismatch there.
+    /// `(key, version)` for every live entry and un-GC'd tombstone in `bucket`,
+    /// for a peer that reported a digest mismatch there.
     fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
 
-    /// [`ShardOps::bucket_entries`] for many buckets in one pass, so an anti-entropy round
-    /// stays linear in shard size instead of quadratic.
+    /// [`ShardOps::bucket_entries`] for many buckets in one pass, so an
+    /// anti-entropy round stays linear in shard size instead of quadratic.
     fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries>;
 
-    /// The full [`WireRecord`] for each of `keys` this shard holds, present entries and
-    /// tombstones alike, answering an `AePull`.
+    /// The full [`WireRecord`] for each of `keys` this shard holds, present
+    /// entries and tombstones alike, answering an `AePull`.
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>>;
 
-    /// Streams the shard's full contents in ~500-record chunks for state transfer to a joining
-    /// node, applied on arrival through the same versioned [`ShardOps::apply_remote`] path as
-    /// live traffic.
+    /// Streams the shard's full contents in ~500-record chunks for state
+    /// transfer to a joining node, applied on arrival through the same
+    /// versioned [`ShardOps::apply_remote`] path as live traffic.
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>>;
 
-    /// Garbage-collects tombstones older than `tombstone_ttl`. While `any_member_absent`, a
-    /// tombstone past `tombstone_ttl` but not `tombstone_max_ttl` is left in place instead.
+    /// Garbage-collects tombstones older than `tombstone_ttl`. While
+    /// `any_member_absent`, a tombstone past `tombstone_ttl` but not
+    /// `tombstone_max_ttl` is left in place instead.
     fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()>;
 
-    /// Runs `engine::Engine::sweep`, since the engine has no free-running sweep of its own.
-    /// Called periodically by `tombstone_gc_task`, independent of read/write traffic.
+    /// Runs `engine::Engine::sweep`, since the engine has no free-running sweep
+    /// of its own. Called periodically by `tombstone_gc_task`, independent
+    /// of read/write traffic.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
 }
 
-/// One side of a [`ConflictResolver::winner`] comparison: everything a resolver needs to pick a
-/// winner, at the wire level. Carries postcard-encoded value bytes rather than the typed value,
-/// matching this module's "local reads never deserialize" boundary.
+/// One side of a [`ConflictResolver::winner`] comparison: everything a resolver
+/// needs to pick a winner, at the wire level. Carries postcard-encoded value
+/// bytes rather than the typed value, matching this module's "local reads never
+/// deserialize" boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct RecordView<'a> {
     /// The record's postcard-encoded value bytes, or `None` for a tombstone.
@@ -267,8 +280,8 @@ pub struct RecordView<'a> {
     pub expires_at_ms: Option<u64>,
 }
 
-/// The outcome of a [`ConflictResolver::winner`] call: which argument record wins, by position
-/// rather than role.
+/// The outcome of a [`ConflictResolver::winner`] call: which argument record
+/// wins, by position rather than role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Winner {
     /// The first record (`a`) wins; `b` is discarded.
@@ -277,36 +290,42 @@ pub enum Winner {
     B,
 }
 
-/// Picks a winner between two differently-versioned records for the same key. A resolver picks;
-/// it never merges, since a synthesized value would make `Shard::apply`'s outcome depend on
-/// which two versions happened to collide locally.
+/// Picks a winner between two differently-versioned records for the same key. A
+/// resolver picks; it never merges, since a synthesized value would make
+/// `Shard::apply`'s outcome depend on which two versions happened to collide
+/// locally.
 ///
 /// # Correctness contract
 ///
-/// `Shard::apply`'s convergence guarantee transfers to a custom resolver only if `winner` is
-/// deterministic (a pure function of `key`, `a`, `b`), antisymmetric (`winner(key, a, b) == A`
-/// iff `winner(key, b, a) == B`, never favoring argument position), and total and transitive
-/// (the "beats" relation over any set of distinct-version records for one key is a strict total
-/// order, with no cycle). `Shard::apply` calls `winner` only when `a.ver != b.ver`.
+/// `Shard::apply`'s convergence guarantee transfers to a custom resolver only
+/// if `winner` is deterministic (a pure function of `key`, `a`, `b`),
+/// antisymmetric (`winner(key, a, b) == A` iff `winner(key, b, a) == B`, never
+/// favoring argument position), and total and transitive (the "beats" relation
+/// over any set of distinct-version records for one key is a strict total
+/// order, with no cycle). `Shard::apply` calls `winner` only when `a.ver !=
+/// b.ver`.
 ///
-/// The default [`LwwResolver`] satisfies all three by comparing [`Hlc`] alone. A resolver that
-/// violates antisymmetry or transitivity is not safe on more than one replica: nothing in this
-/// crate detects the violation, and convergence stops holding.
+/// The default [`LwwResolver`] satisfies all three by comparing [`Hlc`] alone.
+/// A resolver that violates antisymmetry or transitivity is not safe on more
+/// than one replica: nothing in this crate detects the violation, and
+/// convergence stops holding.
 pub trait ConflictResolver: Send + Sync + 'static {
-    /// Decides which of `a`, `b`, two different versions of the record stored at `key`'s
-    /// wire-encoded bytes, wins. See the trait docs for the correctness contract.
+    /// Decides which of `a`, `b`, two different versions of the record stored
+    /// at `key`'s wire-encoded bytes, wins. See the trait docs for the
+    /// correctness contract.
     fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner;
 
-    /// Whether `winner` reads `RecordView::value`. Defaults to `true`. Override to `false` for
-    /// a resolver that, like [`LwwResolver`], only compares `ver`/`expires_at_ms`, so the
-    /// versioned apply skips encoding both records' values on every apply.
+    /// Whether `winner` reads `RecordView::value`. Defaults to `true`. Override
+    /// to `false` for a resolver that, like [`LwwResolver`], only compares
+    /// `ver`/`expires_at_ms`, so the versioned apply skips encoding both
+    /// records' values on every apply.
     fn needs_value_bytes(&self) -> bool {
         true
     }
 }
 
-/// The default resolver: last-write-wins by [`Hlc`], ignoring value bytes and `expires_at_ms`
-/// entirely.
+/// The default resolver: last-write-wins by [`Hlc`], ignoring value bytes and
+/// `expires_at_ms` entirely.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LwwResolver;
 
@@ -320,18 +339,18 @@ impl ConflictResolver for LwwResolver {
     }
 }
 
-/// A stored value paired with the version it was last written at, folded into the per-key
-/// version table, and its absolute expiry, so every replica converts the same origin-stamped
-/// deadline into a local remaining duration.
+/// A stored value paired with the version it was last written at, folded into
+/// the per-key version table, and its absolute expiry, so every replica
+/// converts the same origin-stamped deadline into a local remaining duration.
 #[derive(Debug, Clone)]
 pub struct Stored<V> {
     /// The current value.
     pub value: V,
-    /// `value`'s postcard-encoded bytes: the first encode's bytes on the local-origin path
-    /// (`insert`/`insert_many`/`get_or_load`'s fill), the verbatim wire bytes on the
-    /// replica-apply path (`apply_remote_batch`). Always equal to
-    /// `postcard::to_stdvec(&value)`, or to wire bytes decoding to a structurally equal
-    /// `value`.
+    /// `value`'s postcard-encoded bytes: the first encode's bytes on the
+    /// local-origin path (`insert`/`insert_many`/`get_or_load`'s fill), the
+    /// verbatim wire bytes on the replica-apply path
+    /// (`apply_remote_batch`). Always equal to `postcard::to_stdvec(&
+    /// value)`, or to wire bytes decoding to a structurally equal `value`.
     pub encoded: Bytes,
     /// The version this value was written at.
     pub ver: Hlc,
@@ -339,10 +358,10 @@ pub struct Stored<V> {
     pub expires_at_ms: Option<u64>,
 }
 
-/// A tombstone: the version of the delete that created it, and its two GC deadlines.
-/// `ttl_deadline_ms` is when it becomes eligible for ordinary collection; `max_deadline_ms` is
-/// the hard cap past which it collects regardless of member absence. See
-/// [`ShardOps::gc_tombstones`].
+/// A tombstone: the version of the delete that created it, and its two GC
+/// deadlines. `ttl_deadline_ms` is when it becomes eligible for ordinary
+/// collection; `max_deadline_ms` is the hard cap past which it collects
+/// regardless of member absence. See [`ShardOps::gc_tombstones`].
 #[derive(Debug, Clone, Copy)]
 struct Tombstone {
     ver: Hlc,
@@ -350,21 +369,23 @@ struct Tombstone {
     max_deadline_ms: u64,
 }
 
-/// What a versioned write carries into `Shard::apply`: a live value, or a deletion marker.
+/// What a versioned write carries into `Shard::apply`: a live value, or a
+/// deletion marker.
 enum Incoming<V> {
     Put {
         value: V,
         expires_at_ms: Option<u64>,
-        /// `value`'s postcard-encoded bytes. See [`Stored::encoded`] for which bytes this is on
-        /// each apply path.
+        /// `value`'s postcard-encoded bytes. See [`Stored::encoded`] for which
+        /// bytes this is on each apply path.
         encoded: Bytes,
     },
     Tombstone,
 }
 
-/// Wraps a stampede-collapsed loader failure, the type-erased `Arc<dyn Error + Send + Sync>`
-/// `engine::Inflight` stores so every joined waiter returns the same failure the owner saw, as
-/// a boxable [`std::error::Error`] for [`CacheError::Loader`].
+/// Wraps a stampede-collapsed loader failure, the type-erased `Arc<dyn Error +
+/// Send + Sync>` `engine::Inflight` stores so every joined waiter returns the
+/// same failure the owner saw, as a boxable [`std::error::Error`] for
+/// [`CacheError::Loader`].
 #[derive(Debug)]
 struct SharedLoaderFailure(Arc<dyn std::error::Error + Send + Sync>);
 
@@ -390,12 +411,14 @@ fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Worst-case postcard-encoded size of an [`Hlc`]: 10 LEB128 bytes for `wall_ms: u64`, 5 for
-/// `logical: u32`, 10 for `node: NodeId` (a `u64`), rounded up from 25 for headroom.
+/// Worst-case postcard-encoded size of an [`Hlc`]: 10 LEB128 bytes for
+/// `wall_ms: u64`, 5 for `logical: u32`, 10 for `node: NodeId` (a `u64`),
+/// rounded up from 25 for headroom.
 const HLC_ENCODED_MAX: usize = 32;
 
-/// `xxh3(key_bytes ‖ postcard(ver))`, the digest contribution of one live entry or tombstone.
-/// Encodes `ver` into a stack buffer, not a heap `Vec`, since this runs on every apply.
+/// `xxh3(key_bytes ‖ postcard(ver))`, the digest contribution of one live entry
+/// or tombstone. Encodes `ver` into a stack buffer, not a heap `Vec`, since
+/// this runs on every apply.
 fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
     let mut ver_buf = [0u8; HLC_ENCODED_MAX];
     let ver_bytes = postcard::to_slice(&ver, &mut ver_buf)
@@ -408,9 +431,9 @@ fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
 
 /// Postcard-encodes `key`, its wire form and digest-hash input alike.
 ///
-/// Debug builds assert the encoding round-trips to itself. A key type whose `Serialize` impl is
-/// not canonical, such as an iteration-order-dependent `HashMap`-typed key, would silently
-/// corrupt digests and break wire identity.
+/// Debug builds assert the encoding round-trips to itself. A key type whose
+/// `Serialize` impl is not canonical, such as an iteration-order-dependent
+/// `HashMap`-typed key, would silently corrupt digests and break wire identity.
 fn encode_key<K>(key: &K) -> Result<Bytes, CodecError>
 where
     K: Serialize + DeserializeOwned,
@@ -426,14 +449,14 @@ where
     Ok(Bytes::from(bytes))
 }
 
-/// A typed named cache: an `engine::Engine` of `K -> V` plus the version-and-conflict machinery
-/// that backs [`ShardOps`]. The typed `Cache<K, V>` handle users hold (`crate::cache`) wraps
-/// `Arc<Shard<K, V>>`.
+/// A typed named cache: an `engine::Engine` of `K -> V` plus the
+/// version-and-conflict machinery that backs [`ShardOps`]. The typed `Cache<K,
+/// V>` handle users hold (`crate::cache`) wraps `Arc<Shard<K, V>>`.
 ///
 /// # Bounds
 ///
-/// `K`'s postcard encoding doubles as its wire form and its digest-hash input, so it encodes
-/// deterministically. No map-typed keys.
+/// `K`'s postcard encoding doubles as its wire form and its digest-hash input,
+/// so it encodes deterministically. No map-typed keys.
 pub struct Shard<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -443,25 +466,28 @@ where
     mode: Mode,
     engine: Arc<Engine<K, V>>,
     events: broadcast::Sender<Event<K, V>>,
-    /// Keys written locally and not yet fanned out; see [`FanOutQueue`]. Kept separate from
-    /// `events` so its `receiver_count()` reflects only real external subscribers.
+    /// Keys written locally and not yet fanned out; see [`FanOutQueue`]. Kept
+    /// separate from `events` so its `receiver_count()` reflects only real
+    /// external subscribers.
     fan_out: Arc<FanOutQueue<K>>,
     /// Guards only the synchronous HLC bump itself, never held across `.await`.
     clock: StdMutex<HlcClock>,
-    /// The deterministic-clock hook every timestamp this shard stamps reads, in place of the
-    /// system clock. Defaults to it in [`Shard::new`]; overridden by [`Shard::with_clock`].
+    /// The deterministic-clock hook every timestamp this shard stamps reads, in
+    /// place of the system clock. Defaults to it in [`Shard::new`];
+    /// overridden by [`Shard::with_clock`].
     clock_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
     ttl: Option<Duration>,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
     resolver: Arc<dyn ConflictResolver>,
     max_frame: usize,
-    /// Remembered, with `tti` below, so [`Shard::with_weigher`] can rebuild `engine::Engine`
-    /// from scratch: a weigher installs only at construction.
+    /// Remembered, with `tti` below, so [`Shard::with_weigher`] can rebuild
+    /// `engine::Engine` from scratch: a weigher installs only at
+    /// construction.
     max_capacity: u64,
     tti: Option<Duration>,
-    /// Handle for `sundog_cache_hits_total{cache}`, created once here since label resolution
-    /// costs more than the read path can afford per call.
+    /// Handle for `sundog_cache_hits_total{cache}`, created once here since
+    /// label resolution costs more than the read path can afford per call.
     hits: metrics::Counter,
     /// Handle for `sundog_cache_misses_total{cache}`, same reason as `hits`.
     misses: metrics::Counter,
@@ -481,8 +507,9 @@ where
 {
     /// Builds a new shard. `node` stamps this shard's local writes.
     ///
-    /// Tombstone GC uses [`ClusterConfig::default`]'s `tombstone_ttl` until overridden via
-    /// [`Shard::with_tombstone_ttl`]; `Shard::new` takes no `ClusterConfig` itself.
+    /// Tombstone GC uses [`ClusterConfig::default`]'s `tombstone_ttl` until
+    /// overridden via [`Shard::with_tombstone_ttl`]; `Shard::new` takes no
+    /// `ClusterConfig` itself.
     #[must_use]
     pub fn new(
         name: SmolStr,
@@ -516,41 +543,47 @@ where
         }
     }
 
-    /// Overrides the tombstone retention period used by [`ShardOps::gc_tombstones`], defaulting
-    /// to [`ClusterConfig::default`]'s value. Own-and-return, for the composition layer to
-    /// thread a live cluster's configured `tombstone_ttl` through right after construction.
+    /// Overrides the tombstone retention period used by
+    /// [`ShardOps::gc_tombstones`], defaulting
+    /// to [`ClusterConfig::default`]'s value. Own-and-return, for the
+    /// composition layer to thread a live cluster's configured
+    /// `tombstone_ttl` through right after construction.
     #[must_use]
     pub fn with_tombstone_ttl(mut self, tombstone_ttl: Duration) -> Self {
         self.tombstone_ttl_ms = duration_ms(tombstone_ttl);
         self
     }
 
-    /// Overrides the hard cap on tombstone retention used by [`ShardOps::gc_tombstones`].
+    /// Overrides the hard cap on tombstone retention used by
+    /// [`ShardOps::gc_tombstones`].
     #[must_use]
     pub fn with_tombstone_max_ttl(mut self, tombstone_max_ttl: Duration) -> Self {
         self.tombstone_max_ttl_ms = duration_ms(tombstone_max_ttl);
         self
     }
 
-    /// Overrides the [`ConflictResolver`] `Shard::apply` consults whenever an incoming record's
-    /// version differs from what's stored. Defaults to [`LwwResolver`].
+    /// Overrides the [`ConflictResolver`] `Shard::apply` consults whenever an
+    /// incoming record's version differs from what's stored. Defaults to
+    /// [`LwwResolver`].
     #[must_use]
     pub fn with_resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
         self.resolver = resolver;
         self
     }
 
-    /// Overrides the hard cap [`Shard::insert`] enforces before writing a value, threaded from
-    /// a live cluster's configured `ClusterConfig::max_frame`. Defaults to [`MAX_FRAME`].
+    /// Overrides the hard cap [`Shard::insert`] enforces before writing a
+    /// value, threaded from a live cluster's configured
+    /// `ClusterConfig::max_frame`. Defaults to [`MAX_FRAME`].
     #[must_use]
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
         self
     }
 
-    /// Installs a custom per-entry weigher for size-bounded eviction, in place of the default
-    /// of one weight unit per entry. Rebuilds `engine::Engine` from scratch, so call this
-    /// immediately after [`Shard::new`], before any reads or writes reach this shard.
+    /// Installs a custom per-entry weigher for size-bounded eviction, in place
+    /// of the default of one weight unit per entry. Rebuilds
+    /// `engine::Engine` from scratch, so call this immediately after
+    /// [`Shard::new`], before any reads or writes reach this shard.
     #[must_use]
     pub fn with_weigher<W>(mut self, weigher: W) -> Self
     where
@@ -564,9 +597,9 @@ where
         self
     }
 
-    /// Overrides the clock every timestamp this shard stamps reads from, in place of the system
-    /// clock. Reserved for a deterministic-clock fuzz harness driving this shard's notion of
-    /// time.
+    /// Overrides the clock every timestamp this shard stamps reads from, in
+    /// place of the system clock. Reserved for a deterministic-clock fuzz
+    /// harness driving this shard's notion of time.
     #[doc(hidden)]
     #[must_use]
     pub fn with_clock(mut self, now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
@@ -586,8 +619,9 @@ where
         self.mode
     }
 
-    /// The timestamp, in epoch milliseconds, this shard stamps its writes, deadlines, and
-    /// sweeps with. The system clock, unless overridden by [`Shard::with_clock`].
+    /// The timestamp, in epoch milliseconds, this shard stamps its writes,
+    /// deadlines, and sweeps with. The system clock, unless overridden by
+    /// [`Shard::with_clock`].
     fn now_ms(&self) -> u64 {
         (self.clock_fn)()
     }
@@ -606,19 +640,22 @@ where
             .observe(self.now_ms(), remote);
     }
 
-    /// The absolute expiry a write stamped now carries: the per-write `ttl` if given, else
-    /// the shard's configured default, else none. Only this stamp is per-cache; everything
-    /// downstream reads each record's own `expires_at_ms`.
+    /// The absolute expiry a write stamped now carries: the per-write `ttl` if
+    /// given, else the shard's configured default, else none. Only this
+    /// stamp is per-cache; everything downstream reads each record's own
+    /// `expires_at_ms`.
     fn expiry_for(&self, ttl: Option<Duration>) -> Option<u64> {
         ttl.or(self.ttl)
             .map(|d| self.now_ms().saturating_add(duration_ms(d)))
     }
 
-    /// Handles the outcome of one versioned apply: a local write's fan-out and event. A
-    /// `Rejected` outcome, where the incoming record lost, is a silent no-op.
+    /// Handles the outcome of one versioned apply: a local write's fan-out and
+    /// event. A `Rejected` outcome, where the incoming record lost, is a
+    /// silent no-op.
     ///
-    /// `notify_fan_out: false` is how [`Shard::insert_many`] and [`Shard::remove_many`] opt out
-    /// of the per-write queue push in favor of one hand-off per stripe group.
+    /// `notify_fan_out: false` is how [`Shard::insert_many`] and
+    /// [`Shard::remove_many`] opt out of the per-write queue push in favor
+    /// of one hand-off per stripe group.
     fn handle_apply_outcome(
         &self,
         outcome: ApplyOutcome<K, V>,
@@ -655,15 +692,17 @@ where
         }
     }
 
-    /// The versioned-apply core: applies `incoming` at `ver` for `key` iff the configured
-    /// [`ConflictResolver`] picks it over whatever this shard currently holds, publishing the
-    /// resulting [`Event`] on success. Idempotent and commutative: the single path shared by
-    /// single writes, replication, state transfer, and anti-entropy repair. Bulk writes and
-    /// replicated batches go through `engine::Engine::apply_many` directly instead, holding one
-    /// stripe lock across a whole group.
+    /// The versioned-apply core: applies `incoming` at `ver` for `key` iff the
+    /// configured [`ConflictResolver`] picks it over whatever this shard
+    /// currently holds, publishing the resulting [`Event`] on success.
+    /// Idempotent and commutative: the single path shared by single writes,
+    /// replication, state transfer, and anti-entropy repair. Bulk writes and
+    /// replicated batches go through `engine::Engine::apply_many` directly
+    /// instead, holding one stripe lock across a whole group.
     ///
-    /// Equal versions are always a no-op: a given `(wall_ms, logical, node)` triple comes from
-    /// at most one write ever, so an equal-version incoming record is already the one stored.
+    /// Equal versions are always a no-op: a given `(wall_ms, logical, node)`
+    /// triple comes from at most one write ever, so an equal-version
+    /// incoming record is already the one stored.
     async fn apply(
         &self,
         key: K,
@@ -690,11 +729,11 @@ where
         self.handle_apply_outcome(outcome, origin, true);
     }
 
-    /// Reads `key`, without triggering read-through. A deleted key is never present, since a
-    /// tombstone leaves no live entry to find.
+    /// Reads `key`, without triggering read-through. A deleted key is never
+    /// present, since a tombstone leaves no live entry to find.
     ///
-    /// Counts `sundog_cache_hits_total{cache}` on `Some`, `sundog_cache_misses_total{cache}` on
-    /// `None`.
+    /// Counts `sundog_cache_hits_total{cache}` on `Some`,
+    /// `sundog_cache_misses_total{cache}` on `None`.
     pub async fn get(&self, key: &K) -> Option<V> {
         if let Some(value) = self.engine.get(key, self.now_ms()) {
             self.hits.increment(1);
@@ -705,37 +744,40 @@ where
         }
     }
 
-    /// Reads whether `key` has a live entry, honoring expiry, without cloning the stored value.
-    /// This asks about the entry as written, not against some other deadline; no read method
-    /// here takes a TTL argument. An existence check, not a read: it moves neither
+    /// Reads whether `key` has a live entry, honoring expiry, without cloning
+    /// the stored value. This asks about the entry as written, not against
+    /// some other deadline; no read method here takes a TTL argument. An
+    /// existence check, not a read: it moves neither
     /// `sundog_cache_hits_total` nor `sundog_cache_misses_total`.
     pub async fn contains_key(&self, key: &K) -> bool {
         self.engine.contains_key(key, self.now_ms())
     }
 
-    /// The number of live entries this node currently holds. Runs the engine's sweep first, so
-    /// completed TTL/TTI expiries are reflected rather than estimated. Sampled periodically by
-    /// `cluster::cache_entries_gauge_task` to publish `sundog_cache_entries{cache}`.
+    /// The number of live entries this node currently holds. Runs the engine's
+    /// sweep first, so completed TTL/TTI expiries are reflected rather than
+    /// estimated. Sampled periodically by
+    /// `cluster::cache_entries_gauge_task` to publish
+    /// `sundog_cache_entries{cache}`.
     pub async fn entry_count(&self) -> u64 {
         let now = self.now_ms();
         self.engine.sweep(now);
         self.engine.live_entry_count()
     }
 
-    /// A weakly consistent, point-in-time snapshot of this node's local live keys. Not a
-    /// cluster view, and gives no guarantee about a key inserted concurrently with the scan.
-    /// Cost is O(entries).
+    /// A weakly consistent, point-in-time snapshot of this node's local live
+    /// keys. Not a cluster view, and gives no guarantee about a key
+    /// inserted concurrently with the scan. Cost is O(entries).
     #[must_use]
     pub fn keys(&self) -> Vec<K> {
         self.engine.keys(self.now_ms())
     }
 
-    /// Reads `key`, invoking `loader` on a miss. Concurrent callers racing on the same missing
-    /// key collapse into one `loader` call.
+    /// Reads `key`, invoking `loader` on a miss. Concurrent callers racing on
+    /// the same missing key collapse into one `loader` call.
     ///
-    /// Counts `sundog_cache_misses_total{cache}` exactly once per `loader` execution, from the
-    /// fill's owner. Every other call, a cache hit or a collapsed caller, counts
-    /// `sundog_cache_hits_total{cache}` instead.
+    /// Counts `sundog_cache_misses_total{cache}` exactly once per `loader`
+    /// execution, from the fill's owner. Every other call, a cache hit or a
+    /// collapsed caller, counts `sundog_cache_hits_total{cache}` instead.
     ///
     /// # Errors
     ///
@@ -743,8 +785,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if a value the loader returned fails to postcard-encode, since `Shard::insert`
-    /// relies on the same bound to encode any `V`.
+    /// Panics if a value the loader returned fails to postcard-encode, since
+    /// `Shard::insert` relies on the same bound to encode any `V`.
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
         F: AsyncFnOnce(&K) -> Result<V, E>,
@@ -763,15 +805,17 @@ where
                     return Ok(value);
                 }
                 JoinOutcome::Join(inflight, mut done) => {
-                    // `Err` means the owner's `Inflight` dropped without finishing; the next
-                    // iteration takes over the load.
+                    // `Err` means the owner's `Inflight` dropped without
+                    // finishing; the next iteration takes
+                    // over the load.
                     let _ = done.changed().await;
                     if let Some(err) = inflight.error.get() {
                         return Err(CacheError::Loader(Box::new(SharedLoaderFailure(
                             Arc::clone(err),
                         ))));
                     }
-                    // The fast-path read above picks up the fresh value, or its absence.
+                    // The fast-path read above picks up the fresh value, or its
+                    // absence.
                 }
                 JoinOutcome::Owner(inflight) => {
                     let guard =
@@ -824,9 +868,10 @@ where
         }
     }
 
-    /// [`Shard::get_or_load`] for a loader that never fails: same stampede collapse on
-    /// concurrent misses, same fan-out of the fill. The `Result` remains only for
-    /// [`CacheError::Codec`]; `make` itself cannot fail.
+    /// [`Shard::get_or_load`] for a loader that never fails: same stampede
+    /// collapse on concurrent misses, same fan-out of the fill. The
+    /// `Result` remains only for [`CacheError::Codec`]; `make` itself
+    /// cannot fail.
     ///
     /// # Errors
     ///
@@ -841,20 +886,22 @@ where
         .await
     }
 
-    /// Stamps and applies a local write, then fans it out per [`Mode`]: `Invalidate` for
-    /// `Mode::Invalidation`, `Replicate` for `Mode::Replicated`, nothing for `Mode::Local`,
-    /// through the composition layer's subscription to [`Shard::events`].
+    /// Stamps and applies a local write, then fans it out per [`Mode`]:
+    /// `Invalidate` for `Mode::Invalidation`, `Replicate` for
+    /// `Mode::Replicated`, nothing for `Mode::Local`, through the
+    /// composition layer's subscription to [`Shard::events`].
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] if the wire frame this write would replicate as
-    /// exceeds the configured frame cap. See [`Shard::with_max_frame`], default [`MAX_FRAME`].
+    /// Returns [`CacheError::ValueTooLarge`] if the wire frame this write would
+    /// replicate as exceeds the configured frame cap. See
+    /// [`Shard::with_max_frame`], default [`MAX_FRAME`].
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.insert_expiring(key, value, None).await
     }
 
-    /// [`Shard::insert`] with a lifespan for this entry alone, overriding the shard's default
-    /// TTL. Replicates exactly as a default-TTL stamp does.
+    /// [`Shard::insert`] with a lifespan for this entry alone, overriding the
+    /// shard's default TTL. Replicates exactly as a default-TTL stamp does.
     ///
     /// # Errors
     ///
@@ -896,15 +943,16 @@ where
         Ok(())
     }
 
-    /// [`Shard::insert`] for many entries, grouped by key stripe and applied under one lock
-    /// acquisition per touched stripe rather than one per entry, so unrelated writers to other
-    /// stripes are never blocked for the whole batch. Not a transaction: entries validated
+    /// [`Shard::insert`] for many entries, grouped by key stripe and applied
+    /// under one lock acquisition per touched stripe rather than one per
+    /// entry, so unrelated writers to other stripes are never blocked for
+    /// the whole batch. Not a transaction: entries validated
     /// before an oversized one apply regardless of the error this returns.
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] if any entry's wire frame exceeds the configured
-    /// frame cap (see [`Shard::insert`]).
+    /// Returns [`CacheError::ValueTooLarge`] if any entry's wire frame exceeds
+    /// the configured frame cap (see [`Shard::insert`]).
     pub async fn insert_many(
         &self,
         entries: impl IntoIterator<Item = (K, V)>,
@@ -912,8 +960,9 @@ where
         self.insert_many_expiring(entries, None).await
     }
 
-    /// [`Shard::insert_many`] with one lifespan applied to every entry in the batch, overriding
-    /// the shard's default TTL. See [`Shard::insert_with_ttl`].
+    /// [`Shard::insert_many`] with one lifespan applied to every entry in the
+    /// batch, overriding the shard's default TTL. See
+    /// [`Shard::insert_with_ttl`].
     ///
     /// # Errors
     ///
@@ -990,8 +1039,8 @@ where
             for outcome in outcomes {
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-            // Handed off per stripe as it lands, so replication streams while the rest of the
-            // fill is still applying.
+            // Handed off per stripe as it lands, so replication streams while
+            // the rest of the fill is still applying.
             self.fan_out.extend(applied_keys.drain(..));
         }
         Ok(())
@@ -1018,8 +1067,8 @@ where
     }
 
     /// [`Shard::remove`] for many keys at once, the tombstone counterpart of
-    /// [`Shard::insert_many`]. **Not a transaction**: if a key partway through fails to encode,
-    /// the keys before it are still tombstoned.
+    /// [`Shard::insert_many`]. **Not a transaction**: if a key partway through
+    /// fails to encode, the keys before it are still tombstoned.
     ///
     /// # Errors
     ///
@@ -1066,8 +1115,9 @@ where
         Ok(())
     }
 
-    /// Tombstones every key this node currently holds, via [`Shard::remove_many`] over a
-    /// snapshot of [`Shard::keys`], cost O(entries). An entry a peer holds that never reached
+    /// Tombstones every key this node currently holds, via
+    /// [`Shard::remove_many`] over a snapshot of [`Shard::keys`], cost
+    /// O(entries). An entry a peer holds that never reached
     /// this node survives untouched.
     ///
     /// # Errors
@@ -1077,9 +1127,9 @@ where
         self.remove_many(self.keys()).await
     }
 
-    /// Drops the local copy of `key` without writing a tombstone or fanning out. An escape
-    /// hatch for tests and manual cache-busting; the entry may reappear on the next replicated
-    /// write or anti-entropy round.
+    /// Drops the local copy of `key` without writing a tombstone or fanning
+    /// out. An escape hatch for tests and manual cache-busting; the entry
+    /// may reappear on the next replicated write or anti-entropy round.
     pub async fn invalidate_local(&self, key: &K) {
         let Ok(key_bytes) = postcard::to_stdvec(key) else {
             return;
@@ -1094,16 +1144,18 @@ where
         self.events.subscribe()
     }
 
-    /// The queue of locally written keys awaiting fan-out. `fan_out_task`'s cheaper alternative
-    /// to subscribing on [`Shard::events`], since it never reads `Event`'s `value`. Carries
-    /// local writes only; see [`FanOutQueue`].
+    /// The queue of locally written keys awaiting fan-out. `fan_out_task`'s
+    /// cheaper alternative to subscribing on [`Shard::events`], since it
+    /// never reads `Event`'s `value`. Carries local writes only; see
+    /// [`FanOutQueue`].
     pub(crate) fn fan_out_queue(&self) -> Arc<FanOutQueue<K>> {
         Arc::clone(&self.fan_out)
     }
 
-    /// [`ShardOps::records_for`] for callers that already hold typed `K`s, such as
-    /// `cluster::fan_out_batch` re-fetching for keys read off its own `Event<K, V>`s. Encodes
-    /// each key straight to the bytes `engine::Engine::record_for` looks entries up by, with no
+    /// [`ShardOps::records_for`] for callers that already hold typed `K`s, such
+    /// as `cluster::fan_out_batch` re-fetching for keys read off its own
+    /// `Event<K, V>`s. Encodes each key straight to the bytes
+    /// `engine::Engine::record_for` looks entries up by, with no
     /// decode step on either end.
     pub(crate) async fn records_for_typed(&self, keys: &[K]) -> Vec<WireRecord> {
         let now = self.now_ms();
@@ -1127,8 +1179,9 @@ where
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            // Grouping by raw key bytes' stripe needs no decode. Each group keeps `recs`'
-            // relative order, so the same key always lands in the same stripe in arrival order.
+            // Grouping by raw key bytes' stripe needs no decode. Each group
+            // keeps `recs`' relative order, so the same key always
+            // lands in the same stripe in arrival order.
             type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
             let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
                 (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
@@ -1224,8 +1277,8 @@ where
 
     fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries> {
         let now = self.now_ms();
-        // Every requested bucket exactly once, ascending, so the initiator learns to push even
-        // for buckets this peer holds nothing in.
+        // Every requested bucket exactly once, ascending, so the initiator
+        // learns to push even for buckets this peer holds nothing in.
         let mut wanted: Vec<u16> = buckets
             .into_iter()
             .collect::<HashSet<_>>()
@@ -1385,7 +1438,8 @@ mod tests {
         let s = shard::<u32, String>(1);
         s.insert(1, "fresh".into()).await.expect("insert");
 
-        // An invalidation for an old version does not evict a newer local write.
+        // An invalidation for an old version does not evict a newer local
+        // write.
         ShardOps::invalidate(&s, key_bytes(&1u32), hlc(1, 9)).await;
         assert_eq!(s.get(&1).await, Some("fresh".into()));
 
@@ -1507,7 +1561,8 @@ mod tests {
             tasks.spawn(async move {
                 s.get_or_load(&42, async move |_key: &u32| -> Result<String, BoomError> {
                     calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    // Widens the race window so every caller waits on this one load.
+                    // Widens the race window so every caller waits on this one
+                    // load.
                     tokio::time::sleep(Duration::from_millis(30)).await;
                     Ok("loaded-once".to_string())
                 })
@@ -1605,7 +1660,8 @@ mod tests {
         assert_eq!(b.get(&42).await, None);
     }
 
-    /// Two keys guaranteed to land in different stripes, for the striping tests below.
+    /// Two keys guaranteed to land in different stripes, for the striping tests
+    /// below.
     fn two_keys_in_different_stripes() -> (u32, u32) {
         let a = 0u32;
         let a_stripe = bucket_of(&key_bytes(&a));
@@ -1705,7 +1761,8 @@ mod tests {
         ShardOps::apply_remote(&b, recs[0].clone()).await;
         assert_eq!(b.get(&1).await, Some("short-lived".into()));
 
-        // Waits well past the 50ms TTL, matching the digest-flushing test below.
+        // Waits well past the 50ms TTL, matching the digest-flushing test
+        // below.
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert_eq!(a.get(&1).await, None, "the origin's own copy expires");
         assert_eq!(
@@ -1776,8 +1833,9 @@ mod tests {
         }
     }
 
-    /// Covers both [`ShardOps::apply_remote`] and [`ShardOps::apply_remote_batch`], and both a
-    /// key that expired for real and one that never existed.
+    /// Covers both [`ShardOps::apply_remote`] and
+    /// [`ShardOps::apply_remote_batch`], and both a key that expired for
+    /// real and one that never existed.
     #[tokio::test]
     async fn dead_on_arrival_ttl_record_never_resurrects_a_locally_expired_entry() {
         let s = Shard::<u32, String>::new(
@@ -1861,7 +1919,8 @@ mod tests {
         assert_digest_matches_full_recompute(&s).await;
     }
 
-    /// Forces one tombstone's `ttl_deadline_ms`, and `max_deadline_ms` too when `past_max`.
+    /// Forces one tombstone's `ttl_deadline_ms`, and `max_deadline_ms` too when
+    /// `past_max`.
     fn force_tombstone_past_ttl<K, V>(s: &Shard<K, V>, key_bytes: &Bytes, past_max: bool)
     where
         K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -1946,7 +2005,8 @@ mod tests {
         s.insert(1, "value".into()).await.expect("insert");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Logical expiry is visible before the engine's sweep corrects the digest.
+        // Logical expiry is visible before the engine's sweep corrects the
+        // digest.
         assert!(
             ShardOps::bucket_entries(&s, bucket_of(&key_bytes(&1u32)))
                 .await
@@ -2027,7 +2087,8 @@ mod tests {
 
     #[tokio::test]
     async fn insert_rejects_when_the_value_alone_fits_but_the_wire_frame_does_not() {
-        // The value's own encoding fits a 25-byte cap; the record's full wire frame does not.
+        // The value's own encoding fits a 25-byte cap; the record's full wire
+        // frame does not.
         let s = shard::<u32, Vec<u8>>(1).with_max_frame(25);
         let err = s
             .insert(1, vec![0u8; 20])
@@ -2049,8 +2110,9 @@ mod tests {
         );
     }
 
-    /// A resolver where the longer value wins, `Hlc` breaking ties on equal length. `(len, ver)`
-    /// compared lexicographically satisfies `ConflictResolver::winner`'s contract.
+    /// A resolver where the longer value wins, `Hlc` breaking ties on equal
+    /// length. `(len, ver)` compared lexicographically satisfies
+    /// `ConflictResolver::winner`'s contract.
     #[derive(Debug, Clone, Copy)]
     struct LongestValueWins;
 
@@ -2171,8 +2233,8 @@ mod tests {
         assert_eq!(s.get(&1).await, Some(vec![0u8; 20]));
     }
 
-    /// The permutation-convergence property holds for a custom resolver too, not only the
-    /// default one.
+    /// The permutation-convergence property holds for a custom resolver too,
+    /// not only the default one.
     #[tokio::test]
     async fn custom_resolver_converges_across_permutations_and_duplicates() {
         let a = shard::<u32, Vec<u8>>(10).with_resolver(Arc::new(LongestValueWins));

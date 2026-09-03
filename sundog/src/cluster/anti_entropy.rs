@@ -84,7 +84,8 @@ fn jittered(interval: Duration) -> Duration {
 /// running one anyway; a steady trickle must not starve anti-entropy.
 const MAX_STREAMING_SKIPS: u32 = 3;
 
-/// Whether to skip this round: only while traffic is in motion, never more than [`MAX_STREAMING_SKIPS`] times running.
+/// Whether to skip this round: only while traffic is in motion, never more than
+/// [`MAX_STREAMING_SKIPS`] times running.
 fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
     streaming && skipped_so_far < MAX_STREAMING_SKIPS
 }
@@ -142,7 +143,8 @@ pub(crate) async fn run_round_against(
 
     let mut push_keys: Vec<Bytes> = Vec::new();
     let mut pull_keys: Vec<Bytes> = Vec::new();
-    // Sketch-decoded pulls know only a key hash and are answered per bucket, so they queue separately from `pull_keys`.
+    // Sketch-decoded pulls know only a key hash and are answered per bucket, so
+    // they queue separately from `pull_keys`.
     let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
     let mut undecodable_buckets: Vec<u16> = Vec::new();
 
@@ -217,7 +219,8 @@ async fn apply_repairs(
     for batch in push_keys.chunks(REPAIR_BATCH) {
         let records = shard.records_for(batch.to_vec()).await;
         repaired += records.len() as u64;
-        // `net::batch_replicate` chunks this into a handful of full frames, not one `Msg::Replicate` per record.
+        // `net::batch_replicate` chunks this into a handful of full frames, not
+        // one `Msg::Replicate` per record.
         let msgs = crate::net::batch_replicate(cache, records);
         mesh.send_many(peer, MsgClass::Replicate, msgs);
     }
@@ -265,7 +268,8 @@ async fn apply_repairs(
 /// comparison sketch, subtracts the received one, and peels it. On success,
 /// [`diff_decoded`] classifies the result into `push_keys`/`pull_hashes`; on
 /// failure queues `bucket` into `undecodable_buckets` for the
-/// `Msg::AeEntries` fallback. Emits `sundog_ae_sketch_total{outcome}` either way.
+/// `Msg::AeEntries` fallback. Emits `sundog_ae_sketch_total{outcome}` either
+/// way.
 fn handle_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,

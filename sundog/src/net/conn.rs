@@ -54,7 +54,8 @@ async fn establish_dial(stream: TcpStream, _tls: &TlsCtx) -> std::io::Result<Mes
     std::future::ready(Ok(stream)).await
 }
 
-/// Layers TLS onto a freshly accepted `stream`, the accept-side counterpart of [`establish_dial`].
+/// Layers TLS onto a freshly accepted `stream`, the accept-side counterpart of
+/// [`establish_dial`].
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 async fn establish_accept(stream: TcpStream, tls: &TlsCtx) -> std::io::Result<MeshStream> {
     match tls {
@@ -116,7 +117,8 @@ pub(crate) const REPLICATE_BATCH_COUNT: usize = 4096;
 
 /// A run of consecutive same-cache `Msg::Replicate`/`Msg::ReplicateBatch`
 /// [`OutFrame`]s considered for merging, tracked with cumulative frame byte
-/// size for [`REPLICATE_BATCH_BUDGET`] and record count for [`REPLICATE_BATCH_COUNT`].
+/// size for [`REPLICATE_BATCH_BUDGET`] and record count for
+/// [`REPLICATE_BATCH_COUNT`].
 struct PendingRun {
     cache: SmolStr,
     items: Vec<OutFrame>,
@@ -736,7 +738,8 @@ pub(super) async fn collect_ae_buckets(
 
 /// Reads `AeBucket`/`AeSketch` replies until [`Msg::ReqDone`] marks the
 /// reply complete: [`Mesh::ae_round`]'s collector, one [`super::AeMismatch`]
-/// per bucket regardless of shape. Same pool-checkin rules as [`collect_ae_buckets`].
+/// per bucket regardless of shape. Same pool-checkin rules as
+/// [`collect_ae_buckets`].
 ///
 /// [`Mesh::ae_round`]: super::Mesh::ae_round
 pub(super) async fn collect_ae_mismatches(
@@ -763,7 +766,8 @@ pub(super) async fn collect_ae_mismatches(
     }
 }
 
-/// Reads `Replicate`/`ReplicateBatch` replies until [`Msg::ReqDone`], per [`collect_ae_buckets`].
+/// Reads `Replicate`/`ReplicateBatch` replies until [`Msg::ReqDone`], per
+/// [`collect_ae_buckets`].
 pub(super) async fn collect_pulled_records(
     mut framed: PeerFramed,
     pool: &ReqPool,

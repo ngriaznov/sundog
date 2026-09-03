@@ -38,6 +38,7 @@ fn base_image() -> String {
 /// returns its release binary path. `chitchat` pulls `zstd-sys`, which needs
 /// `CC_x86_64_unknown_linux_musl` to point at a musl-capable `cc`.
 /// # Panics
+///
 /// Panics if the build command cannot be spawned or exits non-zero.
 pub fn build_testnode() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
@@ -79,6 +80,7 @@ impl Node {
     /// cluster `cluster_name`, seeded from `seeds`. Waits for the
     /// `testnode-ready` log line before returning.
     /// # Panics
+    ///
     /// Panics if the container fails to start or never becomes ready.
     pub async fn spawn(
         net: &Arc<Network>,
@@ -121,6 +123,7 @@ impl Node {
 
     /// `put k v`.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the reply is not `ok`.
     pub async fn put(&self, key: &str, value: &str) -> Result<(), String> {
         match self.command(&format!("put {key} {value}")).await?.as_str() {
@@ -131,6 +134,7 @@ impl Node {
 
     /// `get k`, returning `Some(value)` on `val <v>` and `None` on `none`.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the reply matches neither.
     pub async fn get(&self, key: &str) -> Result<Option<String>, String> {
         match self.command(&format!("get {key}")).await? {
@@ -145,6 +149,7 @@ impl Node {
 
     /// `del k`.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the reply is not `ok`.
     pub async fn del(&self, key: &str) -> Result<(), String> {
         match self.command(&format!("del {key}")).await?.as_str() {
@@ -155,6 +160,7 @@ impl Node {
 
     /// `count`, the node's live-entry count including replicated writes.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the reply is not numeric.
     pub async fn count(&self) -> Result<usize, String> {
         self.command("count")
@@ -166,6 +172,7 @@ impl Node {
     /// `fill n`, bulk-inserting `k0..kn` locally with no control round trip
     /// per entry.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the node reports an error.
     pub async fn fill(&self, count: u32) -> Result<(), String> {
         match self.command(&format!("fill {count}")).await?.as_str() {
@@ -177,6 +184,7 @@ impl Node {
     /// `churn n`, running `n` back-to-back insert/remove operations (3:1
     /// mix) on the node's short-TTL `"churn"` cache over a fixed key space.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or an operation fails mid-run.
     pub async fn churn(&self, ops: u32) -> Result<(), String> {
         match self.command(&format!("churn {ops}")).await?.as_str() {
@@ -187,6 +195,7 @@ impl Node {
 
     /// `ccount`, the live-entry count of the node's short-TTL `"churn"` cache.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the reply is not numeric.
     pub async fn churn_count(&self) -> Result<usize, String> {
         self.command("ccount")
@@ -198,6 +207,7 @@ impl Node {
     /// `bigfill n bytes`, bulk-inserting `big0..bign` with a deterministic
     /// `bytes`-sized value each.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the node reports an error.
     pub async fn big_fill(&self, count: u32, bytes: usize) -> Result<(), String> {
         match self
@@ -213,6 +223,7 @@ impl Node {
     /// `bigcheck i bytes`: the node regenerates `bigi`'s expected value and
     /// byte-compares it, replying `ok`, `bad ...`, or `none`.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails.
     pub async fn big_check(&self, index: u32, bytes: usize) -> Result<String, String> {
         self.command(&format!("bigcheck {index} {bytes}")).await
@@ -221,6 +232,7 @@ impl Node {
     /// `bigput bytes`, inserting one `bytes`-sized value under the fixed
     /// large-value key, replying `ok` or `err ...`.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails.
     pub async fn big_put(&self, bytes: usize) -> Result<String, String> {
         self.command(&format!("bigput {bytes}")).await
@@ -229,6 +241,7 @@ impl Node {
     /// `bigverify bytes`, content-checking the fixed large-value key the way
     /// [`Node::big_check`] does for `bigi` keys.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails.
     pub async fn big_verify(&self, bytes: usize) -> Result<String, String> {
         self.command(&format!("bigverify {bytes}")).await
@@ -236,6 +249,7 @@ impl Node {
 
     /// `peers`, the node's live peer count as membership currently reports it.
     /// # Errors
+    ///
     /// Returns `Err` if the connection fails or the reply is not numeric.
     pub async fn peers(&self) -> Result<usize, String> {
         self.command("peers")
@@ -265,6 +279,7 @@ impl Node {
     /// Stops and removes the container, ahead of `ContainerGuard`'s own
     /// cleanup so a failure's output stays free of unrelated containers.
     /// # Errors
+    ///
     /// Returns `Err` if the backend's stop or remove call fails.
     pub async fn stop(self) -> Result<(), String> {
         self.guard.stop().await.map_err(|error| error.to_string())
@@ -274,6 +289,7 @@ impl Node {
 /// Polls `cond` on a short fixed cadence until it returns `true`, or panics
 /// once `timeout` elapses.
 /// # Panics
+///
 /// Panics if `cond` has not returned `true` by `timeout`.
 pub async fn eventually<F, Fut>(timeout: Duration, mut cond: F)
 where

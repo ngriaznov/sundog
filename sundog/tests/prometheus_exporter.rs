@@ -1,8 +1,8 @@
 //! The `prometheus` feature installs a real Prometheus recorder and serves
 //! `GET /metrics` on the address given to
-//! [`sundog::ClusterBuilder::prometheus_listen`]. `metrics::set_global_recorder`
-//! is a single process-global slot, so this must stay the only test in any
-//! `tests/*.rs` binary that installs one.
+//! [`sundog::ClusterBuilder::prometheus_listen`].
+//! `metrics::set_global_recorder` is a single process-global slot, so this must
+//! stay the only test in any `tests/*.rs` binary that installs one.
 
 #![cfg(all(feature = "prometheus", not(feature = "sim")))]
 

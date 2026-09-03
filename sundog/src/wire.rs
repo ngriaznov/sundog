@@ -80,7 +80,8 @@ pub enum Msg {
         key: Bytes,
         ver: Hlc,
     },
-    /// Replication-mode fan-out: the full record. Raw-record layout, not postcard.
+    /// Replication-mode fan-out: the full record. Raw-record layout, not
+    /// postcard.
     Replicate { cache: SmolStr, rec: WireRecord },
     /// Requests a full snapshot stream of a cache, for state transfer on join.
     StRequest { cache: SmolStr },
@@ -145,7 +146,8 @@ pub enum Msg {
     },
 }
 
-/// Frame discriminant: everything after this byte is a postcard-encoded [`Msg`].
+/// Frame discriminant: everything after this byte is a postcard-encoded
+/// [`Msg`].
 const FRAME_KIND_POSTCARD: u8 = 0;
 /// Frame discriminant: everything after this byte is the raw-record layout
 /// for [`Msg::Replicate`]/[`Msg::ReplicateBatch`]/[`Msg::StChunk`].
@@ -155,7 +157,8 @@ const RAW_KIND_REPLICATE: u8 = 0;
 const RAW_KIND_REPLICATE_BATCH: u8 = 1;
 const RAW_KIND_ST_CHUNK: u8 = 2;
 
-/// Record-level flag: this record is a tombstone (`WireRecord::value` is `None`).
+/// Record-level flag: this record is a tombstone (`WireRecord::value` is
+/// `None`).
 const RECORD_FLAG_TOMBSTONE: u8 = 0b01;
 /// Record-level flag: `expires_at_ms` is `Some` and the header's field holds
 /// its value. Without this flag the field is meaningless, always `0`, so a

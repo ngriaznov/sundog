@@ -75,12 +75,14 @@ pub(crate) type MeshStream = tls::MeshStream;
 #[cfg(not(all(feature = "tls", not(feature = "sim"))))]
 pub(crate) type MeshStream = tcp::TcpStream;
 
-/// This node's TLS context: `Some` wraps every connection in mutual TLS, `None` stays plaintext.
+/// This node's TLS context: `Some` wraps every connection in mutual TLS, `None`
+/// stays plaintext.
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 pub(crate) type TlsCtx = Option<Arc<tls::MeshTls>>;
 /// TLS isn't compiled in for this transport: a zero-sized stand-in so
 /// `conn`'s dial/accept plumbing carries a `tls` parameter unconditionally.
-/// A dedicated unit struct, since a bare `()` trips clippy's unit-argument lint.
+/// A dedicated unit struct, since a bare `()` trips clippy's unit-argument
+/// lint.
 #[cfg(not(all(feature = "tls", not(feature = "sim"))))]
 #[derive(Clone)]
 pub(crate) struct TlsCtx;
@@ -117,12 +119,14 @@ fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
 }
 
 /// Capacity of the inbound-message channel and of each per-peer, per-class
-/// outbox absent a caller override, mirroring [`ClusterConfig::outbox_capacity`]'s default.
+/// outbox absent a caller override, mirroring
+/// [`ClusterConfig::outbox_capacity`]'s default.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 
 /// Process-wide wire-frame counters, incremented at [`conn::send_msg`], the
-/// single choke point every outbound frame passes through: [`frames_sent_total`]
-/// and [`bytes_sent_total`] sum every `Mesh` in this process.
+/// single choke point every outbound frame passes through:
+/// [`frames_sent_total`] and [`bytes_sent_total`] sum every `Mesh` in this
+/// process.
 static FRAMES_SENT: AtomicU64 = AtomicU64::new(0);
 static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 
@@ -193,14 +197,16 @@ fn duration_to_ms(d: Duration) -> u64 {
 }
 
 /// Total wire frames sent by this process since start, across every
-/// [`Mesh`] it has spawned. A cheap diagnostic for benchmarking replication cost.
+/// [`Mesh`] it has spawned. A cheap diagnostic for benchmarking replication
+/// cost.
 #[must_use]
 pub fn frames_sent_total() -> u64 {
     FRAMES_SENT.load(Ordering::Relaxed)
 }
 
 /// Total wire-frame bytes sent by this process since start, across every
-/// [`Mesh`] it has spawned. A cheap diagnostic for benchmarking replication cost.
+/// [`Mesh`] it has spawned. A cheap diagnostic for benchmarking replication
+/// cost.
 #[must_use]
 pub fn bytes_sent_total() -> u64 {
     BYTES_SENT.load(Ordering::Relaxed)
@@ -211,7 +217,8 @@ pub fn bytes_sent_total() -> u64 {
 /// caller forever; AP semantics mean a stuck peer must never hang this node.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Wraps a timed-out request/response exchange as a [`CodecError::Io`], the same shape a genuine connection failure produces.
+/// Wraps a timed-out request/response exchange as a [`CodecError::Io`], the
+/// same shape a genuine connection failure produces.
 fn request_timeout_error(what: &str) -> CodecError {
     CodecError::Io(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -223,7 +230,8 @@ fn request_timeout_error(what: &str) -> CodecError {
 /// policy on outbox overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MsgClass {
-    /// Overflow drops the oldest queued invalidation: a storm on a dead peer must never stall writers.
+    /// Overflow drops the oldest queued invalidation: a storm on a dead peer
+    /// must never stall writers.
     Invalidate,
     /// Overflow drops the new message and marks the peer dirty so the next
     /// anti-entropy round targets it first.
@@ -261,9 +269,11 @@ impl AeMismatch {
 
 /// What the net layer needs from the local shard registry to answer
 /// another node's state-transfer or anti-entropy request. An unknown cache
-/// degrades to an empty result rather than an error: a normal race, not a fault.
+/// degrades to an empty result rather than an error: a normal race, not a
+/// fault.
 pub trait RequestHandler: Send + Sync + 'static {
-    /// Streams a full snapshot of `cache` in write-sized chunks, for state transfer on join.
+    /// Streams a full snapshot of `cache` in write-sized chunks, for state
+    /// transfer on join.
     fn snapshot_chunks(&self, cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>>;
     /// Returns `cache`'s current per-bucket digest array.
     fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>>;
@@ -304,13 +314,15 @@ pub trait RequestHandler: Send + Sync + 'static {
     }
 
     /// Bucket size above which the responder answers with an IBLT sketch
-    /// instead of its full listing. Mirrors [`crate::config::ClusterConfig::ae_sketch_min_bucket`].
+    /// instead of its full listing. Mirrors
+    /// [`crate::config::ClusterConfig::ae_sketch_min_bucket`].
     fn ae_sketch_min_bucket(&self) -> usize {
         crate::config::ClusterConfig::default().ae_sketch_min_bucket
     }
 
     /// Sketch size, in cells, the responder builds an `Msg::AeSketch` reply
-    /// with. Mirrors [`crate::config::ClusterConfig::ae_sketch_cells`]'s default.
+    /// with. Mirrors [`crate::config::ClusterConfig::ae_sketch_cells`]'s
+    /// default.
     fn ae_sketch_cells(&self) -> usize {
         crate::config::ClusterConfig::default().ae_sketch_cells
     }
@@ -321,7 +333,8 @@ struct PeerHandle {
     invalidate: Arc<DropOldestQueue<OutFrame>>,
     replicate_tx: mpsc::Sender<OutFrame>,
     dirty: Arc<AtomicBool>,
-    /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none. Read by [`Mesh::replicate_in_flight`].
+    /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none.
+    /// Read by [`Mesh::replicate_in_flight`].
     last_replicate_enqueued: AtomicU64,
     cancel: CancellationToken,
     /// Pooled request/response connections for this peer, dialed on
@@ -352,9 +365,11 @@ impl Mesh {
     /// returns inline from [`Mesh::request_state`], [`Mesh::ae_round`],
     /// and [`Mesh::ae_pull`] instead. `incarnation` is embedded in every
     /// `Hello` this node sends; `handler` answers requests from peers
-    /// dialing in; `config.outbox_capacity` sizes the inbound channel and outboxes.
+    /// dialing in; `config.outbox_capacity` sizes the inbound channel and
+    /// outboxes.
     ///
     /// # Errors
+    ///
     /// Returns [`JoinError::Bind`] if `bind_addr` cannot be bound.
     pub async fn spawn(
         bind_addr: SocketAddr,
@@ -404,7 +419,8 @@ impl Mesh {
         Ok((Self { local_addr, inner }, inbound_rx))
     }
 
-    /// The address the data-plane listener is bound to, relevant when `bind_addr` used port `0`.
+    /// The address the data-plane listener is bound to, relevant when
+    /// `bind_addr` used port `0`.
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -412,9 +428,11 @@ impl Mesh {
 
     /// Refreshes the set of peers the mesh dials and fans traffic out to:
     /// spawns a writer for each newly seen peer, cancels it for any that
-    /// departed or changed `data_addr`. Called on every [`crate::membership::Membership::peers`] change.
+    /// departed or changed `data_addr`. Called on every
+    /// [`crate::membership::Membership::peers`] change.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub fn update_peers(&self, peers: Vec<Peer>) {
         let incoming: HashMap<NodeId, SocketAddr> = peers
@@ -471,6 +489,7 @@ impl Mesh {
     /// A `peer` the mesh doesn't know about is a silent no-op.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub fn send(&self, peer: NodeId, class: MsgClass, msg: Msg) {
         self.send_many(peer, class, std::iter::once(msg));
@@ -478,9 +497,11 @@ impl Mesh {
 
     /// [`Mesh::send`] for many messages, resolving the peer-table lock
     /// once for the batch. Each message still gets its own overflow
-    /// decision. For a multi-peer fan-out sharing content, use `Mesh::send_frames` instead.
+    /// decision. For a multi-peer fan-out sharing content, use
+    /// `Mesh::send_frames` instead.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub fn send_many(&self, peer: NodeId, class: MsgClass, msgs: impl IntoIterator<Item = Msg>) {
         let frames = msgs.into_iter().filter_map(|msg| match OutFrame::new(msg) {
@@ -498,6 +519,7 @@ impl Mesh {
     /// Otherwise identical to [`Mesh::send_many`].
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub(crate) fn send_frames(
         &self,
@@ -544,6 +566,7 @@ impl Mesh {
     /// Anti-entropy skips a round against such a peer.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub(crate) fn replicate_in_flight(&self, peer: NodeId, window: Duration) -> bool {
         let table = self
@@ -566,6 +589,7 @@ impl Mesh {
     /// when the scheduler skips a round it already took the mark for.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub(crate) fn mark_dirty(&self, peer: NodeId) {
         let table = self
@@ -582,6 +606,7 @@ impl Mesh {
     /// since the last call, clearing their dirty mark.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     #[must_use]
     pub fn take_dirty_peers(&self) -> Vec<NodeId> {
@@ -642,7 +667,9 @@ impl Mesh {
     /// fresh connection as the caller polls.
     ///
     /// # Errors
-    /// Returns [`CodecError`] if `donor` is unknown or the request cannot be sent.
+    ///
+    /// Returns [`CodecError`] if `donor` is unknown or the request cannot be
+    /// sent.
     pub async fn request_state(
         &self,
         donor: NodeId,
@@ -663,6 +690,7 @@ impl Mesh {
     /// `local_buckets` and returns the reply for every mismatched bucket.
     ///
     /// # Errors
+    ///
     /// Returns [`CodecError`] if `peer` is unknown or the exchange fails.
     pub async fn ae_round(
         &self,
@@ -687,9 +715,11 @@ impl Mesh {
     }
 
     /// The `AeSketch` fallback: full `(key, version)` listings for
-    /// `buckets` whose `AeSketch` reply failed to decode, answered like [`Mesh::ae_round`].
+    /// `buckets` whose `AeSketch` reply failed to decode, answered like
+    /// [`Mesh::ae_round`].
     ///
     /// # Errors
+    ///
     /// Returns [`CodecError`] if `peer` is unknown or the exchange fails.
     pub async fn ae_entries(
         &self,
@@ -714,6 +744,7 @@ impl Mesh {
     /// Pulls full records for `keys` from `peer`, the `AePull` step.
     ///
     /// # Errors
+    ///
     /// Returns [`CodecError`] if `peer` is unknown or the exchange fails.
     pub async fn ae_pull(
         &self,
@@ -733,6 +764,7 @@ impl Mesh {
     /// in `hashes`, the sketch-decoded counterpart to [`Mesh::ae_pull`].
     ///
     /// # Errors
+    ///
     /// Returns [`CodecError`] if `peer` is unknown or the exchange fails.
     pub async fn ae_pull_hashes(
         &self,
@@ -762,6 +794,7 @@ impl Mesh {
     /// Signals the spawned background work to stop without waiting on sockets.
     ///
     /// # Panics
+    ///
     /// Panics if the peer-table lock is poisoned.
     pub async fn shutdown(self) {
         self.inner.accept_cancel.cancel();
@@ -775,7 +808,8 @@ impl Mesh {
         for handle in table.into_values() {
             handle.cancel.cancel();
         }
-        // Yield once so cancelled tasks observe the token before this handle drops.
+        // Yield once so cancelled tasks observe the token before this handle
+        // drops.
         tokio::task::yield_now().await;
     }
 }
@@ -925,7 +959,8 @@ mod tests {
             .await
             .expect("bind loopback");
 
-        // A peer with no listener: the writer spins on connection failures, so its outbox never drains.
+        // A peer with no listener: the writer spins on connection failures, so
+        // its outbox never drains.
         let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
         mesh.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
 
@@ -1121,7 +1156,8 @@ mod tests {
                 .new_framed(stream);
             let _hello = framed.next().await.expect("hello arrives");
             let _digest = framed.next().await.expect("ae digest arrives");
-            // Accepts and reads, then goes silent: the failure mode `REQUEST_TIMEOUT` bounds.
+            // Accepts and reads, then goes silent: the failure mode
+            // `REQUEST_TIMEOUT` bounds.
             std::future::pending::<()>().await;
         });
 

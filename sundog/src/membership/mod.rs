@@ -65,7 +65,8 @@ pub struct Peer {
 /// absent, never a placeholder value.
 pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 
-/// A request to the background gossip loop, the sole owner of the chitchat handle.
+/// A request to the background gossip loop, the sole owner of the chitchat
+/// handle.
 enum Command {
     SetCacheMode(SmolStr, Mode),
     Shutdown(oneshot::Sender<()>),
@@ -93,7 +94,8 @@ impl Membership {
     /// # Errors
     ///
     /// Returns [`JoinError::Bind`] if `config.gossip_bind_addr` cannot be
-    /// bound, or [`JoinError::Membership`] if the gossip backend fails to start.
+    /// bound, or [`JoinError::Membership`] if the gossip backend fails to
+    /// start.
     pub async fn spawn(
         cluster_name: SmolStr,
         node: NodeId,

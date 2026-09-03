@@ -76,18 +76,21 @@ struct ClusterInner {
     membership: Membership,
     mesh: Mesh,
     shards: ShardRegistry,
-    /// The [`Mode`] each open cache was opened under; [`mode_conflict_task`]'s local half.
+    /// The [`Mode`] each open cache was opened under; [`mode_conflict_task`]'s
+    /// local half.
     local_modes: RwLock<HashMap<SmolStr, Mode>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
-    /// When each peer last streamed replicate traffic in; see [`Cluster::peer_is_streaming`].
+    /// When each peer last streamed replicate traffic in; see
+    /// [`Cluster::peer_is_streaming`].
     inbound_activity: Arc<InboundActivity>,
     tracker: TaskTracker,
     cancel: CancellationToken,
 }
 
 /// Per-peer stamps of the last inbound replicate traffic, recorded by
-/// [`inbound_loop`] so the anti-entropy scheduler can leave a streaming peer alone.
+/// [`inbound_loop`] so the anti-entropy scheduler can leave a streaming peer
+/// alone.
 #[derive(Default)]
 pub(crate) struct InboundActivity {
     seen: RwLock<HashMap<NodeId, u64>>,
@@ -114,7 +117,8 @@ impl InboundActivity {
     }
 }
 
-/// Builds a [`Cluster`]: own-and-return. `.build()` alone forms a working LAN cluster.
+/// Builds a [`Cluster`]: own-and-return. `.build()` alone forms a working LAN
+/// cluster.
 #[must_use]
 pub struct ClusterBuilder {
     name: SmolStr,
@@ -142,7 +146,8 @@ impl Cluster {
         self.inner.node
     }
 
-    /// Opens or joins a named cache. Call `.open().await` on the result to register it.
+    /// Opens or joins a named cache. Call `.open().await` on the result to
+    /// register it.
     pub fn cache<K, V>(&self, name: impl Into<SmolStr>) -> CacheBuilder<K, V>
     where
         K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -159,7 +164,8 @@ impl Cluster {
         Arc::clone(&self.inner.shards)
     }
 
-    /// This cluster's partition-aware tombstone-retention view; see `cluster::absence`. Cheap to clone.
+    /// This cluster's partition-aware tombstone-retention view; see
+    /// `cluster::absence`. Cheap to clone.
     pub(crate) fn absence_tracker(&self) -> absence::AbsenceTracker {
         self.inner.absence.clone()
     }
@@ -174,7 +180,8 @@ impl Cluster {
         self.inner.membership.peers().borrow().clone()
     }
 
-    /// Records `mode` as this node's [`Mode`] for cache `name` and gossips it to peers.
+    /// Records `mode` as this node's [`Mode`] for cache `name` and gossips it
+    /// to peers.
     pub(crate) fn advertise_cache_mode(&self, name: &SmolStr, mode: Mode) {
         self.inner
             .local_modes
@@ -189,12 +196,14 @@ impl Cluster {
         self.inner.membership.cache_modes().borrow().clone()
     }
 
-    /// A fresh watch subscription on the live peer set, for loops that react to changes.
+    /// A fresh watch subscription on the live peer set, for loops that react to
+    /// changes.
     pub(crate) fn peers_watch(&self) -> tokio::sync::watch::Receiver<Vec<Peer>> {
         self.inner.membership.peers()
     }
 
-    /// The live peer set as node ids only, what `Cache`'s fan-out loop iterates.
+    /// The live peer set as node ids only, what `Cache`'s fan-out loop
+    /// iterates.
     pub(crate) fn live_peer_ids(&self) -> Vec<NodeId> {
         self.inner
             .membership
@@ -207,19 +216,22 @@ impl Cluster {
 
     /// Whether replicate traffic between this node and `peer` is in motion
     /// in either direction, judged over one `ae_interval`. Anti-entropy
-    /// leaves such a peer alone, since repairing in parallel would ship records twice.
+    /// leaves such a peer alone, since repairing in parallel would ship records
+    /// twice.
     pub(crate) fn peer_is_streaming(&self, peer: NodeId) -> bool {
         let window = self.inner.config.ae_interval;
         self.inner.inbound_activity.recent(peer, window)
             || self.inner.mesh.replicate_in_flight(peer, window)
     }
 
-    /// A child of this cluster's shutdown token: cancelled the moment [`Cluster::shutdown`] runs.
+    /// A child of this cluster's shutdown token: cancelled the moment
+    /// [`Cluster::shutdown`] runs.
     pub(crate) fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel.child_token()
     }
 
-    /// Spawns `fut` on this cluster's [`TaskTracker`], so [`Cluster::shutdown`] waits for it.
+    /// Spawns `fut` on this cluster's [`TaskTracker`], so [`Cluster::shutdown`]
+    /// waits for it.
     pub(crate) fn spawn_tracked<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -231,7 +243,8 @@ impl Cluster {
     /// joined, then chitchat departs and the data plane closes its
     /// connections. No further calls on any clone of this handle.
     ///
-    /// Cache handles opened before this call keep working for local reads/writes.
+    /// Cache handles opened before this call keep working for local
+    /// reads/writes.
     pub async fn shutdown(self) {
         self.inner.cancel.cancel();
         self.inner.tracker.close();
@@ -243,13 +256,15 @@ impl Cluster {
 }
 
 impl ClusterBuilder {
-    /// A fixed seed list, switching discovery from the zeroconf default (`Mdns`) to [`Static`].
+    /// A fixed seed list, switching discovery from the zeroconf default
+    /// (`Mdns`) to [`Static`].
     pub fn seeds(mut self, seeds: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.discovery = Some(DiscoveryKind::Static(Static::new(seeds)));
         self
     }
 
-    /// Overrides the zeroconf default (`Mdns`) discovery mechanism, e.g. with `DnsSrv`.
+    /// Overrides the zeroconf default (`Mdns`) discovery mechanism, e.g. with
+    /// `DnsSrv`.
     pub fn discovery(mut self, discovery: impl Discovery + 'static) -> Self {
         self.discovery = Some(DiscoveryKind::Custom(Box::new(discovery)));
         self
@@ -273,7 +288,8 @@ impl ClusterBuilder {
         self
     }
 
-    /// Enables mutual TLS on the mesh; equivalent to setting [`ClusterConfig::tls`] via [`Self::config`].
+    /// Enables mutual TLS on the mesh; equivalent to setting
+    /// [`ClusterConfig::tls`] via [`Self::config`].
     #[cfg(feature = "tls")]
     pub fn tls(mut self, tls: crate::config::TlsConfig) -> Self {
         self.config.tls = Some(tls);
@@ -386,7 +402,8 @@ impl ClusterBuilder {
 }
 
 /// Spawns every background loop a freshly built [`Cluster`] keeps running: peer
-/// republishing, the mode-mismatch sweep, absence tracking, inbound dispatch, and the open-cache gauge.
+/// republishing, the mode-mismatch sweep, absence tracking, inbound dispatch,
+/// and the open-cache gauge.
 fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<InboundMsg>) {
     cluster.spawn_tracked(membership_to_mesh_task(
         cluster.inner.membership.peers(),
@@ -595,7 +612,8 @@ async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
     }
 }
 
-/// One (peer, cache) pair where a live peer advertises a different [`Mode`] than this node's own.
+/// One (peer, cache) pair where a live peer advertises a different [`Mode`]
+/// than this node's own.
 #[derive(Debug, PartialEq, Eq)]
 struct ModeConflict {
     peer: NodeId,
@@ -690,7 +708,8 @@ const INBOUND_DRAIN_CAP: usize = 1024;
 
 /// Applies one accumulated same-cache run of `Replicate`/`ReplicateBatch`
 /// records under one `apply_remote_batch` call. `shard_cache` memoizes the
-/// lookup per drained batch, so a cache name costs at most one lock acquisition.
+/// lookup per drained batch, so a cache name costs at most one lock
+/// acquisition.
 async fn apply_pending_replicate(
     shards: &ShardRegistry,
     shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
@@ -844,7 +863,8 @@ async fn fan_out_batch<K, V>(
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    // The queue carries local writes only, so this only dedups the drained burst.
+    // The queue carries local writes only, so this only dedups the drained
+    // burst.
     let mut seen: HashSet<&K> = HashSet::new();
     let mut keys: Vec<K> = Vec::new();
     for key in &notified {
@@ -880,7 +900,8 @@ async fn fan_out_batch<K, V>(
         // writes arriving one drained event at a time.
         Mode::Replicated => (MsgClass::Replicate, batch_replicate(cache_name, records)),
     };
-    // Encodes each message once, so every live peer gets a cheap `Bytes` clone of the same frame.
+    // Encodes each message once, so every live peer gets a cheap `Bytes` clone
+    // of the same frame.
     let frames: Vec<OutFrame> = msgs
         .into_iter()
         .filter_map(|msg| match OutFrame::new(msg) {
