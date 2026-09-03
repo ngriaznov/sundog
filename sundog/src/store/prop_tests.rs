@@ -463,9 +463,10 @@ async fn digest_matches_entries_for_parts(shard: &Shard<u8, u16>) -> bool {
     let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
     let actual = ShardOps::part_digests(shard, all_buckets).await;
     actual.into_iter().all(|(bucket, digests)| {
-        digests.iter().enumerate().all(|(part, &d)| {
-            d == expected[usize::from(bucket) * PART_COUNT + part]
-        })
+        digests
+            .iter()
+            .enumerate()
+            .all(|(part, &d)| d == expected[usize::from(bucket) * PART_COUNT + part])
     })
 }
 

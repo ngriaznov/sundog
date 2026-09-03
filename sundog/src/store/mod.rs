@@ -2322,8 +2322,7 @@ mod tests {
                 acc ^ expected_parts[usize::from(bucket) * PART_COUNT + part]
             });
             assert_eq!(
-                digest,
-                expected,
+                digest, expected,
                 "bucket {bucket} incremental digest diverged from full recompute"
             );
         }
@@ -2444,15 +2443,14 @@ mod tests {
         s.insert(1, "a".into()).await.expect("insert");
         let kb = key_bytes(&1u32);
         let bucket = bucket_of(&kb);
-        let part =
-            u8::try_from(engine::part_index_from_hash(engine::hash_key_bytes(kb.as_ref())))
-                .expect("fits");
+        let part = u8::try_from(engine::part_index_from_hash(engine::hash_key_bytes(
+            kb.as_ref(),
+        )))
+        .expect("fits");
 
-        let result = ShardOps::entries_for_parts(
-            &s,
-            vec![(bucket, part), (bucket, part), (bucket, part)],
-        )
-        .await;
+        let result =
+            ShardOps::entries_for_parts(&s, vec![(bucket, part), (bucket, part), (bucket, part)])
+                .await;
         assert_eq!(
             result.len(),
             1,

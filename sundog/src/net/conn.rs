@@ -655,13 +655,17 @@ async fn serve_ae_digest(
             .partition(|bucket| lens.get(bucket).copied().unwrap_or(0) > part_min_bucket);
 
         if !big.is_empty() {
-            replies.extend(handler.part_digests(cache.clone(), big).await.into_iter().map(
-                |(bucket, digests)| Msg::AePartDigests {
-                    cache: cache.clone(),
-                    bucket,
-                    digests,
-                },
-            ));
+            replies.extend(
+                handler
+                    .part_digests(cache.clone(), big)
+                    .await
+                    .into_iter()
+                    .map(|(bucket, digests)| Msg::AePartDigests {
+                        cache: cache.clone(),
+                        bucket,
+                        digests,
+                    }),
+            );
         }
         if !small.is_empty() {
             // One shard pass for every small mismatched bucket at once:
@@ -856,7 +860,9 @@ pub(super) async fn collect_ae_mismatches(
             Some(Ok(Msg::AeSketch { bucket, cells, .. })) => {
                 result.push(super::AeMismatch::Sketch(bucket, cells));
             }
-            Some(Ok(Msg::AePartDigests { bucket, digests, .. })) => {
+            Some(Ok(Msg::AePartDigests {
+                bucket, digests, ..
+            })) => {
                 result.push(super::AeMismatch::PartDigests(bucket, digests));
             }
             Some(Ok(_)) => {} // unexpected message on this connection; keep reading
@@ -895,7 +901,11 @@ pub(super) async fn collect_ae_part_replies(
                 part,
                 cells,
                 ..
-            })) => result.push(super::AePartReply::Sketch { bucket, part, cells }),
+            })) => result.push(super::AePartReply::Sketch {
+                bucket,
+                part,
+                cells,
+            }),
             Some(Ok(_)) => {} // unexpected message on this connection; keep reading
             Some(Err(err)) => return Err(err),
             None => return Err(unexpected_close("anti-entropy part reply")),

@@ -211,7 +211,10 @@ pub(crate) async fn run_round_against(
     // part digests for the same buckets, one shard call for all of them,
     // then one `ae_parts` request for every part that actually differs.
     if !part_digest_mismatches.is_empty() {
-        let buckets: Vec<u16> = part_digest_mismatches.iter().map(AeMismatch::bucket).collect();
+        let buckets: Vec<u16> = part_digest_mismatches
+            .iter()
+            .map(AeMismatch::bucket)
+            .collect();
         let local_part_digests = shard.part_digests(buckets).await;
         let local_digests_by_bucket: HashMap<u16, Vec<u64>> =
             local_part_digests.into_iter().collect();
@@ -232,7 +235,10 @@ pub(crate) async fn run_round_against(
         }
 
         if !wanted_parts.is_empty() {
-            match mesh.ae_parts(peer, cache.clone(), wanted_parts.clone()).await {
+            match mesh
+                .ae_parts(peer, cache.clone(), wanted_parts.clone())
+                .await
+            {
                 Ok(replies) => {
                     let local_part_entries = shard.entries_for_parts(wanted_parts).await;
                     let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
@@ -487,7 +493,11 @@ fn handle_part_sketch_mismatch(
             "outcome" => "sketch"
         )
         .increment(1);
-        tracing::debug!(outcome = "sketch", bucket, "anti-entropy part sketch decoded");
+        tracing::debug!(
+            outcome = "sketch",
+            bucket,
+            "anti-entropy part sketch decoded"
+        );
     } else {
         undecodable_buckets.push(bucket);
         tracing::debug!(

@@ -534,11 +534,7 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
-    fn bucket_lens(
-        &self,
-        cache: SmolStr,
-        buckets: Vec<u16>,
-    ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.bucket_lens(buckets).await,
@@ -547,7 +543,11 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
-    fn part_digests(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    fn part_digests(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.part_digests(buckets).await,

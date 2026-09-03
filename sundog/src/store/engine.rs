@@ -721,7 +721,8 @@ where
     /// out-of-range bucket ([`BUCKET_COUNT`] or past) or part ([`PART_COUNT`]
     /// or past) is skipped rather than indexed.
     pub(crate) fn collect_parts(&self, wanted: &[(u16, u8)], now_ms: u64) -> PartEntries {
-        let mut by_bucket: std::collections::BTreeMap<u16, Vec<u8>> = std::collections::BTreeMap::new();
+        let mut by_bucket: std::collections::BTreeMap<u16, Vec<u8>> =
+            std::collections::BTreeMap::new();
         for &(bucket, part) in wanted {
             if usize::from(bucket) >= BUCKET_COUNT || usize::from(part) >= PART_COUNT {
                 continue;
@@ -765,7 +766,8 @@ where
     pub(crate) fn digests(&self) -> Vec<(u16, u64)> {
         (0..BUCKET_COUNT)
             .map(|bucket| {
-                let idx = u16::try_from(bucket).expect("invariant: index < BUCKET_COUNT fits in u16");
+                let idx =
+                    u16::try_from(bucket).expect("invariant: index < BUCKET_COUNT fits in u16");
                 let digest = (0..PART_COUNT).fold(0u64, |acc, part| {
                     acc ^ self.digest[digest_slot(bucket, part)].load(Ordering::Relaxed)
                 });
@@ -2282,8 +2284,8 @@ mod tests {
         let engine = engine_u32_string(u64::MAX, None);
         let key = 5u32;
         let kb = key_bytes(key);
-        let bucket = u16::try_from(stripe_index_from_hash(hash_key_bytes(kb.as_ref())))
-            .expect("fits");
+        let bucket =
+            u16::try_from(stripe_index_from_hash(hash_key_bytes(kb.as_ref()))).expect("fits");
         assert_eq!(engine.bucket_len(bucket), 0);
         let _ = put(&engine, key, kb, "a".into(), hlc(1, 1), None, 0);
         assert_eq!(engine.bucket_len(bucket), 1);
@@ -2426,7 +2428,11 @@ mod tests {
             "a part past PART_COUNT yields nothing"
         );
         let mixed = engine.collect_parts(&[(u16::MAX, part), (bucket, part), (bucket, u8::MAX)], 0);
-        assert_eq!(mixed.len(), 1, "only the in-range (bucket, part) is answered");
+        assert_eq!(
+            mixed.len(),
+            1,
+            "only the in-range (bucket, part) is answered"
+        );
         assert_eq!(mixed[0].0, (bucket, part));
         assert_eq!(mixed[0].1, vec![(kb, hlc(1, 1))]);
     }

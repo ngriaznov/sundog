@@ -367,7 +367,11 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// Returns `cache`'s part digests for each of `buckets`: `(bucket, 64
     /// part-digests)` per bucket, the responder's step-2 reply for a bucket
     /// past [`RequestHandler::ae_part_min_bucket`] entries.
-    fn part_digests(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>>;
+    fn part_digests(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>>;
 
     /// [`RequestHandler::entries_for_buckets`] at part granularity: `(key,
     /// version)` for every live entry and un-GC'd tombstone in each
@@ -921,7 +925,9 @@ impl Mesh {
     ) -> Result<Vec<AePartReply>, CodecError> {
         let timeout = request_timeout();
         tokio::time::timeout(timeout, async {
-            let (framed, pool) = self.acquire_conn(peer, Msg::AeParts { cache, parts }).await?;
+            let (framed, pool) = self
+                .acquire_conn(peer, Msg::AeParts { cache, parts })
+                .await?;
             conn::collect_ae_part_replies(framed, &pool).await
         })
         .await

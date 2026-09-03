@@ -328,8 +328,7 @@ async fn ae_round_with_sketch(
         .await
         {
             Ok(Ok(replies)) => {
-                let local_part_entries =
-                    ShardOps::entries_for_parts(shard, wanted_parts).await;
+                let local_part_entries = ShardOps::entries_for_parts(shard, wanted_parts).await;
                 let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
                     local_part_entries.into_iter().collect();
                 for reply in replies {
@@ -343,7 +342,12 @@ async fn ae_round_with_sketch(
                                 .get(&(bucket, part))
                                 .cloned()
                                 .unwrap_or_default();
-                            diff_part(&local_entries, &peer_entries, &mut push_keys, &mut pull_keys);
+                            diff_part(
+                                &local_entries,
+                                &peer_entries,
+                                &mut push_keys,
+                                &mut pull_keys,
+                            );
                         }
                         AePartReply::Sketch {
                             bucket,
@@ -531,7 +535,9 @@ async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
     let defaults = ClusterConfig::default();
     let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::with_min_buckets(
         Arc::clone(&shard),
-        params.ae_part_min_bucket.unwrap_or(defaults.ae_part_min_bucket),
+        params
+            .ae_part_min_bucket
+            .unwrap_or(defaults.ae_part_min_bucket),
         params
             .ae_sketch_min_bucket
             .unwrap_or(defaults.ae_sketch_min_bucket),
