@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;
 
-use super::{Elem, IBLT_PARTITIONS, Iblt, RATED_CAPACITY, Undecodable};
+use super::{Elem, IBLT_PARTITIONS, Iblt, RATED_CAPACITY};
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
@@ -136,14 +136,14 @@ proptest! {
         items in proptest::collection::vec(item_strategy(), 0..300)
     ) {
         let (left, right, expected_left, expected_right) = build(items);
-        match left.subtract(&right).peel() {
-            Ok(decoded) => {
-                let got_left: HashSet<Elem> = decoded.only_left.into_iter().collect();
-                let got_right: HashSet<Elem> = decoded.only_right.into_iter().collect();
-                prop_assert_eq!(got_left, expected_left);
-                prop_assert_eq!(got_right, expected_right);
-            }
-            Err(Undecodable) => {} // acceptable: oversubscribed, no wrong answer returned
+        // `Err(Undecodable)` is also an acceptable outcome here (an
+        // oversubscribed sketch, no wrong answer returned) — only a
+        // successful decode has anything further to check.
+        if let Ok(decoded) = left.subtract(&right).peel() {
+            let got_left: HashSet<Elem> = decoded.only_left.into_iter().collect();
+            let got_right: HashSet<Elem> = decoded.only_right.into_iter().collect();
+            prop_assert_eq!(got_left, expected_left);
+            prop_assert_eq!(got_right, expected_right);
         }
     }
 

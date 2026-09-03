@@ -376,26 +376,7 @@ impl ClusterBuilder {
             }),
         };
 
-        cluster.spawn_tracked(membership_to_mesh_task(
-            cluster.inner.membership.peers(),
-            cluster.inner.mesh.clone(),
-            cluster.cancel_token(),
-        ));
-        cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
-        cluster.spawn_tracked(absence::tracking_task(
-            cluster.inner.membership.peers(),
-            cluster.absence_tracker(),
-            cluster.cancel_token(),
-        ));
-        cluster.spawn_tracked(inbound_loop(
-            cluster.shards(),
-            inbound_rx,
-            cluster.cancel_token(),
-        ));
-        cluster.spawn_tracked(open_cache_gauge_task(
-            cluster.shards(),
-            cluster.cancel_token(),
-        ));
+        spawn_cluster_background_tasks(&cluster, inbound_rx);
 
         tracing::info!(
             %node,
@@ -407,6 +388,36 @@ impl ClusterBuilder {
 
         Ok(cluster)
     }
+}
+
+/// Spawns every background task a freshly built [`Cluster`] keeps running
+/// for its lifetime: membership-to-mesh peer republishing, the late
+/// cache-mode-mismatch sweep, absence tracking, the inbound broadcast-traffic
+/// dispatch loop, and the open-cache gauge. Split out of
+/// [`ClusterBuilder::build`] purely to keep that function's own length
+/// manageable — every task here still shares `cluster`'s own
+/// [`Cluster::cancel_token`] and [`Cluster::spawn_tracked`] bookkeeping.
+fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<InboundMsg>) {
+    cluster.spawn_tracked(membership_to_mesh_task(
+        cluster.inner.membership.peers(),
+        cluster.inner.mesh.clone(),
+        cluster.cancel_token(),
+    ));
+    cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
+    cluster.spawn_tracked(absence::tracking_task(
+        cluster.inner.membership.peers(),
+        cluster.absence_tracker(),
+        cluster.cancel_token(),
+    ));
+    cluster.spawn_tracked(inbound_loop(
+        cluster.shards(),
+        inbound_rx,
+        cluster.cancel_token(),
+    ));
+    cluster.spawn_tracked(open_cache_gauge_task(
+        cluster.shards(),
+        cluster.cancel_token(),
+    ));
 }
 
 /// Resolves the concrete address `Mesh::spawn` should bind to, and that
@@ -1981,6 +1992,8 @@ mod tests {
 
     #[tokio::test]
     async fn anti_entropy_repairs_a_large_bucket_via_the_sketch_path() {
+        const N: u32 = 4096;
+
         let config = ClusterConfig {
             ae_sketch_min_bucket: 4,
             ..loopback_config()
@@ -1999,7 +2012,6 @@ mod tests {
             .await
             .expect("a opens");
 
-        const N: u32 = 4096;
         cache_a
             .insert_many((0..N).map(|k| (k, k.to_string())))
             .await

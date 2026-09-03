@@ -37,7 +37,7 @@
 //! two different versions of the *same* key would then always occupy the
 //! same three cells regardless of version, so subtracting one side's insert
 //! from the other's always cancels their `count` contribution to zero
-//! (`1 - 1`) while still leaving their differing version bytes XORed
+//! (`1 - 1`) while still leaving their differing version bytes `XOR`ed
 //! together in the cell's sums — a residual that can never become a
 //! verified-pure cell and permanently blocks that cell from ever
 //! decoding, for *any* sketch size. Since the whole point of anti-entropy
@@ -261,8 +261,12 @@ impl Iblt {
     /// partition, so always three cells overall (never the same cell
     /// twice: each partition owns a disjoint slice of `self.cells`).
     fn locations(&self, placement_hash: u64) -> [usize; IBLT_PARTITIONS] {
+        let partition_len_u64 =
+            u64::try_from(self.partition_len).expect("invariant: partition_len fits in u64");
         std::array::from_fn(|p| {
-            let offset = (mix(placement_hash, p) % self.partition_len as u64) as usize;
+            let offset = mix(placement_hash, p) % partition_len_u64;
+            let offset = usize::try_from(offset)
+                .expect("invariant: a value taken mod partition_len always fits in usize");
             p * self.partition_len + offset
         })
     }
@@ -490,24 +494,24 @@ mod tests {
         let right: Vec<(u64, Hlc)> = (100..300u64).map(|k| (k, ver(k + 1))).collect();
         let a = sketch_of(&left, cells);
         let b = sketch_of(&right, cells);
-        match a.subtract(&b).peel() {
-            Ok(decoded) => {
-                let left_set: HashSet<Elem> = left
-                    .iter()
-                    .filter(|&&(k, _)| !(100..200).contains(&k))
-                    .map(|&(key_hash, v)| Elem { key_hash, ver: v })
-                    .collect();
-                let expected_left: HashSet<Elem> = decoded.only_left.iter().copied().collect();
-                assert_eq!(expected_left, left_set, "a real decode must be exact");
-                let right_set: HashSet<Elem> = right
-                    .iter()
-                    .filter(|&&(k, _)| !(100..200).contains(&k))
-                    .map(|&(key_hash, v)| Elem { key_hash, ver: v })
-                    .collect();
-                let expected_right: HashSet<Elem> = decoded.only_right.iter().copied().collect();
-                assert_eq!(expected_right, right_set, "a real decode must be exact");
-            }
-            Err(Undecodable) => {} // acceptable: oversubscribed sketch, no wrong answer returned
+        // `Err(Undecodable)` is also an acceptable outcome here (an
+        // oversubscribed sketch reporting it can't decode, never a wrong
+        // answer) — only a successful decode has anything further to check.
+        if let Ok(decoded) = a.subtract(&b).peel() {
+            let left_set: HashSet<Elem> = left
+                .iter()
+                .filter(|&&(k, _)| !(100..200).contains(&k))
+                .map(|&(key_hash, v)| Elem { key_hash, ver: v })
+                .collect();
+            let expected_left: HashSet<Elem> = decoded.only_left.iter().copied().collect();
+            assert_eq!(expected_left, left_set, "a real decode must be exact");
+            let right_set: HashSet<Elem> = right
+                .iter()
+                .filter(|&&(k, _)| !(100..200).contains(&k))
+                .map(|&(key_hash, v)| Elem { key_hash, ver: v })
+                .collect();
+            let expected_right: HashSet<Elem> = decoded.only_right.iter().copied().collect();
+            assert_eq!(expected_right, right_set, "a real decode must be exact");
         }
     }
 

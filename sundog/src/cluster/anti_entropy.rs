@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::Cluster;
-use super::sketch::{Decoded, Iblt};
+use super::sketch::{Cell, Decoded, Iblt};
 use crate::hlc::Hlc;
 use crate::net::{AeMismatch, MsgClass};
 use crate::node::NodeId;
@@ -156,46 +156,15 @@ pub(crate) async fn run_round_against(
             AeMismatch::Sketch(bucket, cells) => {
                 let entries: &[(Bytes, Hlc)] =
                     local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
-                // Sized from the *received* sketch's own cell count, not
-                // this node's own `ae_sketch_cells` config — see
-                // `sketch::Iblt::new`'s docs for why that keeps the two
-                // sketches shape-compatible even if the two nodes' configs
-                // have drifted apart.
-                let mut local_sketch = Iblt::new(cells.len());
-                for (key, ver) in entries {
-                    local_sketch.insert(xxh3_64(key), *ver);
-                }
-                let remote_sketch = Iblt::from_cells(cells);
-                match local_sketch.subtract(&remote_sketch).peel() {
-                    Ok(decoded) => {
-                        let mut hashes = Vec::new();
-                        diff_decoded(entries, &decoded, &mut push_keys, &mut hashes);
-                        if !hashes.is_empty() {
-                            pull_hashes.push((bucket, hashes));
-                        }
-                        metrics::counter!(
-                            "sundog_ae_sketch_total",
-                            "cache" => cache.to_string(),
-                            "outcome" => "decoded"
-                        )
-                        .increment(1);
-                        tracing::debug!(outcome = "decoded", bucket, "anti-entropy sketch decoded");
-                    }
-                    Err(_) => {
-                        undecodable_buckets.push(bucket);
-                        tracing::debug!(
-                            outcome = "fallback",
-                            bucket,
-                            "anti-entropy sketch undecodable; falling back to a full listing"
-                        );
-                        metrics::counter!(
-                            "sundog_ae_sketch_total",
-                            "cache" => cache.to_string(),
-                            "outcome" => "fallback"
-                        )
-                        .increment(1);
-                    }
-                }
+                handle_sketch_mismatch(
+                    cache,
+                    bucket,
+                    cells,
+                    entries,
+                    &mut push_keys,
+                    &mut pull_hashes,
+                    &mut undecodable_buckets,
+                );
             }
         }
     }
@@ -226,6 +195,25 @@ pub(crate) async fn run_round_against(
         }
     }
 
+    apply_repairs(mesh, shard, cache, peer, push_keys, pull_keys, pull_hashes).await;
+}
+
+/// Applies a round's classified push/pull/hash-pull sets against `peer`:
+/// pushes replicate outbound in [`REPAIR_BATCH`] chunks, pulls full records
+/// and applies them locally the same way, and pulls the sketch-decoded
+/// hash-only results per bucket through `Msg::AePullHashes`. Emits
+/// `sundog_ae_repaired_total{cache}` for the round's total once done — split
+/// out of [`run_round_against`] purely to keep that function's own length
+/// manageable.
+async fn apply_repairs(
+    mesh: &crate::net::Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    push_keys: Vec<Bytes>,
+    pull_keys: Vec<Bytes>,
+    pull_hashes: Vec<(u16, Vec<u64>)>,
+) {
     let mut repaired: u64 = 0;
     // Batched so a large divergence makes durable incremental progress: each
     // batch that lands raises local versions, shrinking the next round's
@@ -280,6 +268,61 @@ pub(crate) async fn run_round_against(
             .increment(repaired);
     }
     tracing::debug!(repaired, "anti-entropy round complete");
+}
+
+/// Classifies one `AeMismatch::Sketch(bucket, cells)` reply: builds the
+/// local comparison sketch from `local_entries`, subtracts the received one,
+/// and peels it. On success, [`diff_decoded`] classifies the peeled result
+/// into `push_keys`/`pull_hashes` for `bucket`; on failure queues `bucket`
+/// into `undecodable_buckets` for the `Msg::AeEntries` fallback
+/// [`run_round_against`] sends after every reply in the round has been
+/// classified. Emits `sundog_ae_sketch_total{outcome}` and a matching
+/// `tracing` event either way.
+fn handle_sketch_mismatch(
+    cache: &SmolStr,
+    bucket: u16,
+    cells: Vec<Cell>,
+    local_entries: &[(Bytes, Hlc)],
+    push_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+    undecodable_buckets: &mut Vec<u16>,
+) {
+    // Sized from the *received* sketch's own cell count, not this node's own
+    // `ae_sketch_cells` config — see `sketch::Iblt::new`'s docs for why that
+    // keeps the two sketches shape-compatible even if the two nodes' configs
+    // have drifted apart.
+    let mut local_sketch = Iblt::new(cells.len());
+    for (key, ver) in local_entries {
+        local_sketch.insert(xxh3_64(key), *ver);
+    }
+    let remote_sketch = Iblt::from_cells(cells);
+    if let Ok(decoded) = local_sketch.subtract(&remote_sketch).peel() {
+        let mut hashes = Vec::new();
+        diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
+        if !hashes.is_empty() {
+            pull_hashes.push((bucket, hashes));
+        }
+        metrics::counter!(
+            "sundog_ae_sketch_total",
+            "cache" => cache.to_string(),
+            "outcome" => "decoded"
+        )
+        .increment(1);
+        tracing::debug!(outcome = "decoded", bucket, "anti-entropy sketch decoded");
+    } else {
+        undecodable_buckets.push(bucket);
+        tracing::debug!(
+            outcome = "fallback",
+            bucket,
+            "anti-entropy sketch undecodable; falling back to a full listing"
+        );
+        metrics::counter!(
+            "sundog_ae_sketch_total",
+            "cache" => cache.to_string(),
+            "outcome" => "fallback"
+        )
+        .increment(1);
+    }
 }
 
 fn diff_bucket(
