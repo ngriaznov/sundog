@@ -980,20 +980,38 @@ where
         entries: impl IntoIterator<Item = (K, V)>,
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
+        // Stops preparing entries at the first one that fails to encode or
+        // exceeds `max_frame`, but keeps everything prepared before it so
+        // the apply loop below still applies those, per this method's
+        // not-a-transaction contract.
         let mut prepared = Vec::new();
+        let mut failure: Option<CacheError> = None;
         for (key, value) in entries {
-            let key_bytes = encode_key(&key)?;
-            let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
+            let key_bytes = match encode_key(&key) {
+                Ok(key_bytes) => key_bytes,
+                Err(err) => {
+                    failure = Some(err.into());
+                    break;
+                }
+            };
+            let encoded = match postcard::to_stdvec(&value).map_err(CodecError::from) {
+                Ok(bytes) => Bytes::from(bytes),
+                Err(err) => {
+                    failure = Some(err.into());
+                    break;
+                }
+            };
             let ver = self.stamp_local();
             let expires_at_ms = self.expiry_for(ttl);
             let wire_size =
                 wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
             if wire_size > self.max_frame {
-                return Err(CacheError::ValueTooLarge {
+                failure = Some(CacheError::ValueTooLarge {
                     cache: self.name.clone(),
                     size: encoded.len(),
                     limit: self.max_frame,
                 });
+                break;
             }
             let hash = engine::hash_key_bytes(key_bytes.as_ref());
             prepared.push((hash, key, key_bytes, ver, value, expires_at_ms, encoded));
@@ -1043,7 +1061,10 @@ where
             // the rest of the fill is still applying.
             self.fan_out.extend(applied_keys.drain(..));
         }
-        Ok(())
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
@@ -1586,6 +1607,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_load_stampede_with_a_failing_loader_shares_one_error_with_every_waiter() {
+        const CONCURRENCY: usize = 8;
+        let s = Arc::new(shard::<u32, String>(1));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENCY {
+            let s = Arc::clone(&s);
+            let calls = std::sync::Arc::clone(&calls);
+            tasks.spawn(async move {
+                s.get_or_load(&99, async move |_key: &u32| -> Result<String, BoomError> {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Widens the race window so every caller joins this one
+                    // load before it fails.
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Err(BoomError)
+                })
+                .await
+            });
+        }
+
+        let mut results = Vec::with_capacity(CONCURRENCY);
+        while let Some(result) = tasks.join_next().await {
+            results.push(result.expect("stampede caller does not panic"));
+        }
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the loader runs exactly once under a stampede of {CONCURRENCY} concurrent misses"
+        );
+        assert_eq!(results.len(), CONCURRENCY);
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, Err(CacheError::Loader(_)))),
+            "every joined waiter returns the same Loader failure"
+        );
+    }
+
+    /// Deterministically lands a write in the narrow gap between
+    /// `get_or_load`'s fast-path miss and `Engine::miss_or_join`'s locked
+    /// re-check, by giving the shard a clock whose second call (the one
+    /// feeding `miss_or_join`) performs the write itself before returning a
+    /// timestamp. No real concurrency, and no flakiness: the write always
+    /// lands on the second clock read, deterministically.
+    #[tokio::test]
+    async fn get_or_load_hits_when_a_write_lands_between_the_fast_path_miss_and_the_locked_recheck()
+    {
+        let s0 = shard::<u32, String>(1);
+        let engine_for_clock = Arc::clone(&s0.engine);
+        let resolver_for_clock = Arc::clone(&s0.resolver);
+        let tombstone_ttl_ms = s0.tombstone_ttl_ms;
+        let tombstone_max_ttl_ms = s0.tombstone_max_ttl_ms;
+
+        let call_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_idx_for_clock = Arc::clone(&call_idx);
+        let clock: Arc<dyn Fn() -> u64 + Send + Sync> = Arc::new(move || {
+            let n = call_idx_for_clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 1 {
+                let kb = key_bytes(&7u32);
+                let hash = engine::hash_key_bytes(kb.as_ref());
+                let bucket = engine::stripe_index_from_hash(hash);
+                let value = "landed".to_string();
+                let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encode"));
+                let _ = engine_for_clock.apply_many(
+                    bucket,
+                    vec![(
+                        hash,
+                        7u32,
+                        kb,
+                        hlc(1, 9),
+                        Incoming::Put {
+                            value,
+                            expires_at_ms: None,
+                            encoded,
+                        },
+                    )],
+                    resolver_for_clock.as_ref(),
+                    tombstone_ttl_ms,
+                    tombstone_max_ttl_ms,
+                    0,
+                );
+            }
+            0
+        });
+        let s = s0.with_clock(clock);
+
+        let loaded = s
+            .get_or_load(&7, async move |_key: &u32| -> Result<String, BoomError> {
+                panic!(
+                    "the value already landed before this call reaches the loader; \
+                     get_or_load must resolve via the locked re-check's Hit instead"
+                );
+            })
+            .await
+            .expect("resolves via the Hit path, never reaching the loader");
+        assert_eq!(loaded, "landed");
+        assert_eq!(
+            call_idx.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly two clock reads: the fast-path miss, then the locked re-check that hits"
+        );
+    }
+
+    #[tokio::test]
     async fn value_too_large_is_rejected() {
         let s = shard::<u32, Vec<u8>>(1);
         let big = vec![0u8; MAX_FRAME + 1];
@@ -1594,6 +1721,34 @@ mod tests {
             .await
             .expect_err("oversized value rejected");
         assert!(matches!(err, CacheError::ValueTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn insert_many_applies_entries_before_an_oversized_one_then_fails() {
+        let s = shard::<u32, Vec<u8>>(1);
+        let ok_value = vec![0u8; 4];
+        let big = vec![0u8; MAX_FRAME + 1];
+        let err = s
+            .insert_many([(1u32, ok_value.clone()), (2u32, big)])
+            .await
+            .expect_err("the oversized second entry is rejected");
+        assert!(matches!(err, CacheError::ValueTooLarge { .. }));
+        assert_eq!(
+            s.get(&1).await,
+            Some(ok_value),
+            "insert_many is not a transaction: the key before the oversized one already applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_key_round_trips_through_the_heap_encoding_path() {
+        // Longer than engine::KEY_STACK_BUF (128 bytes) once postcard-encoded,
+        // so both the write and the read fall back to a heap allocation.
+        let s = shard::<String, String>(1);
+        let key = "k".repeat(200);
+        s.insert(key.clone(), "v".into()).await.expect("insert");
+        assert_eq!(s.get(&key).await, Some("v".to_string()));
+        assert!(s.contains_key(&key).await);
     }
 
     #[tokio::test]
@@ -1658,6 +1813,59 @@ mod tests {
         assert!(recs[0].is_tombstone());
         ShardOps::apply_remote(&b, recs[0].clone()).await;
         assert_eq!(b.get(&42).await, None);
+    }
+
+    #[tokio::test]
+    async fn apply_remote_batch_skips_undecodable_records_and_applies_the_rest() {
+        let s = shard::<u32, String>(1);
+        // Postcard decoding of any non-unit type fails on an empty slice: no
+        // length-prefix or varint byte to even start on.
+        let undecodable_key = WireRecord {
+            key: Bytes::new(),
+            value: Some(Bytes::from(postcard::to_stdvec("ignored").expect("encode"))),
+            ver: hlc(10, 2),
+            expires_at_ms: None,
+        };
+        let undecodable_value = WireRecord {
+            key: key_bytes(&2u32),
+            value: Some(Bytes::new()),
+            ver: hlc(10, 2),
+            expires_at_ms: None,
+        };
+        let valid = WireRecord {
+            key: key_bytes(&3u32),
+            value: Some(Bytes::from(postcard::to_stdvec("ok").expect("encode"))),
+            ver: hlc(10, 2),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote_batch(&s, vec![undecodable_key, undecodable_value, valid]).await;
+
+        assert_eq!(
+            s.get(&3).await,
+            Some("ok".to_string()),
+            "the one decodable record in the batch still applies"
+        );
+        assert_eq!(
+            s.get(&2).await,
+            None,
+            "a record with undecodable value bytes is skipped, not applied"
+        );
+        assert_digest_matches_full_recompute(&s).await;
+    }
+
+    #[tokio::test]
+    async fn invalidate_with_undecodable_key_bytes_is_a_silent_no_op() {
+        let s = shard::<u32, String>(1);
+        s.insert(1, "a".into()).await.expect("insert");
+
+        ShardOps::invalidate(&s, Bytes::new(), hlc(u64::MAX / 2, 2)).await;
+
+        assert_eq!(
+            s.get(&1).await,
+            Some("a".into()),
+            "an invalidate call for undecodable key bytes touches nothing"
+        );
+        assert_digest_matches_full_recompute(&s).await;
     }
 
     /// Two keys guaranteed to land in different stripes, for the striping tests
@@ -2167,6 +2375,13 @@ mod tests {
             RecordView {
                 value: Some(b"ab"),
                 ver: hlc(1, 9),
+                expires_at_ms: None,
+            },
+            // Same length as "ab" above, different version: the only pair
+            // here that exercises the equal-length tie-break by `Hlc`.
+            RecordView {
+                value: Some(b"zz"),
+                ver: hlc(5, 3),
                 expires_at_ms: None,
             },
         ];

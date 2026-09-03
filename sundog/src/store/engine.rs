@@ -1244,6 +1244,25 @@ mod tests {
     }
 
     #[test]
+    fn contains_key_and_record_for_read_an_expired_entry_as_absent_before_any_sweep() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(1);
+        let _ = put(&engine, 1, kb.clone(), "a".into(), hlc(1, 1), Some(50), 0);
+        assert!(engine.contains_key(&1, 0));
+        assert!(engine.record_for(kb.as_ref(), 0).is_some());
+
+        // Past the deadline, but no sweep has run yet.
+        assert!(
+            !engine.contains_key(&1, 100),
+            "an expired entry reads as absent from contains_key immediately"
+        );
+        assert!(
+            engine.record_for(kb.as_ref(), 100).is_none(),
+            "record_for treats an expired live entry as absent, no sweep needed"
+        );
+    }
+
+    #[test]
     fn sweep_removes_expired_entries_and_corrects_the_digest() {
         let engine = engine_u32_string(u64::MAX, None);
         let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), Some(50), 0);
@@ -1345,6 +1364,122 @@ mod tests {
         for &k in &same_bucket_keys[1..] {
             assert!(engine.get(&k, 1_000).is_some(), "hotter entries survive");
         }
+    }
+
+    #[test]
+    fn collect_buckets_reports_a_removed_key_with_its_tombstone_version() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 3u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+        let bucket = stripe_index_from_hash(hash);
+        let _ = put(&engine, key, kb.clone(), "a".into(), hlc(1, 1), None, 0);
+
+        {
+            let mut stripe = engine.stripe_lock(bucket).write();
+            let resolver = LwwResolver;
+            let _ = apply_locked(
+                &mut stripe,
+                &engine.digest[bucket],
+                &engine.total_weight,
+                engine.weigher.as_ref(),
+                hash,
+                key,
+                kb.clone(),
+                hlc(2, 1),
+                Incoming::Tombstone,
+                &resolver,
+                60_000,
+                600_000,
+                0,
+            );
+        }
+        assert_eq!(engine.get(&key, 0), None);
+
+        let bucket_u16 = u16::try_from(bucket).expect("invariant: bucket < BUCKET_COUNT");
+        let entries = engine.collect_buckets(&[bucket_u16], 0);
+        assert_eq!(entries.len(), 1);
+        let (_, records) = &entries[0];
+        assert!(
+            records
+                .iter()
+                .any(|(k, ver)| k.as_ref() == kb.as_ref() && *ver == hlc(2, 1)),
+            "a removed key still appears in its bucket's entries, carrying the tombstone's \
+             version: {records:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_rotates_past_an_empty_start_bucket_into_other_stripes() {
+        let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
+        let engine = Engine::<u32, String>::new(3, None, Some(weigher));
+
+        // 8 keys landing in 8 distinct, non-empty stripes.
+        let mut other_keys = Vec::new();
+        let mut used_buckets = std::collections::HashSet::new();
+        let mut candidate = 0u32;
+        while other_keys.len() < 8 {
+            let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(candidate).as_ref()));
+            if used_buckets.insert(bucket) {
+                other_keys.push(candidate);
+            }
+            candidate += 1;
+        }
+        for (i, &k) in other_keys.iter().enumerate() {
+            let now = u64::try_from(i).expect("small");
+            let _ = put(
+                &engine,
+                k,
+                key_bytes(k),
+                k.to_string(),
+                hlc(u64::from(k) + 1, 1),
+                None,
+                now,
+            );
+        }
+
+        // A key landing in a stripe none of the above touched: the eviction
+        // start point, but with only one entry to give up.
+        let start_key = loop {
+            let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(candidate).as_ref()));
+            if !used_buckets.contains(&bucket) {
+                break candidate;
+            }
+            candidate += 1;
+        };
+        let start_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(start_key).as_ref()));
+        let _ = put(
+            &engine,
+            start_key,
+            key_bytes(start_key),
+            start_key.to_string(),
+            hlc(1_000, 1),
+            None,
+            100,
+        );
+
+        let (entries_before, weight_before) = engine.debug_totals();
+        assert_eq!(entries_before, 9);
+        assert_eq!(weight_before, 9);
+
+        engine.enforce_capacity(start_bucket);
+
+        let (entries_after, weight_after) = engine.debug_totals();
+        assert!(
+            weight_after <= 3,
+            "total weight {weight_after} stays within the 3-unit cap"
+        );
+        assert!(
+            entries_after < entries_before - 1,
+            "the start stripe alone (1 entry) cannot account for a {}-entry eviction: \
+             enforce_capacity rotated into other stripes",
+            entries_before - entries_after
+        );
+        assert_eq!(
+            engine.get(&start_key, 100),
+            None,
+            "the start stripe's own entry is evicted too"
+        );
     }
 
     #[tokio::test]
@@ -1506,6 +1641,131 @@ mod tests {
             .expect("a completion that preceded the wait is not lost")
             .expect("the owner finished the fill");
         assert_eq!(engine.get(&key, 0), Some("late".to_string()));
+    }
+
+    #[test]
+    fn miss_or_join_hits_on_the_locked_recheck_after_a_concurrent_insert() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 5u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+
+        assert_eq!(engine.get(&key, 0), None, "the fast-path read misses first");
+        // A write lands on the key between the caller's fast-path miss and its
+        // call to `miss_or_join`, e.g. a concurrent `get_or_load` owner or a
+        // plain remote write.
+        let _ = put(&engine, key, kb.clone(), "late".into(), hlc(1, 1), None, 0);
+
+        match engine.miss_or_join(&kb, hash, 0) {
+            JoinOutcome::Hit(v) => assert_eq!(v, "late"),
+            _ => panic!("the locked re-check finds the entry that landed after the fast-path miss"),
+        }
+    }
+
+    #[test]
+    fn complete_fresh_load_replaces_a_tombstone_and_keeps_digest_and_weight_correct() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 21u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+        let bucket = stripe_index_from_hash(hash);
+
+        let _ = put(&engine, key, kb.clone(), "old".into(), hlc(1, 1), None, 0);
+        {
+            let mut stripe = engine.stripe_lock(bucket).write();
+            let resolver = LwwResolver;
+            let _ = apply_locked(
+                &mut stripe,
+                &engine.digest[bucket],
+                &engine.total_weight,
+                engine.weigher.as_ref(),
+                hash,
+                key,
+                kb.clone(),
+                hlc(2, 1),
+                Incoming::Tombstone,
+                &resolver,
+                60_000,
+                600_000,
+                0,
+            );
+        }
+        assert_eq!(
+            engine.get(&key, 0),
+            None,
+            "a tombstone sits where the load will land"
+        );
+
+        let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+            panic!("no live entry: this caller becomes the owner");
+        };
+        let encoded = Bytes::from(postcard::to_stdvec("fresh").expect("encode"));
+        let had_live = engine.complete_fresh_load(
+            &key,
+            &kb,
+            hash,
+            hlc(3, 1),
+            "fresh".to_string(),
+            encoded,
+            None,
+            0,
+            &inflight,
+        );
+        assert!(!had_live, "a tombstone is not a live entry");
+        assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
+        assert_eq!(engine.digests(), engine.recompute_digests_paired());
+        let (entries, weight) = engine.debug_totals();
+        assert_eq!(entries, 1);
+        assert_eq!(weight, 1);
+    }
+
+    #[test]
+    fn complete_fresh_load_replaces_a_live_entry_that_landed_during_the_load() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 22u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+
+        assert_eq!(engine.get(&key, 0), None);
+        let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+            panic!("first caller becomes the owner");
+        };
+
+        // A write lands on the same key while the load is in flight, e.g. a
+        // replicated write racing the local loader.
+        let _ = put(
+            &engine,
+            key,
+            kb.clone(),
+            "raced-in".into(),
+            hlc(5, 2),
+            None,
+            0,
+        );
+        assert_eq!(engine.get(&key, 0), Some("raced-in".to_string()));
+
+        let encoded = Bytes::from(postcard::to_stdvec("loaded").expect("encode"));
+        let had_live = engine.complete_fresh_load(
+            &key,
+            &kb,
+            hash,
+            hlc(1, 1),
+            "loaded".to_string(),
+            encoded,
+            None,
+            0,
+            &inflight,
+        );
+        assert!(had_live, "the entry that landed during the load was live");
+        assert_eq!(
+            engine.get(&key, 0),
+            Some("loaded".to_string()),
+            "complete_fresh_load installs unconditionally, even over a racer with a newer Hlc"
+        );
+        assert_eq!(engine.digests(), engine.recompute_digests_paired());
+        let (entries, weight) = engine.debug_totals();
+        assert_eq!(entries, 1);
+        assert_eq!(weight, 1);
     }
 
     #[test]
