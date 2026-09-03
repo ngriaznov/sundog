@@ -1,8 +1,7 @@
-//! Property tests for the IBLT sketch: whenever `subtract` + `peel`
-//! decodes, the result is the *exact* symmetric difference, at any size;
-//! and at [`RATED_CAPACITY`] the default shape decodes at least 98% of
-//! seeded random differences (99% is the measured rate; the bound leaves
-//! room for sampling noise without hiding a real regression).
+//! Property tests for the IBLT sketch. Whenever `subtract` and `peel`
+//! decode, the result is the exact symmetric difference at any size, and
+//! at [`RATED_CAPACITY`] the default shape decodes at least 98% of random
+//! differences.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,16 +12,14 @@ use super::{Elem, IBLT_PARTITIONS, Iblt, RATED_CAPACITY};
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
-/// The default sketch size ([`crate::config::ClusterConfig::ae_sketch_cells`]'s
-/// own default) — [`RATED_CAPACITY`] is rated against exactly this shape.
+/// The default sketch size, the shape [`RATED_CAPACITY`] rates against.
 const DEFAULT_CELLS: usize = 240;
 
 #[derive(Debug, Clone, Copy)]
 enum Role {
     LeftOnly,
     RightOnly,
-    /// Present on both sides, at (possibly, if the two generated `Hlc`s
-    /// happen to collide, *not* actually) different versions.
+    /// Present on both sides, usually at different versions.
     Differing,
 }
 
@@ -51,13 +48,9 @@ fn item_strategy() -> impl Strategy<Value = (u64, Role, Hlc, Hlc)> {
     )
 }
 
-/// Builds the two sketches and the expected exact decode from a list of
-/// `(key_hash, role, ver_left, ver_right)` items. A `Differing` item whose
-/// two generated `Hlc`s happen to be equal degenerates to canceling
-/// entirely, exactly as a real identical-version element would, so the
-/// computed expectation always matches what `peel` should return. Colliding
-/// `key_hash`es across items are deduplicated (last write wins), which only
-/// shrinks the real difference, never grows it past the caller's bound.
+/// Builds two sketches and the expected exact decode from
+/// `(key_hash, role, ver_left, ver_right)` items. Colliding `key_hash`es
+/// are deduplicated, which only shrinks the real difference.
 fn build(items: Vec<(u64, Role, Hlc, Hlc)>) -> (Iblt, Iblt, HashSet<Elem>, HashSet<Elem>) {
     let mut by_hash: HashMap<u64, (Role, Hlc, Hlc)> = HashMap::new();
     for (key_hash, role, left_ver, right_ver) in items {
@@ -106,18 +99,14 @@ fn build(items: Vec<(u64, Role, Hlc, Hlc)>) -> (Iblt, Iblt, HashSet<Elem>, HashS
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
-    /// No size cap this time — the difference may well exceed the sketch's
-    /// rated capacity. Either `peel` decodes (and, if it does, the result
-    /// must still be exact) or it reports `Undecodable`; it must never
-    /// return a wrong answer.
+    /// No size cap: `peel` either decodes exactly or reports
+    /// `Undecodable`, never a wrong answer.
     #[test]
     fn beyond_rated_capacity_is_exact_or_undecodable_never_wrong(
         items in proptest::collection::vec(item_strategy(), 0..300)
     ) {
         let (left, right, expected_left, expected_right) = build(items);
-        // `Err(Undecodable)` is also an acceptable outcome here (an
-        // oversubscribed sketch, no wrong answer returned) — only a
-        // successful decode has anything further to check.
+        // `Undecodable` is acceptable; only a decode needs checking.
         if let Ok(decoded) = left.subtract(&right).peel() {
             let got_left: HashSet<Elem> = decoded.only_left.into_iter().collect();
             let got_right: HashSet<Elem> = decoded.only_right.into_iter().collect();
@@ -127,10 +116,7 @@ proptest! {
     }
 
     /// A sketch subtracted from an exact copy of itself always cancels to
-    /// nothing, regardless of how many elements it holds — every element's
-    /// contribution is deterministic and self-inverse, so this holds even
-    /// far past `RATED_CAPACITY` (unlike the two properties above, this one
-    /// carries no size bound at all).
+    /// nothing, at any size, since every element's contribution is self-inverse.
     #[test]
     fn a_sketch_subtracted_from_itself_always_cancels_to_nothing(
         elems in proptest::collection::hash_map(any::<u64>(), hlc_strategy(), 0..500)
@@ -148,8 +134,7 @@ proptest! {
         prop_assert!(decoded.only_right.is_empty());
     }
 
-    /// `Iblt::new` always yields a well-formed shape: a positive multiple of
-    /// [`IBLT_PARTITIONS`], regardless of the requested cell count.
+    /// `Iblt::new` always yields a positive multiple of [`IBLT_PARTITIONS`].
     #[test]
     fn new_always_yields_a_shape_thats_a_multiple_of_partitions(cells in 0usize..10_000) {
         let iblt = Iblt::new(cells);
@@ -159,11 +144,8 @@ proptest! {
     }
 }
 
-/// A seeded, deterministic sample of `RATED_CAPACITY`-sized differences at
-/// the default shape: half the elements on each side over a shared base of
-/// a thousand identical entries, exactly the bucket a large-cache
-/// anti-entropy round compares. Pins the decode rate `RATED_CAPACITY`'s
-/// docs state.
+/// A seeded sample of `RATED_CAPACITY`-sized differences at the default
+/// shape, pinning the decode rate `RATED_CAPACITY`'s docs state.
 #[test]
 fn rated_capacity_decodes_at_least_ninety_eight_percent() {
     const TRIALS: u32 = 500;

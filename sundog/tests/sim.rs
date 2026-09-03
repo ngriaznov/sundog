@@ -1,20 +1,14 @@
 //! Deterministic simulation suite: drives `net::Mesh` and
 //! `store::Shard`/`ShardOps` directly inside a `turmoil` simulation, against
-//! a hand-scripted membership feed built from `Peer` values — no chitchat,
-//! no real UDP/TCP. `cluster.rs`'s composition (membership-driven
-//! `update_peers`, the inbound dispatch loop, the anti-entropy scheduler,
-//! and state-transfer's donor-retry loop) is `pub(crate)` and unusable from
-//! here, so this file re-implements the relevant slice of each against the
-//! same public `Mesh`/`ShardOps` surface `cluster.rs` itself drives.
+//! a hand-scripted membership feed built from `Peer` values, with no real
+//! UDP or TCP. `cluster.rs`'s composition is `pub(crate)` and unusable from
+//! here, so this file reimplements the relevant slice against the same
+//! public `Mesh`/`ShardOps` surface `cluster.rs` itself drives.
 //!
-//! `turmoil`'s simulated TCP objects (reached through `net`'s transport seam,
-//! `src/net/tcp.rs`) must be created and driven from *within* the owning
-//! host's own future — a `Mesh` cannot be shared across hosts. A `Shard` has
-//! no such constraint (pure state, no simulated I/O), so every scenario below
-//! builds each node's `Shard` up front and hands an `Arc` clone to both that
-//! node's host future (for wiring into a `Mesh`-backed `RequestHandler` and
-//! for applying inbound/state-transfer records) and to the test function
-//! itself (for assertions).
+//! `turmoil`'s simulated TCP objects must be created and driven from within
+//! the owning host's own future; a `Mesh` cannot be shared across hosts. A
+//! `Shard` has no such constraint, so each scenario builds it up front and
+//! shares an `Arc` clone with both the host future and the test itself.
 
 #![cfg(feature = "sim")]
 
@@ -41,32 +35,22 @@ use turmoil::{Builder, Sim};
 type TestShard = Shard<u32, String>;
 type SimResult = turmoil::Result;
 
-/// Deterministic by default; the scheduled fresh-seed CI job overrides via
-/// `SUNDOG_SIM_SEED` and the chosen value is echoed so a red run names the
-/// seed to replay. `simulation_is_reproducible_for_a_fixed_seed` keeps its
-/// own fixed seeds regardless.
+/// Deterministic by default. The scheduled fresh-seed CI job overrides via
+/// `SUNDOG_SIM_SEED`, echoing the seed so a red run can replay it.
 fn sim_seed(default: u64) -> u64 {
     std::env::var("SUNDOG_SIM_SEED").map_or(default, |raw| {
-        let seed: u64 = raw
-            .parse()
-            .expect("SUNDOG_SIM_SEED must be a u64 turmoil seed");
+        let seed: u64 = raw.parse().expect("SUNDOG_SIM_SEED is a u64 turmoil seed");
         eprintln!("sim seed override: replay with SUNDOG_SIM_SEED={seed}");
         seed
     })
 }
 
 const CACHE: &str = "sim-users";
-/// Simulated time per `Sim::step()`: small relative to every interval below,
-/// so scheduling stays close to the nominal cadence without needing an
-/// impractical number of steps to cover a few seconds of simulated time.
+/// Simulated time per `Sim::step()`, small relative to every interval below.
 const TICK: Duration = Duration::from_millis(5);
-/// Bounds every request/response network call in this harness (anti-entropy
-/// exchange, state-transfer stream reads). Turmoil's `fail_rate` drops a
-/// message outright with no retransmission (unlike a real dropped TCP
-/// segment, which the OS retries): if the dropped message was the one thing
-/// a reader was waiting on, that read stalls forever rather than erroring.
-/// Real `net::Mesh` never needs this — real TCP retransmits — but a harness
-/// exercising turmoil's lossier model does.
+/// Bounds every request/response network call in this harness. Turmoil's
+/// `fail_rate` drops a message outright with no retransmission, so a
+/// stalled read needs its own timeout; real `net::Mesh` relies on TCP's own.
 const NET_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn cache_name() -> SmolStr {
@@ -77,11 +61,8 @@ fn key_bytes(key: u32) -> Bytes {
     Bytes::from(postcard::to_stdvec(&key).expect("u32 always postcard-encodes"))
 }
 
-/// Runs a `ShardOps` future to completion without any ambient runtime —
-/// valid because `Shard`'s async methods only ever await plain
-/// `tokio::sync` primitives, none of which needs a reactor — for reading
-/// shard state from outside any turmoil host (the test function itself,
-/// which is not itself async).
+/// Runs a `ShardOps` future to completion with no ambient runtime, valid
+/// since `Shard`'s async methods only await plain `tokio::sync` primitives.
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     futures::executor::block_on(fut)
 }
@@ -130,16 +111,13 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
         Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
-        // `Hello`, the request/response messages, and `ReqDone` never reach
-        // this dispatcher — a no-op for all of them, and (a wildcard rather
-        // than an exhaustive list) for any future variant too.
+        // `Hello`, request/response messages, and `ReqDone` are a no-op here.
         _ => {}
     }
 }
 
 /// Wraps a shared `Shard` as the `net::RequestHandler` a `Mesh` answers
-/// inbound state-transfer/anti-entropy requests through — the single-shard
-/// stand-in for `cluster.rs`'s `ClusterRequestHandler` over a whole registry.
+/// inbound requests through, standing in for `cluster.rs`'s handler.
 struct ShardHandler(Arc<TestShard>);
 
 impl RequestHandler for ShardHandler {
@@ -172,10 +150,8 @@ impl RequestHandler for ShardHandler {
     }
 }
 
-/// Fans `key`'s current record out to `peers`, `dup_factor` times each — the
-/// harness stand-in for `cluster::fan_out_one`'s `Mode::Replicated` arm.
-/// Sending the same record repeatedly is this suite's "duplicate storm":
-/// idempotent apply must make it a no-op past the first delivery.
+/// Fans `key`'s current record out to `peers`, `dup_factor` times each,
+/// standing in for `cluster::fan_out_one`'s `Mode::Replicated` arm.
 async fn fan_out(shard: &TestShard, mesh: &Mesh, peers: &[NodeId], key: u32, dup_factor: usize) {
     let Some(rec) = ShardOps::records_for(shard, vec![key_bytes(key)])
         .await
@@ -198,11 +174,8 @@ async fn fan_out(shard: &TestShard, mesh: &Mesh, peers: &[NodeId], key: u32, dup
     }
 }
 
-/// One anti-entropy round against `peer`, re-implementing
-/// `cluster::anti_entropy::run_round_against`'s digest-exchange-then-diff
-/// logic (`pub(crate)`, unreachable here) over the same public `Mesh`/
-/// `ShardOps` calls it drives. Returns whether the round completed (`false`
-/// on any network failure, e.g. a simulated link failure or a crashed peer).
+/// One anti-entropy round against `peer`, reimplementing
+/// `run_round_against`'s digest-exchange logic over the same public calls.
 async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
     let local_buckets = ShardOps::digests(shard).await;
     let Ok(Ok(mismatched)) = tokio::time::timeout(
@@ -217,11 +190,8 @@ async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
     let mut push_keys = Vec::new();
     let mut pull_keys = Vec::new();
     for mismatch in mismatched {
-        // This harness's buckets never grow past `ae_sketch_min_bucket`'s
-        // default, so the responder never answers with `AeMismatch::Sketch`
-        // in practice; skip it rather than decode it, keeping this
-        // reimplementation to the plain listing path
-        // `cluster::anti_entropy::run_round_against` also falls back to.
+        // This harness's buckets never grow past `ae_sketch_min_bucket`, so
+        // the responder never answers with `AeMismatch::Sketch`; skip it.
         let sundog::net::AeMismatch::Bucket(bucket, peer_entries) = mismatch else {
             continue;
         };
@@ -283,15 +253,9 @@ async fn diff_bucket(
 }
 
 /// One symmetric peer's whole role in scenarios 1 and 2: write its own key
-/// range on a timer (fanning each out), run anti-entropy against its peer on
-/// a separate timer, and dispatch inbound traffic — forever.
-///
-/// `remove_on_repeat` turns the key list into a lifecycle schedule: the
-/// first occurrence of a key inserts it, any repeat occurrence removes it
-/// (fanning the tombstone out the same way), so a key listed twice churns
-/// it through insert-then-delete. `ops_issued` counts every issued
-/// operation — the only externally observable "the writes finished" signal
-/// once removes make value-presence checks useless.
+/// range on a timer, fan each write out, run anti-entropy on a separate
+/// timer, and dispatch inbound traffic. `remove_on_repeat` turns a key's
+/// second occurrence into a remove; `ops_issued` counts every issued op.
 #[derive(Clone)]
 struct NodeParams {
     node: NodeId,
@@ -363,8 +327,7 @@ async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
     }
 }
 
-/// A pair of symmetric peers' fixed setup: hostnames, ids, disjoint key
-/// ranges to write, and shared timing/behavior knobs.
+/// A pair of symmetric peers' fixed setup: hosts, ids, key ranges, timing.
 struct PairSpec {
     host_a: &'static str,
     host_b: &'static str,
@@ -489,8 +452,7 @@ fn partition_during_writes_converges_within_five_ae_rounds() {
         None,
     );
 
-    // Partition first, so the whole write burst on both sides happens while
-    // split, then heal and bound convergence to five AE-round intervals.
+    // Partition before the write burst, then heal and bound convergence.
     sim.partition("node-a", "node-b");
     run_steps(&mut sim, steps_for(Duration::from_millis(750)));
     sim.repair("node-a", "node-b");
@@ -501,7 +463,7 @@ fn partition_during_writes_converges_within_five_ae_rounds() {
     });
     assert!(
         converged.is_some(),
-        "digests must converge within five AE-round intervals of healing"
+        "digests converge within five AE-round intervals of healing"
     );
 
     for &key in keys_a.iter().chain(keys_b.iter()) {
@@ -525,10 +487,8 @@ struct StormStats {
     keys_present_b: usize,
 }
 
-/// Message loss + a wide latency spread (reorder) + a deliberate per-write
-/// duplicate storm, all running concurrently with live writes on both
-/// sides. No partition here: `fail_rate` alone breaks and re-establishes
-/// individual links throughout the run.
+/// Message loss, latency spread, and a duplicate storm running concurrently
+/// with live writes; `fail_rate` alone breaks and heals links throughout.
 fn run_storm_scenario(seed: u64) -> StormStats {
     let node_a = NodeId::from(11);
     let node_b = NodeId::from(12);
@@ -544,14 +504,9 @@ fn run_storm_scenario(seed: u64) -> StormStats {
     let mut sim = Builder::new()
         .rng_seed(seed)
         .tick_duration(TICK)
-        // Turmoil's `fail_rate` has no TCP-segment retransmission (its own
-        // documented limitation): a single dropped chunk can break a whole
-        // in-flight connection outright, and a large message — the ~10 KiB
-        // full-digest array sent every anti-entropy round — crosses many
-        // chunks, so its odds of a break compound per chunk. A rate that reads as
-        // "occasional loss" for one small message is "nearly every AE round
-        // breaks" for this one; kept low enough that rounds still routinely
-        // succeed within a handful of `ae_period` retries.
+        // Turmoil's `fail_rate` has no TCP-segment retransmission, so a
+        // dropped chunk can break a whole in-flight connection; kept low
+        // enough that AE rounds still routinely succeed within a few retries.
         .fail_rate(0.03)
         .repair_rate(0.75)
         .min_message_latency(Duration::from_millis(1))
@@ -577,15 +532,9 @@ fn run_storm_scenario(seed: u64) -> StormStats {
         Some(Arc::clone(&ae_failures)),
     );
 
-    // Both sides' write bursts run concurrently with AE from the start
-    // (the "storm"), so digest equality can hold trivially early — neither
-    // side has written anything yet — well before every key exists anywhere
-    // to converge on. A fixed time margin isn't a safe proxy for "the
-    // writes finished issuing" (the inbound-dispatch branch of
-    // `node_loop`'s `select!` can win repeatedly under a heavy duplicate
-    // storm, delaying — never dropping — a late write past any fixed
-    // budget), so wait explicitly for every key to exist on its own origin
-    // shard before treating digest equality as real convergence.
+    // Both sides write concurrently with AE, so digest equality can hold
+    // trivially early. Wait explicitly for every key to exist on its own
+    // origin shard before treating digest equality as real convergence.
     let own_writes_issued =
         |shard: &TestShard, keys: &[u32]| keys.iter().all(|&key| value_of(shard, key).is_some());
     run_until(&mut sim, steps_for(Duration::from_secs(10)), || {
@@ -610,11 +559,11 @@ fn run_storm_scenario(seed: u64) -> StormStats {
     let keys_present_b = present(&shard_b);
     assert_eq!(
         keys_present_a, total_keys,
-        "node-a must hold every key once converged"
+        "node-a holds every key once converged"
     );
     assert_eq!(
         keys_present_b, total_keys,
-        "node-b must hold every key once converged"
+        "node-b holds every key once converged"
     );
 
     StormStats {
@@ -632,23 +581,19 @@ fn loss_reorder_duplicate_storm_still_converges() {
 
 #[test]
 fn simulation_is_reproducible_for_a_fixed_seed() {
-    // Digest *values* embed each write's `Hlc`, which is stamped from real
-    // wall-clock time (`store::now_ms`) — not reproducible across two
-    // separate process runs even under the same turmoil seed. What *is* a
-    // pure function of the seed is turmoil's own network schedule (loss,
-    // latency, reorder), so this asserts on outcomes that depend only on
-    // that: how many simulated steps convergence took, how many AE rounds
-    // hit a network failure, and which keys ended up present.
+    // Digest values embed each write's `Hlc`, stamped from real wall-clock
+    // time, so they are not reproducible across runs. What is a pure
+    // function of the seed is turmoil's own network schedule.
     let run1 = run_storm_scenario(0x5EED_0042);
     let run2 = run_storm_scenario(0x5EED_0042);
 
     assert_eq!(
         run1.steps_to_converge, run2.steps_to_converge,
-        "the same seed must converge at the same simulated step"
+        "the same seed converges at the same simulated step"
     );
     assert_eq!(
         run1.ae_failures, run2.ae_failures,
-        "the same seed must reproduce the same count of failed AE rounds"
+        "the same seed reproduces the same count of failed AE rounds"
     );
     assert_eq!(run1.keys_present_a, run2.keys_present_a);
     assert_eq!(run1.keys_present_b, run2.keys_present_b);
@@ -734,13 +679,9 @@ async fn receiver_software(
     }
 }
 
-/// A deliberately simplified stand-in for `cluster::state_transfer::run`
-/// (`pub(crate)`, unreachable from an external test binary): tries each
-/// donor in order, applying records as they stream in, and falls through to
-/// the next donor the moment the stream reports an error — the same
-/// "a crashed donor surfaces as a stream error, not a clean end" contract
-/// `net::conn::state_stream` guarantees and the production retry loop relies
-/// on: the receiver notices the failure, re-picks a donor, and re-requests.
+/// A simplified stand-in for `cluster::state_transfer::run`: tries each
+/// donor in order, applying records as they stream in, and falls through
+/// to the next donor the moment the stream reports an error.
 async fn warm_up(mesh: &Mesh, shard: &TestShard, donors: &[NodeId], applied: &AtomicUsize) -> bool {
     for &donor in donors {
         let Ok(Ok(mut stream)) =
@@ -781,20 +722,14 @@ fn new_shard_with_tombstone_ttl(
 
 /// Runs the scenario that motivates partition-aware tombstone retention: two
 /// nodes converged on a key, a partition, the survivor deleting the key,
-/// real time passing well past `tombstone_ttl` while still partitioned, a
-/// heal, then anti-entropy rounds. Returns the key's value on each side
-/// once digests converge (or the budget runs out), plus whether they did.
+/// real time passing past `tombstone_ttl` while still partitioned, a heal,
+/// then anti-entropy. Returns each side's value once digests converge, or
+/// the budget runs out, plus whether they did.
 ///
-/// `defer_while_absent` is handed straight to the real
-/// [`ShardOps::gc_tombstones`] — the production GC path — standing in for
-/// `cluster::absence::should_defer_gc`'s decision, which is `pub(crate)`
-/// and unreachable from this external test binary. `true` defers
+/// `defer_while_absent` stands in for `should_defer_gc`'s decision, handed
+/// straight to the real [`ShardOps::gc_tombstones`]. `true` defers
 /// collecting node-b's tombstone while node-a stays absent; `false`
-/// collects it unconditionally, with node-a's continued absence (the
-/// partition is still up) hand-supplied instead of read from a live
-/// `AbsenceTracker`. Anti-entropy itself is not mirrored here —
-/// `ae_round_once` drives the real `net::Mesh`/`ShardOps` wire path, same
-/// as every other scenario in this suite.
+/// collects it unconditionally.
 fn run_partition_delete_scenario(
     seed: u64,
     port: u16,
@@ -851,9 +786,7 @@ fn run_partition_delete_scenario(
             port,
             keys_a: vec![],
             keys_b: vec![],
-            // No automatic writes in this scenario — the delete below is
-            // applied directly, the way a real survivor's own `remove` call
-            // would be.
+            // No automatic writes here; the delete below is applied directly.
             write_period: Duration::from_secs(3600),
             ae_period,
             dup_factor: 1,
@@ -870,14 +803,11 @@ fn run_partition_delete_scenario(
     assert_eq!(
         value_of(&shard_b, key),
         None,
-        "the survivor's own read must reflect its delete immediately"
+        "the survivor's own read reflects its delete immediately"
     );
 
-    // Tombstone deadlines are stamped from real `SystemTime`
-    // (`store::now_ms`), not turmoil's virtual clock, so this needs actual
-    // wall-clock time to pass — well past `tombstone_ttl`, mirroring
-    // `absolute_ttl_on_the_wire_expires_a_shard_configured_with_no_ttl_of_its_own`'s
-    // same real-sleep necessity in `src/store`'s own tests.
+    // Tombstone deadlines are stamped from real `SystemTime`, not turmoil's
+    // virtual clock, so real time must pass past `tombstone_ttl`.
     std::thread::sleep(tombstone_ttl * 10);
 
     block_on(ShardOps::gc_tombstones(
@@ -896,42 +826,34 @@ fn run_partition_delete_scenario(
 }
 
 /// Proves the semantic goal directly: a member absent past
-/// `tombstone_ttl` must not be able to resurrect a manually deleted entry
-/// on heal. `run_partition_delete_scenario(.., true)` runs with deferral
-/// active — `gc_tombstones` defers collecting node-b's tombstone the whole
-/// time node-a is absent, so there's still a tombstone (not silence) for
-/// anti-entropy to converge node-a onto once healed.
+/// `tombstone_ttl` must not resurrect a manually deleted entry on heal.
+/// Deferral keeps node-b's tombstone alive until node-a is reachable again.
 #[test]
 fn partition_survivor_delete_does_not_resurrect_after_heal() {
     let (value_a, value_b, converged) =
         run_partition_delete_scenario(sim_seed(0x2E1E_7A01), 4400, true);
     assert!(
         converged,
-        "digests must converge within the AE-round budget after healing"
+        "digests converge within the AE-round budget after healing"
     );
     assert_eq!(
         value_a, None,
-        "node-a must not resurrect the deleted key after heal + AE"
+        "node-a does not resurrect the deleted key after heal + AE"
     );
-    assert_eq!(value_b, None, "node-b must keep the key deleted");
+    assert_eq!(value_b, None, "node-b keeps the key deleted");
 }
 
-/// The counter-case, proving the deferral is load-bearing rather than
-/// incidental: the *same* scenario — same partition, same delete, same
-/// real time elapsed past `tombstone_ttl` while node-a stays absent — but
-/// with unconditional GC (`defer_while_absent: false`) in the one spot
-/// that decides whether to collect. Node-b forgets the tombstone entirely
-/// while node-a is still unreachable and never learned of the delete; once
-/// healed, anti-entropy sees node-a's still-live stale copy as something
-/// node-b is missing and pulls it back. Run back to back with the
-/// deferred case so the contrast is what the assertions rest on.
+/// The counter-case, proving deferral is load-bearing: the same scenario
+/// with unconditional GC (`defer_while_absent: false`) lets node-b forget
+/// the tombstone while node-a is still absent, so anti-entropy pulls the
+/// stale value back once healed.
 #[test]
 fn tombstone_deferral_is_load_bearing_against_resurrection() {
     let (_, value_b_unconditional, converged_unconditional) =
         run_partition_delete_scenario(sim_seed(0x2E1E_7A02), 4410, false);
     assert!(
         converged_unconditional,
-        "digests must converge (onto the wrong, resurrected state) within the budget"
+        "digests converge within the budget, onto the wrong, resurrected state"
     );
     assert_eq!(
         value_b_unconditional,
@@ -942,10 +864,7 @@ fn tombstone_deferral_is_load_bearing_against_resurrection() {
 
     let (deferred_value_a, deferred_value_b, converged_deferred) =
         run_partition_delete_scenario(sim_seed(0x2E1E_7A03), 4420, true);
-    assert!(
-        converged_deferred,
-        "digests must converge under deferral too"
-    );
+    assert!(converged_deferred, "digests converge under deferral too");
     assert_eq!(
         deferred_value_a, None,
         "same scenario, deferred: node-a stays deleted"
@@ -957,12 +876,9 @@ fn tombstone_deferral_is_load_bearing_against_resurrection() {
     );
 }
 
-/// A link that flaps — six partition/heal cycles in quick succession, each
-/// shorter than an AE interval, while both sides keep writing throughout.
-/// No single heal window is long enough to guarantee a full repair, so this
-/// checks that progress made in one window is never undone by the next
-/// break: once the flapping stops, convergence completes within the same
-/// five-AE-round bound the clean-partition test uses.
+/// A link that flaps: six partition/heal cycles in quick succession, each
+/// shorter than an AE interval, with both sides writing throughout. Once
+/// flapping stops, convergence completes within the usual five-round bound.
 #[test]
 fn link_flapping_under_writes_converges_after_final_heal() {
     let node_a = NodeId::from(31);
@@ -999,8 +915,7 @@ fn link_flapping_under_writes_converges_after_final_heal() {
         None,
     );
 
-    // 6 × (300ms down + 200ms up) = 3s of flapping; both write sequences
-    // (12 keys × 40ms = 480ms) finish while the link is still unstable.
+    // 6 x (300ms down + 200ms up); both write sequences finish mid-flap.
     for _ in 0..6 {
         sim.partition("flap-a", "flap-b");
         run_steps(&mut sim, steps_for(Duration::from_millis(300)));
@@ -1014,25 +929,20 @@ fn link_flapping_under_writes_converges_after_final_heal() {
     });
     assert!(
         converged.is_some(),
-        "digests must converge within five AE-round intervals of the final heal"
+        "digests converge within five AE-round intervals of the final heal"
     );
     for &key in keys_a.iter().chain(keys_b.iter()) {
         assert!(
             value_of(&shard_a, key).is_some() && value_of(&shard_b, key).is_some(),
-            "both sides must hold key {key} after the flapping stops"
+            "both sides hold key {key} after the flapping stops"
         );
     }
 }
 
 /// An asymmetric fault: `partition_oneway` drops everything node-a sends to
-/// node-b (data, AE responses, connection handshakes) while node-b's
-/// established path to node-a keeps delivering. Both properties matter: the
-/// healthy direction must keep replicating *during* the fault — node-a ends
-/// up holding every key node-b wrote — and the broken direction's backlog
-/// must repair via anti-entropy once the link heals. The initial settle
-/// window exists because turmoil connection setup needs both directions
-/// (SYN one way, accept the other), so the meshes must dial each other
-/// before the one-way drop begins.
+/// node-b while node-b's path to node-a keeps delivering. The healthy
+/// direction must keep replicating during the fault, and the broken
+/// direction's backlog must repair once the link heals.
 #[test]
 fn one_way_partition_delivers_the_healthy_direction_and_heals() {
     let node_a = NodeId::from(41);
@@ -1069,28 +979,23 @@ fn one_way_partition_delivers_the_healthy_direction_and_heals() {
         None,
     );
 
-    // Let connections establish and the first few writes cross, then break
-    // the a→b direction only. The 8-key × 100ms write sequences keep
-    // issuing well past this point, so some of node-a's writes are
-    // guaranteed to happen entirely under the fault.
+    // Let connections establish and a few writes cross, then break the
+    // a-to-b direction only; write sequences keep issuing past this point.
     run_steps(&mut sim, steps_for(Duration::from_millis(300)));
     sim.partition_oneway("oneway-a", "oneway-b");
 
-    // The healthy direction keeps working: node-a ends up with every key
-    // node-b wrote, with the fault still up the whole time.
+    // The healthy direction keeps working regardless of the fault.
     let fault_budget = steps_for(Duration::from_secs(10));
     run_until(&mut sim, fault_budget, || {
         keys_b.iter().all(|&key| value_of(&shard_a, key).is_some())
     })
-    .expect("node-b's writes must keep replicating to node-a during the one-way fault");
+    .expect("node-b's writes keep replicating to node-a during the one-way fault");
 
-    // And the broken direction stays broken: node-a wrote keys after the
-    // drop began that node-b cannot have seen (fan-out dropped, AE responses
-    // dropped), so the two sides must still disagree.
+    // The broken direction stays broken: the two sides still disagree.
     assert_ne!(
         digests_of(&shard_a),
         digests_of(&shard_b),
-        "node-b must be missing node-a's post-fault writes while a→b is down"
+        "node-b is missing node-a's post-fault writes while a→b is down"
     );
 
     sim.repair_oneway("oneway-a", "oneway-b");
@@ -1100,22 +1005,19 @@ fn one_way_partition_delivers_the_healthy_direction_and_heals() {
     });
     assert!(
         converged.is_some(),
-        "digests must converge within ten AE-round intervals of repairing a→b"
+        "digests converge within ten AE-round intervals of repairing a→b"
     );
     for &key in keys_a.iter().chain(keys_b.iter()) {
         assert!(
             value_of(&shard_a, key).is_some() && value_of(&shard_b, key).is_some(),
-            "both sides must hold key {key} after the one-way fault heals"
+            "both sides hold key {key} after the one-way fault heals"
         );
     }
 }
 
-/// A permanently slow link — every message takes 50–150ms one way, an order
-/// of magnitude above the other scenarios — with live writes on both sides.
-/// Nothing is lost, only late: replication and anti-entropy must still
-/// converge within a bounded number of rounds, and no request path may sit
-/// closer to `NET_TIMEOUT` than one full round trip (~300ms worst case)
-/// allows.
+/// A permanently slow link, an order of magnitude above the other
+/// scenarios, with live writes on both sides. Nothing is lost, only late:
+/// replication and anti-entropy must still converge within a bounded budget.
 #[test]
 fn sustained_high_latency_still_converges() {
     let node_a = NodeId::from(51);
@@ -1163,27 +1065,21 @@ fn sustained_high_latency_still_converges() {
     });
     assert!(
         converged.is_some(),
-        "a slow-but-lossless link must still converge within the budget"
+        "a slow-but-lossless link still converges within the budget"
     );
     for &key in keys_a.iter().chain(keys_b.iter()) {
         assert_eq!(
             value_of(&shard_a, key),
             value_of(&shard_b, key),
-            "both sides must agree on key {key} under sustained high latency"
+            "both sides agree on key {key} under sustained high latency"
         );
     }
 }
 
 /// High-frequency entry lifecycle under loss: both nodes run overlapping
-/// insert-then-remove schedules (`remove_on_repeat`) over a shared key
-/// range on a lossy, reordering link, so the same key is inserted on one
-/// side, removed on the other, and the tombstone fan-out itself can be
-/// dropped and left for anti-entropy to repair. The end state is fully
-/// determined by those schedules — every even key was removed by every
-/// writer that touched it, every odd key's last operation was an insert —
-/// so the assertions check the converged state is the *correct* one, not
-/// merely a shared one: removed keys stay removed on both sides, surviving
-/// keys agree.
+/// insert-then-remove schedules over a shared key range on a lossy,
+/// reordering link. Every even key ends removed, every odd key's last
+/// operation is an insert, so the converged state must be the correct one.
 #[test]
 fn add_remove_churn_under_loss_converges_to_the_correct_state() {
     let node_a = NodeId::from(61);
@@ -1201,10 +1097,8 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
     let mut sim = Builder::new()
         .rng_seed(sim_seed(0xC4B4_A901))
         .tick_duration(TICK)
-        // Same order of loss as the storm scenario, for the same reason its
-        // comment gives: turmoil loss breaks whole in-flight connections, so
-        // this rate is "AE rounds routinely fail and retry", not "packets
-        // occasionally vanish".
+        // Same loss rate as the storm scenario: AE rounds routinely fail
+        // and retry rather than packets occasionally vanishing.
         .fail_rate(0.03)
         .repair_rate(0.75)
         .min_message_latency(Duration::from_millis(1))
@@ -1266,21 +1160,21 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
         assert_eq!(
             value_of(&shard_a, key),
             None,
-            "removed key {key} must stay removed on node-a"
+            "removed key {key} stays removed on node-a"
         );
         assert_eq!(
             value_of(&shard_b, key),
             None,
-            "removed key {key} must stay removed on node-b"
+            "removed key {key} stays removed on node-b"
         );
     }
     for key in (1..24u32).step_by(2) {
         let (on_a, on_b) = (value_of(&shard_a, key), value_of(&shard_b, key));
         assert!(
             on_a.is_some(),
-            "surviving key {key} must be present once converged"
+            "surviving key {key} is present once converged"
         );
-        assert_eq!(on_a, on_b, "both sides must agree on surviving key {key}");
+        assert_eq!(on_a, on_b, "both sides agree on surviving key {key}");
     }
 }
 
@@ -1348,7 +1242,7 @@ fn donor_crash_mid_state_transfer_repicks_and_completes() {
 
     assert!(
         crashed,
-        "test setup sanity: donor-1 must actually be crashed mid-transfer"
+        "test setup sanity: donor-1 is crashed mid-transfer"
     );
     assert!(
         done.load(Ordering::Relaxed),
@@ -1358,7 +1252,7 @@ fn donor_crash_mid_state_transfer_repicks_and_completes() {
         assert_eq!(
             value_of(&shard_r, key),
             value_of(&shard_d2, key),
-            "receiver's warmed copy must match the surviving donor for key {key}"
+            "receiver's warmed copy matches the surviving donor for key {key}"
         );
     }
 }

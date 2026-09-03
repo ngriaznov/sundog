@@ -1,5 +1,4 @@
-//! Arbitrary bytes into the frame decoder: whatever the network sends, the
-//! decoder returns `Ok` or a `CodecError` — it never panics.
+//! Arbitrary bytes into the frame decoder always return `Ok` or `CodecError`, never a panic.
 
 #![no_main]
 

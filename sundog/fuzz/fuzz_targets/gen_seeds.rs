@@ -1,7 +1,5 @@
 //! Writes one valid encoding of every message shape into each fuzz target's
-//! corpus, so the fuzzer starts from real frames instead of rediscovering
-//! the format byte by byte. Run with plain cargo, not cargo-fuzz:
-//! `cargo +nightly run --bin gen_seeds`.
+//! corpus. Run with plain cargo: `cargo +nightly run --bin gen_seeds`.
 
 use std::fs;
 
@@ -66,9 +64,7 @@ fn main() {
             cache: "users".into(),
             bucket: 512,
             // `Cell`'s fields are private to `cluster::sketch`, so a seed
-            // built from outside the crate can only reach `Cell::default`
-            // (the empty cell) — still a real, valid encoding, without any
-            // accumulated element in it.
+            // can only reach `Cell::default`, a valid empty-cell encoding.
             cells: vec![Cell::default(); 6],
         },
         Msg::AeEntries {

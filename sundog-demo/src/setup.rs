@@ -1,6 +1,5 @@
-//! Shared bootstrap for both the interactive TUI and the `--headless` smoke
-//! run: build N node slots on fixed loopback gossip ports, start them all,
-//! and kick off the background write-load generator.
+//! Shared bootstrap for the interactive TUI and the `--headless` run:
+//! builds node slots, starts them, and kicks off the write-load generator.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,16 +13,13 @@ use crate::cli::Args;
 use crate::load;
 use crate::node::{self, NodeSlot};
 
-/// Anti-entropy tuned faster than the library default (30s) so the chaos
-/// demo's convergence indicator visibly settles within a handful of
-/// seconds instead of half a minute.
+/// Faster than the library default so convergence visibly settles quickly.
 pub(crate) const AE_INTERVAL: Duration = Duration::from_secs(3);
 /// `>= 3 * AE_INTERVAL`, satisfying the tombstone-GC safety rule.
 pub(crate) const TOMBSTONE_TTL: Duration = Duration::from_secs(15);
 
-/// Everything one run of the demo needs: the node slots, the merged event
-/// feed, and the write-load's pause switch — shared verbatim by the TUI and
-/// headless entry points.
+/// Everything one run of the demo needs: node slots, merged event feed,
+/// and the write-load's pause switch, shared by the TUI and headless paths.
 pub(crate) struct Demo {
     pub(crate) nodes: Arc<Vec<Arc<NodeSlot>>>,
     pub(crate) feed_rx: UnboundedReceiver<String>,
@@ -35,8 +31,7 @@ pub(crate) struct Demo {
 }
 
 impl Demo {
-    /// Stops the write load and gracefully shuts down every still-alive
-    /// node.
+    /// Stops the write load and shuts down every still-alive node.
     pub(crate) async fn shutdown(self) {
         self.load_handle.abort();
         for node in self.nodes.iter() {
@@ -45,13 +40,10 @@ impl Demo {
     }
 }
 
-/// Builds `args.nodes` node slots, starts every one of them, and spawns the
+/// Builds `args.nodes` node slots, starts every one, and spawns the
 /// background write-load routine.
-///
 /// # Errors
-///
-/// Returns an error if any node fails to form its cluster or open the demo
-/// cache (most commonly a fixed gossip port already in use).
+/// Returns an error if any node fails to form its cluster or open the cache.
 pub(crate) async fn bootstrap(args: &Args) -> anyhow::Result<Demo> {
     let base_port = args
         .gossip_base_port

@@ -1,7 +1,5 @@
 //! Background write-load generator: on a steady interval, unless paused,
-//! writes one randomized key to a randomly chosen *live* node — tagged by
-//! origin node in the value text, on top of the origin every event already
-//! carries via `sundog::Origin`.
+//! writes one randomized key to a randomly chosen live node.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

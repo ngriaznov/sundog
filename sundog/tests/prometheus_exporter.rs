@@ -1,11 +1,8 @@
 //! The `prometheus` feature installs a real Prometheus recorder and serves
 //! `GET /metrics` on the address given to
-//! [`sundog::ClusterBuilder::prometheus_listen`].
-//!
-//! `metrics::set_global_recorder` is a single process-global slot (see
-//! `sundog::telemetry`'s module docs) — this must stay the *only* test, in
-//! this or any other `tests/*.rs` binary (each its own process), that
-//! installs a Prometheus recorder, or the second install fails.
+//! [`sundog::ClusterBuilder::prometheus_listen`]. `metrics::set_global_recorder`
+//! is a single process-global slot, so this must stay the only test in any
+//! `tests/*.rs` binary that installs one.
 
 #![cfg(all(feature = "prometheus", not(feature = "sim")))]
 
@@ -18,10 +15,8 @@ use sundog::{Cluster, Mode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Reserves a loopback TCP port the same way `cluster.rs`'s own
-/// `reserve_data_bind_addr` does: probe-bind an ephemeral port, read it back,
-/// then drop the listener so the Prometheus exporter's own bind (inside
-/// `prometheus_listen`) can claim the same address moments later.
+/// Reserves a loopback TCP port the way `cluster.rs`'s own
+/// `reserve_data_bind_addr` does: probe-bind, read back, then drop it.
 async fn reserve_tcp_addr() -> SocketAddr {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -31,10 +26,8 @@ async fn reserve_tcp_addr() -> SocketAddr {
         .expect("a freshly bound tcp listener reports a local address")
 }
 
-/// A minimal raw-socket `GET /metrics` — no HTTP client dependency needed for
-/// one request against a text-exposition endpoint. Returns `None` if the
-/// listener isn't accepting connections yet (the exporter's own background
-/// routine may not have started serving by the time this first runs).
+/// A minimal raw-socket `GET /metrics`. Returns `None` if the listener
+/// is not accepting connections yet.
 async fn scrape_metrics(addr: SocketAddr) -> Option<String> {
     let mut stream = TcpStream::connect(addr).await.ok()?;
     stream
@@ -50,10 +43,7 @@ async fn scrape_metrics(addr: SocketAddr) -> Option<String> {
 }
 
 /// Finds `metric{label="value"} <number>` in Prometheus text-exposition
-/// `body`, tolerant of the exporter's label ordering and of whether the
-/// trailing value is rendered as an integer or a float (`"4"` vs `"4.0"`).
-/// Returns the parsed value of the first matching line, skipping `#`
-/// comment/type lines.
+/// `body`, tolerant of label ordering and integer-vs-float rendering.
 fn scraped_metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
     let wanted = format!("{}=\"{}\"", label.0, label.1);
     body.lines().find_map(|line| {
@@ -88,14 +78,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     cache.insert(1, "hello".into()).await.expect("insert");
     cache.remove(&1).await.expect("remove");
 
-    // A known hit/miss sequence on its own cache, so its counters are exact
-    // rather than shared with `users`' own traffic above:
-    // 2 inserts, 3 gets that hit, 2 gets that miss, one `get_or_load` miss
-    // that fills, one `get_or_load` hit on the now-filled key, two
-    // `contains_key` checks that count nothing, one `get_or_insert_with`
-    // miss and one hit, and four concurrent `get_or_load`s of one missing
-    // key (one miss, three hits) ->
-    // hits = 3 + 1 + 1 + 3 = 8, misses = 2 + 1 + 1 + 1 = 5.
+    // A known hit/miss sequence on its own cache, exact rather than shared
+    // with `users`' traffic above: 2 inserts, 3 hit gets, 2 miss gets, one
+    // filling get_or_load, one hit get_or_load, two contains_key checks,
+    // one get_or_insert_with miss and hit, and four concurrent get_or_loads
+    // of one key: hits=3+1+1+3=8, misses=2+1+1+1=5.
     let counted = cluster
         .cache::<u32, String>("counted")
         .mode(Mode::Local)
@@ -138,8 +125,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         .await
         .expect("make succeeds");
     assert_eq!(kept, "made");
-    // Four concurrent loads of one missing key collapse into a single loader
-    // run: one miss for the run, three hits for the callers that joined it.
+    // Four concurrent loads of one key collapse into one loader run.
     let loads = futures::future::join_all((0..4).map(|_| {
         let counted = counted.clone();
         async move {
@@ -155,11 +141,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     .await;
     assert!(loads.iter().all(|value| value == "joined"));
 
-    // `sundog_open_caches` is only set by a periodic background routine (see
-    // `cluster::open_cache_gauge_task`'s docs on why it can't be
-    // event-driven), so this polls until every metric checked below has been
-    // published at least once, rather than stopping at the first reachable
-    // scrape.
+    // `sundog_open_caches` comes from a periodic background routine, so
+    // poll until every metric checked below has been published once.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let body = loop {
         if let Some(body) = scrape_metrics(metrics_addr).await

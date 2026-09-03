@@ -1,6 +1,5 @@
 //! In-process node lifecycle: builds, kills, and restarts a `sundog`
-//! `Cluster` bound to one fixed loopback gossip port, and tracks the
-//! counters the UI reads on every redraw (`NodeStatus`).
+//! `Cluster` on one fixed loopback gossip port, tracking [`NodeStatus`].
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -21,9 +20,8 @@ struct Handle {
     cache: Cache<String, String>,
 }
 
-/// Live counters for one node slot: write/feed counters come from the
-/// event listener, `entry_count` from a periodic store read (the event
-/// stream can drop under lag, so it is not integrated into a count).
+/// Live counters for one node slot: write/feed counters from the event
+/// listener, `entry_count` from a periodic store read.
 #[derive(Debug, Default)]
 pub(crate) struct NodeStatus {
     pub(crate) alive: AtomicBool,
@@ -34,8 +32,7 @@ pub(crate) struct NodeStatus {
     pub(crate) restarts: AtomicU32,
 }
 
-/// One demo node: a fixed loopback gossip address plus whatever `Cluster` is
-/// currently running there — `None` while killed.
+/// One demo node: a fixed loopback gossip address plus its running `Cluster`.
 pub(crate) struct NodeSlot {
     pub(crate) index: usize,
     pub(crate) gossip_addr: SocketAddr,
@@ -60,16 +57,13 @@ impl NodeSlot {
         self.status.alive.load(Ordering::Relaxed)
     }
 
-    /// The live peer count this node's own membership currently reports —
-    /// read straight off the running `Cluster` (a plain sync call), so the
-    /// UI needs no separate polling routine for it.
+    /// The live peer count this node's membership currently reports.
     #[must_use]
     pub(crate) fn peer_count(&self) -> Option<usize> {
         self.read_handle().map(|h| h.cluster.peers().len())
     }
 
-    /// A cheap clone of this node's cache handle, for the write-load
-    /// generator — `None` while the node is killed.
+    /// A cheap clone of this node's cache handle, `None` while killed.
     #[must_use]
     pub(crate) fn cache(&self) -> Option<Cache<String, String>> {
         self.read_handle().map(|h| h.cache)
@@ -107,14 +101,10 @@ impl NodeSlot {
             .expect("invariant: listener lock is never poisoned") = Some(listener);
     }
 
-    /// Starts this node for the first time: opens the cluster and the demo
-    /// cache, and installs the event-feed listener that keeps `status`
-    /// current.
-    ///
+    /// Starts this node for the first time: opens the cluster and cache,
+    /// and installs the event-feed listener that keeps `status` current.
     /// # Errors
-    ///
-    /// Returns an error if the cluster fails to form or the cache fails to
-    /// open (e.g. the fixed gossip port is already bound).
+    /// Returns an error if the cluster fails to form or the cache to open.
     pub(crate) async fn start(
         self: &Arc<Self>,
         cluster_name: &str,
@@ -141,9 +131,8 @@ impl NodeSlot {
         Ok(())
     }
 
-    /// Shuts this node down gracefully (a no-op if it is already killed).
-    /// Concurrent kill/restart calls on the same node are serialized —
-    /// a call that arrives while one is already in flight is dropped.
+    /// Shuts this node down gracefully, a no-op if already killed.
+    /// Concurrent kill/restart calls serialize; a late one is dropped.
     pub(crate) async fn kill(self: &Arc<Self>, feed_tx: &UnboundedSender<String>) {
         if self.status.busy.swap(true, Ordering::AcqRel) {
             return;
@@ -153,10 +142,8 @@ impl NodeSlot {
         self.status.busy.store(false, Ordering::Release);
     }
 
-    /// Tears down whatever is running (if anything) and opens a fresh
-    /// `Cluster` on the same gossip port, so it rejoins via the same static
-    /// seeds and warms back up through state transfer — exactly like a real
-    /// process restart.
+    /// Tears down whatever is running and opens a fresh `Cluster` on the
+    /// same gossip port, rejoining via the same seeds like a real restart.
     pub(crate) async fn restart(
         self: &Arc<Self>,
         cluster_name: &str,
@@ -254,8 +241,7 @@ fn spawn_listener(
     feed_tx: UnboundedSender<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // The broadcast receiver drops events under lag, so entry counts are
-        // read from the store on a timer rather than integrated from events.
+        // Entry counts read from the store on a timer, since events can lag.
         let mut refresh = tokio::time::interval(Duration::from_millis(300));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -315,8 +301,7 @@ fn describe_origin(origin: Origin) -> String {
     }
 }
 
-/// Builds `n` node slots on consecutive loopback gossip ports starting at
-/// `base_port`.
+/// Builds `n` node slots on consecutive loopback ports from `base_port`.
 #[must_use]
 pub(crate) fn build_slots(n: usize, base_port: u16) -> Vec<Arc<NodeSlot>> {
     (0..n)
@@ -328,8 +313,7 @@ pub(crate) fn build_slots(n: usize, base_port: u16) -> Vec<Arc<NodeSlot>> {
         .collect()
 }
 
-/// The fixed seed list every node (and every restart) uses: all nodes'
-/// gossip addresses.
+/// The fixed seed list every node and restart uses: all gossip addresses.
 #[must_use]
 pub(crate) fn seed_list(nodes: &[Arc<NodeSlot>]) -> Vec<SocketAddr> {
     nodes.iter().map(|n| n.gossip_addr).collect()

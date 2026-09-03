@@ -1,6 +1,4 @@
-//! Cross-node convergence check: the soak-test signal — do all currently
-//! live nodes report the same local entry count for the replicated demo
-//! cache?
+//! Cross-node convergence check across the replicated demo cache.
 
 use std::fmt;
 use std::sync::Arc;
