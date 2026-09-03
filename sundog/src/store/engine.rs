@@ -41,8 +41,8 @@ use crate::hlc::Hlc;
 use crate::wire::WireRecord;
 
 use super::{
-    BUCKET_COUNT, BucketEntries, ConflictResolver, Incoming, RecordView, Stored, Tombstone,
-    Weigher, Winner, entry_fingerprint,
+    BUCKET_COUNT, BucketEntries, ConflictResolver, Incoming, PART_COUNT, PartEntries, RecordView,
+    Stored, Tombstone, Weigher, Winner, entry_fingerprint,
 };
 
 /// Stack-buffer size for a key's postcard encoding on the read path, large
@@ -94,6 +94,19 @@ pub(crate) fn hash_key_bytes(key_bytes: &[u8]) -> u64 {
 pub(crate) fn stripe_index_from_hash(hash: u64) -> usize {
     usize::try_from(hash & (BUCKET_COUNT as u64 - 1))
         .expect("invariant: masked to BUCKET_COUNT - 1, always fits in usize")
+}
+
+/// The second-level anti-entropy part, one of [`PART_COUNT`], a precomputed
+/// key hash belongs to within its bucket: the six hash bits above the ten
+/// [`stripe_index_from_hash`] consumes.
+pub(crate) fn part_index_from_hash(hash: u64) -> usize {
+    ((hash >> 10) & 63) as usize
+}
+
+/// The flat index into `Engine::digest`, `BUCKET_COUNT * PART_COUNT` atomics
+/// long, holding `bucket`'s `part`th part digest.
+fn digest_slot(bucket: usize, part: usize) -> usize {
+    bucket * PART_COUNT + part
 }
 
 fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
@@ -557,7 +570,7 @@ where
                 .map(|_| RwLock::new(Stripe::new()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            digest: (0..BUCKET_COUNT)
+            digest: (0..BUCKET_COUNT * PART_COUNT)
                 .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -702,16 +715,75 @@ where
             .collect()
     }
 
+    /// [`Engine::collect_buckets`] at part granularity: `(key, version)` for
+    /// every live entry and un-GC'd tombstone in each requested `(bucket,
+    /// part)` pair, one stripe read lock per distinct bucket in `wanted`. An
+    /// out-of-range bucket ([`BUCKET_COUNT`] or past) or part ([`PART_COUNT`]
+    /// or past) is skipped rather than indexed.
+    pub(crate) fn collect_parts(&self, wanted: &[(u16, u8)], now_ms: u64) -> PartEntries {
+        let mut by_bucket: std::collections::BTreeMap<u16, Vec<u8>> = std::collections::BTreeMap::new();
+        for &(bucket, part) in wanted {
+            if usize::from(bucket) >= BUCKET_COUNT || usize::from(part) >= PART_COUNT {
+                continue;
+            }
+            by_bucket.entry(bucket).or_default().push(part);
+        }
+        let mut out = Vec::new();
+        for (bucket, parts) in by_bucket {
+            let stripe = self.stripes[usize::from(bucket)].read();
+            for part in parts {
+                let mut entries = Vec::new();
+                entries.extend(
+                    stripe
+                        .live
+                        .iter()
+                        .filter(|live| !self.is_absent(live, now_ms))
+                        .filter(|live| {
+                            part_index_from_hash(hash_key_bytes(live.key_bytes.as_ref()))
+                                == usize::from(part)
+                        })
+                        .map(|live| (live.key_bytes.clone(), live.stored.ver)),
+                );
+                entries.extend(
+                    stripe
+                        .tombstones
+                        .iter()
+                        .filter(|(key_bytes, _)| {
+                            part_index_from_hash(hash_key_bytes(key_bytes)) == usize::from(part)
+                        })
+                        .map(|(key_bytes, t)| (key_bytes.clone(), t.ver)),
+                );
+                out.push(((bucket, part), entries));
+            }
+        }
+        out
+    }
+
     /// This engine's current per-bucket XOR digests, `(bucket, digest)` for all
-    /// buckets.
+    /// buckets. Each bucket digest is the XOR of its [`PART_COUNT`] part
+    /// digests, computed on demand.
     pub(crate) fn digests(&self) -> Vec<(u16, u64)> {
-        self.digest
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                let bucket = u16::try_from(i).expect("invariant: index < BUCKET_COUNT fits in u16");
-                (bucket, d.load(Ordering::Relaxed))
+        (0..BUCKET_COUNT)
+            .map(|bucket| {
+                let idx = u16::try_from(bucket).expect("invariant: index < BUCKET_COUNT fits in u16");
+                let digest = (0..PART_COUNT).fold(0u64, |acc, part| {
+                    acc ^ self.digest[digest_slot(bucket, part)].load(Ordering::Relaxed)
+                });
+                (idx, digest)
             })
+            .collect()
+    }
+
+    /// This engine's current part digests for `bucket`: [`PART_COUNT`] values,
+    /// one per part, in ascending part order. A bucket at or past
+    /// [`BUCKET_COUNT`], which only a misbehaving peer names, yields an empty
+    /// vec.
+    pub(crate) fn part_digests(&self, bucket: u16) -> Vec<u64> {
+        if usize::from(bucket) >= BUCKET_COUNT {
+            return Vec::new();
+        }
+        (0..PART_COUNT)
+            .map(|part| self.digest[digest_slot(usize::from(bucket), part)].load(Ordering::Relaxed))
             .collect()
     }
 
@@ -749,13 +821,14 @@ where
     pub(crate) fn gc_tombstones(&self, any_member_absent: bool, now_ms: u64) {
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let mut stripe = stripe_lock.write();
-            let digest_bucket = &self.digest[idx];
             stripe.tombstones.retain(|key_bytes, t| {
                 let past_ttl = now_ms >= t.ttl_deadline_ms;
                 let past_max = now_ms >= t.max_deadline_ms;
                 let collect = past_ttl && (!any_member_absent || past_max);
                 if collect {
-                    digest_bucket.fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
+                    let part = part_index_from_hash(hash_key_bytes(key_bytes));
+                    self.digest[digest_slot(idx, part)]
+                        .fetch_xor(entry_fingerprint(key_bytes, t.ver), Ordering::Relaxed);
                 }
                 !collect
             });
@@ -773,12 +846,12 @@ where
                 continue;
             }
             let mut stripe = stripe_lock.write();
-            let digest_bucket = &self.digest[idx];
             let mut removed_weight = 0u64;
             let mut new_next = u64::MAX;
             stripe.live.retain(|live| {
                 if self.is_absent(live, now_ms) {
-                    digest_bucket.fetch_xor(
+                    let part = part_index_from_hash(hash_key_bytes(live.key_bytes.as_ref()));
+                    self.digest[digest_slot(idx, part)].fetch_xor(
                         entry_fingerprint(&live.key_bytes, live.stored.ver),
                         Ordering::Relaxed,
                     );
@@ -861,7 +934,8 @@ where
             return false;
         };
         let (removed, _vacant) = occ.remove();
-        self.digest[bucket].fetch_xor(
+        let part = part_index_from_hash(hash);
+        self.digest[digest_slot(bucket, part)].fetch_xor(
             entry_fingerprint(&removed.key_bytes, removed.stored.ver),
             Ordering::Relaxed,
         );
@@ -916,8 +990,9 @@ where
         let mut wrote = false;
         {
             let mut stripe = self.stripes[bucket].write();
-            let digest_bucket = &self.digest[bucket];
             for (hash, key, key_bytes, ver, incoming) in entries {
+                let part = part_index_from_hash(hash);
+                let digest_bucket = &self.digest[digest_slot(bucket, part)];
                 let outcome = apply_locked(
                     &mut stripe,
                     digest_bucket,
@@ -968,7 +1043,9 @@ where
         }
         let (weight, old_ver) = remove_live(&mut stripe.live, hash, key_bytes)?;
         drop(stripe);
-        self.digest[bucket].fetch_xor(entry_fingerprint(key_bytes, old_ver), Ordering::Relaxed);
+        let part = part_index_from_hash(hash);
+        self.digest[digest_slot(bucket, part)]
+            .fetch_xor(entry_fingerprint(key_bytes, old_ver), Ordering::Relaxed);
         self.total_weight
             .fetch_sub(u64::from(weight), Ordering::Relaxed);
         Some(old_ver)
@@ -982,7 +1059,9 @@ where
         let mut stripe = self.stripes[bucket].write();
         if let Some((weight, ver)) = remove_live(&mut stripe.live, hash, key_bytes) {
             drop(stripe);
-            self.digest[bucket].fetch_xor(entry_fingerprint(key_bytes, ver), Ordering::Relaxed);
+            let part = part_index_from_hash(hash);
+            self.digest[digest_slot(bucket, part)]
+                .fetch_xor(entry_fingerprint(key_bytes, ver), Ordering::Relaxed);
             self.total_weight
                 .fetch_sub(u64::from(weight), Ordering::Relaxed);
         }
@@ -1057,10 +1136,11 @@ where
         inflight: &Inflight<V>,
     ) -> bool {
         let bucket = stripe_index_from_hash(hash);
+        let part = part_index_from_hash(hash);
         let had_live = {
             let mut stripe = self.stripes[bucket].write();
             stripe.inflight.remove(key_bytes.as_ref());
-            let digest_bucket = &self.digest[bucket];
+            let digest_bucket = &self.digest[digest_slot(bucket, part)];
             let mut had_live = false;
             if let Some(t) = stripe.tombstones.remove(key_bytes.as_ref()) {
                 digest_bucket.fetch_xor(
@@ -1143,17 +1223,20 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Recomputes all digests from scratch, to check against the incrementally
-    /// maintained one.
+    /// Recomputes every part digest from scratch, `BUCKET_COUNT * PART_COUNT`
+    /// values indexed by [`digest_slot`], to check against the incrementally
+    /// maintained ones.
     pub(crate) fn recompute_digests(&self) -> Vec<u64> {
-        let mut out = vec![0u64; BUCKET_COUNT];
+        let mut out = vec![0u64; BUCKET_COUNT * PART_COUNT];
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let stripe = stripe_lock.read();
             for live in &stripe.live {
-                out[idx] ^= entry_fingerprint(&live.key_bytes, live.stored.ver);
+                let part = part_index_from_hash(hash_key_bytes(live.key_bytes.as_ref()));
+                out[digest_slot(idx, part)] ^= entry_fingerprint(&live.key_bytes, live.stored.ver);
             }
             for (key_bytes, t) in &stripe.tombstones {
-                out[idx] ^= entry_fingerprint(key_bytes, t.ver);
+                let part = part_index_from_hash(hash_key_bytes(key_bytes));
+                out[digest_slot(idx, part)] ^= entry_fingerprint(key_bytes, t.ver);
             }
         }
         out
@@ -1258,7 +1341,7 @@ mod tests {
         let resolver = LwwResolver;
         apply_locked(
             &mut stripe,
-            &engine.digest[bucket],
+            &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
             &engine.total_weight,
             engine.weigher.as_ref(),
             engine.tti_ms,
@@ -1428,7 +1511,7 @@ mod tests {
             let resolver = LwwResolver;
             let _ = apply_locked(
                 &mut stripe,
-                &engine.digest[bucket],
+                &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                 &engine.total_weight,
                 engine.weigher.as_ref(),
                 engine.tti_ms,
@@ -1725,7 +1808,7 @@ mod tests {
             let resolver = LwwResolver;
             let _ = apply_locked(
                 &mut stripe,
-                &engine.digest[bucket],
+                &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                 &engine.total_weight,
                 engine.weigher.as_ref(),
                 engine.tti_ms,
@@ -1850,7 +1933,7 @@ mod tests {
                 let encoded = Bytes::from(postcard::to_stdvec(&k.to_string()).expect("encode"));
                 let _ = apply_locked(
                     &mut stripe,
-                    &engine.digest[bucket],
+                    &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                     &engine.total_weight,
                     None,
                     None,
@@ -2073,7 +2156,7 @@ mod tests {
                     let resolver = LwwResolver;
                     let _ = apply_locked(
                         &mut stripe,
-                        &engine.digest[bucket],
+                        &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                         &engine.total_weight,
                         engine.weigher.as_ref(),
                         engine.tti_ms,
@@ -2100,7 +2183,7 @@ mod tests {
                     let resolver = LwwResolver;
                     let _ = apply_locked(
                         &mut stripe,
-                        &engine.digest[bucket],
+                        &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                         &engine.total_weight,
                         engine.weigher.as_ref(),
                         engine.tti_ms,
@@ -2124,6 +2207,15 @@ mod tests {
                     engine.recompute_digests_paired(),
                     "iteration {i}"
                 );
+                assert_eq!(
+                    engine.recompute_digests(),
+                    (0..BUCKET_COUNT)
+                        .flat_map(|b| (0..PART_COUNT).map(move |p| (b, p)))
+                        .map(|(b, p)| engine.part_digests(u16::try_from(b).expect("fits"))[p])
+                        .collect::<Vec<u64>>(),
+                    "iteration {i}: part digests match the full recompute, not only their \
+                     bucket aggregate"
+                );
             }
         }
         assert_eq!(engine.digests(), engine.recompute_digests_paired());
@@ -2138,11 +2230,174 @@ mod tests {
         V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     {
         fn recompute_digests_paired(&self) -> Vec<(u16, u64)> {
-            self.recompute_digests()
-                .into_iter()
-                .enumerate()
-                .map(|(i, d)| (u16::try_from(i).expect("fits"), d))
+            let parts = self.recompute_digests();
+            (0..BUCKET_COUNT)
+                .map(|bucket| {
+                    let digest = (0..PART_COUNT)
+                        .fold(0u64, |acc, part| acc ^ parts[digest_slot(bucket, part)]);
+                    (u16::try_from(bucket).expect("fits"), digest)
+                })
                 .collect()
         }
+    }
+
+    /// The recomputed part digests as `(bucket, part, digest)` triples, paired
+    /// with the bucket each flat index belongs to, for tests that check part
+    /// digests directly rather than only their bucket aggregate.
+    fn recompute_part_digests_paired<K, V>(engine: &Engine<K, V>) -> Vec<(u16, u8, u64)>
+    where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let parts = engine.recompute_digests();
+        (0..BUCKET_COUNT)
+            .flat_map(|bucket| {
+                let parts = &parts;
+                (0..PART_COUNT).map(move |part| {
+                    (
+                        u16::try_from(bucket).expect("fits"),
+                        u8::try_from(part).expect("fits"),
+                        parts[digest_slot(bucket, part)],
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn part_digests_xor_to_the_bucket_digest() {
+        use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+
+        let engine = engine_u32_string(u64::MAX, None);
+        let mut rng = StdRng::seed_from_u64(0xFEED_1234);
+        for i in 0..200u32 {
+            let ver = hlc(u64::from(i) + 1, 1);
+            let _ = put(&engine, i, key_bytes(i), i.to_string(), ver, None, 0);
+            let _ = rng.random_range(0..1u32);
+        }
+        for (bucket, digest) in engine.digests() {
+            let parts = engine.part_digests(bucket);
+            assert_eq!(parts.len(), PART_COUNT);
+            let xored = parts.iter().fold(0u64, |acc, d| acc ^ d);
+            assert_eq!(
+                xored, digest,
+                "bucket {bucket}'s part digests XOR to its bucket digest"
+            );
+        }
+        assert_eq!(
+            recompute_part_digests_paired(&engine)
+                .into_iter()
+                .map(|(bucket, part, digest)| {
+                    let _ = part;
+                    (bucket, digest)
+                })
+                .fold(std::collections::HashMap::new(), |mut acc, (b, d)| {
+                    *acc.entry(b).or_insert(0u64) ^= d;
+                    acc
+                }),
+            engine.digests().into_iter().collect(),
+            "the full recompute agrees with the incrementally maintained part digests"
+        );
+    }
+
+    #[test]
+    fn collect_parts_returns_exactly_that_parts_entries_including_tombstones() {
+        let engine = engine_u32_string(u64::MAX, None);
+        // Find two keys sharing a bucket but landing in different parts, and a
+        // third key in a different bucket entirely.
+        let mut by_bucket_part: HashMap<(usize, usize), u32> = HashMap::new();
+        let mut same_bucket_diff_part: Option<(u32, u32)> = None;
+        let mut candidate = 0u32;
+        while same_bucket_diff_part.is_none() {
+            let kb = key_bytes(candidate);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let part = part_index_from_hash(hash);
+            if let Some(&other) = by_bucket_part
+                .iter()
+                .find(|((b, p), _)| *b == bucket && *p != part)
+                .map(|(_, k)| k)
+            {
+                same_bucket_diff_part = Some((other, candidate));
+            }
+            by_bucket_part.insert((bucket, part), candidate);
+            candidate += 1;
+        }
+        let (key_a, key_b) = same_bucket_diff_part.expect("found within the loop above");
+        let kb_a = key_bytes(key_a);
+        let kb_b = key_bytes(key_b);
+        let bucket = stripe_index_from_hash(hash_key_bytes(kb_a.as_ref()));
+        let part_a = part_index_from_hash(hash_key_bytes(kb_a.as_ref()));
+        let part_b = part_index_from_hash(hash_key_bytes(kb_b.as_ref()));
+
+        let _ = put(&engine, key_a, kb_a.clone(), "a".into(), hlc(1, 1), None, 0);
+        // key_b becomes a tombstone, still expected in its part's listing.
+        let _ = put(&engine, key_b, kb_b.clone(), "b".into(), hlc(1, 1), None, 0);
+        {
+            let hash_b = hash_key_bytes(kb_b.as_ref());
+            let mut stripe = engine.stripe_lock(bucket).write();
+            let resolver = LwwResolver;
+            let _ = apply_locked(
+                &mut stripe,
+                &engine.digest[digest_slot(bucket, part_b)],
+                &engine.total_weight,
+                engine.weigher.as_ref(),
+                engine.tti_ms,
+                hash_b,
+                key_b,
+                kb_b.clone(),
+                hlc(2, 1),
+                Incoming::Tombstone,
+                &resolver,
+                60_000,
+                600_000,
+                0,
+            );
+        }
+
+        let bucket_u16 = u16::try_from(bucket).expect("fits");
+        let part_a_u8 = u8::try_from(part_a).expect("fits");
+        let part_b_u8 = u8::try_from(part_b).expect("fits");
+        let result = engine.collect_parts(&[(bucket_u16, part_a_u8), (bucket_u16, part_b_u8)], 0);
+        assert_eq!(result.len(), 2);
+        let a_entries = &result
+            .iter()
+            .find(|((b, p), _)| *b == bucket_u16 && *p == part_a_u8)
+            .expect("part_a present")
+            .1;
+        assert_eq!(a_entries, &vec![(kb_a, hlc(1, 1))]);
+        let b_entries = &result
+            .iter()
+            .find(|((b, p), _)| *b == bucket_u16 && *p == part_b_u8)
+            .expect("part_b present")
+            .1;
+        assert_eq!(
+            b_entries,
+            &vec![(kb_b, hlc(2, 1))],
+            "a tombstoned key still appears in its part's listing, at its tombstone version"
+        );
+    }
+
+    #[test]
+    fn collect_parts_ignores_out_of_range_bucket_or_part() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(1);
+        let hash = hash_key_bytes(kb.as_ref());
+        let bucket = u16::try_from(stripe_index_from_hash(hash)).expect("fits");
+        let part = u8::try_from(part_index_from_hash(hash)).expect("fits");
+        let _ = put(&engine, 1, kb.clone(), "a".into(), hlc(1, 1), None, 0);
+
+        assert!(
+            engine.collect_parts(&[(u16::MAX, part)], 0).is_empty(),
+            "a bucket past BUCKET_COUNT yields nothing"
+        );
+        assert!(
+            engine.collect_parts(&[(bucket, u8::MAX)], 0).is_empty(),
+            "a part past PART_COUNT yields nothing"
+        );
+        let mixed = engine.collect_parts(&[(u16::MAX, part), (bucket, part), (bucket, u8::MAX)], 0);
+        assert_eq!(mixed.len(), 1, "only the in-range (bucket, part) is answered");
+        assert_eq!(mixed[0].0, (bucket, part));
+        assert_eq!(mixed[0].1, vec![(kb, hlc(1, 1))]);
     }
 }

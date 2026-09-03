@@ -284,15 +284,26 @@ proptest! {
     }
 }
 
-/// Compares the incremental digest against a full recompute.
+/// Compares the incrementally maintained bucket digests, and the part digests
+/// beneath them, against a full recompute.
 fn digest_matches_full_recompute<K, V>(shard: &Shard<K, V>) -> bool
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let expected = shard.engine.recompute_digests();
-    let actual: Vec<u64> = shard.engine.digests().into_iter().map(|(_, d)| d).collect();
-    actual == expected
+    let expected_parts = shard.engine.recompute_digests();
+    let buckets_match = shard.engine.digests().into_iter().all(|(bucket, digest)| {
+        let expected = (0..PART_COUNT).fold(0u64, |acc, part| {
+            acc ^ expected_parts[usize::from(bucket) * PART_COUNT + part]
+        });
+        expected == digest
+    });
+    let parts_match = (0..BUCKET_COUNT).all(|bucket| {
+        let bucket_u16 = u16::try_from(bucket).expect("invariant: bucket < BUCKET_COUNT");
+        let actual = shard.engine.part_digests(bucket_u16);
+        (0..PART_COUNT).all(|part| actual[part] == expected_parts[bucket * PART_COUNT + part])
+    });
+    buckets_match && parts_match
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -435,6 +446,29 @@ async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
     actual == expected
 }
 
+/// [`ShardOps::part_digests`] equals a full recompute over
+/// [`ShardOps::entries_for_parts`], the part-grained counterpart of
+/// [`digest_matches_entries_for_buckets`].
+async fn digest_matches_entries_for_parts(shard: &Shard<u8, u16>) -> bool {
+    let all_parts: Vec<(u16, u8)> = (0..u16::try_from(BUCKET_COUNT).expect("fits"))
+        .flat_map(|b| (0..u8::try_from(PART_COUNT).expect("fits")).map(move |p| (b, p)))
+        .collect();
+    let mut expected = vec![0u64; BUCKET_COUNT * PART_COUNT];
+    for ((bucket, part), entries) in ShardOps::entries_for_parts(shard, all_parts).await {
+        for (key_bytes, ver) in entries {
+            expected[usize::from(bucket) * PART_COUNT + usize::from(part)] ^=
+                entry_fingerprint(&key_bytes, ver);
+        }
+    }
+    let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
+    let actual = ShardOps::part_digests(shard, all_buckets).await;
+    actual.into_iter().all(|(bucket, digests)| {
+        digests.iter().enumerate().all(|(part, &d)| {
+            d == expected[usize::from(bucket) * PART_COUNT + part]
+        })
+    })
+}
+
 /// For every key currently readable, its own record's `expires_at_ms` is
 /// not yet past `now_ms`.
 async fn assert_no_readable_entry_is_expired(shard: &Shard<u8, u16>, now_ms: u64) {
@@ -520,6 +554,11 @@ proptest! {
                         assert!(
                             digest_matches_entries_for_buckets(&shard).await,
                             "digest diverged from a full recompute over entries_for_buckets \
+                             after a sweep"
+                        );
+                        assert!(
+                            digest_matches_entries_for_parts(&shard).await,
+                            "part digest diverged from a full recompute over entries_for_parts \
                              after a sweep"
                         );
                         assert_no_readable_entry_is_expired(&shard, now.load(Ordering::Relaxed)).await;

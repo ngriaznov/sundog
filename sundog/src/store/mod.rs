@@ -41,6 +41,13 @@ pub mod model;
 /// (BUCKET_COUNT - 1)`.
 pub const BUCKET_COUNT: usize = 1024;
 
+/// Number of anti-entropy parts per bucket: `part(k) = (xxh3(key_bytes) >> 10)
+/// & (PART_COUNT - 1)`, the six hash bits above the ten a key's bucket
+/// consumes. A mismatched bucket with more entries than
+/// [`crate::config::ClusterConfig::ae_part_min_bucket`] is compared at this
+/// finer grain before either side sends a listing or a sketch.
+pub const PART_COUNT: usize = 64;
+
 /// A custom per-entry weigher for size-bounded eviction: `(key, value) ->
 /// weight`. Boxed so [`crate::cache::CacheBuilder::weigher`] and
 /// [`Shard::with_weigher`] can store one before its closure type is nameable.
@@ -212,6 +219,10 @@ pub enum Event<K, V> {
 /// requested bucket present, empty lists included.
 pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
 
+/// Entries per part, as a second-level anti-entropy exchange reports them:
+/// every requested `(bucket, part)` pair present, empty lists included.
+pub type PartEntries = Vec<((u16, u8), Vec<(Bytes, Hlc)>)>;
+
 /// The type-erased surface the network layer drives a shard through, wire bytes
 /// in and out. This is the boundary where postcard (de)serialization happens;
 /// local reads never deserialize. Implemented by `Shard<K, V>` for any `K`, `V`
@@ -246,6 +257,17 @@ pub trait ShardOps: Send + Sync {
     /// [`ShardOps::bucket_entries`] for many buckets in one pass, so an
     /// anti-entropy round stays linear in shard size instead of quadratic.
     fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries>;
+
+    /// This shard's part digests for each of `buckets`, `(bucket, 64
+    /// part-digests)` per bucket, the second-level reply for a bucket whose
+    /// digest mismatched and whose entry count passed
+    /// [`crate::config::ClusterConfig::ae_part_min_bucket`].
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>>;
+
+    /// [`ShardOps::entries_for_buckets`] at part granularity: `(key, version)`
+    /// for every live entry and un-GC'd tombstone in each requested
+    /// `(bucket, part)` pair.
+    fn entries_for_parts(&self, parts: Vec<(u16, u8)>) -> BoxFuture<'_, PartEntries>;
 
     /// The full [`WireRecord`] for each of `keys` this shard holds, present
     /// entries and tombstones alike, answering an `AePull`.
@@ -1324,6 +1346,32 @@ where
         Box::pin(async move { entries })
     }
 
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        let mut wanted: Vec<u16> = buckets
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        wanted.sort_unstable();
+        let out = wanted
+            .into_iter()
+            .map(|bucket| (bucket, self.engine.part_digests(bucket)))
+            .collect();
+        Box::pin(async move { out })
+    }
+
+    fn entries_for_parts(&self, parts: Vec<(u16, u8)>) -> BoxFuture<'_, PartEntries> {
+        let now = self.now_ms();
+        let mut wanted: Vec<(u16, u8)> = parts
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        wanted.sort_unstable();
+        let entries = self.engine.collect_parts(&wanted, now);
+        Box::pin(async move { entries })
+    }
+
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         let now = self.now_ms();
         let recs = keys
@@ -2246,11 +2294,14 @@ mod tests {
         K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
         V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     {
-        let expected = s.engine.recompute_digests();
+        let expected_parts = s.engine.recompute_digests();
         for (bucket, digest) in ShardOps::digests(s).await {
+            let expected = (0..PART_COUNT).fold(0u64, |acc, part| {
+                acc ^ expected_parts[usize::from(bucket) * PART_COUNT + part]
+            });
             assert_eq!(
                 digest,
-                expected[usize::from(bucket)],
+                expected,
                 "bucket {bucket} incremental digest diverged from full recompute"
             );
         }
@@ -2291,6 +2342,78 @@ mod tests {
             }
         }
         assert_digest_matches_full_recompute(&s).await;
+    }
+
+    #[tokio::test]
+    async fn part_digests_xor_to_the_bucket_digest_at_the_shard_layer() {
+        let s = shard::<u32, String>(1);
+        for k in 0..500u32 {
+            s.insert(k, k.to_string()).await.expect("insert");
+        }
+        let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
+        let bucket_digests = ShardOps::digests(&s).await;
+        let part_digests = ShardOps::part_digests(&s, all_buckets).await;
+        assert_eq!(part_digests.len(), BUCKET_COUNT);
+        for (bucket, digest) in bucket_digests {
+            let (_, parts) = part_digests
+                .iter()
+                .find(|(b, _)| *b == bucket)
+                .expect("every bucket answered");
+            assert_eq!(parts.len(), PART_COUNT);
+            let xored = parts.iter().fold(0u64, |acc, d| acc ^ d);
+            assert_eq!(xored, digest, "bucket {bucket}'s parts XOR to its digest");
+        }
+    }
+
+    #[tokio::test]
+    async fn part_digests_ignores_a_bucket_outside_the_stripe_range() {
+        let s = shard::<u32, String>(1);
+        s.insert(1, "a".into()).await.expect("insert");
+        let out = ShardOps::part_digests(&s, vec![u16::MAX]).await;
+        assert!(
+            out.iter().all(|(_, digests)| digests.is_empty()),
+            "a bucket past BUCKET_COUNT answers an empty part-digest vec"
+        );
+    }
+
+    #[tokio::test]
+    async fn entries_for_parts_returns_exactly_the_requested_parts_entries() {
+        let s = shard::<u32, String>(1);
+        let key = 7u32;
+        let kb = key_bytes(&key);
+        let hash = engine::hash_key_bytes(kb.as_ref());
+        let bucket = bucket_of(&kb);
+        let part = u8::try_from(engine::part_index_from_hash(hash)).expect("fits");
+        s.insert(key, "seven".into()).await.expect("insert");
+
+        let result = ShardOps::entries_for_parts(&s, vec![(bucket, part)]).await;
+        assert_eq!(result.len(), 1);
+        let (got, entries) = &result[0];
+        assert_eq!(*got, (bucket, part));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.as_ref(), kb.as_ref());
+    }
+
+    #[tokio::test]
+    async fn entries_for_parts_dedupes_and_sorts_requested_pairs() {
+        let s = shard::<u32, String>(1);
+        s.insert(1, "a".into()).await.expect("insert");
+        let kb = key_bytes(&1u32);
+        let bucket = bucket_of(&kb);
+        let part =
+            u8::try_from(engine::part_index_from_hash(engine::hash_key_bytes(kb.as_ref())))
+                .expect("fits");
+
+        let result = ShardOps::entries_for_parts(
+            &s,
+            vec![(bucket, part), (bucket, part), (bucket, part)],
+        )
+        .await;
+        assert_eq!(
+            result.len(),
+            1,
+            "a duplicated (bucket, part) request is answered exactly once"
+        );
     }
 
     #[tokio::test]
