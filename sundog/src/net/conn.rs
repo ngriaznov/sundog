@@ -846,17 +846,37 @@ pub(super) fn state_stream(
 
 #[cfg(test)]
 mod tests {
+    // Only the `not(sim)` tests below dial real loopback sockets through
+    // `handle_accepted`/`run_peer_writer`/the request collectors; under
+    // `sim` those tests (and these imports) are compiled out entirely.
+    #[cfg(not(feature = "sim"))]
+    use std::net::SocketAddr;
+    #[cfg(not(feature = "sim"))]
+    use std::sync::Arc;
+    #[cfg(not(feature = "sim"))]
+    use std::time::Duration;
+
     use bytes::Bytes;
     use futures::{SinkExt as _, StreamExt as _};
     use smol_str::SmolStr;
+    #[cfg(not(feature = "sim"))]
+    use tokio::sync::mpsc;
     // Real tokio sockets and a locally-built codec, not this module's own
     // `new_framed`/`send_msg`/`recv_msg`: this suite exercises the real
     // socket stack regardless of feature flags.
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::codec::LengthDelimitedCodec;
+    #[cfg(not(feature = "sim"))]
+    use tokio_util::sync::CancellationToken;
 
+    #[cfg(not(feature = "sim"))]
+    use super::{InboundMsg, PeerFramed, ReqPool};
     use super::{OutFrame, coalesce_replicate};
+    #[cfg(not(feature = "sim"))]
+    use crate::error::CodecError;
     use crate::hlc::Hlc;
+    #[cfg(not(feature = "sim"))]
+    use crate::net::AeMismatch;
     use crate::node::NodeId;
     use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
@@ -950,6 +970,76 @@ mod tests {
                 rec: record(2),
             }
         );
+    }
+
+    /// A `Msg::ReplicateBatch` following same-cache entries in the pending
+    /// run merges into it too, not just a lone `Msg::Replicate`.
+    #[test]
+    fn coalesce_replicate_merges_a_replicate_batch_into_a_pending_run() {
+        let drained = vec![
+            out_frame(Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: record(1),
+            }),
+            out_frame(Msg::ReplicateBatch {
+                cache: SmolStr::new("users"),
+                recs: vec![record(2), record(3)],
+            }),
+        ];
+        let out = coalesce_replicate(drained);
+        assert_eq!(
+            out.len(),
+            1,
+            "a same-cache batch must merge into the pending run"
+        );
+        let decoded = wire::decode(&out[0]).expect("decodes");
+        assert_eq!(
+            decoded,
+            Msg::ReplicateBatch {
+                cache: SmolStr::new("users"),
+                recs: vec![record(1), record(2), record(3)],
+            }
+        );
+    }
+
+    /// A non-`Replicate`-class frame following a pending run flushes the run
+    /// first, then passes through untouched.
+    #[test]
+    fn coalesce_replicate_flushes_the_pending_run_before_a_non_replicate_frame() {
+        let invalidate = Msg::Invalidate {
+            cache: SmolStr::new("users"),
+            key: Bytes::from_static(b"k"),
+            ver: Hlc {
+                wall_ms: 9,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        };
+        let drained = vec![
+            out_frame(Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: record(1),
+            }),
+            out_frame(Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: record(2),
+            }),
+            out_frame(invalidate.clone()),
+        ];
+        let out = coalesce_replicate(drained);
+        assert_eq!(
+            out.len(),
+            2,
+            "the non-replicate frame must close off the pending merge first"
+        );
+        assert_eq!(
+            wire::decode(&out[0]).expect("decodes"),
+            Msg::ReplicateBatch {
+                cache: SmolStr::new("users"),
+                recs: vec![record(1), record(2)],
+            }
+        );
+        assert_eq!(wire::decode(&out[1]).expect("decodes"), invalidate);
     }
 
     #[tokio::test]
@@ -1074,5 +1164,350 @@ mod tests {
                  leaves it running with the shard registry Arc still held",
             )
             .expect("accepted-connection handler did not panic");
+    }
+
+    /// `TlsCtx` for a plain (non-TLS) accepted/dialed connection in a test,
+    /// matching whichever concrete shape the active feature set gives it.
+    #[cfg(all(feature = "tls", not(feature = "sim")))]
+    fn no_tls() -> super::TlsCtx {
+        None
+    }
+    #[cfg(all(not(feature = "tls"), not(feature = "sim")))]
+    fn no_tls() -> super::TlsCtx {
+        super::TlsCtx
+    }
+
+    /// A `RequestHandler` with nothing to serve: every lookup comes back
+    /// empty, never called in the tests that use it since they exercise
+    /// paths that never reach the handler.
+    #[cfg(not(feature = "sim"))]
+    struct EmptyHandler;
+    #[cfg(not(feature = "sim"))]
+    impl super::RequestHandler for EmptyHandler {
+        fn snapshot_chunks(
+            &self,
+            _cache: SmolStr,
+        ) -> futures::stream::BoxStream<'static, Vec<WireRecord>> {
+            Box::pin(futures::stream::empty())
+        }
+        fn digests(&self, _cache: SmolStr) -> futures::future::BoxFuture<'_, Vec<(u16, u64)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn bucket_entries(
+            &self,
+            _cache: SmolStr,
+            _bucket: u16,
+        ) -> futures::future::BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn entries_for_buckets(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, crate::store::BucketEntries> {
+            Box::pin(async { Vec::new() })
+        }
+        fn records_for(
+            &self,
+            _cache: SmolStr,
+            _keys: Vec<Bytes>,
+        ) -> futures::future::BoxFuture<'_, Vec<WireRecord>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    /// Dials a fresh loopback connection to a fake donor that sends every
+    /// message in `prelude` and then drops the connection without a
+    /// terminating `Msg::ReqDone`, for the "closed before `ReqDone`" and
+    /// "unrelated frame skipped" collector tests below.
+    #[cfg(not(feature = "sim"))]
+    async fn dial_fake_donor(prelude: Vec<Msg>) -> PeerFramed {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut framed = LengthDelimitedCodec::builder()
+                .max_frame_length(MAX_FRAME)
+                .new_framed(stream);
+            for msg in prelude {
+                let encoded = wire::encode(&msg).expect("encodes");
+                framed.send(encoded).await.expect("send");
+            }
+            // Dropped here: the connection closes without ever sending
+            // `Msg::ReqDone`.
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        super::new_framed(as_mesh_stream(client))
+    }
+
+    /// Asserts `err` is the `UnexpectedEof` a collector returns when its
+    /// connection closes before the terminating `Msg::ReqDone`.
+    #[cfg(not(feature = "sim"))]
+    fn assert_unexpected_eof(err: &CodecError) {
+        assert!(
+            matches!(err, CodecError::Io(io_err) if io_err.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected an UnexpectedEof i/o error, got {err:?}"
+        );
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_buckets_errors_on_a_connection_closed_before_req_done() {
+        let framed = dial_fake_donor(Vec::new()).await;
+        let pool = ReqPool::new();
+        let err = super::collect_ae_buckets(framed, &pool)
+            .await
+            .expect_err("a connection closed before ReqDone must error");
+        assert_unexpected_eof(&err);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_mismatches_errors_on_a_connection_closed_before_req_done() {
+        let framed = dial_fake_donor(Vec::new()).await;
+        let pool = ReqPool::new();
+        let err = super::collect_ae_mismatches(framed, &pool)
+            .await
+            .expect_err("a connection closed before ReqDone must error");
+        assert_unexpected_eof(&err);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_pulled_records_errors_on_a_connection_closed_before_req_done() {
+        let framed = dial_fake_donor(Vec::new()).await;
+        let pool = ReqPool::new();
+        let err = super::collect_pulled_records(framed, &pool)
+            .await
+            .expect_err("a connection closed before ReqDone must error");
+        assert_unexpected_eof(&err);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_buckets_skips_an_unrelated_hello_mid_reply() {
+        let entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        let framed = dial_fake_donor(vec![
+            Msg::Hello {
+                node: NodeId::from(9),
+                incarnation: 1,
+            },
+            Msg::AeBucket {
+                cache: SmolStr::new("users"),
+                bucket: 3,
+                entries: entries.clone(),
+            },
+            Msg::ReqDone,
+        ])
+        .await;
+        let pool = ReqPool::new();
+        let got = super::collect_ae_buckets(framed, &pool)
+            .await
+            .expect("the stray Hello must be skipped, not break the reply");
+        assert_eq!(got, vec![(3, entries)]);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_mismatches_skips_an_unrelated_hello_mid_reply() {
+        let framed = dial_fake_donor(vec![
+            Msg::Hello {
+                node: NodeId::from(9),
+                incarnation: 1,
+            },
+            Msg::AeSketch {
+                cache: SmolStr::new("users"),
+                bucket: 2,
+                cells: Vec::new(),
+            },
+            Msg::ReqDone,
+        ])
+        .await;
+        let pool = ReqPool::new();
+        let got = super::collect_ae_mismatches(framed, &pool)
+            .await
+            .expect("the stray Hello must be skipped, not break the reply");
+        assert_eq!(got, vec![AeMismatch::Sketch(2, Vec::new())]);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_pulled_records_skips_an_unrelated_hello_mid_reply() {
+        let rec = WireRecord {
+            key: Bytes::from_static(b"k1"),
+            value: Some(Bytes::from_static(b"v1")),
+            ver: Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        };
+        let framed = dial_fake_donor(vec![
+            Msg::Hello {
+                node: NodeId::from(9),
+                incarnation: 1,
+            },
+            Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: rec.clone(),
+            },
+            Msg::ReqDone,
+        ])
+        .await;
+        let pool = ReqPool::new();
+        let got = super::collect_pulled_records(framed, &pool)
+            .await
+            .expect("the stray Hello must be skipped, not break the reply");
+        assert_eq!(got, vec![rec]);
+    }
+
+    /// `Msg::ReqDone`/`Msg::AeBucket` arriving as the first message after
+    /// `Hello` fall into the request-class routing arm that treats this as
+    /// a persistent broadcast-class connection: neither served nor
+    /// forwarded to `inbound_tx`, but the loop keeps reading, so a genuine
+    /// broadcast message afterward still comes through.
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn req_done_and_ae_bucket_after_hello_are_not_served_or_forwarded() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let client_stream = TcpStream::connect(addr).await.expect("connect");
+        let server_stream = accept.await.expect("connection accepted");
+
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handler: Arc<dyn super::RequestHandler> = Arc::new(EmptyHandler);
+        // `handle_accepted` takes the pre-TLS raw stream, not `MeshStream`;
+        // it layers TLS on internally via `establish_accept`.
+        let accepted_task = tokio::spawn(super::handle_accepted(
+            server_stream,
+            inbound_tx,
+            handler,
+            no_tls(),
+            cancel.clone(),
+        ));
+
+        let mut client = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME)
+            .new_framed(client_stream);
+        let from = NodeId::from(9);
+        for msg in [
+            Msg::Hello {
+                node: from,
+                incarnation: 1,
+            },
+            Msg::ReqDone,
+            Msg::AeBucket {
+                cache: SmolStr::new("users"),
+                bucket: 0,
+                entries: Vec::new(),
+            },
+        ] {
+            let encoded = wire::encode(&msg).expect("encodes");
+            client.send(encoded).await.expect("send");
+        }
+
+        let nothing = tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv()).await;
+        assert!(
+            nothing.is_err(),
+            "ReqDone/AeBucket right after Hello must not reach inbound_tx"
+        );
+
+        // The accept loop must still be reading: a genuine broadcast
+        // message afterward is forwarded normally.
+        let invalidate = Msg::Invalidate {
+            cache: SmolStr::new("users"),
+            key: Bytes::from_static(b"k"),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: from,
+            },
+        };
+        let encoded = wire::encode(&invalidate).expect("encodes");
+        client.send(encoded).await.expect("send");
+        let got = tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())
+            .await
+            .expect("the connection must still be reading")
+            .expect("channel open");
+        assert_eq!(
+            got,
+            InboundMsg {
+                from,
+                msg: invalidate
+            }
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), accepted_task).await;
+    }
+
+    #[cfg(all(unix, not(feature = "sim")))]
+    #[tokio::test]
+    async fn disable_nagle_logs_and_does_not_panic_when_set_nodelay_fails() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+
+        // Close the stream's underlying fd out from under it, so the
+        // subsequent `set_nodelay` fails with a real OS error (EBADF)
+        // instead of the happy path.
+        let fd = stream.as_raw_fd();
+        // SAFETY: `fd` is a valid, open fd owned by `stream`; wrapping and
+        // immediately dropping it closes that fd number exactly once. The
+        // stream is forgotten below so its own `Drop` never double-closes it.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+
+        super::disable_nagle(&stream); // must log, not panic
+        std::mem::forget(stream);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn run_peer_writer_exits_promptly_when_cancelled_while_retrying() {
+        // Loopback port 1 is unassigned: the connection is refused
+        // immediately, so the writer cycles through its reconnect backoff
+        // instead of hanging on a slow connect.
+        let unreachable: SocketAddr = "127.0.0.1:1".parse().expect("valid addr");
+        let invalidate = Arc::new(super::DropOldestQueue::new(4));
+        let (_replicate_tx, replicate_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(super::run_peer_writer(
+            NodeId::from(1),
+            1,
+            unreachable,
+            invalidate,
+            replicate_rx,
+            cancel.clone(),
+            no_tls(),
+        ));
+
+        // Let it fail to connect and settle into the retry backoff.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect(
+                "run_peer_writer must exit promptly once cancelled while retrying, not wait \
+                 out its reconnect backoff",
+            )
+            .expect("writer task did not panic");
     }
 }

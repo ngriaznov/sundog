@@ -217,12 +217,55 @@ pub fn bytes_sent_total() -> u64 {
 /// caller forever; AP semantics mean a stuck peer must never hang this node.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+// The override seam below backs only the `not(sim)` test module's
+// `ae_entries_times_out_promptly_under_a_short_override`; gated the same
+// way that module is, so it isn't dead code under `sim`.
+#[cfg(all(test, not(feature = "sim")))]
+thread_local! {
+    /// Per-thread override of [`REQUEST_TIMEOUT`], set only by
+    /// [`with_request_timeout`] in tests. Production code never touches
+    /// this; [`request_timeout`] always returns the real constant outside
+    /// `#[cfg(test)]`.
+    static REQUEST_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The request timeout every `ae_*`/`request_state` call races against:
+/// [`REQUEST_TIMEOUT`], unless a test installed a shorter override on this
+/// thread via [`with_request_timeout`].
+fn request_timeout() -> Duration {
+    #[cfg(all(test, not(feature = "sim")))]
+    {
+        if let Some(over) = REQUEST_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+            return over;
+        }
+    }
+    REQUEST_TIMEOUT
+}
+
+/// Test-only seam for [`request_timeout`]: polls `fut` with `duration` in
+/// effect on this thread for [`request_timeout`] to read, restoring the
+/// real [`REQUEST_TIMEOUT`] once `fut` resolves. `duration` is set before
+/// `fut` is ever polled and cleared only after, so it's in effect for
+/// `fut`'s whole lifetime, not just the moment this function is called.
+/// Doesn't change production behavior, which never reads the override.
+#[cfg(all(test, not(feature = "sim")))]
+async fn with_request_timeout<T>(
+    duration: Duration,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    REQUEST_TIMEOUT_OVERRIDE.with(|cell| cell.set(Some(duration)));
+    let result = fut.await;
+    REQUEST_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
+    result
+}
+
 /// Wraps a timed-out request/response exchange as a [`CodecError::Io`], the
 /// same shape a genuine connection failure produces.
-fn request_timeout_error(what: &str) -> CodecError {
+fn request_timeout_error(what: &str, timeout: Duration) -> CodecError {
     CodecError::Io(io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("{what} did not complete within {REQUEST_TIMEOUT:?}"),
+        format!("{what} did not complete within {timeout:?}"),
     ))
 }
 
@@ -677,12 +720,13 @@ impl Mesh {
     ) -> Result<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>, CodecError> {
         // Only the checkout-or-dial step is bounded here; `try_donor`'s own
         // `PER_DONOR_BUDGET` governs the full snapshot stream instead.
-        let (framed, pool) = tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            self.acquire_conn(donor, Msg::StRequest { cache }),
-        )
-        .await
-        .unwrap_or_else(|_| Err(request_timeout_error("state transfer request")))?;
+        let timeout = request_timeout();
+        let (framed, pool) =
+            tokio::time::timeout(timeout, self.acquire_conn(donor, Msg::StRequest { cache }))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(request_timeout_error("state transfer request", timeout))
+                })?;
         Ok(conn::state_stream(framed, pool))
     }
 
@@ -698,7 +742,8 @@ impl Mesh {
         cache: SmolStr,
         local_buckets: Vec<(u16, u64)>,
     ) -> Result<Vec<AeMismatch>, CodecError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
             let (framed, pool) = self
                 .acquire_conn(
                     peer,
@@ -711,7 +756,12 @@ impl Mesh {
             conn::collect_ae_mismatches(framed, &pool).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy digest exchange")))
+        .unwrap_or_else(|_| {
+            Err(request_timeout_error(
+                "anti-entropy digest exchange",
+                timeout,
+            ))
+        })
     }
 
     /// The `AeSketch` fallback: full `(key, version)` listings for
@@ -727,7 +777,8 @@ impl Mesh {
         cache: SmolStr,
         buckets: Vec<u16>,
     ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
             let (framed, pool) = self
                 .acquire_conn(peer, Msg::AeEntries { cache, buckets })
                 .await?;
@@ -737,6 +788,7 @@ impl Mesh {
         .unwrap_or_else(|_| {
             Err(request_timeout_error(
                 "anti-entropy sketch-fallback listing",
+                timeout,
             ))
         })
     }
@@ -752,12 +804,13 @@ impl Mesh {
         cache: SmolStr,
         keys: Vec<Bytes>,
     ) -> Result<Vec<WireRecord>, CodecError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
             let (framed, pool) = self.acquire_conn(peer, Msg::AePull { cache, keys }).await?;
             conn::collect_pulled_records(framed, &pool).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull")))
+        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull", timeout)))
     }
 
     /// Pulls records from `peer` for `bucket`'s entries whose key hash is
@@ -773,7 +826,8 @@ impl Mesh {
         bucket: u16,
         hashes: Vec<u64>,
     ) -> Result<Vec<WireRecord>, CodecError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
             let (framed, pool) = self
                 .acquire_conn(
                     peer,
@@ -787,7 +841,7 @@ impl Mesh {
             conn::collect_pulled_records(framed, &pool).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull-by-hash")))
+        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull-by-hash", timeout)))
     }
 
     /// Shuts down the mesh: stops accepting, cancels every per-peer writer.
@@ -1337,6 +1391,7 @@ mod tests {
         client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
 
         let frames_before = frames_sent_total();
+        let bytes_before = bytes_sent_total();
         let got = client
             .ae_pull(
                 NodeId::from(1),
@@ -1346,10 +1401,15 @@ mod tests {
             .await
             .expect("ae_pull succeeds");
         let frames = frames_sent_total() - frames_before;
+        let bytes = bytes_sent_total() - bytes_before;
         assert_eq!(got, records, "every pulled record arrives, in order");
         assert!(
             frames < 100,
             "a 3000-record pull reply travels as a few batch frames, not one per record: {frames}"
+        );
+        assert!(
+            bytes > 0,
+            "sending 3000 records' worth of frames must grow the byte counter"
         );
     }
 
@@ -1402,6 +1462,67 @@ mod tests {
         );
     }
 
+    /// A handler whose `entries_for_buckets` never resolves, for
+    /// [`ae_entries_times_out_promptly_under_a_short_override`].
+    struct HangingHandler;
+    impl RequestHandler for HangingHandler {
+        fn snapshot_chunks(&self, _cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
+            Box::pin(futures::stream::empty())
+        }
+        fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn bucket_entries(
+            &self,
+            _cache: SmolStr,
+            _bucket: u16,
+        ) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn entries_for_buckets(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> BoxFuture<'_, crate::store::BucketEntries> {
+            Box::pin(std::future::pending())
+        }
+        fn records_for(
+            &self,
+            _cache: SmolStr,
+            _keys: Vec<Bytes>,
+        ) -> BoxFuture<'_, Vec<WireRecord>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    #[tokio::test]
+    async fn ae_entries_times_out_promptly_under_a_short_override() {
+        // `AeEntries` is served by `entries_for_buckets`, which never
+        // resolves here: `ae_entries` must give up on its own internal
+        // timeout rather than hang forever waiting on a stuck peer.
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), Arc::new(HangingHandler)).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let short = Duration::from_millis(100);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_request_timeout(
+                short,
+                client.ae_entries(NodeId::from(1), SmolStr::new("users"), vec![3]),
+            ),
+        )
+        .await
+        .expect(
+            "ae_entries must give up on its own short REQUEST_TIMEOUT override, well inside \
+             this generous outer bound, not hang forever",
+        );
+        assert!(
+            result.is_err(),
+            "a handler whose entries never resolve must time out, not hang"
+        );
+    }
+
     #[tokio::test]
     async fn request_to_an_unknown_peer_errors_instead_of_hanging() {
         let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
@@ -1450,6 +1571,40 @@ mod tests {
                 from: NodeId::from(2),
                 msg: invalidate
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn update_peers_cancels_the_writer_of_a_dropped_peer() {
+        let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let unreachable = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+        mesh.update_peers(vec![peer_at(NodeId::from(2), unreachable)]);
+
+        let cancel = {
+            let table = mesh.inner.peers.read().expect("lock");
+            table
+                .get(&NodeId::from(2))
+                .expect("peer registered")
+                .cancel
+                .clone()
+        };
+        assert!(!cancel.is_cancelled(), "not cancelled while still a peer");
+
+        // Dropping peer 2 from the incoming set removes its handle and
+        // must cancel the writer task that was spawned for it.
+        mesh.update_peers(Vec::new());
+        assert!(
+            cancel.is_cancelled(),
+            "removing a peer must cancel its writer's token"
+        );
+        assert!(
+            mesh.inner
+                .peers
+                .read()
+                .expect("lock")
+                .get(&NodeId::from(2))
+                .is_none(),
+            "the dropped peer's handle must leave the table"
         );
     }
 }

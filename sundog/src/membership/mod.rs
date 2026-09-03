@@ -588,6 +588,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_peers_stays_empty_and_shuts_down_cleanly() {
+        // No seed stream and no partner ever gossips in: `peers()` must
+        // stay at its initial empty value rather than hang or panic, and
+        // `set_cache_mode`/`shutdown` must both work with nothing to gossip
+        // with.
+        let cluster_name: SmolStr = "membership-test-solo".into();
+        let config = ClusterConfig {
+            gossip_bind_addr: addr(0),
+            ..ClusterConfig::default()
+        };
+        let node = NodeId::random();
+        let membership = Membership::spawn(
+            cluster_name,
+            node,
+            "solo",
+            addr(9401),
+            &config,
+            stream::pending().boxed(),
+        )
+        .await
+        .expect("solo node starts");
+
+        assert_eq!(membership.local_peer().node, node);
+        assert!(
+            membership.peers().borrow().is_empty(),
+            "a single node without a partner never gains a peer"
+        );
+
+        membership.set_cache_mode("users", Mode::Replicated);
+
+        // No partner is gossiping, so `peers()` never changes; give the
+        // background loop a moment to have processed the command, then
+        // confirm the view is still empty rather than having errored.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(membership.peers().borrow().is_empty());
+
+        membership.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn three_nodes_converge_over_loopback() {
         let cluster_name: SmolStr = "membership-test-converge".into();
         let config = ClusterConfig {

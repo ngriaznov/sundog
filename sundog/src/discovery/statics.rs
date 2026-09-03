@@ -138,6 +138,42 @@ mod tests {
         );
     }
 
+    // `SUNDOG_SEEDS` is process-global, so this is the only test that
+    // touches it: set, exercise `from_env`, then unset before returning.
+    #[test]
+    fn from_env_parses_the_sundog_seeds_variable() {
+        // SAFETY: no other test in this binary reads or writes
+        // `SUNDOG_SEEDS`; setting and unsetting it here doesn't race.
+        unsafe {
+            std::env::set_var(SUNDOG_SEEDS_ENV, "host1:4000, host2:4001");
+        }
+        let discovery = Static::from_env();
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(SUNDOG_SEEDS_ENV);
+        }
+        let specs: Vec<&str> = discovery.specs.iter().map(String::as_str).collect();
+        assert_eq!(specs, vec!["host1:4000", "host2:4001"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_specs_skips_an_unparsable_entry_and_resolves_the_rest() {
+        let specs = [
+            String::from("127.0.0.1:not-a-port"),
+            String::from("localhost:4321"),
+        ];
+        let resolved = resolve_specs(&specs).await;
+        assert_eq!(
+            resolved.len(),
+            1,
+            "the unparsable spec must be skipped, not fail the whole round"
+        );
+        assert!(
+            resolved[0].port() == 4321 && resolved[0].ip().is_loopback(),
+            "the good spec must still resolve, got {resolved:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn stream_deduplicates_and_repeats_forever_without_ending() {
         let a: SocketAddr = "127.0.0.1:5000".parse().expect("valid addr");

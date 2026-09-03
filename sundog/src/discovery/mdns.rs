@@ -113,19 +113,23 @@ fn resolved_addr(event: &ServiceEvent, cluster_name: &str) -> Option<SocketAddr>
     {
         return None;
     }
-    let ip = resolved
-        .addresses
-        .iter()
-        .map(mdns_sd::ScopedIp::to_ip_addr)
-        .find(IpAddr::is_ipv4)
-        .or_else(|| {
-            resolved
-                .addresses
-                .iter()
-                .next()
-                .map(mdns_sd::ScopedIp::to_ip_addr)
-        })?;
+    let ip = select_ip(resolved.addresses.iter().map(mdns_sd::ScopedIp::to_ip_addr))?;
     Some(SocketAddr::new(ip, resolved.port))
+}
+
+/// Picks the best candidate IP out of a resolved service's advertised
+/// addresses: the first IPv4 address, or, absent one, whatever address was
+/// advertised first. Pure and independent of `mdns_sd`'s own types, so it's
+/// unit-testable with hand-built addresses.
+fn select_ip(addresses: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    let mut first = None;
+    for ip in addresses {
+        if ip.is_ipv4() {
+            return Some(ip);
+        }
+        first.get_or_insert(ip);
+    }
+    first
 }
 
 #[cfg(test)]
@@ -140,6 +144,25 @@ mod tests {
         let info = build_service_info("demo", "node1-aaaa", addr).expect("service info builds");
         assert_eq!(info.get_port(), addr.port());
         assert_eq!(info.get_property_val_str(CLUSTER_TXT_KEY), Some("demo"));
+    }
+
+    #[test]
+    fn select_ip_prefers_ipv4_over_an_earlier_ipv6_address() {
+        let v6: IpAddr = "fe80::1".parse().expect("valid addr");
+        let v4: IpAddr = "10.0.0.1".parse().expect("valid addr");
+        assert_eq!(select_ip([v6, v4]), Some(v4));
+    }
+
+    #[test]
+    fn select_ip_falls_back_to_the_first_address_absent_any_ipv4() {
+        let first: IpAddr = "fe80::1".parse().expect("valid addr");
+        let second: IpAddr = "fe80::2".parse().expect("valid addr");
+        assert_eq!(select_ip([first, second]), Some(first));
+    }
+
+    #[test]
+    fn select_ip_on_no_addresses_is_none() {
+        assert_eq!(select_ip(std::iter::empty()), None);
     }
 
     #[test]
