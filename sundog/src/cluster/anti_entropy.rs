@@ -90,21 +90,39 @@ fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
     streaming && skipped_so_far < MAX_STREAMING_SKIPS
 }
 
+/// The choice for one round: a `dirty` peer wins whenever there is one,
+/// leaving every other dirty peer in the returned give-back list for the
+/// caller to re-mark; with none dirty, a `live` peer is chosen instead, with
+/// an empty give-back. `None` when both are empty.
+///
+/// `live` takes ownership, not a slice, to match `dirty`'s shape: both come
+/// from a caller that just built them fresh (`take_dirty_peers`,
+/// `live_peer_ids`), and only `dirty` needs the transfer, on the branch that
+/// consumes it into `give_back`.
+#[allow(clippy::needless_pass_by_value)]
+fn choose_peer(
+    dirty: Vec<NodeId>,
+    live: Vec<NodeId>,
+    rng: &mut impl rand::Rng,
+) -> Option<(NodeId, bool, Vec<NodeId>)> {
+    if let Some(&peer) = dirty.choose(rng) {
+        let give_back = dirty.into_iter().filter(|&other| other != peer).collect();
+        return Some((peer, true, give_back));
+    }
+    live.choose(rng).map(|&peer| (peer, false, Vec::new()))
+}
+
 /// The peer for this round, and whether it came from the dirty set; a
 /// skipped round can hand the mark back.
 fn pick_peer(cluster: &Cluster) -> Option<(NodeId, bool)> {
     let mut rng = rand::rng();
     let dirty = cluster.mesh().take_dirty_peers();
-    if let Some(&peer) = dirty.choose(&mut rng) {
-        for &other in dirty.iter().filter(|&&other| other != peer) {
-            cluster.mesh().mark_dirty(other);
-        }
-        return Some((peer, true));
+    let live = cluster.live_peer_ids();
+    let (peer, was_dirty, give_back) = choose_peer(dirty, live, &mut rng)?;
+    for other in give_back {
+        cluster.mesh().mark_dirty(other);
     }
-    cluster
-        .live_peer_ids()
-        .choose(&mut rng)
-        .map(|&peer| (peer, false))
+    Some((peer, was_dirty))
 }
 
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
@@ -403,6 +421,49 @@ mod tests {
             !should_skip_round(true, MAX_STREAMING_SKIPS),
             "a steady trickle cannot starve anti-entropy"
         );
+    }
+
+    #[test]
+    fn choose_peer_prefers_a_dirty_peer_over_live_ones() {
+        let mut rng = rand::rng();
+        let dirty = vec![NodeId::from(1)];
+        let live = vec![NodeId::from(2), NodeId::from(3)];
+        let (peer, was_dirty, give_back) =
+            choose_peer(dirty, live, &mut rng).expect("a peer is chosen");
+        assert_eq!(peer, NodeId::from(1));
+        assert!(was_dirty);
+        assert!(give_back.is_empty());
+    }
+
+    #[test]
+    fn choose_peer_hands_back_the_unchosen_dirty_peer() {
+        let mut rng = rand::rng();
+        let dirty = vec![NodeId::from(1), NodeId::from(2)];
+        let (peer, was_dirty, give_back) =
+            choose_peer(dirty.clone(), Vec::new(), &mut rng).expect("a peer is chosen");
+        assert!(was_dirty);
+        let other = dirty
+            .into_iter()
+            .find(|&p| p != peer)
+            .expect("two dirty peers, one chosen");
+        assert_eq!(give_back, vec![other]);
+    }
+
+    #[test]
+    fn choose_peer_falls_back_to_a_live_peer_with_no_dirty_ones() {
+        let mut rng = rand::rng();
+        let live = vec![NodeId::from(5)];
+        let (peer, was_dirty, give_back) =
+            choose_peer(Vec::new(), live, &mut rng).expect("a peer is chosen");
+        assert_eq!(peer, NodeId::from(5));
+        assert!(!was_dirty);
+        assert!(give_back.is_empty());
+    }
+
+    #[test]
+    fn choose_peer_returns_none_with_no_peers_at_all() {
+        let mut rng = rand::rng();
+        assert_eq!(choose_peer(Vec::new(), Vec::new(), &mut rng), None);
     }
 
     #[test]

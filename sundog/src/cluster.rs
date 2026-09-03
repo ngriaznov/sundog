@@ -2018,4 +2018,318 @@ mod tests {
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
     }
+
+    /// `cluster_b`'s registered shard for `cache`, as [`anti_entropy::run_round_against`]
+    /// takes it: the same handle `Cache::open` installs in the registry.
+    fn registered_shard(cluster: &Cluster, cache: &SmolStr) -> Arc<dyn ShardOps> {
+        cluster
+            .shards()
+            .read()
+            .expect("invariant: shard registry lock is never poisoned")
+            .get(cache)
+            .cloned()
+            .expect("the cache was opened, so its shard is registered")
+    }
+
+    #[tokio::test]
+    async fn run_round_against_pulls_a_dropped_key_via_the_decoded_sketch() {
+        const N: u32 = 4096;
+        let config = ClusterConfig {
+            ae_sketch_min_bucket: 4,
+            ..loopback_config()
+        };
+
+        let cluster_a = Cluster::builder("cluster-it-ae-round-pull")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let node_a = cluster_a.node_id();
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        cache_a
+            .insert_many((0..N).map(|k| (k, k.to_string())))
+            .await
+            .expect("a inserts a few thousand entries before b ever joins");
+
+        let bucket_keys = dense_bucket_keys(N, config.ae_sketch_min_bucket + 1);
+        let target_key = bucket_keys[0];
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-round-pull")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, u64::from(N));
+
+        // Simulate a dropped `Replicate` message, the way the sketch-decode
+        // integration test above does, then run the round directly instead
+        // of waiting on the scheduler: the two-node sketch test above races
+        // both peers' schedulers, so it never pins the pull-by-hash path
+        // this exercises deterministically.
+        cache_b.invalidate_local(&target_key).await;
+        assert_eq!(cache_b.get(&target_key).await, None);
+
+        let name = SmolStr::new("users");
+        let shard_b = registered_shard(&cluster_b, &name);
+        crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a).await;
+
+        assert_eq!(
+            cache_b.get(&target_key).await,
+            Some(target_key.to_string()),
+            "the pull-by-hash path repairs the dropped key by the time the round returns"
+        );
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_round_against_pushes_a_locally_held_key_via_the_decoded_sketch() {
+        const N: u32 = 4096;
+        let config = ClusterConfig {
+            ae_sketch_min_bucket: 4,
+            ..loopback_config()
+        };
+
+        let cluster_a = Cluster::builder("cluster-it-ae-round-push")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let node_a = cluster_a.node_id();
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        cache_a
+            .insert_many((0..N).map(|k| (k, k.to_string())))
+            .await
+            .expect("a inserts a few thousand entries before b ever joins");
+
+        let bucket_keys = dense_bucket_keys(N, config.ae_sketch_min_bucket + 1);
+        let target_bucket = bucket_of_u32(bucket_keys[0]);
+        // Bounded to ~200 expected hits against 1,024 buckets, so the search
+        // is certain in practice without an unbounded iterator.
+        let extra_key = (N..)
+            .take(200_000)
+            .find(|&k| bucket_of_u32(k) == target_bucket)
+            .expect("some key beyond n lands in the same dense bucket");
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-round-push")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, u64::from(N));
+
+        let name = SmolStr::new("users");
+        let shard_b = registered_shard(&cluster_b, &name);
+
+        // Applied straight to the shard, not through `cache_b.insert`, so
+        // nothing fans out to a on its own: only the round's push path is
+        // exercised below.
+        let extra_value = extra_key.to_string();
+        shard_b
+            .apply_remote(WireRecord {
+                key: Bytes::from(postcard::to_stdvec(&extra_key).expect("test key encodes")),
+                value: Some(Bytes::from(
+                    postcard::to_stdvec(&extra_value).expect("test value encodes"),
+                )),
+                ver: Hlc {
+                    wall_ms: u64::MAX / 2,
+                    logical: 0,
+                    node: cluster_b.node_id(),
+                },
+                expires_at_ms: None,
+            })
+            .await;
+        assert_eq!(cache_b.get(&extra_key).await, Some(extra_value.clone()));
+        assert_eq!(cache_a.get(&extra_key).await, None, "a never had this key");
+
+        crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a).await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cache_a.get(&extra_key).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the push path delivers b's extra key to a within the bound");
+        assert_eq!(cache_a.get(&extra_key).await, Some(extra_value));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn records_for_hashes_answers_exactly_the_records_whose_hash_matches() {
+        let cluster = Cluster::builder("cluster-it-records-for-hashes")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("open succeeds");
+        cache
+            .insert_many([
+                (1, "one".to_string()),
+                (2, "two".into()),
+                (3, "three".into()),
+            ])
+            .await
+            .expect("insert");
+
+        // Constructed the way `ClusterBuilder::build` constructs the handler
+        // it hands to `Mesh::spawn`, against this single-node cluster's own
+        // registry.
+        let handler = ClusterRequestHandler {
+            shards: cluster.shards(),
+            ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
+            ae_sketch_cells: cluster.config().ae_sketch_cells,
+        };
+        let name = SmolStr::new("users");
+        let key_one = Bytes::from(postcard::to_stdvec(&1u32).expect("test key encodes"));
+        let bucket = bucket_of_u32(1);
+        let hash_one = xxh3_64(&key_one);
+
+        let records = handler
+            .records_for_hashes(name.clone(), bucket, vec![hash_one])
+            .await;
+        assert_eq!(records.len(), 1, "exactly the one matching hash comes back");
+        assert_eq!(records[0].key, key_one);
+
+        let none = handler
+            .records_for_hashes(name, bucket, vec![hash_one.wrapping_add(1)])
+            .await;
+        assert!(none.is_empty(), "a hash matching nothing yields nothing");
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn builder_discovery_override_forms_a_working_cluster() {
+        let cluster = Cluster::builder("cluster-it-discovery-override")
+            .discovery(crate::discovery::statics::Static::new(std::iter::empty()))
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds with a custom Discovery implementor");
+
+        let cache = cluster
+            .cache::<u32, String>("solo")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+        cache.insert(1, "a".into()).await.expect("insert");
+        assert_eq!(cache.get(&1).await, Some("a".to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn build_returns_bind_error_when_the_configured_data_port_is_taken() {
+        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind an ephemeral loopback port to occupy it");
+        let addr = occupied
+            .local_addr()
+            .expect("a freshly bound listener reports its address");
+
+        let config = ClusterConfig {
+            data_bind_addr: addr,
+            ..loopback_config()
+        };
+
+        let err = Cluster::builder("cluster-it-data-bind-conflict")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err("the configured data-plane port is already taken");
+        assert!(matches!(err, JoinError::Bind { .. }));
+
+        drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn report_mode_conflicts_logs_a_late_conflict_against_a_live_peer() {
+        let cluster = Cluster::builder("cluster-it-mode-conflict-log")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let _cache = cluster
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("open succeeds");
+
+        // Hand-built rather than gossiped: `report_mode_conflicts` only
+        // reads `cluster`'s own advertised mode, so no live peer is needed
+        // to exercise its late-conflict log line deterministically.
+        let peer = NodeId::from(99);
+        let mut advertised: CacheModes = HashMap::new();
+        advertised.insert(
+            peer,
+            [(SmolStr::new("users"), Mode::Invalidation)]
+                .into_iter()
+                .collect(),
+        );
+        let mut warned = HashSet::new();
+
+        report_mode_conflicts(&advertised, &cluster, &mut warned);
+        assert!(
+            warned.contains(&(peer, SmolStr::new("users"))),
+            "the conflict is recorded so a repeated view doesn't re-warn"
+        );
+
+        cluster.shutdown().await;
+    }
 }

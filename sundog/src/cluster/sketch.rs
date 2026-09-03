@@ -391,31 +391,47 @@ mod tests {
         );
     }
 
+    /// Every element on both sides of a difference like this one's is at a
+    /// distinct `(key_hash, ver)`, even where the key ranges overlap: the
+    /// overlap keys carry a bumped version on `right`, so nothing cancels
+    /// and the full symmetric difference is `left` plus `right`, whole.
+    fn expect_elems(side: &[(u64, Hlc)]) -> HashSet<Elem> {
+        side.iter()
+            .map(|&(key_hash, v)| Elem { key_hash, ver: v })
+            .collect()
+    }
+
     #[test]
     fn a_large_symmetric_difference_is_either_exact_or_undecodable_never_wrong() {
-        let cells = 24; // deliberately small, to force undecodable outcomes
+        // A modest difference against a full-size sketch: small enough that
+        // peeling always succeeds, and exactly, since the overlap's bumped
+        // versions never cancel.
+        let left: Vec<(u64, Hlc)> = (0..20u64).map(|k| (k, ver(k))).collect();
+        let right: Vec<(u64, Hlc)> = (10..30u64).map(|k| (k, ver(k + 1))).collect();
+        let decoded = sketch_of(&left, 240)
+            .subtract(&sketch_of(&right, 240))
+            .peel()
+            .expect("a modest diff against 240 cells always decodes");
+        assert_eq!(
+            decoded.only_left.iter().copied().collect::<HashSet<_>>(),
+            expect_elems(&left),
+            "a real decode must be exact"
+        );
+        assert_eq!(
+            decoded.only_right.iter().copied().collect::<HashSet<_>>(),
+            expect_elems(&right),
+            "a real decode must be exact"
+        );
+
+        // The same shape of difference, scaled up against a deliberately
+        // tiny sketch (8 cells per partition): too large to peel, so it
+        // must fail closed rather than decode wrong.
         let left: Vec<(u64, Hlc)> = (0..200u64).map(|k| (k, ver(k))).collect();
         let right: Vec<(u64, Hlc)> = (100..300u64).map(|k| (k, ver(k + 1))).collect();
-        let a = sketch_of(&left, cells);
-        let b = sketch_of(&right, cells);
-        // `Err(Undecodable)` is an acceptable outcome here too; only a
-        // successful decode has anything further to check.
-        if let Ok(decoded) = a.subtract(&b).peel() {
-            let left_set: HashSet<Elem> = left
-                .iter()
-                .filter(|&&(k, _)| !(100..200).contains(&k))
-                .map(|&(key_hash, v)| Elem { key_hash, ver: v })
-                .collect();
-            let expected_left: HashSet<Elem> = decoded.only_left.iter().copied().collect();
-            assert_eq!(expected_left, left_set, "a real decode must be exact");
-            let right_set: HashSet<Elem> = right
-                .iter()
-                .filter(|&&(k, _)| !(100..200).contains(&k))
-                .map(|&(key_hash, v)| Elem { key_hash, ver: v })
-                .collect();
-            let expected_right: HashSet<Elem> = decoded.only_right.iter().copied().collect();
-            assert_eq!(expected_right, right_set, "a real decode must be exact");
-        }
+        assert_eq!(
+            sketch_of(&left, 24).subtract(&sketch_of(&right, 24)).peel(),
+            Err(Undecodable)
+        );
     }
 
     #[test]

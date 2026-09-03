@@ -68,21 +68,34 @@ fn tls_node_config(gossip_bind_addr: SocketAddr, tls: TlsConfig) -> ClusterConfi
     })
 }
 
+/// Like [`tls_node_config`], minus the `tls` field: for the case below that
+/// enables TLS through [`sundog::Cluster::builder`]'s `.tls()` setter
+/// instead of the config field directly.
+fn node_config(gossip_bind_addr: SocketAddr) -> ClusterConfig {
+    common::fast_config().with(|c| {
+        c.gossip_bind_addr = gossip_bind_addr;
+    })
+}
+
 #[tokio::test]
 async fn nodes_sharing_a_ca_replicate_a_put_over_tls() {
     let ca = generate_ca();
     let gossip_a = reserve_gossip_addr().await;
     let gossip_b = reserve_gossip_addr().await;
 
+    // Enabled via `ClusterBuilder::tls`, not `ClusterConfig::tls` directly,
+    // so this test covers both entry points to the same setting.
     let cluster_a = Cluster::builder("it-tls-shared-ca")
         .seeds([gossip_b])
-        .config(tls_node_config(gossip_a, generate_node_tls(&ca)))
+        .config(node_config(gossip_a))
+        .tls(generate_node_tls(&ca))
         .build()
         .await
         .expect("node a builds with tls");
     let cluster_b = Cluster::builder("it-tls-shared-ca")
         .seeds([gossip_a])
-        .config(tls_node_config(gossip_b, generate_node_tls(&ca)))
+        .config(node_config(gossip_b))
+        .tls(generate_node_tls(&ca))
         .build()
         .await
         .expect("node b builds with tls");
