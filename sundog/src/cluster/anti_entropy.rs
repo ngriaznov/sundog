@@ -166,132 +166,28 @@ pub(crate) async fn run_round_against(
     let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
     let mut undecodable_buckets: Vec<u16> = Vec::new();
 
-    // One local shard pass for every bucket answered with a listing or
-    // sketch, not one per bucket, since a mostly-divergent peer mismatches
-    // many at once and per-bucket scans would be quadratic. Covers sketch
-    // replies too: a sketch diff needs the local entries to build its own
-    // comparison sketch.
-    if !bucket_mismatches.is_empty() {
-        let local_entries = shard
-            .entries_for_buckets(bucket_mismatches.iter().map(AeMismatch::bucket).collect())
-            .await;
-        let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries.into_iter().collect();
-
-        for mismatch in bucket_mismatches {
-            match mismatch {
-                AeMismatch::Bucket(bucket, peer_entries) => {
-                    diff_bucket(
-                        local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
-                        &peer_entries,
-                        &mut push_keys,
-                        &mut pull_keys,
-                    );
-                }
-                AeMismatch::Sketch(bucket, cells) => {
-                    let entries: &[(Bytes, Hlc)] =
-                        local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
-                    handle_sketch_mismatch(
-                        cache,
-                        bucket,
-                        cells,
-                        entries,
-                        &mut push_keys,
-                        &mut pull_hashes,
-                        &mut undecodable_buckets,
-                    );
-                }
-                AeMismatch::PartDigests(..) => {
-                    unreachable!("invariant: partitioned out above")
-                }
-            }
-        }
-    }
-
-    // Buckets answered with part digests: compare against this node's own
-    // part digests for the same buckets, one shard call for all of them,
-    // then one `ae_parts` request for every part that actually differs.
-    if !part_digest_mismatches.is_empty() {
-        let buckets: Vec<u16> = part_digest_mismatches
-            .iter()
-            .map(AeMismatch::bucket)
-            .collect();
-        let local_part_digests = shard.part_digests(buckets).await;
-        let local_digests_by_bucket: HashMap<u16, Vec<u64>> =
-            local_part_digests.into_iter().collect();
-
-        let mut wanted_parts: Vec<(u16, u8)> = Vec::new();
-        for mismatch in &part_digest_mismatches {
-            let AeMismatch::PartDigests(bucket, remote_parts) = mismatch else {
-                unreachable!("invariant: partitioned in above")
-            };
-            let local_parts = local_digests_by_bucket
-                .get(bucket)
-                .map_or(&[][..], Vec::as_slice);
-            wanted_parts.extend(
-                mismatched_parts(local_parts, remote_parts)
-                    .into_iter()
-                    .map(|part| (*bucket, part)),
-            );
-        }
-
-        if !wanted_parts.is_empty() {
-            match mesh
-                .ae_parts(peer, cache.clone(), wanted_parts.clone())
-                .await
-            {
-                Ok(replies) => {
-                    let local_part_entries = shard.entries_for_parts(wanted_parts).await;
-                    let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
-                        local_part_entries.into_iter().collect();
-                    for reply in replies {
-                        match reply {
-                            AePartReply::Listing {
-                                bucket,
-                                part,
-                                entries,
-                            } => {
-                                diff_bucket(
-                                    local_by_part
-                                        .get(&(bucket, part))
-                                        .map_or(&[], Vec::as_slice),
-                                    &entries,
-                                    &mut push_keys,
-                                    &mut pull_keys,
-                                );
-                                metrics::counter!(
-                                    "sundog_ae_parts_total",
-                                    "cache" => cache.to_string(),
-                                    "outcome" => "listing"
-                                )
-                                .increment(1);
-                            }
-                            AePartReply::Sketch {
-                                bucket,
-                                part,
-                                cells,
-                            } => {
-                                let entries: &[(Bytes, Hlc)] = local_by_part
-                                    .get(&(bucket, part))
-                                    .map_or(&[], Vec::as_slice);
-                                handle_part_sketch_mismatch(
-                                    cache,
-                                    bucket,
-                                    cells,
-                                    entries,
-                                    &mut push_keys,
-                                    &mut pull_hashes,
-                                    &mut undecodable_buckets,
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(%error, "anti-entropy part exchange failed");
-                }
-            }
-        }
-    }
+    classify_bucket_mismatches(
+        shard,
+        cache,
+        bucket_mismatches,
+        &mut push_keys,
+        &mut pull_keys,
+        &mut pull_hashes,
+        &mut undecodable_buckets,
+    )
+    .await;
+    classify_part_digest_mismatches(
+        mesh,
+        shard,
+        cache,
+        peer,
+        part_digest_mismatches,
+        &mut push_keys,
+        &mut pull_keys,
+        &mut pull_hashes,
+        &mut undecodable_buckets,
+    )
+    .await;
 
     // One fallback request for every bucket whose sketch failed to decode,
     // sent once the round's replies are classified: several oversized
@@ -325,6 +221,161 @@ pub(crate) async fn run_round_against(
     }
 
     apply_repairs(mesh, shard, cache, peer, push_keys, pull_keys, pull_hashes).await;
+}
+
+/// Classifies buckets answered with a listing or sketch
+/// (`AeMismatch::Bucket`/`Sketch`): one local shard pass for all of them at
+/// once, not one per bucket, since a mostly-divergent peer mismatches many
+/// and per-bucket scans would be quadratic; each is then classified into
+/// `push_keys`/`pull_keys` directly, or, for a sketch, via
+/// [`handle_sketch_mismatch`]. A no-op when `mismatches` is empty.
+async fn classify_bucket_mismatches(
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    mismatches: Vec<AeMismatch>,
+    push_keys: &mut Vec<Bytes>,
+    pull_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+    undecodable_buckets: &mut Vec<u16>,
+) {
+    if mismatches.is_empty() {
+        return;
+    }
+    let local_entries = shard
+        .entries_for_buckets(mismatches.iter().map(AeMismatch::bucket).collect())
+        .await;
+    let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries.into_iter().collect();
+
+    for mismatch in mismatches {
+        match mismatch {
+            AeMismatch::Bucket(bucket, peer_entries) => {
+                diff_bucket(
+                    local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
+                    &peer_entries,
+                    push_keys,
+                    pull_keys,
+                );
+            }
+            AeMismatch::Sketch(bucket, cells) => {
+                let entries: &[(Bytes, Hlc)] =
+                    local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
+                handle_sketch_mismatch(
+                    cache,
+                    bucket,
+                    cells,
+                    entries,
+                    push_keys,
+                    pull_hashes,
+                    undecodable_buckets,
+                );
+            }
+            AeMismatch::PartDigests(..) => {
+                unreachable!("invariant: run_round_against partitions this variant out")
+            }
+        }
+    }
+}
+
+/// Classifies buckets answered with part digests (`AeMismatch::PartDigests`):
+/// compares each against this node's own part digests for the same bucket,
+/// one shard call for all of them, then one [`Mesh::ae_parts`] request for
+/// every part that actually differs, classifying each reply the same way
+/// [`classify_bucket_mismatches`] does at bucket scale. A no-op when
+/// `mismatches` is empty.
+///
+/// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
+#[allow(clippy::too_many_arguments)]
+async fn classify_part_digest_mismatches(
+    mesh: &crate::net::Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    mismatches: Vec<AeMismatch>,
+    push_keys: &mut Vec<Bytes>,
+    pull_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+    undecodable_buckets: &mut Vec<u16>,
+) {
+    if mismatches.is_empty() {
+        return;
+    }
+    let buckets: Vec<u16> = mismatches.iter().map(AeMismatch::bucket).collect();
+    let local_part_digests = shard.part_digests(buckets).await;
+    let local_digests_by_bucket: HashMap<u16, Vec<u64>> = local_part_digests.into_iter().collect();
+
+    let mut wanted_parts: Vec<(u16, u8)> = Vec::new();
+    for mismatch in &mismatches {
+        let AeMismatch::PartDigests(bucket, remote_parts) = mismatch else {
+            unreachable!("invariant: run_round_against partitions in only this variant")
+        };
+        let local_parts = local_digests_by_bucket
+            .get(bucket)
+            .map_or(&[][..], Vec::as_slice);
+        wanted_parts.extend(
+            mismatched_parts(local_parts, remote_parts)
+                .into_iter()
+                .map(|part| (*bucket, part)),
+        );
+    }
+    if wanted_parts.is_empty() {
+        return;
+    }
+
+    match mesh
+        .ae_parts(peer, cache.clone(), wanted_parts.clone())
+        .await
+    {
+        Ok(replies) => {
+            let local_part_entries = shard.entries_for_parts(wanted_parts).await;
+            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
+                local_part_entries.into_iter().collect();
+            for reply in replies {
+                match reply {
+                    AePartReply::Listing {
+                        bucket,
+                        part,
+                        entries,
+                    } => {
+                        diff_bucket(
+                            local_by_part
+                                .get(&(bucket, part))
+                                .map_or(&[], Vec::as_slice),
+                            &entries,
+                            push_keys,
+                            pull_keys,
+                        );
+                        metrics::counter!(
+                            "sundog_ae_parts_total",
+                            "cache" => cache.to_string(),
+                            "outcome" => "listing"
+                        )
+                        .increment(1);
+                    }
+                    AePartReply::Sketch {
+                        bucket,
+                        part,
+                        cells,
+                    } => {
+                        let entries: &[(Bytes, Hlc)] = local_by_part
+                            .get(&(bucket, part))
+                            .map_or(&[], Vec::as_slice);
+                        handle_part_sketch_mismatch(
+                            cache,
+                            bucket,
+                            cells,
+                            entries,
+                            push_keys,
+                            pull_hashes,
+                            undecodable_buckets,
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::debug!(%error, "anti-entropy part exchange failed");
+        }
+    }
 }
 
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
@@ -453,6 +504,7 @@ fn handle_sketch_mismatch(
 /// re-exports it as `crate::mismatched_parts` under `feature = "sim"`, to
 /// classify a peer's `AeMismatch::PartDigests` reply the same way
 /// `run_round_against` does here, without duplicating this comparison.
+#[must_use]
 pub fn mismatched_parts(local: &[u64], remote: &[u64]) -> Vec<u8> {
     let len = local.len().max(remote.len());
     (0..len)

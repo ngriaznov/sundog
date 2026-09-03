@@ -500,63 +500,16 @@ async fn handle_accepted(
                 | Msg::AePullHashes { .. }
                 | Msg::AeParts { .. }
         );
-        let stop = match msg {
-            Msg::Invalidate { .. } | Msg::Replicate { .. } | Msg::ReplicateBatch { .. } => {
-                let _ = inbound_tx.send(InboundMsg { from, msg }).await;
-                false
-            }
-            Msg::StRequest { cache } => {
-                serve_state_transfer(&mut framed, cache, handler.as_ref(), &cancel).await
-            }
-            Msg::AeDigest { cache, buckets } => {
-                if mesh.defers_ae_digest_from(from) {
-                    tracing::debug!(
-                        peer = %from,
-                        %cache,
-                        "anti-entropy digest from a peer with replicate frames queued toward it; answered empty"
-                    );
-                    send_batch_or_cancelled(&mut framed, &[Msg::ReqDone], &cancel).await
-                } else {
-                    serve_ae_digest(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
-                }
-            }
-            Msg::AeEntries { cache, buckets } => {
-                serve_ae_entries(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
-            }
-            Msg::AePull { cache, keys } => {
-                serve_ae_pull(&mut framed, cache, keys, handler.as_ref(), &cancel).await
-            }
-            Msg::AePullHashes {
-                cache,
-                bucket,
-                hashes,
-            } => {
-                serve_ae_pull_hashes(
-                    &mut framed,
-                    cache,
-                    bucket,
-                    hashes,
-                    handler.as_ref(),
-                    &cancel,
-                )
-                .await
-            }
-            Msg::AeParts { cache, parts } => {
-                serve_ae_parts(&mut framed, cache, parts, handler.as_ref(), &cancel).await
-            }
-            // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
-            // `AePartDigests`/`AePart`/`AePartSketch`/`ReqDone` sent only as
-            // replies on a connection this node initiated, never on one
-            // being served here.
-            Msg::Hello { .. }
-            | Msg::StChunk { .. }
-            | Msg::AeBucket { .. }
-            | Msg::AeSketch { .. }
-            | Msg::AePartDigests { .. }
-            | Msg::AePart { .. }
-            | Msg::AePartSketch { .. }
-            | Msg::ReqDone => false,
-        };
+        let stop = dispatch_one(
+            msg,
+            from,
+            &mut framed,
+            &inbound_tx,
+            handler.as_ref(),
+            mesh.as_ref(),
+            &cancel,
+        )
+        .await;
         if stop {
             return;
         }
@@ -566,6 +519,64 @@ async fn handle_accepted(
         if served_requests >= REQ_CONN_MAX_REQUESTS {
             return;
         }
+    }
+}
+
+/// Dispatches one message off an accepted connection: forwards a broadcast
+/// message to `inbound_tx`, serves a request inline, or, for a message only
+/// ever sent as a reply on a connection this node initiated, does nothing.
+/// Returns `true` when this connection is done.
+async fn dispatch_one(
+    msg: Msg,
+    from: NodeId,
+    framed: &mut PeerFramed,
+    inbound_tx: &mpsc::Sender<InboundMsg>,
+    handler: &dyn RequestHandler,
+    mesh: &MeshInner,
+    cancel: &CancellationToken,
+) -> bool {
+    match msg {
+        Msg::Invalidate { .. } | Msg::Replicate { .. } | Msg::ReplicateBatch { .. } => {
+            let _ = inbound_tx.send(InboundMsg { from, msg }).await;
+            false
+        }
+        Msg::StRequest { cache } => serve_state_transfer(framed, cache, handler, cancel).await,
+        Msg::AeDigest { cache, buckets } => {
+            if mesh.defers_ae_digest_from(from) {
+                tracing::debug!(
+                    peer = %from,
+                    %cache,
+                    "anti-entropy digest from a peer with replicate frames queued toward it; answered empty"
+                );
+                send_batch_or_cancelled(framed, &[Msg::ReqDone], cancel).await
+            } else {
+                serve_ae_digest(framed, cache, buckets, handler, cancel).await
+            }
+        }
+        Msg::AeEntries { cache, buckets } => {
+            serve_ae_entries(framed, cache, buckets, handler, cancel).await
+        }
+        Msg::AePull { cache, keys } => serve_ae_pull(framed, cache, keys, handler, cancel).await,
+        Msg::AePullHashes {
+            cache,
+            bucket,
+            hashes,
+        } => serve_ae_pull_hashes(framed, cache, bucket, hashes, handler, cancel).await,
+        Msg::AeParts { cache, parts } => {
+            serve_ae_parts(framed, cache, parts, handler, cancel).await
+        }
+        // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
+        // `AePartDigests`/`AePart`/`AePartSketch`/`ReqDone` sent only as
+        // replies on a connection this node initiated, never on one being
+        // served here.
+        Msg::Hello { .. }
+        | Msg::StChunk { .. }
+        | Msg::AeBucket { .. }
+        | Msg::AeSketch { .. }
+        | Msg::AePartDigests { .. }
+        | Msg::AePart { .. }
+        | Msg::AePartSketch { .. }
+        | Msg::ReqDone => false,
     }
 }
 

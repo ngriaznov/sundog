@@ -128,6 +128,14 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
         )
             .prop_map(|(cache, recs)| Msg::ReplicateBatch { cache, recs }),
         Just(Msg::ReqDone),
+        part_msg_strategy(),
+    ]
+}
+
+/// The four part-digest anti-entropy variants, split out of [`msg_strategy`]
+/// so neither function trips clippy's line-count lint.
+fn part_msg_strategy() -> impl Strategy<Value = Msg> {
+    prop_oneof![
         (
             smol_str_strategy(),
             any::<u16>(),

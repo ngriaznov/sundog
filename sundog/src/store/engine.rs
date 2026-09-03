@@ -2388,19 +2388,19 @@ mod tests {
         }
 
         let bucket_u16 = u16::try_from(bucket).expect("fits");
-        let part_a_u8 = u8::try_from(part_a).expect("fits");
-        let part_b_u8 = u8::try_from(part_b).expect("fits");
-        let result = engine.collect_parts(&[(bucket_u16, part_a_u8), (bucket_u16, part_b_u8)], 0);
+        let req_a: (u16, u8) = (bucket_u16, u8::try_from(part_a).expect("fits"));
+        let req_b: (u16, u8) = (bucket_u16, u8::try_from(part_b).expect("fits"));
+        let result = engine.collect_parts(&[req_a, req_b], 0);
         assert_eq!(result.len(), 2);
         let a_entries = &result
             .iter()
-            .find(|((b, p), _)| *b == bucket_u16 && *p == part_a_u8)
+            .find(|(key, _)| *key == req_a)
             .expect("part_a present")
             .1;
         assert_eq!(a_entries, &vec![(kb_a, hlc(1, 1))]);
         let b_entries = &result
             .iter()
-            .find(|((b, p), _)| *b == bucket_u16 && *p == part_b_u8)
+            .find(|(key, _)| *key == req_b)
             .expect("part_b present")
             .1;
         assert_eq!(
