@@ -350,6 +350,12 @@ async fn classify_part_digest_mismatches(
                             "outcome" => "listing"
                         )
                         .increment(1);
+                        tracing::debug!(
+                            outcome = "listing",
+                            bucket,
+                            part,
+                            "anti-entropy part listing"
+                        );
                     }
                     AePartReply::Sketch {
                         bucket,
