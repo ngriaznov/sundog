@@ -160,7 +160,7 @@ mod tests {
     async fn resolve_specs_skips_an_unparsable_entry_and_resolves_the_rest() {
         let specs = [
             String::from("127.0.0.1:not-a-port"),
-            String::from("localhost:4321"),
+            String::from("127.0.0.1:4321"),
         ];
         let resolved = resolve_specs(&specs).await;
         assert_eq!(
