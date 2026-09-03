@@ -59,7 +59,7 @@ impl AbsenceTracker {
     }
 }
 
-/// Whether `tombstone_gc_task` should defer a tombstone past `tombstone_ttl`
+/// Whether `tombstone_gc_task` defers a tombstone past `tombstone_ttl`
 /// this tick. Only [`Mode::Replicated`] runs anti-entropy, the mechanism
 /// that could resurrect a tombstone, so other modes are never deferred.
 pub(crate) fn should_defer_gc(mode: Mode, tracker: &AbsenceTracker, hard_cap: Duration) -> bool {

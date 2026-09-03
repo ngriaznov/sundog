@@ -107,7 +107,7 @@ fn build_tls_ctx(config: &ClusterConfig) -> TlsCtx {
     if config.tls.is_some() {
         tracing::warn!(
             "ClusterConfig::tls is set but the `sim` feature is active; TLS is not applied \
-             over the turmoil transport — see net::tls's module docs"
+             over the turmoil transport; see net::tls's module docs"
         );
     }
     TlsCtx
@@ -1171,7 +1171,7 @@ mod tests {
         .await
         .expect(
             "ae_round must give up on its own internal REQUEST_TIMEOUT, well inside this \
-             generous outer bound — not hang forever",
+             generous outer bound, not hang forever",
         );
         assert!(
             result.is_err(),

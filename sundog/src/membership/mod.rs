@@ -268,7 +268,7 @@ async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Ve
     seed_nodes
 }
 
-/// Determines the address peers should use to reach this node's gossip
+/// The address peers use to reach this node's gossip
 /// socket. A concrete bind IP is used as-is; the zeroconf default resolves
 /// to the OS-chosen outbound interface via a UDP "connect", which never
 /// sends a packet on a datagram socket. `pub(crate)`: `cluster.rs` reuses

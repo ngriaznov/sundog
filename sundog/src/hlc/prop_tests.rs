@@ -20,7 +20,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// `HlcClock::now` must strictly increase on every call regardless of
-    /// what the physical clock reports — frozen, jumping forward, or
+    /// what the physical clock reports: frozen, jumping forward, or
     /// rewinding entirely.
     #[test]
     fn now_is_strictly_monotonic_under_arbitrary_wall_clock(
@@ -37,8 +37,8 @@ proptest! {
     }
 
     /// `HlcClock::observe` must strictly increase local time and dominate
-    /// both what came before and the remote stamp just merged in, no matter
-    /// how skewed or stale the remote stamp or the local physical reading.
+    /// both the previous local stamp and the merged remote stamp, however
+    /// skewed or stale the remote stamp or the local physical reading.
     #[test]
     fn observe_is_strictly_monotonic_and_dominates_remote(
         node in any::<u64>(),
@@ -64,7 +64,7 @@ proptest! {
     }
 
     /// Any two distinct [`Hlc`] stamps compare unequal, and the ordering is a
-    /// strict total order (trichotomy, antisymmetric) — the node-id tiebreak
+    /// strict total order, trichotomous and antisymmetric; the node-id tiebreak
     /// is what makes two concurrent writers' stamps never collide.
     #[test]
     fn distinct_stamps_are_totally_ordered_and_never_compare_equal(

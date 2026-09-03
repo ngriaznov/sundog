@@ -214,8 +214,8 @@ fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
 
 /// [`send_or_cancelled`], but for a whole in-memory reply rather than one
 /// message at a time: feeds every message in `msgs` and flushes once,
-/// racing the whole batch against `cancel`. Returns `true` if the caller
-/// should stop serving this connection.
+/// racing the whole batch against `cancel`. Returns `true` when this
+/// connection is done.
 async fn send_batch_or_cancelled(
     framed: &mut PeerFramed,
     msgs: &[Msg],
@@ -550,8 +550,8 @@ async fn handle_accepted(
     }
 }
 
-/// Sends `msg`, racing the write against `cancel`. Returns `true` if the
-/// caller should stop serving this connection.
+/// Sends `msg`, racing the write against `cancel`. Returns `true` when this
+/// connection is done.
 async fn send_or_cancelled(framed: &mut PeerFramed, msg: &Msg, cancel: &CancellationToken) -> bool {
     tokio::select! {
         biased;
@@ -560,8 +560,8 @@ async fn send_or_cancelled(framed: &mut PeerFramed, msg: &Msg, cancel: &Cancella
     }
 }
 
-/// Serves one state-transfer request. Returns `true` if the caller should
-/// stop serving this connection, `false` once the final `done: true` chunk
+/// Serves one state-transfer request. Returns `true` when this connection
+/// is done, `false` once the final `done: true` chunk
 /// sent cleanly and the connection remains reusable.
 async fn serve_state_transfer(
     framed: &mut PeerFramed,
@@ -602,7 +602,7 @@ async fn serve_state_transfer(
 /// bucket's reply plus a trailing [`Msg::ReqDone`] and flushing once. A
 /// bucket whose local entry count exceeds `handler.ae_sketch_min_bucket()`
 /// replies with an IBLT sketch instead of its full [`Msg::AeBucket`]
-/// listing. Returns `true` if the caller should stop serving this connection.
+/// listing. Returns `true` when this connection is done.
 async fn serve_ae_digest(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -1070,7 +1070,7 @@ mod tests {
             .await
             .expect(
                 "an accepted-connection handler must observe cancellation instead of blocking \
-                 forever on a snapshot stream that never yields — otherwise Mesh::shutdown() \
+                 forever on a snapshot stream that never yields; otherwise Mesh::shutdown() \
                  leaves it running with the shard registry Arc still held",
             )
             .expect("accepted-connection handler did not panic");
