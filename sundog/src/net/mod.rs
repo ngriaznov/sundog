@@ -1424,6 +1424,90 @@ mod tests {
         assert_eq!(result, vec![AeMismatch::Bucket(1, entries)]);
     }
 
+    #[tokio::test]
+    async fn ae_round_returns_part_digests_for_a_bucket_past_the_part_threshold() {
+        let part_digests: Vec<u64> = (0..64u64).collect();
+        let handler = Arc::new(FixtureHandler {
+            digests: vec![(0, 111), (1, 222)],
+            bucket_lens: vec![(1, 500)],
+            part_digests: vec![(1, part_digests.clone())],
+            ae_part_min_bucket: 100,
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        // bucket 0 matches (under threshold anyway); bucket 1 mismatches and
+        // its 500-entry fixture length passes ae_part_min_bucket, so the
+        // responder answers with its part digests instead of a listing.
+        let local_buckets = vec![(0, 111), (1, 999)];
+        let result = client
+            .ae_round(NodeId::from(1), SmolStr::new("users"), local_buckets)
+            .await
+            .expect("ae round succeeds");
+
+        assert_eq!(result, vec![AeMismatch::PartDigests(1, part_digests)]);
+    }
+
+    #[tokio::test]
+    async fn ae_parts_returns_listings_and_sketches_per_the_threshold() {
+        let small_entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        // Past ClusterConfig::default's ae_sketch_min_bucket (384), so this
+        // part answers with a sketch instead of a listing.
+        let big_entries: Vec<(Bytes, Hlc)> = (0..400u32)
+            .map(|i| {
+                (
+                    Bytes::from(i.to_le_bytes().to_vec()),
+                    Hlc {
+                        wall_ms: u64::from(i) + 1,
+                        logical: 0,
+                        node: NodeId::from(1),
+                    },
+                )
+            })
+            .collect();
+        let handler = Arc::new(FixtureHandler {
+            part_entries: vec![((1, 2), small_entries.clone()), ((1, 3), big_entries)],
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let got = client
+            .ae_parts(NodeId::from(1), SmolStr::new("users"), vec![(1, 2), (1, 3)])
+            .await
+            .expect("ae_parts succeeds");
+
+        assert_eq!(got.len(), 2, "one reply per requested part");
+        assert!(
+            got.iter().any(|reply| matches!(
+                reply,
+                AePartReply::Listing { bucket: 1, part: 2, entries } if *entries == small_entries
+            )),
+            "the small part answers with a listing: {got:?}"
+        );
+        assert!(
+            got.iter().any(|reply| matches!(
+                reply,
+                AePartReply::Sketch {
+                    bucket: 1,
+                    part: 3,
+                    ..
+                }
+            )),
+            "the large part answers with a sketch: {got:?}"
+        );
+    }
+
     #[test]
     fn defer_ae_digest_only_with_frames_queued_and_a_bounded_number_of_times() {
         assert!(!defer_ae_digest(0, 0), "an empty outbox is served");

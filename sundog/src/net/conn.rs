@@ -1571,6 +1571,89 @@ mod tests {
         assert_eq!(got, vec![rec]);
     }
 
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_mismatches_reports_part_digests_replies() {
+        let digests: Vec<u64> = (0..64u64).collect();
+        let framed = dial_fake_donor(vec![
+            Msg::AePartDigests {
+                cache: SmolStr::new("users"),
+                bucket: 5,
+                digests: digests.clone(),
+            },
+            Msg::ReqDone,
+        ])
+        .await;
+        let pool = ReqPool::new();
+        let got = super::collect_ae_mismatches(framed, &pool)
+            .await
+            .expect("collects the AePartDigests reply");
+        assert_eq!(got, vec![AeMismatch::PartDigests(5, digests)]);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_part_replies_errors_on_a_connection_closed_before_req_done() {
+        let framed = dial_fake_donor(Vec::new()).await;
+        let pool = ReqPool::new();
+        let err = super::collect_ae_part_replies(framed, &pool)
+            .await
+            .expect_err("a connection closed before ReqDone must error");
+        assert_unexpected_eof(&err);
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn collect_ae_part_replies_reports_listings_and_sketches() {
+        let entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        let framed = dial_fake_donor(vec![
+            Msg::Hello {
+                node: NodeId::from(9),
+                incarnation: 1,
+            },
+            Msg::AePart {
+                cache: SmolStr::new("users"),
+                bucket: 3,
+                part: 7,
+                entries: entries.clone(),
+            },
+            Msg::AePartSketch {
+                cache: SmolStr::new("users"),
+                bucket: 3,
+                part: 8,
+                cells: Vec::new(),
+            },
+            Msg::ReqDone,
+        ])
+        .await;
+        let pool = ReqPool::new();
+        let got = super::collect_ae_part_replies(framed, &pool)
+            .await
+            .expect("the stray Hello must be skipped, not break the reply");
+        assert_eq!(
+            got,
+            vec![
+                super::super::AePartReply::Listing {
+                    bucket: 3,
+                    part: 7,
+                    entries,
+                },
+                super::super::AePartReply::Sketch {
+                    bucket: 3,
+                    part: 8,
+                    cells: Vec::new(),
+                },
+            ]
+        );
+    }
+
     /// `Msg::ReqDone`/`Msg::AeBucket` arriving as the first message after
     /// `Hello` fall into the request-class routing arm that treats this as
     /// a persistent broadcast-class connection: neither served nor
