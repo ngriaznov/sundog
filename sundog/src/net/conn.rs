@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
-use super::{InboundMsg, MeshStream, OutFrame, RequestHandler, TlsCtx};
+use super::{InboundMsg, MeshInner, MeshStream, OutFrame, RequestHandler, TlsCtx};
 use crate::error::CodecError;
 use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
@@ -413,15 +413,15 @@ async fn connect_with_hello(
     }
 }
 
-/// Accepts connections until `cancel` fires, spawning a handler per
-/// connection.
+/// Accepts connections until `mesh`'s accept token fires, spawning a handler
+/// per connection.
 pub(super) async fn accept_loop(
     listener: TcpListener,
     inbound_tx: mpsc::Sender<InboundMsg>,
     handler: Arc<dyn RequestHandler>,
-    cancel: CancellationToken,
-    tls: TlsCtx,
+    mesh: Arc<MeshInner>,
 ) {
+    let cancel = mesh.accept_cancel.clone();
     loop {
         tokio::select! {
             biased;
@@ -433,8 +433,7 @@ pub(super) async fn accept_loop(
                     stream,
                     inbound_tx.clone(),
                     Arc::clone(&handler),
-                    tls.clone(),
-                    cancel.clone(),
+                    Arc::clone(&mesh),
                 ));
             }
         }
@@ -449,17 +448,20 @@ pub(super) async fn accept_loop(
 /// [`REQ_CONN_MAX_REQUESTS`]. A failed serve or TLS handshake closes the
 /// connection immediately, since it may be mid-frame and unsafe to reuse.
 ///
-/// `cancel` is `accept_loop`'s own token: every read and write below races
-/// against it, tearing a slow snapshot or AE reply down promptly on
-/// [`super::Mesh::shutdown`].
+/// Every read and write below races against `mesh`'s accept token, tearing
+/// a slow snapshot or AE reply down promptly on [`super::Mesh::shutdown`].
+/// An `AeDigest` from a peer this node still has replicate frames queued
+/// toward is answered empty (`MeshInner::defers_ae_digest_from`): the
+/// stream delivers what a listing would, and the peer's next round catches
+/// the rest.
 async fn handle_accepted(
     stream: TcpStream,
     inbound_tx: mpsc::Sender<InboundMsg>,
     handler: Arc<dyn RequestHandler>,
-    tls: TlsCtx,
-    cancel: CancellationToken,
+    mesh: Arc<MeshInner>,
 ) {
-    let stream = match establish_accept(stream, &tls).await {
+    let cancel = mesh.accept_cancel.clone();
+    let stream = match establish_accept(stream, &mesh.tls).await {
         Ok(stream) => stream,
         Err(error) => {
             tracing::debug!(%error, "TLS handshake failed on accept; dropping connection");
@@ -506,7 +508,16 @@ async fn handle_accepted(
                 serve_state_transfer(&mut framed, cache, handler.as_ref(), &cancel).await
             }
             Msg::AeDigest { cache, buckets } => {
-                serve_ae_digest(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
+                if mesh.defers_ae_digest_from(from) {
+                    tracing::debug!(
+                        peer = %from,
+                        %cache,
+                        "anti-entropy digest from a peer with replicate frames queued toward it; answered empty"
+                    );
+                    send_batch_or_cancelled(&mut framed, &[Msg::ReqDone], &cancel).await
+                } else {
+                    serve_ae_digest(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
+                }
             }
             Msg::AeEntries { cache, buckets } => {
                 serve_ae_entries(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
@@ -1396,8 +1407,7 @@ mod tests {
             server_stream,
             inbound_tx,
             handler,
-            no_tls(),
-            cancel.clone(),
+            super::MeshInner::for_tests(no_tls(), cancel.clone()),
         ));
 
         let mut client = LengthDelimitedCodec::builder()

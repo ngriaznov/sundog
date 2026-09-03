@@ -26,7 +26,7 @@ mod tls;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -379,6 +379,9 @@ struct PeerHandle {
     /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none.
     /// Read by [`Mesh::replicate_in_flight`].
     last_replicate_enqueued: AtomicU64,
+    /// Anti-entropy digests from this peer answered empty in a row, for
+    /// [`MeshInner::defers_ae_digest_from`]'s bound.
+    ae_deferrals: AtomicU32,
     cancel: CancellationToken,
     /// Pooled request/response connections for this peer, dialed on
     /// demand, dropped with this handle when the peer departs.
@@ -392,6 +395,76 @@ struct MeshInner {
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
+}
+
+/// Digests from one peer answered empty in a row before the responder serves
+/// one regardless, so a steady write trickle toward that peer cannot starve
+/// its repair. Mirrors the initiator's own bound on skipped rounds.
+const MAX_AE_DEFERRALS: u32 = 3;
+
+/// Whether the responder answers a digest empty: only while its outbox
+/// toward the requesting peer still holds `queued` replicate frames, and
+/// never more than [`MAX_AE_DEFERRALS`] times running.
+fn defer_ae_digest(queued: usize, deferred_so_far: u32) -> bool {
+    queued > 0 && deferred_so_far < MAX_AE_DEFERRALS
+}
+
+impl MeshInner {
+    /// Whether replicate traffic toward `peer` is still in motion: frames
+    /// queued in its outbox, or a frame enqueued within the last `window`.
+    fn replicate_in_flight(&self, peer: NodeId, window: Duration) -> bool {
+        let table = self
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        let Some(handle) = table.get(&peer) else {
+            return false;
+        };
+        let queued = handle.replicate_tx.max_capacity() - handle.replicate_tx.capacity();
+        if queued > 0 {
+            return true;
+        }
+        let last = handle.last_replicate_enqueued.load(Ordering::Relaxed);
+        last != 0 && (mono_ms() + 1).saturating_sub(last) <= duration_to_ms(window)
+    }
+
+    /// Whether an anti-entropy digest from `peer` is answered empty: this
+    /// node's outbox toward it still holds replicate frames, so a listing of
+    /// every bucket the stream has not yet delivered would only ship the
+    /// same records twice. Bounded by [`MAX_AE_DEFERRALS`] in a row; the
+    /// peer's next round repairs whatever the stream left.
+    fn defers_ae_digest_from(&self, peer: NodeId) -> bool {
+        let table = self
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        let Some(handle) = table.get(&peer) else {
+            return false;
+        };
+        let queued = handle.replicate_tx.max_capacity() - handle.replicate_tx.capacity();
+        let deferred = handle.ae_deferrals.load(Ordering::Relaxed);
+        if defer_ae_digest(queued, deferred) {
+            handle.ae_deferrals.store(deferred + 1, Ordering::Relaxed);
+            true
+        } else {
+            handle.ae_deferrals.store(0, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// A mesh with no peers, for `conn`'s tests that drive
+    /// `handle_accepted` over a raw accepted stream.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(super) fn for_tests(tls: TlsCtx, accept_cancel: CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            node: NodeId::from(1),
+            incarnation: 1,
+            outbox_capacity: DEFAULT_CHANNEL_CAPACITY,
+            peers: RwLock::new(HashMap::new()),
+            accept_cancel,
+            tls,
+        })
+    }
 }
 
 /// A cheap-to-clone handle onto the running data-plane mesh.
@@ -442,23 +515,20 @@ impl Mesh {
             config.outbox_capacity
         };
         let (inbound_tx, inbound_rx) = mpsc::channel(outbox_capacity);
-        let accept_cancel = CancellationToken::new();
-        tokio::spawn(conn::accept_loop(
-            listener,
-            inbound_tx,
-            handler,
-            accept_cancel.clone(),
-            tls.clone(),
-        ));
-
         let inner = Arc::new(MeshInner {
             node,
             incarnation,
             outbox_capacity,
             peers: RwLock::new(HashMap::new()),
-            accept_cancel,
+            accept_cancel: CancellationToken::new(),
             tls,
         });
+        tokio::spawn(conn::accept_loop(
+            listener,
+            inbound_tx,
+            handler,
+            Arc::clone(&inner),
+        ));
         Ok((Self { local_addr, inner }, inbound_rx))
     }
 
@@ -522,6 +592,7 @@ impl Mesh {
             replicate_tx,
             dirty: Arc::new(AtomicBool::new(false)),
             last_replicate_enqueued: AtomicU64::new(0),
+            ae_deferrals: AtomicU32::new(0),
             cancel,
             req_pool: Arc::new(conn::ReqPool::new()),
         }
@@ -612,20 +683,7 @@ impl Mesh {
     ///
     /// Panics if the peer-table lock is poisoned.
     pub(crate) fn replicate_in_flight(&self, peer: NodeId, window: Duration) -> bool {
-        let table = self
-            .inner
-            .peers
-            .read()
-            .expect("invariant: peers lock is never poisoned");
-        let Some(handle) = table.get(&peer) else {
-            return false;
-        };
-        let queued = handle.replicate_tx.max_capacity() - handle.replicate_tx.capacity();
-        if queued > 0 {
-            return true;
-        }
-        let last = handle.last_replicate_enqueued.load(Ordering::Relaxed);
-        last != 0 && (mono_ms() + 1).saturating_sub(last) <= duration_to_ms(window)
+        self.inner.replicate_in_flight(peer, window)
     }
 
     /// Marks `peer` dirty for the next [`Mesh::take_dirty_peers`], for
@@ -1195,6 +1253,77 @@ mod tests {
             .expect("ae round succeeds");
 
         assert_eq!(result, vec![AeMismatch::Bucket(1, entries)]);
+    }
+
+    #[test]
+    fn defer_ae_digest_only_with_frames_queued_and_a_bounded_number_of_times() {
+        assert!(!defer_ae_digest(0, 0), "an empty outbox is served");
+        assert!(defer_ae_digest(1, 0));
+        assert!(defer_ae_digest(5, MAX_AE_DEFERRALS - 1));
+        assert!(
+            !defer_ae_digest(5, MAX_AE_DEFERRALS),
+            "the bound serves a round even with frames still queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_digest_from_a_peer_with_replicate_frames_queued_is_answered_empty() {
+        let entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        let handler = Arc::new(FixtureHandler {
+            records: Vec::new(),
+            digests: vec![(0, 111), (1, 222)],
+            bucket_entries: entries.clone(),
+            pulled: Mutex::new(Vec::new()),
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+        // The server knows the client at an address nobody listens on, so a
+        // replicate frame toward it stays queued: a stream in motion, from
+        // the server's side, for as long as this test runs.
+        let unreachable = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+        server.update_peers(vec![peer_at(NodeId::from(2), unreachable)]);
+        let frame = OutFrame::new(Msg::Replicate {
+            cache: SmolStr::new("users"),
+            rec: sample_record(1),
+        })
+        .expect("encodes");
+        server.send_frames(NodeId::from(2), MsgClass::Replicate, [frame]);
+
+        let round = || async {
+            client
+                .ae_round(
+                    NodeId::from(1),
+                    SmolStr::new("users"),
+                    vec![(0, 111), (1, 999)],
+                )
+                .await
+                .expect("ae round succeeds")
+        };
+        for attempt in 0..MAX_AE_DEFERRALS {
+            let result = round().await;
+            assert!(
+                result.is_empty(),
+                "round {attempt}: bucket 1 mismatches, but the stream in motion covers it: {result:?}"
+            );
+        }
+        assert_eq!(
+            round().await,
+            vec![AeMismatch::Bucket(1, entries.clone())],
+            "the bound serves the next round, frames queued or not"
+        );
+        assert!(round().await.is_empty(), "a served round resets the bound");
+        assert!(
+            !server.inner.defers_ae_digest_from(NodeId::from(3)),
+            "a peer nothing streams to is served as usual"
+        );
     }
 
     #[tokio::test]

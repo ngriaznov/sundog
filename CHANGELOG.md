@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- An anti-entropy responder answers a digest from a peer it still has
+  replicate frames queued toward with an empty round, at most three rounds
+  running, on top of the initiator-side skip. A bulk fill's own fan-out and
+  its repair no longer ship the same records twice when the peer's round
+  lands mid-stream.
+- The README quick start opens a second, session-typed cache for its
+  per-entry TTL example; a cache is typed once at open.
+
 ## [0.3.0] – 2026-09-03
 
 ### Added
