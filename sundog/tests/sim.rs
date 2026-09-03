@@ -133,9 +133,8 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
         Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
         // `Hello`, the request/response messages, and `ReqDone` never reach
-        // this dispatcher — a no-op for all of them, and (since `Msg` is
-        // `#[non_exhaustive]` outside `sundog` itself, which this
-        // integration test lives outside of) for any future variant too.
+        // this dispatcher — a no-op for all of them, and (a wildcard rather
+        // than an exhaustive list) for any future variant too.
         _ => {}
     }
 }

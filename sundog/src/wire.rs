@@ -84,7 +84,6 @@ impl WireRecord {
 }
 
 /// Every message exchanged on the data-plane mesh.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Sent once a new connection is established: identifies the sender.
@@ -149,6 +148,28 @@ pub enum Msg {
         /// The keys the requester is missing or holds an older version of.
         keys: Vec<Bytes>,
     },
+    /// Replication-mode fan-out, batched: several records to apply together.
+    /// Never built at enqueue time — `net::conn`'s per-peer writer
+    /// opportunistically coalesces consecutive same-cache queued
+    /// [`Msg::Replicate`] messages into this on the wire, applied under one
+    /// acquisition of the store's apply serialization lock
+    /// (`store::ShardOps::apply_remote_batch`). Wire-encoded via the
+    /// raw-record layout (this module's docs), not postcard.
+    ReplicateBatch {
+        /// The target cache's name.
+        cache: SmolStr,
+        /// The records to apply, in order.
+        recs: Vec<WireRecord>,
+    },
+    /// Marks the end of one reply on a request/response connection kept
+    /// open for reuse: sent once after the last `AeBucket`/`Replicate`
+    /// reply to an `AeDigest`/`AePull` request, so the requester knows the
+    /// reply is complete without relying on the connection closing.
+    /// `StRequest`'s reply already has its own per-chunk `done` flag on
+    /// `StChunk` and needs no analogous marker. Appended after every
+    /// variant that predates it so their postcard encodings (by declaration
+    /// index, not just their `as isize` discriminant) stay unchanged.
+    ReqDone,
     /// Anti-entropy round, step 2 (large-bucket path): an IBLT sketch
     /// (`cluster::sketch`'s module docs) over a mismatched bucket's
     /// `(key_hash, version)` pairs, sent instead of [`Msg::AeBucket`] once
@@ -196,27 +217,6 @@ pub enum Msg {
         /// Key hashes the requester is missing or holds an older version of.
         hashes: Vec<u64>,
     },
-    /// Replication-mode fan-out, batched: several records to apply together.
-    /// Never built at enqueue time — `net::conn`'s per-peer writer
-    /// opportunistically coalesces consecutive same-cache queued
-    /// [`Msg::Replicate`] messages into this on the wire, applied under one
-    /// acquisition of the store's apply serialization lock
-    /// (`store::ShardOps::apply_remote_batch`). Wire-encoded via the
-    /// raw-record layout (this module's docs), not postcard.
-    ReplicateBatch {
-        /// The target cache's name.
-        cache: SmolStr,
-        /// The records to apply, in order.
-        recs: Vec<WireRecord>,
-    },
-    /// Marks the end of one reply on a request/response connection kept
-    /// open for reuse: sent once after the last `AeBucket`/`Replicate`
-    /// reply to an `AeDigest`/`AePull` request, so the requester knows the
-    /// reply is complete without relying on the connection closing.
-    /// `StRequest`'s reply already has its own per-chunk `done` flag on
-    /// `StChunk` and needs no analogous marker. Appended after every
-    /// pre-existing variant so their encodings are unchanged.
-    ReqDone,
 }
 
 /// Frame discriminant: everything after this byte is a postcard-encoded [`Msg`].
