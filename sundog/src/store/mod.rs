@@ -37,6 +37,18 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
+/// A sequential, single-threaded reference model of everything downstream of
+/// a successful wire decode — versioned apply, tombstone retention, expiry,
+/// and digest bookkeeping — shared by `sundog-fuzz`'s stateful fuzz targets
+/// and this crate's own
+/// `shard_matches_the_reference_model_under_arbitrary_op_sequences` property
+/// test (`store::prop_tests`). `#[doc(hidden)]` because it's a
+/// testing/fuzzing seam, not part of the crate's API: it exists so the
+/// semantics get written once, not twice.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod model;
+
 /// Number of anti-entropy buckets per shard: `bucket(k) = xxh3(key_bytes) & (BUCKET_COUNT - 1)`.
 pub const BUCKET_COUNT: usize = 1024;
 

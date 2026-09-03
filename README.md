@@ -185,7 +185,7 @@ lives at [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
 ## Testing
 
-Four layers, cheapest and highest-signal first:
+Five layers, cheapest and highest-signal first:
 
 1. **Property tests** (`proptest`, alongside `hlc`, `wire`, and `store` in
    `sundog/src`). The one that matters most is `store`'s
@@ -228,7 +228,25 @@ Four layers, cheapest and highest-signal first:
    the code they exercise — `sundog::store`'s stampede-collapse and TTL
    tests, `sundog::cluster`'s two-node
    replication/invalidation/state-transfer/anti-entropy/local-mode tests.
-4. **Chaos demo** (`sundog-demo`, headless mode) — see below.
+4. **Coverage-guided fuzzing** (`sundog/fuzz`, a `cargo-fuzz` crate outside
+   the workspace; nightly-only, run in CI by `.github/workflows/nightly-fuzz.yml`).
+   `decode_never_panics` and `decode_encode_roundtrip` throw arbitrary bytes
+   at the wire decoder — it must never panic, and any frame it accepts must
+   re-encode to a fixed point. `apply_model` and `apply_permutation` cover
+   what those two leave untouched: everything *after* a successful decode.
+   `apply_model` replays an `Arbitrary`-generated sequence of local writes,
+   remote applies and batches, invalidations, tombstone GC, and clock
+   advances against a real `Shard` and a from-scratch reference model
+   (`sundog::store::model`, `#[doc(hidden)]`) side by side, asserting after
+   every op that reads, digests, and the entry set agree — the same
+   semantics the in-crate `shard_matches_the_reference_model_under_arbitrary_op_sequences`
+   property test checks, sampled by libFuzzer's coverage guidance instead
+   of proptest. `apply_permutation` is the permutation-convergence property
+   (`store`'s property tests, above) under that same coverage guidance:
+   an arbitrary record set, duplicated and shuffled two different ways,
+   must converge two independent shards to identical digests and entry
+   sets.
+5. **Chaos demo** (`sundog-demo`, headless mode) — see below.
 
 Plain `cargo test --workspace` runs everything except the `sim` and
 container suites, which need their feature/env var explicitly:

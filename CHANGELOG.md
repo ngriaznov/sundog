@@ -3,6 +3,20 @@
 All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Stateful fuzzing of the apply path**: two new `cargo-fuzz` targets,
+  `apply_model` and `apply_permutation` (`sundog/fuzz`), drive coverage-guided,
+  sequence-generated local writes, remote applies and batches, invalidations,
+  tombstone GC, and clock advances through a real `Shard` alongside a
+  from-scratch reference model of the same semantics, and check the
+  permutation-convergence invariant under libFuzzer's own mutation instead
+  of proptest's sampling. The model (`sundog::store::model`, `#[doc(hidden)]`,
+  behind the new `fuzzing` feature or `cfg(test)`) is shared with a matching
+  in-crate property test, `shard_matches_the_reference_model_under_arbitrary_op_sequences`.
+
 ## [0.2.0] – 2026-09-02
 
 ### Added
