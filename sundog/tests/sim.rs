@@ -26,11 +26,12 @@ use smol_str::SmolStr;
 use sundog::config::ClusterConfig;
 use sundog::hlc::Hlc;
 use sundog::membership::Peer;
-use sundog::net::{InboundMsg, Mesh, MsgClass, RequestHandler};
+use sundog::net::{AeMismatch, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
 use sundog::store::{Mode, Shard, ShardOps};
 use sundog::wire::{Msg, WireRecord};
 use turmoil::{Builder, Sim};
+use xxhash_rust::xxh3::xxh3_64;
 
 type TestShard = Shard<u32, String>;
 type SimResult = turmoil::Result;
@@ -118,20 +119,41 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
 
 /// Wraps a shared `Shard` as the `net::RequestHandler` a `Mesh` answers
 /// inbound requests through, standing in for `cluster.rs`'s handler.
-struct ShardHandler(Arc<TestShard>);
+/// `ae_sketch_min_bucket` mirrors the field of the same name on
+/// `ClusterConfig`, letting a scenario force a low threshold so a mismatched
+/// bucket answers with `AeMismatch::Sketch` instead of a full listing.
+struct ShardHandler {
+    shard: Arc<TestShard>,
+    ae_sketch_min_bucket: usize,
+}
+
+impl ShardHandler {
+    /// The threshold at [`ClusterConfig::default`]'s value: every scenario
+    /// but the sketch one wants this, since its buckets never grow past it.
+    fn new(shard: Arc<TestShard>) -> Self {
+        Self::with_min_bucket(shard, ClusterConfig::default().ae_sketch_min_bucket)
+    }
+
+    fn with_min_bucket(shard: Arc<TestShard>, ae_sketch_min_bucket: usize) -> Self {
+        Self {
+            shard,
+            ae_sketch_min_bucket,
+        }
+    }
+}
 
 impl RequestHandler for ShardHandler {
     fn snapshot_chunks(&self, _cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
-        ShardOps::snapshot_chunks(self.0.as_ref())
+        ShardOps::snapshot_chunks(self.shard.as_ref())
     }
 
     fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
-        let shard = Arc::clone(&self.0);
+        let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::digests(shard.as_ref()).await })
     }
 
     fn bucket_entries(&self, _cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
-        let shard = Arc::clone(&self.0);
+        let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::bucket_entries(shard.as_ref(), bucket).await })
     }
 
@@ -140,13 +162,17 @@ impl RequestHandler for ShardHandler {
         _cache: SmolStr,
         buckets: Vec<u16>,
     ) -> BoxFuture<'_, sundog::store::BucketEntries> {
-        let shard = Arc::clone(&self.0);
+        let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::entries_for_buckets(shard.as_ref(), buckets).await })
     }
 
     fn records_for(&self, _cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
-        let shard = Arc::clone(&self.0);
+        let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::records_for(shard.as_ref(), keys).await })
+    }
+
+    fn ae_sketch_min_bucket(&self) -> usize {
+        self.ae_sketch_min_bucket
     }
 }
 
@@ -175,8 +201,15 @@ async fn fan_out(shard: &TestShard, mesh: &Mesh, peers: &[NodeId], key: u32, dup
 }
 
 /// One anti-entropy round against `peer`, reimplementing
-/// `run_round_against`'s digest-exchange logic over the same public calls.
-async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
+/// `run_round_against`'s digest-exchange logic over the same public calls,
+/// including the sketch path: a bucket answered as `AeMismatch::Sketch`
+/// gets a local comparison sketch built from `bucket_entries`, subtracted
+/// against the received one, and peeled via [`sundog::Iblt`]; a decode
+/// classifies into pushes and hash-pulls via [`sundog::diff_decoded`], the
+/// same function `cluster::anti_entropy::handle_sketch_mismatch` calls, and
+/// an `Undecodable` one queues for the `Mesh::ae_entries` listing fallback,
+/// exactly mirroring `run_round_against`'s own shape.
+async fn ae_round_with_sketch(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
     let local_buckets = ShardOps::digests(shard).await;
     let Ok(Ok(mismatched)) = tokio::time::timeout(
         NET_TIMEOUT,
@@ -189,13 +222,51 @@ async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
 
     let mut push_keys = Vec::new();
     let mut pull_keys = Vec::new();
+    let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
+    let mut undecodable_buckets = Vec::new();
+
     for mismatch in mismatched {
-        // This harness's buckets never grow past `ae_sketch_min_bucket`, so
-        // the responder never answers with `AeMismatch::Sketch`; skip it.
-        let sundog::net::AeMismatch::Bucket(bucket, peer_entries) = mismatch else {
-            continue;
-        };
-        diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
+        match mismatch {
+            AeMismatch::Bucket(bucket, peer_entries) => {
+                diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
+            }
+            AeMismatch::Sketch(bucket, cells) => {
+                let local_entries = ShardOps::bucket_entries(shard, bucket).await;
+                let mut local_sketch = sundog::Iblt::new(cells.len());
+                for (key, ver) in &local_entries {
+                    local_sketch.insert(xxh3_64(key), *ver);
+                }
+                match local_sketch
+                    .subtract(&sundog::Iblt::from_cells(cells))
+                    .peel()
+                {
+                    Ok(decoded) => {
+                        let mut hashes = Vec::new();
+                        sundog::diff_decoded(&local_entries, &decoded, &mut push_keys, &mut hashes);
+                        if !hashes.is_empty() {
+                            pull_hashes.push((bucket, hashes));
+                        }
+                    }
+                    Err(_) => undecodable_buckets.push(bucket),
+                }
+            }
+        }
+    }
+
+    if !undecodable_buckets.is_empty() {
+        match tokio::time::timeout(
+            NET_TIMEOUT,
+            mesh.ae_entries(peer, cache_name(), undecodable_buckets),
+        )
+        .await
+        {
+            Ok(Ok(fallback)) => {
+                for (bucket, peer_entries) in fallback {
+                    diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
+                }
+            }
+            Ok(Err(_)) | Err(_) => return false,
+        }
     }
 
     if !push_keys.is_empty() {
@@ -210,20 +281,33 @@ async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
             );
         }
     }
+    let mut ok = true;
     if !pull_keys.is_empty() {
-        return match tokio::time::timeout(NET_TIMEOUT, mesh.ae_pull(peer, cache_name(), pull_keys))
-            .await
+        match tokio::time::timeout(NET_TIMEOUT, mesh.ae_pull(peer, cache_name(), pull_keys)).await {
+            Ok(Ok(records)) => {
+                for rec in records {
+                    ShardOps::apply_remote(shard, rec).await;
+                }
+            }
+            Ok(Err(_)) | Err(_) => ok = false,
+        }
+    }
+    for (bucket, hashes) in pull_hashes {
+        match tokio::time::timeout(
+            NET_TIMEOUT,
+            mesh.ae_pull_hashes(peer, cache_name(), bucket, hashes),
+        )
+        .await
         {
             Ok(Ok(records)) => {
                 for rec in records {
                     ShardOps::apply_remote(shard, rec).await;
                 }
-                true
             }
-            Ok(Err(_)) | Err(_) => false,
-        };
+            Ok(Err(_)) | Err(_) => ok = false,
+        }
     }
-    true
+    ok
 }
 
 async fn diff_bucket(
@@ -269,10 +353,17 @@ struct NodeParams {
     ae_failures: Option<Arc<AtomicUsize>>,
     remove_on_repeat: bool,
     ops_issued: Option<Arc<AtomicUsize>>,
+    /// Overrides the responder's `ae_sketch_min_bucket`; `None` keeps
+    /// [`ClusterConfig::default`]'s value, past what any scenario but the
+    /// sketch one ever populates a bucket to.
+    ae_sketch_min_bucket: Option<usize>,
 }
 
 async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
-    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler(Arc::clone(&shard)));
+    let handler: Arc<dyn RequestHandler> = Arc::new(match params.ae_sketch_min_bucket {
+        Some(min_bucket) => ShardHandler::with_min_bucket(Arc::clone(&shard), min_bucket),
+        None => ShardHandler::new(Arc::clone(&shard)),
+    });
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], params.port));
     let (mesh, mut inbound) = Mesh::spawn(
         bind_addr,
@@ -316,7 +407,7 @@ async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
             }
             _ = ae_tick.tick() => {
                 for &peer in &peer_ids {
-                    if !ae_round_once(&mesh, shard.as_ref(), peer).await
+                    if !ae_round_with_sketch(&mesh, shard.as_ref(), peer).await
                         && let Some(counter) = params.ae_failures.as_ref()
                     {
                         counter.fetch_add(1, Ordering::Relaxed);
@@ -360,6 +451,7 @@ fn spawn_symmetric_pair(
         ae_failures: ae_failures.clone(),
         remove_on_repeat: false,
         ops_issued: None,
+        ae_sketch_min_bucket: None,
     };
     sim.host(spec.host_a, move || {
         let shard = Arc::clone(&shard_a);
@@ -379,6 +471,7 @@ fn spawn_symmetric_pair(
         ae_failures,
         remove_on_repeat: false,
         ops_issued: None,
+        ae_sketch_min_bucket: None,
     };
     sim.host(spec.host_b, move || {
         let shard = Arc::clone(&shard_b);
@@ -620,7 +713,7 @@ async fn donor_software(
     peers: Vec<(NodeId, &'static str, u16)>,
     shard: Arc<TestShard>,
 ) -> SimResult {
-    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler(Arc::clone(&shard)));
+    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(Arc::clone(&shard)));
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let (mesh, mut inbound) =
         Mesh::spawn(bind_addr, node, 1, &ClusterConfig::default(), handler).await?;
@@ -661,7 +754,7 @@ async fn receiver_software(
     applied: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
 ) -> SimResult {
-    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler(Arc::clone(&shard)));
+    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(Arc::clone(&shard)));
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
     let (mesh, mut inbound) =
         Mesh::spawn(bind_addr, node, 1, &ClusterConfig::default(), handler).await?;
@@ -1117,6 +1210,7 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
         ae_failures: None,
         remove_on_repeat: true,
         ops_issued: Some(Arc::clone(&ops_a)),
+        ae_sketch_min_bucket: None,
     };
     let shard = Arc::clone(&shard_a);
     sim.host("churn-a", move || {
@@ -1137,6 +1231,7 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
         ae_failures: None,
         remove_on_repeat: true,
         ops_issued: Some(Arc::clone(&ops_b)),
+        ae_sketch_min_bucket: None,
     };
     let shard = Arc::clone(&shard_b);
     sim.host("churn-b", move || {
@@ -1255,4 +1350,139 @@ fn donor_crash_mid_state_transfer_repicks_and_completes() {
             "receiver's warmed copy matches the surviving donor for key {key}"
         );
     }
+}
+
+/// Mirrors `store::bucket_of`'s formula so a fixed key range can be
+/// searched for a dense bucket without that private function; `cluster.rs`'s
+/// own tests carry the identical helper for the same reason.
+fn bucket_of_u32(key: u32) -> u16 {
+    let bucket = xxh3_64(&key_bytes(key)) & (sundog::store::BUCKET_COUNT as u64 - 1);
+    u16::try_from(bucket).expect("invariant: masked to BUCKET_COUNT - 1, always fits in u16")
+}
+
+/// Among `0..n`, every key in a bucket holding more than `min_count` of
+/// them. Deterministic given a fixed key range.
+fn dense_bucket_keys(n: u32, min_count: usize) -> Vec<u32> {
+    let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
+    for key in 0..n {
+        by_bucket.entry(bucket_of_u32(key)).or_default().push(key);
+    }
+    by_bucket
+        .into_values()
+        .find(|keys| keys.len() > min_count)
+        .expect("at least one bucket exceeds min_count among this many keys")
+}
+
+/// Two shards start byte-identical across 4,096 keys, dense enough that a
+/// forced `ae_sketch_min_bucket` of 4 puts several hundred entries in some
+/// buckets; the responder answers a mismatch there with `AeMismatch::Sketch`
+/// rather than a listing. One key is then dropped locally on node-b, as if
+/// its `Replicate` never arrived, and the two nodes run `ae_round_with_sketch`
+/// against each other on a timer under turmoil packet loss and reordering.
+/// Recovery goes through the full sketch machinery: `sundog::Iblt` built and
+/// peeled locally, `sundog::diff_decoded`'s classification, and
+/// `Mesh::ae_pull_hashes` for the pull, with `Mesh::ae_entries` available as
+/// the undecodable fallback though this scenario's single-key diff always
+/// peels clean.
+#[test]
+fn sketch_reconciliation_under_loss_converges() {
+    const N: u32 = 4096;
+    const MIN_BUCKET: usize = 4;
+    let node_a = NodeId::from(71);
+    let node_b = NodeId::from(72);
+    let port = 4900;
+
+    let shard_a = Arc::new(seed_shard(node_a, 0..N));
+    let shard_b = Arc::new(new_shard(node_b));
+    block_on(async {
+        let mut chunks = ShardOps::snapshot_chunks(shard_a.as_ref());
+        while let Some(chunk) = chunks.next().await {
+            ShardOps::apply_remote_batch(shard_b.as_ref(), chunk).await;
+        }
+    });
+    assert_eq!(
+        digests_of(&shard_a),
+        digests_of(&shard_b),
+        "both sides start converged before the drop"
+    );
+
+    // A bucket dense enough that MIN_BUCKET's threshold answers it as an
+    // IBLT sketch instead of a full listing.
+    let bucket_keys = dense_bucket_keys(N, MIN_BUCKET + 1);
+    let target_key = bucket_keys[0];
+    block_on(shard_b.invalidate_local(&target_key));
+    assert_eq!(
+        value_of(&shard_b, target_key),
+        None,
+        "node-b's copy is dropped, as if a Replicate never arrived"
+    );
+    assert_ne!(
+        digests_of(&shard_a),
+        digests_of(&shard_b),
+        "test setup sanity: the drop makes one bucket mismatch"
+    );
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x5CE7_C401))
+        .tick_duration(TICK)
+        // Same loss/reorder shape as the storm scenario: AE rounds routinely
+        // fail and retry rather than never losing a packet.
+        .fail_rate(0.03)
+        .repair_rate(0.75)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(60))
+        .build();
+
+    let ae_period = Duration::from_millis(150);
+    let base_params = NodeParams {
+        node: node_a,
+        label: "a",
+        port,
+        peers: vec![(node_b, "sketch-b", port)],
+        keys: vec![],
+        // No writes in this scenario: the fixed dataset plus the one drop
+        // is the whole story.
+        write_period: Duration::from_secs(3600),
+        ae_period,
+        dup_factor: 1,
+        ae_failures: None,
+        remove_on_repeat: false,
+        ops_issued: None,
+        ae_sketch_min_bucket: Some(MIN_BUCKET),
+    };
+
+    let params_a = base_params.clone();
+    let shard = Arc::clone(&shard_a);
+    sim.host("sketch-a", move || {
+        let shard = Arc::clone(&shard);
+        let params = params_a.clone();
+        async move { node_loop(params, shard).await }
+    });
+
+    let params_b = NodeParams {
+        node: node_b,
+        label: "b",
+        peers: vec![(node_a, "sketch-a", port)],
+        ..base_params
+    };
+    let shard = Arc::clone(&shard_b);
+    sim.host("sketch-b", move || {
+        let shard = Arc::clone(&shard);
+        let params = params_b.clone();
+        async move { node_loop(params, shard).await }
+    });
+
+    let budget = steps_for(ae_period * 20 + Duration::from_secs(5));
+    let converged = run_until(&mut sim, budget, || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+    });
+    assert!(
+        converged.is_some(),
+        "sketch-decoded anti-entropy converges within a bounded number of rounds despite loss"
+    );
+    assert_eq!(
+        value_of(&shard_b, target_key),
+        value_of(&shard_a, target_key),
+        "the dropped key is repaired via the sketch decode / pull-by-hash path"
+    );
 }

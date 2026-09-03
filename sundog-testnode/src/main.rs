@@ -11,7 +11,10 @@
 //! Control protocol, one command per line, one line-terminated reply each:
 //! `put k v` -> `ok`; `get k` -> `val <v>` | `none`; `del k` -> `ok`;
 //! `count` -> `<n>`; `fill n` -> `ok`, bulk-inserting `k0..kn` = `v0..vn`;
-//! `peers` -> `<n>`; `quit` -> exits 0.
+//! `drop k` -> `ok`, dropping `k`'s local copy with no tombstone, standing
+//! in for a lost `Replicate`; `netstats` -> `<frames> <bytes>`, this
+//! process's total wire frames and bytes sent; `peers` -> `<n>`; `quit` ->
+//! exits 0.
 //!
 //! A second `Mode::Replicated` cache named `"churn"` carries a short TTL
 //! (`CHURN_TTL`): `churn n` -> `ok` runs `n` operations (3:1 insert:remove)
@@ -198,6 +201,18 @@ async fn dispatch(
         "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
             big_command(cache, command, &mut parts).await
         }
+        "drop" => {
+            let Some(key) = parts.next() else {
+                return Reply::Line("err drop needs a key".to_string());
+            };
+            cache.invalidate_local(&key.to_string()).await;
+            Reply::Line("ok".to_string())
+        }
+        "netstats" => Reply::Line(format!(
+            "{} {}",
+            sundog::net::frames_sent_total(),
+            sundog::net::bytes_sent_total()
+        )),
         "peers" => Reply::Line(cluster.peers().len().to_string()),
         "quit" => Reply::Quit,
         other => Reply::Line(format!("err unknown command {other:?}")),

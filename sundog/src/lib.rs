@@ -76,3 +76,18 @@ pub use node::{NodeId, NodeName};
 pub use store::{ConflictResolver, Event, LwwResolver, Mode, Origin, RecordView, Winner};
 #[cfg(feature = "prometheus")]
 pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
+
+/// `cluster::sketch` and `cluster::anti_entropy` are `pub(crate)`: nothing
+/// outside `cluster.rs`'s own composition normally names an IBLT or its
+/// diffing directly. `tests/sim.rs` is the one exception, driving `net::Mesh`
+/// itself rather than `Cluster`, so it needs these to reconcile a sketch
+/// reply the same way `cluster::anti_entropy::run_round_against` does.
+/// `#[doc(hidden)]` and gated on `feature = "sim"` so this never appears in
+/// the crate's normal public API, matching [`wire::Cell`]'s narrower
+/// precedent for the same module.
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub use cluster::anti_entropy::diff_decoded;
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};

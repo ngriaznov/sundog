@@ -121,8 +121,13 @@ impl Cell {
 /// One IBLT element: a key's `xxh3_64` hash paired with its version, never
 /// the key's actual bytes. A pulled-only element is always pulled by hash
 /// ([`crate::wire::Msg::AePullHashes`]), never by key.
+///
+/// Reachable outside `cluster::sketch` only because `crate::diff_decoded`
+/// (a `feature = "sim"`-gated re-export `tests/sim.rs` drives directly)
+/// carries [`Decoded`], which carries this; every field stays crate-visible
+/// in spirit even though `pub` is what the re-export requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct Elem {
+pub struct Elem {
     pub(crate) key_hash: u64,
     pub(crate) ver: Hlc,
 }
@@ -130,8 +135,13 @@ pub(crate) struct Elem {
 /// [`Iblt::peel`]'s success case: every element on one side of `subtract`
 /// but not the other. `only_left` is what the caller had and the other
 /// didn't; `only_right` is the reverse.
+///
+/// Reachable outside `cluster::sketch` only because [`Iblt::peel`] returns
+/// it and `crate::diff_decoded` takes it, both re-exported (the latter
+/// under its `crate::` path) for `tests/sim.rs` under `feature = "sim"`;
+/// see this module's docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Decoded {
+pub struct Decoded {
     pub(crate) only_left: Vec<Elem>,
     pub(crate) only_right: Vec<Elem>,
 }
@@ -139,13 +149,22 @@ pub(crate) struct Decoded {
 /// [`Iblt::peel`]'s failure case: the symmetric difference was too large
 /// for peeling to resolve every cell back to zero. Never a wrong result,
 /// only no result; the caller's `AeEntries` fallback is exact regardless.
+///
+/// Reachable outside `cluster::sketch` only because [`Iblt::peel`]'s
+/// `Result` names it; see [`Decoded`]'s doc for why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Undecodable;
+pub struct Undecodable;
 
 /// A partitioned IBLT over `(key_hash, version)` elements; see this
 /// module's docs for the overall scheme.
+///
+/// Reachable outside `cluster::sketch` only because
+/// [`crate::wire::Msg::AeSketch`]'s peer needs the same construction on the
+/// initiator's side; `tests/sim.rs` re-exports it as `crate::Iblt` under
+/// `feature = "sim"` to build and peel its own comparison sketch, the same
+/// way `net::conn::serve_ae_digest` does on the responder's side.
 #[derive(Debug, Clone)]
-pub(crate) struct Iblt {
+pub struct Iblt {
     cells: Vec<Cell>,
     partition_len: usize,
 }
@@ -154,7 +173,8 @@ impl Iblt {
     /// Builds an empty sketch with approximately `cells` total cells, split
     /// evenly across [`IBLT_PARTITIONS`] partitions. A tiny or zero `cells`
     /// still yields a well-formed, if uselessly small, sketch.
-    pub(crate) fn new(cells: usize) -> Self {
+    #[must_use]
+    pub fn new(cells: usize) -> Self {
         let partition_len = (cells / IBLT_PARTITIONS).max(1);
         Self {
             cells: vec![Cell::default(); partition_len * IBLT_PARTITIONS],
@@ -164,7 +184,8 @@ impl Iblt {
 
     /// Rebuilds a sketch from cells received off the wire; `partition_len`
     /// is re-derived the same way [`Iblt::new`] derives it.
-    pub(crate) fn from_cells(cells: Vec<Cell>) -> Self {
+    #[must_use]
+    pub fn from_cells(cells: Vec<Cell>) -> Self {
         let partition_len = (cells.len() / IBLT_PARTITIONS).max(1);
         Self {
             cells,
@@ -173,7 +194,8 @@ impl Iblt {
     }
 
     /// Unwraps this sketch's cells for the wire.
-    pub(crate) fn into_cells(self) -> Vec<Cell> {
+    #[must_use]
+    pub fn into_cells(self) -> Vec<Cell> {
         self.cells
     }
 
@@ -206,7 +228,7 @@ impl Iblt {
     }
 
     /// Inserts one `(key_hash, ver)` element.
-    pub(crate) fn insert(&mut self, key_hash: u64, ver: Hlc) {
+    pub fn insert(&mut self, key_hash: u64, ver: Hlc) {
         self.apply(key_hash, ver, 1);
     }
 
@@ -218,7 +240,8 @@ impl Iblt {
     /// # Panics
     ///
     /// Panics if `self` and `other` have a different cell count.
-    pub(crate) fn subtract(&self, other: &Self) -> Self {
+    #[must_use]
+    pub fn subtract(&self, other: &Self) -> Self {
         assert_eq!(
             self.cells.len(),
             other.cells.len(),
@@ -252,7 +275,13 @@ impl Iblt {
     /// its element, subtracts it back out of all three of its cells, and
     /// requeues any cell that newly purifies. If every cell returns to zero,
     /// the decode is exact; otherwise this returns [`Undecodable`].
-    pub(crate) fn peel(mut self) -> Result<Decoded, Undecodable> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Undecodable`] if the symmetric difference was too large
+    /// for every cell to peel back to zero; the caller falls back to a full
+    /// listing.
+    pub fn peel(mut self) -> Result<Decoded, Undecodable> {
         let mut only_left = Vec::new();
         let mut only_right = Vec::new();
         let mut queue: std::collections::VecDeque<usize> = (0..self.cells.len())

@@ -190,15 +190,19 @@ Five layers, cheapest and highest-signal first:
    behind the `sim` feature. It drives the real net layer and store against a
    scripted membership feed with no sockets involved. Scenarios: partition under
    load, heal, check convergence within a bounded number of rounds; message
-   loss, reordering, duplication; a donor dying mid-state-transfer.
+   loss, reordering, duplication; a donor dying mid-state-transfer; a forced
+   low `ae_sketch_min_bucket` driving the IBLT sketch path itself, under the
+   same loss and reordering.
 3. **Container integration** runs via
    [`rightsize`](https://crates.io/crates/rightsize) in
    `sundog/tests/containers.rs`, no Docker CLI, no `bollard`. Multi-node
    scenarios run as separate processes on a real virtual network. They cover
    three-node convergence, tombstones reaching every node, and cold joins up to
    a million entries. They also cover a killed node's gap repaired by
-   anti-entropy, high-churn add/remove/TTL workloads draining to zero, and 64
-   KiB values verified byte-for-byte. Each node is `sundog-testnode`, a tiny
+   anti-entropy, a dropped key repaired the same way at 500k-entry sketch
+   scale, a bulk fill's wire cost pinned via `netstats` against the fan-out
+   queue duplicating it, high-churn add/remove/TTL workloads draining to zero,
+   and 64 KiB values verified byte-for-byte. Each node is `sundog-testnode`, a tiny
    static/musl binary driven over a line-based control protocol. It sits behind
    an env var, so plain `cargo test --workspace` still compiles without a
    container backend:
