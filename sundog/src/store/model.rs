@@ -1,16 +1,13 @@
-//! The reference model for stateful fuzzing of the apply path (see
-//! `super`'s docs on this module). [`Model`] is a sequential,
-//! single-threaded last-writer-wins map keyed by `u8` — a small key space
-//! forces version conflicts between concurrent origins — that reimplements
-//! [`Shard::apply`]'s versioned-write rule, [`ShardOps::gc_tombstones`]'s
-//! retention rule, and TTL expiry from scratch, independently of
-//! `engine::Engine`, so a divergence between the two is a real bug rather
-//! than the model quietly agreeing with its own implementation.
+//! The reference model the apply-path fuzz targets and the in-crate property
+//! test drive alongside a real [`Shard`]. [`Model`] is a sequential
+//! last-writer-wins map over `u8` keys, small enough to force version
+//! conflicts, that reimplements [`Shard::apply`]'s versioned-write rule,
+//! [`ShardOps::gc_tombstones`]'s retention rule, and TTL expiry without
+//! touching `engine::Engine`, so a divergence is a bug in one of them.
 //!
-//! [`Op`] is the `Arbitrary` operation vocabulary both the fuzz targets and
-//! the in-crate property test generate sequences of; [`run`] is the one
-//! driver that applies a sequence to a live [`Shard`] and its paired
-//! [`Model`] side by side, asserting after every op that they agree.
+//! [`Op`] is the `Arbitrary` operation vocabulary; [`run`] applies a sequence
+//! to a shard and its model side by side and asserts agreement after every
+//! step.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

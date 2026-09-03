@@ -1,6 +1,5 @@
-//! Cluster-wide tunables. A plain, `Clone`-able settings struct consumed by
-//! the `Cluster` builder (`src/cluster.rs`) — this module owns only the
-//! values and their defaults, not the builder API.
+//! Cluster-wide tunables: the values and their defaults, consumed by the
+//! `Cluster` builder.
 
 use std::net::SocketAddr;
 use std::time::Duration;

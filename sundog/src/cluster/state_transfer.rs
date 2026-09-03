@@ -1,12 +1,8 @@
-//! State transfer on cache open: pulls a full snapshot of a
-//! cluster-wide [`Mode::Replicated`] cache from the lowest-live-node-id
-//! donor before `open()` returns, then runs one immediate anti-entropy round
-//! against that donor as a belt-and-braces sweep.
-//!
-//! Runs only for `Mode::Replicated`, for the same reason anti-entropy does
-//! (see `cluster::anti_entropy`'s module docs): `Invalidation`-mode nodes
-//! are supposed to hold different, independent subsets of a cache, so there
-//! is no cluster-wide snapshot for a joiner to warm from.
+//! State transfer on cache open: a [`Mode::Replicated`] cache pulls a full
+//! snapshot from the live donor with the lowest node id before `open()`
+//! returns, then runs one anti-entropy round against that donor.
+//! `Invalidation` caches skip it: their nodes hold different subsets by
+//! design, so there is no snapshot to warm from.
 
 use std::sync::Arc;
 use std::time::Duration;

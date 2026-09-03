@@ -1,37 +1,24 @@
-//! The wire format: what crosses the data-plane TCP mesh, and the
-//! encode/decode helpers every connection uses.
+//! The wire format of the data-plane mesh and its encode/decode helpers.
 //!
-//! Every frame starts with a one-byte discriminant. Control messages
-//! (`Hello`, `StRequest`, `AeDigest`, `AeBucket`, `AeSketch`, `AeEntries`,
-//! `AePull`, `AePullHashes`, `ReqDone`) carry `FRAME_KIND_POSTCARD` and are
-//! postcard-encoded. The three record-carrying variants —
-//! [`Msg::Replicate`], [`Msg::ReplicateBatch`], [`Msg::StChunk`] — carry
-//! `FRAME_KIND_RAW_RECORD` and use a length-prefixed layout instead: a
-//! fixed-size header (read via `zerocopy`'s safe [`FromBytes`]/[`IntoBytes`]
-//! views, never `unsafe`) followed by each record's key and value bytes back
-//! to back.
+//! Every frame starts with a one-byte discriminant. Control messages carry
+//! `FRAME_KIND_POSTCARD` and are postcard-encoded. The record-carrying
+//! variants [`Msg::Replicate`], [`Msg::ReplicateBatch`], and [`Msg::StChunk`]
+//! carry `FRAME_KIND_RAW_RECORD`: a fixed header read through `zerocopy`'s
+//! [`FromBytes`] and [`IntoBytes`] views, then each record's key and value
+//! bytes back to back.
 //!
-//! Decoding this layout slices `Bytes` views directly out of the received
-//! frame (`Bytes::slice`, an `Arc` refcount bump independent of the frame
-//! argument's lifetime), with no payload copy, unlike postcard's
-//! decode-into-owned-`Vec<u8>` path. Encoding assembles into one
-//! exact-reserve `BytesMut` from already-owned `Bytes` — a record's key, and
-//! its value since `store::Stored::encoded` caches it — so there is no
-//! intermediate postcard `Vec` either.
+//! Decoding a raw-record frame slices `Bytes` views out of the received
+//! buffer with no payload copy. Encoding assembles one exact-size `BytesMut`
+//! from bytes the caller already owns, including the cached
+//! `store::Stored::encoded` value.
 //!
-//! **`tls` caveat.** This zero-copy path only holds up to the TCP framing
-//! layer. When the `tls` feature wraps a connection in rustls, rustls owns
-//! its own read/write buffers and copies application bytes through them
-//! independently of `wire::decode`/`encode`.
+//! Under feature `tls`, rustls copies application bytes through its own
+//! buffers; the zero-copy path holds only up to the TCP framing layer.
 //!
-//! **Memory retention.** A [`WireRecord`] decoded off a raw-record frame
-//! borrows its `key`/`value` from that frame's backing buffer. If a
-//! replica-applied record's value bytes end up cached as
-//! `store::Stored::encoded`, that `Stored` keeps the whole originating frame
-//! buffer alive for as long as the entry stays cached — bounded, since a
-//! `ReplicateBatch`/`StChunk` frame is capped under [`MAX_FRAME`]
-//! (`net::conn::REPLICATE_BATCH_BUDGET`,
-//! `store::SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`).
+//! A [`WireRecord`] decoded from a raw-record frame borrows from that frame's
+//! buffer. A replica that caches the value as `store::Stored::encoded` keeps
+//! the whole frame alive while the entry lives. A frame is capped under
+//! [`MAX_FRAME`], so the retention is bounded.
 
 use std::mem::size_of;
 

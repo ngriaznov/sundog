@@ -1,14 +1,8 @@
-//! Membership: chitchat-backed cluster view. Answers "who is alive right now"
-//! by gossiping each node's data-plane address and incarnation, and exposes
-//! the live set as a `watch` stream that drives the net and store layers.
-//!
-//! Alongside identity, each node also gossips a per-cache config fingerprint:
-//! `Membership::set_cache_mode` sets a `cache:<name>` key to the opened
-//! [`Mode`]'s wire token, and every such key on a live peer's state is read
-//! back into the `CacheModes` view published next to the peer set — the
-//! data `cluster` compares against this node's own open caches (at `open()`
-//! time, and again on every membership-view change) to catch two nodes
-//! disagreeing about a cache name's mode.
+//! Membership: the chitchat-backed cluster view. Each node gossips its
+//! data-plane address, incarnation, and a `cache:<name>` key per open cache
+//! holding that cache's [`Mode`]. The live peer set and the per-peer cache
+//! modes are published as `watch` streams that drive the net, store, and
+//! cluster layers.
 
 use std::collections::{HashMap, HashSet};
 use std::io;

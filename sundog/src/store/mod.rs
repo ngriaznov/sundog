@@ -1,12 +1,9 @@
-//! Store: bespoke-engine-backed shards, versioned apply, and the digest
-//! machinery that makes anti-entropy cheap. See `engine`'s module docs for
-//! the engine itself; this module is the typed `Shard`/`ShardOps` surface
-//! built on it.
+//! Typed shards over the store engine: versioned apply, conflict resolution,
+//! tombstones, and the per-bucket digests anti-entropy compares.
 //!
-//! `Shard` holds no handle to `net::Mesh`. Every local mutation (`insert`,
-//! `remove`, `get_or_load`'s fill) publishes an `Origin::Local` [`Event`] on
-//! [`Shard::events`]; correlating that stream to wire fan-out is the
-//! composition layer's job.
+//! A `Shard` holds no network handle. Every local write pushes its key onto
+//! the shard's fan-out queue and publishes an `Origin::Local` [`Event`]; the
+//! cluster layer turns those into wire traffic.
 
 use std::collections::HashSet;
 use std::hash::Hash;

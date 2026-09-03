@@ -1,18 +1,14 @@
-//! The top-level public entry point: `Cluster::builder(name).build()` forms a
-//! working zeroconf cluster, and `cluster.cache(name)` opens named caches on
-//! it — zero further setup is required for a working LAN cluster.
+//! The public entry point. `Cluster::builder(name).build()` forms a cluster;
+//! `cluster.cache(name)` opens a named cache on it.
 //!
-//! Composition: `build()` resolves the data-plane's advertised address,
-//! starts [`Membership`] (gossip), announces via [`Discovery`], then starts
-//! [`Mesh`] (the TCP data plane) with a [`RequestHandler`] that answers
-//! inbound state-transfer/anti-entropy requests over this cluster's shard
-//! registry. Background loops, all stopped together by
-//! [`Cluster::shutdown`], keep the planes in sync: membership changes flow
-//! into `Mesh::update_peers` and into `absence`'s partition-aware
-//! tombstone-retention tracker, inbound wire messages dispatch to shards by
-//! cache name, and — spawned per opened cache — local writes fan out over
-//! the mesh per [`Mode`] and expired tombstones are garbage-collected
-//! (`tombstone_gc_task`).
+//! `build()` resolves the data-plane address, starts [`Membership`] over
+//! gossip, announces through [`Discovery`], and starts the [`Mesh`] with a
+//! [`RequestHandler`] that answers state-transfer and anti-entropy requests
+//! from this cluster's shard registry. Background tasks, all stopped by
+//! [`Cluster::shutdown`], carry membership changes into the mesh and the
+//! absence tracker, dispatch inbound messages to shards by cache name, and,
+//! per opened cache, fan local writes out per [`Mode`] and collect expired
+//! tombstones.
 
 pub(crate) mod absence;
 pub(crate) mod anti_entropy;

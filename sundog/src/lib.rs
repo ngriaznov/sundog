@@ -1,16 +1,15 @@
-//! sundog: an embedded, replicated, zeroconf cache for Rust. It runs inside
-//! your process — no separate cache server to deploy or operate.
+//! sundog is an embedded, replicated, zeroconf cache for Rust. It runs inside
+//! your process; there is no cache server to deploy.
 //!
-//! Instances of a service on the same network discover each other, form a
-//! cluster over gossip membership, and keep named caches coherent across
-//! nodes — invalidation or full replication, last-write-wins on a hybrid
-//! logical clock, healed by anti-entropy. No consensus, no operator action on
+//! Instances of a service on one network find each other, form a cluster over
+//! gossip, and keep named caches coherent by invalidation or full replication.
+//! Writes are last-writer-wins on a hybrid logical clock. Anti-entropy heals
+//! whatever the network drops. There is no consensus and no operator action on
 //! join, leave, crash, or partition.
 //!
-//! # Examples
+//! # Example
 //!
-//! The zeroconf happy path — this exact snippet is the project's acceptance
-//! test:
+//! The zeroconf path, also the project's acceptance test:
 //!
 //! ```no_run
 //! use std::time::Duration;

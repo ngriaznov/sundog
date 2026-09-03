@@ -1,12 +1,9 @@
-//! The typed public cache handle and its builder. `Cache<K, V>` is a thin
-//! wrapper over `Arc<Shard<K, V>>` — serialization happens only at the wire
-//! boundary; local reads never deserialize.
+//! The typed cache handle and its builder. `Cache<K, V>` wraps
+//! `Arc<Shard<K, V>>`; local reads never deserialize.
 //!
-//! `CacheBuilder::open` checks the requested [`Mode`] against what live
-//! peers already advertise for the same cache name (`membership`'s
-//! cache-mode fingerprint gossip) before registering the shard, and
-//! advertises its own choice on success — see [`CacheBuilder::open`]'s docs
-//! for what this catches and what it can't.
+//! [`CacheBuilder::open`] checks the requested [`Mode`] against what live
+//! peers advertise for the same name before registering the shard, and
+//! advertises its own choice on success.
 
 use std::hash::Hash;
 use std::marker::PhantomData;

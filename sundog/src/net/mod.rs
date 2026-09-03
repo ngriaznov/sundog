@@ -1,26 +1,19 @@
-//! Data plane: a lazily-dialed TCP mesh between live peers, carrying
-//! invalidations, replications, state transfer, and anti-entropy. Losing a
-//! message here is acceptable by design — anti-entropy repairs it.
+//! Data plane: a lazily dialed TCP mesh between live peers carrying
+//! invalidations, replications, state transfer, and anti-entropy. A lost
+//! message is acceptable; anti-entropy repairs it.
 //!
-//! Every live peer gets one persistent, unidirectional writer connection
-//! (`Hello` then a stream of `Invalidate`/`Replicate`, drained from bounded
-//! per-class outboxes) plus a small pool of reused connections for
-//! request/response exchanges (state transfer, anti-entropy): checked out
-//! of the pool when idle, dialed fresh only when the pool is empty or every
-//! pooled connection is dead. This pool stays off the broadcast path so a
-//! slow snapshot never backs up live traffic. On the accept side, both kinds
-//! of connection share one listener: every connection starts with `Hello`,
-//! and the message that follows decides whether the connection loops
-//! serving further requests until it goes idle or hits its request cap, or
-//! loops indefinitely as the persistent link.
+//! Each live peer gets one persistent writer connection, `Hello` then a
+//! stream of `Invalidate` and `Replicate` frames drained from bounded
+//! per-class outboxes, plus a small pool of reused connections for
+//! request/response exchanges. The pool stays off the broadcast path, so a
+//! slow snapshot never delays live traffic. Both kinds share one listener:
+//! the message after `Hello` decides whether the connection serves requests
+//! until idle or loops as the persistent link.
 //!
-//! Feature `tls` (real-tokio transport only, the private `tls` submodule's
-//! own docs): every connection this module opens or accepts is wrapped in
-//! mutual TLS when `ClusterConfig::tls` is set (that field only exists when
-//! this feature is compiled in). The internal `MeshStream` and `TlsCtx` type
-//! aliases collapse to the non-TLS/`sim` types when the feature is off or
-//! `sim` is on, so `conn`'s framing code is written once and never branches
-//! on the feature.
+//! With feature `tls` and `ClusterConfig::tls` set, every connection is
+//! wrapped in mutual TLS. The `MeshStream` and `TlsCtx` aliases collapse to
+//! plain types when the feature is off or `sim` is on, so the framing code
+//! never branches on the feature.
 
 mod conn;
 

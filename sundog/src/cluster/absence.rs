@@ -1,9 +1,8 @@
-//! Partition-aware tombstone retention: tracks which recently-known cluster
-//! members are currently absent from the live peer set, so
-//! `tombstone_gc_task` can defer collecting a tombstone while a member that
-//! might still hold the deleted entry is unreachable. Without this, an
-//! unconditional GC would let anti-entropy resurrect a removed entry once
-//! that member returns.
+//! Partition-aware tombstone retention. Tracks which recently known members
+//! are absent from the live peer set, so tombstone collection defers while a
+//! member that may still hold the deleted entry is unreachable. Collecting
+//! anyway would let anti-entropy resurrect the entry when that member
+//! returns.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};

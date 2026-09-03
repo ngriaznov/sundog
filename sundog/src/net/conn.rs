@@ -1,7 +1,6 @@
-//! TCP framing and connection tasks: the accept-side demux (persistent mesh
-//! traffic vs. pooled request/response, distinguished by the first message
-//! after `Hello`) and the per-peer dial/write loop for the broadcast-class
-//! outboxes.
+//! Framing and connection tasks: the accept-side demux between persistent
+//! mesh traffic and pooled request/response, and the per-peer dial-and-write
+//! loop over the broadcast outboxes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -1,56 +1,32 @@
-//! A partitioned invertible Bloom lookup table (IBLT) over anti-entropy
-//! bucket elements — `(key_hash, version)` pairs, `key_hash = xxh3_64(key
-//! bytes)` (the same hash [`crate::store::bucket_of`] takes the low bits
-//! of) — used by [`super::anti_entropy`] to reconcile a large mismatched
-//! bucket without shipping its full entry list.
+//! A partitioned invertible Bloom lookup table (IBLT) over one anti-entropy
+//! bucket's `(key_hash, version)` elements, where `key_hash` is the
+//! `xxh3_64` of the key bytes that `store::bucket_of` takes its low bits
+//! from. [`super::anti_entropy`] uses it to reconcile a large bucket without
+//! shipping the bucket's entry list.
 //!
-//! # How this differs from a Bloom filter
-//!
-//! A Bloom filter answers "is this element a member?"; an IBLT answers "what
-//! is the symmetric difference between two sets?" without either side
-//! sending its actual elements. Each side inserts its own bucket's elements
-//! into an [`Iblt`] of the same shape, one side sends its sketch to the
-//! other, the receiver [`Iblt::subtract`]s the two, and [`Iblt::peel`]s the
-//! result: a per-cell XOR/count structure that, so long as the two sets
-//! don't differ by more than the sketch's rated capacity
-//! ([`RATED_CAPACITY`]), can be unwound one element at a time back into the
-//! exact list of elements only on one side or the other. Unlike a bucket's
-//! full listing (O(bucket size) on the wire), a sketch's wire cost is fixed
-//! by its cell count regardless of how many elements went into it — cheap
-//! when the bucket is large and the diff is small, the anti-entropy common
-//! case.
+//! Each side inserts its bucket into an [`Iblt`] of the same shape. One side
+//! sends its sketch; the other [`Iblt::subtract`]s the two and
+//! [`Iblt::peel`]s the result into the elements present on only one side.
+//! The sketch's wire size is fixed by its cell count, whatever the bucket
+//! holds, and decoding succeeds whenever the two sides differ by no more
+//! than roughly [`RATED_CAPACITY`] elements.
 //!
 //! # Structure
 //!
-//! [`IBLT_PARTITIONS`] (3) equal-length partitions of [`Cell`]s. An
-//! element's cell in partition `p` is `mix(placement_hash, p) %
-//! partition_len`, a distinct mix per partition, so one element always
-//! lands in exactly one cell per partition: three cells total, never the
-//! same cell twice. Partitioning trades a little locality for a
-//! correctness property the peel loop leans on.
+//! [`IBLT_PARTITIONS`] equal partitions of [`Cell`]s. An element lands in one
+//! cell per partition, at `mix(placement_hash, p) % partition_len`, so its
+//! three cells are always distinct. `placement_hash` is `check`'s hash of
+//! the whole element, key and version together. Placing by key alone would
+//! put two versions of one key in the same cells, where their counts cancel
+//! and their version bytes stay folded together in a cell that can never
+//! become pure.
 //!
-//! `placement_hash` is [`check`]'s hash of the whole element — `key_hash`
-//! folded together with its version — not `key_hash` alone. Placing by
-//! `key_hash` alone does not work: two different versions of the same key
-//! would then always occupy the same three cells, so subtracting one
-//! side's insert from the other's cancels their `count` contribution to
-//! zero (`1 - 1`) while still leaving their differing version bytes `XOR`ed
-//! together in the cell's sums — a residual that can never become a
-//! verified-pure cell, permanently blocking that cell from decoding at any
-//! sketch size. Reconciling the same key at different versions is most of
-//! what anti-entropy does, so hashing the whole element for placement makes
-//! two versions of one key two independent elements for placement purposes.
+//! # Never wrong
 //!
-//! # Never wrong, only sometimes undecodable
-//!
-//! [`Iblt::peel`] only ever returns [`Decoded`] when it has verified, cell
-//! by cell, that a candidate element's checksum matches its claimed
-//! `key_hash`/version — a "pure" cell (`count` of exactly `1` or `-1`) whose
-//! `check_sum` doesn't match is left alone rather than trusted. If the
-//! difference is too large for the sketch to resolve fully, some cells are
-//! left non-zero at the end and this returns [`Undecodable`]: a decode
-//! failure never surfaces a wrong element, only "try the fallback path"
-//! (`AeEntries`/`Msg::AeBucket`).
+//! [`Iblt::peel`] accepts a cell only when its count is `1` or `-1` and its
+//! checksum matches the element it claims to hold. A difference too large to
+//! resolve leaves cells non-zero and returns [`Undecodable`]; the caller
+//! falls back to the bucket's full listing.
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;

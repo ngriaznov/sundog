@@ -1,28 +1,24 @@
-//! The bespoke store engine: [`BUCKET_COUNT`] independently locked stripes,
-//! each stripe doubling as one anti-entropy bucket, holding both live
-//! entries and tombstones under a single [`parking_lot::RwLock`]. A read
-//! takes one stripe's read lock, looks a key up by its postcard-encoded
-//! bytes in a [`hashbrown::HashTable`] (no allocation for keys that fit
-//! [`KEY_STACK_BUF`]), and clones the value. A versioned write
-//! ([`apply_locked`]) is a plain synchronous function operating on `&mut
-//! Stripe`, called while holding that stripe's write lock for the call's
-//! whole duration — no `.await` anywhere inside it. Because a stripe *is*
-//! an anti-entropy bucket, [`Engine::collect_buckets`] touches only the
-//! stripes a caller asked about, not the whole shard.
+//! The store engine: [`BUCKET_COUNT`] stripes, each one anti-entropy bucket,
+//! each a [`parking_lot::RwLock`] over the bucket's live entries and
+//! tombstones.
 //!
-//! Capacity eviction is sampled LRU: when the shard's total live weight
-//! exceeds its configured cap, [`Engine::enforce_capacity`] repeatedly takes
-//! one stripe's write lock at a time (the stripe most recently written to,
-//! then pseudo-random stripes), looks at up to 8 of that stripe's live entries,
-//! and evicts whichever was least recently read — never a full LRU order,
-//! never two stripe locks held at once.
+//! A read takes a stripe's read lock, finds the key by its postcard bytes in a
+//! [`hashbrown::HashTable`], and clones the value. Keys up to `KEY_STACK_BUF`
+//! bytes encode on the stack. A versioned write (`apply_locked`) runs
+//! synchronously under the stripe's write lock. Anti-entropy enumerates a
+//! bucket by locking one stripe.
 //!
-//! [`super::Shard::get_or_load`]'s stampede collapse is built on the same
-//! primitives: a per-stripe `inflight` map of in-progress loads, joined by
-//! concurrent callers through a [`tokio::sync::watch`] channel subscribed
-//! under the stripe lock, so a completion can never slip between a waiter's
-//! lookup and its wait. A drop guard ([`InflightGuard`]) frees a cancelled
-//! load so a waiter can take over rather than hang.
+//! Expiry is checked on every read and reclaimed by [`Engine::sweep`], which
+//! visits only stripes with an entry due. Capacity eviction is sampled LRU:
+//! [`Engine::enforce_capacity`] locks one stripe at a time, weighs up to
+//! `EVICTION_SAMPLE` entries from a rotating offset, and evicts the least
+//! recently read, until total weight fits.
+//!
+//! [`super::Shard::get_or_load`] collapses concurrent misses through a
+//! per-stripe map of in-flight loads. A waiter subscribes to the load's
+//! completion channel under the stripe lock, so a completion cannot slip
+//! between its lookup and its wait. `InflightGuard` frees a cancelled load so
+//! a waiter takes over.
 
 use std::collections::HashMap;
 use std::hash::Hash;

@@ -1,23 +1,13 @@
-//! Anti-entropy: a per-cache, jittered-interval loop that reconciles one
-//! shard against one live peer per round — a digest exchange followed by a
-//! bucket-diff push/pull, computed on the initiating side, so both a peer
-//! that is behind and a peer that is ahead of this node converge after one
-//! round. Tombstones participate identically to live entries: a tombstone
-//! is a [`crate::wire::WireRecord`] with `value: None`.
+//! Anti-entropy: every jittered `ae_interval`, each [`Mode::Replicated`]
+//! cache reconciles itself against one live peer. The initiator sends its
+//! 1,024 bucket digests; for each mismatch the peer answers with the bucket's
+//! entry listing, or an IBLT sketch for a large bucket. The initiator diffs,
+//! pushes what it has newer, and pulls what the peer has newer, so both sides
+//! converge in one round. Tombstones take part as records with no value.
 //!
-//! Runs only for [`Mode::Replicated`] caches: `Invalidation` mode nodes
-//! deliberately hold different, independent subsets of a cache, so a
-//! full-record digest reconciliation between them would defeat that design.
-//!
-//! A mismatched bucket's reply takes one of two shapes
-//! ([`crate::net::AeMismatch`]): a small bucket's full `(key, version)`
-//! listing, diffed by [`diff_bucket`]; a large bucket's IBLT sketch instead
-//! (`super::sketch`'s module docs), diffed by building the matching local
-//! sketch, subtracting, and peeling ([`diff_decoded`] classifies the peeled
-//! result). A sketch that fails to peel falls back to requesting that
-//! bucket's full listing via `Msg::AeEntries`, once, after every reply in
-//! the round has been processed, so one hard-to-decode bucket never blocks
-//! the rest of the round's sketches.
+//! A sketch that fails to peel is retried once as a full listing, after every
+//! other reply in the round is handled. `Invalidation` caches never run this:
+//! their nodes hold different subsets by design.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
