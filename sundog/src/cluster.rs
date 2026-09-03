@@ -48,16 +48,14 @@ use crate::store::{FanOutQueue, Mode, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
-/// Shared between [`Cluster`] itself and the [`RequestHandler`]
-/// handed to [`Mesh::spawn`], so a cache opened after the mesh starts is
-/// immediately visible to inbound state-transfer/anti-entropy requests.
+/// Shared with the [`RequestHandler`] passed to [`Mesh::spawn`].
 type ShardRegistry = Arc<RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>>>;
 
 /// A running cluster membership: the join point for opening named caches.
 ///
 /// Cheap to `Clone`; every clone shares the same membership, mesh, and cache
-/// registry. Dropping every clone does not tear the cluster down — call
-/// [`Cluster::shutdown`] for a graceful leave.
+/// registry. Call [`Cluster::shutdown`] for a graceful leave; dropping every
+/// clone does not tear it down.
 #[derive(Clone)]
 pub struct Cluster {
     inner: Arc<ClusterInner>,
@@ -78,23 +76,18 @@ struct ClusterInner {
     membership: Membership,
     mesh: Mesh,
     shards: ShardRegistry,
-    /// The [`Mode`] each cache open in this process was opened under, the
-    /// local half of the cache-config fingerprint [`mode_conflict_task`]
-    /// compares peers' advertisements against.
+    /// The [`Mode`] each open cache was opened under; [`mode_conflict_task`]'s local half.
     local_modes: RwLock<HashMap<SmolStr, Mode>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
-    /// When each peer last streamed replicate traffic into this node, the
-    /// inbound half of [`Cluster::peer_is_streaming`].
+    /// When each peer last streamed replicate traffic in; see [`Cluster::peer_is_streaming`].
     inbound_activity: Arc<InboundActivity>,
     tracker: TaskTracker,
     cancel: CancellationToken,
 }
 
-/// Per-peer stamps of the last inbound `Replicate`/`ReplicateBatch`,
-/// recorded once per drained inbound batch by [`inbound_loop`] and read by
-/// the anti-entropy scheduler to leave a peer alone while its fan-out is
-/// still landing here.
+/// Per-peer stamps of the last inbound replicate traffic, recorded by
+/// [`inbound_loop`] so the anti-entropy scheduler can leave a streaming peer alone.
 #[derive(Default)]
 pub(crate) struct InboundActivity {
     seen: RwLock<HashMap<NodeId, u64>>,
@@ -108,8 +101,7 @@ impl InboundActivity {
             .insert(from, crate::net::mono_ms());
     }
 
-    /// Whether `peer` streamed replicate traffic here within the last
-    /// `window`.
+    /// Whether `peer` streamed replicate traffic within `window`.
     pub(crate) fn recent(&self, peer: NodeId, window: Duration) -> bool {
         let seen = self
             .seen
@@ -122,9 +114,7 @@ impl InboundActivity {
     }
 }
 
-/// Builds a [`Cluster`]: own-and-return. Zero further calls beyond
-/// `.build()` form a working LAN cluster — mDNS discovery, ephemeral ports,
-/// and the [`ClusterConfig`] defaults.
+/// Builds a [`Cluster`]: own-and-return. `.build()` alone forms a working LAN cluster.
 #[must_use]
 pub struct ClusterBuilder {
     name: SmolStr,
@@ -135,8 +125,7 @@ pub struct ClusterBuilder {
 }
 
 impl Cluster {
-    /// Starts building a cluster named `name`. The cluster name is chitchat's
-    /// cluster id — wrong-cluster gossip is rejected for free.
+    /// Starts building a cluster named `name`, chitchat's cluster id.
     pub fn builder(name: impl Into<SmolStr>) -> ClusterBuilder {
         ClusterBuilder {
             name: name.into(),
@@ -153,9 +142,7 @@ impl Cluster {
         self.inner.node
     }
 
-    /// Opens or joins a named cache. Returns a builder — call `.open().await`
-    /// to register it in the cluster's shard registry and get back a usable
-    /// [`crate::cache::Cache`] handle.
+    /// Opens or joins a named cache. Call `.open().await` on the result to register it.
     pub fn cache<K, V>(&self, name: impl Into<SmolStr>) -> CacheBuilder<K, V>
     where
         K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -172,9 +159,7 @@ impl Cluster {
         Arc::clone(&self.inner.shards)
     }
 
-    /// This cluster's partition-aware tombstone-retention view — see
-    /// `cluster::absence`'s module docs. Cheap to clone; shared by every
-    /// opened cache's `tombstone_gc_task`.
+    /// This cluster's partition-aware tombstone-retention view; see `cluster::absence`. Cheap to clone.
     pub(crate) fn absence_tracker(&self) -> absence::AbsenceTracker {
         self.inner.absence.clone()
     }
@@ -183,16 +168,13 @@ impl Cluster {
         &self.inner.mesh
     }
 
-    /// The live peer set, as membership currently reports it, for diagnostics.
+    /// The live peer set, as membership reports it, for diagnostics.
     #[must_use]
     pub fn peers(&self) -> Vec<Peer> {
         self.inner.membership.peers().borrow().clone()
     }
 
-    /// Records `mode` as this node's [`Mode`] for cache `name` and gossips
-    /// it, so peers can compare it against their own choice for the same
-    /// name. Called once by [`crate::cache::CacheBuilder::open`] right
-    /// after a cache is registered in this cluster's shard registry.
+    /// Records `mode` as this node's [`Mode`] for cache `name` and gossips it to peers.
     pub(crate) fn advertise_cache_mode(&self, name: &SmolStr, mode: Mode) {
         self.inner
             .local_modes
@@ -202,20 +184,17 @@ impl Cluster {
         self.inner.membership.set_cache_mode(name, mode);
     }
 
-    /// Every live peer's advertised cache modes, as membership currently
-    /// reports them.
+    /// Every live peer's advertised cache modes, as membership reports them.
     pub(crate) fn advertised_cache_modes(&self) -> CacheModes {
         self.inner.membership.cache_modes().borrow().clone()
     }
 
-    /// A fresh watch subscription on the live peer set, for loops that
-    /// need to react to membership changes rather than sample them.
+    /// A fresh watch subscription on the live peer set, for loops that react to changes.
     pub(crate) fn peers_watch(&self) -> tokio::sync::watch::Receiver<Vec<Peer>> {
         self.inner.membership.peers()
     }
 
-    /// The live peer set, as node ids only — what `Cache`'s write-fan-out
-    /// loop iterates to decide who to send `Invalidate`/`Replicate` to.
+    /// The live peer set as node ids only, what `Cache`'s fan-out loop iterates.
     pub(crate) fn live_peer_ids(&self) -> Vec<NodeId> {
         self.inner
             .membership
@@ -226,25 +205,21 @@ impl Cluster {
             .collect()
     }
 
-    /// Whether replicate traffic between this node and `peer` is still in
-    /// motion in either direction, judged over one `ae_interval`. The
-    /// anti-entropy scheduler leaves such a peer alone for a few rounds,
-    /// since repairing in parallel with an in-flight fan-out would ship
-    /// every record twice.
+    /// Whether replicate traffic between this node and `peer` is in motion
+    /// in either direction, judged over one `ae_interval`. Anti-entropy
+    /// leaves such a peer alone, since repairing in parallel would ship records twice.
     pub(crate) fn peer_is_streaming(&self, peer: NodeId) -> bool {
         let window = self.inner.config.ae_interval;
         self.inner.inbound_activity.recent(peer, window)
             || self.inner.mesh.replicate_in_flight(peer, window)
     }
 
-    /// A child of this cluster's shutdown token: cancelled the moment
-    /// [`Cluster::shutdown`] is called on any clone of this handle.
+    /// A child of this cluster's shutdown token: cancelled the moment [`Cluster::shutdown`] runs.
     pub(crate) fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel.child_token()
     }
 
-    /// Spawns `fut` on this cluster's [`TaskTracker`], so
-    /// [`Cluster::shutdown`] waits for it to observe cancellation and exit.
+    /// Spawns `fut` on this cluster's [`TaskTracker`], so [`Cluster::shutdown`] waits for it.
     pub(crate) fn spawn_tracked<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -252,14 +227,11 @@ impl Cluster {
         self.inner.tracker.spawn(fut);
     }
 
-    /// Leaves the cluster gracefully: background fan-out/dispatch loops are
-    /// cancelled and joined first, then chitchat departs politely and the
-    /// data plane closes its connections. No more calls should be made on
-    /// any clone of this handle afterward.
+    /// Leaves the cluster gracefully: background loops are cancelled and
+    /// joined, then chitchat departs and the data plane closes its
+    /// connections. No further calls on any clone of this handle.
     ///
-    /// Cache handles opened before this call keep working for purely local
-    /// reads/writes afterward — `Shard` never depends on `Mesh` or
-    /// `Membership` directly, they only stop having anywhere to fan out to.
+    /// Cache handles opened before this call keep working for local reads/writes.
     pub async fn shutdown(self) {
         self.inner.cancel.cancel();
         self.inner.tracker.close();
@@ -271,16 +243,13 @@ impl Cluster {
 }
 
 impl ClusterBuilder {
-    /// A fixed seed list, switching discovery from the zeroconf default
-    /// (`Mdns`) to [`Static`] — the escape hatch for environments where mDNS
-    /// doesn't reach (containers, isolated Wi-Fi) and the workhorse for tests.
+    /// A fixed seed list, switching discovery from the zeroconf default (`Mdns`) to [`Static`].
     pub fn seeds(mut self, seeds: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.discovery = Some(DiscoveryKind::Static(Static::new(seeds)));
         self
     }
 
-    /// Overrides the zeroconf default (`Mdns`) discovery mechanism, e.g. with
-    /// `DnsSrv` for Kubernetes, or a custom implementation.
+    /// Overrides the zeroconf default (`Mdns`) discovery mechanism, e.g. with `DnsSrv`.
     pub fn discovery(mut self, discovery: impl Discovery + 'static) -> Self {
         self.discovery = Some(DiscoveryKind::Custom(Box::new(discovery)));
         self
@@ -295,23 +264,16 @@ impl ClusterBuilder {
     /// Installs a Prometheus recorder and serves `GET /metrics` on `addr` for
     /// the life of the process, once [`build`](Self::build) succeeds.
     ///
-    /// `metrics`'s recorder is a single process-global slot: a second
-    /// `prometheus_listen` (on this or another `Cluster`), or a mix of
-    /// `prometheus_listen` and [`crate::telemetry::prometheus_handle`] in
-    /// the same process, fails `build()` with [`JoinError::Bind`] rather
-    /// than panicking. For embedding the scrape endpoint in an HTTP server
-    /// the caller already runs, use [`crate::telemetry::prometheus_handle`]
-    /// instead.
+    /// `metrics`'s recorder is a single process-global slot: a second call to
+    /// this, or mixing it with [`crate::telemetry::prometheus_handle`], fails
+    /// `build()` with [`JoinError::Bind`] rather than panicking.
     #[cfg(feature = "prometheus")]
     pub fn prometheus_listen(mut self, addr: SocketAddr) -> Self {
         self.prometheus_listen = Some(addr);
         self
     }
 
-    /// Enables mutual TLS on the data-plane mesh, behind the `tls` feature.
-    /// Equivalent to setting [`ClusterConfig::tls`] via [`Self::config`]; a
-    /// dedicated method for the common case of overriding only this field.
-    /// See [`crate::config::TlsConfig`]'s docs for what this implies.
+    /// Enables mutual TLS on the mesh; equivalent to setting [`ClusterConfig::tls`] via [`Self::config`].
     #[cfg(feature = "tls")]
     pub fn tls(mut self, tls: crate::config::TlsConfig) -> Self {
         self.config.tls = Some(tls);
@@ -319,15 +281,13 @@ impl ClusterBuilder {
     }
 
     /// Starts discovery, membership, and the data-plane mesh, and returns
-    /// once this node has joined (or begun forming) the cluster.
-    ///
-    /// mDNS finding nobody (a container with no multicast, a LAN of one) is
-    /// not an error; it is a healthy single-node cluster.
+    /// once this node has joined or begun forming the cluster. mDNS finding
+    /// nobody is not an error; it is a healthy single-node cluster.
     ///
     /// # Errors
     ///
-    /// Returns [`JoinError`] if the gossip or data-plane sockets cannot be
-    /// bound, or the membership backend fails to start.
+    /// Returns [`JoinError`] if the gossip or data-plane sockets cannot bind,
+    /// or the membership backend fails to start.
     pub async fn build(self) -> Result<Cluster, JoinError> {
         let Self {
             name,
@@ -425,10 +385,8 @@ impl ClusterBuilder {
     }
 }
 
-/// Spawns every background loop a freshly built [`Cluster`] keeps running
-/// for its lifetime: membership-to-mesh peer republishing, the late
-/// cache-mode-mismatch sweep, absence tracking, the inbound
-/// broadcast-traffic dispatch loop, and the open-cache gauge.
+/// Spawns every background loop a freshly built [`Cluster`] keeps running: peer
+/// republishing, the mode-mismatch sweep, absence tracking, inbound dispatch, and the open-cache gauge.
 fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<InboundMsg>) {
     cluster.spawn_tracked(membership_to_mesh_task(
         cluster.inner.membership.peers(),
@@ -453,12 +411,10 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     ));
 }
 
-/// Resolves the concrete address `Mesh::spawn` should bind to, and that
-/// `Membership::spawn` advertises for it. A configured non-zero port is
-/// used as-is; the zeroconf default (port `0`) needs a real port before
-/// `Membership::spawn` so it can be gossiped, but only `Mesh::spawn` owns
-/// the listener, so a free port is claimed here and released for
-/// `Mesh::spawn` to rebind moments later.
+/// Resolves the address `Mesh::spawn` binds to and `Membership::spawn`
+/// advertises. A non-zero configured port is used as-is; the zeroconf port
+/// `0` is claimed here and released for `Mesh::spawn` to reclaim, so
+/// `Membership::spawn` has a real port to gossip.
 async fn reserve_data_bind_addr(configured: SocketAddr) -> Result<SocketAddr, JoinError> {
     if configured.port() != 0 {
         return Ok(configured);
@@ -483,10 +439,9 @@ fn local_hostname() -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-/// Answers inbound state-transfer/anti-entropy requests (`StRequest`,
-/// `AeDigest`, `AePull`) over this cluster's shard registry, for whichever
-/// cache a peer names. A cache name this node doesn't (yet) have degrades
-/// to an empty result rather than an error — a normal race, not a fault.
+/// Answers inbound state-transfer/anti-entropy requests over this cluster's
+/// shard registry, for whichever cache a peer names. An unregistered cache
+/// name degrades to an empty result rather than an error.
 struct ClusterRequestHandler {
     shards: ShardRegistry,
     ae_sketch_min_bucket: usize,
@@ -561,10 +516,8 @@ impl RequestHandler for ClusterRequestHandler {
             let Some(shard) = self.lookup(&cache) else {
                 return Vec::new();
             };
-            // One shard lookup serves both steps: `bucket_entries` already
-            // holds every local key in `bucket`, so filtering by
-            // `xxh3_64(key)` membership in `hashes` before the
-            // `records_for` fetch avoids a second independent shard pass.
+            // `bucket_entries` already holds every local key in `bucket`, so
+            // filtering by `xxh3_64(key)` first avoids a second shard pass.
             let wanted: HashSet<u64> = hashes.into_iter().collect();
             let keys: Vec<Bytes> = shard
                 .bucket_entries(bucket)
@@ -594,8 +547,7 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
         .cloned()
 }
 
-/// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls,
-/// for the lifetime of the cluster.
+/// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls.
 async fn membership_to_mesh_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     mesh: Mesh,
@@ -621,12 +573,9 @@ async fn membership_to_mesh_task(
     }
 }
 
-/// The cache-mode-mismatch late-detection sweep (see
-/// [`report_mode_conflicts`]): since two nodes opening the same name under
-/// different `Mode`s concurrently can both pass `open()`'s best-effort
-/// check, this re-checks every live peer's advertised cache modes against
-/// this node's own open caches whenever membership publishes a new view,
-/// including one caused only by this node's own later `open()`.
+/// The cache-mode-mismatch late-detection sweep. Two nodes opening the same
+/// name concurrently under different `Mode`s can both pass `open()`'s
+/// best-effort check, so this re-checks every membership view instead.
 async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
     let mut modes = cluster.inner.membership.cache_modes();
     let mut warned: HashSet<(NodeId, SmolStr)> = HashSet::new();
@@ -646,8 +595,7 @@ async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
     }
 }
 
-/// One (peer, cache) pair where a live peer advertises a cache this node
-/// also has open, under a different [`Mode`].
+/// One (peer, cache) pair where a live peer advertises a different [`Mode`] than this node's own.
 #[derive(Debug, PartialEq, Eq)]
 struct ModeConflict {
     peer: NodeId,
@@ -656,12 +604,9 @@ struct ModeConflict {
     remote: Mode,
 }
 
-/// The conflicts in `advertised` against `local_modes` that `warned` has
-/// not seen yet; each is recorded in `warned`, so a later view reports only
-/// pairs new since the last sweep. `warned` accumulates for the life of the
-/// cluster rather than clearing entries that stop conflicting: a genuine
-/// mismatch is a standing misconfiguration cleared only by a re-`open()`
-/// (a fresh process, hence a fresh [`NodeId`]).
+/// The conflicts in `advertised` against `local_modes` that `warned` has not
+/// seen yet. Each is recorded in `warned`, so a mismatch is reported once
+/// and clears only via a re-`open()` under a fresh [`NodeId`].
 fn new_mode_conflicts(
     advertised: &CacheModes,
     local_modes: &HashMap<SmolStr, Mode>,
@@ -686,9 +631,7 @@ fn new_mode_conflicts(
     found
 }
 
-/// Logs a `tracing::error!` for every conflict [`new_mode_conflicts`] finds,
-/// backstopping what [`CacheBuilder::open`]'s own check can miss under a
-/// race.
+/// Logs a `tracing::error!` for every conflict [`new_mode_conflicts`] finds.
 fn report_mode_conflicts(
     advertised: &CacheModes,
     cluster: &Cluster,
@@ -720,11 +663,9 @@ fn set_live_peers_gauge(count: usize) {
     metrics::gauge!("sundog_live_peers").set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
 }
 
-/// Periodically republishes the count of caches open in this process as the
-/// `sundog_open_caches` gauge. A gauge, not an event-driven update, because
-/// [`crate::cache::CacheBuilder::open`] — the only place a cache is ever
-/// added to the registry — lives outside this module and has no hook to
-/// call back into telemetry from.
+/// Periodically republishes the count of open caches as the
+/// `sundog_open_caches` gauge. A gauge, not an event-driven update, since
+/// [`crate::cache::CacheBuilder::open`] has no hook back into telemetry.
 async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken) {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -744,16 +685,12 @@ async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken)
     }
 }
 
-/// Cap on how many already-queued inbound messages [`inbound_loop`] drains
-/// per wake — bounds one iteration's work under a multi-peer burst rather
-/// than draining an unbounded backlog before dispatching anything.
+/// Cap on how many queued inbound messages [`inbound_loop`] drains per wake.
 const INBOUND_DRAIN_CAP: usize = 1024;
 
 /// Applies one accumulated same-cache run of `Replicate`/`ReplicateBatch`
-/// records under one `apply_remote_batch` call, looking `cache` up in
-/// `shard_cache` first (memoized per drained batch by [`inbound_loop`]) so
-/// a run's cache name costs at most one `shards` registry lock acquisition
-/// no matter how many runs land on it.
+/// records under one `apply_remote_batch` call. `shard_cache` memoizes the
+/// lookup per drained batch, so a cache name costs at most one lock acquisition.
 async fn apply_pending_replicate(
     shards: &ShardRegistry,
     shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
@@ -771,16 +708,13 @@ async fn apply_pending_replicate(
 }
 
 /// The single consumer of `Mesh`'s inbound-message channel: dispatches
-/// `Invalidate`/`Replicate`/`ReplicateBatch` to the named shard. A cache
-/// name with no registered shard is dropped with a trace event, since the
-/// opening side may not have called `open()` for it yet.
+/// `Invalidate`/`Replicate`/`ReplicateBatch` to the named shard. A message
+/// for an unregistered cache is dropped with a trace event.
 ///
-/// Drains a bounded batch of already-queued messages per wake with
-/// `recv_many` rather than one `shards` registry lookup per message: a
-/// cache name is looked up at most once per drained batch, and a run of
-/// consecutive same-cache `Replicate`/`ReplicateBatch` messages coalesces
-/// into one `apply_remote_batch` call. Every message is still applied
-/// exactly once, in drain order; only lock-acquisition counts change.
+/// Drains a bounded batch per wake with `recv_many`, so a cache name is
+/// looked up at most once per batch and a run of same-cache
+/// `Replicate`/`ReplicateBatch` messages coalesces into one
+/// `apply_remote_batch` call, applied in drain order.
 async fn inbound_loop(
     shards: ShardRegistry,
     activity: Arc<InboundActivity>,
@@ -850,8 +784,7 @@ async fn inbound_loop(
                         tracing::trace!(%cache, %from, "invalidate for unknown cache; dropped");
                     }
                 }
-                // `Hello` and the request/response messages never reach
-                // this channel — `net::Mesh` handles those inline.
+                // `Hello` and the request/response messages never reach this channel.
                 Msg::Hello { .. }
                 | Msg::StRequest { .. }
                 | Msg::StChunk { .. }
@@ -870,16 +803,14 @@ async fn inbound_loop(
     }
 }
 
-/// Drains one opened cache's queue of locally written keys and fans them
-/// out over the mesh per [`Mode`], the composition-layer half of `Shard`'s
-/// design (`Shard` holds no handle to `net::Mesh`). A `get_or_load`
-/// read-through fill fans out too, since it is itself a genuine versioned
-/// write, letting other `Replicated`-mode peers skip their own loader call.
+/// Drains one opened cache's queue of locally written keys and fans them out
+/// over the mesh per [`Mode`]; `Shard` holds no handle to `net::Mesh`. A
+/// `get_or_load` read-through fill fans out too, letting other
+/// `Replicated`-mode peers skip their own loader call.
 ///
-/// Each iteration takes the whole backlog at once, so a burst of local
-/// writes costs one round of per-peer sends for the whole burst, not one
-/// per write, and nothing is dropped for arriving too fast (see
-/// [`FanOutQueue`]).
+/// Each iteration takes the whole backlog at once, so a burst of writes
+/// costs one round of per-peer sends, not one per write. See [`FanOutQueue`]
+/// for why nothing drops for arriving too fast.
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
@@ -913,8 +844,7 @@ async fn fan_out_batch<K, V>(
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    // The queue carries local writes only (see `store::FanOutQueue`), so no
-    // origin filter is needed, only a dedup of the drained burst.
+    // The queue carries local writes only, so this only dedups the drained burst.
     let mut seen: HashSet<&K> = HashSet::new();
     let mut keys: Vec<K> = Vec::new();
     for key in &notified {
@@ -927,13 +857,8 @@ async fn fan_out_batch<K, V>(
     }
 
     // Re-fetches through `Shard::records_for_typed` rather than carrying the
-    // `Hlc`/wire bytes on `Event` itself: a benign race with a fast
-    // follow-up write/GC can make a key come back missing, in which case
-    // there is nothing stale to fan out for it, since a later event (or
-    // anti-entropy) covers its current state. Typed keys are already in
-    // hand from the events above, so this skips the encode-then-decode
-    // round trip `ShardOps::records_for`'s `Bytes`-keyed signature would
-    // otherwise need.
+    // `Hlc`/wire bytes on `Event` itself. A missing key on re-fetch means a
+    // later write or GC already covers it, so nothing stale needs fanning out.
     let records = shard.records_for_typed(&keys).await;
     let peers = cluster.live_peer_ids();
     let (class, msgs): (MsgClass, Vec<Msg>) = match mode {
@@ -950,18 +875,12 @@ async fn fan_out_batch<K, V>(
                 .collect(),
         ),
         // Pre-batched by the same budget/count rules `net::conn`'s writer
-        // uses for opportunistic coalescing: a drained burst (e.g. an
-        // `insert_many` fill) leaves here as a handful of
-        // `Msg::ReplicateBatch` frames instead of one `Msg::Replicate` per
-        // record, so a bulk burst can't flood the outbox into drop-newest
-        // and the anti-entropy repair that follows. The writer-side
-        // coalescer still catches what this can't: trickle writes that
-        // arrive one drained event at a time.
+        // uses for coalescing, so a drained burst can't flood the outbox
+        // into drop-newest. The writer-side coalescer still catches trickle
+        // writes arriving one drained event at a time.
         Mode::Replicated => (MsgClass::Replicate, batch_replicate(cache_name, records)),
     };
-    // Encodes each message once, before the per-peer loop, so every live
-    // peer gets a cheap `Bytes` clone of the same frame instead of
-    // `net::conn`'s writer independently re-deriving identical content.
+    // Encodes each message once, so every live peer gets a cheap `Bytes` clone of the same frame.
     let frames: Vec<OutFrame> = msgs
         .into_iter()
         .filter_map(|msg| match OutFrame::new(msg) {
@@ -972,9 +891,7 @@ async fn fan_out_batch<K, V>(
             }
         })
         .collect();
-    // Resolves each peer's handle once and reuses it for every message in
-    // this batch, rather than `Mesh::send`'s per-message peer-table lock
-    // acquisition.
+    // Resolves each peer's handle once and reuses it for the whole batch.
     for &peer in &peers {
         cluster
             .mesh()
@@ -983,17 +900,14 @@ async fn fan_out_batch<K, V>(
 }
 
 /// Periodically garbage-collects one shard's expired tombstones and flushes
-/// pending housekeeping (`ShardOps::run_pending_tasks`; without this, a
-/// shard that goes quiet right after a TTL/size eviction can keep a stale
-/// digest forever). Runs at a quarter of `tombstone_ttl` so a tombstone is
-/// never held much past its deadline once nothing defers it.
+/// pending housekeeping via `ShardOps::run_pending_tasks`. Runs at a quarter
+/// of `tombstone_ttl` so a tombstone is never held much past its deadline.
 ///
-/// `mode` and `absence` decide, on every tick, whether collection past
-/// `tombstone_ttl` is deferred this round (`absence::should_defer_gc`):
-/// while any recently-known member is absent, a `Mode::Replicated` cache's
-/// tombstone survives up to the hard cap `tombstone_max_ttl`, so that
-/// member can't resurrect the deleted entry via anti-entropy once it
-/// returns. `Mode::Local`/`Mode::Invalidation` caches are never deferred.
+/// `mode` and `absence` decide each tick whether collection past
+/// `tombstone_ttl` defers via [`absence::should_defer_gc`]: while a
+/// recently known member is absent, a `Mode::Replicated` tombstone survives
+/// up to `tombstone_max_ttl`, so that member can't resurrect the entry on
+/// return. `Mode::Local`/`Mode::Invalidation` never defer.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
@@ -1018,11 +932,10 @@ pub(crate) async fn tombstone_gc_task(
     }
 }
 
-/// Publishes `sundog_cache_entries{cache}` for one opened cache: set once
-/// immediately, then refreshed on a fixed 5-second cadence from
-/// [`Shard::entry_count`] for as long as the cache stays open. The entry
-/// count is only advisory until pending housekeeping is flushed, so a fixed
-/// sampling cadence is what [`Shard::entry_count`] is built around.
+/// Publishes `sundog_cache_entries{cache}` for one opened cache: set
+/// immediately, then refreshed every 5 seconds from [`Shard::entry_count`]
+/// for as long as the cache stays open. The count is only advisory until
+/// pending housekeeping flushes.
 pub(crate) async fn cache_entries_gauge_task<K, V>(
     shard: Arc<Shard<K, V>>,
     name: SmolStr,
@@ -1047,16 +960,13 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
     }
 }
 
-/// Saturating `u64` -> `f64` conversion for gauge values, matching
-/// [`set_live_peers_gauge`] and [`open_cache_gauge_task`]'s own count-to-gauge
-/// conversions.
+/// Saturating `u64` -> `f64` conversion for gauge values.
 fn entry_count_f64(count: u64) -> f64 {
     f64::from(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
-// Real-transport-only: these build a live `Cluster` (real `Mesh`, real
-// sockets), which panics under `sim` outside a driven `turmoil::Sim` — see
-// `net::mod`'s test-module comment for the full rationale.
+// Real-transport-only: these build a live `Cluster` with a real `Mesh` and
+// sockets, which panics under `sim` outside a driven `turmoil::Sim`.
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::net::Ipv4Addr;
@@ -1066,9 +976,8 @@ mod tests {
     use crate::error::CacheError;
     use crate::store::{Event, Origin};
 
-    /// Loopback-only config: skips the outbound-interface probe for the
-    /// zeroconf `0.0.0.0`/`::` default, and keeps anti-entropy/tombstone
-    /// timing tight for fast, deterministic tests.
+    /// Loopback-only config: skips the outbound-interface probe and keeps
+    /// anti-entropy/tombstone timing tight for fast, deterministic tests.
     fn loopback_config() -> ClusterConfig {
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
         ClusterConfig {
@@ -1269,10 +1178,8 @@ mod tests {
         (cluster_a, cluster_b)
     }
 
-    /// Polls `cluster`'s peer set until it sees a live peer advertising
-    /// `cache` under some [`Mode`]. Every mode-mismatch test needs this
-    /// gossip-convergence wait before its second `open()`, or that `open()`
-    /// could race the first node's `cache:<name>` key still in flight.
+    /// Polls until `cluster` sees a live peer advertising `cache` under some
+    /// [`Mode`]. Needed before a second `open()`, or it could race the first.
     async fn wait_for_cache_advertised(cluster: &Cluster, cache: &str) {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1385,10 +1292,6 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    /// End to end over the real mesh: a per-entry TTL set on node a expires
-    /// the replica on node b at the deadline a stamped, while a sibling
-    /// entry written with the cache's (absent) default lives on. Neither
-    /// cache is opened with a TTL — the override is the only expiry in play.
     #[test]
     fn inbound_activity_is_recent_only_inside_the_window() {
         let activity = InboundActivity::default();
@@ -1600,10 +1503,8 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    /// `Mode::Local` publishes no wire message, so there is no "delivered"
-    /// event to await; the only observable proof is polling past a settle
-    /// window a real cross-node message would need, then asserting it
-    /// never showed.
+    /// `Mode::Local` publishes no wire message, so this polls past a settle
+    /// window a real message would need, then asserts it never showed.
     #[tokio::test]
     async fn local_mode_never_leaks_a_write_to_the_peer() {
         let (cluster_a, cluster_b) = two_node_cluster("cluster-it-local-no-fan-out").await;
@@ -1655,9 +1556,8 @@ mod tests {
             .await
             .expect("b opens");
 
-        // B warms its own local copy first (Invalidation mode never
-        // replicates values). A short sleep before A's write guarantees
-        // A's HLC stamp is strictly later, independent of tie-break order.
+        // B warms its own local copy first; Invalidation mode never
+        // replicates values. The sleep guarantees A's HLC stamp is later.
         cache_b
             .insert(1, "stale".into())
             .await
@@ -1714,8 +1614,7 @@ mod tests {
         wait_for_peer_count(&cluster_b, 1).await;
 
         // `open()` blocks for state transfer, so B's copy of a key A wrote
-        // before B ever joined the cluster must already be warm — no
-        // waiting for a live write or an anti-entropy round.
+        // before B joined is already warm, with no wait for a live write.
         let cache_b = tokio::time::timeout(
             Duration::from_secs(15),
             cluster_b
@@ -1762,9 +1661,8 @@ mod tests {
         .await
         .expect("live fan-out delivers the insert to b");
 
-        // Simulate a dropped `Replicate` message: wipe B's local copy
-        // without a tombstone. Only anti-entropy (not live traffic) can
-        // bring this back, since nothing writes key 1 again.
+        // Simulate a dropped `Replicate` message: wipe B's copy without a
+        // tombstone. Only anti-entropy can bring it back.
         cache_b.invalidate_local(&1).await;
         assert_eq!(cache_b.get(&1).await, None);
 
@@ -1827,10 +1725,9 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    // --- Sketch-based anti-entropy (`cluster::sketch`) -----------------
+    // --- Sketch-based anti-entropy (`cluster::sketch`) ---
 
-    /// Mirrors `store::bucket_of`'s formula (`postcard`-encoded key bytes,
-    /// `xxh3_64`, masked to `BUCKET_COUNT - 1`) so a test can compute which
+    /// Mirrors `store::bucket_of`'s formula so a test can compute which
     /// anti-entropy bucket a key lands in without that private function.
     fn bucket_of_u32(key: u32) -> u16 {
         let bytes = postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes");
@@ -1838,9 +1735,8 @@ mod tests {
         u16::try_from(bucket).expect("masked to BUCKET_COUNT - 1, always fits in u16")
     }
 
-    /// Among `0..n`, every key that landed in a bucket holding more than
-    /// `min_count` of them; deterministic given a fixed key range, so
-    /// "a densely populated bucket" is the same one on every run.
+    /// Among `0..n`, every key in a bucket holding more than `min_count` of
+    /// them. Deterministic given a fixed key range.
     fn dense_bucket_keys(n: u32, min_count: usize) -> Vec<u32> {
         let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
         for key in 0..n {
@@ -1852,9 +1748,8 @@ mod tests {
             .expect("at least one bucket exceeds min_count among this many keys")
     }
 
-    /// `count` distinct keys that all hash into the same anti-entropy
-    /// bucket as key `0`, a tight, deliberately oversized true difference
-    /// for the sketch-fallback test below.
+    /// `count` distinct keys that all hash into the same anti-entropy bucket
+    /// as key `0`, for the sketch-fallback test below.
     fn keys_colliding_with_zero(count: usize) -> Vec<u32> {
         let target = bucket_of_u32(0);
         (0..)
@@ -1864,13 +1759,9 @@ mod tests {
     }
 
     /// A [`tracing::Subscriber`] that counts `cluster::anti_entropy`'s
-    /// `outcome = "decoded"`/`outcome = "fallback"` events, the sketch
-    /// tests' stand-in for reading `sundog_ae_sketch_total` through a
+    /// `outcome = "decoded"`/`"fallback"` events, standing in for the
     /// process-global `metrics` recorder, too fragile to install per-test.
-    /// `tracing::subscriber::set_default` is thread-local instead, and
-    /// every test below runs on `#[tokio::test]`'s single-threaded
-    /// runtime, so everything it spawns is captured for the guard's
-    /// lifetime.
+    /// `set_default` is thread-local, scoped to this single-threaded test.
     struct AeSketchOutcomeSubscriber {
         decoded: Arc<AtomicUsize>,
         fallback: Arc<AtomicUsize>,
@@ -1954,8 +1845,7 @@ mod tests {
             .expect("a inserts a few thousand entries before b ever joins");
 
         // A bucket with more than `ae_sketch_min_bucket + 1` entries, so it
-        // still exceeds `ae_sketch_min_bucket` on B's side too once one
-        // entry is dropped below.
+        // still exceeds the threshold once one entry drops below.
         let bucket_keys = dense_bucket_keys(N, config.ae_sketch_min_bucket + 1);
         let target_key = bucket_keys[0];
 
@@ -1987,9 +1877,8 @@ mod tests {
             fallback: Arc::clone(&fallback),
         });
 
-        // Simulate a dropped `Replicate` message on B; this bucket is
-        // large enough that the responder answers with `Msg::AeSketch`
-        // rather than the full listing.
+        // Simulate a dropped `Replicate` message on B; this bucket is large
+        // enough that the responder answers with `Msg::AeSketch`.
         cache_b.invalidate_local(&target_key).await;
         assert_eq!(cache_b.get(&target_key).await, None);
 
@@ -2022,8 +1911,8 @@ mod tests {
     async fn anti_entropy_falls_back_to_the_listing_when_a_sketch_cannot_decode() {
         let config = ClusterConfig {
             ae_sketch_min_bucket: 4,
-            // 2 cells per IBLT partition, far too small to peel the
-            // 25-element true difference this test forces below.
+            // 2 cells per IBLT partition, too small to peel the 25-element
+            // difference this test forces below.
             ae_sketch_cells: 6,
             ..loopback_config()
         };
@@ -2041,8 +1930,8 @@ mod tests {
             .await
             .expect("a opens");
 
-        // 30 keys in the same anti-entropy bucket, a deliberately
-        // oversized true difference once most of them are dropped below.
+        // 30 keys in the same anti-entropy bucket, an oversized true
+        // difference once most of them are dropped below.
         let colliding_keys = keys_colliding_with_zero(30);
         let total = u64::try_from(colliding_keys.len()).expect("30 fits in a u64");
         cache_a
@@ -2078,9 +1967,8 @@ mod tests {
             fallback: Arc::clone(&fallback),
         });
 
-        // Drop all but the last 5 keys on B — a true difference of 25
-        // elements in one bucket, far past what a 6-cell (2-per-partition)
-        // sketch can ever peel.
+        // Drop all but the last 5 keys on B: a true difference of 25
+        // elements in one bucket, past what a 6-cell sketch can peel.
         for &key in &colliding_keys[..colliding_keys.len() - 5] {
             cache_b.invalidate_local(&key).await;
         }
