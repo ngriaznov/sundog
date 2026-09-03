@@ -132,16 +132,11 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
         Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
-        Msg::Hello { .. }
-        | Msg::StRequest { .. }
-        | Msg::StChunk { .. }
-        | Msg::AeDigest { .. }
-        | Msg::AeBucket { .. }
-        | Msg::AeSketch { .. }
-        | Msg::AeEntries { .. }
-        | Msg::AePull { .. }
-        | Msg::AePullHashes { .. }
-        | Msg::ReqDone => {}
+        // `Hello`, the request/response messages, and `ReqDone` never reach
+        // this dispatcher — a no-op for all of them, and (since `Msg` is
+        // `#[non_exhaustive]` outside `sundog` itself, which this
+        // integration test lives outside of) for any future variant too.
+        _ => {}
     }
 }
 
