@@ -66,6 +66,14 @@ All notable changes to this project are documented in this file. Format follows
   apiece. `cargo semver-checks --release-type minor` against 0.2.0 reports
   exactly this one intentional break; every other check passes.
 
+### Fixed
+
+- `insert_many` and `insert_many_with_ttl` apply the entries before an
+  oversized value and then return `ValueTooLarge`, as their docs state.
+  Every entry was rejected before.
+- `DnsSrv` discovery uses the configured fallback port for an SRV record
+  whose port is zero instead of dialing port zero.
+
 ## [0.2.0] – 2026-09-02
 
 ### Added
