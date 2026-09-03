@@ -22,22 +22,17 @@ struct AbsenceState {
 }
 
 /// Cheap-to-clone, cluster-wide view of which recently-known members are
-/// currently absent from the live peer set — fed by [`tracking_task`],
-/// sampled once per tick by `tombstone_gc_task` via [`should_defer_gc`].
-///
-/// On a single-node cluster the live peer set is always empty, so no
-/// departure is ever observed and [`AbsenceTracker::any_absent`] stays
-/// `false`. [`should_defer_gc`] never defers a `Mode::Local` cache either,
-/// since such a cache never runs anti-entropy.
+/// currently absent, fed by [`tracking_task`] and sampled by
+/// `tombstone_gc_task` via [`should_defer_gc`]. On a single-node cluster the
+/// live peer set is always empty, so [`AbsenceTracker::any_absent`] stays `false`.
 #[derive(Clone, Default)]
 pub(crate) struct AbsenceTracker {
     state: Arc<StdMutex<AbsenceState>>,
 }
 
 impl AbsenceTracker {
-    /// Applies one membership-watch snapshot: a peer that dropped out of
-    /// `live` since the last call starts being tracked absent (if it isn't
-    /// already); a peer back in `live` clears its tracked absence.
+    /// Applies one membership-watch snapshot: a peer newly dropped from
+    /// `live` starts being tracked absent; a peer back in `live` clears it.
     fn observe(&self, live: &[Peer]) {
         let live_ids: HashSet<NodeId> = live.iter().map(|peer| peer.node).collect();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -51,10 +46,8 @@ impl AbsenceTracker {
         state.live = live_ids;
     }
 
-    /// Whether any recently-known member is currently absent and has not yet
-    /// aged past `hard_cap` — pruning entries older than `hard_cap` as a side
-    /// effect, so a member that never returns doesn't grow this tracker's
-    /// memory forever.
+    /// Whether any recently-known member is absent and not yet aged past
+    /// `hard_cap`. Prunes older entries as a side effect.
     pub(crate) fn any_absent(&self, hard_cap: Duration) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
@@ -66,17 +59,14 @@ impl AbsenceTracker {
 }
 
 /// Whether `tombstone_gc_task` should defer a tombstone past `tombstone_ttl`
-/// on this tick. Only [`Mode::Replicated`] caches run anti-entropy, the
-/// only mechanism that could resurrect a tombstone from a peer that was out
-/// of contact, so `Mode::Local`/`Mode::Invalidation` caches are never
-/// deferred.
+/// this tick. Only [`Mode::Replicated`] runs anti-entropy, the mechanism
+/// that could resurrect a tombstone, so other modes are never deferred.
 pub(crate) fn should_defer_gc(mode: Mode, tracker: &AbsenceTracker, hard_cap: Duration) -> bool {
     matches!(mode, Mode::Replicated) && tracker.any_absent(hard_cap)
 }
 
 /// Republishes [`crate::membership::Membership::peers`] changes into
-/// `tracker`, keeping [`AbsenceTracker`] current for the lifetime of the
-/// cluster.
+/// `tracker`, keeping [`AbsenceTracker`] current.
 pub(crate) async fn tracking_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     tracker: AbsenceTracker,
@@ -172,7 +162,7 @@ mod tests {
     fn should_defer_gc_ignores_absence_outside_replicated_mode() {
         let tracker = AbsenceTracker::default();
         tracker.observe(&[peer(1)]);
-        tracker.observe(&[]); // peer 1 now absent
+        tracker.observe(&[]);
         let hard_cap = Duration::from_secs(3600);
 
         assert!(should_defer_gc(Mode::Replicated, &tracker, hard_cap));

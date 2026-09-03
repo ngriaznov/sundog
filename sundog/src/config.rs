@@ -13,31 +13,23 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::wire::MAX_FRAME;
 
 /// Mutual-TLS material for the data-plane mesh (feature `tls`). Set
-/// [`ClusterConfig::tls`] (or [`crate::cluster::ClusterBuilder::tls`]) to
-/// wrap every data-plane connection, including the short-lived
-/// request/response ones (state transfer, anti-entropy), in TLS; client
-/// certificates are verified against `root_ca_certs` too, for mutual auth.
+/// [`ClusterConfig::tls`] to wrap every data-plane connection in TLS;
+/// client certificates are verified against `root_ca_certs` too.
 ///
-/// A node with `tls: None` and a node with `tls: Some(_)` cannot join the
-/// same mesh: the plaintext side never speaks the TLS record layer the
-/// other expects, so every connection between them fails outright rather
-/// than silently downgrading. Every certificate must carry
-/// [`crate::net::MESH_SERVER_NAME`] as a DNS SAN. Applies only to the
-/// real-tokio transport; a `sim`-feature build stays plaintext regardless of
-/// this field.
+/// A node with `tls: None` and one with `tls: Some(_)` cannot join the same
+/// mesh: every connection between them fails outright rather than silently
+/// downgrading. Every certificate must carry [`crate::net::MESH_SERVER_NAME`]
+/// as a DNS SAN. A `sim`-feature build stays plaintext regardless of this field.
 #[cfg(feature = "tls")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsConfig {
     /// This node's certificate chain, leaf first, DER-encoded.
     pub cert_chain: Vec<CertificateDer<'static>>,
     /// This node's private key, matching `cert_chain`'s leaf certificate.
-    /// `Arc`-wrapped so `TlsConfig` stays cheaply `Clone` despite
-    /// [`PrivateKeyDer`] itself not being `Clone`.
+    /// `Arc`-wrapped so `TlsConfig` stays cheaply `Clone`.
     pub private_key: Arc<PrivateKeyDer<'static>>,
-    /// DER-encoded root CA certificate(s) trusted for verifying peers on
-    /// both sides of the handshake: a server verifying a dialing client's
-    /// certificate, and a dialing client verifying the server it connects
-    /// to.
+    /// DER-encoded root CA certificate(s) trusted on both sides of the
+    /// handshake.
     pub root_ca_certs: Vec<CertificateDer<'static>>,
 }
 
@@ -46,108 +38,79 @@ pub struct TlsConfig {
 /// overriding day to day.
 ///
 /// `#[non_exhaustive]`: a field added here in a future release must not
-/// break code that only overrides a few knobs. Construct one with
-/// [`ClusterConfig::default`] and [`ClusterConfig::with`] to change a subset
-/// of fields — the fully-public fields remain directly readable and
-/// writable on an existing value.
+/// break code that only overrides a few knobs. Use [`ClusterConfig::default`]
+/// and [`ClusterConfig::with`] to change a subset of fields.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ClusterConfig {
     /// Base interval between a node's anti-entropy rounds. The actual delay
-    /// is jittered around this value to avoid thundering-herd rounds across
-    /// the cluster.
+    /// is jittered around this value to avoid thundering-herd rounds.
     pub ae_interval: Duration,
-    /// How long a tombstone is retained before garbage collection, once
-    /// every recently-known cluster member is accounted for. Must be at
-    /// least `3 * ae_interval` so a lagging peer gets a few anti-entropy
-    /// rounds to observe the deletion before it is forgotten.
+    /// How long a tombstone is retained before garbage collection. Must be
+    /// at least `3 * ae_interval` so a lagging peer gets a few anti-entropy
+    /// rounds to observe the deletion first.
     ///
-    /// While a member is absent from the live peer set, a `Replicated`-mode
-    /// cache defers collection past this point, up to
-    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl), so that member can't
-    /// resurrect the deleted entry via anti-entropy once it returns. Deleted
-    /// entries accumulate as tombstones (tens of bytes each) during the
-    /// outage until the member returns or `tombstone_max_ttl` expires.
+    /// While a member is absent, a `Replicated`-mode cache defers collection
+    /// past this point, up to [`tombstone_max_ttl`](Self::tombstone_max_ttl),
+    /// so that member can't resurrect the entry via anti-entropy on return.
     pub tombstone_ttl: Duration,
-    /// Hard cap on tombstone retention: once a tombstone is older than this,
-    /// it is garbage-collected regardless of any member's absence. Bounds
-    /// the memory trade described on [`tombstone_ttl`](Self::tombstone_ttl)
-    /// against a member that never comes back.
+    /// Hard cap on tombstone retention regardless of any member's absence.
+    /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
+    /// member that never comes back.
     pub tombstone_max_ttl: Duration,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
     /// Hard cap on a single wire frame, in bytes. Must not exceed
-    /// [`crate::wire::MAX_FRAME`] (the wire codec's own hard-coded cap) —
-    /// [`crate::cluster::ClusterBuilder::build`] rejects a config that sets
-    /// this higher with [`crate::error::JoinError::InvalidConfig`].
+    /// [`crate::wire::MAX_FRAME`]; `build()` rejects a higher value with
+    /// [`crate::error::JoinError::InvalidConfig`].
     pub max_frame: usize,
-    /// Bind address for the gossip (membership) UDP socket. Port `0` picks an
-    /// ephemeral port, which is the zeroconf default.
+    /// Bind address for the gossip (membership) UDP socket. Port `0` picks the zeroconf default.
     pub gossip_bind_addr: SocketAddr,
-    /// Bind address for the data-plane TCP listener. Port `0` picks an
-    /// ephemeral port, which is the zeroconf default.
+    /// Bind address for the data-plane TCP listener. Port `0` picks the zeroconf default.
     pub data_bind_addr: SocketAddr,
-    /// Cadence of chitchat's own SWIM gossip rounds — distinct from
-    /// [`ae_interval`](Self::ae_interval), which paces this crate's own
-    /// anti-entropy, not chitchat's membership gossip. Chosen for sub-5s
-    /// failure detection on a LAN.
+    /// Cadence of chitchat's own SWIM gossip rounds, distinct from
+    /// [`ae_interval`](Self::ae_interval). Chosen for sub-5s failure
+    /// detection on a LAN.
     pub gossip_interval: Duration,
     /// Phi-accrual failure-detector suspicion threshold: a peer is flagged
     /// faulty once its accrual value crosses this. Higher tolerates more
-    /// gossip jitter before suspecting a peer, at the cost of slower
-    /// detection; see chitchat's own docs for the trade-off.
+    /// jitter at the cost of slower detection.
     pub phi_threshold: f64,
     /// Sample window size behind the phi-accrual calculation.
     pub phi_sampling_window_size: usize,
-    /// Upper bound on the failure detector's inter-heartbeat interval;
-    /// heartbeats spaced further apart than this are dropped from the
-    /// sample window.
+    /// Upper bound on the failure detector's inter-heartbeat interval; wider
+    /// gaps are dropped from the sample window.
     pub phi_max_interval: Duration,
     /// Initial assumed heartbeat interval, used before the failure detector
     /// has enough samples of its own to adapt.
     pub phi_initial_interval: Duration,
     /// How long a dead node's chitchat state is retained before this node
-    /// forgets it entirely. Bounded well below chitchat's own 24h default so
-    /// a churning cluster doesn't grow memory unboundedly.
+    /// forgets it. Bounded well below chitchat's own 24h default.
     pub dead_node_grace_period: Duration,
-    /// Grace period for tombstoned *chitchat key-values* (distinct from this
-    /// crate's own cache tombstones, [`tombstone_ttl`](Self::tombstone_ttl)
-    /// above) before chitchat garbage-collects them.
+    /// Grace period for tombstoned chitchat key-values, distinct from this
+    /// crate's own cache tombstones, before chitchat garbage-collects them.
     pub kv_tombstone_grace_period: Duration,
     /// Wall-clock budget for the state transfer a [`Mode::Replicated`] cache
-    /// runs inside `open()` (and inside the deferred warm-up when `open()`
-    /// raced gossip convergence): how long a joining node keeps pulling a
-    /// snapshot from donors before giving up and proceeding with whatever it
-    /// has. A startup-latency bound, not a correctness one: anti-entropy
-    /// repairs whatever the cut-off transfer didn't deliver, so size it for
-    /// how long `open()` may block, not for safety. Transfer moves roughly
-    /// tens of thousands of small entries per second on a LAN; the default
-    /// comfortably covers caches into the hundreds of thousands of entries,
-    /// and a million-entry cache warms fully inside `open()` only if this is
-    /// raised to match. Zero is honored: `open()` skips waiting entirely and
-    /// leaves all warming to anti-entropy.
+    /// runs inside `open()`: how long a joining node pulls a snapshot from
+    /// donors before giving up and proceeding with whatever it has. A
+    /// startup-latency bound, not a correctness one: anti-entropy repairs
+    /// whatever the cut-off transfer didn't deliver. Zero is honored:
+    /// `open()` skips waiting entirely.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
     /// Bucket size past which an anti-entropy responder answers a mismatch
-    /// with an IBLT sketch (`Msg::AeSketch`) instead of the bucket's full
-    /// `(key, version)` listing (`Msg::AeBucket`). A sketch costs a fixed
-    /// ~9 KB at the default `ae_sketch_cells`; a listing costs ~23 bytes per
-    /// entry with small keys, so 384 is the crossover, sooner for larger
-    /// keys. Below it a listing is cheaper; above it the sketch's cost stays
-    /// flat while the listing's keeps climbing.
+    /// with an IBLT sketch instead of the bucket's full listing. A sketch
+    /// costs a fixed ~9 KB at the default `ae_sketch_cells`; a listing costs
+    /// ~23 bytes per entry, so 384 is the crossover for small keys.
     pub ae_sketch_min_bucket: usize,
-    /// Cell count of the IBLT sketch an anti-entropy responder builds for a
-    /// bucket past [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The
-    /// default of 240 decodes a symmetric difference of up to 100 elements
-    /// in at least 99% of cases (`cluster::sketch::RATED_CAPACITY` gives the
-    /// measured curve); a larger difference, or the rare undecodable
-    /// smaller one, falls back to `Msg::AeEntries`'s full listing rather
-    /// than risking a wrong decode.
+    /// Cell count of the IBLT sketch built for a bucket past
+    /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of
+    /// 240 decodes a difference of up to 100 elements in at least 99% of
+    /// cases; an undecodable one falls back to a full listing.
     pub ae_sketch_cells: usize,
-    /// Mutual-TLS material for the data-plane mesh (feature `tls`); `None`
-    /// (the default) means the mesh runs plaintext. See [`TlsConfig`]'s own
-    /// docs for what setting this implies.
+    /// Mutual-TLS material for the data-plane mesh; `None` (the default)
+    /// means the mesh runs plaintext. See [`TlsConfig`].
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
 }
@@ -160,11 +123,9 @@ impl ClusterConfig {
         self.tombstone_ttl >= self.ae_interval.saturating_mul(3)
     }
 
-    /// Applies `f` to a mutable borrow of `self` and returns it. Since
-    /// `ClusterConfig` is `#[non_exhaustive]`, this is how code outside this
-    /// crate overrides a subset of fields on top of
-    /// [`ClusterConfig::default`] without breaking when a new field is
-    /// added.
+    /// Applies `f` to a mutable borrow of `self` and returns it: how code
+    /// outside this crate overrides a subset of fields on
+    /// [`ClusterConfig::default`] without breaking when a field is added.
     #[must_use]
     pub fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
         f(&mut self);

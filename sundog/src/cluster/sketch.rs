@@ -1,32 +1,26 @@
 //! A partitioned invertible Bloom lookup table (IBLT) over one anti-entropy
-//! bucket's `(key_hash, version)` elements, where `key_hash` is the
-//! `xxh3_64` of the key bytes that `store::bucket_of` takes its low bits
-//! from. [`super::anti_entropy`] uses it to reconcile a large bucket without
-//! shipping the bucket's entry list.
+//! bucket's `(key_hash, version)` elements. [`super::anti_entropy`] uses it
+//! to reconcile a large bucket without shipping the bucket's entry list.
 //!
 //! Each side inserts its bucket into an [`Iblt`] of the same shape. One side
 //! sends its sketch; the other [`Iblt::subtract`]s the two and
 //! [`Iblt::peel`]s the result into the elements present on only one side.
-//! The sketch's wire size is fixed by its cell count, whatever the bucket
-//! holds, and decoding succeeds whenever the two sides differ by no more
-//! than roughly [`RATED_CAPACITY`] elements.
+//! The wire size is fixed by cell count, and decoding succeeds whenever the
+//! two sides differ by no more than roughly [`RATED_CAPACITY`] elements.
 //!
 //! # Structure
 //!
 //! [`IBLT_PARTITIONS`] equal partitions of [`Cell`]s. An element lands in one
-//! cell per partition, at `mix(placement_hash, p) % partition_len`, so its
-//! three cells are always distinct. `placement_hash` is `check`'s hash of
-//! the whole element, key and version together. Placing by key alone would
-//! put two versions of one key in the same cells, where their counts cancel
-//! and their version bytes stay folded together in a cell that can never
-//! become pure.
+//! cell per partition, at `mix(placement_hash, p) % partition_len`, always
+//! distinct. `placement_hash` is `check`'s hash of the whole element, key and
+//! version together; placing by key alone would put two versions of one key
+//! in the same cells, where they cancel and can never become pure.
 //!
 //! # Never wrong
 //!
 //! [`Iblt::peel`] accepts a cell only when its count is `1` or `-1` and its
-//! checksum matches the element it claims to hold. A difference too large to
-//! resolve leaves cells non-zero and returns [`Undecodable`]; the caller
-//! falls back to the bucket's full listing.
+//! checksum matches. A difference too large to resolve leaves cells
+//! non-zero and returns [`Undecodable`]; the caller falls back to a listing.
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
@@ -34,49 +28,37 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
-/// Number of independent hash partitions each element is inserted into —
-/// see this module's docs for why partitioning (rather than `k` independent
-/// hashes into one flat table) is the shape used here.
+/// Number of independent hash partitions each element is inserted into. See
+/// this module's docs for why partitioning is the shape used here.
 pub(crate) const IBLT_PARTITIONS: usize = 3;
 
-/// Symmetric-difference size the crate's default sketch shape
-/// ([`crate::config::ClusterConfig::ae_sketch_cells`]'s default of 240
-/// cells, 80 per partition at [`IBLT_PARTITIONS`] = 3) decodes in at least
-/// 99% of cases.
-///
-/// An IBLT decodes by peeling cells that hold exactly one element; a
-/// difference whose elements overlap in every cell they touch stalls the
-/// peel, so decoding is a probability, not a guarantee. Measured over
-/// seeded random differences at the default shape: 240 cells decode a
-/// 100-element difference 99% of the time, 140 elements 98%, 180 elements
-/// 88%; 120 cells hold up to about 60. Pinned by
-/// `prop_tests::rated_capacity_decodes_at_least_ninety_eight_percent`. A
-/// failed decode costs one listing fallback, never a wrong answer.
+/// Symmetric-difference size the default sketch shape (240 cells) decodes in
+/// at least 99% of cases. Decoding is a probability, not a guarantee: it
+/// peels cells holding exactly one element, and a difference whose elements
+/// overlap in every cell they touch stalls the peel. A failed decode costs
+/// one listing fallback, never a wrong answer.
 // Only read by the tests that pin it; a non-test build never evaluates it.
 #[allow(dead_code)]
 pub(crate) const RATED_CAPACITY: usize = 100;
 
-/// Distinct per-partition salts folded into [`mix`] — arbitrary odd 64-bit
-/// mixing constants, not secret, whose only job is keeping the three
-/// partitions' hash functions independent of each other.
+/// Distinct per-partition salts folded into [`mix`]: arbitrary odd 64-bit
+/// constants keeping the three partitions' hash functions independent.
 const PARTITION_SALTS: [u64; IBLT_PARTITIONS] = [
     0x9E37_79B9_7F4A_7C15,
     0xC2B2_AE3D_27D4_EB4F,
     0x1656_67B1_9E37_79F9,
 ];
 
-/// The per-partition hash placing a `placement_hash` (this module's
-/// docs; [`check`]'s hash of a whole element) in partition `p`: salting
-/// then re-hashing keeps the three partitions' placements independent, so a
-/// collision in one partition is very unlikely to recur in the other two.
+/// The per-partition hash placing a `placement_hash` in partition `p`:
+/// salting then re-hashing keeps the three partitions' placements
+/// independent, so a collision in one is unlikely to recur in the others.
 fn mix(placement_hash: u64, partition: usize) -> u64 {
     xxh3_64(&(placement_hash ^ PARTITION_SALTS[partition]).to_le_bytes())
 }
 
-/// `xxh3_64` over the concatenated little-endian bytes of `(key_hash,
-/// wall_ms, logical, node)`: the fingerprint [`Iblt::peel`] checks a
-/// candidate "pure" cell's accumulated sums against before trusting it as a
-/// real, single element rather than an accidental combination of several.
+/// `xxh3_64` over `(key_hash, wall_ms, logical, node)`: the fingerprint
+/// [`Iblt::peel`] checks a candidate "pure" cell against before trusting it
+/// as a real, single element rather than an accidental combination.
 fn check(key_hash: u64, wall_ms: u64, logical: u32, node: u64) -> u64 {
     let mut buf = [0u8; 8 + 8 + 4 + 8];
     buf[0..8].copy_from_slice(&key_hash.to_le_bytes());
@@ -86,22 +68,14 @@ fn check(key_hash: u64, wall_ms: u64, logical: u32, node: u64) -> u64 {
     xxh3_64(&buf)
 }
 
-/// One IBLT cell: `count`, and XOR sums of every accumulated element's
-/// `key_hash` and version fields, plus `check_sum`, the fingerprint that
-/// verifies a "pure" cell genuinely holds exactly one element. `Default` is
-/// the empty cell (every field zero), what every cell in a freshly built
-/// `Iblt` starts as.
+/// One IBLT cell: `count`, XOR sums of every accumulated element's
+/// `key_hash` and version fields, and `check_sum`, the fingerprint that
+/// verifies a "pure" cell holds exactly one element. `Default` is the empty
+/// cell, what every cell in a freshly built `Iblt` starts as.
 ///
 /// Reachable outside `cluster::sketch` only because
-/// [`crate::wire::Msg::AeSketch`] carries a `Vec<Cell>` on the wire
-/// (re-exported as [`crate::wire::Cell`]); every field stays private to
-/// this module. Serde postcard-encodes this as five varints plus a signed
-/// varint for `count`, so an empty cell costs six bytes on the wire — cheap,
-/// but not the typical cell a responder sends: `Msg::AeSketch` carries the
-/// un-subtracted sketch built from every entry the responder's own bucket
-/// holds, so how many cells stay empty depends on the bucket's population
-/// against [`crate::config::ClusterConfig::ae_sketch_cells`], not on
-/// `RATED_CAPACITY`.
+/// [`crate::wire::Msg::AeSketch`] carries a `Vec<Cell>` on the wire,
+/// re-exported as [`crate::wire::Cell`]; every field stays private here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     count: i32,
@@ -123,17 +97,15 @@ impl Cell {
     }
 
     /// `true` if this cell's `count` claims exactly one net element and its
-    /// accumulated sums check out as a real, single `(key_hash, ver)`
-    /// rather than an accidental combination — the only condition under
+    /// sums check out as a real `(key_hash, ver)`, the only condition under
     /// which [`Iblt::peel`] trusts a cell enough to peel it.
     fn is_pure_and_valid(self) -> bool {
         (self.count == 1 || self.count == -1)
             && self.check_sum == check(self.key_sum, self.wall_sum, self.logical_sum, self.node_sum)
     }
 
-    /// The element a pure cell claims to hold, read straight off its
-    /// accumulated sums. Only meaningful when [`Cell::is_pure_and_valid`]
-    /// holds — callers only ever call this after checking that.
+    /// The element a pure cell claims to hold, read off its accumulated
+    /// sums. Meaningful only when [`Cell::is_pure_and_valid`] holds.
     fn claimed_elem(self) -> Elem {
         Elem {
             key_hash: self.key_sum,
@@ -147,35 +119,30 @@ impl Cell {
 }
 
 /// One IBLT element: a key's `xxh3_64` hash paired with its version, never
-/// the key's actual bytes, since a sketch decodes without either side
-/// shipping its elements. A pulled-only element is therefore always pulled
-/// by hash ([`crate::wire::Msg::AePullHashes`]), never by key.
+/// the key's actual bytes. A pulled-only element is always pulled by hash
+/// ([`crate::wire::Msg::AePullHashes`]), never by key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Elem {
     pub(crate) key_hash: u64,
     pub(crate) ver: Hlc,
 }
 
-/// [`Iblt::peel`]'s success case: every element present on one side of the
-/// `subtract` but not the other, split by which side. `only_left` is what
-/// the sketch that called `subtract` had and the other didn't; `only_right`
-/// is the reverse.
+/// [`Iblt::peel`]'s success case: every element on one side of `subtract`
+/// but not the other. `only_left` is what the caller had and the other
+/// didn't; `only_right` is the reverse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Decoded {
     pub(crate) only_left: Vec<Elem>,
     pub(crate) only_right: Vec<Elem>,
 }
 
-/// [`Iblt::peel`]'s failure case: the symmetric difference between the two
-/// sketches was too large (or, vanishingly unlikely, an accidental
-/// checksum collision blocked a real cell) for peeling to fully resolve
-/// every cell back to zero. Never means a wrong result was returned, only
-/// that no result could be; the caller's fallback path (`AeEntries`) is
-/// exact regardless of size.
+/// [`Iblt::peel`]'s failure case: the symmetric difference was too large
+/// for peeling to resolve every cell back to zero. Never a wrong result,
+/// only no result; the caller's `AeEntries` fallback is exact regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Undecodable;
 
-/// A partitioned IBLT over `(key_hash, version)` elements — see this
+/// A partitioned IBLT over `(key_hash, version)` elements; see this
 /// module's docs for the overall scheme.
 #[derive(Debug, Clone)]
 pub(crate) struct Iblt {
@@ -184,15 +151,9 @@ pub(crate) struct Iblt {
 }
 
 impl Iblt {
-    /// Builds an empty sketch with (approximately) `cells` total cells,
-    /// split evenly across [`IBLT_PARTITIONS`] partitions, each
-    /// `(cells / IBLT_PARTITIONS).max(1)` long so a tiny or zero `cells`
-    /// still yields a well-formed, if uselessly small, sketch. Pass
-    /// [`crate::config::ClusterConfig::ae_sketch_cells`] for the
-    /// responder's own outbound sketch; the initiator instead builds its
-    /// comparison sketch over the received sketch's own `cells.len()` (via
-    /// [`Iblt::from_cells`]'s companion sizing), so the two stay
-    /// shape-compatible regardless of config drift between nodes.
+    /// Builds an empty sketch with approximately `cells` total cells, split
+    /// evenly across [`IBLT_PARTITIONS`] partitions. A tiny or zero `cells`
+    /// still yields a well-formed, if uselessly small, sketch.
     pub(crate) fn new(cells: usize) -> Self {
         let partition_len = (cells / IBLT_PARTITIONS).max(1);
         Self {
@@ -201,11 +162,8 @@ impl Iblt {
         }
     }
 
-    /// Rebuilds a sketch from cells received off the wire
-    /// ([`crate::wire::Msg::AeSketch`]'s payload). `partition_len` is
-    /// re-derived from `cells.len()` the same way [`Iblt::new`] derives it,
-    /// so a sketch built with `new` and one rebuilt here from its own
-    /// `into_cells()` output always agree on shape.
+    /// Rebuilds a sketch from cells received off the wire; `partition_len`
+    /// is re-derived the same way [`Iblt::new`] derives it.
     pub(crate) fn from_cells(cells: Vec<Cell>) -> Self {
         let partition_len = (cells.len() / IBLT_PARTITIONS).max(1);
         Self {
@@ -214,17 +172,13 @@ impl Iblt {
         }
     }
 
-    /// Unwraps this sketch's cells for the wire
-    /// ([`crate::wire::Msg::AeSketch`]'s payload).
+    /// Unwraps this sketch's cells for the wire.
     pub(crate) fn into_cells(self) -> Vec<Cell> {
         self.cells
     }
 
-    /// The three cell indices a `placement_hash` ([`check`]'s hash of a
-    /// whole element, not a bare `key_hash`) maps to, one per partition:
-    /// always three distinct offsets within their own partition, so never
-    /// the same cell twice since each partition owns a disjoint slice of
-    /// `self.cells`.
+    /// The three cell indices a `placement_hash` maps to, one per
+    /// partition; always distinct, since partitions own disjoint slices.
     fn locations(&self, placement_hash: u64) -> [usize; IBLT_PARTITIONS] {
         let partition_len_u64 =
             u64::try_from(self.partition_len).expect("invariant: partition_len fits in u64");
@@ -237,8 +191,7 @@ impl Iblt {
     }
 
     /// Folds `(key_hash, ver)` into this sketch with `sign` (`1` to insert,
-    /// `-1` to remove) at each of its three cells, placed by the whole
-    /// element's hash, never by `key_hash` alone.
+    /// `-1` to remove), placed by the whole element's hash.
     fn apply(&mut self, key_hash: u64, ver: Hlc, sign: i32) {
         let c = check(key_hash, ver.wall_ms, ver.logical, ver.node.as_u64());
         for idx in self.locations(c) {
@@ -258,16 +211,13 @@ impl Iblt {
     }
 
     /// The symmetric-difference sketch: cell-wise `count` subtraction and
-    /// XOR of every other field. An element present at the same version on
-    /// both sides cancels to a zero cell in all three of its locations; an
-    /// element present on only one side, or at different versions on each,
-    /// survives as a nonzero contribution [`Iblt::peel`] can later resolve.
+    /// XOR of every other field. An element at the same version on both
+    /// sides cancels to zero; one differing or on only one side survives
+    /// for [`Iblt::peel`] to resolve.
     ///
     /// # Panics
     ///
-    /// Panics if `self` and `other` have a different cell count. The two
-    /// sketches being compared are always shape-compatible by construction
-    /// ([`Iblt::new`]'s docs), so this is an invariant violation.
+    /// Panics if `self` and `other` have a different cell count.
     pub(crate) fn subtract(&self, other: &Self) -> Self {
         assert_eq!(
             self.cells.len(),
@@ -293,21 +243,15 @@ impl Iblt {
         }
     }
 
-    /// Unwinds this already-subtracted sketch back into the exact list of
-    /// elements only on the `self` ("left") side and only on the `other`
-    /// ("right") side of that subtraction. Upholds the "never wrong, only
-    /// sometimes undecodable" guarantee described in this module's docs.
+    /// Unwinds this already-subtracted sketch into the exact list of
+    /// elements only on the `self` ("left") side and only on `other`
+    /// ("right"). Upholds the "never wrong, only sometimes undecodable"
+    /// guarantee described in this module's docs.
     ///
-    /// Standard IBLT peeling: repeatedly finds a cell that is verified pure
-    /// (`Cell::is_pure_and_valid`), records the element it claims, subtracts
-    /// that element back out of all three of its cells (zeroing the
-    /// peeled cell, and possibly purifying one of the other two), and
-    /// repeats via a work queue until no verified-pure cells remain. If
-    /// every cell has returned to zero at that point, the decode is exact;
-    /// otherwise the remaining nonzero cells mean the difference was too
-    /// large (or, astronomically unlikely, a checksum collision blocked a
-    /// real cell), and this returns [`Undecodable`] rather than a partial
-    /// or guessed result.
+    /// Standard IBLT peeling: repeatedly finds a verified-pure cell, records
+    /// its element, subtracts it back out of all three of its cells, and
+    /// requeues any cell that newly purifies. If every cell returns to zero,
+    /// the decode is exact; otherwise this returns [`Undecodable`].
     pub(crate) fn peel(mut self) -> Result<Decoded, Undecodable> {
         let mut only_left = Vec::new();
         let mut only_right = Vec::new();
@@ -318,14 +262,12 @@ impl Iblt {
         while let Some(idx) = queue.pop_front() {
             let cell = self.cells[idx];
             if !cell.is_pure_and_valid() {
-                continue; // touched again since it was enqueued; re-checked below if it re-purifies
+                continue; // touched again since it was enqueued
             }
             let elem = cell.claimed_elem();
             let sign = cell.count;
-            // `cell.check_sum`, already verified equal to `check(key_sum,
-            // wall_sum, logical_sum, node_sum)` by `is_pure_and_valid`
-            // above, is this element's placement hash, so re-deriving it
-            // from `elem`'s fields would recompute the same value.
+            // `cell.check_sum` is already this element's placement hash,
+            // verified by `is_pure_and_valid` above.
             let placement_hash = cell.check_sum;
             for target in self.locations(placement_hash) {
                 let c = &mut self.cells[target];
@@ -456,9 +398,8 @@ mod tests {
         let right: Vec<(u64, Hlc)> = (100..300u64).map(|k| (k, ver(k + 1))).collect();
         let a = sketch_of(&left, cells);
         let b = sketch_of(&right, cells);
-        // `Err(Undecodable)` is also an acceptable outcome here (an
-        // oversubscribed sketch reporting it can't decode, never a wrong
-        // answer) — only a successful decode has anything further to check.
+        // `Err(Undecodable)` is an acceptable outcome here too; only a
+        // successful decode has anything further to check.
         if let Ok(decoded) = a.subtract(&b).peel() {
             let left_set: HashSet<Elem> = left
                 .iter()

@@ -7,25 +7,18 @@ use smol_str::SmolStr;
 
 use crate::node::NodeId;
 
-/// Errors from encoding or decoding a [`crate::wire::Msg`] or [`crate::wire::WireRecord`]
-/// on the wire.
+/// Errors from encoding or decoding a [`crate::wire::Msg`] or [`crate::wire::WireRecord`].
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     /// The frame exceeded [`crate::wire::MAX_FRAME`].
     #[error("frame of {size} bytes exceeds the {limit}-byte cap")]
-    FrameTooLarge {
-        /// The offending frame's size in bytes.
-        size: usize,
-        /// The configured cap it exceeded.
-        limit: usize,
-    },
+    FrameTooLarge { size: usize, limit: usize },
     /// postcard failed to serialize or deserialize a value.
     #[error("postcard codec error")]
     Postcard(#[from] postcard::Error),
     /// A raw-record frame (`Replicate`/`ReplicateBatch`/`StChunk`) failed to
-    /// parse: a header didn't fit, a length field pointed past the frame's
-    /// end, the cache name wasn't valid UTF-8, or a length exceeded what the
-    /// layout's fixed-width fields can hold.
+    /// parse: a header didn't fit, a length pointed past the frame's end, or
+    /// the cache name wasn't valid UTF-8.
     #[error("malformed record frame: {0}")]
     MalformedFrame(&'static str),
     /// The underlying I/O stream failed.
@@ -62,59 +55,42 @@ pub enum JoinError {
 /// Errors from operating on a named [`crate::cache::Cache`].
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
-    /// A value (or its postcard-encoded key) exceeded the configured max frame size
-    /// and was rejected at the API boundary rather than fragmented.
+    /// A value or key exceeded the configured max frame size and was
+    /// rejected at the API boundary rather than fragmented.
     #[error("value for cache {cache:?} is {size} bytes, exceeding the {limit}-byte frame cap")]
     ValueTooLarge {
         /// The cache the oversized write targeted.
         cache: SmolStr,
-        /// The encoded size in bytes.
         size: usize,
         /// The configured cap it exceeded.
         limit: usize,
     },
     /// The named cache was opened locally with a [`crate::store::Mode`] that
-    /// conflicts with how another live node already has it configured.
-    ///
-    /// [`crate::cache::CacheBuilder::open`] checks the requested mode
-    /// against every live peer's advertised `cache:<name>` fingerprint
-    /// before registering the shard. Since that check only sees gossip that
-    /// has already converged, two nodes opening the same name under
-    /// different modes at nearly the same moment can both pass it;
-    /// `cluster`'s membership-change handling re-checks on every view
-    /// change and logs whatever this constructor-time check missed.
+    /// conflicts with how another live node already has it configured. This
+    /// check is best-effort: two nodes opening the same name at nearly the
+    /// same moment can both pass it, so `cluster` re-checks on every
+    /// membership view and logs whatever this check missed.
     #[error("cache {cache:?} mode mismatch: local {local:?}, cluster has {remote:?}")]
     ModeMismatch {
-        /// The cache name.
         cache: SmolStr,
         /// The mode requested locally.
         local: crate::store::Mode,
-        /// The mode observed elsewhere in the cluster.
+        /// The mode observed elsewhere.
         remote: crate::store::Mode,
     },
     /// The cache was opened as [`crate::store::Mode::Replicated`] with a
-    /// finite `max_capacity` or `tti`. Replicated mode expects every node to
-    /// hold every entry; anti-entropy would silently re-pull back any entry
-    /// evicted locally for capacity or idle reasons from a peer that still
-    /// holds it, defeating the bound. Use [`crate::store::Mode::Invalidation`]
-    /// for a bounded local cache, or leave `max_capacity`/`tti` unset for a
-    /// `Replicated` one.
+    /// finite `max_capacity` or `tti`. Every `Replicated` node holds every
+    /// entry, so anti-entropy would silently re-pull an evicted entry back.
+    /// Use [`crate::store::Mode::Invalidation`] for a bounded local cache.
     #[error(
         "cache {cache:?} combines Mode::Replicated with a finite max_capacity or tti, which anti-entropy would silently defeat"
     )]
-    ReplicatedWithLocalEviction {
-        /// The cache name.
-        cache: SmolStr,
-    },
-    /// The named cache is already open in this process. Reopening under a
-    /// different key/value type would be unsound (the registry is
-    /// type-erased), so a second `open()` for the same name is always
-    /// rejected, even when the type matches.
+    ReplicatedWithLocalEviction { cache: SmolStr },
+    /// The named cache is already open in this process. The registry is
+    /// type-erased, so a second `open()` is always rejected, even when the
+    /// key/value types match.
     #[error("cache {cache:?} is already open in this process")]
-    AlreadyOpen {
-        /// The cache name.
-        cache: SmolStr,
-    },
+    AlreadyOpen { cache: SmolStr },
     /// A read-through loader returned an error.
     #[error("read-through loader failed")]
     Loader(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
@@ -124,9 +100,7 @@ pub enum CacheError {
     /// State transfer for a newly opened cache failed.
     #[error("state transfer from donor {donor} failed")]
     StateTransfer {
-        /// The donor node that was streaming the snapshot.
         donor: NodeId,
-        /// The underlying cause.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },

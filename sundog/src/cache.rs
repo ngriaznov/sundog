@@ -66,35 +66,28 @@ where
 
     /// Sets the cache's default lifespan (TTL): every write is stamped with
     /// an absolute `expires_at_ms` that replicates with the record, so an
-    /// entry expires at the same instant on every node. Default: no expiry.
-    /// [`Cache::insert_with_ttl`] and [`Cache::insert_many_with_ttl`]
-    /// override it per write; reads never touch expiry.
+    /// entry expires at the same instant everywhere. Default: no expiry.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
     }
 
-    /// Sets a local-only max-idle (TTI). Deliberately not cluster-replicated.
-    /// Default: no idle expiry.
+    /// Sets a local-only max-idle (TTI), not cluster-replicated. Default: no idle expiry.
     pub fn tti(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self
     }
 
     /// Overrides the [`ConflictResolver`] that decides which of two
-    /// differently-versioned records for the same key wins, consulted by
-    /// every versioned apply. Default: [`LwwResolver`] (last-write-wins by
-    /// [`crate::Hlc`]). See [`ConflictResolver::winner`] for the
-    /// correctness contract a custom resolver must satisfy.
+    /// differently-versioned records for the same key wins. Default:
+    /// [`LwwResolver`], last-write-wins by [`crate::Hlc`].
     pub fn resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
         self.resolver = resolver;
         self
     }
 
     /// Sets a custom per-entry weigher for size-bounded eviction:
-    /// `max_capacity` then becomes a weight budget rather than an entry
-    /// count. Default: every entry weighs 1, so `max_capacity` counts
-    /// entries.
+    /// `max_capacity` becomes a weight budget rather than an entry count.
     pub fn weigher<W>(mut self, weigher: W) -> Self
     where
         W: Fn(&K, &V) -> u32 + Send + Sync + 'static,
@@ -103,52 +96,32 @@ where
         self
     }
 
-    /// Opens the cache: builds the local shard and registers it in the
-    /// cluster's shard registry, so inbound replication/invalidation and
-    /// anti-entropy/state-transfer requests for this name can find it from
-    /// this point on; unless `mode` is [`Mode::Local`], starts fanning this
-    /// shard's own local writes out to the mesh per `mode`.
+    /// Opens the cache: builds the local shard, registers it in the
+    /// cluster's shard registry, and, unless `mode` is [`Mode::Local`],
+    /// starts fanning local writes out to the mesh per `mode`.
     ///
     /// For [`Mode::Replicated`], `open()` also runs state transfer before
     /// returning: pulls a full snapshot from the lowest-node-id live peer,
-    /// applies it through the same versioned-apply path as live traffic,
-    /// then runs one immediate anti-entropy round against that donor. This
-    /// is bounded by
-    /// [`ClusterConfig::state_transfer_budget`](crate::config::ClusterConfig::state_transfer_budget)
-    /// — an unresponsive or empty cluster does not block `open()` forever,
-    /// and a cache too large to finish inside the budget opens with a
-    /// partial copy that anti-entropy tops up — and is followed by a
-    /// background anti-entropy scheduler for the life of the cache.
-    /// `Mode::Invalidation` gets neither, since its nodes are meant to hold
-    /// independent subsets and there is no cluster-wide snapshot to warm
-    /// from.
+    /// then runs one anti-entropy round against that donor, bounded by
+    /// `ClusterConfig::state_transfer_budget`. A cache too large to finish
+    /// inside the budget opens with a partial copy anti-entropy tops up.
     ///
     /// # Errors
     ///
     /// Returns [`CacheError::AlreadyOpen`] if a cache named `name` is
-    /// already open in this process; the shard registry is type-erased, so
-    /// a second `open()` is always rejected even when `K`/`V` match.
+    /// already open in this process.
     ///
     /// Returns [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
-    /// [`Mode::Replicated`] and `max_capacity`/`tti` was also set: every
-    /// node in `Replicated` mode is expected to hold every entry, so a
-    /// local capacity/idle eviction would be silently re-pulled back by the
-    /// next anti-entropy round, defeating the bound.
+    /// [`Mode::Replicated`] and `max_capacity`/`tti` was also set: a local
+    /// eviction would be silently re-pulled by the next anti-entropy round.
     ///
     /// Returns [`CacheError::ModeMismatch`] if a live peer already
-    /// advertises `name` under a different [`Mode`] than requested here.
-    /// This check is best-effort: it only sees gossip that has already
-    /// converged, so two nodes opening the same name under different modes
-    /// at nearly the same moment can both pass it; a background sweep in
-    /// `cluster` logs whatever mismatch this misses.
-    ///
-    /// On success, this node's [`Mode`] for `name` is gossiped, so the next
-    /// node to open (or reopen) `name` sees it.
+    /// advertises `name` under a different [`Mode`]. Best-effort: a
+    /// background sweep in `cluster` logs whatever mismatch this misses.
     ///
     /// # Panics
     ///
-    /// Panics if the shard registry lock is poisoned, which only happens if
-    /// an earlier call already panicked while holding it.
+    /// Panics if the shard registry lock is poisoned.
     pub async fn open(self) -> Result<Cache<K, V>, CacheError> {
         let Self {
             cluster,
@@ -254,9 +227,8 @@ where
     }
 }
 
-/// A typed handle to one named, possibly-clustered cache.
-///
-/// Cheap to `Clone`; every clone shares the same underlying [`Shard`].
+/// A typed handle to one named, possibly-clustered cache. Cheap to
+/// `Clone`; every clone shares the same underlying [`Shard`].
 #[derive(Clone)]
 pub struct Cache<K, V>
 where
@@ -295,34 +267,28 @@ where
         self.shard.get(key).await
     }
 
-    /// Reads whether `key` has a live entry, honoring expiry, without
-    /// cloning the stored value.
+    /// Reads whether `key` has a live entry, honoring expiry, without cloning it.
     pub async fn contains_key(&self, key: &K) -> bool {
         self.shard.contains_key(key).await
     }
 
-    /// The number of live entries in this node's local copy of the cache.
-    /// Counts only this node: `Invalidation`-mode nodes legitimately hold
-    /// different subsets, and even `Replicated`-mode nodes may briefly
-    /// disagree under replication lag.
+    /// The number of live entries in this node's local copy; nodes may
+    /// legitimately hold different subsets or briefly disagree under lag.
     pub async fn entry_count(&self) -> u64 {
         self.shard.entry_count().await
     }
 
-    /// A weakly consistent, point-in-time snapshot of this node's local live
-    /// keys — not a cluster view, and no guarantee about a key inserted
-    /// concurrently with the scan. Cost is O(entries).
+    /// A weakly consistent snapshot of this node's local live keys, not a cluster view. O(entries).
     #[must_use]
     pub fn keys(&self) -> Vec<K> {
         self.shard.keys()
     }
 
-    /// Reads `key`, invoking `loader` on a miss; concurrent misses on the
-    /// same key are collapsed into one `loader` call.
+    /// Reads `key`, invoking `loader` on a miss; concurrent misses collapse into one `loader` call.
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::Loader`] if `loader` fails. Returns
+    /// Returns [`CacheError::Loader`] if `loader` fails, or
     /// [`CacheError::Codec`] if `key` fails to postcard-encode.
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
@@ -332,9 +298,7 @@ where
         self.shard.get_or_load(key, loader).await
     }
 
-    /// [`Cache::get_or_load`] for a loader that never fails: same stampede
-    /// collapse on concurrent misses, same fan-out of the fill. The
-    /// `Result` remains only for [`CacheError::Codec`].
+    /// [`Cache::get_or_load`] for a loader that never fails; `Result` remains only for [`CacheError::Codec`].
     ///
     /// # Errors
     ///
@@ -348,23 +312,18 @@ where
     }
 
     /// Writes `key` = `value`: stamps an HLC version, applies locally, and
-    /// fans out per [`Mode`]. The entry gets the cache's default TTL, if
-    /// one is configured — [`Cache::insert_with_ttl`] gives it its own.
+    /// fans out per [`Mode`]. Gets the cache's default TTL, if configured.
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds the
-    /// configured frame cap. Returns [`CacheError::Codec`] if `key` fails to
-    /// postcard-encode.
+    /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds
+    /// the frame cap, or [`CacheError::Codec`] if `key` fails to encode.
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.insert(key, value).await
     }
 
-    /// [`Cache::insert`] with a lifespan for this entry alone: `ttl`
-    /// overrides the cache's default (shorter or longer), and gives an
-    /// entry an expiry on a cache configured with none. The absolute
-    /// deadline travels with the record, so the entry expires at the same
-    /// instant on every node.
+    /// [`Cache::insert`] with a lifespan for this entry alone; `ttl`
+    /// overrides the cache's default and travels with the record.
     ///
     /// # Errors
     ///
@@ -373,21 +332,14 @@ where
         self.shard.insert_with_ttl(key, value, ttl).await
     }
 
-    /// Writes many entries at once: each is stamped with its own HLC version
-    /// and applied locally under one acquisition of the store's apply lock,
-    /// emitting one [`Event`] per entry exactly as [`Cache::insert`] would.
-    /// **Not a transaction** — there is no single version or all-or-nothing
-    /// outcome: if an entry partway through fails to encode or is too
-    /// large, the entries before it are still applied. This call never
-    /// builds a batched wire message itself; `net::conn`'s per-peer writer
-    /// opportunistically coalesces the outbox into `Msg::ReplicateBatch`
-    /// frames.
+    /// Writes many entries under one acquisition of the store's apply lock,
+    /// emitting one [`Event`] per entry as [`Cache::insert`] would. **Not a
+    /// transaction**: an entry that fails partway through still leaves the
+    /// entries before it applied.
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] if any entry's encoded wire
-    /// frame exceeds the configured frame cap. Returns [`CacheError::Codec`]
-    /// if a key fails to postcard-encode.
+    /// As [`Cache::insert`], for any entry.
     pub async fn insert_many(
         &self,
         entries: impl IntoIterator<Item = (K, V)>,
@@ -395,9 +347,8 @@ where
         self.shard.insert_many(entries).await
     }
 
-    /// [`Cache::insert_many`] with one lifespan applied to every entry in
-    /// the batch, overriding the cache's default — see
-    /// [`Cache::insert_with_ttl`].
+    /// [`Cache::insert_many`] with one lifespan applied to every entry,
+    /// overriding the cache's default.
     ///
     /// # Errors
     ///
@@ -414,14 +365,12 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a [`CacheError`] if the removal cannot be applied or fanned out.
+    /// Returns a [`CacheError`] if the removal cannot apply or fan out.
     pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
         self.shard.remove(key).await
     }
 
-    /// [`Cache::remove`] for many keys at once: the tombstone counterpart of
-    /// [`Cache::insert_many`], same not-a-transaction caveat, read "written"
-    /// as "tombstoned". Emits one [`Event::Removed`] per key.
+    /// [`Cache::remove`] for many keys at once, the tombstone counterpart of [`Cache::insert_many`].
     ///
     /// # Errors
     ///
@@ -430,12 +379,9 @@ where
         self.shard.remove_many(keys).await
     }
 
-    /// Tombstones every key this node currently holds — not a coordinated
-    /// cluster-wide reset. An entry a peer holds that never reached this
-    /// node, or a concurrent write that outraces the snapshot's tombstone
-    /// on the HLC, survives; in [`crate::store::Mode::Replicated`], where
-    /// every node holds every entry, that makes it a cluster-wide clear
-    /// once the fanned-out tombstones converge. Cost is O(entries).
+    /// Tombstones every key this node currently holds, not a coordinated
+    /// cluster-wide reset: an entry never reached from a peer, or a
+    /// concurrent write outracing the tombstone's HLC, survives.
     ///
     /// # Errors
     ///
@@ -445,14 +391,12 @@ where
     }
 
     /// Drops the local copy of `key` without writing a tombstone or fanning
-    /// out — an escape hatch for tests and manual cache-busting; the entry
-    /// may reappear on the next replicated write or anti-entropy round.
+    /// out. The entry may reappear on the next anti-entropy round.
     pub async fn invalidate_local(&self, key: &K) {
         self.shard.invalidate_local(key).await;
     }
 
-    /// Subscribes to this cache's change events (created/updated/removed,
-    /// each tagged with its [`crate::store::Origin`]).
+    /// Subscribes to this cache's change events, each tagged with its [`crate::store::Origin`].
     #[must_use]
     pub fn events(&self) -> broadcast::Receiver<Event<K, V>> {
         self.shard.events()

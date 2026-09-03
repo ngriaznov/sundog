@@ -15,22 +15,18 @@ use crate::net::Mesh;
 use crate::node::NodeId;
 use crate::store::ShardOps;
 
-/// Delay between retrying the same still-live donor after a transient
-/// failure (e.g. the mesh hasn't finished dialing it yet).
+/// Delay between retrying the same still-live donor after a transient failure.
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
-/// Per-donor slice of the overall budget: how long a single donor gets to
-/// keep the stream moving before this node gives up and re-picks (a
-/// different node, if this donor died meanwhile). Two fifths of the total,
-/// so a wedged first donor still leaves room for a second full attempt plus
-/// the belt-and-braces anti-entropy sweep.
+/// Per-donor slice of the overall budget, two fifths of the total, so a
+/// wedged first donor still leaves room for a second attempt plus the
+/// closing anti-entropy sweep.
 fn per_donor_budget(total: Duration) -> Duration {
     total * 2 / 5
 }
 
-/// How [`run`] ended — [`Outcome::NoPeers`] is the caller's cue to arm
-/// [`late_sync_task`], since `open()` racing gossip convergence is normal on
-/// a cold join.
+/// How [`run`] ended. [`Outcome::NoPeers`] is the caller's cue to arm
+/// [`late_sync_task`], since racing gossip convergence is normal on a cold join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Completed,
@@ -38,20 +34,15 @@ pub(crate) enum Outcome {
     TimedOut,
 }
 
-/// Runs state transfer for `cache`, blocking until either a donor finishes
-/// (followed by one immediate anti-entropy round against it), no live peers
-/// remain to try, or [`crate::config::ClusterConfig::state_transfer_budget`]
-/// elapses.
+/// Runs state transfer for `cache`, blocking until a donor finishes, no
+/// live peers remain to try, or `state_transfer_budget` elapses.
 #[tracing::instrument(skip_all, fields(cache = %cache))]
 pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &SmolStr) -> Outcome {
     let budget = cluster.config().state_transfer_budget;
     let started = tokio::time::Instant::now();
     match tokio::time::timeout(budget, transfer_loop(cluster, shard, cache)).await {
         Ok(Some(donor)) => {
-            // Keeps the belt-and-braces sweep inside the same overall
-            // budget, rather than letting `run_round_against`'s own
-            // internal timeout run on top of the transfer loop's elapsed
-            // time.
+            // Keeps the closing sweep inside the same overall budget.
             let remaining = budget.saturating_sub(started.elapsed());
             if tokio::time::timeout(
                 remaining,
@@ -78,10 +69,8 @@ pub(crate) async fn run(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Sm
     }
 }
 
-/// One-shot deferred warm-up for a cache opened before gossip had converged:
-/// waits until the first live peer appears (or `cancel`), then runs [`run`]
-/// once. Without this, a cold joiner's `open()` finds nobody, skips state
-/// transfer, and warms up only as fast as anti-entropy intervals allow.
+/// One-shot deferred warm-up for a cache opened before gossip converged:
+/// waits until the first live peer appears, or `cancel`, then runs [`run`] once.
 pub(crate) async fn late_sync_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
@@ -111,12 +100,11 @@ pub(crate) async fn late_sync_task(
     }
 }
 
-/// Retries donors — always the current lowest-id live peer — until one
+/// Retries donors, always the current lowest-id live peer, until one
 /// completes a full snapshot or the live peer set is empty. No donor is
-/// permanently excluded: a failed donor is retried after `RETRY_BACKOFF`,
-/// re-reading the live set each time so a donor that died mid-stream is
-/// naturally replaced by the next-lowest survivor. Returns the donor that
-/// succeeded, or `None` if there was nobody to transfer from.
+/// permanently excluded: a failed one is retried after `RETRY_BACKOFF`,
+/// re-reading the live set each time. Returns the donor that succeeded, or
+/// `None` if there was nobody to transfer from.
 async fn transfer_loop(
     cluster: &Cluster,
     shard: &Arc<dyn ShardOps>,
@@ -143,8 +131,7 @@ async fn transfer_loop(
 }
 
 /// Requests and applies one donor's full snapshot. Returns `true` iff the
-/// stream completed normally (a `done: true` chunk was observed —
-/// `net::conn::state_stream` distinguishes this from a mid-stream close).
+/// stream completed normally rather than closing mid-stream.
 async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, donor: NodeId) -> bool {
     let mut stream = match mesh.request_state(donor, cache.clone()).await {
         Ok(stream) => stream,
@@ -159,11 +146,8 @@ async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, dono
         match stream.next().await {
             Some(Ok(chunk)) => {
                 // Weakly consistent donor-side iteration is safe: this is
-                // the same versioned-apply path live `Replicate` traffic
-                // uses, so whatever the snapshot misses, concurrency
-                // delivers, and whatever both deliver, the version check
-                // deduplicates. Applied as one donor chunk (~500 records)
-                // under one lock acquisition.
+                // the same versioned-apply path live `Replicate` uses, so
+                // concurrency delivers whatever the snapshot misses.
                 applied += chunk.len() as u64;
                 shard.apply_remote_batch(chunk).await;
             }
@@ -186,8 +170,7 @@ async fn try_donor(shard: &Arc<dyn ShardOps>, mesh: &Mesh, cache: &SmolStr, dono
     }
 }
 
-// Real-transport-only, same reason as `net::mod`'s test module: this builds
-// a live `Cluster` with a real `Mesh`.
+// Real-transport-only: this builds a live `Cluster` with a real `Mesh`.
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use super::*;

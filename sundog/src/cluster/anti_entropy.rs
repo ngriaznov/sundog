@@ -27,10 +27,9 @@ use crate::net::{AeMismatch, MsgClass};
 use crate::node::NodeId;
 use crate::store::ShardOps;
 
-/// Runs anti-entropy for one shard for as long as `cancel` stays live: every
-/// jittered `ae_interval`, picks one live peer (a dirty-marked one first —
-/// the target of a dropped `Replicate` message) and runs one round against
-/// it.
+/// Runs anti-entropy for one shard while `cancel` stays live: every jittered
+/// `ae_interval`, picks one live peer, a dirty-marked one first, and runs
+/// one round against it.
 pub(crate) async fn scheduler_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
@@ -58,10 +57,8 @@ pub(crate) async fn scheduler_task(
             continue;
         }
         *skips = 0;
-        // `run_round_against`'s own network calls carry an internal
-        // `REQUEST_TIMEOUT`, but racing the whole round against `cancel`
-        // too means a `Cluster::shutdown()` in progress never waits out
-        // that timeout for `TaskTracker::wait()` to return.
+        // Races the whole round against `cancel` too, so a `shutdown()` in
+        // progress never waits out the round's internal `REQUEST_TIMEOUT`.
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
@@ -71,33 +68,29 @@ pub(crate) async fn scheduler_task(
 }
 
 /// Keys per push/pull batch within one round. Bounds each `ae_pull`
-/// request/response well under the frame cap and its request timeout, so a
-/// large divergence repairs incrementally across batches (and rounds)
-/// rather than betting everything on one oversized exchange.
+/// request/response under the frame cap, so a large divergence repairs
+/// incrementally across batches rather than in one oversized exchange.
 const REPAIR_BATCH: usize = 4096;
 
-/// A jittered delay around `interval` (uniformly in `[0.5, 1.5) * interval`,
-/// floored at 1ms) — avoids every node's anti-entropy rounds landing in
-/// lockstep across the cluster.
+/// A jittered delay around `interval`, uniformly in `[0.5, 1.5) * interval`
+/// and floored at 1ms, so anti-entropy rounds don't land in lockstep.
 fn jittered(interval: Duration) -> Duration {
     let base = interval.max(Duration::from_millis(1)).as_secs_f64();
     let factor = rand::rng().random_range(0.5..1.5);
     Duration::from_secs_f64((base * factor).max(0.001))
 }
 
-/// Rounds in a row the scheduler will leave a streaming peer alone before
-/// running one anyway: a steady trickle of writes must not starve
-/// anti-entropy, only a burst defers it.
+/// Rounds in a row the scheduler leaves a streaming peer alone before
+/// running one anyway; a steady trickle must not starve anti-entropy.
 const MAX_STREAMING_SKIPS: u32 = 3;
 
-/// Whether to skip this round against a peer: only while replicate traffic
-/// is in motion, and never more than [`MAX_STREAMING_SKIPS`] times in a row.
+/// Whether to skip this round: only while traffic is in motion, never more than [`MAX_STREAMING_SKIPS`] times running.
 fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
     streaming && skipped_so_far < MAX_STREAMING_SKIPS
 }
 
-/// The peer to run this round against and whether it was taken from the
-/// dirty set (so a skipped round can hand the mark back).
+/// The peer for this round, and whether it came from the dirty set; a
+/// skipped round can hand the mark back.
 fn pick_peer(cluster: &Cluster) -> Option<(NodeId, bool)> {
     let mut rng = rand::rng();
     let dirty = cluster.mesh().take_dirty_peers();
@@ -114,11 +107,9 @@ fn pick_peer(cluster: &Cluster) -> Option<(NodeId, bool)> {
 }
 
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
-/// mismatched buckets in both directions. Keys this node has newer (or
-/// `peer` lacks entirely) are pushed via the normal `Replicate` fan-out
-/// path; keys `peer` has newer (or this node lacks) are pulled and applied
-/// directly. Both directions run from one side's diff, since the responder
-/// already reported its own entries for every mismatched bucket.
+/// mismatched buckets. Keys this node has newer, or `peer` lacks, push via
+/// the normal `Replicate` path; keys `peer` has newer, or this node lacks,
+/// pull and apply directly.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
 pub(crate) async fn run_round_against(
     cluster: &Cluster,
@@ -140,11 +131,10 @@ pub(crate) async fn run_round_against(
         return;
     }
 
-    // One local shard pass for every mismatched bucket, not one per bucket
-    // (a mostly-divergent peer mismatches all 1,024, and per-bucket scans
-    // would be quadratic). Covers both the plain-listing and sketch
-    // replies: a sketch diff needs the local bucket's entries to build its
-    // own comparison sketch, the same as a listing diff needs them.
+    // One local shard pass for every mismatched bucket, not one per bucket,
+    // since a mostly-divergent peer mismatches all 1,024 and per-bucket
+    // scans would be quadratic. Covers sketch replies too: a sketch diff
+    // needs the local entries to build its own comparison sketch.
     let local_entries = shard
         .entries_for_buckets(mismatched.iter().map(AeMismatch::bucket).collect())
         .await;
@@ -152,9 +142,7 @@ pub(crate) async fn run_round_against(
 
     let mut push_keys: Vec<Bytes> = Vec::new();
     let mut pull_keys: Vec<Bytes> = Vec::new();
-    // Sketch-decoded pulls: only a key *hash* is known (never key bytes),
-    // and `Msg::AePullHashes` is answered per bucket, so these queue
-    // separately from `pull_keys` rather than merging with it.
+    // Sketch-decoded pulls know only a key hash and are answered per bucket, so they queue separately from `pull_keys`.
     let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
     let mut undecodable_buckets: Vec<u16> = Vec::new();
 
@@ -185,9 +173,8 @@ pub(crate) async fn run_round_against(
     }
 
     // One fallback request for every bucket whose sketch failed to decode,
-    // sent once the round's replies are all classified: a peer that sends
-    // several oversized sketches gets one `AeEntries` round trip for all of
-    // them, not one each.
+    // sent once the round's replies are classified: several oversized
+    // sketches get one `AeEntries` round trip, not one each.
     if !undecodable_buckets.is_empty() {
         match mesh
             .ae_entries(peer, cache.clone(), undecodable_buckets)
@@ -212,11 +199,8 @@ pub(crate) async fn run_round_against(
     apply_repairs(mesh, shard, cache, peer, push_keys, pull_keys, pull_hashes).await;
 }
 
-/// Applies a round's classified push/pull/hash-pull sets against `peer`:
-/// pushes replicate outbound in [`REPAIR_BATCH`] chunks, pulls full records
-/// and applies them locally the same way, and pulls the sketch-decoded
-/// hash-only results per bucket through `Msg::AePullHashes`. Emits
-/// `sundog_ae_repaired_total{cache}` for the round's total once done.
+/// Applies a round's classified push/pull/hash-pull sets against `peer`, in
+/// [`REPAIR_BATCH`] chunks, and emits `sundog_ae_repaired_total{cache}`.
 async fn apply_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -228,15 +212,12 @@ async fn apply_repairs(
 ) {
     let mut repaired: u64 = 0;
     // Batched so a large divergence makes durable incremental progress:
-    // each batch that lands raises local versions, shrinking the next
-    // round's diff, instead of one all-or-nothing exchange racing a
-    // request timeout.
+    // each landed batch shrinks the next round's diff, instead of one
+    // all-or-nothing exchange racing a request timeout.
     for batch in push_keys.chunks(REPAIR_BATCH) {
         let records = shard.records_for(batch.to_vec()).await;
         repaired += records.len() as u64;
-        // `net::batch_replicate`'s budgeted chunking: a large repair
-        // travels as a handful of full frames, not one `Msg::Replicate`
-        // per record.
+        // `net::batch_replicate` chunks this into a handful of full frames, not one `Msg::Replicate` per record.
         let msgs = crate::net::batch_replicate(cache, records);
         mesh.send_many(peer, MsgClass::Replicate, msgs);
     }
@@ -280,13 +261,11 @@ async fn apply_repairs(
     tracing::debug!(repaired, "anti-entropy round complete");
 }
 
-/// Classifies one `AeMismatch::Sketch(bucket, cells)` reply: builds the
-/// local comparison sketch from `local_entries`, subtracts the received
-/// one, and peels it. On success, [`diff_decoded`] classifies the peeled
-/// result into `push_keys`/`pull_hashes` for `bucket`; on failure queues
-/// `bucket` into `undecodable_buckets` for the `Msg::AeEntries` fallback.
-/// Emits `sundog_ae_sketch_total{outcome}` and a matching `tracing` event
-/// either way.
+/// Classifies one `AeMismatch::Sketch(bucket, cells)` reply: builds a local
+/// comparison sketch, subtracts the received one, and peels it. On success,
+/// [`diff_decoded`] classifies the result into `push_keys`/`pull_hashes`; on
+/// failure queues `bucket` into `undecodable_buckets` for the
+/// `Msg::AeEntries` fallback. Emits `sundog_ae_sketch_total{outcome}` either way.
 fn handle_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,
@@ -297,8 +276,7 @@ fn handle_sketch_mismatch(
     undecodable_buckets: &mut Vec<u16>,
 ) {
     // Sized from the received sketch's cell count, not this node's own
-    // `ae_sketch_cells` config, so the two sketches stay shape-compatible
-    // even if the two nodes' configs have drifted apart.
+    // config, so the two sketches stay shape-compatible if configs drift.
     let mut local_sketch = Iblt::new(cells.len());
     for (key, ver) in local_entries {
         local_sketch.insert(xxh3_64(key), *ver);
@@ -359,16 +337,13 @@ fn diff_bucket(
 }
 
 /// The initiator's push/pull classification once an `AeSketch` reply
-/// decodes ([`Iblt::peel`]'s [`Decoded`] success case): mirrors
-/// [`diff_bucket`]'s rules over the peeled element lists instead of two
-/// full listings. A key present at different versions in both
-/// `decoded.only_left` (this node's contribution) and `decoded.only_right`
-/// (the peer's) pushes if the local version is newer, pulls if the peer's
-/// is; a key present only in `only_left` pushes, only in `only_right`
-/// pulls. Unlike `diff_bucket`, a sketch carries no key bytes, only a
-/// `key_hash`, so every pull queues a hash into `pull_hashes` instead of a
-/// key; only a push, whose hash resolves back to an entry in
-/// `local_entries`, queues actual key bytes.
+/// decodes: mirrors [`diff_bucket`]'s rules over [`Iblt::peel`]'s peeled
+/// element lists instead of two full listings. A key newer in
+/// `decoded.only_left` (this node) than in `only_right` (the peer's) pushes;
+/// newer on the peer's side pulls; present in only one side follows suit.
+/// A sketch carries no key bytes, only a `key_hash`, so every pull queues a
+/// hash into `pull_hashes`; only a push resolves its hash back to
+/// `local_entries` and queues actual key bytes.
 fn diff_decoded(
     local_entries: &[(Bytes, Hlc)],
     decoded: &Decoded,
@@ -510,9 +485,8 @@ mod tests {
 
     #[test]
     fn diff_decoded_pulls_a_remote_only_key_by_hash_alone() {
-        // This node never held the key at all — `local_entries` is empty —
-        // so the only thing `diff_decoded` can possibly queue for it is the
-        // hash the peeled sketch reported, never key bytes it never had.
+        // This node never held the key; `local_entries` is empty, so the
+        // only thing to queue is the hash the peeled sketch reported.
         let hash = xxh3_64(b"k3");
         let local_entries: Vec<(Bytes, Hlc)> = Vec::new();
         let decoded = Decoded {
