@@ -56,6 +56,9 @@ All notable changes to this project are documented in this file. Format follows
   it, judged over one `ae_interval`, for at most three rounds running. This
   closes the double-delivery race between a bulk fill's own fan-out and its
   repair, without letting a steady write trickle starve the repair.
+- `Cluster::build` returns `JoinError::InvalidConfig` for an `ae_sketch_cells`
+  whose sketch cannot fit in one `max_frame` frame, the same way it already
+  rejects a `max_frame` above the wire codec's cap.
 - Mixed 0.2/0.3 clusters are not supported: a 0.3 node's anti-entropy round can
   send `AeSketch`, `AeEntries`, and `AePullHashes`, which a 0.2 node cannot
   decode. Upgrade every node.
@@ -63,8 +66,8 @@ All notable changes to this project are documented in this file. Format follows
   `Msg` without a wildcard arm needs one added, a one-time cost that lets future
   wire message kinds, like this release's own
   `AeSketch`/`AeEntries`/`AePullHashes`, ship without another breaking release
-  apiece. `cargo semver-checks --release-type minor` against 0.2.0 reports
-  exactly this one intentional break; every other check passes.
+  apiece. `cargo semver-checks --release-type minor` reports exactly this one
+  intentional break; every other check passes.
 
 ### Fixed
 

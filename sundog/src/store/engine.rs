@@ -222,6 +222,24 @@ fn incoming_loses<V>(
     resolver.winner(key_bytes, stored_view, incoming_view) == Winner::A
 }
 
+/// Whether a read of `live` at `now_ms` sees nothing: past its expiry, or
+/// idle for `tti_ms` or longer. Lazy expiry and idle eviction both hinge on
+/// this; a sweep only reclaims what it already reports absent.
+fn absent_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool {
+    if let Some(exp) = live.stored.expires_at_ms
+        && now_ms >= exp
+    {
+        return true;
+    }
+    if let Some(tti) = tti_ms {
+        let last = live.last_access_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) >= tti {
+            return true;
+        }
+    }
+    false
+}
+
 /// The outcome of [`apply_locked`]: the caller's `key` back plus what changed,
 /// to build an [`super::Event`] and decide on fan-out.
 pub(crate) enum ApplyOutcome<K, V> {
@@ -236,6 +254,17 @@ pub(crate) enum ApplyOutcome<K, V> {
     Tombstoned { key: K },
 }
 
+impl<K, V> ApplyOutcome<K, V> {
+    /// The key a write landed on; `None` for a rejected write, which changed
+    /// nothing and has nothing to fan out.
+    pub(crate) fn key(&self) -> Option<&K> {
+        match self {
+            Self::Rejected => None,
+            Self::Put { key, .. } | Self::Tombstoned { key } => Some(key),
+        }
+    }
+}
+
 /// The versioned-apply core: applies `incoming` at `ver` for `key`
 /// (`key_bytes`/`hash` its postcard-encoded bytes and their xxh3 hash) iff
 /// `resolver` picks it over whatever `stripe` currently holds, updating
@@ -247,6 +276,7 @@ pub(crate) fn apply_locked<K, V>(
     digest_bucket: &AtomicU64,
     total_weight: &AtomicU64,
     weigher: Option<&Weigher<K, V>>,
+    tti_ms: Option<u64>,
     hash: u64,
     key: K,
     key_bytes: Bytes,
@@ -262,6 +292,9 @@ where
     V: Clone,
 {
     let prior_tombstone = stripe.tombstones.get(key_bytes.as_ref()).copied();
+    // `visible` is what a read at `now_ms` would see: an expired or idle
+    // entry still takes part in conflict resolution and still gets displaced,
+    // but a write over it counts as a creation, the same as after a sweep.
     let stored_live = if prior_tombstone.is_none() {
         stripe
             .live
@@ -271,6 +304,7 @@ where
                     l.stored.ver,
                     l.stored.encoded.clone(),
                     l.stored.expires_at_ms,
+                    !absent_at(l, tti_ms, now_ms),
                 )
             })
     } else {
@@ -278,11 +312,11 @@ where
     };
     let stored_ver = prior_tombstone
         .map(|t| t.ver)
-        .or_else(|| stored_live.as_ref().map(|(v, _, _)| *v));
+        .or_else(|| stored_live.as_ref().map(|(v, _, _, _)| *v));
 
     if let Some(sv) = stored_ver {
-        let stored_encoded = stored_live.as_ref().map(|(_, enc, _)| enc.as_ref());
-        let stored_expires_at_ms = stored_live.as_ref().and_then(|(_, _, e)| *e);
+        let stored_encoded = stored_live.as_ref().map(|(_, enc, _, _)| enc.as_ref());
+        let stored_expires_at_ms = stored_live.as_ref().and_then(|(_, _, e, _)| *e);
         if incoming_loses(
             resolver,
             key_bytes.as_ref(),
@@ -297,6 +331,9 @@ where
     }
 
     let had_live = prior_tombstone.is_none() && stored_ver.is_some();
+    let was_visible = stored_live
+        .as_ref()
+        .is_some_and(|(_, _, _, visible)| *visible);
     let new_fp = entry_fingerprint(key_bytes.as_ref(), ver);
 
     // Subtracts whatever this write displaces before adding the new fingerprint
@@ -329,6 +366,7 @@ where
             expires_at_ms,
             encoded,
             had_live,
+            was_visible,
             now_ms,
         ),
         Incoming::Tombstone => apply_tombstone(
@@ -347,8 +385,8 @@ where
 }
 
 /// The `Incoming::Put` half of [`apply_locked`]'s write: installs the new
-/// value, corrects total weight for whatever it displaced, and reports whether
-/// this created a fresh entry.
+/// value, corrects total weight for whatever it displaced (`had_live`), and
+/// reports `created` unless a readable entry (`was_visible`) was replaced.
 #[allow(clippy::too_many_arguments)]
 fn apply_put<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -362,6 +400,7 @@ fn apply_put<K, V>(
     expires_at_ms: Option<u64>,
     encoded: Bytes,
     had_live: bool,
+    was_visible: bool,
     now_ms: u64,
 ) -> ApplyOutcome<K, V>
 where
@@ -400,7 +439,7 @@ where
     ApplyOutcome::Put {
         key,
         value,
-        created: !had_live,
+        created: !was_visible,
     }
 }
 
@@ -532,18 +571,7 @@ where
     }
 
     fn is_absent(&self, live: &Live<K, V>, now_ms: u64) -> bool {
-        if let Some(exp) = live.stored.expires_at_ms
-            && now_ms >= exp
-        {
-            return true;
-        }
-        if let Some(tti) = self.tti_ms {
-            let last = live.last_access_ms.load(Ordering::Relaxed);
-            if now_ms.saturating_sub(last) >= tti {
-                return true;
-            }
-        }
-        false
+        absent_at(live, self.tti_ms, now_ms)
     }
 
     /// Whether a read updates `last_access_ms`, only when it is consulted for
@@ -564,7 +592,12 @@ where
     pub(crate) fn get(&self, key: &K, now_ms: u64) -> Option<V> {
         let key_buf = encode_key_for_read(key).ok()?;
         let key_bytes = key_buf.as_slice();
-        let hash = hash_key_bytes(key_bytes);
+        self.get_by_bytes(key_bytes, hash_key_bytes(key_bytes), now_ms)
+    }
+
+    /// [`Engine::get`] for a key already encoded and hashed, so a caller that
+    /// holds both, as the `get_or_load` loop does, skips re-encoding.
+    pub(crate) fn get_by_bytes(&self, key_bytes: &[u8], hash: u64, now_ms: u64) -> Option<V> {
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
         let live = stripe
             .live
@@ -642,10 +675,12 @@ where
     }
 
     /// [`Engine::record_for`] for every requested bucket, one stripe lock each:
-    /// O(bucket size) per bucket, not O(shard size).
+    /// O(bucket size) per bucket, not O(shard size). A bucket at or past
+    /// [`BUCKET_COUNT`], which only a misbehaving peer names, yields nothing.
     pub(crate) fn collect_buckets(&self, wanted: &[u16], now_ms: u64) -> BucketEntries {
         wanted
             .iter()
+            .filter(|&&bucket| usize::from(bucket) < BUCKET_COUNT)
             .map(|&bucket| {
                 let stripe = self.stripes[usize::from(bucket)].read();
                 let mut entries = Vec::with_capacity(stripe.live.len() + stripe.tombstones.len());
@@ -801,7 +836,9 @@ where
         }
     }
 
-    fn evict_one_sampled(&self, bucket: usize) {
+    /// Evicts the coldest of up to [`EVICTION_SAMPLE`] entries in `bucket`.
+    /// Returns `false` when the stripe holds nothing to evict.
+    fn evict_one_sampled(&self, bucket: usize) -> bool {
         let mut stripe = self.stripes[bucket].write();
         let offset = self.sample_offset(stripe.live.len());
         let Some(victim_bytes) = stripe
@@ -813,43 +850,52 @@ where
             .min_by_key(|live| live.last_access_ms.load(Ordering::Relaxed))
             .map(|live| live.key_bytes.clone())
         else {
-            return;
+            return false;
         };
         let hash = hash_key_bytes(victim_bytes.as_ref());
-        if let Entry::Occupied(occ) = stripe.live.entry(
+        let Entry::Occupied(occ) = stripe.live.entry(
             hash,
             |l| l.key_bytes.as_ref() == victim_bytes.as_ref(),
             hasher_for,
-        ) {
-            let (removed, _vacant) = occ.remove();
-            self.digest[bucket].fetch_xor(
-                entry_fingerprint(&removed.key_bytes, removed.stored.ver),
-                Ordering::Relaxed,
-            );
-            self.total_weight
-                .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
-        }
+        ) else {
+            return false;
+        };
+        let (removed, _vacant) = occ.remove();
+        self.digest[bucket].fetch_xor(
+            entry_fingerprint(&removed.key_bytes, removed.stored.ver),
+            Ordering::Relaxed,
+        );
+        self.total_weight
+            .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
+        true
+    }
+
+    /// Evicts one entry from the first non-empty stripe at or after `bucket`,
+    /// wrapping around once. Returns the stripe it evicted from, or `None`
+    /// when every stripe is empty.
+    fn evict_one_scanning(&self, bucket: usize) -> Option<usize> {
+        (0..BUCKET_COUNT)
+            .map(|step| (bucket + step) % BUCKET_COUNT)
+            .find(|&candidate| self.evict_one_sampled(candidate))
     }
 
     /// After a write to `start_bucket` may have pushed total weight over
     /// `max_capacity`, evicts sampled-cold entries, starting at
     /// `start_bucket` then pseudo-random stripes, until it is back under
-    /// the cap. Never holds two stripe locks at once; a no-op when
-    /// `max_capacity` is [`u64::MAX`].
+    /// the cap. A random probe that lands on an empty stripe falls back to
+    /// a scan for the next non-empty one, so the loop ends only under the
+    /// cap or with nothing left to evict. Never holds two stripe locks at
+    /// once; a no-op when `max_capacity` is [`u64::MAX`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
         if self.max_capacity == u64::MAX {
             return;
         }
         let mut bucket = start_bucket;
-        // Bounded, so a pathological configuration cannot spin forever.
-        for attempt in 0..BUCKET_COUNT.saturating_mul(4) {
-            if self.total_weight.load(Ordering::Relaxed) <= self.max_capacity {
+        while self.total_weight.load(Ordering::Relaxed) > self.max_capacity {
+            if !self.evict_one_sampled(bucket) && self.evict_one_scanning(bucket).is_none() {
                 return;
             }
-            if attempt > 0 {
-                bucket = self.next_pseudo_random_bucket();
-            }
-            self.evict_one_sampled(bucket);
+            bucket = self.next_pseudo_random_bucket();
         }
     }
 
@@ -877,6 +923,7 @@ where
                     digest_bucket,
                     &self.total_weight,
                     self.weigher.as_ref(),
+                    self.tti_ms,
                     hash,
                     key,
                     key_bytes,
@@ -1214,6 +1261,7 @@ mod tests {
             &engine.digest[bucket],
             &engine.total_weight,
             engine.weigher.as_ref(),
+            engine.tti_ms,
             hash,
             key,
             key_bytes,
@@ -1383,6 +1431,7 @@ mod tests {
                 &engine.digest[bucket],
                 &engine.total_weight,
                 engine.weigher.as_ref(),
+                engine.tti_ms,
                 hash,
                 key,
                 kb.clone(),
@@ -1679,6 +1728,7 @@ mod tests {
                 &engine.digest[bucket],
                 &engine.total_weight,
                 engine.weigher.as_ref(),
+                engine.tti_ms,
                 hash,
                 key,
                 kb.clone(),
@@ -1803,6 +1853,7 @@ mod tests {
                     &engine.digest[bucket],
                     &engine.total_weight,
                     None,
+                    None,
                     hash,
                     k,
                     kb,
@@ -1857,6 +1908,148 @@ mod tests {
     }
 
     #[test]
+    fn get_by_bytes_reads_what_get_reads() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(7);
+        let hash = hash_key_bytes(kb.as_ref());
+        assert_eq!(engine.get_by_bytes(kb.as_ref(), hash, 0), None);
+        let _ = put(
+            &engine,
+            7,
+            kb.clone(),
+            "seven".into(),
+            hlc(1, 1),
+            Some(50),
+            0,
+        );
+        assert_eq!(
+            engine.get_by_bytes(kb.as_ref(), hash, 0),
+            Some("seven".to_string())
+        );
+        assert_eq!(engine.get_by_bytes(kb.as_ref(), hash, 0), engine.get(&7, 0));
+        assert_eq!(
+            engine.get_by_bytes(kb.as_ref(), hash, 100),
+            None,
+            "an expired entry reads as absent by bytes too"
+        );
+    }
+
+    #[test]
+    fn collect_buckets_ignores_a_bucket_outside_the_stripe_range() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(1);
+        let bucket = u16::try_from(stripe_index_from_hash(hash_key_bytes(kb.as_ref())))
+            .expect("bucket fits");
+        let _ = put(&engine, 1, kb.clone(), "a".into(), hlc(1, 1), None, 0);
+
+        assert!(
+            engine.collect_buckets(&[u16::MAX], 0).is_empty(),
+            "a bucket past BUCKET_COUNT yields nothing instead of indexing past the stripes"
+        );
+        let mixed = engine.collect_buckets(&[u16::MAX, bucket, 1024], 0);
+        assert_eq!(mixed.len(), 1, "only the in-range bucket is answered");
+        assert_eq!(mixed[0].0, bucket);
+        assert_eq!(mixed[0].1, vec![(kb, hlc(1, 1))]);
+    }
+
+    #[test]
+    fn a_write_over_an_expired_unswept_entry_reports_created() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(1);
+        let _ = put(&engine, 1, kb.clone(), "a".into(), hlc(1, 1), Some(50), 0);
+
+        let replaced = put(&engine, 1, kb.clone(), "b".into(), hlc(2, 1), Some(50), 10);
+        assert!(
+            matches!(replaced, ApplyOutcome::Put { created: false, .. }),
+            "a write over a readable entry is an update"
+        );
+        let over_expired = put(&engine, 1, kb.clone(), "c".into(), hlc(3, 1), Some(100), 60);
+        assert!(
+            matches!(over_expired, ApplyOutcome::Put { created: true, .. }),
+            "a write over an entry a read no longer sees is a creation, sweep or no sweep"
+        );
+        // The expired entry was still displaced: one live entry, one weight.
+        assert_eq!(engine.debug_totals(), (1, 1));
+        assert_eq!(engine.get(&1, 60), Some("c".to_string()));
+    }
+
+    #[test]
+    fn a_write_over_an_idle_entry_reports_created() {
+        let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+        let kb = key_bytes(1);
+        let _ = put(&engine, 1, kb.clone(), "a".into(), hlc(1, 1), None, 0);
+        assert_eq!(
+            engine.get(&1, 150),
+            None,
+            "idle past the TTI reads as absent"
+        );
+        let over_idle = put(&engine, 1, kb, "b".into(), hlc(2, 1), None, 150);
+        assert!(matches!(over_idle, ApplyOutcome::Put { created: true, .. }));
+        assert_eq!(engine.debug_totals(), (1, 1));
+    }
+
+    #[test]
+    fn enforce_capacity_clears_an_overage_needing_thousands_of_evictions() {
+        let weigher: Weigher<u32, String> =
+            Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+        let engine = Engine::<u32, String>::new(10_000, None, Some(weigher));
+        // 6,000 one-unit entries, then one 9,500-unit entry: back under the
+        // cap only after more than 5,500 evictions.
+        for k in 1..=6_000u32 {
+            let _ = put(
+                &engine,
+                k,
+                key_bytes(k),
+                "x".into(),
+                hlc(u64::from(k), 1),
+                None,
+                0,
+            );
+        }
+        let big = 7_000u32;
+        let big_bytes = key_bytes(big);
+        let start_bucket = stripe_index_from_hash(hash_key_bytes(big_bytes.as_ref()));
+        let _ = put(
+            &engine,
+            big,
+            big_bytes,
+            "y".repeat(9_500),
+            hlc(10_000, 1),
+            None,
+            1,
+        );
+        assert_eq!(engine.debug_totals().1, 15_500);
+
+        engine.enforce_capacity(start_bucket);
+
+        let (entries, weight) = engine.debug_totals();
+        assert!(
+            weight <= 10_000,
+            "total weight {weight} is back under the cap"
+        );
+        assert!(
+            entries <= 501,
+            "{entries} entries remain; the overage cost more than 5,499 evictions"
+        );
+    }
+
+    #[test]
+    fn enforce_capacity_stops_once_every_stripe_is_empty() {
+        let weigher: Weigher<u32, String> =
+            Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+        let engine = Engine::<u32, String>::new(5, None, Some(weigher));
+        // One entry heavier than the whole cap: evicting it is all there is.
+        let _ = put(&engine, 1, key_bytes(1), "z".repeat(50), hlc(1, 1), None, 0);
+        engine.enforce_capacity(0);
+        assert_eq!(engine.debug_totals(), (0, 0));
+        assert!(
+            !engine.evict_one_sampled(0),
+            "an empty stripe evicts nothing"
+        );
+        assert_eq!(engine.evict_one_scanning(0), None);
+    }
+
+    #[test]
     fn digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions() {
         use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
@@ -1883,6 +2076,7 @@ mod tests {
                         &engine.digest[bucket],
                         &engine.total_weight,
                         engine.weigher.as_ref(),
+                        engine.tti_ms,
                         hash,
                         key,
                         kb,
@@ -1909,6 +2103,7 @@ mod tests {
                         &engine.digest[bucket],
                         &engine.total_weight,
                         engine.weigher.as_ref(),
+                        engine.tti_ms,
                         hash,
                         key,
                         kb,

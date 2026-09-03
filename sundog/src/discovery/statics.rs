@@ -30,7 +30,8 @@ impl Static {
     #[must_use]
     pub fn new(seeds: impl IntoIterator<Item = SocketAddr>) -> Self {
         let explicit = seeds.into_iter().map(|addr| addr.to_string());
-        Self::from_specs(explicit.chain(env_seed_specs()))
+        let env = std::env::var(SUNDOG_SEEDS_ENV).ok();
+        Self::from_specs(explicit.chain(seed_specs_from(env.as_deref())))
     }
 
     /// Builds a seed list from `SUNDOG_SEEDS` alone. Equivalent to
@@ -60,12 +61,9 @@ impl Static {
     }
 }
 
-fn env_seed_specs() -> Vec<String> {
-    std::env::var(SUNDOG_SEEDS_ENV)
-        .ok()
-        .as_deref()
-        .map(parse_seed_list)
-        .unwrap_or_default()
+/// The specs a `SUNDOG_SEEDS` value names; none when the variable is unset.
+fn seed_specs_from(raw: Option<&str>) -> Vec<String> {
+    raw.map(parse_seed_list).unwrap_or_default()
 }
 
 fn parse_seed_list(raw: &str) -> Vec<String> {
@@ -138,22 +136,17 @@ mod tests {
         );
     }
 
-    // `SUNDOG_SEEDS` is process-global, so this is the only test that
-    // touches it: set, exercise `from_env`, then unset before returning.
+    // `SUNDOG_SEEDS` is process-global and every `Static::new` reads it, so
+    // the parsing is exercised on its input, never by mutating the
+    // environment under concurrently running tests.
     #[test]
-    fn from_env_parses_the_sundog_seeds_variable() {
-        // SAFETY: no other test in this binary reads or writes
-        // `SUNDOG_SEEDS`; setting and unsetting it here doesn't race.
-        unsafe {
-            std::env::set_var(SUNDOG_SEEDS_ENV, "host1:4000, host2:4001");
-        }
-        let discovery = Static::from_env();
-        // SAFETY: see above.
-        unsafe {
-            std::env::remove_var(SUNDOG_SEEDS_ENV);
-        }
-        let specs: Vec<&str> = discovery.specs.iter().map(String::as_str).collect();
-        assert_eq!(specs, vec!["host1:4000", "host2:4001"]);
+    fn seed_specs_from_parses_a_set_variable_and_treats_unset_as_empty() {
+        assert_eq!(
+            seed_specs_from(Some("host1:4000, host2:4001")),
+            vec!["host1:4000", "host2:4001"]
+        );
+        assert!(seed_specs_from(None).is_empty());
+        assert!(seed_specs_from(Some("")).is_empty());
     }
 
     #[tokio::test]

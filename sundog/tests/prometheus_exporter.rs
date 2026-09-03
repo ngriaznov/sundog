@@ -61,32 +61,24 @@ fn scraped_metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option
     })
 }
 
-#[tokio::test]
-async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
-    let metrics_addr = reserve_tcp_addr().await;
+/// Every bucket of the [`SKETCH_FILL`]-key fill holds about 20 entries, so
+/// with this threshold a mismatch there reconciles through an IBLT sketch.
+const SKETCH_MIN_BUCKET: usize = 8;
+const SKETCH_FILL: u32 = 20_000;
 
-    let cluster = Cluster::builder("it-prometheus-exporter")
-        .seeds(std::iter::empty())
-        .config(common::fast_config())
-        .prometheus_listen(metrics_addr)
-        .build()
-        .await
-        .expect("cluster builds with a prometheus listener");
+fn node_config(gossip_bind_addr: SocketAddr) -> sundog::ClusterConfig {
+    common::fast_config().with(|c| {
+        c.gossip_bind_addr = gossip_bind_addr;
+        c.ae_sketch_min_bucket = SKETCH_MIN_BUCKET;
+    })
+}
 
-    let cache = cluster
-        .cache::<u32, String>("users")
-        .mode(Mode::Replicated)
-        .open()
-        .await
-        .expect("cache opens");
-    cache.insert(1, "hello".into()).await.expect("insert");
-    cache.remove(&1).await.expect("remove");
-
-    // A known hit/miss sequence on its own cache, exact rather than shared
-    // with `users`' traffic above: 2 inserts, 3 hit gets, 2 miss gets, one
-    // filling get_or_load, one hit get_or_load, two contains_key checks,
-    // one get_or_insert_with miss and hit, and four concurrent get_or_loads
-    // of one key: hits=3+1+1+3=8, misses=2+1+1+1=5.
+/// A known hit/miss sequence on a `Mode::Local` cache of its own, exact
+/// rather than shared with `users`' traffic: 2 inserts, 3 hit gets, 2 miss
+/// gets, one filling `get_or_load`, one hit `get_or_load`, two
+/// `contains_key` checks, one `get_or_insert_with` miss and hit, and four
+/// concurrent `get_or_load`s of one key: hits=3+1+1+3=8, misses=2+1+1+1=5.
+async fn count_hits_and_misses(cluster: &Cluster) {
     let counted = cluster
         .cache::<u32, String>("counted")
         .mode(Mode::Local)
@@ -144,22 +136,80 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     }))
     .await;
     assert!(loads.iter().all(|value| value == "joined"));
+}
 
-    // `sundog_open_caches` comes from a periodic background routine, so
-    // poll until every metric checked below has been published once.
+#[tokio::test]
+async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
+    let metrics_addr = reserve_tcp_addr().await;
+    let gossip_a = common::reserve_gossip_addr().await;
+    let gossip_b = common::reserve_gossip_addr().await;
+
+    let cluster = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_b])
+        .config(node_config(gossip_a))
+        .prometheus_listen(metrics_addr)
+        .build()
+        .await
+        .expect("cluster builds with a prometheus listener");
+    // A peer for `users` to replicate to and reconcile against; only the
+    // first node serves metrics, since the recorder is process-global.
+    let peer = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(node_config(gossip_b))
+        .build()
+        .await
+        .expect("peer builds");
+    common::wait_for_peer_count(&cluster, 1, Duration::from_secs(15)).await;
+    common::wait_for_peer_count(&peer, 1, Duration::from_secs(15)).await;
+
+    let cache = cluster
+        .cache::<u32, String>("users")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("cache opens");
+    let peer_users = peer
+        .cache::<u32, String>("users")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("peer cache opens");
+    cache.insert(1, "hello".into()).await.expect("insert");
+    cache.remove(&1).await.expect("remove");
+
+    // A sketch-scale fill, replicated to the peer, then one key dropped
+    // there: the next anti-entropy round finds that bucket mismatched, and
+    // at ~20 entries it reconciles through a sketch, which decodes.
+    cache
+        .insert_many((100..SKETCH_FILL + 100).map(|k| (k, k.to_string())))
+        .await
+        .expect("bulk insert");
+    common::eventually(Duration::from_secs(15), || async {
+        peer_users.get(&(SKETCH_FILL + 99)).await.is_some()
+    })
+    .await;
+    peer_users.invalidate_local(&150).await;
+
+    count_hits_and_misses(&cluster).await;
+
+    // `sundog_open_caches` comes from a periodic background routine and the
+    // sketch counter from an anti-entropy round, so poll until every metric
+    // checked below has been published once.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let body = loop {
         if let Some(body) = scrape_metrics(metrics_addr).await
             && body.contains("sundog_open_caches")
             && body.contains("sundog_live_peers")
             && body.contains("sundog_cache_entries")
+            && scraped_metric_value(&body, "sundog_ae_sketch_total", ("outcome", "decoded"))
+                .is_some()
         {
             break body;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "metrics endpoint never served sundog_open_caches, sundog_live_peers, and \
-             sundog_cache_entries within the bound"
+            "metrics endpoint never served sundog_open_caches, sundog_live_peers, \
+             sundog_cache_entries, and a decoded sundog_ae_sketch_total within the bound"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -178,7 +228,13 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         scraped_metric_value(&body, "sundog_cache_entries", ("cache", "counted")).is_some(),
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
     );
+    assert!(
+        scraped_metric_value(&body, "sundog_ae_sketch_total", ("cache", "users"))
+            .is_some_and(|decoded| decoded >= 1.0),
+        "expected at least one decoded sketch on the 'users' cache; got body:\n{body}"
+    );
 
+    peer.shutdown().await;
     cluster.shutdown().await;
 }
 

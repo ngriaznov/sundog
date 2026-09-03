@@ -32,7 +32,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cache::CacheBuilder;
 use crate::config::ClusterConfig;
@@ -328,6 +327,16 @@ impl ClusterBuilder {
                 wire::MAX_FRAME
             )));
         }
+        // Sized for a cache name of up to 255 bytes; the wire codec still
+        // refuses a frame that a longer name pushes past `max_frame`.
+        let sketch_frame = wire::ae_sketch_frame_max_len(255, config.ae_sketch_cells);
+        if sketch_frame > config.max_frame {
+            return Err(JoinError::InvalidConfig(format!(
+                "ClusterConfig::ae_sketch_cells ({}) encodes to up to {sketch_frame} bytes, \
+                 more than max_frame ({}) allows",
+                config.ae_sketch_cells, config.max_frame
+            )));
+        }
 
         let node = NodeId::random();
         let hostname = local_hostname();
@@ -520,30 +529,6 @@ impl RequestHandler for ClusterRequestHandler {
                 Some(shard) => shard.records_for(keys).await,
                 None => Vec::new(),
             }
-        })
-    }
-
-    fn records_for_hashes(
-        &self,
-        cache: SmolStr,
-        bucket: u16,
-        hashes: Vec<u64>,
-    ) -> BoxFuture<'_, Vec<WireRecord>> {
-        Box::pin(async move {
-            let Some(shard) = self.lookup(&cache) else {
-                return Vec::new();
-            };
-            // `bucket_entries` already holds every local key in `bucket`, so
-            // filtering by `xxh3_64(key)` first avoids a second shard pass.
-            let wanted: HashSet<u64> = hashes.into_iter().collect();
-            let keys: Vec<Bytes> = shard
-                .bucket_entries(bucket)
-                .await
-                .into_iter()
-                .filter(|(key, _)| wanted.contains(&xxh3_64(key)))
-                .map(|(key, _)| key)
-                .collect();
-            shard.records_for(keys).await
         })
     }
 
@@ -1109,6 +1094,20 @@ mod tests {
             .await
             .expect_err("max_frame above the wire cap must be rejected at build() time");
         assert!(matches!(err, JoinError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_sketch_that_cannot_fit_one_frame() {
+        let mut config = loopback_config();
+        config.ae_sketch_cells = crate::wire::MAX_FRAME;
+
+        let err = Cluster::builder("cluster-it-sketch-cells-guard")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err("a sketch wider than max_frame must be rejected at build() time");
+        assert!(matches!(err, JoinError::InvalidConfig(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -2361,7 +2360,7 @@ mod tests {
         let name = SmolStr::new("users");
         let key_one = Bytes::from(postcard::to_stdvec(&1u32).expect("test key encodes"));
         let bucket = bucket_of_u32(1);
-        let hash_one = xxh3_64(&key_one);
+        let hash_one = xxhash_rust::xxh3::xxh3_64(&key_one);
 
         let records = handler
             .records_for_hashes(name.clone(), bucket, vec![hash_one])

@@ -110,7 +110,9 @@ pub struct ClusterConfig {
     /// Cell count of the IBLT sketch built for a bucket past
     /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of
     /// 240 decodes a difference of up to 100 elements in at least 99% of
-    /// cases; an undecodable one falls back to a full listing.
+    /// cases; an undecodable one falls back to a full listing. A count whose
+    /// sketch cannot fit in one [`max_frame`](Self::max_frame) frame fails
+    /// [`ClusterBuilder::build`](crate::ClusterBuilder::build).
     pub ae_sketch_cells: usize,
     /// Mutual-TLS material for the data-plane mesh; `None` (the default)
     /// means the mesh runs plaintext. See [`TlsConfig`].

@@ -206,6 +206,20 @@ pub(crate) fn replicate_frame_len(cache_len: usize, key_len: usize, value_len: u
     1 + size_of::<RawFrameHeader>() + cache_len + RECORD_HEADER_LEN + key_len + value_len
 }
 
+/// The widest postcard encoding of one [`Cell`]: each of its six integer
+/// fields at its maximum varint width.
+pub(crate) const CELL_MAX_WIRE_LEN: usize = 5 + 10 + 10 + 5 + 10 + 10;
+
+/// An upper bound on the byte length a [`Msg::AeSketch`] with `cells` cells
+/// and a `cache_len`-byte cache name encodes to: the frame discriminant, the
+/// variant tag, the name and cell-count lengths and the bucket at their
+/// widest, then every cell at its widest. `Cluster::build` rejects an
+/// `ae_sketch_cells` this puts past `max_frame`.
+#[must_use]
+pub(crate) fn ae_sketch_frame_max_len(cache_len: usize, cells: usize) -> usize {
+    (1 + 2 + 10 + cache_len + 3 + 10).saturating_add(cells.saturating_mul(CELL_MAX_WIRE_LEN))
+}
+
 fn check_frame_len(len: usize) -> Result<(), CodecError> {
     if len > MAX_FRAME {
         return Err(CodecError::FrameTooLarge {
@@ -720,6 +734,39 @@ mod tests {
             expected_value_ptr,
             "decoded value must be a zero-copy slice into the received frame"
         );
+    }
+
+    #[test]
+    fn ae_sketch_frame_max_len_bounds_a_real_encode_from_above_and_tightly() {
+        // Every cell XOR-accumulates well-spread elements, so each field
+        // encodes as a varint of a random full-width integer.
+        let spread = |i: u64| i.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut iblt = crate::cluster::sketch::Iblt::new(240);
+        for i in 0..2_000u64 {
+            iblt.insert(
+                spread(i),
+                Hlc {
+                    wall_ms: spread(i ^ 0x55),
+                    logical: u32::try_from(spread(i ^ 0xAA) >> 32).expect("fits"),
+                    node: NodeId::from(spread(i ^ 0xFF)),
+                },
+            );
+        }
+        let cache = SmolStr::new("users");
+        let actual = encode(&Msg::AeSketch {
+            cache: cache.clone(),
+            bucket: u16::MAX,
+            cells: iblt.into_cells(),
+        })
+        .expect("encodes")
+        .len();
+        let bound = ae_sketch_frame_max_len(cache.len(), 240);
+        assert!(actual <= bound, "{actual} bytes on the wire, bound {bound}");
+        assert!(
+            actual * 10 >= bound * 8,
+            "the bound stays within a quarter of the real size: {actual} vs {bound}"
+        );
+        assert_eq!(ae_sketch_frame_max_len(255, usize::MAX), usize::MAX);
     }
 
     #[test]

@@ -298,13 +298,15 @@ fn handle_sketch_mismatch(
     undecodable_buckets: &mut Vec<u16>,
 ) {
     // Sized from the received sketch's cell count, not this node's own
-    // config, so the two sketches stay shape-compatible if configs drift.
+    // config, so the two sketches stay shape-compatible if configs drift. A
+    // cell count `Iblt::new` cannot reproduce fails `subtract`, and falls
+    // back like any other undecodable sketch.
     let mut local_sketch = Iblt::new(cells.len());
     for (key, ver) in local_entries {
         local_sketch.insert(xxh3_64(key), *ver);
     }
     let remote_sketch = Iblt::from_cells(cells);
-    if let Ok(decoded) = local_sketch.subtract(&remote_sketch).peel() {
+    if let Ok(decoded) = local_sketch.subtract(&remote_sketch).and_then(Iblt::peel) {
         let mut hashes = Vec::new();
         diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
         if !hashes.is_empty() {
@@ -551,6 +553,57 @@ mod tests {
         diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
         assert_eq!(push, vec![key]);
         assert!(pull.is_empty());
+    }
+
+    fn mismatch_of(cells: Vec<Cell>, local_entries: &[(Bytes, Hlc)]) -> SketchOutcome {
+        let mut out = SketchOutcome::default();
+        handle_sketch_mismatch(
+            &SmolStr::new("users"),
+            7,
+            cells,
+            local_entries,
+            &mut out.push_keys,
+            &mut out.pull_hashes,
+            &mut out.undecodable_buckets,
+        );
+        out
+    }
+
+    #[derive(Default)]
+    struct SketchOutcome {
+        push_keys: Vec<Bytes>,
+        pull_hashes: Vec<(u16, Vec<u64>)>,
+        undecodable_buckets: Vec<u16>,
+    }
+
+    #[test]
+    fn a_well_formed_sketch_decodes_into_hashes_to_pull() {
+        let mut remote = Iblt::new(240);
+        remote.insert(xxh3_64(b"k1"), hlc(5));
+        let out = mismatch_of(remote.into_cells(), &[]);
+        assert!(out.push_keys.is_empty());
+        assert_eq!(out.pull_hashes, vec![(7, vec![xxh3_64(b"k1")])]);
+        assert!(out.undecodable_buckets.is_empty());
+    }
+
+    #[test]
+    fn an_empty_sketch_off_the_wire_falls_back_to_a_full_listing() {
+        let out = mismatch_of(Vec::new(), &[(Bytes::from_static(b"k1"), hlc(5))]);
+        assert!(out.push_keys.is_empty());
+        assert!(out.pull_hashes.is_empty());
+        assert_eq!(out.undecodable_buckets, vec![7]);
+    }
+
+    #[test]
+    fn a_sketch_of_an_unreproducible_shape_falls_back_to_a_full_listing() {
+        // 100 cells: `Iblt::new(100)` builds 99, so the two never line up.
+        let out = mismatch_of(
+            vec![Cell::default(); 100],
+            &[(Bytes::from_static(b"k1"), hlc(5))],
+        );
+        assert!(out.push_keys.is_empty());
+        assert!(out.pull_hashes.is_empty());
+        assert_eq!(out.undecodable_buckets, vec![7]);
     }
 
     #[test]

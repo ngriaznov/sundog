@@ -238,7 +238,7 @@ async fn ae_round_with_sketch(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> b
                 }
                 match local_sketch
                     .subtract(&sundog::Iblt::from_cells(cells))
-                    .peel()
+                    .and_then(sundog::Iblt::peel)
                 {
                     Ok(decoded) => {
                         let mut hashes = Vec::new();

@@ -237,16 +237,15 @@ impl Iblt {
     /// sides cancels to zero; one differing or on only one side survives
     /// for [`Iblt::peel`] to resolve.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `self` and `other` have a different cell count.
-    #[must_use]
-    pub fn subtract(&self, other: &Self) -> Self {
-        assert_eq!(
-            self.cells.len(),
-            other.cells.len(),
-            "invariant: subtracting IBLTs of different cell counts"
-        );
+    /// Returns [`Undecodable`] if `other` has a different cell count: a
+    /// sketch off the wire whose shape this node cannot rebuild, which the
+    /// caller treats like any other failed decode.
+    pub fn subtract(&self, other: &Self) -> Result<Self, Undecodable> {
+        if self.cells.len() != other.cells.len() {
+            return Err(Undecodable);
+        }
         let cells = self
             .cells
             .iter()
@@ -260,10 +259,10 @@ impl Iblt {
                 check_sum: a.check_sum ^ b.check_sum,
             })
             .collect();
-        Self {
+        Ok(Self {
             cells,
             partition_len: self.partition_len,
-        }
+        })
     }
 
     /// Unwinds this already-subtracted sketch into the exact list of
@@ -354,7 +353,10 @@ mod tests {
     fn empty_sketches_subtract_and_peel_to_nothing() {
         let a = Iblt::new(240);
         let b = Iblt::new(240);
-        let decoded = a.subtract(&b).peel().expect("empty diff always decodes");
+        let decoded = a
+            .subtract(&b)
+            .and_then(Iblt::peel)
+            .expect("empty diff always decodes");
         assert!(decoded.only_left.is_empty());
         assert!(decoded.only_right.is_empty());
     }
@@ -364,7 +366,10 @@ mod tests {
         let elems = [(1u64, ver(10)), (2, ver(20)), (3, ver(30))];
         let a = sketch_of(&elems, 240);
         let b = sketch_of(&elems, 240);
-        let decoded = a.subtract(&b).peel().expect("identical sets decode");
+        let decoded = a
+            .subtract(&b)
+            .and_then(Iblt::peel)
+            .expect("identical sets decode");
         assert!(decoded.only_left.is_empty());
         assert!(decoded.only_right.is_empty());
     }
@@ -373,7 +378,10 @@ mod tests {
     fn one_sided_insert_decodes_as_only_left() {
         let a = sketch_of(&[(1, ver(10))], 240);
         let b = Iblt::new(240);
-        let decoded = a.subtract(&b).peel().expect("small diff decodes");
+        let decoded = a
+            .subtract(&b)
+            .and_then(Iblt::peel)
+            .expect("small diff decodes");
         assert_eq!(
             decoded.only_left,
             vec![Elem {
@@ -388,7 +396,10 @@ mod tests {
     fn one_sided_insert_on_the_other_side_decodes_as_only_right() {
         let a = Iblt::new(240);
         let b = sketch_of(&[(7, ver(10))], 240);
-        let decoded = a.subtract(&b).peel().expect("small diff decodes");
+        let decoded = a
+            .subtract(&b)
+            .and_then(Iblt::peel)
+            .expect("small diff decodes");
         assert!(decoded.only_left.is_empty());
         assert_eq!(
             decoded.only_right,
@@ -403,7 +414,10 @@ mod tests {
     fn same_key_different_version_appears_on_both_sides() {
         let a = sketch_of(&[(1, ver(20))], 240);
         let b = sketch_of(&[(1, ver(10))], 240);
-        let decoded = a.subtract(&b).peel().expect("small diff decodes");
+        let decoded = a
+            .subtract(&b)
+            .and_then(Iblt::peel)
+            .expect("small diff decodes");
         assert_eq!(
             decoded.only_left,
             vec![Elem {
@@ -439,7 +453,7 @@ mod tests {
         let right: Vec<(u64, Hlc)> = (10..30u64).map(|k| (k, ver(k + 1))).collect();
         let decoded = sketch_of(&left, 240)
             .subtract(&sketch_of(&right, 240))
-            .peel()
+            .and_then(Iblt::peel)
             .expect("a modest diff against 240 cells always decodes");
         assert_eq!(
             decoded.only_left.iter().copied().collect::<HashSet<_>>(),
@@ -458,7 +472,9 @@ mod tests {
         let left: Vec<(u64, Hlc)> = (0..200u64).map(|k| (k, ver(k))).collect();
         let right: Vec<(u64, Hlc)> = (100..300u64).map(|k| (k, ver(k + 1))).collect();
         assert_eq!(
-            sketch_of(&left, 24).subtract(&sketch_of(&right, 24)).peel(),
+            sketch_of(&left, 24)
+                .subtract(&sketch_of(&right, 24))
+                .and_then(Iblt::peel),
             Err(Undecodable)
         );
     }
@@ -476,6 +492,30 @@ mod tests {
     fn tiny_sketch_still_builds_a_well_formed_shape() {
         let iblt = Iblt::new(0);
         assert_eq!(iblt.into_cells().len(), IBLT_PARTITIONS);
+    }
+
+    #[test]
+    fn subtract_refuses_a_sketch_of_another_shape() {
+        let local = Iblt::new(240);
+        assert_eq!(
+            local
+                .subtract(&Iblt::from_cells(Vec::new()))
+                .map(Iblt::into_cells),
+            Err(Undecodable),
+            "an empty sketch off the wire is undecodable, not a panic"
+        );
+        assert_eq!(
+            local
+                .subtract(&Iblt::from_cells(vec![Cell::default(); 100]))
+                .map(Iblt::into_cells),
+            Err(Undecodable),
+            "a cell count this node's own construction cannot reproduce is undecodable"
+        );
+        assert!(
+            local
+                .subtract(&Iblt::from_cells(vec![Cell::default(); 240]))
+                .is_ok()
+        );
     }
 }
 

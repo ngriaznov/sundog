@@ -795,7 +795,10 @@ where
         let key_bytes = encode_key(key)?;
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         loop {
-            if let Some(value) = self.engine.get(key, self.now_ms()) {
+            if let Some(value) = self
+                .engine
+                .get_by_bytes(key_bytes.as_ref(), hash, self.now_ms())
+            {
                 self.hits.increment(1);
                 return Ok(value);
             }
@@ -1031,7 +1034,6 @@ where
                 .into_iter()
                 .map(
                     |(hash, key, key_bytes, ver, value, expires_at_ms, encoded)| {
-                        applied_keys.push(key.clone());
                         (
                             hash,
                             key,
@@ -1055,10 +1057,12 @@ where
                 now,
             );
             for outcome in outcomes {
+                applied_keys.extend(outcome.key().cloned());
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-            // Handed off per stripe as it lands, so replication streams while
-            // the rest of the fill is still applying.
+            // Only the writes that landed, handed off per stripe as they
+            // land, so replication streams while the rest of the fill is
+            // still applying.
             self.fan_out.extend(applied_keys.drain(..));
         }
         match failure {
@@ -1115,10 +1119,7 @@ where
             }
             let entries: Vec<_> = group
                 .into_iter()
-                .map(|(hash, key, key_bytes, ver)| {
-                    applied_keys.push(key.clone());
-                    (hash, key, key_bytes, ver, Incoming::Tombstone)
-                })
+                .map(|(hash, key, key_bytes, ver)| (hash, key, key_bytes, ver, Incoming::Tombstone))
                 .collect();
             let outcomes = self.engine.apply_many(
                 bucket,
@@ -1129,6 +1130,7 @@ where
                 now,
             );
             for outcome in outcomes {
+                applied_keys.extend(outcome.key().cloned());
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
             self.fan_out.extend(applied_keys.drain(..));
@@ -2573,6 +2575,43 @@ mod tests {
             .expect("a push after the wait wakes it")
             .expect("waiter completes");
         assert_eq!(drained, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn insert_many_queues_only_the_keys_that_landed() {
+        // Under `AlwaysA` whatever is stored wins, so a bulk write over an
+        // existing key is rejected and must not reach the fan-out queue.
+        let s = shard::<u32, String>(1).with_resolver(Arc::new(AlwaysA));
+        s.insert(1, "first".into()).await.expect("insert");
+        let _ = s.fan_out.drain();
+
+        s.insert_many([(1, "again".to_string()), (2, "two".to_string())])
+            .await
+            .expect("insert_many");
+
+        assert_eq!(
+            s.fan_out.drain(),
+            vec![2],
+            "only the write that landed is queued for replication"
+        );
+        assert_eq!(s.get(&1).await, Some("first".to_string()));
+        assert_eq!(s.get(&2).await, Some("two".to_string()));
+    }
+
+    #[tokio::test]
+    async fn remove_many_queues_only_the_keys_that_landed() {
+        let s = shard::<u32, String>(1).with_resolver(Arc::new(AlwaysA));
+        s.insert(1, "first".into()).await.expect("insert");
+        let _ = s.fan_out.drain();
+
+        s.remove_many([1, 3]).await.expect("remove_many");
+
+        assert_eq!(
+            s.fan_out.drain(),
+            vec![3],
+            "the rejected tombstone never reaches the fan-out queue"
+        );
+        assert_eq!(s.get(&1).await, Some("first".to_string()));
     }
 
     #[tokio::test]

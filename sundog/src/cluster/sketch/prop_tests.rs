@@ -107,7 +107,7 @@ proptest! {
     ) {
         let (left, right, expected_left, expected_right) = build(items);
         // `Undecodable` is acceptable; only a decode needs checking.
-        if let Ok(decoded) = left.subtract(&right).peel() {
+        if let Ok(decoded) = left.subtract(&right).and_then(Iblt::peel) {
             let got_left: HashSet<Elem> = decoded.only_left.into_iter().collect();
             let got_right: HashSet<Elem> = decoded.only_right.into_iter().collect();
             prop_assert_eq!(got_left, expected_left);
@@ -128,7 +128,7 @@ proptest! {
         let b = a.clone();
         let decoded = a
             .subtract(&b)
-            .peel()
+            .and_then(Iblt::peel)
             .expect("a sketch subtracted from an identical copy always cancels to nothing");
         prop_assert!(decoded.only_left.is_empty());
         prop_assert!(decoded.only_right.is_empty());
@@ -182,7 +182,7 @@ fn rated_capacity_decodes_at_least_ninety_eight_percent() {
                 expected_right.insert(elem);
             }
         }
-        if let Ok(result) = left.subtract(&right).peel() {
+        if let Ok(result) = left.subtract(&right).and_then(Iblt::peel) {
             let got_left: HashSet<Elem> = result.only_left.into_iter().collect();
             let got_right: HashSet<Elem> = result.only_right.into_iter().collect();
             assert_eq!(got_left, expected_left, "a decode is always exact");

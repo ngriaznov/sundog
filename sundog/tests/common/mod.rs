@@ -48,6 +48,17 @@ where
     }
 }
 
+/// Reserves a loopback UDP port for a node's gossip bind address: probe-bind,
+/// read back, then drop it.
+pub async fn reserve_gossip_addr() -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind an ephemeral loopback udp port to reserve a gossip address");
+    socket
+        .local_addr()
+        .expect("a freshly bound udp socket reports a local address")
+}
+
 /// A running node plus the loopback gossip address it was built with,
 /// tracked here since the public API has no accessor for it.
 pub struct Node {
