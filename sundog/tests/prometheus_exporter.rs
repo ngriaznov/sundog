@@ -1,8 +1,12 @@
-//! The `prometheus` feature installs a real Prometheus recorder and serves
-//! `GET /metrics` on the address given to
-//! [`sundog::ClusterBuilder::prometheus_listen`].
-//! `metrics::set_global_recorder` is a single process-global slot, so this must
-//! stay the only test in any `tests/*.rs` binary that installs one.
+//! The `prometheus` feature installs a real Prometheus recorder, either
+//! serving `GET /metrics` itself
+//! ([`sundog::ClusterBuilder::prometheus_listen`]) or handing back a
+//! [`sundog::PrometheusHandle`] for a caller's own HTTP stack
+//! ([`sundog::prometheus_handle`]).
+//! `metrics::set_global_recorder` is a single process-global slot: whichever
+//! test in this binary installs a recorder first wins it, so the second
+//! test below tolerates losing that race instead of assuming it always
+//! runs first.
 
 #![cfg(all(feature = "prometheus", not(feature = "sim")))]
 
@@ -174,6 +178,44 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         scraped_metric_value(&body, "sundog_cache_entries", ("cache", "counted")).is_some(),
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
     );
+
+    cluster.shutdown().await;
+}
+
+/// [`sundog::prometheus_handle`], the no-listener install, for a caller that
+/// serves `/metrics` from its own HTTP stack. Whichever test in this binary
+/// installs the process-global recorder first wins it: if the recorder
+/// above already claimed the slot, `prometheus_handle` still runs (and this
+/// test still exercises it), it just cannot hand back a usable handle, so
+/// the render-based assertion below only applies when this test wins the
+/// race.
+#[tokio::test]
+async fn prometheus_handle_exposes_cache_hits_without_a_listener() {
+    let cluster = Cluster::builder("it-prometheus-handle")
+        .seeds(std::iter::empty())
+        .config(common::fast_config())
+        .build()
+        .await
+        .expect("cluster builds");
+
+    let cache = cluster
+        .cache::<u32, String>("handle-metrics")
+        .mode(Mode::Local)
+        .open()
+        .await
+        .expect("cache opens");
+    cache.insert(1, "a".into()).await.expect("insert");
+    assert_eq!(cache.get(&1).await, Some("a".to_string()));
+
+    if let Ok(handle) = sundog::prometheus_handle() {
+        let body = handle.render();
+        assert!(
+            body.contains("sundog_cache_hits_total"),
+            "prometheus_handle's own recorder captures cache hits; got body:\n{body}"
+        );
+    }
+    // Else: another test in this binary installed the process-global
+    // recorder first; there is no handle to render from here.
 
     cluster.shutdown().await;
 }

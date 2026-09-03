@@ -995,7 +995,7 @@ mod tests {
 
     use super::*;
     use crate::error::CacheError;
-    use crate::store::{Event, Origin};
+    use crate::store::{ConflictResolver, Event, Origin, RecordView, Winner};
 
     /// Loopback-only config: skips the outbound-interface probe and keeps
     /// anti-entropy/tombstone timing tight for fast, deterministic tests.
@@ -1129,6 +1129,132 @@ mod tests {
         assert!(cluster_fmt.contains("Cluster"));
         let cache_fmt = format!("{cache:?}");
         assert!(cache_fmt.contains("debug-fmt"));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_name_returns_the_opened_name() {
+        let cluster = Cluster::builder("cluster-it-cache-name")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let cache = cluster
+            .cache::<u32, String>("named-cache")
+            .open()
+            .await
+            .expect("open succeeds");
+        assert_eq!(cache.name(), "named-cache");
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_cache_with_weigher_and_ttl_stays_bounded_and_expires() {
+        let cluster = Cluster::builder("cluster-it-weigher-ttl")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let cache = cluster
+            .cache::<u32, Vec<u8>>("weighed")
+            .mode(Mode::Local)
+            .max_capacity(50)
+            .weigher(|_key: &u32, value: &Vec<u8>| u32::try_from(value.len()).unwrap_or(u32::MAX))
+            .ttl(Duration::from_millis(150))
+            .open()
+            .await
+            .expect("open succeeds");
+
+        // Checked before the burst below, so capacity eviction never
+        // competes with it for survival.
+        cache.insert(999, vec![0u8; 5]).await.expect("insert");
+        assert_eq!(cache.get(&999).await, Some(vec![0u8; 5]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            cache.get(&999).await,
+            None,
+            "the entry expires by its own TTL"
+        );
+
+        // 40 entries at weight 5 each (200) against a 50-unit cap: at most 10
+        // survive.
+        for i in 0..40u32 {
+            cache.insert(i, vec![0u8; 5]).await.expect("insert");
+        }
+        assert!(
+            cache.entry_count().await <= 10,
+            "a weigher-and-capacity cache stays within its weight bound after a burst of inserts"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    /// A resolver that keeps whichever record has the longer value, for
+    /// exercising [`crate::cache::CacheBuilder::resolver`] end to end.
+    #[derive(Debug, Clone, Copy)]
+    struct KeepsTheLongerValue;
+
+    impl ConflictResolver for KeepsTheLongerValue {
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            let len_a = a.value.map_or(0, <[u8]>::len);
+            let len_b = b.value.map_or(0, <[u8]>::len);
+            if len_b > len_a { Winner::B } else { Winner::A }
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_opened_with_a_custom_resolver_keeps_the_longer_value_over_a_newer_shorter_remote_write()
+     {
+        let cluster = Cluster::builder("cluster-it-custom-resolver")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let cache = cluster
+            .cache::<u32, Vec<u8>>("resolved")
+            .mode(Mode::Local)
+            .resolver(Arc::new(KeepsTheLongerValue))
+            .open()
+            .await
+            .expect("open succeeds");
+        cache.insert(1, vec![0u8; 10]).await.expect("insert");
+
+        let name = SmolStr::new("resolved");
+        let shard = cluster
+            .shards()
+            .read()
+            .expect("shard registry lock is never poisoned")
+            .get(&name)
+            .cloned()
+            .expect("shard is registered under the name it was opened with");
+
+        let shorter_but_newer = WireRecord {
+            key: Bytes::from(postcard::to_stdvec(&1u32).expect("u32 key encodes")),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&vec![0u8; 3]).expect("value encodes"),
+            )),
+            ver: Hlc {
+                wall_ms: u64::MAX / 2,
+                logical: 0,
+                node: NodeId::from(9),
+            },
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(shard.as_ref(), shorter_but_newer).await;
+
+        assert_eq!(
+            cache.get(&1).await,
+            Some(vec![0u8; 10]),
+            "the custom resolver keeps the longer value over a newer-but-shorter remote write"
+        );
 
         cluster.shutdown().await;
     }
