@@ -66,10 +66,9 @@ pub struct Model {
     /// Mirrors the paired [`Shard`]'s own internal `HlcClock` exactly: every
     /// event that touches the shard's clock (a local stamp, an observed
     /// remote version) touches this one identically, in the same order, so
-    /// [`Model::stamp_local`] always predicts the version the shard is
-    /// about to stamp rather than needing to read it back afterward — see
-    /// [`Op::LocalInsert`]'s docs for why prediction, not read-back, is the
-    /// only sound option for a write whose TTL makes it dead on arrival.
+    /// [`Model::stamp_local`] always predicts the version the shard is about
+    /// to stamp rather than reading it back afterward (see
+    /// [`Op::LocalInsert`]'s docs for why that matters).
     hlc_clock: HlcClock,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
@@ -296,23 +295,17 @@ fn remote_expiry(now_ms: u64, expires_offset_ms: Option<i16>) -> Option<u64> {
 }
 
 /// One `RemoteApply`-shaped record inside an [`Op::RemoteBatch`] — same
-/// fields as [`Op::RemoteApply`], factored into its own type only because a
-/// struct-variant's fields can't be reused as a standalone type for `Vec<_>`.
+/// fields as [`Op::RemoteApply`] (see its docs for each one), factored into
+/// its own type only because a struct-variant's fields can't be reused as a
+/// standalone type for `Vec<_>`.
 #[derive(Debug, Clone, arbitrary::Arbitrary)]
 pub struct RemoteRecord {
-    /// The key this record targets.
     pub key: u8,
-    /// The record's value, or `None` for a tombstone.
     pub value: Option<u8>,
-    /// Offset from the current clock reading, for [`Hlc::wall_ms`] — signed,
-    /// so a generated batch lands records both before and after "now".
+    /// Signed, so a generated batch lands records both before and after "now".
     pub wall_ms_offset: i16,
-    /// The record's [`Hlc::logical`] tiebreaker.
     pub logical: u8,
-    /// The stamping node, clamped to `1..=4` by [`clamp_node`].
     pub node: u8,
-    /// Offset from the current clock reading for `expires_at_ms`, or `None`
-    /// for no TTL.
     pub expires_offset_ms: Option<i16>,
 }
 
@@ -325,14 +318,12 @@ pub struct RemoteRecord {
 pub enum Op {
     /// [`Shard::insert`] or [`Shard::insert_with_ttl`] — stamped by the
     /// shard's own [`crate::hlc::HlcClock`]. [`run`]'s driver predicts the
-    /// stamp via [`Model::stamp_local`] rather than reading it back
-    /// afterward: [`ShardOps::records_for`] filters an entry that's already
-    /// past its own `expires_at_ms` (`engine::Engine::is_absent`, the same
-    /// filter [`Shard::get`] applies), so a write whose `ttl_ms` makes it
-    /// dead on arrival — a real, reachable case, not an edge case reads
-    /// alone would ever surface — would be invisible to a read-back
-    /// immediately after writing it, silently leaving the model on stale
-    /// data for that key.
+    /// stamp via [`Model::stamp_local`] rather than reading it back: a write
+    /// whose `ttl_ms` makes it dead on arrival is invisible to
+    /// [`ShardOps::records_for`] (which filters an already-expired entry,
+    /// the same filter [`Shard::get`] applies), so a read-back immediately
+    /// after writing would silently leave the model on stale data for that
+    /// key.
     LocalInsert {
         /// The key to write.
         key: u8,
