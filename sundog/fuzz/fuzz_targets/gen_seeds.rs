@@ -67,8 +67,8 @@ fn main() {
             bucket: 512,
             // `Cell`'s fields are private to `cluster::sketch`, so a seed
             // built from outside the crate can only reach `Cell::default`
-            // (the empty cell) — still a real, valid encoding, just not one
-            // with any accumulated element in it.
+            // (the empty cell) — still a real, valid encoding, without any
+            // accumulated element in it.
             cells: vec![Cell::default(); 6],
         },
         Msg::AeEntries {

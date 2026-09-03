@@ -43,7 +43,7 @@ async fn reserve_gossip_addr() -> SocketAddr {
         .expect("bind an ephemeral loopback udp port to reserve a gossip address");
     socket
         .local_addr()
-        .expect("a just-bound udp socket reports a local address")
+        .expect("a freshly bound udp socket reports a local address")
 }
 
 fn node_config(gossip_bind_addr: SocketAddr) -> ClusterConfig {
@@ -407,22 +407,22 @@ async fn steady_small_writes() {
     cluster_b.shutdown().await;
 }
 
-/// [`steady_small_writes`]'s single-task baseline, but driven by `WRITERS`
-/// concurrent tasks writing disjoint keys to the same node's cache handle at
-/// once — the shape the apply-serialization lock's per-key-bucket striping
-/// exists for, which `steady_small_writes`' single-task loop can never
-/// exercise regardless of how cheap a single `insert` call is. A single
-/// global apply lock would serialize every concurrent writer here no matter
-/// which keys they touch; striping lets writers whose keys land in different
-/// stripes proceed independently, so this scenario's `per_write_micros` is
-/// the number a striped lock should visibly improve, unlike
-/// `steady_small_writes`' or `bulk_insert_replication`'s (both single-task,
-/// sequential inserts).
+/// [`steady_small_writes`]'s single-worker baseline, but driven by
+/// `WRITERS` concurrent workers writing disjoint keys to the same node's
+/// cache handle at once — the shape the apply-serialization lock's
+/// per-key-bucket striping exists for, which `steady_small_writes`'
+/// single-worker loop can never exercise regardless of how cheap a single
+/// `insert` call is. A single global apply lock would serialize every
+/// concurrent writer here no matter which keys they touch; striping lets
+/// writers whose keys land in different stripes proceed independently, so
+/// this scenario's `per_write_micros` is the number a striped lock
+/// visibly improves, unlike `steady_small_writes`' or
+/// `bulk_insert_replication`'s (both single-worker, sequential inserts).
 ///
 /// Multi-threaded runtime, unlike every other test in this binary — the
 /// point is real cross-core parallelism putting actual lock contention on
 /// the apply-serialization stripe(s), which a single-threaded runtime's
-/// cooperative task interleaving can't produce.
+/// cooperative scheduling can't produce.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_small_writes() {
     const ENTRIES: u32 = 5_000;
@@ -469,7 +469,7 @@ async fn concurrent_small_writes() {
         })
         .collect();
     for handle in handles {
-        handle.await.expect("writer task did not panic");
+        handle.await.expect("writer worker did not panic");
     }
     let elapsed = started.elapsed();
 

@@ -2,10 +2,10 @@
 
 - Every new bit of code ships with test coverage. A new public method gets a
   test at every layer it is exposed on (`Shard` and `Cache`), a new
-  background task gets its decision logic split into a pure function with a
-  unit test, and a new metric gets its value pinned in the exporter test.
-  Before reporting a feature done, audit each new symbol by name and confirm
-  a test exercises it.
+  background routine gets its decision logic split into a pure function
+  with a unit test, and a new metric gets its value pinned in the exporter
+  test. Before reporting a feature done, check each new symbol by name for
+  a test that exercises it.
 - Run every local lane before pushing: `cargo fmt --all --check`, the three
   clippy lanes (`--workspace`, `--features sim`, `--features tls,prometheus`)
   with `-D warnings -W clippy::pedantic`, `cargo test --workspace`, the sim
@@ -21,10 +21,10 @@
 - Commits are authored by Nikita Griaznov
   (`17167893+ngriaznov@users.noreply.github.com`), unsigned, with no
   co-author trailers and no model identifiers in any pushed artifact.
-- Subagents run on Sonnet. Work on a feature branch; merges to `main`,
-  releases, and yanks wait for an explicit go.
-- Prose is greenfield and describes the code as it is: no process
-  narration, no plan citations, no wind-ups or hedges.
+- Delegated work runs on Sonnet. Work on a feature branch; merges to
+  `main`, releases, and yanks wait for an explicit go.
+- Prose is greenfield and describes the code as it is: present tense, no
+  wind-ups or hedges.
 - Container tests use the `rightsize` crate only; no Docker CLI, compose,
   or bollard in the repo. The test node is the `sundog-testnode` binary.
 - Publishing goes through GitHub Actions (`release.yml`, `tag-release.yml`,

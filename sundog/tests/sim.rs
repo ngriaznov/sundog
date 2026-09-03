@@ -5,8 +5,7 @@
 //! `update_peers`, the inbound dispatch loop, the anti-entropy scheduler,
 //! and state-transfer's donor-retry loop) is `pub(crate)` and unusable from
 //! here, so this file re-implements the relevant slice of each against the
-//! same public `Mesh`/`ShardOps` surface `cluster.rs` itself drives — see
-//! this suite's own "needs" note in the owning agent's report.
+//! same public `Mesh`/`ShardOps` surface `cluster.rs` itself drives.
 //!
 //! `turmoil`'s simulated TCP objects (reached through `net`'s transport seam,
 //! `src/net/tcp.rs`) must be created and driven from *within* the owning
@@ -67,8 +66,7 @@ const TICK: Duration = Duration::from_millis(5);
 /// segment, which the OS retries): if the dropped message was the one thing
 /// a reader was waiting on, that read stalls forever rather than erroring.
 /// Real `net::Mesh` never needs this — real TCP retransmits — but a harness
-/// exercising turmoil's lossier model does; see this suite's own "needs"
-/// note in the owning agent's report.
+/// exercising turmoil's lossier model does.
 const NET_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn cache_name() -> SmolStr {
@@ -81,9 +79,9 @@ fn key_bytes(key: u32) -> Bytes {
 
 /// Runs a `ShardOps` future to completion without any ambient runtime —
 /// valid because `Shard`'s async methods only ever await plain
-/// `tokio::sync` primitives and `moka`, neither of which needs a reactor —
-/// for reading shard state from outside any turmoil host (the test function
-/// itself, which is not itself async).
+/// `tokio::sync` primitives, none of which needs a reactor — for reading
+/// shard state from outside any turmoil host (the test function itself,
+/// which is not itself async).
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     futures::executor::block_on(fut)
 }
@@ -288,12 +286,12 @@ async fn diff_bucket(
 /// range on a timer (fanning each out), run anti-entropy against its peer on
 /// a separate timer, and dispatch inbound traffic — forever.
 ///
-/// `remove_on_repeat` turns the key plan into a lifecycle plan: the first
-/// occurrence of a key inserts it, any repeat occurrence removes it (fanning
-/// the tombstone out the same way), so a plan listing a key twice churns it
-/// through insert-then-delete. `ops_issued` counts every issued operation —
-/// the only externally observable "the write plan finished" signal once
-/// removes make value-presence checks useless.
+/// `remove_on_repeat` turns the key list into a lifecycle schedule: the
+/// first occurrence of a key inserts it, any repeat occurrence removes it
+/// (fanning the tombstone out the same way), so a key listed twice churns
+/// it through insert-then-delete. `ops_issued` counts every issued
+/// operation — the only externally observable "the writes finished" signal
+/// once removes make value-presence checks useless.
 #[derive(Clone)]
 struct NodeParams {
     node: NodeId,
@@ -580,20 +578,20 @@ fn run_storm_scenario(seed: u64) -> StormStats {
     );
 
     // Both sides' write bursts run concurrently with AE from the start
-    // (that's the "storm"), so digest equality can hold trivially early —
-    // e.g. neither side has written anything yet — well before every key
-    // exists anywhere to converge on. A fixed time margin isn't a safe proxy
-    // for "the write plan finished issuing" (the inbound-dispatch branch of
+    // (the "storm"), so digest equality can hold trivially early — neither
+    // side has written anything yet — well before every key exists anywhere
+    // to converge on. A fixed time margin isn't a safe proxy for "the
+    // writes finished issuing" (the inbound-dispatch branch of
     // `node_loop`'s `select!` can win repeatedly under a heavy duplicate
     // storm, delaying — never dropping — a late write past any fixed
-    // budget), so wait explicitly for every key to exist on its own
-    // origin shard before treating digest equality as real convergence.
+    // budget), so wait explicitly for every key to exist on its own origin
+    // shard before treating digest equality as real convergence.
     let own_writes_issued =
         |shard: &TestShard, keys: &[u32]| keys.iter().all(|&key| value_of(shard, key).is_some());
     run_until(&mut sim, steps_for(Duration::from_secs(10)), || {
         own_writes_issued(&shard_a, &keys_a) && own_writes_issued(&shard_b, &keys_b)
     })
-    .expect("both sides finish issuing their own write plan within the budget");
+    .expect("both sides finish issuing their own writes within the budget");
 
     let budget = steps_for(Duration::from_secs(20));
     let steps_to_converge = run_until(&mut sim, budget, || {
@@ -789,14 +787,14 @@ fn new_shard_with_tombstone_ttl(
 ///
 /// `defer_while_absent` is handed straight to the real
 /// [`ShardOps::gc_tombstones`] — the production GC path — standing in for
-/// `cluster::absence::should_defer_gc`'s decision, which is `pub(crate)` and
-/// unreachable from this external test binary (this suite's own "needs"
-/// note, module docs). `true` exercises the fix; `false` exercises the old
-/// unconditional-GC rule it replaced, with node-a's continued absence
-/// (the partition is still up) hand-supplied instead of read from a live
-/// `AbsenceTracker`. Anti-entropy itself is not mirrored here — `ae_round_once`
-/// drives the real `net::Mesh`/`ShardOps` wire path, same as every other
-/// scenario in this suite.
+/// `cluster::absence::should_defer_gc`'s decision, which is `pub(crate)`
+/// and unreachable from this external test binary. `true` defers
+/// collecting node-b's tombstone while node-a stays absent; `false`
+/// collects it unconditionally, with node-a's continued absence (the
+/// partition is still up) hand-supplied instead of read from a live
+/// `AbsenceTracker`. Anti-entropy itself is not mirrored here —
+/// `ae_round_once` drives the real `net::Mesh`/`ShardOps` wire path, same
+/// as every other scenario in this suite.
 fn run_partition_delete_scenario(
     seed: u64,
     port: u16,
@@ -826,7 +824,7 @@ fn run_partition_delete_scenario(
     ))
     .into_iter()
     .next()
-    .expect("just-inserted key has a record");
+    .expect("the freshly inserted key has a record");
     block_on(ShardOps::apply_remote(shard_b.as_ref(), rec));
     assert_eq!(value_of(&shard_a, key), Some("original".to_string()));
     assert_eq!(value_of(&shard_b, key), Some("original".to_string()));
@@ -897,10 +895,10 @@ fn run_partition_delete_scenario(
     (value_of(&shard_a, key), value_of(&shard_b, key), converged)
 }
 
-/// The owner's semantic goal, proven directly: a member absent past
-/// `tombstone_ttl` must not be able to resurrect a manually deleted entry on
-/// heal. `run_partition_delete_scenario(.., true)` is the deferral fix in
-/// effect — `gc_tombstones` defers collecting node-b's tombstone the whole
+/// Proves the semantic goal directly: a member absent past
+/// `tombstone_ttl` must not be able to resurrect a manually deleted entry
+/// on heal. `run_partition_delete_scenario(.., true)` runs with deferral
+/// active — `gc_tombstones` defers collecting node-b's tombstone the whole
 /// time node-a is absent, so there's still a tombstone (not silence) for
 /// anti-entropy to converge node-a onto once healed.
 #[test]
@@ -918,17 +916,15 @@ fn partition_survivor_delete_does_not_resurrect_after_heal() {
     assert_eq!(value_b, None, "node-b must keep the key deleted");
 }
 
-/// The counter-case that motivates the fix, proving the deferral is
-/// load-bearing rather than incidental: the *same* scenario — same
-/// partition, same delete, same real time elapsed past `tombstone_ttl` while
-/// node-a stays absent — but with the old unconditional-GC rule
-/// (`defer_while_absent: false`) in the one spot that decides whether to
-/// collect. Node-b forgets the tombstone entirely while node-a is still
-/// unreachable and never learned of the delete; once healed, anti-entropy
-/// sees node-a's still-live stale copy as something node-b is simply
-/// missing and pulls it back. Run back to back with the deferred case so the
-/// contrast — not a standalone claim about old behavior — is what the
-/// assertions rest on.
+/// The counter-case, proving the deferral is load-bearing rather than
+/// incidental: the *same* scenario — same partition, same delete, same
+/// real time elapsed past `tombstone_ttl` while node-a stays absent — but
+/// with unconditional GC (`defer_while_absent: false`) in the one spot
+/// that decides whether to collect. Node-b forgets the tombstone entirely
+/// while node-a is still unreachable and never learned of the delete; once
+/// healed, anti-entropy sees node-a's still-live stale copy as something
+/// node-b is missing and pulls it back. Run back to back with the
+/// deferred case so the contrast is what the assertions rest on.
 #[test]
 fn tombstone_deferral_is_load_bearing_against_resurrection() {
     let (_, value_b_unconditional, converged_unconditional) =
@@ -956,8 +952,8 @@ fn tombstone_deferral_is_load_bearing_against_resurrection() {
     );
     assert_eq!(
         deferred_value_b, None,
-        "same scenario, deferred: node-b stays deleted — the fix closes exactly \
-         the gap the unconditional rule above just demonstrated"
+        "same scenario, deferred: node-b stays deleted, closing exactly the gap \
+         the unconditional case above demonstrated"
     );
 }
 
@@ -1003,7 +999,7 @@ fn link_flapping_under_writes_converges_after_final_heal() {
         None,
     );
 
-    // 6 × (300ms down + 200ms up) = 3s of flapping; both write plans
+    // 6 × (300ms down + 200ms up) = 3s of flapping; both write sequences
     // (12 keys × 40ms = 480ms) finish while the link is still unstable.
     for _ in 0..6 {
         sim.partition("flap-a", "flap-b");
@@ -1074,9 +1070,9 @@ fn one_way_partition_delivers_the_healthy_direction_and_heals() {
     );
 
     // Let connections establish and the first few writes cross, then break
-    // the a→b direction only. The 8-key × 100ms write plans keep issuing
-    // well past this point, so some of node-a's writes are guaranteed to
-    // happen entirely under the fault.
+    // the a→b direction only. The 8-key × 100ms write sequences keep
+    // issuing well past this point, so some of node-a's writes are
+    // guaranteed to happen entirely under the fault.
     run_steps(&mut sim, steps_for(Duration::from_millis(300)));
     sim.partition_oneway("oneway-a", "oneway-b");
 
@@ -1088,7 +1084,7 @@ fn one_way_partition_delivers_the_healthy_direction_and_heals() {
     })
     .expect("node-b's writes must keep replicating to node-a during the one-way fault");
 
-    // And the broken direction really is broken: node-a wrote keys after the
+    // And the broken direction stays broken: node-a wrote keys after the
     // drop began that node-b cannot have seen (fan-out dropped, AE responses
     // dropped), so the two sides must still disagree.
     assert_ne!(
@@ -1116,7 +1112,7 @@ fn one_way_partition_delivers_the_healthy_direction_and_heals() {
 
 /// A permanently slow link — every message takes 50–150ms one way, an order
 /// of magnitude above the other scenarios — with live writes on both sides.
-/// Nothing is lost, just late: replication and anti-entropy must still
+/// Nothing is lost, only late: replication and anti-entropy must still
 /// converge within a bounded number of rounds, and no request path may sit
 /// closer to `NET_TIMEOUT` than one full round trip (~300ms worst case)
 /// allows.
@@ -1179,14 +1175,15 @@ fn sustained_high_latency_still_converges() {
 }
 
 /// High-frequency entry lifecycle under loss: both nodes run overlapping
-/// insert-then-remove plans (`remove_on_repeat`) over a shared key range on
-/// a lossy, reordering link, so the same key is inserted on one side,
-/// removed on the other, and the tombstone fan-out itself can be dropped and
-/// left for anti-entropy to repair. The end state is fully determined by
-/// the plans — every even key was removed by every writer that touched it,
-/// every odd key's last operation was an insert — so the assertions check
-/// the converged state is the *correct* one, not merely a shared one:
-/// removed keys stay removed on both sides, surviving keys agree.
+/// insert-then-remove schedules (`remove_on_repeat`) over a shared key
+/// range on a lossy, reordering link, so the same key is inserted on one
+/// side, removed on the other, and the tombstone fan-out itself can be
+/// dropped and left for anti-entropy to repair. The end state is fully
+/// determined by those schedules — every even key was removed by every
+/// writer that touched it, every odd key's last operation was an insert —
+/// so the assertions check the converged state is the *correct* one, not
+/// merely a shared one: removed keys stay removed on both sides, surviving
+/// keys agree.
 #[test]
 fn add_remove_churn_under_loss_converges_to_the_correct_state() {
     let node_a = NodeId::from(61);
@@ -1258,7 +1255,7 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
         ops_a.load(Ordering::Relaxed) >= plan_a.len()
             && ops_b.load(Ordering::Relaxed) >= plan_b.len()
     })
-    .expect("both churn plans finish issuing within the budget");
+    .expect("both churn sequences finish issuing within the budget");
 
     run_until(&mut sim, steps_for(Duration::from_secs(20)), || {
         digests_of(&shard_a) == digests_of(&shard_b)

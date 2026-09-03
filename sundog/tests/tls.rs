@@ -64,7 +64,7 @@ async fn reserve_gossip_addr() -> SocketAddr {
         .expect("bind an ephemeral loopback udp port to reserve a gossip address");
     socket
         .local_addr()
-        .expect("a just-bound udp socket reports a local address")
+        .expect("a freshly bound udp socket reports a local address")
 }
 
 fn tls_node_config(gossip_bind_addr: SocketAddr, tls: TlsConfig) -> ClusterConfig {

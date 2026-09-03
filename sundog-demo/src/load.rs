@@ -13,7 +13,7 @@ use crate::node::NodeSlot;
 
 const REMOVE_PROBABILITY: f64 = 0.15;
 
-/// Runs until the task is aborted by the caller. Intended to be driven via
+/// Runs until aborted by the caller. Intended to be driven via
 /// `tokio::spawn` and cancelled with `JoinHandle::abort`.
 pub(crate) async fn run(
     nodes: Arc<Vec<Arc<NodeSlot>>>,

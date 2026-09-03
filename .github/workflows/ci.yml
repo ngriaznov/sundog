@@ -50,16 +50,16 @@ jobs:
       # to turmoil (`net::tcp`'s seam), which every plain `#[tokio::test]`
       # elsewhere in the crate — including these two features' own tests —
       # dials real OS sockets against, so `sim` combined with anything else
-      # fails outside a turmoil `Sim`; `--all-features` compiles cleanly (see
-      # this crate's build-agent report) but is nonsensical to *test* against,
-      # which is why `sim` keeps its own lane above instead.
+      # fails outside a turmoil `Sim`; `--all-features` compiles cleanly but
+      # is nonsensical to *test* against, which is why `sim` keeps its own
+      # lane above instead.
       - name: cargo test (tls,prometheus features)
         run: cargo test --package sundog --features tls,prometheus
 
   # Portability lane: the crate claims no OS-specific behavior, but mDNS,
   # socket handling, and timers all differ per platform — this proves the
   # workspace builds and its default-feature test suite (plus the turmoil
-  # sim lane) passes on macOS and Windows, not just Linux. The container/
+  # sim lane) passes on macOS and Windows, not only Linux. The container/
   # musl and tls,prometheus lanes stay Linux-only: containers need a Linux
   # docker host, and the `tls` feature's aws-lc-rs build wants NASM on
   # Windows — a separate decision from plain portability.
