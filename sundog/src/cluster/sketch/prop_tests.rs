@@ -1,14 +1,13 @@
-//! Property tests for the IBLT sketch: within [`RATED_CAPACITY`],
-//! `subtract` + `peel` decodes the *exact* symmetric difference with
-//! overwhelming probability — see [`RATED_CAPACITY`]'s own docs for why that
-//! can never be an absolute guarantee, only one made statistically
-//! negligible by this shape's cell count — and past it, arbitrarily large
-//! differences either decode exactly or report `Undecodable`, never a wrong
-//! answer.
+//! Property tests for the IBLT sketch: whenever `subtract` + `peel`
+//! decodes, the result is the *exact* symmetric difference, at any size;
+//! and at [`RATED_CAPACITY`] the default shape decodes at least 98% of
+//! seeded random differences (99% is the measured rate; the bound leaves
+//! room for sampling noise without hiding a real regression).
 
 use std::collections::{HashMap, HashSet};
 
 use proptest::prelude::*;
+use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
 use super::{Elem, IBLT_PARTITIONS, Iblt, RATED_CAPACITY};
 use crate::hlc::Hlc;
@@ -16,7 +15,7 @@ use crate::node::NodeId;
 
 /// The default sketch size ([`crate::config::ClusterConfig::ae_sketch_cells`]'s
 /// own default) — [`RATED_CAPACITY`] is rated against exactly this shape.
-const DEFAULT_CELLS: usize = 951;
+const DEFAULT_CELLS: usize = 240;
 
 #[derive(Debug, Clone, Copy)]
 enum Role {
@@ -108,33 +107,6 @@ fn build(items: Vec<(u64, Role, Hlc, Hlc)>) -> (Iblt, Iblt, HashSet<Elem>, HashS
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
 
-    /// Every `Differing` item costs at most 2 toward the true symmetric
-    /// difference, every `LeftOnly`/`RightOnly` item at most 1 — so capping
-    /// the item count at `RATED_CAPACITY / 2` bounds the true difference at
-    /// or below `RATED_CAPACITY` regardless of which roles proptest picks.
-    /// Within that bound, decode succeeds with overwhelming probability —
-    /// [`RATED_CAPACITY`]'s own docs on why a hash-based sketch can never
-    /// make that an absolute guarantee, and on how rare a red run here
-    /// should be even so.
-    #[test]
-    fn within_rated_capacity_always_decodes_exactly(
-        items in proptest::collection::vec(item_strategy(), 0..=(RATED_CAPACITY / 2))
-    ) {
-        let (left, right, expected_left, expected_right) = build(items);
-        let decoded = left
-            .subtract(&right)
-            .peel()
-            .expect(
-                "a symmetric difference within the rated capacity decodes except on the rare, \
-                 documented hash-collision case (RATED_CAPACITY's own docs) - re-run once before \
-                 treating this as a regression",
-            );
-        let got_left: HashSet<Elem> = decoded.only_left.into_iter().collect();
-        let got_right: HashSet<Elem> = decoded.only_right.into_iter().collect();
-        prop_assert_eq!(got_left, expected_left);
-        prop_assert_eq!(got_right, expected_right);
-    }
-
     /// No size cap this time — the difference may well exceed the sketch's
     /// rated capacity. Either `peel` decodes (and, if it does, the result
     /// must still be exact) or it reports `Undecodable`; it must never
@@ -186,4 +158,60 @@ proptest! {
         prop_assert!(len > 0);
         prop_assert_eq!(len % IBLT_PARTITIONS, 0);
     }
+}
+
+/// A seeded, deterministic sample of `RATED_CAPACITY`-sized differences at
+/// the default shape: half the elements on each side over a shared base of
+/// a thousand identical entries, exactly the bucket a large-cache
+/// anti-entropy round compares. Pins the decode rate `RATED_CAPACITY`'s
+/// docs state.
+#[test]
+fn rated_capacity_decodes_at_least_ninety_eight_percent() {
+    const TRIALS: u32 = 500;
+    let mut rng = StdRng::seed_from_u64(0x5EED);
+    let mut decoded = 0u32;
+    for _ in 0..TRIALS {
+        let mut left = Iblt::new(DEFAULT_CELLS);
+        let mut right = Iblt::new(DEFAULT_CELLS);
+        let mut expected_left = HashSet::new();
+        let mut expected_right = HashSet::new();
+        for _ in 0..1000 {
+            let key_hash: u64 = rng.random();
+            let ver = Hlc {
+                wall_ms: rng.random_range(1..1_000_000_000),
+                logical: 0,
+                node: NodeId::from(rng.random_range(1..8u64)),
+            };
+            left.insert(key_hash, ver);
+            right.insert(key_hash, ver);
+        }
+        for i in 0..RATED_CAPACITY {
+            let key_hash: u64 = rng.random();
+            let ver = Hlc {
+                wall_ms: rng.random_range(1..1_000_000_000),
+                logical: 0,
+                node: NodeId::from(1),
+            };
+            let elem = Elem { key_hash, ver };
+            if i % 2 == 0 {
+                left.insert(key_hash, ver);
+                expected_left.insert(elem);
+            } else {
+                right.insert(key_hash, ver);
+                expected_right.insert(elem);
+            }
+        }
+        if let Ok(result) = left.subtract(&right).peel() {
+            let got_left: HashSet<Elem> = result.only_left.into_iter().collect();
+            let got_right: HashSet<Elem> = result.only_right.into_iter().collect();
+            assert_eq!(got_left, expected_left, "a decode is always exact");
+            assert_eq!(got_right, expected_right, "a decode is always exact");
+            decoded += 1;
+        }
+    }
+    let rate = f64::from(decoded) / f64::from(TRIALS);
+    assert!(
+        rate >= 0.98,
+        "{decoded}/{TRIALS} differences of {RATED_CAPACITY} decoded at {DEFAULT_CELLS} cells"
+    );
 }

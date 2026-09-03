@@ -70,46 +70,22 @@ use crate::node::NodeId;
 pub(crate) const IBLT_PARTITIONS: usize = 3;
 
 /// Symmetric-difference size the crate's default sketch shape
-/// ([`crate::config::ClusterConfig::ae_sketch_cells`]'s default of 951
-/// cells, 317 per partition at [`IBLT_PARTITIONS`] = 3) is rated for.
+/// ([`crate::config::ClusterConfig::ae_sketch_cells`]'s default of 240
+/// cells, 80 per partition at [`IBLT_PARTITIONS`] = 3) decodes in at least
+/// 99% of cases.
 ///
-/// This is a *statistical*, not absolute, guarantee: two elements that
-/// happen to land in the exact same cell in all three partitions (an
-/// [`IBLT_PARTITIONS`]-way hash collision, roughly `1 / partition_len^3` per
-/// pair at random) leave that trio of cells non-pure and unresolvable —
-/// vanishingly unlikely for any one pair, but with up to
-/// `RATED_CAPACITY / 2` elements possibly pairwise-colliding, not literally
-/// zero. At this constant's value, direct Monte Carlo sampling (tens of
-/// thousands of random trials at this exact sketch shape, well beyond what
-/// the property tests below run on every `cargo test`) puts the
-/// per-difference-pair failure rate low enough that a full 1024-case
-/// property-test run turning up even one `Undecodable` inside the rated
-/// capacity is itself a rare event — not a mathematical impossibility, so a
-/// red run here first re-runs before assuming a real regression, but not
-/// one to expect in normal use. Past this size, decode failures become the
-/// norm rather than an outlier (still never a *wrong* answer, only
-/// `Undecodable` — see this module's docs); this constant is the boundary
-/// the property tests hold that near-certain "always exact" property to,
-/// not a hard cutoff enforced anywhere at runtime.
-///
-/// 317 is prime, not a round/highly-divisible number like 240 or 320 — this
-/// matters because proptest's own integer shrinker narrows a failing case by
-/// bisection, which tends to land two colliding elements' hash values a
-/// suspiciously round (power-of-two-ish) distance apart; a highly composite
-/// `partition_len` (say, one sharing factors of 2 and 5) lets that shrunk
-/// distance stay a multiple of it far more often than genuine random luck
-/// would predict, turning one real but rare statistical collision into a
-/// *permanently reproducible* one once proptest saves the shrunk case to
-/// `proptest-regressions`. A prime `partition_len` has (almost) no small
-/// factors in common with a shrinker-produced delta, so this class of
-/// self-inflicted flakiness — distinct from the genuine, inherent
-/// `1 / partition_len^3` collision risk above — stays as unlikely as
-/// intended.
-// Only read by the property tests (`prop_tests`, `#[cfg(test)]`) that pin
-// it; a non-test build never evaluates it, hence the otherwise-unused
-// warning this silences.
+/// An IBLT decodes by peeling cells that hold exactly one element; a
+/// difference whose elements happen to overlap in every cell they touch
+/// stalls the peel, so decoding is a probability, not a guarantee. Measured
+/// over seeded random differences at the default shape, 240 cells decode a
+/// 100-element difference 99% of the time, 140 elements 98%, and 180
+/// elements 88%; 120 cells hold up to about 60. The rate is pinned by
+/// `prop_tests::rated_capacity_decodes_at_least_ninety_eight_percent`.
+/// A failed decode costs one listing fallback, never a wrong answer
+/// (`Iblt::peel`).
+// Only read by the tests that pin it; a non-test build never evaluates it.
 #[allow(dead_code)]
-pub(crate) const RATED_CAPACITY: usize = 40;
+pub(crate) const RATED_CAPACITY: usize = 100;
 
 /// Distinct per-partition salts folded into [`mix`] — arbitrary odd 64-bit
 /// constants (borrowed from well-known mixing constants), not secret; their

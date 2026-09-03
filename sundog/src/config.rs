@@ -134,24 +134,22 @@ pub struct ClusterConfig {
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
-    /// Local entry-list length above which an anti-entropy responder answers
-    /// a mismatched bucket with an IBLT sketch (`Msg::AeSketch`) instead of
-    /// the bucket's full `(key, version)` listing (`Msg::AeBucket`). Below
-    /// this point a listing is already cheap on the wire and a fixed-cost
-    /// sketch reply buys nothing; past it, a sketch's wire cost stops
-    /// growing with the bucket while a listing's keeps climbing, so the
-    /// sketch increasingly wins the larger the bucket gets regardless of how
-    /// large the actual diff turns out to be.
+    /// Bucket size past which an anti-entropy responder answers a mismatch
+    /// with an IBLT sketch (`Msg::AeSketch`) instead of the bucket's full
+    /// `(key, version)` listing (`Msg::AeBucket`). A sketch costs a fixed
+    /// ~9 KB at the default `ae_sketch_cells`; a listing costs ~23 bytes
+    /// per entry with small keys, so the default of 384 is the crossover,
+    /// and larger keys cross over sooner. Below it a listing is cheaper;
+    /// above it the sketch's cost stays flat while the listing's keeps
+    /// climbing, whatever the true difference turns out to be.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch an anti-entropy responder builds for a
     /// bucket past [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket).
-    /// Rated (see `cluster::sketch::RATED_CAPACITY`, whose own docs cover
-    /// why this is a statistical rather than absolute guarantee) to decode
-    /// any symmetric difference up to 40 elements with overwhelming
-    /// probability; a larger true difference — or, on the rare documented
-    /// hash-collision case, sometimes even a smaller one — falls back to
-    /// `Msg::AeEntries`'s full listing rather than ever risking a wrong
-    /// decode.
+    /// The default of 240 decodes a symmetric difference of up to 100
+    /// elements in at least 99% of cases (`cluster::sketch::RATED_CAPACITY`
+    /// gives the measured curve); a larger difference, or the rare
+    /// undecodable smaller one, falls back to `Msg::AeEntries`'s full
+    /// listing rather than ever risking a wrong decode.
     pub ae_sketch_cells: usize,
     /// Mutual-TLS material for the data-plane mesh (feature `tls`); `None`
     /// (the default) means the mesh runs plaintext. See [`TlsConfig`]'s own
@@ -198,8 +196,8 @@ impl Default for ClusterConfig {
             dead_node_grace_period: Duration::from_secs(600),
             kv_tombstone_grace_period: Duration::from_mins(15),
             state_transfer_budget: Duration::from_secs(20),
-            ae_sketch_min_bucket: 256,
-            ae_sketch_cells: 951,
+            ae_sketch_min_bucket: 384,
+            ae_sketch_cells: 240,
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -236,8 +234,8 @@ mod tests {
     #[test]
     fn default_ae_sketch_knobs_match_the_rated_sketch_shape() {
         let config = ClusterConfig::default();
-        assert_eq!(config.ae_sketch_min_bucket, 256);
-        assert_eq!(config.ae_sketch_cells, 951);
+        assert_eq!(config.ae_sketch_min_bucket, 384);
+        assert_eq!(config.ae_sketch_cells, 240);
     }
 
     #[test]

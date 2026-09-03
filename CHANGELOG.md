@@ -9,12 +9,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Sketch-based anti-entropy for large buckets**: a mismatched bucket whose
   local entry count exceeds `ClusterConfig::ae_sketch_min_bucket` (default
-  256) is answered with an invertible Bloom lookup table
-  (`ClusterConfig::ae_sketch_cells`, default 951 cells) instead of its full
-  `(key, version)` listing — a fixed wire cost regardless of bucket size,
-  rated to decode any symmetric difference up to 40 elements with
-  overwhelming probability, falling back to the full listing on the rare
-  cases it can't. New wire messages `Msg::AeSketch`, `Msg::AeEntries`, and
+  384) is answered with an invertible Bloom lookup table
+  (`ClusterConfig::ae_sketch_cells`, default 240 cells, about 9 KB on the
+  wire) instead of its full `(key, version)` listing — a fixed wire cost
+  regardless of bucket size, decoding a symmetric difference of up to 100
+  elements in at least 99% of cases and falling back to the full listing
+  otherwise. New wire messages `Msg::AeSketch`, `Msg::AeEntries`, and
   `Msg::AePullHashes` carry the sketch exchange and its listing/pull
   fallbacks. New metric `sundog_ae_sketch_total{cache, outcome}` counts
   `decoded` vs `fallback` outcomes.
