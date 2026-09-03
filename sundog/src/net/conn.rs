@@ -318,7 +318,15 @@ pub(super) async fn dial_with_hello(
     disable_nagle(&stream);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
-    send_msg(&mut framed, &Msg::Hello { node, incarnation }).await?;
+    send_msg(
+        &mut framed,
+        &Msg::Hello {
+            node,
+            incarnation,
+            protocol: wire::PROTOCOL_VERSION,
+        },
+    )
+    .await?;
     Ok(framed)
 }
 
@@ -335,7 +343,18 @@ pub(super) async fn dial_with_hello_and(
     disable_nagle(&stream);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
-    send_batch(&mut framed, &[Msg::Hello { node, incarnation }, first]).await?;
+    send_batch(
+        &mut framed,
+        &[
+            Msg::Hello {
+                node,
+                incarnation,
+                protocol: wire::PROTOCOL_VERSION,
+            },
+            first,
+        ],
+    )
+    .await?;
     Ok(framed)
 }
 
@@ -474,9 +493,21 @@ async fn handle_accepted(
         () = cancel.cancelled() => return,
         hello = recv_msg(&mut framed) => hello,
     };
-    let Some(Ok(Msg::Hello { node: from, .. })) = hello else {
+    let Some(Ok(Msg::Hello {
+        node: from,
+        protocol: peer_protocol,
+        ..
+    })) = hello
+    else {
         return;
     };
+    if peer_protocol > wire::PROTOCOL_VERSION {
+        tracing::debug!(
+            peer = %from,
+            peer_protocol,
+            "peer speaks a newer protocol; it limits itself to what this node understands"
+        );
+    }
 
     let mut served_requests: usize = 0;
     loop {
@@ -503,6 +534,7 @@ async fn handle_accepted(
         let stop = dispatch_one(
             msg,
             from,
+            peer_protocol,
             &mut framed,
             &inbound_tx,
             handler.as_ref(),
@@ -526,9 +558,11 @@ async fn handle_accepted(
 /// message to `inbound_tx`, serves a request inline, or, for a message only
 /// ever sent as a reply on a connection this node initiated, does nothing.
 /// Returns `true` when this connection is done.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_one(
     msg: Msg,
     from: NodeId,
+    peer_protocol: u16,
     framed: &mut PeerFramed,
     inbound_tx: &mpsc::Sender<InboundMsg>,
     handler: &dyn RequestHandler,
@@ -540,7 +574,9 @@ async fn dispatch_one(
             let _ = inbound_tx.send(InboundMsg { from, msg }).await;
             false
         }
-        Msg::StRequest { cache } => serve_state_transfer(framed, cache, handler, cancel).await,
+        Msg::StRequest { cache } => {
+            serve_state_transfer(framed, cache, handler, cancel, peer_protocol).await
+        }
         Msg::AeDigest { cache, buckets } => {
             if mesh.defers_ae_digest_from(from) {
                 tracing::debug!(
@@ -550,7 +586,7 @@ async fn dispatch_one(
                 );
                 send_batch_or_cancelled(framed, &[Msg::ReqDone], cancel).await
             } else {
-                serve_ae_digest(framed, cache, buckets, handler, cancel).await
+                serve_ae_digest(framed, cache, buckets, handler, cancel, peer_protocol).await
             }
         }
         Msg::AeEntries { cache, buckets } => {
@@ -599,10 +635,18 @@ async fn serve_state_transfer(
     cache: SmolStr,
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
+    peer_protocol: u16,
 ) -> bool {
     if !handler.snapshot_available(cache.clone()) {
-        tracing::debug!(%cache, "state transfer requested before this node is warm; declined");
-        return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
+        if wire::peer_supports(peer_protocol, wire::PROTOCOL_ST_UNAVAILABLE) {
+            tracing::debug!(%cache, "state transfer requested before this node is warm; declined");
+            return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
+        }
+        tracing::debug!(
+            %cache,
+            peer_protocol,
+            "state transfer requested before this node is warm by a peer that cannot be declined; serving"
+        );
     }
     let mut chunks = handler.snapshot_chunks(cache.clone());
     loop {
@@ -647,6 +691,7 @@ async fn serve_ae_digest(
     remote_buckets: Vec<(u16, u64)>,
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
+    peer_protocol: u16,
 ) -> bool {
     let local: std::collections::HashMap<u16, u64> =
         handler.digests(cache.clone()).await.into_iter().collect();
@@ -660,7 +705,13 @@ async fn serve_ae_digest(
 
     let mut replies: Vec<Msg> = Vec::new();
     if !mismatched.is_empty() {
-        let part_min_bucket = handler.ae_part_min_bucket();
+        // A peer that predates part digests gets a listing or sketch for
+        // every bucket, whatever its size.
+        let part_min_bucket = if wire::peer_supports(peer_protocol, wire::PROTOCOL_PART_DIGESTS) {
+            handler.ae_part_min_bucket()
+        } else {
+            usize::MAX
+        };
         let lens: std::collections::HashMap<u16, usize> = handler
             .bucket_lens(cache.clone(), mismatched.clone())
             .await
@@ -1239,6 +1290,7 @@ mod tests {
         let sent = Msg::Hello {
             node: NodeId::from(7),
             incarnation: 3,
+            protocol: wire::PROTOCOL_VERSION,
         };
         let encoded = wire::encode(&sent).expect("encodes");
         client.send(encoded).await.expect("send");
@@ -1346,6 +1398,7 @@ mod tests {
                 SmolStr::new("c"),
                 &NeverRespondingHandler,
                 &cancel_for_task,
+                crate::wire::PROTOCOL_VERSION,
             )
             .await;
         });
@@ -1516,6 +1569,7 @@ mod tests {
             Msg::Hello {
                 node: NodeId::from(9),
                 incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
             },
             Msg::AeBucket {
                 cache: SmolStr::new("users"),
@@ -1539,6 +1593,7 @@ mod tests {
             Msg::Hello {
                 node: NodeId::from(9),
                 incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
             },
             Msg::AeSketch {
                 cache: SmolStr::new("users"),
@@ -1572,6 +1627,7 @@ mod tests {
             Msg::Hello {
                 node: NodeId::from(9),
                 incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
             },
             Msg::Replicate {
                 cache: SmolStr::new("users"),
@@ -1633,6 +1689,7 @@ mod tests {
             Msg::Hello {
                 node: NodeId::from(9),
                 incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
             },
             Msg::AePart {
                 cache: SmolStr::new("users"),
@@ -1706,6 +1763,7 @@ mod tests {
             Msg::Hello {
                 node: from,
                 incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
             },
             Msg::ReqDone,
             Msg::AeBucket {

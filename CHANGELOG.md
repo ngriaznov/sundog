@@ -32,9 +32,18 @@ All notable changes to this project are documented in this file. Format follows
   a multi-megabyte bucket listing. New wire messages `Msg::AePartDigests`,
   `Msg::AeParts`, `Msg::AePart`, and `Msg::AePartSketch` carry the exchange.
   New metric `sundog_ae_parts_total{cache, outcome}` counts `listing`,
-  `sketch`, and `fallback` outcomes, one increment per part reply. A mixed
-  0.3/0.4 cluster is unsupported, as with any wire-format change across a
-  minor version.
+  `sketch`, and `fallback` outcomes, one increment per part reply. A 0.3 peer
+  is answered with listings and sketches only, so a mixed 0.3/0.4 cluster
+  keeps repairing.
+- **Protocol versioning**: `wire::PROTOCOL_VERSION`, 2 for this release,
+  travels in every `Msg::Hello` and in gossip as `Peer::protocol`. A hello
+  from a 0.3 node, which has no such field, decodes as protocol 1, and a
+  hello from a newer node with fields this release does not know decodes
+  with them ignored. A node serves a peer only with what that peer's
+  protocol understands: no part-digest replies and no `Msg::StUnavailable`
+  to a protocol-1 peer. One release step interoperates, so a cluster upgrades
+  one node at a time; a container test runs the 0.3.1 node against this one
+  in both directions.
 - **Breaking**, in the `sim`-feature test seams only: `net::AeMismatch`
   gains the `PartDigests` variant and is `#[non_exhaustive]` from here on,
   as is the new `net::AePartReply`; `net::RequestHandler` and

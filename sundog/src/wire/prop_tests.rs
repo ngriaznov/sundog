@@ -67,8 +67,11 @@ fn raw_record_msg_strategy() -> impl Strategy<Value = Msg> {
 
 fn msg_strategy() -> impl Strategy<Value = Msg> {
     prop_oneof![
-        (node_id_strategy(), any::<u64>())
-            .prop_map(|(node, incarnation)| Msg::Hello { node, incarnation }),
+        (node_id_strategy(), any::<u64>()).prop_map(|(node, incarnation)| Msg::Hello {
+            node,
+            incarnation,
+            protocol: crate::wire::PROTOCOL_VERSION,
+        }),
         (smol_str_strategy(), bytes_strategy(), hlc_strategy())
             .prop_map(|(cache, key, ver)| Msg::Invalidate { cache, key, ver }),
         (smol_str_strategy(), wire_record_strategy())

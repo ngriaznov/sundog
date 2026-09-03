@@ -35,6 +35,9 @@ const MAX_INITIAL_SEEDS: usize = 16;
 const NODE_ID_KEY: &str = "node_id";
 const DATA_ADDR_KEY: &str = "data_addr";
 const INCARNATION_KEY: &str = "incarnation";
+/// The peer's [`crate::wire::PROTOCOL_VERSION`]; absent on a 0.3 node,
+/// which speaks protocol 1.
+const PROTOCOL_KEY: &str = "protocol";
 /// Prefix for the per-cache mode keys `Membership::set_cache_mode` sets:
 /// the full key is `cache:<name>`.
 const CACHE_KEY_PREFIX: &str = "cache:";
@@ -58,6 +61,10 @@ pub struct Peer {
     /// Incremented each time this node leaves and rejoins, distinguishing a
     /// restarted process from a still-live one.
     pub incarnation: u64,
+    /// The wire protocol the peer speaks, its
+    /// [`crate::wire::PROTOCOL_VERSION`]; `1` for a node whose gossip
+    /// state predates the key.
+    pub protocol: u16,
 }
 
 /// Every cache each live peer advertises as open, keyed by peer, with the
@@ -162,6 +169,10 @@ impl Membership {
             (NODE_ID_KEY.to_string(), node.to_string()),
             (DATA_ADDR_KEY.to_string(), data_addr.to_string()),
             (INCARNATION_KEY.to_string(), incarnation.to_string()),
+            (
+                PROTOCOL_KEY.to_string(),
+                crate::wire::PROTOCOL_VERSION.to_string(),
+            ),
         ];
 
         let handle = spawn_chitchat(chitchat_config, initial_key_values, &UdpTransport)
@@ -182,6 +193,7 @@ impl Membership {
             gossip_addr: gossip_advertise_addr,
             data_addr,
             incarnation,
+            protocol: crate::wire::PROTOCOL_VERSION,
         };
 
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
@@ -313,6 +325,10 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
 
     let data_addr: SocketAddr = node_state.get(DATA_ADDR_KEY)?.parse().ok()?;
     let incarnation: u64 = node_state.get(INCARNATION_KEY)?.parse().ok()?;
+    let protocol: u16 = node_state
+        .get(PROTOCOL_KEY)
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(1);
 
     Some(Peer {
         node,
@@ -320,7 +336,23 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
         gossip_addr: chitchat_id.gossip_advertise_addr,
         data_addr,
         incarnation,
+        protocol,
     })
+}
+
+/// What a peer's protocol version means for this node, for the one log line
+/// per peer [`Membership`] emits when a view first shows it: `None` when the
+/// peer is fully served.
+fn protocol_notice(peer_protocol: u16) -> Option<&'static str> {
+    if peer_protocol > crate::wire::PROTOCOL_VERSION {
+        Some(
+            "peer speaks a newer protocol; it limits itself to what this node understands, upgrade this node",
+        )
+    } else if peer_protocol < crate::wire::MIN_PROTOCOL_VERSION {
+        Some("peer speaks a protocol this node no longer serves; upgrade the peer")
+    } else {
+        None
+    }
 }
 
 /// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
@@ -360,6 +392,9 @@ async fn run(
     let mut seeds = seeds.fuse();
     let chitchat = handle.chitchat();
     let mut live_nodes = chitchat.lock().await.live_nodes_watch_stream().fuse();
+    // Peers whose protocol version has been logged once, so a view refresh
+    // does not repeat the notice.
+    let mut protocol_noticed: HashSet<NodeId> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -373,6 +408,11 @@ async fn run(
                 let mut cache_modes: CacheModes = HashMap::new();
                 for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
                     let Some(peer) = parse_peer(id, state) else { continue };
+                    if let Some(notice) = protocol_notice(peer.protocol)
+                        && protocol_noticed.insert(peer.node)
+                    {
+                        tracing::warn!(peer = %peer.node, peer_protocol = peer.protocol, "{notice}");
+                    }
                     cache_modes.insert(peer.node, parse_cache_modes(state));
                     peers.push(peer);
                 }
@@ -447,6 +487,30 @@ mod tests {
         assert_eq!(peer.gossip_addr, addr(7000));
         assert_eq!(peer.data_addr, "127.0.0.1:8000".parse().unwrap());
         assert_eq!(peer.incarnation, 12_345);
+        assert_eq!(peer.protocol, 1, "a 0.3 node gossips no protocol key");
+    }
+
+    #[test]
+    fn parse_peer_reads_the_protocol_key_when_present() {
+        let node = NodeId::from(42u64);
+        let name = NodeName::new("host-a", node);
+        let id = chitchat_id(name.as_str(), 7000);
+        let state = state_with(&[
+            (NODE_ID_KEY, &node.to_string()),
+            (DATA_ADDR_KEY, "127.0.0.1:8000"),
+            (INCARNATION_KEY, "12345"),
+            (PROTOCOL_KEY, "7"),
+        ]);
+        let peer = parse_peer(&id, &state).expect("well-formed state parses");
+        assert_eq!(peer.protocol, 7);
+    }
+
+    #[test]
+    fn protocol_notice_flags_only_newer_or_unserved_peers() {
+        assert!(protocol_notice(crate::wire::PROTOCOL_VERSION).is_none());
+        assert!(protocol_notice(crate::wire::MIN_PROTOCOL_VERSION).is_none());
+        assert!(protocol_notice(crate::wire::PROTOCOL_VERSION + 1).is_some());
+        assert!(protocol_notice(0).is_some());
     }
 
     #[test]

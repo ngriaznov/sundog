@@ -24,6 +24,10 @@
   releases, and yanks wait for an explicit go.
 - Prose is greenfield and describes the code as it is: present tense, no
   wind-ups or hedges.
+- Every wire change bumps `wire::PROTOCOL_VERSION`, and a responder gates the
+  new message kinds on the peer's protocol from its hello. Release N
+  interoperates with N-1; the mixed-version container test runs the previous
+  release's node against the current one and must stay green.
 - Container tests use the `rightsize` crate only; no Docker CLI, compose, or
   bollard in the repo. The test node is the `sundog-testnode` binary.
 - Publishing goes through GitHub Actions (`release.yml`, `tag-release.yml`,

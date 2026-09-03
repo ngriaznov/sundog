@@ -1059,6 +1059,8 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::codec::LengthDelimitedCodec;
 
+    use futures::SinkExt as _;
+
     use super::*;
     use crate::node::NodeName;
     use crate::wire::{self, MAX_FRAME};
@@ -1240,6 +1242,7 @@ mod tests {
             gossip_addr: addr,
             data_addr: addr,
             incarnation: 1,
+            protocol: wire::PROTOCOL_VERSION,
         }
     }
 
@@ -1267,7 +1270,8 @@ mod tests {
             msg,
             Msg::Hello {
                 node: NodeId::from(1),
-                incarnation: 1
+                incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
             }
         );
     }
@@ -1542,6 +1546,153 @@ mod tests {
             .expect("ae round succeeds");
 
         assert_eq!(result, vec![AeMismatch::PartDigests(1, part_digests)]);
+    }
+
+    /// A raw request connection to `addr` that has already sent `hello`, for
+    /// speaking as a peer of any protocol version, including the ones this
+    /// build's own `Mesh` no longer sends.
+    async fn raw_request_conn(
+        addr: SocketAddr,
+        hello: Bytes,
+    ) -> tokio_util::codec::Framed<tokio::net::TcpStream, tokio_util::codec::LengthDelimitedCodec>
+    {
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the mesh listener");
+        let mut framed = tokio_util::codec::LengthDelimitedCodec::builder()
+            .max_frame_length(wire::MAX_FRAME)
+            .new_framed(stream);
+        framed.send(hello).await.expect("hello sends");
+        framed
+    }
+
+    /// A protocol-1 hello: the protocol-2 encoding minus its trailing
+    /// `protocol` byte, checked to decode back as protocol 1.
+    fn legacy_hello(node: NodeId) -> Bytes {
+        let full = wire::encode(&Msg::Hello {
+            node,
+            incarnation: 1,
+            protocol: 2,
+        })
+        .expect("encodes");
+        let legacy = full.slice(..full.len() - 1);
+        assert!(matches!(
+            wire::decode(&legacy),
+            Ok(Msg::Hello { protocol: 1, .. })
+        ));
+        legacy
+    }
+
+    async fn replies_until_req_done(
+        framed: &mut tokio_util::codec::Framed<
+            tokio::net::TcpStream,
+            tokio_util::codec::LengthDelimitedCodec,
+        >,
+    ) -> Vec<Msg> {
+        let mut replies = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), framed.next())
+                .await
+                .expect("a reply arrives")
+                .expect("connection stays open")
+                .expect("frame reads");
+            let msg = wire::decode(&frame.freeze()).expect("reply decodes");
+            if matches!(msg, Msg::ReqDone) {
+                return replies;
+            }
+            replies.push(msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_protocol_one_peer_never_receives_part_digests() {
+        let handler = Arc::new(FixtureHandler {
+            digests: vec![(1, 222)],
+            bucket_lens: vec![(1, 500)],
+            part_digests: vec![(1, (0..64u64).collect())],
+            bucket_entries: vec![(Bytes::from_static(b"k1"), sample_record(1).ver)],
+            ae_part_min_bucket: 100,
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let digest = wire::encode(&Msg::AeDigest {
+            cache: SmolStr::new("users"),
+            buckets: vec![(1, 999)],
+        })
+        .expect("encodes");
+
+        let mut old_peer =
+            raw_request_conn(server.local_addr(), legacy_hello(NodeId::from(2))).await;
+        old_peer.send(digest.clone()).await.expect("digest sends");
+        let replies = replies_until_req_done(&mut old_peer).await;
+        assert!(
+            replies
+                .iter()
+                .all(|msg| matches!(msg, Msg::AeBucket { .. } | Msg::AeSketch { .. })),
+            "a protocol-1 peer gets only the shapes it understands: {replies:?}"
+        );
+        assert!(!replies.is_empty());
+
+        let hello = wire::encode(&Msg::Hello {
+            node: NodeId::from(3),
+            incarnation: 1,
+            protocol: wire::PROTOCOL_VERSION,
+        })
+        .expect("encodes");
+        let mut new_peer = raw_request_conn(server.local_addr(), hello).await;
+        new_peer.send(digest).await.expect("digest sends");
+        let replies = replies_until_req_done(&mut new_peer).await;
+        assert!(
+            replies
+                .iter()
+                .any(|msg| matches!(msg, Msg::AePartDigests { .. })),
+            "the same bucket answers a current peer with part digests: {replies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_donor_serves_a_protocol_one_peer_and_declines_a_current_one() {
+        let handler = Arc::new(FixtureHandler {
+            records: vec![sample_record(1)],
+            snapshot_unavailable: true,
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let request = wire::encode(&Msg::StRequest {
+            cache: SmolStr::new("users"),
+        })
+        .expect("encodes");
+
+        let mut old_peer =
+            raw_request_conn(server.local_addr(), legacy_hello(NodeId::from(2))).await;
+        old_peer.send(request.clone()).await.expect("request sends");
+        let frame = tokio::time::timeout(Duration::from_secs(5), old_peer.next())
+            .await
+            .expect("a reply arrives")
+            .expect("connection stays open")
+            .expect("frame reads");
+        assert!(
+            matches!(wire::decode(&frame.freeze()), Ok(Msg::StChunk { .. })),
+            "a peer that cannot be declined is served"
+        );
+
+        let hello = wire::encode(&Msg::Hello {
+            node: NodeId::from(3),
+            incarnation: 1,
+            protocol: wire::PROTOCOL_VERSION,
+        })
+        .expect("encodes");
+        let mut new_peer = raw_request_conn(server.local_addr(), hello).await;
+        new_peer.send(request).await.expect("request sends");
+        let frame = tokio::time::timeout(Duration::from_secs(5), new_peer.next())
+            .await
+            .expect("a reply arrives")
+            .expect("connection stays open")
+            .expect("frame reads");
+        assert!(matches!(
+            wire::decode(&frame.freeze()),
+            Ok(Msg::StUnavailable { .. })
+        ));
     }
 
     #[tokio::test]
@@ -2046,6 +2197,7 @@ mod tests {
         let hello = wire::encode(&Msg::Hello {
             node: NodeId::from(2),
             incarnation: 1,
+            protocol: wire::PROTOCOL_VERSION,
         })
         .expect("encodes");
         futures::SinkExt::send(&mut framed, hello)

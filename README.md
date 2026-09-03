@@ -159,6 +159,17 @@ Every node gossips the mode of each cache it has open; opening a name under a
 mode that conflicts with a live peer fails with `CacheError::ModeMismatch`. TTL
 and capacity are local knobs, free to differ.
 
+## Rolling upgrades
+
+Every node states its wire protocol version, `sundog::wire::PROTOCOL_VERSION`,
+in the hello that opens each connection and in its gossip state. A node
+answers a peer only with what that peer's version understands: an older peer
+never receives a message kind its release cannot decode, and a newer peer
+limits itself the same way. One release step interoperates, so a cluster
+upgrades one node at a time with replication and repair running throughout.
+0.4 speaks protocol 2 and serves 0.3's protocol 1; a container test runs the
+previous release's node against the current one in both roles.
+
 ## How nodes find each other
 
 | Mechanism | Default? | What it does | Use it for |

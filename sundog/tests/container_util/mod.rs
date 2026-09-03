@@ -64,6 +64,87 @@ pub fn build_testnode() -> &'static Path {
     })
 }
 
+/// The release whose test node [`build_previous_testnode`] builds: the one
+/// this checkout must interoperate with across a rolling upgrade.
+pub const PREVIOUS_RELEASE_TAG: &str = "v0.3.1";
+
+/// Builds the previous release's `sundog-testnode` from its git tag, once per
+/// test process, into `target/prev-release/` and returns the musl binary
+/// path. The tag is fetched if the clone lacks it, as a shallow CI checkout
+/// does.
+/// # Panics
+///
+/// Panics if the tag cannot be fetched or checked out, or the build fails.
+pub fn build_previous_testnode() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let root = workspace_root();
+        let base = root.join("target").join("prev-release");
+        let src = base.join(format!("src-{PREVIOUS_RELEASE_TAG}"));
+        let target_dir = base.join("target");
+        if !src.join("Cargo.toml").exists() {
+            let has_tag = Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/tags/{PREVIOUS_RELEASE_TAG}"),
+                ])
+                .current_dir(&root)
+                .status()
+                .expect("git runs")
+                .success();
+            if !has_tag {
+                let fetched = Command::new("git")
+                    .args([
+                        "fetch",
+                        "--depth",
+                        "1",
+                        "origin",
+                        "tag",
+                        PREVIOUS_RELEASE_TAG,
+                    ])
+                    .current_dir(&root)
+                    .status()
+                    .expect("git runs");
+                assert!(
+                    fetched.success(),
+                    "fetching tag {PREVIOUS_RELEASE_TAG} succeeds"
+                );
+            }
+            std::fs::create_dir_all(&base).expect("target/prev-release is creatable");
+            let added = Command::new("git")
+                .args(["worktree", "add", "--detach"])
+                .arg(&src)
+                .arg(PREVIOUS_RELEASE_TAG)
+                .current_dir(&root)
+                .status()
+                .expect("git runs");
+            assert!(
+                added.success(),
+                "checking out {PREVIOUS_RELEASE_TAG} succeeds"
+            );
+        }
+        let status = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "-p",
+                "sundog-testnode",
+                "--target-dir",
+            ])
+            .arg(&target_dir)
+            .env("CC_x86_64_unknown_linux_musl", "musl-gcc")
+            .current_dir(&src)
+            .status()
+            .expect("cargo build of the previous release spawns");
+        assert!(status.success(), "the previous release's test node builds");
+        target_dir.join("x86_64-unknown-linux-musl/release/sundog-testnode")
+    })
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -107,8 +188,23 @@ impl Node {
         seeds: &[&str],
         extra_env: &[(&str, &str)],
     ) -> Node {
+        Self::spawn_binary(net, cluster_name, alias, seeds, extra_env, build_testnode()).await
+    }
+
+    /// [`Node::spawn_with_env`] running `bin` instead of this checkout's
+    /// test node: [`build_previous_testnode`] for a mixed-version cluster.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never becomes ready.
+    pub async fn spawn_binary(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        bin: &Path,
+    ) -> Node {
         rightsize_modules::register_default_backends();
-        let bin = build_testnode();
 
         let mut container = Container::new(&base_image())
             .with_network(net)

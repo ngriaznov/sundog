@@ -39,6 +39,34 @@ pub use crate::cluster::sketch::Cell;
 /// at the API boundary (`CacheError::ValueTooLarge`) instead.
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 
+/// The wire protocol this build speaks, carried in every [`Msg::Hello`] and
+/// gossiped with membership. A node answers a peer only with what that
+/// peer's protocol understands, so a cluster mixing this version with the
+/// one before it keeps replicating and repairing through a rolling upgrade.
+///
+/// - 1: the 0.3 releases. [`Msg::Hello`] has no `protocol` field.
+/// - 2: 0.4. Adds [`Msg::AePartDigests`], [`Msg::AeParts`],
+///   [`Msg::AePart`], [`Msg::AePartSketch`], and [`Msg::StUnavailable`].
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// The oldest peer protocol this build still serves in full.
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
+
+/// The protocol that introduced the part-digest anti-entropy replies; a
+/// responder sends none of them to an older peer.
+pub const PROTOCOL_PART_DIGESTS: u16 = 2;
+
+/// The protocol that introduced [`Msg::StUnavailable`]; a cold donor serves
+/// an older peer rather than declining it.
+pub const PROTOCOL_ST_UNAVAILABLE: u16 = 2;
+
+/// Whether a peer speaking `peer_protocol` understands a message kind
+/// introduced in protocol `since`.
+#[must_use]
+pub const fn peer_supports(peer_protocol: u16, since: u16) -> bool {
+    peer_protocol >= since
+}
+
 /// One versioned key/value record as it travels the wire: a live entry when
 /// `value` is `Some`, a tombstone when `value` is `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +100,10 @@ pub enum Msg {
         node: NodeId,
         /// The sender's membership incarnation number.
         incarnation: u64,
+        /// The sender's [`PROTOCOL_VERSION`]. Last on purpose: a protocol-1
+        /// sender omits it and decodes here as protocol 1, and a newer
+        /// sender's further trailing fields are ignored.
+        protocol: u16,
     },
     /// Invalidation-mode fan-out: "the entry at `key` changed, drop your
     /// copy." `key` is postcard-encoded; `ver` is the write's version.
@@ -480,10 +512,31 @@ pub fn decode(frame: &Bytes) -> Result<Msg, CodecError> {
     };
     let body = frame.slice(1..);
     match kind {
-        FRAME_KIND_POSTCARD => Ok(postcard::from_bytes(&body)?),
+        FRAME_KIND_POSTCARD => match postcard::from_bytes(&body) {
+            Ok(msg) => Ok(msg),
+            Err(err) => decode_legacy_hello(&body).ok_or_else(|| CodecError::from(err)),
+        },
         FRAME_KIND_RAW_RECORD => decode_raw_frame(&body),
         _ => Err(CodecError::MalformedFrame("unknown frame discriminant")),
     }
+}
+
+/// [`Msg::Hello`] as protocol 1 encodes it: the same variant index, no
+/// `protocol` field. Only shape a protocol-2 decode can fail on that still
+/// means something, so [`decode`] falls back to it.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+enum LegacyMsg {
+    Hello { node: NodeId, incarnation: u64 },
+}
+
+fn decode_legacy_hello(body: &[u8]) -> Option<Msg> {
+    let LegacyMsg::Hello { node, incarnation } = postcard::from_bytes(body).ok()?;
+    Some(Msg::Hello {
+        node,
+        incarnation,
+        protocol: 1,
+    })
 }
 
 #[cfg(test)]
@@ -524,7 +577,70 @@ mod tests {
         roundtrip(&Msg::Hello {
             node: NodeId::from(1),
             incarnation: 3,
+            protocol: PROTOCOL_VERSION,
         });
+    }
+
+    #[test]
+    fn a_hello_without_a_protocol_field_decodes_as_protocol_one() {
+        let legacy = LegacyMsg::Hello {
+            node: NodeId::from(1),
+            incarnation: 3,
+        };
+        let mut frame = vec![FRAME_KIND_POSTCARD];
+        frame.extend(postcard::to_stdvec(&legacy).expect("encodes"));
+        assert_eq!(
+            decode(&Bytes::from(frame)).expect("a 0.3 hello decodes"),
+            Msg::Hello {
+                node: NodeId::from(1),
+                incarnation: 3,
+                protocol: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hello_with_trailing_fields_from_a_newer_protocol_decodes() {
+        let mut frame = encode(&Msg::Hello {
+            node: NodeId::from(1),
+            incarnation: 3,
+            protocol: PROTOCOL_VERSION + 1,
+        })
+        .expect("encodes")
+        .to_vec();
+        frame.extend_from_slice(&[0x07, 0x09, 0x11]);
+        assert_eq!(
+            decode(&Bytes::from(frame)).expect("trailing fields are ignored"),
+            Msg::Hello {
+                node: NodeId::from(1),
+                incarnation: 3,
+                protocol: PROTOCOL_VERSION + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_truncated_non_hello_frame_still_fails_to_decode() {
+        let frame = encode(&Msg::ReqDone).expect("encodes");
+        let mut body = frame.to_vec();
+        body.push(0xFF);
+        body.push(0xFF);
+        // A bare variant index past the enum's range is neither a message
+        // nor a legacy hello.
+        let bogus = Bytes::from(vec![FRAME_KIND_POSTCARD, 0x7F]);
+        assert!(decode(&bogus).is_err());
+        assert!(
+            decode(&Bytes::from(body)).is_ok(),
+            "trailing bytes after ReqDone are ignored"
+        );
+    }
+
+    #[test]
+    fn peer_supports_compares_against_the_introducing_protocol() {
+        assert!(peer_supports(2, PROTOCOL_PART_DIGESTS));
+        assert!(peer_supports(3, PROTOCOL_ST_UNAVAILABLE));
+        assert!(!peer_supports(1, PROTOCOL_PART_DIGESTS));
+        assert!(!peer_supports(1, PROTOCOL_ST_UNAVAILABLE));
     }
 
     #[test]

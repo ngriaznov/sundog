@@ -18,7 +18,7 @@ mod container_util;
 use std::sync::Arc;
 use std::time::Duration;
 
-use container_util::{Node, container_tests_enabled, eventually};
+use container_util::{Node, build_previous_testnode, container_tests_enabled, eventually};
 use rand::rngs::StdRng;
 use rand::{RngExt as _, SeedableRng as _};
 use rightsize::Network;
@@ -1016,5 +1016,64 @@ async fn chaos_crashes_churn_and_drops_still_converge() {
     for node in nodes {
         node.stop().await.expect("node stops");
     }
+    net.close().await.expect("network closes");
+}
+
+/// A rolling upgrade in miniature: the previous release's node and this
+/// one's share a cluster, each donates to and repairs the other, and every
+/// message the old node receives is one it can decode.
+#[tokio::test]
+async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
+    const ENTRIES: u32 = 5_000;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let previous = build_previous_testnode();
+    let net = Arc::new(Network::new_network());
+    // The old node originates the data; the new node joins it.
+    let old = Node::spawn_binary(&net, "mixed-cluster", "n1", &[], &[], previous).await;
+    old.fill(ENTRIES).await.expect("bulk fill on the old node");
+    let new = Node::spawn(&net, "mixed-cluster", "n2", &[&seed("n1")]).await;
+    wait_for_peers(&[&old, &new], 1).await;
+    eventually(Duration::from_secs(60), || async {
+        new.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+
+    // Live replication both ways.
+    new.put("from-new", "v").await.expect("put on the new node");
+    old.put("from-old", "v").await.expect("put on the old node");
+    eventually(Duration::from_secs(30), || async {
+        old.get("from-new").await == Ok(Some("v".to_string()))
+            && new.get("from-old").await == Ok(Some("v".to_string()))
+    })
+    .await;
+
+    // Anti-entropy both ways: a copy dropped on either side comes back from
+    // the other, the old node initiating rounds the new one answers in the
+    // old shapes, and the new node initiating rounds the old one serves.
+    old.drop_key("k100").await.expect("drop on the old node");
+    new.drop_key("k200").await.expect("drop on the new node");
+    eventually(Duration::from_secs(60), || async {
+        old.get("k100").await == Ok(Some("v100".to_string()))
+            && new.get("k200").await == Ok(Some("v200".to_string()))
+    })
+    .await;
+
+    // A second old node joins with the new node as its only seed, so the
+    // new node is its donor.
+    let old2 = Node::spawn_binary(&net, "mixed-cluster", "n3", &[&seed("n2")], &[], previous).await;
+    wait_for_peers(&[&old, &new, &old2], 2).await;
+    eventually(Duration::from_secs(60), || async {
+        old2.count().await == Ok(ENTRIES as usize + 2)
+    })
+    .await;
+
+    old.stop().await.expect("old node stops");
+    new.stop().await.expect("new node stops");
+    old2.stop().await.expect("second old node stops");
     net.close().await.expect("network closes");
 }
