@@ -485,6 +485,33 @@ async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
     net.close().await.expect("network closes");
 }
 
+/// Waits until `node`'s cumulative sent-frame/byte counters stop changing
+/// across a 1s sample, so a `netstats` snapshot taken right after this
+/// returns isolates whatever traffic comes next from any trailing activity
+/// (a state-transfer stream's last chunks, or the first post-join
+/// anti-entropy round) still draining at the moment a peer's local count
+/// first matches the expected total.
+/// # Panics
+///
+/// Panics if the counters are still changing once `timeout` elapses.
+async fn wait_for_quiescent_netstats(node: &Node, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last = node.netstats().await.expect("netstats");
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let current = node.netstats().await.expect("netstats");
+        if current == last {
+            return;
+        }
+        last = current;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{}'s netstats never settled within {timeout:?}",
+            node.name()
+        );
+    }
+}
+
 /// At 500k entries, `sundog-testnode`'s 1,024 buckets hold about 488 entries
 /// apiece, past `ClusterConfig::default`'s `ae_sketch_min_bucket` of 384:
 /// the repair below runs through the IBLT sketch path, not a full listing.
@@ -542,7 +569,11 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
 /// one part the dropped key falls into then answers with its own small
 /// listing. n2 cold-joins and warms first, so both replicas start
 /// byte-identical; dropping one key locally on n2 then leaves exactly one
-/// bucket, and within it one part, mismatched.
+/// bucket, and within it one part, mismatched. The wire-cost measurement
+/// waits for [`wait_for_quiescent_netstats`] first: n2's local count reaches
+/// ENTRIES slightly before its state-transfer stream and the first
+/// post-join anti-entropy round finish draining, and that unrelated tail
+/// would otherwise land inside the measured window.
 #[tokio::test]
 async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     const ENTRIES: u32 = 1_000_000;
@@ -571,6 +602,12 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     })
     .await;
     assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
+
+    // n2's local count reaches ENTRIES slightly before its state-transfer
+    // stream and the first post-join anti-entropy round finish draining;
+    // waiting for n1's own sent-byte counter to go quiet isolates the
+    // repair's cost below from that unrelated tail.
+    wait_for_quiescent_netstats(&n1, Duration::from_secs(30)).await;
 
     let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the drop");
 
