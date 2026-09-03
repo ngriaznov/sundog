@@ -442,7 +442,12 @@ fn handle_sketch_mismatch(
 /// `remote`'s [`crate::store::PART_COUNT`] values. A ragged pair, which only
 /// a misbehaving peer sends, treats any index either side lacks as mismatched
 /// rather than panicking or silently skipping it.
-fn mismatched_parts(local: &[u64], remote: &[u64]) -> Vec<u8> {
+///
+/// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
+/// re-exports it as `crate::mismatched_parts` under `feature = "sim"`, to
+/// classify a peer's `AeMismatch::PartDigests` reply the same way
+/// `run_round_against` does here, without duplicating this comparison.
+pub fn mismatched_parts(local: &[u64], remote: &[u64]) -> Vec<u8> {
     let len = local.len().max(remote.len());
     (0..len)
         .filter(|&i| local.get(i).copied().unwrap_or(0) != remote.get(i).copied().unwrap_or(0))

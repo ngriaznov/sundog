@@ -26,7 +26,7 @@ use smol_str::SmolStr;
 use sundog::config::ClusterConfig;
 use sundog::hlc::Hlc;
 use sundog::membership::Peer;
-use sundog::net::{AeMismatch, InboundMsg, Mesh, MsgClass, RequestHandler};
+use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
 use sundog::store::{Mode, Shard, ShardOps};
 use sundog::wire::{Msg, WireRecord};
@@ -119,24 +119,37 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
 
 /// Wraps a shared `Shard` as the `net::RequestHandler` a `Mesh` answers
 /// inbound requests through, standing in for `cluster.rs`'s handler.
-/// `ae_sketch_min_bucket` mirrors the field of the same name on
-/// `ClusterConfig`, letting a scenario force a low threshold so a mismatched
-/// bucket answers with `AeMismatch::Sketch` instead of a full listing.
+/// `ae_sketch_min_bucket`/`ae_part_min_bucket` mirror the fields of the same
+/// name on `ClusterConfig`, letting a scenario force a low threshold so a
+/// mismatched bucket answers with `AeMismatch::Sketch`/`PartDigests` instead
+/// of a full listing.
 struct ShardHandler {
     shard: Arc<TestShard>,
+    ae_part_min_bucket: usize,
     ae_sketch_min_bucket: usize,
 }
 
 impl ShardHandler {
-    /// The threshold at [`ClusterConfig::default`]'s value: every scenario
-    /// but the sketch one wants this, since its buckets never grow past it.
+    /// Both thresholds at [`ClusterConfig::default`]'s values: every
+    /// scenario but the sketch/part ones want this, since their buckets
+    /// never grow past either.
     fn new(shard: Arc<TestShard>) -> Self {
-        Self::with_min_bucket(shard, ClusterConfig::default().ae_sketch_min_bucket)
+        let defaults = ClusterConfig::default();
+        Self::with_min_buckets(
+            shard,
+            defaults.ae_part_min_bucket,
+            defaults.ae_sketch_min_bucket,
+        )
     }
 
-    fn with_min_bucket(shard: Arc<TestShard>, ae_sketch_min_bucket: usize) -> Self {
+    fn with_min_buckets(
+        shard: Arc<TestShard>,
+        ae_part_min_bucket: usize,
+        ae_sketch_min_bucket: usize,
+    ) -> Self {
         Self {
             shard,
+            ae_part_min_bucket,
             ae_sketch_min_bucket,
         }
     }
@@ -169,6 +182,33 @@ impl RequestHandler for ShardHandler {
     fn records_for(&self, _cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::records_for(shard.as_ref(), keys).await })
+    }
+
+    fn bucket_lens(&self, _cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        let shard = Arc::clone(&self.shard);
+        Box::pin(async move { ShardOps::bucket_lens(shard.as_ref(), buckets).await })
+    }
+
+    fn part_digests(
+        &self,
+        _cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        let shard = Arc::clone(&self.shard);
+        Box::pin(async move { ShardOps::part_digests(shard.as_ref(), buckets).await })
+    }
+
+    fn entries_for_parts(
+        &self,
+        _cache: SmolStr,
+        parts: Vec<(u16, u8)>,
+    ) -> BoxFuture<'_, sundog::store::PartEntries> {
+        let shard = Arc::clone(&self.shard);
+        Box::pin(async move { ShardOps::entries_for_parts(shard.as_ref(), parts).await })
+    }
+
+    fn ae_part_min_bucket(&self) -> usize {
+        self.ae_part_min_bucket
     }
 
     fn ae_sketch_min_bucket(&self) -> usize {
@@ -207,9 +247,22 @@ async fn fan_out(shard: &TestShard, mesh: &Mesh, peers: &[NodeId], key: u32, dup
 /// against the received one, and peeled via [`sundog::Iblt`]; a decode
 /// classifies into pushes and hash-pulls via [`sundog::diff_decoded`], the
 /// same function `cluster::anti_entropy::handle_sketch_mismatch` calls, and
-/// an `Undecodable` one queues for the `Mesh::ae_entries` listing fallback,
-/// exactly mirroring `run_round_against`'s own shape.
-async fn ae_round_with_sketch(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
+/// an `Undecodable` one queues for the `Mesh::ae_entries` listing fallback;
+/// and the part path, a bucket answered as `AeMismatch::PartDigests` is
+/// compared against this node's own `ShardOps::part_digests` for the same
+/// bucket via [`sundog::mismatched_parts`], the differing `(bucket, part)`
+/// pairs requested in one `Mesh::ae_parts` call, and each reply classified
+/// the same way as the bucket path above but scoped to
+/// `ShardOps::entries_for_parts`. `bucket_listings` counts every
+/// `AeMismatch::Bucket`/`Msg::AeBucket`-shaped reply this round receives, so
+/// a scenario can assert the part path never carries one. Exactly mirrors
+/// `run_round_against`'s own shape.
+async fn ae_round_with_sketch(
+    mesh: &Mesh,
+    shard: &TestShard,
+    peer: NodeId,
+    bucket_listings: Option<&AtomicUsize>,
+) -> bool {
     let local_buckets = ShardOps::digests(shard).await;
     let Ok(Ok(mismatched)) = tokio::time::timeout(
         NET_TIMEOUT,
@@ -224,10 +277,14 @@ async fn ae_round_with_sketch(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> b
     let mut pull_keys = Vec::new();
     let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
     let mut undecodable_buckets = Vec::new();
+    let mut wanted_parts: Vec<(u16, u8)> = Vec::new();
 
     for mismatch in mismatched {
         match mismatch {
             AeMismatch::Bucket(bucket, peer_entries) => {
+                if let Some(counter) = bucket_listings {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
                 diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
             }
             AeMismatch::Sketch(bucket, cells) => {
@@ -250,6 +307,80 @@ async fn ae_round_with_sketch(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> b
                     Err(_) => undecodable_buckets.push(bucket),
                 }
             }
+            AeMismatch::PartDigests(bucket, remote_parts) => {
+                let local_parts = ShardOps::part_digests(shard, vec![bucket])
+                    .await
+                    .into_iter()
+                    .find(|(b, _)| *b == bucket)
+                    .map_or_else(Vec::new, |(_, d)| d);
+                for part in sundog::mismatched_parts(&local_parts, &remote_parts) {
+                    wanted_parts.push((bucket, part));
+                }
+            }
+        }
+    }
+
+    if !wanted_parts.is_empty() {
+        match tokio::time::timeout(
+            NET_TIMEOUT,
+            mesh.ae_parts(peer, cache_name(), wanted_parts.clone()),
+        )
+        .await
+        {
+            Ok(Ok(replies)) => {
+                let local_part_entries =
+                    ShardOps::entries_for_parts(shard, wanted_parts).await;
+                let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
+                    local_part_entries.into_iter().collect();
+                for reply in replies {
+                    match reply {
+                        AePartReply::Listing {
+                            bucket,
+                            part,
+                            entries: peer_entries,
+                        } => {
+                            let local_entries = local_by_part
+                                .get(&(bucket, part))
+                                .cloned()
+                                .unwrap_or_default();
+                            diff_part(&local_entries, &peer_entries, &mut push_keys, &mut pull_keys);
+                        }
+                        AePartReply::Sketch {
+                            bucket,
+                            part,
+                            cells,
+                        } => {
+                            let local_entries = local_by_part
+                                .get(&(bucket, part))
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut local_sketch = sundog::Iblt::new(cells.len());
+                            for (key, ver) in &local_entries {
+                                local_sketch.insert(xxh3_64(key), *ver);
+                            }
+                            match local_sketch
+                                .subtract(&sundog::Iblt::from_cells(cells))
+                                .and_then(sundog::Iblt::peel)
+                            {
+                                Ok(decoded) => {
+                                    let mut hashes = Vec::new();
+                                    sundog::diff_decoded(
+                                        &local_entries,
+                                        &decoded,
+                                        &mut push_keys,
+                                        &mut hashes,
+                                    );
+                                    if !hashes.is_empty() {
+                                        pull_hashes.push((bucket, hashes));
+                                    }
+                                }
+                                Err(_) => undecodable_buckets.push(bucket),
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) | Err(_) => return false,
         }
     }
 
@@ -336,6 +467,35 @@ async fn diff_bucket(
     }
 }
 
+/// [`diff_bucket`]'s comparison, but over an already-fetched local entry
+/// list rather than a fresh `ShardOps::bucket_entries` call: the part path's
+/// counterpart, since `AePartReply::Listing`'s local side comes from one
+/// batched `ShardOps::entries_for_parts` call up front.
+fn diff_part(
+    local_entries: &[(Bytes, Hlc)],
+    peer_entries: &[(Bytes, Hlc)],
+    push_keys: &mut Vec<Bytes>,
+    pull_keys: &mut Vec<Bytes>,
+) {
+    let peer_by_key: HashMap<&Bytes, Hlc> = peer_entries.iter().map(|(k, v)| (k, *v)).collect();
+    let mut local_keys = HashSet::with_capacity(local_entries.len());
+
+    for (key, local_ver) in local_entries {
+        local_keys.insert(key);
+        match peer_by_key.get(key) {
+            Some(&peer_ver) if *local_ver > peer_ver => push_keys.push(key.clone()),
+            Some(&peer_ver) if *local_ver < peer_ver => pull_keys.push(key.clone()),
+            Some(_) => {}
+            None => push_keys.push(key.clone()),
+        }
+    }
+    for (key, _) in peer_entries {
+        if !local_keys.contains(key) {
+            pull_keys.push(key.clone());
+        }
+    }
+}
+
 /// One symmetric peer's whole role in scenarios 1 and 2: write its own key
 /// range on a timer, fan each write out, run anti-entropy on a separate
 /// timer, and dispatch inbound traffic. `remove_on_repeat` turns a key's
@@ -357,13 +517,25 @@ struct NodeParams {
     /// [`ClusterConfig::default`]'s value, past what any scenario but the
     /// sketch one ever populates a bucket to.
     ae_sketch_min_bucket: Option<usize>,
+    /// Overrides the responder's `ae_part_min_bucket`; `None` keeps
+    /// [`ClusterConfig::default`]'s value, past what any scenario but the
+    /// part one ever populates a bucket to.
+    ae_part_min_bucket: Option<usize>,
+    /// Counts every `AeMismatch::Bucket` reply this node's rounds receive:
+    /// a full bucket listing, the cost the part path exists to avoid. `None`
+    /// for scenarios that don't care.
+    bucket_listings: Option<Arc<AtomicUsize>>,
 }
 
 async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
-    let handler: Arc<dyn RequestHandler> = Arc::new(match params.ae_sketch_min_bucket {
-        Some(min_bucket) => ShardHandler::with_min_bucket(Arc::clone(&shard), min_bucket),
-        None => ShardHandler::new(Arc::clone(&shard)),
-    });
+    let defaults = ClusterConfig::default();
+    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::with_min_buckets(
+        Arc::clone(&shard),
+        params.ae_part_min_bucket.unwrap_or(defaults.ae_part_min_bucket),
+        params
+            .ae_sketch_min_bucket
+            .unwrap_or(defaults.ae_sketch_min_bucket),
+    ));
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], params.port));
     let (mesh, mut inbound) = Mesh::spawn(
         bind_addr,
@@ -407,7 +579,13 @@ async fn node_loop(params: NodeParams, shard: Arc<TestShard>) -> SimResult {
             }
             _ = ae_tick.tick() => {
                 for &peer in &peer_ids {
-                    if !ae_round_with_sketch(&mesh, shard.as_ref(), peer).await
+                    if !ae_round_with_sketch(
+                        &mesh,
+                        shard.as_ref(),
+                        peer,
+                        params.bucket_listings.as_deref(),
+                    )
+                    .await
                         && let Some(counter) = params.ae_failures.as_ref()
                     {
                         counter.fetch_add(1, Ordering::Relaxed);
@@ -452,6 +630,8 @@ fn spawn_symmetric_pair(
         remove_on_repeat: false,
         ops_issued: None,
         ae_sketch_min_bucket: None,
+        ae_part_min_bucket: None,
+        bucket_listings: None,
     };
     sim.host(spec.host_a, move || {
         let shard = Arc::clone(&shard_a);
@@ -472,6 +652,8 @@ fn spawn_symmetric_pair(
         remove_on_repeat: false,
         ops_issued: None,
         ae_sketch_min_bucket: None,
+        ae_part_min_bucket: None,
+        bucket_listings: None,
     };
     sim.host(spec.host_b, move || {
         let shard = Arc::clone(&shard_b);
@@ -1211,6 +1393,8 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
         remove_on_repeat: true,
         ops_issued: Some(Arc::clone(&ops_a)),
         ae_sketch_min_bucket: None,
+        ae_part_min_bucket: None,
+        bucket_listings: None,
     };
     let shard = Arc::clone(&shard_a);
     sim.host("churn-a", move || {
@@ -1232,6 +1416,8 @@ fn add_remove_churn_under_loss_converges_to_the_correct_state() {
         remove_on_repeat: true,
         ops_issued: Some(Arc::clone(&ops_b)),
         ae_sketch_min_bucket: None,
+        ae_part_min_bucket: None,
+        bucket_listings: None,
     };
     let shard = Arc::clone(&shard_b);
     sim.host("churn-b", move || {
@@ -1449,6 +1635,8 @@ fn sketch_reconciliation_under_loss_converges() {
         remove_on_repeat: false,
         ops_issued: None,
         ae_sketch_min_bucket: Some(MIN_BUCKET),
+        ae_part_min_bucket: None,
+        bucket_listings: None,
     };
 
     let params_a = base_params.clone();
@@ -1484,5 +1672,134 @@ fn sketch_reconciliation_under_loss_converges() {
         value_of(&shard_b, target_key),
         value_of(&shard_a, target_key),
         "the dropped key is repaired via the sketch decode / pull-by-hash path"
+    );
+}
+
+/// Two shards start byte-identical across 4,096 keys, dense enough that a
+/// forced `ae_part_min_bucket` of 2 puts several entries in some buckets;
+/// the responder answers a mismatch there with `AeMismatch::PartDigests`
+/// rather than a full listing or sketch. One key is then dropped locally on
+/// node-b, and the two nodes run `ae_round_with_sketch` against each other
+/// on a timer under turmoil packet loss and reordering. Recovery goes
+/// through the part machinery: `ShardOps::part_digests` compared via
+/// `sundog::mismatched_parts`, `Mesh::ae_parts` for the differing parts, and
+/// `diff_part`/`ShardOps::entries_for_parts` for the pull, with the
+/// `bucket_listings` counter proving no `AeMismatch::Bucket`/`Msg::AeBucket`
+/// listing ever carried the repair.
+#[test]
+fn part_reconciliation_repairs_one_key_under_loss() {
+    const N: u32 = 4096;
+    const MIN_PART_BUCKET: usize = 2;
+    let node_a = NodeId::from(81);
+    let node_b = NodeId::from(82);
+    let port = 5000;
+
+    let shard_a = Arc::new(seed_shard(node_a, 0..N));
+    let shard_b = Arc::new(new_shard(node_b));
+    block_on(async {
+        let mut chunks = ShardOps::snapshot_chunks(shard_a.as_ref());
+        while let Some(chunk) = chunks.next().await {
+            ShardOps::apply_remote_batch(shard_b.as_ref(), chunk).await;
+        }
+    });
+    assert_eq!(
+        digests_of(&shard_a),
+        digests_of(&shard_b),
+        "both sides start converged before the drop"
+    );
+
+    // A bucket dense enough that MIN_PART_BUCKET's threshold answers it with
+    // part digests instead of a full listing or sketch.
+    let bucket_keys = dense_bucket_keys(N, MIN_PART_BUCKET + 1);
+    let target_key = bucket_keys[0];
+    block_on(shard_b.invalidate_local(&target_key));
+    assert_eq!(
+        value_of(&shard_b, target_key),
+        None,
+        "node-b's copy is dropped, as if a Replicate never arrived"
+    );
+    assert_ne!(
+        digests_of(&shard_a),
+        digests_of(&shard_b),
+        "test setup sanity: the drop makes one bucket mismatch"
+    );
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x9A27_7501))
+        .tick_duration(TICK)
+        // Same loss/reorder shape as the storm scenario: AE rounds routinely
+        // fail and retry rather than never losing a packet.
+        .fail_rate(0.03)
+        .repair_rate(0.75)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(60))
+        .build();
+
+    let ae_period = Duration::from_millis(150);
+    let bucket_listings_a = Arc::new(AtomicUsize::new(0));
+    let bucket_listings_b = Arc::new(AtomicUsize::new(0));
+    let base_params = NodeParams {
+        node: node_a,
+        label: "a",
+        port,
+        peers: vec![(node_b, "part-b", port)],
+        keys: vec![],
+        // No writes in this scenario: the fixed dataset plus the one drop
+        // is the whole story.
+        write_period: Duration::from_secs(3600),
+        ae_period,
+        dup_factor: 1,
+        ae_failures: None,
+        remove_on_repeat: false,
+        ops_issued: None,
+        ae_sketch_min_bucket: None,
+        ae_part_min_bucket: Some(MIN_PART_BUCKET),
+        bucket_listings: Some(Arc::clone(&bucket_listings_a)),
+    };
+
+    let params_a = base_params.clone();
+    let shard = Arc::clone(&shard_a);
+    sim.host("part-a", move || {
+        let shard = Arc::clone(&shard);
+        let params = params_a.clone();
+        async move { node_loop(params, shard).await }
+    });
+
+    let params_b = NodeParams {
+        node: node_b,
+        label: "b",
+        peers: vec![(node_a, "part-a", port)],
+        bucket_listings: Some(Arc::clone(&bucket_listings_b)),
+        ..base_params
+    };
+    let shard = Arc::clone(&shard_b);
+    sim.host("part-b", move || {
+        let shard = Arc::clone(&shard);
+        let params = params_b.clone();
+        async move { node_loop(params, shard).await }
+    });
+
+    let budget = steps_for(ae_period * 20 + Duration::from_secs(5));
+    let converged = run_until(&mut sim, budget, || {
+        digests_of(&shard_a) == digests_of(&shard_b)
+    });
+    assert!(
+        converged.is_some(),
+        "part-digest anti-entropy converges within a bounded number of rounds despite loss"
+    );
+    assert_eq!(
+        value_of(&shard_b, target_key),
+        value_of(&shard_a, target_key),
+        "the dropped key is repaired via the part-digest / part-listing path"
+    );
+    assert_eq!(
+        bucket_listings_a.load(Ordering::Relaxed),
+        0,
+        "node-a's rounds never carried a full bucket listing"
+    );
+    assert_eq!(
+        bucket_listings_b.load(Ordering::Relaxed),
+        0,
+        "node-b's rounds never carried a full bucket listing"
     );
 }
