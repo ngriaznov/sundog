@@ -8,10 +8,13 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+futures = "0.3"
 libfuzzer-sys = "0.4"
 
 [dependencies.sundog]
 path = ".."
+features = ["fuzzing"]
 
 [dependencies.bytes]
 version = "1"
@@ -26,6 +29,20 @@ bench = false
 [[bin]]
 name = "decode_encode_roundtrip"
 path = "fuzz_targets/decode_encode_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apply_model"
+path = "fuzz_targets/apply_model.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apply_permutation"
+path = "fuzz_targets/apply_permutation.rs"
 test = false
 doc = false
 bench = false

@@ -38,31 +38,6 @@ binding constraint in a real deployment. Until then the current numbers
 already lead the embedded-replicated category, and the risk budget is
 better spent on real-workload mileage.
 
-## Stateful fuzzing of the apply path
-
-The wire decoder is fuzzed (`sundog/fuzz`: arbitrary bytes must never panic
-the decoder, and every decodable frame must re-encode to a fixed point).
-What that leaves uncovered is everything *after* a successful decode: the
-versioned apply, the digest bookkeeping, tombstone retention, and the
-resolver, driven by arbitrary *sequences* of valid records rather than
-arbitrary bytes. A stateful fuzz target would feed a shard a generated
-sequence of applies, removes, batch applies, GC ticks, and clock moves, and
-check the invariants the property tests already state — permutation
-convergence, digest consistency with the entry set, no tombstone
-resurrection, no expired entry readable — under libFuzzer's coverage
-guidance instead of proptest's random sampling.
-
-**Cost:** an `Arbitrary` model of the operation sequence, a harness that
-drives `ShardOps` without a runtime (the sim suite's `block_on` pattern),
-and a way to make wall-clock-stamped TTLs deterministic inside the target,
-which the current `store::now_ms` (real `SystemTime`) does not allow —
-the one piece of real design work here.
-
-**Trigger:** the first store-level bug that the property tests missed and a
-sequence-driven fuzzer would have found — or the bespoke store engine
-above landing, whose new invariants deserve exactly this kind of hammer
-before they carry production data.
-
 ## Distribution mode
 
 A consistent-hash ring over the live member set, `numOwners` primary+backup

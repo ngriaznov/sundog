@@ -1,6 +1,11 @@
-# Nightly fuzz smoke over the wire decoder: five minutes per target,
-# starting from the generated seed corpus. A crash uploads its artifact for
-# local reproduction with `cargo +nightly fuzz run <target> <artifact>`.
+# Nightly fuzz smoke: five minutes per target. The two wire-decoder targets
+# start from a generated seed corpus; the two stateful apply-path targets
+# (`apply_model`, `apply_permutation`) have no hand-built seeds — their
+# input is an `Arbitrary`-decoded op/record sequence, not a wire frame, so
+# there's no cheap way to hand-craft a seed corpus for them, and libFuzzer's
+# own coverage-guided mutation is what grows one. A crash uploads its
+# artifact for local reproduction with `cargo +nightly fuzz run <target>
+# <artifact>`.
 name: nightly-fuzz
 
 on:
@@ -28,6 +33,12 @@ jobs:
       - name: Fuzz decode_encode_roundtrip
         working-directory: sundog/fuzz
         run: cargo +nightly fuzz run decode_encode_roundtrip -- -max_total_time=300 -max_len=65536
+      - name: Fuzz apply_model
+        working-directory: sundog/fuzz
+        run: cargo +nightly fuzz run apply_model -- -max_total_time=300 -max_len=65536
+      - name: Fuzz apply_permutation
+        working-directory: sundog/fuzz
+        run: cargo +nightly fuzz run apply_permutation -- -max_total_time=300 -max_len=65536
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4

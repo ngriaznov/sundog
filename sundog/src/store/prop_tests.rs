@@ -4,14 +4,19 @@
 //! same multiset of versioned writes, in any order, with any duplication,
 //! converges to byte-identical state. Alongside it: a focused tombstone/put
 //! race property, incremental-digest-vs-full-recompute across arbitrary op
-//! sequences including anti-entropy-style repairs and tombstone GC, and a
+//! sequences including anti-entropy-style repairs and tombstone GC, a
 //! clock-driven property that puts [`Shard::with_clock`] through its actual
 //! job — TTL expiry and sweep correctness — on a manual clock instead of
-//! real time.
+//! real time, and
+//! [`shard_matches_the_reference_model_under_arbitrary_op_sequences`], which
+//! runs the same [`model::run`] driver `sundog-fuzz`'s stateful apply-path
+//! targets use, over proptest-generated op sequences instead of
+//! libFuzzer-guided ones.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
+use proptest_arbitrary_interop::arb;
 use rand::seq::SliceRandom as _;
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
@@ -581,5 +586,34 @@ proptest! {
                 }
             }
         });
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Runs [`model::run`] — the identical driver `sundog-fuzz`'s
+    /// `apply_model` and `apply_permutation` targets use — over a sequence
+    /// of `model::Op`, each one `arbitrary`-generated and bridged into a
+    /// proptest strategy by `proptest-arbitrary-interop`, with
+    /// `proptest::collection::vec` controlling the sequence length (an
+    /// `Op`-at-a-time `arb` composes with proptest's own size-controlled
+    /// collection strategy; asking `arb` for the whole `Vec<Op>` at once
+    /// hands length control to `arbitrary`'s own geometric,
+    /// buffer-size-independent continuation instead, which averages under
+    /// two ops per sequence — far too short to exercise cross-op
+    /// interactions). The model and the driver's assertions live once, in
+    /// `store::model`; this test and the fuzz targets differ only in how
+    /// they sample op sequences (proptest's shrinking here, libFuzzer's
+    /// coverage guidance there), so a divergence either can find is a real
+    /// bug in the versioned apply, digest bookkeeping, tombstone retention,
+    /// expiry, or resolver — not in this test's own bookkeeping, since it
+    /// has none: [`model::run`] does all the asserting.
+    #[test]
+    fn shard_matches_the_reference_model_under_arbitrary_op_sequences(
+        ops in proptest::collection::vec(arb::<model::Op>(), 1..128),
+    ) {
+        let (shard, mut model) = model::new_shard_and_model("model-prop", 1);
+        model::run(&ops, &shard, &mut model);
     }
 }
