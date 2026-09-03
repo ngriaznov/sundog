@@ -44,13 +44,14 @@ All notable changes to this project are documented in this file. Format follows
   to a protocol-1 peer. One release step interoperates, so a cluster upgrades
   one node at a time; a container test runs the 0.3.1 node against this one
   in both directions.
-- **Breaking**, in the `sim`-feature test seams only: `net::AeMismatch`
-  gains the `PartDigests` variant and is `#[non_exhaustive]` from here on,
-  as is the new `net::AePartReply`; `net::RequestHandler` and
-  `store::ShardOps` gain the required methods `bucket_lens`,
-  `part_digests`, and `entries_for_parts`. `cargo semver-checks
-  --release-type minor` against 0.3.1 reports exactly these; every other
-  check passes.
+- **Breaking**, in the `sim`-feature test seams and the wire types only:
+  `net::AeMismatch` gains the `PartDigests` variant and is
+  `#[non_exhaustive]` from here on, as is the new `net::AePartReply`;
+  `net::RequestHandler` and `store::ShardOps` gain the required methods
+  `bucket_lens`, `part_digests`, and `entries_for_parts`;
+  `wire::Msg::Hello` gains the `protocol` field and `membership::Peer` the
+  `protocol` field. `cargo semver-checks --release-type minor` against
+  0.3.1 reports exactly these; every other check passes.
 - **Chaos lane** for the container suite: `chaos_crashes_churn_and_drops_still_converge`
   drives a four-node cluster through a seeded random mix of crashes, churn,
   dropped keys, refills, and put bursts for a bounded time, then checks every
