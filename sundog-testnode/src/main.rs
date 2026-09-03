@@ -4,7 +4,10 @@
 //! static musl binary with no libc dependency.
 //!
 //! Usage: `sundog-testnode <cluster-name>`, with `SUNDOG_SEEDS` a
-//! comma-separated list of `host:port` gossip seeds. Opens one
+//! comma-separated list of `host:port` gossip seeds,
+//! `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET`/`SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET`
+//! optional `usize` overrides for `ClusterConfig::ae_part_min_bucket`/
+//! `ae_sketch_min_bucket` (absent means the built-in default). Opens one
 //! `Mode::Replicated` cache named `"it"` and prints `testnode-ready` once
 //! the control listener is up.
 //!
@@ -100,17 +103,38 @@ async fn main() {
     }
 }
 
+/// Parses an env override's raw string into a `usize`, `None` for an absent
+/// or unparsable value: the pure decision [`usize_env`] wraps around a real
+/// `std::env::var` read, for [`run`]'s `ae_part_min_bucket`/
+/// `ae_sketch_min_bucket` overrides.
+fn parse_usize_override(raw: Option<&str>) -> Option<usize> {
+    raw?.parse().ok()
+}
+
+/// Reads `name` as a `usize` env override via [`parse_usize_override`].
+fn usize_env(name: &str) -> Option<usize> {
+    parse_usize_override(env::var(name).ok().as_deref())
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_name = env::args()
         .nth(1)
         .ok_or("usage: sundog-testnode <cluster-name>")?;
     let seeds = resolve_seeds(&env::var("SUNDOG_SEEDS").unwrap_or_default()).await;
+    let ae_part_min_bucket = usize_env("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET");
+    let ae_sketch_min_bucket = usize_env("SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET");
 
     let config = ClusterConfig::default().with(|c| {
         c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
         // Faster than the default so container tests converge in seconds.
         c.ae_interval = Duration::from_secs(2);
         c.tombstone_ttl = Duration::from_secs(10);
+        if let Some(min_bucket) = ae_part_min_bucket {
+            c.ae_part_min_bucket = min_bucket;
+        }
+        if let Some(min_bucket) = ae_sketch_min_bucket {
+            c.ae_sketch_min_bucket = min_bucket;
+        }
     });
 
     let cluster = Cluster::builder(cluster_name)
@@ -333,5 +357,44 @@ async fn serve(
                 std::process::exit(3);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_usize_override_reads_a_valid_number() {
+        assert_eq!(parse_usize_override(Some("512")), Some(512));
+        assert_eq!(parse_usize_override(Some("0")), Some(0));
+    }
+
+    #[test]
+    fn parse_usize_override_is_none_for_absent_or_unparsable_input() {
+        assert_eq!(parse_usize_override(None), None);
+        assert_eq!(parse_usize_override(Some("")), None);
+        assert_eq!(parse_usize_override(Some("not-a-number")), None);
+        assert_eq!(
+            parse_usize_override(Some("-1")),
+            None,
+            "usize rejects a negative value"
+        );
+    }
+
+    #[test]
+    fn big_value_is_deterministic_and_regenerable() {
+        let a = big_value(7, 20);
+        let b = big_value(7, 20);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 20);
+        assert!(a.starts_with("00000007"));
+    }
+
+    #[test]
+    fn verdict_matches_only_the_exact_regenerated_value() {
+        let value = big_value(3, 16);
+        assert_eq!(verdict(&value, 3, 16), "ok");
+        assert_ne!(verdict("wrong", 3, 16), "ok");
     }
 }

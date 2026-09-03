@@ -144,6 +144,42 @@ pub enum Msg {
         bucket: u16,
         hashes: Vec<u64>,
     },
+    /// Anti-entropy round, step 2, part path: this node's 64 part digests for
+    /// a mismatched `bucket` whose entry count passed
+    /// `ClusterConfig::ae_part_min_bucket`, sent instead of [`Msg::AeBucket`]
+    /// or [`Msg::AeSketch`]. The initiator compares these against its own
+    /// part digests for the same bucket and requests only the parts that
+    /// differ, via [`Msg::AeParts`].
+    AePartDigests {
+        cache: SmolStr,
+        bucket: u16,
+        digests: Vec<u64>,
+    },
+    /// Anti-entropy round, step 3, part path: "send me your part digests'
+    /// mismatched `(bucket, part)` pairs' answer," the part-grained
+    /// counterpart of [`Msg::AeDigest`]. Answered one reply per part
+    /// ([`Msg::AePart`] or [`Msg::AePartSketch`]), then [`Msg::ReqDone`].
+    AeParts {
+        cache: SmolStr,
+        parts: Vec<(u16, u8)>,
+    },
+    /// A part's full `(key, version)` listing, the part-grained counterpart
+    /// of [`Msg::AeBucket`].
+    AePart {
+        cache: SmolStr,
+        bucket: u16,
+        part: u8,
+        entries: Vec<(Bytes, Hlc)>,
+    },
+    /// A part's IBLT sketch, the part-grained counterpart of
+    /// [`Msg::AeSketch`], sent once the part's own entry count passes
+    /// `ClusterConfig::ae_sketch_min_bucket`.
+    AePartSketch {
+        cache: SmolStr,
+        bucket: u16,
+        part: u8,
+        cells: Vec<Cell>,
+    },
 }
 
 /// Frame discriminant: everything after this byte is a postcard-encoded
@@ -647,6 +683,53 @@ mod tests {
             cache: SmolStr::new("users"),
             bucket: 7,
             hashes: vec![1, 2, u64::MAX],
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_part_digests() {
+        roundtrip(&Msg::AePartDigests {
+            cache: SmolStr::new("users"),
+            bucket: 42,
+            digests: (0..64u64).collect(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_parts() {
+        roundtrip(&Msg::AeParts {
+            cache: SmolStr::new("users"),
+            parts: vec![(0, 0), (42, 7), (1023, 63)],
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_part() {
+        roundtrip(&Msg::AePart {
+            cache: SmolStr::new("users"),
+            bucket: 42,
+            part: 7,
+            entries: vec![(Bytes::from_static(b"k1"), sample_hlc())],
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_part_sketch() {
+        roundtrip(&Msg::AePartSketch {
+            cache: SmolStr::new("users"),
+            bucket: 42,
+            part: 7,
+            cells: sample_cells(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_part_sketch_empty_cells() {
+        roundtrip(&Msg::AePartSketch {
+            cache: SmolStr::new("users"),
+            bucket: 0,
+            part: 0,
+            cells: Vec::new(),
         });
     }
 

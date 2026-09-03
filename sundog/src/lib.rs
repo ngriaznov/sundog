@@ -99,7 +99,7 @@ pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
 /// precedent for the same module.
 #[cfg(feature = "sim")]
 #[doc(hidden)]
-pub use cluster::anti_entropy::diff_decoded;
+pub use cluster::anti_entropy::{diff_decoded, mismatched_parts};
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};

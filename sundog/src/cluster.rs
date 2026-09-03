@@ -374,6 +374,7 @@ impl ClusterBuilder {
         let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
         let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
             shards: Arc::clone(&shards),
+            ae_part_min_bucket: config.ae_part_min_bucket,
             ae_sketch_min_bucket: config.ae_sketch_min_bucket,
             ae_sketch_cells: config.ae_sketch_cells,
         });
@@ -470,6 +471,7 @@ fn local_hostname() -> String {
 /// name degrades to an empty result rather than an error.
 struct ClusterRequestHandler {
     shards: ShardRegistry,
+    ae_part_min_bucket: usize,
     ae_sketch_min_bucket: usize,
     ae_sketch_cells: usize,
 }
@@ -530,6 +532,45 @@ impl RequestHandler for ClusterRequestHandler {
                 None => Vec::new(),
             }
         })
+    }
+
+    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.bucket_lens(buckets).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn part_digests(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.part_digests(buckets).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn entries_for_parts(
+        &self,
+        cache: SmolStr,
+        parts: Vec<(u16, u8)>,
+    ) -> BoxFuture<'_, crate::store::PartEntries> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.entries_for_parts(parts).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn ae_part_min_bucket(&self) -> usize {
+        self.ae_part_min_bucket
     }
 
     fn ae_sketch_min_bucket(&self) -> usize {
@@ -798,6 +839,10 @@ async fn inbound_loop(
                 | Msg::AeEntries { .. }
                 | Msg::AePull { .. }
                 | Msg::AePullHashes { .. }
+                | Msg::AePartDigests { .. }
+                | Msg::AeParts { .. }
+                | Msg::AePart { .. }
+                | Msg::AePartSketch { .. }
                 | Msg::ReqDone => {}
             }
         }
@@ -1913,16 +1958,17 @@ mod tests {
         fallback: Arc<AtomicUsize>,
     }
 
-    struct OutcomeVisitor(Option<&'static str>);
+    /// Captures an `outcome = "..."` field verbatim, shared by every
+    /// `tracing::Subscriber` in this module that stands in for the
+    /// process-global `metrics` recorder: `AeSketchOutcomeSubscriber` reads
+    /// `decoded`/`fallback` off it, `AePartsOutcomeSubscriber` reads
+    /// `listing`/`sketch`/`fallback`.
+    struct OutcomeVisitor(Option<String>);
 
     impl tracing::field::Visit for OutcomeVisitor {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             if field.name() == "outcome" {
-                self.0 = match value {
-                    "decoded" => Some("decoded"),
-                    "fallback" => Some("fallback"),
-                    _ => None,
-                };
+                self.0 = Some(value.to_string());
             }
         }
 
@@ -1948,7 +1994,7 @@ mod tests {
             }
             let mut visitor = OutcomeVisitor(None);
             event.record(&mut visitor);
-            match visitor.0 {
+            match visitor.0.as_deref() {
                 Some("decoded") => {
                     self.decoded.fetch_add(1, Ordering::SeqCst);
                 }
@@ -1961,6 +2007,131 @@ mod tests {
 
         fn enter(&self, _span: &tracing::span::Id) {}
         fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// A [`tracing::Subscriber`] that counts `cluster::anti_entropy`'s
+    /// part-path `outcome = "listing"`/`"sketch"`/`"fallback"` events, the
+    /// part-grained counterpart of [`AeSketchOutcomeSubscriber`], standing in
+    /// for `sundog_ae_parts_total` the same way that one stands in for
+    /// `sundog_ae_sketch_total`.
+    struct AePartsOutcomeSubscriber {
+        listing: Arc<AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for AePartsOutcomeSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != "sundog::cluster::anti_entropy" {
+                return;
+            }
+            let mut visitor = OutcomeVisitor(None);
+            event.record(&mut visitor);
+            if visitor.0.as_deref() == Some("listing") {
+                self.listing.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_repairs_a_dropped_key_via_the_part_digest_path() {
+        const N: u32 = 20_000;
+
+        let config = ClusterConfig {
+            ae_part_min_bucket: 8,
+            // Large enough that a mismatched part, ~20 entries at most,
+            // never itself exceeds it: every mismatched part answers with a
+            // listing, never a sketch.
+            ae_sketch_min_bucket: 1_000_000,
+            ..loopback_config()
+        };
+
+        let cluster_a = Cluster::builder("cluster-it-ae-part-digest")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+
+        cache_a
+            .insert_many((0..N).map(|k| (k, k.to_string())))
+            .await
+            .expect("a inserts a few thousand entries before b ever joins");
+
+        // A bucket with more than `ae_part_min_bucket + 1` entries, so it
+        // still exceeds the threshold once one entry drops below.
+        let bucket_keys = dense_bucket_keys(N, config.ae_part_min_bucket + 1);
+        let target_key = bucket_keys[0];
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-part-digest")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, u64::from(N));
+
+        let listing = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(AePartsOutcomeSubscriber {
+            listing: Arc::clone(&listing),
+        });
+
+        // Simulate a dropped `Replicate` message on B; this bucket is dense
+        // enough that the responder answers with part digests, and each
+        // mismatched part with a listing.
+        cache_b.invalidate_local(&target_key).await;
+        assert_eq!(cache_b.get(&target_key).await, None);
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cache_b.get(&target_key).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("anti-entropy repairs the dropped entry via the part-digest path within the bound");
+
+        assert!(
+            listing.load(Ordering::SeqCst) > 0,
+            "expected at least one part to reconcile through a listing"
+        );
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
     }
 
     #[tokio::test]
@@ -2354,6 +2525,7 @@ mod tests {
         // registry.
         let handler = ClusterRequestHandler {
             shards: cluster.shards(),
+            ae_part_min_bucket: cluster.config().ae_part_min_bucket,
             ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
             ae_sketch_cells: cluster.config().ae_sketch_cells,
         };

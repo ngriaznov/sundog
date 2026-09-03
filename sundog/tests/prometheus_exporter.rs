@@ -63,14 +63,49 @@ fn scraped_metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option
 
 /// Every bucket of the [`SKETCH_FILL`]-key fill holds about 20 entries, so
 /// with this threshold a mismatch there reconciles through an IBLT sketch.
+/// Comfortably under [`PART_MIN_BUCKET`], so this cache's buckets never take
+/// the part path.
 const SKETCH_MIN_BUCKET: usize = 8;
 const SKETCH_FILL: u32 = 20_000;
+
+/// Bucket size past which a mismatch answers with part digests instead of a
+/// listing or sketch. Between [`SKETCH_FILL`]'s ~20-entry buckets (which
+/// must stay on the bucket-level sketch path) and [`DENSE_BUCKET_COUNT`]
+/// (which must exceed it).
+const PART_MIN_BUCKET: usize = 100;
+/// Keys concentrated into one bucket via [`keys_in_one_bucket`], dense
+/// enough to clear [`PART_MIN_BUCKET`] while each of its 64 parts (~3
+/// entries apiece) stays well under [`SKETCH_MIN_BUCKET`], so a part
+/// mismatch there answers with a listing.
+const DENSE_BUCKET_COUNT: usize = 200;
 
 fn node_config(gossip_bind_addr: SocketAddr) -> sundog::ClusterConfig {
     common::fast_config().with(|c| {
         c.gossip_bind_addr = gossip_bind_addr;
         c.ae_sketch_min_bucket = SKETCH_MIN_BUCKET;
+        c.ae_part_min_bucket = PART_MIN_BUCKET;
     })
+}
+
+/// The anti-entropy bucket a `u32` key hashes into, mirroring
+/// `store::stripe_index_from_hash`'s formula; `cluster.rs`'s and
+/// `tests/sim.rs`'s own tests carry the identical helper for the same
+/// reason.
+fn bucket_of(key: u32) -> u16 {
+    let bytes = postcard::to_stdvec(&key).expect("u32 key encodes");
+    let bucket = xxhash_rust::xxh3::xxh3_64(&bytes) & (sundog::store::BUCKET_COUNT as u64 - 1);
+    u16::try_from(bucket).expect("invariant: masked to BUCKET_COUNT - 1, always fits in u16")
+}
+
+/// `count` keys guaranteed to land in the same anti-entropy bucket, dense
+/// enough to force the part path at [`PART_MIN_BUCKET`] without a
+/// uniform-fill key count in the millions.
+fn keys_in_one_bucket(count: usize) -> Vec<u32> {
+    let target = bucket_of(0);
+    (0..)
+        .filter(|&k| bucket_of(k) == target)
+        .take(count)
+        .collect()
 }
 
 /// A known hit/miss sequence on a `Mode::Local` cache of its own, exact
@@ -138,6 +173,69 @@ async fn count_hits_and_misses(cluster: &Cluster) {
     assert!(loads.iter().all(|value| value == "joined"));
 }
 
+/// Opens `users` on both `cluster` and `peer`, does one plain insert/remove
+/// pair, then a sketch-scale fill with one key dropped on the peer, so the
+/// next round finds one bucket mismatched at ~20 entries: past
+/// `SKETCH_MIN_BUCKET`, so it reconciles through a decoded IBLT sketch.
+async fn seed_sketch_mismatch(cluster: &Cluster, peer: &Cluster) {
+    let cache = cluster
+        .cache::<u32, String>("users")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("cache opens");
+    let peer_users = peer
+        .cache::<u32, String>("users")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("peer cache opens");
+    cache.insert(1, "hello".into()).await.expect("insert");
+    cache.remove(&1).await.expect("remove");
+
+    cache
+        .insert_many((100..SKETCH_FILL + 100).map(|k| (k, k.to_string())))
+        .await
+        .expect("bulk insert");
+    common::eventually(Duration::from_secs(15), || async {
+        peer_users.get(&(SKETCH_FILL + 99)).await.is_some()
+    })
+    .await;
+    peer_users.invalidate_local(&150).await;
+}
+
+/// Opens `parts` on both `cluster` and `peer`, densely fills one anti-entropy
+/// bucket past `PART_MIN_BUCKET`, then drops one key on the peer: the bucket
+/// mismatch answers with part digests, and each mismatched part, far under
+/// `SKETCH_MIN_BUCKET`, reconciles through a listing.
+async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
+    let parts_cache = cluster
+        .cache::<u32, String>("parts")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("parts cache opens");
+    let peer_parts = peer
+        .cache::<u32, String>("parts")
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("peer parts cache opens");
+    let dense_keys = keys_in_one_bucket(DENSE_BUCKET_COUNT);
+    parts_cache
+        .insert_many(dense_keys.iter().map(|&k| (k, k.to_string())))
+        .await
+        .expect("dense bulk insert");
+    let last_dense_key = *dense_keys.last().expect("DENSE_BUCKET_COUNT is nonzero");
+    common::eventually(Duration::from_secs(15), || async {
+        peer_parts.get(&last_dense_key).await.is_some()
+    })
+    .await;
+    peer_parts
+        .invalidate_local(dense_keys.first().expect("DENSE_BUCKET_COUNT is nonzero"))
+        .await;
+}
+
 #[tokio::test]
 async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     let metrics_addr = reserve_tcp_addr().await;
@@ -162,44 +260,20 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     common::wait_for_peer_count(&cluster, 1, Duration::from_secs(15)).await;
     common::wait_for_peer_count(&peer, 1, Duration::from_secs(15)).await;
 
-    let cache = cluster
-        .cache::<u32, String>("users")
-        .mode(Mode::Replicated)
-        .open()
-        .await
-        .expect("cache opens");
-    let peer_users = peer
-        .cache::<u32, String>("users")
-        .mode(Mode::Replicated)
-        .open()
-        .await
-        .expect("peer cache opens");
-    cache.insert(1, "hello".into()).await.expect("insert");
-    cache.remove(&1).await.expect("remove");
-
-    // A sketch-scale fill, replicated to the peer, then one key dropped
-    // there: the next anti-entropy round finds that bucket mismatched, and
-    // at ~20 entries it reconciles through a sketch, which decodes.
-    cache
-        .insert_many((100..SKETCH_FILL + 100).map(|k| (k, k.to_string())))
-        .await
-        .expect("bulk insert");
-    common::eventually(Duration::from_secs(15), || async {
-        peer_users.get(&(SKETCH_FILL + 99)).await.is_some()
-    })
-    .await;
-    peer_users.invalidate_local(&150).await;
-
+    seed_sketch_mismatch(&cluster, &peer).await;
+    seed_part_mismatch(&cluster, &peer).await;
     count_hits_and_misses(&cluster).await;
 
     // `sundog_open_caches` comes from a periodic background routine and the
-    // sketch counter from an anti-entropy round, so poll until every metric
-    // checked below has been published once.
+    // sketch/parts counters from an anti-entropy round, so poll until every
+    // metric checked below has been published once.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let body = loop {
         if let Some(body) = scrape_metrics(metrics_addr).await
             && body.contains("sundog_open_caches")
             && body.contains("sundog_live_peers")
+            && scraped_metric_value(&body, "sundog_ae_parts_total", ("outcome", "listing"))
+                .is_some()
             && body.contains("sundog_cache_entries")
             && scraped_metric_value(&body, "sundog_ae_sketch_total", ("outcome", "decoded"))
                 .is_some()
@@ -232,6 +306,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         scraped_metric_value(&body, "sundog_ae_sketch_total", ("cache", "users"))
             .is_some_and(|decoded| decoded >= 1.0),
         "expected at least one decoded sketch on the 'users' cache; got body:\n{body}"
+    );
+    assert!(
+        scraped_metric_value(&body, "sundog_ae_parts_total", ("cache", "parts"))
+            .is_some_and(|listings| listings >= 1.0),
+        "expected at least one part listing on the 'parts' cache; got body:\n{body}"
     );
 
     peer.shutdown().await;
