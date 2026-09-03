@@ -26,11 +26,11 @@ pub(super) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
 /// Disables Nagle's algorithm on a freshly dialed/accepted socket. Every
 /// wire message here is already a deliberately-sized, application-level
 /// batch (`net::conn`'s own coalescing, or a lone small message that should
-/// go out now) — nothing is ever gained by the kernel holding it back to
-/// wait for more, and Nagle's interaction with the peer's delayed-ACK timer
-/// is a classic multi-millisecond stall on exactly this small-frequent-write
-/// traffic shape. Best-effort: a failure here (a socket already gone) is
-/// harmless and surfaces on the next real read/write instead.
+/// go out now); the kernel never gains anything by holding it back to wait
+/// for more, and Nagle's interaction with the peer's delayed-ACK timer is a
+/// classic multi-millisecond stall on this small-frequent-write traffic
+/// shape. Best-effort: a failure here (a socket already gone) is harmless
+/// and surfaces on the next real read/write instead.
 fn disable_nagle(stream: &TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "set_nodelay failed; leaving Nagle's algorithm enabled");
@@ -53,7 +53,7 @@ async fn establish_dial(stream: TcpStream, tls: &TlsCtx) -> std::io::Result<Mesh
         None => Ok(MeshStream::Plain(stream)),
     }
 }
-// A genuine (if instantly-ready) `.await` — not just `Ok(stream)` — keeps
+// A genuine (if instantly-ready) `.await`, not `Ok(stream)` alone, keeps
 // this signature `async fn` like the TLS-active branch above, so every
 // caller can write `establish_dial(..).await` unconditionally rather than
 // forking on the feature.
@@ -85,11 +85,10 @@ pub(super) async fn send_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), C
 }
 
 /// Sends every message in `msgs` and flushes once at the end, rather than
-/// once per message — the "drain-many-then-flush-once" half of the per-peer
-/// writer's opportunistic batching: several messages sharing one flush
-/// instead of one syscall-worthy flush each. Used for control-plane
-/// replies (`serve_ae_digest`/`serve_ae_pull`) and `Hello`-plus-first-request
-/// dials, which build their own `Msg`s in-process rather than reusing an
+/// once per message: several messages sharing one flush instead of one
+/// syscall-worthy flush each. Used for control-plane replies
+/// (`serve_ae_digest`/`serve_ae_pull`) and `Hello`-plus-first-request dials,
+/// which build their own `Msg`s in-process rather than reusing an
 /// already-encoded [`OutFrame`] — see [`send_frames`] for the broadcast path
 /// that does.
 async fn send_batch(framed: &mut PeerFramed, msgs: &[Msg]) -> Result<(), CodecError> {
@@ -103,9 +102,9 @@ async fn send_batch(framed: &mut PeerFramed, msgs: &[Msg]) -> Result<(), CodecEr
     Ok(())
 }
 
-/// [`send_batch`], but for already-encoded frames: the per-peer
-/// writer's broadcast-class drain feeds these straight onto the wire with no
-/// `wire::encode` call of its own — the frame was built once, upstream, and
+/// [`send_batch`], but for already-encoded frames: the per-peer writer's
+/// broadcast-class drain feeds these straight onto the wire with no
+/// `wire::encode` call of its own. The frame was built once, upstream, and
 /// shared (a `Bytes` clone per peer) across every live peer's outbox.
 async fn send_frames(
     framed: &mut PeerFramed,
@@ -144,14 +143,11 @@ struct PendingRun {
     records: usize,
 }
 
-/// Flushes `pending` (if any) into `out`: a run of exactly one accumulated
-/// record reuses that record's own already-encoded frame as-is (no
-/// re-encode for the uncoalesced case), a run of more than one is combined
-/// into a fresh `Msg::ReplicateBatch` encode — the shared close-off step
+/// Flushes `pending` (if any) into `out` — the close-off step
 /// [`coalesce_replicate`] calls both mid-run (a cache change, or a
-/// budget/count cap hit) and at the end of `drained`. A batch that somehow
-/// fails to encode (unexpected — every record in it already encoded fine on
-/// its own) is dropped with a warning rather than panicking; anti-entropy
+/// budget/count cap hit) and at the end of `drained`. A batch that fails to
+/// encode (unexpected, since every record in it already encoded fine on its
+/// own) is dropped with a warning rather than panicking; anti-entropy
 /// repairs the gap like any other lost write.
 fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes>) {
     let Some(run) = pending.take() else {
@@ -188,18 +184,17 @@ fn flush_pending_replicate(pending: &mut Option<PendingRun>, out: &mut Vec<Bytes
     }
 }
 
-/// Opportunistically coalesces consecutive same-cache `Msg::Replicate` *and*
+/// Coalesces consecutive same-cache `Msg::Replicate` *and*
 /// `Msg::ReplicateBatch` entries in `drained` — messages the writer already
 /// had queued by the time it drained them, never delayed to wait for more
-/// (Aeron-style smart batching: no timers, no added latency) — into
-/// `Msg::ReplicateBatch` frames bounded by [`REPLICATE_BATCH_BUDGET`] and
-/// [`REPLICATE_BATCH_COUNT`] (counting *records*, not queue items — one
-/// pre-batched item from `cluster::fan_out_batch` can carry many). A run of
-/// exactly one item reuses its already-encoded [`OutFrame::frame`] as-is
-/// rather than re-encoding — only an actual merge (more than one item
-/// combined) pays for a fresh encode. Anything else passes its frame through
-/// unchanged (the replicate-class outbox never actually carries anything
-/// else, but this stays honest rather than assuming it).
+/// (no timers, no added latency) — into `Msg::ReplicateBatch` frames bounded
+/// by [`REPLICATE_BATCH_BUDGET`] and [`REPLICATE_BATCH_COUNT`] (counting
+/// *records*, not queue items — one pre-batched item from
+/// `cluster::fan_out_batch` can carry many). A run of exactly one item
+/// reuses its already-encoded [`OutFrame::frame`] as-is; only an actual
+/// merge pays for a fresh encode. Anything else passes its frame through
+/// unchanged (the replicate-class outbox never carries anything else, but
+/// this stays honest rather than assuming it).
 fn coalesce_replicate(drained: Vec<OutFrame>) -> Vec<Bytes> {
     let mut out = Vec::with_capacity(drained.len());
     let mut pending: Option<PendingRun> = None;
@@ -262,12 +257,11 @@ async fn send_batch_or_cancelled(
 
 /// Reads the next message off `framed`, bounded by `idle_timeout` when set —
 /// used only once a connection has already served at least one
-/// request/response exchange: a persistent per-peer
-/// broadcast link never goes through this path (`idle_timeout` stays `None`
-/// for it, matching the original unbounded wait), but a connection kept
-/// alive for client-side request-pool reuse must not sit open on this side
-/// forever if the peer never checks it back out. Timing out is treated
-/// exactly like the peer closing the connection.
+/// request/response exchange: a persistent per-peer broadcast link never
+/// goes through this path (`idle_timeout` stays `None` for it), but a
+/// connection kept alive for client-side request-pool reuse must not sit
+/// open on this side forever if the peer never checks it back out. Timing
+/// out is treated like the peer closing the connection.
 async fn recv_msg_or_idle_timeout(
     framed: &mut PeerFramed,
     idle_timeout: Option<Duration>,
@@ -309,13 +303,13 @@ const REQ_CONN_MAX_REQUESTS: usize = 4096;
 /// A small per-peer pool of request/response connections that have already
 /// completed `Hello` (and, under `tls`, a full mutual-cert handshake),
 /// reused across `Mesh::ae_round`/`ae_pull`/`request_state` calls instead of
-/// dialing fresh every time. Deliberately separate from the persistent
-/// per-peer writer connection (`run_peer_writer`), so a slow snapshot
-/// transfer can never back up live broadcast traffic.
+/// dialing fresh every time. Separate from the persistent per-peer writer
+/// connection (`run_peer_writer`), so a slow snapshot transfer never backs
+/// up live broadcast traffic.
 ///
-/// A connection only ever gets checked back in after a clean end-of-reply
+/// A connection only gets checked back in after a clean end-of-reply
 /// (`Msg::ReqDone`, or a state-transfer stream that reached its final
-/// `done: true` chunk) — one left in an unknown framing state after an
+/// `done: true` chunk); one left in an unknown framing state after an
 /// error, a timeout, or cancellation is dropped instead of pooled, so a
 /// broken or partially-consumed connection is never handed out again.
 pub(super) struct ReqPool {
@@ -356,8 +350,7 @@ impl ReqPool {
 /// [`connect_with_hello`]'s persistent per-peer writer, which has nothing
 /// further to send right away. The one-shot request/response paths (state
 /// transfer, anti-entropy) want [`dial_with_hello_and`] instead, so their
-/// first request message shares `Hello`'s flush rather than paying for a
-/// second one.
+/// first request shares `Hello`'s flush rather than paying for a second one.
 pub(super) async fn dial_with_hello(
     addr: SocketAddr,
     node: NodeId,
@@ -375,9 +368,9 @@ pub(super) async fn dial_with_hello(
 /// [`dial_with_hello`], but `feed()`s `first` onto the fresh connection
 /// alongside `Hello` and flushes once for both — one syscall instead of two,
 /// for the one-shot request/response callers (`Mesh::request_state`,
-/// `Mesh::ae_round`, `Mesh::ae_pull`) that always have a request message
-/// ready to send immediately after `Hello`, with no read in between and
-/// Nagle already disabled.
+/// `Mesh::ae_round`, `Mesh::ae_pull`) that always have a request ready to
+/// send immediately after `Hello`, with no read in between and Nagle
+/// already disabled.
 pub(super) async fn dial_with_hello_and(
     addr: SocketAddr,
     node: NodeId,
@@ -469,7 +462,7 @@ async fn connect_with_hello(
     }
 }
 
-/// Accepts connections until `cancel` fires, spawning a handler task per
+/// Accepts connections until `cancel` fires, spawning a handler per
 /// connection.
 pub(super) async fn accept_loop(
     listener: TcpListener,
@@ -502,23 +495,17 @@ pub(super) async fn accept_loop(
 /// `Invalidate`/`Replicate`/`ReplicateBatch` keep the connection open and
 /// forward to `inbound_tx` (the persistent mesh-link case). A request
 /// message (`StRequest`/`AeDigest`/`AePull`) is served, and the connection
-/// is then kept open for the requester to reuse rather than
-/// closed after one exchange, subject to [`REQ_CONN_IDLE_TIMEOUT`] and
-/// [`REQ_CONN_MAX_REQUESTS`] so a peer that never checks a pooled connection
-/// back in doesn't hold a server-side socket (and, under `tls`, an open
-/// session) forever; a failed serve (an error or this task's own
-/// cancellation mid-reply, `serve_*`'s `bool` return) still closes the
-/// connection immediately, since it may be mid-frame and unsafe to reuse. A
-/// failed TLS handshake (a plaintext peer dialing a TLS-configured node, or
-/// a certificate that doesn't chain to the trusted root) drops the
-/// connection exactly like a missing `Hello` — a loud `tracing` event, no
-/// crash.
+/// stays open for the requester to reuse rather than closing after one
+/// exchange, subject to [`REQ_CONN_IDLE_TIMEOUT`] and
+/// [`REQ_CONN_MAX_REQUESTS`]. A failed serve (an error or cancellation
+/// mid-reply, `serve_*`'s `bool` return) closes the connection immediately,
+/// since it may be mid-frame and unsafe to reuse; a failed TLS handshake
+/// drops the connection the same way, like a missing `Hello`.
 ///
 /// `cancel` is `accept_loop`'s own token: every read and write below races
 /// against it, so a slow/never-ending snapshot or AE reply gets torn down
-/// promptly on [`super::Mesh::shutdown`] instead of outliving it (the
-/// `handler` this task holds keeps the whole shard registry alive until the
-/// task actually returns).
+/// promptly on [`super::Mesh::shutdown`] (the `handler` held here keeps the
+/// shard registry alive until this function returns).
 async fn handle_accepted(
     stream: TcpStream,
     inbound_tx: mpsc::Sender<InboundMsg>,
@@ -547,8 +534,8 @@ async fn handle_accepted(
     loop {
         // Only a connection that has already served at least one
         // request/response exchange is a pooling candidate; a persistent
-        // broadcast link (which never sends a request message) keeps
-        // waiting indefinitely, exactly as before this wave.
+        // broadcast link, which never sends a request message, waits
+        // indefinitely.
         let idle_timeout = (served_requests > 0).then_some(REQ_CONN_IDLE_TIMEOUT);
         let received = tokio::select! {
             biased;
@@ -600,8 +587,8 @@ async fn handle_accepted(
             }
             // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
             // `ReqDone` — the latter only ever sent as replies on a
-            // connection *we* initiated as a requester, never to a
-            // connection we're serving.
+            // connection this node initiated as a requester, never on a
+            // connection being served here.
             Msg::Hello { .. }
             | Msg::StChunk { .. }
             | Msg::AeBucket { .. }
@@ -679,8 +666,8 @@ async fn serve_state_transfer(
 /// module docs for why past that size a fixed-cost sketch reply is cheaper
 /// on the wire than the listing regardless of the actual diff. Returns
 /// `true` if the caller should stop serving this connection (cancelled, or
-/// the send failed), `false` once the reply (including `ReqDone`) sent
-/// cleanly and the connection remains reusable.
+/// the send failed), `false` once the reply sent cleanly and the connection
+/// remains reusable.
 async fn serve_ae_digest(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -794,11 +781,11 @@ async fn serve_ae_pull_hashes(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
-/// Reads `AeBucket` replies until [`Msg::ReqDone`] marks the reply complete
-/// — not until the peer closes the connection, which it no longer does
-/// after one exchange. On success, checks `framed` back into `pool` for
-/// reuse; on error, the connection is dropped instead (never safe to reuse
-/// mid-frame).
+/// Reads `AeBucket` replies until [`Msg::ReqDone`] marks the reply
+/// complete: the peer keeps the connection open for reuse rather than
+/// closing it after one exchange. On success, checks `framed` back into
+/// `pool` for reuse; on error, the connection is dropped instead (never
+/// safe to reuse mid-frame).
 pub(super) async fn collect_ae_buckets(
     mut framed: PeerFramed,
     pool: &ReqPool,
@@ -823,8 +810,8 @@ pub(super) async fn collect_ae_buckets(
 /// Reads `AeBucket`/`AeSketch` replies until [`Msg::ReqDone`] marks the
 /// reply complete — [`Mesh::ae_round`]'s collector, one [`super::AeMismatch`]
 /// per mismatched bucket regardless of which shape the responder answered
-/// with. See [`collect_ae_buckets`]'s docs for the same "no longer relies on
-/// connection close" reasoning and pool-checkin-on-success rule.
+/// with. See [`collect_ae_buckets`]'s docs for the same reply-completion
+/// and pool-checkin-on-success rules.
 ///
 /// [`Mesh::ae_round`]: super::Mesh::ae_round
 pub(super) async fn collect_ae_mismatches(
@@ -851,9 +838,9 @@ pub(super) async fn collect_ae_mismatches(
     }
 }
 
-/// Reads `Replicate`/`ReplicateBatch` replies until [`Msg::ReqDone`] marks the reply
-/// complete — see [`collect_ae_buckets`]'s docs for the same "no longer
-/// relies on connection close" reasoning and pool-checkin-on-success rule.
+/// Reads `Replicate`/`ReplicateBatch` replies until [`Msg::ReqDone`] marks
+/// the reply complete — see [`collect_ae_buckets`]'s docs for the same
+/// reply-completion and pool-checkin-on-success rules.
 pub(super) async fn collect_pulled_records(
     mut framed: PeerFramed,
     pool: &ReqPool,
@@ -884,12 +871,11 @@ fn unexpected_close(what: &str) -> CodecError {
 /// Adapts a request-state connection into a lazy stream of record chunks,
 /// reading `StChunk`s off the wire only as the consumer polls for more, and
 /// yielding each `StChunk`'s records as one `Vec` — the donor's own chunk
-/// boundaries (~500 records) preserved so the caller can apply a
-/// whole chunk through `ShardOps::apply_remote_batch` under one lock
-/// acquisition instead of one per record. On reaching the final
-/// `done: true` chunk, checks the connection back into `pool` for reuse
-/// instead of dropping it; any error path (including a truncated,
-/// donor-crash-mid-stream close) drops it instead.
+/// boundaries (~500 records) preserved so the caller can apply a whole
+/// chunk through `ShardOps::apply_remote_batch` under one lock acquisition
+/// instead of one per record. On reaching the final `done: true` chunk,
+/// checks the connection back into `pool` for reuse; any error path
+/// (including a truncated, donor-crash-mid-stream close) drops it instead.
 pub(super) fn state_stream(
     framed: PeerFramed,
     pool: Arc<ReqPool>,
@@ -919,11 +905,10 @@ pub(super) fn state_stream(
                     }
                     Some(Ok(_)) => {} // unexpected message on this stream; keep reading
                     Some(Err(err)) => return Some((Err(err), None)),
-                    // The connection closed before a `done: true` chunk ever
+                    // The connection closed before a `done: true` chunk
                     // arrived — a donor crash/close mid-stream. Surfacing
-                    // this as an error (rather than silently ending the
-                    // stream, indistinguishable from a clean completion) is
-                    // what lets the state-transfer retry logic tell a
+                    // this as an error, rather than silently ending the
+                    // stream, lets the state-transfer retry logic tell a
                     // truncated transfer from a finished one.
                     None => {
                         let err = CodecError::Io(std::io::Error::new(
@@ -946,8 +931,8 @@ mod tests {
     // Real tokio sockets and a locally-built codec throughout, not this
     // module's own `new_framed`/`send_msg`/`recv_msg` — those are typed
     // against `net::tcp`'s seam alias (`turmoil::net::TcpStream` under the
-    // `sim` feature), while this suite specifically exercises the real
-    // socket stack regardless of feature flags.
+    // `sim` feature), while this suite exercises the real socket stack
+    // regardless of feature flags.
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::codec::LengthDelimitedCodec;
 
@@ -1068,7 +1053,7 @@ mod tests {
         });
         let client = TcpStream::connect(addr).await.expect("connect");
         let mut client = tokio_util::codec::Framed::new(client, codec());
-        let mut server = accept.await.expect("accept task");
+        let mut server = accept.await.expect("connection accepted");
 
         let sent = Msg::Hello {
             node: NodeId::from(7),
@@ -1088,9 +1073,9 @@ mod tests {
     // `serve_state_transfer` takes `&mut PeerFramed` (`Framed<MeshStream,
     // _>`), and `MeshStream` is a different concrete type per feature (a
     // `turmoil` socket under `sim`, `tls::MeshStream` wrapping a plain
-    // `tokio` socket under `tls`) — this test exercises the real transport
-    // directly, so it's skipped under `sim` the same way `net::mod`'s and
-    // `state_transfer`'s own real-transport test modules are.
+    // `tokio` socket under `tls`). This test exercises the real transport
+    // directly, so it's skipped under `sim`, like `net::mod`'s and
+    // `state_transfer`'s own real-transport test modules.
     #[cfg(all(feature = "tls", not(feature = "sim")))]
     fn as_mesh_stream(stream: tokio::net::TcpStream) -> super::MeshStream {
         super::MeshStream::Plain(stream)
@@ -1150,7 +1135,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener has a local addr");
         let accept = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
         let _client = TcpStream::connect(addr).await.expect("connect");
-        let server_stream = accept.await.expect("accept task");
+        let server_stream = accept.await.expect("connection accepted");
 
         let framed = super::new_framed(as_mesh_stream(server_stream));
         let cancel = CancellationToken::new();
@@ -1175,6 +1160,6 @@ mod tests {
                  forever on a snapshot stream that never yields — otherwise Mesh::shutdown() \
                  leaves it running with the shard registry Arc still held",
             )
-            .expect("task must not panic");
+            .expect("accepted-connection handler did not panic");
     }
 }

@@ -24,9 +24,9 @@ const CLUSTER_TXT_KEY: &str = "cluster";
 /// `ServiceDaemon::new` does not itself open the multicast sockets — per its
 /// own docs those open lazily on the daemon thread, so an environment
 /// without multicast (many CI containers) surfaces no error here, from
-/// `browse`, or from `register`; the candidate stream simply never yields
-/// anything. A hard daemon-startup failure (rare) is logged and degrades the
-/// same way, so this type never panics regardless of multicast availability.
+/// `browse`, or from `register`; the candidate stream never yields anything.
+/// A hard daemon-startup failure (rare) is logged and degrades the same way,
+/// so this type never panics regardless of multicast availability.
 pub struct Mdns {
     cluster_name: SmolStr,
     instance_name: String,
