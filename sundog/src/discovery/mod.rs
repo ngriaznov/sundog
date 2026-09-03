@@ -1,6 +1,5 @@
-//! Discovery: "who might be out there" — the `JGroups` `PING` layer analog.
-//! Continuously produces candidate gossip addresses that feed
-//! [`crate::membership::Membership::spawn`]'s seed stream.
+//! Discovery: "who might be out there," the `JGroups` `PING` layer analog.
+//! Feeds [`crate::membership::Membership::spawn`]'s seed stream.
 
 pub mod dns;
 pub mod mdns;
@@ -12,23 +11,17 @@ use std::net::SocketAddr;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
-/// A source of candidate cluster peers.
-///
-/// Object-safe by construction (`BoxStream`/`BoxFuture` return types rather
-/// than `impl Stream`/`impl Future`) so a `Cluster` can hold
-/// `Box<dyn Discovery>` and the builder can accept any implementation
-/// uniformly — RPITIT return types are not object-safe, so this trait
-/// returns boxed futures and streams instead.
+/// A source of candidate cluster peers. Object-safe by construction
+/// (`BoxStream`/`BoxFuture` returns rather than `impl Stream`/`impl
+/// Future`), so a `Cluster` can hold `Box<dyn Discovery>`.
 pub trait Discovery: Send + Sync + 'static {
-    /// A continuous stream of candidate peer gossip addresses. Duplicates are
-    /// fine and expected; the stream must never terminate on its own — a
-    /// fully restarted cluster relies on continuous (not one-shot) discovery
-    /// to re-find itself.
+    /// A continuous stream of candidate peer gossip addresses. Duplicates
+    /// are expected; the stream must never terminate, so a restarted
+    /// cluster can re-find itself.
     fn candidates(&self) -> BoxStream<'static, SocketAddr>;
 
-    /// Makes this node findable by other instances of the same discovery
-    /// mechanism (e.g. registers an mDNS service record). A no-op for
-    /// discovery sources with nothing to announce (`Static`, `DnsSrv`).
+    /// Makes this node findable by other instances of the same mechanism.
+    /// A no-op for sources with nothing to announce (`Static`, `DnsSrv`).
     ///
     /// # Errors
     ///
@@ -38,16 +31,13 @@ pub trait Discovery: Send + Sync + 'static {
 
 /// The discovery source a [`crate::cluster::ClusterBuilder`] holds: one of
 /// the three built-in mechanisms, or a caller-supplied implementation.
-/// Implements [`Discovery`] itself by delegating to whichever variant it
-/// holds, so callers never need to box a built-in source to store it
-/// alongside a custom one.
 pub enum DiscoveryKind {
     /// The zeroconf default: `mdns-sd`-based LAN discovery.
     Mdns(mdns::Mdns),
     /// A fixed seed list, from the builder and/or `SUNDOG_SEEDS`.
     Static(statics::Static),
-    /// SRV-record discovery against a headless service name. Boxed: a
-    /// `TokioResolver` makes this variant far larger than its siblings.
+    /// SRV-record discovery against a headless service name. Boxed since a
+    /// `TokioResolver` dwarfs the other variants.
     DnsSrv(Box<dns::DnsSrv>),
     /// A caller-supplied discovery mechanism.
     Custom(Box<dyn Discovery>),

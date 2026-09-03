@@ -32,15 +32,11 @@ use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
-/// One cell of the anti-entropy IBLT sketch ([`Msg::AeSketch`]'s payload),
-/// defined in `cluster::sketch` and re-exported here so a wire message can
-/// carry a `Vec<Cell>`. Every field is private to that module; nothing
-/// outside it constructs, inspects, or matches on one.
+/// One cell of the anti-entropy IBLT sketch, defined in `cluster::sketch`.
 pub use crate::cluster::sketch::Cell;
 
-/// Hard cap on any single wire frame, in bytes (4 MiB). Oversized values are
-/// rejected at the API boundary (`CacheError::ValueTooLarge`) rather than
-/// fragmented across multiple frames.
+/// Hard cap on any single wire frame: 4 MiB. Oversized values are rejected
+/// at the API boundary (`CacheError::ValueTooLarge`) instead.
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 
 /// One versioned key/value record as it travels the wire: a live entry when
@@ -58,147 +54,93 @@ pub struct WireRecord {
 }
 
 impl WireRecord {
-    /// Returns `true` if this record is a tombstone (a deletion marker).
+    /// Returns `true` if this record is a tombstone.
     #[must_use]
     pub const fn is_tombstone(&self) -> bool {
         self.value.is_none()
     }
 }
 
-/// Every message exchanged on the data-plane mesh.
-///
-/// `#[non_exhaustive]`: new wire message kinds are added as the
-/// anti-entropy and state-transfer protocols grow; matching code needs a
-/// wildcard arm rather than a breaking release for every addition.
+/// Every message exchanged on the data-plane mesh. `#[non_exhaustive]`: new
+/// kinds are added as the protocols grow, so matching code needs a wildcard
+/// arm rather than a breaking release for every addition.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Sent once a new connection is established: identifies the sender.
     Hello {
-        /// The sending node's id.
         node: NodeId,
-        /// The sending node's membership incarnation number.
+        /// The sender's membership incarnation number.
         incarnation: u64,
     },
-    /// Invalidation-mode fan-out: "the entry at `key` changed, drop your copy."
+    /// Invalidation-mode fan-out: "the entry at `key` changed, drop your
+    /// copy." `key` is postcard-encoded; `ver` is the write's version.
     Invalidate {
-        /// The target cache's name.
         cache: SmolStr,
-        /// The postcard-encoded key that changed.
         key: Bytes,
-        /// The version of the write that caused the invalidation.
         ver: Hlc,
     },
-    /// Replication-mode fan-out: the full record to apply. Wire-encoded via
-    /// the raw-record layout (this module's docs), not postcard.
-    Replicate {
-        /// The target cache's name.
-        cache: SmolStr,
-        /// The record to apply.
-        rec: WireRecord,
-    },
+    /// Replication-mode fan-out: the full record. Raw-record layout, not postcard.
+    Replicate { cache: SmolStr, rec: WireRecord },
     /// Requests a full snapshot stream of a cache, for state transfer on join.
-    StRequest {
-        /// The cache to snapshot.
-        cache: SmolStr,
-    },
-    /// One chunk of a state-transfer snapshot stream. Wire-encoded via the
-    /// raw-record layout (this module's docs), not postcard.
+    StRequest { cache: SmolStr },
+    /// One chunk (~500 records) of a state-transfer snapshot stream, `done`
+    /// set on the final one. Raw-record layout, not postcard.
     StChunk {
-        /// The cache being transferred.
         cache: SmolStr,
-        /// A batch of records (~500 per chunk).
         recs: Vec<WireRecord>,
-        /// `true` on the final chunk of the stream.
         done: bool,
     },
-    /// Anti-entropy round, step 1: this node's per-bucket digest array.
+    /// Anti-entropy round, step 1: this node's per-bucket digest array, as
+    /// `(bucket, xor_digest)` pairs, one per bucket (1 024 total).
     AeDigest {
-        /// The cache being reconciled.
         cache: SmolStr,
-        /// `(bucket, xor_digest)` pairs, one per bucket (1 024 total).
         buckets: Vec<(u16, u64)>,
     },
-    /// Anti-entropy round, step 2: key/version listing for a mismatched bucket.
+    /// Anti-entropy round, step 2: `(key, version)` pairs live in the
+    /// mismatched `bucket` on the sender.
     AeBucket {
-        /// The cache being reconciled.
         cache: SmolStr,
-        /// Which bucket this listing covers.
         bucket: u16,
-        /// `(key, version)` pairs live in that bucket on the sender.
         entries: Vec<(Bytes, Hlc)>,
     },
-    /// Anti-entropy round, step 3: "send me your full records for these keys."
-    AePull {
-        /// The cache being reconciled.
-        cache: SmolStr,
-        /// The keys the requester is missing or holds an older version of.
-        keys: Vec<Bytes>,
-    },
-    /// Replication-mode fan-out, batched: several records to apply together.
-    /// `net::conn`'s per-peer writer coalesces consecutive same-cache queued
-    /// [`Msg::Replicate`] messages into this on the wire; the batch applies
-    /// under one acquisition of the store's apply lock
-    /// (`store::ShardOps::apply_remote_batch`). Wire-encoded via the
-    /// raw-record layout (this module's docs), not postcard.
+    /// Anti-entropy round, step 3: "send me your full records for these
+    /// keys," `keys` being ones the requester is missing or holds stale.
+    AePull { cache: SmolStr, keys: Vec<Bytes> },
+    /// Replication-mode fan-out, batched: several records to apply
+    /// together. `net::conn`'s per-peer writer coalesces consecutive
+    /// same-cache queued [`Msg::Replicate`] messages into this; the batch
+    /// applies under one lock acquisition. Raw-record layout, not postcard.
     ReplicateBatch {
-        /// The target cache's name.
         cache: SmolStr,
-        /// The records to apply, in order.
         recs: Vec<WireRecord>,
     },
     /// Marks the end of one reply on a request/response connection kept
-    /// open for reuse: sent after the last `AeBucket`/`Replicate` reply to
-    /// an `AeDigest`/`AePull` request, so the requester knows the reply is
-    /// complete without relying on the connection closing. `StChunk`'s own
-    /// `done` flag already serves this role for `StRequest`'s reply.
-    /// Declared after every variant that predates it, so their postcard
-    /// encodings, ordered by declaration index, stay unchanged.
+    /// open for reuse. Declared after every variant that predates it, so
+    /// their postcard encodings stay unchanged.
     ReqDone,
-    /// Anti-entropy round, step 2 (large-bucket path): an IBLT sketch
-    /// (`cluster::sketch`'s module docs) over a mismatched bucket's
-    /// `(key_hash, version)` pairs, sent instead of [`Msg::AeBucket`] once
-    /// the bucket's own listing would cost more on the wire than the sketch
-    /// (`ClusterConfig::ae_sketch_min_bucket`). The initiator subtracts its
-    /// own local sketch of the bucket from this one and peels the result;
-    /// on success this replaces the `AeBucket` round trip for that bucket,
-    /// on failure (`cluster::sketch::Undecodable`) the initiator falls back
+    /// Anti-entropy round, step 2, large-bucket path: an IBLT sketch over a
+    /// mismatched bucket's `(key_hash, version)` pairs, sent instead of
+    /// [`Msg::AeBucket`] once the bucket's own listing would cost more on
+    /// the wire than the sketch. The initiator subtracts its own local
+    /// sketch from this one and peels the result; on failure it falls back
     /// to [`Msg::AeEntries`].
-    ///
-    /// [`ClusterConfig::ae_sketch_min_bucket`]: crate::config::ClusterConfig::ae_sketch_min_bucket
     AeSketch {
-        /// The cache being reconciled.
         cache: SmolStr,
-        /// Which bucket this sketch covers.
         bucket: u16,
-        /// The sketch's cells (`ClusterConfig::ae_sketch_cells` of them, as
-        /// built by the sender).
+        /// `ClusterConfig::ae_sketch_cells` of them, built by the sender.
         cells: Vec<Cell>,
     },
-    /// Anti-entropy round, step 2 fallback: "send me the full `(key,
-    /// version)` listing for these buckets" — the initiator's request after
-    /// one or more `AeSketch` replies failed to decode. Answered like
-    /// `AeDigest`'s reply shape: one [`Msg::AeBucket`] per requested
-    /// bucket, then [`Msg::ReqDone`].
-    AeEntries {
-        /// The cache being reconciled.
-        cache: SmolStr,
-        /// The buckets to list in full.
-        buckets: Vec<u16>,
-    },
-    /// Anti-entropy round, step 3 (sketch-decoded path): "send me your full
-    /// records for the entries of `bucket` whose key hash (`xxh3_64` of the
-    /// key's wire bytes) is one of `hashes`" — the sketch-decoded
-    /// counterpart to [`Msg::AePull`], used when the initiator peeled an
-    /// `AeSketch` reply and learned only the key *hashes* it is missing or
-    /// holds stale, never the keys themselves. Answered like `AePull`'s
-    /// reply shape: [`Msg::Replicate`] records, then [`Msg::ReqDone`].
+    /// Anti-entropy round, step 2 fallback: the sketch-fallback request for
+    /// the full `(key, version)` listing of these buckets, after one or
+    /// more `AeSketch` replies failed to decode. Answered like `AeDigest`.
+    AeEntries { cache: SmolStr, buckets: Vec<u16> },
+    /// Anti-entropy round, step 3, sketch-decoded path: the sketch-decoded
+    /// counterpart to [`Msg::AePull`], requesting records for the entries
+    /// of `bucket` whose key hash is one of `hashes`. Answered like `AePull`.
     AePullHashes {
-        /// The cache being reconciled.
         cache: SmolStr,
-        /// Which bucket the requested hashes were reported in.
         bucket: u16,
-        /// Key hashes the requester is missing or holds an older version of.
         hashes: Vec<u64>,
     },
 }
@@ -206,7 +148,7 @@ pub enum Msg {
 /// Frame discriminant: everything after this byte is a postcard-encoded [`Msg`].
 const FRAME_KIND_POSTCARD: u8 = 0;
 /// Frame discriminant: everything after this byte is the raw-record layout
-/// (this module's docs) for [`Msg::Replicate`]/[`Msg::ReplicateBatch`]/[`Msg::StChunk`].
+/// for [`Msg::Replicate`]/[`Msg::ReplicateBatch`]/[`Msg::StChunk`].
 const FRAME_KIND_RAW_RECORD: u8 = 1;
 
 const RAW_KIND_REPLICATE: u8 = 0;
@@ -215,18 +157,16 @@ const RAW_KIND_ST_CHUNK: u8 = 2;
 
 /// Record-level flag: this record is a tombstone (`WireRecord::value` is `None`).
 const RECORD_FLAG_TOMBSTONE: u8 = 0b01;
-/// Record-level flag: `expires_at_ms` is `Some` and the header's
-/// `expires_at_ms` field holds its value — without this flag the field is
-/// meaningless (always written as `0`), so a real expiry of `0` and "no
-/// expiry" are never ambiguous the way a sentinel value would make them.
+/// Record-level flag: `expires_at_ms` is `Some` and the header's field holds
+/// its value. Without this flag the field is meaningless, always `0`, so a
+/// real expiry of `0` is never ambiguous with "no expiry."
 const RECORD_FLAG_HAS_EXPIRY: u8 = 0b10;
 
 /// Fixed header preceding a raw-record frame's payload: which of the three
 /// record-carrying [`Msg`] variants this is, the state-transfer `done` flag
-/// (meaningless — always `0` — outside [`Msg::StChunk`]), the cache name's
-/// byte length, and how many [`RecordHeader`]-prefixed records follow. Every
-/// field is a byte-order-explicit, alignment-1 `zerocopy` integer, so this
-/// struct has no implicit padding and can sit at any offset in a frame.
+/// (always `0` outside [`Msg::StChunk`]), the cache name's byte length, and
+/// how many [`RecordHeader`]-prefixed records follow. Every field is a
+/// byte-order-explicit, alignment-1 `zerocopy` integer: no implicit padding.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]
 struct RawFrameHeader {
@@ -252,15 +192,12 @@ struct RecordHeader {
 
 /// Exact per-record fixed overhead the raw-record layout adds ahead of each
 /// record's key/value bytes. `store::chunk_records_for_snapshot` uses it for
-/// exact chunk-budget arithmetic; unlike postcard's variable-length framing,
-/// this layout has no size variance to account for.
+/// exact chunk-budget arithmetic.
 pub(crate) const RECORD_HEADER_LEN: usize = size_of::<RecordHeader>();
 
-/// Exact byte length a lone `Msg::Replicate { cache, rec }` carrying one
-/// record with the given cache-name/key/value lengths encodes to under the
-/// raw-record layout — lets `Shard::insert`/`insert_many` enforce
-/// `max_frame` from lengths already in hand instead of paying for a
-/// real encode to measure it.
+/// Exact byte length a lone `Msg::Replicate { cache, rec }` with the given
+/// cache-name/key/value lengths encodes to. Lets `Shard::insert`/`insert_many`
+/// enforce `max_frame` from lengths already in hand, without a real encode.
 #[must_use]
 pub(crate) fn replicate_frame_len(cache_len: usize, key_len: usize, value_len: usize) -> usize {
     1 + size_of::<RawFrameHeader>() + cache_len + RECORD_HEADER_LEN + key_len + value_len
@@ -277,18 +214,14 @@ fn check_frame_len(len: usize) -> Result<(), CodecError> {
 }
 
 /// Encodes a message to its wire form: postcard for control messages, the
-/// raw-record layout for `Replicate`/`ReplicateBatch`/`StChunk` (this
-/// module's docs).
+/// raw-record layout for `Replicate`/`ReplicateBatch`/`StChunk`.
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::FrameTooLarge`] if the encoded frame would exceed
+/// Returns [`CodecError::FrameTooLarge`] if the frame would exceed
 /// [`MAX_FRAME`], [`CodecError::Postcard`] if a control message fails to
-/// postcard-serialize (unexpected for these types, but fallible in
-/// general), or [`CodecError::MalformedFrame`] if a raw-record frame's cache
-/// name or record count doesn't fit the layout's fixed-width fields (a
-/// cache name over 64 KiB, or a batch of billions of records — never hit at
-/// this crate's target scale of clusters and cache sizes).
+/// serialize, or [`CodecError::MalformedFrame`] if a raw-record frame's
+/// cache name or record count overflows the layout's fixed-width fields.
 pub fn encode(msg: &Msg) -> Result<Bytes, CodecError> {
     match msg {
         Msg::Replicate { cache, rec } => {
@@ -382,10 +315,9 @@ fn encode_raw_frame(
     Ok(buf.freeze())
 }
 
-/// Takes `len` bytes at `offset` out of `body` as a zero-copy `Bytes` slice
-/// (an `Arc` refcount bump, no payload copy), or a [`CodecError::MalformedFrame`]
-/// if that range runs past the end of `body` rather than panicking — `body`
-/// is data a peer sent, never trusted to be well-formed.
+/// Takes `len` bytes at `offset` out of `body` as a zero-copy `Bytes` slice,
+/// or a [`CodecError::MalformedFrame`] if that range runs past `body`'s end
+/// rather than panicking. `body` is peer-sent data, never trusted well-formed.
 fn take(body: &Bytes, offset: usize, len: usize) -> Result<Bytes, CodecError> {
     let end = offset.checked_add(len).ok_or(CodecError::MalformedFrame(
         "record length overflows a frame offset",
@@ -397,9 +329,8 @@ fn take(body: &Bytes, offset: usize, len: usize) -> Result<Bytes, CodecError> {
 }
 
 /// Caps how many records [`decode_raw_frame`] preallocates its output `Vec`
-/// for, independent of the frame's own claimed `record_count` — a short,
-/// corrupt frame claiming billions of records must not itself trigger a
-/// huge allocation before the length checks below ever run.
+/// for, independent of the frame's claimed `record_count`. A short, corrupt
+/// frame claiming billions of records must not trigger a huge allocation.
 const RECORD_COUNT_PREALLOC_CAP: usize = 4096;
 
 fn decode_raw_frame(body: &Bytes) -> Result<Msg, CodecError> {
@@ -475,18 +406,16 @@ fn decode_raw_frame(body: &Bytes) -> Result<Msg, CodecError> {
     }
 }
 
-/// Decodes a message from its wire form. `frame` need only be borrowed — a
+/// Decodes a message from its wire form. `frame` need only be borrowed: a
 /// raw-record frame's key/value bytes are sliced out as zero-copy `Bytes`
-/// views (this module's docs) that share `frame`'s backing allocation
-/// through their own `Arc` handle, so the returned [`Msg`] outlives this call.
+/// views sharing `frame`'s backing allocation.
 ///
 /// # Errors
 ///
 /// Returns [`CodecError::FrameTooLarge`] if `frame` exceeds [`MAX_FRAME`],
 /// [`CodecError::Postcard`] if a control message's bytes aren't a valid
 /// [`Msg`] encoding, or [`CodecError::MalformedFrame`] if a raw-record
-/// frame's header, cache name, or record lengths don't fit the bytes
-/// actually present.
+/// frame's header, cache name, or record lengths don't fit the bytes present.
 pub fn decode(frame: &Bytes) -> Result<Msg, CodecError> {
     check_frame_len(frame.len())?;
     let Some(&kind) = frame.first() else {
@@ -577,9 +506,8 @@ mod tests {
         });
     }
 
-    /// `u64::MAX` would collide with a sentinel-based "no expiry" encoding —
-    /// this crate uses an explicit flag bit instead (`RECORD_FLAG_HAS_EXPIRY`),
-    /// so this must round-trip as a real expiry, not as `None`.
+    /// `u64::MAX` must round-trip as a real expiry, not `None`, since
+    /// `RECORD_FLAG_HAS_EXPIRY` is an explicit flag, not a sentinel value.
     #[test]
     fn roundtrip_replicate_expiry_at_u64_max() {
         roundtrip(&Msg::Replicate {
@@ -662,9 +590,8 @@ mod tests {
         });
     }
 
-    /// `Cell`'s fields are private to `cluster::sketch`; this builds one
-    /// through `Iblt`'s pub(crate) API rather than a struct literal it has
-    /// no access to.
+    /// `Cell`'s fields are private; this builds one through `Iblt`'s
+    /// `pub(crate)` API instead of a struct literal.
     fn sample_cells() -> Vec<Cell> {
         let mut iblt = crate::cluster::sketch::Iblt::new(6);
         iblt.insert(1, sample_hlc());
@@ -760,10 +687,9 @@ mod tests {
         }
     }
 
-    /// A [`Msg::Replicate`] frame's raw-record payload must decode a
-    /// key/value `Bytes` that shares the received frame's backing storage at
-    /// its exact expected offset, rather than copying it — the zero-copy
-    /// property this module's docs describe.
+    /// A [`Msg::Replicate`] frame's raw-record payload decodes a key/value
+    /// `Bytes` sharing the frame's backing storage at its exact expected
+    /// offset, never copying it.
     #[test]
     fn decoded_record_bytes_are_zero_copy_slices_of_the_frame() {
         let cache = SmolStr::new("users");

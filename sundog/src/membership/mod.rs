@@ -25,11 +25,9 @@ use crate::error::JoinError;
 use crate::node::{NodeId, NodeName};
 use crate::store::Mode;
 
-/// How long `spawn` samples the `seeds` stream to build chitchat's initial
-/// static seed list, before handing the stream off to the continuous
-/// re-seeding loop. A short window: convergence does not depend on it, only
-/// on the continuous forwarding below, which is what lets a full-cluster
-/// cold restart still converge.
+/// How long `spawn` samples `seeds` to build chitchat's initial static seed
+/// list, before handing it to the continuous re-seeding loop. Convergence
+/// depends only on that continuous forwarding, letting a cold restart converge.
 const INITIAL_SEED_WINDOW: Duration = Duration::from_millis(200);
 /// Cap on how many distinct addresses the initial window collects.
 const MAX_INITIAL_SEEDS: usize = 16;
@@ -37,8 +35,8 @@ const MAX_INITIAL_SEEDS: usize = 16;
 const NODE_ID_KEY: &str = "node_id";
 const DATA_ADDR_KEY: &str = "data_addr";
 const INCARNATION_KEY: &str = "incarnation";
-/// Prefix for the per-cache config fingerprint keys set by
-/// `Membership::set_cache_mode`: the full key is `cache:<name>`.
+/// Prefix for the per-cache mode keys `Membership::set_cache_mode` sets:
+/// the full key is `cache:<name>`.
 const CACHE_KEY_PREFIX: &str = "cache:";
 
 /// Builds the gossip key one cache's mode is set/read under.
@@ -57,30 +55,26 @@ pub struct Peer {
     pub gossip_addr: SocketAddr,
     /// The address the data-plane TCP mesh dials this node on.
     pub data_addr: SocketAddr,
-    /// Incremented each time this node leaves and rejoins the cluster;
-    /// distinguishes a restarted process from a still-live one.
+    /// Incremented each time this node leaves and rejoins, distinguishing a
+    /// restarted process from a still-live one.
     pub incarnation: u64,
 }
 
 /// Every cache each live peer advertises as open, keyed by peer, with the
-/// [`Mode`] it opened each one under — read off the peers' `cache:<name>`
-/// gossip keys and published alongside the peer set. A cache a peer hasn't
-/// opened (or whose mode token this build doesn't recognize) is absent,
-/// never a placeholder value.
+/// [`Mode`] it opened each one under. A cache a peer hasn't opened is
+/// absent, never a placeholder value.
 pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 
-/// A request to the background gossip loop, the only owner of the chitchat
-/// handle.
+/// A request to the background gossip loop, the sole owner of the chitchat handle.
 enum Command {
     SetCacheMode(SmolStr, Mode),
     Shutdown(oneshot::Sender<()>),
 }
 
-/// A cheap-to-clone handle onto a running membership session.
-///
-/// Cloning shares the same background gossip loop and live-peer view;
-/// dropping every clone does not stop it — call [`Membership::shutdown`]
-/// explicitly for a graceful chitchat departure.
+/// A cheap-to-clone handle onto a running membership session. Cloning
+/// shares the background gossip loop and live-peer view; dropping every
+/// clone does not stop it. Call [`Membership::shutdown`] for a graceful
+/// chitchat departure.
 #[derive(Clone)]
 pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
@@ -90,23 +84,16 @@ pub struct Membership {
 }
 
 impl Membership {
-    /// Starts gossip-based membership for one node and returns a handle once
-    /// the background gossip loop is running.
-    ///
-    /// `seeds` is a continuous stream of candidate gossip addresses from a
-    /// [`crate::discovery::Discovery`] implementation, not one-shot, so a
-    /// full-cluster cold restart still converges. An initial window of it
-    /// seeds chitchat's static seed list; every address it produces
-    /// afterward is forwarded to chitchat's dynamic
-    /// [`ChitchatHandle::gossip`] for the lifetime of this membership
-    /// session — chitchat's only mechanism to grow the seed set after
-    /// startup.
+    /// Starts gossip-based membership for one node, returning a handle once
+    /// the background gossip loop is running. `seeds` is a continuous
+    /// stream of candidate gossip addresses: an initial window seeds
+    /// chitchat's static seed list, and every address afterward forwards
+    /// to [`ChitchatHandle::gossip`] for this session's lifetime.
     ///
     /// # Errors
     ///
     /// Returns [`JoinError::Bind`] if `config.gossip_bind_addr` cannot be
-    /// bound, or [`JoinError::Membership`] if the gossip backend fails to
-    /// start.
+    /// bound, or [`JoinError::Membership`] if the gossip backend fails to start.
     pub async fn spawn(
         cluster_name: SmolStr,
         node: NodeId,
@@ -117,11 +104,9 @@ impl Membership {
     ) -> Result<Self, JoinError> {
         let bind_addr = config.gossip_bind_addr;
         let port = if bind_addr.port() == 0 {
-            // Probe-bind to claim a free ephemeral port, then release it so
-            // chitchat's own transport can bind the same port number. This
-            // "reserve then rebind" pattern has an unavoidable race (another
-            // process could grab the port in between); on a trusted LAN it's
-            // an accepted trade-off.
+            // Probe-bind to claim a free port, then release it for
+            // chitchat's own transport. The resulting race is accepted on a
+            // trusted LAN.
             let probe = tokio::net::UdpSocket::bind(bind_addr)
                 .await
                 .map_err(|source| JoinError::Bind {
@@ -224,39 +209,33 @@ impl Membership {
         &self.local
     }
 
-    /// A live-updating view of the current member set. Every membership
-    /// change (join, leave, suspect, data-plane address change) publishes a
-    /// fresh `Vec<Peer>`; downstream consumers (`net`, `cluster`) `.borrow()`
-    /// or `.changed().await` this rather than polling.
+    /// A live-updating view of the current member set. Downstream
+    /// consumers (`net`, `cluster`) `.borrow()` or `.changed().await` this
+    /// rather than polling.
     #[must_use]
     pub fn peers(&self) -> watch::Receiver<Vec<Peer>> {
         self.peers.clone()
     }
 
-    /// A live-updating view of every live peer's advertised cache modes —
-    /// see [`CacheModes`]. Published in lockstep with [`Membership::peers`].
+    /// A live-updating view of every live peer's [`CacheModes`], published
+    /// in lockstep with [`Membership::peers`].
     pub(crate) fn cache_modes(&self) -> watch::Receiver<CacheModes> {
         self.cache_modes.clone()
     }
 
-    /// Advertises `mode` as this node's [`Mode`] for cache `name`, under the
-    /// `cache:<name>` gossip key — read back by every peer into its
-    /// [`CacheModes`] view. Setting the same value twice is a no-op on the
-    /// wire (chitchat only bumps a key's version when the value changes), so
-    /// this is safe to call unconditionally after every successful `open()`.
+    /// Advertises `mode` as this node's [`Mode`] for cache `name`, under
+    /// the `cache:<name>` gossip key. Safe to call unconditionally after
+    /// every `open()`; setting the same value twice is a no-op.
     pub(crate) fn set_cache_mode(&self, name: &str, mode: Mode) {
         let _ = self
             .commands
             .send(Command::SetCacheMode(SmolStr::new(name), mode));
     }
 
-    /// Leaves the cluster gracefully (chitchat departs politely) and stops
-    /// the background gossip loop.
-    ///
-    /// chitchat 0.13 has no protocol-level "leave" broadcast: departure means
-    /// stopping the gossip loop cleanly (vs. an abrupt process death) so
-    /// peers observe it like any other silence, and the failure detector
-    /// reclaims it after the usual grace period.
+    /// Leaves the cluster gracefully and stops the background gossip loop.
+    /// chitchat has no protocol-level "leave" broadcast: peers instead
+    /// observe the stopped loop as silence, and the failure detector
+    /// reclaims it after its grace period.
     pub async fn shutdown(self) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.commands.send(Command::Shutdown(reply_tx)).is_ok() {
@@ -267,17 +246,13 @@ impl Membership {
 
 /// Samples `seeds` for up to [`INITIAL_SEED_WINDOW`] to build chitchat's
 /// static seed list, deduplicating and capping at [`MAX_INITIAL_SEEDS`].
-/// Does not exhaust the stream — the caller keeps consuming it afterward.
+/// Does not exhaust the stream; the caller keeps consuming it afterward.
 async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut seed_nodes = Vec::new();
     let deadline = time::Instant::now() + INITIAL_SEED_WINDOW;
-    // The `time::Instant::now() < deadline` guard is load-bearing, not
-    // redundant with `timeout_at` below: `Timeout::poll` checks its inner
-    // future before the deadline, so a stream that is always synchronously
-    // ready (never `Pending`) starves the deadline check and this loop would
-    // otherwise spin without yielding. This plain sync check runs every
-    // iteration regardless of whether the await below suspends.
+    // Load-bearing: a stream that is always synchronously ready starves
+    // `timeout_at`'s own deadline check, spinning this loop forever.
     while seed_nodes.len() < MAX_INITIAL_SEEDS && time::Instant::now() < deadline {
         match time::timeout_at(deadline, seeds.next()).await {
             Ok(Some(addr)) => {
@@ -292,14 +267,10 @@ async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Ve
 }
 
 /// Determines the address peers should use to reach this node's gossip
-/// socket. A concrete bind IP is used as-is; the zeroconf default
-/// (`0.0.0.0`/`::`) is resolved to the OS-chosen outbound interface via a UDP
-/// "connect" — for a datagram socket this only sets the kernel's default
-/// peer and never sends a packet, so it's a cheap, synchronous call safe to
-/// make inline.
-///
-/// `pub(crate)` rather than private: `cluster.rs` reuses this to resolve the
-/// data-plane's advertised address with the same logic.
+/// socket. A concrete bind IP is used as-is; the zeroconf default resolves
+/// to the OS-chosen outbound interface via a UDP "connect", which never
+/// sends a packet on a datagram socket. `pub(crate)`: `cluster.rs` reuses
+/// this for the data-plane's address.
 pub(crate) fn resolve_advertise_ip(bind_ip: IpAddr) -> io::Result<IpAddr> {
     if !bind_ip.is_unspecified() {
         return Ok(bind_ip);
@@ -326,18 +297,14 @@ fn now_incarnation_ms() -> u64 {
 }
 
 /// Reconstructs a [`Peer`] from a live chitchat member, or `None` if its
-/// gossiped state is missing or malformed (a peer mid-startup that hasn't
-/// published its keys yet, or a node running an incompatible version) — such
-/// peers are silently excluded rather than surfaced as an error, since
-/// they'll appear once their state catches up.
+/// gossiped state is missing or malformed. Such peers are excluded rather
+/// than surfaced as an error; they appear once their state catches up.
 fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> {
     let node_id_value = u64::from_str_radix(node_state.get(NODE_ID_KEY)?, 16).ok()?;
     let node = NodeId::from(node_id_value);
 
-    // The node id string chitchat carries is exactly `{hostname}-{node_id}`
-    // — `NodeName::new` builds it, and `spawn` above passes it as the
-    // chitchat node id. Strip the known suffix rather than splitting on the
-    // last `-`, so a hyphenated hostname round-trips correctly.
+    // Strip the known `-{node_id}` suffix rather than splitting on the
+    // last `-`, so a hyphenated hostname round-trips.
     let suffix = format!("-{node}");
     let hostname = chitchat_id.node_id.strip_suffix(suffix.as_str())?;
     let name = NodeName::new(hostname, node);
@@ -355,9 +322,7 @@ fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> 
 }
 
 /// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
-/// map. A key whose value isn't a recognized [`Mode`] token (a peer running
-/// a build that added a mode this one doesn't know, or plain corruption) is
-/// logged and skipped — it never fails `parse_peer` for the whole node.
+/// map, logging and skipping any value that isn't a recognized [`Mode`] token.
 fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
     node_state
         .iter_prefix(CACHE_KEY_PREFIX)
@@ -378,12 +343,10 @@ fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
         .collect()
 }
 
-/// Owns the chitchat handle for the lifetime of one membership session:
-/// forwards freshly discovered addresses into chitchat's gossip, republishes
-/// chitchat's live-set changes as `Vec<Peer>`, and performs the graceful
-/// shutdown on request. Spawned once, so `ChitchatHandle::shutdown` (which
-/// consumes it) has exactly one owner regardless of how many [`Membership`]
-/// clones exist.
+/// Owns the chitchat handle for one membership session: forwards discovered
+/// addresses into gossip, republishes live-set changes as `Vec<Peer>`, and
+/// performs shutdown on request. Spawned once, so `ChitchatHandle::shutdown`
+/// has exactly one owner regardless of how many [`Membership`] clones exist.
 async fn run(
     handle: ChitchatHandle,
     seeds: BoxStream<'static, SocketAddr>,
@@ -519,8 +482,7 @@ mod tests {
 
     #[test]
     fn parse_peer_rejects_name_suffix_mismatch() {
-        // node_id in the KV state doesn't match the suffix actually present
-        // in the chitchat node-id string (state disagreement / different node).
+        // The KV state's node_id doesn't match the chitchat id's suffix.
         let other_node = NodeId::from(99u64);
         let id = chitchat_id("host-a-000000000000002a", 7000);
         let state = state_with(&[

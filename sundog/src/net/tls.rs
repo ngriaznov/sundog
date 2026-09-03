@@ -1,29 +1,22 @@
 //! Mutual TLS for the data plane, behind the `tls` feature. Every
-//! persistent and short-lived connection — accepted and dialed alike,
-//! including the request/response ones (state transfer, anti-entropy) — is
-//! wrapped once this node's
+//! connection is wrapped once
 //! [`ClusterConfig::tls`](crate::config::ClusterConfig::tls) is set; the
 //! dialing side also presents a certificate, verified against the same root
-//! CA as the accepting side (mutual auth).
+//! CA as the accepting side.
 //!
-//! Peer identity comes entirely from chain-of-trust to the shared root CA,
-//! not from hostname verification: nodes are addressed by ephemeral
-//! `ip:port` (mDNS/gossip-discovered), not stable DNS names, so there is no
-//! meaningful per-node hostname to check either side of the handshake
-//! against. Every certificate this mesh accepts must instead carry the
-//! fixed [`MESH_SERVER_NAME`] as a DNS Subject Alternative Name.
+//! Peer identity comes from chain-of-trust to the shared root CA, not
+//! hostname verification: nodes are addressed by ephemeral `ip:port`, not
+//! stable DNS names. Every accepted certificate carries the fixed
+//! [`MESH_SERVER_NAME`] as a DNS Subject Alternative Name instead.
 //!
 //! A TLS-configured node and a plaintext node cannot join the same mesh: the
-//! plaintext side never speaks the TLS record layer the other expects, so
-//! the connection fails outright rather than silently downgrading — retried
-//! by [`super::conn::run_peer_writer`]'s backoff on the dial side, silently
-//! dropped by [`super::conn::accept_loop`] on the accept side, like any
-//! other connection failure.
+//! plaintext side never speaks the TLS record layer, so the connection
+//! fails outright rather than downgrading. It surfaces like any other
+//! connection failure, retried by dial backoff and dropped silently on
+//! accept.
 //!
-//! Applies only to the real-tokio transport: this module, and every call
-//! into it, is compiled only under `not(feature = "sim")` — a turmoil-hosted
-//! simulation build stays plaintext regardless of `ClusterConfig::tls` (see
-//! `net`'s `TlsCtx`/`MeshStream` aliases).
+//! Compiled only under `not(feature = "sim")`; a turmoil-hosted simulation
+//! build stays plaintext regardless of `ClusterConfig::tls`.
 
 use std::io;
 use std::pin::Pin;
@@ -41,18 +34,14 @@ use super::tcp::TcpStream;
 use crate::config::TlsConfig;
 
 /// The fixed DNS name every certificate on a TLS-enabled mesh must carry as
-/// a Subject Alternative Name — see this module's docs for why a per-node
-/// hostname isn't the right check here.
+/// a Subject Alternative Name.
 pub const MESH_SERVER_NAME: &str = "sundog-mesh.internal";
 
-/// A dialed or accepted mesh connection, plaintext or TLS-wrapped: the type
-/// every [`super::conn`] framing function operates over once this feature is
-/// active, so call sites never need to know which they got.
+/// A dialed or accepted mesh connection, plaintext or TLS-wrapped.
 pub(crate) enum MeshStream {
     Plain(TcpStream),
-    // Boxed: `tokio_rustls::TlsStream` carries a full client/server session
-    // state machine, dwarfing a bare `TcpStream` — leaving it unboxed here
-    // would blow up every `MeshStream` to the size of its biggest variant.
+    // Boxed: a `tokio_rustls::TlsStream` session dwarfs a bare `TcpStream`,
+    // so unboxed it would blow up `MeshStream` to its biggest variant's size.
     Tls(Box<tokio_rustls::TlsStream<TcpStream>>),
 }
 
@@ -97,19 +86,16 @@ impl AsyncWrite for MeshStream {
 }
 
 /// This node's rustls connector/acceptor pair, built once from its
-/// [`TlsConfig`] and shared by every dial and accept for the life of the
-/// owning [`super::Mesh`].
+/// [`TlsConfig`] and shared by every dial and accept.
 pub(crate) struct MeshTls {
     connector: TlsConnector,
     acceptor: TlsAcceptor,
 }
 
 // `ServerConfig::builder()`/`ClientConfig::builder()` panic if the
-// process-default crypto provider is ambiguous, which it is the moment any
-// other dependency in the binary (e.g. a `ring`-based transitive dep pulled
-// in by an unrelated feature) unifies a second provider alongside
-// aws-lc-rs. Install ours explicitly, once, so mesh TLS never depends on
-// what else is linked in.
+// process-default crypto provider is ambiguous, which happens once any
+// other dependency unifies a second provider alongside aws-lc-rs. Install
+// ours explicitly, once, so mesh TLS never depends on what else is linked in.
 fn ensure_crypto_provider() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -121,8 +107,7 @@ impl MeshTls {
     /// # Errors
     ///
     /// Returns [`rustls::Error`] if `config`'s certificate chain, key, or
-    /// root CA material is malformed or internally inconsistent (e.g. the
-    /// private key doesn't match the leaf certificate).
+    /// root CA material is malformed or inconsistent.
     pub(crate) fn new(config: &TlsConfig) -> Result<Self, rustls::Error> {
         ensure_crypto_provider();
         let mut roots = RootCertStore::empty();
@@ -250,9 +235,8 @@ mod tests {
         let (client_cert, client_key) = generate_node_cert(&other_ca.issuer);
         let server_tls = MeshTls::new(&tls_config(&server_ca.der, server_cert, &server_key))
             .expect("server tls config");
-        // The client trusts the server's CA (so it accepts the server's
-        // certificate), but presents a leaf issued by a different CA — the
-        // side of mutual auth this test exercises.
+        // The client trusts the server's CA but presents a leaf from a
+        // different one: the side of mutual auth this test exercises.
         let client_tls = MeshTls::new(&tls_config(&server_ca.der, client_cert, &client_key))
             .expect("client tls config");
 
