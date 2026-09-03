@@ -1,24 +1,20 @@
-//! The store engine: [`BUCKET_COUNT`] stripes, each one anti-entropy bucket,
-//! each a [`parking_lot::RwLock`] over the bucket's live entries and
-//! tombstones.
+//! The store engine: [`BUCKET_COUNT`] stripes, each one anti-entropy bucket, each a
+//! [`parking_lot::RwLock`] over the bucket's live entries and tombstones.
 //!
 //! A read takes a stripe's read lock, finds the key by its postcard bytes in a
-//! [`hashbrown::HashTable`], and clones the value. Keys up to `KEY_STACK_BUF`
-//! bytes encode on the stack. A versioned write (`apply_locked`) runs
-//! synchronously under the stripe's write lock. Anti-entropy enumerates a
-//! bucket by locking one stripe.
+//! [`hashbrown::HashTable`], and clones the value. Keys up to `KEY_STACK_BUF` bytes encode on the
+//! stack. A versioned write (`apply_locked`) runs synchronously under the stripe's write lock.
+//! Anti-entropy enumerates a bucket by locking one stripe.
 //!
-//! Expiry is checked on every read and reclaimed by [`Engine::sweep`], which
-//! visits only stripes with an entry due. Capacity eviction is sampled LRU:
-//! [`Engine::enforce_capacity`] locks one stripe at a time, weighs up to
-//! `EVICTION_SAMPLE` entries from a rotating offset, and evicts the least
-//! recently read, until total weight fits.
+//! Expiry is checked on every read and reclaimed by [`Engine::sweep`], which visits only stripes
+//! with an entry due. Capacity eviction is sampled LRU: [`Engine::enforce_capacity`] locks one
+//! stripe at a time, weighs up to `EVICTION_SAMPLE` entries from a rotating offset, and evicts the
+//! least recently read, until total weight fits.
 //!
-//! [`super::Shard::get_or_load`] collapses concurrent misses through a
-//! per-stripe map of in-flight loads. A waiter subscribes to the load's
-//! completion channel under the stripe lock, so a completion cannot slip
-//! between its lookup and its wait. `InflightGuard` frees a cancelled load so
-//! a waiter takes over.
+//! [`super::Shard::get_or_load`] collapses concurrent misses through a per-stripe map of in-flight
+//! loads. A waiter subscribes to the load's completion channel under the stripe lock, so a
+//! completion cannot slip between its lookup and its wait. `InflightGuard` frees a cancelled load
+//! so a waiter takes over.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -45,18 +41,17 @@ use super::{
     Weigher, Winner, entry_fingerprint,
 };
 
-/// Stack-buffer size for a key's postcard encoding on the read path: large
-/// enough for every key type this crate ships and most user key types.
-/// A key that doesn't fit falls back to one heap allocation — a read never
-/// allocates for the key in the common case.
+/// Stack-buffer size for a key's postcard encoding on the read path, large enough for every key
+/// type this crate ships and most user key types. A key that doesn't fit falls back to one heap
+/// allocation.
 const KEY_STACK_BUF: usize = 128;
 
-/// How many live entries one capacity-eviction pass weighs before evicting
-/// the least recently read of them.
+/// How many live entries one capacity-eviction pass weighs before evicting the least recently read
+/// of them.
 const EVICTION_SAMPLE: usize = 8;
 
-/// Holds one postcard-encoded key: on the stack when it fits
-/// [`KEY_STACK_BUF`], on the heap otherwise.
+/// Holds one postcard-encoded key: on the stack when it fits [`KEY_STACK_BUF`], on the heap
+/// otherwise.
 enum KeyBuf {
     Stack([u8; KEY_STACK_BUF], usize),
     Heap(Vec<u8>),
@@ -84,14 +79,14 @@ fn encode_key_for_read<K: Serialize>(key: &K) -> Result<KeyBuf, CodecError> {
     }
 }
 
-/// The 64-bit xxh3 of a key's encoded bytes — computed once per operation
-/// and reused both as the stripe index ([`stripe_index_from_hash`]) and as
-/// the hash [`hashbrown::HashTable`] stores each entry under.
+/// The 64-bit xxh3 of a key's encoded bytes, computed once per operation and reused as both the
+/// stripe index ([`stripe_index_from_hash`]) and the hash [`hashbrown::HashTable`] stores each
+/// entry under.
 pub(crate) fn hash_key_bytes(key_bytes: &[u8]) -> u64 {
     xxh3_64(key_bytes)
 }
 
-/// The stripe (= anti-entropy bucket) a precomputed key hash belongs to.
+/// The stripe, an anti-entropy bucket, a precomputed key hash belongs to.
 pub(crate) fn stripe_index_from_hash(hash: u64) -> usize {
     usize::try_from(hash & (BUCKET_COUNT as u64 - 1))
         .expect("invariant: masked to BUCKET_COUNT - 1, always fits in usize")
@@ -101,11 +96,9 @@ fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
     xxh3_64(live.key_bytes.as_ref())
 }
 
-/// One live entry: the value, its version and expiry ([`Stored`] inline, no
-/// `Arc`), its weight for capacity accounting, and the last time it was
-/// read — written only when TTI or a finite capacity is configured, so a
-/// plain unbounded, no-idle-timeout read never touches shared memory beyond
-/// cloning the value.
+/// One live entry: the value, its version and expiry ([`Stored`] inline, no `Arc`), its weight for
+/// capacity accounting, and the last time it was read. The read timestamp is written only when TTI
+/// or a finite capacity is configured.
 struct Live<K, V> {
     key_bytes: Bytes,
     key: K,
@@ -114,19 +107,16 @@ struct Live<K, V> {
     last_access_ms: AtomicU64,
 }
 
-/// One in-progress [`Engine::get_or_load`] fill, shared by every caller
-/// racing on the same missing key. Carries no value: a successful fill is
-/// visible to joined waiters by re-reading the stripe once notified: only a
-/// failure needs to travel through here explicitly.
+/// One in-progress [`Engine::get_or_load`] fill, shared by every caller racing on the same missing
+/// key. Carries no value: a successful fill is visible to joined waiters by re-reading the stripe
+/// once notified. Only a failure travels through here explicitly.
 pub(crate) struct Inflight<V> {
-    /// Flips to `true` once the fill finishes, one way or another. A waiter
-    /// subscribes in [`Engine::miss_or_join`], under the same stripe lock
-    /// that removes a finished fill from the map, so a receiver always
-    /// exists before the flip it waits for: the wakeup cannot be lost.
+    /// Flips to `true` once the fill finishes. A waiter subscribes in [`Engine::miss_or_join`],
+    /// under the same stripe lock that removes a finished fill from the map, so a receiver always
+    /// exists before the flip it waits for.
     done: watch::Sender<bool>,
-    /// Set iff the fill failed; a joined waiter that finds this populated
-    /// after being woken returns the same [`crate::error::CacheError::Loader`]
-    /// the owner did. `pub(crate)`: `Shard::get_or_load` reads it directly.
+    /// Set iff the fill failed; a joined waiter that finds this populated after being woken
+    /// returns the same [`crate::error::CacheError::Loader`] the owner did.
     pub(crate) error: OnceLock<Arc<dyn std::error::Error + Send + Sync>>,
     _marker: PhantomData<fn() -> V>,
 }
@@ -140,25 +130,21 @@ impl<V> Inflight<V> {
         }
     }
 
-    /// Wakes every subscribed waiter; a receiver subscribed before this call
-    /// observes the change even if it only starts waiting afterwards.
+    /// Wakes every subscribed waiter; a receiver subscribed before this call observes the change
+    /// even if it only starts waiting afterwards.
     fn finish(&self) {
         self.done.send_replace(true);
     }
 }
 
-/// One stripe: an anti-entropy bucket's worth of live entries, tombstones,
-/// and in-flight loads, all under the one [`parking_lot::RwLock`] that owns
-/// this struct.
+/// One stripe: an anti-entropy bucket's worth of live entries, tombstones, and in-flight loads,
+/// all under the one [`parking_lot::RwLock`] that owns this struct.
 pub(crate) struct Stripe<K, V> {
     live: HashTable<Live<K, V>>,
     tombstones: HashMap<Bytes, Tombstone>,
     inflight: HashMap<Bytes, Arc<Inflight<V>>>,
-    /// The minimum `expires_at_ms` among this stripe's live entries,
-    /// `u64::MAX` if none — a lower bound, not necessarily tight (a removal
-    /// never tightens it; only [`Engine::sweep`] recomputes it exactly), so
-    /// the sweeper can skip a stripe with nothing due without ever missing
-    /// one that is.
+    /// The minimum `expires_at_ms` among this stripe's live entries, `u64::MAX` if none. A lower
+    /// bound, not necessarily tight, since only [`Engine::sweep`] recomputes it exactly.
     next_expiry_ms: u64,
 }
 
@@ -173,9 +159,7 @@ impl<K, V> Stripe<K, V> {
     }
 }
 
-/// Removes the live entry at `key_bytes` (already known to hash to `hash`)
-/// if present, returning its weight and version for the caller's digest/
-/// weight bookkeeping.
+/// Removes the live entry at `key_bytes`, hashing to `hash`, returning its weight and version.
 fn remove_live<K, V>(
     table: &mut HashTable<Live<K, V>>,
     hash: u64,
@@ -190,11 +174,9 @@ fn remove_live<K, V>(
     }
 }
 
-/// Whether `incoming` (at `ver`) loses to whatever is already stored (`sv`,
-/// plus its encoded value/expiry when the resolver reads them) — the
-/// [`ConflictResolver`]-consultation half of [`apply_locked`]'s decision,
-/// factored out for readability. See [`super::Shard::apply`]'s docs for the
-/// correctness contract.
+/// Whether `incoming` at `ver` loses to whatever is already stored at `sv`, the
+/// [`ConflictResolver`]-consultation half of [`apply_locked`]'s decision. See
+/// [`super::Shard::apply`]'s docs for the correctness contract.
 fn incoming_loses<V>(
     resolver: &dyn ConflictResolver,
     key_bytes: &[u8],
@@ -229,28 +211,22 @@ fn incoming_loses<V>(
     resolver.winner(key_bytes, stored_view, incoming_view) == Winner::A
 }
 
-/// The outcome of [`apply_locked`], carrying the caller's `key` back (the
-/// function consumed it) plus what changed, for the caller to build an
+/// The outcome of [`apply_locked`]: the caller's `key` back plus what changed, to build an
 /// [`super::Event`] and decide on fan-out.
 pub(crate) enum ApplyOutcome<K, V> {
     /// `incoming` lost to what was already stored; nothing changed.
     Rejected,
-    /// A value was written. `created` is `false` for a value that replaced
-    /// an existing live entry.
+    /// A value was written. `created` is `false` for a value that replaced an existing live entry.
     Put { key: K, value: V, created: bool },
-    /// A tombstone was written, replacing whatever (live entry or nothing)
-    /// was there before — the caller's [`super::Event::Removed`] doesn't
-    /// distinguish the two cases, so unlike `Put`'s `created` this carries
-    /// no prior-liveness flag.
+    /// A tombstone was written, replacing whatever, live entry or nothing, was there before.
+    /// Unlike `Put`'s `created`, this carries no prior-liveness flag.
     Tombstoned { key: K },
 }
 
-/// The versioned-apply core: applies `incoming` at `ver` for `key`
-/// (`key_bytes`/`hash` its postcard-encoded bytes and their xxh3 hash) iff
-/// `resolver` picks it over whatever `stripe` currently holds — a live entry
-/// or a tombstone, mutually exclusive — updating `digest_bucket` and
-/// `total_weight` to match. Fully synchronous: the caller holds `stripe`'s
-/// write lock for this call's entire duration, no `.await` anywhere inside.
+/// The versioned-apply core: applies `incoming` at `ver` for `key` (`key_bytes`/`hash` its
+/// postcard-encoded bytes and their xxh3 hash) iff `resolver` picks it over whatever `stripe`
+/// currently holds, updating `digest_bucket` and `total_weight` to match. Fully synchronous: the
+/// caller holds `stripe`'s write lock for this call's entire duration.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -309,8 +285,7 @@ where
     let had_live = prior_tombstone.is_none() && stored_ver.is_some();
     let new_fp = entry_fingerprint(key_bytes.as_ref(), ver);
 
-    // Subtracts whatever this write displaces before adding the new
-    // fingerprint in, synchronously, on the write itself.
+    // Subtracts whatever this write displaces before adding the new fingerprint in.
     if let Some(t) = prior_tombstone {
         digest_bucket.fetch_xor(
             entry_fingerprint(key_bytes.as_ref(), t.ver),
@@ -356,10 +331,8 @@ where
     }
 }
 
-/// The `Incoming::Put` half of [`apply_locked`]'s write, factored out to
-/// keep that function under clippy's line-count lint: installs the new
-/// value, corrects total weight for whatever it displaced, and reports
-/// whether this created a fresh entry or replaced a live one.
+/// The `Incoming::Put` half of [`apply_locked`]'s write: installs the new value, corrects total
+/// weight for whatever it displaced, and reports whether this created a fresh entry.
 #[allow(clippy::too_many_arguments)]
 fn apply_put<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -415,10 +388,8 @@ where
     }
 }
 
-/// The `Incoming::Tombstone` half of [`apply_locked`]'s write, factored out
-/// for the same reason as [`apply_put`]: removes the displaced live entry
-/// (if any) from total weight, then records the tombstone with its two GC
-/// deadlines.
+/// The `Incoming::Tombstone` half of [`apply_locked`]'s write: removes the displaced live entry
+/// from total weight, then records the tombstone with its two GC deadlines.
 #[allow(clippy::too_many_arguments)]
 fn apply_tombstone<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -451,23 +422,19 @@ where
     ApplyOutcome::Tombstoned { key }
 }
 
-/// The outcome of [`Engine::miss_or_join`]: a fast-path re-check hit
-/// (someone else's write landed between the caller's lock-free fast path
-/// and this lock acquisition), joining an already in-flight load, or this
-/// call becoming the one that runs the loader.
+/// The outcome of [`Engine::miss_or_join`]: a fast-path re-check hit, joining an already in-flight
+/// load, or this call becoming the one that runs the loader.
 pub(crate) enum JoinOutcome<V> {
     Hit(V),
-    /// An in-flight load to wait on, with a receiver subscribed under the
-    /// stripe lock: `changed()` resolves once the owner finishes, and
-    /// resolves immediately if that already happened.
+    /// An in-flight load to wait on, with a receiver subscribed under the stripe lock: `changed()`
+    /// resolves once the owner finishes, or immediately if that already happened.
     Join(Arc<Inflight<V>>, watch::Receiver<bool>),
     Owner(Arc<Inflight<V>>),
 }
 
-/// A drop guard that frees a cancelled [`Engine::get_or_load`] fill: if the
-/// caller's future is dropped before [`InflightGuard::complete`] runs (the
-/// loader was cancelled), the in-flight entry is removed and waiters are
-/// notified so one of them takes over rather than hangs forever.
+/// A drop guard that frees a cancelled [`Engine::get_or_load`] fill: if the caller's future drops
+/// before [`InflightGuard::complete`] runs, the in-flight entry is removed and waiters are
+/// notified so one of them takes over.
 pub(crate) struct InflightGuard<'a, K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -485,8 +452,7 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Marks the fill as finished (success or failure already recorded by
-    /// the caller) so the drop path becomes a no-op.
+    /// Marks the fill as finished, so the drop path becomes a no-op.
     pub(crate) fn complete(mut self) {
         self.completed = true;
     }
@@ -505,9 +471,8 @@ where
     }
 }
 
-/// `Engine<K, V>` owns [`BUCKET_COUNT`] independently locked stripes — one
-/// per anti-entropy bucket — plus the per-bucket XOR digests and the total
-/// live weight used for sampled-LRU capacity eviction. See the module docs.
+/// `Engine<K, V>` owns [`BUCKET_COUNT`] independently locked stripes, one per anti-entropy bucket,
+/// plus the per-bucket XOR digests and the total live weight for sampled-LRU eviction.
 pub(crate) struct Engine<K, V> {
     stripes: Box<[RwLock<Stripe<K, V>>]>,
     digest: Box<[AtomicU64]>,
@@ -561,9 +526,8 @@ where
         false
     }
 
-    /// Whether a read through this engine should pay for updating
-    /// `last_access_ms` — only when it would ever be consulted (TTI) or
-    /// sampled (capacity eviction needs *some* recency signal to sample by).
+    /// Whether a read updates `last_access_ms`, only when it is consulted for TTI or sampled for
+    /// capacity eviction.
     fn tracks_last_access(&self) -> bool {
         self.tti_ms.is_some() || self.max_capacity != u64::MAX
     }
@@ -574,9 +538,8 @@ where
         }
     }
 
-    /// Reads `key`: a stripe read lock, a hashbrown lookup by the key's
-    /// postcard-encoded bytes (stack-allocated when short), and a value
-    /// clone. No mutation beyond the recency touch (only when configured).
+    /// Reads `key`: a stripe read lock, a hashbrown lookup by the key's postcard-encoded bytes,
+    /// and a value clone. No mutation beyond the recency touch, when configured.
     pub(crate) fn get(&self, key: &K, now_ms: u64) -> Option<V> {
         let key_buf = encode_key_for_read(key).ok()?;
         let key_bytes = key_buf.as_slice();
@@ -613,8 +576,7 @@ where
         true
     }
 
-    /// Every live, unexpired, non-idle key. O(entries): a full pass over
-    /// every stripe.
+    /// Every live, unexpired, non-idle key. O(entries): a full pass over every stripe.
     pub(crate) fn keys(&self, now_ms: u64) -> Vec<K> {
         let mut out = Vec::new();
         for stripe_lock in &self.stripes {
@@ -630,8 +592,7 @@ where
         out
     }
 
-    /// The full [`WireRecord`] for `key_bytes`, present entry or tombstone
-    /// alike — one stripe lock, no decode back to `K` needed.
+    /// The full [`WireRecord`] for `key_bytes`, present entry or tombstone alike.
     pub(crate) fn record_for(&self, key_bytes: &[u8], now_ms: u64) -> Option<WireRecord> {
         let hash = hash_key_bytes(key_bytes);
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
@@ -657,9 +618,8 @@ where
         })
     }
 
-    /// [`Engine::record_for`] for every requested bucket, one stripe lock
-    /// each — O(bucket size) per bucket, not O(shard size), since a stripe
-    /// *is* a bucket.
+    /// [`Engine::record_for`] for every requested bucket, one stripe lock each: O(bucket size) per
+    /// bucket, not O(shard size).
     pub(crate) fn collect_buckets(&self, wanted: &[u16], now_ms: u64) -> BucketEntries {
         wanted
             .iter()
@@ -684,8 +644,7 @@ where
             .collect()
     }
 
-    /// This engine's current per-bucket XOR digests, `(bucket, digest)` for
-    /// all [`BUCKET_COUNT`] buckets.
+    /// This engine's current per-bucket XOR digests, `(bucket, digest)` for all buckets.
     pub(crate) fn digests(&self) -> Vec<(u16, u64)> {
         self.digest
             .iter()
@@ -697,8 +656,7 @@ where
             .collect()
     }
 
-    /// Every live (unexpired, non-idle) entry and every tombstone, as
-    /// [`WireRecord`]s — full state, for [`super::ShardOps::snapshot_chunks`].
+    /// Every live entry and tombstone as [`WireRecord`]s, for [`super::ShardOps::snapshot_chunks`].
     pub(crate) fn snapshot_records(&self, now_ms: u64) -> Vec<WireRecord> {
         let mut out = Vec::new();
         for stripe_lock in &self.stripes {
@@ -725,8 +683,8 @@ where
         out
     }
 
-    /// Drops tombstones past `tombstone_ttl` (or, while `any_member_absent`,
-    /// past the hard cap `tombstone_max_ttl`), correcting the digest.
+    /// Drops tombstones past `tombstone_ttl`, or past the hard cap `tombstone_max_ttl` while
+    /// `any_member_absent`, correcting the digest.
     pub(crate) fn gc_tombstones(&self, any_member_absent: bool, now_ms: u64) {
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let mut stripe = stripe_lock.write();
@@ -743,11 +701,9 @@ where
         }
     }
 
-    /// The engine's only free-running housekeeping: visits every stripe
-    /// whose `next_expiry_ms` is due (every stripe, if TTI is configured,
-    /// since idling isn't reflected there), removes expired/idle live
-    /// entries, corrects the digest and total weight, and recomputes that
-    /// stripe's `next_expiry_ms` exactly.
+    /// The engine's only free-running housekeeping: visits every stripe whose `next_expiry_ms` is
+    /// due, or every stripe if TTI is configured, removes expired/idle live entries, corrects the
+    /// digest and total weight, and recomputes `next_expiry_ms` exactly.
     pub(crate) fn sweep(&self, now_ms: u64) {
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let due = stripe_lock.read().next_expiry_ms <= now_ms;
@@ -782,8 +738,7 @@ where
         }
     }
 
-    /// The number of live entries across every stripe. O(`BUCKET_COUNT`)
-    /// lock acquisitions, not O(entries).
+    /// The number of live entries across every stripe. O(`BUCKET_COUNT`) locks, not O(entries).
     pub(crate) fn live_entry_count(&self) -> u64 {
         self.stripes
             .iter()
@@ -791,10 +746,8 @@ where
             .fold(0u64, u64::saturating_add)
     }
 
-    /// xorshift64: fast, allocation-free, plenty uniform for choosing which
-    /// stripe to look at next and where inside it to start sampling — no
-    /// correctness property depends on its output, only that it spreads
-    /// eviction pressure around.
+    /// xorshift64: fast and allocation-free for choosing which stripe to look at next and where to
+    /// start sampling. No correctness property depends on its output.
     fn next_random(&self) -> u64 {
         let mut x = self.evict_cursor.load(Ordering::Relaxed);
         x ^= x << 13;
@@ -808,10 +761,8 @@ where
         stripe_index_from_hash(self.next_random())
     }
 
-    /// Where in a stripe of `len` entries the next sample starts. Rotating
-    /// the start keeps every entry reachable: a sample anchored at the
-    /// table's first slots would only ever weigh those, leaving colder
-    /// entries further along untouched for as long as the first ones last.
+    /// Where in a stripe of `len` entries the next sample starts. Rotating the start keeps every
+    /// entry reachable, instead of always weighing the table's first slots.
     fn sample_offset(&self, len: usize) -> usize {
         if len == 0 {
             0
@@ -850,20 +801,16 @@ where
         }
     }
 
-    /// After a write to `start_bucket` may have pushed total weight over
-    /// `max_capacity`, evicts sampled-cold entries — starting at
-    /// `start_bucket`, then pseudo-random stripes — until it is back under
-    /// the cap. Never holds two stripe locks at once; a no-op when
-    /// `max_capacity` is [`u64::MAX`] (unbounded).
+    /// After a write to `start_bucket` may have pushed total weight over `max_capacity`, evicts
+    /// sampled-cold entries, starting at `start_bucket` then pseudo-random stripes, until it is
+    /// back under the cap. Never holds two stripe locks at once; a no-op when `max_capacity` is
+    /// [`u64::MAX`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
         if self.max_capacity == u64::MAX {
             return;
         }
         let mut bucket = start_bucket;
-        // Bounded rather than an unconditional `loop`: a pathological
-        // configuration (every stripe sampled empty, e.g. capacity set
-        // below the weight of entries this call itself cannot see yet)
-        // must not spin forever.
+        // Bounded, so a pathological configuration cannot spin forever.
         for attempt in 0..BUCKET_COUNT.saturating_mul(4) {
             if self.total_weight.load(Ordering::Relaxed) <= self.max_capacity {
                 return;
@@ -875,14 +822,9 @@ where
         }
     }
 
-    /// Applies a batch of versioned writes that all hash into `bucket`,
-    /// under one write-lock acquisition for the whole group — the
-    /// amortized lock path [`super::Shard::insert_many`],
-    /// [`super::Shard::remove_many`], and
-    /// [`super::ShardOps::apply_remote_batch`] all want. Runs
-    /// [`Self::enforce_capacity`] once afterward, outside the write lock, iff
-    /// the batch put anything (a batch of pure removals can only shrink
-    /// total weight, never grow it, so there is nothing to enforce).
+    /// Applies a batch of versioned writes that all hash into `bucket`, under one write-lock
+    /// acquisition for the whole group. Runs [`Self::enforce_capacity`] once afterward, outside
+    /// the write lock, iff the batch put anything.
     pub(crate) fn apply_many(
         &self,
         bucket: usize,
@@ -923,14 +865,9 @@ where
         outcomes
     }
 
-    /// Applies an inbound [`super::ShardOps::invalidate`]: drops the live
-    /// entry at `key_bytes` iff `ver` is newer than whatever version is
-    /// currently stored there (live or tombstoned) — writes no tombstone of
-    /// its own, since an invalidation carries no value for a
-    /// [`ConflictResolver`] to arbitrate with, only an `Hlc` to compare.
-    /// Returns the departing version on an actual removal, for the caller to
-    /// build an [`super::Event::Removed`]; `None` both when nothing was
-    /// stored and when the stored version already won.
+    /// Applies an inbound [`super::ShardOps::invalidate`]: drops the live entry at `key_bytes` iff
+    /// `ver` is newer than whatever version is stored, writing no tombstone of its own. Returns
+    /// the departing version on an actual removal, `None` otherwise.
     pub(crate) fn invalidate(&self, key_bytes: &[u8], hash: u64, ver: Hlc) -> Option<Hlc> {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
@@ -957,9 +894,8 @@ where
         Some(old_ver)
     }
 
-    /// Drops the local live entry at `key_bytes` unconditionally — no
-    /// version check, no tombstone written — for
-    /// [`super::Shard::invalidate_local`]'s cache-busting escape hatch.
+    /// Drops the local live entry at `key_bytes` unconditionally, no version check, no tombstone,
+    /// for [`super::Shard::invalidate_local`]'s cache-busting escape hatch.
     pub(crate) fn invalidate_local(&self, key_bytes: &[u8], hash: u64) {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
@@ -971,10 +907,8 @@ where
         }
     }
 
-    /// The lock-protected first half of [`super::Shard::get_or_load`]: a
-    /// fast-path re-check (in case a write landed between the caller's
-    /// lock-free [`Engine::get`] and this call), then either joining an
-    /// already in-flight load or registering this call as the new owner.
+    /// The lock-protected first half of [`super::Shard::get_or_load`]: a fast-path re-check, then
+    /// either joining an already in-flight load or registering as the new owner.
     pub(crate) fn miss_or_join(&self, key_bytes: &Bytes, hash: u64, now_ms: u64) -> JoinOutcome<V> {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
@@ -996,8 +930,7 @@ where
         JoinOutcome::Owner(inflight)
     }
 
-    /// Builds the [`InflightGuard`] that frees `inflight` if the loader
-    /// future this call is about to run is dropped before finishing.
+    /// Builds the [`InflightGuard`] that frees `inflight` if its loader future drops early.
     pub(crate) fn guard_inflight(
         &self,
         key_bytes: Bytes,
@@ -1013,24 +946,18 @@ where
         }
     }
 
-    /// Removes `key_bytes`'s in-flight entry from its stripe. Setting an
-    /// error (on failure) or nothing (on cancellation) is the caller's job,
-    /// against the `Inflight` handle it already holds — by the time this
-    /// returns, the map does not hold that handle.
+    /// Removes `key_bytes`'s in-flight entry from its stripe. Setting an error, on failure, is the
+    /// caller's job against the `Inflight` handle it already holds.
     fn finish_inflight(&self, key_bytes: &Bytes, hash: u64) {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
         stripe.inflight.remove(key_bytes.as_ref());
     }
 
-    /// Applies a successful [`super::Shard::get_or_load`] fill: removes any
-    /// prior tombstone or (in the race window while the loader ran with no
-    /// lock held) live entry for `key`, unconditionally installs the
-    /// loader's value — a fresh load always wins, there is no competing
-    /// remote version to arbitrate — and removes the now-finished
-    /// `inflight` entry, all under one stripe write-lock acquisition.
-    /// Returns whether a live entry already existed (a genuine miss should
-    /// see `false`).
+    /// Applies a successful [`super::Shard::get_or_load`] fill: removes any prior tombstone or
+    /// live entry for `key`, unconditionally installs the loader's value, and removes the
+    /// `inflight` entry, all under one stripe write-lock acquisition. Returns whether a live entry
+    /// already existed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_fresh_load(
         &self,
@@ -1099,9 +1026,8 @@ where
         had_live
     }
 
-    /// Records a failed loader run: removes the `inflight` entry and stores
-    /// `error` so every joined waiter returns the same
-    /// [`crate::error::CacheError::Loader`].
+    /// Records a failed loader run: removes the `inflight` entry and stores `error` so every
+    /// joined waiter returns the same [`crate::error::CacheError::Loader`].
     pub(crate) fn fail_inflight(
         &self,
         key_bytes: &Bytes,
@@ -1115,13 +1041,11 @@ where
     }
 }
 
-/// One live entry as [`Engine::debug_snapshot`] reports it: key bytes, its
-/// encoded value, and its version.
+/// One live entry as [`Engine::debug_snapshot`] reports it: key bytes, encoded value, version.
 #[cfg(test)]
 type DebugLive = (Bytes, Bytes, Hlc);
 
-/// One tombstone as [`Engine::debug_snapshot`] reports it: key bytes and its
-/// version.
+/// One tombstone as [`Engine::debug_snapshot`] reports it: key bytes and version.
 #[cfg(test)]
 type DebugTombstone = (Bytes, Hlc);
 
@@ -1131,9 +1055,7 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// Test-only: recomputes all `BUCKET_COUNT` digests from scratch by
-    /// scanning every stripe's live entries and tombstones, to check
-    /// against the incrementally maintained digest.
+    /// Recomputes all digests from scratch, to check against the incrementally maintained one.
     pub(crate) fn recompute_digests(&self) -> Vec<u64> {
         let mut out = vec![0u64; BUCKET_COUNT];
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
@@ -1148,8 +1070,7 @@ where
         out
     }
 
-    /// Test-only: every stripe's raw contents, for building a canonical
-    /// state to compare across replicas.
+    /// Every stripe's raw contents, for building a canonical state to compare across replicas.
     pub(crate) fn debug_snapshot(&self) -> (Vec<DebugLive>, Vec<DebugTombstone>) {
         let mut live_out = Vec::new();
         let mut tomb_out = Vec::new();
@@ -1169,8 +1090,7 @@ where
         (live_out, tomb_out)
     }
 
-    /// Test-only: total live entries and current total weight, for capacity
-    /// eviction tests.
+    /// Total live entries and current total weight, for capacity eviction tests.
     pub(crate) fn debug_totals(&self) -> (u64, u64) {
         (
             self.live_entry_count(),
@@ -1178,10 +1098,8 @@ where
         )
     }
 
-    /// Test-only: forces the tombstone at `key_bytes` (if any) to read as
-    /// past its `ttl_deadline_ms`, and past `max_deadline_ms` too iff
-    /// `past_max` — for tests that drive [`Self::gc_tombstones`]'s
-    /// deferral/hard-cap logic without waiting on a real `tombstone_ttl`.
+    /// Forces the tombstone at `key_bytes` past `ttl_deadline_ms`, past `max_deadline_ms` too
+    /// when `past_max`.
     pub(crate) fn debug_force_tombstone_ttl_past(&self, key_bytes: &[u8], past_max: bool) {
         let hash = hash_key_bytes(key_bytes);
         let bucket = stripe_index_from_hash(hash);
@@ -1194,11 +1112,8 @@ where
         }
     }
 
-    /// Test-only direct access to one stripe's lock, for tests proving
-    /// stripe independence at the lock level: a raw [`parking_lot::RwLock`]
-    /// blocks the OS thread that waits on it rather than yielding to an
-    /// async runtime, so this is exercised directly here rather than through
-    /// `Shard::insert`.
+    /// Direct access to one stripe's lock, for tests proving stripe independence at the lock
+    /// level: a raw [`parking_lot::RwLock`] blocks the OS thread that waits on it.
     pub(crate) fn stripe_lock(&self, bucket: usize) -> &RwLock<Stripe<K, V>> {
         &self.stripes[bucket]
     }
@@ -1332,10 +1247,8 @@ mod tests {
 
     #[test]
     fn weighted_capacity_eviction_stays_within_bound_and_evicts_colder_first() {
-        // Sampling looks within one stripe at a time, never a global LRU
-        // order, so "coldest first" is a guaranteed property only *within*
-        // a bucket. Find several keys landing in the same bucket so a
-        // single sampling pass sees all of them at once.
+        // "Coldest first" holds only within one bucket. Find several keys in the same bucket so
+        // a single sampling pass sees all of them.
         let target_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(0).as_ref()));
         let mut same_bucket_keys = vec![0u32];
         let mut candidate = 1u32;
@@ -1464,9 +1377,7 @@ mod tests {
         };
         let guard = engine.guard_inflight(kb.clone(), hash, Arc::clone(&inflight));
 
-        // A second caller joins the same in-flight load; its receiver is
-        // subscribed under the stripe lock, so the failure below is observed
-        // no matter how late the waiter starts waiting.
+        // The receiver subscribes under the stripe lock, so a late waiter still sees the failure.
         let JoinOutcome::Join(joined, mut done) = engine.miss_or_join(&kb, hash, 0) else {
             panic!("second caller joins the existing load");
         };
@@ -1499,12 +1410,10 @@ mod tests {
             panic!("first caller becomes the owner");
         };
         {
-            // The guard is dropped here without `complete()` — simulating the
-            // loader future being cancelled before it finished.
+            // Dropped without `complete()`, simulating a cancelled loader future.
             let _guard = engine.guard_inflight(kb.clone(), hash, Arc::clone(&inflight));
         }
 
-        // A waiter registered before cancellation is woken...
         assert!(
             !engine
                 .stripe_lock(stripe_index_from_hash(hash))
@@ -1512,8 +1421,7 @@ mod tests {
                 .inflight
                 .contains_key(kb.as_ref())
         );
-        // ...and a fresh caller can become the new owner instead of
-        // perpetually joining a dead entry.
+        // A fresh caller becomes the new owner instead of joining a dead entry.
         match engine.miss_or_join(&kb, hash, 0) {
             JoinOutcome::Owner(_) => {}
             _ => panic!("a cancelled load's key is free for a new owner"),
@@ -1615,7 +1523,6 @@ mod tests {
     #[test]
     fn two_different_stripes_lock_independently() {
         let engine = Arc::new(engine_u32_string(u64::MAX, None));
-        // Two buckets guaranteed distinct.
         let (bucket_a, bucket_b) = (0usize, 1usize);
 
         let held = Arc::clone(&engine);
