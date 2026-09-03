@@ -234,7 +234,7 @@ async fn kill_one_node_and_replace_it_under_the_same_alias() {
 /// sweep. The tight bound below (a handful of `sundog-testnode`'s 2s
 /// `ae_interval`) is what actually distinguishes this from a cold join like
 /// `warm_join_state_transfer_with_no_new_writes`: convergence here must be
-/// fast, not just eventual.
+/// fast, not only eventual.
 #[tokio::test]
 async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
     if !container_tests_enabled() {

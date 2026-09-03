@@ -62,7 +62,7 @@ impl NodeSlot {
 
     /// The live peer count this node's own membership currently reports —
     /// read straight off the running `Cluster` (a plain sync call), so the
-    /// UI needs no separate polling task for it.
+    /// UI needs no separate polling routine for it.
     #[must_use]
     pub(crate) fn peer_count(&self) -> Option<usize> {
         self.read_handle().map(|h| h.cluster.peers().len())

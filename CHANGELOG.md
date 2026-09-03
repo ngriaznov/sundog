@@ -29,7 +29,6 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Msg::AePullHashes` carry the sketch exchange and its listing/pull
   fallbacks. New metric `sundog_ae_sketch_total{cache, outcome}` counts
   `decoded` vs `fallback` outcomes.
-
 - **Stateful fuzzing of the apply path**: two new `cargo-fuzz` targets,
   `apply_model` and `apply_permutation` (`sundog/fuzz`), drive coverage-guided,
   sequence-generated local writes, remote applies and batches, invalidations,
@@ -46,9 +45,8 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `weigher`) is sampled LRU: a write that pushes total weight past the cap
   evicts the least recently read of eight entries sampled from a rotating
   offset in one stripe, repeating until the cap holds. TTI stays a local
-  per-entry idle deadline. Neither is available in `Replicated` mode, as
-  before.
-- The hand-off from a local write to the fan-out task is a lossless queue
+  per-entry idle deadline. Neither is available in `Replicated` mode.
+- The hand-off from a local write to the fan-out routine is a lossless queue
   of pending keys drained whole, instead of a bounded broadcast channel
   that lagged under a burst of single inserts and left the gap to
   anti-entropy. A burst of any size costs one drain.
@@ -56,12 +54,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ReplicateBatch` frames under the same byte and count budget as the live
   fan-out, instead of one `Replicate` frame per record; a 100k-record
   repair is a few dozen frames.
-- Anti-entropy leaves a peer alone while replicate traffic between the two
-  is still in motion — frames queued or just sent toward it, or a batch just
-  received from it, judged over one `ae_interval` — for at most three
-  rounds in a row. A bulk fill no longer gets repaired in parallel with its
-  own fan-out, which shipped every record twice; a steady trickle of
-  writes cannot starve the repair.
+- Anti-entropy skips a peer while replicate traffic with it is still in
+  motion (frames queued or recently sent toward it, or a batch recently
+  received from it, judged over one `ae_interval`), for at most three
+  rounds running — closing the double delivery from a bulk fill's own fan-out
+  racing its repair, without letting a steady trickle of writes starve the
+  repair.
 - Mixed 0.2/0.3 clusters are not supported: a 0.3 node's anti-entropy round
   can send `AeSketch`, `AeEntries`, and `AePullHashes`, which a 0.2 node
   cannot decode. Upgrade every node.
@@ -129,33 +127,33 @@ TTL parameter at odds with the design below (reads never touch expiry).
 
 ### Fixed
 
-- The README shipped in the crate no longer links to `ROADMAP.md`, which
-  isn't part of the package — on crates.io that link was dead. The roadmap
-  lives in the repository.
+- The crate's packaged README omits the `ROADMAP.md` link: the file isn't
+  part of the package, so the link 404s on crates.io. The repository
+  README links to `ROADMAP.md` instead.
 
 ## [0.1.0] – 2026-09-01
 
-The first release: the full buildout of the core library.
+The first release: the full core library.
 
 ### Added
 
 - **Discovery** (`sundog::discovery`): `Mdns` (zeroconf default, `mdns-sd`),
   `Static` (fixed/env-var seed list, re-resolved on an interval), and
   `DnsSrv` (SRV-record polling for Kubernetes headless services, with an
-  A/AAAA fallback). All three implement continuous, never-terminating
-  candidate streams so a full-cluster cold restart still re-converges.
+  A/AAAA fallback). All three stream candidates continuously, so a
+  full-cluster cold restart still re-converges.
 - **Membership** (`sundog::membership`): gossip membership on `chitchat`,
   advertising each node's data-plane address and incarnation; a `watch`
   stream of the live peer set drives everything downstream.
 - **Data plane** (`sundog::net`): a lazy TCP mesh, one connection per live
   peer, `LengthDelimitedCodec`-framed with a 4 MiB frame cap; per-class
-  bounded outboxes with the documented drop policy (`Invalidate` drops
-  oldest, `Replicate` drops newest and marks the peer dirty for anti-entropy
-  priority); `StRequest`/`AeDigest`/`AePull` request/response paths kept off
-  the broadcast channel entirely.
-- **Store** (`sundog::store`): `moka`-backed typed shards with a hybrid
-  logical clock (`Hlc`/`HlcClock`) whose stamps encode deterministically and
-  order lexicographically, versioned apply as the single path every write —
+  bounded outboxes with a documented drop policy (`Invalidate` drops
+  oldest, `Replicate` drops newest and marks the peer dirty for
+  anti-entropy priority); `StRequest`/`AeDigest`/`AePull` request/response
+  paths off the broadcast channel entirely.
+- **Store** (`sundog::store`): typed shards on a hybrid logical clock
+  (`Hlc`/`HlcClock`) whose stamps encode deterministically and order
+  lexicographically, versioned apply as the single path every write —
   local, replicated, state-transfer, anti-entropy — funnels through,
   tombstones with independent TTL, and a 1,024-bucket
   incrementally-maintained XOR digest array for anti-entropy.
@@ -178,9 +176,9 @@ The first release: the full buildout of the core library.
   `Replicated` (full copy per node, writes broadcast the value).
 - **State transfer**: a newly opened `Replicated` cache pulls a full
   snapshot from the lowest-node-id live donor before `open()` returns, then
-  runs one immediate anti-entropy round against that donor as a
-  belt-and-braces sweep; donor death mid-stream is recovered by re-picking
-  and re-requesting, made free by idempotent apply. The time `open()` spends
+  runs one immediate anti-entropy round against that donor as a safety
+  sweep; donor death mid-stream is recovered by re-picking and
+  re-requesting, made free by idempotent apply. The time `open()` spends
   on this is bounded by `ClusterConfig::state_transfer_budget` (default 20s)
   — a startup-latency knob, not a correctness one, since anti-entropy tops
   up whatever a cut-off transfer didn't deliver.
@@ -207,12 +205,12 @@ The first release: the full buildout of the core library.
   static loopback seeds, a background write load, interactive kill/restart
   per node, live replication/anti-entropy visibility; plus a `--headless
   <SECS>` mode for CI smoke checks and manual soak runs.
-- **Test suite**: property tests (`proptest`) on HLC, wire encoding, and the
-  store — including the permutation-convergence property that is the
-  correctness license for the whole loss-tolerant design; the `turmoil`
+- **Test suite**: property tests (`proptest`) on HLC, wire encoding, and
+  the store, including the permutation-convergence property — the
+  correctness argument for the whole loss-tolerant design; the `turmoil`
   simulation suite; a container-backed multi-node integration suite (see
-  next bullet); two-node loopback integration tests living as ordinary unit
-  tests next to the code they exercise (`sundog::cluster`'s
+  next bullet); two-node loopback integration tests living as ordinary
+  unit tests next to the code they exercise (`sundog::cluster`'s
   replication/invalidation/state-transfer/anti-entropy/local-mode tests,
   `sundog::store`'s read-through stampede-collapse and TTL-expiry tests);
   Prometheus-exporter and TLS integration tests; unit tests in every module.
@@ -221,25 +219,24 @@ The first release: the full buildout of the core library.
   line-based control protocol — `put`/`get`/`del`/`count`/`peers`/`quit`,
   plus bulk-fill, high-frequency churn, and large-value content-check
   commands — so external test harnesses can drive a real cluster member as
-  a real, separate process.
+  a separate process.
 - **Container-backed integration suite** (`sundog/tests/containers.rs`,
   `sundog/tests/container_smoke.rs`, harness in `sundog/tests/container_util`):
-  multi-node scenarios run as real, separate `sundog-testnode` processes on
-  a real virtual network, exclusively through the
+  multi-node scenarios run as separate `sundog-testnode` processes on a
+  real virtual network, exclusively through the
   [`rightsize`](https://crates.io/crates/rightsize) crate — no Docker CLI,
-  no `bollard`. Covers three-node
-  convergence across distinct writers, tombstones reaching every node, a
-  warm join via state transfer into a populated cluster, a killed node
-  catching back up via anti-entropy after restart under the same alias,
-  cold joins at 100k- and million-entry scale, a three-writer high-churn
-  add/remove/TTL scenario that must drain to zero and stay there, and
-  realistic 64 KiB values with in-node content verification plus both sides
-  of the frame-cap boundary.
-  Gated on `SUNDOG_CONTAINER_TESTS=1` (checked first in every test, not
-  `#[ignore]`) so a plain `cargo test --workspace` still compiles and passes
-  the file trivially without a container backend or the musl target
-  installed; needs `RIGHTSIZE_BACKEND=docker` because sundog's gossip is UDP
-  and rightsize's microsandbox network emulation relays TCP only.
+  no `bollard`. Covers three-node convergence across distinct writers,
+  tombstones reaching every node, a warm join via state transfer into a
+  populated cluster, a killed node catching back up via anti-entropy after
+  restart under the same alias, cold joins at 100k- and million-entry
+  scale, a three-writer high-churn add/remove/TTL scenario that must drain
+  to zero and stay there, and realistic 64 KiB values with in-node content
+  verification plus both sides of the frame-cap boundary. Gated on
+  `SUNDOG_CONTAINER_TESTS=1` (checked first in every test, not
+  `#[ignore]`) so a plain `cargo test --workspace` still compiles and
+  passes the file without a container backend or the musl target
+  installed; needs `RIGHTSIZE_BACKEND=docker` because sundog's gossip is
+  UDP and rightsize's microsandbox network emulation relays TCP only.
 - CI: the main `ci` job runs, in order, `cargo fmt --check`, `cargo clippy
   --workspace --all-targets -D warnings -W clippy::pedantic` (plus a
   `sim`-feature pass and a `tls,prometheus`-features pass), `cargo test
@@ -259,9 +256,9 @@ The first release: the full buildout of the core library.
   notifications for a bulk fill travel as per-stripe key batches on the
   internal channel (`store::FanOutNotice::Many`) rather than one notice per
   entry, so an arbitrarily large fill can never lag the fan-out channel and
-  silently degrade its replication to anti-entropy repair — a 100k-entry
-  fill fully converges on live peers a fraction of a second after the call
-  returns, in a few hundred wire frames.
+  degrade its replication to anti-entropy repair — a 100k-entry fill fully
+  converges on live peers a fraction of a second after the call returns, in
+  a few hundred wire frames.
 - **Batched replication on the wire**: the fan-out layer pre-batches each
   drained burst of local writes into `Msg::ReplicateBatch` frames (budget-
   and count-capped), so a bulk burst occupies outbox slots per *batch*

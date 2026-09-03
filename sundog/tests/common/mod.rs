@@ -1,13 +1,8 @@
-//! Shared harness for sundog's remaining in-process tests (`tests/tls.rs`,
-//! `tests/prometheus_exporter.rs`): a fast-cycling [`ClusterConfig`], a
-//! bounded-wait polling helper so no test ever asserts convergence after a
-//! fixed `sleep`, and the small [`Node`] bookkeeping struct both files build
-//! their own real, loopback-`Static`-discovery [`Cluster`]s around.
-//!
-//! The former general-purpose multi-node group builders (`spawn_cluster_group`,
-//! `join_node`, and their `_with` variants) moved to `tests/containers.rs`'s
-//! rightsize-based harness (`tests/container_util`) along with the tests that
-//! used them.
+//! Shared harness for `tests/tls.rs` and `tests/prometheus_exporter.rs`: a
+//! fast-cycling [`ClusterConfig`], a bounded-wait polling helper so no test
+//! ever asserts convergence after a fixed `sleep`, and the small [`Node`]
+//! bookkeeping struct both files build their own real,
+//! loopback-`Static`-discovery [`Cluster`]s around.
 //!
 //! Each `tests/*.rs` file that uses this module pulls in only the helpers it
 //! needs — unused ones in any given binary are expected, hence the blanket
@@ -67,8 +62,7 @@ where
 ///
 /// Tracked here, rather than read back from `Cluster`, because the public API
 /// has no accessor for a cluster's own advertised gossip address (only other
-/// live nodes' addresses, via [`Cluster::peers`]) — see this suite's reported
-/// API wart.
+/// live nodes' addresses, via [`Cluster::peers`]).
 pub struct Node {
     pub cluster: Cluster,
     pub gossip_addr: SocketAddr,

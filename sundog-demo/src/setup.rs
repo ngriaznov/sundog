@@ -46,7 +46,7 @@ impl Demo {
 }
 
 /// Builds `args.nodes` node slots, starts every one of them, and spawns the
-/// background write-load task.
+/// background write-load routine.
 ///
 /// # Errors
 ///

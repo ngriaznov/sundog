@@ -1,55 +1,53 @@
 # Roadmap
 
-Design sketches for what v1 deliberately does not do. Each cut here was made
-to keep the core buildable and correct first; this document is where those
-cuts get an honest paragraph on cost and trigger, so revisiting one is a
-decision made on evidence, not on itch.
+Design sketches for what v1 deliberately excludes, each cut to keep the
+core buildable and correct first. Every section states its cost and
+trigger, so revisiting one is a decision made on evidence, not on itch.
 
-None of what follows is scheduled. A section moves from here into actual
-code only once its trigger condition is observed in a real deployment, not
-because it would be interesting to build.
+Nothing here is scheduled: a section becomes code only once its trigger
+condition is observed in a real deployment, not because it would be
+interesting to build.
 
 ## Distribution mode
 
 A consistent-hash ring over the live member set, `numOwners` primary+backup
 replicas per key instead of every node holding every entry, and — the hard
-part — rebalancing the ring and streaming ownership transfers whenever
-membership changes, without ever dropping a write or serving a stale
-primary during the transition. sundog's `Replicated` mode sidesteps nearly
-all of this: every node is trivially "owner" of everything, so join/leave
-only ever needs a snapshot pull plus anti-entropy, never a rebalance. That
-simplification is why state transfer fits in a page of design instead of a
-subsystem — a rebalancing coordinator, conflict resolution during
-rebalance, and partial-rebalance-on-partition logic are the hardest part of
-building a distribution mode at all.
+part — rebalancing the ring and streaming ownership transfers on every
+membership change without dropping a write or serving a stale primary
+mid-transition. `Replicated` mode sidesteps nearly all of this: every node
+is trivially "owner" of everything, so join/leave needs only a snapshot
+pull plus anti-entropy, never a rebalance — why state transfer fits in a
+page of design instead of a subsystem. A rebalancing coordinator, conflict
+resolution during rebalance, and partial-rebalance-on-partition logic are
+the hardest part of building a distribution mode at all.
 
 **Feasibility, assessed against the code:** feasible with restrictions.
 Ownership belongs at the anti-entropy bucket (`xxh3(key) & 1023`), not the
-key: the 1,024 buckets already have digests, entry enumeration, and
+key — the 1,024 buckets already have digests, entry enumeration, and
 chunked streaming, so "who owns bucket b" is the only new question.
-Rendezvous (highest-random-weight) hashing answers it as a pure function
-of the live `Peer` list — no ring to maintain, adding or losing one node
-moves about `1/n` of the buckets, and `owners = k` is "the top k scores".
-The mesh's per-peer outboxes and pooled request/response path carry a
+Rendezvous (highest-random-weight) hashing answers it as a pure function of
+the live `Peer` list: no ring to maintain, adding or losing one node moves
+about `1/n` of the buckets, and `owners = k` is "the top k scores." The
+mesh's per-peer outboxes and pooled request/response path carry a
 non-owner read as one more request shape. What changes shape rather than
-grows: fan-out must group records by owner set instead of broadcasting;
-anti-entropy must pair only peers that share a bucket; state transfer must
-run on every membership change, scoped to newly owned buckets, not once at
-`open()`; and tombstone-GC deferral must ask whether an *owner* of the
-bucket is absent, not whether any member is.
+grows: fan-out groups records by owner set instead of broadcasting;
+anti-entropy pairs only peers sharing a bucket; state transfer runs on
+every membership change, scoped to newly owned buckets, not once at
+`open()`; and tombstone-GC deferral asks whether an *owner* of the bucket
+is absent, not whether any member is.
 
 Three gaps are real, not paperwork. `NodeId` is generated fresh per
 process, so a rolling restart with no capacity change would rehash nearly
 every bucket — a persisted node identity is a prerequisite. Gossip
 membership has no quorum, so a partition lets each side compute its own
-owner set and both accept writes; convergence after the heal is by version,
-and the design must state that plainly. Nothing tracks an ownership epoch,
-so a transfer can complete against a stale owner set when membership
-changes twice mid-flight. Restrictions that keep the mode honest:
-`owners >= 2` always (a single owner lost is a bucket lost), no finite
-`max_capacity` on a distributed cache (the same guard `Replicated` has,
-for the same reason), and a non-owner read as a separately typed operation
-rather than a silent network hop inside `get`.
+owner set and both accept writes; convergence after the heal is by version
+only, and the design must say so plainly. Nothing tracks an ownership
+epoch, so a transfer can complete against a stale owner set when
+membership changes twice mid-flight. Restrictions that keep the mode
+honest: `owners >= 2` always (a single lost owner is a lost bucket), no
+finite `max_capacity` on a distributed cache (the same guard `Replicated`
+has, for the same reason), and a non-owner read as a separately typed
+operation, not a silent network hop inside `get`.
 
 **Cost:** roughly 3,000–5,000 lines plus a comparable volume of sim and
 property coverage, and a new invariant class for the test stack — "the
@@ -71,8 +69,8 @@ The data plane is one `LengthDelimitedCodec`-framed TCP connection per peer,
 carrying every message class — `Invalidate`/`Replicate` broadcast traffic,
 state-transfer chunk streams, and anti-entropy digest/pull round-trips — over
 the same stream, ordered by TCP's own head-of-line blocking. A `quinn`-based
-QUIC transport would give each message class its own stream, so a large
-state-transfer snapshot streaming to a joining node can no longer stall a
+QUIC transport would give each message class its own stream, keeping a
+large state-transfer snapshot to a joining node from stalling a
 latency-sensitive invalidation behind it.
 
 **Cost:** a second transport implementation behind the existing `net::tcp`
@@ -106,7 +104,7 @@ the feature is worth.
 idle expiry needs a different tool than an embedded cache library — see
 "remote thin clients" below for the general shape of that advice.
 
-## Remote thin clients vs. "just run Valkey"
+## Remote thin clients vs. "run Valkey instead"
 
 A thin-client protocol would let non-embedding clients talk to a cluster
 over a small binary TCP protocol with topology hints, so a process that
@@ -127,5 +125,5 @@ wanted, the right first move is to compare against running
 using its already-mature, already-multi-language client ecosystem. sundog's
 entire value proposition is *embedded* zeroconf clustering for services that
 already share a process boundary with their cache; a remote-client story
-gives that up in exchange for reinventing a strictly worse Valkey. This item
-stays on the roadmap as a sketch, not a plan, for exactly that reason.
+gives that up in exchange for reinventing a strictly worse Valkey. This
+item stays here as a sketch, not a commitment, for exactly that reason.

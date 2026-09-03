@@ -48,8 +48,7 @@ struct Input {
 
 /// xorshift64* — a tiny, allocation-free, deterministic generator (the same
 /// algorithm `engine::Engine`'s own eviction sampling uses), so this target
-/// needs no RNG dependency just to permute and duplicate a short record
-/// list.
+/// needs no RNG dependency to permute and duplicate a short record list.
 fn next_u64(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;

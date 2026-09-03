@@ -28,13 +28,13 @@ async fn reserve_tcp_addr() -> SocketAddr {
         .expect("bind an ephemeral loopback tcp port to reserve a metrics address");
     listener
         .local_addr()
-        .expect("a just-bound tcp listener reports a local address")
+        .expect("a freshly bound tcp listener reports a local address")
 }
 
 /// A minimal raw-socket `GET /metrics` — no HTTP client dependency needed for
 /// one request against a text-exposition endpoint. Returns `None` if the
 /// listener isn't accepting connections yet (the exporter's own background
-/// task may not have started serving by the time this first runs).
+/// routine may not have started serving by the time this first runs).
 async fn scrape_metrics(addr: SocketAddr) -> Option<String> {
     let mut stream = TcpStream::connect(addr).await.ok()?;
     stream
@@ -155,7 +155,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     .await;
     assert!(loads.iter().all(|value| value == "joined"));
 
-    // `sundog_open_caches` is only set by a periodic background task (see
+    // `sundog_open_caches` is only set by a periodic background routine (see
     // `cluster::open_cache_gauge_task`'s docs on why it can't be
     // event-driven), so this polls until every metric checked below has been
     // published at least once, rather than stopping at the first reachable
