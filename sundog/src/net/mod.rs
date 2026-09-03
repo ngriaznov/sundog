@@ -291,7 +291,10 @@ pub struct InboundMsg {
 
 /// One anti-entropy digest-exchange reply, as [`Mesh::ae_round`] collects
 /// them: a mismatched bucket's full listing, or, once too large for that,
-/// an IBLT sketch for the initiator to peel against its own.
+/// an IBLT sketch for the initiator to peel against its own, or its part
+/// digests. `#[non_exhaustive]`, like [`crate::wire::Msg`]: a new reply
+/// shape is not a breaking release.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AeMismatch {
     /// `(bucket, entries)`: the bucket's full listing.
@@ -321,6 +324,7 @@ impl AeMismatch {
 /// One reply to [`Mesh::ae_parts`]: a mismatched part's full listing, or,
 /// once too large for that, an IBLT sketch, the part-grained counterpart of
 /// [`AeMismatch`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AePartReply {
     /// The part's full `(key, version)` listing.
@@ -335,6 +339,24 @@ pub enum AePartReply {
         part: u8,
         cells: Vec<Cell>,
     },
+}
+
+impl AePartReply {
+    /// The bucket this reply's part belongs to, whichever shape it took.
+    #[must_use]
+    pub const fn bucket(&self) -> u16 {
+        match self {
+            Self::Listing { bucket, .. } | Self::Sketch { bucket, .. } => *bucket,
+        }
+    }
+
+    /// The part within [`AePartReply::bucket`] this reply covers.
+    #[must_use]
+    pub const fn part(&self) -> u8 {
+        match self {
+            Self::Listing { part, .. } | Self::Sketch { part, .. } => *part,
+        }
+    }
 }
 
 /// What the net layer needs from the local shard registry to answer
@@ -1447,6 +1469,22 @@ mod tests {
         assert!(second.is_err(), "truncated stream must surface as an error");
 
         donor.await.expect("donor did not panic");
+    }
+
+    #[test]
+    fn ae_part_reply_names_its_bucket_and_part_in_either_shape() {
+        let listing = AePartReply::Listing {
+            bucket: 7,
+            part: 3,
+            entries: Vec::new(),
+        };
+        let sketch = AePartReply::Sketch {
+            bucket: 9,
+            part: 63,
+            cells: Vec::new(),
+        };
+        assert_eq!((listing.bucket(), listing.part()), (7, 3));
+        assert_eq!((sketch.bucket(), sketch.part()), (9, 63));
     }
 
     #[tokio::test]

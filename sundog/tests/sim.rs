@@ -318,6 +318,9 @@ async fn classify_ae_mismatches(
                     wanted_parts.push((bucket, part));
                 }
             }
+            // `AeMismatch` is `#[non_exhaustive]`: a reply shape this
+            // scenario does not model is left to the full listing.
+            other => undecodable_buckets.push(other.bucket()),
         }
     }
 }
@@ -379,6 +382,9 @@ async fn resolve_wanted_parts(
                             undecodable_buckets,
                         );
                     }
+                    // `AePartReply` is `#[non_exhaustive]`: an unmodelled
+                    // reply shape is left to the whole-bucket fallback.
+                    other => undecodable_buckets.push(other.bucket()),
                 }
             }
             true

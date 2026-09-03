@@ -35,6 +35,13 @@ All notable changes to this project are documented in this file. Format follows
   `sketch`, and `fallback` outcomes, one increment per part reply. A mixed
   0.3/0.4 cluster is unsupported, as with any wire-format change across a
   minor version.
+- **Breaking**, in the `sim`-feature test seams only: `net::AeMismatch`
+  gains the `PartDigests` variant and is `#[non_exhaustive]` from here on,
+  as is the new `net::AePartReply`; `net::RequestHandler` and
+  `store::ShardOps` gain the required methods `bucket_lens`,
+  `part_digests`, and `entries_for_parts`. `cargo semver-checks
+  --release-type minor` against 0.3.1 reports exactly these; every other
+  check passes.
 - **Chaos lane** for the container suite: `chaos_crashes_churn_and_drops_still_converge`
   drives a four-node cluster through a seeded random mix of crashes, churn,
   dropped keys, refills, and put bursts for a bounded time, then checks every
