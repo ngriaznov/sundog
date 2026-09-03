@@ -1907,7 +1907,10 @@ mod tests {
     /// insert's natural bucket-size variance to produce one.
     fn keys_colliding_with_zero(count: usize) -> Vec<u32> {
         let target = bucket_of_u32(0);
-        (0..).filter(|&k| bucket_of_u32(k) == target).take(count).collect()
+        (0..)
+            .filter(|&k| bucket_of_u32(k) == target)
+            .take(count)
+            .collect()
     }
 
     /// A [`tracing::Subscriber`] that counts `cluster::anti_entropy`'s own

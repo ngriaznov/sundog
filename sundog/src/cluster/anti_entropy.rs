@@ -206,7 +206,10 @@ pub(crate) async fn run_round_against(
     // sketches gets one `AeEntries` round trip for all of them, not one
     // each.
     if !undecodable_buckets.is_empty() {
-        match mesh.ae_entries(peer, cache.clone(), undecodable_buckets).await {
+        match mesh
+            .ae_entries(peer, cache.clone(), undecodable_buckets)
+            .await
+        {
             Ok(fallback_buckets) => {
                 for (bucket, peer_entries) in fallback_buckets {
                     diff_bucket(

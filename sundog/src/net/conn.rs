@@ -588,8 +588,15 @@ async fn handle_accepted(
                 bucket,
                 hashes,
             } => {
-                serve_ae_pull_hashes(&mut framed, cache, bucket, hashes, handler.as_ref(), &cancel)
-                    .await
+                serve_ae_pull_hashes(
+                    &mut framed,
+                    cache,
+                    bucket,
+                    hashes,
+                    handler.as_ref(),
+                    &cancel,
+                )
+                .await
             }
             // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
             // `ReqDone` — the latter only ever sent as replies on a

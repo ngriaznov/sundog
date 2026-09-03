@@ -243,7 +243,10 @@ impl Iblt {
     /// agree on shape.
     pub(crate) fn from_cells(cells: Vec<Cell>) -> Self {
         let partition_len = (cells.len() / IBLT_PARTITIONS).max(1);
-        Self { cells, partition_len }
+        Self {
+            cells,
+            partition_len,
+        }
     }
 
     /// Unwraps this sketch's cells for the wire
@@ -434,7 +437,13 @@ mod tests {
         let a = sketch_of(&[(1, ver(10))], 240);
         let b = Iblt::new(240);
         let decoded = a.subtract(&b).peel().expect("small diff decodes");
-        assert_eq!(decoded.only_left, vec![Elem { key_hash: 1, ver: ver(10) }]);
+        assert_eq!(
+            decoded.only_left,
+            vec![Elem {
+                key_hash: 1,
+                ver: ver(10)
+            }]
+        );
         assert!(decoded.only_right.is_empty());
     }
 
@@ -444,7 +453,13 @@ mod tests {
         let b = sketch_of(&[(7, ver(10))], 240);
         let decoded = a.subtract(&b).peel().expect("small diff decodes");
         assert!(decoded.only_left.is_empty());
-        assert_eq!(decoded.only_right, vec![Elem { key_hash: 7, ver: ver(10) }]);
+        assert_eq!(
+            decoded.only_right,
+            vec![Elem {
+                key_hash: 7,
+                ver: ver(10)
+            }]
+        );
     }
 
     #[test]
@@ -452,8 +467,20 @@ mod tests {
         let a = sketch_of(&[(1, ver(20))], 240);
         let b = sketch_of(&[(1, ver(10))], 240);
         let decoded = a.subtract(&b).peel().expect("small diff decodes");
-        assert_eq!(decoded.only_left, vec![Elem { key_hash: 1, ver: ver(20) }]);
-        assert_eq!(decoded.only_right, vec![Elem { key_hash: 1, ver: ver(10) }]);
+        assert_eq!(
+            decoded.only_left,
+            vec![Elem {
+                key_hash: 1,
+                ver: ver(20)
+            }]
+        );
+        assert_eq!(
+            decoded.only_right,
+            vec![Elem {
+                key_hash: 1,
+                ver: ver(10)
+            }]
+        );
     }
 
     #[test]

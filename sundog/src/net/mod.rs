@@ -725,7 +725,11 @@ impl Mesh {
             conn::collect_ae_buckets(framed, &pool).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy sketch-fallback listing")))
+        .unwrap_or_else(|_| {
+            Err(request_timeout_error(
+                "anti-entropy sketch-fallback listing",
+            ))
+        })
     }
 
     /// Pulls full records for `keys` from `peer` (the `AePull` step of

@@ -42,7 +42,12 @@ fn hlc_strategy() -> impl Strategy<Value = Hlc> {
 }
 
 fn item_strategy() -> impl Strategy<Value = (u64, Role, Hlc, Hlc)> {
-    (any::<u64>(), role_strategy(), hlc_strategy(), hlc_strategy())
+    (
+        any::<u64>(),
+        role_strategy(),
+        hlc_strategy(),
+        hlc_strategy(),
+    )
 }
 
 /// Builds the two sketches and the expected exact decode from a list of

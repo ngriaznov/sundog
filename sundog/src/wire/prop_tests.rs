@@ -105,12 +105,13 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
             proptest::collection::vec(bytes_strategy(), 0..8),
         )
             .prop_map(|(cache, keys)| Msg::AePull { cache, keys }),
-        (
-            smol_str_strategy(),
-            any::<u16>(),
-            cells_strategy(),
-        )
-            .prop_map(|(cache, bucket, cells)| Msg::AeSketch { cache, bucket, cells }),
+        (smol_str_strategy(), any::<u16>(), cells_strategy(),).prop_map(
+            |(cache, bucket, cells)| Msg::AeSketch {
+                cache,
+                bucket,
+                cells
+            }
+        ),
         (
             smol_str_strategy(),
             proptest::collection::vec(any::<u16>(), 0..8),
@@ -121,7 +122,11 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
             any::<u16>(),
             proptest::collection::vec(any::<u64>(), 0..8),
         )
-            .prop_map(|(cache, bucket, hashes)| Msg::AePullHashes { cache, bucket, hashes }),
+            .prop_map(|(cache, bucket, hashes)| Msg::AePullHashes {
+                cache,
+                bucket,
+                hashes
+            }),
         (
             smol_str_strategy(),
             proptest::collection::vec(wire_record_strategy(), 0..8),
