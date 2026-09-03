@@ -1208,6 +1208,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ae_entries_returns_full_listings_for_the_requested_buckets() {
+        let entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        let handler = Arc::new(FixtureHandler {
+            records: Vec::new(),
+            digests: Vec::new(),
+            bucket_entries: entries.clone(),
+            pulled: Mutex::new(Vec::new()),
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let got = client
+            .ae_entries(NodeId::from(1), SmolStr::new("users"), vec![3, 7])
+            .await
+            .expect("ae_entries succeeds");
+
+        assert_eq!(got, vec![(3, entries.clone()), (7, entries)]);
+    }
+
+    #[tokio::test]
+    async fn ae_pull_hashes_resolves_only_the_requested_hash_to_records() {
+        // Two entries in the bucket, only one hash requested — the default
+        // `RequestHandler::records_for_hashes` (`bucket_entries` +
+        // `records_for` composed, `FixtureHandler` never overrides it) must
+        // filter down to just the key that hash belongs to before pulling,
+        // not hand every bucket key to `records_for`.
+        let key_a = Bytes::from_static(b"a");
+        let key_b = Bytes::from_static(b"b");
+        let ver = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(1),
+        };
+        let handler = Arc::new(FixtureHandler {
+            records: vec![sample_record(9)],
+            digests: Vec::new(),
+            bucket_entries: vec![(key_a.clone(), ver), (key_b, ver)],
+            pulled: Mutex::new(Vec::new()),
+        });
+        let handler_for_asserts = Arc::clone(&handler);
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let hash_a = xxh3_64(&key_a);
+        let got = client
+            .ae_pull_hashes(NodeId::from(1), SmolStr::new("users"), 3, vec![hash_a])
+            .await
+            .expect("ae_pull_hashes succeeds");
+        assert_eq!(got, vec![sample_record(9)]);
+
+        let pulled = handler_for_asserts
+            .pulled
+            .lock()
+            .expect("invariant: fixture mutex is never poisoned");
+        assert_eq!(
+            pulled.as_slice(),
+            [(SmolStr::new("users"), vec![key_a])],
+            "the resolved hash must pull exactly key_a's bytes, never key_b's"
+        );
+    }
+
+    #[tokio::test]
     async fn request_to_an_unknown_peer_errors_instead_of_hanging() {
         let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
         let err = mesh
