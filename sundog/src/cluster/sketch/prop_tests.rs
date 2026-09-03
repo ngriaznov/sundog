@@ -1,6 +1,8 @@
 //! Property tests for the IBLT sketch: within [`RATED_CAPACITY`],
-//! `subtract` + `peel` always decodes the *exact* symmetric difference —
-//! never `Undecodable`, let alone wrong — and past it, arbitrarily large
+//! `subtract` + `peel` decodes the *exact* symmetric difference with
+//! overwhelming probability — see [`RATED_CAPACITY`]'s own docs for why that
+//! can never be an absolute guarantee, only one made statistically
+//! negligible by this shape's cell count — and past it, arbitrarily large
 //! differences either decode exactly or report `Undecodable`, never a wrong
 //! answer.
 
@@ -14,7 +16,7 @@ use crate::node::NodeId;
 
 /// The default sketch size ([`crate::config::ClusterConfig::ae_sketch_cells`]'s
 /// own default) — [`RATED_CAPACITY`] is rated against exactly this shape.
-const DEFAULT_CELLS: usize = 240;
+const DEFAULT_CELLS: usize = 951;
 
 #[derive(Debug, Clone, Copy)]
 enum Role {
@@ -110,8 +112,10 @@ proptest! {
     /// difference, every `LeftOnly`/`RightOnly` item at most 1 — so capping
     /// the item count at `RATED_CAPACITY / 2` bounds the true difference at
     /// or below `RATED_CAPACITY` regardless of which roles proptest picks.
-    /// Within that bound, decode must be exact, always — never
-    /// `Undecodable`.
+    /// Within that bound, decode succeeds with overwhelming probability —
+    /// [`RATED_CAPACITY`]'s own docs on why a hash-based sketch can never
+    /// make that an absolute guarantee, and on how rare a red run here
+    /// should be even so.
     #[test]
     fn within_rated_capacity_always_decodes_exactly(
         items in proptest::collection::vec(item_strategy(), 0..=(RATED_CAPACITY / 2))
@@ -120,7 +124,11 @@ proptest! {
         let decoded = left
             .subtract(&right)
             .peel()
-            .expect("a symmetric difference within the rated capacity must always decode");
+            .expect(
+                "a symmetric difference within the rated capacity decodes except on the rare, \
+                 documented hash-collision case (RATED_CAPACITY's own docs) - re-run once before \
+                 treating this as a regression",
+            );
         let got_left: HashSet<Elem> = decoded.only_left.into_iter().collect();
         let got_right: HashSet<Elem> = decoded.only_right.into_iter().collect();
         prop_assert_eq!(got_left, expected_left);

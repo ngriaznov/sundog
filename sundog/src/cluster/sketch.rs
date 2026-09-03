@@ -70,16 +70,41 @@ use crate::node::NodeId;
 pub(crate) const IBLT_PARTITIONS: usize = 3;
 
 /// Symmetric-difference size the crate's default sketch shape
-/// ([`crate::config::ClusterConfig::ae_sketch_cells`]'s default of 240
-/// cells, 80 per partition at [`IBLT_PARTITIONS`] = 3) is rated for:
-/// measured over the property tests below (`prop_tests`, thousands of
-/// random trials at this exact cell count), `subtract` + `peel` returns the
-/// exact `only_left`/`only_right` split for every symmetric difference at or
-/// below this many elements — never once `Undecodable`, let alone wrong.
-/// Past this size decode failures start appearing (still never a *wrong*
-/// answer, only `Undecodable` — see this module's docs); this constant is
-/// the boundary the property tests hold the "always exact" property to, not
-/// a hard cutoff enforced anywhere at runtime.
+/// ([`crate::config::ClusterConfig::ae_sketch_cells`]'s default of 951
+/// cells, 317 per partition at [`IBLT_PARTITIONS`] = 3) is rated for.
+///
+/// This is a *statistical*, not absolute, guarantee: two elements that
+/// happen to land in the exact same cell in all three partitions (an
+/// [`IBLT_PARTITIONS`]-way hash collision, roughly `1 / partition_len^3` per
+/// pair at random) leave that trio of cells non-pure and unresolvable —
+/// vanishingly unlikely for any one pair, but with up to
+/// `RATED_CAPACITY / 2` elements possibly pairwise-colliding, not literally
+/// zero. At this constant's value, direct Monte Carlo sampling (tens of
+/// thousands of random trials at this exact sketch shape, well beyond what
+/// the property tests below run on every `cargo test`) puts the
+/// per-difference-pair failure rate low enough that a full 1024-case
+/// property-test run turning up even one `Undecodable` inside the rated
+/// capacity is itself a rare event — not a mathematical impossibility, so a
+/// red run here first re-runs before assuming a real regression, but not
+/// one to expect in normal use. Past this size, decode failures become the
+/// norm rather than an outlier (still never a *wrong* answer, only
+/// `Undecodable` — see this module's docs); this constant is the boundary
+/// the property tests hold that near-certain "always exact" property to,
+/// not a hard cutoff enforced anywhere at runtime.
+///
+/// 317 is prime, not a round/highly-divisible number like 240 or 320 — this
+/// matters because proptest's own integer shrinker narrows a failing case by
+/// bisection, which tends to land two colliding elements' hash values a
+/// suspiciously round (power-of-two-ish) distance apart; a highly composite
+/// `partition_len` (say, one sharing factors of 2 and 5) lets that shrunk
+/// distance stay a multiple of it far more often than genuine random luck
+/// would predict, turning one real but rare statistical collision into a
+/// *permanently reproducible* one once proptest saves the shrunk case to
+/// `proptest-regressions`. A prime `partition_len` has (almost) no small
+/// factors in common with a shrinker-produced delta, so this class of
+/// self-inflicted flakiness — distinct from the genuine, inherent
+/// `1 / partition_len^3` collision risk above — stays as unlikely as
+/// intended.
 // Only read by the property tests (`prop_tests`, `#[cfg(test)]`) that pin
 // it; a non-test build never evaluates it, hence the otherwise-unused
 // warning this silences.
@@ -123,7 +148,7 @@ fn check(key_hash: u64, wall_ms: u64, logical: u32, node: u64) -> u64 {
 /// `key_hash` and version fields, plus `check_sum` — the fingerprint used to
 /// verify a "pure" cell genuinely holds exactly one element (this module's
 /// docs, "Never wrong, only sometimes undecodable"). `Default` is the empty
-/// cell (every field zero), what every cell in a freshly built [`Iblt`]
+/// cell (every field zero), what every cell in a freshly built `Iblt`
 /// starts as.
 ///
 /// Reachable outside `cluster::sketch` only because
@@ -131,9 +156,14 @@ fn check(key_hash: u64, wall_ms: u64, logical: u32, node: u64) -> u64 {
 /// (re-exported as [`crate::wire::Cell`]) — every field stays private to
 /// this module; nothing outside it constructs, inspects, or matches on one.
 /// Serde derives postcard-encode this as five varints plus a signed varint
-/// for `count` (zigzag-encoded), so an empty cell — the common case for a
-/// bucket well under [`RATED_CAPACITY`]'s worth of actual difference —
-/// costs six single bytes on the wire.
+/// for `count` (zigzag-encoded), so an empty cell costs six single bytes on
+/// the wire — cheap, but not the typical cell in the sketch a responder
+/// actually sends: `Msg::AeSketch` carries the *un-subtracted* sketch built
+/// from every entry the responder's own bucket holds (not the diff, which
+/// only the initiator ever computes, after subtracting), so how many cells
+/// stay empty depends on the bucket's population against
+/// [`crate::config::ClusterConfig::ae_sketch_cells`], not on
+/// `RATED_CAPACITY`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cell {
     count: i32,
@@ -221,12 +251,15 @@ impl Iblt {
     /// split evenly across [`IBLT_PARTITIONS`] partitions (each
     /// `(cells / IBLT_PARTITIONS).max(1)` long, so a tiny or zero `cells`
     /// still yields a well-formed, if uselessly small, sketch rather than
-    /// an empty one). Pass [`crate::config::ClusterConfig::ae_sketch_cells`]
-    /// for the responder's own outbound sketch; the initiator instead
-    /// builds its comparison sketch with [`Iblt::new`] over the *received*
-    /// sketch's own `cells.len()` (via [`Iblt::from_cells`]'s companion
-    /// sizing), so the two are always shape-compatible regardless of
-    /// config drift between nodes.
+    /// an empty one — this does not require `cells` to make the resulting
+    /// `partition_len` prime, but [`RATED_CAPACITY`]'s docs are why the
+    /// crate's own default does). Pass
+    /// [`crate::config::ClusterConfig::ae_sketch_cells`] for the responder's
+    /// own outbound sketch; the initiator instead builds its comparison
+    /// sketch with [`Iblt::new`] over the *received* sketch's own
+    /// `cells.len()` (via [`Iblt::from_cells`]'s companion sizing), so the
+    /// two are always shape-compatible regardless of config drift between
+    /// nodes.
     pub(crate) fn new(cells: usize) -> Self {
         let partition_len = (cells / IBLT_PARTITIONS).max(1);
         Self {

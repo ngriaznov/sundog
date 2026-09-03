@@ -136,19 +136,22 @@ pub struct ClusterConfig {
     pub state_transfer_budget: Duration,
     /// Local entry-list length above which an anti-entropy responder answers
     /// a mismatched bucket with an IBLT sketch (`Msg::AeSketch`) instead of
-    /// the bucket's full `(key, version)` listing (`Msg::AeBucket`). A
-    /// listing this long costs about what a
-    /// [`ae_sketch_cells`](Self::ae_sketch_cells)-cell sketch costs on the
-    /// wire (each listed entry is a key hash plus an `Hlc`, comparable in
-    /// size to a sketch cell), so past this point the sketch is the cheaper
-    /// reply regardless of how large the actual diff turns out to be.
+    /// the bucket's full `(key, version)` listing (`Msg::AeBucket`). Below
+    /// this point a listing is already cheap on the wire and a fixed-cost
+    /// sketch reply buys nothing; past it, a sketch's wire cost stops
+    /// growing with the bucket while a listing's keeps climbing, so the
+    /// sketch increasingly wins the larger the bucket gets regardless of how
+    /// large the actual diff turns out to be.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch an anti-entropy responder builds for a
     /// bucket past [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket).
-    /// Rated (see `cluster::sketch::RATED_CAPACITY`) to decode any symmetric
-    /// difference up to 40 elements exactly, every time; a larger true
-    /// difference falls back to `Msg::AeEntries`'s full listing rather than
-    /// ever risking a wrong decode.
+    /// Rated (see `cluster::sketch::RATED_CAPACITY`, whose own docs cover
+    /// why this is a statistical rather than absolute guarantee) to decode
+    /// any symmetric difference up to 40 elements with overwhelming
+    /// probability; a larger true difference — or, on the rare documented
+    /// hash-collision case, sometimes even a smaller one — falls back to
+    /// `Msg::AeEntries`'s full listing rather than ever risking a wrong
+    /// decode.
     pub ae_sketch_cells: usize,
     /// Mutual-TLS material for the data-plane mesh (feature `tls`); `None`
     /// (the default) means the mesh runs plaintext. See [`TlsConfig`]'s own
@@ -196,7 +199,7 @@ impl Default for ClusterConfig {
             kv_tombstone_grace_period: Duration::from_mins(15),
             state_transfer_budget: Duration::from_secs(20),
             ae_sketch_min_bucket: 256,
-            ae_sketch_cells: 240,
+            ae_sketch_cells: 951,
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -234,7 +237,7 @@ mod tests {
     fn default_ae_sketch_knobs_match_the_rated_sketch_shape() {
         let config = ClusterConfig::default();
         assert_eq!(config.ae_sketch_min_bucket, 256);
-        assert_eq!(config.ae_sketch_cells, 240);
+        assert_eq!(config.ae_sketch_cells, 951);
     }
 
     #[test]

@@ -156,7 +156,7 @@ pub enum Msg {
     /// (`ClusterConfig::ae_sketch_min_bucket`). The initiator subtracts its
     /// own local sketch of the bucket from this one and peels the result;
     /// on success this replaces the whole `AeBucket` round trip for that
-    /// bucket, on failure ([`crate::cluster::sketch::Undecodable`]) the
+    /// bucket, on failure (`cluster::sketch::Undecodable`) the
     /// initiator falls back to [`Msg::AeEntries`].
     ///
     /// [`ClusterConfig::ae_sketch_min_bucket`]: crate::config::ClusterConfig::ae_sketch_min_bucket
