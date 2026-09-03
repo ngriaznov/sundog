@@ -1,5 +1,4 @@
 //! `Static`: a fixed seed list, from the builder or `SUNDOG_SEEDS=host:port,…`.
-//! The escape hatch and the test-suite workhorse.
 
 use std::collections::HashSet;
 use std::io;
@@ -15,14 +14,11 @@ use super::Discovery;
 const SUNDOG_SEEDS_ENV: &str = "SUNDOG_SEEDS";
 const DEFAULT_REDISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 
-/// A fixed seed list: explicit addresses from the builder, merged with the
-/// `SUNDOG_SEEDS=host:port,host:port` environment variable if it is set.
-///
-/// Entries may be hostnames as well as literal addresses — each is
-/// re-resolved through the OS resolver on every rediscovery tick, so DNS
-/// changes are picked up. The candidate stream never ends: it re-yields the
-/// whole (de-duplicated) seed set on a slow interval, which is what lets a
-/// fully restarted cluster re-find itself.
+/// A fixed seed list: explicit addresses merged with `SUNDOG_SEEDS`.
+/// Entries may be hostnames; each re-resolves through the OS resolver on
+/// every rediscovery tick. The candidate stream never ends, re-yielding the
+/// deduplicated seed set on a slow interval so a restarted cluster can
+/// re-find itself.
 pub struct Static {
     specs: Arc<[String]>,
     rediscover_interval: Duration,
@@ -30,22 +26,21 @@ pub struct Static {
 
 impl Static {
     /// Builds a seed list from explicit addresses, merged with
-    /// `SUNDOG_SEEDS` if it is set. Duplicate entries (by their `host:port`
-    /// text form) are collapsed to one.
+    /// `SUNDOG_SEEDS` if set. Duplicate entries collapse to one.
     #[must_use]
     pub fn new(seeds: impl IntoIterator<Item = SocketAddr>) -> Self {
         let explicit = seeds.into_iter().map(|addr| addr.to_string());
         Self::from_specs(explicit.chain(env_seed_specs()))
     }
 
-    /// Builds a seed list from `SUNDOG_SEEDS` alone, with no explicit
-    /// addresses. Equivalent to `Static::new(std::iter::empty())`.
+    /// Builds a seed list from `SUNDOG_SEEDS` alone. Equivalent to
+    /// `Static::new(std::iter::empty())`.
     #[must_use]
     pub fn from_env() -> Self {
         Self::new(std::iter::empty())
     }
 
-    /// Overrides the default 30s rediscovery interval.
+    /// Overrides the default 30s rediscover interval.
     #[must_use]
     pub fn with_rediscover_interval(mut self, interval: Duration) -> Self {
         self.rediscover_interval = interval;
@@ -81,9 +76,8 @@ fn parse_seed_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Resolves every spec via the OS resolver, skipping (and logging) any that
-/// fail rather than failing the whole round — one bad seed must never stop
-/// the rest from being discovered.
+/// Resolves every spec via the OS resolver, skipping and logging any that
+/// fail rather than failing the whole round.
 async fn resolve_specs(specs: &[String]) -> Vec<SocketAddr> {
     let mut resolved = Vec::new();
     for spec in specs {

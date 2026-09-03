@@ -1,14 +1,12 @@
 //! The `Invalidate`-class per-peer outbox: a bounded FIFO that drops the
-//! *oldest* queued entry on overflow rather than rejecting the newest,
-//! because an invalidation storm on a dead peer must never stall
-//! writers. `Replicate`-class traffic uses a plain `tokio::sync::mpsc`
-//! channel instead (see `net::conn`), since its overflow policy — drop the
-//! new entry — is exactly what `try_send` already gives for free.
+//! oldest queued entry on overflow rather than rejecting the newest. An
+//! invalidation storm on a dead peer must never stall writers.
+//! `Replicate`-class traffic uses a plain `tokio::sync::mpsc` channel
+//! instead (`net::conn`), whose drop-the-newest overflow is what `try_send`
+//! already gives.
 //!
-//! Generic over the queued element type `T` (`super::OutFrame` in
-//! production: a message paired with its already-encoded wire frame)
-//! purely so this drop-policy logic is provably independent of what is
-//! actually being queued; see this module's tests.
+//! Generic over the queued element type `T` so this drop-policy logic stays
+//! independent of what is queued.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -16,9 +14,8 @@ use std::sync::Mutex;
 use tokio::sync::Notify;
 
 /// A bounded queue that discards its oldest entry rather than rejecting a
-/// push once full. `push` is synchronous and non-blocking, matching
-/// [`super::Mesh::send`]'s fire-and-forget contract; `pop` is the async side
-/// the per-peer writer task awaits.
+/// push once full. `push` is synchronous and non-blocking; `pop` is the
+/// async side the per-peer writer task awaits.
 pub(super) struct DropOldestQueue<T> {
     inner: Mutex<VecDeque<T>>,
     notify: Notify,
@@ -34,8 +31,7 @@ impl<T> DropOldestQueue<T> {
         }
     }
 
-    /// Enqueues `item`, dropping the oldest queued entry first if already
-    /// at capacity. Never blocks.
+    /// Enqueues `item`, dropping the oldest entry first if already at capacity.
     pub(super) fn push(&self, item: T) {
         let mut queue = self
             .inner
@@ -49,11 +45,8 @@ impl<T> DropOldestQueue<T> {
         self.notify.notify_one();
     }
 
-    /// Removes and returns the oldest queued entry if one is present,
-    /// without waiting — the non-blocking counterpart to
-    /// [`DropOldestQueue::pop`], for draining whatever is already queued
-    /// once the writer has been woken (Aeron-style smart batching: coalesce
-    /// only what's already there, never wait for more).
+    /// Removes and returns the oldest queued entry, if any, without
+    /// waiting. The non-blocking counterpart to [`DropOldestQueue::pop`].
     pub(super) fn try_pop(&self) -> Option<T> {
         self.inner
             .lock()
@@ -88,7 +81,7 @@ mod tests {
         let queue = DropOldestQueue::new(2);
         queue.push(1u64);
         queue.push(2u64);
-        queue.push(3u64); // 1 should be dropped, not 3
+        queue.push(3u64); // drops 1, not 3
 
         assert_eq!(queue.pop().await, 2);
         assert_eq!(queue.pop().await, 3);

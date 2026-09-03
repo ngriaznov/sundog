@@ -1,7 +1,6 @@
 //! `Mdns`: the zeroconf default. Registers `_sundog._udp.local.` (cluster
-//! name as a TXT property, instance = node id) and browses continuously via
-//! `mdns-sd`. Does not cross the default Docker bridge — compose demos use
-//! `Static` instead.
+//! name as a TXT property, instance = node id) and browses continuously.
+//! Does not cross the default Docker bridge; compose demos use `Static`.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -18,15 +17,11 @@ const CLUSTER_TXT_KEY: &str = "cluster";
 
 /// Zeroconf discovery over `_sundog._udp.local.` via `mdns-sd`. Registers
 /// this node's instance (TXT `cluster=<name>`) on [`Discovery::announce`]
-/// and browses continuously for others, filtering out any advertising a
-/// different cluster name.
+/// and browses continuously, filtering out any other cluster name.
 ///
-/// `ServiceDaemon::new` does not itself open the multicast sockets — per its
-/// own docs those open lazily on the daemon thread, so an environment
-/// without multicast (many CI containers) surfaces no error here, from
-/// `browse`, or from `register`; the candidate stream never yields anything.
-/// A hard daemon-startup failure (rare) is logged and degrades the same way,
-/// so this type never panics regardless of multicast availability.
+/// The multicast sockets open lazily on the daemon thread, so an
+/// environment without multicast surfaces no error anywhere here; the
+/// candidate stream never yields anything instead. This type never panics.
 pub struct Mdns {
     cluster_name: SmolStr,
     instance_name: String,
@@ -34,9 +29,8 @@ pub struct Mdns {
 }
 
 impl Mdns {
-    /// `instance_name` becomes the mDNS instance label — typically the node
-    /// name; `cluster_name` is both the TXT filter applied to browse
-    /// results and the value this node advertises on announce.
+    /// `instance_name` becomes the mDNS instance label. `cluster_name` is
+    /// both the browse-result TXT filter and the announced value.
     #[must_use]
     pub fn new(cluster_name: impl Into<SmolStr>, instance_name: impl Into<String>) -> Self {
         let daemon = ServiceDaemon::new()
@@ -106,8 +100,8 @@ fn build_service_info(
 }
 
 /// Extracts a candidate address from a resolved event, filtering out
-/// services from any other cluster. Prefers an IPv4 address, falling back
-/// to whatever the peer advertised.
+/// services from any other cluster. Prefers IPv4, falling back to whatever
+/// the peer advertised.
 fn resolved_addr(event: &ServiceEvent, cluster_name: &str) -> Option<SocketAddr> {
     let ServiceEvent::ServiceResolved(resolved) = event else {
         return None;
@@ -150,8 +144,7 @@ mod tests {
 
     #[test]
     fn constructing_never_panics_even_without_multicast() {
-        // Exercises the graceful-degradation path this module documents:
-        // whatever the sandbox's multicast support, `new` must not panic.
+        // `new` must not panic regardless of the sandbox's multicast support.
         let _discovery = Mdns::new("test-cluster", "test-node");
     }
 

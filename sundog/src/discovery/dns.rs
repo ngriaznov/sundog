@@ -16,13 +16,10 @@ use super::Discovery;
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// SRV-record discovery against a headless service name, e.g.
-/// `_sundog._tcp.my-cluster.svc.cluster.local.` on Kubernetes.
-///
-/// Falls back to a plain A/AAAA lookup of `service_name` (paired with
-/// `fallback_port`) when it has no SRV records, so a bare hostname works
-/// too. Polls on an interval rather than once, so a rolling DNS update
-/// (pod restarts, a scaled headless service) is picked up without a
-/// restart.
+/// `_sundog._tcp.my-cluster.svc.cluster.local.` on Kubernetes. Falls back to
+/// an A/AAAA lookup of `service_name`/`fallback_port` with no SRV records,
+/// so a bare hostname works too. Polls on an interval to pick up rolling
+/// DNS updates without a restart.
 pub struct DnsSrv {
     resolver: Option<TokioResolver>,
     service_name: String,
@@ -31,10 +28,8 @@ pub struct DnsSrv {
 }
 
 impl DnsSrv {
-    /// Builds a resolver against the system DNS configuration
-    /// (`/etc/resolv.conf` on Unix). If the resolver fails to initialize,
-    /// this degrades to a permanently empty candidate stream rather than
-    /// failing the whole discovery source.
+    /// Builds a resolver against the system DNS configuration. A failed
+    /// resolver degrades to a permanently empty candidate stream.
     #[must_use]
     pub fn new(service_name: impl Into<String>, fallback_port: u16) -> Self {
         let resolver = TokioResolver::builder_tokio()
@@ -51,7 +46,7 @@ impl DnsSrv {
         }
     }
 
-    /// Overrides the default 30s poll interval.
+    /// Overrides the default poll interval of 30s.
     #[must_use]
     pub fn with_interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
@@ -59,10 +54,8 @@ impl DnsSrv {
     }
 }
 
-/// One resolution round: SRV first, falling back to A/AAAA on
-/// `service_name` itself when no SRV records exist. Failures are logged and
-/// yield an empty (not error) result — a transient DNS hiccup must not end
-/// the candidate stream.
+/// One resolution round: SRV first, falling back to A/AAAA. Failures are
+/// logged and yield an empty result, never an error.
 async fn resolve_once(
     resolver: &TokioResolver,
     service_name: &str,
