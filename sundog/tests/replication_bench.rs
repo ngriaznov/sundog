@@ -1,26 +1,17 @@
-//! Replication-cost baseline — in-process, real `Static`-discovery loopback
-//! nodes, public API only — the honest "before" numbers an optimization
-//! phase is judged against. Not a correctness
-//! suite: nothing here asserts a performance bound, it only measures and
-//! prints.
+//! Replication-cost baseline: in-process, real `Static`-discovery loopback
+//! nodes, public API only. Not a correctness suite; it measures and prints.
 //!
-//! Gated on `SUNDOG_BENCH=1` (checked first thing in every test, an
-//! `eprintln!` and early return otherwise, mirroring `tests/containers.rs`)
-//! rather than `#[ignore]`, so a plain `cargo test --workspace` run still
-//! compiles and "passes" this binary without spending the wall-clock a
-//! 100k-entry replication run costs.
-//!
-//! All scenarios below share the process-wide wire counters in
-//! `sundog::net` (`frames_sent_total`/`bytes_sent_total`), so run this
-//! binary single-threaded or the scenarios' deltas bleed into each other:
+//! Gated on `SUNDOG_BENCH=1`, an `eprintln!` and early return otherwise, so
+//! a plain `cargo test` run still compiles without the wall-clock cost.
+//! Scenarios share the process-wide wire counters in `sundog::net`, so run
+//! this binary single-threaded:
 //!
 //! ```text
 //! SUNDOG_BENCH=1 cargo test --release -p sundog --test replication_bench \
 //!     -- --test-threads=1 --nocapture
 //! ```
 //!
-//! Each `BENCH` line is one `key=value`-per-metric record, meant to be
-//! `grep`bable across runs rather than parsed as structured output.
+//! Each `BENCH` line is one `key=value`-per-metric record, `grep`bable.
 
 mod common;
 
@@ -34,9 +25,7 @@ fn bench_enabled() -> bool {
 }
 
 /// Mirrors `tests/tls.rs`'s own copy: the only way, from outside the crate,
-/// to learn a concrete gossip address before the node that will bind it
-/// exists — every node in a mutually-`Static`-seeded group needs the
-/// others' addresses up front.
+/// to learn a gossip address before the node that binds it exists.
 async fn reserve_gossip_addr() -> SocketAddr {
     let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -87,19 +76,10 @@ fn bench_value(i: u32) -> String {
 }
 
 /// The shape that matters for a bulk-write baseline: 100k sequential local
-/// inserts on one node of a 3-node `Replicated` cluster,
-/// timing (a) the insert loop itself — local apply plus a non-blocking
-/// fan-out push, per `net::PeerHandle::send`'s docs — and (b) wall time
-/// until the other two nodes' local copies both fully catch up, which in
-/// the steady default config (`outbox_capacity` 8,192 against 100k writes)
-/// leans heavily on anti-entropy repair rather than the live fan-out path,
-/// exactly as the crate's drop-policy semantics predict.
-///
-/// Multi-threaded runtime: an embedded cache's host application overwhelmingly
-/// runs one, and on a current-thread runtime the insert loop, both peers'
-/// coalescers, the TCP writers, and any concurrent anti-entropy rounds all
-/// serialize onto one core — charging the whole replication engine's CPU time
-/// to the caller's insert loop and making `insert_secs` a fiction.
+/// inserts on one node of a 3-node `Replicated` cluster, timing the insert
+/// loop itself and wall time until the other two nodes fully catch up.
+/// Multi-threaded runtime, so fan-out and anti-entropy do not share the
+/// insert loop's core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_insert_replication() {
     const ENTRIES: u32 = 100_000;
@@ -165,13 +145,9 @@ async fn bulk_insert_replication() {
     }
 }
 
-/// [`bulk_insert_replication`]'s counterpart through the batch API: the same
-/// 100k entries on the same 3-node cluster, but handed to `insert_many` as
-/// one call — the path a bulk loader should actually use. Amortizes
-/// per-call overhead and lets the store apply under far fewer lock
-/// acquisitions, so the spread between this scenario's `insert_secs` and the
-/// sequential loop's is the price of writing bulk data one `insert` at a
-/// time.
+/// [`bulk_insert_replication`]'s counterpart through the batch API: the
+/// same 100k entries handed to `insert_many` as one call, the path a bulk
+/// loader uses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bulk_insert_many_replication() {
     const ENTRIES: u32 = 100_000;
@@ -235,12 +211,9 @@ async fn bulk_insert_many_replication() {
     }
 }
 
-/// The read path, which no other scenario measures: 1M `get` calls against a
-/// warm 100k-entry cache on a live 2-node `Replicated` cluster. Reads are
-/// pure local lookups — no network hop, by design — so `per_read_nanos` is
-/// the number that justifies "embedded": it should sit orders of magnitude
-/// under any networked cache's round trip. The cost measured is the honest
-/// public-API cost, value clone and `async` machinery included.
+/// The read path, which no other scenario measures: 1M `get` calls against
+/// a warm 100k-entry cache on a live 2-node `Replicated` cluster. Reads are
+/// pure local lookups, so `per_read_nanos` justifies "embedded".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_read_latency() {
     const ENTRIES: u32 = 100_000;
@@ -294,13 +267,9 @@ async fn local_read_latency() {
     cluster_b.shutdown().await;
 }
 
-/// [`local_read_latency`]'s quiet-path control: the same 1M reads against
-/// the same warm 100k entries, but on a [`Mode::Local`] cache — no
-/// anti-entropy loop attaches to it, so nothing iterates the store behind
-/// the reader's back. The spread between this number and
-/// [`local_read_latency`]'s is the ambient cost of *being* a live
-/// `Replicated` member (background digest scans and bucket iteration
-/// sharing the machine), not of the read path itself.
+/// [`local_read_latency`]'s quiet-path control: the same 1M reads on a
+/// [`Mode::Local`] cache, with no anti-entropy loop attached. The spread
+/// is the ambient cost of being a live `Replicated` member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_mode_read_latency() {
     const ENTRIES: u32 = 100_000;
@@ -348,13 +317,9 @@ async fn local_mode_read_latency() {
     cluster_b.shutdown().await;
 }
 
-/// Per-write overhead signal at a scale small enough to run every commit:
-/// 5,000 sequential inserts on one node of a live 2-node `Replicated`
-/// cluster, wall time only — no convergence wait, since the point is the
-/// caller-observed cost of `insert` itself under real (if idle) fan-out.
-/// Multi-threaded runtime for the same representativeness reason as
-/// [`bulk_insert_replication`]: the fan-out machinery must not share the
-/// insert loop's core.
+/// Per-write overhead at a scale small enough to run every commit: 5,000
+/// sequential inserts on one node of a live 2-node `Replicated` cluster,
+/// wall time only, no convergence wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steady_small_writes() {
     const ENTRIES: u32 = 5_000;
@@ -407,22 +372,11 @@ async fn steady_small_writes() {
     cluster_b.shutdown().await;
 }
 
-/// [`steady_small_writes`]'s single-worker baseline, but driven by
-/// `WRITERS` concurrent workers writing disjoint keys to the same node's
-/// cache handle at once — the shape the apply-serialization lock's
-/// per-key-bucket striping exists for, which `steady_small_writes`'
-/// single-worker loop can never exercise regardless of how cheap a single
-/// `insert` call is. A single global apply lock would serialize every
-/// concurrent writer here no matter which keys they touch; striping lets
-/// writers whose keys land in different stripes proceed independently, so
-/// this scenario's `per_write_micros` is the number a striped lock
-/// visibly improves, unlike `steady_small_writes`' or
-/// `bulk_insert_replication`'s (both single-worker, sequential inserts).
-///
-/// Multi-threaded runtime, unlike every other test in this binary — the
-/// point is real cross-core parallelism putting actual lock contention on
-/// the apply-serialization stripe(s), which a single-threaded runtime's
-/// cooperative scheduling can't produce.
+/// [`steady_small_writes`]'s counterpart under real contention: `WRITERS`
+/// concurrent workers writing disjoint keys to the same cache handle at
+/// once, the shape the apply lock's per-key-bucket striping exists for.
+/// Multi-threaded runtime, so real cross-core contention lands on the
+/// apply-serialization stripes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_small_writes() {
     const ENTRIES: u32 = 5_000;

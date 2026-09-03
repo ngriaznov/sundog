@@ -1,5 +1,4 @@
-//! Interactive TUI application state: node selection, the merged event
-//! feed, and the key handling that drives fault injection.
+//! Interactive TUI application state: node selection, event feed, key handling.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -13,8 +12,7 @@ use crate::setup::Demo;
 
 const FEED_CAPACITY: usize = 400;
 
-/// The TUI's mutable state for one run: node handles live under `demo`,
-/// everything else here is presentation state.
+/// The TUI's mutable state for one run: node handles under `demo`, the rest presentation state.
 pub(crate) struct App {
     pub(crate) demo: Demo,
     pub(crate) cursor: usize,

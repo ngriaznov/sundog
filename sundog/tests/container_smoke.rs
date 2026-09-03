@@ -1,12 +1,9 @@
 //! Smoke validation for the rightsize container harness: one
-//! `sundog-testnode` container boots for real and answers `count` over its
-//! mapped control port. Gated on `SUNDOG_CONTAINER_TESTS=1` like the rest of
-//! the container suite — it needs a container backend
-//! (`RIGHTSIZE_BACKEND=docker`) and a musl toolchain.
+//! `sundog-testnode` container boots and answers `count` over its control
+//! port. Gated on `SUNDOG_CONTAINER_TESTS=1`.
 //!
-//! Run: `SUNDOG_CONTAINER_TESTS=1 SUNDOG_TEST_BASE_IMAGE=rz-base:local
-//! RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test
-//! container_smoke -- --nocapture`.
+//! Run `SUNDOG_CONTAINER_TESTS=1 SUNDOG_TEST_BASE_IMAGE=rz-base:local
+//! RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test container_smoke -- --nocapture`.
 
 mod container_util;
 

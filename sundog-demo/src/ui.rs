@@ -1,5 +1,3 @@
-//! Rendering: node table, event feed, and status bar.
-
 use std::sync::atomic::Ordering;
 
 use ratatui::Frame;

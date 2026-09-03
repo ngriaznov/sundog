@@ -1,15 +1,10 @@
-//! Property tests for the store. [`permutation_convergence`] is the direct
-//! test of the license for the whole loss-tolerant design: applying the
-//! same multiset of versioned writes, in any order, with any duplication,
-//! converges to byte-identical state. Alongside it: a focused tombstone/put
-//! race property, incremental-digest-vs-full-recompute across arbitrary op
-//! sequences including anti-entropy-style repairs and tombstone GC, a
-//! clock-driven property that puts [`Shard::with_clock`] through TTL expiry
-//! and sweep correctness on a manual clock instead of real time, and
+//! Property tests for the store. [`permutation_convergence`] applies the
+//! same multiset of versioned writes, in any order with any duplication,
+//! to multiple shards and checks they converge to byte-identical state.
+//! Other properties cover a tombstone/put race, incremental digest against
+//! full recompute, TTL and sweep under a manual clock, and
 //! [`shard_matches_the_reference_model_under_arbitrary_op_sequences`], which
-//! runs the [`model::run`] driver `sundog-fuzz`'s stateful apply-path
-//! targets use, over proptest-generated op sequences instead of
-//! libFuzzer-guided ones.
+//! runs the [`model::run`] driver over proptest-generated op sequences.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,12 +17,9 @@ use super::*;
 
 /// Origin nodes a generated workload is spread across.
 const NUM_NODES: u8 = 3;
-/// Fresh shards the same multiset is replayed into, each under its own
-/// sampled permutation and duplication.
+/// Fresh shards the multiset replays into under independent permutations.
 const NUM_REPLICAS: usize = 4;
-/// Keyspace size: small on purpose, so puts/removes from different origins
-/// collide on the same key and race — the case that exercises versioned-apply
-/// convergence.
+/// Keyspace size, small enough that writes from different origins collide.
 const KEYSPACE: u8 = 8;
 
 #[derive(Debug, Clone, Copy)]
@@ -46,12 +38,9 @@ fn op_strategy() -> impl Strategy<Value = (u8, OpKind)> {
     )
 }
 
-/// Turns a sequence of (origin, op) pairs into the actual multiset of
-/// [`WireRecord`]s a live cluster would have produced: each origin stamps
-/// with its own [`HlcClock`], and every write is observed by the next node
-/// in rotation immediately after — a stand-in for the gossip/replication
-/// exchange that makes real HLC stamps interleave across nodes instead of
-/// only advancing independently.
+/// Turns (origin, op) pairs into the [`WireRecord`] multiset a live cluster
+/// would produce: each origin stamps with its own [`HlcClock`], observed by
+/// the next node in rotation, mimicking gossip interleaving HLC stamps.
 fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
     let mut clocks: Vec<HlcClock> = (0..NUM_NODES)
         .map(|i| HlcClock::new(NodeId::from(u64::from(i) + 1)))
@@ -90,9 +79,8 @@ fn build_records(ops: &[(u8, OpKind)]) -> Vec<WireRecord> {
         .collect()
 }
 
-/// Duplicates every record a random number of times (1–3) and shuffles the
-/// result under `seed` — a sampled permutation with random duplication,
-/// deterministic given the seed so proptest shrinking stays reproducible.
+/// Duplicates every record 1-3 times and shuffles under `seed`,
+/// deterministic so proptest shrinking stays reproducible.
 fn shuffled_with_duplicates(records: &[WireRecord], seed: u64) -> Vec<WireRecord> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut expanded = Vec::with_capacity(records.len() * 2);
@@ -106,11 +94,8 @@ fn shuffled_with_duplicates(records: &[WireRecord], seed: u64) -> Vec<WireRecord
     expanded
 }
 
-/// The full observable state of a shard, canonicalized (sorted by key) so two
-/// shards that converged to the same content compare equal regardless of
-/// internal (per-stripe) iteration order: live entries as `(key, value,
-/// ver)`, the tombstone set as `(key, ver)`, and all [`BUCKET_COUNT`]
-/// digests.
+/// A shard's full observable state, sorted by key so two converged shards
+/// compare equal regardless of internal iteration order.
 type CanonicalState = (Vec<(Bytes, Bytes, Hlc)>, Vec<(Bytes, Hlc)>, Vec<u64>);
 
 fn canonical_state<K, V>(shard: &Shard<K, V>) -> CanonicalState
@@ -125,17 +110,9 @@ where
     (live, tomb, digest)
 }
 
-/// Applies `records` (already permuted and duplicated by
-/// [`shuffled_with_duplicates`]) as a mix of single and batch applies:
-/// `seed`-derived contiguous run lengths (1..=4) decide, for each run,
-/// whether it goes through [`ShardOps::apply_remote`] (length 1) or
-/// [`ShardOps::apply_remote_batch`] (length > 1, one lock acquisition for
-/// the whole run) — mirroring how live traffic arrives (a coalesced
-/// `Msg::ReplicateBatch` next to individual `Msg::Replicate`s).
-/// Consuming `records` in order and only choosing how to *group* the calls
-/// keeps the effective application order identical to always calling
-/// `apply_remote` one record at a time, so this converges to the same state
-/// the single-apply path always has.
+/// Applies permuted `records` as a mix of single and batch applies:
+/// `seed`-derived run lengths decide [`ShardOps::apply_remote`] vs
+/// [`ShardOps::apply_remote_batch`], preserving record order either way.
 async fn apply_mixed<K, V>(shard: &Shard<K, V>, records: Vec<WireRecord>, seed: u64)
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -156,16 +133,9 @@ where
     }
 }
 
-/// Applies `records` (already permuted and duplicated by
-/// [`shuffled_with_duplicates`]) via real concurrent scheduling rather than
-/// [`apply_mixed`]'s sequential run-grouping: splits into a handful of
-/// partitions and drives them all through [`tokio::spawn`] at once (each
-/// partition itself applied via [`apply_mixed`]'s single/batch mix). Two
-/// records for the same key landing in different partitions is exactly the
-/// stress case per-key stripe serialization exists for — the stripe's own
-/// lock, not program order, keeps concurrently scheduled applies to that key
-/// from racing — so this still converges to the identical state
-/// [`apply_mixed`] alone always has.
+/// Applies permuted `records` via real concurrent scheduling: splits into
+/// partitions driven through [`tokio::spawn`] at once, each partition
+/// applied via [`apply_mixed`]. Per-key stripe locking still converges.
 async fn apply_concurrent<K, V>(shard: &Arc<Shard<K, V>>, records: Vec<WireRecord>, seed: u64)
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -202,15 +172,10 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// The permutation-convergence property: apply the same multiset of
-    /// writes/removes across several interleaved-clock origin nodes to
-    /// multiple fresh shards, each in its own sampled permutation with
-    /// random duplication — the converged state (live entries, tombstones,
-    /// and all 1024 digests) is byte-identical everywhere. Alternates, by
-    /// seed parity, between [`apply_mixed`]'s sequential single/batch mix and
-    /// [`apply_concurrent`]'s real concurrent scheduling across stripes, so
-    /// the property holds under real scheduling too, not only sampled
-    /// sequential orderings.
+    /// The permutation-convergence property: the same multiset of writes and
+    /// removes, applied to several shards under independent permutation and
+    /// duplication and alternating [`apply_mixed`] with [`apply_concurrent`],
+    /// converges to byte-identical state everywhere.
     #[test]
     fn permutation_convergence(
         ops in proptest::collection::vec(op_strategy(), 4..40),
@@ -248,10 +213,8 @@ proptest! {
         });
     }
 
-    /// Focused tombstone/put race: whichever of a put and a tombstone at the
-    /// same key carries the newer [`Hlc`] wins, and that outcome — plus the
-    /// full converged state — is identical across every permutation and
-    /// duplication of the two records.
+    /// Focused tombstone/put race: the newer [`Hlc`] wins at a shared key,
+    /// and that outcome and the full converged state hold under any order.
     #[test]
     fn tombstone_put_race_converges_regardless_of_order(
         put_wall in 0u64..10_000,
@@ -261,9 +224,8 @@ proptest! {
         put_value in any::<u16>(),
         seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
     ) {
-        // Disjoint node-id ranges: put and tombstone always come from
-        // distinct nodes, so their stamps never tie and the race always has
-        // a definitive winner.
+        // Disjoint node ranges keep put and tombstone stamps from tying, so
+        // the race always has a definitive winner.
         let put_ver = Hlc {
             wall_ms: put_wall,
             logical: 0,
@@ -322,8 +284,7 @@ proptest! {
     }
 }
 
-/// Compares the engine's incrementally-maintained digest against
-/// [`engine::Engine::recompute_digests`]'s full pass over every stripe.
+/// Compares the incremental digest against a full recompute.
 fn digest_matches_full_recompute<K, V>(shard: &Shard<K, V>) -> bool
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -357,11 +318,9 @@ fn digest_op_strategy() -> impl Strategy<Value = DigestOp> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// After an arbitrary sequence of local writes, remote applies,
-    /// invalidations, and tombstone GC, the incrementally-maintained digest
-    /// always equals a full recompute from the live entries and un-GC'd
-    /// tombstones — and immediately after a GC pass (with `tombstone_ttl`
-    /// zeroed), every tombstone is gone.
+    /// After arbitrary local writes, remote applies, invalidations, and
+    /// tombstone GC, the incremental digest always equals a full recompute,
+    /// and a GC pass with `tombstone_ttl` zeroed clears every tombstone.
     #[test]
     fn digest_matches_recompute_after_arbitrary_ops_and_gc(
         ops in proptest::collection::vec(digest_op_strategy(), 4..60),
@@ -428,10 +387,8 @@ proptest! {
     }
 }
 
-/// One op in [`clock_driven_sweep_keeps_digest_and_readability_consistent`]'s
-/// workload: a TTL'd local insert, a remove, a remote apply carrying its own
-/// (possibly already-past) absolute deadline, a manual-clock advance, a
-/// sweep, or a tombstone GC pass.
+/// One op in the clock-driven workload: a TTL'd insert, a remove, a remote
+/// apply with its own deadline, a clock advance, a sweep, or a GC pass.
 #[derive(Debug, Clone, Copy)]
 enum ClockOp {
     InsertTtl(u8, u16, u16),
@@ -461,9 +418,7 @@ fn clock_op_strategy() -> impl Strategy<Value = ClockOp> {
 }
 
 /// [`ShardOps::digests`] equals a full recompute over
-/// [`ShardOps::entries_for_buckets`] — the same check anti-entropy itself
-/// makes, using only the public trait surface (no reach into engine
-/// internals, unlike [`digest_matches_full_recompute`] above).
+/// [`ShardOps::entries_for_buckets`], the same check anti-entropy makes.
 async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
     let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
     let mut expected = vec![0u64; BUCKET_COUNT];
@@ -480,10 +435,8 @@ async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
     actual == expected
 }
 
-/// For every key in the small keyspace that currently reads as present, its
-/// own record's `expires_at_ms` (fetched through the public
-/// [`ShardOps::records_for`], not engine internals) is not yet past
-/// `now_ms` — the direct statement of "no readable entry is expired".
+/// For every key currently readable, its own record's `expires_at_ms` is
+/// not yet past `now_ms`.
 async fn assert_no_readable_entry_is_expired(shard: &Shard<u8, u16>, now_ms: u64) {
     for k in 0..KEYSPACE {
         if shard.get(&k).await.is_none() {
@@ -507,14 +460,10 @@ async fn assert_no_readable_entry_is_expired(shard: &Shard<u8, u16>, now_ms: u64
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// Drives a shard through random TTL'd inserts, remote applies (each
-    /// carrying its own absolute, possibly already-past deadline), removes,
-    /// manual-clock advances, sweeps, and tombstone GC — all timestamped by
-    /// a manual clock installed via [`Shard::with_clock`], never real time,
-    /// so this runs fast and deterministically. After every
-    /// [`ClockOp::Sweep`], the digest equals a full recompute over
-    /// [`ShardOps::entries_for_buckets`], and no readable entry is past its
-    /// own deadline.
+    /// Drives a shard through random TTL'd inserts, remote applies, removes,
+    /// clock advances, sweeps, and GC, all timestamped by a manual clock.
+    /// After every [`ClockOp::Sweep`], the digest matches a full recompute
+    /// and no readable entry is past its deadline.
     #[test]
     fn clock_driven_sweep_keeps_digest_and_readability_consistent(
         ops in proptest::collection::vec(clock_op_strategy(), 4..80),
@@ -587,19 +536,10 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    /// Runs [`model::run`] — the driver `sundog-fuzz`'s `apply_model` and
-    /// `apply_permutation` targets use — over a sequence of `model::Op`,
-    /// each one `arbitrary`-generated and bridged into a proptest strategy
-    /// by `proptest-arbitrary-interop`, with `proptest::collection::vec`
-    /// controlling the sequence length. Asking `arb` for the whole
-    /// `Vec<Op>` at once would hand length control to `arbitrary`'s own
-    /// geometric continuation instead, which averages under two ops per
-    /// sequence — far too short to exercise cross-op interactions. The
-    /// model and the driver's assertions live once, in `store::model`; this
-    /// test and the fuzz targets differ only in how they sample op
-    /// sequences, so a divergence either finds is a real bug in versioned
-    /// apply, digest bookkeeping, tombstone retention, expiry, or resolver —
-    /// not in this test, which has no assertions of its own.
+    /// Runs [`model::run`], the driver `sundog-fuzz`'s apply-path targets
+    /// use, over `arbitrary`-generated `model::Op` sequences sampled by
+    /// `proptest::collection::vec` for length control. A divergence is a
+    /// real bug in versioned apply, digests, retention, expiry, or resolver.
     #[test]
     fn shard_matches_the_reference_model_under_arbitrary_op_sequences(
         ops in proptest::collection::vec(arb::<model::Op>(), 1..128),

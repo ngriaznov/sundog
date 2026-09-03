@@ -1,9 +1,7 @@
-//! `sundog-demo`: an interactive chaos-testing TUI for a `sundog` cluster —
-//! spawns N in-process nodes over static loopback seeds, drives a
+//! `sundog-demo`: an interactive chaos-testing TUI for a `sundog` cluster.
+//! Spawns N in-process nodes over static loopback seeds, drives a
 //! background write-load, and lets you kill/restart nodes to watch
 //! replication and anti-entropy repair the divergence live.
-//! `--headless <SECS>` runs the same load without a terminal, for CI smoke
-//! checks.
 
 mod app;
 mod cli;

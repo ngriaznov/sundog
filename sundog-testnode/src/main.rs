@@ -1,35 +1,27 @@
 //! Container test-node: embeds the sundog library behind a tiny line-based
 //! control protocol, so the rightsize harness (`sundog/tests/container_util`)
 //! can drive a real cluster member from outside its container. Built as a
-//! static musl binary — no libc dependency inside the guest image.
+//! static musl binary with no libc dependency.
 //!
 //! Usage: `sundog-testnode <cluster-name>`, with `SUNDOG_SEEDS` a
-//! comma-separated list of `host:port` gossip seeds (Docker network aliases
-//! resolve here via ordinary DNS). Opens one `Mode::Replicated` cache named
-//! `"it"` and prints `testnode-ready` once the control listener is up — the
-//! harness's `Wait::for_log_message` target.
+//! comma-separated list of `host:port` gossip seeds. Opens one
+//! `Mode::Replicated` cache named `"it"` and prints `testnode-ready` once
+//! the control listener is up.
 //!
-//! Control protocol, one command per line, one line-terminated reply each
-//! (`quit` excepted): `put k v` -> `ok`; `get k` -> `val <v>` | `none`;
-//! `del k` -> `ok`; `count` -> `<n>` (live local entries, read from the
-//! store); `fill n` -> `ok` (bulk-inserts `k0..kn` = `v0..vn` locally);
+//! Control protocol, one command per line, one line-terminated reply each:
+//! `put k v` -> `ok`; `get k` -> `val <v>` | `none`; `del k` -> `ok`;
+//! `count` -> `<n>`; `fill n` -> `ok`, bulk-inserting `k0..kn` = `v0..vn`;
 //! `peers` -> `<n>`; `quit` -> exits 0.
 //!
 //! A second `Mode::Replicated` cache named `"churn"` carries a short TTL
-//! (`CHURN_TTL`) for high-frequency lifecycle tests: `churn n` -> `ok` runs
-//! `n` back-to-back operations over a fixed `CHURN_KEYSPACE`-key space —
-//! three inserts to every remove, full speed, no pacing — and `ccount` ->
-//! `<n>` reads that cache's live-entry count.
+//! (`CHURN_TTL`): `churn n` -> `ok` runs `n` operations (3:1 insert:remove)
+//! over `CHURN_KEYSPACE` keys; `ccount` -> `<n>` reads its live-entry count.
 //!
-//! Large-value commands work on the `"it"` cache with deterministic content
-//! ([`big_value`]), so a value is generated on the writing node and verified
-//! on a reading node without ever crossing the control connection:
-//! `bigfill n bytes` -> `ok` bulk-inserts `big0..bign` with `bytes`-sized
-//! values; `bigcheck i bytes` -> `ok` | `bad` | `none` regenerates and
-//! compares `bigi`'s value; `bigput bytes` -> `ok` | `err …` inserts one
-//! `bytes`-sized value under a fixed key (the `err` reply is the point for
-//! over-frame-cap sizes); `bigverify bytes` -> `ok` | `bad` | `none` checks
-//! that fixed key.
+//! Large-value commands work on `"it"` with deterministic content
+//! ([`big_value`]), verified without crossing the control connection:
+//! `bigfill n bytes` -> `ok`; `bigcheck i bytes` -> `ok` | `bad` | `none`;
+//! `bigput bytes` -> `ok` | `err ...`, the point for over-cap sizes;
+//! `bigverify bytes` -> `ok` | `bad` | `none`.
 
 use std::env;
 use std::io::Write as _;
@@ -44,28 +36,21 @@ const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
 const CACHE_NAME: &str = "it";
 const CHURN_CACHE_NAME: &str = "churn";
-/// Short enough that entries written early in a `churn` run expire while the
-/// run is still writing — replication of already-expired records is part of
-/// what the churn suite exists to exercise.
+/// Short enough that early `churn` writes expire while the run continues.
 const CHURN_TTL: Duration = Duration::from_secs(2);
-/// `churn` wraps keys modulo this, so concurrent churners on different nodes
-/// keep colliding on the same keys instead of writing disjoint ranges.
+/// `churn` wraps keys modulo this, so churners on different nodes collide.
 const CHURN_KEYSPACE: u32 = 512;
-/// The fixed key `bigput`/`bigverify` operate on, with [`BIG_ONE_INDEX`] as
-/// its content seed.
+/// The fixed key `bigput`/`bigverify` operate on.
 const BIG_ONE_KEY: &str = "bigone";
 const BIG_ONE_INDEX: u32 = u32::MAX;
 
-/// Deterministic large-value content: `index`'s hex digits cycled out to
-/// `len` bytes. Any node can regenerate and byte-compare a value locally, so
-/// content-integrity checks never ship the value itself over the control
-/// connection.
+/// Deterministic large-value content: `index`'s hex digits cycled to `len`
+/// bytes, so any node can regenerate and byte-compare it locally.
 fn big_value(index: u32, len: usize) -> String {
     format!("{index:08x}").chars().cycle().take(len).collect()
 }
 
-/// `ok` if `stored` matches [`big_value`]`(index, len)` exactly, `bad` (with
-/// a length hint) otherwise.
+/// `ok` if `stored` matches [`big_value`]`(index, len)`, `bad` otherwise.
 fn verdict(stored: &str, index: u32, len: usize) -> String {
     if stored == big_value(index, len) {
         "ok".to_string()
@@ -90,8 +75,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ClusterConfig::default().with(|c| {
         c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
-        // Faster than the library default so container tests converge in
-        // seconds, not the production 30s/10min cadence.
+        // Faster than the default so container tests converge in seconds.
         c.ae_interval = Duration::from_secs(2);
         c.tombstone_ttl = Duration::from_secs(10);
     });
@@ -123,10 +107,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Resolves each `host:port` entry via DNS (Docker network aliases included);
-/// a seed that fails to resolve is logged and skipped rather than failing
-/// startup — a lone first node with no reachable seeds is a healthy
-/// single-node cluster, exactly as `Cluster::builder` treats it.
+/// Resolves each `host:port` entry via DNS; a seed that fails to resolve
+/// is logged and skipped rather than failing startup.
 async fn resolve_seeds(spec: &str) -> Vec<SocketAddr> {
     let mut seeds = Vec::new();
     for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -222,8 +204,8 @@ async fn dispatch(
     }
 }
 
-/// The `big*` command family (see the module docs): every variant parses a
-/// trailing `usize` size, `bigfill`/`bigcheck` an index or count before it.
+/// The `big*` command family: every variant parses a trailing `usize` size,
+/// `bigfill`/`bigcheck` an index or count before it.
 async fn big_command(
     cache: &Cache<String, String>,
     command: &str,
@@ -256,8 +238,7 @@ async fn big_command(
             Ok(()) => "ok".to_string(),
             Err(error) => format!("err {error}"),
         },
-        // `bigcheck big{index}` or `bigverify`'s fixed key: regenerate and
-        // byte-compare locally.
+        // `bigcheck`/`bigverify`'s fixed key: regenerate and byte-compare.
         _ => {
             let key = if command == "bigcheck" {
                 format!("big{index}")

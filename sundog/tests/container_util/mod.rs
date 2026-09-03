@@ -1,15 +1,10 @@
 //! Dev-only harness for driving `sundog-testnode` inside real containers,
-//! exclusively through the `rightsize` crate — no docker CLI, no `bollard`.
+//! exclusively through the `rightsize` crate, never the docker CLI or
+//! `bollard`.
 //!
-//! `RIGHTSIZE_BACKEND=docker` is required for the multi-node suite: sundog's
-//! gossip is UDP, and rightsize's microsandbox network emulation relays TCP
-//! only (msb's `install_network_links`). Not enforced here — rightsize
-//! itself resolves `RIGHTSIZE_BACKEND` from the real environment — but every
-//! CI job that runs `tests/container_*` must set it; see `.github/workflows`.
-//!
-//! Each `tests/*.rs` binary that needs containers writes `mod container_util;`
-//! and pulls in only the helpers it needs — unused ones are expected, hence
-//! the blanket `dead_code` allow.
+//! `RIGHTSIZE_BACKEND=docker` is required: sundog's gossip is UDP, and
+//! rightsize's microsandbox network emulation relays TCP only. Every CI job
+//! running `tests/container_*` sets it; see `.github/workflows`.
 #![allow(dead_code)]
 
 use std::future::Future;
@@ -26,33 +21,24 @@ const CONTROL_PORT: u16 = 8080;
 const READY_LOG: &str = "testnode-ready";
 
 /// Gate for `tests/containers.rs`: `false` unless `SUNDOG_CONTAINER_TESTS=1`,
-/// so a plain `cargo test --workspace` run stays hermetic (no docker daemon,
-/// no musl toolchain required) while still compiling and "passing" the
-/// gated tests trivially.
+/// so a plain `cargo test --workspace` stays hermetic.
 #[must_use]
 pub fn container_tests_enabled() -> bool {
     std::env::var("SUNDOG_CONTAINER_TESTS").as_deref() == Ok("1")
 }
 
-/// Base image for test-node containers. Defaults to a normal, registry-pulled
-/// image; overridden locally (`SUNDOG_TEST_BASE_IMAGE=rz-base:local`) where
-/// registry pulls are blocked and a minimal placeholder image is pre-seeded
-/// in the local daemon instead. Any image works as long as it can run a
-/// static musl binary — `sundog-testnode` needs no libc, no shell.
+/// Base image for test-node containers, `SUNDOG_TEST_BASE_IMAGE` overrides
+/// it locally where registry pulls are blocked. Any image works as long as
+/// it can run a static musl binary.
 fn base_image() -> String {
     std::env::var("SUNDOG_TEST_BASE_IMAGE").unwrap_or_else(|_| "alpine:3.22".to_string())
 }
 
 /// Builds `sundog-testnode` for the musl target, once per test process, and
 /// returns its release binary path. `chitchat` pulls `zstd-sys`, which needs
-/// a C compiler for the musl target — `CC_x86_64_unknown_linux_musl` must
-/// point at a musl-capable `cc` (`musl-gcc`; CI installs `musl-tools`).
-///
+/// `CC_x86_64_unknown_linux_musl` to point at a musl-capable `cc`.
 /// # Panics
-///
-/// Panics if the build command cannot be spawned or exits non-zero — a build
-/// failure here means every container test in the binary is unusable, so
-/// there is no useful degraded path to fall back to.
+/// Panics if the build command cannot be spawned or exits non-zero.
 pub fn build_testnode() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
@@ -90,14 +76,10 @@ pub struct Node {
 
 impl Node {
     /// Starts one `sundog-testnode` container named `alias` on `net`, in
-    /// cluster `cluster_name`, seeded from `seeds` (peer aliases, e.g.
-    /// `["n1:7946"]`). Waits for the `testnode-ready` log line before
-    /// returning, so every `Node` this returns is immediately usable.
-    ///
+    /// cluster `cluster_name`, seeded from `seeds`. Waits for the
+    /// `testnode-ready` log line before returning.
     /// # Panics
-    ///
-    /// Panics if the container fails to start or never becomes ready — see
-    /// [`build_testnode`] for why there's no useful fallback here either.
+    /// Panics if the container fails to start or never becomes ready.
     pub async fn spawn(
         net: &Arc<Network>,
         cluster_name: &str,
@@ -137,12 +119,9 @@ impl Node {
         self.guard.name()
     }
 
-    /// `put k v` — `Ok(())` iff the node replied `ok`.
-    ///
+    /// `put k v`.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails, or the node's reply
-    /// isn't `ok`.
+    /// Returns `Err` if the connection fails or the reply is not `ok`.
     pub async fn put(&self, key: &str, value: &str) -> Result<(), String> {
         match self.command(&format!("put {key} {value}")).await?.as_str() {
             "ok" => Ok(()),
@@ -150,12 +129,9 @@ impl Node {
         }
     }
 
-    /// `get k` — `Some(value)` on `val <v>`, `None` on `none`.
-    ///
+    /// `get k`, returning `Some(value)` on `val <v>` and `None` on `none`.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails, or the node's reply
-    /// matches neither `val <v>` nor `none`.
+    /// Returns `Err` if the connection fails or the reply matches neither.
     pub async fn get(&self, key: &str) -> Result<Option<String>, String> {
         match self.command(&format!("get {key}")).await? {
             reply if reply == "none" => Ok(None),
@@ -167,12 +143,9 @@ impl Node {
         }
     }
 
-    /// `del k` — `Ok(())` iff the node replied `ok`.
-    ///
+    /// `del k`.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails, or the node's reply
-    /// isn't `ok`.
+    /// Returns `Err` if the connection fails or the reply is not `ok`.
     pub async fn del(&self, key: &str) -> Result<(), String> {
         match self.command(&format!("del {key}")).await?.as_str() {
             "ok" => Ok(()),
@@ -180,12 +153,9 @@ impl Node {
         }
     }
 
-    /// `count` — the node's live-entry count (replicated writes included).
-    ///
+    /// `count`, the node's live-entry count including replicated writes.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails, or the reply doesn't
-    /// parse as a number.
+    /// Returns `Err` if the connection fails or the reply is not numeric.
     pub async fn count(&self) -> Result<usize, String> {
         self.command("count")
             .await?
@@ -193,13 +163,10 @@ impl Node {
             .map_err(|error| format!("bad count reply: {error}"))
     }
 
-    /// `fill n` — bulk-inserts `k0..kn` locally on the node, without paying a
-    /// control round trip per entry.
-    ///
+    /// `fill n`, bulk-inserting `k0..kn` locally with no control round trip
+    /// per entry.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails or the node reports an
-    /// insert error.
+    /// Returns `Err` if the connection fails or the node reports an error.
     pub async fn fill(&self, count: u32) -> Result<(), String> {
         match self.command(&format!("fill {count}")).await?.as_str() {
             "ok" => Ok(()),
@@ -207,14 +174,10 @@ impl Node {
         }
     }
 
-    /// `churn n` — runs `n` back-to-back insert/remove operations (3:1 mix)
-    /// on the node's short-TTL `"churn"` cache, over a fixed shared key
-    /// space, full speed. Returns once the whole run has been issued.
-    ///
+    /// `churn n`, running `n` back-to-back insert/remove operations (3:1
+    /// mix) on the node's short-TTL `"churn"` cache over a fixed key space.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails or the node reports an
-    /// operation error mid-run.
+    /// Returns `Err` if the connection fails or an operation fails mid-run.
     pub async fn churn(&self, ops: u32) -> Result<(), String> {
         match self.command(&format!("churn {ops}")).await?.as_str() {
             "ok" => Ok(()),
@@ -222,13 +185,9 @@ impl Node {
         }
     }
 
-    /// `ccount` — the live-entry count of the node's short-TTL `"churn"`
-    /// cache.
-    ///
+    /// `ccount`, the live-entry count of the node's short-TTL `"churn"` cache.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails, or the reply doesn't
-    /// parse as a number.
+    /// Returns `Err` if the connection fails or the reply is not numeric.
     pub async fn churn_count(&self) -> Result<usize, String> {
         self.command("ccount")
             .await?
@@ -236,13 +195,10 @@ impl Node {
             .map_err(|error| format!("bad ccount reply: {error}"))
     }
 
-    /// `bigfill n bytes` — bulk-inserts `big0..bign`, each with a
-    /// deterministic `bytes`-sized value generated on the node.
-    ///
+    /// `bigfill n bytes`, bulk-inserting `big0..bign` with a deterministic
+    /// `bytes`-sized value each.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails or the node reports an
-    /// insert error.
+    /// Returns `Err` if the connection fails or the node reports an error.
     pub async fn big_fill(&self, count: u32, bytes: usize) -> Result<(), String> {
         match self
             .command(&format!("bigfill {count} {bytes}"))
@@ -254,44 +210,33 @@ impl Node {
         }
     }
 
-    /// `bigcheck i bytes` — the node regenerates `bigi`'s expected
-    /// `bytes`-sized value and byte-compares its stored copy, replying
-    /// `ok`, `bad …`, or `none`; the raw reply is returned for asserting.
-    ///
+    /// `bigcheck i bytes`: the node regenerates `bigi`'s expected value and
+    /// byte-compares it, replying `ok`, `bad ...`, or `none`.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails.
+    /// Returns `Err` if the connection fails.
     pub async fn big_check(&self, index: u32, bytes: usize) -> Result<String, String> {
         self.command(&format!("bigcheck {index} {bytes}")).await
     }
 
-    /// `bigput bytes` — inserts one `bytes`-sized value under the fixed
-    /// large-value key, returning the raw reply: `ok`, or `err …` — the
-    /// latter being the expected outcome for an over-frame-cap size.
-    ///
+    /// `bigput bytes`, inserting one `bytes`-sized value under the fixed
+    /// large-value key, replying `ok` or `err ...`.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails.
+    /// Returns `Err` if the connection fails.
     pub async fn big_put(&self, bytes: usize) -> Result<String, String> {
         self.command(&format!("bigput {bytes}")).await
     }
 
-    /// `bigverify bytes` — content-checks the fixed large-value key the way
+    /// `bigverify bytes`, content-checking the fixed large-value key the way
     /// [`Node::big_check`] does for `bigi` keys.
-    ///
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails.
+    /// Returns `Err` if the connection fails.
     pub async fn big_verify(&self, bytes: usize) -> Result<String, String> {
         self.command(&format!("bigverify {bytes}")).await
     }
 
-    /// `peers` — the node's live peer count, as membership currently reports it.
-    ///
+    /// `peers`, the node's live peer count as membership currently reports it.
     /// # Errors
-    ///
-    /// Returns `Err` if the control connection fails, or the reply doesn't
-    /// parse as a number.
+    /// Returns `Err` if the connection fails or the reply is not numeric.
     pub async fn peers(&self) -> Result<usize, String> {
         self.command("peers")
             .await?
@@ -299,10 +244,8 @@ impl Node {
             .map_err(|error| format!("bad peers reply: {error}"))
     }
 
-    /// Sends one control-protocol line and returns its single-line reply.
-    /// Opens a fresh connection per call — the protocol is stateless and this
-    /// keeps the client trivial; a test issuing many commands pays a
-    /// reconnect each time, which is cheap on loopback.
+    /// Sends one control-protocol line and returns its single-line reply,
+    /// over a fresh connection per call.
     async fn command(&self, line: &str) -> Result<String, String> {
         let mut stream = TcpStream::connect(("127.0.0.1", self.control_port))
             .await
@@ -319,25 +262,18 @@ impl Node {
         Ok(reply.trim_end().to_string())
     }
 
-    /// Stops and removes the container. Not required for cleanliness —
-    /// `ContainerGuard`'s `Drop` reclaims it via rightsize's own cleanup
-    /// thread — but explicit teardown keeps a test's failure output free of
-    /// unrelated containers from earlier cases in the same run.
-    ///
+    /// Stops and removes the container, ahead of `ContainerGuard`'s own
+    /// cleanup so a failure's output stays free of unrelated containers.
     /// # Errors
-    ///
-    /// Returns `Err` if the backend's stop/remove calls fail.
+    /// Returns `Err` if the backend's stop or remove call fails.
     pub async fn stop(self) -> Result<(), String> {
         self.guard.stop().await.map_err(|error| error.to_string())
     }
 }
 
 /// Polls `cond` on a short fixed cadence until it returns `true`, or panics
-/// once `timeout` elapses — the container-test analog of `tests/common`'s
-/// in-process `eventually`.
-///
+/// once `timeout` elapses.
 /// # Panics
-///
 /// Panics if `cond` has not returned `true` by `timeout`.
 pub async fn eventually<F, Fut>(timeout: Duration, mut cond: F)
 where

@@ -1,6 +1,5 @@
-//! Semantic consistency behind the panic check: any frame the decoder
-//! accepts must re-encode, and decoding that re-encoding must yield the
-//! same message — otherwise two nodes could read one frame differently.
+//! Any frame the decoder accepts re-encodes, and decoding that re-encoding
+//! yields the same message.
 
 #![no_main]
 
@@ -11,7 +10,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(msg) = sundog::wire::decode(&Bytes::copy_from_slice(data)) else {
         return;
     };
-    let encoded = sundog::wire::encode(&msg).expect("a decoded message must re-encode");
-    let redecoded = sundog::wire::decode(&encoded).expect("a re-encoded frame must decode");
-    assert_eq!(msg, redecoded, "decode/encode/decode must be a fixed point");
+    let encoded = sundog::wire::encode(&msg).expect("a decoded message re-encodes");
+    let redecoded = sundog::wire::decode(&encoded).expect("a re-encoded frame decodes");
+    assert_eq!(msg, redecoded, "decode/encode/decode is a fixed point");
 });
