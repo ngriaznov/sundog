@@ -96,6 +96,9 @@ jobs:
     env:
       RIGHTSIZE_BACKEND: docker
       SUNDOG_CONTAINER_TESTS: "1"
+      # A short chaos pass on every run; `nightly-chaos.yml` runs the same
+      # test for ten minutes with a fresh seed.
+      SUNDOG_CHAOS_SECS: "45"
     steps:
       - uses: actions/checkout@v4
 

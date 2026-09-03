@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use container_util::{Node, container_tests_enabled, eventually};
+use rand::rngs::StdRng;
+use rand::{RngExt as _, SeedableRng as _};
 use rightsize::Network;
 
 /// Every `sundog-testnode` binds gossip on this fixed port; seed strings
@@ -606,5 +608,304 @@ async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
     n1.stop().await.expect("n1 stops");
     n2.stop().await.expect("n2 stops");
     n3.stop().await.expect("n3 stops");
+    net.close().await.expect("network closes");
+}
+
+/// Resolves this run's chaos seed: `SUNDOG_CHAOS_SEED` if set, else 8 random
+/// bytes read as a `u64`. Either way, prints a GitHub Actions notice so a
+/// failing run can be replayed exactly.
+fn chaos_seed(secs: u64) -> u64 {
+    let seed = std::env::var("SUNDOG_CHAOS_SEED").map_or_else(
+        |_| rand::rng().random::<u64>(),
+        |raw| raw.parse().expect("SUNDOG_CHAOS_SEED is a u64"),
+    );
+    eprintln!(
+        "::notice title=chaos seed::replay with SUNDOG_CHAOS_SEED={seed} \
+         SUNDOG_CHAOS_SECS={secs}"
+    );
+    seed
+}
+
+/// One randomly chosen chaos action, and everything an iteration needs to
+/// carry it out. Kept as a value (rather than performed inline in the
+/// picking match) so the picking logic — the part that must stay
+/// deterministic for a given seed — is a plain, independently testable
+/// function with no `.await` in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChaosAction {
+    /// Crash a random node and respawn it under the same alias.
+    Crash { node: usize },
+    /// Run `ops` churn operations on a random live node.
+    Churn { node: usize, ops: u32 },
+    /// Drop one fill key's local copy on a random live node.
+    Drop { node: usize, key_index: u32 },
+    /// Rewrite a further chunk of fill keys on a random live node.
+    Fill { node: usize, count: u32 },
+    /// A burst of distinct-key puts on a random live node.
+    Burst { node: usize, count: u32 },
+}
+
+/// Picks one [`ChaosAction`] from a fixed weighted distribution over
+/// `node_count` live nodes and `fill_keys` existing fill keys — crashes are
+/// deliberately rare (10%) since they are the most disruptive action and the
+/// scenario needs most of its run at steady churn, not mid-recovery; the
+/// remaining 90% splits across churn (30%), drop (20%), fill (15%), and a
+/// burst of puts (25%). Pure and deterministic: the same `rng` state always
+/// picks the same action.
+fn pick_chaos_action(
+    rng: &mut StdRng,
+    node_count: usize,
+    fill_keys: u32,
+    churn_ops: u32,
+    fill_count: u32,
+    burst_count: u32,
+) -> ChaosAction {
+    let node = rng.random_range(0..node_count);
+    match rng.random_range(0..100u32) {
+        0..=9 => ChaosAction::Crash { node },
+        10..=39 => ChaosAction::Churn {
+            node,
+            ops: churn_ops,
+        },
+        40..=59 => ChaosAction::Drop {
+            node,
+            key_index: rng.random_range(0..fill_keys),
+        },
+        60..=74 => ChaosAction::Fill {
+            node,
+            count: fill_count,
+        },
+        _ => ChaosAction::Burst {
+            node,
+            count: burst_count,
+        },
+    }
+}
+
+/// Spawns `aliases.len()` nodes on `cluster`, each seeded from the aliases
+/// already spawned before it, and waits for all of them to see every other
+/// one as a peer.
+async fn spawn_chaos_cluster(net: &Arc<Network>, cluster: &str, aliases: &[&str]) -> Vec<Node> {
+    let mut nodes = Vec::with_capacity(aliases.len());
+    for (i, alias) in aliases.iter().enumerate() {
+        let seeds: Vec<String> = aliases[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn(net, cluster, alias, &seed_refs).await);
+    }
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), aliases.len() - 1).await;
+    nodes
+}
+
+/// Crashes `nodes[idx]`, respawns it under the same alias seeded from the
+/// other still-live aliases, and waits for every node to see the rest of
+/// the cluster again before returning — the point past which the next
+/// chaos iteration may pick another node to crash.
+async fn crash_and_respawn(
+    nodes: &mut Vec<Node>,
+    net: &Arc<Network>,
+    cluster: &str,
+    aliases: &[&str],
+    idx: usize,
+    iteration: u64,
+) {
+    let alias = aliases[idx];
+    eprintln!("chaos[{iteration}]: crashing {alias}");
+    let dead = nodes.remove(idx);
+    dead.crash()
+        .await
+        .expect("crashed node dies and is removed cleanly");
+
+    let seeds: Vec<String> = aliases
+        .iter()
+        .enumerate()
+        .filter(|&(j, _)| j != idx)
+        .map(|(_, a)| seed(a))
+        .collect();
+    let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+    nodes.insert(idx, Node::spawn(net, cluster, alias, &seed_refs).await);
+
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), aliases.len() - 1).await;
+    eprintln!(
+        "chaos[{iteration}]: {alias} respawned and saw {} peers",
+        aliases.len() - 1
+    );
+}
+
+/// Runs one non-crash [`ChaosAction`] and logs it; crashes are handled
+/// separately by [`crash_and_respawn`] since only they touch `nodes` itself.
+async fn perform_chaos_action(nodes: &[Node], action: ChaosAction, iteration: u64, run_seed: u64) {
+    match action {
+        ChaosAction::Crash { .. } => unreachable!("crashes are handled by crash_and_respawn"),
+        ChaosAction::Churn { node: idx, ops } => {
+            eprintln!(
+                "chaos[{iteration}]: churn {ops} ops on {}",
+                nodes[idx].name()
+            );
+            nodes[idx].churn(ops).await.expect("churn completes");
+        }
+        ChaosAction::Drop {
+            node: idx,
+            key_index,
+        } => {
+            let key = format!("k{key_index}");
+            eprintln!(
+                "chaos[{iteration}]: dropping {key} on {}",
+                nodes[idx].name()
+            );
+            nodes[idx].drop_key(&key).await.expect("drop succeeds");
+        }
+        ChaosAction::Fill { node: idx, count } => {
+            eprintln!(
+                "chaos[{iteration}]: refilling {count} keys on {}",
+                nodes[idx].name()
+            );
+            nodes[idx].fill(count).await.expect("refill succeeds");
+        }
+        ChaosAction::Burst { node: idx, count } => {
+            eprintln!(
+                "chaos[{iteration}]: bursting {count} puts on {}",
+                nodes[idx].name()
+            );
+            for j in 0..count {
+                let key = format!("burst-{run_seed:x}-{iteration}-{j}");
+                let value = format!("v-{run_seed:x}-{iteration}-{j}");
+                nodes[idx]
+                    .put(&key, &value)
+                    .await
+                    .expect("burst put succeeds");
+            }
+        }
+    }
+}
+
+/// Waits for every node's `count` and `digest` to agree, then reads
+/// `sample_size` random fill keys off every node and asserts they all match
+/// [`fill`][Node::fill]'s deterministic `k{i}`/`v{i}` content. The `churn`
+/// cache carries a short TTL by design, so both checks stay on `"it"` only.
+async fn assert_converged(
+    nodes: &[Node],
+    rng: &mut StdRng,
+    fill_keys: u32,
+    sample_size: usize,
+    wait: Duration,
+) {
+    eventually(wait, || async {
+        let mut counts = Vec::with_capacity(nodes.len());
+        let mut digests = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            counts.push(node.count().await);
+            digests.push(node.digest().await);
+        }
+        counts.iter().all(Result::is_ok)
+            && counts.windows(2).all(|w| w[0] == w[1])
+            && digests.iter().all(Result::is_ok)
+            && digests.windows(2).all(|w| w[0] == w[1])
+    })
+    .await;
+    eprintln!("chaos: every node converged to the same count and digest");
+
+    for _ in 0..sample_size {
+        let key_index = rng.random_range(0..fill_keys);
+        let key = format!("k{key_index}");
+        let expected = format!("v{key_index}");
+        let mut values = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            values.push(node.get(&key).await);
+        }
+        assert!(
+            values
+                .iter()
+                .all(|v| v.as_ref() == Ok(&Some(expected.clone()))),
+            "{key} disagrees across nodes after convergence: {values:?}"
+        );
+    }
+    eprintln!("chaos: {sample_size} sampled fill keys read identically on every node");
+}
+
+/// Random crashes, churn, dropped keys, refills, and put bursts against a
+/// four-node cluster for a bounded time, then checks every node converges to
+/// the same `"it"` content — count, digest, and a key sample all agreeing.
+/// Exercises the class of bug 0.3.1 fixed (an anti-entropy round landing
+/// during a bulk fill) by never letting the cluster settle before the next
+/// disruption lands.
+///
+/// Gated on `SUNDOG_CONTAINER_TESTS=1` *and* `SUNDOG_CHAOS_SECS` (the run
+/// length in seconds) being set; `SUNDOG_CHAOS_SEED` pins the scenario's
+/// random choices for a repeatable replay, otherwise a fresh seed is drawn
+/// and logged. The cluster's own timing is never seeded and never
+/// deterministic — that unpredictability is the point of a chaos lane.
+#[tokio::test]
+async fn chaos_crashes_churn_and_drops_still_converge() {
+    const NODE_COUNT: usize = 4;
+    const FILL_KEYS: u32 = 20_000;
+    const FILL_WAIT: Duration = Duration::from_secs(120);
+    const CHURN_OPS: u32 = 500;
+    const REFILL_COUNT: u32 = 2_000;
+    const BURST_COUNT: u32 = 50;
+    const CONVERGENCE_WAIT: Duration = Duration::from_secs(120);
+    const SAMPLE_SIZE: usize = 100;
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4"];
+    const CLUSTER: &str = "chaos-cluster";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+    let Ok(secs_raw) = std::env::var("SUNDOG_CHAOS_SECS") else {
+        eprintln!("skipping: SUNDOG_CHAOS_SECS not set");
+        return;
+    };
+    let secs: u64 = secs_raw
+        .parse()
+        .expect("SUNDOG_CHAOS_SECS is a u64 seconds count");
+
+    let run_seed = chaos_seed(secs);
+    let mut rng = StdRng::seed_from_u64(run_seed);
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = spawn_chaos_cluster(&net, CLUSTER, &ALIASES).await;
+
+    nodes[0]
+        .fill(FILL_KEYS)
+        .await
+        .expect("initial fill succeeds");
+    for node in &nodes {
+        eventually(FILL_WAIT, || async {
+            node.count().await == Ok(FILL_KEYS as usize)
+        })
+        .await;
+    }
+    eprintln!("chaos: {FILL_KEYS} keys filled and present on all {NODE_COUNT} nodes");
+
+    let mut crashes = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut iteration = 0u64;
+    while std::time::Instant::now() < deadline {
+        iteration += 1;
+        let action = pick_chaos_action(
+            &mut rng,
+            nodes.len(),
+            FILL_KEYS,
+            CHURN_OPS,
+            REFILL_COUNT,
+            BURST_COUNT,
+        );
+        if let ChaosAction::Crash { node: idx } = action {
+            crashes += 1;
+            crash_and_respawn(&mut nodes, &net, CLUSTER, &ALIASES, idx, iteration).await;
+        } else {
+            perform_chaos_action(&nodes, action, iteration, run_seed).await;
+        }
+    }
+    eprintln!(
+        "chaos: ran {iteration} actions over {secs}s, including {crashes} crash/respawn cycles \
+         (every one already confirmed 3 peers before the next action ran)"
+    );
+
+    assert_converged(&nodes, &mut rng, FILL_KEYS, SAMPLE_SIZE, CONVERGENCE_WAIT).await;
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
     net.close().await.expect("network closes");
 }

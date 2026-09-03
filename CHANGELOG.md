@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Chaos lane** for the container suite: `chaos_crashes_churn_and_drops_still_converge`
+  drives a four-node cluster through a seeded random mix of crashes, churn,
+  dropped keys, refills, and put bursts for a bounded time, then checks every
+  node converges to the same content. Gated on `SUNDOG_CONTAINER_TESTS=1` and
+  `SUNDOG_CHAOS_SECS`; `SUNDOG_CHAOS_SEED` replays a specific run. Runs for 45s
+  in every CI pass and for ten minutes nightly with a fresh seed
+  (`nightly-chaos.yml`).
+- `sundog-testnode` control commands `digest` (an order-independent xxh3
+  digest of the `"it"` cache's live content) and `crash` (exits with status 3
+  after replying, with no graceful cluster leave), backing the chaos lane's
+  convergence check and node kills.
+
 ## [0.3.1] – 2026-09-03
 
 ### Fixed

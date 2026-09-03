@@ -224,6 +224,16 @@ Five layers, cheapest and highest-signal first:
    `SUNDOG_TEST_BASE_IMAGE` at a pre-seeded image if registry pulls aren't
    available.
 
+   - **Chaos lane**: `chaos_crashes_churn_and_drops_still_converge` runs a
+     seeded random mix of crashes, churn, dropped keys, refills, and put
+     bursts against a four-node cluster for `SUNDOG_CHAOS_SECS` seconds, then
+     checks that every node converges to the same content. `SUNDOG_CHAOS_SEED`
+     pins a run for replay; `nightly-chaos.yml` runs it for ten minutes with a
+     fresh seed, logged so a red night replays with
+     `SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=<secs>
+     RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test containers
+     -- --test-threads=1 chaos_`.
+
    Scenarios needing only one node, or two on loopback with real UDP membership,
    run as ordinary `#[cfg(test)]` unit tests beside the code they exercise:
    `sundog::store`'s stampede-collapse and TTL tests, `sundog::cluster`'s

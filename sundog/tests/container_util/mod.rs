@@ -19,6 +19,9 @@ use tokio::net::TcpStream;
 
 const CONTROL_PORT: u16 = 8080;
 const READY_LOG: &str = "testnode-ready";
+/// Bound on [`Node::crash`]'s wait for the backend to confirm the container
+/// process actually died.
+const CRASH_WAIT: Duration = Duration::from_secs(30);
 
 /// Gate for `tests/containers.rs`: `false` unless `SUNDOG_CONTAINER_TESTS=1`,
 /// so a plain `cargo test --workspace` stays hermetic.
@@ -287,6 +290,50 @@ impl Node {
             .await?
             .parse()
             .map_err(|error| format!("bad peers reply: {error}"))
+    }
+
+    /// `digest`, this node's order-independent xxh3 digest of `"it"`'s live
+    /// content (see `sundog-testnode`'s module docs for the exact formula):
+    /// two nodes holding identical content return the same digest, and any
+    /// single differing, missing, or extra entry changes it.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply isn't 16 hex digits.
+    pub async fn digest(&self) -> Result<u64, String> {
+        let reply = self.command("digest").await?;
+        u64::from_str_radix(&reply, 16).map_err(|error| format!("bad digest reply: {error}"))
+    }
+
+    /// `crash`: sends the command, waits for the backend to confirm the
+    /// container process actually died, then removes the (already-dead)
+    /// container so `name()`'s alias is free for a fresh [`Node::spawn`].
+    ///
+    /// `ContainerGuard::is_running` only tracks whether this guard's own
+    /// `stop()` has run — it has no way to observe a death this process
+    /// didn't itself cause — so death is detected the way the backend
+    /// itself would notice: `docker exec` against an exited container
+    /// fails, so polling `exec` until it errors is that confirmation.
+    /// # Errors
+    ///
+    /// Returns `Err` if the container has not died within
+    /// [`CRASH_WAIT`], or if the cleanup `stop()`/remove afterward fails.
+    pub async fn crash(self) -> Result<(), String> {
+        // The reply is flushed before the process exits, but the connection
+        // can still race the exit on a loaded runner, so a failed round trip
+        // here is not itself a failure to crash.
+        let _ = self.command("crash").await;
+
+        let deadline = tokio::time::Instant::now() + CRASH_WAIT;
+        while self.guard.exec(&["true"]).await.is_ok() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{} did not stop within {CRASH_WAIT:?} of crash",
+                    self.name()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        self.stop().await
     }
 
     /// Sends one control-protocol line and returns its single-line reply,

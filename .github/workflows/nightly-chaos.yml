@@ -1,0 +1,40 @@
+# Nightly ten-minute chaos run with a fresh seed: the chosen seed is printed
+# before the suite runs, so a red night is replayed locally with
+# `SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=600
+# RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test containers
+# -- --test-threads=1 chaos_`.
+name: nightly-chaos
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  chaos-fresh-seed:
+    runs-on: ubuntu-latest
+    env:
+      RIGHTSIZE_BACKEND: docker
+      SUNDOG_CONTAINER_TESTS: "1"
+      SUNDOG_CHAOS_SECS: "600"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Pick and log tonight's seed
+        run: |
+          SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+          echo "SUNDOG_CHAOS_SEED=$SEED" >> "$GITHUB_ENV"
+          echo "::notice title=chaos seed::replay with SUNDOG_CHAOS_SEED=$SEED SUNDOG_CHAOS_SECS=$SUNDOG_CHAOS_SECS"
+
+      - name: Run the chaos scenario
+        run: cargo test --release --package sundog --test containers -- --test-threads=1 chaos_

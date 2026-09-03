@@ -25,6 +25,11 @@
 //! `bigfill n bytes` -> `ok`; `bigcheck i bytes` -> `ok` | `bad` | `none`;
 //! `bigput bytes` -> `ok` | `err ...`, the point for over-cap sizes;
 //! `bigverify bytes` -> `ok` | `bad` | `none`.
+//!
+//! `digest` -> `<hex u64>`: an order-independent digest of `"it"`'s live
+//! content, computed as [`digest_it`] describes. `crash` -> `ok`, then the
+//! process exits with status 3 without leaving the cluster gracefully, the
+//! closest a control command can get to a process actually being killed.
 
 use std::env;
 use std::io::Write as _;
@@ -34,6 +39,7 @@ use std::time::Duration;
 use sundog::{Cache, Cluster, ClusterConfig, Mode};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use xxhash_rust::xxh3::xxh3_64;
 
 const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
@@ -60,6 +66,30 @@ fn verdict(stored: &str, index: u32, len: usize) -> String {
     } else {
         format!("bad len={} want={len}", stored.len())
     }
+}
+
+/// An order-independent digest of `cache`'s live content: XORs
+/// `xxh3_64(key ++ 0x00 ++ value)` (both as UTF-8 bytes, `0x00` never
+/// appearing in either since `fill`/`put`/`churn` never write it) over every
+/// live entry. XOR makes the fold order-independent, so two nodes holding the
+/// same set of entries compute the same digest regardless of insertion
+/// order or [`Cache::keys`]'s iteration order; any single entry differing in
+/// key, value, or presence changes the result.
+async fn digest_it(cache: &Cache<String, String>) -> u64 {
+    let mut digest = 0u64;
+    for key in cache.keys() {
+        let Some(value) = cache.get(&key).await else {
+            // Expired or removed between `keys()` and `get`: no contribution,
+            // matching a digest taken after it was already gone.
+            continue;
+        };
+        let mut buf = Vec::with_capacity(key.len() + 1 + value.len());
+        buf.extend_from_slice(key.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(value.as_bytes());
+        digest ^= xxh3_64(&buf);
+    }
+    digest
 }
 
 #[tokio::main]
@@ -129,6 +159,7 @@ async fn resolve_seeds(spec: &str) -> Vec<SocketAddr> {
 enum Reply {
     Line(String),
     Quit,
+    Crash,
 }
 
 async fn dispatch(
@@ -214,7 +245,9 @@ async fn dispatch(
             sundog::net::bytes_sent_total()
         )),
         "peers" => Reply::Line(cluster.peers().len().to_string()),
+        "digest" => Reply::Line(format!("{:016x}", digest_it(cache).await)),
         "quit" => Reply::Quit,
+        "crash" => Reply::Crash,
         other => Reply::Line(format!("err unknown command {other:?}")),
     }
 }
@@ -291,6 +324,14 @@ async fn serve(
                 }
             }
             Reply::Quit => std::process::exit(0),
+            Reply::Crash => {
+                // Reply first so the harness's `crash` round trip completes,
+                // then exit uncleanly: no cluster leave, the way a killed
+                // process dies.
+                let _ = writer.write_all(b"ok\n").await;
+                let _ = writer.flush().await;
+                std::process::exit(3);
+            }
         }
     }
 }
