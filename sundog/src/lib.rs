@@ -20,8 +20,12 @@
 //! # struct UserId(u64);
 //! # #[derive(Clone, serde::Serialize, serde::Deserialize)]
 //! # struct Profile;
+//! # #[derive(Clone, serde::Serialize, serde::Deserialize, Hash, PartialEq, Eq)]
+//! # struct Token(String);
+//! # #[derive(Clone, serde::Serialize, serde::Deserialize)]
+//! # struct Session;
 //! # async fn load_profile(_id: &UserId) -> Result<Profile, std::io::Error> { unimplemented!() }
-//! # async fn run(id: UserId) -> anyhow::Result<()> {
+//! # async fn run(id: UserId, token: Token) -> anyhow::Result<()> {
 //! let cluster = Cluster::builder("demo")
 //!     .build() // mDNS discovery, ephemeral ports, sane defaults
 //!     .await?;
@@ -37,6 +41,14 @@
 //! users.insert(id.clone(), Profile).await?; // stamp HLC -> local apply -> fan out
 //! let profile = users.get_or_load(&id, async |id| load_profile(id).await).await?;
 //! users.remove(&id).await?; // tombstone write
+//!
+//! // A cache is typed at open, so sessions get one of their own.
+//! let sessions = cluster
+//!     .cache::<Token, Session>("sessions")
+//!     .mode(Mode::Replicated)
+//!     .open()
+//!     .await?;
+//! sessions.insert_with_ttl(token, Session, Duration::from_secs(30)).await?; // this entry's own TTL
 //!
 //! let mut events = users.events();
 //! while let Ok(ev) = events.recv().await {
