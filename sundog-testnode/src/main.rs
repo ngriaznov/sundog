@@ -73,10 +73,17 @@ async fn main() {
     }
 }
 
-/// Reads `name` as a `usize` env override, `None` if absent or unparsable,
-/// for [`run`]'s `ae_part_min_bucket`/`ae_sketch_min_bucket` overrides.
+/// Parses an env override's raw string into a `usize`, `None` for an absent
+/// or unparsable value: the pure decision [`usize_env`] wraps around a real
+/// `std::env::var` read, for [`run`]'s `ae_part_min_bucket`/
+/// `ae_sketch_min_bucket` overrides.
+fn parse_usize_override(raw: Option<&str>) -> Option<usize> {
+    raw?.parse().ok()
+}
+
+/// Reads `name` as a `usize` env override via [`parse_usize_override`].
 fn usize_env(name: &str) -> Option<usize> {
-    env::var(name).ok().and_then(|raw| raw.parse().ok())
+    parse_usize_override(env::var(name).ok().as_deref())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -309,5 +316,44 @@ async fn serve(
             }
             Reply::Quit => std::process::exit(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_usize_override_reads_a_valid_number() {
+        assert_eq!(parse_usize_override(Some("512")), Some(512));
+        assert_eq!(parse_usize_override(Some("0")), Some(0));
+    }
+
+    #[test]
+    fn parse_usize_override_is_none_for_absent_or_unparsable_input() {
+        assert_eq!(parse_usize_override(None), None);
+        assert_eq!(parse_usize_override(Some("")), None);
+        assert_eq!(parse_usize_override(Some("not-a-number")), None);
+        assert_eq!(
+            parse_usize_override(Some("-1")),
+            None,
+            "usize rejects a negative value"
+        );
+    }
+
+    #[test]
+    fn big_value_is_deterministic_and_regenerable() {
+        let a = big_value(7, 20);
+        let b = big_value(7, 20);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 20);
+        assert!(a.starts_with("00000007"));
+    }
+
+    #[test]
+    fn verdict_matches_only_the_exact_regenerated_value() {
+        let value = big_value(3, 16);
+        assert_eq!(verdict(&value, 3, 16), "ok");
+        assert_ne!(verdict("wrong", 3, 16), "ok");
     }
 }
