@@ -3,6 +3,31 @@
 All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Sketch-based anti-entropy for large buckets**: a mismatched bucket whose
+  local entry count exceeds `ClusterConfig::ae_sketch_min_bucket` (default
+  256) is answered with an invertible Bloom lookup table
+  (`ClusterConfig::ae_sketch_cells`, default 951 cells) instead of its full
+  `(key, version)` listing — a fixed wire cost regardless of bucket size,
+  rated to decode any symmetric difference up to 40 elements with
+  overwhelming probability, falling back to the full listing on the rare
+  cases it can't. New wire messages `Msg::AeSketch`, `Msg::AeEntries`, and
+  `Msg::AePullHashes` carry the sketch exchange and its listing/pull
+  fallbacks. New metric `sundog_ae_sketch_total{cache, outcome}` counts
+  `decoded` vs `fallback` outcomes.
+
+### Changed
+
+- **Breaking**: `wire::Msg` is now `#[non_exhaustive]`. A downstream
+  `match` on `Msg` without a wildcard arm needs one added — a one-time cost
+  for letting future wire message kinds (like this release's own
+  `AeSketch`/`AeEntries`/`AePullHashes`) ship without another breaking
+  release apiece. `cargo semver-checks --release-type minor` against 0.2.0
+  reports exactly this one intentional break; every other check passes.
+
 ## [0.2.0] – 2026-09-02
 
 ### Added

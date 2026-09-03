@@ -84,6 +84,14 @@ impl WireRecord {
 }
 
 /// Every message exchanged on the data-plane mesh.
+///
+/// `#[non_exhaustive]`: this crate adds new wire message kinds as its
+/// anti-entropy and state-transfer protocols grow (`Msg::AeSketch`,
+/// `AeEntries`, and `AePullHashes` are exactly this, added on top of
+/// 0.2.0's exhaustive shape) — matching downstream code adds a wildcard arm
+/// once, here, rather than needing another breaking release for every
+/// future addition.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Sent once a new connection is established: identifies the sender.
