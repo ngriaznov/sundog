@@ -298,6 +298,12 @@ pub enum AeMismatch {
     Bucket(u16, Vec<(Bytes, Hlc)>),
     /// `(bucket, cells)`: an IBLT sketch over the bucket.
     Sketch(u16, Vec<Cell>),
+    /// `(bucket, digests)`: the bucket's 64 part digests, sent instead of a
+    /// listing or sketch once the bucket's entry count passed
+    /// `ClusterConfig::ae_part_min_bucket`. The initiator compares these
+    /// against its own part digests and requests only the mismatched parts
+    /// via [`Mesh::ae_parts`].
+    PartDigests(u16, Vec<u64>),
 }
 
 impl AeMismatch {
@@ -305,9 +311,30 @@ impl AeMismatch {
     #[must_use]
     pub const fn bucket(&self) -> u16 {
         match self {
-            Self::Bucket(bucket, _) | Self::Sketch(bucket, _) => *bucket,
+            Self::Bucket(bucket, _) | Self::Sketch(bucket, _) | Self::PartDigests(bucket, _) => {
+                *bucket
+            }
         }
     }
+}
+
+/// One reply to [`Mesh::ae_parts`]: a mismatched part's full listing, or,
+/// once too large for that, an IBLT sketch, the part-grained counterpart of
+/// [`AeMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AePartReply {
+    /// The part's full `(key, version)` listing.
+    Listing {
+        bucket: u16,
+        part: u8,
+        entries: Vec<(Bytes, Hlc)>,
+    },
+    /// An IBLT sketch over the part.
+    Sketch {
+        bucket: u16,
+        part: u8,
+        cells: Vec<Cell>,
+    },
 }
 
 /// What the net layer needs from the local shard registry to answer
@@ -330,6 +357,26 @@ pub trait RequestHandler: Send + Sync + 'static {
     ) -> BoxFuture<'_, crate::store::BucketEntries>;
     /// Returns full records for `keys` in `cache` that this node holds.
     fn records_for(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>>;
+
+    /// Returns the entry count of each of `buckets` in `cache`, without
+    /// materializing their contents: the cheap check `serve_ae_digest` makes
+    /// before deciding whether a mismatched bucket is answered with part
+    /// digests instead of a listing or sketch.
+    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>>;
+
+    /// Returns `cache`'s part digests for each of `buckets`: `(bucket, 64
+    /// part-digests)` per bucket, the responder's step-2 reply for a bucket
+    /// past [`RequestHandler::ae_part_min_bucket`] entries.
+    fn part_digests(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>>;
+
+    /// [`RequestHandler::entries_for_buckets`] at part granularity: `(key,
+    /// version)` for every live entry and un-GC'd tombstone in each
+    /// requested `(bucket, part)` pair of `cache`.
+    fn entries_for_parts(
+        &self,
+        cache: SmolStr,
+        parts: Vec<(u16, u8)>,
+    ) -> BoxFuture<'_, crate::store::PartEntries>;
 
     /// Returns full records for the entries of `bucket` in `cache` whose
     /// key hash is in `hashes`: the sketch-decoded counterpart to
@@ -354,6 +401,13 @@ pub trait RequestHandler: Send + Sync + 'static {
                 .collect();
             self.records_for(cache, keys).await
         })
+    }
+
+    /// Bucket size above which the responder answers a mismatch with its 64
+    /// part digests instead of a listing or sketch. Mirrors
+    /// [`crate::config::ClusterConfig::ae_part_min_bucket`].
+    fn ae_part_min_bucket(&self) -> usize {
+        crate::config::ClusterConfig::default().ae_part_min_bucket
     }
 
     /// Bucket size above which the responder answers with an IBLT sketch
@@ -851,6 +905,29 @@ impl Mesh {
         })
     }
 
+    /// Requests the mismatched `(bucket, part)` pairs found by comparing a
+    /// peer's [`AeMismatch::PartDigests`] reply against this node's own part
+    /// digests: the third step of the part path, answered one
+    /// [`AePartReply`] per part.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `peer` is unknown or the exchange fails.
+    pub async fn ae_parts(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        parts: Vec<(u16, u8)>,
+    ) -> Result<Vec<AePartReply>, CodecError> {
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
+            let (framed, pool) = self.acquire_conn(peer, Msg::AeParts { cache, parts }).await?;
+            conn::collect_ae_part_replies(framed, &pool).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy part exchange", timeout)))
+    }
+
     /// Pulls full records for `keys` from `peer`, the `AePull` step.
     ///
     /// # Errors
@@ -947,6 +1024,25 @@ mod tests {
         digests: Vec<(u16, u64)>,
         bucket_entries: Vec<(Bytes, Hlc)>,
         pulled: Mutex<Vec<(SmolStr, Vec<Bytes>)>>,
+        bucket_lens: Vec<(u16, usize)>,
+        part_digests: Vec<(u16, Vec<u64>)>,
+        part_entries: crate::store::PartEntries,
+        ae_part_min_bucket: usize,
+    }
+
+    impl Default for FixtureHandler {
+        fn default() -> Self {
+            Self {
+                records: Vec::new(),
+                digests: Vec::new(),
+                bucket_entries: Vec::new(),
+                pulled: Mutex::new(Vec::new()),
+                bucket_lens: Vec::new(),
+                part_digests: Vec::new(),
+                part_entries: Vec::new(),
+                ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+            }
+        }
     }
 
     impl RequestHandler for FixtureHandler {
@@ -986,6 +1082,70 @@ mod tests {
                 .push((cache, keys));
             Box::pin(async { self.records.clone() })
         }
+
+        fn bucket_lens(
+            &self,
+            _cache: SmolStr,
+            buckets: Vec<u16>,
+        ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+            Box::pin(async move {
+                let fixture = &self.bucket_lens;
+                buckets
+                    .into_iter()
+                    .map(|bucket| {
+                        let len = fixture
+                            .iter()
+                            .find(|(b, _)| *b == bucket)
+                            .map_or(0, |(_, len)| *len);
+                        (bucket, len)
+                    })
+                    .collect()
+            })
+        }
+
+        fn part_digests(
+            &self,
+            _cache: SmolStr,
+            buckets: Vec<u16>,
+        ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+            Box::pin(async move {
+                let fixture = &self.part_digests;
+                buckets
+                    .into_iter()
+                    .map(|bucket| {
+                        let digests = fixture
+                            .iter()
+                            .find(|(b, _)| *b == bucket)
+                            .map_or_else(Vec::new, |(_, d)| d.clone());
+                        (bucket, digests)
+                    })
+                    .collect()
+            })
+        }
+
+        fn entries_for_parts(
+            &self,
+            _cache: SmolStr,
+            parts: Vec<(u16, u8)>,
+        ) -> BoxFuture<'_, crate::store::PartEntries> {
+            Box::pin(async move {
+                let fixture = &self.part_entries;
+                parts
+                    .into_iter()
+                    .map(|key| {
+                        let entries = fixture
+                            .iter()
+                            .find(|(k, _)| *k == key)
+                            .map_or_else(Vec::new, |(_, e)| e.clone());
+                        (key, entries)
+                    })
+                    .collect()
+            })
+        }
+
+        fn ae_part_min_bucket(&self) -> usize {
+            self.ae_part_min_bucket
+        }
     }
 
     fn sample_record(n: u8) -> WireRecord {
@@ -1017,6 +1177,7 @@ mod tests {
             digests: Vec::new(),
             bucket_entries: Vec::new(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         })
     }
 
@@ -1163,6 +1324,7 @@ mod tests {
             digests: Vec::new(),
             bucket_entries: Vec::new(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
         let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -1240,6 +1402,7 @@ mod tests {
             digests: vec![(0, 111), (1, 222)],
             bucket_entries: entries.clone(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -1281,6 +1444,7 @@ mod tests {
             digests: vec![(0, 111), (1, 222)],
             bucket_entries: entries.clone(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -1370,6 +1534,7 @@ mod tests {
             digests: Vec::new(),
             bucket_entries: Vec::new(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -1398,6 +1563,7 @@ mod tests {
             digests: Vec::new(),
             bucket_entries: entries.clone(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -1427,6 +1593,7 @@ mod tests {
             digests: Vec::new(),
             bucket_entries: vec![(key_a.clone(), ver), (key_b, ver)],
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let handler_for_asserts = Arc::clone(&handler);
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
@@ -1514,6 +1681,7 @@ mod tests {
             digests: Vec::new(),
             bucket_entries: Vec::new(),
             pulled: Mutex::new(Vec::new()),
+            ..Default::default()
         });
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -1620,6 +1788,27 @@ mod tests {
             _cache: SmolStr,
             _keys: Vec<Bytes>,
         ) -> BoxFuture<'_, Vec<WireRecord>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn bucket_lens(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn part_digests(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn entries_for_parts(
+            &self,
+            _cache: SmolStr,
+            _parts: Vec<(u16, u8)>,
+        ) -> BoxFuture<'_, crate::store::PartEntries> {
             Box::pin(async { Vec::new() })
         }
     }

@@ -774,6 +774,19 @@ where
             .collect()
     }
 
+    /// The number of live entries plus un-GC'd tombstones in `bucket`,
+    /// without cloning or enumerating any of them: `O(1)` past the stripe's
+    /// read lock. A bucket at or past [`BUCKET_COUNT`] yields `0`. Lets an
+    /// anti-entropy responder decide the part-digest threshold without
+    /// paying to materialize a bucket's full listing first.
+    pub(crate) fn bucket_len(&self, bucket: u16) -> usize {
+        if usize::from(bucket) >= BUCKET_COUNT {
+            return 0;
+        }
+        let stripe = self.stripes[usize::from(bucket)].read();
+        stripe.live.len() + stripe.tombstones.len()
+    }
+
     /// This engine's current part digests for `bucket`: [`PART_COUNT`] values,
     /// one per part, in ascending part order. A bucket at or past
     /// [`BUCKET_COUNT`], which only a misbehaving peer names, yields an empty
@@ -2262,6 +2275,23 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn bucket_len_counts_live_entries_and_tombstones_without_materializing_them() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 5u32;
+        let kb = key_bytes(key);
+        let bucket = u16::try_from(stripe_index_from_hash(hash_key_bytes(kb.as_ref())))
+            .expect("fits");
+        assert_eq!(engine.bucket_len(bucket), 0);
+        let _ = put(&engine, key, kb, "a".into(), hlc(1, 1), None, 0);
+        assert_eq!(engine.bucket_len(bucket), 1);
+        assert_eq!(
+            engine.bucket_len(u16::MAX),
+            0,
+            "a bucket past BUCKET_COUNT counts as 0, not an index panic"
+        );
     }
 
     #[test]

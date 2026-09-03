@@ -103,9 +103,21 @@ pub struct ClusterConfig {
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
     /// Bucket size past which an anti-entropy responder answers a mismatch
-    /// with an IBLT sketch instead of the bucket's full listing. A sketch
-    /// costs a fixed ~9 KB at the default `ae_sketch_cells`; a listing costs
-    /// ~23 bytes per entry, so 384 is the crossover for small keys.
+    /// with its 64 part digests instead of a listing or sketch, narrowing
+    /// the mismatch to whichever parts actually differ before either side
+    /// sends anything at bucket scale. Each mismatched part is then answered
+    /// by the same rule [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket)
+    /// applies at bucket scale: a sketch past that many entries, a listing
+    /// otherwise. Effectively a three-tier responder rule: part digests,
+    /// then sketch, then listing.
+    pub ae_part_min_bucket: usize,
+    /// Bucket size past which an anti-entropy responder answers a mismatch
+    /// with an IBLT sketch instead of the bucket's full listing; the same
+    /// rule applies to a mismatched part once
+    /// [`ae_part_min_bucket`](Self::ae_part_min_bucket) has narrowed a
+    /// bucket to it. A sketch costs a fixed ~9 KB at the default
+    /// `ae_sketch_cells`; a listing costs ~23 bytes per entry, so 384 is the
+    /// crossover for small keys.
     pub ae_sketch_min_bucket: usize,
     /// Cell count of the IBLT sketch built for a bucket past
     /// [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket). The default of
@@ -156,6 +168,7 @@ impl Default for ClusterConfig {
             dead_node_grace_period: Duration::from_secs(600),
             kv_tombstone_grace_period: Duration::from_mins(15),
             state_transfer_budget: Duration::from_secs(20),
+            ae_part_min_bucket: 4_096,
             ae_sketch_min_bucket: 384,
             ae_sketch_cells: 240,
             #[cfg(feature = "tls")]
@@ -196,6 +209,11 @@ mod tests {
         let config = ClusterConfig::default();
         assert_eq!(config.ae_sketch_min_bucket, 384);
         assert_eq!(config.ae_sketch_cells, 240);
+    }
+
+    #[test]
+    fn default_ae_part_min_bucket_is_four_thousand_ninety_six() {
+        assert_eq!(ClusterConfig::default().ae_part_min_bucket, 4_096);
     }
 
     #[test]

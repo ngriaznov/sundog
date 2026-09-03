@@ -128,6 +128,45 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
         )
             .prop_map(|(cache, recs)| Msg::ReplicateBatch { cache, recs }),
         Just(Msg::ReqDone),
+        (
+            smol_str_strategy(),
+            any::<u16>(),
+            proptest::collection::vec(any::<u64>(), 0..8),
+        )
+            .prop_map(|(cache, bucket, digests)| Msg::AePartDigests {
+                cache,
+                bucket,
+                digests
+            }),
+        (
+            smol_str_strategy(),
+            proptest::collection::vec((any::<u16>(), any::<u8>()), 0..16),
+        )
+            .prop_map(|(cache, parts)| Msg::AeParts { cache, parts }),
+        (
+            smol_str_strategy(),
+            any::<u16>(),
+            any::<u8>(),
+            proptest::collection::vec((bytes_strategy(), hlc_strategy()), 0..8),
+        )
+            .prop_map(|(cache, bucket, part, entries)| Msg::AePart {
+                cache,
+                bucket,
+                part,
+                entries,
+            }),
+        (
+            smol_str_strategy(),
+            any::<u16>(),
+            any::<u8>(),
+            cells_strategy(),
+        )
+            .prop_map(|(cache, bucket, part, cells)| Msg::AePartSketch {
+                cache,
+                bucket,
+                part,
+                cells,
+            }),
     ]
 }
 

@@ -498,6 +498,7 @@ async fn handle_accepted(
                 | Msg::AePull { .. }
                 | Msg::AeEntries { .. }
                 | Msg::AePullHashes { .. }
+                | Msg::AeParts { .. }
         );
         let stop = match msg {
             Msg::Invalidate { .. } | Msg::Replicate { .. } | Msg::ReplicateBatch { .. } => {
@@ -540,13 +541,20 @@ async fn handle_accepted(
                 )
                 .await
             }
+            Msg::AeParts { cache, parts } => {
+                serve_ae_parts(&mut framed, cache, parts, handler.as_ref(), &cancel).await
+            }
             // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
-            // `ReqDone` sent only as replies on a connection this node
-            // initiated, never on one being served here.
+            // `AePartDigests`/`AePart`/`AePartSketch`/`ReqDone` sent only as
+            // replies on a connection this node initiated, never on one
+            // being served here.
             Msg::Hello { .. }
             | Msg::StChunk { .. }
             | Msg::AeBucket { .. }
             | Msg::AeSketch { .. }
+            | Msg::AePartDigests { .. }
+            | Msg::AePart { .. }
+            | Msg::AePartSketch { .. }
             | Msg::ReqDone => false,
         };
         if stop {
@@ -610,10 +618,13 @@ async fn serve_state_transfer(
 }
 
 /// Serves one anti-entropy digest exchange, feeding every mismatched
-/// bucket's reply plus a trailing [`Msg::ReqDone`] and flushing once. A
-/// bucket whose local entry count exceeds `handler.ae_sketch_min_bucket()`
-/// replies with an IBLT sketch instead of its full [`Msg::AeBucket`]
-/// listing. Returns `true` when this connection is done.
+/// bucket's reply plus a trailing [`Msg::ReqDone`] and flushing once. The
+/// three-tier responder rule: a bucket whose local entry count exceeds
+/// `handler.ae_part_min_bucket()` replies with its 64 part digests
+/// ([`Msg::AePartDigests`]) without ever materializing its listing; a
+/// smaller mismatched bucket falls back to the existing rule, an IBLT
+/// sketch past `handler.ae_sketch_min_bucket()` entries or else the full
+/// [`Msg::AeBucket`] listing. Returns `true` when this connection is done.
 async fn serve_ae_digest(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -630,32 +641,107 @@ async fn serve_ae_digest(
         })
         .map(|(bucket, _)| bucket)
         .collect();
-    // One shard pass for every mismatched bucket at once: per-bucket scans
-    // would be quadratic against a mostly-divergent peer.
-    let mut replies: Vec<Msg> = if mismatched.is_empty() {
+
+    let mut replies: Vec<Msg> = Vec::new();
+    if !mismatched.is_empty() {
+        let part_min_bucket = handler.ae_part_min_bucket();
+        let lens: std::collections::HashMap<u16, usize> = handler
+            .bucket_lens(cache.clone(), mismatched.clone())
+            .await
+            .into_iter()
+            .collect();
+        let (big, small): (Vec<u16>, Vec<u16>) = mismatched
+            .into_iter()
+            .partition(|bucket| lens.get(bucket).copied().unwrap_or(0) > part_min_bucket);
+
+        if !big.is_empty() {
+            replies.extend(handler.part_digests(cache.clone(), big).await.into_iter().map(
+                |(bucket, digests)| Msg::AePartDigests {
+                    cache: cache.clone(),
+                    bucket,
+                    digests,
+                },
+            ));
+        }
+        if !small.is_empty() {
+            // One shard pass for every small mismatched bucket at once:
+            // per-bucket scans would be quadratic against a
+            // mostly-divergent peer. A bucket answered above with part
+            // digests never reaches this call, so its listing is never
+            // materialized.
+            let min_bucket = handler.ae_sketch_min_bucket();
+            let sketch_cells = handler.ae_sketch_cells();
+            replies.extend(
+                handler
+                    .entries_for_buckets(cache.clone(), small)
+                    .await
+                    .into_iter()
+                    .map(|(bucket, entries)| {
+                        if entries.len() > min_bucket {
+                            let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
+                            for (key, ver) in &entries {
+                                iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
+                            }
+                            Msg::AeSketch {
+                                cache: cache.clone(),
+                                bucket,
+                                cells: iblt.into_cells(),
+                            }
+                        } else {
+                            Msg::AeBucket {
+                                cache: cache.clone(),
+                                bucket,
+                                entries,
+                            }
+                        }
+                    }),
+            );
+        }
+    }
+    replies.push(Msg::ReqDone);
+    send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// Serves an `AeParts` request: the part-grained counterpart of
+/// [`serve_ae_digest`]'s classification step, one reply per requested
+/// `(bucket, part)` pair, a part past `handler.ae_sketch_min_bucket()`
+/// entries answered with [`Msg::AePartSketch`], otherwise
+/// [`Msg::AePart`]. Unlike `AeDigest`, never deferred by
+/// `MeshInner::defers_ae_digest_from`: a part request only ever follows a
+/// part-digest reply the requester already paid to compare.
+async fn serve_ae_parts(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    parts: Vec<(u16, u8)>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    let mut replies: Vec<Msg> = if parts.is_empty() {
         Vec::new()
     } else {
         let min_bucket = handler.ae_sketch_min_bucket();
         let sketch_cells = handler.ae_sketch_cells();
         handler
-            .entries_for_buckets(cache.clone(), mismatched)
+            .entries_for_parts(cache.clone(), parts)
             .await
             .into_iter()
-            .map(|(bucket, entries)| {
+            .map(|((bucket, part), entries)| {
                 if entries.len() > min_bucket {
                     let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
                     for (key, ver) in &entries {
                         iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
                     }
-                    Msg::AeSketch {
+                    Msg::AePartSketch {
                         cache: cache.clone(),
                         bucket,
+                        part,
                         cells: iblt.into_cells(),
                     }
                 } else {
-                    Msg::AeBucket {
+                    Msg::AePart {
                         cache: cache.clone(),
                         bucket,
+                        part,
                         entries,
                     }
                 }
@@ -770,9 +856,49 @@ pub(super) async fn collect_ae_mismatches(
             Some(Ok(Msg::AeSketch { bucket, cells, .. })) => {
                 result.push(super::AeMismatch::Sketch(bucket, cells));
             }
+            Some(Ok(Msg::AePartDigests { bucket, digests, .. })) => {
+                result.push(super::AeMismatch::PartDigests(bucket, digests));
+            }
             Some(Ok(_)) => {} // unexpected message on this connection; keep reading
             Some(Err(err)) => return Err(err),
             None => return Err(unexpected_close("anti-entropy digest reply")),
+        }
+    }
+}
+
+/// Reads `AePart`/`AePartSketch` replies until [`Msg::ReqDone`]:
+/// [`super::Mesh::ae_parts`]'s collector, one [`super::AePartReply`] per
+/// part. Same pool-checkin rules as [`collect_ae_buckets`].
+pub(super) async fn collect_ae_part_replies(
+    mut framed: PeerFramed,
+    pool: &ReqPool,
+) -> Result<Vec<super::AePartReply>, CodecError> {
+    let mut result = Vec::new();
+    loop {
+        match recv_msg(&mut framed).await {
+            Some(Ok(Msg::ReqDone)) => {
+                pool.checkin(framed);
+                return Ok(result);
+            }
+            Some(Ok(Msg::AePart {
+                bucket,
+                part,
+                entries,
+                ..
+            })) => result.push(super::AePartReply::Listing {
+                bucket,
+                part,
+                entries,
+            }),
+            Some(Ok(Msg::AePartSketch {
+                bucket,
+                part,
+                cells,
+                ..
+            })) => result.push(super::AePartReply::Sketch { bucket, part, cells }),
+            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
+            Some(Err(err)) => return Err(err),
+            None => return Err(unexpected_close("anti-entropy part reply")),
         }
     }
 }
@@ -1141,6 +1267,27 @@ mod tests {
             ) -> BoxFuture<'_, Vec<wire::WireRecord>> {
                 Box::pin(async { Vec::new() })
             }
+            fn bucket_lens(
+                &self,
+                _cache: SmolStr,
+                _buckets: Vec<u16>,
+            ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+                Box::pin(async { Vec::new() })
+            }
+            fn part_digests(
+                &self,
+                _cache: SmolStr,
+                _buckets: Vec<u16>,
+            ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+                Box::pin(async { Vec::new() })
+            }
+            fn entries_for_parts(
+                &self,
+                _cache: SmolStr,
+                _parts: Vec<(u16, u8)>,
+            ) -> BoxFuture<'_, crate::store::PartEntries> {
+                Box::pin(async { Vec::new() })
+            }
         }
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1223,6 +1370,27 @@ mod tests {
             _cache: SmolStr,
             _keys: Vec<Bytes>,
         ) -> futures::future::BoxFuture<'_, Vec<WireRecord>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn bucket_lens(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, Vec<(u16, usize)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn part_digests(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn entries_for_parts(
+            &self,
+            _cache: SmolStr,
+            _parts: Vec<(u16, u8)>,
+        ) -> futures::future::BoxFuture<'_, crate::store::PartEntries> {
             Box::pin(async { Vec::new() })
         }
     }

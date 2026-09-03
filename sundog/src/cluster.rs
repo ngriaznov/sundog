@@ -374,6 +374,7 @@ impl ClusterBuilder {
         let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
         let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
             shards: Arc::clone(&shards),
+            ae_part_min_bucket: config.ae_part_min_bucket,
             ae_sketch_min_bucket: config.ae_sketch_min_bucket,
             ae_sketch_cells: config.ae_sketch_cells,
         });
@@ -470,6 +471,7 @@ fn local_hostname() -> String {
 /// name degrades to an empty result rather than an error.
 struct ClusterRequestHandler {
     shards: ShardRegistry,
+    ae_part_min_bucket: usize,
     ae_sketch_min_bucket: usize,
     ae_sketch_cells: usize,
 }
@@ -530,6 +532,45 @@ impl RequestHandler for ClusterRequestHandler {
                 None => Vec::new(),
             }
         })
+    }
+
+    fn bucket_lens(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.bucket_lens(buckets).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn part_digests(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.part_digests(buckets).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn entries_for_parts(
+        &self,
+        cache: SmolStr,
+        parts: Vec<(u16, u8)>,
+    ) -> BoxFuture<'_, crate::store::PartEntries> {
+        Box::pin(async move {
+            match self.lookup(&cache) {
+                Some(shard) => shard.entries_for_parts(parts).await,
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn ae_part_min_bucket(&self) -> usize {
+        self.ae_part_min_bucket
     }
 
     fn ae_sketch_min_bucket(&self) -> usize {
@@ -798,6 +839,10 @@ async fn inbound_loop(
                 | Msg::AeEntries { .. }
                 | Msg::AePull { .. }
                 | Msg::AePullHashes { .. }
+                | Msg::AePartDigests { .. }
+                | Msg::AeParts { .. }
+                | Msg::AePart { .. }
+                | Msg::AePartSketch { .. }
                 | Msg::ReqDone => {}
             }
         }
@@ -2354,6 +2399,7 @@ mod tests {
         // registry.
         let handler = ClusterRequestHandler {
             shards: cluster.shards(),
+            ae_part_min_bucket: cluster.config().ae_part_min_bucket,
             ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
             ae_sketch_cells: cluster.config().ae_sketch_cells,
         };

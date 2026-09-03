@@ -258,6 +258,14 @@ pub trait ShardOps: Send + Sync {
     /// anti-entropy round stays linear in shard size instead of quadratic.
     fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries>;
 
+    /// The number of live entries plus un-GC'd tombstones in each of
+    /// `buckets`, without materializing any of them: an anti-entropy
+    /// responder's cheap check for whether a mismatched bucket passes
+    /// [`crate::config::ClusterConfig::ae_part_min_bucket`] before it pays to
+    /// build a listing or sketch. A bucket at or past [`BUCKET_COUNT`]
+    /// answers `0`.
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>>;
+
     /// This shard's part digests for each of `buckets`, `(bucket, 64
     /// part-digests)` per bucket, the second-level reply for a bucket whose
     /// digest mismatched and whose entry count passed
@@ -1346,6 +1354,20 @@ where
         Box::pin(async move { entries })
     }
 
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        let mut wanted: Vec<u16> = buckets
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        wanted.sort_unstable();
+        let out = wanted
+            .into_iter()
+            .map(|bucket| (bucket, self.engine.bucket_len(bucket)))
+            .collect();
+        Box::pin(async move { out })
+    }
+
     fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
         let mut wanted: Vec<u16> = buckets
             .into_iter()
@@ -2342,6 +2364,28 @@ mod tests {
             }
         }
         assert_digest_matches_full_recompute(&s).await;
+    }
+
+    #[tokio::test]
+    async fn bucket_lens_counts_without_materializing_entries() {
+        let s = shard::<u32, String>(1);
+        let key = 3u32;
+        let kb = key_bytes(&key);
+        let bucket = bucket_of(&kb);
+        s.insert(key, "three".into()).await.expect("insert");
+        s.remove(&99u32).await.expect("tombstone somewhere else");
+
+        let lens = ShardOps::bucket_lens(&s, vec![bucket, u16::MAX]).await;
+        let (_, len) = lens
+            .iter()
+            .find(|(b, _)| *b == bucket)
+            .expect("the populated bucket is answered");
+        assert!(*len >= 1, "bucket_lens counts at least the inserted entry");
+        let (_, oob_len) = lens
+            .iter()
+            .find(|(b, _)| *b == u16::MAX)
+            .expect("an out-of-range bucket is still answered, at 0");
+        assert_eq!(*oob_len, 0);
     }
 
     #[tokio::test]
