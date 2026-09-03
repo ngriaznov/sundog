@@ -247,6 +247,37 @@ impl Node {
         self.command(&format!("bigverify {bytes}")).await
     }
 
+    /// `drop k`, dropping `k`'s local copy with no tombstone and no fan-out,
+    /// as if a `Replicate` for it never arrived.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not `ok`.
+    pub async fn drop_key(&self, key: &str) -> Result<(), String> {
+        match self.command(&format!("drop {key}")).await?.as_str() {
+            "ok" => Ok(()),
+            other => Err(format!("unexpected reply to drop: {other}")),
+        }
+    }
+
+    /// `netstats`, this node's total wire frames and bytes sent since start.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply isn't `<frames>
+    /// <bytes>`.
+    pub async fn netstats(&self) -> Result<(u64, u64), String> {
+        let reply = self.command("netstats").await?;
+        let (frames, bytes) = reply
+            .split_once(' ')
+            .ok_or_else(|| format!("bad netstats reply: {reply:?}"))?;
+        let frames = frames
+            .parse()
+            .map_err(|error| format!("bad netstats frames: {error}"))?;
+        let bytes = bytes
+            .parse()
+            .map_err(|error| format!("bad netstats bytes: {error}"))?;
+        Ok((frames, bytes))
+    }
+
     /// `peers`, the node's live peer count as membership currently reports it.
     /// # Errors
     ///

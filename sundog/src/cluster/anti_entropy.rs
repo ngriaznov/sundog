@@ -366,7 +366,12 @@ fn diff_bucket(
 /// A sketch carries no key bytes, only a `key_hash`, so every pull queues a
 /// hash into `pull_hashes`; only a push resolves its hash back to
 /// `local_entries` and queues actual key bytes.
-fn diff_decoded(
+///
+/// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
+/// re-exports it as `crate::diff_decoded` under `feature = "sim"`, to
+/// reconcile a peeled sketch the same way [`handle_sketch_mismatch`] does
+/// here, without duplicating this classification.
+pub fn diff_decoded(
     local_entries: &[(Bytes, Hlc)],
     decoded: &Decoded,
     push_keys: &mut Vec<Bytes>,

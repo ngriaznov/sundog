@@ -484,3 +484,127 @@ async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
     n2.stop().await.expect("n2 stops");
     net.close().await.expect("network closes");
 }
+
+/// At 500k entries, `sundog-testnode`'s 1,024 buckets hold about 488 entries
+/// apiece, past `ClusterConfig::default`'s `ae_sketch_min_bucket` of 384:
+/// the repair below runs through the IBLT sketch path, not a full listing.
+/// n2 cold-joins and warms first, so both replicas start byte-identical;
+/// dropping one key locally on n2 then leaves exactly one bucket mismatched
+/// for anti-entropy to close.
+#[tokio::test]
+async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
+    const ENTRIES: u32 = 500_000;
+    const TARGET_KEY: &str = "k123456";
+    const TARGET_VALUE: &str = "v123456";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "ae-sketch-cluster", "n1", &[]).await;
+    n1.fill(ENTRIES).await.expect("bulk fill succeeds");
+    assert_eq!(n1.count().await, Ok(ENTRIES as usize));
+
+    let n2 = Node::spawn(&net, "ae-sketch-cluster", "n2", &[&seed("n1")]).await;
+    eventually(Duration::from_secs(200), || async {
+        n2.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+    assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
+
+    n2.drop_key(TARGET_KEY)
+        .await
+        .expect("drop succeeds, standing in for a lost Replicate");
+    assert_eq!(
+        n2.get(TARGET_KEY).await,
+        Ok(None),
+        "n2's copy is gone locally right after the drop"
+    );
+
+    // sundog-testnode sets `ae_interval` to 2s; generous past that plus the
+    // digest pass and sketch build/peel/pull round trip over 500k entries.
+    eventually(Duration::from_secs(60), || async {
+        n2.get(TARGET_KEY).await == Ok(Some(TARGET_VALUE.to_string()))
+    })
+    .await;
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    net.close().await.expect("network closes");
+}
+
+/// `wire::RecordHeader`'s exact fixed width per record ahead of its key and
+/// value bytes: `wall_ms` (8) + `logical` (4) + `node` (8) + `expires_at_ms`
+/// (8) + `key_len` (4) + `value_len` (4) + `flags` (1). Not reachable from
+/// here (`wire::RECORD_HEADER_LEN` is `pub(crate)`), so restated as the
+/// documented layout rather than a bare magic number.
+const RECORD_HEADER_BYTES: u64 = 8 + 4 + 8 + 8 + 4 + 4 + 1;
+
+/// One wire-sized copy of `fill`'s deterministic `k{i}`/`v{i}` entries: each
+/// record's key/value bytes plus its fixed [`RECORD_HEADER_BYTES`] header,
+/// the dominant cost at these key/value sizes. Omits the handful of
+/// `RawFrameHeader`/cache-name/length-delimiter bytes shared across a whole
+/// batch, negligible once amortized over thousands of records per batch.
+/// [`bulk_fill_replicates_without_anti_entropy_duplicating_it`] checks its
+/// measured bytes against a multiple of this.
+fn fill_payload_bytes(count: u32) -> u64 {
+    (0..count)
+        .map(|i| RECORD_HEADER_BYTES + (format!("k{i}").len() + format!("v{i}").len()) as u64)
+        .sum()
+}
+
+/// Pins the fan-out queue and the anti-entropy streaming skip together: a
+/// bulk fill on a live three-node cluster must replicate as a handful of
+/// batched frames fanned out once per peer, not one frame per record and not
+/// a second copy from anti-entropy racing in behind it.
+#[tokio::test]
+async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
+    const ENTRIES: u32 = 100_000;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "fanout-cluster", "n1", &[]).await;
+    let n2 = Node::spawn(&net, "fanout-cluster", "n2", &[&seed("n1")]).await;
+    let n3 = Node::spawn(&net, "fanout-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
+    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+
+    let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the fill");
+
+    n1.fill(ENTRIES).await.expect("bulk fill succeeds");
+    assert_eq!(n1.count().await, Ok(ENTRIES as usize));
+    eventually(Duration::from_secs(120), || async {
+        n2.count().await == Ok(ENTRIES as usize) && n3.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+
+    let (frames_after, bytes_after) = n1.netstats().await.expect("netstats after the fill");
+    let frames_for_fill = frames_after - frames_before;
+    let bytes_for_fill = bytes_after - bytes_before;
+
+    let payload_estimate = fill_payload_bytes(ENTRIES);
+    assert!(
+        frames_for_fill < 1_000,
+        "n1 sent {frames_for_fill} frames for a {ENTRIES}-entry fill to 2 peers; the batched \
+         fan-out queue should coalesce this into a few dozen `ReplicateBatch` frames per peer, \
+         not one frame per record"
+    );
+    assert!(
+        bytes_for_fill < payload_estimate * 3,
+        "n1 sent {bytes_for_fill} bytes for a {ENTRIES}-entry fill against an estimated \
+         single-copy wire payload of {payload_estimate} bytes (each entry's `k{{i}}`/`v{{i}}` \
+         bytes plus its fixed {RECORD_HEADER_BYTES}-byte record header); a normal 2-peer fan-out \
+         costs about 2x that, so 3x leaves headroom for batch/frame overhead without also \
+         covering anti-entropy re-sending a duplicate copy behind it"
+    );
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    n3.stop().await.expect("n3 stops");
+    net.close().await.expect("network closes");
+}
