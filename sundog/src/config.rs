@@ -97,8 +97,10 @@ pub struct ClusterConfig {
     /// runs inside `open()`: how long a joining node pulls a snapshot from
     /// donors before giving up and proceeding with whatever it has. A
     /// startup-latency bound, not a correctness one: anti-entropy repairs
-    /// whatever the cut-off transfer didn't deliver. Zero is honored:
-    /// `open()` skips waiting entirely.
+    /// whatever the cut-off transfer didn't deliver. A fifth of it is the
+    /// grace a node with no peer in sight waits for gossip to show one
+    /// before it opens as the cluster's origin. Zero is honored: `open()`
+    /// skips waiting entirely.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,

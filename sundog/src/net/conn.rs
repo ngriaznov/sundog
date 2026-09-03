@@ -244,7 +244,7 @@ async fn recv_msg_or_idle_timeout(
     }
 }
 
-async fn recv_msg(framed: &mut PeerFramed) -> Option<Result<Msg, CodecError>> {
+pub(super) async fn recv_msg(framed: &mut PeerFramed) -> Option<Result<Msg, CodecError>> {
     match framed.next().await {
         Some(Ok(bytes)) => Some(wire::decode(&bytes.freeze())),
         Some(Err(source)) => Some(Err(CodecError::Io(source))),
@@ -566,7 +566,7 @@ async fn dispatch_one(
             serve_ae_parts(framed, cache, parts, handler, cancel).await
         }
         // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
-        // `AePartDigests`/`AePart`/`AePartSketch`/`ReqDone` sent only as
+        // `AePartDigests`/`AePart`/`AePartSketch`/`StUnavailable`/`ReqDone` sent only as
         // replies on a connection this node initiated, never on one being
         // served here.
         Msg::Hello { .. }
@@ -576,6 +576,7 @@ async fn dispatch_one(
         | Msg::AePartDigests { .. }
         | Msg::AePart { .. }
         | Msg::AePartSketch { .. }
+        | Msg::StUnavailable { .. }
         | Msg::ReqDone => false,
     }
 }
@@ -599,6 +600,10 @@ async fn serve_state_transfer(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
+    if !handler.snapshot_available(cache.clone()) {
+        tracing::debug!(%cache, "state transfer requested before this node is warm; declined");
+        return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
+    }
     let mut chunks = handler.snapshot_chunks(cache.clone());
     loop {
         let next = tokio::select! {
@@ -961,45 +966,56 @@ fn unexpected_close(what: &str) -> CodecError {
 pub(super) fn state_stream(
     framed: PeerFramed,
     pool: Arc<ReqPool>,
+    first: Option<Result<Msg, CodecError>>,
 ) -> futures::stream::BoxStream<'static, Result<Vec<WireRecord>, CodecError>> {
-    Box::pin(futures::stream::unfold(Some(framed), move |state| {
-        let pool = Arc::clone(&pool);
-        async move {
-            let mut framed = state?;
-            loop {
-                match recv_msg(&mut framed).await {
-                    Some(Ok(Msg::StChunk { recs, done, .. })) => {
-                        if recs.is_empty() {
-                            // The trailing marker chunk, or a no-op chunk:
-                            // nothing to yield either way.
+    Box::pin(futures::stream::unfold(
+        Some((framed, first)),
+        move |state| {
+            let pool = Arc::clone(&pool);
+            async move {
+                let (mut framed, mut pending) = state?;
+                loop {
+                    // `Mesh::request_state` already read the first message
+                    // to tell a declined request from a stream; it is
+                    // consumed here before the connection is read again.
+                    let received = match pending.take() {
+                        Some(first) => Some(first),
+                        None => recv_msg(&mut framed).await,
+                    };
+                    match received {
+                        Some(Ok(Msg::StChunk { recs, done, .. })) => {
+                            if recs.is_empty() {
+                                // The trailing marker chunk, or a no-op
+                                // chunk: nothing to yield either way.
+                                if done {
+                                    pool.checkin(framed);
+                                    return None;
+                                }
+                                continue;
+                            }
                             if done {
                                 pool.checkin(framed);
-                                return None;
+                                return Some((Ok(recs), None));
                             }
-                            continue;
+                            return Some((Ok(recs), Some((framed, None))));
                         }
-                        if done {
-                            pool.checkin(framed);
-                            return Some((Ok(recs), None));
+                        Some(Ok(_)) => {} // unexpected message on this stream; keep reading
+                        Some(Err(err)) => return Some((Err(err), None)),
+                        // Surfacing this as an error, not a silent stream
+                        // end, lets the retry logic tell a truncated
+                        // transfer from a finished one.
+                        None => {
+                            let err = CodecError::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "state-transfer connection closed before the final chunk",
+                            ));
+                            return Some((Err(err), None));
                         }
-                        return Some((Ok(recs), Some(framed)));
-                    }
-                    Some(Ok(_)) => {} // unexpected message on this stream; keep reading
-                    Some(Err(err)) => return Some((Err(err), None)),
-                    // Surfacing this as an error, not a silent stream end,
-                    // lets the retry logic tell a truncated transfer from a
-                    // finished one.
-                    None => {
-                        let err = CodecError::Io(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "state-transfer connection closed before the final chunk",
-                        ));
-                        return Some((Err(err), None));
                     }
                 }
             }
-        }
-    }))
+        },
+    ))
 }
 
 #[cfg(test)]

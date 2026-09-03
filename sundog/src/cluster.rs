@@ -83,6 +83,8 @@ struct ClusterInner {
     /// When each peer last streamed replicate traffic in; see
     /// [`Cluster::peer_is_streaming`].
     inbound_activity: Arc<InboundActivity>,
+    /// Shared with the request handler, which consults it before donating.
+    warmth: Arc<Warmth>,
     tracker: TaskTracker,
     cancel: CancellationToken,
 }
@@ -113,6 +115,32 @@ impl InboundActivity {
             let age = crate::net::mono_ms().saturating_sub(at);
             age <= u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
         })
+    }
+}
+
+/// The caches this node can donate a snapshot of: every `Local` or
+/// `Invalidation` cache from the moment it opens, and a `Replicated` cache
+/// once its own state transfer completes or finds no donor to complete from.
+/// A cache still warming declines `StRequest`s, so a joiner never copies a
+/// snapshot that is itself a partial copy.
+#[derive(Default)]
+pub(crate) struct Warmth {
+    warm: RwLock<HashSet<SmolStr>>,
+}
+
+impl Warmth {
+    fn mark(&self, cache: &SmolStr) {
+        self.warm
+            .write()
+            .expect("invariant: warmth lock is never poisoned")
+            .insert(cache.clone());
+    }
+
+    fn is_warm(&self, cache: &SmolStr) -> bool {
+        self.warm
+            .read()
+            .expect("invariant: warmth lock is never poisoned")
+            .contains(cache)
     }
 }
 
@@ -197,6 +225,18 @@ impl Cluster {
 
     /// A fresh watch subscription on the live peer set, for loops that react to
     /// changes.
+    /// Records that this node can donate a snapshot of `cache` from now on;
+    /// see [`Warmth`].
+    pub(crate) fn mark_warm(&self, cache: &SmolStr) {
+        self.inner.warmth.mark(cache);
+    }
+
+    /// Whether this node donates snapshots of `cache`; see [`Warmth`].
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(crate) fn is_warm(&self, cache: &SmolStr) -> bool {
+        self.inner.warmth.is_warm(cache)
+    }
+
     pub(crate) fn peers_watch(&self) -> tokio::sync::watch::Receiver<Vec<Peer>> {
         self.inner.membership.peers()
     }
@@ -372,8 +412,10 @@ impl ClusterBuilder {
 
         let incarnation = membership.local_peer().incarnation;
         let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let warmth = Arc::new(Warmth::default());
         let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
             shards: Arc::clone(&shards),
+            warmth: Arc::clone(&warmth),
             ae_part_min_bucket: config.ae_part_min_bucket,
             ae_sketch_min_bucket: config.ae_sketch_min_bucket,
             ae_sketch_cells: config.ae_sketch_cells,
@@ -392,6 +434,7 @@ impl ClusterBuilder {
                 config,
                 absence: absence::AbsenceTracker::default(),
                 inbound_activity: Arc::new(InboundActivity::default()),
+                warmth,
                 tracker: TaskTracker::new(),
                 cancel: CancellationToken::new(),
             }),
@@ -471,6 +514,7 @@ fn local_hostname() -> String {
 /// name degrades to an empty result rather than an error.
 struct ClusterRequestHandler {
     shards: ShardRegistry,
+    warmth: Arc<Warmth>,
     ae_part_min_bucket: usize,
     ae_sketch_min_bucket: usize,
     ae_sketch_cells: usize,
@@ -487,6 +531,10 @@ impl ClusterRequestHandler {
 }
 
 impl RequestHandler for ClusterRequestHandler {
+    fn snapshot_available(&self, cache: SmolStr) -> bool {
+        self.warmth.is_warm(&cache)
+    }
+
     fn snapshot_chunks(&self, cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
         match self.lookup(&cache) {
             Some(shard) => shard.snapshot_chunks(),
@@ -843,6 +891,7 @@ async fn inbound_loop(
                 | Msg::AeParts { .. }
                 | Msg::AePart { .. }
                 | Msg::AePartSketch { .. }
+                | Msg::StUnavailable { .. }
                 | Msg::ReqDone => {}
             }
         }
@@ -1036,6 +1085,8 @@ mod tests {
             data_bind_addr: loopback,
             ae_interval: Duration::from_millis(200),
             tombstone_ttl: Duration::from_secs(2),
+            // A one-second first-peer grace, so a lone node opens fast.
+            state_transfer_budget: Duration::from_secs(5),
             ..ClusterConfig::default()
         }
     }
@@ -1774,6 +1825,182 @@ mod tests {
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_lone_node_waits_the_first_peer_grace_and_then_opens_warm() {
+        let name = SmolStr::new("users");
+        let cluster = Cluster::builder("cluster-it-origin-grace")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let started = tokio::time::Instant::now();
+        let _cache = cluster
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("opens alone");
+        let elapsed = started.elapsed();
+        // loopback_config's 5s budget gives a 1s grace.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "open waits the grace for a first peer before deciding it is the origin: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "and no longer: {elapsed:?}"
+        );
+        assert!(
+            cluster.is_warm(&name),
+            "the origin is warm with nothing to receive"
+        );
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn nodes_opening_together_in_a_fresh_cluster_all_end_warm() {
+        let name = SmolStr::new("users");
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-fresh-together").await;
+        // Both open at once: each sees the other cold and declining, so both
+        // become warm by vacancy once the grace passes.
+        let (cache_a, cache_b) = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures::future::join(
+                cluster_a
+                    .cache::<u32, String>("users")
+                    .mode(Mode::Replicated)
+                    .open(),
+                cluster_b
+                    .cache::<u32, String>("users")
+                    .mode(Mode::Replicated)
+                    .open(),
+            ),
+        )
+        .await
+        .expect("two cold nodes do not stall each other's open");
+        let cache_a = cache_a.expect("a opens");
+        let cache_b = cache_b.expect("b opens");
+        assert!(cluster_a.is_warm(&name));
+        assert!(cluster_b.is_warm(&name));
+
+        cache_a.insert(1, "a".into()).await.expect("a writes");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while cache_b.get(&1).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replication runs as usual"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_and_invalidation_caches_are_warm_the_moment_they_open() {
+        let cluster = Cluster::builder("cluster-it-warmth-modes")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let _local = cluster
+            .cache::<u32, String>("local")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("local opens");
+        let _inval = cluster
+            .cache::<u32, String>("inval")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("invalidation opens");
+        assert!(cluster.is_warm(&SmolStr::new("local")));
+        assert!(cluster.is_warm(&SmolStr::new("inval")));
+        assert!(!cluster.is_warm(&SmolStr::new("never-opened")));
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_joiner_reconciles_with_every_peer_after_its_snapshot() {
+        // Anti-entropy far apart, so only the reconcile step that follows a
+        // snapshot can close the gap within the test.
+        let slow_ae = || {
+            let mut config = loopback_config();
+            config.ae_interval = Duration::from_secs(60);
+            config
+        };
+        let cluster_a = Cluster::builder("cluster-it-reconcile-all")
+            .seeds(std::iter::empty())
+            .config(slow_ae())
+            .build()
+            .await
+            .expect("node a builds");
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-reconcile-all")
+            .seeds([gossip_a])
+            .config(slow_ae())
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_a, 1).await;
+        wait_for_peer_count(&cluster_b, 1).await;
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+        cache_a
+            .insert(1, "held-by-a".into())
+            .await
+            .expect("a writes");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while cache_b.get(&1).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "b receives a's write"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // B loses its copy, the way a dropped replicate leaves it: whichever
+        // of A and B donates to C, C must hold the key once open returns.
+        cache_b.invalidate_local(&1).await;
+        assert_eq!(cache_b.get(&1).await, None);
+
+        let gossip_b = cluster_b.inner.membership.local_peer().gossip_addr;
+        let cluster_c = Cluster::builder("cluster-it-reconcile-all")
+            .seeds([gossip_a, gossip_b])
+            .config(slow_ae())
+            .build()
+            .await
+            .expect("node c builds");
+        wait_for_peer_count(&cluster_c, 2).await;
+        let cache_c = cluster_c
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("c opens");
+        assert_eq!(
+            cache_c.get(&1).await,
+            Some("held-by-a".to_string()),
+            "the post-snapshot round against every peer covers a donor's gap"
+        );
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+        cluster_c.shutdown().await;
     }
 
     #[tokio::test]
@@ -2525,6 +2752,7 @@ mod tests {
         // registry.
         let handler = ClusterRequestHandler {
             shards: cluster.shards(),
+            warmth: Arc::clone(&cluster.inner.warmth),
             ae_part_min_bucket: cluster.config().ae_part_min_bucket,
             ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
             ae_sketch_cells: cluster.config().ae_sketch_cells,

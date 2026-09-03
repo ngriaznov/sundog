@@ -1031,7 +1031,8 @@ async fn receiver_software(
 /// to the next donor the moment the stream reports an error.
 async fn warm_up(mesh: &Mesh, shard: &TestShard, donors: &[NodeId], applied: &AtomicUsize) -> bool {
     for &donor in donors {
-        let Ok(Ok(mut stream)) =
+        // A donor that declines, `Ok(None)`, is skipped like an unreachable one.
+        let Ok(Ok(Some(mut stream))) =
             tokio::time::timeout(NET_TIMEOUT, mesh.request_state(donor, cache_name())).await
         else {
             continue;

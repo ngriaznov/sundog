@@ -180,6 +180,11 @@ where
             guard.insert(name.clone(), Arc::clone(&shard) as Arc<dyn ShardOps>);
         }
         cluster.advertise_cache_mode(&name, mode);
+        // Only a `Replicated` cache has anything to receive before it can
+        // donate; the other modes are warm the moment they open.
+        if !matches!(mode, Mode::Replicated) {
+            cluster.mark_warm(&name);
+        }
 
         if !matches!(mode, Mode::Local) {
             cluster.spawn_tracked(crate::cluster::fan_out_task(
@@ -192,23 +197,7 @@ where
             ));
         }
         if matches!(mode, Mode::Replicated) {
-            let shard_ops = Arc::clone(&shard) as Arc<dyn ShardOps>;
-            let outcome = crate::cluster::state_transfer::run(&cluster, &shard_ops, &name).await;
-            if outcome == crate::cluster::state_transfer::Outcome::NoPeers {
-                cluster.spawn_tracked(crate::cluster::state_transfer::late_sync_task(
-                    cluster.clone(),
-                    Arc::clone(&shard_ops),
-                    name.clone(),
-                    cluster.cancel_token(),
-                ));
-            }
-            cluster.spawn_tracked(crate::cluster::anti_entropy::scheduler_task(
-                cluster.clone(),
-                shard_ops,
-                name.clone(),
-                cluster.config().ae_interval,
-                cluster.cancel_token(),
-            ));
+            warm_and_repair(&cluster, Arc::clone(&shard) as Arc<dyn ShardOps>, &name).await;
         }
         cluster.spawn_tracked(crate::cluster::tombstone_gc_task(
             Arc::clone(&shard) as Arc<dyn ShardOps>,
@@ -226,6 +215,33 @@ where
 
         Ok(Cache { shard })
     }
+}
+
+/// The `Replicated`-only half of [`CacheBuilder::open`]: pulls the cache's
+/// state from a live peer and starts the anti-entropy scheduler. Anything
+/// short of a landed snapshot or a cluster with nothing to give leaves the
+/// cache cold, declining to donate until the warm-up task gets it there.
+async fn warm_and_repair(cluster: &Cluster, shard_ops: Arc<dyn ShardOps>, name: &SmolStr) {
+    let outcome = crate::cluster::state_transfer::run(cluster, &shard_ops, name).await;
+    if !matches!(
+        outcome,
+        crate::cluster::state_transfer::Outcome::Completed
+            | crate::cluster::state_transfer::Outcome::NoDonor
+    ) {
+        cluster.spawn_tracked(crate::cluster::state_transfer::warm_up_task(
+            cluster.clone(),
+            Arc::clone(&shard_ops),
+            name.clone(),
+            cluster.cancel_token(),
+        ));
+    }
+    cluster.spawn_tracked(crate::cluster::anti_entropy::scheduler_task(
+        cluster.clone(),
+        shard_ops,
+        name.clone(),
+        cluster.config().ae_interval,
+        cluster.cancel_token(),
+    ));
 }
 
 /// A typed handle to one named, possibly-clustered cache. Cheap to

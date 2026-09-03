@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A node declines to donate a state-transfer snapshot of a cache until its
+  own transfer of that cache has completed, answering `Msg::StUnavailable`;
+  a joiner tries every live peer in turn and, once its snapshot lands, runs
+  one anti-entropy round against every live peer, not only its donor. A
+  node with no peer in sight at `open()` waits a fifth of
+  `state_transfer_budget`, 4 s by default, for gossip to show one before it
+  opens as the origin. A node that came up before gossip found any peer
+  could donate an empty or half-warm copy to the next joiner, and a chain of
+  such joins with the last complete holder crashing lost live entries
+  cluster-wide.
+
 ### Added
 
 - **Hierarchical anti-entropy digests**: each of the 1,024 anti-entropy

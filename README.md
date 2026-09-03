@@ -151,7 +151,8 @@ megabytes, a part digest exchange costs a few hundred bytes.
 `Invalidation` never sends values between nodes: a write on A tells B "your copy
 of this key is stale," and B drops it or reloads it on next access. `Replicated`
 alone runs state transfer on join, a new node pulling a full snapshot from an
-existing peer. It also keeps a background anti-entropy loop running while the
+existing peer that has finished its own, then reconciling with every other
+peer once. It also keeps a background anti-entropy loop running while the
 cache is open.
 
 Every node gossips the mode of each cache it has open; opening a name under a

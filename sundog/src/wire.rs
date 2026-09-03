@@ -180,6 +180,10 @@ pub enum Msg {
         part: u8,
         cells: Vec<Cell>,
     },
+    /// The answer to a [`Msg::StRequest`] from a node that cannot donate
+    /// `cache` yet: it has not completed its own state transfer for it, or
+    /// never opened it. The requester moves on to its next candidate.
+    StUnavailable { cache: SmolStr },
 }
 
 /// Frame discriminant: everything after this byte is a postcard-encoded
@@ -720,6 +724,13 @@ mod tests {
             bucket: 42,
             part: 7,
             cells: sample_cells(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_st_unavailable() {
+        roundtrip(&Msg::StUnavailable {
+            cache: SmolStr::new("users"),
         });
     }
 

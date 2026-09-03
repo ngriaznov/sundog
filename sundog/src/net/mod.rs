@@ -342,6 +342,14 @@ pub enum AePartReply {
 /// degrades to an empty result rather than an error: a normal race, not a
 /// fault.
 pub trait RequestHandler: Send + Sync + 'static {
+    /// Whether this node can donate a snapshot of `cache` right now. A node
+    /// still warming `cache` from its own state transfer, or one that never
+    /// opened it, answers `false` and the requester moves on to another
+    /// donor; defaults to `true`.
+    fn snapshot_available(&self, cache: SmolStr) -> bool {
+        let _ = cache;
+        true
+    }
     /// Streams a full snapshot of `cache` in write-sized chunks, for state
     /// transfer on join.
     fn snapshot_chunks(&self, cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>>;
@@ -833,17 +841,25 @@ impl Mesh {
         &self,
         donor: NodeId,
         cache: SmolStr,
-    ) -> Result<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>, CodecError> {
-        // Only the checkout-or-dial step is bounded here; `try_donor`'s own
-        // `PER_DONOR_BUDGET` governs the full snapshot stream instead.
+    ) -> Result<Option<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>>, CodecError> {
+        // Only the checkout-or-dial step and the donor's first reply are
+        // bounded here; `try_donor`'s own per-donor budget governs the full
+        // snapshot stream instead.
         let timeout = request_timeout();
-        let (framed, pool) =
+        let (mut framed, pool) =
             tokio::time::timeout(timeout, self.acquire_conn(donor, Msg::StRequest { cache }))
                 .await
                 .unwrap_or_else(|_| {
                     Err(request_timeout_error("state transfer request", timeout))
                 })?;
-        Ok(conn::state_stream(framed, pool))
+        let first = tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
+            .await
+            .map_err(|_| request_timeout_error("state transfer request", timeout))?;
+        if let Some(Ok(Msg::StUnavailable { .. })) = first {
+            pool.checkin(framed);
+            return Ok(None);
+        }
+        Ok(Some(conn::state_stream(framed, pool, first)))
     }
 
     /// Runs one anti-entropy digest exchange against `peer`: sends
@@ -1034,6 +1050,9 @@ mod tests {
         part_digests: Vec<(u16, Vec<u64>)>,
         part_entries: crate::store::PartEntries,
         ae_part_min_bucket: usize,
+        /// Declines every state-transfer request, the way a node still
+        /// warming does.
+        snapshot_unavailable: bool,
     }
 
     impl Default for FixtureHandler {
@@ -1047,11 +1066,16 @@ mod tests {
                 part_digests: Vec::new(),
                 part_entries: Vec::new(),
                 ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+                snapshot_unavailable: false,
             }
         }
     }
 
     impl RequestHandler for FixtureHandler {
+        fn snapshot_available(&self, _cache: SmolStr) -> bool {
+            !self.snapshot_unavailable
+        }
+
         fn snapshot_chunks(&self, _cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
             Box::pin(futures::stream::iter(vec![self.records.clone()]))
         }
@@ -1339,12 +1363,43 @@ mod tests {
         let mut stream = requester
             .request_state(NodeId::from(1), SmolStr::new("users"))
             .await
-            .expect("request accepted");
+            .expect("request accepted")
+            .expect("a warm donor streams");
         let mut got = Vec::new();
         while let Some(chunk) = stream.next().await {
             got.extend(chunk.expect("chunk decodes"));
         }
         assert_eq!(got, records);
+    }
+
+    #[tokio::test]
+    async fn request_state_reports_a_donor_that_declines_and_keeps_its_connection() {
+        let handler = Arc::new(FixtureHandler {
+            records: vec![sample_record(1)],
+            snapshot_unavailable: true,
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        for attempt in 0..2 {
+            let declined = requester
+                .request_state(NodeId::from(1), SmolStr::new("users"))
+                .await
+                .expect("request accepted");
+            assert!(
+                declined.is_none(),
+                "attempt {attempt}: a donor that is not warm declines instead of streaming"
+            );
+        }
+        // The declined connection went back to the pool: an unrelated
+        // request on the same peer still works.
+        let digests = requester
+            .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
+            .await
+            .expect("the pooled connection serves the next request");
+        assert!(digests.is_empty());
     }
 
     #[tokio::test]
@@ -1381,7 +1436,8 @@ mod tests {
         let mut stream = requester
             .request_state(NodeId::from(1), SmolStr::new("users"))
             .await
-            .expect("request accepted");
+            .expect("request accepted")
+            .expect("a warm donor streams");
         let first = stream.next().await.expect("first chunk arrives");
         assert_eq!(first.expect("decodes"), vec![sample_record(1)]);
         let second = stream
