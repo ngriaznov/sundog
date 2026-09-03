@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.3.0] – 2026-09-03
 
 ### Added
 
@@ -14,7 +14,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   runs synchronously under one write guard; enumerating a bucket for
   anti-entropy is O(bucket), not O(cache). Expiry is checked on read and
   reclaimed by a sweep that visits only stripes with something due.
-  ENGINE_NUMBERS
+  Measured on one machine against 0.2.0 with the crate's own benchmark: a
+  local read 1,083 ns to 447 ns, a steady replicated write 4.0 µs to
+  1.0 µs, a 100k-entry `insert_many` converging on two peers 0.63 s to
+  0.20 s.
 - **Sketch-based anti-entropy for large buckets**: a mismatched bucket whose
   local entry count exceeds `ClusterConfig::ae_sketch_min_bucket` (default
   384) is answered with an invertible Bloom lookup table

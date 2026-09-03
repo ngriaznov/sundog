@@ -31,7 +31,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-sundog = "0.2"
+sundog = "0.3"
 ```
 
 sundog is async and runs on [tokio](https://tokio.rs) — the examples below
@@ -121,6 +121,13 @@ small clusters (2–30 nodes) and LAN latencies. There's no
 consistent-hashing / partitioning mode — every replicated node holds every
 entry.
 
+The store is an in-crate engine: 1,024 lock-striped tables, one per
+anti-entropy bucket, so a read is one read lock and one lookup with no
+allocation, a versioned write applies under one guard with nothing
+awaited, and a bucket enumerates in time proportional to the bucket, not
+the cache. On one machine that is a 447 ns local read and a 1.0 µs
+replicated write.
+
 A burst of writes — `insert_many` or back-to-back `insert` calls — fans out
 as coalesced `Replicate` batches rather than one frame per key, so
 replication throughput scales with the burst instead of the per-message
@@ -174,6 +181,7 @@ save `Mdns` for host networking or bare-metal LANs.
 | `tls` | off | mutual TLS on the data-plane mesh (`rustls`) — set `ClusterConfig::tls` / `ClusterBuilder::tls` and every connection, including state-transfer and anti-entropy, gets wrapped |
 | `prometheus` | off | a Prometheus exporter — `ClusterBuilder::prometheus_listen` serves `GET /metrics` directly, or grab a recorder via `telemetry::prometheus_handle` and mount it in your own server |
 | `sim` | off | swaps the data-plane transport for `turmoil`'s, so the net layer can run inside a deterministic simulation — test-only, never enable it in a real deployment |
+| `fuzzing` | off | exposes the reference model the apply-path fuzz targets drive against a real shard (`sundog::store::model`); changes no behavior |
 
 Metrics (`sundog_cache_hits_total{cache}` / `sundog_cache_misses_total{cache}`,
 `sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,

@@ -17,6 +17,6 @@ anyhow = "1.0.104"
 crossterm = "0.29.0"
 rand = "0.10.2"
 ratatui = "0.30.2"
-sundog = { version = "0.2.0", path = "../sundog" }
+sundog = { version = "0.3.0", path = "../sundog" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "io-std", "signal"] }
 tracing-subscriber = "0.3.23"
