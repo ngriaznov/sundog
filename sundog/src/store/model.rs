@@ -263,11 +263,8 @@ impl Model {
 }
 
 /// Postcard-encodes a `u8` key — the same bytes [`Shard`]'s own
-/// `encode_key` produces for a `u8`. `pub` so `sundog-fuzz`'s
-/// `apply_permutation` target (which builds [`WireRecord`]s of its own,
-/// outside [`run`]'s driver) can match it exactly.
-#[must_use]
-pub fn key_bytes(key: u8) -> Bytes {
+/// `encode_key` produces for a `u8`.
+fn key_bytes(key: u8) -> Bytes {
     Bytes::from(postcard::to_stdvec(&key).expect("invariant: u8 always postcard-encodes"))
 }
 
