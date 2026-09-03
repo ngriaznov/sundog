@@ -22,6 +22,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::ClusterConfig;
 use crate::error::{CacheError, CodecError};
 use crate::hlc::{Hlc, HlcClock};
+use crate::net::REPLICATE_BATCH_COUNT;
 use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
@@ -655,7 +656,7 @@ where
     ///
     /// `notify_fan_out: false` is how [`Shard::insert_many`] and
     /// [`Shard::remove_many`] opt out of the per-write queue push in favor
-    /// of one hand-off per stripe group.
+    /// of [`Shard::hand_off_bulk`].
     fn handle_apply_outcome(
         &self,
         outcome: ApplyOutcome<K, V>,
@@ -1060,11 +1061,9 @@ where
                 applied_keys.extend(outcome.key().cloned());
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-            // Only the writes that landed, handed off per stripe as they
-            // land, so replication streams while the rest of the fill is
-            // still applying.
-            self.fan_out.extend(applied_keys.drain(..));
+            self.hand_off_bulk(&mut applied_keys, false);
         }
+        self.hand_off_bulk(&mut applied_keys, true);
         match failure {
             Some(err) => Err(err),
             None => Ok(()),
@@ -1133,9 +1132,22 @@ where
                 applied_keys.extend(outcome.key().cloned());
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-            self.fan_out.extend(applied_keys.drain(..));
+            self.hand_off_bulk(&mut applied_keys, false);
         }
+        self.hand_off_bulk(&mut applied_keys, true);
         Ok(())
+    }
+
+    /// Hands a bulk write's landed keys to the fan-out queue one full
+    /// replicate batch ([`REPLICATE_BATCH_COUNT`] keys) at a time, and the
+    /// remainder when `flush` is set, so replication streams full frames
+    /// while the rest of the write is still applying and a fill costs a
+    /// bounded number of frames per peer whatever the machine's speed.
+    fn hand_off_bulk(&self, landed: &mut Vec<K>, flush: bool) {
+        if landed.is_empty() || (!flush && landed.len() < REPLICATE_BATCH_COUNT) {
+            return;
+        }
+        self.fan_out.extend(landed.drain(..));
     }
 
     /// Tombstones every key this node currently holds, via
@@ -2575,6 +2587,38 @@ mod tests {
             .expect("a push after the wait wakes it")
             .expect("waiter completes");
         assert_eq!(drained, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn hand_off_bulk_waits_for_a_full_batch_unless_flushed() {
+        let s = shard::<u32, String>(1);
+        let mut landed: Vec<u32> =
+            (0..u32::try_from(REPLICATE_BATCH_COUNT - 1).expect("fits")).collect();
+
+        s.hand_off_bulk(&mut landed, false);
+        assert_eq!(
+            landed.len(),
+            REPLICATE_BATCH_COUNT - 1,
+            "short of a batch, nothing moves"
+        );
+        assert!(s.fan_out.drain().is_empty());
+
+        landed.push(u32::MAX);
+        s.hand_off_bulk(&mut landed, false);
+        assert!(landed.is_empty(), "a full batch is handed off whole");
+        assert_eq!(s.fan_out.drain().len(), REPLICATE_BATCH_COUNT);
+
+        let mut remainder = vec![1, 2, 3];
+        s.hand_off_bulk(&mut remainder, true);
+        assert!(remainder.is_empty(), "a flush hands off whatever is left");
+        assert_eq!(s.fan_out.drain(), vec![1, 2, 3]);
+
+        let mut nothing: Vec<u32> = Vec::new();
+        s.hand_off_bulk(&mut nothing, true);
+        assert!(
+            s.fan_out.drain().is_empty(),
+            "an empty flush queues nothing"
+        );
     }
 
     #[tokio::test]

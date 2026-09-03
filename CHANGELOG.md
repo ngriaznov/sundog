@@ -46,7 +46,9 @@ All notable changes to this project are documented in this file. Format follows
 - The hand-off from a local write to the fan-out routine is a lossless queue of
   pending keys drained whole, replacing a bounded broadcast channel that lagged
   under a burst of single inserts and left the gap to anti-entropy. A burst of
-  any size costs one drain.
+  any size costs one drain. `insert_many` and `remove_many` hand their keys
+  off one full replicate batch at a time, so a fill costs a bounded number
+  of frames per peer whatever the machine's speed.
 - Anti-entropy pull replies (`AePull`, `AePullHashes`) travel as
   `ReplicateBatch` frames under the same byte and count budget as the live
   fan-out, replacing one `Replicate` frame per record; a 100k-record repair is a
