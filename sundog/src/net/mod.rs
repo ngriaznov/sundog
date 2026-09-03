@@ -1523,7 +1523,10 @@ mod tests {
         assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(2)]);
         assert!(mesh.take_dirty_peers().is_empty(), "taking clears the mark");
         mesh.mark_dirty(NodeId::from(42));
-        assert!(mesh.take_dirty_peers().is_empty(), "an unknown peer is ignored");
+        assert!(
+            mesh.take_dirty_peers().is_empty(),
+            "an unknown peer is ignored"
+        );
     }
 
     #[tokio::test]

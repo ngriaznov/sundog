@@ -45,6 +45,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   offset in one stripe, repeating until the cap holds. TTI stays a local
   per-entry idle deadline. Neither is available in `Replicated` mode, as
   before.
+- The hand-off from a local write to the fan-out task is a lossless queue
+  of pending keys drained whole, instead of a bounded broadcast channel
+  that lagged under a burst of single inserts and left the gap to
+  anti-entropy. A burst of any size costs one drain.
 - Anti-entropy pull replies (`AePull`, `AePullHashes`) travel as
   `ReplicateBatch` frames under the same byte and count budget as the live
   fan-out, instead of one `Replicate` frame per record; a 100k-record

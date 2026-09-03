@@ -32,7 +32,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use xxhash_rust::xxh3::xxh3_64;
@@ -47,7 +47,7 @@ use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler, batch_replicate};
 use crate::node::{NodeId, NodeName};
-use crate::store::{FanOutNotice, Mode, Shard, ShardOps};
+use crate::store::{FanOutQueue, Mode, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
@@ -769,8 +769,7 @@ async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken)
 
 /// Cap on how many already-queued inbound messages [`inbound_loop`] drains
 /// per wake — bounds one iteration's work under a multi-peer burst rather
-/// than draining an unbounded backlog before dispatching anything (mirrors
-/// [`FAN_OUT_DRAIN_CAP`]'s role on the outbound side).
+/// than draining an unbounded backlog before dispatching anything.
 const INBOUND_DRAIN_CAP: usize = 1024;
 
 /// Applies one accumulated same-cache run of `Replicate`/`ReplicateBatch`
@@ -900,13 +899,7 @@ async fn inbound_loop(
     }
 }
 
-/// Cap on how many further events [`fan_out_task`] drains in one go past the
-/// one it just woke on — bounds one iteration's work under sustained load
-/// (e.g. `Cache::insert_many`) rather than draining an unbounded backlog
-/// before ever sending anything.
-const FAN_OUT_DRAIN_CAP: usize = 1024;
-
-/// Subscribes to one opened cache's local-write notices and fans them out
+/// Drains one opened cache's queue of locally written keys and fans them out
 /// over the mesh per [`Mode`] — the composition-layer half of `Shard`'s
 /// design (`store::mod` docs: "`Shard` intentionally holds no handle to
 /// `net::Mesh`"). Every local write fans out uniformly, including a
@@ -916,16 +909,14 @@ const FAN_OUT_DRAIN_CAP: usize = 1024;
 /// re-derivable data, so under-propagating costs nothing but an extra
 /// loader call elsewhere, never correctness.
 ///
-/// Micro-batches: after waiting for one notice, drains whatever further
-/// notices are already available (bounded by [`FAN_OUT_DRAIN_CAP`] notices —
-/// one [`FanOutNotice::Many`] carries a whole chunk of keys and still counts
-/// as one) before doing any work, so a burst of local writes costs one
-/// `ShardOps::records_for` call and one round of per-peer sends for the
-/// whole burst, not one of each per write.
+/// Each iteration takes the whole backlog at once, so a burst of local
+/// writes costs one `records_for_typed` call and one round of per-peer
+/// sends for the whole burst, not one of each per write, and nothing is
+/// ever dropped for arriving too fast (see [`FanOutQueue`]).
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
-    mut notices: broadcast::Receiver<FanOutNotice<K>>,
+    queue: Arc<FanOutQueue<K>>,
     cache_name: SmolStr,
     mode: Mode,
     cancel: CancellationToken,
@@ -933,46 +924,12 @@ pub(crate) async fn fan_out_task<K, V>(
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    let push_keys = |keys: &mut Vec<K>, notice: FanOutNotice<K>| match notice {
-        FanOutNotice::One(key) => keys.push(key),
-        FanOutNotice::Many(chunk) => keys.extend(chunk),
-    };
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            received = notices.recv() => {
-                let mut keys = Vec::new();
-                match received {
-                    Ok(notice) => push_keys(&mut keys, notice),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            cache = %cache_name,
-                            skipped,
-                            "cache fan-out lagged behind local writes; anti-entropy repairs the gap"
-                        );
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-                let mut drained = 1usize;
-                while drained < FAN_OUT_DRAIN_CAP {
-                    match notices.try_recv() {
-                        Ok(notice) => {
-                            push_keys(&mut keys, notice);
-                            drained += 1;
-                        }
-                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                cache = %cache_name,
-                                skipped,
-                                "cache fan-out lagged mid-drain; anti-entropy repairs the gap"
-                            );
-                            break;
-                        }
-                        Err(_) => break, // Empty (nothing more queued) or Closed (next recv() handles it)
-                    }
-                }
+            () = queue.wait_nonempty() => {
+                let keys = queue.drain();
                 fan_out_batch(&shard, &cluster, &cache_name, mode, keys).await;
             }
         }
@@ -989,8 +946,8 @@ async fn fan_out_batch<K, V>(
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    // The channel carries local writes only (see `store::FanOutNotice`), so
-    // no origin filter remains here — just dedup within the drained burst.
+    // The queue carries local writes only (see `store::FanOutQueue`), so
+    // no origin filter is needed here — only a dedup of the drained burst.
     let mut seen: HashSet<&K> = HashSet::new();
     let mut keys: Vec<K> = Vec::new();
     for key in &notified {
@@ -1478,7 +1435,10 @@ mod tests {
     fn inbound_activity_is_recent_only_inside_the_window() {
         let activity = InboundActivity::default();
         let peer = NodeId::from(5);
-        assert!(!activity.recent(peer, Duration::from_secs(10)), "never seen");
+        assert!(
+            !activity.recent(peer, Duration::from_secs(10)),
+            "never seen"
+        );
         activity.note(peer);
         assert!(activity.recent(peer, Duration::from_secs(10)));
         std::thread::sleep(Duration::from_millis(15));

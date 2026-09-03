@@ -108,25 +108,72 @@ fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> 
 /// rather than applying backpressure to writers.
 const EVENTS_CAPACITY: usize = 1024;
 
-/// How many keys one `FanOutNotice::Many` carries at most — aligned with
-/// `net::conn`'s `REPLICATE_BATCH_COUNT` so one notice's worth of records
-/// coalesces into at most one full wire batch. A bulk burst of `n` writes
-/// occupies `n / 4096` fan-out channel slots instead of `n`, which is what
-/// keeps `Cache::insert_many` from lagging the channel and degrading its
-/// whole burst to anti-entropy repair.
-const FAN_OUT_MANY_CHUNK: usize = 4096;
+/// The keys this node has written locally and not yet fanned out — the
+/// hand-off between every local versioned write and `cluster::fan_out_task`.
+/// Lossless: a write appends its key and the task drains the whole backlog
+/// at once, so a burst of any size costs one drain, never a lagged channel
+/// that leaves anti-entropy to re-ship what was dropped. Only local writes
+/// ever land here; remote applies would just re-broadcast what a peer
+/// already sent. Keys only, no values: the task re-fetches fresh wire bytes
+/// through `records_for_typed`, so nothing here can go stale. Duplicates
+/// are fine, the task deduplicates a drained batch before fetching.
+pub(crate) struct FanOutQueue<K> {
+    pending: StdMutex<Vec<K>>,
+    notify: tokio::sync::Notify,
+}
 
-/// One fan-out notification: "these locally-written keys need replicating".
-/// Only local writes ever notify — remote applies would just re-broadcast
-/// what a peer already sent — so no origin travels here.
-#[derive(Clone)]
-pub(crate) enum FanOutNotice<K> {
-    /// A single write ([`Shard::insert`], [`Shard::remove`], a read-through
-    /// fill).
-    One(K),
-    /// A bulk burst ([`Shard::insert_many`]), chunked to
-    /// [`FAN_OUT_MANY_CHUNK`].
-    Many(Vec<K>),
+impl<K> FanOutQueue<K> {
+    fn new() -> Self {
+        Self {
+            pending: StdMutex::new(Vec::new()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn push(&self, key: K) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(key);
+        self.notify.notify_one();
+    }
+
+    fn extend(&self, keys: impl IntoIterator<Item = K>) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(keys);
+        self.notify.notify_one();
+    }
+
+    /// Takes every pending key, leaving the queue empty.
+    pub(crate) fn drain(&self) -> Vec<K> {
+        std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Resolves once the queue holds at least one key. A push that lands
+    /// before the wait stores a permit, so nothing is ever missed.
+    pub(crate) async fn wait_nonempty(&self) {
+        loop {
+            if !self
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+            {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
 }
 
 /// A named cache's clustering behavior: how writes fan out to other nodes.
@@ -534,18 +581,12 @@ where
     mode: Mode,
     engine: Arc<Engine<K, V>>,
     events: broadcast::Sender<Event<K, V>>,
-    /// Internal-only notification channel: keys only, no value clone, fed by
-    /// every *local* versioned write — remote applies never notify, they'd
-    /// only re-broadcast what a peer already sent (`fan_out_task`'s sole
-    /// source of truth for "what changed" — it re-fetches fresh wire bytes
-    /// through `records_for_typed` rather than reading a value off this
-    /// channel, so there is nothing here for it to be stale about). A bulk
-    /// burst notifies as `FanOutNotice::Many` chunks so it can never lag
-    /// the channel. Kept separate from `events` so the app-facing
-    /// broadcast's `receiver_count()` reflects only real external
-    /// subscribers, making the "skip the value clone when nobody's
-    /// listening" guard on `events` meaningful.
-    fan_out: broadcast::Sender<FanOutNotice<K>>,
+    /// Keys written locally and not yet fanned out; see [`FanOutQueue`].
+    /// Kept separate from `events` so the app-facing broadcast's
+    /// `receiver_count()` reflects only real external subscribers, making
+    /// the "skip the value clone when nobody's listening" guard on `events`
+    /// meaningful.
+    fan_out: Arc<FanOutQueue<K>>,
     /// Guards only the synchronous HLC bump itself, never held across `.await`.
     clock: StdMutex<HlcClock>,
     /// The deterministic-clock hook: every timestamp this shard stamps (HLC,
@@ -612,7 +653,7 @@ where
             mode,
             engine,
             events: broadcast::channel(EVENTS_CAPACITY).0,
-            fan_out: broadcast::channel(EVENTS_CAPACITY).0,
+            fan_out: Arc::new(FanOutQueue::new()),
             clock: StdMutex::new(HlcClock::new(node)),
             clock_fn: Arc::new(now_ms),
             ttl,
@@ -750,11 +791,9 @@ where
     /// it always was.
     ///
     /// `notify_fan_out: false` is [`Shard::insert_many`]/[`Shard::remove_many`]'s
-    /// bulk path opting out of the per-write [`FanOutNotice::One`] here in
-    /// favor of its own `FanOutNotice::Many` chunks after the batch — same
-    /// notifications, thousands of times fewer channel slots. (A local
-    /// origin is what makes a notice happen at all; remote applies never
-    /// notify.)
+    /// bulk path opting out of the per-write queue push here in favor of
+    /// one hand-off per stripe group. (A local origin is what makes a push
+    /// happen at all; remote applies never fan out.)
     fn handle_apply_outcome(
         &self,
         outcome: ApplyOutcome<K, V>,
@@ -769,7 +808,7 @@ where
                 created,
             } => {
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
+                    self.fan_out.push(key.clone());
                 }
                 if self.events.receiver_count() > 0 {
                     let event = if created {
@@ -782,7 +821,7 @@ where
             }
             ApplyOutcome::Tombstoned { key } => {
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
+                    self.fan_out.push(key.clone());
                 }
                 if self.events.receiver_count() > 0 {
                     let _ = self.events.send(Event::Removed { key, origin });
@@ -949,7 +988,7 @@ where
                                 &inflight,
                             );
                             guard.complete();
-                            let _ = self.fan_out.send(FanOutNotice::One(key.clone()));
+                            self.fan_out.push(key.clone());
                             if self.events.receiver_count() > 0 {
                                 let _ = self.events.send(Event::Created {
                                     key: key.clone(),
@@ -1160,13 +1199,13 @@ where
             for outcome in outcomes {
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-        }
-        // One `Many` notice per chunk after the whole batch (see
-        // `handle_apply_outcome`'s `notify_fan_out` docs): a notice per
-        // stripe would hand the fan-out task a thousand slivers of a bulk
-        // fill, each shipped as its own undersized frame.
-        for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
-            let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
+            // Handed off per stripe as it lands (see `handle_apply_outcome`'s
+            // `notify_fan_out` docs), so replication streams while the rest
+            // of the fill is still applying: peers see traffic in motion
+            // from the first stripe on, and the fan-out task drains whatever
+            // has accumulated per iteration, so the slivers still ship as
+            // full-size frames.
+            self.fan_out.extend(applied_keys.drain(..));
         }
         Ok(())
     }
@@ -1198,7 +1237,7 @@ where
     /// caveat as [`Shard::insert_many`], read "written" as "tombstoned": if
     /// a key partway through fails to encode, the keys before it are still
     /// tombstoned. Emits one [`Event::Removed`] per key and fans out in
-    /// `FanOutNotice::Many` chunks exactly as [`Shard::insert_many`]
+    /// one queue hand-off per stripe group
     /// describes.
     ///
     /// # Errors
@@ -1241,9 +1280,7 @@ where
             for outcome in outcomes {
                 self.handle_apply_outcome(outcome, Origin::Local, false);
             }
-        }
-        for chunk in applied_keys.chunks(FAN_OUT_MANY_CHUNK) {
-            let _ = self.fan_out.send(FanOutNotice::Many(chunk.to_vec()));
+            self.fan_out.extend(applied_keys.drain(..));
         }
         Ok(())
     }
@@ -1283,13 +1320,12 @@ where
         self.events.subscribe()
     }
 
-    /// Subscribes to this shard's lightweight keys-only fan-out
-    /// notifications — `fan_out_task`'s cheaper alternative to
-    /// subscribing on [`Shard::events`] directly, since it never reads
-    /// `Event`'s `value` at all. Carries local writes only; see
-    /// [`FanOutNotice`].
-    pub(crate) fn fan_out_events(&self) -> broadcast::Receiver<FanOutNotice<K>> {
-        self.fan_out.subscribe()
+    /// The queue of locally written keys awaiting fan-out —
+    /// `fan_out_task`'s cheaper alternative to subscribing on
+    /// [`Shard::events`], since it never reads `Event`'s `value` at all.
+    /// Carries local writes only; see [`FanOutQueue`].
+    pub(crate) fn fan_out_queue(&self) -> Arc<FanOutQueue<K>> {
+        Arc::clone(&self.fan_out)
     }
 
     /// [`ShardOps::records_for`], but for callers that already hold typed
@@ -2520,34 +2556,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_writes_notify_fan_out_in_whole_batch_chunks_not_per_stripe() {
+    async fn bulk_writes_queue_every_key_for_fan_out_and_a_drain_takes_them_all() {
         let s = shard::<u32, String>(1);
-        let mut notices = s.fan_out_events();
+        let queue = s.fan_out_queue();
         s.insert_many((0..10_000u32).map(|k| (k, k.to_string())))
             .await
             .expect("bulk insert");
-        let mut chunks = Vec::new();
-        while let Ok(notice) = notices.try_recv() {
-            match notice {
-                FanOutNotice::Many(keys) => chunks.push(keys.len()),
-                FanOutNotice::One(_) => panic!("a bulk write never notifies per key"),
-            }
-        }
-        assert_eq!(
-            chunks.len(),
-            10_000usize.div_ceil(FAN_OUT_MANY_CHUNK),
-            "one notice per FAN_OUT_MANY_CHUNK keys, not one per stripe: {chunks:?}"
-        );
-        assert_eq!(chunks.iter().sum::<usize>(), 10_000);
-        assert!(chunks.iter().all(|&n| n <= FAN_OUT_MANY_CHUNK));
+        assert_eq!(queue.len(), 10_000, "nothing is lost to a lagged channel");
+        let mut keys = queue.drain();
+        keys.sort_unstable();
+        assert_eq!(keys, (0..10_000u32).collect::<Vec<_>>());
+        assert_eq!(queue.len(), 0);
 
         s.remove_many(0..10_000u32).await.expect("bulk remove");
-        let mut removals = 0;
-        while let Ok(FanOutNotice::Many(keys)) = notices.try_recv() {
-            removals += 1;
-            assert!(keys.len() <= FAN_OUT_MANY_CHUNK);
-        }
-        assert_eq!(removals, 10_000usize.div_ceil(FAN_OUT_MANY_CHUNK));
+        assert_eq!(queue.drain().len(), 10_000);
+        s.insert(1, "one".into()).await.expect("insert");
+        s.insert(1, "one again".into()).await.expect("insert");
+        assert_eq!(
+            queue.drain(),
+            vec![1, 1],
+            "single writes queue their key each time"
+        );
+    }
+
+    #[tokio::test]
+    async fn fan_out_queue_wakes_a_waiter_for_a_push_before_or_after_the_wait() {
+        let queue = Arc::new(FanOutQueue::<u32>::new());
+        queue.push(7);
+        tokio::time::timeout(Duration::from_secs(1), queue.wait_nonempty())
+            .await
+            .expect("a push before the wait is not missed");
+        assert_eq!(queue.drain(), vec![7]);
+
+        let waiter = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move {
+                queue.wait_nonempty().await;
+                queue.drain()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        queue.extend([1, 2]);
+        let drained = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a push after the wait wakes it")
+            .expect("waiter task");
+        assert_eq!(drained, vec![1, 2]);
     }
 
     #[tokio::test]
