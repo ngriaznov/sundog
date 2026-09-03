@@ -10,6 +10,17 @@
 //! deliberately hold different, independent subsets of a cache, so a
 //! full-record digest reconciliation between them would defeat that
 //! design rather than repair it.
+//!
+//! A mismatched bucket's reply takes one of two shapes
+//! ([`crate::net::AeMismatch`]): a small bucket's full `(key, version)`
+//! listing, diffed by [`diff_bucket`] exactly as before; a large bucket's
+//! IBLT sketch instead (`super::sketch`'s module docs), diffed by building
+//! the matching local sketch, subtracting, and peeling
+//! ([`diff_decoded`] classifies the peeled result). A sketch that fails to
+//! peel ([`super::sketch::Undecodable`]) falls back to requesting that
+//! bucket's full listing via `Msg::AeEntries`, once, after every reply in
+//! the round has been processed — so one hard-to-decode bucket never blocks
+//! the rest of the round's sketches from being used.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -20,9 +31,12 @@ use rand::RngExt as _;
 use rand::seq::IndexedRandom as _;
 use smol_str::SmolStr;
 use tokio_util::sync::CancellationToken;
+use xxhash_rust::xxh3::xxh3_64;
 
 use super::Cluster;
-use crate::net::MsgClass;
+use super::sketch::{Decoded, Iblt};
+use crate::hlc::Hlc;
+use crate::net::{AeMismatch, MsgClass};
 use crate::node::NodeId;
 use crate::store::ShardOps;
 
@@ -112,22 +126,95 @@ pub(crate) async fn run_round_against(
 
     // One local shard pass for every mismatched bucket (a mostly-divergent
     // peer mismatches all 1,024; per-bucket scans would be quadratic here,
-    // exactly as on the serving side).
+    // exactly as on the serving side) — covers both the plain-listing and
+    // sketch replies, since a sketch diff needs the local bucket's entries
+    // to build its own comparison sketch from just as much as a listing
+    // diff needs them.
     let local_entries = shard
-        .entries_for_buckets(mismatched.iter().map(|&(bucket, _)| bucket).collect())
+        .entries_for_buckets(mismatched.iter().map(AeMismatch::bucket).collect())
         .await;
-    let local_by_bucket: HashMap<u16, Vec<(Bytes, crate::hlc::Hlc)>> =
-        local_entries.into_iter().collect();
+    let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries.into_iter().collect();
 
     let mut push_keys: Vec<Bytes> = Vec::new();
     let mut pull_keys: Vec<Bytes> = Vec::new();
-    for (bucket, peer_entries) in mismatched {
-        diff_bucket(
-            local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
-            &peer_entries,
-            &mut push_keys,
-            &mut pull_keys,
-        );
+    // Sketch-decoded pulls: only a key *hash* is known (never key bytes),
+    // and `Msg::AePullHashes` is answered per bucket, so these queue
+    // separately from `pull_keys` rather than merging with it.
+    let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
+    let mut undecodable_buckets: Vec<u16> = Vec::new();
+
+    for mismatch in mismatched {
+        match mismatch {
+            AeMismatch::Bucket(bucket, peer_entries) => {
+                diff_bucket(
+                    local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
+                    &peer_entries,
+                    &mut push_keys,
+                    &mut pull_keys,
+                );
+            }
+            AeMismatch::Sketch(bucket, cells) => {
+                let entries: &[(Bytes, Hlc)] =
+                    local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
+                // Sized from the *received* sketch's own cell count, not
+                // this node's own `ae_sketch_cells` config — see
+                // `sketch::Iblt::new`'s docs for why that keeps the two
+                // sketches shape-compatible even if the two nodes' configs
+                // have drifted apart.
+                let mut local_sketch = Iblt::new(cells.len());
+                for (key, ver) in entries {
+                    local_sketch.insert(xxh3_64(key), *ver);
+                }
+                let remote_sketch = Iblt::from_cells(cells);
+                match local_sketch.subtract(&remote_sketch).peel() {
+                    Ok(decoded) => {
+                        let mut hashes = Vec::new();
+                        diff_decoded(entries, &decoded, &mut push_keys, &mut hashes);
+                        if !hashes.is_empty() {
+                            pull_hashes.push((bucket, hashes));
+                        }
+                        metrics::counter!(
+                            "sundog_ae_sketch_total",
+                            "cache" => cache.to_string(),
+                            "outcome" => "decoded"
+                        )
+                        .increment(1);
+                    }
+                    Err(_) => {
+                        undecodable_buckets.push(bucket);
+                        metrics::counter!(
+                            "sundog_ae_sketch_total",
+                            "cache" => cache.to_string(),
+                            "outcome" => "fallback"
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // One fallback request for every bucket whose sketch failed to decode,
+    // sent after every reply in the round has been classified rather than
+    // per-bucket as they're found — a peer that sends several oversized
+    // sketches gets one `AeEntries` round trip for all of them, not one
+    // each.
+    if !undecodable_buckets.is_empty() {
+        match mesh.ae_entries(peer, cache.clone(), undecodable_buckets).await {
+            Ok(fallback_buckets) => {
+                for (bucket, peer_entries) in fallback_buckets {
+                    diff_bucket(
+                        local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
+                        &peer_entries,
+                        &mut push_keys,
+                        &mut pull_keys,
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::debug!(%error, "anti-entropy sketch-fallback listing failed");
+            }
+        }
     }
 
     let mut repaired: u64 = 0;
@@ -158,6 +245,26 @@ pub(crate) async fn run_round_against(
             }
         }
     }
+    'buckets: for (bucket, hashes) in pull_hashes {
+        for batch in hashes.chunks(REPAIR_BATCH) {
+            match mesh
+                .ae_pull_hashes(peer, cache.clone(), bucket, batch.to_vec())
+                .await
+            {
+                Ok(records) => {
+                    repaired += records.len() as u64;
+                    shard.apply_remote_batch(records).await;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error, repaired,
+                        "anti-entropy hash pull failed; keeping progress"
+                    );
+                    break 'buckets;
+                }
+            }
+        }
+    }
 
     if repaired > 0 {
         metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
@@ -167,13 +274,12 @@ pub(crate) async fn run_round_against(
 }
 
 fn diff_bucket(
-    local_entries: &[(Bytes, crate::hlc::Hlc)],
-    peer_entries: &[(Bytes, crate::hlc::Hlc)],
+    local_entries: &[(Bytes, Hlc)],
+    peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
 ) {
-    let peer_by_key: HashMap<&Bytes, crate::hlc::Hlc> =
-        peer_entries.iter().map(|(k, v)| (k, *v)).collect();
+    let peer_by_key: HashMap<&Bytes, Hlc> = peer_entries.iter().map(|(k, v)| (k, *v)).collect();
     let mut local_keys = HashSet::with_capacity(local_entries.len());
 
     for (key, local_ver) in local_entries {
@@ -192,10 +298,62 @@ fn diff_bucket(
     }
 }
 
+/// The initiator's push/pull classification once an `AeSketch` reply
+/// decodes ([`Iblt::peel`]'s [`Decoded`] success case) — mirrors
+/// [`diff_bucket`]'s own rules over the peeled element lists instead of two
+/// full listings: a key present (at different versions) in both
+/// `decoded.only_left` (this node's contribution) and `decoded.only_right`
+/// (the peer's) pushes if the local version is newer, pulls if the peer's
+/// is; a key present only in `only_left` pushes; a key present only in
+/// `only_right` pulls. The one departure from `diff_bucket`: a sketch never
+/// carries key bytes, only a `key_hash`, so every pull here queues a hash
+/// into `pull_hashes` (resolved through `Msg::AePullHashes`) rather than a
+/// key — only a push, whose key hash always resolves back to an entry in
+/// `local_entries` (the same list the local sketch was built from), queues
+/// actual key bytes.
+fn diff_decoded(
+    local_entries: &[(Bytes, Hlc)],
+    decoded: &Decoded,
+    push_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<u64>,
+) {
+    let local_by_hash: HashMap<u64, &Bytes> = local_entries
+        .iter()
+        .map(|(key, _)| (xxh3_64(key), key))
+        .collect();
+    let local_only: HashMap<u64, Hlc> = decoded
+        .only_left
+        .iter()
+        .map(|elem| (elem.key_hash, elem.ver))
+        .collect();
+    let remote_only: HashMap<u64, Hlc> = decoded
+        .only_right
+        .iter()
+        .map(|elem| (elem.key_hash, elem.ver))
+        .collect();
+
+    for (&key_hash, &local_ver) in &local_only {
+        match remote_only.get(&key_hash) {
+            Some(&remote_ver) if remote_ver > local_ver => pull_hashes.push(key_hash),
+            _ => {
+                if let Some(&key) = local_by_hash.get(&key_hash) {
+                    push_keys.push(key.clone());
+                }
+            }
+        }
+    }
+    for &key_hash in remote_only.keys() {
+        if !local_only.contains_key(&key_hash) {
+            pull_hashes.push(key_hash);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    use super::super::sketch::Elem;
     use super::*;
 
     #[test]
@@ -209,5 +367,94 @@ mod tests {
     #[test]
     fn jittered_floors_at_one_millisecond_for_a_zero_interval() {
         assert!(jittered(Duration::ZERO) >= Duration::from_millis(1));
+    }
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            node: NodeId::from(1),
+        }
+    }
+
+    fn entry(key: &[u8]) -> (Bytes, u64) {
+        (Bytes::copy_from_slice(key), xxh3_64(key))
+    }
+
+    #[test]
+    fn diff_decoded_pushes_the_same_key_when_the_local_version_is_newer() {
+        let (key, hash) = entry(b"k1");
+        let local_entries = vec![(key.clone(), hlc(20))];
+        let decoded = Decoded {
+            only_left: vec![Elem {
+                key_hash: hash,
+                ver: hlc(20),
+            }],
+            only_right: vec![Elem {
+                key_hash: hash,
+                ver: hlc(10),
+            }],
+        };
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        assert_eq!(push, vec![key]);
+        assert!(pull.is_empty());
+    }
+
+    #[test]
+    fn diff_decoded_pulls_by_hash_when_the_remote_version_is_newer() {
+        let (key, hash) = entry(b"k1");
+        let local_entries = vec![(key, hlc(10))];
+        let decoded = Decoded {
+            only_left: vec![Elem {
+                key_hash: hash,
+                ver: hlc(10),
+            }],
+            only_right: vec![Elem {
+                key_hash: hash,
+                ver: hlc(20),
+            }],
+        };
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        assert!(push.is_empty());
+        assert_eq!(pull, vec![hash]);
+    }
+
+    #[test]
+    fn diff_decoded_pushes_a_local_only_key() {
+        let (key, hash) = entry(b"k2");
+        let local_entries = vec![(key.clone(), hlc(5))];
+        let decoded = Decoded {
+            only_left: vec![Elem {
+                key_hash: hash,
+                ver: hlc(5),
+            }],
+            only_right: Vec::new(),
+        };
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        assert_eq!(push, vec![key]);
+        assert!(pull.is_empty());
+    }
+
+    #[test]
+    fn diff_decoded_pulls_a_remote_only_key_by_hash_alone() {
+        // This node never held the key at all — `local_entries` is empty —
+        // so the only thing `diff_decoded` can possibly queue for it is the
+        // hash the peeled sketch reported, never key bytes it never had.
+        let hash = xxh3_64(b"k3");
+        let local_entries: Vec<(Bytes, Hlc)> = Vec::new();
+        let decoded = Decoded {
+            only_left: Vec::new(),
+            only_right: vec![Elem {
+                key_hash: hash,
+                ver: hlc(7),
+            }],
+        };
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        assert!(push.is_empty());
+        assert_eq!(pull, vec![hash]);
     }
 }

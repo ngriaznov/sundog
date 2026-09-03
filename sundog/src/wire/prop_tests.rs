@@ -10,7 +10,7 @@ use bytes::Bytes;
 use proptest::prelude::*;
 use smol_str::SmolStr;
 
-use super::{Msg, WireRecord, decode, encode};
+use super::{Cell, Msg, WireRecord, decode, encode};
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
@@ -107,11 +107,41 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
             .prop_map(|(cache, keys)| Msg::AePull { cache, keys }),
         (
             smol_str_strategy(),
+            any::<u16>(),
+            cells_strategy(),
+        )
+            .prop_map(|(cache, bucket, cells)| Msg::AeSketch { cache, bucket, cells }),
+        (
+            smol_str_strategy(),
+            proptest::collection::vec(any::<u16>(), 0..8),
+        )
+            .prop_map(|(cache, buckets)| Msg::AeEntries { cache, buckets }),
+        (
+            smol_str_strategy(),
+            any::<u16>(),
+            proptest::collection::vec(any::<u64>(), 0..8),
+        )
+            .prop_map(|(cache, bucket, hashes)| Msg::AePullHashes { cache, bucket, hashes }),
+        (
+            smol_str_strategy(),
             proptest::collection::vec(wire_record_strategy(), 0..8),
         )
             .prop_map(|(cache, recs)| Msg::ReplicateBatch { cache, recs }),
         Just(Msg::ReqDone),
     ]
+}
+
+/// A handful of real `Cell`s, built the same way any real sender would —
+/// through `Iblt`'s own pub(crate) API, since `Cell`'s fields are private to
+/// `cluster::sketch` and this test module has no other way to construct one.
+fn cells_strategy() -> impl Strategy<Value = Vec<Cell>> {
+    proptest::collection::vec((any::<u64>(), hlc_strategy()), 0..8).prop_map(|elems| {
+        let mut iblt = crate::cluster::sketch::Iblt::new(6);
+        for (key_hash, ver) in elems {
+            iblt.insert(key_hash, ver);
+        }
+        iblt.into_cells()
+    })
 }
 
 proptest! {

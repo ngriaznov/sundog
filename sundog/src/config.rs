@@ -134,6 +134,22 @@ pub struct ClusterConfig {
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
+    /// Local entry-list length above which an anti-entropy responder answers
+    /// a mismatched bucket with an IBLT sketch (`Msg::AeSketch`) instead of
+    /// the bucket's full `(key, version)` listing (`Msg::AeBucket`). A
+    /// listing this long costs about what a
+    /// [`ae_sketch_cells`](Self::ae_sketch_cells)-cell sketch costs on the
+    /// wire (each listed entry is a key hash plus an `Hlc`, comparable in
+    /// size to a sketch cell), so past this point the sketch is the cheaper
+    /// reply regardless of how large the actual diff turns out to be.
+    pub ae_sketch_min_bucket: usize,
+    /// Cell count of the IBLT sketch an anti-entropy responder builds for a
+    /// bucket past [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket).
+    /// Rated (see `cluster::sketch::RATED_CAPACITY`) to decode any symmetric
+    /// difference up to 40 elements exactly, every time; a larger true
+    /// difference falls back to `Msg::AeEntries`'s full listing rather than
+    /// ever risking a wrong decode.
+    pub ae_sketch_cells: usize,
     /// Mutual-TLS material for the data-plane mesh (feature `tls`); `None`
     /// (the default) means the mesh runs plaintext. See [`TlsConfig`]'s own
     /// docs for what setting this implies.
@@ -179,6 +195,8 @@ impl Default for ClusterConfig {
             dead_node_grace_period: Duration::from_secs(600),
             kv_tombstone_grace_period: Duration::from_mins(15),
             state_transfer_budget: Duration::from_secs(20),
+            ae_sketch_min_bucket: 256,
+            ae_sketch_cells: 240,
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -210,6 +228,13 @@ mod tests {
             config.outbox_capacity,
             ClusterConfig::default().outbox_capacity
         );
+    }
+
+    #[test]
+    fn default_ae_sketch_knobs_match_the_rated_sketch_shape() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.ae_sketch_min_bucket, 256);
+        assert_eq!(config.ae_sketch_cells, 240);
     }
 
     #[test]

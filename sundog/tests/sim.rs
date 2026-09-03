@@ -137,7 +137,10 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
         | Msg::StChunk { .. }
         | Msg::AeDigest { .. }
         | Msg::AeBucket { .. }
+        | Msg::AeSketch { .. }
+        | Msg::AeEntries { .. }
         | Msg::AePull { .. }
+        | Msg::AePullHashes { .. }
         | Msg::ReqDone => {}
     }
 }
@@ -221,7 +224,15 @@ async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
 
     let mut push_keys = Vec::new();
     let mut pull_keys = Vec::new();
-    for (bucket, peer_entries) in mismatched {
+    for mismatch in mismatched {
+        // This harness's buckets never grow past `ae_sketch_min_bucket`'s
+        // default, so the responder never answers with `AeMismatch::Sketch`
+        // in practice; skip it rather than decode it, keeping this
+        // reimplementation to the plain listing path
+        // `cluster::anti_entropy::run_round_against` also falls back to.
+        let sundog::net::AeMismatch::Bucket(bucket, peer_entries) = mismatch else {
+            continue;
+        };
         diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
     }
 

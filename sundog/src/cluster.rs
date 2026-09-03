@@ -15,6 +15,7 @@
 
 pub(crate) mod absence;
 pub(crate) mod anti_entropy;
+pub(crate) mod sketch;
 pub(crate) mod state_transfer;
 
 use std::collections::{HashMap, HashSet};
@@ -34,6 +35,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cache::CacheBuilder;
 use crate::config::ClusterConfig;
@@ -353,6 +355,8 @@ impl ClusterBuilder {
         let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
         let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
             shards: Arc::clone(&shards),
+            ae_sketch_min_bucket: config.ae_sketch_min_bucket,
+            ae_sketch_cells: config.ae_sketch_cells,
         });
         let (mesh, inbound_rx) =
             Mesh::spawn(data_bind_addr, node, incarnation, &config, handler).await?;
@@ -444,6 +448,8 @@ fn local_hostname() -> String {
 /// [`RequestHandler`]'s own docs).
 struct ClusterRequestHandler {
     shards: ShardRegistry,
+    ae_sketch_min_bucket: usize,
+    ae_sketch_cells: usize,
 }
 
 impl ClusterRequestHandler {
@@ -502,6 +508,41 @@ impl RequestHandler for ClusterRequestHandler {
                 None => Vec::new(),
             }
         })
+    }
+
+    fn records_for_hashes(
+        &self,
+        cache: SmolStr,
+        bucket: u16,
+        hashes: Vec<u64>,
+    ) -> BoxFuture<'_, Vec<WireRecord>> {
+        Box::pin(async move {
+            let Some(shard) = self.lookup(&cache) else {
+                return Vec::new();
+            };
+            // One shard lookup serves both steps: `bucket_entries` already
+            // holds every local key in `bucket`, so filtering by
+            // `xxh3_64(key)` membership in `hashes` before the
+            // `records_for` fetch avoids the default trait
+            // implementation's second independent shard pass.
+            let wanted: HashSet<u64> = hashes.into_iter().collect();
+            let keys: Vec<Bytes> = shard
+                .bucket_entries(bucket)
+                .await
+                .into_iter()
+                .filter(|(key, _)| wanted.contains(&xxh3_64(key)))
+                .map(|(key, _)| key)
+                .collect();
+            shard.records_for(keys).await
+        })
+    }
+
+    fn ae_sketch_min_bucket(&self) -> usize {
+        self.ae_sketch_min_bucket
+    }
+
+    fn ae_sketch_cells(&self) -> usize {
+        self.ae_sketch_cells
     }
 }
 
@@ -776,7 +817,10 @@ async fn inbound_loop(
                 | Msg::StChunk { .. }
                 | Msg::AeDigest { .. }
                 | Msg::AeBucket { .. }
+                | Msg::AeSketch { .. }
+                | Msg::AeEntries { .. }
                 | Msg::AePull { .. }
+                | Msg::AePullHashes { .. }
                 | Msg::ReqDone => {}
             }
         }
