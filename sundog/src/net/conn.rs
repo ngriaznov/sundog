@@ -560,7 +560,11 @@ async fn handle_accepted(
         };
         let is_request = matches!(
             msg,
-            Msg::StRequest { .. } | Msg::AeDigest { .. } | Msg::AePull { .. }
+            Msg::StRequest { .. }
+                | Msg::AeDigest { .. }
+                | Msg::AePull { .. }
+                | Msg::AeEntries { .. }
+                | Msg::AePullHashes { .. }
         );
         let stop = match msg {
             Msg::Invalidate { .. } | Msg::Replicate { .. } | Msg::ReplicateBatch { .. } => {
@@ -573,13 +577,36 @@ async fn handle_accepted(
             Msg::AeDigest { cache, buckets } => {
                 serve_ae_digest(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
             }
+            Msg::AeEntries { cache, buckets } => {
+                serve_ae_entries(&mut framed, cache, buckets, handler.as_ref(), &cancel).await
+            }
             Msg::AePull { cache, keys } => {
                 serve_ae_pull(&mut framed, cache, keys, handler.as_ref(), &cancel).await
             }
-            // A duplicate `Hello`, or `StChunk`/`AeBucket`/`ReqDone` — the
-            // latter only ever sent as replies on a connection *we*
-            // initiated as a requester, never to a connection we're serving.
-            Msg::Hello { .. } | Msg::StChunk { .. } | Msg::AeBucket { .. } | Msg::ReqDone => false,
+            Msg::AePullHashes {
+                cache,
+                bucket,
+                hashes,
+            } => {
+                serve_ae_pull_hashes(
+                    &mut framed,
+                    cache,
+                    bucket,
+                    hashes,
+                    handler.as_ref(),
+                    &cancel,
+                )
+                .await
+            }
+            // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
+            // `ReqDone` — the latter only ever sent as replies on a
+            // connection *we* initiated as a requester, never to a
+            // connection we're serving.
+            Msg::Hello { .. }
+            | Msg::StChunk { .. }
+            | Msg::AeBucket { .. }
+            | Msg::AeSketch { .. }
+            | Msg::ReqDone => false,
         };
         if stop {
             return;
@@ -645,10 +672,15 @@ async fn serve_state_transfer(
 
 /// Serves one anti-entropy digest exchange, feeding every mismatched
 /// bucket's reply plus a trailing [`Msg::ReqDone`] and flushing once,
-/// rather than one flush per bucket. Returns `true` if the caller
-/// should stop serving this connection (cancelled, or the send failed),
-/// `false` once the reply (including `ReqDone`) sent cleanly and the
-/// connection remains reusable.
+/// rather than one flush per bucket. A mismatched bucket whose local entry
+/// count exceeds `handler.ae_sketch_min_bucket()` replies with an IBLT
+/// sketch ([`Msg::AeSketch`], built with `handler.ae_sketch_cells()` cells)
+/// instead of its full listing (`Msg::AeBucket`) — `cluster::sketch`'s
+/// module docs for why past that size a fixed-cost sketch reply is cheaper
+/// on the wire than the listing regardless of the actual diff. Returns
+/// `true` if the caller should stop serving this connection (cancelled, or
+/// the send failed), `false` once the reply (including `ReqDone`) sent
+/// cleanly and the connection remains reusable.
 async fn serve_ae_digest(
     framed: &mut PeerFramed,
     cache: SmolStr,
@@ -670,8 +702,52 @@ async fn serve_ae_digest(
     let mut replies: Vec<Msg> = if mismatched.is_empty() {
         Vec::new()
     } else {
+        let min_bucket = handler.ae_sketch_min_bucket();
+        let sketch_cells = handler.ae_sketch_cells();
         handler
             .entries_for_buckets(cache.clone(), mismatched)
+            .await
+            .into_iter()
+            .map(|(bucket, entries)| {
+                if entries.len() > min_bucket {
+                    let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
+                    for (key, ver) in &entries {
+                        iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
+                    }
+                    Msg::AeSketch {
+                        cache: cache.clone(),
+                        bucket,
+                        cells: iblt.into_cells(),
+                    }
+                } else {
+                    Msg::AeBucket {
+                        cache: cache.clone(),
+                        bucket,
+                        entries,
+                    }
+                }
+            })
+            .collect()
+    };
+    replies.push(Msg::ReqDone);
+    send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// Serves an `AeEntries` request: the sketch fallback, full listings for the
+/// named `buckets` — exactly [`serve_ae_digest`]'s own `AeBucket` reply
+/// shape, requested explicitly rather than chosen by the responder.
+async fn serve_ae_entries(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    buckets: Vec<u16>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    let mut replies: Vec<Msg> = if buckets.is_empty() {
+        Vec::new()
+    } else {
+        handler
+            .entries_for_buckets(cache.clone(), buckets)
             .await
             .into_iter()
             .map(|(bucket, entries)| Msg::AeBucket {
@@ -705,6 +781,31 @@ async fn serve_ae_pull(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
+/// Serves an `AePullHashes` request: full records for the entries of
+/// `bucket` whose key hash is in `hashes` — the sketch-decoded counterpart
+/// to [`serve_ae_pull`], answered with the same `Replicate`-then-`ReqDone`
+/// reply shape.
+async fn serve_ae_pull_hashes(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    bucket: u16,
+    hashes: Vec<u64>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    let mut replies: Vec<Msg> = handler
+        .records_for_hashes(cache.clone(), bucket, hashes)
+        .await
+        .into_iter()
+        .map(|rec| Msg::Replicate {
+            cache: cache.clone(),
+            rec,
+        })
+        .collect();
+    replies.push(Msg::ReqDone);
+    send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
 /// Reads `AeBucket` replies until [`Msg::ReqDone`] marks the reply complete
 /// — not until the peer closes the connection, which it no longer does
 /// after one exchange. On success, checks `framed` back into `pool` for
@@ -724,6 +825,37 @@ pub(super) async fn collect_ae_buckets(
             Some(Ok(Msg::AeBucket {
                 bucket, entries, ..
             })) => result.push((bucket, entries)),
+            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
+            Some(Err(err)) => return Err(err),
+            None => return Err(unexpected_close("anti-entropy digest reply")),
+        }
+    }
+}
+
+/// Reads `AeBucket`/`AeSketch` replies until [`Msg::ReqDone`] marks the
+/// reply complete — [`Mesh::ae_round`]'s collector, one [`super::AeMismatch`]
+/// per mismatched bucket regardless of which shape the responder answered
+/// with. See [`collect_ae_buckets`]'s docs for the same "no longer relies on
+/// connection close" reasoning and pool-checkin-on-success rule.
+///
+/// [`Mesh::ae_round`]: super::Mesh::ae_round
+pub(super) async fn collect_ae_mismatches(
+    mut framed: PeerFramed,
+    pool: &ReqPool,
+) -> Result<Vec<super::AeMismatch>, CodecError> {
+    let mut result = Vec::new();
+    loop {
+        match recv_msg(&mut framed).await {
+            Some(Ok(Msg::ReqDone)) => {
+                pool.checkin(framed);
+                return Ok(result);
+            }
+            Some(Ok(Msg::AeBucket {
+                bucket, entries, ..
+            })) => result.push(super::AeMismatch::Bucket(bucket, entries)),
+            Some(Ok(Msg::AeSketch { bucket, cells, .. })) => {
+                result.push(super::AeMismatch::Sketch(bucket, cells));
+            }
             Some(Ok(_)) => {} // unexpected message on this connection; keep reading
             Some(Err(err)) => return Err(err),
             None => return Err(unexpected_close("anti-entropy digest reply")),

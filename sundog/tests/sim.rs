@@ -132,13 +132,10 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
         Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
-        Msg::Hello { .. }
-        | Msg::StRequest { .. }
-        | Msg::StChunk { .. }
-        | Msg::AeDigest { .. }
-        | Msg::AeBucket { .. }
-        | Msg::AePull { .. }
-        | Msg::ReqDone => {}
+        // `Hello`, the request/response messages, and `ReqDone` never reach
+        // this dispatcher — a no-op for all of them, and (a wildcard rather
+        // than an exhaustive list) for any future variant too.
+        _ => {}
     }
 }
 
@@ -221,7 +218,15 @@ async fn ae_round_once(mesh: &Mesh, shard: &TestShard, peer: NodeId) -> bool {
 
     let mut push_keys = Vec::new();
     let mut pull_keys = Vec::new();
-    for (bucket, peer_entries) in mismatched {
+    for mismatch in mismatched {
+        // This harness's buckets never grow past `ae_sketch_min_bucket`'s
+        // default, so the responder never answers with `AeMismatch::Sketch`
+        // in practice; skip it rather than decode it, keeping this
+        // reimplementation to the plain listing path
+        // `cluster::anti_entropy::run_round_against` also falls back to.
+        let sundog::net::AeMismatch::Bucket(bucket, peer_entries) = mismatch else {
+            continue;
+        };
         diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
     }
 

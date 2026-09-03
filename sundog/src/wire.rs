@@ -2,8 +2,9 @@
 //! encode/decode helpers every connection uses.
 //!
 //! Every frame starts with a one-byte discriminant. Control messages
-//! (`Hello`, `StRequest`, `AeDigest`, `AeBucket`, `AePull`, `ReqDone`) carry
-//! `FRAME_KIND_POSTCARD` and are postcard-encoded exactly as before. The
+//! (`Hello`, `StRequest`, `AeDigest`, `AeBucket`, `AeSketch`, `AeEntries`,
+//! `AePull`, `AePullHashes`, `ReqDone`) carry `FRAME_KIND_POSTCARD` and are
+//! postcard-encoded exactly as before. The
 //! three record-carrying variants — [`Msg::Replicate`], [`Msg::ReplicateBatch`],
 //! [`Msg::StChunk`] — carry `FRAME_KIND_RAW_RECORD` and use a dedicated
 //! length-prefixed layout instead: a fixed-size header (read via the
@@ -47,6 +48,14 @@ use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
+/// One cell of the anti-entropy IBLT sketch ([`Msg::AeSketch`]'s payload) —
+/// defined in `cluster::sketch` (an internal implementation module) and
+/// re-exported here only so a wire message can carry a `Vec<Cell>`; every
+/// field stays private to that module, so this type is otherwise opaque
+/// outside it — nothing outside `cluster::sketch` constructs, inspects, or
+/// matches on one.
+pub use crate::cluster::sketch::Cell;
+
 /// Hard cap on any single wire frame, in bytes (4 MiB). Oversized values are
 /// rejected at the API boundary (`CacheError::ValueTooLarge`) rather than
 /// fragmented across multiple frames.
@@ -75,6 +84,14 @@ impl WireRecord {
 }
 
 /// Every message exchanged on the data-plane mesh.
+///
+/// `#[non_exhaustive]`: this crate adds new wire message kinds as its
+/// anti-entropy and state-transfer protocols grow (`Msg::AeSketch`,
+/// `AeEntries`, and `AePullHashes` are exactly this, added on top of
+/// 0.2.0's exhaustive shape) — matching downstream code adds a wildcard arm
+/// once, here, rather than needing another breaking release for every
+/// future addition.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     /// Sent once a new connection is established: identifies the sender.
@@ -158,8 +175,56 @@ pub enum Msg {
     /// reply is complete without relying on the connection closing.
     /// `StRequest`'s reply already has its own per-chunk `done` flag on
     /// `StChunk` and needs no analogous marker. Appended after every
-    /// pre-existing variant so their encodings are unchanged.
+    /// variant that predates it so their postcard encodings (by declaration
+    /// index, not just their `as isize` discriminant) stay unchanged.
     ReqDone,
+    /// Anti-entropy round, step 2 (large-bucket path): an IBLT sketch
+    /// (`cluster::sketch`'s module docs) over a mismatched bucket's
+    /// `(key_hash, version)` pairs, sent instead of [`Msg::AeBucket`] once
+    /// the bucket's own listing would cost more on the wire than the sketch
+    /// (`ClusterConfig::ae_sketch_min_bucket`). The initiator subtracts its
+    /// own local sketch of the bucket from this one and peels the result;
+    /// on success this replaces the whole `AeBucket` round trip for that
+    /// bucket, on failure (`cluster::sketch::Undecodable`) the
+    /// initiator falls back to [`Msg::AeEntries`].
+    ///
+    /// [`ClusterConfig::ae_sketch_min_bucket`]: crate::config::ClusterConfig::ae_sketch_min_bucket
+    AeSketch {
+        /// The cache being reconciled.
+        cache: SmolStr,
+        /// Which bucket this sketch covers.
+        bucket: u16,
+        /// The sketch's cells (`ClusterConfig::ae_sketch_cells` of them, as
+        /// built by the sender).
+        cells: Vec<Cell>,
+    },
+    /// Anti-entropy round, step 2 fallback: "send me the full `(key,
+    /// version)` listing for these buckets" — the initiator's request after
+    /// one or more `AeSketch` replies failed to decode. Answered exactly
+    /// like `AeDigest`'s own reply shape: one [`Msg::AeBucket`] per
+    /// requested bucket, then [`Msg::ReqDone`].
+    AeEntries {
+        /// The cache being reconciled.
+        cache: SmolStr,
+        /// The buckets to list in full.
+        buckets: Vec<u16>,
+    },
+    /// Anti-entropy round, step 3 (sketch-decoded path): "send me your full
+    /// records for the entries of `bucket` whose key hash (`xxh3_64` of the
+    /// key's wire bytes) is one of `hashes`" — the sketch-decoded
+    /// counterpart to [`Msg::AePull`], used when the initiator peeled an
+    /// `AeSketch` reply and learned only the key *hashes* it is missing or
+    /// holds stale, never the keys themselves. Answered exactly like
+    /// `AePull`'s own reply shape: [`Msg::Replicate`] records, then
+    /// [`Msg::ReqDone`].
+    AePullHashes {
+        /// The cache being reconciled.
+        cache: SmolStr,
+        /// Which bucket the requested hashes were reported in.
+        bucket: u16,
+        /// Key hashes the requester is missing or holds an older version of.
+        hashes: Vec<u64>,
+    },
 }
 
 /// Frame discriminant: everything after this byte is a postcard-encoded [`Msg`].
@@ -620,6 +685,50 @@ mod tests {
         roundtrip(&Msg::AePull {
             cache: SmolStr::new("users"),
             keys: vec![Bytes::from_static(b"k1"), Bytes::from_static(b"k2")],
+        });
+    }
+
+    /// `Cell`'s fields are private to `cluster::sketch`; a wire test builds
+    /// one the same way any real sender would, through `Iblt`'s own
+    /// pub(crate) API, rather than a struct literal it has no access to.
+    fn sample_cells() -> Vec<Cell> {
+        let mut iblt = crate::cluster::sketch::Iblt::new(6);
+        iblt.insert(1, sample_hlc());
+        iblt.into_cells()
+    }
+
+    #[test]
+    fn roundtrip_ae_sketch() {
+        roundtrip(&Msg::AeSketch {
+            cache: SmolStr::new("users"),
+            bucket: 42,
+            cells: sample_cells(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_sketch_empty_cells() {
+        roundtrip(&Msg::AeSketch {
+            cache: SmolStr::new("users"),
+            bucket: 0,
+            cells: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_entries() {
+        roundtrip(&Msg::AeEntries {
+            cache: SmolStr::new("users"),
+            buckets: vec![0, 512, 1023],
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_pull_hashes() {
+        roundtrip(&Msg::AePullHashes {
+            cache: SmolStr::new("users"),
+            bucket: 7,
+            hashes: vec![1, 2, u64::MAX],
         });
     }
 

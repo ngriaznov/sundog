@@ -8,7 +8,7 @@ use std::fs;
 use bytes::Bytes;
 use sundog::hlc::Hlc;
 use sundog::node::NodeId;
-use sundog::wire::{Msg, WireRecord};
+use sundog::wire::{Cell, Msg, WireRecord};
 
 fn main() {
     let node = NodeId::from(7);
@@ -62,9 +62,27 @@ fn main() {
             bucket: 512,
             entries: vec![(Bytes::from_static(b"\x01k"), ver)],
         },
+        Msg::AeSketch {
+            cache: "users".into(),
+            bucket: 512,
+            // `Cell`'s fields are private to `cluster::sketch`, so a seed
+            // built from outside the crate can only reach `Cell::default`
+            // (the empty cell) — still a real, valid encoding, just not one
+            // with any accumulated element in it.
+            cells: vec![Cell::default(); 6],
+        },
+        Msg::AeEntries {
+            cache: "users".into(),
+            buckets: vec![0, 512, 1023],
+        },
         Msg::AePull {
             cache: "users".into(),
             keys: vec![Bytes::from_static(b"\x01k")],
+        },
+        Msg::AePullHashes {
+            cache: "users".into(),
+            bucket: 512,
+            hashes: vec![1, 2, u64::MAX],
         },
     ];
     for target in ["decode_never_panics", "decode_encode_roundtrip"] {

@@ -15,6 +15,7 @@
 
 pub(crate) mod absence;
 pub(crate) mod anti_entropy;
+pub(crate) mod sketch;
 pub(crate) mod state_transfer;
 
 use std::collections::{HashMap, HashSet};
@@ -34,6 +35,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cache::CacheBuilder;
 use crate::config::ClusterConfig;
@@ -353,6 +355,8 @@ impl ClusterBuilder {
         let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
         let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
             shards: Arc::clone(&shards),
+            ae_sketch_min_bucket: config.ae_sketch_min_bucket,
+            ae_sketch_cells: config.ae_sketch_cells,
         });
         let (mesh, inbound_rx) =
             Mesh::spawn(data_bind_addr, node, incarnation, &config, handler).await?;
@@ -372,26 +376,7 @@ impl ClusterBuilder {
             }),
         };
 
-        cluster.spawn_tracked(membership_to_mesh_task(
-            cluster.inner.membership.peers(),
-            cluster.inner.mesh.clone(),
-            cluster.cancel_token(),
-        ));
-        cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
-        cluster.spawn_tracked(absence::tracking_task(
-            cluster.inner.membership.peers(),
-            cluster.absence_tracker(),
-            cluster.cancel_token(),
-        ));
-        cluster.spawn_tracked(inbound_loop(
-            cluster.shards(),
-            inbound_rx,
-            cluster.cancel_token(),
-        ));
-        cluster.spawn_tracked(open_cache_gauge_task(
-            cluster.shards(),
-            cluster.cancel_token(),
-        ));
+        spawn_cluster_background_tasks(&cluster, inbound_rx);
 
         tracing::info!(
             %node,
@@ -403,6 +388,36 @@ impl ClusterBuilder {
 
         Ok(cluster)
     }
+}
+
+/// Spawns every background task a freshly built [`Cluster`] keeps running
+/// for its lifetime: membership-to-mesh peer republishing, the late
+/// cache-mode-mismatch sweep, absence tracking, the inbound broadcast-traffic
+/// dispatch loop, and the open-cache gauge. Split out of
+/// [`ClusterBuilder::build`] purely to keep that function's own length
+/// manageable — every task here still shares `cluster`'s own
+/// [`Cluster::cancel_token`] and [`Cluster::spawn_tracked`] bookkeeping.
+fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<InboundMsg>) {
+    cluster.spawn_tracked(membership_to_mesh_task(
+        cluster.inner.membership.peers(),
+        cluster.inner.mesh.clone(),
+        cluster.cancel_token(),
+    ));
+    cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
+    cluster.spawn_tracked(absence::tracking_task(
+        cluster.inner.membership.peers(),
+        cluster.absence_tracker(),
+        cluster.cancel_token(),
+    ));
+    cluster.spawn_tracked(inbound_loop(
+        cluster.shards(),
+        inbound_rx,
+        cluster.cancel_token(),
+    ));
+    cluster.spawn_tracked(open_cache_gauge_task(
+        cluster.shards(),
+        cluster.cancel_token(),
+    ));
 }
 
 /// Resolves the concrete address `Mesh::spawn` should bind to, and that
@@ -444,6 +459,8 @@ fn local_hostname() -> String {
 /// [`RequestHandler`]'s own docs).
 struct ClusterRequestHandler {
     shards: ShardRegistry,
+    ae_sketch_min_bucket: usize,
+    ae_sketch_cells: usize,
 }
 
 impl ClusterRequestHandler {
@@ -502,6 +519,41 @@ impl RequestHandler for ClusterRequestHandler {
                 None => Vec::new(),
             }
         })
+    }
+
+    fn records_for_hashes(
+        &self,
+        cache: SmolStr,
+        bucket: u16,
+        hashes: Vec<u64>,
+    ) -> BoxFuture<'_, Vec<WireRecord>> {
+        Box::pin(async move {
+            let Some(shard) = self.lookup(&cache) else {
+                return Vec::new();
+            };
+            // One shard lookup serves both steps: `bucket_entries` already
+            // holds every local key in `bucket`, so filtering by
+            // `xxh3_64(key)` membership in `hashes` before the
+            // `records_for` fetch avoids the default trait
+            // implementation's second independent shard pass.
+            let wanted: HashSet<u64> = hashes.into_iter().collect();
+            let keys: Vec<Bytes> = shard
+                .bucket_entries(bucket)
+                .await
+                .into_iter()
+                .filter(|(key, _)| wanted.contains(&xxh3_64(key)))
+                .map(|(key, _)| key)
+                .collect();
+            shard.records_for(keys).await
+        })
+    }
+
+    fn ae_sketch_min_bucket(&self) -> usize {
+        self.ae_sketch_min_bucket
+    }
+
+    fn ae_sketch_cells(&self) -> usize {
+        self.ae_sketch_cells
     }
 }
 
@@ -776,7 +828,10 @@ async fn inbound_loop(
                 | Msg::StChunk { .. }
                 | Msg::AeDigest { .. }
                 | Msg::AeBucket { .. }
+                | Msg::AeSketch { .. }
+                | Msg::AeEntries { .. }
                 | Msg::AePull { .. }
+                | Msg::AePullHashes { .. }
                 | Msg::ReqDone => {}
             }
         }
@@ -1077,6 +1132,7 @@ fn entry_count_f64(count: u64) -> f64 {
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::error::CacheError;
@@ -1824,6 +1880,300 @@ mod tests {
         })
         .await
         .expect("b's copy converges to empty within the bound");
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    // --- Sketch-based anti-entropy (`cluster::sketch`) -----------------
+
+    /// Mirrors `store::bucket_of`'s own formula (`postcard`-encoded key
+    /// bytes, `xxh3_64`, masked to `BUCKET_COUNT - 1`) so a test can compute
+    /// which anti-entropy bucket a given key lands in without that private
+    /// function.
+    fn bucket_of_u32(key: u32) -> u16 {
+        let bytes = postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes");
+        let bucket = xxhash_rust::xxh3::xxh3_64(&bytes) & (crate::store::BUCKET_COUNT as u64 - 1);
+        u16::try_from(bucket).expect("masked to BUCKET_COUNT - 1, always fits in u16")
+    }
+
+    /// Among `0..n`, every key that landed in a bucket holding more than
+    /// `min_count` of them — deterministic given a fixed key range, so a
+    /// test picking "a densely populated bucket" always gets the same one
+    /// on every run.
+    fn dense_bucket_keys(n: u32, min_count: usize) -> Vec<u32> {
+        let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
+        for key in 0..n {
+            by_bucket.entry(bucket_of_u32(key)).or_default().push(key);
+        }
+        by_bucket
+            .into_values()
+            .find(|keys| keys.len() > min_count)
+            .expect("at least one bucket exceeds min_count among this many keys")
+    }
+
+    /// `count` distinct keys that all hash into the same anti-entropy
+    /// bucket as key `0` — a tight, deliberately oversized true difference
+    /// for the sketch-fallback test below, rather than leaning on a bulk
+    /// insert's natural bucket-size variance to produce one.
+    fn keys_colliding_with_zero(count: usize) -> Vec<u32> {
+        let target = bucket_of_u32(0);
+        (0..)
+            .filter(|&k| bucket_of_u32(k) == target)
+            .take(count)
+            .collect()
+    }
+
+    /// A [`tracing::Subscriber`] that counts `cluster::anti_entropy`'s own
+    /// `outcome = "decoded"`/`outcome = "fallback"` tracing events — the
+    /// sketch tests' stand-in for reading `sundog_ae_sketch_total` through a
+    /// `metrics` recorder. `metrics::set_global_recorder` is a single
+    /// process-global slot (`telemetry`'s own module docs) shared with every
+    /// other test in this binary, too fragile to install per-test here;
+    /// `tracing::subscriber::set_default` is thread-local instead, and every
+    /// test below runs on `#[tokio::test]`'s default single-threaded
+    /// runtime, so every task it spawns — including the anti-entropy
+    /// scheduler backing the cluster under test — runs on this same thread
+    /// and is captured for the guard's lifetime.
+    struct AeSketchOutcomeSubscriber {
+        decoded: Arc<AtomicUsize>,
+        fallback: Arc<AtomicUsize>,
+    }
+
+    struct OutcomeVisitor(Option<&'static str>);
+
+    impl tracing::field::Visit for OutcomeVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "outcome" {
+                self.0 = match value {
+                    "decoded" => Some("decoded"),
+                    "fallback" => Some("fallback"),
+                    _ => None,
+                };
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    impl tracing::Subscriber for AeSketchOutcomeSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() != "sundog::cluster::anti_entropy" {
+                return;
+            }
+            let mut visitor = OutcomeVisitor(None);
+            event.record(&mut visitor);
+            match visitor.0 {
+                Some("decoded") => {
+                    self.decoded.fetch_add(1, Ordering::SeqCst);
+                }
+                Some("fallback") => {
+                    self.fallback.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_repairs_a_large_bucket_via_the_sketch_path() {
+        const N: u32 = 4096;
+
+        let config = ClusterConfig {
+            ae_sketch_min_bucket: 4,
+            ..loopback_config()
+        };
+
+        let cluster_a = Cluster::builder("cluster-it-ae-sketch-decode")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+
+        cache_a
+            .insert_many((0..N).map(|k| (k, k.to_string())))
+            .await
+            .expect("a inserts a few thousand entries before b ever joins");
+
+        // A bucket with more than `ae_sketch_min_bucket + 1` entries, so it
+        // still exceeds `ae_sketch_min_bucket` on B's side too once one
+        // entry is dropped below — whichever of A or B ends up the
+        // responder for this bucket's mismatch, both answer with a sketch.
+        let bucket_keys = dense_bucket_keys(N, config.ae_sketch_min_bucket + 1);
+        let target_key = bucket_keys[0];
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-sketch-decode")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, u64::from(N));
+
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(AeSketchOutcomeSubscriber {
+            decoded: Arc::clone(&decoded),
+            fallback: Arc::clone(&fallback),
+        });
+
+        // Simulate a dropped `Replicate` message on B, exactly like
+        // `anti_entropy_repairs_a_locally_dropped_entry` — except this
+        // bucket is large enough that the responder answers with
+        // `Msg::AeSketch` rather than the full listing.
+        cache_b.invalidate_local(&target_key).await;
+        assert_eq!(cache_b.get(&target_key).await, None);
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cache_b.get(&target_key).await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("anti-entropy repairs the dropped entry via the sketch path within the bound");
+
+        assert!(
+            decoded.load(Ordering::SeqCst) > 0,
+            "expected the sketch reply for this bucket to decode at least once"
+        );
+        assert_eq!(
+            fallback.load(Ordering::SeqCst),
+            0,
+            "a single-entry diff in a large bucket must decode, never fall back to a listing"
+        );
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_falls_back_to_the_listing_when_a_sketch_cannot_decode() {
+        let config = ClusterConfig {
+            ae_sketch_min_bucket: 4,
+            // 2 cells per IBLT partition (`ae_sketch_cells / IBLT_PARTITIONS`)
+            // — far too small to peel the 25-element true difference this
+            // test forces below.
+            ae_sketch_cells: 6,
+            ..loopback_config()
+        };
+
+        let cluster_a = Cluster::builder("cluster-it-ae-sketch-fallback")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+
+        // 30 keys that all land in the same anti-entropy bucket — a tight,
+        // deliberately oversized true difference once most of them are
+        // dropped from B below, rather than leaning on a bulk insert's
+        // natural bucket-size variance to produce one.
+        let colliding_keys = keys_colliding_with_zero(30);
+        let total = u64::try_from(colliding_keys.len()).expect("30 fits in a u64");
+        cache_a
+            .insert_many(colliding_keys.iter().map(|&k| (k, k.to_string())))
+            .await
+            .expect("a inserts the colliding keys before b ever joins");
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-sketch-fallback")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, total);
+
+        let decoded = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(AeSketchOutcomeSubscriber {
+            decoded: Arc::clone(&decoded),
+            fallback: Arc::clone(&fallback),
+        });
+
+        // Drop all but the last 5 keys on B — a true difference of 25
+        // elements in one bucket, far past what a 6-cell (2-per-partition)
+        // sketch can ever peel.
+        for &key in &colliding_keys[..colliding_keys.len() - 5] {
+            cache_b.invalidate_local(&key).await;
+        }
+        assert_eq!(cache_b.entry_count().await, 5);
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cache_b.entry_count().await == total {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fallback listing path repairs every dropped entry within the bound");
+
+        for &key in &colliding_keys {
+            assert_eq!(cache_b.get(&key).await, Some(key.to_string()));
+        }
+
+        assert!(
+            fallback.load(Ordering::SeqCst) > 0,
+            "expected the oversized diff to be reported undecodable at least once"
+        );
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;

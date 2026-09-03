@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a6247dc5102e92fe7a4fefb1e94d19a4b6db509f551137a321c1dfffbe797e0b # shrinks to items = [(12366299871922669512, RightOnly, Hlc { wall_ms: 0, logical: 0, node: NodeId(1) }, Hlc { wall_ms: 2304852784241013723, logical: 120843989, node: NodeId(1) }), (7363356556484492216, RightOnly, Hlc { wall_ms: 0, logical: 0, node: NodeId(1) }, Hlc { wall_ms: 11527192639310324480, logical: 914998448, node: NodeId(1) })]
+cc f78ed00c555b2cedd09fbebb41bd1aea14d6841edf2e7beeaa18e7c8cd53cde1 # shrinks to items = [(2709032570756801808, LeftOnly, Hlc { wall_ms: 6479988329101941401, logical: 2633753699, node: NodeId(1) }, Hlc { wall_ms: 0, logical: 0, node: NodeId(1) }), (677764239283982298, Differing, Hlc { wall_ms: 17913656540074659816, logical: 3060545196, node: NodeId(1) }, Hlc { wall_ms: 0, logical: 0, node: NodeId(1) })]

@@ -45,13 +45,14 @@ use smol_str::SmolStr;
 use tcp::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ClusterConfig;
 use crate::error::{CodecError, JoinError};
 use crate::hlc::Hlc;
 use crate::membership::Peer;
 use crate::node::NodeId;
-use crate::wire::{self, Msg, WireRecord};
+use crate::wire::{self, Cell, Msg, WireRecord};
 use outbox::DropOldestQueue;
 
 /// A queued outbound message paired with its already-encoded wire frame.
@@ -218,6 +219,31 @@ pub struct InboundMsg {
     pub msg: Msg,
 }
 
+/// One anti-entropy digest-exchange reply, as [`Mesh::ae_round`] collects
+/// them: either a mismatched bucket's full `(key, version)` listing
+/// ([`Msg::AeBucket`]'s payload), or — once the responder judged the bucket
+/// too large for that (`ClusterConfig::ae_sketch_min_bucket`) — an IBLT
+/// sketch over it instead ([`Msg::AeSketch`]'s payload, `cluster::sketch`'s
+/// module docs), for the initiator to subtract its own local sketch of the
+/// same bucket from and peel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AeMismatch {
+    /// `(bucket, entries)` — the bucket's full listing.
+    Bucket(u16, Vec<(Bytes, Hlc)>),
+    /// `(bucket, cells)` — an IBLT sketch over the bucket.
+    Sketch(u16, Vec<Cell>),
+}
+
+impl AeMismatch {
+    /// The bucket this reply covers, regardless of which shape it took.
+    #[must_use]
+    pub const fn bucket(&self) -> u16 {
+        match self {
+            Self::Bucket(bucket, _) | Self::Sketch(bucket, _) => *bucket,
+        }
+    }
+}
+
 /// What the net layer needs from the local shard registry to answer another
 /// node's state-transfer or anti-entropy request, without depending on
 /// `store` directly. An implementation typically looks `cache` up in the
@@ -242,6 +268,57 @@ pub trait RequestHandler: Send + Sync + 'static {
     ) -> BoxFuture<'_, crate::store::BucketEntries>;
     /// Returns full records for `keys` in `cache` that this node holds.
     fn records_for(&self, cache: SmolStr, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>>;
+
+    /// Returns full records for the entries of `bucket` in `cache` whose key
+    /// hash (`xxh3_64` of the key's wire bytes — the same hash
+    /// `store::bucket_of` takes the low bits of) is in `hashes` — answers an
+    /// `AePullHashes` request, the sketch-decoded counterpart to
+    /// [`RequestHandler::records_for`]'s direct-key form (used once the
+    /// initiator only knows *hashes* it is missing, from peeling an
+    /// `AeSketch` reply, never the keys themselves).
+    ///
+    /// The default implementation composes
+    /// [`RequestHandler::bucket_entries`] and [`RequestHandler::records_for`]
+    /// — correct for any implementation, but pays for two independent shard
+    /// lookups; override it (as `cluster::ClusterRequestHandler` does) when a
+    /// single lookup can serve both.
+    fn records_for_hashes(
+        &self,
+        cache: SmolStr,
+        bucket: u16,
+        hashes: Vec<u64>,
+    ) -> BoxFuture<'_, Vec<WireRecord>> {
+        Box::pin(async move {
+            let wanted: std::collections::HashSet<u64> = hashes.into_iter().collect();
+            let entries = self.bucket_entries(cache.clone(), bucket).await;
+            let keys: Vec<Bytes> = entries
+                .into_iter()
+                .filter(|(key, _)| wanted.contains(&xxh3_64(key)))
+                .map(|(key, _)| key)
+                .collect();
+            self.records_for(cache, keys).await
+        })
+    }
+
+    /// Bucket size (local entry count) above which the responder answers a
+    /// mismatched bucket with an IBLT sketch (`Msg::AeSketch`) instead of its
+    /// full listing (`Msg::AeBucket`) — mirrors
+    /// [`crate::config::ClusterConfig::ae_sketch_min_bucket`]. Defaults to
+    /// that field's own default, so a `RequestHandler` written before this
+    /// method existed keeps answering with the full listing exactly as it
+    /// did (the default is well above what any of this crate's own test
+    /// doubles ever populate a bucket with).
+    fn ae_sketch_min_bucket(&self) -> usize {
+        crate::config::ClusterConfig::default().ae_sketch_min_bucket
+    }
+
+    /// Sketch size (cell count) the responder builds an `Msg::AeSketch`
+    /// reply with — mirrors
+    /// [`crate::config::ClusterConfig::ae_sketch_cells`]. Defaults to that
+    /// field's own default.
+    fn ae_sketch_cells(&self) -> usize {
+        crate::config::ClusterConfig::default().ae_sketch_cells
+    }
 }
 
 struct PeerHandle {
@@ -594,8 +671,9 @@ impl Mesh {
     }
 
     /// Runs one anti-entropy digest exchange against `peer`: sends
-    /// `local_buckets` and returns the peer's entries for every bucket whose
-    /// digest mismatched.
+    /// `local_buckets` and returns the peer's reply for every bucket whose
+    /// digest mismatched — a full listing, or an IBLT sketch for a bucket
+    /// the responder judged too large to list ([`AeMismatch`]'s docs).
     ///
     /// # Errors
     ///
@@ -606,7 +684,7 @@ impl Mesh {
         peer: NodeId,
         cache: SmolStr,
         local_buckets: Vec<(u16, u64)>,
-    ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
+    ) -> Result<Vec<AeMismatch>, CodecError> {
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             let (framed, pool) = self
                 .acquire_conn(
@@ -617,10 +695,41 @@ impl Mesh {
                     },
                 )
                 .await?;
-            conn::collect_ae_buckets(framed, &pool).await
+            conn::collect_ae_mismatches(framed, &pool).await
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy digest exchange")))
+    }
+
+    /// The `AeSketch` fallback: requests the full `(key, version)` listing
+    /// for `buckets` from `peer`, for buckets whose `AeSketch` reply failed
+    /// to decode (`Iblt::peel` returned `Undecodable`, `cluster::sketch`'s
+    /// module docs) — answered exactly like [`Mesh::ae_round`]'s own
+    /// full-listing replies, just requested explicitly rather than as the
+    /// digest exchange's default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `peer` is not a known peer or the
+    /// request/response exchange fails.
+    pub async fn ae_entries(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let (framed, pool) = self
+                .acquire_conn(peer, Msg::AeEntries { cache, buckets })
+                .await?;
+            conn::collect_ae_buckets(framed, &pool).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(request_timeout_error(
+                "anti-entropy sketch-fallback listing",
+            ))
+        })
     }
 
     /// Pulls full records for `keys` from `peer` (the `AePull` step of
@@ -642,6 +751,40 @@ impl Mesh {
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull")))
+    }
+
+    /// Pulls full records from `peer` for the entries of `bucket` whose key
+    /// hash is in `hashes` (the `AePullHashes` step of anti-entropy: the
+    /// sketch-decoded counterpart to [`Mesh::ae_pull`], used when the
+    /// initiator peeled an `AeSketch` reply and only learned key *hashes* it
+    /// is missing or holds stale, never the keys themselves).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `peer` is not a known peer or the
+    /// request/response exchange fails.
+    pub async fn ae_pull_hashes(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        bucket: u16,
+        hashes: Vec<u64>,
+    ) -> Result<Vec<WireRecord>, CodecError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let (framed, pool) = self
+                .acquire_conn(
+                    peer,
+                    Msg::AePullHashes {
+                        cache,
+                        bucket,
+                        hashes,
+                    },
+                )
+                .await?;
+            conn::collect_pulled_records(framed, &pool).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull-by-hash")))
     }
 
     /// Shuts down the mesh: stops accepting, and cancels every per-peer
@@ -1002,7 +1145,7 @@ mod tests {
             .await
             .expect("ae round succeeds");
 
-        assert_eq!(result, vec![(1, entries)]);
+        assert_eq!(result, vec![AeMismatch::Bucket(1, entries)]);
     }
 
     #[tokio::test]
@@ -1062,6 +1205,77 @@ mod tests {
             .await
             .expect("pull succeeds");
         assert_eq!(got, records);
+    }
+
+    #[tokio::test]
+    async fn ae_entries_returns_full_listings_for_the_requested_buckets() {
+        let entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        let handler = Arc::new(FixtureHandler {
+            records: Vec::new(),
+            digests: Vec::new(),
+            bucket_entries: entries.clone(),
+            pulled: Mutex::new(Vec::new()),
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let got = client
+            .ae_entries(NodeId::from(1), SmolStr::new("users"), vec![3, 7])
+            .await
+            .expect("ae_entries succeeds");
+
+        assert_eq!(got, vec![(3, entries.clone()), (7, entries)]);
+    }
+
+    #[tokio::test]
+    async fn ae_pull_hashes_resolves_only_the_requested_hash_to_records() {
+        // Two entries in the bucket, only one hash requested — the default
+        // `RequestHandler::records_for_hashes` (`bucket_entries` +
+        // `records_for` composed, `FixtureHandler` never overrides it) must
+        // filter down to just the key that hash belongs to before pulling,
+        // not hand every bucket key to `records_for`.
+        let key_a = Bytes::from_static(b"a");
+        let key_b = Bytes::from_static(b"b");
+        let ver = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(1),
+        };
+        let handler = Arc::new(FixtureHandler {
+            records: vec![sample_record(9)],
+            digests: Vec::new(),
+            bucket_entries: vec![(key_a.clone(), ver), (key_b, ver)],
+            pulled: Mutex::new(Vec::new()),
+        });
+        let handler_for_asserts = Arc::clone(&handler);
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let hash_a = xxh3_64(&key_a);
+        let got = client
+            .ae_pull_hashes(NodeId::from(1), SmolStr::new("users"), 3, vec![hash_a])
+            .await
+            .expect("ae_pull_hashes succeeds");
+        assert_eq!(got, vec![sample_record(9)]);
+
+        let pulled = handler_for_asserts
+            .pulled
+            .lock()
+            .expect("invariant: fixture mutex is never poisoned");
+        assert_eq!(
+            pulled.as_slice(),
+            [(SmolStr::new("users"), vec![key_a])],
+            "the resolved hash must pull exactly key_a's bytes, never key_b's"
+        );
     }
 
     #[tokio::test]
