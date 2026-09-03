@@ -4,7 +4,8 @@
 //! Metric *emission* — the `metrics::counter!`/`metrics::gauge!` calls spread
 //! across the crate (`sundog_backlog_dropped_total`, `sundog_live_peers`,
 //! `sundog_open_caches`, `sundog_cache_hits_total`,
-//! `sundog_cache_misses_total`, `sundog_cache_entries`, ...) — is
+//! `sundog_cache_misses_total`, `sundog_cache_entries`,
+//! `sundog_ae_repaired_total`, `sundog_ae_sketch_total`, ...) — is
 //! unconditional and feature-independent: a
 //! build without this feature simply never installs a recorder, so those
 //! calls fall through to `metrics`'s own no-op default. This module only

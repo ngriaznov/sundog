@@ -177,7 +177,9 @@ save `Mdns` for host networking or bare-metal LANs.
 
 Metrics (`sundog_cache_hits_total{cache}` / `sundog_cache_misses_total{cache}`,
 `sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,
-`sundog_live_peers`, `sundog_open_caches`, and a few more) are emitted
+`sundog_live_peers`, `sundog_open_caches`, `sundog_ae_sketch_total{cache,
+outcome}` — anti-entropy's IBLT-sketch reconciliation for large buckets,
+`outcome` either `decoded` or `fallback` — and a few more) are emitted
 regardless of features —
 without `prometheus`, they fall into the `metrics` crate's no-op default
 recorder instead of going anywhere. A ready-made Grafana dashboard for them

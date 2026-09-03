@@ -179,9 +179,15 @@ pub(crate) async fn run_round_against(
                             "outcome" => "decoded"
                         )
                         .increment(1);
+                        tracing::debug!(outcome = "decoded", bucket, "anti-entropy sketch decoded");
                     }
                     Err(_) => {
                         undecodable_buckets.push(bucket);
+                        tracing::debug!(
+                            outcome = "fallback",
+                            bucket,
+                            "anti-entropy sketch undecodable; falling back to a full listing"
+                        );
                         metrics::counter!(
                             "sundog_ae_sketch_total",
                             "cache" => cache.to_string(),
