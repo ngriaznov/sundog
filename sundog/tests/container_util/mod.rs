@@ -88,10 +88,26 @@ impl Node {
         alias: &str,
         seeds: &[&str],
     ) -> Node {
+        Self::spawn_with_env(net, cluster_name, alias, seeds, &[]).await
+    }
+
+    /// [`Node::spawn`] with additional container environment variables, for
+    /// `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET`/`SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET`
+    /// overrides a test needs a node to start with.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never becomes ready.
+    pub async fn spawn_with_env(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Node {
         rightsize_modules::register_default_backends();
         let bin = build_testnode();
 
-        let guard = Container::new(&base_image())
+        let mut container = Container::new(&base_image())
             .with_network(net)
             .with_network_aliases(&[alias])
             .with_exposed_ports(&[CONTROL_PORT])
@@ -100,7 +116,11 @@ impl Node {
                 "/sundog-testnode",
             )
             .with_env("SUNDOG_SEEDS", &seeds.join(","))
-            .with_command(&["/sundog-testnode", cluster_name])
+            .with_command(&["/sundog-testnode", cluster_name]);
+        for &(key, value) in extra_env {
+            container = container.with_env(key, value);
+        }
+        let guard = container
             .waiting_for(Wait::for_log_message(READY_LOG, 1))
             .start()
             .await

@@ -535,6 +535,78 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
     net.close().await.expect("network closes");
 }
 
+/// At a 1,000,000-entry fill, `sundog-testnode`'s 1,024 buckets hold about
+/// 976 entries apiece. With `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET` lowered to
+/// [`PART_MIN_BUCKET`], well past that, the mismatched bucket below is
+/// answered with 64 part digests instead of a ~976-entry listing; only the
+/// one part the dropped key falls into then answers with its own small
+/// listing. n2 cold-joins and warms first, so both replicas start
+/// byte-identical; dropping one key locally on n2 then leaves exactly one
+/// bucket, and within it one part, mismatched.
+#[tokio::test]
+async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
+    const ENTRIES: u32 = 1_000_000;
+    const TARGET_KEY: &str = "k123456";
+    const TARGET_VALUE: &str = "v123456";
+    const PART_MIN_BUCKET: &str = "512";
+    /// A full bucket listing at this scale runs about 22 KB; the part path
+    /// is ~512 B of part digests, plus a small listing for the one
+    /// differing part, plus the repaired record itself.
+    const REPAIR_BYTES_BUDGET: u64 = 16 * 1024;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let env = [("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET", PART_MIN_BUCKET)];
+    let n1 = Node::spawn_with_env(&net, "ae-parts-cluster", "n1", &[], &env).await;
+    n1.fill(ENTRIES).await.expect("bulk fill succeeds");
+    assert_eq!(n1.count().await, Ok(ENTRIES as usize));
+
+    let n2 = Node::spawn_with_env(&net, "ae-parts-cluster", "n2", &[&seed("n1")], &env).await;
+    eventually(Duration::from_secs(200), || async {
+        n2.count().await == Ok(ENTRIES as usize)
+    })
+    .await;
+    assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
+
+    let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the drop");
+
+    n2.drop_key(TARGET_KEY)
+        .await
+        .expect("drop succeeds, standing in for a lost Replicate");
+    assert_eq!(
+        n2.get(TARGET_KEY).await,
+        Ok(None),
+        "n2's copy is gone locally right after the drop"
+    );
+
+    // sundog-testnode sets `ae_interval` to 2s; generous past that plus the
+    // digest pass, part-digest comparison, and pull round trip.
+    eventually(Duration::from_secs(60), || async {
+        n2.get(TARGET_KEY).await == Ok(Some(TARGET_VALUE.to_string()))
+    })
+    .await;
+
+    let (frames_after, bytes_after) = n1.netstats().await.expect("netstats after the repair");
+    let frames_for_repair = frames_after - frames_before;
+    let bytes_for_repair = bytes_after - bytes_before;
+    println!("part-digest repair: n1 sent {frames_for_repair} frames / {bytes_for_repair} bytes");
+    assert!(
+        bytes_for_repair < REPAIR_BYTES_BUDGET,
+        "n1 sent {bytes_for_repair} bytes to repair one dropped key out of a {REPAIR_BYTES_BUDGET}-byte \
+         budget; a full bucket listing at this scale runs about 22 KB, so the part-digest path \
+         should cost a small fraction of that"
+    );
+    assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    net.close().await.expect("network closes");
+}
+
 /// `wire::RecordHeader`'s exact fixed width per record ahead of its key and
 /// value bytes: `wall_ms` (8) + `logical` (4) + `node` (8) + `expires_at_ms`
 /// (8) + `key_len` (4) + `value_len` (4) + `flags` (1). Not reachable from

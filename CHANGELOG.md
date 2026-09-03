@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Hierarchical anti-entropy digests**: each of the 1,024 anti-entropy
+  buckets now also keeps 64 part digests, the next 6 hash bits below the
+  bucket's own 10. A mismatched bucket past
+  `ClusterConfig::ae_part_min_bucket` entries, default 4,096, answers with its
+  64 part digests instead of a full listing or an IBLT sketch, without ever
+  materializing the listing; a mismatched part then follows the existing
+  listing-or-sketch rule at part scale. This narrows a mismatch 64x before any
+  listing or sketch is sent, so repairing one changed key in a 100M-entry
+  cache costs a few hundred bytes of digests plus a small listing, instead of
+  a multi-megabyte bucket listing. New wire messages `Msg::AePartDigests`,
+  `Msg::AeParts`, `Msg::AePart`, and `Msg::AePartSketch` carry the exchange.
+  New metric `sundog_ae_parts_total{cache, outcome}` counts `listing`,
+  `sketch`, and `fallback` outcomes, one increment per part reply. A mixed
+  0.3/0.4 cluster is unsupported, as with any wire-format change across a
+  minor version.
+
 ## [0.3.1] – 2026-09-03
 
 ### Fixed

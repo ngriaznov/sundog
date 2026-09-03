@@ -4,7 +4,10 @@
 //! static musl binary with no libc dependency.
 //!
 //! Usage: `sundog-testnode <cluster-name>`, with `SUNDOG_SEEDS` a
-//! comma-separated list of `host:port` gossip seeds. Opens one
+//! comma-separated list of `host:port` gossip seeds,
+//! `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET`/`SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET`
+//! optional `usize` overrides for `ClusterConfig::ae_part_min_bucket`/
+//! `ae_sketch_min_bucket` (absent means the built-in default). Opens one
 //! `Mode::Replicated` cache named `"it"` and prints `testnode-ready` once
 //! the control listener is up.
 //!
@@ -70,17 +73,31 @@ async fn main() {
     }
 }
 
+/// Reads `name` as a `usize` env override, `None` if absent or unparsable,
+/// for [`run`]'s `ae_part_min_bucket`/`ae_sketch_min_bucket` overrides.
+fn usize_env(name: &str) -> Option<usize> {
+    env::var(name).ok().and_then(|raw| raw.parse().ok())
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_name = env::args()
         .nth(1)
         .ok_or("usage: sundog-testnode <cluster-name>")?;
     let seeds = resolve_seeds(&env::var("SUNDOG_SEEDS").unwrap_or_default()).await;
+    let ae_part_min_bucket = usize_env("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET");
+    let ae_sketch_min_bucket = usize_env("SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET");
 
     let config = ClusterConfig::default().with(|c| {
         c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
         // Faster than the default so container tests converge in seconds.
         c.ae_interval = Duration::from_secs(2);
         c.tombstone_ttl = Duration::from_secs(10);
+        if let Some(min_bucket) = ae_part_min_bucket {
+            c.ae_part_min_bucket = min_bucket;
+        }
+        if let Some(min_bucket) = ae_sketch_min_bucket {
+            c.ae_sketch_min_bucket = min_bucket;
+        }
     });
 
     let cluster = Cluster::builder(cluster_name)

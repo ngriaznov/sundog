@@ -130,6 +130,16 @@ Writes to different keys apply concurrently; same-key writes still serialize.
 Anti-entropy and state-transfer requests reuse pooled connections instead of
 dialing fresh every round.
 
+Each bucket also keeps 64 part digests, the next 6 hash bits below the bucket's
+own 10. A round exchanges the 1,024 bucket digests first; a mismatched bucket
+answers with a full `(key, version)` listing, or, past `ae_sketch_min_bucket`
+entries, an IBLT sketch decoding up to ~100 differing elements, or, past the
+larger `ae_part_min_bucket`, its 64 part digests instead of either, without ever
+building the listing. A mismatched part then follows the same
+listing-or-sketch rule at part scale. That third tier is what keeps repairing
+one changed key in a 100M-entry cache cheap: a bucket-level listing there costs
+megabytes, a part digest exchange costs a few hundred bytes.
+
 ## The three modes
 
 | Mode | Each node stores | On write | On read | Pick this when |
@@ -178,11 +188,14 @@ host networking or bare-metal LANs.
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,
 `sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,
-`sundog_live_peers`, `sundog_open_caches`, and `sundog_ae_sketch_total{cache,
-outcome}`. That last one tags anti-entropy's IBLT-sketch reconciliation on large
-buckets; `outcome` is `decoded` or `fallback`. Without `prometheus` they fall
-into the `metrics` crate's no-op default recorder. A ready-made Grafana
-dashboard lives at [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
+`sundog_live_peers`, `sundog_open_caches`, `sundog_ae_sketch_total{cache,
+outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
+tags anti-entropy's IBLT-sketch reconciliation on large buckets; `outcome` is
+`decoded` or `fallback`. The second tags the part-digest path's per-part
+reconciliation; `outcome` is `listing`, `sketch`, or `fallback`. Without
+`prometheus` they fall into the `metrics` crate's no-op default recorder. A
+ready-made Grafana dashboard lives at
+[`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
 ## Testing
 
@@ -198,8 +211,9 @@ Five layers, cheapest and highest-signal first:
    scripted membership feed with no sockets involved. Scenarios: partition under
    load, heal, check convergence within a bounded number of rounds; message
    loss, reordering, duplication; a donor dying mid-state-transfer; a forced
-   low `ae_sketch_min_bucket` driving the IBLT sketch path itself, under the
-   same loss and reordering.
+   low `ae_sketch_min_bucket` driving the IBLT sketch path itself, and a forced
+   low `ae_part_min_bucket` driving the part-digest path, both under the same
+   loss and reordering.
 3. **Container integration** runs via
    [`rightsize`](https://crates.io/crates/rightsize) in
    `sundog/tests/containers.rs`, no Docker CLI, no `bollard`. Multi-node
@@ -207,9 +221,11 @@ Five layers, cheapest and highest-signal first:
    three-node convergence, tombstones reaching every node, and cold joins up to
    a million entries. They also cover a killed node's gap repaired by
    anti-entropy, a dropped key repaired the same way at 500k-entry sketch
-   scale, a bulk fill's wire cost pinned via `netstats` against the fan-out
-   queue duplicating it, high-churn add/remove/TTL workloads draining to zero,
-   and 64 KiB values verified byte-for-byte. Each node is `sundog-testnode`, a tiny
+   scale, the same repair again at 1M-entry part-digest scale with its wire
+   cost pinned via `netstats` under a lowered `ae_part_min_bucket`, a bulk
+   fill's wire cost pinned via `netstats` against the fan-out queue
+   duplicating it, high-churn add/remove/TTL workloads draining to zero, and
+   64 KiB values verified byte-for-byte. Each node is `sundog-testnode`, a tiny
    static/musl binary driven over a line-based control protocol. It sits behind
    an env var, so plain `cargo test --workspace` still compiles without a
    container backend:
