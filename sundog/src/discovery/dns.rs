@@ -149,8 +149,7 @@ mod tests {
     #[test]
     fn resolver_builds_against_the_system_configuration() {
         // On any sane Unix CI box `/etc/resolv.conf` exists, so resolver
-        // construction itself must succeed even though we never issue a
-        // real query here.
+        // construction itself must succeed even without a real query here.
         let discovery = DnsSrv::new("_sundog._tcp.svc.cluster.local.", 7946);
         assert!(discovery.resolver.is_some());
     }

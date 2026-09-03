@@ -1,25 +1,24 @@
 //! Mutual TLS for the data plane, behind the `tls` feature. Every
-//! persistent and short-lived connection — accepted and dialed alike, so the
-//! request/response ones (state transfer, anti-entropy) too — is wrapped
-//! once this node's [`ClusterConfig::tls`](crate::config::ClusterConfig::tls)
-//! is set; the dialing side also presents a certificate, verified against
-//! the same root CA as the accepting side (mutual auth).
+//! persistent and short-lived connection — accepted and dialed alike,
+//! including the request/response ones (state transfer, anti-entropy) — is
+//! wrapped once this node's
+//! [`ClusterConfig::tls`](crate::config::ClusterConfig::tls) is set; the
+//! dialing side also presents a certificate, verified against the same root
+//! CA as the accepting side (mutual auth).
 //!
-//! Peer identity here comes entirely from chain-of-trust to the shared root
-//! CA, not from hostname verification: nodes are addressed by ephemeral
+//! Peer identity comes entirely from chain-of-trust to the shared root CA,
+//! not from hostname verification: nodes are addressed by ephemeral
 //! `ip:port` (mDNS/gossip-discovered), not stable DNS names, so there is no
 //! meaningful per-node hostname to check either side of the handshake
 //! against. Every certificate this mesh accepts must instead carry the
-//! fixed [`MESH_SERVER_NAME`] as a DNS Subject Alternative Name — documented
-//! loudly here because it is easy to trip over when hand-rolling test or
-//! ops certificates.
+//! fixed [`MESH_SERVER_NAME`] as a DNS Subject Alternative Name.
 //!
 //! A TLS-configured node and a plaintext node cannot join the same mesh: the
 //! plaintext side never speaks the TLS record layer the other expects, so
-//! the connection fails outright rather than silently downgrading —
-//! retried by [`super::conn::run_peer_writer`]'s backoff on the dial side,
-//! silently dropped by [`super::conn::accept_loop`] on the accept side,
-//! exactly like any other connection failure.
+//! the connection fails outright rather than silently downgrading — retried
+//! by [`super::conn::run_peer_writer`]'s backoff on the dial side, silently
+//! dropped by [`super::conn::accept_loop`] on the accept side, like any
+//! other connection failure.
 //!
 //! Applies only to the real-tokio transport: this module, and every call
 //! into it, is compiled only under `not(feature = "sim")` — a turmoil-hosted
@@ -108,9 +107,9 @@ pub(crate) struct MeshTls {
 // `ServerConfig::builder()`/`ClientConfig::builder()` panic if the
 // process-default crypto provider is ambiguous, which it is the moment any
 // other dependency in the binary (e.g. a `ring`-based transitive dep pulled
-// in by an unrelated feature) unifies a second provider into the build
-// alongside aws-lc-rs. Install ours explicitly, once, so mesh TLS never
-// depends on what else happens to be linked in.
+// in by an unrelated feature) unifies a second provider alongside
+// aws-lc-rs. Install ours explicitly, once, so mesh TLS never depends on
+// what else is linked in.
 fn ensure_crypto_provider() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -239,7 +238,7 @@ mod tests {
         let mut tls = client_tls.connect(stream).await.expect("client handshake");
         tls.write_all(b"hello").await.expect("write to server");
 
-        let got = server.await.expect("server task did not panic");
+        let got = server.await.expect("server did not panic");
         assert_eq!(&got, b"hello");
     }
 
@@ -271,7 +270,7 @@ mod tests {
             .await
             .expect("dial loopback");
         let client_result = client_tls.connect(stream).await;
-        let server_result = server.await.expect("server task did not panic");
+        let server_result = server.await.expect("server did not panic");
 
         assert!(
             client_result.is_err() || server_result.is_err(),

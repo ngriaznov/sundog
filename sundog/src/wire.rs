@@ -4,37 +4,34 @@
 //! Every frame starts with a one-byte discriminant. Control messages
 //! (`Hello`, `StRequest`, `AeDigest`, `AeBucket`, `AeSketch`, `AeEntries`,
 //! `AePull`, `AePullHashes`, `ReqDone`) carry `FRAME_KIND_POSTCARD` and are
-//! postcard-encoded exactly as before. The
-//! three record-carrying variants — [`Msg::Replicate`], [`Msg::ReplicateBatch`],
-//! [`Msg::StChunk`] — carry `FRAME_KIND_RAW_RECORD` and use a dedicated
-//! length-prefixed layout instead: a fixed-size header (read via the
-//! `zerocopy` crate's safe [`FromBytes`]/[`IntoBytes`] views, never
-//! `unsafe`) followed by each record's key and value bytes back to back.
+//! postcard-encoded. The three record-carrying variants —
+//! [`Msg::Replicate`], [`Msg::ReplicateBatch`], [`Msg::StChunk`] — carry
+//! `FRAME_KIND_RAW_RECORD` and use a length-prefixed layout instead: a
+//! fixed-size header (read via `zerocopy`'s safe [`FromBytes`]/[`IntoBytes`]
+//! views, never `unsafe`) followed by each record's key and value bytes back
+//! to back.
+//!
 //! Decoding this layout slices `Bytes` views directly out of the received
-//! frame (`Bytes::slice`, an `Arc` refcount bump that shares the frame's
-//! backing allocation through its own handle, independent of the frame
-//! argument's lifetime) — no payload copy on receive, unlike postcard's
-//! decode-into-owned-`Vec<u8>` path. Encoding assembles straight into one
-//! exact-reserve `BytesMut` from
-//! already-owned `Bytes` (a record's key, and — since `store::Stored::encoded`
-//! caches it — its value), so there is no intermediate postcard `Vec` either.
+//! frame (`Bytes::slice`, an `Arc` refcount bump independent of the frame
+//! argument's lifetime), with no payload copy, unlike postcard's
+//! decode-into-owned-`Vec<u8>` path. Encoding assembles into one
+//! exact-reserve `BytesMut` from already-owned `Bytes` — a record's key, and
+//! its value since `store::Stored::encoded` caches it — so there is no
+//! intermediate postcard `Vec` either.
 //!
 //! **`tls` caveat.** This zero-copy path only holds up to the TCP framing
 //! layer. When the `tls` feature wraps a connection in rustls, rustls owns
-//! its own internal read/write buffers and copies application bytes through
-//! them independently of what `wire::decode`/`encode` do above — the
-//! zero-copy property described here is about avoiding *this module's own*
-//! copies, not about eliminating every copy in the transport stack.
+//! its own read/write buffers and copies application bytes through them
+//! independently of `wire::decode`/`encode`.
 //!
-//! **Memory-retention note.** A [`WireRecord`] decoded off a raw-record
-//! frame borrows its `key`/`value` from that frame's backing buffer. If a
-//! replica-applied record's value bytes end up cached verbatim as
-//! `store::Stored::encoded`, that `Stored` keeps the whole
-//! originating frame buffer alive for as long as the entry stays cached —
-//! bounded in practice, since a `ReplicateBatch`/`StChunk` frame is itself
-//! capped well under [`MAX_FRAME`] (`net::conn::REPLICATE_BATCH_BUDGET`,
-//! `store::SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`), not a concern for a lone
-//! `Replicate` frame sized to one record.
+//! **Memory retention.** A [`WireRecord`] decoded off a raw-record frame
+//! borrows its `key`/`value` from that frame's backing buffer. If a
+//! replica-applied record's value bytes end up cached as
+//! `store::Stored::encoded`, that `Stored` keeps the whole originating frame
+//! buffer alive for as long as the entry stays cached — bounded, since a
+//! `ReplicateBatch`/`StChunk` frame is capped under [`MAX_FRAME`]
+//! (`net::conn::REPLICATE_BATCH_BUDGET`,
+//! `store::SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`).
 
 use std::mem::size_of;
 
@@ -48,12 +45,10 @@ use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
 
-/// One cell of the anti-entropy IBLT sketch ([`Msg::AeSketch`]'s payload) —
-/// defined in `cluster::sketch` (an internal implementation module) and
-/// re-exported here only so a wire message can carry a `Vec<Cell>`; every
-/// field stays private to that module, so this type is otherwise opaque
-/// outside it — nothing outside `cluster::sketch` constructs, inspects, or
-/// matches on one.
+/// One cell of the anti-entropy IBLT sketch ([`Msg::AeSketch`]'s payload),
+/// defined in `cluster::sketch` and re-exported here so a wire message can
+/// carry a `Vec<Cell>`. Every field is private to that module; nothing
+/// outside it constructs, inspects, or matches on one.
 pub use crate::cluster::sketch::Cell;
 
 /// Hard cap on any single wire frame, in bytes (4 MiB). Oversized values are
@@ -85,12 +80,9 @@ impl WireRecord {
 
 /// Every message exchanged on the data-plane mesh.
 ///
-/// `#[non_exhaustive]`: this crate adds new wire message kinds as its
-/// anti-entropy and state-transfer protocols grow (`Msg::AeSketch`,
-/// `AeEntries`, and `AePullHashes` are exactly this, added on top of
-/// 0.2.0's exhaustive shape) — matching downstream code adds a wildcard arm
-/// once, here, rather than needing another breaking release for every
-/// future addition.
+/// `#[non_exhaustive]`: new wire message kinds are added as the
+/// anti-entropy and state-transfer protocols grow; matching code needs a
+/// wildcard arm rather than a breaking release for every addition.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
@@ -157,10 +149,9 @@ pub enum Msg {
         keys: Vec<Bytes>,
     },
     /// Replication-mode fan-out, batched: several records to apply together.
-    /// Never built at enqueue time — `net::conn`'s per-peer writer
-    /// opportunistically coalesces consecutive same-cache queued
-    /// [`Msg::Replicate`] messages into this on the wire, applied under one
-    /// acquisition of the store's apply serialization lock
+    /// `net::conn`'s per-peer writer coalesces consecutive same-cache queued
+    /// [`Msg::Replicate`] messages into this on the wire; the batch applies
+    /// under one acquisition of the store's apply lock
     /// (`store::ShardOps::apply_remote_batch`). Wire-encoded via the
     /// raw-record layout (this module's docs), not postcard.
     ReplicateBatch {
@@ -170,13 +161,12 @@ pub enum Msg {
         recs: Vec<WireRecord>,
     },
     /// Marks the end of one reply on a request/response connection kept
-    /// open for reuse: sent once after the last `AeBucket`/`Replicate`
-    /// reply to an `AeDigest`/`AePull` request, so the requester knows the
-    /// reply is complete without relying on the connection closing.
-    /// `StRequest`'s reply already has its own per-chunk `done` flag on
-    /// `StChunk` and needs no analogous marker. Appended after every
-    /// variant that predates it so their postcard encodings (by declaration
-    /// index, not just their `as isize` discriminant) stay unchanged.
+    /// open for reuse: sent after the last `AeBucket`/`Replicate` reply to
+    /// an `AeDigest`/`AePull` request, so the requester knows the reply is
+    /// complete without relying on the connection closing. `StChunk`'s own
+    /// `done` flag already serves this role for `StRequest`'s reply.
+    /// Declared after every variant that predates it, so their postcard
+    /// encodings, ordered by declaration index, stay unchanged.
     ReqDone,
     /// Anti-entropy round, step 2 (large-bucket path): an IBLT sketch
     /// (`cluster::sketch`'s module docs) over a mismatched bucket's
@@ -184,9 +174,9 @@ pub enum Msg {
     /// the bucket's own listing would cost more on the wire than the sketch
     /// (`ClusterConfig::ae_sketch_min_bucket`). The initiator subtracts its
     /// own local sketch of the bucket from this one and peels the result;
-    /// on success this replaces the whole `AeBucket` round trip for that
-    /// bucket, on failure (`cluster::sketch::Undecodable`) the
-    /// initiator falls back to [`Msg::AeEntries`].
+    /// on success this replaces the `AeBucket` round trip for that bucket,
+    /// on failure (`cluster::sketch::Undecodable`) the initiator falls back
+    /// to [`Msg::AeEntries`].
     ///
     /// [`ClusterConfig::ae_sketch_min_bucket`]: crate::config::ClusterConfig::ae_sketch_min_bucket
     AeSketch {
@@ -200,9 +190,9 @@ pub enum Msg {
     },
     /// Anti-entropy round, step 2 fallback: "send me the full `(key,
     /// version)` listing for these buckets" — the initiator's request after
-    /// one or more `AeSketch` replies failed to decode. Answered exactly
-    /// like `AeDigest`'s own reply shape: one [`Msg::AeBucket`] per
-    /// requested bucket, then [`Msg::ReqDone`].
+    /// one or more `AeSketch` replies failed to decode. Answered like
+    /// `AeDigest`'s reply shape: one [`Msg::AeBucket`] per requested
+    /// bucket, then [`Msg::ReqDone`].
     AeEntries {
         /// The cache being reconciled.
         cache: SmolStr,
@@ -214,9 +204,8 @@ pub enum Msg {
     /// key's wire bytes) is one of `hashes`" — the sketch-decoded
     /// counterpart to [`Msg::AePull`], used when the initiator peeled an
     /// `AeSketch` reply and learned only the key *hashes* it is missing or
-    /// holds stale, never the keys themselves. Answered exactly like
-    /// `AePull`'s own reply shape: [`Msg::Replicate`] records, then
-    /// [`Msg::ReqDone`].
+    /// holds stale, never the keys themselves. Answered like `AePull`'s
+    /// reply shape: [`Msg::Replicate`] records, then [`Msg::ReqDone`].
     AePullHashes {
         /// The cache being reconciled.
         cache: SmolStr,
@@ -275,17 +264,16 @@ struct RecordHeader {
 }
 
 /// Exact per-record fixed overhead the raw-record layout adds ahead of each
-/// record's key/value bytes — used by `store::chunk_records_for_snapshot`
-/// for exact (not approximated) chunk-budget arithmetic, since this layout,
-/// unlike postcard's variable-length framing, has no size variance to
-/// approximate.
+/// record's key/value bytes. `store::chunk_records_for_snapshot` uses it for
+/// exact chunk-budget arithmetic; unlike postcard's variable-length framing,
+/// this layout has no size variance to account for.
 pub(crate) const RECORD_HEADER_LEN: usize = size_of::<RecordHeader>();
 
 /// Exact byte length a lone `Msg::Replicate { cache, rec }` carrying one
 /// record with the given cache-name/key/value lengths encodes to under the
 /// raw-record layout — lets `Shard::insert`/`insert_many` enforce
 /// `max_frame` from lengths already in hand instead of paying for a
-/// real encode just to measure it.
+/// real encode to measure it.
 #[must_use]
 pub(crate) fn replicate_frame_len(cache_len: usize, key_len: usize, value_len: usize) -> usize {
     1 + size_of::<RawFrameHeader>() + cache_len + RECORD_HEADER_LEN + key_len + value_len
@@ -502,9 +490,8 @@ fn decode_raw_frame(body: &Bytes) -> Result<Msg, CodecError> {
 
 /// Decodes a message from its wire form. `frame` need only be borrowed — a
 /// raw-record frame's key/value bytes are sliced out as zero-copy `Bytes`
-/// views (this module's docs) via `Bytes::slice`, which shares the backing
-/// allocation through its own independent `Arc` handle rather than borrowing
-/// from `frame`'s lifetime, so the returned [`Msg`] outlives this call fine.
+/// views (this module's docs) that share `frame`'s backing allocation
+/// through their own `Arc` handle, so the returned [`Msg`] outlives this call.
 ///
 /// # Errors
 ///
@@ -688,9 +675,9 @@ mod tests {
         });
     }
 
-    /// `Cell`'s fields are private to `cluster::sketch`; a wire test builds
-    /// one the same way any real sender would, through `Iblt`'s own
-    /// pub(crate) API, rather than a struct literal it has no access to.
+    /// `Cell`'s fields are private to `cluster::sketch`; this builds one
+    /// through `Iblt`'s pub(crate) API rather than a struct literal it has
+    /// no access to.
     fn sample_cells() -> Vec<Cell> {
         let mut iblt = crate::cluster::sketch::Iblt::new(6);
         iblt.insert(1, sample_hlc());

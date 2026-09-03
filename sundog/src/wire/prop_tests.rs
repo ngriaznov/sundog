@@ -1,7 +1,6 @@
-//! Property tests for the wire format: encoding must be
-//! deterministic for arbitrary [`WireRecord`]s and [`Msg`]s — encode, decode,
-//! re-encode always reproduces the exact same bytes, and decodes back to an
-//! equal value — for both the postcard-encoded control messages and the
+//! Property tests for the wire format: encode, decode, re-encode reproduces
+//! identical bytes and an equal value, for arbitrary [`WireRecord`]s and
+//! [`Msg`]s across both the postcard-encoded control messages and the
 //! raw-record layout (`Replicate`/`ReplicateBatch`/`StChunk`, `crate::wire`'s
 //! module docs), including tombstones and boundary-sized (empty key/value,
 //! empty batch) records.
@@ -50,8 +49,7 @@ fn wire_record_strategy() -> impl Strategy<Value = WireRecord> {
 }
 
 /// Only the three raw-record-layout variants (`Replicate`/`ReplicateBatch`/
-/// `StChunk`), for properties specific to that layout rather than the whole
-/// [`Msg`] enum.
+/// `StChunk`), for properties specific to that layout.
 fn raw_record_msg_strategy() -> impl Strategy<Value = Msg> {
     prop_oneof![
         (smol_str_strategy(), wire_record_strategy())
@@ -136,9 +134,9 @@ fn msg_strategy() -> impl Strategy<Value = Msg> {
     ]
 }
 
-/// A handful of real `Cell`s, built the same way any real sender would —
-/// through `Iblt`'s own pub(crate) API, since `Cell`'s fields are private to
-/// `cluster::sketch` and this test module has no other way to construct one.
+/// Real `Cell`s built through `Iblt`'s pub(crate) API, since `Cell`'s
+/// fields are private to `cluster::sketch` and this module has no other
+/// way to construct one.
 fn cells_strategy() -> impl Strategy<Value = Vec<Cell>> {
     proptest::collection::vec((any::<u64>(), hlc_strategy()), 0..8).prop_map(|elems| {
         let mut iblt = crate::cluster::sketch::Iblt::new(6);
@@ -158,33 +156,31 @@ proptest! {
     fn wire_record_postcard_encoding_is_byte_stable(rec in wire_record_strategy()) {
         let encoded1 = postcard::to_stdvec(&rec).expect("WireRecord always postcard-encodes");
         let decoded: WireRecord =
-            postcard::from_bytes(&encoded1).expect("just-encoded bytes always decode");
+            postcard::from_bytes(&encoded1).expect("freshly encoded bytes always decode");
         let encoded2 = postcard::to_stdvec(&decoded).expect("decoded value always re-encodes");
         prop_assert_eq!(encoded1, encoded2);
         prop_assert_eq!(rec, decoded);
     }
 
-    /// Same property for the full [`Msg`] enum, through the wire module's own
-    /// `encode`/`decode` (which also enforces `MAX_FRAME`) — covers every
-    /// variant, including `Replicate`/`ReplicateBatch`/`StChunk` tombstones
-    /// and boundary-sized records (`wire_record_strategy`'s empty-`Bytes`
-    /// and empty-batch cases) through the raw-record layout, not just the
-    /// postcard-only control messages.
+    /// Same property for the full [`Msg`] enum, through `encode`/`decode`
+    /// (which also enforces `MAX_FRAME`) — covers every variant, including
+    /// `Replicate`/`ReplicateBatch`/`StChunk` tombstones and boundary-sized
+    /// records (`wire_record_strategy`'s empty-`Bytes` and empty-batch
+    /// cases) through the raw-record layout, not only postcard.
     #[test]
     fn msg_postcard_encoding_is_byte_stable(msg in msg_strategy()) {
         let encoded1 = encode(&msg).expect("Msg always encodes under MAX_FRAME");
-        let decoded = decode(&encoded1).expect("just-encoded frame always decodes");
+        let decoded = decode(&encoded1).expect("freshly encoded frame always decodes");
         let encoded2 = encode(&decoded).expect("decoded value always re-encodes");
         prop_assert_eq!(encoded1, encoded2);
         prop_assert_eq!(msg, decoded);
     }
 
     /// The raw-record layout's key/value `Bytes` decode as zero-copy slices
-    /// into the received frame (this module's docs) — for every
-    /// `Msg::Replicate`/`ReplicateBatch`/`StChunk` shape, including
-    /// tombstones and empty keys/values, a decoded record's `key`/`value`
-    /// pointers must fall within the original frame's own allocation rather
-    /// than a fresh one.
+    /// into the received frame, for every `Msg::Replicate`/`ReplicateBatch`/
+    /// `StChunk` shape including tombstones and empty keys/values: a decoded
+    /// record's `key`/`value` pointers fall within the original frame's
+    /// allocation, not a fresh one.
     #[test]
     fn raw_record_frames_decode_without_copying_payload_bytes(msg in raw_record_msg_strategy()) {
         let frame = encode(&msg).expect("encodes");

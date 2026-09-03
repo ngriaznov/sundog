@@ -112,7 +112,7 @@ mod tests {
         let id = NodeId::random();
         let bytes = postcard::to_stdvec(&id).expect("invariant: NodeId always encodes");
         let decoded: NodeId =
-            postcard::from_bytes(&bytes).expect("invariant: just-encoded bytes decode");
+            postcard::from_bytes(&bytes).expect("invariant: freshly encoded bytes decode");
         assert_eq!(id, decoded);
     }
 }

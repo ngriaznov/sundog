@@ -39,8 +39,8 @@ pub trait Discovery: Send + Sync + 'static {
 /// The discovery source a [`crate::cluster::ClusterBuilder`] holds: one of
 /// the three built-in mechanisms, or a caller-supplied implementation.
 /// Implements [`Discovery`] itself by delegating to whichever variant it
-/// holds, so callers never need to box a built-in source just to store it
-/// uniformly alongside a custom one.
+/// holds, so callers never need to box a built-in source to store it
+/// alongside a custom one.
 pub enum DiscoveryKind {
     /// The zeroconf default: `mdns-sd`-based LAN discovery.
     Mdns(mdns::Mdns),

@@ -33,7 +33,7 @@ use crate::store::Mode;
 
 /// How long `spawn` samples the `seeds` stream to build chitchat's initial
 /// static seed list, before handing the stream off to the continuous
-/// re-seeding task. A short window: convergence does not depend on it, only
+/// re-seeding loop. A short window: convergence does not depend on it, only
 /// on the continuous forwarding below, which is what lets a full-cluster
 /// cold restart still converge.
 const INITIAL_SEED_WINDOW: Duration = Duration::from_millis(200);
@@ -71,12 +71,12 @@ pub struct Peer {
 /// Every cache each live peer advertises as open, keyed by peer, with the
 /// [`Mode`] it opened each one under — read off the peers' `cache:<name>`
 /// gossip keys and published alongside the peer set. A cache a peer hasn't
-/// opened (or whose mode token this build doesn't recognize) is simply
-/// absent, never a placeholder value.
+/// opened (or whose mode token this build doesn't recognize) is absent,
+/// never a placeholder value.
 pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 
-/// A request to the background gossip task, which is the only owner of the
-/// chitchat handle.
+/// A request to the background gossip loop, the only owner of the chitchat
+/// handle.
 enum Command {
     SetCacheMode(SmolStr, Mode),
     Shutdown(oneshot::Sender<()>),
@@ -84,8 +84,8 @@ enum Command {
 
 /// A cheap-to-clone handle onto a running membership session.
 ///
-/// Cloning shares the same background gossip task and live-peer view;
-/// dropping every clone does not stop the task — call [`Membership::shutdown`]
+/// Cloning shares the same background gossip loop and live-peer view;
+/// dropping every clone does not stop it — call [`Membership::shutdown`]
 /// explicitly for a graceful chitchat departure.
 #[derive(Clone)]
 pub struct Membership {
@@ -97,16 +97,16 @@ pub struct Membership {
 
 impl Membership {
     /// Starts gossip-based membership for one node and returns a handle once
-    /// the background task is running.
+    /// the background gossip loop is running.
     ///
     /// `seeds` is a continuous stream of candidate gossip addresses from a
-    /// [`crate::discovery::Discovery`] implementation — continuous, not
-    /// one-shot, so a full-cluster cold restart still converges. An
-    /// initial window of it seeds chitchat's static seed list; every address
-    /// it produces afterward is forwarded to chitchat's dynamic
-    /// [`ChitchatHandle::gossip`] for the lifetime of this membership session
-    /// — chitchat has no other mechanism to grow the seed set after startup,
-    /// so this is how continuous discovery reaches it.
+    /// [`crate::discovery::Discovery`] implementation, not one-shot, so a
+    /// full-cluster cold restart still converges. An initial window of it
+    /// seeds chitchat's static seed list; every address it produces
+    /// afterward is forwarded to chitchat's dynamic
+    /// [`ChitchatHandle::gossip`] for the lifetime of this membership
+    /// session — chitchat's only mechanism to grow the seed set after
+    /// startup.
     ///
     /// # Errors
     ///
@@ -124,10 +124,10 @@ impl Membership {
         let bind_addr = config.gossip_bind_addr;
         let port = if bind_addr.port() == 0 {
             // Probe-bind to claim a free ephemeral port, then release it so
-            // chitchat's own transport can bind the same port number. There
-            // is an unavoidable race (another process could grab the port in
-            // between) inherent to this "reserve then rebind" pattern; on a
-            // trusted LAN this is an accepted, standard trade-off.
+            // chitchat's own transport can bind the same port number. This
+            // "reserve then rebind" pattern has an unavoidable race (another
+            // process could grab the port in between); on a trusted LAN it's
+            // an accepted trade-off.
             let probe = tokio::net::UdpSocket::bind(bind_addr)
                 .await
                 .map_err(|source| JoinError::Bind {
@@ -257,12 +257,12 @@ impl Membership {
     }
 
     /// Leaves the cluster gracefully (chitchat departs politely) and stops
-    /// the background gossip task.
+    /// the background gossip loop.
     ///
     /// chitchat 0.13 has no protocol-level "leave" broadcast: departure means
     /// stopping the gossip loop cleanly (vs. an abrupt process death) so
-    /// peers observe it exactly like any other silence, and the failure
-    /// detector reclaims it after the usual grace period.
+    /// peers observe it like any other silence, and the failure detector
+    /// reclaims it after the usual grace period.
     pub async fn shutdown(self) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.commands.send(Command::Shutdown(reply_tx)).is_ok() {
@@ -281,9 +281,9 @@ async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Ve
     // The `time::Instant::now() < deadline` guard is load-bearing, not
     // redundant with `timeout_at` below: `Timeout::poll` checks its inner
     // future before the deadline, so a stream that is always synchronously
-    // ready (never `Pending`) starves the deadline check forever and this
-    // loop would otherwise spin without yielding. The plain sync check here
-    // runs every iteration regardless of whether the await below suspends.
+    // ready (never `Pending`) starves the deadline check and this loop would
+    // otherwise spin without yielding. This plain sync check runs every
+    // iteration regardless of whether the await below suspends.
     while seed_nodes.len() < MAX_INITIAL_SEEDS && time::Instant::now() < deadline {
         match time::timeout_at(deadline, seeds.next()).await {
             Ok(Some(addr)) => {
@@ -301,12 +301,11 @@ async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Ve
 /// socket. A concrete bind IP is used as-is; the zeroconf default
 /// (`0.0.0.0`/`::`) is resolved to the OS-chosen outbound interface via a UDP
 /// "connect" — for a datagram socket this only sets the kernel's default
-/// peer and never sends a packet, so it is a cheap, effectively synchronous
-/// call safe to make inline.
+/// peer and never sends a packet, so it's a cheap, synchronous call safe to
+/// make inline.
 ///
 /// `pub(crate)` rather than private: `cluster.rs` reuses this to resolve the
-/// data-plane's advertised address with the identical logic, rather than
-/// duplicating it.
+/// data-plane's advertised address with the same logic.
 pub(crate) fn resolve_advertise_ip(bind_ip: IpAddr) -> io::Result<IpAddr> {
     if !bind_ip.is_unspecified() {
         return Ok(bind_ip);
@@ -388,9 +387,9 @@ fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
 /// Owns the chitchat handle for the lifetime of one membership session:
 /// forwards freshly discovered addresses into chitchat's gossip, republishes
 /// chitchat's live-set changes as `Vec<Peer>`, and performs the graceful
-/// shutdown on request. Runs as a single task so `ChitchatHandle::shutdown`
-/// (which consumes it) has exactly one owner regardless of how many
-/// [`Membership`] clones exist.
+/// shutdown on request. Spawned once, so `ChitchatHandle::shutdown` (which
+/// consumes it) has exactly one owner regardless of how many [`Membership`]
+/// clones exist.
 async fn run(
     handle: ChitchatHandle,
     seeds: BoxStream<'static, SocketAddr>,
