@@ -45,7 +45,7 @@ use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
-use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler};
+use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler, batch_replicate};
 use crate::node::{NodeId, NodeName};
 use crate::store::{FanOutNotice, Mode, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
@@ -87,8 +87,42 @@ struct ClusterInner {
     local_modes: RwLock<HashMap<SmolStr, Mode>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
+    /// When each peer last streamed replicate traffic into this node — the
+    /// inbound half of [`Cluster::peer_is_streaming`].
+    inbound_activity: Arc<InboundActivity>,
     tracker: TaskTracker,
     cancel: CancellationToken,
+}
+
+/// Per-peer stamps of the last inbound `Replicate`/`ReplicateBatch`,
+/// recorded once per drained inbound batch by [`inbound_loop`] and read by
+/// the anti-entropy scheduler to leave a peer alone while its fan-out is
+/// still landing here.
+#[derive(Default)]
+pub(crate) struct InboundActivity {
+    seen: RwLock<HashMap<NodeId, u64>>,
+}
+
+impl InboundActivity {
+    fn note(&self, from: NodeId) {
+        self.seen
+            .write()
+            .expect("invariant: inbound-activity lock is never poisoned")
+            .insert(from, crate::net::mono_ms());
+    }
+
+    /// Whether `peer` streamed replicate traffic here within the last
+    /// `window`.
+    pub(crate) fn recent(&self, peer: NodeId, window: Duration) -> bool {
+        let seen = self
+            .seen
+            .read()
+            .expect("invariant: inbound-activity lock is never poisoned");
+        seen.get(&peer).is_some_and(|&at| {
+            let age = crate::net::mono_ms().saturating_sub(at);
+            age <= u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
+        })
+    }
 }
 
 /// Builds a [`Cluster`]: own-and-return. Zero further calls beyond
@@ -196,6 +230,18 @@ impl Cluster {
             .iter()
             .map(|peer| peer.node)
             .collect()
+    }
+
+    /// Whether replicate traffic between this node and `peer` is still in
+    /// motion in either direction, judged over one `ae_interval`: frames
+    /// queued or just enqueued toward `peer`, or a batch just received from
+    /// it. The anti-entropy scheduler leaves such a peer alone for a few
+    /// rounds — its digests would only report what the fan-out is already
+    /// delivering, and repairing that in parallel ships every record twice.
+    pub(crate) fn peer_is_streaming(&self, peer: NodeId) -> bool {
+        let window = self.inner.config.ae_interval;
+        self.inner.inbound_activity.recent(peer, window)
+            || self.inner.mesh.replicate_in_flight(peer, window)
     }
 
     /// A child of this cluster's shutdown token: cancelled the moment
@@ -371,6 +417,7 @@ impl ClusterBuilder {
                 local_modes: RwLock::new(HashMap::new()),
                 config,
                 absence: absence::AbsenceTracker::default(),
+                inbound_activity: Arc::new(InboundActivity::default()),
                 tracker: TaskTracker::new(),
                 cancel: CancellationToken::new(),
             }),
@@ -411,6 +458,7 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     ));
     cluster.spawn_tracked(inbound_loop(
         cluster.shards(),
+        Arc::clone(&cluster.inner.inbound_activity),
         inbound_rx,
         cluster.cancel_token(),
     ));
@@ -765,6 +813,7 @@ async fn apply_pending_replicate(
 /// per-record apply lock are acquired to do it.
 async fn inbound_loop(
     shards: ShardRegistry,
+    activity: Arc<InboundActivity>,
     mut inbound: mpsc::Receiver<InboundMsg>,
     cancel: CancellationToken,
 ) {
@@ -779,6 +828,16 @@ async fn inbound_loop(
                     return; // channel closed, nothing left to drain
                 }
             }
+        }
+
+        let mut streaming_from: HashSet<NodeId> = HashSet::new();
+        for InboundMsg { from, msg } in &drained {
+            if matches!(msg, Msg::Replicate { .. } | Msg::ReplicateBatch { .. }) {
+                streaming_from.insert(*from);
+            }
+        }
+        for from in streaming_from {
+            activity.note(from);
         }
 
         let mut shard_cache: HashMap<SmolStr, Option<Arc<dyn ShardOps>>> = HashMap::new();
@@ -999,54 +1058,6 @@ async fn fan_out_batch<K, V>(
             .mesh()
             .send_frames(peer, class, frames.iter().cloned());
     }
-}
-
-/// Splits one fan-out burst's records into `Msg::ReplicateBatch` chunks by
-/// the same byte budget and count cap `net::conn`'s opportunistic coalescer
-/// enforces ([`crate::net::REPLICATE_BATCH_BUDGET`]/
-/// [`crate::net::REPLICATE_BATCH_COUNT`]) — sized by each record's
-/// single-`Replicate` wire length, the same estimate the coalescer's own
-/// budget check runs on. A chunk of exactly one record stays a plain
-/// [`Msg::Replicate`], so trickle writes keep their uncoalesced shape.
-fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
-    let mut chunks: Vec<Vec<WireRecord>> = Vec::new();
-    let mut current: Vec<WireRecord> = Vec::new();
-    let mut current_bytes = 0usize;
-    for rec in records {
-        let rec_bytes = wire::replicate_frame_len(
-            cache_name.len(),
-            rec.key.len(),
-            rec.value.as_ref().map_or(0, Bytes::len),
-        );
-        if !current.is_empty()
-            && (current.len() >= crate::net::REPLICATE_BATCH_COUNT
-                || current_bytes + rec_bytes > crate::net::REPLICATE_BATCH_BUDGET)
-        {
-            chunks.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes += rec_bytes;
-        current.push(rec);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-        .into_iter()
-        .map(|mut recs| {
-            if recs.len() == 1 {
-                Msg::Replicate {
-                    cache: cache_name.clone(),
-                    rec: recs.pop().expect("invariant: length checked above"),
-                }
-            } else {
-                Msg::ReplicateBatch {
-                    cache: cache_name.clone(),
-                    recs,
-                }
-            }
-        })
-        .collect()
 }
 
 /// Periodically garbage-collects one shard's expired tombstones (tombstones
@@ -1463,6 +1474,21 @@ mod tests {
     /// the replica on node b at the deadline a stamped, while a sibling
     /// entry written with the cache's (absent) default lives on. Neither
     /// cache is opened with a TTL — the override is the only expiry in play.
+    #[test]
+    fn inbound_activity_is_recent_only_inside_the_window() {
+        let activity = InboundActivity::default();
+        let peer = NodeId::from(5);
+        assert!(!activity.recent(peer, Duration::from_secs(10)), "never seen");
+        activity.note(peer);
+        assert!(activity.recent(peer, Duration::from_secs(10)));
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(
+            !activity.recent(peer, Duration::from_millis(5)),
+            "a stamp older than the window no longer counts"
+        );
+        assert!(!activity.recent(NodeId::from(6), Duration::from_secs(10)));
+    }
+
     #[test]
     fn mode_conflicts_are_reported_once_per_peer_and_cache() {
         let peer_a = NodeId::from(1);

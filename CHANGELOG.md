@@ -7,6 +7,14 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Bespoke store engine**: live entries and tombstones share one set of
+  1,024 stripes, one per anti-entropy bucket, each a `parking_lot::RwLock`
+  over a `hashbrown` table keyed by the postcard-encoded key. A read is one
+  read lock and one lookup with no allocation for the key; a versioned apply
+  runs synchronously under one write guard; enumerating a bucket for
+  anti-entropy is O(bucket), not O(cache). Expiry is checked on read and
+  reclaimed by a sweep that visits only stripes with something due.
+  ENGINE_NUMBERS
 - **Sketch-based anti-entropy for large buckets**: a mismatched bucket whose
   local entry count exceeds `ClusterConfig::ae_sketch_min_bucket` (default
   384) is answered with an invertible Bloom lookup table
@@ -31,6 +39,25 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `moka` is no longer a dependency. Size-bounded eviction (`max_capacity`,
+  `weigher`) is sampled LRU: a write that pushes total weight past the cap
+  evicts the least recently read of eight entries sampled from a rotating
+  offset in one stripe, repeating until the cap holds. TTI stays a local
+  per-entry idle deadline. Neither is available in `Replicated` mode, as
+  before.
+- Anti-entropy pull replies (`AePull`, `AePullHashes`) travel as
+  `ReplicateBatch` frames under the same byte and count budget as the live
+  fan-out, instead of one `Replicate` frame per record; a 100k-record
+  repair is a few dozen frames.
+- Anti-entropy leaves a peer alone while replicate traffic between the two
+  is still in motion — frames queued or just sent toward it, or a batch just
+  received from it, judged over one `ae_interval` — for at most three
+  rounds in a row. A bulk fill no longer gets repaired in parallel with its
+  own fan-out, which shipped every record twice; a steady trickle of
+  writes cannot starve the repair.
+- Mixed 0.2/0.3 clusters are not supported: a 0.3 node's anti-entropy round
+  can send `AeSketch`, `AeEntries`, and `AePullHashes`, which a 0.2 node
+  cannot decode. Upgrade every node.
 - **Breaking**: `wire::Msg` is now `#[non_exhaustive]`. A downstream
   `match` on `Msg` without a wildcard arm needs one added — a one-time cost
   for letting future wire message kinds (like this release's own

@@ -36,7 +36,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -160,6 +160,66 @@ pub(super) fn record_frame_sent(len: usize) {
     BYTES_SENT.fetch_add(len as u64, Ordering::Relaxed);
     metrics::counter!("sundog_frames_sent_total").increment(1);
     metrics::counter!("sundog_bytes_sent_total").increment(len as u64);
+}
+
+/// Splits a run of records — a fan-out burst, an anti-entropy push, or an
+/// anti-entropy pull reply — into `Msg::ReplicateBatch` chunks by the same
+/// byte budget and count cap `net::conn`'s opportunistic coalescer enforces ([`REPLICATE_BATCH_BUDGET`]/
+/// [`REPLICATE_BATCH_COUNT`]) — sized by each record's
+/// single-`Replicate` wire length, the same estimate the coalescer's own
+/// budget check runs on. A chunk of exactly one record stays a plain
+/// [`Msg::Replicate`], so trickle writes keep their uncoalesced shape.
+pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
+    let mut chunks: Vec<Vec<WireRecord>> = Vec::new();
+    let mut current: Vec<WireRecord> = Vec::new();
+    let mut current_bytes = 0usize;
+    for rec in records {
+        let rec_bytes = wire::replicate_frame_len(
+            cache_name.len(),
+            rec.key.len(),
+            rec.value.as_ref().map_or(0, Bytes::len),
+        );
+        if !current.is_empty()
+            && (current.len() >= REPLICATE_BATCH_COUNT
+                || current_bytes + rec_bytes > REPLICATE_BATCH_BUDGET)
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += rec_bytes;
+        current.push(rec);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+        .into_iter()
+        .map(|mut recs| {
+            if recs.len() == 1 {
+                Msg::Replicate {
+                    cache: cache_name.clone(),
+                    rec: recs.pop().expect("invariant: length checked above"),
+                }
+            } else {
+                Msg::ReplicateBatch {
+                    cache: cache_name.clone(),
+                    recs,
+                }
+            }
+        })
+        .collect()
+}
+
+/// Milliseconds since the first call in this process — a monotonic stamp
+/// cheap enough to store in an atomic, for "how recently" bookkeeping that
+/// never needs wall-clock meaning.
+pub(crate) fn mono_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    duration_to_ms(START.get_or_init(Instant::now).elapsed())
+}
+
+fn duration_to_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Total wire frames sent by this process since start, across every
@@ -326,6 +386,9 @@ struct PeerHandle {
     invalidate: Arc<DropOldestQueue<OutFrame>>,
     replicate_tx: mpsc::Sender<OutFrame>,
     dirty: Arc<AtomicBool>,
+    /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued for this peer,
+    /// `0` if none ever was — read by [`Mesh::replicate_in_flight`].
+    last_replicate_enqueued: AtomicU64,
     cancel: CancellationToken,
     /// Pooled request/response connections for this peer — dialed
     /// on demand by `Mesh::ae_round`/`ae_pull`/`request_state` instead of
@@ -477,6 +540,7 @@ impl Mesh {
             invalidate,
             replicate_tx,
             dirty: Arc::new(AtomicBool::new(false)),
+            last_replicate_enqueued: AtomicU64::new(0),
             cancel,
             req_pool: Arc::new(conn::ReqPool::new()),
         }
@@ -549,10 +613,12 @@ impl Mesh {
         let Some(handle) = table.get(&peer) else {
             return;
         };
+        let mut enqueued_replicate = false;
         for frame in frames {
             match class {
                 MsgClass::Invalidate => handle.invalidate.push(frame),
                 MsgClass::Replicate => {
+                    enqueued_replicate = true;
                     if let Err(mpsc::error::TrySendError::Full(_)) =
                         handle.replicate_tx.try_send(frame)
                     {
@@ -565,6 +631,56 @@ impl Mesh {
                     }
                 }
             }
+        }
+        if enqueued_replicate {
+            handle
+                .last_replicate_enqueued
+                .store(mono_ms() + 1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether replicate traffic toward `peer` is still in motion: frames
+    /// queued in its outbox, or a frame enqueued within the last `window`.
+    /// Anti-entropy skips a round against such a peer — its digests would
+    /// only report what the fan-out is already delivering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal peer-table lock is poisoned, which only
+    /// happens if an earlier call already panicked while holding it.
+    pub(crate) fn replicate_in_flight(&self, peer: NodeId, window: Duration) -> bool {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        let Some(handle) = table.get(&peer) else {
+            return false;
+        };
+        let queued = handle.replicate_tx.max_capacity() - handle.replicate_tx.capacity();
+        if queued > 0 {
+            return true;
+        }
+        let last = handle.last_replicate_enqueued.load(Ordering::Relaxed);
+        last != 0 && (mono_ms() + 1).saturating_sub(last) <= duration_to_ms(window)
+    }
+
+    /// Marks `peer` dirty for the next [`Mesh::take_dirty_peers`] — the
+    /// anti-entropy scheduler hands a dirty peer back this way when it
+    /// skips the round it took the mark for.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal peer-table lock is poisoned, which only
+    /// happens if an earlier call already panicked while holding it.
+    pub(crate) fn mark_dirty(&self, peer: NodeId) {
+        let table = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned");
+        if let Some(handle) = table.get(&peer) {
+            handle.dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1276,6 +1392,138 @@ mod tests {
             [(SmolStr::new("users"), vec![key_a])],
             "the resolved hash must pull exactly key_a's bytes, never key_b's"
         );
+    }
+
+    #[test]
+    fn batch_replicate_splits_by_count_and_budget_and_keeps_a_singleton_plain() {
+        let cache = SmolStr::new("users");
+        let tiny = |i: u32| WireRecord {
+            key: Bytes::from(i.to_le_bytes().to_vec()),
+            value: Some(Bytes::from_static(b"v")),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        };
+        assert!(matches!(
+            batch_replicate(&cache, vec![tiny(0)]).as_slice(),
+            [Msg::Replicate { .. }]
+        ));
+        let msgs = batch_replicate(
+            &cache,
+            (0..u32::try_from(REPLICATE_BATCH_COUNT + 1).expect("fits"))
+                .map(tiny)
+                .collect(),
+        );
+        assert_eq!(
+            msgs.len(),
+            2,
+            "one record past the count cap starts a second batch"
+        );
+        assert!(
+            matches!(&msgs[0], Msg::ReplicateBatch { recs, .. } if recs.len() == REPLICATE_BATCH_COUNT)
+        );
+        assert!(matches!(&msgs[1], Msg::Replicate { .. }));
+        let big = |i: u32| WireRecord {
+            value: Some(Bytes::from(vec![0u8; REPLICATE_BATCH_BUDGET / 3])),
+            ..tiny(i)
+        };
+        let msgs = batch_replicate(&cache, (0..4).map(big).collect());
+        assert_eq!(
+            msgs.len(),
+            2,
+            "the byte budget splits four third-budget records two and two"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_pull_of_thousands_of_records_returns_every_record_through_batched_frames() {
+        let records: Vec<WireRecord> = (0..3000u32)
+            .map(|i| WireRecord {
+                key: Bytes::from(i.to_le_bytes().to_vec()),
+                value: Some(Bytes::from(vec![7u8; 16])),
+                ver: Hlc {
+                    wall_ms: u64::from(i) + 1,
+                    logical: 0,
+                    node: NodeId::from(1),
+                },
+                expires_at_ms: None,
+            })
+            .collect();
+        let handler = Arc::new(FixtureHandler {
+            records: records.clone(),
+            digests: Vec::new(),
+            bucket_entries: Vec::new(),
+            pulled: Mutex::new(Vec::new()),
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let frames_before = frames_sent_total();
+        let got = client
+            .ae_pull(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                vec![Bytes::from_static(b"any")],
+            )
+            .await
+            .expect("ae_pull succeeds");
+        let frames = frames_sent_total() - frames_before;
+        assert_eq!(got, records, "every pulled record arrives, in order");
+        assert!(
+            frames < 100,
+            "a 3000-record pull reply travels as a few batch frames, not one per record: {frames}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicate_in_flight_reflects_queued_and_recent_frames() {
+        let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        // A peer nobody listens on: the writer cannot drain, so an enqueued
+        // frame stays queued.
+        let unreachable = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+        mesh.update_peers(vec![peer_at(NodeId::from(2), unreachable)]);
+        let window = Duration::from_millis(500);
+        assert!(
+            !mesh.replicate_in_flight(NodeId::from(2), window),
+            "nothing sent yet"
+        );
+        assert!(
+            !mesh.replicate_in_flight(NodeId::from(9), window),
+            "an unknown peer is never in flight"
+        );
+        let frame = OutFrame::new(Msg::Replicate {
+            cache: SmolStr::new("users"),
+            rec: sample_record(1),
+        })
+        .expect("encodes");
+        mesh.send_frames(NodeId::from(2), MsgClass::Replicate, [frame]);
+        assert!(
+            mesh.replicate_in_flight(NodeId::from(2), window),
+            "a queued frame counts as in flight"
+        );
+        assert!(
+            mesh.replicate_in_flight(NodeId::from(2), Duration::ZERO),
+            "queued frames count regardless of the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_dirty_shows_up_in_the_next_take() {
+        let (mesh, _inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        mesh.update_peers(vec![peer_at(
+            NodeId::from(2),
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1)),
+        )]);
+        assert!(mesh.take_dirty_peers().is_empty());
+        mesh.mark_dirty(NodeId::from(2));
+        assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(2)]);
+        assert!(mesh.take_dirty_peers().is_empty(), "taking clears the mark");
+        mesh.mark_dirty(NodeId::from(42));
+        assert!(mesh.take_dirty_peers().is_empty(), "an unknown peer is ignored");
     }
 
     #[tokio::test]

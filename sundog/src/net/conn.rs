@@ -768,22 +768,15 @@ async fn serve_ae_pull(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let mut replies: Vec<Msg> = handler
-        .records_for(cache.clone(), keys)
-        .await
-        .into_iter()
-        .map(|rec| Msg::Replicate {
-            cache: cache.clone(),
-            rec,
-        })
-        .collect();
+    let records = handler.records_for(cache.clone(), keys).await;
+    let mut replies = super::batch_replicate(&cache, records);
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
 /// Serves an `AePullHashes` request: full records for the entries of
 /// `bucket` whose key hash is in `hashes` — the sketch-decoded counterpart
-/// to [`serve_ae_pull`], answered with the same `Replicate`-then-`ReqDone`
+/// to [`serve_ae_pull`], answered with the same batched-records-then-`ReqDone`
 /// reply shape.
 async fn serve_ae_pull_hashes(
     framed: &mut PeerFramed,
@@ -793,15 +786,10 @@ async fn serve_ae_pull_hashes(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let mut replies: Vec<Msg> = handler
+    let records = handler
         .records_for_hashes(cache.clone(), bucket, hashes)
-        .await
-        .into_iter()
-        .map(|rec| Msg::Replicate {
-            cache: cache.clone(),
-            rec,
-        })
-        .collect();
+        .await;
+    let mut replies = super::batch_replicate(&cache, records);
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
@@ -863,7 +851,7 @@ pub(super) async fn collect_ae_mismatches(
     }
 }
 
-/// Reads `Replicate` replies until [`Msg::ReqDone`] marks the reply
+/// Reads `Replicate`/`ReplicateBatch` replies until [`Msg::ReqDone`] marks the reply
 /// complete — see [`collect_ae_buckets`]'s docs for the same "no longer
 /// relies on connection close" reasoning and pool-checkin-on-success rule.
 pub(super) async fn collect_pulled_records(
@@ -878,6 +866,7 @@ pub(super) async fn collect_pulled_records(
                 return Ok(result);
             }
             Some(Ok(Msg::Replicate { rec, .. })) => result.push(rec),
+            Some(Ok(Msg::ReplicateBatch { recs, .. })) => result.extend(recs),
             Some(Ok(_)) => {} // unexpected message on this connection; keep reading
             Some(Err(err)) => return Err(err),
             None => return Err(unexpected_close("anti-entropy pull reply")),

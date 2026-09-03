@@ -133,7 +133,7 @@ requests reuse pooled connections instead of dialing fresh every round.
 
 | Mode | Each node stores | On write | On read | Pick this when |
 |---|---|---|---|---|
-| `Local` | its own data, nothing shared | nothing sent | local only | you want `moka` with less setup — no cluster traffic at all |
+| `Local` | its own data, nothing shared | nothing sent | local only | you want a fast in-process cache with TTL and bounded size, and no cluster traffic at all |
 | `Invalidation` (default) | its own working set | broadcasts "this key changed" | local, may be momentarily stale | the dataset is big or expensive to hold everywhere, and each node mostly cares about its own hot keys |
 | `Replicated` | a full copy of everything | broadcasts the value | always local, never waits on the network | the dataset is small enough to duplicate, and you want reads to never touch the network |
 

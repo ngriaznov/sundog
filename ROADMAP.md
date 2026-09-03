@@ -9,35 +9,6 @@ None of what follows is scheduled. A section moves from here into actual
 code only once its trigger condition is observed in a real deployment, not
 because it would be interesting to build.
 
-## Bespoke store engine (sub-200ns reads)
-
-The store rides on [`moka`](https://crates.io/crates/moka), which supplies
-TTL/TTI expiry, size- and weight-bounded TinyLFU eviction, and the
-stampede-collapsed `get_or_load` path — battle-tested semantics the whole
-verification stack leans on. It also sets the performance floor: a `moka`
-`get` costs ~600ns of the ~700ns a `Shard::get` measures end to end, and
-its async insert path is the largest single slice of a ~3.4µs replicated
-write. State-of-the-art concurrent cache reads (Caffeine-class designs)
-land in the 50–150ns range, so a purpose-built engine — our own concurrent
-map, TTL wheel, eviction policy, and stampede collapse behind the existing
-`ShardOps` seam — is worth an estimated 5× on reads and 3× on writes, and
-speeds up bulk remote apply in proportion. Nothing above the store (wire,
-fan-out batching, anti-entropy) needs to change; the replication pipeline
-already converges within a fraction of a second of the writes landing.
-
-**Cost:** a multi-week engine build whose hardest parts are exactly the
-semantics `moka` currently guarantees for free — expiry correctness under
-concurrent writes, eviction that can't resurrect stale entries, and
-stampede collapse without deadlock — all of which the permutation
-proptests, TTL-guarantee ladder, and churn suites must hold green through
-the swap.
-
-**Trigger:** a benchmark against a competing embedded cache where the read
-path is the measured, deciding gap — or read latency showing up as the
-binding constraint in a real deployment. Until then the current numbers
-already lead the embedded-replicated category, and the risk budget is
-better spent on real-workload mileage.
-
 ## Distribution mode
 
 A consistent-hash ring over the live member set, `numOwners` primary+backup
@@ -117,30 +88,6 @@ practice, not as a theoretical concern. The per-class outbox split and
 request/response traffic living outside the broadcast channel already
 remove the worst of this at the application layer; QUIC would only matter
 for what's left after that.
-
-## Set reconciliation past ~10⁶ entries (IBLT / minisketch)
-
-Anti-entropy compares 1,024 XOR-of-hash bucket digests per round — cheap,
-unconditional, incrementally maintained in O(1) per write, no rescans. Its
-cost is per-bucket, not per-entry, so it scales with cache *size* only
-insofar as bucket collision rates rise: at some entry count, enough distinct
-keys land in the same bucket that a single digest mismatch forces pulling
-the whole bucket's key/version list to find the actual diff, even when only
-one entry disagrees. Invertible Bloom lookup tables or minisketch-style set
-reconciliation would let two peers exchange a sketch sized to the *diff*,
-not the bucket, regardless of how many entries share a bucket.
-
-**Cost:** a second reconciliation protocol alongside the existing digest
-round, a decision about the sketch size (over-provisioned wastes bandwidth,
-under-provisioned fails to decode and falls back anyway), and — the part
-that matters — this only pays for itself once buckets are hot enough that
-the fallback (full bucket pull) is happening routinely rather than as the
-rare exception it's designed to be.
-
-**Trigger:** measured anti-entropy bandwidth per round exceeds budget on a
-cache in the ~10⁶-entries-and-up range, i.e. `BUCKET_COUNT` (1,024, fixed
-today) is no longer coarse enough to keep bucket pulls rare. Below that scale
-the current design is simpler and already convergence-bounded.
 
 ## Cluster-wide max-idle
 

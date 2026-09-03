@@ -51,15 +51,26 @@ pub(crate) async fn scheduler_task(
     ae_interval: Duration,
     cancel: CancellationToken,
 ) {
+    let mut skipped: HashMap<NodeId, u32> = HashMap::new();
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(jittered(ae_interval)) => {}
         }
-        let Some(peer) = pick_peer(&cluster) else {
+        let Some((peer, was_dirty)) = pick_peer(&cluster) else {
             continue;
         };
+        let skips = skipped.entry(peer).or_insert(0);
+        if should_skip_round(cluster.peer_is_streaming(peer), *skips) {
+            *skips += 1;
+            if was_dirty {
+                cluster.mesh().mark_dirty(peer);
+            }
+            tracing::trace!(%peer, "replicate traffic in motion; skipping this round");
+            continue;
+        }
+        *skips = 0;
         // `run_round_against`'s own network calls carry an internal
         // `REQUEST_TIMEOUT`, but racing the whole round against `cancel`
         // too means a `Cluster::shutdown()` in progress never has to wait
@@ -87,13 +98,32 @@ fn jittered(interval: Duration) -> Duration {
     Duration::from_secs_f64((base * factor).max(0.001))
 }
 
-fn pick_peer(cluster: &Cluster) -> Option<NodeId> {
+/// Rounds in a row the scheduler will leave a streaming peer alone before
+/// running one anyway: a steady trickle of writes must not starve
+/// anti-entropy, only a burst defers it.
+const MAX_STREAMING_SKIPS: u32 = 3;
+
+/// Whether to skip this round against a peer: only while replicate traffic
+/// is in motion, and never more than [`MAX_STREAMING_SKIPS`] times in a row.
+fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
+    streaming && skipped_so_far < MAX_STREAMING_SKIPS
+}
+
+/// The peer to run this round against and whether it was taken from the
+/// dirty set (so a skipped round can hand the mark back).
+fn pick_peer(cluster: &Cluster) -> Option<(NodeId, bool)> {
     let mut rng = rand::rng();
     let dirty = cluster.mesh().take_dirty_peers();
     if let Some(&peer) = dirty.choose(&mut rng) {
-        return Some(peer);
+        for &other in dirty.iter().filter(|&&other| other != peer) {
+            cluster.mesh().mark_dirty(other);
+        }
+        return Some((peer, true));
     }
-    cluster.live_peer_ids().choose(&mut rng).copied()
+    cluster
+        .live_peer_ids()
+        .choose(&mut rng)
+        .map(|&peer| (peer, false))
 }
 
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
@@ -222,10 +252,10 @@ async fn apply_repairs(
         let records = shard.records_for(batch.to_vec()).await;
         repaired += records.len() as u64;
         // The same budgeted `Msg::ReplicateBatch` chunking the live fan-out
-        // uses (`cluster::batch_replicate`): a large repair travels as a
+        // uses (`net::batch_replicate`): a large repair travels as a
         // handful of full frames and outbox slots, not one `Msg::Replicate`
         // per record.
-        let msgs = super::batch_replicate(cache, records);
+        let msgs = crate::net::batch_replicate(cache, records);
         // One peer-table lock acquisition for the whole batch rather than
         // one per record (see `Mesh::send_many`'s docs).
         mesh.send_many(peer, MsgClass::Replicate, msgs);
@@ -407,6 +437,18 @@ mod tests {
 
     use super::super::sketch::Elem;
     use super::*;
+
+    #[test]
+    fn a_streaming_peer_is_skipped_a_bounded_number_of_times() {
+        assert!(!should_skip_round(false, 0), "idle peers are never skipped");
+        for skipped in 0..MAX_STREAMING_SKIPS {
+            assert!(should_skip_round(true, skipped));
+        }
+        assert!(
+            !should_skip_round(true, MAX_STREAMING_SKIPS),
+            "a steady trickle cannot starve anti-entropy"
+        );
+    }
 
     #[test]
     fn jittered_stays_within_the_expected_band() {
