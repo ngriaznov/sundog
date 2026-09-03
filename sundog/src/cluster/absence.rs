@@ -1,9 +1,9 @@
 //! Partition-aware tombstone retention: tracks which recently-known cluster
 //! members are currently absent from the live peer set, so
 //! `tombstone_gc_task` can defer collecting a tombstone while a member that
-//! might still hold the deleted entry is unreachable — closing the gap where
-//! an unconditional tombstone GC would let anti-entropy resurrect a manually
-//! removed entry once that member returns.
+//! might still hold the deleted entry is unreachable. Without this, an
+//! unconditional GC would let anti-entropy resurrect a removed entry once
+//! that member returns.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
@@ -28,10 +28,8 @@ struct AbsenceState {
 ///
 /// On a single-node cluster the live peer set is always empty, so no
 /// departure is ever observed and [`AbsenceTracker::any_absent`] stays
-/// `false` forever — GC behaves exactly as it did before this tracker
-/// existed. [`should_defer_gc`] applies the same "unaffected" rule to every
-/// `Mode::Local` cache regardless of cluster size, since such a cache never
-/// runs anti-entropy in the first place.
+/// `false`. [`should_defer_gc`] never defers a `Mode::Local` cache either,
+/// since such a cache never runs anti-entropy.
 #[derive(Clone, Default)]
 pub(crate) struct AbsenceTracker {
     state: Arc<StdMutex<AbsenceState>>,
@@ -69,19 +67,17 @@ impl AbsenceTracker {
 }
 
 /// Whether `tombstone_gc_task` should defer a tombstone past `tombstone_ttl`
-/// on this tick. Only [`Mode::Replicated`] caches run anti-entropy
-/// (`cluster::anti_entropy`'s module docs), the only mechanism that could
-/// resurrect a tombstone this node already collected from a peer that was
-/// out of contact — so `Mode::Local`/`Mode::Invalidation` caches are never
-/// deferred, regardless of cluster membership.
+/// on this tick. Only [`Mode::Replicated`] caches run anti-entropy, the
+/// only mechanism that could resurrect a tombstone from a peer that was out
+/// of contact, so `Mode::Local`/`Mode::Invalidation` caches are never
+/// deferred.
 pub(crate) fn should_defer_gc(mode: Mode, tracker: &AbsenceTracker, hard_cap: Duration) -> bool {
     matches!(mode, Mode::Replicated) && tracker.any_absent(hard_cap)
 }
 
 /// Republishes [`crate::membership::Membership::peers`] changes into
-/// `tracker`, for the lifetime of the cluster — the background task that
-/// keeps [`AbsenceTracker`] current, mirroring `cluster::membership_to_mesh_task`'s
-/// own watch-and-republish shape.
+/// `tracker`, keeping [`AbsenceTracker`] current for the lifetime of the
+/// cluster.
 pub(crate) async fn tracking_task(
     mut peers: watch::Receiver<Vec<Peer>>,
     tracker: AbsenceTracker,
@@ -154,7 +150,7 @@ mod tests {
         tracker.observe(&[p]);
         assert!(
             !tracker.any_absent(Duration::from_secs(3600)),
-            "member is live again: no longer absent"
+            "a live member is not tracked absent"
         );
     }
 

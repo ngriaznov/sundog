@@ -52,13 +52,12 @@ fn item_strategy() -> impl Strategy<Value = (u64, Role, Hlc, Hlc)> {
 }
 
 /// Builds the two sketches and the expected exact decode from a list of
-/// `(key_hash, role, ver_left, ver_right)` items — a `Differing` item whose
+/// `(key_hash, role, ver_left, ver_right)` items. A `Differing` item whose
 /// two generated `Hlc`s happen to be equal degenerates to canceling
 /// entirely, exactly as a real identical-version element would, so the
-/// computed expectation always matches what `peel` should return regardless.
-/// Colliding `key_hash`es across items are deduplicated (last write wins),
-/// which only ever shrinks the real difference, never grows it past the
-/// caller's own bound.
+/// computed expectation always matches what `peel` should return. Colliding
+/// `key_hash`es across items are deduplicated (last write wins), which only
+/// shrinks the real difference, never grows it past the caller's bound.
 fn build(items: Vec<(u64, Role, Hlc, Hlc)>) -> (Iblt, Iblt, HashSet<Elem>, HashSet<Elem>) {
     let mut by_hash: HashMap<u64, (Role, Hlc, Hlc)> = HashMap::new();
     for (key_hash, role, left_ver, right_ver) in items {

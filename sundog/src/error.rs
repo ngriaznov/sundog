@@ -22,11 +22,10 @@ pub enum CodecError {
     /// postcard failed to serialize or deserialize a value.
     #[error("postcard codec error")]
     Postcard(#[from] postcard::Error),
-    /// A raw-record frame (`Replicate`/`ReplicateBatch`/`StChunk`, see
-    /// `crate::wire`'s module docs) failed to parse: a header didn't fit,
-    /// a length field pointed past the frame's end, the cache name wasn't
-    /// valid UTF-8, or a length exceeded what the layout's fixed-width
-    /// fields can hold.
+    /// A raw-record frame (`Replicate`/`ReplicateBatch`/`StChunk`) failed to
+    /// parse: a header didn't fit, a length field pointed past the frame's
+    /// end, the cache name wasn't valid UTF-8, or a length exceeded what the
+    /// layout's fixed-width fields can hold.
     #[error("malformed record frame: {0}")]
     MalformedFrame(&'static str),
     /// The underlying I/O stream failed.
@@ -74,21 +73,16 @@ pub enum CacheError {
         /// The configured cap it exceeded.
         limit: usize,
     },
-    /// The named cache was opened locally with a [`crate::store::Mode`] that conflicts
-    /// with how another live node already has it configured.
+    /// The named cache was opened locally with a [`crate::store::Mode`] that
+    /// conflicts with how another live node already has it configured.
     ///
-    /// Every opened cache gossips its own name and [`crate::store::Mode`] as
-    /// a `cache:<name>` chitchat key (`membership`'s cache-mode
-    /// fingerprint). [`crate::cache::CacheBuilder::open`] checks the
-    /// requested mode against every live peer's advertised fingerprint for
-    /// the same name before
-    /// registering the shard, and returns this error on a mismatch. That
-    /// check only sees gossip that has already converged, so two nodes
-    /// opening the same name under different modes at nearly the same
-    /// moment can both pass it — `cluster`'s membership-change handling
-    /// re-checks the live peer set against this node's shard registry on
-    /// every view change as a background backstop, logging (not tearing
-    /// down) whatever this constructor-time check missed.
+    /// [`crate::cache::CacheBuilder::open`] checks the requested mode
+    /// against every live peer's advertised `cache:<name>` fingerprint
+    /// before registering the shard. Since that check only sees gossip that
+    /// has already converged, two nodes opening the same name under
+    /// different modes at nearly the same moment can both pass it;
+    /// `cluster`'s membership-change handling re-checks on every view
+    /// change and logs whatever this constructor-time check missed.
     #[error("cache {cache:?} mode mismatch: local {local:?}, cluster has {remote:?}")]
     ModeMismatch {
         /// The cache name.
