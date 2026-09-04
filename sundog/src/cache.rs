@@ -223,11 +223,7 @@ where
 /// cache cold, declining to donate until the warm-up task gets it there.
 async fn warm_and_repair(cluster: &Cluster, shard_ops: Arc<dyn ShardOps>, name: &SmolStr) {
     let outcome = crate::cluster::state_transfer::run(cluster, &shard_ops, name).await;
-    if !matches!(
-        outcome,
-        crate::cluster::state_transfer::Outcome::Completed
-            | crate::cluster::state_transfer::Outcome::NoDonor
-    ) {
+    if outcome.needs_warm_up() {
         cluster.spawn_tracked(crate::cluster::state_transfer::warm_up_task(
             cluster.clone(),
             Arc::clone(&shard_ops),

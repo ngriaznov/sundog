@@ -99,8 +99,11 @@ pub struct ClusterConfig {
     /// startup-latency bound, not a correctness one: anti-entropy repairs
     /// whatever the cut-off transfer didn't deliver. A fifth of it is the
     /// grace a node with no peer in sight waits for gossip to show one
-    /// before it opens as the cluster's origin. Zero is honored: `open()`
-    /// skips waiting entirely.
+    /// before it opens as the cluster's origin. A cache whose transfer times
+    /// out opens cold, declining to donate, and keeps pulling in the
+    /// background every `ae_interval`; after three timed-out pulls it opens
+    /// warm with what landed. Zero is honored: `open()` skips the transfer
+    /// entirely and the cache is warm with what it has.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,

@@ -748,22 +748,17 @@ async fn serve_ae_digest(
                     .await
                     .into_iter()
                     .map(|(bucket, entries)| {
-                        if entries.len() > min_bucket {
-                            let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
-                            for (key, ver) in &entries {
-                                iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
-                            }
-                            Msg::AeSketch {
+                        match listing_or_sketch(entries, min_bucket, sketch_cells) {
+                            ListingOrSketch::Sketch(cells) => Msg::AeSketch {
                                 cache: cache.clone(),
                                 bucket,
-                                cells: iblt.into_cells(),
-                            }
-                        } else {
-                            Msg::AeBucket {
+                                cells,
+                            },
+                            ListingOrSketch::Listing(entries) => Msg::AeBucket {
                                 cache: cache.clone(),
                                 bucket,
                                 entries,
-                            }
+                            },
                         }
                     }),
             );
@@ -797,30 +792,53 @@ async fn serve_ae_parts(
             .await
             .into_iter()
             .map(|((bucket, part), entries)| {
-                if entries.len() > min_bucket {
-                    let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
-                    for (key, ver) in &entries {
-                        iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
-                    }
-                    Msg::AePartSketch {
+                match listing_or_sketch(entries, min_bucket, sketch_cells) {
+                    ListingOrSketch::Sketch(cells) => Msg::AePartSketch {
                         cache: cache.clone(),
                         bucket,
                         part,
-                        cells: iblt.into_cells(),
-                    }
-                } else {
-                    Msg::AePart {
+                        cells,
+                    },
+                    ListingOrSketch::Listing(entries) => Msg::AePart {
                         cache: cache.clone(),
                         bucket,
                         part,
                         entries,
-                    }
+                    },
                 }
             })
             .collect()
     };
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// A responder's shape for one mismatched bucket or part: its listing, or
+/// an IBLT sketch once the listing would outweigh one.
+#[derive(Debug, PartialEq, Eq)]
+enum ListingOrSketch {
+    Listing(Vec<(bytes::Bytes, crate::hlc::Hlc)>),
+    Sketch(Vec<crate::wire::Cell>),
+}
+
+/// The one crossover rule for [`serve_ae_digest`] and [`serve_ae_parts`]:
+/// more than `min_bucket` entries answer with a `sketch_cells`-cell sketch
+/// over their `(key_hash, version)` pairs, anything up to it with the
+/// listing itself.
+fn listing_or_sketch(
+    entries: Vec<(bytes::Bytes, crate::hlc::Hlc)>,
+    min_bucket: usize,
+    sketch_cells: usize,
+) -> ListingOrSketch {
+    if entries.len() > min_bucket {
+        let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
+        for (key, ver) in &entries {
+            iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
+        }
+        ListingOrSketch::Sketch(iblt.into_cells())
+    } else {
+        ListingOrSketch::Listing(entries)
+    }
 }
 
 /// Serves an `AeEntries` request: the sketch fallback, full listings for the
@@ -1071,6 +1089,33 @@ pub(super) fn state_stream(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listing_or_sketch_crosses_over_past_min_bucket() {
+        let entry = |n: u64| {
+            (
+                bytes::Bytes::from(n.to_be_bytes().to_vec()),
+                crate::hlc::Hlc {
+                    wall_ms: n,
+                    logical: 0,
+                    node: crate::node::NodeId::from(1),
+                },
+            )
+        };
+        let small: Vec<_> = (0..3).map(entry).collect();
+        assert_eq!(
+            super::listing_or_sketch(small.clone(), 3, 6),
+            super::ListingOrSketch::Listing(small),
+            "up to min_bucket entries stay a listing"
+        );
+        let large: Vec<_> = (0..4).map(entry).collect();
+        match super::listing_or_sketch(large, 3, 6) {
+            super::ListingOrSketch::Sketch(cells) => assert_eq!(cells.len(), 6),
+            other @ super::ListingOrSketch::Listing(_) => {
+                panic!("expected a sketch, got {other:?}")
+            }
+        }
+    }
+
     // Only the `not(sim)` tests below dial real loopback sockets through
     // `handle_accepted`/`run_peer_writer`/the request collectors; under
     // `sim` those tests (and these imports) are compiled out entirely.

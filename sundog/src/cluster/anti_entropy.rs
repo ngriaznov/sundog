@@ -329,7 +329,9 @@ async fn classify_part_digest_mismatches(
             let local_part_entries = shard.entries_for_parts(wanted_parts).await;
             let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
                 local_part_entries.into_iter().collect();
+            let mut gathered: HashMap<u16, BucketParts> = HashMap::new();
             for reply in replies {
+                let slot = gathered.entry(reply.bucket()).or_default();
                 match reply {
                     AePartReply::Listing {
                         bucket,
@@ -341,8 +343,8 @@ async fn classify_part_digest_mismatches(
                                 .get(&(bucket, part))
                                 .map_or(&[], Vec::as_slice),
                             &entries,
-                            push_keys,
-                            pull_keys,
+                            &mut slot.push_keys,
+                            &mut slot.pull_keys,
                         );
                         metrics::counter!(
                             "sundog_ae_parts_total",
@@ -365,18 +367,27 @@ async fn classify_part_digest_mismatches(
                         let entries: &[(Bytes, Hlc)] = local_by_part
                             .get(&(bucket, part))
                             .map_or(&[], Vec::as_slice);
+                        let mut undecodable = Vec::new();
                         handle_part_sketch_mismatch(
                             cache,
                             bucket,
                             cells,
                             entries,
-                            push_keys,
-                            pull_hashes,
-                            undecodable_buckets,
+                            &mut slot.push_keys,
+                            &mut slot.pull_hashes,
+                            &mut undecodable,
                         );
+                        slot.undecodable |= !undecodable.is_empty();
                     }
                 }
             }
+            settle_bucket_parts(
+                gathered,
+                push_keys,
+                pull_keys,
+                pull_hashes,
+                undecodable_buckets,
+            );
         }
         Err(error) => {
             tracing::debug!(%error, "anti-entropy part exchange failed");
@@ -462,6 +473,59 @@ fn handle_sketch_mismatch(
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
 ) {
+    if !peel_sketch_into(
+        SketchScope::Bucket,
+        cache,
+        bucket,
+        cells,
+        local_entries,
+        push_keys,
+        pull_hashes,
+    ) {
+        undecodable_buckets.push(bucket);
+    }
+}
+
+/// Which reply a sketch came in, deciding the metric it counts under.
+#[derive(Debug, Clone, Copy)]
+enum SketchScope {
+    /// An `AeSketch` over a whole bucket: `sundog_ae_sketch_total`.
+    Bucket,
+    /// An `AePartSketch` over one part: `sundog_ae_parts_total`.
+    Part,
+}
+
+impl SketchScope {
+    const fn metric(self) -> &'static str {
+        match self {
+            Self::Bucket => "sundog_ae_sketch_total",
+            Self::Part => "sundog_ae_parts_total",
+        }
+    }
+
+    const fn decoded_outcome(self) -> &'static str {
+        match self {
+            Self::Bucket => "decoded",
+            Self::Part => "sketch",
+        }
+    }
+}
+
+/// The one peel path for bucket and part sketches: builds the local
+/// comparison sketch over `local_entries`, subtracts the received `cells`,
+/// and peels. On success [`diff_decoded`] classifies the result into
+/// `push_keys` and `pull_hashes`, scoped to `bucket`, and this returns
+/// `true`; on failure it returns `false` and the caller queues the fallback.
+/// Emits `scope`'s metric either way.
+fn peel_sketch_into(
+    scope: SketchScope,
+    cache: &SmolStr,
+    bucket: u16,
+    cells: Vec<Cell>,
+    local_entries: &[(Bytes, Hlc)],
+    push_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+) -> bool {
     // Sized from the received sketch's cell count, not this node's own
     // config, so the two sketches stay shape-compatible if configs drift. A
     // cell count `Iblt::new` cannot reproduce fails `subtract`, and falls
@@ -471,33 +535,24 @@ fn handle_sketch_mismatch(
         local_sketch.insert(xxh3_64(key), *ver);
     }
     let remote_sketch = Iblt::from_cells(cells);
-    if let Ok(decoded) = local_sketch.subtract(&remote_sketch).and_then(Iblt::peel) {
-        let mut hashes = Vec::new();
-        diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
-        if !hashes.is_empty() {
-            pull_hashes.push((bucket, hashes));
-        }
-        metrics::counter!(
-            "sundog_ae_sketch_total",
-            "cache" => cache.to_string(),
-            "outcome" => "decoded"
-        )
-        .increment(1);
-        tracing::debug!(outcome = "decoded", bucket, "anti-entropy sketch decoded");
+    let decoded = local_sketch.subtract(&remote_sketch).and_then(Iblt::peel);
+    let outcome = if decoded.is_ok() {
+        scope.decoded_outcome()
     } else {
-        undecodable_buckets.push(bucket);
-        tracing::debug!(
-            outcome = "fallback",
-            bucket,
-            "anti-entropy sketch undecodable; falling back to a full listing"
-        );
-        metrics::counter!(
-            "sundog_ae_sketch_total",
-            "cache" => cache.to_string(),
-            "outcome" => "fallback"
-        )
+        "fallback"
+    };
+    metrics::counter!(scope.metric(), "cache" => cache.to_string(), "outcome" => outcome)
         .increment(1);
+    tracing::debug!(outcome, bucket, ?scope, "anti-entropy sketch peeled");
+    let Ok(decoded) = decoded else {
+        return false;
+    };
+    let mut hashes = Vec::new();
+    diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
+    if !hashes.is_empty() {
+        pull_hashes.push((bucket, hashes));
     }
+    true
 }
 
 /// The parts, of a bucket answered with [`AeMismatch::PartDigests`], whose
@@ -519,12 +574,10 @@ pub fn mismatched_parts(local: &[u64], remote: &[u64]) -> Vec<u8> {
         .collect()
 }
 
-/// Classifies one part's `AePartReply::Sketch` reply: the same peel logic as
-/// [`handle_sketch_mismatch`], scoped to a single part's local entries, but
-/// emitting `sundog_ae_parts_total{outcome}` in place of
-/// `sundog_ae_sketch_total`. On failure, `bucket` queues into
-/// `undecodable_buckets` for the existing whole-bucket `Msg::AeEntries`
-/// fallback: a part sketch never gets its own part-scoped fallback.
+/// Classifies one part's `AePartReply::Sketch` reply through
+/// [`peel_sketch_into`] at part scope. On failure, `bucket` queues into
+/// `undecodable_buckets` for the whole-bucket `Msg::AeEntries` fallback: a
+/// part sketch never gets its own part-scoped fallback.
 fn handle_part_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,
@@ -534,41 +587,52 @@ fn handle_part_sketch_mismatch(
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
 ) {
-    let mut local_sketch = Iblt::new(cells.len());
-    for (key, ver) in local_entries {
-        local_sketch.insert(xxh3_64(key), *ver);
-    }
-    let remote_sketch = Iblt::from_cells(cells);
-    if let Ok(decoded) = local_sketch.subtract(&remote_sketch).and_then(Iblt::peel) {
-        let mut hashes = Vec::new();
-        diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
-        if !hashes.is_empty() {
-            pull_hashes.push((bucket, hashes));
-        }
-        metrics::counter!(
-            "sundog_ae_parts_total",
-            "cache" => cache.to_string(),
-            "outcome" => "sketch"
-        )
-        .increment(1);
-        tracing::debug!(
-            outcome = "sketch",
-            bucket,
-            "anti-entropy part sketch decoded"
-        );
-    } else {
+    if !peel_sketch_into(
+        SketchScope::Part,
+        cache,
+        bucket,
+        cells,
+        local_entries,
+        push_keys,
+        pull_hashes,
+    ) {
         undecodable_buckets.push(bucket);
-        tracing::debug!(
-            outcome = "fallback",
-            bucket,
-            "anti-entropy part sketch undecodable; falling back to a full bucket listing"
-        );
-        metrics::counter!(
-            "sundog_ae_parts_total",
-            "cache" => cache.to_string(),
-            "outcome" => "fallback"
-        )
-        .increment(1);
+    }
+}
+
+/// One bucket's classification gathered across its part replies, kept aside
+/// until every reply is in: a bucket with any undecodable part falls back
+/// to its full listing, and the work its other parts classified is dropped
+/// rather than repaired twice.
+#[derive(Default)]
+struct BucketParts {
+    push_keys: Vec<Bytes>,
+    pull_keys: Vec<Bytes>,
+    pull_hashes: Vec<(u16, Vec<u64>)>,
+    undecodable: bool,
+}
+
+/// Folds every bucket's gathered part classification into the round's
+/// sets: a bucket with an undecodable part goes to `undecodable_buckets`
+/// once and contributes nothing else; every other bucket's keys and hashes
+/// are kept.
+fn settle_bucket_parts(
+    gathered: HashMap<u16, BucketParts>,
+    push_keys: &mut Vec<Bytes>,
+    pull_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+    undecodable_buckets: &mut Vec<u16>,
+) {
+    let mut buckets: Vec<(u16, BucketParts)> = gathered.into_iter().collect();
+    buckets.sort_unstable_by_key(|(bucket, _)| *bucket);
+    for (bucket, parts) in buckets {
+        if parts.undecodable {
+            undecodable_buckets.push(bucket);
+            continue;
+        }
+        push_keys.extend(parts.push_keys);
+        pull_keys.extend(parts.pull_keys);
+        pull_hashes.extend(parts.pull_hashes);
     }
 }
 
@@ -900,6 +964,46 @@ mod tests {
         assert!(out.push_keys.is_empty());
         assert!(out.pull_hashes.is_empty());
         assert_eq!(out.undecodable_buckets, vec![7]);
+    }
+
+    #[test]
+    fn settle_bucket_parts_drops_a_bucket_with_an_undecodable_part_and_queues_it_once() {
+        let mut gathered: HashMap<u16, BucketParts> = HashMap::new();
+        gathered.insert(
+            3,
+            BucketParts {
+                push_keys: vec![Bytes::from_static(b"p3")],
+                pull_keys: vec![Bytes::from_static(b"q3")],
+                pull_hashes: vec![(3, vec![33])],
+                undecodable: true,
+            },
+        );
+        gathered.insert(
+            5,
+            BucketParts {
+                push_keys: vec![Bytes::from_static(b"p5")],
+                pull_keys: Vec::new(),
+                pull_hashes: vec![(5, vec![55])],
+                undecodable: false,
+            },
+        );
+        let (mut push, mut pull, mut hashes, mut undecodable) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        settle_bucket_parts(
+            gathered,
+            &mut push,
+            &mut pull,
+            &mut hashes,
+            &mut undecodable,
+        );
+        assert_eq!(push, vec![Bytes::from_static(b"p5")]);
+        assert!(pull.is_empty());
+        assert_eq!(hashes, vec![(5, vec![55])]);
+        assert_eq!(
+            undecodable,
+            vec![3],
+            "the bucket falls back once, its part work dropped"
+        );
     }
 
     #[test]

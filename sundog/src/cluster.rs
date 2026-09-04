@@ -223,8 +223,6 @@ impl Cluster {
         self.inner.membership.cache_modes().borrow().clone()
     }
 
-    /// A fresh watch subscription on the live peer set, for loops that react to
-    /// changes.
     /// Records that this node can donate a snapshot of `cache` from now on;
     /// see [`Warmth`].
     pub(crate) fn mark_warm(&self, cache: &SmolStr) {
@@ -237,6 +235,8 @@ impl Cluster {
         self.inner.warmth.is_warm(cache)
     }
 
+    /// A fresh watch subscription on the live peer set, for loops that react to
+    /// changes.
     pub(crate) fn peers_watch(&self) -> tokio::sync::watch::Receiver<Vec<Peer>> {
         self.inner.membership.peers()
     }

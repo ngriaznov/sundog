@@ -730,32 +730,39 @@ where
             by_bucket.entry(bucket).or_default().push(part);
         }
         let mut out = Vec::new();
-        for (bucket, parts) in by_bucket {
-            let stripe = self.stripes[usize::from(bucket)].read();
-            for part in parts {
-                let mut entries = Vec::new();
-                entries.extend(
-                    stripe
-                        .live
-                        .iter()
-                        .filter(|live| !self.is_absent(live, now_ms))
-                        .filter(|live| {
-                            part_index_from_hash(hash_key_bytes(live.key_bytes.as_ref()))
-                                == usize::from(part)
-                        })
-                        .map(|live| (live.key_bytes.clone(), live.stored.ver)),
-                );
-                entries.extend(
-                    stripe
-                        .tombstones
-                        .iter()
-                        .filter(|(key_bytes, _)| {
-                            part_index_from_hash(hash_key_bytes(key_bytes)) == usize::from(part)
-                        })
-                        .map(|(key_bytes, t)| (key_bytes.clone(), t.ver)),
-                );
-                out.push(((bucket, part), entries));
+        for (bucket, mut parts) in by_bucket {
+            parts.sort_unstable();
+            parts.dedup();
+            // One pass over the stripe, hashing each key once, routing every
+            // entry to its part's slot; a bucket's 64 parts cost one listing.
+            let mut slot_of_part = [usize::MAX; PART_COUNT];
+            for (slot, &part) in parts.iter().enumerate() {
+                slot_of_part[usize::from(part)] = slot;
             }
+            let mut per_part: Vec<Vec<(Bytes, Hlc)>> = vec![Vec::new(); parts.len()];
+            let stripe = self.stripes[usize::from(bucket)].read();
+            let live_entries = stripe
+                .live
+                .iter()
+                .filter(|live| !self.is_absent(live, now_ms))
+                .map(|live| (&live.key_bytes, live.stored.ver));
+            let tombstone_entries = stripe
+                .tombstones
+                .iter()
+                .map(|(key_bytes, t)| (key_bytes, t.ver));
+            for (key_bytes, ver) in live_entries.chain(tombstone_entries) {
+                let slot = slot_of_part[part_index_from_hash(hash_key_bytes(key_bytes.as_ref()))];
+                if slot != usize::MAX {
+                    per_part[slot].push((key_bytes.clone(), ver));
+                }
+            }
+            drop(stripe);
+            out.extend(
+                parts
+                    .into_iter()
+                    .zip(per_part)
+                    .map(|(part, entries)| ((bucket, part), entries)),
+            );
         }
         out
     }
