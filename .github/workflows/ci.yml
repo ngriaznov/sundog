@@ -38,6 +38,11 @@ jobs:
       - name: cargo clippy (tls,prometheus features)
         run: cargo clippy --package sundog --all-targets --features tls,prometheus -- -D warnings -W clippy::pedantic
 
+      # The fuzz crate sits outside the workspace; a wire change that misses
+      # its seed generator or a target would otherwise surface only nightly.
+      - name: cargo check (fuzz crate)
+        run: cargo check --manifest-path sundog/fuzz/Cargo.toml --all-targets
+
       - name: cargo test
         run: cargo test --workspace
 

@@ -25,6 +25,7 @@ fn main() {
         Msg::Hello {
             node,
             incarnation: 42,
+            protocol: sundog::wire::PROTOCOL_VERSION,
         },
         Msg::Invalidate {
             cache: "users".into(),
