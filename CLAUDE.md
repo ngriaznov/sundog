@@ -32,5 +32,8 @@
 - Container tests use the `rightsize` crate only; no Docker CLI, compose, or
   bollard in the repo. The test node is the `sundog-testnode` binary.
 - Publishing goes through GitHub Actions (`release.yml`, `tag-release.yml`,
-  `yank.yml`); the session git proxy cannot push tags. After a release run,
-  verify the run's conclusion, not only the crates.io max version.
+  `yank.yml`); the session git proxy cannot push tags. `release.yml` refuses
+  to publish unless CI, nightly-sim, nightly-fuzz, and nightly-chaos each
+  have a successful run on the exact release commit: dispatch all four on
+  that commit and wait for green before the release run. After a release
+  run, verify the run's conclusion, not only the crates.io max version.

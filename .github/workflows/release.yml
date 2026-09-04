@@ -5,7 +5,10 @@
 #
 # or a manual workflow dispatch against the branch to publish from. On a
 # tag push, the tag must match the crate version exactly; the guard step
-# refuses a mismatch before anything is uploaded.
+# refuses a mismatch before anything is uploaded. Publishing also requires
+# a successful run of every verification workflow on the exact commit being
+# published: CI, nightly-sim, nightly-fuzz, and nightly-chaos. Dispatch the
+# three nightlies on the release commit and wait for them before this run.
 name: release
 
 on:
@@ -13,11 +16,35 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Require a green run of every verification workflow on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          missing=0
+          for wf in ci.yml nightly-sim.yml nightly-fuzz.yml nightly-chaos.yml; do
+            count=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$wf" \
+              --commit "$GITHUB_SHA" --status success --json databaseId --jq 'length')
+            if [ "${count:-0}" -eq 0 ]; then
+              echo "::error title=release gate::no successful $wf run on $GITHUB_SHA"
+              missing=1
+            else
+              echo "$wf: $count successful run(s) on $GITHUB_SHA"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "dispatch the missing workflows on $GITHUB_SHA and rerun once they are green" >&2
+            exit 1
+          fi
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
