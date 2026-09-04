@@ -17,6 +17,6 @@ path = "src/main.rs"
 pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
-sundog = { version = "0.3.1", path = "../sundog" }
+sundog = { version = "0.4.0", path = "../sundog" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
