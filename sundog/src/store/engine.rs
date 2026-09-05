@@ -11,11 +11,10 @@
 //! Expiry is checked on every read and reclaimed by [`Engine::sweep`], which
 //! visits only stripes with an entry due. Capacity eviction is sampled LRU:
 //! [`Engine::enforce_capacity`] locks one stripe at a time, weighs up to
-//! `EVICTION_SAMPLE` entries from a rotating offset, and evicts up to
+//! `EVICTION_BATCH_SAMPLE` entries from a rotating offset, and evicts up to
 //! `EVICTION_BATCH` of the coldest under that one lock hold, until total
-//! weight fits. [`Engine::live_entry_count`] is an `AtomicU64` every
-//! insert/remove path keeps current, so reading it costs one atomic load
-//! rather than a pass over every stripe.
+//! weight fits. [`Engine::live_entry_count`] is a counter every insert and
+//! remove path maintains.
 //!
 //! [`super::Shard::get_or_load`] collapses concurrent misses through a
 //! per-stripe map of in-flight loads. A waiter subscribes to the load's
@@ -57,8 +56,9 @@ const KEY_STACK_BUF: usize = 128;
 /// least recently read of them.
 const EVICTION_SAMPLE: usize = 8;
 
-/// How many sampled-cold entries [`Engine::enforce_capacity`] evicts per
-/// stripe write-lock acquisition, when the overage needs that many.
+/// How many entries one [`Engine::enforce_capacity`] lock hold samples, and
+/// at most how many of the coldest it evicts.
+const EVICTION_BATCH_SAMPLE: usize = 32;
 const EVICTION_BATCH: usize = 8;
 
 /// Holds one postcard-encoded key: on the stack when it fits [`KEY_STACK_BUF`],
@@ -260,23 +260,20 @@ fn absent_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool 
     false
 }
 
-/// How many of `sampled_weights` (coldest-first) one eviction lock
-/// acquisition takes: the fewest entries whose combined weight clears
-/// `over_by`, capped at everything sampled. Never returns one entry more
-/// than clearing the overage needs, so only the last entry counted may push
-/// total weight further under the cap than its own weight.
+/// How many of `sampled_weights` (coldest first) one lock hold evicts: the
+/// fewest that clear `over_by`, at most [`EVICTION_BATCH`], and never more
+/// than the colder half of the sample, so recency still decides under a
+/// burst.
 fn eviction_batch_size(over_by: u64, sampled_weights: &[u32]) -> usize {
-    if over_by == 0 {
-        return 0;
-    }
+    let cap = EVICTION_BATCH.min(sampled_weights.len().div_ceil(2));
     let mut cleared = 0u64;
-    for (victims, &weight) in sampled_weights.iter().enumerate() {
-        cleared += u64::from(weight);
+    for (evicted, &weight) in sampled_weights.iter().take(cap).enumerate() {
         if cleared >= over_by {
-            return victims + 1;
+            return evicted;
         }
+        cleared += u64::from(weight);
     }
-    sampled_weights.len()
+    cap
 }
 
 /// The outcome of [`apply_locked`]: the caller's `key` back plus what changed,
@@ -585,16 +582,11 @@ pub(crate) struct Engine<K, V> {
     stripes: Box<[RwLock<Stripe<K, V>>]>,
     digest: Box<[AtomicU64]>,
     total_weight: AtomicU64,
-    /// Live entries across every stripe, kept current by every path that
-    /// inserts or removes one so [`Engine::live_entry_count`] is one atomic
-    /// load instead of a pass over every stripe.
     live_count: AtomicU64,
     max_capacity: u64,
     tti_ms: Option<u64>,
     weigher: Option<Weigher<K, V>>,
     evict_cursor: AtomicU64,
-    /// Stripe write-lock acquisitions [`Engine::enforce_capacity`] has made
-    /// for eviction, for tests that check batching cuts lock traffic.
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
 }
@@ -947,9 +939,7 @@ where
         }
     }
 
-    /// The number of live entries across every stripe: one atomic load,
-    /// maintained incrementally by every path that inserts or removes a live
-    /// entry.
+    /// The number of live entries across every stripe.
     pub(crate) fn live_entry_count(&self) -> u64 {
         self.live_count.load(Ordering::Relaxed)
     }
@@ -981,8 +971,6 @@ where
         }
     }
 
-    /// Marks one stripe write-lock acquisition made for eviction, for tests
-    /// that check batching cuts lock traffic. A no-op in non-test builds.
     #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn note_eviction_lock_acquisition(&self) {
         #[cfg(test)]
@@ -1036,10 +1024,10 @@ where
             .find(|&candidate| self.evict_one_sampled(candidate))
     }
 
-    /// Evicts up to [`EVICTION_BATCH`] of a bucket's sampled-cold entries
-    /// under one stripe write-lock acquisition, clearing `over_by` in as
-    /// few of them as [`eviction_batch_size`] decides. Returns the weight
-    /// actually removed, `0` when the stripe holds nothing to evict.
+    /// Evicts the coldest of up to [`EVICTION_BATCH_SAMPLE`] entries in
+    /// `bucket` under one lock hold, as many as [`eviction_batch_size`]
+    /// allows for `over_by`. Returns the weight removed, `0` when the stripe
+    /// holds nothing to evict.
     fn evict_batch_sampled(&self, bucket: usize, over_by: u64) -> u64 {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
@@ -1049,7 +1037,7 @@ where
             .iter()
             .skip(offset)
             .chain(stripe.live.iter().take(offset))
-            .take(EVICTION_BATCH)
+            .take(EVICTION_BATCH_SAMPLE)
             .map(|live| {
                 (
                     live.key_bytes.clone(),
@@ -1099,14 +1087,11 @@ where
     /// After a write to `start_bucket` may have pushed total weight over
     /// `max_capacity`, evicts sampled-cold entries, starting at
     /// `start_bucket` then pseudo-random stripes, until it is back under
-    /// the cap. Each stripe write-lock acquisition clears up to
-    /// [`EVICTION_BATCH`] entries at once via [`Self::evict_batch_sampled`],
-    /// sized by [`eviction_batch_size`] so a burst converges in far fewer
-    /// lock acquisitions than entries evicted. A random probe that lands on
-    /// an empty stripe falls back to a scan for the next non-empty one, so
-    /// the loop ends only under the cap or with nothing left to evict.
-    /// Never holds two stripe locks at once; a no-op when `max_capacity` is
-    /// [`u64::MAX`].
+    /// the cap, up to [`EVICTION_BATCH`] entries per lock hold. A random
+    /// probe that lands on an empty stripe falls back to a scan for the next
+    /// non-empty one, so the loop ends only under the cap or with nothing
+    /// left to evict. Never holds two stripe locks at once; a no-op when
+    /// `max_capacity` is [`u64::MAX`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
         if self.max_capacity == u64::MAX {
             return;
@@ -1453,9 +1438,7 @@ where
         &self.stripes[bucket]
     }
 
-    /// The number of live entries across every stripe by a full pass, taking
-    /// every stripe's read lock, to check against the incrementally
-    /// maintained [`Engine::live_entry_count`].
+    /// [`Engine::live_entry_count`] by a full pass over every stripe.
     pub(crate) fn recompute_live_entry_count(&self) -> u64 {
         self.stripes
             .iter()
@@ -1463,8 +1446,6 @@ where
             .fold(0u64, u64::saturating_add)
     }
 
-    /// Stripe write-lock acquisitions [`Engine::enforce_capacity`] has made
-    /// for eviction so far, for tests that check batching cuts lock traffic.
     pub(crate) fn debug_eviction_lock_acquisitions(&self) -> u64 {
         self.eviction_lock_acquisitions.load(Ordering::Relaxed)
     }
@@ -2252,14 +2233,12 @@ mod tests {
     }
 
     #[test]
-    fn enforce_capacity_clears_a_heterogeneous_weight_overage_within_one_batch() {
+    fn enforce_capacity_clears_an_overage_needing_thousands_of_evictions() {
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
         let engine = Engine::<u32, String>::new(10_000, None, Some(weigher));
-        // 6,000 one-unit entries, then one 9,500-unit entry landing in the
-        // same stripe as some of them: a single batch's sample can include
-        // both small and large entries, so clearing the 5,500-unit overage
-        // may cost only a handful of evictions rather than thousands.
+        // 6,000 one-unit entries, then one warmer 9,500-unit entry: back
+        // under the cap only after more than 5,500 evictions of cold ones.
         for k in 1..=6_000u32 {
             let _ = put(
                 &engine,
@@ -2293,13 +2272,8 @@ mod tests {
             "total weight {weight} is back under the cap"
         );
         assert!(
-            entries < 6_001,
-            "at least one entry was evicted to clear the overage"
-        );
-        assert!(
-            engine.debug_eviction_lock_acquisitions() < 20,
-            "a batch that samples both small and large entries clears a heterogeneous overage \
-             in a handful of lock acquisitions, not thousands"
+            entries <= 501,
+            "{entries} entries remain; the warm big entry was evicted instead of cold ones"
         );
     }
 
@@ -2322,8 +2296,18 @@ mod tests {
         );
         assert_eq!(
             eviction_batch_size(100, &[1, 1, 1]),
-            3,
-            "an overage bigger than every sampled weight combined takes them all"
+            2,
+            "a large overage takes only the colder half of the sample"
+        );
+        assert_eq!(
+            eviction_batch_size(100, &[1; 32]),
+            EVICTION_BATCH,
+            "a full sample evicts at most EVICTION_BATCH"
+        );
+        assert_eq!(
+            eviction_batch_size(100, &[7]),
+            1,
+            "a lone sampled entry is evicted, as the single-entry path did"
         );
         assert_eq!(
             eviction_batch_size(5, &[]),

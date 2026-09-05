@@ -30,9 +30,6 @@ bytes = { version = "1.12.1", features = ["serde"] }
 chitchat = "0.13.0"
 futures = "0.3.34"
 hashbrown = "0.16.1"
-# Already pulled in transitively via mdns-sd; pinned directly so
-# `membership::resolve_advertise_ip`'s interface-address fallback doesn't
-# depend on another crate's dependency choice.
 if-addrs = "0.15.0"
 hickory-resolver = "0.26.1"
 hostname = "0.4.1"
