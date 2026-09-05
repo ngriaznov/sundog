@@ -113,6 +113,16 @@ pub fn build_previous_testnode() -> &'static Path {
                 );
             }
             std::fs::create_dir_all(&base).expect("target/prev-release is creatable");
+            // A restored CI cache can leave the directory behind without its
+            // worktree metadata or sources; `git worktree add` refuses a
+            // path that exists, so clear both before adding.
+            if src.exists() {
+                std::fs::remove_dir_all(&src).expect("a stale prev-release checkout is removable");
+            }
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(&root)
+                .status();
             let added = Command::new("git")
                 .args(["worktree", "add", "--detach"])
                 .arg(&src)
