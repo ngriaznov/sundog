@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- `Engine::live_entry_count` reads an `AtomicU64` maintained by every insert
+  and remove path instead of taking all 1,024 stripe read locks.
+- `Engine::enforce_capacity` evicts up to 8 sampled-cold entries per stripe
+  write-lock acquisition instead of one, converging a large overage in far
+  fewer lock acquisitions.
+- `serde`'s `rc` feature is enabled, so `Arc<V>` values serialize.
+
 ## [0.4.0] – 2026-09-04
 
 ### Fixed
