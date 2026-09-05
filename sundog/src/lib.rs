@@ -85,6 +85,8 @@ pub use discovery::Discovery;
 pub use error::{CacheError, CodecError, JoinError};
 pub use hlc::{Hlc, HlcClock};
 pub use node::{NodeId, NodeName};
+#[cfg(feature = "spill")]
+pub use store::spill::SpillConfig;
 pub use store::{ConflictResolver, Event, LwwResolver, Mode, Origin, RecordView, Winner};
 #[cfg(feature = "prometheus")]
 pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};

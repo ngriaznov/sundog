@@ -83,3 +83,6 @@ sim = ["dep:turmoil"]
 # (`sundog/fuzz`'s hook for its sequence-driven fuzz targets); no effect on
 # any other behavior.
 fuzzing = ["dep:arbitrary"]
+# Local SSD/NVMe spill tier for capacity-bounded caches (`store::spill`). No
+# new dependency: zerocopy and xxhash-rust are already direct dependencies.
+spill = []
