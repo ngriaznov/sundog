@@ -41,9 +41,17 @@
 //! `Spilled`, or a failed write hands that weight back through
 //! [`super::spill::SpillSink::abandon`]. A `Resident` entry at weight `0`
 //! is a hand-off already in flight and is never sampled as a victim again;
-//! nor is a `Payload::Spilled` one. If the tier declines the job outright,
-//! its queue full or closed, the ordinary delete-and-XOR path runs
-//! instead, weight and all, exactly as without a tier.
+//! nor is a `Payload::Spilled` one. If the record can never fit any region,
+//! or the tier is closed, the ordinary delete-and-XOR path runs instead,
+//! weight and all, exactly as without a tier — decided under the stripe
+//! lock, before hand-off, via `SpillTier::would_accept`. A queue with no
+//! room right now is different: that can only be discovered by actually
+//! trying to send, so `Engine::evict_victim_locked` commits to the
+//! hand-off first, and the actual channel send, `SpillTier::enqueue`, runs
+//! only once the stripe lock is released, in
+//! `Engine::finish_spill_handoff`. A full queue found there is handled
+//! exactly like a downstream failed write: `SpillSink::abandon` restores
+//! the weight, the entry stays resident, never a physical removal.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -410,20 +418,26 @@ impl EvictOutcome {
 }
 
 /// What handing one victim to [`Engine::evict_victim_locked`] accomplished.
-#[derive(Clone, Copy, Debug)]
 enum VictimOutcome {
     /// Physically removed from `live`: frees `weight` and one live entry,
     /// both the caller's job to fold into `total_weight`/`live_count`.
     Removed(u32),
-    /// Handed to a configured spill tier: still `Resident` in `live`, at
-    /// weight `0`, until the flusher's `install` flips it to `Spilled`.
-    /// `weight` is what the entry carried right before hand-off, already
-    /// zeroed on the entry itself, so it is the caller's to fold into
-    /// `total_weight` exactly like `Removed`'s — only `live_count` differs
-    /// between the two. Only ever constructed under `feature = "spill"`,
-    /// the only build where anything can be handed off in the first place.
+    /// Committed to a configured spill tier: still `Resident` in `live`, at
+    /// weight `0`, the entry's fate already decided under the stripe lock
+    /// via [`SpillTier::would_accept`], but the channel send itself,
+    /// [`SpillTier::enqueue`], deliberately deferred until the lock is
+    /// released — see [`Engine::try_spill_victim`]. `weight` is what the
+    /// entry carried right before hand-off, already zeroed on the entry
+    /// itself, so it is the caller's to fold into `total_weight` exactly
+    /// like `Removed`'s — only `live_count` differs between the two. The
+    /// caller finishes the hand-off with [`Engine::finish_spill_handoff`]
+    /// once the lock is dropped: on a full queue that restores the weight
+    /// through [`SpillSink::abandon`] exactly as a downstream write or
+    /// install failure would, never a physical removal. Only ever
+    /// constructed under `feature = "spill"`, the only build where anything
+    /// can be handed off in the first place.
     #[cfg(feature = "spill")]
-    Spilled(u32),
+    PendingSpill(u32, SpillJob),
     /// Vanished between sampling and this call, a race with another
     /// writer on the same stripe; nothing to do.
     Vanished,
@@ -1401,18 +1415,31 @@ where
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Whether a configured spill tier accepted `victim_bytes`, found at
-    /// `hash` in `bucket` with `stripe` already write-locked, in place of
-    /// physically removing it. `None` with no tier configured, a victim
-    /// that has since stopped being [`Payload::Resident`], or a `try_spill`
-    /// the tier declined, its queue full or closed; the ordinary
-    /// remove-and-XOR path runs in every one of those cases. `Some(weight)`
-    /// on acceptance: `weight` is the victim's weight *before* this call,
-    /// already zeroed on the entry in place and thus already excluded from
-    /// what a fresh read of `live.weight` would report, so the caller can
-    /// fold it into `total_weight` exactly like a physical removal's freed
-    /// weight. Never touches disk: `SpillTier::try_spill` only enqueues, so
-    /// this is safe to call while holding the stripe write lock.
+    /// Whether a configured spill tier commits to taking `victim_bytes`,
+    /// found at `hash` in `bucket` with `stripe` already write-locked, in
+    /// place of physically removing it. `None` with no tier configured, a
+    /// victim that has since stopped being [`Payload::Resident`], or a
+    /// record [`SpillTier::would_accept`] declines outright, too large to
+    /// ever fit a region or the tier closed; the ordinary remove-and-XOR
+    /// path runs in every one of those cases, exactly as before. On
+    /// `Some((weight, job))`, `weight` is the victim's weight *before* this
+    /// call, already zeroed on the entry in place and thus already excluded
+    /// from what a fresh read of `live.weight` would report, and `job` is
+    /// the caller's to hand to [`Engine::finish_spill_handoff`] once the
+    /// stripe lock is released.
+    ///
+    /// Deliberately does not call [`SpillTier::enqueue`] itself: that is
+    /// the one part of a hand-off that touches the flusher's channel, worth
+    /// keeping off this lock, and it is safe to defer because
+    /// `SpillTier::would_accept`'s checks — too large, closed — are the
+    /// only ways this decision could otherwise need to unwind, and both are
+    /// already settled here, under the lock, before the weight is zeroed. A
+    /// full queue, the only way `enqueue` can still fail, is handled
+    /// exactly like a downstream write or install failure already is:
+    /// [`SpillSink::abandon`] restores the weight, never a physical
+    /// removal — seeing `would_accept` succeed here is not a guarantee the
+    /// record ever reaches disk, only that it is now this victim's only
+    /// path off `live`.
     #[cfg(feature = "spill")]
     fn try_spill_victim(
         &self,
@@ -1420,7 +1447,7 @@ where
         bucket: usize,
         hash: u64,
         victim_bytes: &Bytes,
-    ) -> Option<u32> {
+    ) -> Option<(u32, SpillJob)> {
         let tier = self.spill()?;
         let live = stripe
             .live
@@ -1428,6 +1455,9 @@ where
         let Payload::Resident { encoded, .. } = &live.payload else {
             return None;
         };
+        if !tier.would_accept(victim_bytes.len(), encoded.len()) {
+            return None;
+        }
         let job = SpillJob {
             stripe_idx: bucket,
             hash,
@@ -1436,33 +1466,53 @@ where
             expires_at_ms: live.expires_at_ms,
             encoded: encoded.clone(),
         };
-        if !tier.try_spill(job) {
-            return None;
-        }
         let weight = live.weight;
         live.weight = 0;
-        Some(weight)
+        Some((weight, job))
+    }
+
+    /// Finishes a hand-off [`Engine::evict_victim_locked`] committed to via
+    /// [`Engine::try_spill_victim`], after the stripe lock that decided it
+    /// has already been released: the one part of the hand-off that touches
+    /// the flusher's channel, [`SpillTier::enqueue`]. A full queue gets
+    /// `job` back, key bytes included, with nothing cloned to recover them;
+    /// [`SpillSink::abandon`] then restores the victim's weight exactly as
+    /// it would for a write or install failure discovered later, downstream
+    /// in the flusher itself. No tier configured is unreachable here, since
+    /// `try_spill_victim` never commits to a hand-off without one, but is
+    /// still handled rather than assumed.
+    #[cfg(feature = "spill")]
+    fn finish_spill_handoff(&self, job: SpillJob) {
+        let Some(tier) = self.spill() else { return };
+        let stripe_idx = job.stripe_idx;
+        let hash = job.hash;
+        let ver = job.ver;
+        if let Err(job) = tier.enqueue(job) {
+            self.abandon(stripe_idx, &job.key_bytes, hash, ver);
+        }
     }
 
     /// Removes or spills `victim_bytes`, found at `hash` in `bucket` with
     /// `stripe` already write-locked. Hands a [`Payload::Resident`] victim
-    /// to a configured spill tier when it has room: [`try_spill_victim`]
-    /// zeroes its weight in place right there, so this reports it as
-    /// [`VictimOutcome::Spilled`] with that freed weight, while
-    /// `stripe.live`, the digest, and `live_count` stay untouched until the
-    /// flusher, `Engine`'s [`SpillSink`] impl, installs it. The entry
-    /// stays resident, at weight `0`, until then. Otherwise runs the
-    /// ordinary remove-and-XOR path, [`VictimOutcome::Removed`]. A
-    /// [`Payload::Spilled`] victim, or a `Resident` one already at weight
-    /// `0`, a hand-off already pending, is never handed here: the sampling
-    /// passes above filter both out via [`is_spill_candidate`]. A race
-    /// where the entry vanished between sampling and this call reports
-    /// [`VictimOutcome::Vanished`].
+    /// to a configured spill tier when [`try_spill_victim`] commits to it:
+    /// weight zeroed in place right there, so this reports it as
+    /// [`VictimOutcome::PendingSpill`] with that freed weight and the job
+    /// still to enqueue, while `stripe.live`, the digest, and `live_count`
+    /// stay untouched until the flusher, `Engine`'s [`SpillSink`] impl,
+    /// installs it. The entry stays resident, at weight `0`, until then.
+    /// Otherwise runs the ordinary remove-and-XOR path,
+    /// [`VictimOutcome::Removed`]. A [`Payload::Spilled`] victim, or a
+    /// `Resident` one already at weight `0`, a hand-off already pending, is
+    /// never handed here: the sampling passes above filter both out via
+    /// [`is_spill_candidate`]. A race where the entry vanished between
+    /// sampling and this call reports [`VictimOutcome::Vanished`].
     ///
     /// Total weight and `live_count` are the caller's job: this only
     /// mutates `stripe.live` and the digest, so a batch caller can fold
     /// several victims' weight into one pair of atomic updates after the
-    /// loop.
+    /// loop. The caller is likewise responsible for calling
+    /// [`Engine::finish_spill_handoff`] on a [`VictimOutcome::PendingSpill`]
+    /// job, once it has dropped `stripe`.
     ///
     /// [`try_spill_victim`]: Engine::try_spill_victim
     fn evict_victim_locked(
@@ -1473,8 +1523,8 @@ where
     ) -> VictimOutcome {
         let hash = hash_key_bytes(victim_bytes.as_ref());
         #[cfg(feature = "spill")]
-        if let Some(weight) = self.try_spill_victim(stripe, bucket, hash, victim_bytes) {
-            return VictimOutcome::Spilled(weight);
+        if let Some((weight, job)) = self.try_spill_victim(stripe, bucket, hash, victim_bytes) {
+            return VictimOutcome::PendingSpill(weight, job);
         }
         let Entry::Occupied(occ) = stripe.live.entry(
             hash,
@@ -1523,9 +1573,10 @@ where
                 }
             }
             #[cfg(feature = "spill")]
-            VictimOutcome::Spilled(weight) => {
+            VictimOutcome::PendingSpill(weight, job) => {
                 self.total_weight
                     .fetch_sub(u64::from(weight), Ordering::Relaxed);
+                self.finish_spill_handoff(job);
                 EvictOutcome {
                     removed_weight: u64::from(weight),
                 }
@@ -1579,6 +1630,8 @@ where
 
         let mut removed_weight = 0u64;
         let mut removed_count = 0u64;
+        #[cfg(feature = "spill")]
+        let mut pending_spills: Vec<SpillJob> = Vec::new();
         for (key_bytes, _, _) in sampled.into_iter().take(victims) {
             match self.evict_victim_locked(&mut stripe, bucket, &key_bytes) {
                 VictimOutcome::Removed(weight) => {
@@ -1586,13 +1639,24 @@ where
                     removed_count += 1;
                 }
                 #[cfg(feature = "spill")]
-                VictimOutcome::Spilled(weight) => {
+                VictimOutcome::PendingSpill(weight, job) => {
                     removed_weight += u64::from(weight);
+                    pending_spills.push(job);
                 }
                 VictimOutcome::Vanished => {}
             }
         }
         drop(stripe);
+        // Every victim's channel send waits until here, past the stripe
+        // lock this whole batch shared: cloning a victim's bytes and
+        // deciding its fate needs that lock, but handing the job to the
+        // flusher's channel does not, so this is the one point per batch
+        // where that per-victim cost, rather than per-eviction-pass, comes
+        // off the lock.
+        #[cfg(feature = "spill")]
+        for job in pending_spills {
+            self.finish_spill_handoff(job);
+        }
         if removed_weight > 0 {
             self.total_weight
                 .fetch_sub(removed_weight, Ordering::Relaxed);

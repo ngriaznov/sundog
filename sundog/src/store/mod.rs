@@ -3737,8 +3737,14 @@ mod tests {
 
         #[tokio::test]
         async fn insert_on_a_spilled_key_discards_the_pending_spill() {
-            let (shard, spilled_key, _old_value, _resident_key, _resident_value, dir) =
+            let (shard, spilled_key, _old_value, resident_key, _resident_value, dir) =
                 shard_with_one_spilled_entry("insert-over-spilled").await;
+
+            // Frees the other live key's weight first, so the capacity-1
+            // shard has room for the fresh write below without immediately
+            // sampling it back out again: this test is about what one write
+            // installs, not a second race against `enforce_capacity`.
+            shard.remove(&resident_key).await.expect("remove");
 
             shard
                 .insert(spilled_key, "fresh".to_string())

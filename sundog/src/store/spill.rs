@@ -17,18 +17,32 @@
 //! Writes go through one dedicated flusher thread, `std::thread` rather
 //! than a tokio task, since `SpillTier::try_spill` must work from sync and
 //! async callers alike, with no blocking I/O on the caller's stripe-locked
-//! hot path. It is fed by a bounded [`std::sync::mpsc::sync_channel`]. The
-//! flusher never re-inserts a key into the engine's tables. It calls back
-//! through `SpillSink` to flip an *existing* entry's payload in place, and
-//! only when the entry's current state still matches what was spilled,
-//! verified via `spilled_is_current`. A victim's weight is zeroed and freed
-//! from `total_weight` the moment eviction hands it off, before this
-//! thread ever touches it, so a queued-but-unwritten job that never
-//! reaches `install`, a failed region write, calls back through
-//! `SpillSink::abandon` instead, to put that weight back. Reads are
-//! positional, `pread`/`pwrite`-style, one syscall each, with no `open()`
-//! on the hot path, using a `read_exact_at`/`write_all_at` unix
-//! implementation and a `seek_read`/`seek_write` windows one below.
+//! hot path. It is fed by a bounded [`std::sync::mpsc::sync_channel`]:
+//! after a blocking `recv` returns one job, the flusher drains the channel
+//! greedily with `try_recv`, up to `FLUSH_BATCH_MAX_JOBS` jobs or
+//! `FLUSH_BATCH_MAX_BYTES` of summed record bytes, and encodes the whole
+//! batch into one buffer for one positional write. A batch that outgrows
+//! the active region's remaining space writes what it has, rotates, and
+//! continues the rest of the batch in the new region, so a batch costs one
+//! write per region it touches and a record never straddles two; see
+//! `flush_batch`, `write_segment`, and the pure split rule,
+//! `records_fitting_region`. Each written record then installs through
+//! `SpillSink` individually, since the sink's stripe lock is necessarily
+//! per-entry, but a batch's confirmed write count and byte total post to
+//! this module's own counters once for the whole batch, and a region's
+//! reverse-index rows post once per region the batch touches, not once per
+//! record. The flusher never re-inserts a key into the engine's tables. It
+//! calls back through `SpillSink` to flip an *existing* entry's payload in
+//! place, and only when the entry's current state still matches what was
+//! spilled, verified via `spilled_is_current`. A victim's weight is zeroed
+//! and freed from `total_weight` the moment eviction hands it off, before
+//! this thread ever touches it, so a queued-but-unwritten job that never
+//! reaches `install`, a region write whose batch failed, calls back
+//! through `SpillSink::abandon` instead, to put that weight back for every
+//! job the failed write covered. Reads are positional, `pread`/`pwrite`-
+//! style, one syscall each, with no `open()` on the hot path, using a
+//! `read_exact_at`/`write_all_at` unix implementation and a
+//! `seek_read`/`seek_write` windows one below.
 //!
 //! # No wire effect
 //!
@@ -53,12 +67,18 @@
 //! # A note on this module's `pub(crate)` surface
 //!
 //! `store::engine`'s `Payload::Spilled` integration consumes every item
-//! here: eviction hands a victim to `try_spill`, `Engine`'s `SpillSink` impl
-//! installs and reclaims through `spilled_is_current`, and abandons a job
-//! whose write never reached `install`, `open`/`attach` are
-//! called from `Shard::with_spill`, and `read_at`/`bytes_used`/
-//! `SpilledBytes` back `Shard::get`/`Shard::get_or_load`'s promotion path
-//! and the anti-entropy/snapshot read path, both behind `spawn_blocking`.
+//! here: eviction decides a victim's fallback with `would_accept`, still
+//! under the stripe write lock, then hands it to `enqueue` once the lock is
+//! released; a queue with no room right now reaches `SpillSink::abandon`
+//! exactly like a job whose write never reached `install`. `Engine`'s
+//! `SpillSink` impl installs and reclaims through `spilled_is_current`.
+//! `open`/`attach` are called from `Shard::with_spill`, and
+//! `read_at`/`bytes_used`/`SpilledBytes` back `Shard::get`/
+//! `Shard::get_or_load`'s promotion path and the anti-entropy/snapshot read
+//! path, both behind `spawn_blocking`. `try_spill` itself, `would_accept`
+//! plus `enqueue` in one call, is what this module's own tests drive
+//! directly and the only form a caller outside eviction's lock-sensitive
+//! path needs.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -97,6 +117,17 @@ const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// entry sits in `live` — queuing it costs nothing beyond what is already
 /// paid for.
 const FLUSH_QUEUE_CAPACITY: usize = 8192;
+/// Bound on how many jobs one flusher batch coalesces into as few
+/// positional writes as its rotations require. After a blocking `recv`
+/// returns the first job, [`flusher_loop`] drains the channel greedily with
+/// `try_recv` until it hits this many jobs or [`FLUSH_BATCH_MAX_BYTES`],
+/// whichever comes first, then hands the whole batch to [`flush_batch`].
+const FLUSH_BATCH_MAX_JOBS: usize = 512;
+/// Bound on the summed record length, header included, one flusher batch
+/// coalesces before it stops draining and writes what it has. 1 MiB keeps a
+/// batch's transient encode buffer small next to a typical page cache while
+/// still amortizing the write syscall over hundreds of records.
+const FLUSH_BATCH_MAX_BYTES: usize = 1024 * 1024;
 /// Corruption/format-skew guard at the front of every [`SpillRecordHeader`].
 /// Built from its ASCII bytes so the constant's value and its on-disk byte
 /// order always agree: `SPILL_MAGIC.to_le_bytes() == *b"SPIL"`.
@@ -315,6 +346,32 @@ pub(crate) fn record_too_large(record_len: u64, region_bytes: u64) -> bool {
     record_len > region_bytes
 }
 
+/// The flusher's batch-splitting rule: how many of `record_lens`, taken in
+/// order, fit consecutively in a region of `region_bytes` bytes whose write
+/// cursor already sits at `write_cursor`, before the first one that does
+/// not. Returns `record_lens.len()` when every record fits. [`flush_batch`]
+/// calls this once per region a batch touches: it writes the leading
+/// `records_fitting_region(..)` records in one buffer, rotates, then calls
+/// this again with `write_cursor` reset to `0` and the unconsumed remainder,
+/// so a batch that spans a rotation still never lets a record straddle two
+/// regions. Pure; unit-tested directly, including the exact-boundary and
+/// spans-a-rotation cases.
+pub(crate) fn records_fitting_region(
+    write_cursor: u32,
+    region_bytes: u32,
+    record_lens: &[u32],
+) -> usize {
+    let mut cursor = write_cursor;
+    for (taken, &len) in record_lens.iter().enumerate() {
+        if !record_fits(cursor, region_bytes, len) {
+            return taken;
+        }
+        // `record_fits` above already ruled out overflow for this add.
+        cursor += len;
+    }
+    record_lens.len()
+}
+
 /// The next region in FIFO round-robin order after `current`. Pure, total.
 /// Never returns `current` when `region_count >= 2`, enforced by
 /// [`SpillConfig::validate`]. That keeps the active-write region and the
@@ -383,9 +440,12 @@ impl Inner {
         .increment(1);
     }
 
-    fn record_write(&self) {
+    /// Increments `sundog_spill_writes_total{cache}` by `count`, once per
+    /// flush batch for however many of its jobs actually installed, rather
+    /// than once per record.
+    fn record_writes(&self, count: u64) {
         metrics::counter!("sundog_spill_writes_total", "cache" => self.cache_name.clone())
-            .increment(1);
+            .increment(count);
     }
 
     fn record_region_reclaim(&self) {
@@ -519,24 +579,67 @@ impl SpillTier {
     /// must fall back to an unconditional delete. Never touches disk on
     /// this call, so it is safe to call while holding a stripe write
     /// lock.
+    ///
+    /// Built from [`SpillTier::would_accept`] and [`SpillTier::enqueue`],
+    /// which `Engine::try_spill_victim` calls separately instead: the first,
+    /// cheap and lock-hold-safe, decides eviction's fallback right there
+    /// under the stripe lock, while the second, the only part that touches
+    /// the channel, runs after the lock is released. See the module docs.
+    /// Test-only: production has exactly one caller of either half, and it
+    /// needs them split.
+    #[cfg(test)]
     pub(crate) fn try_spill(&self, job: SpillJob) -> bool {
+        if !self.would_accept(job.key_bytes.len(), job.encoded.len()) {
+            return false;
+        }
+        self.enqueue(job).is_ok()
+    }
+
+    /// Whether a record built from `key_len` and `value_len` bytes could be
+    /// queued right now, judged purely from this tier's own state: not
+    /// closed, and small enough to ever fit a region. Never touches the
+    /// flusher's channel, so, unlike [`SpillTier::enqueue`], this is cheap
+    /// enough to call while holding a stripe write lock. `false` increments
+    /// `sundog_spill_dropped_total` with `reason = "too_large"` or
+    /// `reason = "closed"`, whichever applied.
+    pub(crate) fn would_accept(&self, key_len: usize, value_len: usize) -> bool {
         if self.inner.closed.load(Ordering::Acquire) {
             self.inner.record_dropped("closed");
             return false;
         }
-        let record_len = HEADER_LEN as u64 + job.key_bytes.len() as u64 + job.encoded.len() as u64;
+        let record_len = HEADER_LEN as u64 + key_len as u64 + value_len as u64;
         if record_too_large(record_len, u64::from(self.inner.region_bytes)) {
             self.inner.record_dropped("too_large");
             return false;
         }
+        true
+    }
+
+    /// Enqueues `job` onto the flusher's channel. Callers that already
+    /// separately checked [`SpillTier::would_accept`] get `job` back in
+    /// `Err` on failure, since a full or missing channel is the only way
+    /// this can fail; a caller with no further use for the job on failure
+    /// can discard it, exactly like `try_spill`'s plain `bool`. `reason =
+    /// "queue_full"` covers both a full queue and one that was never
+    /// attached. Never touches disk, but does take the channel's own lock,
+    /// so, unlike [`SpillTier::would_accept`], this is not meant to run
+    /// while holding a stripe write lock.
+    pub(crate) fn enqueue(&self, job: SpillJob) -> Result<(), SpillJob> {
         let sent = {
             let sender = self.sender.lock();
-            sender.as_ref().is_some_and(|tx| tx.try_send(job).is_ok())
+            let Some(tx) = sender.as_ref() else {
+                self.inner.record_dropped("queue_full");
+                return Err(job);
+            };
+            tx.try_send(job)
         };
-        if !sent {
-            self.inner.record_dropped("queue_full");
+        match sent {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
+                self.inner.record_dropped("queue_full");
+                Err(job)
+            }
         }
-        sent
     }
 
     /// One positional read of the record at `loc`. `Ok(None)` when the
@@ -667,84 +770,196 @@ fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
 }
 
 fn flusher_loop(inner: &Arc<Inner>, rx: &Receiver<SpillJob>, sink: &Weak<dyn SpillSink>) {
-    while let Ok(job) = rx.recv() {
+    while let Ok(first) = rx.recv() {
         let Some(sink) = sink.upgrade() else {
             return;
         };
-        flush_one(inner, sink.as_ref(), job);
+        let mut batch_bytes = job_record_len_or_zero(&first);
+        let mut batch = vec![first];
+        while batch.len() < FLUSH_BATCH_MAX_JOBS && batch_bytes < FLUSH_BATCH_MAX_BYTES {
+            let Ok(job) = rx.try_recv() else {
+                break;
+            };
+            batch_bytes += job_record_len_or_zero(&job);
+            batch.push(job);
+        }
+        flush_batch(inner, sink.as_ref(), batch);
     }
 }
 
-fn flush_one(inner: &Inner, sink: &dyn SpillSink, job: SpillJob) {
-    let Ok(key_len) = u32::try_from(job.key_bytes.len()) else {
-        return; // unreachable: try_spill already bounds this by region_bytes
-    };
-    let Ok(value_len) = u32::try_from(job.encoded.len()) else {
-        return; // unreachable: try_spill already bounds this by region_bytes
-    };
-    let Ok(header_len) = u32::try_from(HEADER_LEN) else {
-        return; // unreachable: HEADER_LEN is a small fixed constant
-    };
-    let Some(record_len) = header_len
-        .checked_add(key_len)
-        .and_then(|n| n.checked_add(value_len))
-    else {
-        return; // unreachable: try_spill already bounds this by region_bytes
-    };
+/// A job's on-disk record length, header plus key plus value, together with
+/// the header's own `key_len`/`value_len` fields, computed once per job and
+/// reused for both the batch-drain byte bound and the record it builds.
+/// `None` only if `job`'s key or value is too long to ever have passed
+/// `SpillTier::would_accept`'s own `record_too_large` check before this job
+/// was ever queued; unreachable in practice, never assumed.
+fn job_record_lens(job: &SpillJob) -> Option<(u32, u32, u32)> {
+    let key_len = u32::try_from(job.key_bytes.len()).ok()?;
+    let value_len = u32::try_from(job.encoded.len()).ok()?;
+    let header_len = u32::try_from(HEADER_LEN).ok()?;
+    let record_len = header_len.checked_add(key_len)?.checked_add(value_len)?;
+    Some((record_len, key_len, value_len))
+}
 
-    let mut active = inner.active.load(Ordering::Acquire);
-    let cursor = inner.regions[active as usize]
-        .write_cursor
-        .load(Ordering::Acquire);
-    if !record_fits(cursor, inner.region_bytes, record_len) {
-        active = rotate(inner, sink, active);
+fn job_record_len_or_zero(job: &SpillJob) -> usize {
+    job_record_lens(job).map_or(0, |(record_len, ..)| record_len as usize)
+}
+
+/// One job drained into a flush batch, with its record length and header
+/// field lengths already computed: reused for the batch-splitting decision
+/// ([`records_fitting_region`]) and, once a segment is decided, for the
+/// header this job contributes to it.
+struct PreparedJob {
+    job: SpillJob,
+    record_len: u32,
+    key_len: u32,
+    value_len: u32,
+}
+
+/// Encodes and writes `jobs` in as few positional writes as the active
+/// region's remaining space allows: one per region the batch touches, a
+/// rotation between them exactly where [`records_fitting_region`] says the
+/// next record stops fitting, never a record straddling two regions. Each
+/// written record then installs through `sink` individually, since its
+/// stripe lock is necessarily per-entry, but the batch's confirmed write
+/// count and byte total post to `inner` once for the whole batch, and each
+/// region's reverse-index rows post once per region the batch touches
+/// rather than once per record. A region whose write fails calls
+/// `sink.abandon` for every job that segment held; jobs in a segment
+/// written earlier in the same batch are unaffected.
+fn flush_batch(inner: &Inner, sink: &dyn SpillSink, jobs: Vec<SpillJob>) {
+    let mut pending: Vec<PreparedJob> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if let Some((record_len, key_len, value_len)) = job_record_lens(&job) {
+            pending.push(PreparedJob {
+                job,
+                record_len,
+                key_len,
+                value_len,
+            });
+        }
+        // else: unreachable, see `job_record_lens`; drop the job exactly as
+        // the pre-batching `flush_one` did, rather than ever panic this
+        // thread over a job that could never have been queued.
     }
 
-    let region = &inner.regions[active as usize];
-    let offset = region.write_cursor.load(Ordering::Acquire);
-    let generation = region.generation.load(Ordering::Acquire);
+    let mut batch_installed = 0u64;
+    let mut batch_bytes = 0u64;
+    let mut active = inner.active.load(Ordering::Acquire);
 
-    let header = build_header(&job, key_len, value_len);
-    let mut buf = Vec::with_capacity(record_len as usize);
-    buf.extend_from_slice(header.as_bytes());
-    buf.extend_from_slice(&job.key_bytes);
-    buf.extend_from_slice(&job.encoded);
+    while !pending.is_empty() {
+        let region = &inner.regions[active as usize];
+        let cursor = region.write_cursor.load(Ordering::Acquire);
+        let generation = region.generation.load(Ordering::Acquire);
+        let lens: Vec<u32> = pending.iter().map(|p| p.record_len).collect();
+        let take = records_fitting_region(cursor, inner.region_bytes, &lens);
 
-    if let Err(err) = pwrite_all(&region.file, &buf, u64::from(offset)) {
+        if take == 0 {
+            // Not even the next record fits what is left of the active
+            // region; rotate into an empty one and retry against it.
+            // `try_spill`/`would_accept` already bounds every queued job's
+            // record length to at most `region_bytes`, so a freshly rotated,
+            // empty region always fits at least one more record.
+            active = rotate(inner, sink, active);
+            continue;
+        }
+
+        let segment: Vec<PreparedJob> = pending.drain(..take).collect();
+        let (installed, bytes) = write_segment(inner, sink, active, cursor, generation, segment);
+        batch_installed += installed;
+        batch_bytes += bytes;
+
+        if !pending.is_empty() {
+            active = rotate(inner, sink, active);
+        }
+    }
+
+    if batch_installed > 0 {
+        inner.record_writes(batch_installed);
+    }
+    if batch_bytes > 0 {
+        inner.bytes_used.fetch_add(batch_bytes, Ordering::AcqRel);
+        inner.publish_bytes_used();
+    }
+}
+
+/// Writes one segment, every record in it destined for the same region and
+/// generation, as one positional write, then installs each record
+/// individually. Returns `(installed_count, installed_bytes)`, folded into
+/// the enclosing batch's single counter increment and byte total. A failed
+/// write calls `sink.abandon` for every job in `segment` and returns
+/// `(0, 0)`; the region's write cursor is left untouched either way the
+/// write itself resolves, since it only ever advances past bytes actually
+/// on disk.
+fn write_segment(
+    inner: &Inner,
+    sink: &dyn SpillSink,
+    region_idx: u32,
+    base_offset: u32,
+    generation: u32,
+    segment: Vec<PreparedJob>,
+) -> (u64, u64) {
+    let region = &inner.regions[region_idx as usize];
+
+    let mut buf = Vec::new();
+    let mut locs = Vec::with_capacity(segment.len());
+    let mut cursor = base_offset;
+    for prepared in &segment {
+        let header = build_header(&prepared.job, prepared.key_len, prepared.value_len);
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(&prepared.job.key_bytes);
+        buf.extend_from_slice(&prepared.job.encoded);
+        locs.push(SpillLoc {
+            region: region_idx,
+            offset: cursor,
+            len: prepared.record_len,
+            generation,
+        });
+        // `records_fitting_region` already validated this segment's summed
+        // record lengths fit below `region_bytes` starting from `base_offset`.
+        cursor += prepared.record_len;
+    }
+
+    if let Err(err) = pwrite_all(&region.file, &buf, u64::from(base_offset)) {
         tracing::warn!(
             cache = %inner.cache_name,
             error = %err,
-            "sundog spill: region write failed, dropping the write"
+            "sundog spill: region write failed, dropping the batch"
         );
-        sink.abandon(job.stripe_idx, &job.key_bytes, job.hash, job.ver);
-        return;
+        for prepared in segment {
+            let job = prepared.job;
+            sink.abandon(job.stripe_idx, &job.key_bytes, job.hash, job.ver);
+        }
+        return (0, 0);
     }
-    region
-        .write_cursor
-        .store(offset + record_len, Ordering::Release);
+    region.write_cursor.store(cursor, Ordering::Release);
 
-    let loc = SpillLoc {
-        region: active,
-        offset,
-        len: record_len,
-        generation,
-    };
-    if sink.install(job.stripe_idx, &job.key_bytes, job.hash, job.ver, loc) {
+    let mut installed_count = 0u64;
+    let mut installed_bytes = 0u64;
+    let mut newly_indexed = Vec::with_capacity(segment.len());
+    for (prepared, loc) in segment.into_iter().zip(locs) {
+        let SpillJob {
+            stripe_idx,
+            hash,
+            key_bytes,
+            ver,
+            ..
+        } = prepared.job;
+        if sink.install(stripe_idx, &key_bytes, hash, ver, loc) {
+            installed_count += 1;
+            installed_bytes += u64::from(loc.len);
+            newly_indexed.push((stripe_idx, key_bytes));
+        } else {
+            inner.record_dropped("obsolete");
+        }
+    }
+    if !newly_indexed.is_empty() {
         region
             .used_bytes
-            .fetch_add(u64::from(record_len), Ordering::AcqRel);
-        inner
-            .bytes_used
-            .fetch_add(u64::from(record_len), Ordering::AcqRel);
-        region
-            .reverse_index
-            .lock()
-            .push((job.stripe_idx, job.key_bytes));
-        inner.record_write();
-        inner.publish_bytes_used();
-    } else {
-        inner.record_dropped("obsolete");
+            .fetch_add(installed_bytes, Ordering::AcqRel);
+        region.reverse_index.lock().extend(newly_indexed);
     }
+    (installed_count, installed_bytes)
 }
 
 /// Reclaims `next_region_index(current, region_count)`, the next region due
@@ -841,6 +1056,41 @@ mod tests {
     fn record_fits_never_wraps_on_a_pathological_record_len() {
         assert!(!record_fits(u32::MAX - 1, 64, u32::MAX));
         assert!(!record_fits(10, u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn records_fitting_region_takes_every_record_when_they_all_fit() {
+        // Four 16-byte records exactly fill a 64-byte region starting at 0.
+        assert_eq!(records_fitting_region(0, 64, &[16, 16, 16, 16]), 4);
+    }
+
+    #[test]
+    fn records_fitting_region_stops_at_the_first_record_that_does_not_fit() {
+        // 60 bytes are free; a 4-byte record lands exactly on the boundary
+        // and is taken, a following 1-byte record is not.
+        assert_eq!(records_fitting_region(60, 64, &[4, 1]), 1);
+        // The same 4-byte record one byte later no longer fits at all.
+        assert_eq!(records_fitting_region(61, 64, &[4]), 0);
+    }
+
+    #[test]
+    fn records_fitting_region_an_empty_batch_takes_nothing() {
+        assert_eq!(records_fitting_region(0, 64, &[]), 0);
+    }
+
+    #[test]
+    fn records_fitting_region_a_batch_spanning_a_rotation_splits_in_two() {
+        // A region with 20 bytes free; a four-record batch of 8 bytes each
+        // fits two before the third would overrun, exactly the split
+        // `flush_batch` uses to write the first segment, rotate, and retry
+        // the remainder against a freshly emptied region (write_cursor 0).
+        let lens = [8u32, 8, 8, 8];
+        let first_segment = records_fitting_region(0, 20, &lens);
+        assert_eq!(first_segment, 2);
+        let remainder = &lens[first_segment..];
+        // After a rotation the new region starts at cursor 0, where every
+        // remaining record fits.
+        assert_eq!(records_fitting_region(0, 20, remainder), remainder.len());
     }
 
     #[test]
@@ -1152,6 +1402,201 @@ mod tests {
                 .collect();
             key_strings.sort();
             assert_eq!(key_strings, vec!["key-00", "key-01"]);
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn flush_batch_spanning_a_rotation_installs_correctly_on_both_sides() {
+            // Two records exactly fill one region. Handing all four jobs to
+            // one direct `flush_batch` call, rather than through `try_spill`
+            // and the flusher thread, makes the rotation deterministic: the
+            // batch writes the first two, rotates once into the never-yet-
+            // used second region, and writes the last two there, a record
+            // never straddling the two.
+            let dir = temp_dir("batch-rotation");
+            let record_len = HEADER_LEN as u64 + 6 + 4; // fixed-width key/value
+            let region_bytes = record_len * 2;
+            let cfg = SpillConfig::new(&dir, region_bytes * 2).region_bytes(region_bytes);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            let sink = Arc::new(RecordingSink::default());
+
+            let jobs: Vec<SpillJob> = (0..4u32)
+                .map(|i| job(&format!("key-{i:02}"), b"1234", hlc(u64::from(i) + 1, 0)))
+                .collect();
+            flush_batch(&tier.inner, &*sink, jobs);
+
+            assert_eq!(sink.install_count(), 4, "every job in the batch installs");
+            assert_eq!(
+                sink.reclaims.lock().unwrap().len(),
+                1,
+                "one rotation, into the never-yet-used second region"
+            );
+
+            let installs = sink.installs.lock().unwrap().clone();
+            let regions: Vec<u32> = installs.iter().map(|(_, _, _, loc)| loc.region).collect();
+            assert_eq!(
+                regions,
+                vec![0, 0, 1, 1],
+                "the batch's four records land two per side of the one rotation"
+            );
+            for (idx, (_, key_bytes, _, loc)) in installs.iter().enumerate() {
+                assert_eq!(key_bytes.as_ref(), format!("key-{idx:02}").as_bytes());
+                let bytes = tier
+                    .read_at(*loc)
+                    .unwrap()
+                    .expect("record present on both sides of the rotation");
+                assert_eq!(bytes.encoded.as_ref(), b"1234");
+            }
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Captures `sundog_spill_writes_total{cache}` increments for one
+        /// dedicated cache name, ignoring every other metric: the
+        /// write-count counterpart to [`DropCounts`]/[`DropRecorder`] below.
+        #[derive(Clone, Default)]
+        struct WriteCounts(Arc<StdMutex<u64>>);
+
+        impl WriteCounts {
+            fn get(&self) -> u64 {
+                *self.0.lock().unwrap()
+            }
+        }
+
+        struct WriteCounter {
+            counts: WriteCounts,
+        }
+
+        impl metrics::CounterFn for WriteCounter {
+            fn increment(&self, value: u64) {
+                *self.counts.0.lock().unwrap() += value;
+            }
+
+            fn absolute(&self, value: u64) {
+                *self.counts.0.lock().unwrap() = value;
+            }
+        }
+
+        struct WriteRecorder {
+            counts: WriteCounts,
+        }
+
+        impl metrics::Recorder for WriteRecorder {
+            fn describe_counter(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn describe_gauge(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn describe_histogram(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                let this_cache = key
+                    .labels()
+                    .any(|l| l.key() == "cache" && l.value() == WRITE_COUNTS_CACHE);
+                if key.name() != "sundog_spill_writes_total" || !this_cache {
+                    return metrics::Counter::noop();
+                }
+                metrics::Counter::from_arc(Arc::new(WriteCounter {
+                    counts: self.counts.clone(),
+                }))
+            }
+
+            fn register_gauge(
+                &self,
+                _key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+
+            fn register_histogram(
+                &self,
+                _key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        /// The cache name only this test opens, so the process-global
+        /// recorder ignores writes from every other test's tier.
+        const WRITE_COUNTS_CACHE: &str = "write-counts-only";
+
+        #[test]
+        fn flusher_batches_two_thousand_records_and_installs_every_one_byte_exact() {
+            const COUNT: u32 = 2_000;
+
+            let write_counts = WriteCounts::default();
+            // Same single-process-global-slot race every other metrics-
+            // reading test in this module tolerates: if another test already
+            // won the slot, this one just skips the counter assertion below.
+            let recorder_installed = metrics::set_global_recorder(WriteRecorder {
+                counts: write_counts.clone(),
+            })
+            .is_ok();
+
+            let dir = temp_dir("batch-2000");
+            let cfg = SpillConfig::new(&dir, 1 << 24).region_bytes(1 << 20);
+            let tier = SpillTier::open(&cfg, WRITE_COUNTS_CACHE).unwrap();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+            let expected: Vec<(String, Vec<u8>)> = (0..COUNT)
+                .map(|i| (format!("key-{i:05}"), format!("value-{i:05}").into_bytes()))
+                .collect();
+            for i in 0..COUNT {
+                let (key, value) = &expected[i as usize];
+                let ver = hlc(u64::from(i) + 1, 0);
+                assert!(tier.try_spill(job(key, value, ver)));
+            }
+
+            assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == COUNT as usize));
+
+            let installs = sink.installs.lock().unwrap().clone();
+            assert_eq!(installs.len(), COUNT as usize);
+            for (idx, (expected_key, expected_value)) in expected.iter().enumerate() {
+                let (_, key_bytes, _, loc) = &installs[idx];
+                assert_eq!(
+                    key_bytes.as_ref(),
+                    expected_key.as_bytes(),
+                    "installs land in the order jobs were sent, batched or not"
+                );
+                let bytes = tier
+                    .read_at(*loc)
+                    .unwrap()
+                    .expect("every installed record reads back");
+                assert_eq!(bytes.encoded.as_ref(), expected_value.as_slice());
+            }
+
+            if recorder_installed {
+                assert_eq!(
+                    write_counts.get(),
+                    u64::from(COUNT),
+                    "the writes counter equals the install count, batched or not"
+                );
+            }
 
             let _ = fs::remove_dir_all(&dir);
         }
