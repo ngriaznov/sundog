@@ -4562,19 +4562,19 @@ mod tests {
                     "hand-off zeroes the victim's weight and frees it from total_weight \
                      immediately, before any disk write or install has happened"
                 );
-                assert!(
-                    matches!(
-                        {
-                            let stripe = engine.stripe_lock(bucket).read();
-                            stripe
-                                .live
-                                .iter()
-                                .find(|l| l.key_bytes.as_ref() == kb.as_ref())
-                                .map(|l| (l.weight, matches!(l.payload, Payload::Resident { .. })))
-                        },
-                        Some((0, true))
-                    ),
-                    "the victim stays Resident at weight 0 until the flusher installs it"
+                // The flusher may already have installed the victim by now;
+                // either way its weight is 0 from the hand-off on.
+                assert_eq!(
+                    {
+                        let stripe = engine.stripe_lock(bucket).read();
+                        stripe
+                            .live
+                            .iter()
+                            .find(|l| l.key_bytes.as_ref() == kb.as_ref())
+                            .map(|l| l.weight)
+                    },
+                    Some(0),
+                    "the victim keeps weight 0 from the hand-off, resident or spilled"
                 );
 
                 assert!(
