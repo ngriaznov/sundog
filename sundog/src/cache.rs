@@ -601,7 +601,8 @@ where
     }
 }
 
-#[cfg(test)]
+// These tests dial real loopback sockets, which the `sim` transport cannot serve.
+#[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 

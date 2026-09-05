@@ -17,7 +17,7 @@
 //!
 //! Each `BENCH` line is one `key=value`-per-metric record, `grep`able.
 
-#![cfg(feature = "spill")]
+#![cfg(all(feature = "spill", feature = "prometheus"))]
 
 mod common;
 
