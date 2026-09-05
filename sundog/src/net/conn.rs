@@ -1662,6 +1662,55 @@ mod tests {
         super::new_framed(as_mesh_stream(client))
     }
 
+    /// Polls [`super::probe_reused`] until it stops reporting `Pending`, for
+    /// a connection whose peer has already acted.
+    async fn probe_settled(framed: &mut PeerFramed) -> super::ReusedProbe {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match super::probe_reused(framed) {
+                    super::ReusedProbe::Pending => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    settled => return settled,
+                }
+            }
+        })
+        .await
+        .expect("the peer's action reaches the probe within the bound")
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn probe_reused_tells_a_waiting_reply_from_a_closed_peer_and_a_quiet_one() {
+        let mut replied = dial_fake_donor(vec![Msg::ReqDone]).await;
+        assert!(matches!(
+            probe_settled(&mut replied).await,
+            super::ReusedProbe::Ready(Msg::ReqDone)
+        ));
+
+        let mut closed = dial_fake_donor(Vec::new()).await;
+        assert!(matches!(
+            probe_settled(&mut closed).await,
+            super::ReusedProbe::Stale
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let _quiet_server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let mut quiet = super::new_framed(as_mesh_stream(client));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(
+            super::probe_reused(&mut quiet),
+            super::ReusedProbe::Pending
+        ));
+    }
+
     /// Asserts `err` is the `UnexpectedEof` a collector returns when its
     /// connection closes before the terminating `Msg::ReqDone`.
     #[cfg(not(feature = "sim"))]

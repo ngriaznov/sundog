@@ -780,6 +780,7 @@ where
     }
 
     /// [`Shard::get`] without an async runtime: same hit and miss counting.
+    #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
         if let Some(value) = self.engine.get(key, self.now_ms()) {
             self.hits.increment(1);
@@ -800,6 +801,7 @@ where
     }
 
     /// [`Shard::contains_key`] without an async runtime.
+    #[must_use]
     pub fn contains_key_sync(&self, key: &K) -> bool {
         self.engine.contains_key(key, self.now_ms())
     }

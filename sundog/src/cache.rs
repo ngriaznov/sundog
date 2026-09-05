@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::cluster::Cluster;
 use crate::error::CacheError;
@@ -188,46 +189,70 @@ where
         }
 
         let cancel = cluster.cancel_token().child_token();
-
-        if !matches!(mode, Mode::Local) {
-            cluster.spawn_tracked(crate::cluster::fan_out_task(
-                Arc::clone(&shard),
-                cluster.clone(),
-                shard.fan_out_queue(),
-                name.clone(),
-                mode,
-                cancel.clone(),
-            ));
-        }
-        if matches!(mode, Mode::Replicated) {
-            warm_and_repair(
-                &cluster,
-                Arc::clone(&shard) as Arc<dyn ShardOps>,
-                &name,
-                cancel.clone(),
-            )
-            .await;
-        }
-        cluster.spawn_tracked(crate::cluster::tombstone_gc_task(
-            Arc::clone(&shard) as Arc<dyn ShardOps>,
-            mode,
-            cluster.config().tombstone_ttl,
-            cluster.config().tombstone_max_ttl,
-            cluster.absence_tracker(),
-            cancel.clone(),
-        ));
-        cluster.spawn_tracked(crate::cluster::cache_entries_gauge_task(
-            Arc::clone(&shard),
-            name.clone(),
-            cancel.clone(),
-        ));
+        let tasks = TaskTracker::new();
+        spawn_cache_tasks(&cluster, &shard, &name, mode, &cancel, &tasks).await;
 
         Ok(Cache {
             shard,
             cluster,
             cancel,
+            tasks,
         })
     }
+}
+
+/// The background loops one opened cache runs: fan-out for a clustered
+/// mode, warm-up and anti-entropy for `Replicated`, tombstone GC, and the
+/// entry gauge, all under `cancel` and tracked by `tasks`.
+async fn spawn_cache_tasks<K, V>(
+    cluster: &Cluster,
+    shard: &Arc<Shard<K, V>>,
+    name: &SmolStr,
+    mode: Mode,
+    cancel: &CancellationToken,
+    tasks: &TaskTracker,
+) where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    if !matches!(mode, Mode::Local) {
+        cluster.spawn_tracked_in(
+            tasks,
+            crate::cluster::fan_out_task(
+                Arc::clone(shard),
+                cluster.clone(),
+                shard.fan_out_queue(),
+                name.clone(),
+                mode,
+                cancel.clone(),
+            ),
+        );
+    }
+    if matches!(mode, Mode::Replicated) {
+        warm_and_repair(
+            cluster,
+            Arc::clone(shard) as Arc<dyn ShardOps>,
+            name,
+            cancel.clone(),
+            tasks,
+        )
+        .await;
+    }
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::cluster::tombstone_gc_task(
+            Arc::clone(shard) as Arc<dyn ShardOps>,
+            mode,
+            cluster.config().tombstone_ttl,
+            cluster.config().tombstone_max_ttl,
+            cluster.absence_tracker(),
+            cancel.clone(),
+        ),
+    );
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::cluster::cache_entries_gauge_task(Arc::clone(shard), name.clone(), cancel.clone()),
+    );
 }
 
 /// The `Replicated`-only half of [`CacheBuilder::open`]: pulls the cache's
@@ -239,28 +264,35 @@ async fn warm_and_repair(
     shard_ops: Arc<dyn ShardOps>,
     name: &SmolStr,
     cancel: CancellationToken,
+    tasks: &TaskTracker,
 ) {
     let outcome = crate::cluster::state_transfer::run(cluster, &shard_ops, name).await;
     if outcome.needs_warm_up() {
-        cluster.spawn_tracked(crate::cluster::state_transfer::warm_up_task(
-            cluster.clone(),
-            Arc::clone(&shard_ops),
-            name.clone(),
-            cancel.clone(),
-        ));
+        cluster.spawn_tracked_in(
+            tasks,
+            crate::cluster::state_transfer::warm_up_task(
+                cluster.clone(),
+                Arc::clone(&shard_ops),
+                name.clone(),
+                cancel.clone(),
+            ),
+        );
     }
-    cluster.spawn_tracked(crate::cluster::anti_entropy::scheduler_task(
-        cluster.clone(),
-        shard_ops,
-        name.clone(),
-        cluster.config().ae_interval,
-        cancel,
-    ));
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::cluster::anti_entropy::scheduler_task(
+            cluster.clone(),
+            shard_ops,
+            name.clone(),
+            cluster.config().ae_interval,
+            cancel,
+        ),
+    );
 }
 
 /// A typed handle to one named, possibly-clustered cache. Cheap to
 /// `Clone`; every clone shares the same underlying [`Shard`] and the same
-/// background-task [`CancellationToken`].
+/// background tasks.
 #[derive(Clone)]
 pub struct Cache<K, V>
 where
@@ -270,6 +302,7 @@ where
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
     cancel: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl<K, V> std::fmt::Debug for Cache<K, V>
@@ -478,18 +511,19 @@ where
         self.shard.events()
     }
 
-    /// Closes this cache: stops its background tasks, drops it from the
-    /// cluster's shard registry, and clears its gossiped mode, so live peers
-    /// stop seeing it advertised and this node stops serving or applying
-    /// replication traffic for it. The name is free to `open()` again as
-    /// soon as this returns.
+    /// Closes this cache: stops its background tasks and waits for them,
+    /// drops it from the cluster's shard registry, and clears its gossiped
+    /// mode, so peers stop seeing it advertised and this node stops serving
+    /// or applying replication traffic for it. The name is free to `open()`
+    /// again when this returns.
     ///
     /// Closing is idempotent. A clone kept past `close` keeps working as a
     /// local, detached cache: its reads and writes reach the same in-memory
     /// [`Shard`], and nothing replicates.
-    #[allow(clippy::unused_async)]
     pub async fn close(self) {
         self.cancel.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
         self.shard.fan_out_queue().close();
         self.cluster.forget_cache(self.shard.name());
     }
@@ -543,6 +577,33 @@ mod tests {
             "the reopened cache starts empty, not resuming the closed shard's state"
         );
 
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn close_returns_only_once_every_background_task_has_stopped() {
+        let cluster = Cluster::builder("cache-it-close-waits")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("orders")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("open succeeds");
+        let tasks = cache.tasks.clone();
+        assert!(
+            !tasks.is_empty(),
+            "a Replicated cache runs background tasks"
+        );
+
+        cache.close().await;
+
+        assert!(tasks.is_closed() && tasks.is_empty());
+        assert!(!cluster.is_warm(&SmolStr::new("orders")));
         cluster.shutdown().await;
     }
 

@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 /// A compact, random identifier for one running instance of the process.
 ///
-/// Generated fresh per incarnation (not persisted): a restarted process is, by
-/// design, a new node as far as membership and HLC tie-breaking are concerned.
+/// Random per incarnation unless [`crate::ClusterBuilder::node_id`] supplies
+/// a persisted one: with a fresh id a restarted process is a new node for
+/// membership and HLC tie-breaking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(u64);
 

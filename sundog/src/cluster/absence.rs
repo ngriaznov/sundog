@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::membership::Peer;
 use crate::node::NodeId;
 use crate::store::Mode;
 
@@ -37,12 +36,12 @@ pub(crate) struct AbsenceTracker {
 }
 
 impl AbsenceTracker {
-    /// Applies one membership-watch snapshot: a peer newly dropped from
-    /// `live` starts being tracked absent, unless `departing` shows it
-    /// signaled a graceful departure before disappearing; a peer back in
-    /// `live` clears it.
-    fn observe(&self, live: &[Peer], departing: &HashMap<NodeId, bool>) {
-        let live_ids: HashSet<NodeId> = live.iter().map(|peer| peer.node).collect();
+    /// Applies one membership snapshot, the live peers and whether each has
+    /// gossiped a graceful departure: a peer newly dropped from `live`
+    /// starts being tracked absent unless its last flag was set; a peer back
+    /// in `live` clears it.
+    fn observe(&self, live: &HashMap<NodeId, bool>) {
+        let live_ids: HashSet<NodeId> = live.keys().copied().collect();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let departed: Vec<NodeId> = state.live.difference(&live_ids).copied().collect();
         for node in departed {
@@ -52,11 +51,9 @@ impl AbsenceTracker {
             }
             state.last_departing.remove(&node);
         }
-        for &node in &live_ids {
+        for (&node, &departing) in live {
             state.absent_since.remove(&node);
-            state
-                .last_departing
-                .insert(node, departing.get(&node).copied().unwrap_or(false));
+            state.last_departing.insert(node, departing);
         }
         state.live = live_ids;
     }
@@ -88,31 +85,23 @@ fn counts_as_absent(departed_gracefully: bool) -> bool {
     !departed_gracefully
 }
 
-/// Republishes [`crate::membership::Membership::peers`] and
-/// [`crate::membership::Membership::departing_flags`] changes into
-/// `tracker`, keeping [`AbsenceTracker`] current.
+/// Republishes [`crate::membership::Membership::departing_flags`] changes
+/// into `tracker`, keeping [`AbsenceTracker`] current.
 pub(crate) async fn tracking_task(
-    mut peers: watch::Receiver<Vec<Peer>>,
-    mut departing: watch::Receiver<HashMap<NodeId, bool>>,
+    mut live: watch::Receiver<HashMap<NodeId, bool>>,
     tracker: AbsenceTracker,
     cancel: CancellationToken,
 ) {
-    tracker.observe(&peers.borrow_and_update(), &departing.borrow_and_update());
+    tracker.observe(&live.borrow_and_update());
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            changed = peers.changed() => {
+            changed = live.changed() => {
                 if changed.is_err() {
                     return; // membership shut down
                 }
-                tracker.observe(&peers.borrow_and_update(), &departing.borrow());
-            }
-            changed = departing.changed() => {
-                if changed.is_err() {
-                    return; // membership shut down
-                }
-                tracker.observe(&peers.borrow(), &departing.borrow_and_update());
+                tracker.observe(&live.borrow_and_update());
             }
         }
     }
@@ -120,26 +109,15 @@ pub(crate) async fn tracking_task(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
 
     use super::*;
-    use crate::node::NodeName;
 
-    fn peer(node: u64) -> Peer {
-        let id = NodeId::from(node);
-        Peer {
-            node: id,
-            name: NodeName::new("host", id),
-            gossip_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)),
-            data_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8000)),
-            incarnation: 1,
-            protocol: crate::wire::PROTOCOL_VERSION,
-        }
-    }
-
-    /// No peer in the snapshot has gossiped a graceful departure.
-    fn no_departures() -> HashMap<NodeId, bool> {
-        HashMap::new()
+    /// A live set of `(node, departing)` pairs.
+    fn live(peers: &[(u64, bool)]) -> HashMap<NodeId, bool> {
+        peers
+            .iter()
+            .map(|&(node, departing)| (NodeId::from(node), departing))
+            .collect()
     }
 
     #[test]
@@ -151,14 +129,13 @@ mod tests {
     #[test]
     fn a_peer_that_leaves_the_live_set_is_tracked_absent() {
         let tracker = AbsenceTracker::default();
-        let p = peer(1);
-        tracker.observe(std::slice::from_ref(&p), &no_departures());
+        tracker.observe(&live(&[(1, false)]));
         assert!(
             !tracker.any_absent(Duration::from_secs(3600)),
             "still live: not absent"
         );
 
-        tracker.observe(&[], &no_departures());
+        tracker.observe(&live(&[]));
         assert!(
             tracker.any_absent(Duration::from_secs(3600)),
             "dropped out of the live set without gossiping a departure: now tracked absent"
@@ -168,12 +145,11 @@ mod tests {
     #[test]
     fn a_returning_peer_clears_its_tracked_absence() {
         let tracker = AbsenceTracker::default();
-        let p = peer(1);
-        tracker.observe(std::slice::from_ref(&p), &no_departures());
-        tracker.observe(&[], &no_departures());
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
         assert!(tracker.any_absent(Duration::from_secs(3600)));
 
-        tracker.observe(&[p], &no_departures());
+        tracker.observe(&live(&[(1, false)]));
         assert!(
             !tracker.any_absent(Duration::from_secs(3600)),
             "a live member is not tracked absent"
@@ -183,11 +159,9 @@ mod tests {
     #[test]
     fn a_peer_that_gossiped_departing_before_leaving_is_never_tracked_absent() {
         let tracker = AbsenceTracker::default();
-        let p = peer(1);
-        let departing = HashMap::from([(p.node, true)]);
-        tracker.observe(std::slice::from_ref(&p), &departing);
+        tracker.observe(&live(&[(1, true)]));
 
-        tracker.observe(&[], &no_departures());
+        tracker.observe(&live(&[]));
         assert!(
             !tracker.any_absent(Duration::from_secs(3600)),
             "a graceful departure never counts as absence"
@@ -197,9 +171,8 @@ mod tests {
     #[tokio::test]
     async fn absence_ages_out_past_the_hard_cap() {
         let tracker = AbsenceTracker::default();
-        let p = peer(1);
-        tracker.observe(&[p], &no_departures());
-        tracker.observe(&[], &no_departures());
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
 
         let tiny_cap = Duration::from_millis(1);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -218,8 +191,8 @@ mod tests {
     #[test]
     fn should_defer_gc_ignores_absence_outside_replicated_mode() {
         let tracker = AbsenceTracker::default();
-        tracker.observe(&[peer(1)], &no_departures());
-        tracker.observe(&[], &no_departures());
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
         let hard_cap = Duration::from_secs(3600);
 
         assert!(should_defer_gc(Mode::Replicated, &tracker, hard_cap));

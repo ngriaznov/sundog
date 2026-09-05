@@ -255,9 +255,9 @@ impl Membership {
         self.cache_modes.clone()
     }
 
-    /// A live-updating view of which live peers have gossiped a graceful
-    /// departure, published in lockstep with [`Membership::peers`]. A peer
-    /// absent from the map has not signaled departure.
+    /// The live peers, each with whether it has gossiped a graceful
+    /// departure; the absence tracker's only input, so a peer's last flag
+    /// and its disappearance arrive together.
     pub(crate) fn departing_flags(&self) -> watch::Receiver<HashMap<NodeId, bool>> {
         self.departing.clone()
     }
@@ -280,10 +280,11 @@ impl Membership {
             .send(Command::ClearCacheMode(SmolStr::new(name)));
     }
 
-    /// Leaves the cluster gracefully and stops the background gossip loop.
-    /// chitchat has no protocol-level "leave" broadcast: peers instead
-    /// observe the stopped loop as silence, and the failure detector
-    /// reclaims it after its grace period.
+    /// Gossips a departure, waits three gossip intervals for it to spread,
+    /// then leaves the cluster and stops the background gossip loop. Peers
+    /// read the departure off the last state they saw, so the leave never
+    /// counts as absence; the failure detector still reclaims the silent
+    /// node after its grace period.
     pub async fn shutdown(self) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.commands.send(Command::Shutdown(reply_tx)).is_ok() {
@@ -892,6 +893,39 @@ mod tests {
         assert!(membership.peers().borrow().is_empty());
 
         membership.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_every_handle_without_shutdown_aborts_the_gossip_server() {
+        let config = ClusterConfig {
+            gossip_bind_addr: addr(0),
+            ..ClusterConfig::default()
+        };
+        let membership = Membership::spawn(
+            "membership-test-crash".into(),
+            NodeId::random(),
+            "solo",
+            addr(9403),
+            &config,
+            stream::pending().boxed(),
+        )
+        .await
+        .expect("solo node starts");
+        let gossip_addr = membership.local_peer().gossip_addr;
+        assert!(
+            std::net::UdpSocket::bind(gossip_addr).is_err(),
+            "the gossip socket is bound while the server runs"
+        );
+
+        drop(membership);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::net::UdpSocket::bind(gossip_addr).is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the aborted server releases its socket");
     }
 
     #[tokio::test]

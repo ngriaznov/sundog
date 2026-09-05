@@ -383,6 +383,15 @@ impl Cluster {
         self.inner.tracker.spawn(fut);
     }
 
+    /// [`Cluster::spawn_tracked`], also tracked by `tasks`, the tracker one
+    /// cache's `close` waits on.
+    pub(crate) fn spawn_tracked_in<F>(&self, tasks: &TaskTracker, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.inner.tracker.spawn(tasks.track_future(fut));
+    }
+
     /// Leaves the cluster gracefully: background loops are cancelled and
     /// joined, then chitchat departs and the data plane closes its
     /// connections. No further calls on any clone of this handle.
@@ -640,7 +649,6 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     ));
     cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
     cluster.spawn_tracked(absence::tracking_task(
-        cluster.inner.membership.peers(),
         cluster.inner.membership.departing_flags(),
         cluster.absence_tracker(),
         cluster.cancel_token(),

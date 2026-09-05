@@ -46,7 +46,6 @@ All notable changes to this project are documented in this file. Format follows
   entries per stripe lock instead of one.
 - `serde`'s `rc` feature is on, so `Arc` and `Rc` values serialize.
 
-
 ## [0.4.0] – 2026-09-04
 
 ### Fixed
