@@ -11,8 +11,11 @@
 //! Expiry is checked on every read and reclaimed by [`Engine::sweep`], which
 //! visits only stripes with an entry due. Capacity eviction is sampled LRU:
 //! [`Engine::enforce_capacity`] locks one stripe at a time, weighs up to
-//! `EVICTION_SAMPLE` entries from a rotating offset, and evicts the
-//! least recently read, until total weight fits.
+//! `EVICTION_SAMPLE` entries from a rotating offset, and evicts up to
+//! `EVICTION_BATCH` of the coldest under that one lock hold, until total
+//! weight fits. [`Engine::live_entry_count`] is an `AtomicU64` every
+//! insert/remove path keeps current, so reading it costs one atomic load
+//! rather than a pass over every stripe.
 //!
 //! [`super::Shard::get_or_load`] collapses concurrent misses through a
 //! per-stripe map of in-flight loads. A waiter subscribes to the load's
@@ -53,6 +56,10 @@ const KEY_STACK_BUF: usize = 128;
 /// How many live entries one capacity-eviction pass weighs before evicting the
 /// least recently read of them.
 const EVICTION_SAMPLE: usize = 8;
+
+/// How many sampled-cold entries [`Engine::enforce_capacity`] evicts per
+/// stripe write-lock acquisition, when the overage needs that many.
+const EVICTION_BATCH: usize = 8;
 
 /// Holds one postcard-encoded key: on the stack when it fits [`KEY_STACK_BUF`],
 /// on the heap otherwise.
@@ -253,6 +260,25 @@ fn absent_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool 
     false
 }
 
+/// How many of `sampled_weights` (coldest-first) one eviction lock
+/// acquisition takes: the fewest entries whose combined weight clears
+/// `over_by`, capped at everything sampled. Never returns one entry more
+/// than clearing the overage needs, so only the last entry counted may push
+/// total weight further under the cap than its own weight.
+fn eviction_batch_size(over_by: u64, sampled_weights: &[u32]) -> usize {
+    if over_by == 0 {
+        return 0;
+    }
+    let mut cleared = 0u64;
+    for (victims, &weight) in sampled_weights.iter().enumerate() {
+        cleared += u64::from(weight);
+        if cleared >= over_by {
+            return victims + 1;
+        }
+    }
+    sampled_weights.len()
+}
+
 /// The outcome of [`apply_locked`]: the caller's `key` back plus what changed,
 /// to build an [`super::Event`] and decide on fan-out.
 pub(crate) enum ApplyOutcome<K, V> {
@@ -281,13 +307,15 @@ impl<K, V> ApplyOutcome<K, V> {
 /// The versioned-apply core: applies `incoming` at `ver` for `key`
 /// (`key_bytes`/`hash` its postcard-encoded bytes and their xxh3 hash) iff
 /// `resolver` picks it over whatever `stripe` currently holds, updating
-/// `digest_bucket` and `total_weight` to match. Fully synchronous: the
-/// caller holds `stripe`'s write lock for this call's entire duration.
+/// `digest_bucket`, `total_weight`, and `live_count` to match. Fully
+/// synchronous: the caller holds `stripe`'s write lock for this call's
+/// entire duration.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
     digest_bucket: &AtomicU64,
     total_weight: &AtomicU64,
+    live_count: &AtomicU64,
     weigher: Option<&Weigher<K, V>>,
     tti_ms: Option<u64>,
     hash: u64,
@@ -370,6 +398,7 @@ where
         } => apply_put(
             stripe,
             total_weight,
+            live_count,
             weigher,
             hash,
             key,
@@ -385,6 +414,7 @@ where
         Incoming::Tombstone => apply_tombstone(
             stripe,
             total_weight,
+            live_count,
             hash,
             key,
             key_bytes,
@@ -398,12 +428,14 @@ where
 }
 
 /// The `Incoming::Put` half of [`apply_locked`]'s write: installs the new
-/// value, corrects total weight for whatever it displaced (`had_live`), and
+/// value, corrects total weight for whatever it displaced (`had_live`), bumps
+/// `live_count` iff nothing physically live occupied the key before, and
 /// reports `created` unless a readable entry (`was_visible`) was replaced.
 #[allow(clippy::too_many_arguments)]
 fn apply_put<K, V>(
     stripe: &mut Stripe<K, V>,
     total_weight: &AtomicU64,
+    live_count: &AtomicU64,
     weigher: Option<&Weigher<K, V>>,
     hash: u64,
     key: K,
@@ -448,6 +480,8 @@ where
     total_weight.fetch_add(u64::from(weight), Ordering::Relaxed);
     if let Some(ow) = old_weight {
         total_weight.fetch_sub(u64::from(ow), Ordering::Relaxed);
+    } else {
+        live_count.fetch_add(1, Ordering::Relaxed);
     }
     ApplyOutcome::Put {
         key,
@@ -457,12 +491,13 @@ where
 }
 
 /// The `Incoming::Tombstone` half of [`apply_locked`]'s write: removes the
-/// displaced live entry from total weight, then records the tombstone with its
-/// two GC deadlines.
+/// displaced live entry from total weight and `live_count`, then records the
+/// tombstone with its two GC deadlines.
 #[allow(clippy::too_many_arguments)]
 fn apply_tombstone<K, V>(
     stripe: &mut Stripe<K, V>,
     total_weight: &AtomicU64,
+    live_count: &AtomicU64,
     hash: u64,
     key: K,
     key_bytes: Bytes,
@@ -479,6 +514,7 @@ where
         && let Some((old_weight, _)) = remove_live(&mut stripe.live, hash, key_bytes.as_ref())
     {
         total_weight.fetch_sub(u64::from(old_weight), Ordering::Relaxed);
+        live_count.fetch_sub(1, Ordering::Relaxed);
     }
     stripe.tombstones.insert(
         key_bytes,
@@ -549,10 +585,18 @@ pub(crate) struct Engine<K, V> {
     stripes: Box<[RwLock<Stripe<K, V>>]>,
     digest: Box<[AtomicU64]>,
     total_weight: AtomicU64,
+    /// Live entries across every stripe, kept current by every path that
+    /// inserts or removes one so [`Engine::live_entry_count`] is one atomic
+    /// load instead of a pass over every stripe.
+    live_count: AtomicU64,
     max_capacity: u64,
     tti_ms: Option<u64>,
     weigher: Option<Weigher<K, V>>,
     evict_cursor: AtomicU64,
+    /// Stripe write-lock acquisitions [`Engine::enforce_capacity`] has made
+    /// for eviction, for tests that check batching cuts lock traffic.
+    #[cfg(test)]
+    eviction_lock_acquisitions: AtomicU64,
 }
 
 impl<K, V> Engine<K, V>
@@ -575,11 +619,14 @@ where
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             total_weight: AtomicU64::new(0),
+            live_count: AtomicU64::new(0),
             max_capacity,
             tti_ms: tti.map(super::duration_ms),
             weigher,
             // Any nonzero seed; xorshift64* never recovers from a zero state.
             evict_cursor: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            #[cfg(test)]
+            eviction_lock_acquisitions: AtomicU64::new(0),
         }
     }
 
@@ -869,6 +916,7 @@ where
             }
             let mut stripe = stripe_lock.write();
             let mut removed_weight = 0u64;
+            let mut removed_count = 0u64;
             let mut new_next = u64::MAX;
             stripe.live.retain(|live| {
                 if self.is_absent(live, now_ms) {
@@ -878,6 +926,7 @@ where
                         Ordering::Relaxed,
                     );
                     removed_weight += u64::from(live.weight);
+                    removed_count += 1;
                     false
                 } else {
                     if let Some(exp) = live.stored.expires_at_ms {
@@ -892,16 +941,17 @@ where
                 self.total_weight
                     .fetch_sub(removed_weight, Ordering::Relaxed);
             }
+            if removed_count > 0 {
+                self.live_count.fetch_sub(removed_count, Ordering::Relaxed);
+            }
         }
     }
 
-    /// The number of live entries across every stripe. O(`BUCKET_COUNT`) locks,
-    /// not O(entries).
+    /// The number of live entries across every stripe: one atomic load,
+    /// maintained incrementally by every path that inserts or removes a live
+    /// entry.
     pub(crate) fn live_entry_count(&self) -> u64 {
-        self.stripes
-            .iter()
-            .map(|s| u64::try_from(s.read().live.len()).unwrap_or(u64::MAX))
-            .fold(0u64, u64::saturating_add)
+        self.live_count.load(Ordering::Relaxed)
     }
 
     /// xorshift64: fast and allocation-free for choosing which stripe to look
@@ -931,9 +981,19 @@ where
         }
     }
 
+    /// Marks one stripe write-lock acquisition made for eviction, for tests
+    /// that check batching cuts lock traffic. A no-op in non-test builds.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn note_eviction_lock_acquisition(&self) {
+        #[cfg(test)]
+        self.eviction_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Evicts the coldest of up to [`EVICTION_SAMPLE`] entries in `bucket`.
     /// Returns `false` when the stripe holds nothing to evict.
     fn evict_one_sampled(&self, bucket: usize) -> bool {
+        self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
         let offset = self.sample_offset(stripe.live.len());
         let Some(victim_bytes) = stripe
@@ -963,6 +1023,7 @@ where
         );
         self.total_weight
             .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
+        self.live_count.fetch_sub(1, Ordering::Relaxed);
         true
     }
 
@@ -975,20 +1036,91 @@ where
             .find(|&candidate| self.evict_one_sampled(candidate))
     }
 
+    /// Evicts up to [`EVICTION_BATCH`] of a bucket's sampled-cold entries
+    /// under one stripe write-lock acquisition, clearing `over_by` in as
+    /// few of them as [`eviction_batch_size`] decides. Returns the weight
+    /// actually removed, `0` when the stripe holds nothing to evict.
+    fn evict_batch_sampled(&self, bucket: usize, over_by: u64) -> u64 {
+        self.note_eviction_lock_acquisition();
+        let mut stripe = self.stripes[bucket].write();
+        let offset = self.sample_offset(stripe.live.len());
+        let mut sampled: Vec<(Bytes, u64, u32)> = stripe
+            .live
+            .iter()
+            .skip(offset)
+            .chain(stripe.live.iter().take(offset))
+            .take(EVICTION_BATCH)
+            .map(|live| {
+                (
+                    live.key_bytes.clone(),
+                    live.last_access_ms.load(Ordering::Relaxed),
+                    live.weight,
+                )
+            })
+            .collect();
+        if sampled.is_empty() {
+            return 0;
+        }
+        sampled.sort_unstable_by_key(|&(_, last_access, _)| last_access);
+        let weights: Vec<u32> = sampled.iter().map(|&(_, _, w)| w).collect();
+        let victims = eviction_batch_size(over_by, &weights);
+
+        let mut removed_weight = 0u64;
+        let mut removed_count = 0u64;
+        for (key_bytes, _, _) in sampled.into_iter().take(victims) {
+            let hash = hash_key_bytes(key_bytes.as_ref());
+            let Entry::Occupied(occ) = stripe.live.entry(
+                hash,
+                |l| l.key_bytes.as_ref() == key_bytes.as_ref(),
+                hasher_for,
+            ) else {
+                continue;
+            };
+            let (removed, _vacant) = occ.remove();
+            let part = part_index_from_hash(hash);
+            self.digest[digest_slot(bucket, part)].fetch_xor(
+                entry_fingerprint(&removed.key_bytes, removed.stored.ver),
+                Ordering::Relaxed,
+            );
+            removed_weight += u64::from(removed.weight);
+            removed_count += 1;
+        }
+        drop(stripe);
+        if removed_weight > 0 {
+            self.total_weight
+                .fetch_sub(removed_weight, Ordering::Relaxed);
+        }
+        if removed_count > 0 {
+            self.live_count.fetch_sub(removed_count, Ordering::Relaxed);
+        }
+        removed_weight
+    }
+
     /// After a write to `start_bucket` may have pushed total weight over
     /// `max_capacity`, evicts sampled-cold entries, starting at
     /// `start_bucket` then pseudo-random stripes, until it is back under
-    /// the cap. A random probe that lands on an empty stripe falls back to
-    /// a scan for the next non-empty one, so the loop ends only under the
-    /// cap or with nothing left to evict. Never holds two stripe locks at
-    /// once; a no-op when `max_capacity` is [`u64::MAX`].
+    /// the cap. Each stripe write-lock acquisition clears up to
+    /// [`EVICTION_BATCH`] entries at once via [`Self::evict_batch_sampled`],
+    /// sized by [`eviction_batch_size`] so a burst converges in far fewer
+    /// lock acquisitions than entries evicted. A random probe that lands on
+    /// an empty stripe falls back to a scan for the next non-empty one, so
+    /// the loop ends only under the cap or with nothing left to evict.
+    /// Never holds two stripe locks at once; a no-op when `max_capacity` is
+    /// [`u64::MAX`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
         if self.max_capacity == u64::MAX {
             return;
         }
         let mut bucket = start_bucket;
-        while self.total_weight.load(Ordering::Relaxed) > self.max_capacity {
-            if !self.evict_one_sampled(bucket) && self.evict_one_scanning(bucket).is_none() {
+        loop {
+            let current = self.total_weight.load(Ordering::Relaxed);
+            if current <= self.max_capacity {
+                return;
+            }
+            let over_by = current - self.max_capacity;
+            if self.evict_batch_sampled(bucket, over_by) == 0
+                && self.evict_one_scanning(bucket).is_none()
+            {
                 return;
             }
             bucket = self.next_pseudo_random_bucket();
@@ -1019,6 +1151,7 @@ where
                     &mut stripe,
                     digest_bucket,
                     &self.total_weight,
+                    &self.live_count,
                     self.weigher.as_ref(),
                     self.tti_ms,
                     hash,
@@ -1070,6 +1203,7 @@ where
             .fetch_xor(entry_fingerprint(key_bytes, old_ver), Ordering::Relaxed);
         self.total_weight
             .fetch_sub(u64::from(weight), Ordering::Relaxed);
+        self.live_count.fetch_sub(1, Ordering::Relaxed);
         Some(old_ver)
     }
 
@@ -1086,6 +1220,7 @@ where
                 .fetch_xor(entry_fingerprint(key_bytes, ver), Ordering::Relaxed);
             self.total_weight
                 .fetch_sub(u64::from(weight), Ordering::Relaxed);
+            self.live_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -1141,9 +1276,9 @@ where
 
     /// Applies a successful [`super::Shard::get_or_load`] fill: removes any
     /// prior tombstone or live entry for `key`, unconditionally installs
-    /// the loader's value, and removes the `inflight` entry, all under one
-    /// stripe write-lock acquisition. Returns whether a live entry
-    /// already existed.
+    /// the loader's value, corrects `live_count` for the net change, and
+    /// removes the `inflight` entry, all under one stripe write-lock
+    /// acquisition. Returns whether a live entry already existed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_fresh_load(
         &self,
@@ -1179,6 +1314,9 @@ where
                 );
                 self.total_weight
                     .fetch_sub(u64::from(old_weight), Ordering::Relaxed);
+            }
+            if !had_live {
+                self.live_count.fetch_add(1, Ordering::Relaxed);
             }
             digest_bucket.fetch_xor(
                 entry_fingerprint(key_bytes.as_ref(), ver),
@@ -1314,6 +1452,22 @@ where
     pub(crate) fn stripe_lock(&self, bucket: usize) -> &RwLock<Stripe<K, V>> {
         &self.stripes[bucket]
     }
+
+    /// The number of live entries across every stripe by a full pass, taking
+    /// every stripe's read lock, to check against the incrementally
+    /// maintained [`Engine::live_entry_count`].
+    pub(crate) fn recompute_live_entry_count(&self) -> u64 {
+        self.stripes
+            .iter()
+            .map(|s| u64::try_from(s.read().live.len()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Stripe write-lock acquisitions [`Engine::enforce_capacity`] has made
+    /// for eviction so far, for tests that check batching cuts lock traffic.
+    pub(crate) fn debug_eviction_lock_acquisitions(&self) -> u64 {
+        self.eviction_lock_acquisitions.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -1365,6 +1519,7 @@ mod tests {
             &mut stripe,
             &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
             &engine.total_weight,
+            &engine.live_count,
             engine.weigher.as_ref(),
             engine.tti_ms,
             hash,
@@ -1535,6 +1690,7 @@ mod tests {
                 &mut stripe,
                 &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                 &engine.total_weight,
+                &engine.live_count,
                 engine.weigher.as_ref(),
                 engine.tti_ms,
                 hash,
@@ -1832,6 +1988,7 @@ mod tests {
                 &mut stripe,
                 &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                 &engine.total_weight,
+                &engine.live_count,
                 engine.weigher.as_ref(),
                 engine.tti_ms,
                 hash,
@@ -1957,6 +2114,7 @@ mod tests {
                     &mut stripe,
                     &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                     &engine.total_weight,
+                    &engine.live_count,
                     None,
                     None,
                     hash,
@@ -2094,12 +2252,14 @@ mod tests {
     }
 
     #[test]
-    fn enforce_capacity_clears_an_overage_needing_thousands_of_evictions() {
+    fn enforce_capacity_clears_a_heterogeneous_weight_overage_within_one_batch() {
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
         let engine = Engine::<u32, String>::new(10_000, None, Some(weigher));
-        // 6,000 one-unit entries, then one 9,500-unit entry: back under the
-        // cap only after more than 5,500 evictions.
+        // 6,000 one-unit entries, then one 9,500-unit entry landing in the
+        // same stripe as some of them: a single batch's sample can include
+        // both small and large entries, so clearing the 5,500-unit overage
+        // may cost only a handful of evictions rather than thousands.
         for k in 1..=6_000u32 {
             let _ = put(
                 &engine,
@@ -2133,8 +2293,102 @@ mod tests {
             "total weight {weight} is back under the cap"
         );
         assert!(
-            entries <= 501,
-            "{entries} entries remain; the overage cost more than 5,499 evictions"
+            entries < 6_001,
+            "at least one entry was evicted to clear the overage"
+        );
+        assert!(
+            engine.debug_eviction_lock_acquisitions() < 20,
+            "a batch that samples both small and large entries clears a heterogeneous overage \
+             in a handful of lock acquisitions, not thousands"
+        );
+    }
+
+    #[test]
+    fn eviction_batch_size_takes_the_fewest_entries_that_clear_the_overage() {
+        assert_eq!(
+            eviction_batch_size(0, &[3, 3, 3]),
+            0,
+            "no overage evicts nothing"
+        );
+        assert_eq!(
+            eviction_batch_size(2, &[5, 5, 5]),
+            1,
+            "the first sampled entry alone already clears a 2-unit overage"
+        );
+        assert_eq!(
+            eviction_batch_size(6, &[3, 3, 3]),
+            2,
+            "3 clears none of a 6-unit overage, 3+3 clears all of it"
+        );
+        assert_eq!(
+            eviction_batch_size(100, &[1, 1, 1]),
+            3,
+            "an overage bigger than every sampled weight combined takes them all"
+        );
+        assert_eq!(
+            eviction_batch_size(5, &[]),
+            0,
+            "nothing sampled means nothing to evict"
+        );
+    }
+
+    #[test]
+    fn enforce_capacity_batches_evictions_under_a_burst_ten_thousand_over_the_cap() {
+        let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
+        // A 40,000-unit cap left dense after eviction (~39 entries/stripe)
+        // so a random probe rarely lands on an already-empty stripe; the
+        // point here is measuring the batch size, not the scanning
+        // fallback's cost on a nearly-drained table.
+        let engine = Engine::<u32, String>::new(40_000, None, Some(weigher));
+        // 50,000 one-unit entries: 10,000 over the cap.
+        for k in 1..=50_000u32 {
+            let _ = put(
+                &engine,
+                k,
+                key_bytes(k),
+                "x".into(),
+                hlc(u64::from(k), 1),
+                None,
+                0,
+            );
+        }
+        let (entries_before, weight_before) = engine.debug_totals();
+        assert_eq!(entries_before, 50_000);
+        assert_eq!(weight_before, 50_000);
+
+        engine.enforce_capacity(0);
+
+        let (entries_after, weight_after) = engine.debug_totals();
+        assert!(
+            weight_after <= 40_000,
+            "total weight {weight_after} is back under the cap"
+        );
+        let evicted = entries_before - entries_after;
+        let acquisitions = engine.debug_eviction_lock_acquisitions();
+        assert!(
+            acquisitions * 2 < evicted,
+            "{acquisitions} lock acquisitions to evict {evicted} entries: batching should need \
+             far fewer acquisitions than entries evicted"
+        );
+    }
+
+    #[test]
+    fn engine_reads_back_an_arc_string_value_serialized_via_serdes_rc_feature() {
+        let engine = Engine::<u32, Arc<String>>::new(u64::MAX, None, None);
+        let value = Arc::new("shared".to_string());
+        let _ = put(
+            &engine,
+            1,
+            key_bytes(1),
+            Arc::clone(&value),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        assert_eq!(
+            engine.get(&1, 0),
+            Some(value),
+            "an Arc<String> value round-trips through postcard's serde `rc` support"
         );
     }
 
@@ -2180,6 +2434,7 @@ mod tests {
                         &mut stripe,
                         &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                         &engine.total_weight,
+                        &engine.live_count,
                         engine.weigher.as_ref(),
                         engine.tti_ms,
                         hash,
@@ -2207,6 +2462,7 @@ mod tests {
                         &mut stripe,
                         &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
                         &engine.total_weight,
+                        &engine.live_count,
                         engine.weigher.as_ref(),
                         engine.tti_ms,
                         hash,
@@ -2223,6 +2479,12 @@ mod tests {
                 2 => engine.sweep(now),
                 _ => engine.gc_tombstones(false, now),
             }
+            assert_eq!(
+                engine.live_entry_count(),
+                engine.recompute_live_entry_count(),
+                "iteration {i}: the incrementally maintained live count diverged from a full \
+                 recount"
+            );
             if i % 15 == 0 {
                 assert_eq!(
                     engine.digests(),
@@ -2380,6 +2642,7 @@ mod tests {
                 &mut stripe,
                 &engine.digest[digest_slot(bucket, part_b)],
                 &engine.total_weight,
+                &engine.live_count,
                 engine.weigher.as_ref(),
                 engine.tti_ms,
                 hash_b,

@@ -29,6 +29,14 @@ All notable changes to this project are documented in this file. Format follows
   reused, and one the peer has already closed is retried on a fresh dial
   rather than failing the anti-entropy round.
 
+### Changed
+
+- The live-entry gauge reads one atomic counter instead of taking every
+  stripe lock on each tick, and capacity eviction removes up to eight cold
+  entries per stripe lock instead of one.
+- `serde`'s `rc` feature is on, so `Arc` and `Rc` values serialize.
+
+
 ## [0.4.0] – 2026-09-04
 
 ### Fixed

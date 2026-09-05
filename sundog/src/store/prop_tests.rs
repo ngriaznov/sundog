@@ -306,6 +306,16 @@ where
     buckets_match && parts_match
 }
 
+/// Whether the incrementally maintained live-entry count agrees with a full
+/// recount over every stripe.
+fn live_count_matches_full_recount<K, V>(shard: &Shard<K, V>) -> bool
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    shard.engine.live_entry_count() == shard.engine.recompute_live_entry_count()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DigestOp {
     Insert(u8, u16),
@@ -392,6 +402,10 @@ proptest! {
                 assert!(
                     digest_matches_full_recompute(&shard),
                     "incremental digest diverged from full recompute after {op:?}"
+                );
+                assert!(
+                    live_count_matches_full_recount(&shard),
+                    "incremental live count diverged from a full recount after {op:?}"
                 );
             }
         });
