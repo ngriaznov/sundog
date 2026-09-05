@@ -609,7 +609,9 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     // stream and the first post-join anti-entropy round finish draining;
     // waiting for n1's own sent-byte counter to go quiet isolates the
     // repair's cost below from that unrelated tail.
-    wait_for_quiescent_netstats(&n1, Duration::from_secs(30)).await;
+    // A shared CI runner can keep n1's counters moving well past 30 s while
+    // the million-entry transfer and fan-out drain.
+    wait_for_quiescent_netstats(&n1, Duration::from_secs(90)).await;
 
     let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the drop");
 
