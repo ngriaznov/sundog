@@ -4,10 +4,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::{SinkExt as _, StreamExt as _};
+use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -254,12 +254,25 @@ pub(super) async fn recv_msg(framed: &mut PeerFramed) -> Option<Result<Msg, Code
 
 /// Max idle pooled request/response connections kept per peer: bounds
 /// memory/fd use while letting requests skip a fresh dial on a known peer.
-const REQ_POOL_MAX_IDLE: usize = 4;
+const REQ_POOL_MAX_IDLE_CONNS: usize = 4;
 
 /// Idle bound on an accepted request/response connection: torn down after
 /// this long without a new request, so a peer that stops checking a pooled
 /// connection back in doesn't hold a server-side socket open forever.
 const REQ_CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Age bound for a pooled connection at [`ReqPool::checkout`], half of
+/// [`REQ_CONN_IDLE_TIMEOUT`]. The server may already have closed anything
+/// older than this, so a connection past the bound is dropped instead of
+/// handed back: reusing it would still write successfully into the
+/// half-closed socket, only to see the first read come back `EOF`.
+const REQ_POOL_MAX_IDLE: Duration = Duration::from_secs(30);
+
+/// True when a connection checked into the pool at `checked_in` is still
+/// within [`REQ_POOL_MAX_IDLE`] of `now`.
+fn pooled_is_fresh(checked_in: Instant, now: Instant) -> bool {
+    now.duration_since(checked_in) < REQ_POOL_MAX_IDLE
+}
 
 /// Bounds how many requests one accepted connection serves before this
 /// side closes it, guarding against one reused forever without going idle.
@@ -273,7 +286,7 @@ const REQ_CONN_MAX_REQUESTS: usize = 4096;
 /// A connection is checked back in only after a clean end-of-reply; one
 /// left in an unknown framing state is dropped instead of pooled.
 pub(super) struct ReqPool {
-    idle: std::sync::Mutex<Vec<PeerFramed>>,
+    idle: std::sync::Mutex<Vec<(PeerFramed, Instant)>>,
 }
 
 impl ReqPool {
@@ -283,24 +296,67 @@ impl ReqPool {
         }
     }
 
-    /// Takes one idle connection out of the pool, if any.
+    /// Takes one idle connection out of the pool, if any, skipping and
+    /// dropping every one checked in more than [`REQ_POOL_MAX_IDLE`] ago:
+    /// the server may already have torn it down as idle.
     pub(super) fn checkout(&self) -> Option<PeerFramed> {
-        self.idle
+        let mut idle = self
+            .idle
             .lock()
-            .expect("invariant: req pool lock is never poisoned")
-            .pop()
+            .expect("invariant: req pool lock is never poisoned");
+        let now = Instant::now();
+        while let Some((framed, checked_in)) = idle.pop() {
+            if pooled_is_fresh(checked_in, now) {
+                return Some(framed);
+            }
+        }
+        None
     }
 
     /// Returns a connection known to be in a clean, ready-for-reuse framing
-    /// state. Silently drops it once the pool is at [`REQ_POOL_MAX_IDLE`].
+    /// state, stamped with the check-in instant [`ReqPool::checkout`] ages
+    /// it against. Silently drops it once the pool is at
+    /// [`REQ_POOL_MAX_IDLE_CONNS`].
     pub(super) fn checkin(&self, framed: PeerFramed) {
         let mut idle = self
             .idle
             .lock()
             .expect("invariant: req pool lock is never poisoned");
-        if idle.len() < REQ_POOL_MAX_IDLE {
-            idle.push(framed);
+        if idle.len() < REQ_POOL_MAX_IDLE_CONNS {
+            idle.push((framed, Instant::now()));
         }
+    }
+}
+
+/// Outcome of [`probe_reused`]: what a reused pooled connection shows right
+/// after the caller's request is written onto it.
+pub(super) enum ReusedProbe {
+    /// Nothing to read yet: the connection is alive and the reply is still
+    /// in flight, unread.
+    Pending,
+    /// A receive-side `EOF` or a broken read: the server already closed
+    /// this connection as idle, or it is otherwise unusable.
+    Stale,
+    /// A reply frame was already there. Handed back so the caller doesn't
+    /// lose it, since reading it here already took it off the wire.
+    Ready(Msg),
+}
+
+/// Polls `framed` exactly once, without waiting, right after
+/// [`Mesh::acquire_conn`][acq] writes onto a connection taken out of the
+/// pool. A connection the server already timed out is a half-closed
+/// socket: the write into it still succeeds, but the receive side is
+/// already at `EOF`, which this catches before the caller commits to a
+/// connection that would fail its whole request. A live connection has
+/// nothing to read yet, so the probe returns [`ReusedProbe::Pending`]
+/// instantly rather than waiting on the real reply.
+///
+/// [acq]: super::Mesh::acquire_conn
+pub(super) fn probe_reused(framed: &mut PeerFramed) -> ReusedProbe {
+    match recv_msg(framed).now_or_never() {
+        None => ReusedProbe::Pending,
+        Some(None | Some(Err(_))) => ReusedProbe::Stale,
+        Some(Some(Ok(msg))) => ReusedProbe::Ready(msg),
     }
 }
 
@@ -901,13 +957,21 @@ async fn serve_ae_pull_hashes(
 
 /// Reads `AeBucket` replies until [`Msg::ReqDone`]. On success, checks
 /// `framed` back into `pool`; on error, the connection is dropped instead.
+/// `first`, when set, is consumed before any further read: `acquire_conn`
+/// hands one over when it already peeked a reply off a reused connection.
 pub(super) async fn collect_ae_buckets(
     mut framed: PeerFramed,
     pool: &ReqPool,
+    first: Option<Result<Msg, CodecError>>,
 ) -> Result<Vec<(u16, Vec<(Bytes, crate::hlc::Hlc)>)>, CodecError> {
     let mut result = Vec::new();
+    let mut pending = first;
     loop {
-        match recv_msg(&mut framed).await {
+        let received = match pending.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
             Some(Ok(Msg::ReqDone)) => {
                 pool.checkin(framed);
                 return Ok(result);
@@ -931,10 +995,16 @@ pub(super) async fn collect_ae_buckets(
 pub(super) async fn collect_ae_mismatches(
     mut framed: PeerFramed,
     pool: &ReqPool,
+    first: Option<Result<Msg, CodecError>>,
 ) -> Result<Vec<super::AeMismatch>, CodecError> {
     let mut result = Vec::new();
+    let mut pending = first;
     loop {
-        match recv_msg(&mut framed).await {
+        let received = match pending.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
             Some(Ok(Msg::ReqDone)) => {
                 pool.checkin(framed);
                 return Ok(result);
@@ -963,10 +1033,16 @@ pub(super) async fn collect_ae_mismatches(
 pub(super) async fn collect_ae_part_replies(
     mut framed: PeerFramed,
     pool: &ReqPool,
+    first: Option<Result<Msg, CodecError>>,
 ) -> Result<Vec<super::AePartReply>, CodecError> {
     let mut result = Vec::new();
+    let mut pending = first;
     loop {
-        match recv_msg(&mut framed).await {
+        let received = match pending.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
             Some(Ok(Msg::ReqDone)) => {
                 pool.checkin(framed);
                 return Ok(result);
@@ -1003,10 +1079,16 @@ pub(super) async fn collect_ae_part_replies(
 pub(super) async fn collect_pulled_records(
     mut framed: PeerFramed,
     pool: &ReqPool,
+    first: Option<Result<Msg, CodecError>>,
 ) -> Result<Vec<crate::wire::WireRecord>, CodecError> {
     let mut result = Vec::new();
+    let mut pending = first;
     loop {
-        match recv_msg(&mut framed).await {
+        let received = match pending.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
             Some(Ok(Msg::ReqDone)) => {
                 pool.checkin(framed);
                 return Ok(result);
@@ -1116,6 +1198,31 @@ mod tests {
         }
     }
 
+    /// Below [`super::REQ_POOL_MAX_IDLE`] a pooled connection stays fresh;
+    /// at or past it, `ReqPool::checkout` must treat it as stale. Uses
+    /// tokio's paused clock so the boundary is exact rather than
+    /// timing-dependent.
+    #[tokio::test(start_paused = true)]
+    async fn pooled_is_fresh_expires_at_the_max_idle_boundary() {
+        let checked_in = tokio::time::Instant::now().into();
+        tokio::time::advance(
+            super::REQ_POOL_MAX_IDLE
+                .checked_sub(Duration::from_millis(1))
+                .expect("invariant: REQ_POOL_MAX_IDLE exceeds one millisecond"),
+        )
+        .await;
+        assert!(
+            super::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
+            "just under REQ_POOL_MAX_IDLE must stay fresh"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            !super::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
+            "at REQ_POOL_MAX_IDLE must be stale"
+        );
+    }
+
     // Only the `not(sim)` tests below dial real loopback sockets through
     // `handle_accepted`/`run_peer_writer`/the request collectors; under
     // `sim` those tests (and these imports) are compiled out entirely.
@@ -1123,7 +1230,6 @@ mod tests {
     use std::net::SocketAddr;
     #[cfg(not(feature = "sim"))]
     use std::sync::Arc;
-    #[cfg(not(feature = "sim"))]
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -1571,7 +1677,7 @@ mod tests {
     async fn collect_ae_buckets_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
         let pool = ReqPool::new();
-        let err = super::collect_ae_buckets(framed, &pool)
+        let err = super::collect_ae_buckets(framed, &pool, None)
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -1582,7 +1688,7 @@ mod tests {
     async fn collect_ae_mismatches_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
         let pool = ReqPool::new();
-        let err = super::collect_ae_mismatches(framed, &pool)
+        let err = super::collect_ae_mismatches(framed, &pool, None)
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -1593,7 +1699,7 @@ mod tests {
     async fn collect_pulled_records_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
         let pool = ReqPool::new();
-        let err = super::collect_pulled_records(framed, &pool)
+        let err = super::collect_pulled_records(framed, &pool, None)
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -1625,7 +1731,7 @@ mod tests {
         ])
         .await;
         let pool = ReqPool::new();
-        let got = super::collect_ae_buckets(framed, &pool)
+        let got = super::collect_ae_buckets(framed, &pool, None)
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![(3, entries)]);
@@ -1649,7 +1755,7 @@ mod tests {
         ])
         .await;
         let pool = ReqPool::new();
-        let got = super::collect_ae_mismatches(framed, &pool)
+        let got = super::collect_ae_mismatches(framed, &pool, None)
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![AeMismatch::Sketch(2, Vec::new())]);
@@ -1682,7 +1788,7 @@ mod tests {
         ])
         .await;
         let pool = ReqPool::new();
-        let got = super::collect_pulled_records(framed, &pool)
+        let got = super::collect_pulled_records(framed, &pool, None)
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![rec]);
@@ -1702,7 +1808,7 @@ mod tests {
         ])
         .await;
         let pool = ReqPool::new();
-        let got = super::collect_ae_mismatches(framed, &pool)
+        let got = super::collect_ae_mismatches(framed, &pool, None)
             .await
             .expect("collects the AePartDigests reply");
         assert_eq!(got, vec![AeMismatch::PartDigests(5, digests)]);
@@ -1713,7 +1819,7 @@ mod tests {
     async fn collect_ae_part_replies_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
         let pool = ReqPool::new();
-        let err = super::collect_ae_part_replies(framed, &pool)
+        let err = super::collect_ae_part_replies(framed, &pool, None)
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -1752,7 +1858,7 @@ mod tests {
         ])
         .await;
         let pool = ReqPool::new();
-        let got = super::collect_ae_part_replies(framed, &pool)
+        let got = super::collect_ae_part_replies(framed, &pool, None)
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(

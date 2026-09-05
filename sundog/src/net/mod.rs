@@ -828,27 +828,50 @@ impl Mesh {
 
     /// Checks a pooled, already-`Hello`'d connection out of `peer`'s pool
     /// and sends `first` on it, or dials a fresh one, coalescing `Hello`
-    /// and `first` into one flush. Returns the connection with its pool.
+    /// and `first` into one flush. Returns the connection with its pool
+    /// and, when a reused connection's first reply frame was already
+    /// there to read, that pre-read reply: `Mesh::request_state` and the
+    /// `conn::collect_*` helpers consume it in place of their own first
+    /// read.
+    ///
+    /// A reused connection whose write succeeds but whose receive side is
+    /// already at `EOF` is the server's idle timeout having closed it
+    /// first: this is caught here and retried, on the next pooled
+    /// connection or a fresh dial, rather than failing the whole request.
     async fn acquire_conn(
         &self,
         peer: NodeId,
         first: Msg,
-    ) -> Result<(conn::PeerFramed, Arc<conn::ReqPool>), CodecError> {
+    ) -> Result<
+        (
+            conn::PeerFramed,
+            Arc<conn::ReqPool>,
+            Option<Result<Msg, CodecError>>,
+        ),
+        CodecError,
+    > {
         let (addr, pool) = self.peer_req_pool(peer)?;
         while let Some(mut framed) = pool.checkout() {
             // A fresh dial has a real yield point; a reused connection has
             // none. Without this yield, an anti-entropy loop that skips
             // dialing can hog a single-threaded runtime turn after turn.
             tokio::task::yield_now().await;
-            if conn::send_msg(&mut framed, &first).await.is_ok() {
-                return Ok((framed, pool));
+            if conn::send_msg(&mut framed, &first).await.is_err() {
+                // A stale or broken pooled connection: try the next one, or
+                // fall through to a fresh dial if none are left.
+                continue;
             }
-            // A stale or broken pooled connection: try the next one, or
-            // fall through to a fresh dial if none are left.
+            match conn::probe_reused(&mut framed) {
+                conn::ReusedProbe::Pending => return Ok((framed, pool, None)),
+                conn::ReusedProbe::Ready(msg) => return Ok((framed, pool, Some(Ok(msg)))),
+                // Stale: the server already closed this one; try the next
+                // pooled connection, or fall through to a fresh dial.
+                conn::ReusedProbe::Stale => {}
+            }
         }
         let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
         let framed = conn::dial_with_hello_and(addr, node, incarnation, tls, first).await?;
-        Ok((framed, pool))
+        Ok((framed, pool, None))
     }
 
     /// Requests a full snapshot of `cache` from `donor`, for state transfer
@@ -868,15 +891,18 @@ impl Mesh {
         // bounded here; `try_donor`'s own per-donor budget governs the full
         // snapshot stream instead.
         let timeout = request_timeout();
-        let (mut framed, pool) =
+        let (mut framed, pool, pre_read) =
             tokio::time::timeout(timeout, self.acquire_conn(donor, Msg::StRequest { cache }))
                 .await
                 .unwrap_or_else(|_| {
                     Err(request_timeout_error("state transfer request", timeout))
                 })?;
-        let first = tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
-            .await
-            .map_err(|_| request_timeout_error("state transfer request", timeout))?;
+        let first = match pre_read {
+            Some(result) => Some(result),
+            None => tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
+                .await
+                .map_err(|_| request_timeout_error("state transfer request", timeout))?,
+        };
         if let Some(Ok(Msg::StUnavailable { .. })) = first {
             pool.checkin(framed);
             return Ok(None);
@@ -898,7 +924,7 @@ impl Mesh {
     ) -> Result<Vec<AeMismatch>, CodecError> {
         let timeout = request_timeout();
         tokio::time::timeout(timeout, async {
-            let (framed, pool) = self
+            let (framed, pool, first) = self
                 .acquire_conn(
                     peer,
                     Msg::AeDigest {
@@ -907,7 +933,7 @@ impl Mesh {
                     },
                 )
                 .await?;
-            conn::collect_ae_mismatches(framed, &pool).await
+            conn::collect_ae_mismatches(framed, &pool, first).await
         })
         .await
         .unwrap_or_else(|_| {
@@ -933,10 +959,10 @@ impl Mesh {
     ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
         let timeout = request_timeout();
         tokio::time::timeout(timeout, async {
-            let (framed, pool) = self
+            let (framed, pool, first) = self
                 .acquire_conn(peer, Msg::AeEntries { cache, buckets })
                 .await?;
-            conn::collect_ae_buckets(framed, &pool).await
+            conn::collect_ae_buckets(framed, &pool, first).await
         })
         .await
         .unwrap_or_else(|_| {
@@ -963,10 +989,10 @@ impl Mesh {
     ) -> Result<Vec<AePartReply>, CodecError> {
         let timeout = request_timeout();
         tokio::time::timeout(timeout, async {
-            let (framed, pool) = self
+            let (framed, pool, first) = self
                 .acquire_conn(peer, Msg::AeParts { cache, parts })
                 .await?;
-            conn::collect_ae_part_replies(framed, &pool).await
+            conn::collect_ae_part_replies(framed, &pool, first).await
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy part exchange", timeout)))
@@ -985,8 +1011,9 @@ impl Mesh {
     ) -> Result<Vec<WireRecord>, CodecError> {
         let timeout = request_timeout();
         tokio::time::timeout(timeout, async {
-            let (framed, pool) = self.acquire_conn(peer, Msg::AePull { cache, keys }).await?;
-            conn::collect_pulled_records(framed, &pool).await
+            let (framed, pool, first) =
+                self.acquire_conn(peer, Msg::AePull { cache, keys }).await?;
+            conn::collect_pulled_records(framed, &pool, first).await
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull", timeout)))
@@ -1007,7 +1034,7 @@ impl Mesh {
     ) -> Result<Vec<WireRecord>, CodecError> {
         let timeout = request_timeout();
         tokio::time::timeout(timeout, async {
-            let (framed, pool) = self
+            let (framed, pool, first) = self
                 .acquire_conn(
                     peer,
                     Msg::AePullHashes {
@@ -1017,7 +1044,7 @@ impl Mesh {
                     },
                 )
                 .await?;
-            conn::collect_pulled_records(framed, &pool).await
+            conn::collect_pulled_records(framed, &pool, first).await
         })
         .await
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull-by-hash", timeout)))
@@ -1546,6 +1573,79 @@ mod tests {
             .expect("ae round succeeds");
 
         assert_eq!(result, vec![AeMismatch::PartDigests(1, part_digests)]);
+    }
+
+    /// Accepts connections off `listener` forever, one task per connection:
+    /// reads `Hello`, then serves at most one `AeDigest` with an empty
+    /// `ReqDone`-only reply and closes right after, standing in for the
+    /// server's `REQ_CONN_IDLE_TIMEOUT` without waiting out the real 60s
+    /// bound. `Mesh::update_peers` also opens its own persistent writer
+    /// connection to the same address, which sends `Hello` and then
+    /// nothing else; that connection's task simply blocks forever on its
+    /// second read and is otherwise harmless, since every connection is
+    /// served independently. `served` fires once per request actually
+    /// answered, after its connection is already closed.
+    fn spawn_serve_one_digest_per_connection(
+        listener: TcpListener,
+        served: Arc<tokio::sync::Notify>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let served = Arc::clone(&served);
+                tokio::spawn(async move {
+                    let mut framed = LengthDelimitedCodec::builder()
+                        .max_frame_length(MAX_FRAME)
+                        .new_framed(stream);
+                    let Some(Ok(_hello)) = framed.next().await else {
+                        return;
+                    };
+                    let Some(Ok(_digest)) = framed.next().await else {
+                        return;
+                    };
+                    let reply = wire::encode(&Msg::ReqDone).expect("encodes");
+                    framed.send(reply).await.expect("reply sends");
+                    drop(framed); // closes the connection, as the idle timeout would
+                    served.notify_one();
+                });
+            }
+        })
+    }
+
+    /// A connection `Mesh::acquire_conn` reuses from the pool after the
+    /// server already closed it (its idle timeout, forced here to fire
+    /// after exactly one request rather than after the real
+    /// `REQ_CONN_IDLE_TIMEOUT`) must not fail the request it carries: the
+    /// stale reply is caught as an immediate `EOF` and the request retries
+    /// on a fresh dial instead.
+    #[tokio::test]
+    async fn ae_round_retries_a_pooled_connection_the_server_already_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let served = Arc::new(tokio::sync::Notify::new());
+        let _server = spawn_serve_one_digest_per_connection(listener, Arc::clone(&served));
+
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(2), addr)]);
+
+        let first = client
+            .ae_round(NodeId::from(2), SmolStr::new("users"), Vec::new())
+            .await
+            .expect("first round succeeds and checks its connection into the pool");
+        assert!(first.is_empty());
+
+        served.notified().await;
+
+        let second = client
+            .ae_round(NodeId::from(2), SmolStr::new("users"), Vec::new())
+            .await
+            .expect(
+                "a pooled connection the server already closed must not fail the request: \
+                 acquire_conn retries it on a fresh dial",
+            );
+        assert!(second.is_empty());
     }
 
     /// A raw request connection to `addr` that has already sent `hello`, for
