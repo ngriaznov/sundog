@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- `ClusterBuilder::build` honors `SUNDOG_SEEDS` even without a `.seeds()`
+  call: with no discovery source configured and the variable set to a
+  non-empty seed list, discovery uses `Static::from_env()` instead of
+  falling through to the `Mdns` default.
+
+### Added
+
+- **`ClusterConfig::advertise_ip`**: the IP a node advertises for both
+  gossip and the data plane, skipping the automatic outbound-interface
+  probe entirely. Useful behind NAT, a container port mapping, or host
+  networking. Left unset, a probe failure now falls back to the first
+  non-loopback, non-link-local address `if-addrs` reports for the bind
+  address's family, and finally to loopback, rather than failing
+  `ClusterBuilder::build`.
+- **`ClusterBuilder::node_id`**: sets a persisted `NodeId`, so a restarted
+  process with the same id resumes as the same cluster member instead of
+  joining as a new one. `NodeId` gained `Display`/`FromStr` round-tripping
+  to support storing it across a restart.
+- **Graceful departure**: `Cluster::shutdown` gossips a departure before
+  leaving, and the absence tracker that gates tombstone retention never
+  counts a gracefully departed member absent — only a crash does.
+- **`Cluster::is_ready`/`Cluster::health`**: report whether every open
+  `Mode::Replicated` cache has finished warming. With the `prometheus`
+  feature, the metrics listener also serves `GET /readyz` (200 once ready,
+  503 otherwise) and `GET /healthz` (200 for as long as the process serves).
+
 ## [0.4.0] – 2026-09-04
 
 ### Fixed

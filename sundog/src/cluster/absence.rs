@@ -18,6 +18,11 @@ use crate::store::Mode;
 #[derive(Default)]
 struct AbsenceState {
     live: HashSet<NodeId>,
+    /// The last-seen graceful-departure flag for every currently live peer,
+    /// consulted the moment a peer drops out of `live` so a crash (flag never
+    /// set) and a graceful leave (flag set just before disappearing) are
+    /// told apart.
+    last_departing: HashMap<NodeId, bool>,
     absent_since: HashMap<NodeId, Instant>,
 }
 
@@ -33,16 +38,25 @@ pub(crate) struct AbsenceTracker {
 
 impl AbsenceTracker {
     /// Applies one membership-watch snapshot: a peer newly dropped from
-    /// `live` starts being tracked absent; a peer back in `live` clears it.
-    fn observe(&self, live: &[Peer]) {
+    /// `live` starts being tracked absent, unless `departing` shows it
+    /// signaled a graceful departure before disappearing; a peer back in
+    /// `live` clears it.
+    fn observe(&self, live: &[Peer], departing: &HashMap<NodeId, bool>) {
         let live_ids: HashSet<NodeId> = live.iter().map(|peer| peer.node).collect();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let departed: Vec<NodeId> = state.live.difference(&live_ids).copied().collect();
         for node in departed {
-            state.absent_since.entry(node).or_insert_with(Instant::now);
+            let departed_gracefully = state.last_departing.get(&node).copied().unwrap_or(false);
+            if counts_as_absent(departed_gracefully) {
+                state.absent_since.entry(node).or_insert_with(Instant::now);
+            }
+            state.last_departing.remove(&node);
         }
         for &node in &live_ids {
             state.absent_since.remove(&node);
+            state
+                .last_departing
+                .insert(node, departing.get(&node).copied().unwrap_or(false));
         }
         state.live = live_ids;
     }
@@ -66,14 +80,24 @@ pub(crate) fn should_defer_gc(mode: Mode, tracker: &AbsenceTracker, hard_cap: Du
     matches!(mode, Mode::Replicated) && tracker.any_absent(hard_cap)
 }
 
-/// Republishes [`crate::membership::Membership::peers`] changes into
+/// Whether a node that just dropped out of the live set should start being
+/// tracked absent: true unless `departed_gracefully` shows it gossiped its
+/// departure (chitchat's `departing` key) before it left. A crash carries no
+/// such signal, so it always counts.
+fn counts_as_absent(departed_gracefully: bool) -> bool {
+    !departed_gracefully
+}
+
+/// Republishes [`crate::membership::Membership::peers`] and
+/// [`crate::membership::Membership::departing_flags`] changes into
 /// `tracker`, keeping [`AbsenceTracker`] current.
 pub(crate) async fn tracking_task(
     mut peers: watch::Receiver<Vec<Peer>>,
+    mut departing: watch::Receiver<HashMap<NodeId, bool>>,
     tracker: AbsenceTracker,
     cancel: CancellationToken,
 ) {
-    tracker.observe(&peers.borrow_and_update());
+    tracker.observe(&peers.borrow_and_update(), &departing.borrow_and_update());
     loop {
         tokio::select! {
             biased;
@@ -82,7 +106,13 @@ pub(crate) async fn tracking_task(
                 if changed.is_err() {
                     return; // membership shut down
                 }
-                tracker.observe(&peers.borrow_and_update());
+                tracker.observe(&peers.borrow_and_update(), &departing.borrow());
+            }
+            changed = departing.changed() => {
+                if changed.is_err() {
+                    return; // membership shut down
+                }
+                tracker.observe(&peers.borrow(), &departing.borrow_and_update());
             }
         }
     }
@@ -107,6 +137,11 @@ mod tests {
         }
     }
 
+    /// No peer in the snapshot has gossiped a graceful departure.
+    fn no_departures() -> HashMap<NodeId, bool> {
+        HashMap::new()
+    }
+
     #[test]
     fn no_peers_ever_observed_means_never_absent() {
         let tracker = AbsenceTracker::default();
@@ -117,16 +152,16 @@ mod tests {
     fn a_peer_that_leaves_the_live_set_is_tracked_absent() {
         let tracker = AbsenceTracker::default();
         let p = peer(1);
-        tracker.observe(std::slice::from_ref(&p));
+        tracker.observe(std::slice::from_ref(&p), &no_departures());
         assert!(
             !tracker.any_absent(Duration::from_secs(3600)),
             "still live: not absent"
         );
 
-        tracker.observe(&[]);
+        tracker.observe(&[], &no_departures());
         assert!(
             tracker.any_absent(Duration::from_secs(3600)),
-            "dropped out of the live set: now tracked absent"
+            "dropped out of the live set without gossiping a departure: now tracked absent"
         );
     }
 
@@ -134,14 +169,28 @@ mod tests {
     fn a_returning_peer_clears_its_tracked_absence() {
         let tracker = AbsenceTracker::default();
         let p = peer(1);
-        tracker.observe(std::slice::from_ref(&p));
-        tracker.observe(&[]);
+        tracker.observe(std::slice::from_ref(&p), &no_departures());
+        tracker.observe(&[], &no_departures());
         assert!(tracker.any_absent(Duration::from_secs(3600)));
 
-        tracker.observe(&[p]);
+        tracker.observe(&[p], &no_departures());
         assert!(
             !tracker.any_absent(Duration::from_secs(3600)),
             "a live member is not tracked absent"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_gossiped_departing_before_leaving_is_never_tracked_absent() {
+        let tracker = AbsenceTracker::default();
+        let p = peer(1);
+        let departing = HashMap::from([(p.node, true)]);
+        tracker.observe(std::slice::from_ref(&p), &departing);
+
+        tracker.observe(&[], &no_departures());
+        assert!(
+            !tracker.any_absent(Duration::from_secs(3600)),
+            "a graceful departure never counts as absence"
         );
     }
 
@@ -149,8 +198,8 @@ mod tests {
     async fn absence_ages_out_past_the_hard_cap() {
         let tracker = AbsenceTracker::default();
         let p = peer(1);
-        tracker.observe(&[p]);
-        tracker.observe(&[]);
+        tracker.observe(&[p], &no_departures());
+        tracker.observe(&[], &no_departures());
 
         let tiny_cap = Duration::from_millis(1);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -161,10 +210,16 @@ mod tests {
     }
 
     #[test]
+    fn counts_as_absent_is_false_only_for_a_graceful_departure() {
+        assert!(counts_as_absent(false), "a crash carries no departing flag");
+        assert!(!counts_as_absent(true), "a graceful departure never counts");
+    }
+
+    #[test]
     fn should_defer_gc_ignores_absence_outside_replicated_mode() {
         let tracker = AbsenceTracker::default();
-        tracker.observe(&[peer(1)]);
-        tracker.observe(&[]);
+        tracker.observe(&[peer(1)], &no_departures());
+        tracker.observe(&[], &no_departures());
         let hard_cap = Duration::from_secs(3600);
 
         assert!(should_defer_gc(Mode::Replicated, &tracker, hard_cap));

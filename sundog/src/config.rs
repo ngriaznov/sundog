@@ -1,7 +1,7 @@
 //! Cluster-wide tunables: the values and their defaults, consumed by the
 //! `Cluster` builder.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 #[cfg(feature = "tls")]
@@ -131,6 +131,18 @@ pub struct ClusterConfig {
     /// sketch cannot fit in one [`max_frame`](Self::max_frame) frame fails
     /// [`ClusterBuilder::build`](crate::ClusterBuilder::build).
     pub ae_sketch_cells: usize,
+    /// The IP this node advertises for both gossip and the data plane,
+    /// overriding the automatic outbound-interface probe. `None` (the
+    /// default) resolves it automatically: a UDP-connect probe toward a
+    /// public address, falling back to the first non-loopback,
+    /// non-link-local local interface address, and finally to loopback.
+    ///
+    /// Set this behind NAT or a container port mapping, where the interface
+    /// address a probe or `if-addrs` finds is not the address peers must
+    /// dial: a cloud instance's public IP while the process binds its
+    /// private one, a container's externally published port, or a fixed
+    /// address under host networking. When set, no probe runs at all.
+    pub advertise_ip: Option<IpAddr>,
     /// Mutual-TLS material for the data-plane mesh; `None` (the default)
     /// means the mesh runs plaintext. See [`TlsConfig`].
     #[cfg(feature = "tls")]
@@ -176,6 +188,7 @@ impl Default for ClusterConfig {
             ae_part_min_bucket: 4_096,
             ae_sketch_min_bucket: 384,
             ae_sketch_cells: 240,
+            advertise_ip: None,
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -234,6 +247,11 @@ mod tests {
         let config = ClusterConfig::default();
         assert_eq!(config.gossip_bind_addr.port(), 0);
         assert_eq!(config.data_bind_addr.port(), 0);
+    }
+
+    #[test]
+    fn default_advertise_ip_is_none() {
+        assert_eq!(ClusterConfig::default().advertise_ip, None);
     }
 
     #[test]
