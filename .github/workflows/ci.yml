@@ -38,6 +38,12 @@ jobs:
       - name: cargo clippy (tls,prometheus features)
         run: cargo clippy --package sundog --all-targets --features tls,prometheus -- -D warnings -W clippy::pedantic
 
+      # The optional local SSD/NVMe spill tier. Off by default, its own
+      # lane like `sim`: positional file I/O has nothing to do with the
+      # turmoil transport seam, so the two features are never combined.
+      - name: cargo clippy (spill feature)
+        run: cargo clippy --package sundog --all-targets --features spill -- -D warnings -W clippy::pedantic
+
       # The fuzz crate sits outside the workspace; a wire change that misses
       # its seed generator or a target would otherwise surface only nightly.
       - name: cargo check (fuzz crate)
@@ -60,6 +66,14 @@ jobs:
       # lane above instead.
       - name: cargo test (tls,prometheus features)
         run: cargo test --package sundog --features tls,prometheus
+
+      # Exercises tests/prometheus_exporter.rs's spill metrics pin alongside
+      # the tier's own unit and engine/shard suites. Not combined with
+      # `sim`, for the same reason as the lane above: spill's flusher thread
+      # does real filesystem I/O that a turmoil `Sim` gives no determinism
+      # over.
+      - name: cargo test (spill,prometheus features)
+        run: cargo test --package sundog --features spill,prometheus
 
   # Portability lane: the crate claims no OS-specific behavior, but mDNS,
   # socket handling, and timers all differ per platform — this proves the
@@ -87,6 +101,13 @@ jobs:
 
       - name: cargo test (turmoil simulation suite)
         run: cargo test --package sundog --features sim --test 'sim*'
+
+      # The spill tier's positional I/O is platform-gated (unix pread/pwrite
+      # vs. windows seek_read/seek_write); this is what actually runs those
+      # primitives on macOS and Windows, not only Linux's lane above. Never
+      # combined with `sim`.
+      - name: cargo test (spill feature)
+        run: cargo test --package sundog --features spill
 
   # Container-backed multi-node suite, exclusively through the `rightsize`
   # crate — no docker CLI, no bollard. Separate job because it needs the

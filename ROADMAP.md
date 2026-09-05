@@ -138,17 +138,37 @@ application layer; QUIC would only matter for what's left after that.
 
 ## Tiered storage
 
-A local NVMe tier behind the in-memory tables, cold entries spilling to disk
-and reading back in microseconds, is how a node holds more than its RAM. It is
-also an index, a compaction schedule, an I/O path, and a second set of failure
-modes, and it does nothing about the reason a replicated cluster runs out of
-memory: every node holds every entry. Distribution mode removes that reason;
-tiered storage only postpones it per node.
+A local SSD/NVMe tier behind the in-memory tables exists: the `spill`
+feature, off by default. `CacheBuilder::spill(SpillConfig::new(dir,
+capacity_bytes))` lets eviction demote cold entries onto a FIFO ring of
+region files instead of discarding them, and a later read promotes a
+spilled entry back into RAM. It composes with `Mode::Replicated`'s capacity
+bound — eviction demotes rather than deletes, so anti-entropy no longer
+needs to silently re-pull an evicted entry back — but it does nothing about
+the reason a replicated cluster runs out of memory in the first place: every
+node still holds every entry. Distribution mode removes that reason; the
+spill tier only extends how much of it one node's disk, rather than its
+RAM, can hold.
 
-**Cost:** a storage engine of its own, comparable to distribution mode.
+A spilled entry still keeps its full key resident: only the value moves to
+disk, so the fixed per-key bookkeeping (key, version, expiry, disk pointer)
+stays in RAM regardless of how cold the entry is. That is deliberate for
+now — it is what lets a spilled entry stay a normal member of the live
+table with no second index to keep in sync — but it means RAM per spilled
+entry does not shrink below one key's worth, however small the value it
+replaced.
 
-**Trigger:** a deployment already running distribution mode whose per-node
-working set still exceeds RAM. Not before.
+**Cost:** a real on-disk index keyed by a hash of the key instead of the key
+itself, plus the collision handling that implies: a hash match must confirm
+against the record's stored key before trusting it, so an occasional
+false-positive disk read replaces a guaranteed-correct in-memory comparison.
+
+**Trigger:** a `spill`-configured deployment whose per-node RAM is bound by
+the number of spilled keys rather than by the resident values spilling was
+built to move off-heap in the first place — many small values behind large
+keys, or a cold working set large enough that a fixed ~100 bytes a key adds
+up. Not before: today's resident-key design is simpler and correct by
+construction, and nothing observed yet needs trading that away.
 
 ## Distributed locks and leader leases
 

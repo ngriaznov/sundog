@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `spill` feature: a local SSD/NVMe spill tier. `CacheBuilder::spill(SpillConfig::new(dir,
+  capacity_bytes))` lets eviction demote cold entries onto a FIFO ring of
+  region files on disk instead of discarding them, extending a cache's
+  effective size past its RAM budget; a later read promotes a spilled entry
+  back into RAM. `SpillConfig::region_bytes` and `SpillConfig::read_concurrency`
+  tune the region file size (64 MiB default) and how many spilled-value reads
+  run at once (16 default). Off by default; no effect on a non-`spill` build.
+  With `spill` configured, `Mode::Replicated` accepts a finite `max_capacity`
+  — eviction demotes rather than deletes, so anti-entropy no longer needs to
+  silently re-pull evicted entries back; `tti` stays rejected for `Replicated`
+  regardless, since it is local-only by design.
+
 ## [0.4.1] – 2026-09-05
 
 ### Added

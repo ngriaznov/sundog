@@ -105,6 +105,25 @@ pub enum CacheError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+    /// The cache's [`crate::store::spill::SpillConfig`] failed validation at
+    /// `open()`: `region_bytes` was zero, or `capacity_bytes` was less than
+    /// two regions.
+    #[cfg(feature = "spill")]
+    #[error("cache {cache:?} has an invalid spill config: {reason}")]
+    InvalidSpillConfig {
+        cache: SmolStr,
+        /// Why the config was rejected.
+        reason: &'static str,
+    },
+    /// The cache's spill directory could not be created, or a region file
+    /// under it could not be created.
+    #[cfg(feature = "spill")]
+    #[error("cache {cache:?} could not open its spill directory")]
+    SpillUnavailable {
+        cache: SmolStr,
+        #[source]
+        source: io::Error,
+    },
 }
 
 #[cfg(test)]
