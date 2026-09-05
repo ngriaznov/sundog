@@ -22,9 +22,7 @@ pub use metrics_exporter_prometheus::{BuildError, PrometheusHandle};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// What `install_listener`'s `GET /readyz` route reports, supplied by
-/// [`crate::cluster::ClusterBuilder::build`]. `pub(crate)`: only `cluster.rs`
-/// implements it.
+/// What `install_listener`'s `GET /readyz` route reports.
 pub(crate) trait ReadinessSource: Send + Sync + 'static {
     /// Mirrors [`crate::cluster::Cluster::is_ready`].
     fn is_ready(&self) -> bool;
@@ -32,7 +30,7 @@ pub(crate) trait ReadinessSource: Send + Sync + 'static {
 
 /// Installs a Prometheus recorder and serves `GET /metrics`, `GET /readyz`
 /// (200 once `readiness` reports ready, 503 otherwise), and `GET /healthz`
-/// (200 for as long as this listener runs) on `addr`.
+/// on `addr`.
 ///
 /// # Errors
 ///
@@ -51,9 +49,21 @@ pub(crate) fn install_listener(
         .map_err(|error| BuildError::FailedToCreateHTTPListener(error.to_string()))?;
     let listener = TcpListener::from_std(std_listener)
         .map_err(|error| BuildError::FailedToCreateHTTPListener(error.to_string()))?;
+    tokio::spawn(upkeep(handle.clone()));
     tokio::spawn(serve(listener, handle, readiness));
     Ok(())
 }
+
+/// Drains histogram buckets on the exporter's default cadence, the task its
+/// built-in listener would otherwise run.
+async fn upkeep(handle: PrometheusHandle) {
+    loop {
+        tokio::time::sleep(UPKEEP_INTERVAL).await;
+        handle.run_upkeep();
+    }
+}
+
+const UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Accepts connections on `listener` forever, answering each on its own task.
 async fn serve(
@@ -63,6 +73,7 @@ async fn serve(
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
         };
         let handle = handle.clone();
@@ -75,9 +86,8 @@ async fn serve(
     }
 }
 
-/// Reads one request line off `stream` and answers `/metrics`, `/readyz`, or
-/// `/healthz`; anything else gets a 404. Never keeps the connection open past
-/// one response.
+/// Answers one request on `stream`: `/metrics`, `/readyz`, `/healthz` (and
+/// its `/health` alias from the exporter's own listener), 404 otherwise.
 async fn respond(
     mut stream: TcpStream,
     handle: &PrometheusHandle,
@@ -96,7 +106,7 @@ async fn respond(
         "/metrics" => ("200 OK", handle.render()),
         "/readyz" if readiness.is_ready() => ("200 OK", "ready\n".to_string()),
         "/readyz" => ("503 Service Unavailable", "not ready\n".to_string()),
-        "/healthz" => ("200 OK", "ok\n".to_string()),
+        "/healthz" | "/health" => ("200 OK", "ok\n".to_string()),
         _ => ("404 Not Found", String::new()),
     };
 

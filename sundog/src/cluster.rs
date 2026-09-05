@@ -76,8 +76,7 @@ struct ClusterInner {
     mesh: Mesh,
     shards: ShardRegistry,
     /// The [`Mode`] each open cache was opened under; [`mode_conflict_task`]'s
-    /// local half. `Arc`-wrapped so the `prometheus` feature's `/readyz`
-    /// listener, built before this struct exists, can share it.
+    /// local half, shared with the `prometheus` feature's `/readyz` route.
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
@@ -173,9 +172,23 @@ pub struct Health {
     pub caches: Vec<CacheHealth>,
 }
 
-/// The pure decision behind [`Cluster::is_ready`]: ready once every
-/// [`Mode::Replicated`] cache in `caches` is warm. A `Local`/`Invalidation`
-/// cache never gates readiness; it is warm synchronously on open.
+/// Every open cache's mode and warmth, from the maps [`Cluster`] and the
+/// `prometheus` listener share.
+fn cache_health(local_modes: &RwLock<HashMap<SmolStr, Mode>>, warmth: &Warmth) -> Vec<CacheHealth> {
+    local_modes
+        .read()
+        .expect("invariant: local cache-mode map lock is never poisoned")
+        .iter()
+        .map(|(name, &mode)| CacheHealth {
+            name: name.clone(),
+            mode,
+            warm: warmth.is_warm(name),
+        })
+        .collect()
+}
+
+/// Ready once every [`Mode::Replicated`] cache in `caches` is warm; a
+/// `Local` or `Invalidation` cache is warm from the moment it opens.
 fn is_ready_from(caches: &[CacheHealth]) -> bool {
     caches
         .iter()
@@ -265,19 +278,7 @@ impl Cluster {
     /// Panics if the local cache-mode map lock is poisoned.
     #[must_use]
     pub fn health(&self) -> Health {
-        let modes = self
-            .inner
-            .local_modes
-            .read()
-            .expect("invariant: local cache-mode map lock is never poisoned");
-        let caches: Vec<CacheHealth> = modes
-            .iter()
-            .map(|(name, &mode)| CacheHealth {
-                name: name.clone(),
-                mode,
-                warm: self.inner.warmth.is_warm(name),
-            })
-            .collect();
+        let caches = cache_health(&self.inner.local_modes, &self.inner.warmth);
         Health {
             ready: is_ready_from(&caches),
             live_peers: self.peers().len(),
@@ -394,19 +395,18 @@ impl ClusterBuilder {
     }
 
     /// Uses `id` as this node's identity instead of a fresh
-    /// [`NodeId::random`]. Persist `id` yourself (it round-trips through
-    /// `Display`/`FromStr`, e.g. via a file written on first boot) and pass
-    /// the same value back here on restart: a restarted node with the same
-    /// id resumes as the same cluster member rather than joining as a new
-    /// one, so `absence` doesn't hold its old tombstones absent-length for
-    /// `tombstone_max_ttl` after every rolling restart.
+    /// [`NodeId::random`]. Persist it (it round-trips through `Display` and
+    /// `FromStr`) and pass the same value on restart: the node rejoins as
+    /// the same member, so its earlier incarnation is not tracked absent
+    /// for `tombstone_max_ttl` after every restart.
     pub fn node_id(mut self, id: NodeId) -> Self {
         self.node_id = Some(id);
         self
     }
 
-    /// Installs a Prometheus recorder and serves `GET /metrics` on `addr` for
-    /// the life of the process, once [`build`](Self::build) succeeds.
+    /// Installs a Prometheus recorder and serves `GET /metrics`, `GET /readyz`,
+    /// and `GET /healthz` on `addr` for the life of the process, once
+    /// [`build`](Self::build) succeeds.
     ///
     /// `metrics`'s recorder is a single process-global slot: a second call to
     /// this, or mixing it with [`crate::telemetry::prometheus_handle`], fails
@@ -445,8 +445,6 @@ impl ClusterBuilder {
 
         validate_config(&config)?;
 
-        // Created before the readiness-serving prometheus listener below, so
-        // its `/readyz` route can share them with the `Cluster` built later.
         let local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let warmth = Arc::new(Warmth::default());
@@ -523,9 +521,7 @@ impl ClusterBuilder {
     }
 }
 
-/// Feeds `local_modes`/`warmth`, shared with the eventual [`Cluster`], to
-/// [`crate::telemetry::install_listener`]'s `/readyz` route: built and
-/// installed before the `Cluster` it will describe exists.
+/// The `/readyz` view over the maps the eventual [`Cluster`] shares.
 #[cfg(feature = "prometheus")]
 struct ClusterReadiness {
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
@@ -535,19 +531,7 @@ struct ClusterReadiness {
 #[cfg(feature = "prometheus")]
 impl crate::telemetry::ReadinessSource for ClusterReadiness {
     fn is_ready(&self) -> bool {
-        let modes = self
-            .local_modes
-            .read()
-            .expect("invariant: local cache-mode map lock is never poisoned");
-        let caches: Vec<CacheHealth> = modes
-            .iter()
-            .map(|(name, &mode)| CacheHealth {
-                name: name.clone(),
-                mode,
-                warm: self.warmth.is_warm(name),
-            })
-            .collect();
-        is_ready_from(&caches)
+        is_ready_from(&cache_health(&self.local_modes, &self.warmth))
     }
 }
 
@@ -592,10 +576,7 @@ fn resolve_discovery(
     node_name: &NodeName,
 ) -> DiscoveryKind {
     let discovery_set = discovery.is_some();
-    // "SUNDOG_SEEDS": the same variable name `discovery::statics::Static`
-    // reads; duplicated here rather than imported, since that constant is
-    // private to that module.
-    let seeds_env = std::env::var("SUNDOG_SEEDS").ok();
+    let seeds_env = std::env::var(crate::discovery::statics::SUNDOG_SEEDS_ENV).ok();
     discovery.unwrap_or_else(|| {
         if use_static_from_env(discovery_set, seeds_env.as_deref()) {
             DiscoveryKind::Static(Static::from_env())
@@ -605,9 +586,7 @@ fn resolve_discovery(
     })
 }
 
-/// Builds the readiness view over `local_modes`/`warmth` and installs the
-/// `prometheus` feature's `/metrics`, `/readyz`, `/healthz` listener on
-/// `addr`, before the `Cluster` those maps belong to exists.
+/// Installs the `/metrics`, `/readyz`, `/healthz` listener on `addr`.
 #[cfg(feature = "prometheus")]
 fn install_readiness_listener(
     addr: SocketAddr,

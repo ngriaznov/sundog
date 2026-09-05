@@ -11,7 +11,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 
 use super::Discovery;
 
-const SUNDOG_SEEDS_ENV: &str = "SUNDOG_SEEDS";
+pub(crate) const SUNDOG_SEEDS_ENV: &str = "SUNDOG_SEEDS";
 const DEFAULT_REDISCOVER_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A fixed seed list: explicit addresses merged with `SUNDOG_SEEDS`.
