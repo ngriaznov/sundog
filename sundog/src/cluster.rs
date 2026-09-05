@@ -2793,6 +2793,19 @@ mod tests {
         .expect("b opens");
         assert_eq!(cache_b.entry_count().await, u64::from(N));
 
+        // A's fan-out of the bulk insert can still be draining toward B; a
+        // late `Replicate` would restore the dropped key without any
+        // anti-entropy round. Wait for replicate traffic to settle in both
+        // directions first.
+        let (node_a, node_b) = (cluster_a.inner.node, cluster_b.inner.node);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while cluster_a.peer_is_streaming(node_b) || cluster_b.peer_is_streaming(node_a) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replicate traffic settles within the bound");
+
         let listing = Arc::new(AtomicUsize::new(0));
         let _guard = tracing::subscriber::set_default(AePartsOutcomeSubscriber {
             listing: Arc::clone(&listing),
