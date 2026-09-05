@@ -16,9 +16,9 @@ Both changes below are breaking; the next release is 0.5.0.
   back into RAM. `SpillConfig::region_bytes` and `SpillConfig::read_concurrency`
   tune the region file size (64 MiB default) and how many spilled-value reads
   run at once (16 default). Off by default; no effect on a non-`spill` build.
-  With `spill` configured, `Mode::Replicated` accepts a finite `max_capacity`
-  — eviction demotes rather than deletes, so anti-entropy no longer needs to
-  silently re-pull evicted entries back; `tti` stays rejected for `Replicated`
+  With `spill` configured, `Mode::Replicated` accepts a finite `max_capacity`.
+  Eviction demotes rather than deletes, so anti-entropy does not need to
+  silently re-pull evicted entries back. `tti` stays rejected for `Replicated`
   regardless, since it is local-only by design.
 
 ### Changed

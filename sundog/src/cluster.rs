@@ -393,13 +393,14 @@ impl Cluster {
     }
 
     /// Leaves the cluster gracefully: background loops are cancelled and
-    /// joined, every still-registered cache has its spill tier closed (see
-    /// [`ShardOps::close_spill`] — a cache already closed via
-    /// `crate::cache::Cache::close` is a no-op here, and one never
-    /// explicitly closed gets its tier closed now instead of leaking its
-    /// flusher thread until the process exits), then chitchat departs and
-    /// the data plane closes its connections. No further calls on any clone
-    /// of this handle.
+    /// joined, every still-registered cache has its spill tier closed, then
+    /// chitchat departs and the data plane closes its connections. No
+    /// further calls on any clone of this handle.
+    ///
+    /// See [`ShardOps::close_spill`]. Closing the spill tier of a cache
+    /// already closed via `crate::cache::Cache::close` is a no-op. Closing
+    /// the tier of a cache never explicitly closed keeps its flusher
+    /// thread from leaking past process exit.
     ///
     /// Cache handles opened before this call keep working for local
     /// reads/writes.

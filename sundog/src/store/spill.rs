@@ -4,33 +4,34 @@
 //! # Shape
 //!
 //! A `SpillTier` owns `region_count_for(capacity_bytes, region_bytes)`
-//! preallocated region files (`<dir>/<cache>/spill-XXXXXXXX.reg`, `open`
-//! recreates them from scratch every time — see `SpillTier::open`). One
-//! region is "active": new records append to it at its `write_cursor`. When a
-//! record no longer fits, the next region in round-robin order is reclaimed
-//! (its still-current keys are purged from the engine's `live` tables via
-//! `SpillSink::reclaim`, *before* it is reused) and becomes the new active
-//! region. A `generation` counter per region, bumped on every reclaim, lets a
-//! read recognize a pointer into a region that has since rotated out from
-//! under it — see `SpillTier::read_at`.
+//! preallocated region files, `<dir>/<cache>/spill-XXXXXXXX.reg`. `open`
+//! recreates them from scratch every time; see `SpillTier::open`. One
+//! region is "active": new records append to it at its `write_cursor`. When
+//! a record doesn't fit, the next region in round-robin order is reclaimed
+//! and becomes the new active region. Its still-current keys are purged
+//! from the engine's `live` tables via `SpillSink::reclaim`, *before* it is
+//! reused. A `generation` counter per region, bumped on every reclaim, lets
+//! a read recognize a pointer into a region that has since rotated out
+//! from under it. See `SpillTier::read_at`.
 //!
-//! Writes go through one dedicated flusher thread (`std::thread`, not a tokio
-//! task: `SpillTier::try_spill` must work from sync and async callers
-//! alike, with no blocking I/O on the caller's stripe-locked hot path) fed by
-//! a bounded [`std::sync::mpsc::sync_channel`]. The flusher never re-inserts
-//! a key into the engine's tables — it calls back through `SpillSink` to
-//! flip an *existing* entry's payload in place, and only when the entry's
-//! current state still matches what was spilled (`spilled_is_current`).
-//! Reads are positional (`pread`/`pwrite`-style, one syscall each, no `open()`
-//! on the hot path), with a `read_exact_at`/`write_all_at` unix
-//! implementation and a `seek_read`/`seek_write` windows one below.
+//! Writes go through one dedicated flusher thread, `std::thread` rather
+//! than a tokio task, since `SpillTier::try_spill` must work from sync and
+//! async callers alike, with no blocking I/O on the caller's stripe-locked
+//! hot path. It is fed by a bounded [`std::sync::mpsc::sync_channel`]. The
+//! flusher never re-inserts a key into the engine's tables. It calls back
+//! through `SpillSink` to flip an *existing* entry's payload in place, and
+//! only when the entry's current state still matches what was spilled,
+//! verified via `spilled_is_current`. Reads are positional, `pread`/
+//! `pwrite`-style, one syscall each, with no `open()` on the hot path,
+//! using a `read_exact_at`/`write_all_at` unix implementation and a
+//! `seek_read`/`seek_write` windows one below.
 //!
 //! # No wire effect
 //!
 //! Spilling is a purely local, per-node representation choice for a value
-//! already accepted and versioned. It never changes what goes on the wire —
-//! a promoted or served-from-disk value round-trips identically to a
-//! resident one — so it needs no `wire::PROTOCOL_VERSION` bump and no
+//! already accepted and versioned. It never changes what goes on the wire.
+//! A promoted or served-from-disk value round-trips identically to a
+//! resident one, so it needs no `wire::PROTOCOL_VERSION` bump and no
 //! `store::model`/`sundog-fuzz` changes: those cover "everything downstream
 //! of a successful wire decode," and spilling has no wire decode of its own.
 //!
@@ -40,10 +41,10 @@
 //! gives no determinism or virtual-time guarantee over this module's real
 //! filesystem I/O or the flusher's real OS thread. A `SpillConfig`'d cache
 //! driven inside a turmoil `Sim` does real wall-clock disk I/O interleaved
-//! with virtual-time network traffic — an orthogonal, non-composable
+//! with virtual-time network traffic, an orthogonal, non-composable
 //! combination. `spill` and `sim` are never enabled together in this crate's
-//! CI, and this module's own I/O tests are gated accordingly (see the `tests`
-//! module below).
+//! CI, and this module's own I/O tests are gated accordingly; see the
+//! `tests` module below.
 //!
 //! # A note on this module's `pub(crate)` surface
 //!
@@ -75,11 +76,11 @@ use crate::node::NodeId;
 const DEFAULT_REGION_BYTES: u64 = 64 * 1024 * 1024;
 /// Concurrent-disk-read bound a [`SpillConfig`] uses when
 /// [`SpillConfig::read_concurrency`] is never called. Consulted by the
-/// engine's read path (`spawn_blocking` behind a semaphore of this size), not
-/// by anything in this module.
+/// engine's read path, `spawn_blocking` behind a semaphore of this size,
+/// not by anything in this module.
 const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// Bound on the flusher's job queue: a scheduling buffer, not a capacity
-/// knob. Config-independent by design — every [`SpillConfig`] gets the same
+/// knob. Config-independent by design: every [`SpillConfig`] gets the same
 /// bound regardless of `capacity_bytes`.
 const FLUSH_QUEUE_CAPACITY: usize = 256;
 /// Corruption/format-skew guard at the front of every [`SpillRecordHeader`].
@@ -91,28 +92,28 @@ const HEADER_LEN: usize = size_of::<SpillRecordHeader>();
 
 /// Disk budget and layout knobs for a cache's optional spill tier.
 ///
-/// `dir`/`capacity_bytes` have no default — a disk budget is never safe to
-/// assume — but `region_bytes` and `read_concurrency` do. Construct with
-/// [`SpillConfig::new`] and adjust either default with the matching builder
-/// method; [`SpillConfig::region_bytes_value`] and
+/// `dir`/`capacity_bytes` have no default, since a disk budget is never
+/// safe to assume, but `region_bytes` and `read_concurrency` do. Construct
+/// with [`SpillConfig::new`] and adjust either default with the matching
+/// builder method; [`SpillConfig::region_bytes_value`] and
 /// [`SpillConfig::read_concurrency_value`] read back whatever is in effect.
 #[derive(Debug, Clone)]
 pub struct SpillConfig {
     /// Directory the tier's region files live under. `SpillTier::open`
-    /// creates and owns a per-cache subdirectory inside it — two caches
+    /// creates and owns a per-cache subdirectory inside it. Two caches
     /// never share a directory even when given the same `dir`.
     pub dir: PathBuf,
     /// Disk budget for this cache's spill tier, in bytes. Must be at least
-    /// twice `region_bytes_value()` — see `SpillConfig::validate` (a
-    /// crate-internal check; called for you by `CacheBuilder::open`).
+    /// twice `region_bytes_value()`. See `SpillConfig::validate`, a
+    /// crate-internal check called by `CacheBuilder::open`.
     pub capacity_bytes: u64,
     region_bytes: u64,
     read_concurrency: usize,
 }
 
 impl SpillConfig {
-    /// Starts a config with the default `region_bytes` (64 MiB) and
-    /// `read_concurrency` (16).
+    /// Starts a config with the default `region_bytes`, 64 MiB, and
+    /// `read_concurrency`, 16.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>, capacity_bytes: u64) -> Self {
         Self {
@@ -123,14 +124,14 @@ impl SpillConfig {
         }
     }
 
-    /// Overrides the per-region file size (default 64 MiB). Own-and-return.
+    /// Overrides the per-region file size, default 64 MiB. Own-and-return.
     #[must_use]
     pub fn region_bytes(mut self, bytes: u64) -> Self {
         self.region_bytes = bytes;
         self
     }
 
-    /// Overrides the bound on concurrent disk reads (default 16).
+    /// Overrides the bound on concurrent disk reads, default 16.
     /// Own-and-return.
     #[must_use]
     pub fn read_concurrency(mut self, n: usize) -> Self {
@@ -154,7 +155,7 @@ impl SpillConfig {
     ///
     /// Rejects a zero `region_bytes`, a `region_bytes` too large to address
     /// with the tier's 32-bit on-disk offsets, and a `capacity_bytes` less
-    /// than twice `region_bytes` — the last is the fix for a hazard where a
+    /// than twice `region_bytes`. The last rule prevents a hazard where a
     /// single region would be both the active writer and the only candidate
     /// for FIFO reclaim, so `next_region_index` would immediately reclaim the
     /// region it is currently writing to. With this held, `region_count_for`
@@ -241,15 +242,15 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
 
 /// Fixed header preceding one record's key and value bytes on disk:
 /// `[SpillRecordHeader][key_bytes][value_bytes]`. All eight-byte fields lead
-/// so the `#[repr(C)]` layout has no implicit padding — required for
-/// `zerocopy`'s `IntoBytes`/`FromBytes` derives, which reject types with
-/// unaccounted-for padding bytes.
+/// so the `#[repr(C)]` layout has no implicit padding. That is required
+/// for `zerocopy`'s `IntoBytes`/`FromBytes` derives, which reject types
+/// with unaccounted-for padding bytes.
 #[derive(IntoBytes, FromBytes, Immutable, KnownLayout, Clone, Copy, Debug)]
 #[repr(C)]
 struct SpillRecordHeader {
     /// `xxh3_64` over `[key_bytes || value_bytes]`, re-verified on every
     /// read. The tier's only defense against a torn write from an unclean
-    /// shutdown (no fsync is ever issued).
+    /// shutdown; no fsync is ever issued.
     checksum: u64,
     /// `u64::MAX` sentinel for `None`.
     expires_at_ms: u64,
@@ -263,9 +264,9 @@ struct SpillRecordHeader {
 
 /// Region count for a capacity/region-size pair. Pure; unit-tested directly.
 /// [`SpillConfig::validate`] additionally requires the result be at least
-/// 2 — a lone region would be both the active writer and the only candidate
-/// for FIFO reclaim. This function itself stays a simple division; the floor
-/// is enforced by the caller ([`SpillTier::open`]).
+/// 2, since a lone region would be both the active writer and the only
+/// candidate for FIFO reclaim. This function itself stays a simple
+/// division; the floor is enforced by the caller, [`SpillTier::open`].
 pub(crate) fn region_count_for(capacity_bytes: u64, region_bytes: u64) -> u32 {
     u32::try_from((capacity_bytes / region_bytes.max(1)).max(1)).unwrap_or(u32::MAX)
 }
@@ -279,27 +280,28 @@ pub(crate) fn record_fits(write_cursor: u32, region_bytes: u32, record_len: u32)
         .is_some_and(|end| end <= region_bytes)
 }
 
-/// Whether a record of `record_len` bytes (header + key + value) could ever
-/// fit in *any* region of `region_bytes` bytes. `try_spill` rejects a record
-/// that fails this before it is ever queued — no rotation would help it.
+/// Whether a record of `record_len` bytes, header plus key plus value,
+/// could ever fit in *any* region of `region_bytes` bytes. `try_spill`
+/// rejects a record that fails this before it is ever queued. No rotation
+/// would help it.
 pub(crate) fn record_too_large(record_len: u64, region_bytes: u64) -> bool {
     record_len > region_bytes
 }
 
-/// The next region in round-robin (FIFO) order after `current`. Pure, total.
-/// Never returns `current` when `region_count >= 2` (enforced by
-/// [`SpillConfig::validate`]) — this is what keeps the active-write region
-/// and the next-to-reclaim region always distinct.
+/// The next region in FIFO round-robin order after `current`. Pure, total.
+/// Never returns `current` when `region_count >= 2`, enforced by
+/// [`SpillConfig::validate`]. That keeps the active-write region and the
+/// next-to-reclaim region always distinct.
 pub(crate) fn next_region_index(current: u32, region_count: u32) -> u32 {
     (current + 1) % region_count.max(1)
 }
 
 /// Whether a record spilled at `spilled_ver` still describes the key's
-/// current state: no tombstone, and a live entry at exactly that version.
-/// Used by the flusher's install and by promotion; both are no-ops when this
-/// is `false` — a key missing from `live` (`stored_live_ver == None`) is
-/// never re-added, and a tombstone or a differing live version always wins
-/// over the stale flush.
+/// current state: no tombstone, and a live entry at that version. Used by
+/// the flusher's install and by promotion; both are no-ops when this is
+/// `false`. A key missing from `live`, `stored_live_ver == None`, is never
+/// re-added, and a tombstone or a differing live version always wins over
+/// the stale flush.
 pub(crate) fn spilled_is_current(
     stored_tombstone_ver: Option<Hlc>,
     stored_live_ver: Option<Hlc>,
@@ -308,17 +310,17 @@ pub(crate) fn spilled_is_current(
     stored_tombstone_ver.is_none() && stored_live_ver == Some(spilled_ver)
 }
 
-/// Per-region mutable state: the pre-opened file handle (one syscall per
-/// read/write, no `open()` on the hot path), the write cursor, the
+/// Per-region mutable state: the pre-opened file handle, one syscall per
+/// read/write with no `open()` on the hot path, the write cursor, the
 /// generation, and the reverse index of keys currently pointing into this
-/// region (populated on every install that returns `true`, drained whenever
-/// this region is reclaimed).
+/// region. That index is populated on every install that returns `true`,
+/// and drained whenever this region is reclaimed.
 struct RegionState {
     file: File,
     write_cursor: AtomicU32,
     generation: AtomicU32,
     /// Bytes this region currently contributes to `Inner::bytes_used`.
-    /// Reset to 0 (and subtracted from the tier total) on reclaim.
+    /// Reset to 0, and subtracted from the tier total, on reclaim.
     used_bytes: AtomicU64,
     reverse_index: Mutex<Vec<(usize, Bytes)>>,
 }
@@ -338,13 +340,13 @@ struct Inner {
 
 impl Inner {
     /// Increments `sundog_spill_dropped_total{cache,reason}`. `reason` is
-    /// one of: `"too_large"` (the record can never fit any region, checked
-    /// by [`record_too_large`] before it is ever queued), `"closed"` (a
-    /// [`SpillTier::try_spill`] call after [`SpillTier::close`]),
-    /// `"queue_full"` (the flusher's bounded channel has no room, or was
-    /// never attached), or `"obsolete"` (the flusher wrote the record, but
+    /// one of: `"too_large"`, the record can never fit any region, checked
+    /// by [`record_too_large`] before it is ever queued; `"closed"`, a
+    /// [`SpillTier::try_spill`] call after [`SpillTier::close`];
+    /// `"queue_full"`, the flusher's bounded channel has no room, or was
+    /// never attached; or `"obsolete"`, the flusher wrote the record, but
     /// [`SpillSink::install`] rejected it because the key's state had
-    /// already moved on).
+    /// already moved on.
     fn record_dropped(&self, reason: &'static str) {
         metrics::counter!(
             "sundog_spill_dropped_total",
@@ -373,9 +375,10 @@ impl Inner {
     }
 }
 
-// A gauge only needs f64's exact-integer range (up to 2^53), which comfortably
-// covers realistic spill capacities (petabytes) with no meaningful precision
-// loss — unlike an entry count, a byte count routinely exceeds `u32::MAX`.
+// A gauge only needs f64's exact-integer range, up to 2^53, which
+// comfortably covers realistic spill capacities, petabytes, with no
+// meaningful precision loss. Unlike an entry count, a byte count routinely
+// exceeds `u32::MAX`.
 #[allow(clippy::cast_precision_loss)]
 fn bytes_used_f64(bytes: u64) -> f64 {
     bytes as f64
@@ -392,17 +395,17 @@ pub(crate) struct SpillTier {
 }
 
 impl SpillTier {
-    /// Opens (or reopens) the tier at `cfg.dir.join(cache_name)`.
+    /// Opens, or reopens, the tier at `cfg.dir.join(cache_name)`.
     ///
     /// Every `*.reg` file already in that directory is removed, then
     /// `region_count_for(cfg.capacity_bytes, cfg.region_bytes_value())`
     /// fresh region files are created and preallocated to
     /// `cfg.region_bytes_value()` bytes each. The index lives only in RAM
-    /// and starts empty on every call: bytes left over from a prior run are,
-    /// by construction, unreferenced by anything new, so nothing is ever
-    /// read back from a previous incarnation's region files.
+    /// and starts empty on every call: bytes left over from a prior run
+    /// are unreferenced by anything new, so nothing is ever read back
+    /// from a previous incarnation's region files.
     ///
-    /// Does not start the flusher thread — call [`SpillTier::attach`] once
+    /// Does not start the flusher thread. Call [`SpillTier::attach`] once
     /// the engine implementing [`SpillSink`] exists.
     ///
     /// # Errors
@@ -420,8 +423,8 @@ impl SpillTier {
 
         let region_bytes = cfg.region_bytes_value();
         // `validate` already guarantees this fits; the fallback keeps this
-        // conversion total rather than panicking on a config this module
-        // did not itself validate (a direct, non-`validate`d test caller).
+        // conversion total rather than panicking on a config this module did
+        // not itself validate, such as a direct, non-`validate`d test caller.
         let region_bytes_u32 = u32::try_from(region_bytes).unwrap_or(u32::MAX);
         let region_count = region_count_for(cfg.capacity_bytes, region_bytes).max(2);
 
@@ -461,7 +464,7 @@ impl SpillTier {
 
     /// Starts the flusher thread, fed by a fresh bounded channel.
     /// `try_spill` returns `false` for every call before this and every call
-    /// after [`SpillTier::close`]. The flusher holds only `sink` (a `Weak`)
+    /// after [`SpillTier::close`]. The flusher holds only `sink`, a `Weak`,
     /// and exits as soon as the upgrade fails, so the caller may drop its
     /// last strong reference at any time without joining anything.
     ///
@@ -483,12 +486,12 @@ impl SpillTier {
     }
 
     /// Non-blocking, best-effort: `false` means the record can never fit any
-    /// region (`reason = "too_large"`), [`SpillTier::close`] has run
-    /// (`reason = "closed"`), or the flusher's queue has no room, or was
-    /// never attached in the first place (`reason = "queue_full"` either
-    /// way) — the caller must fall back to an unconditional delete. Never
-    /// touches disk on this call, so it is safe to call while holding a
-    /// stripe write lock.
+    /// region, `reason = "too_large"`, or [`SpillTier::close`] has run,
+    /// `reason = "closed"`, or the flusher's queue has no room, or was
+    /// never attached, `reason = "queue_full"` either way. The caller
+    /// must fall back to an unconditional delete. Never touches disk on
+    /// this call, so it is safe to call while holding a stripe write
+    /// lock.
     pub(crate) fn try_spill(&self, job: SpillJob) -> bool {
         if self.inner.closed.load(Ordering::Acquire) {
             self.inner.record_dropped("closed");
@@ -510,11 +513,12 @@ impl SpillTier {
     }
 
     /// One positional read of the record at `loc`. `Ok(None)` when the
-    /// region's generation has moved past `loc.generation` (it rotated out
-    /// from under this pointer) or the record fails its checksum (a torn
-    /// write, or corruption) — both are ordinary, expected outcomes, not
-    /// errors. `Err` only for a genuine I/O failure. Blocking: call from
-    /// `spawn_blocking` or a dedicated thread, never inline in async code.
+    /// region's generation has moved past `loc.generation`, since it
+    /// rotated out from under this pointer, or the record fails its
+    /// checksum, from a torn write or corruption. Both are ordinary,
+    /// expected outcomes, not errors. `Err` only for a genuine I/O
+    /// failure. Blocking: call from `spawn_blocking` or a dedicated
+    /// thread, never inline in async code.
     ///
     /// # Errors
     ///
@@ -538,21 +542,21 @@ impl SpillTier {
         Ok(decode_record(&buf))
     }
 
-    /// Live (un-reclaimed) bytes across all regions.
+    /// Live, un-reclaimed, bytes across all regions.
     pub(crate) fn bytes_used(&self) -> u64 {
         self.inner.bytes_used.load(Ordering::Acquire)
     }
 
-    /// The cache name this tier was [`SpillTier::open`]ed under — the
-    /// `cache` label every metric this module or its `SpillSink` caller
-    /// (`engine::Engine`) publishes carries.
+    /// The cache name this tier was [`SpillTier::open`]ed under. The
+    /// `cache` label every metric this module or its `SpillSink` caller,
+    /// `engine::Engine`, publishes carries.
     pub(crate) fn cache_name(&self) -> &str {
         &self.inner.cache_name
     }
 
     /// Stops accepting new spills and drops the flusher's sender, so its
     /// `recv()` loop drains whatever is already queued and then exits on its
-    /// own. Never joins the flusher thread — this must be safe to call from
+    /// own. Never joins the flusher thread: this must be safe to call from
     /// an async context without blocking it. Region file handles close via
     /// `Drop` once every clone of the shared inner state is gone. Nothing is
     /// fsync'd or persisted, matching the tier's fully lossy contract.
@@ -604,11 +608,11 @@ fn build_header(job: &SpillJob, key_len: u32, value_len: u32) -> SpillRecordHead
     }
 }
 
-/// Parses `buf` (exactly one record's bytes, as read off disk) into
+/// Parses `buf`, one record's bytes as read off disk, into
 /// [`SpilledBytes`], or `None` for anything that doesn't check out: a short
-/// buffer, a bad magic, a length mismatch, or a checksum mismatch. Every one
-/// of these is treated identically — a corrupted or torn record reads
-/// exactly like a record that was never there.
+/// buffer, a bad magic, a length mismatch, or a checksum mismatch. Every
+/// one of these is treated identically. A corrupted or torn record reads
+/// like a record that was never there.
 fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
     let (header, rest) = SpillRecordHeader::read_from_prefix(buf).ok()?;
     if header.magic != SPILL_MAGIC {
@@ -717,10 +721,10 @@ fn flush_one(inner: &Inner, sink: &dyn SpillSink, job: SpillJob) {
 
 /// Reclaims `next_region_index(current, region_count)`, the next region due
 /// for reuse: walks its reverse index, hands every listed key to
-/// `sink.reclaim` *before* bumping the generation or resetting the cursor —
-/// only a key whose pointer, at that exact moment, still names this
-/// region/generation is genuinely gone — then makes it the new active
-/// region. Returns the newly active region's index. Infallible: reclaim and
+/// `sink.reclaim` *before* bumping the generation or resetting the cursor.
+/// Only a key whose pointer, at that moment, still names this
+/// region/generation is gone. Then makes it the new active region.
+/// Returns the newly active region's index. Infallible: reclaim and
 /// rotation are pure bookkeeping, with no I/O of their own.
 fn rotate(inner: &Inner, sink: &dyn SpillSink, current: u32) -> u32 {
     let region_count = u32::try_from(inner.regions.len()).unwrap_or(u32::MAX);
@@ -1033,8 +1037,8 @@ mod tests {
 
         #[test]
         fn read_at_returns_none_for_a_stale_generation() {
-            // Each region holds exactly one record, so writing a third job
-            // rotates region 0 out from under the first job's pointer.
+            // Each region holds one record, so writing a third job rotates
+            // region 0 out from under the first job's pointer.
             let dir = temp_dir("stale-gen");
             let record_len = HEADER_LEN as u64 + 1 + 1; // 1-byte key, 1-byte value
             let cfg = SpillConfig::new(&dir, 2 * record_len).region_bytes(record_len);
@@ -1080,9 +1084,9 @@ mod tests {
 
         #[test]
         fn rotation_reclaims_the_oldest_region_and_reports_its_keys() {
-            // region_bytes fits exactly two records; five writes force a
-            // rotation into region 1 (empty) and then back into region 0,
-            // which by then holds the first two jobs' keys.
+            // region_bytes fits two records; five writes force a rotation
+            // into region 1, empty, and then back into region 0, which by
+            // then holds the first two jobs' keys.
             let dir = temp_dir("rotation");
             let record_len = HEADER_LEN as u64 + 6 + 4; // fixed-width key/value
             let region_bytes = record_len * 2;

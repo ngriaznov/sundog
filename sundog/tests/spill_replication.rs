@@ -1,11 +1,11 @@
 //! A spilled entry's digest fingerprint is bit-for-bit identical to a
 //! resident one, so anti-entropy repairs a peer's dropped copy from a donor
 //! whose own copy is, by the time the repair runs, sitting on disk rather
-//! than in RAM — exercising the AE-pull-reply path's off-lock spilled-value
-//! read, end to end.
+//! than in RAM. This exercises the AE-pull-reply path's off-lock
+//! spilled-value read, end to end.
 //!
-//! Its own test binary (a separate process from every other `tests/*.rs`
-//! file), so installing the process-global Prometheus recorder here never
+//! Its own test binary, a separate process from every other `tests/*.rs`
+//! file, so installing the process-global Prometheus recorder here never
 //! races another test for the slot.
 
 #![cfg(all(feature = "spill", feature = "prometheus", not(feature = "sim")))]
@@ -36,13 +36,13 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
 
 /// A tiny `max_capacity` plus a `SpillConfig` on node `a` forces it to
 /// spill some of what it inserts; node `b` stays unbounded and spill-free.
-/// Live fan-out delivers every key to `b` first; wiping one of `b`'s
-/// entries without a tombstone means only anti-entropy can bring it back —
+/// Live fan-out delivers every key to `b` first. Wiping one of `b`'s
+/// entries without a tombstone means only anti-entropy can bring it back,
 /// and by the time it runs, `a`'s own copy may already be on disk, so the
-/// repair only succeeds if the AE-pull-reply path's spilled-value read
-/// (`ShardOps::records_for`) works. Once repaired, further
-/// anti-entropy rounds with nothing new to reconcile settle the repair
-/// counter at a fixed value.
+/// repair only succeeds if the AE-pull-reply path's spilled-value read,
+/// `ShardOps::records_for`, works. Once repaired, further anti-entropy
+/// rounds with nothing new to reconcile settle the repair counter at a
+/// fixed value.
 #[tokio::test]
 async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     let handle = sundog::prometheus_handle()
@@ -114,7 +114,7 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     .await;
 
     // Wipe one key on b without a tombstone: only anti-entropy repairs it,
-    // and a's own copy may by now be sitting on disk rather than in RAM.
+    // and a's own copy may already be sitting on disk rather than in RAM.
     cache_b.invalidate_local(&0).await;
     assert_eq!(cache_b.get(&0).await, None);
 
@@ -131,10 +131,10 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
 
     // Steady state: with nothing left to reconcile, the repair counter
     // stops moving across further anti-entropy rounds. This is a quiescence
-    // check — "nothing happens for a while" — which a bounded poll cannot
-    // express (a poll returns the instant its condition first holds, so it
+    // check, "nothing happens for a while," which a bounded poll cannot
+    // express. A poll returns the instant its condition first holds, so it
     // could observe `before == after` after only one round, missing a
-    // repair that lands one round later); two fixed windows are the
+    // repair that lands one round later. Two fixed windows are the
     // deliberate exception to this file's own bounded-poll rule. `fast_
     // config`'s 150ms ae_interval means two 500ms windows span several
     // rounds each, giving the counter ample opportunity to move if it were

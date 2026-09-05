@@ -65,7 +65,7 @@ async fn scrape_status(addr: SocketAddr, path: &str) -> Option<String> {
 /// Finds `metric{label1="value1",label2="value2",...} <number>` in
 /// Prometheus text-exposition `body`, tolerant of label ordering and
 /// integer-vs-float rendering. Every pair in `labels` must match the same
-/// line: a single label (`&[("cache", "x")]`) is ambiguous once more than
+/// line. A single label, `&[("cache", "x")]`, is ambiguous once more than
 /// one series shares that label's value under a different label, such as
 /// `sundog_spill_reads_total`'s `outcome` varying per `cache`.
 fn scraped_metric_value(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f64> {
@@ -493,7 +493,7 @@ async fn prometheus_handle_exposes_cache_hits_without_a_listener() {
 }
 
 /// A directory path under the OS temp dir, unique to this test process,
-/// call, and `label` — never created on disk; [`sundog::SpillConfig::new`]'s
+/// call, and `label`. Never created on disk; [`sundog::SpillConfig::new`]'s
 /// `SpillTier::open` creates it.
 #[cfg(feature = "spill")]
 fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
@@ -508,14 +508,14 @@ fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
 }
 
 /// The spill metrics pin: a tiny `max_capacity` plus a `spill` tier on
-/// `cluster` forces exactly one eviction-to-spill, and a single `get` of the
-/// spilled key forces exactly one disk hit and one promotion. Two further,
+/// `cluster` forces one eviction-to-spill, and a single `get` of the
+/// spilled key forces one disk hit and one promotion. Two further,
 /// isolated caches then pin an overwrite-after-spill and a
 /// remove-after-spill, each sized so the one operation under test settles
-/// without triggering a second eviction of its own — batch eviction can
+/// without triggering a second eviction of its own. Batch eviction can
 /// otherwise clear more than one unit of weight per pass, which would make
 /// an exact count depend on internal batching details rather than on the
-/// behavior actually under test.
+/// behavior under test.
 ///
 /// Runs inside `metrics_endpoint_serves_sundog_metrics_after_cache_ops`
 /// rather than as its own `#[tokio::test]`, for the same reason
@@ -523,12 +523,12 @@ fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
 /// above do: a cache's `hits`/`misses`-style `metrics::Counter` handles
 /// bind to whichever recorder is installed at the moment
 /// `Shard::new`/`Shard::attach_spill` calls `metrics::counter!`, not
-/// whatever gets installed later, so only the one test in this binary that
-/// reliably owns the process-global recorder from the start (via
-/// `prometheus_listen`, synchronously early in `Cluster::builder(..).build()`)
-/// can pin exact metric values — a second, independent `#[tokio::test]`
-/// racing for the same slot is either a no-op (if it loses) or breaks the
-/// first test's own `build()` (if it wins).
+/// whatever gets installed later. Only the one test in this binary that
+/// reliably owns the process-global recorder from the start, via
+/// `prometheus_listen` synchronously early in `Cluster::builder(..).build()`,
+/// can pin exact metric values. A second, independent `#[tokio::test]`
+/// racing for the same slot either is a no-op, if it loses, or breaks the
+/// first test's own `build()`, if it wins.
 ///
 /// Returns every tier's scratch directory for the caller to clean up.
 #[allow(
@@ -565,16 +565,16 @@ async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::pa
         2u32
     };
 
-    // Exactly one promotion: a single disk read of the spilled key.
+    // One promotion: a single disk read of the spilled key.
     let _ = cache.get(&spilled_key).await;
     dirs.push(dir);
 
     // --- "spill-overwrite": an overwrite of a currently-spilled key must
     // decrement sundog_spill_entries with no further disk write. `1`/`2`/`3`
-    // fill a `max_capacity(2)` cache past its limit, spilling exactly one of
-    // them; removing one of the two others first frees exactly the one unit
-    // of headroom the overwrite below needs, so it settles at the cap
-    // instead of forcing a second eviction.
+    // fill a `max_capacity(2)` cache past its limit, spilling one of them;
+    // removing one of the two others first frees the one unit of headroom
+    // the overwrite below needs, so it settles at the cap instead of
+    // forcing a second eviction.
     let dir = fresh_spill_dir("overwrite");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
     let cache = cluster

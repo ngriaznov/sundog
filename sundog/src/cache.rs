@@ -131,15 +131,14 @@ where
     ///
     /// Returns [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
     /// [`Mode::Replicated`] and `tti` was set, or `max_capacity` was set
-    /// with no `spill` tier configured (see the `spill` feature's
-    /// `CacheBuilder::spill`): a local eviction would be silently re-pulled
-    /// by the next anti-entropy round. `tti` is rejected unconditionally,
-    /// spill or not — it is local-only by design, and spilling does nothing
-    /// to reconcile it.
+    /// with no `spill` tier configured via `CacheBuilder::spill`. A local
+    /// eviction would be silently re-pulled by the next anti-entropy
+    /// round. `tti` is rejected unconditionally, spill or not. It is
+    /// local-only by design, and spilling does nothing to reconcile it.
     ///
-    /// Returns `CacheError::InvalidSpillConfig` (the `spill` feature) if
-    /// `spill` was configured with a `region_bytes` of zero, or a
-    /// `capacity_bytes` under two regions.
+    /// Returns `CacheError::InvalidSpillConfig`, with the `spill` feature
+    /// compiled in, if `spill` was configured with a `region_bytes` of
+    /// zero, or a `capacity_bytes` under two regions.
     ///
     /// Returns [`CacheError::ModeMismatch`] if a live peer already
     /// advertises `name` under a different [`Mode`]. Best-effort: a
@@ -218,7 +217,7 @@ where
         // wipe and preallocate the same `<dir>/<cache>/` region files before
         // either learns it lost to `AlreadyOpen`, corrupting whichever cache
         // is already running. Reserving this name first means a losing
-        // `open()` never touches disk for it at all.
+        // `open()` never touches disk for it.
         let registry = cluster.shards();
         {
             let mut guard = registry
@@ -231,11 +230,11 @@ where
         }
 
         // Only the `open()` that won the reservation above ever attaches a
-        // spill tier. `Shard::attach_spill` runs through `&self` (its
-        // `Engine`/`SpillRead` fields are `OnceLock`s for exactly this),
-        // so it works fine on a shard already `Arc`-shared in the registry.
-        // A failure here rolls the reservation back: nothing has advertised
-        // or scheduled tasks for this name yet, so removing it is enough.
+        // spill tier. `Shard::attach_spill` runs through `&self`; its
+        // `Engine`/`SpillRead` fields are `OnceLock`s, so it runs on a
+        // shard already `Arc`-shared in the registry. A failure here rolls
+        // the reservation back: nothing has advertised or scheduled tasks
+        // for this name yet, so removing it is enough.
         #[cfg(feature = "spill")]
         if let Some(cfg) = &spill
             && let Err(source) = shard.attach_spill(cfg)
@@ -581,12 +580,12 @@ where
     }
 
     /// Closes this cache: stops its background tasks and waits for them,
-    /// closes its spill tier if one was configured (the flusher thread
-    /// drains its queue and exits on its own), drops it from the cluster's
-    /// shard registry, and clears its gossiped mode, so peers stop seeing
-    /// it advertised and this node stops serving or applying replication
-    /// traffic for it. The name is free to `open()` again when this
-    /// returns.
+    /// closes its spill tier if one was configured, drops it from the
+    /// cluster's shard registry, and clears its gossiped mode, so peers
+    /// stop seeing it advertised and this node stops serving or applying
+    /// replication traffic for it. The name is free to `open()` again
+    /// when this returns. Closing the spill tier lets its flusher thread
+    /// drain its queue and exit on its own.
     ///
     /// Closing is idempotent. A clone kept past `close` keeps working as a
     /// local, detached cache: its reads and writes reach the same in-memory
@@ -720,9 +719,8 @@ mod tests {
         use super::*;
 
         /// A directory path under the OS temp dir, unique to this test
-        /// process and call — never created on disk, since config
-        /// validation in `open()` is pure arithmetic and never touches the
-        /// filesystem.
+        /// process and call. Never created on disk: config validation in
+        /// `open()` is pure arithmetic and never touches the filesystem.
         fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
             std::env::temp_dir().join(format!(
                 "sundog-spill-gate-{label}-{}-{}",
@@ -880,11 +878,12 @@ mod tests {
         }
 
         /// Opens a cache under `mode` with a tiny `max_capacity` and a real
-        /// spill tier, inserts past that capacity, waits (bounded) for
-        /// eviction to spill one of the two keys — observed via
-        /// `get_sync` reading a miss, `Shard::get_sync`'s documented
-        /// contract for a currently-spilled entry — then reads it back
-        /// through `get` and asserts the disk round-trip.
+        /// spill tier, inserts past that capacity, then waits up to a
+        /// bound for eviction to spill one of the two keys. Spilling is
+        /// observed via `get_sync` reading a miss, `Shard::get_sync`'s
+        /// documented contract for a currently-spilled entry. It then
+        /// reads the key back through `get` and asserts the disk
+        /// round-trip.
         async fn spill_composes_with_max_capacity(mode: Mode, label: &str) {
             let cluster = Cluster::builder("cache-it-spill-compose")
                 .seeds(std::iter::empty())
@@ -938,11 +937,9 @@ mod tests {
             spill_composes_with_max_capacity(Mode::Invalidation, "compose-invalidation").await;
         }
 
-        /// A second `open()` of an already-open name, with a spill tier
-        /// configured, returns `AlreadyOpen` without ever touching the
-        /// first cache's region files: `Shard::attach_spill` runs only for
-        /// the `open()` that wins the registry reservation, so the second
-        /// call never reaches it at all.
+        /// `Shard::attach_spill` runs only for the `open()` that wins the
+        /// registry reservation, so the losing `open()` never touches the
+        /// first cache's region files.
         #[tokio::test]
         async fn reopening_the_same_spill_cache_name_returns_already_open_without_corrupting_it() {
             let cluster = Cluster::builder("cache-it-spill-reopen-guard")
@@ -977,7 +974,7 @@ mod tests {
                 (2u32, "two".to_string())
             };
 
-            // Same name, same SpillConfig (same directory): the registry
+            // Same name and SpillConfig, same directory. The registry
             // reservation must reject this second open before
             // `Shard::attach_spill` ever wipes and preallocates the first
             // cache's region files.
@@ -1033,11 +1030,11 @@ mod tests {
                  surviving clone since they share one Shard"
             );
 
-            // A surviving clone keeps working locally; capacity eviction on
-            // it can no longer hand a victim to the now-closed tier, so it
-            // falls back to an ordinary delete instead of spilling. A
-            // spilled entry would still count as live, so `entry_count`
-            // tells them apart.
+            // A surviving clone keeps working locally. With the tier
+            // closed, capacity eviction on it deletes rather than spills,
+            // since there is no live tier to hand a victim to. A spilled
+            // entry still counts as live, so `entry_count` distinguishes a
+            // delete from a spill.
             surviving
                 .insert(1, "one".to_string())
                 .await

@@ -22,20 +22,20 @@
 //! between its lookup and its wait. `InflightGuard` frees a cancelled load so a
 //! waiter takes over.
 //!
-//! # The optional spill tier (`spill` feature)
+//! # The optional spill tier
 //!
-//! A live entry's `payload` is `Payload::Resident` (the value in RAM) or,
-//! only under `feature = "spill"`, `Payload::Spilled` (a pointer into a
-//! [`super::spill::SpillTier`]'s region log; the value is on disk). Weight,
-//! `ver`, and `expires_at_ms` are common `Live` fields regardless of
-//! `payload`'s variant, so eviction, expiry, and the digest never need to
-//! know which one a key is in: a spilled entry's weight is always `0`, and
-//! `entry_fingerprint` never reads the value. `Engine::evict_one_sampled` and
-//! `Engine::evict_batch_sampled` hand a `Payload::Resident` victim to a
+//! A live entry's `payload` is `Payload::Resident`, the value in RAM, or,
+//! only under `feature = "spill"`, `Payload::Spilled`, a pointer into a
+//! [`super::spill::SpillTier`]'s region log with the value on disk.
+//! Weight, `ver`, and `expires_at_ms` are common `Live` fields regardless
+//! of `payload`'s variant, so eviction, expiry, and the digest never need
+//! to know which one a key is in: a spilled entry's weight is always `0`,
+//! and `entry_fingerprint` never reads the value. `Engine::evict_one_sampled`
+//! and `Engine::evict_batch_sampled` hand a `Payload::Resident` victim to a
 //! configured tier's `try_spill` instead of deleting it, leaving `live`,
 //! `total_weight`, `live_count`, and the digest untouched until the tier's
-//! flusher installs it (`Engine`'s [`super::spill::SpillSink`] impl) or the
-//! send fails and the ordinary delete-and-XOR path runs instead. A
+//! flusher, `Engine`'s [`super::spill::SpillSink`] impl, installs it, or
+//! the send fails and the ordinary delete-and-XOR path runs instead. A
 //! `Payload::Spilled` entry is never sampled as a victim.
 
 use std::collections::HashMap;
@@ -140,14 +140,14 @@ fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
     xxh3_64(live.key_bytes.as_ref())
 }
 
-/// One live entry: its version and expiry, its payload (in RAM or, under
-/// `feature = "spill"`, on disk), its weight for capacity accounting, and the
-/// last time it was read. `ver`/`expires_at_ms` sit on `Live` itself rather
-/// than inside `payload`, since every reader that never touches the value —
-/// eviction, expiry, the digest, anti-entropy's listings — needs exactly
-/// these two fields and nothing else, whichever `payload` variant is
-/// current. The read timestamp is written only when TTI or a finite capacity
-/// is configured.
+/// One live entry: its version and expiry, its payload, its weight for
+/// capacity accounting, and the last time it was read. The payload lives
+/// in RAM, or, under `feature = "spill"`, on disk. `ver`/`expires_at_ms`
+/// sit on `Live` itself rather than inside `payload`, since every reader
+/// that never touches the value, eviction, expiry, the digest,
+/// anti-entropy's listings, needs only these two fields, whichever
+/// `payload` variant is current. The read timestamp is written only when
+/// TTI or a finite capacity is configured.
 struct Live<K, V> {
     key_bytes: Bytes,
     key: K,
@@ -162,18 +162,18 @@ struct Live<K, V> {
 /// pointer into a [`super::spill::SpillTier`]'s region log. `weight` on
 /// [`Live`] is always `0` while `Spilled`. A non-`spill` build never
 /// compiles the `Spilled` arm, so `Payload<V>` collapses to a plain
-/// one-variant wrapper around `Resident`'s two fields, identical in layout
-/// and cost to what this crate stored before the spill tier existed.
+/// one-variant wrapper around `Resident`'s two fields, with no layout or
+/// cost overhead over storing those two fields directly.
 enum Payload<V> {
     Resident {
         /// The current value.
         value: V,
-        /// `value`'s postcard-encoded bytes: the first encode's bytes on the
-        /// local-origin path (`insert`/`insert_many`/`get_or_load`'s fill),
-        /// the verbatim wire bytes on the replica-apply path
-        /// (`apply_remote_batch`). Always equal to `postcard::to_stdvec(&
-        /// value)`, or to wire bytes decoding to a structurally equal
-        /// `value`.
+        /// `value`'s postcard-encoded bytes. On the local-origin path,
+        /// `insert`/`insert_many`/`get_or_load`'s fill, these are the
+        /// first encode's bytes; on the replica-apply path,
+        /// `apply_remote_batch`, they are the verbatim wire bytes. Always
+        /// equal to `postcard::to_stdvec(&value)`, or to wire bytes
+        /// decoding to a structurally equal `value`.
         encoded: Bytes,
     },
     /// The value lives on disk at this location; nothing here is in RAM.
@@ -183,8 +183,8 @@ enum Payload<V> {
 
 /// Whether `live`'s payload is currently in RAM: eviction and spill
 /// candidacy hinge on this, since a [`Payload::Spilled`] entry is never
-/// sampled as a victim (it holds nothing to spill, and physically deleting
-/// it is region reclaim's job alone, not sampled LRU's).
+/// sampled as a victim. It holds nothing to spill, and physically
+/// deleting it is region reclaim's job alone, not sampled LRU's.
 fn is_resident<K, V>(live: &Live<K, V>) -> bool {
     matches!(live.payload, Payload::Resident { .. })
 }
@@ -192,7 +192,7 @@ fn is_resident<K, V>(live: &Live<K, V>) -> bool {
 /// Whether `live`'s payload is currently spilled: the mirror of
 /// [`is_resident`], used only to decide whether removing this entry from
 /// `live` must also decrement `sundog_spill_entries{cache}`. Always `false`
-/// in a non-`spill` build, which never compiles the `Spilled` arm at all.
+/// in a non-`spill` build, which never compiles the `Spilled` arm.
 fn is_spilled<K, V>(live: &Live<K, V>) -> bool {
     #[cfg(feature = "spill")]
     {
@@ -205,10 +205,10 @@ fn is_spilled<K, V>(live: &Live<K, V>) -> bool {
     }
 }
 
-/// A currently-spilled entry's pointer, as [`Engine::snapshot_spilled`] and
-/// [`Engine::records_for_or_spilled`] report it to a spill-aware caller: the
-/// bits an off-lock disk read and, where applicable, a `WireRecord` need —
-/// key bytes, version, expiry, and the disk location itself.
+/// A currently-spilled entry's pointer: key bytes, version, expiry, and
+/// the disk location, the bits an off-lock disk read and, where
+/// applicable, a `WireRecord` need. Reported to a spill-aware caller by
+/// [`Engine::snapshot_spilled`] and [`Engine::records_for_or_spilled`].
 #[cfg(feature = "spill")]
 pub(crate) type SpilledPointer = (Bytes, Hlc, Option<u64>, SpillLoc);
 
@@ -269,11 +269,12 @@ impl<K, V> Stripe<K, V> {
     }
 }
 
-/// What [`remove_live`] reports about the entry it took out of `live`: its
-/// weight (already `0` for a [`Payload::Spilled`] entry), its version, and
-/// whether it was spilled — every caller that discards a live entry needs
-/// `was_spilled` to keep `sundog_spill_entries{cache}` from drifting, via
-/// [`Engine::note_spill_departure`] or [`Engine::note_spill_departures`].
+/// What [`remove_live`] reports about the entry it took out of `live`:
+/// its weight, already `0` for a [`Payload::Spilled`] entry, its
+/// version, and whether it was spilled. Every caller that discards a
+/// live entry needs `was_spilled` to keep `sundog_spill_entries{cache}`
+/// from drifting, via [`Engine::note_spill_departure`] or
+/// [`Engine::note_spill_departures`].
 struct RemovedLive {
     weight: u32,
     ver: Hlc,
@@ -375,7 +376,7 @@ fn eviction_batch_size(over_by: u64, sampled_weights: &[u32]) -> usize {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EvictOutcome {
     /// Weight physically freed this pass; `0` when every handled victim was
-    /// spilled instead, or nothing was handled at all.
+    /// spilled instead, or nothing was handled.
     removed_weight: u64,
     /// Victims handed to the spill tier this pass, still resident until the
     /// flusher installs them.
@@ -383,26 +384,27 @@ struct EvictOutcome {
 }
 
 impl EvictOutcome {
-    /// Neither removed anything nor spilled anything — the stripe this pass
-    /// sampled held no resident victim, most likely because it is empty.
+    /// Neither removed anything nor spilled anything: the stripe this
+    /// pass sampled held no resident victim, for example because it was
+    /// empty.
     fn made_no_progress(self) -> bool {
         self.removed_weight == 0 && self.spilled == 0
     }
 }
 
 /// Whether [`Engine::enforce_capacity`]'s loop should give up on this call
-/// rather than immediately resampling, given what one pass just
-/// accomplished: `true` exactly when every victim handled was spilled and
-/// none was physically removed. `total_weight` only drops once the spill
-/// tier's flusher installs those spills — asynchronously, off this thread —
-/// so looping again right away would just resample the same still-resident
-/// entries against an unchanged `total_weight`. `false` when nothing at all
-/// was handled (the caller already falls through to a wider scan before
-/// this ever runs) or when something was physically removed, which is worth
-/// rechecking the cap for immediately. Always `false` when `spilled` is `0`,
-/// so a non-spill build (or a spill-configured one that never actually
-/// spills) never pauses early: this is a strict addition to
-/// `enforce_capacity`'s prior behavior, not a change to it.
+/// rather than immediately resampling, given what one pass accomplished:
+/// `true` when every victim handled was spilled and none was physically
+/// removed. `total_weight` only drops once the spill tier's flusher
+/// installs those spills, asynchronously and off this thread, so looping
+/// again right away would resample the same still-resident entries
+/// against an unchanged `total_weight`. `false` when nothing was handled,
+/// since the caller already falls through to a wider scan before this
+/// ever runs, or when something was physically removed, which is worth
+/// rechecking the cap for immediately. Always `false` when `spilled` is
+/// `0`, so a non-spill build, or a spill-configured one that never
+/// spills, never pauses early: in that case `enforce_capacity`'s loop
+/// behaves as if this check were absent.
 pub(crate) fn should_pause_for_pending_spills(removed_weight: u64, spilled: usize) -> bool {
     removed_weight == 0 && spilled > 0
 }
@@ -438,10 +440,10 @@ impl<K, V> ApplyOutcome<K, V> {
 /// `digest_bucket`, `total_weight`, and `live_count` to match. Fully
 /// synchronous: the caller holds `stripe`'s write lock for this call's
 /// entire duration. The returned `bool` is whether this call displaced a
-/// [`Payload::Spilled`] entry from `live` — `false` for a `Rejected`
-/// outcome, which changes nothing; the caller uses it to keep
-/// `sundog_spill_entries{cache}` correct (see
-/// [`Engine::note_spill_departure`]).
+/// [`Payload::Spilled`] entry from `live`. It is `false` for a
+/// `Rejected` outcome, which changes nothing. The caller uses it to keep
+/// `sundog_spill_entries{cache}` correct; see
+/// [`Engine::note_spill_departure`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -575,7 +577,7 @@ where
 /// `live_count` iff nothing physically live occupied the key before, and
 /// reports `created` unless a readable entry (`was_visible`) was replaced.
 /// The returned `bool` is whether the displaced entry, if any, was
-/// [`Payload::Spilled`] — an overwrite of a spilled key always installs
+/// [`Payload::Spilled`]. An overwrite of a spilled key always installs
 /// fresh as resident, so this is the only place such an entry departs
 /// without a matching promotion.
 #[allow(clippy::too_many_arguments)]
@@ -749,17 +751,17 @@ pub(crate) struct Engine<K, V> {
     /// [`Engine::set_spill`]. Unset until then, and always unset in a
     /// non-`spill` build. A `OnceLock`, not a plain `Option` behind
     /// `&mut self`, so [`super::Shard::attach_spill`] can attach a tier to
-    /// an engine that is already `Arc`-shared and registered — the shard
-    /// registry reservation wins before any disk I/O runs, and this is what
-    /// lets the tier attach afterward without needing exclusive access.
+    /// an engine that is already `Arc`-shared and registered. The shard
+    /// registry reservation wins before any disk I/O runs, and that lets
+    /// the tier attach afterward without needing exclusive access.
     #[cfg(feature = "spill")]
     spill: OnceLock<Arc<SpillTier>>,
     /// Handle for `sundog_spill_entries{cache}`, created once in
     /// [`Engine::set_spill`] for the same reason `Shard::hits`/
-    /// `Shard::misses` are: label resolution costs more than the paths that
-    /// touch this gauge (install, promote, reclaim, and every write or
-    /// removal that displaces a [`Payload::Spilled`] entry from `live`) can
-    /// afford per call.
+    /// `Shard::misses` are: label resolution costs more than the paths
+    /// that touch this gauge can afford per call. Those paths are install,
+    /// promote, reclaim, and every write or removal that displaces a
+    /// [`Payload::Spilled`] entry from `live`.
     #[cfg(feature = "spill")]
     spill_entries_gauge: OnceLock<metrics::Gauge>,
     /// Test-only mirror of `spill_entries_gauge`'s value, updated in
@@ -813,9 +815,9 @@ where
     /// Attaches `tier` as this engine's spill tier and creates its
     /// `sundog_spill_entries{cache}` gauge handle. Called once, by
     /// [`super::Shard::attach_spill`], through `&self`: `spill` and
-    /// `spill_entries_gauge` are `OnceLock`s precisely so this can run after
-    /// the engine is already `Arc`-shared (attached only once this shard has
-    /// won its name in the cluster's shard registry), not just before.
+    /// `spill_entries_gauge` are `OnceLock`s so this can run after the
+    /// engine is already `Arc`-shared. It attaches only once this shard
+    /// has won its name in the cluster's shard registry.
     ///
     /// # Panics
     ///
@@ -837,9 +839,9 @@ where
     /// test-only mirror counter, iff a spill tier's gauge is attached.
     /// Always a no-op in a non-`spill` build. The counterpart to
     /// [`Engine::note_spill_arrival`]; every write or removal path that
-    /// takes a [`Payload::Spilled`] entry out of `live` calls this (or
-    /// [`Engine::note_spill_departure`], its one-entry shorthand) so the
-    /// gauge never drifts from how many entries are actually spilled.
+    /// takes a [`Payload::Spilled`] entry out of `live` calls this, or
+    /// [`Engine::note_spill_departure`], its one-entry shorthand, so the
+    /// gauge never drifts from how many entries are spilled.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -874,8 +876,9 @@ where
 
     /// Increments `sundog_spill_entries{cache}`, plus the test-only mirror
     /// counter. The counterpart to [`Engine::note_spill_departures`], called
-    /// wherever a `live` entry newly becomes [`Payload::Spilled`]
-    /// (`SpillSink::install`, and the test-only [`Engine::debug_insert_spilled`]).
+    /// wherever a `live` entry newly becomes [`Payload::Spilled`]: from
+    /// `SpillSink::install`, and from the test-only
+    /// [`Engine::debug_insert_spilled`].
     #[cfg(feature = "spill")]
     fn note_spill_arrival(&self) {
         if let Some(gauge) = self.spill_entries_gauge.get() {
@@ -920,9 +923,9 @@ where
     /// [`Engine::get`] for a key already encoded and hashed, so a caller that
     /// holds both, as the `get_or_load` loop does, skips re-encoding.
     ///
-    /// `None` for a currently-[`Payload::Spilled`] entry too — a spill-aware
-    /// caller (`get`/`get_or_load`) checks [`Engine::spilled_loc`] next; a
-    /// spill-blind one (`get_sync`) treats this exactly like a miss, per its
+    /// `None` for a currently-[`Payload::Spilled`] entry too. A spill-aware
+    /// caller, `get`/`get_or_load`, checks [`Engine::spilled_loc`] next; a
+    /// spill-blind one, `get_sync`, treats this like a miss, per its
     /// documented contract.
     pub(crate) fn get_by_bytes(&self, key_bytes: &[u8], hash: u64, now_ms: u64) -> Option<V> {
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
@@ -1001,8 +1004,8 @@ where
 
     /// The full [`WireRecord`] for `key_bytes`, present entry or tombstone
     /// alike. `None` for a currently-spilled entry: the fan-out records path
-    /// this feeds simply skips it, correct because a peer's next
-    /// anti-entropy round repairs it.
+    /// this feeds skips it, correct because a peer's next anti-entropy
+    /// round repairs it.
     pub(crate) fn record_for(&self, key_bytes: &[u8], now_ms: u64) -> Option<WireRecord> {
         let hash = hash_key_bytes(key_bytes);
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
@@ -1161,7 +1164,7 @@ where
     ///
     /// Non-`spill` builds never compile a `Payload::Spilled` arm, so the
     /// `filter_map` below degenerates to an infallible `map`; the allow
-    /// below is scoped to exactly that configuration.
+    /// below is scoped to that configuration.
     #[cfg_attr(not(feature = "spill"), allow(clippy::unnecessary_filter_map))]
     pub(crate) fn snapshot_records(&self, now_ms: u64) -> Vec<WireRecord> {
         let mut out = Vec::new();
@@ -1196,8 +1199,8 @@ where
     /// [`Engine::snapshot_records`]'s sibling: every currently-spilled live
     /// entry's pointer, `(key_bytes, ver, expires_at_ms, loc)`, snapshotted
     /// under each stripe's read lock alongside `snapshot_records`' pass. A
-    /// spill-aware caller reads these off-lock (`spawn_blocking` behind the
-    /// tier's read semaphore) and folds the results into the snapshot,
+    /// spill-aware caller reads these off-lock, via `spawn_blocking` behind
+    /// the tier's read semaphore, and folds the results into the snapshot,
     /// dropping any whose read comes back `None`.
     #[cfg(feature = "spill")]
     pub(crate) fn snapshot_spilled(&self, now_ms: u64) -> Vec<SpilledPointer> {
@@ -1221,12 +1224,12 @@ where
     }
 
     /// [`Engine::record_for`] for many keys in one pass, but reporting a
-    /// currently-spilled entry's pointer instead of treating it as absent:
-    /// the AE-pull-reply path (`ShardOps::records_for`) reads the spilled
-    /// half off-lock (`spawn_blocking` behind the tier's read semaphore) and
-    /// folds any successful read back in as a `WireRecord`, dropping the
-    /// rest. Nothing here promotes; a served-from-disk record leaves
-    /// `payload` exactly as it was.
+    /// currently-spilled entry's pointer instead of treating it as absent.
+    /// The AE-pull-reply path, `ShardOps::records_for`, reads the spilled
+    /// half off-lock, via `spawn_blocking` behind the tier's read
+    /// semaphore, and folds any successful read back in as a `WireRecord`,
+    /// dropping the rest. Nothing here promotes; a served-from-disk record
+    /// leaves `payload` as it was.
     #[cfg(feature = "spill")]
     pub(crate) fn records_for_or_spilled(
         &self,
@@ -1378,12 +1381,12 @@ where
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Whether a configured spill tier accepted `victim_bytes` (found at
-    /// `hash` in `bucket`, `stripe` already write-locked) in place of
-    /// physically removing it: `false` with no tier configured, a victim
+    /// Whether a configured spill tier accepted `victim_bytes`, found at
+    /// `hash` in `bucket` with `stripe` already write-locked, in place of
+    /// physically removing it. `false` with no tier configured, a victim
     /// that has since stopped being [`Payload::Resident`], or a `try_spill`
-    /// the tier declined (its queue full, or closed). Never touches disk —
-    /// `SpillTier::try_spill` only enqueues — so this is safe to call while
+    /// the tier declined, its queue full or closed. Never touches disk:
+    /// `SpillTier::try_spill` only enqueues, so this is safe to call while
     /// holding the stripe write lock.
     #[cfg(feature = "spill")]
     fn try_spill_victim(
@@ -1415,20 +1418,20 @@ where
         })
     }
 
-    /// Removes or spills `victim_bytes` (found at `hash` in `bucket`,
-    /// `stripe` already write-locked): hands a [`Payload::Resident`] victim
+    /// Removes or spills `victim_bytes`, found at `hash` in `bucket` with
+    /// `stripe` already write-locked. Hands a [`Payload::Resident`] victim
     /// to a configured spill tier when it has room, leaving `stripe.live`,
-    /// the digest, and `live_count` untouched for now — the entry stays
-    /// resident until the flusher installs it (`Engine`'s [`SpillSink`]
-    /// impl); otherwise runs the ordinary remove-and-XOR path. A
-    /// [`Payload::Spilled`] victim is never handed here (the sampling passes
-    /// above filter it out via [`is_resident`]), but a race — the entry
-    /// vanished between sampling and this call — is handled the same as
-    /// today: nothing to remove.
+    /// the digest, and `live_count` untouched until the flusher,
+    /// `Engine`'s [`SpillSink`] impl, installs it. The entry stays
+    /// resident until then. Otherwise runs the ordinary remove-and-XOR
+    /// path. A [`Payload::Spilled`] victim is never handed here, since the
+    /// sampling passes above filter it out via [`is_resident`]. A race
+    /// where the entry vanished between sampling and this call is handled
+    /// the same way: nothing to remove.
     ///
-    /// Returns `(removed_weight, spilled)`: `Some(weight)` for a physical
-    /// removal (freeing `weight`), `None` for a spill hand-off or a
-    /// vanished-by-a-race victim — distinguished by `spilled`. Total weight
+    /// Returns `(removed_weight, spilled)`. `Some(weight)` is a physical
+    /// removal that frees `weight`. `None` is a spill hand-off or a
+    /// vanished-by-a-race victim, distinguished by `spilled`. Total weight
     /// and `live_count` are the caller's job: this only mutates
     /// `stripe.live` and the digest, so a batch caller can fold several
     /// victims' weight into one pair of atomic updates after the loop.
@@ -1513,7 +1516,7 @@ where
     /// entries in `bucket` under one lock hold, as many as
     /// [`eviction_batch_size`] allows for `over_by`. Each victim is removed
     /// or, with a spill tier configured and room in its queue, handed off
-    /// instead (see [`Engine::evict_victim_locked`]).
+    /// instead; see [`Engine::evict_victim_locked`].
     fn evict_batch_sampled(&self, bucket: usize, over_by: u64) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
@@ -1575,13 +1578,13 @@ where
     /// left to evict. Never holds two stripe locks at once; a no-op when
     /// `max_capacity` is [`u64::MAX`].
     ///
-    /// With a spill tier configured, a pass that only spilled victims — none
-    /// physically removed — ends the call early rather than resampling
-    /// (see [`should_pause_for_pending_spills`]): `total_weight` only drops
-    /// once the flusher installs those spills, off this thread, shortly
-    /// after. Without a tier, `spilled` is always `0`, so this never
-    /// triggers and the loop's behavior is unchanged from before spill
-    /// existed.
+    /// With a spill tier configured, a pass that only spilled victims,
+    /// none physically removed, ends the call early rather than
+    /// resampling; see [`should_pause_for_pending_spills`]. `total_weight`
+    /// only drops once the flusher installs those spills, off this
+    /// thread, shortly after. Without a tier, `spilled` is always `0`, so
+    /// this never triggers and the loop's behavior matches a build with
+    /// no spill tier.
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
         if self.max_capacity == u64::MAX {
             return;
@@ -1713,7 +1716,7 @@ where
     /// fast-path re-check, then either joining an already in-flight load or
     /// registering as the new owner.
     ///
-    /// A currently-spilled entry never takes the `Hit` branch — there is no
+    /// A currently-spilled entry never takes the `Hit` branch. There is no
     /// value here to clone. A spill-aware caller checks
     /// [`Engine::spilled_loc`] before ever reaching this call, so it only
     /// falls through to here once it already knows the entry, if any, is
@@ -1864,12 +1867,13 @@ where
 
     /// Snapshots a currently-[`Payload::Spilled`] entry's pointer under the
     /// stripe read lock: `None` for a resident entry, an absent key, or one
-    /// a read at `now_ms` would see as expired. Touches `last_access_ms`
-    /// (the entry's `ver` travels alongside the pointer so a later promotion
-    /// can re-verify it is still current via [`spilled_is_current`]). The
-    /// caller drops the read lock, reads the pointer's bytes off-lock
-    /// (`spawn_blocking` behind the tier's read semaphore), then reacquires
-    /// the stripe write lock for [`Engine::promote_locked`].
+    /// a read at `now_ms` would see as expired. Touches `last_access_ms`.
+    /// The entry's `ver` travels alongside the pointer so a later
+    /// promotion can re-verify it is still current via
+    /// [`spilled_is_current`]. The caller drops the read lock, reads the
+    /// pointer's bytes off-lock, via `spawn_blocking` behind the tier's
+    /// read semaphore, then reacquires the stripe write lock for
+    /// [`Engine::promote_locked`].
     #[cfg(feature = "spill")]
     pub(crate) fn spilled_loc(
         &self,
@@ -1897,16 +1901,17 @@ where
 
     /// Flips a currently-[`Payload::Spilled`] entry back to
     /// [`Payload::Resident`] in place, iff [`spilled_is_current`] still
-    /// holds for `read_ver` against whatever is stored now — a tombstone or
-    /// a version change since the disk read started means the promotion is
-    /// a silent no-op (the caller's read already succeeded independently of
-    /// this; only the RAM reinstall is skipped). Adds the freshly weighed
-    /// entry's weight back to `total_weight`; **never touches the digest or
-    /// `live_count`** — same key, same `ver`, same fingerprint, so nothing
-    /// about the entry's replicated identity changes. Also decrements
-    /// `sundog_spill_entries{cache}`, the mirror of `SpillSink::install`'s
-    /// increment: the key is no longer counted among currently-spilled
-    /// entries. Returns whether it promoted.
+    /// holds for `read_ver` against what is currently stored. A tombstone
+    /// or a version change since the disk read started means the
+    /// promotion is a silent no-op. The caller's read already succeeded
+    /// independently of this; only the RAM reinstall is skipped. Adds the
+    /// freshly weighed entry's weight back to `total_weight`. **Never
+    /// touches the digest or `live_count`**: same key, same `ver`, same
+    /// fingerprint, so nothing about the entry's replicated identity
+    /// changes. Also decrements `sundog_spill_entries{cache}`, the mirror
+    /// of `SpillSink::install`'s increment, since a resident entry is not
+    /// counted among currently-spilled entries. Returns whether it
+    /// promoted.
     #[cfg(feature = "spill")]
     pub(crate) fn promote_locked(
         &self,
@@ -1929,8 +1934,8 @@ where
             return false;
         }
         if !matches!(live.payload, Payload::Spilled(_)) {
-            // Already resident: a racing promotion (or a fresh write that
-            // happens to share this exact version) got there first.
+            // Already resident: a racing promotion, or a fresh write that
+            // happens to share this version, got there first.
             return false;
         }
         let weight = self.weigher.as_ref().map_or(1, |w| w(&live.key, &value));
@@ -2028,7 +2033,7 @@ where
     }
 }
 
-/// A gauge only needs `f64`'s exact-integer range (up to 2^53), which
+/// A gauge only needs `f64`'s exact-integer range, up to 2^53, which
 /// comfortably covers any realistic entry count with no meaningful precision
 /// loss. Mirrors `spill::bytes_used_f64`.
 #[cfg(feature = "spill")]
@@ -2189,9 +2194,9 @@ where
 
     /// This engine's current `sundog_spill_entries{cache}` value, mirrored
     /// through [`Engine::note_spill_arrival`]/[`Engine::note_spill_departures`]
-    /// regardless of whether a real gauge (and thus a real metrics recorder)
-    /// is attached — see `spill_entries_test_count`'s own doc for why tests
-    /// need this instead of reading the gauge itself.
+    /// regardless of whether a real gauge, and thus a real metrics
+    /// recorder, is attached. See `spill_entries_test_count`'s own doc for
+    /// why tests need this instead of reading the gauge itself.
     #[cfg(feature = "spill")]
     pub(crate) fn debug_spill_entries_count(&self) -> i64 {
         self.spill_entries_test_count.load(Ordering::Relaxed)
@@ -4113,11 +4118,11 @@ mod tests {
         #[test]
         fn complete_fresh_load_over_a_spilled_key_decrements_spill_entries() {
             // A rare race: `get_spilled_by_bytes` already failed to promote
-            // this key (a concurrent tombstone or newer write raced its
-            // read), yet the entry, sampled independently right here, is
-            // still `Spilled` when the loader's fill lands. `complete_fresh_load`
-            // unconditionally replaces it, and must still keep
-            // `sundog_spill_entries` correct.
+            // this key, since a concurrent tombstone or newer write raced
+            // its read, yet the entry, sampled independently right here,
+            // is still `Spilled` when the loader's fill lands.
+            // `complete_fresh_load` unconditionally replaces it, and must
+            // still keep `sundog_spill_entries` correct.
             let engine = engine_u32_string(u64::MAX, None);
             let key = 1u32;
             let kb = key_bytes(key);

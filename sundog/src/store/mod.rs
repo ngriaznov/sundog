@@ -419,12 +419,12 @@ enum Incoming<V> {
     Put {
         value: V,
         expires_at_ms: Option<u64>,
-        /// `value`'s postcard-encoded bytes: the first encode's bytes on the
-        /// local-origin path (`insert`/`insert_many`/`get_or_load`'s fill),
-        /// the verbatim wire bytes on the replica-apply path
-        /// (`apply_remote_batch`). Always equal to `postcard::to_stdvec(&
-        /// value)`, or to wire bytes decoding to a structurally equal
-        /// `value`.
+        /// `value`'s postcard-encoded bytes. On the local-origin path,
+        /// `insert`/`insert_many`/`get_or_load`'s fill, these are the
+        /// first encode's bytes; on the replica-apply path,
+        /// `apply_remote_batch`, they are the verbatim wire bytes. Always
+        /// equal to `postcard::to_stdvec(&value)`, or to wire bytes
+        /// decoding to a structurally equal `value`.
         encoded: Bytes,
     },
     Tombstone,
@@ -543,7 +543,7 @@ where
     /// disk reads and the metric handles the spilled-key read path counts
     /// against. Unset until then, and always unset in a non-`spill` build.
     /// A `OnceLock`, not a plain `Option` behind `&mut self`, so
-    /// `attach_spill` can run through `&self` — see its own doc for why
+    /// `attach_spill` can run through `&self`. See its own doc for why
     /// that matters.
     #[cfg(feature = "spill")]
     spill_read: OnceLock<SpillRead>,
@@ -551,8 +551,8 @@ where
 
 /// [`Shard::with_spill`]'s read-side counterpart to the tier itself: the
 /// semaphore [`Shard::get`]/[`Shard::get_or_load`]'s disk reads acquire a
-/// permit from before `spawn_blocking`-ing a positional read (the
-/// configured `read_concurrency` bound), plus the four `Counter` handles
+/// permit from before `spawn_blocking`-ing a positional read, bounded by
+/// the configured `read_concurrency`, plus the four `Counter` handles
 /// those reads and the anti-entropy/snapshot read path count against,
 /// precomputed for the same reason `Shard::hits`/`Shard::misses` are.
 #[cfg(feature = "spill")]
@@ -562,8 +562,8 @@ struct SpillRead {
     /// `sundog_spill_reads_total{cache,outcome="hit"}`.
     reads_hit: metrics::Counter,
     /// `sundog_spill_reads_total{cache,outcome="stale"}`: a generation
-    /// mismatch (the region rotated out from under the pointer) or a
-    /// checksum failure.
+    /// mismatch, meaning the region rotated out from under the pointer, or
+    /// a checksum failure.
     reads_stale: metrics::Counter,
     /// `sundog_spill_reads_total{cache,outcome="io_error"}`: the positional
     /// read itself failed, or the bytes it returned failed to postcard-decode
@@ -574,11 +574,11 @@ struct SpillRead {
 }
 
 // Every method here is fully synchronous, with no `.await`, except
-// `Shard::get`/`Shard::get_or_load`'s spilled-key path (`feature =
-// "spill"`): a disk read runs behind `spawn_blocking` and a semaphore
-// permit there, the one place this backend actually awaits. `async fn`
-// stays the signature everywhere in this block regardless, so callers and a
-// later backend swap need no signature change.
+// `Shard::get`/`Shard::get_or_load`'s spilled-key path under `feature =
+// "spill"`: a disk read runs behind `spawn_blocking` and a semaphore
+// permit there, the one place this backend awaits. `async fn` stays the
+// signature everywhere in this block regardless, so callers and a later
+// backend swap need no signature change.
 #[allow(
     clippy::unused_async,
     clippy::unused_async_trait_impl,
@@ -687,7 +687,7 @@ where
     /// shard's engine: once `max_capacity` is exceeded, eviction demotes the
     /// coldest entries onto disk instead of discarding them. Call this last
     /// in the builder chain, right after [`Shard::with_weigher`] if both are
-    /// used — [`Shard::with_weigher`] rebuilds the engine from scratch, and
+    /// used. [`Shard::with_weigher`] rebuilds the engine from scratch, and
     /// the tier attaches to whichever engine is current when this runs.
     ///
     /// # Errors
@@ -697,8 +697,8 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `Shard::attach_spill` (which this calls) has already run
-    /// on this shard.
+    /// Panics if `Shard::attach_spill` has already run on this shard; this
+    /// method calls it.
     #[cfg(feature = "spill")]
     pub fn with_spill(self, cfg: &spill::SpillConfig) -> Result<Self, std::io::Error> {
         self.attach_spill(cfg)?;
@@ -707,16 +707,17 @@ where
 
     /// The core of [`Shard::with_spill`], through `&self` rather than
     /// consuming `self`: opens the tier, attaches it to this shard's engine,
-    /// and creates the spilled-key read-path metric handles. Since
+    /// and creates the spilled-key read-path metric handles.
     /// `Engine::spill`/`Engine::set_spill` and this shard's own `spill_read`
-    /// are `OnceLock`s rather than plain fields behind `&mut self`, this can
-    /// run once the shard is already `Arc`-shared — which is exactly what
-    /// [`crate::cache::CacheBuilder::open`] needs: it reserves this shard's
-    /// name in the cluster's shard registry first, and only calls this for
-    /// the `open()` that wins that reservation, so a losing (already-open)
-    /// `open()` never wipes or preallocates another cache's region files.
-    /// [`Shard::with_spill`] stays the ordinary builder-chain entry point
-    /// for a caller that already owns an unshared `Shard`.
+    /// are `OnceLock`s rather than plain fields behind `&mut self`, so this
+    /// can run once the shard is already `Arc`-shared.
+    /// [`crate::cache::CacheBuilder::open`] relies on that. It reserves
+    /// this shard's name in the cluster's shard registry first, then calls
+    /// this only for the `open()` that wins that reservation, so a losing,
+    /// already-open, `open()` never wipes or preallocates another cache's
+    /// region files. [`Shard::with_spill`] stays the ordinary
+    /// builder-chain entry point for a caller that already owns an
+    /// unshared `Shard`.
     ///
     /// # Errors
     ///
@@ -887,10 +888,11 @@ where
     /// Counts `sundog_cache_hits_total{cache}` on `Some`,
     /// `sundog_cache_misses_total{cache}` on `None`. On a `feature = "spill"`
     /// build, a RAM miss that turns out to be a currently-spilled entry is
-    /// read back off disk (`spawn_blocking` behind the tier's read
-    /// semaphore) and, on success, promoted back to residency under a fresh
-    /// stripe write lock; either way it still counts as a hit. See the store
-    /// module's docs and [`Shard::get_sync`], which never does this.
+    /// read back off disk behind the tier's read semaphore, via
+    /// `spawn_blocking`, and, on success, promoted back to residency under
+    /// a fresh stripe write lock; either way it still counts as a hit. See
+    /// the store module's docs and [`Shard::get_sync`], which never does
+    /// this.
     pub async fn get(&self, key: &K) -> Option<V> {
         if let Some(value) = self.engine.get(key, self.now_ms()) {
             self.hits.increment(1);
@@ -907,7 +909,7 @@ where
 
     /// [`Shard::get`] without an async runtime: same hit and miss counting,
     /// for every entry except a currently-spilled one. On `feature =
-    /// "spill"`, a spilled entry reads as a miss here — this is the one
+    /// "spill"`, a spilled entry reads as a miss here. This is the
     /// documented behavioral difference between the sync and async twins:
     /// the RAM-only synchronous path never touches disk, so it cannot read a
     /// value that has moved there. Use [`Shard::get`] to read a spilled
@@ -935,8 +937,8 @@ where
     }
 
     /// [`Shard::contains_key`] without an async runtime. Answers `true` for
-    /// a currently-spilled entry exactly as [`Shard::contains_key`] does,
-    /// with zero disk reads: existence doesn't need the value bytes.
+    /// a currently-spilled entry as [`Shard::contains_key`] does, with zero
+    /// disk reads: existence doesn't need the value bytes.
     #[must_use]
     pub fn contains_key_sync(&self, key: &K) -> bool {
         self.engine.contains_key(key, self.now_ms())
@@ -944,15 +946,15 @@ where
 
     /// After a RAM miss, checks whether `key` is currently spilled and, if
     /// so, reads its bytes back off disk and promotes it to residency.
-    /// `None` for a resident or absent entry, a stale generation (the
-    /// region rotated out from under the pointer), a checksum mismatch, or
-    /// a postcard decode failure — each of the latter three counts
-    /// `sundog_spill_reads_total{cache,outcome}` accordingly. A genuine hit
-    /// counts `outcome = "hit"` and, iff it actually flips the entry back
-    /// to residency (a tombstone or a newer write racing the disk read
-    /// means it does not), `sundog_spill_promotions_total{cache}`. No lock
-    /// or permit is ever held across more than one `.await` point at a
-    /// time, and no stripe lock is ever held across the disk read itself.
+    /// Returns `None` for a resident or absent entry, a stale generation
+    /// where the region rotated out from under the pointer, a checksum
+    /// mismatch, or a postcard decode failure. Each of the latter three
+    /// counts `sundog_spill_reads_total{cache,outcome}` accordingly. A hit
+    /// counts `outcome = "hit"` and, iff it flips the entry back to
+    /// residency, `sundog_spill_promotions_total{cache}`; a tombstone or a
+    /// newer write racing the disk read means it does not. No lock or
+    /// permit is ever held across more than one `.await` point at a time,
+    /// and no stripe lock is ever held across the disk read.
     #[cfg(feature = "spill")]
     async fn get_spilled(&self, key: &K) -> Option<V> {
         let key_bytes = encode_key(key).ok()?;
@@ -1045,10 +1047,10 @@ where
     /// On a `feature = "spill"` build, the collapse extends to a spilled
     /// key's disk read too: only the call that wins ownership of the
     /// missing key checks whether it is currently spilled and, if so, reads
-    /// it back before ever calling `loader` — every other concurrent caller
-    /// joins and waits exactly as it already does for an in-flight `loader`
-    /// run, so a burst of concurrent misses on one spilled key still reads
-    /// it off disk exactly once.
+    /// it back before ever calling `loader`. Every other concurrent caller
+    /// joins and waits as it already does for an in-flight `loader` run,
+    /// so a burst of concurrent misses on one spilled key reads it off
+    /// disk once.
     ///
     /// # Errors
     ///
@@ -1099,11 +1101,11 @@ where
                     // before ever calling `loader`: a burst of concurrent
                     // misses collapses to at most one spilled-key read, the
                     // same way it already collapses to at most one `loader`
-                    // call. Dropping `guard` unfinished (rather than calling
-                    // `guard.complete()`) removes the in-flight entry and
-                    // wakes every joined waiter exactly as an early-dropped
-                    // loader future would, so they re-check the fast path
-                    // above and see the now-resident promoted value.
+                    // call. Dropping `guard` unfinished, instead of calling
+                    // `guard.complete()`, removes the in-flight entry and
+                    // wakes every joined waiter as an early-dropped loader
+                    // future would, so they re-check the fast path above
+                    // and see the resident promoted value.
                     #[cfg(feature = "spill")]
                     if let Some(value) = self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await {
                         self.hits.increment(1);
@@ -1509,11 +1511,11 @@ where
         }
     }
 
-    /// Whether this shard's attached spill tier has been closed (by
-    /// [`Shard::close_spill`]), or there never was one. `false` only while a
+    /// Whether this shard's attached spill tier has been closed by
+    /// [`Shard::close_spill`], or there never was one. `false` only while a
     /// tier is attached and still open. Test-facing: lets a test observe
-    /// that [`Cache::close`] actually stopped the tier a surviving clone
-    /// still shares, without needing to drive an eviction and infer it
+    /// that [`Cache::close`] stopped the tier a surviving clone still
+    /// shares, without needing to drive an eviction and infer it
     /// indirectly.
     #[cfg(all(feature = "spill", test))]
     pub(crate) fn spill_tier_closed(&self) -> bool {
@@ -1537,13 +1539,13 @@ where
 }
 
 /// Reads a batch of currently-spilled pointers off-lock, behind a single
-/// semaphore permit for the whole batch rather than one per key:
-/// [`ShardOps::records_for`] (the AE-pull-reply path) and
+/// semaphore permit for the whole batch rather than one per key.
+/// [`ShardOps::records_for`], the AE-pull-reply path, and
 /// [`ShardOps::snapshot_chunks`] both fold spilled entries in this way. A
-/// pointer whose read fails (a stale generation, a checksum mismatch, or a
-/// genuine I/O error) is dropped, exactly like an absent key; nothing here
-/// promotes. `Vec::new()` with no read attempted at all if this shard never
-/// attached a tier.
+/// pointer read that fails, whether from a stale generation, a checksum
+/// mismatch, or a genuine I/O error, is dropped like an absent key;
+/// nothing here promotes. Returns `Vec::new()` with no read attempted if
+/// this shard never attached a tier.
 #[cfg(feature = "spill")]
 async fn read_spilled_batch<K, V>(
     engine: &engine::Engine<K, V>,
@@ -1765,7 +1767,7 @@ where
 
     /// A spilled entry's value is read off-lock behind the tier's read
     /// semaphore, batched into one `spawn_blocking` call, and dropped if the
-    /// read fails — never promoted, since an anti-entropy pull reply covers
+    /// read fails. It is never promoted: an anti-entropy pull reply covers
     /// many keys, and reinstalling every one of them on every round would
     /// repopulate RAM as fast as eviction drains it.
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
@@ -3510,7 +3512,7 @@ mod tests {
     /// `Shard`-layer coverage of the spill read path: every method here
     /// goes through a real [`crate::store::spill::SpillTier`] and its
     /// dedicated flusher thread, never a synthetic engine-level shortcut, so
-    /// I/O tests are gated exactly like `spill.rs`'s own.
+    /// I/O tests are gated like `spill.rs`'s own.
     #[cfg(all(feature = "spill", not(feature = "sim")))]
     mod spill_reads {
         use std::path::PathBuf;
@@ -3567,11 +3569,11 @@ mod tests {
         }
 
         /// Inserts two entries under `max_capacity == 1`, forcing eviction to
-        /// spill exactly one of them, and waits (bounded) for the flusher to
-        /// install it — observed through the tier's own `bytes_used`, so
-        /// this never depends on which of the two keys the sampler picked.
-        /// Returns `(shard, spilled_key, spilled_value, resident_key,
-        /// resident_value, dir)`.
+        /// spill one of them, then waits up to a bound for the flusher to
+        /// install it. This is observed through the tier's own
+        /// `bytes_used`, so it never depends on which of the two keys the
+        /// sampler picked. Returns `(shard, spilled_key, spilled_value,
+        /// resident_key, resident_value, dir)`.
         async fn shard_with_one_spilled_entry(
             label: &str,
         ) -> (Shard<u32, String>, u32, String, u32, String, PathBuf) {
@@ -3755,10 +3757,10 @@ mod tests {
         #[tokio::test]
         async fn remove_on_a_spilled_key_prevents_a_late_flush_from_resurrecting_it() {
             // No real tier needed here: this drives `SpillSink::install`
-            // directly, exactly the call a real flusher makes, to
-            // deterministically simulate a flush of the pre-removal value
-            // landing *after* the remove — the narrow race a real disk's
-            // timing cannot be made to land on demand.
+            // directly, the call a real flusher makes, to deterministically
+            // simulate a flush of the pre-removal value landing *after*
+            // the remove. This is the narrow race a real disk's timing
+            // cannot be made to land on demand.
             let shard = Shard::<u32, String>::new(
                 SmolStr::new("spill-remove-race"),
                 Mode::Local,

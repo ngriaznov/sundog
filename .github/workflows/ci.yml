@@ -38,16 +38,15 @@ jobs:
       - name: cargo clippy (tls,prometheus features)
         run: cargo clippy --package sundog --all-targets --features tls,prometheus -- -D warnings -W clippy::pedantic
 
-      # The optional local SSD/NVMe spill tier. Off by default, its own
-      # lane like `sim`: positional file I/O has nothing to do with the
+      # The optional local SSD/NVMe spill tier. Off by default, in its own
+      # lane like `sim`. Positional file I/O has nothing to do with the
       # turmoil transport seam, so the two features are never combined.
       - name: cargo clippy (spill feature)
         run: cargo clippy --package sundog --all-targets --features spill -- -D warnings -W clippy::pedantic
 
-      # `spill,prometheus` together: the exporter pin test
-      # (tests/prometheus_exporter.rs's spill metrics scenario) only
-      # compiles under both features at once, so this is the lane that
-      # actually lints it.
+      # `spill,prometheus` together. The exporter pin test in
+      # tests/prometheus_exporter.rs's spill metrics scenario compiles only
+      # under both features at once, so this lane lints it.
       - name: cargo clippy (spill,prometheus features)
         run: cargo clippy --package sundog --all-targets --features spill,prometheus -- -D warnings -W clippy::pedantic
 
@@ -76,7 +75,7 @@ jobs:
 
       # Exercises tests/prometheus_exporter.rs's spill metrics pin alongside
       # the tier's own unit and engine/shard suites. Not combined with
-      # `sim`, for the same reason as the lane above: spill's flusher thread
+      # `sim`, for the same reason as the lane above. Spill's flusher thread
       # does real filesystem I/O that a turmoil `Sim` gives no determinism
       # over.
       - name: cargo test (spill,prometheus features)
@@ -109,8 +108,8 @@ jobs:
       - name: cargo test (turmoil simulation suite)
         run: cargo test --package sundog --features sim --test 'sim*'
 
-      # The spill tier's positional I/O is platform-gated (unix pread/pwrite
-      # vs. windows seek_read/seek_write); this is what actually runs those
+      # The spill tier's positional I/O is platform-gated, unix pread/pwrite
+      # against windows seek_read/seek_write. This lane runs those
       # primitives on macOS and Windows, not only Linux's lane above. Never
       # combined with `sim`.
       - name: cargo test (spill feature)

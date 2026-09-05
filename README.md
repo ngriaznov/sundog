@@ -210,7 +210,7 @@ address is already correct, leave it unset.
 | `prometheus` | off | a Prometheus exporter; `ClusterBuilder::prometheus_listen` serves `GET /metrics` directly, or grab a recorder via `telemetry::prometheus_handle` and mount it in your own server |
 | `sim` | off | swaps the data-plane transport for `turmoil`'s, so the net layer can run inside a deterministic simulation; test-only, never enable it in a real deployment |
 | `fuzzing` | off | exposes the reference model the apply-path fuzz targets drive against a real shard (`sundog::store::model`); changes no behavior |
-| `spill` | off | a local SSD/NVMe spill tier: `CacheBuilder::spill(SpillConfig::new(dir, capacity_bytes))` lets eviction demote cold entries to disk instead of discarding them |
+| `spill` | off | a local SSD/NVMe spill tier; `CacheBuilder::spill(SpillConfig::new(dir, capacity_bytes))` lets eviction demote cold entries to disk instead of discarding them |
 
 With `spill` configured, eviction writes cold entries to a FIFO ring of region
 files on local disk instead of discarding them, so a cache's effective size
