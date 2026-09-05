@@ -6,7 +6,7 @@ revisiting one is a decision made on evidence, not on itch.
 
 Nothing here is scheduled: a section becomes code only once its trigger
 condition is observed in a real deployment, not because it would be interesting
-to build. The two exceptions are under "Next": small, self-contained, and
+to build. The exceptions are under "Next": small, self-contained, and
 already justified by the code as it stands.
 
 ## Next
@@ -46,15 +46,6 @@ peer choice.
 
 **Trigger:** a multi-zone deployment measuring cross-zone egress from joins
 or repairs.
-
-### HTTP cache layer
-
-A `sundog-tower` crate: a `tower::Layer` for axum and friends that serves a
-route from a `Cache<K, V>` and answers `If-None-Match` from the entry's HLC
-version as its `ETag`, so an unchanged entry is a `304` at the network
-boundary. Separate crate, separate release cadence, no change to `sundog`.
-
-**Cost:** a few hundred lines plus an axum integration test.
 
 ### Merge resolvers
 
@@ -159,96 +150,14 @@ tiered storage only postpones it per node.
 **Trigger:** a deployment already running distribution mode whose per-node
 working set still exceeds RAM. Not before.
 
-## Wire-level trace context
-
-A trace id carried in replicate and state-transfer frames would let a tracing
-backend show one span from a write on A through its repair on B. It is a
-wire-format field on the hottest frames, a protocol bump, and 16 bytes per
-frame that most deployments never read.
-
-**Cost:** small in code, permanent on the wire.
-
-**Trigger:** a deployment chasing cross-node latency that per-node metrics
-cannot attribute. Until then, `sundog_frames_sent_total`,
-`sundog_ae_repaired_total`, and the peer-level counters answer the question
-without touching the wire.
-
-## Cluster-wide max-idle
-
-Touch-propagating max-idle (TTI) across a distributed cache, every read anywhere
-resetting every replica's idle clock, sounds like a small feature but drags in a
-specific set of anomalies: touch messages that themselves need to be reliable
-and ordered against concurrent writes, idle timers that drift apart under any
-message loss, and a feature that turns reading a cache into cluster-wide
-chatter. sundog's stance is **local-only, permanently**: `.tti()` on a
-`CacheBuilder` bounds only that node's own idle eviction and is never gossiped
-or replicated. This is not a gap to close later; it's a deliberate refusal to
-build a subsystem whose failure modes cost more than the feature is worth.
-
-**Cost / trigger:** none tracked. Anyone who needs cluster-wide idle expiry
-needs a different tool than an embedded cache library; see "remote thin clients"
-below for the general shape of that advice.
-
 ## Distributed locks and leader leases
 
 A lock or a lease is a promise that at most one holder exists. sundog's
 membership is gossip with no quorum, so under a partition each side computes
 its own view and both sides can grant the lease. Every construction on top of
 that either admits two holders or bolts on a consensus protocol, which is a
-different system. The stance is a refusal, the same as cluster-wide max-idle:
-anyone who needs a lease needs etcd or a database row, and sundog stays a
-cache.
+different system. The stance is a refusal: anyone who needs a lease needs
+etcd or a database row, and sundog stays a cache.
 
 Coordinator-free rate limiting and counters are a different question: they
 are CRDTs, and they wait on merge resolvers above.
-
-## Remote thin clients vs. "run Valkey instead"
-
-A thin-client protocol would let non-embedding clients talk to a cluster over a
-small binary TCP protocol with topology hints, so a process that isn't a Rust
-member of the cluster could still be a cache client. sundog is embedded-only by
-design: the whole point is that every participant runs the identical stack with
-no roles and no separate server tier. A thin-client protocol would mean
-designing and versioning a second, external wire format alongside the internal
-one, plus routing and topology awareness for clients that aren't cluster members
-and can't watch chitchat's gossip.
-
-**Cost:** effectively a second product: protocol design, client-side topology
-tracking, versioning discipline for a wire format now consumed by code sundog
-doesn't control the release cadence of.
-
-**Trigger, and the honest caveat:** the moment a remote thin client is wanted,
-the right first move is to compare against running [Valkey](https://valkey.io/),
-or Redis, as a standalone cache server and using its already-mature,
-already-multi-language client ecosystem. sundog's entire value proposition is
-*embedded* zeroconf clustering for services that already share a process
-boundary with their cache; a remote-client story gives that up in exchange for
-reinventing a strictly worse Valkey. This item stays here as a sketch, not a
-commitment, for exactly that reason.
-
-A sidecar speaking the Redis protocol on localhost is this item in a container:
-the application keeps a Redis client, the cache becomes a separate process,
-and the only thing sundog adds over Valkey is a mesh that Valkey Cluster
-already has. The same answer applies.
-
-## Not planned
-
-- **Zero-copy values.** The engine keeps every value's encoded bytes next to
-  the decoded value, and a `Cache<K, Bytes>` read clones a reference-counted
-  handle, not the bytes. A caller who wants zero-copy access to a large value
-  stores its own archived encoding as `Bytes` and reads through it; a
-  serialization-framework feature flag adds nothing that layering does not.
-- **A caching attribute macro.** `#[cached]` over an `async fn` needs a global
-  cluster handle to find the cache, and a global handle is the one thing the
-  API refuses: every cache is opened from an explicit `Cluster`. A macro that
-  takes the handle as an argument saves four lines and hides the stampede
-  collapse it relies on. Revisit after 1.0, when the surface it wraps stops
-  moving.
-- **Change-data-capture adapters.** A logical-replication client for one
-  database is its own product with its own release cadence and failure modes.
-  The integration point already exists: a consumer of a CDC stream calls
-  `remove` or `insert` on a `Cache`.
-- **A bundled dashboard.** The Prometheus exporter and its Grafana panels
-  cover the metrics; the demo's TUI covers the rest. A web dashboard inside
-  the library is an HTTP server and a front end to maintain for a view
-  Grafana already gives.
