@@ -30,6 +30,11 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
+/// The optional local SSD/NVMe spill tier. Off by default; see
+/// [`spill::SpillConfig`] and [`crate::cache::CacheBuilder::spill`].
+#[cfg(feature = "spill")]
+pub mod spill;
+
 /// A sequential, single-threaded reference model of everything downstream of a
 /// successful wire decode. Shared by `sundog-fuzz`'s fuzz targets and
 /// `store::prop_tests`, so the semantics are written once. `#[doc(hidden)]`: a

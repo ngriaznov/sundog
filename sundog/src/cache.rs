@@ -19,6 +19,8 @@ use tokio_util::task::TaskTracker;
 
 use crate::cluster::Cluster;
 use crate::error::CacheError;
+#[cfg(feature = "spill")]
+use crate::store::spill::SpillConfig;
 use crate::store::{ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher};
 
 /// Builds a [`Cache`]: own-and-return, per house style.
@@ -32,6 +34,8 @@ pub struct CacheBuilder<K, V> {
     tti: Option<Duration>,
     resolver: Arc<dyn ConflictResolver>,
     weigher: Option<Weigher<K, V>>,
+    #[cfg(feature = "spill")]
+    spill: Option<SpillConfig>,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -50,6 +54,8 @@ where
             tti: None,
             resolver: Arc::new(LwwResolver),
             weigher: None,
+            #[cfg(feature = "spill")]
+            spill: None,
             marker: PhantomData,
         }
     }
@@ -99,6 +105,15 @@ where
         self
     }
 
+    /// Configures the local SSD/NVMe spill tier: once `max_capacity` is
+    /// exceeded, eviction demotes the coldest entries onto disk instead of
+    /// discarding them, extending capacity beyond RAM. Off by default.
+    #[cfg(feature = "spill")]
+    pub fn spill(mut self, cfg: SpillConfig) -> Self {
+        self.spill = Some(cfg);
+        self
+    }
+
     /// Opens the cache: builds the local shard, registers it in the
     /// cluster's shard registry, and, unless `mode` is [`Mode::Local`],
     /// starts fanning local writes out to the mesh per `mode`.
@@ -115,8 +130,16 @@ where
     /// already open in this process.
     ///
     /// Returns [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
-    /// [`Mode::Replicated`] and `max_capacity`/`tti` was also set: a local
-    /// eviction would be silently re-pulled by the next anti-entropy round.
+    /// [`Mode::Replicated`] and `tti` was set, or `max_capacity` was set
+    /// with no `spill` tier configured (see the `spill` feature's
+    /// `CacheBuilder::spill`): a local eviction would be silently re-pulled
+    /// by the next anti-entropy round. `tti` is rejected unconditionally,
+    /// spill or not — it is local-only by design, and spilling does nothing
+    /// to reconcile it.
+    ///
+    /// Returns `CacheError::InvalidSpillConfig` (the `spill` feature) if
+    /// `spill` was configured with a `region_bytes` of zero, or a
+    /// `capacity_bytes` under two regions.
     ///
     /// Returns [`CacheError::ModeMismatch`] if a live peer already
     /// advertises `name` under a different [`Mode`]. Best-effort: a
@@ -135,11 +158,30 @@ where
             tti,
             resolver,
             weigher,
+            #[cfg(feature = "spill")]
+            spill,
             marker: _,
         } = self;
 
-        if matches!(mode, Mode::Replicated) && (max_capacity != u64::MAX || tti.is_some()) {
+        #[cfg(feature = "spill")]
+        let spill_configured = spill.is_some();
+        #[cfg(not(feature = "spill"))]
+        let spill_configured = false;
+
+        if matches!(mode, Mode::Replicated)
+            && (tti.is_some() || (max_capacity != u64::MAX && !spill_configured))
+        {
             return Err(CacheError::ReplicatedWithLocalEviction { cache: name });
+        }
+
+        #[cfg(feature = "spill")]
+        if let Some(cfg) = &spill
+            && let Err(reason) = cfg.validate()
+        {
+            return Err(CacheError::InvalidSpillConfig {
+                cache: name,
+                reason,
+            });
         }
 
         if let Some(remote) = cluster
@@ -169,6 +211,10 @@ where
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
+        // Validated above; `Shard::with_spill` (a later part of this work)
+        // attaches it to the engine. Nothing consumes it yet.
+        #[cfg(feature = "spill")]
+        let _ = spill;
         let shard = Arc::new(shard);
 
         let registry = cluster.shards();
@@ -640,5 +686,126 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[cfg(feature = "spill")]
+    mod spill_gate {
+        use super::*;
+
+        /// A directory path under the OS temp dir, unique to this test
+        /// process and call — never created on disk, since config
+        /// validation in `open()` is pure arithmetic and never touches the
+        /// filesystem.
+        fn fresh_spill_dir(label: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "sundog-spill-gate-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after the unix epoch")
+                    .as_nanos()
+            ))
+        }
+
+        #[tokio::test]
+        async fn open_rejects_a_spill_config_whose_capacity_is_under_two_regions() {
+            let cluster = Cluster::builder("cache-it-spill-under-two-regions")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            // Default region_bytes is 64 MiB; one byte under two regions.
+            let cfg = SpillConfig::new(fresh_spill_dir("under-two-regions"), 128 * 1024 * 1024 - 1);
+            let err = cluster
+                .cache::<u32, String>("scratch")
+                .spill(cfg)
+                .open()
+                .await
+                .expect_err("a capacity under two regions is rejected");
+
+            assert!(
+                matches!(err, CacheError::InvalidSpillConfig { .. }),
+                "expected InvalidSpillConfig, got {err:?}"
+            );
+
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn open_rejects_replicated_with_max_capacity_and_no_spill() {
+            let cluster = Cluster::builder("cache-it-spill-no-spill-max-capacity")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let err = cluster
+                .cache::<u32, String>("scratch")
+                .mode(Mode::Replicated)
+                .max_capacity(100)
+                .open()
+                .await
+                .expect_err("Replicated + finite max_capacity + no spill is rejected");
+
+            assert!(
+                matches!(err, CacheError::ReplicatedWithLocalEviction { .. }),
+                "expected ReplicatedWithLocalEviction, got {err:?}"
+            );
+
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn open_accepts_replicated_with_max_capacity_once_spill_is_configured() {
+            let cluster = Cluster::builder("cache-it-spill-relaxes-gate")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let cfg = SpillConfig::new(fresh_spill_dir("relaxes-gate"), 256 * 1024 * 1024);
+            let cache = cluster
+                .cache::<u32, String>("scratch")
+                .mode(Mode::Replicated)
+                .max_capacity(100)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("Replicated + finite max_capacity is accepted once spill is configured");
+
+            cache.close().await;
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn open_still_rejects_replicated_with_tti_even_with_spill() {
+            let cluster = Cluster::builder("cache-it-spill-tti-still-rejected")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let cfg = SpillConfig::new(fresh_spill_dir("tti-still-rejected"), 256 * 1024 * 1024);
+            let err = cluster
+                .cache::<u32, String>("scratch")
+                .mode(Mode::Replicated)
+                .tti(Duration::from_secs(30))
+                .spill(cfg)
+                .open()
+                .await
+                .expect_err("tti stays an unconditional error for Replicated, spill or not");
+
+            assert!(
+                matches!(err, CacheError::ReplicatedWithLocalEviction { .. }),
+                "expected ReplicatedWithLocalEviction, got {err:?}"
+            );
+
+            cluster.shutdown().await;
+        }
     }
 }

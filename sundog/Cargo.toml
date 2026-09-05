@@ -83,3 +83,7 @@ sim = ["dep:turmoil"]
 # (`sundog/fuzz`'s hook for its sequence-driven fuzz targets); no effect on
 # any other behavior.
 fuzzing = ["dep:arbitrary"]
+# The optional local SSD/NVMe spill tier (`store::spill`). Off by default: a
+# non-spill build never allocates a region file or a flusher thread. No new
+# dependency — `zerocopy` and `xxhash-rust` are already direct dependencies.
+spill = []
