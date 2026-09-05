@@ -1312,7 +1312,10 @@ mod tests {
                 key: &metrics::Key,
                 _metadata: &metrics::Metadata<'_>,
             ) -> metrics::Counter {
-                if key.name() != "sundog_spill_dropped_total" {
+                let this_cache = key
+                    .labels()
+                    .any(|l| l.key() == "cache" && l.value() == DROP_REASONS_CACHE);
+                if key.name() != "sundog_spill_dropped_total" || !this_cache {
                     return metrics::Counter::noop();
                 }
                 let reason = key
@@ -1343,6 +1346,10 @@ mod tests {
             }
         }
 
+        /// The cache name only this test opens, so the process-global
+        /// recorder ignores drops from every other test's tier.
+        const DROP_REASONS_CACHE: &str = "drop-reasons-only";
+
         #[test]
         fn try_spill_and_flush_record_the_documented_drop_reason_for_each_case() {
             let counts = DropCounts::default();
@@ -1362,7 +1369,7 @@ mod tests {
             // too_large: a record too big for the tier's own region size.
             let dir = temp_dir("reasons-too-large");
             let cfg = SpillConfig::new(&dir, 128).region_bytes(64);
-            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
             let sink: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
             tier.attach(Arc::downgrade(&sink));
             assert!(!tier.try_spill(job("k", &[0u8; 100], hlc(1, 0))));
@@ -1373,7 +1380,7 @@ mod tests {
             // closed: try_spill after SpillTier::close.
             let dir = temp_dir("reasons-closed");
             let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
-            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
             let sink: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
             tier.attach(Arc::downgrade(&sink));
             tier.close();
@@ -1384,7 +1391,7 @@ mod tests {
             // queue_full: never attached, so there is no channel to send on.
             let dir = temp_dir("reasons-queue-full");
             let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
-            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
             assert!(!tier.try_spill(job("k", b"v", hlc(1, 0))));
             assert_eq!(counts.get("queue_full"), 1);
             let _ = fs::remove_dir_all(&dir);
@@ -1393,7 +1400,7 @@ mod tests {
             // installing it.
             let dir = temp_dir("reasons-obsolete");
             let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
-            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
             let sink: Arc<dyn SpillSink> = Arc::new(RejectingSink);
             tier.attach(Arc::downgrade(&sink));
             assert!(tier.try_spill(job("k", b"v", hlc(1, 0))));
