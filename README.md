@@ -82,10 +82,14 @@ That's the whole API surface for the common case.
 doctest in `sundog/src/lib.rs` runs it as the project's acceptance test. For
 bulk fills, `users.insert_many(entries).await?` gives every entry its own HLC
 stamp and event under one lock acquisition instead of one per entry. The rest of
-the surface: `contains_key`; `keys`, a local snapshot; `get_or_insert_with`, an
-infallible `get_or_load`; `remove_many`; and `clear`. `clear` tombstones and
-fans out every key this node holds. In `Replicated` mode that empties the whole
-cluster once the tombstones land.
+the surface: `contains_key`; `keys`, a local snapshot, and `for_each_key`, the
+same scan as a visitor that never materializes it all at once;
+`get_or_insert_with`, an infallible `get_or_load`; `remove_many`; and `clear`.
+`clear` tombstones and fans out every key this node holds. In `Replicated` mode
+that empties the whole cluster once the tombstones land. `get_sync`,
+`contains_key_sync`, `insert_sync`, and `remove_sync` are synchronous twins of
+`get`, `contains_key`, `insert`, and `remove` for a caller with no async
+runtime handy.
 
 ## Should you use this?
 

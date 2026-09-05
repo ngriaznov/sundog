@@ -20,6 +20,11 @@ All notable changes to this project are documented in this file. Format follows
   `Mode::Replicated` cache has finished warming. With the `prometheus`
   feature the metrics listener also serves `GET /readyz` (200 or 503) and
   `GET /healthz`.
+- `Cache::get_sync`, `contains_key_sync`, `insert_sync`, and `remove_sync`,
+  and the same on `Shard`: the operations without an async runtime, with the
+  same hit and miss counting, fan-out, and events as the async ones.
+- `Cache::for_each_key` and `Shard::for_each_key`: a visitor over this node's
+  live keys that never holds every key in one `Vec`.
 
 ### Fixed
 

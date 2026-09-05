@@ -699,6 +699,28 @@ where
         out
     }
 
+    /// [`Engine::keys`] without materializing them all at once: for each
+    /// stripe, takes its read lock only long enough to clone that stripe's
+    /// live keys into a small buffer, releases the lock, then calls `f` for
+    /// each. `f` never runs with a stripe lock held. Still O(entries)
+    /// overall, but peak extra memory is one stripe's worth of keys.
+    pub(crate) fn for_each_key(&self, now_ms: u64, mut f: impl FnMut(K)) {
+        for stripe_lock in &self.stripes {
+            let stripe_keys: Vec<K> = {
+                let stripe = stripe_lock.read();
+                stripe
+                    .live
+                    .iter()
+                    .filter(|live| !self.is_absent(live, now_ms))
+                    .map(|live| live.key.clone())
+                    .collect()
+            };
+            for key in stripe_keys {
+                f(key);
+            }
+        }
+    }
+
     /// The full [`WireRecord`] for `key_bytes`, present entry or tombstone
     /// alike.
     pub(crate) fn record_for(&self, key_bytes: &[u8], now_ms: u64) -> Option<WireRecord> {
@@ -1548,6 +1570,23 @@ mod tests {
         assert!(
             engine.record_for(kb.as_ref(), 100).is_none(),
             "record_for treats an expired live entry as absent, no sweep needed"
+        );
+    }
+
+    #[test]
+    fn for_each_key_skips_an_expired_entry_and_visits_every_live_key_exactly_once() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), Some(50), 0);
+        let _ = put(&engine, 2, key_bytes(2), "b".into(), hlc(1, 1), None, 0);
+        let _ = put(&engine, 3, key_bytes(3), "c".into(), hlc(1, 1), None, 0);
+
+        let mut visited = Vec::new();
+        engine.for_each_key(100, |k| visited.push(k));
+        visited.sort_unstable();
+        assert_eq!(
+            visited,
+            vec![2, 3],
+            "the expired key is skipped, every live key is visited exactly once"
         );
     }
 
