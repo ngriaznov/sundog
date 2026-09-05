@@ -85,7 +85,9 @@ stamp and event under one lock acquisition instead of one per entry. The rest of
 the surface: `contains_key`; `keys`, a local snapshot; `get_or_insert_with`, an
 infallible `get_or_load`; `remove_many`; and `clear`. `clear` tombstones and
 fans out every key this node holds. In `Replicated` mode that empties the whole
-cluster once the tombstones land.
+cluster once the tombstones land. `users.close().await` stops its background
+tasks and frees the name for a fresh `open()`; a clone kept past `close()`
+keeps working as a local, detached cache.
 
 ## Should you use this?
 

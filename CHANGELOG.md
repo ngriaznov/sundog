@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`Cache::close`**: stops a cache's background tasks, drops it from the
+  cluster's registry, and clears its gossiped mode, freeing the name to
+  `open()` again right away. Closing is idempotent, and a clone kept past
+  `close()` keeps working as a local, detached cache.
+
 ## [0.4.0] – 2026-09-04
 
 ### Fixed

@@ -76,6 +76,7 @@ pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 /// handle.
 enum Command {
     SetCacheMode(SmolStr, Mode),
+    ClearCacheMode(SmolStr),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -244,6 +245,15 @@ impl Membership {
         let _ = self
             .commands
             .send(Command::SetCacheMode(SmolStr::new(name), mode));
+    }
+
+    /// Deletes the `cache:<name>` gossip key, so live peers stop seeing this
+    /// node advertise `name` once the deletion propagates. Safe to call on a
+    /// name never advertised or already cleared.
+    pub(crate) fn clear_cache_mode(&self, name: &str) {
+        let _ = self
+            .commands
+            .send(Command::ClearCacheMode(SmolStr::new(name)));
     }
 
     /// Leaves the cluster gracefully and stops the background gossip loop.
@@ -429,6 +439,13 @@ async fn run(
                             .self_node_state()
                             .set(cache_key(&name), mode.as_token());
                     }
+                    Some(Command::ClearCacheMode(name)) => {
+                        chitchat
+                            .lock()
+                            .await
+                            .self_node_state()
+                            .delete(&cache_key(&name));
+                    }
                     Some(Command::Shutdown(reply)) => {
                         if let Err(error) = handle.shutdown().await {
                             tracing::warn!(%error, "chitchat shutdown reported an error");
@@ -599,6 +616,19 @@ mod tests {
         assert!(!caches.contains_key("bogus"));
     }
 
+    #[test]
+    fn parse_cache_modes_omits_a_key_deleted_from_node_state() {
+        let mut state = state_with(&[("cache:users", "replicated"), ("cache:orders", "local")]);
+        assert_eq!(parse_cache_modes(&state).len(), 2);
+
+        state.delete(&cache_key("users"));
+
+        let caches = parse_cache_modes(&state);
+        assert_eq!(caches.len(), 1, "the deleted key no longer appears");
+        assert!(!caches.contains_key("users"));
+        assert_eq!(caches.get("orders"), Some(&Mode::Local));
+    }
+
     #[tokio::test]
     async fn collect_initial_seeds_dedupes_and_stops_at_window() {
         let a = addr(1);
@@ -688,6 +718,36 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(membership.peers().borrow().is_empty());
 
+        membership.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn clear_cache_mode_on_an_unset_name_does_not_panic_or_hang() {
+        let cluster_name: SmolStr = "membership-test-clear-solo".into();
+        let config = ClusterConfig {
+            gossip_bind_addr: addr(0),
+            ..ClusterConfig::default()
+        };
+        let node = NodeId::random();
+        let membership = Membership::spawn(
+            cluster_name,
+            node,
+            "solo",
+            addr(9402),
+            &config,
+            stream::pending().boxed(),
+        )
+        .await
+        .expect("solo node starts");
+
+        membership.set_cache_mode("users", Mode::Replicated);
+        membership.clear_cache_mode("users");
+        // Clearing a name never set, and clearing the same name twice, are
+        // both no-ops rather than errors.
+        membership.clear_cache_mode("never-set");
+        membership.clear_cache_mode("users");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
         membership.shutdown().await;
     }
 
