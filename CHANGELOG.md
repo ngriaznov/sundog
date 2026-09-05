@@ -5,10 +5,6 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
-### Fixed
-
-## [Unreleased]
-
 ### Added
 
 - `ClusterConfig::advertise_ip`: the address a node advertises for gossip
@@ -32,7 +28,6 @@ All notable changes to this project are documented in this file. Format follows
 - A pooled request connection idle for more than 30 s is dropped instead of
   reused, and one the peer has already closed is retried on a fresh dial
   rather than failing the anti-entropy round.
-
 
 ## [0.4.0] – 2026-09-04
 
