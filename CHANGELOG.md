@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- A pooled request connection past `ReqPool::checkin`'s check-in instant by
+  more than 30s, half the server's 60s `REQ_CONN_IDLE_TIMEOUT`, is dropped
+  at checkout instead of handed out: the server may already have closed it.
+  `Mesh::acquire_conn` also catches an immediate `EOF` on a reused
+  connection's first reply, the case a connection just under that bound
+  still slips through, and retries the request on a fresh dial rather than
+  failing it.
+
 ## [0.4.0] – 2026-09-04
 
 ### Fixed
