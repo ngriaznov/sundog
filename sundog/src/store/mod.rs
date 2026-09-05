@@ -28,8 +28,6 @@ use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
-#[cfg(feature = "spill")]
-pub mod spill;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
 /// The optional local SSD/NVMe spill tier. Off by default; see
