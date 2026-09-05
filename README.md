@@ -311,6 +311,19 @@ Five layers, cheapest and highest-signal first:
    set must converge two shards to identical digests and entry sets.
 5. **Chaos demo** runs `sundog-demo` in headless mode; see below.
 
+Two benchmark suites sit outside these five layers, each gated on
+`SUNDOG_BENCH=1` so a plain `cargo test` never pays their wall-clock cost:
+`sundog/tests/replication_bench.rs` (bulk write and read latency across a live
+cluster) and `sundog/tests/spill_bench.rs` (the optional SSD spill tier's
+write path, RAM-hit versus tier-hit read latency, concurrent tier reads,
+region reclaim, and its hit-ratio case against plain eviction). Run the spill
+suite with:
+
+```sh
+SUNDOG_BENCH=1 cargo test --release -p sundog --features spill,prometheus \
+    --test spill_bench -- --test-threads=1 --nocapture
+```
+
 Plain `cargo test --workspace` runs everything except the `sim` and container
 suites, which need their feature/env var explicitly:
 
