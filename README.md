@@ -87,9 +87,10 @@ same scan as a visitor that never materializes it all at once;
 `get_or_insert_with`, an infallible `get_or_load`; `remove_many`; and `clear`.
 `clear` tombstones and fans out every key this node holds. In `Replicated` mode
 that empties the whole cluster once the tombstones land. `get_sync`,
-`contains_key_sync`, `insert_sync`, and `remove_sync` are synchronous twins of
-`get`, `contains_key`, `insert`, and `remove` for a caller with no async
-runtime handy.
+`contains_key_sync`, `insert_sync`, and `remove_sync` are the same operations
+without an async runtime. `users.close().await` stops its background tasks and
+frees the name for a fresh `open()`; a clone kept past `close()` keeps working
+as a local, detached cache.
 
 ## Should you use this?
 

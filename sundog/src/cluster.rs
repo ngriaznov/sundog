@@ -142,6 +142,13 @@ impl Warmth {
             .expect("invariant: warmth lock is never poisoned")
             .contains(cache)
     }
+
+    fn forget(&self, cache: &str) {
+        self.warm
+            .write()
+            .expect("invariant: warmth lock is never poisoned")
+            .remove(cache);
+    }
 }
 
 /// One open cache's contribution to [`Cluster::health`]: its mode and
@@ -312,6 +319,25 @@ impl Cluster {
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn is_warm(&self, cache: &SmolStr) -> bool {
         self.inner.warmth.is_warm(cache)
+    }
+
+    /// The cluster-side half of [`crate::cache::Cache::close`]: drops `name`
+    /// from the shard registry, this node's local mode map and warmth set,
+    /// and clears its gossiped mode so live peers stop seeing it advertised.
+    /// Idempotent: closing an already-forgotten name changes nothing.
+    pub(crate) fn forget_cache(&self, name: &str) {
+        self.inner
+            .shards
+            .write()
+            .expect("invariant: shard registry lock is never poisoned")
+            .remove(name);
+        self.inner
+            .local_modes
+            .write()
+            .expect("invariant: local cache-mode map lock is never poisoned")
+            .remove(name);
+        self.inner.warmth.forget(name);
+        self.inner.membership.clear_cache_mode(name);
     }
 
     /// A fresh watch subscription on the live peer set, for loops that react to
@@ -1621,6 +1647,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_a_cache_clears_its_local_mode_and_warmth_and_frees_the_name() {
+        let cluster = Cluster::builder("cluster-it-close-clears-state")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let name = SmolStr::new("closable");
+        let cache = cluster
+            .cache::<u32, String>("closable")
+            .open()
+            .await
+            .expect("open succeeds");
+        assert!(cluster.is_warm(&name), "an Invalidation cache opens warm");
+        assert!(
+            cluster
+                .inner
+                .local_modes
+                .read()
+                .expect("local-modes lock is never poisoned")
+                .contains_key(&name),
+            "open() records the cache's local mode"
+        );
+
+        cache.close().await;
+
+        assert!(!cluster.is_warm(&name), "close forgets the cache's warmth");
+        assert!(
+            !cluster
+                .inner
+                .local_modes
+                .read()
+                .expect("local-modes lock is never poisoned")
+                .contains_key(&name),
+            "close removes the cache's local mode"
+        );
+        assert!(
+            !cluster
+                .shards()
+                .read()
+                .expect("shard registry lock is never poisoned")
+                .contains_key(&name),
+            "close removes the shard from the registry"
+        );
+
+        let _reopened = cluster
+            .cache::<u32, String>("closable")
+            .open()
+            .await
+            .expect("closing frees the name for a fresh open");
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn cache_handle_survives_shutdown_without_panicking() {
         let cluster = Cluster::builder("cluster-it-shutdown")
             .seeds(std::iter::empty())
@@ -1773,6 +1855,78 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert_eq!(cache_b.get(&1).await, Some("hello".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_replicated_cache_on_one_node_stops_it_serving_or_advertising() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-close-two-node").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("orders")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("orders")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+
+        cache_a.insert(1, "seed".into()).await.expect("a inserts");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !cache_b.contains_key(&1).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the seed value replicates to b before a closes");
+
+        cache_a.close().await;
+        assert!(
+            !cluster_a
+                .shards()
+                .read()
+                .expect("shard registry lock is never poisoned")
+                .contains_key("orders"),
+            "close removes a's shard from its own registry"
+        );
+
+        cache_b
+            .insert(2, "after-close".into())
+            .await
+            .expect("b inserts after a closes");
+
+        // Give any in-flight replicate traffic and a couple of anti-entropy
+        // rounds a chance to have reached a, if it were still listening.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !cluster_a
+                .shards()
+                .read()
+                .expect("shard registry lock is never poisoned")
+                .contains_key("orders"),
+            "a never re-registers the closed cache on its own"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !cluster_b
+                    .advertised_cache_modes()
+                    .values()
+                    .any(|caches| caches.contains_key("orders"))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b stops seeing a advertise the closed cache within a few gossip intervals");
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;

@@ -25,6 +25,9 @@ All notable changes to this project are documented in this file. Format follows
   same hit and miss counting, fan-out, and events as the async ones.
 - `Cache::for_each_key` and `Shard::for_each_key`: a visitor over this node's
   live keys that never holds every key in one `Vec`.
+- `Cache::close`: stops the cache's background tasks, drops it from the
+  registry, and clears its gossiped mode, so the name opens again at once. A
+  clone kept past `close` keeps working as a local, detached cache.
 
 ### Fixed
 
