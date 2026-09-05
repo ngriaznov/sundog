@@ -6,7 +6,71 @@ revisiting one is a decision made on evidence, not on itch.
 
 Nothing here is scheduled: a section becomes code only once its trigger
 condition is observed in a real deployment, not because it would be interesting
-to build.
+to build. The two exceptions are under "Next": small, self-contained, and
+already justified by the code as it stands.
+
+## Next
+
+### Clock-skew guard
+
+`HlcClock::observe` absorbs any remote stamp. One node with a clock an hour
+ahead wins every write cluster-wide and drags every other node's clock forward
+with it, and nothing reports it. A `max_clock_skew` on `ClusterConfig`
+rejects a remote stamp further ahead than that, counts the rejection, and logs
+a local clock jump once.
+
+**Cost:** two days, with a skewed-node simulation scenario.
+
+### Memory ceilings that refuse rather than diverge
+
+`Replicated` mode has no capacity bound because evicting locally makes
+replicas differ. A byte-accurate accounting of keys, values, and per-entry
+overhead, a `sundog_cache_bytes{cache}` gauge, and a soft ceiling that
+rejects writes with a typed error keep every replica identical under memory
+pressure.
+
+**Cost:** about a week, most of it the accounting's property coverage.
+
+### Zone-aware donor and repair choice
+
+Every replicated node holds every entry, so a write crosses every zone once
+whatever the topology; that traffic is the floor. What is not the floor is
+where a joiner pulls its snapshot from and which peer a node reconciles with:
+both pick by node id today. A `zone` key in gossip state, set from
+`ClusterConfig::zone`, lets a joiner prefer a warm donor in its own zone and
+lets anti-entropy weight same-zone peers, which is where the bulk transfers
+happen. For distribution mode, the same key places replicas across zones.
+
+**Cost:** a few hundred lines; membership, state transfer, and the scheduler's
+peer choice.
+
+**Trigger:** a multi-zone deployment measuring cross-zone egress from joins
+or repairs.
+
+### HTTP cache layer
+
+A `sundog-tower` crate: a `tower::Layer` for axum and friends that serves a
+route from a `Cache<K, V>` and answers `If-None-Match` from the entry's HLC
+version as its `ETag`, so an unchanged entry is a `304` at the network
+boundary. Separate crate, separate release cadence, no change to `sundog`.
+
+**Cost:** a few hundred lines plus an axum integration test.
+
+### Merge resolvers
+
+`ConflictResolver::winner` picks one of two records; it cannot produce a
+third. A merge outcome, the stored and incoming records folded into a new
+value, is what a PN-counter or an observed-remove set needs to converge under
+concurrent writes. The versioned apply already runs the resolver under the
+stripe lock with both encoded values in hand, so the engine change is small;
+the API change is a new `Winner` variant, which is a break on an exhaustive
+enum and waits for the next major.
+
+**Cost:** the variant, the apply path, and a CRDT property suite proving
+merge is commutative, associative, and idempotent for the reference types.
+
+**Trigger:** a user with a counter or set that concurrent writers clobber
+under last-write-wins.
 
 ## Distribution mode
 
@@ -81,6 +145,34 @@ theoretical concern. The per-class outbox split and request-response traffic
 living outside the broadcast channel already remove the worst of this at the
 application layer; QUIC would only matter for what's left after that.
 
+## Tiered storage
+
+A local NVMe tier behind the in-memory tables, cold entries spilling to disk
+and reading back in microseconds, is how a node holds more than its RAM. It is
+also an index, a compaction schedule, an I/O path, and a second set of failure
+modes, and it does nothing about the reason a replicated cluster runs out of
+memory: every node holds every entry. Distribution mode removes that reason;
+tiered storage only postpones it per node.
+
+**Cost:** a storage engine of its own, comparable to distribution mode.
+
+**Trigger:** a deployment already running distribution mode whose per-node
+working set still exceeds RAM. Not before.
+
+## Wire-level trace context
+
+A trace id carried in replicate and state-transfer frames would let a tracing
+backend show one span from a write on A through its repair on B. It is a
+wire-format field on the hottest frames, a protocol bump, and 16 bytes per
+frame that most deployments never read.
+
+**Cost:** small in code, permanent on the wire.
+
+**Trigger:** a deployment chasing cross-node latency that per-node metrics
+cannot attribute. Until then, `sundog_frames_sent_total`,
+`sundog_ae_repaired_total`, and the peer-level counters answer the question
+without touching the wire.
+
 ## Cluster-wide max-idle
 
 Touch-propagating max-idle (TTI) across a distributed cache, every read anywhere
@@ -96,6 +188,19 @@ build a subsystem whose failure modes cost more than the feature is worth.
 **Cost / trigger:** none tracked. Anyone who needs cluster-wide idle expiry
 needs a different tool than an embedded cache library; see "remote thin clients"
 below for the general shape of that advice.
+
+## Distributed locks and leader leases
+
+A lock or a lease is a promise that at most one holder exists. sundog's
+membership is gossip with no quorum, so under a partition each side computes
+its own view and both sides can grant the lease. Every construction on top of
+that either admits two holders or bolts on a consensus protocol, which is a
+different system. The stance is a refusal, the same as cluster-wide max-idle:
+anyone who needs a lease needs etcd or a database row, and sundog stays a
+cache.
+
+Coordinator-free rate limiting and counters are a different question: they
+are CRDTs, and they wait on merge resolvers above.
 
 ## Remote thin clients vs. "run Valkey instead"
 
@@ -120,3 +225,30 @@ already-multi-language client ecosystem. sundog's entire value proposition is
 boundary with their cache; a remote-client story gives that up in exchange for
 reinventing a strictly worse Valkey. This item stays here as a sketch, not a
 commitment, for exactly that reason.
+
+A sidecar speaking the Redis protocol on localhost is this item in a container:
+the application keeps a Redis client, the cache becomes a separate process,
+and the only thing sundog adds over Valkey is a mesh that Valkey Cluster
+already has. The same answer applies.
+
+## Not planned
+
+- **Zero-copy values.** The engine keeps every value's encoded bytes next to
+  the decoded value, and a `Cache<K, Bytes>` read clones a reference-counted
+  handle, not the bytes. A caller who wants zero-copy access to a large value
+  stores its own archived encoding as `Bytes` and reads through it; a
+  serialization-framework feature flag adds nothing that layering does not.
+- **A caching attribute macro.** `#[cached]` over an `async fn` needs a global
+  cluster handle to find the cache, and a global handle is the one thing the
+  API refuses: every cache is opened from an explicit `Cluster`. A macro that
+  takes the handle as an argument saves four lines and hides the stampede
+  collapse it relies on. Revisit after 1.0, when the surface it wraps stops
+  moving.
+- **Change-data-capture adapters.** A logical-replication client for one
+  database is its own product with its own release cadence and failure modes.
+  The integration point already exists: a consumer of a CDC stream calls
+  `remove` or `insert` on a `Cache`.
+- **A bundled dashboard.** The Prometheus exporter and its Grafana panels
+  cover the metrics; the demo's TUI covers the rest. A web dashboard inside
+  the library is an HTTP server and a front end to maintain for a view
+  Grafana already gives.
