@@ -317,6 +317,14 @@ pub trait ShardOps: Send + Sync {
     /// of its own. Called periodically by `tombstone_gc_task`, independent
     /// of read/write traffic.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
+
+    /// Closes this shard's spill tier, if the `spill` feature is compiled in
+    /// and one was ever attached via `CacheBuilder::spill`: stops accepting
+    /// new spills and drops the flusher thread's channel sender. A no-op
+    /// otherwise. Called by `crate::cache::Cache::close` and by
+    /// `crate::cluster::Cluster::shutdown` for every cache still registered
+    /// when the cluster shuts down without an explicit `close`.
+    fn close_spill(&self) {}
 }
 
 /// One side of a [`ConflictResolver::winner`] comparison: everything a resolver
@@ -529,14 +537,48 @@ where
     hits: metrics::Counter,
     /// Handle for `sundog_cache_misses_total{cache}`, same reason as `hits`.
     misses: metrics::Counter,
+    /// Set by [`Shard::with_spill`]: the semaphore bounding concurrent disk
+    /// reads and the metric handles the spilled-key read path counts
+    /// against, per Amendment A6. `None` until then, and always `None` in a
+    /// non-`spill` build.
+    #[cfg(feature = "spill")]
+    spill_read: Option<SpillRead>,
 }
 
-// Every method here is fully synchronous, with no `.await`, but stays
-// `async fn` so callers and a later backend swap need no signature change.
+/// [`Shard::with_spill`]'s read-side counterpart to the tier itself: the
+/// semaphore [`Shard::get`]/[`Shard::get_or_load`]'s disk reads acquire a
+/// permit from before `spawn_blocking`-ing a positional read (Q5's
+/// `read_concurrency` bound), plus the four `Counter` handles those reads
+/// and the anti-entropy/snapshot read path count against, precomputed for
+/// the same reason `Shard::hits`/`Shard::misses` are.
+#[cfg(feature = "spill")]
+#[derive(Clone)]
+struct SpillRead {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    /// `sundog_spill_reads_total{cache,outcome="hit"}`.
+    reads_hit: metrics::Counter,
+    /// `sundog_spill_reads_total{cache,outcome="stale"}`: a generation
+    /// mismatch (the region rotated out from under the pointer) or a
+    /// checksum failure.
+    reads_stale: metrics::Counter,
+    /// `sundog_spill_reads_total{cache,outcome="io_error"}`: the positional
+    /// read itself failed, or the bytes it returned failed to postcard-decode
+    /// as `V`.
+    reads_io_error: metrics::Counter,
+    /// `sundog_spill_promotions_total{cache}`.
+    promotions: metrics::Counter,
+}
+
+// Every method here is fully synchronous, with no `.await`, except
+// `Shard::get`/`Shard::get_or_load`'s spilled-key path (`feature =
+// "spill"`): a disk read runs behind `spawn_blocking` and a semaphore
+// permit there, the one place this backend actually awaits (Amendment A6).
+// `async fn` stays the signature everywhere in this block regardless, so
+// callers and a later backend swap need no signature change.
 #[allow(
     clippy::unused_async,
     clippy::unused_async_trait_impl,
-    reason = "public API keeps async fn even though this backend never awaits"
+    reason = "most methods here keep async fn even though this backend never awaits"
 )]
 impl<K, V> Shard<K, V>
 where
@@ -578,6 +620,8 @@ where
             tti,
             hits,
             misses,
+            #[cfg(feature = "spill")]
+            spill_read: None,
         }
     }
 
@@ -663,6 +707,25 @@ where
             .set_spill(Arc::clone(&tier));
         let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
         tier.attach(Arc::downgrade(&sink));
+        self.spill_read = Some(SpillRead {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(cfg.read_concurrency_value())),
+            reads_hit: metrics::counter!(
+                "sundog_spill_reads_total",
+                "cache" => self.name.to_string(), "outcome" => "hit",
+            ),
+            reads_stale: metrics::counter!(
+                "sundog_spill_reads_total",
+                "cache" => self.name.to_string(), "outcome" => "stale",
+            ),
+            reads_io_error: metrics::counter!(
+                "sundog_spill_reads_total",
+                "cache" => self.name.to_string(), "outcome" => "io_error",
+            ),
+            promotions: metrics::counter!(
+                "sundog_spill_promotions_total",
+                "cache" => self.name.to_string(),
+            ),
+        });
         Ok(self)
     }
 
@@ -795,12 +858,33 @@ where
     /// present, since a tombstone leaves no live entry to find.
     ///
     /// Counts `sundog_cache_hits_total{cache}` on `Some`,
-    /// `sundog_cache_misses_total{cache}` on `None`.
+    /// `sundog_cache_misses_total{cache}` on `None`. On a `feature = "spill"`
+    /// build, a RAM miss that turns out to be a currently-spilled entry is
+    /// read back off disk (`spawn_blocking` behind the tier's read
+    /// semaphore) and, on success, promoted back to residency under a fresh
+    /// stripe write lock; either way it still counts as a hit. See the store
+    /// module's docs and [`Shard::get_sync`], which never does this.
     pub async fn get(&self, key: &K) -> Option<V> {
-        self.get_sync(key)
+        if let Some(value) = self.engine.get(key, self.now_ms()) {
+            self.hits.increment(1);
+            return Some(value);
+        }
+        #[cfg(feature = "spill")]
+        if let Some(value) = self.get_spilled(key).await {
+            self.hits.increment(1);
+            return Some(value);
+        }
+        self.misses.increment(1);
+        None
     }
 
-    /// [`Shard::get`] without an async runtime: same hit and miss counting.
+    /// [`Shard::get`] without an async runtime: same hit and miss counting,
+    /// for every entry except a currently-spilled one. On `feature =
+    /// "spill"`, a spilled entry reads as a miss here — this is the one
+    /// documented behavioral difference between the sync and async twins:
+    /// the RAM-only synchronous path never touches disk, so it cannot read a
+    /// value that has moved there. Use [`Shard::get`] to read a spilled
+    /// value; it also promotes the entry back to residency on success.
     #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
         if let Some(value) = self.engine.get(key, self.now_ms()) {
@@ -816,15 +900,88 @@ where
     /// the stored value. This asks about the entry as written, not against
     /// some other deadline; no read method here takes a TTL argument. An
     /// existence check, not a read: it moves neither
-    /// `sundog_cache_hits_total` nor `sundog_cache_misses_total`.
+    /// `sundog_cache_hits_total` nor `sundog_cache_misses_total`. A
+    /// currently-spilled entry counts as present with zero disk reads:
+    /// existence doesn't need the value bytes.
     pub async fn contains_key(&self, key: &K) -> bool {
         self.contains_key_sync(key)
     }
 
-    /// [`Shard::contains_key`] without an async runtime.
+    /// [`Shard::contains_key`] without an async runtime. Answers `true` for
+    /// a currently-spilled entry exactly as [`Shard::contains_key`] does,
+    /// with zero disk reads: existence doesn't need the value bytes.
     #[must_use]
     pub fn contains_key_sync(&self, key: &K) -> bool {
         self.engine.contains_key(key, self.now_ms())
+    }
+
+    /// After a RAM miss, checks whether `key` is currently spilled and, if
+    /// so, reads its bytes back off disk and promotes it to residency.
+    /// `None` for a resident or absent entry, a stale generation (the
+    /// region rotated out from under the pointer), a checksum mismatch, or
+    /// a postcard decode failure — each of the latter three counts
+    /// `sundog_spill_reads_total{cache,outcome}` accordingly. A genuine hit
+    /// counts `outcome = "hit"` and, iff it actually flips the entry back
+    /// to residency (a tombstone or a newer write racing the disk read
+    /// means it does not), `sundog_spill_promotions_total{cache}` (Q5,
+    /// Amendment A6). No lock or permit is ever held across more than one
+    /// `.await` point at a time, and no stripe lock is ever held across the
+    /// disk read itself.
+    #[cfg(feature = "spill")]
+    async fn get_spilled(&self, key: &K) -> Option<V> {
+        let key_bytes = encode_key(key).ok()?;
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await
+    }
+
+    /// [`Shard::get_spilled`] for a caller that already has `key_bytes` and
+    /// its hash, such as [`Shard::get_or_load`]'s owner arm.
+    #[cfg(feature = "spill")]
+    async fn get_spilled_by_bytes(&self, key_bytes: &[u8], hash: u64) -> Option<V> {
+        let spill_read = self.spill_read.as_ref()?;
+        let tier = Arc::clone(self.engine.spill()?);
+        let (ver, loc) = self.engine.spilled_loc(key_bytes, hash, self.now_ms())?;
+        let permit = Arc::clone(&spill_read.semaphore)
+            .acquire_owned()
+            .await
+            .ok()?;
+        let read = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            tier.read_at(loc)
+        })
+        .await;
+        let bytes = match read {
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => {
+                spill_read.reads_stale.increment(1);
+                return None;
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    cache = %self.name,
+                    error = %err,
+                    "sundog spill: positional read failed"
+                );
+                spill_read.reads_io_error.increment(1);
+                return None;
+            }
+            Err(_join_err) => {
+                spill_read.reads_io_error.increment(1);
+                return None;
+            }
+        };
+        let Ok(value) = postcard::from_bytes::<V>(&bytes.encoded) else {
+            spill_read.reads_io_error.increment(1);
+            return None;
+        };
+        spill_read.reads_hit.increment(1);
+        if self
+            .engine
+            .promote_locked(key_bytes, hash, ver, value.clone(), bytes.encoded)
+        {
+            spill_read.promotions.increment(1);
+        }
+        Some(value)
     }
 
     /// The number of live entries this node currently holds. Runs the engine's
@@ -858,6 +1015,14 @@ where
     /// Counts `sundog_cache_misses_total{cache}` exactly once per `loader`
     /// execution, from the fill's owner. Every other call, a cache hit or a
     /// collapsed caller, counts `sundog_cache_hits_total{cache}` instead.
+    ///
+    /// On a `feature = "spill"` build, the collapse extends to a spilled
+    /// key's disk read too: only the call that wins ownership of the
+    /// missing key checks whether it is currently spilled and, if so, reads
+    /// it back before ever calling `loader` — every other concurrent caller
+    /// joins and waits exactly as it already does for an in-flight `loader`
+    /// run, so a burst of concurrent misses on one spilled key still reads
+    /// it off disk exactly once.
     ///
     /// # Errors
     ///
@@ -904,6 +1069,21 @@ where
                     let guard =
                         self.engine
                             .guard_inflight(key_bytes.clone(), hash, Arc::clone(&inflight));
+                    // The sole owner of this key's fill checks the disk
+                    // before ever calling `loader`: a burst of concurrent
+                    // misses collapses to at most one spilled-key read, the
+                    // same way it already collapses to at most one `loader`
+                    // call. Dropping `guard` unfinished (rather than calling
+                    // `guard.complete()`) removes the in-flight entry and
+                    // wakes every joined waiter exactly as an early-dropped
+                    // loader future would, so they re-check the fast path
+                    // above and see the now-resident promoted value.
+                    #[cfg(feature = "spill")]
+                    if let Some(value) = self.get_spilled_by_bytes(key_bytes.as_ref(), hash).await {
+                        self.hits.increment(1);
+                        drop(guard);
+                        return Ok(value);
+                    }
                     return match loader(key).await {
                         Ok(value) => {
                             let ver = self.stamp_local();
@@ -1277,6 +1457,32 @@ where
         Arc::clone(&self.fan_out)
     }
 
+    /// Closes this shard's attached spill tier, if [`Shard::with_spill`] ever
+    /// ran: stops accepting new spills and drops the flusher thread's
+    /// channel sender, so its loop drains whatever is queued and exits on
+    /// its own. A no-op otherwise, and always a no-op in a non-`spill`
+    /// build. Called by `Cache::close` and, for a cache still registered at
+    /// cluster shutdown without an explicit `close`, by
+    /// `Cluster::shutdown`'s [`ShardOps::close_spill`] sweep.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_self,
+            reason = "the tier accessor only exists under feature = \"spill\""
+        )
+    )]
+    pub(crate) fn close_spill(&self) {
+        #[cfg(feature = "spill")]
+        if let Some(tier) = self.engine.spill() {
+            tracing::debug!(
+                cache = %self.name,
+                bytes_used = tier.bytes_used(),
+                "sundog spill: closing tier"
+            );
+            tier.close();
+        }
+    }
+
     /// [`ShardOps::records_for`] for callers that already hold typed `K`s, such
     /// as `cluster::fan_out_batch` re-fetching for keys read off its own
     /// `Event<K, V>`s. Encodes each key straight to the bytes
@@ -1291,6 +1497,72 @@ where
             })
             .collect()
     }
+}
+
+/// Reads a batch of currently-spilled pointers off-lock, behind a single
+/// semaphore permit for the whole batch rather than one per key
+/// (Amendment A6): [`ShardOps::records_for`] (the AE-pull-reply path) and
+/// [`ShardOps::snapshot_chunks`] both fold spilled entries in this way. A
+/// pointer whose read fails (a stale generation, a checksum mismatch, or a
+/// genuine I/O error) is dropped, exactly like an absent key; nothing here
+/// promotes. `Vec::new()` with no read attempted at all if this shard never
+/// attached a tier.
+#[cfg(feature = "spill")]
+async fn read_spilled_batch<K, V>(
+    engine: &engine::Engine<K, V>,
+    spill_read: Option<&SpillRead>,
+    cache_name: &str,
+    spilled: Vec<engine::SpilledPointer>,
+) -> Vec<WireRecord>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let Some(spill_read) = spill_read else {
+        return Vec::new();
+    };
+    let Some(tier) = engine.spill() else {
+        return Vec::new();
+    };
+    let tier = Arc::clone(tier);
+    let Ok(permit) = Arc::clone(&spill_read.semaphore).acquire_owned().await else {
+        return Vec::new();
+    };
+    let reads_hit = spill_read.reads_hit.clone();
+    let reads_stale = spill_read.reads_stale.clone();
+    let reads_io_error = spill_read.reads_io_error.clone();
+    let cache_name = cache_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut out = Vec::with_capacity(spilled.len());
+        for (key_bytes, ver, expires_at_ms, loc) in spilled {
+            match tier.read_at(loc) {
+                Ok(Some(bytes)) => {
+                    reads_hit.increment(1);
+                    out.push(WireRecord {
+                        key: key_bytes,
+                        value: Some(bytes.encoded),
+                        ver,
+                        expires_at_ms,
+                    });
+                }
+                Ok(None) => {
+                    reads_stale.increment(1);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        cache = %cache_name,
+                        error = %err,
+                        "sundog spill: anti-entropy/snapshot read failed"
+                    );
+                    reads_io_error.increment(1);
+                }
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 impl<K, V> ShardOps for Shard<K, V>
@@ -1454,19 +1726,67 @@ where
         Box::pin(async move { entries })
     }
 
+    /// Amendment A6: a spilled entry's value is read off-lock behind the
+    /// tier's read semaphore, batched into one `spawn_blocking` call, and
+    /// dropped if the read fails — never promoted, since an anti-entropy
+    /// pull reply covers many keys, and reinstalling every one of them on
+    /// every round would repopulate RAM as fast as eviction drains it.
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         let now = self.now_ms();
-        let recs = keys
-            .into_iter()
-            .filter_map(|key_bytes| self.engine.record_for(key_bytes.as_ref(), now))
-            .collect();
-        Box::pin(async move { recs })
+        #[cfg(feature = "spill")]
+        {
+            let (records, spilled) = self.engine.records_for_or_spilled(&keys, now);
+            Box::pin(async move {
+                let mut records = records;
+                if !spilled.is_empty() {
+                    records.extend(
+                        read_spilled_batch(
+                            self.engine.as_ref(),
+                            self.spill_read.as_ref(),
+                            &self.name,
+                            spilled,
+                        )
+                        .await,
+                    );
+                }
+                records
+            })
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let recs = keys
+                .into_iter()
+                .filter_map(|key_bytes| self.engine.record_for(key_bytes.as_ref(), now))
+                .collect();
+            Box::pin(async move { recs })
+        }
     }
 
+    /// [`ShardOps::records_for`]'s note applies here too: a spilled entry is
+    /// read off-lock and folded in, never promoted.
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>> {
         let engine = Arc::clone(&self.engine);
         let now = self.now_ms();
-        let fut = async move { chunk_records_for_snapshot(engine.snapshot_records(now)) };
+        #[cfg(feature = "spill")]
+        let spill_read = self.spill_read.clone();
+        #[cfg(feature = "spill")]
+        let name = self.name.to_string();
+        let fut = async move {
+            let records = engine.snapshot_records(now);
+            #[cfg(feature = "spill")]
+            let records = {
+                let spilled = engine.snapshot_spilled(now);
+                let mut records = records;
+                if !spilled.is_empty() {
+                    records.extend(
+                        read_spilled_batch(engine.as_ref(), spill_read.as_ref(), &name, spilled)
+                            .await,
+                    );
+                }
+                records
+            };
+            chunk_records_for_snapshot(records)
+        };
         Box::pin(stream::once(fut).flat_map(stream::iter))
     }
 
@@ -1480,6 +1800,10 @@ where
         let now = self.now_ms();
         self.engine.sweep(now);
         Box::pin(async move {})
+    }
+
+    fn close_spill(&self) {
+        Shard::close_spill(self);
     }
 }
 
@@ -3144,6 +3468,282 @@ mod tests {
             0,
             "the sweep ran against the injected clock, not real time"
         );
+    }
+
+    /// `Shard`-layer coverage of the spill read path (Q5/Q10, Amendments A6
+    /// and A8): every method here goes through a real [`crate::store::spill::SpillTier`]
+    /// and its dedicated flusher thread, never a synthetic engine-level
+    /// shortcut, so I/O tests are gated exactly like `spill.rs`'s own (Q9).
+    #[cfg(all(feature = "spill", not(feature = "sim")))]
+    mod spill_reads {
+        use std::path::PathBuf;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::store::spill::{SpillConfig, SpillLoc, SpillSink};
+
+        fn temp_dir(label: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "sundog-shard-spill-test-{label}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id(),
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
+        /// Polls `cond` until it returns `true` or `timeout` elapses,
+        /// returning the final result either way. Never a fixed sleep.
+        async fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if cond() {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return cond();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
+        /// A `Mode::Local` shard with a real spill tier attached, under
+        /// `max_capacity`. Returns the shard and its scratch directory,
+        /// cleaned up by the caller.
+        fn spill_shard(label: &str, max_capacity: u64) -> (Shard<u32, String>, PathBuf) {
+            let dir = temp_dir(label);
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("spill-test"),
+                Mode::Local,
+                NodeId::from(1u64),
+                max_capacity,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            (shard, dir)
+        }
+
+        /// Inserts two entries under `max_capacity == 1`, forcing eviction to
+        /// spill exactly one of them, and waits (bounded) for the flusher to
+        /// install it — observed through the tier's own `bytes_used`, so
+        /// this never depends on which of the two keys the sampler picked.
+        /// Returns `(shard, spilled_key, spilled_value, resident_key,
+        /// resident_value, dir)`.
+        async fn shard_with_one_spilled_entry(
+            label: &str,
+        ) -> (Shard<u32, String>, u32, String, u32, String, PathBuf) {
+            let (shard, dir) = spill_shard(label, 1);
+            shard.insert(1, "one".to_string()).await.expect("insert 1");
+            shard.insert(2, "two".to_string()).await.expect("insert 2");
+
+            assert!(
+                poll_until(POLL_TIMEOUT, || {
+                    shard
+                        .engine
+                        .spill()
+                        .is_some_and(|tier| tier.bytes_used() > 0)
+                })
+                .await,
+                "eviction spills exactly one of the two keys within the poll bound"
+            );
+            if shard.get_sync(&1).is_none() {
+                (shard, 1, "one".to_string(), 2, "two".to_string(), dir)
+            } else {
+                (shard, 2, "two".to_string(), 1, "one".to_string(), dir)
+            }
+        }
+
+        #[tokio::test]
+        async fn get_sync_misses_a_spilled_key_while_get_promotes_it() {
+            let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("get-sync-vs-get").await;
+
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                None,
+                "get_sync never touches disk; a spilled key reads as a miss"
+            );
+            assert_eq!(
+                shard.get(&spilled_key).await,
+                Some(spilled_value.clone()),
+                "get reads the spilled value back off disk"
+            );
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                Some(spilled_value),
+                "the disk read promoted the key back to residency"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn contains_key_and_contains_key_sync_both_see_a_spilled_key_with_zero_disk_reads() {
+            let (shard, spilled_key, _spilled_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("contains-key").await;
+
+            assert!(
+                shard.contains_key_sync(&spilled_key),
+                "existence doesn't need the value bytes"
+            );
+            assert!(shard.contains_key(&spilled_key).await);
+            // Neither existence check triggered a promotion: still spilled.
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                None,
+                "contains_key/contains_key_sync never read the disk"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn get_or_load_promotes_on_hit_without_a_duplicate_loader_call() {
+            let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("get-or-load").await;
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = Arc::clone(&calls);
+            let loaded = shard
+                .get_or_load(
+                    &spilled_key,
+                    async move |_key: &u32| -> Result<String, std::convert::Infallible> {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok("should-not-run".to_string())
+                    },
+                )
+                .await
+                .expect("resolves via the spilled-read path");
+            assert_eq!(loaded, spilled_value.clone());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the loader never runs once the disk read already found the key"
+            );
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                Some(spilled_value),
+                "the owner's disk read promoted the key back to residency"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn get_or_insert_with_promotes_on_hit() {
+            let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("get-or-insert-with").await;
+
+            let made = shard
+                .get_or_insert_with(&spilled_key, async move |_key: &u32| {
+                    "should-not-run".to_string()
+                })
+                .await
+                .expect("resolves via the spilled-read path");
+            assert_eq!(made, spilled_value.clone());
+            assert_eq!(shard.get_sync(&spilled_key), Some(spilled_value));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn insert_on_a_spilled_key_discards_the_pending_spill() {
+            let (shard, spilled_key, _old_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("insert-over-spilled").await;
+
+            shard
+                .insert(spilled_key, "fresh".to_string())
+                .await
+                .expect("insert");
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                Some("fresh".to_string()),
+                "a fresh write always installs resident, discarding whatever was spilled"
+            );
+            assert!(shard.contains_key_sync(&spilled_key));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn remove_on_a_spilled_key_prevents_a_late_flush_from_resurrecting_it() {
+            // No real tier needed here: this drives `SpillSink::install`
+            // directly, exactly the call a real flusher makes, to
+            // deterministically simulate a flush of the pre-removal value
+            // landing *after* the remove — the narrow race a real disk's
+            // timing cannot be made to land on demand.
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("spill-remove-race"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            );
+            shard
+                .insert(1, "original".to_string())
+                .await
+                .expect("insert");
+            shard.remove(&1).await.expect("remove");
+            assert_eq!(shard.get_sync(&1), None);
+
+            let key_bytes = Bytes::from(postcard::to_stdvec(&1u32).expect("key encodes"));
+            let hash = engine::hash_key_bytes(key_bytes.as_ref());
+            let bucket = engine::stripe_index_from_hash(hash);
+            let installed = shard.engine.install(
+                bucket,
+                &key_bytes,
+                hash,
+                Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    node: NodeId::from(1u64),
+                },
+                SpillLoc {
+                    region: 0,
+                    offset: 0,
+                    len: 4,
+                    generation: 0,
+                },
+            );
+            assert!(!installed, "a late flush never resurrects a removed key");
+            assert_eq!(shard.get_sync(&1), None, "the tombstone still wins");
+            assert!(!shard.contains_key_sync(&1));
+        }
+
+        #[tokio::test]
+        async fn invalidate_local_on_a_spilled_key_removes_it_unconditionally() {
+            let (shard, spilled_key, _spilled_value, resident_key, resident_value, dir) =
+                shard_with_one_spilled_entry("invalidate-local").await;
+
+            shard.invalidate_local(&spilled_key).await;
+            assert_eq!(shard.get_sync(&spilled_key), None);
+            assert!(!shard.contains_key_sync(&spilled_key));
+            // The untouched, still-resident key survives.
+            assert_eq!(shard.get_sync(&resident_key), Some(resident_value));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn clear_tombstones_a_spilled_key() {
+            let (shard, spilled_key, _spilled_value, resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("clear").await;
+
+            shard.clear().await.expect("clear");
+            assert_eq!(shard.get_sync(&spilled_key), None);
+            assert!(!shard.contains_key_sync(&spilled_key));
+            assert_eq!(shard.get_sync(&resident_key), None);
+            assert!(!shard.contains_key_sync(&resident_key));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 

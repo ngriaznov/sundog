@@ -46,18 +46,12 @@
 //!
 //! # A note on this module's `pub(crate)` surface
 //!
-//! `store::engine`'s `Payload::Spilled` integration consumes most of this
-//! module already: eviction hands a victim to `try_spill`, `Engine`'s
-//! `SpillSink` impl installs and reclaims through `spilled_is_current`, and
-//! `open`/`attach` are called from `Shard::with_spill`. What's still
-//! uncalled outside this module's own test suite is the async read path —
-//! `read_at`, `bytes_used`, and `SpilledBytes` — which lands as a parallel
-//! change wiring `get`/`get_or_load`'s promotion through `spawn_blocking`.
-//! `#![allow(dead_code)]` covers exactly that remaining gap and is expected
-//! to come off once that change gives every item here a real, non-test
-//! caller. [`crate::store::spill::SpillConfig`] is exempt: it is re-exported
-//! at the crate root, so it is already live.
-#![allow(dead_code)]
+//! `store::engine`'s `Payload::Spilled` integration consumes every item
+//! here: eviction hands a victim to `try_spill`, `Engine`'s `SpillSink` impl
+//! installs and reclaims through `spilled_is_current`, `open`/`attach` are
+//! called from `Shard::with_spill`, and `read_at`/`bytes_used`/
+//! `SpilledBytes` back `Shard::get`/`Shard::get_or_load`'s promotion path
+//! and the anti-entropy/snapshot read path, both behind `spawn_blocking`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -195,6 +189,9 @@ pub(crate) struct SpillLoc {
 /// write the record and, later, to install it back into the right stripe.
 pub(crate) struct SpillJob {
     pub(crate) stripe_idx: usize,
+    /// `key_bytes`'s hash, already computed by the eviction site that built
+    /// this job. Carried through to [`SpillSink::install`] so the sink
+    /// never has to rehash the key on this hot path.
     pub(crate) hash: u64,
     pub(crate) key_bytes: Bytes,
     pub(crate) ver: Hlc,
@@ -215,12 +212,21 @@ pub(crate) struct SpilledBytes {
 /// implements this; the flusher holds only a `Weak<dyn SpillSink>` and exits
 /// once the upgrade fails.
 pub(crate) trait SpillSink: Send + Sync + 'static {
-    /// The flusher wrote `key_bytes`'s record at `loc`. Under the stripe
-    /// write lock, flip the entry to `Payload::Spilled(loc)` if
+    /// The flusher wrote `key_bytes`'s record at `loc`. `hash` is the
+    /// job's already-computed key hash, handed back here so the sink never
+    /// has to rehash `key_bytes` on this hot path. Under the stripe write
+    /// lock, flip the entry to `Payload::Spilled(loc)` if
     /// [`spilled_is_current`] holds for its current tombstone/live state and
     /// `ver`, and return `true`; otherwise leave it untouched and return
     /// `false`. Never re-inserts a key that is not already present.
-    fn install(&self, stripe_idx: usize, key_bytes: &Bytes, ver: Hlc, loc: SpillLoc) -> bool;
+    fn install(
+        &self,
+        stripe_idx: usize,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        loc: SpillLoc,
+    ) -> bool;
 
     /// `region` at `generation` is about to be reused. Under each stripe
     /// write lock, remove every listed key whose payload is still
@@ -669,7 +675,7 @@ fn flush_one(inner: &Inner, sink: &dyn SpillSink, job: SpillJob) {
         len: record_len,
         generation,
     };
-    if sink.install(job.stripe_idx, &job.key_bytes, job.ver, loc) {
+    if sink.install(job.stripe_idx, &job.key_bytes, job.hash, job.ver, loc) {
         region
             .used_bytes
             .fetch_add(u64::from(record_len), Ordering::AcqRel);
@@ -921,6 +927,7 @@ mod tests {
                 &self,
                 stripe_idx: usize,
                 key_bytes: &Bytes,
+                _hash: u64,
                 ver: Hlc,
                 loc: SpillLoc,
             ) -> bool {

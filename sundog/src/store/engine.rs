@@ -187,6 +187,14 @@ fn is_resident<K, V>(live: &Live<K, V>) -> bool {
     matches!(live.payload, Payload::Resident { .. })
 }
 
+/// A currently-spilled entry's pointer, as [`Engine::snapshot_spilled`] and
+/// [`Engine::records_for_or_spilled`] report it to a spill-aware caller
+/// (Amendment A6): the bits an off-lock disk read and, where applicable, a
+/// `WireRecord` need — key bytes, version, expiry, and the disk location
+/// itself.
+#[cfg(feature = "spill")]
+pub(crate) type SpilledPointer = (Bytes, Hlc, Option<u64>, SpillLoc);
+
 /// One in-progress [`Engine::get_or_load`] fill, shared by every caller racing
 /// on the same missing key. Carries no value: a successful fill is visible to
 /// joined waiters by re-reading the stripe once notified. Only a failure
@@ -1055,14 +1063,8 @@ where
     /// spill-aware caller reads these off-lock (`spawn_blocking` behind the
     /// tier's read semaphore, Amendment A6) and folds the results into the
     /// snapshot, dropping any whose read comes back `None`.
-    ///
-    /// `#[allow(dead_code)]`: this is the engine-side half of the
-    /// `snapshot_chunks`/AE-pull read path a parallel change wires up on the
-    /// `Shard`/async side; it has no caller yet, mirroring
-    /// `spill::SpillTier`'s own module-level allowance for the same reason.
     #[cfg(feature = "spill")]
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_spilled(&self, now_ms: u64) -> Vec<(Bytes, Hlc, Option<u64>, SpillLoc)> {
+    pub(crate) fn snapshot_spilled(&self, now_ms: u64) -> Vec<SpilledPointer> {
         let mut out = Vec::new();
         for stripe_lock in &self.stripes {
             let stripe = stripe_lock.read();
@@ -1080,6 +1082,57 @@ where
             );
         }
         out
+    }
+
+    /// [`Engine::record_for`] for many keys in one pass, but reporting a
+    /// currently-spilled entry's pointer instead of treating it as absent:
+    /// the AE-pull-reply path (`ShardOps::records_for`, Amendment A6) reads
+    /// the spilled half off-lock (`spawn_blocking` behind the tier's read
+    /// semaphore) and folds any successful read back in as a `WireRecord`,
+    /// dropping the rest. Nothing here promotes; a served-from-disk record
+    /// leaves `payload` exactly as it was.
+    #[cfg(feature = "spill")]
+    pub(crate) fn records_for_or_spilled(
+        &self,
+        keys: &[Bytes],
+        now_ms: u64,
+    ) -> (Vec<WireRecord>, Vec<SpilledPointer>) {
+        let mut records = Vec::new();
+        let mut spilled = Vec::new();
+        for key_bytes in keys {
+            let hash = hash_key_bytes(key_bytes.as_ref());
+            let stripe = self.stripes[stripe_index_from_hash(hash)].read();
+            if let Some(t) = stripe.tombstones.get(key_bytes.as_ref()) {
+                records.push(WireRecord {
+                    key: key_bytes.clone(),
+                    value: None,
+                    ver: t.ver,
+                    expires_at_ms: None,
+                });
+                continue;
+            }
+            let Some(live) = stripe
+                .live
+                .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+            else {
+                continue;
+            };
+            if self.is_absent(live, now_ms) {
+                continue;
+            }
+            match &live.payload {
+                Payload::Resident { encoded, .. } => records.push(WireRecord {
+                    key: key_bytes.clone(),
+                    value: Some(encoded.clone()),
+                    ver: live.ver,
+                    expires_at_ms: live.expires_at_ms,
+                }),
+                Payload::Spilled(loc) => {
+                    spilled.push((key_bytes.clone(), live.ver, live.expires_at_ms, *loc));
+                }
+            }
+        }
+        (records, spilled)
     }
 
     /// Drops tombstones past `tombstone_ttl`, or past the hard cap
@@ -1672,12 +1725,7 @@ where
     /// caller drops the read lock, reads the pointer's bytes off-lock
     /// (`spawn_blocking` behind the tier's read semaphore), then reacquires
     /// the stripe write lock for [`Engine::promote_locked`].
-    ///
-    /// `#[allow(dead_code)]`: exercised by this module's own tests; its
-    /// production caller is `get`/`get_or_load`'s promotion path, wired up
-    /// by a parallel change to the `Shard`/async side.
     #[cfg(feature = "spill")]
-    #[allow(dead_code)]
     pub(crate) fn spilled_loc(
         &self,
         key_bytes: &[u8],
@@ -1710,14 +1758,11 @@ where
     /// this; only the RAM reinstall is skipped). Adds the freshly weighed
     /// entry's weight back to `total_weight`; **never touches the digest or
     /// `live_count`** — same key, same `ver`, same fingerprint, so nothing
-    /// about the entry's replicated identity changes. Returns whether it
-    /// promoted.
-    ///
-    /// `#[allow(dead_code)]`: exercised by this module's own tests; its
-    /// production caller is `get`/`get_or_load`'s promotion path, wired up
-    /// by a parallel change to the `Shard`/async side.
+    /// about the entry's replicated identity changes. Also decrements
+    /// `sundog_spill_entries{cache}`, the mirror of `SpillSink::install`'s
+    /// increment: the key is no longer counted among currently-spilled
+    /// entries. Returns whether it promoted.
     #[cfg(feature = "spill")]
-    #[allow(dead_code)]
     pub(crate) fn promote_locked(
         &self,
         key_bytes: &[u8],
@@ -1749,6 +1794,10 @@ where
         drop(stripe);
         self.total_weight
             .fetch_add(u64::from(weight), Ordering::Relaxed);
+        if let Some(tier) = self.spill() {
+            metrics::gauge!("sundog_spill_entries", "cache" => tier.cache_name().to_string())
+                .decrement(1.0);
+        }
         true
     }
 }
@@ -1765,8 +1814,14 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    fn install(&self, stripe_idx: usize, key_bytes: &Bytes, ver: Hlc, loc: SpillLoc) -> bool {
-        let hash = hash_key_bytes(key_bytes.as_ref());
+    fn install(
+        &self,
+        stripe_idx: usize,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        loc: SpillLoc,
+    ) -> bool {
         let weight = {
             let mut stripe = self.stripes[stripe_idx].write();
             let stored_tombstone_ver = stripe.tombstones.get(key_bytes.as_ref()).map(|t| t.ver);
@@ -3569,7 +3624,8 @@ mod tests {
                 0,
             );
 
-            let installed = SpillSink::install(&engine, bucket, &kb, old_ver, loc(0, 0, 4, 0));
+            let installed =
+                SpillSink::install(&engine, bucket, &kb, hash, old_ver, loc(0, 0, 4, 0));
             assert!(
                 !installed,
                 "a stale flush is discarded once a newer write has landed"
@@ -3612,7 +3668,7 @@ mod tests {
                 );
             }
 
-            let installed = SpillSink::install(&engine, bucket, &kb, ver, loc(0, 0, 4, 0));
+            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0));
             assert!(
                 !installed,
                 "a stale flush is discarded once a tombstone has landed"

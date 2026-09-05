@@ -211,10 +211,17 @@ where
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
-        // Validated above; `Shard::with_spill` (a later part of this work)
-        // attaches it to the engine. Nothing consumes it yet.
+        // Validated above; attaches after `with_weigher` per `Shard::with_spill`'s
+        // own doc, since `with_weigher` rebuilds the engine from scratch.
         #[cfg(feature = "spill")]
-        let _ = spill;
+        if let Some(cfg) = &spill {
+            shard = shard
+                .with_spill(cfg)
+                .map_err(|source| CacheError::SpillUnavailable {
+                    cache: name.clone(),
+                    source,
+                })?;
+        }
         let shard = Arc::new(shard);
 
         let registry = cluster.shards();
@@ -558,19 +565,23 @@ where
     }
 
     /// Closes this cache: stops its background tasks and waits for them,
-    /// drops it from the cluster's shard registry, and clears its gossiped
-    /// mode, so peers stop seeing it advertised and this node stops serving
-    /// or applying replication traffic for it. The name is free to `open()`
-    /// again when this returns.
+    /// closes its spill tier if one was configured (the flusher thread
+    /// drains its queue and exits on its own), drops it from the cluster's
+    /// shard registry, and clears its gossiped mode, so peers stop seeing
+    /// it advertised and this node stops serving or applying replication
+    /// traffic for it. The name is free to `open()` again when this
+    /// returns.
     ///
     /// Closing is idempotent. A clone kept past `close` keeps working as a
     /// local, detached cache: its reads and writes reach the same in-memory
-    /// [`Shard`], and nothing replicates.
+    /// [`Shard`], and nothing replicates. A cache never explicitly closed
+    /// still has its spill tier closed by `Cluster::shutdown`.
     pub async fn close(self) {
         self.cancel.cancel();
         self.tasks.close();
         self.tasks.wait().await;
         self.shard.fan_out_queue().close();
+        self.shard.close_spill();
         self.cluster.forget_cache(self.shard.name());
     }
 }
@@ -806,6 +817,80 @@ mod tests {
             );
 
             cluster.shutdown().await;
+        }
+
+        /// Polls `cond` until it returns `true` or `timeout` elapses,
+        /// returning the final result either way. Never a fixed sleep.
+        async fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                if cond() {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return cond();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Opens a cache under `mode` with a tiny `max_capacity` and a real
+        /// spill tier, inserts past that capacity, waits (bounded) for
+        /// eviction to spill one of the two keys — observed via
+        /// `get_sync` reading a miss, `Shard::get_sync`'s documented
+        /// contract for a currently-spilled entry — then reads it back
+        /// through `get` and asserts the disk round-trip.
+        async fn spill_composes_with_max_capacity(mode: Mode, label: &str) {
+            let cluster = Cluster::builder("cache-it-spill-compose")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let cfg = SpillConfig::new(fresh_spill_dir(label), 1 << 20).region_bytes(4096);
+            let cache = cluster
+                .cache::<u32, String>("scratch")
+                .mode(mode)
+                .max_capacity(1)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("opens with spill composing with max_capacity");
+
+            cache.insert(1, "one".to_string()).await.expect("insert 1");
+            cache.insert(2, "two".to_string()).await.expect("insert 2");
+
+            assert!(
+                poll_until(Duration::from_secs(5), || {
+                    cache.get_sync(&1).is_none() || cache.get_sync(&2).is_none()
+                })
+                .await,
+                "eviction spills exactly one of the two keys under a tiny max_capacity"
+            );
+            let (spilled_key, expected) = if cache.get_sync(&1).is_none() {
+                (1u32, "one".to_string())
+            } else {
+                (2u32, "two".to_string())
+            };
+            assert_eq!(
+                cache.get(&spilled_key).await,
+                Some(expected),
+                "the spilled key reads back correctly through the disk tier"
+            );
+
+            cache.close().await;
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn spill_composes_with_max_capacity_under_mode_local() {
+            spill_composes_with_max_capacity(Mode::Local, "compose-local").await;
+        }
+
+        #[tokio::test]
+        async fn spill_composes_with_max_capacity_under_mode_invalidation() {
+            spill_composes_with_max_capacity(Mode::Invalidation, "compose-invalidation").await;
         }
     }
 }

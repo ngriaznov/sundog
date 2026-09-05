@@ -393,15 +393,33 @@ impl Cluster {
     }
 
     /// Leaves the cluster gracefully: background loops are cancelled and
-    /// joined, then chitchat departs and the data plane closes its
-    /// connections. No further calls on any clone of this handle.
+    /// joined, every still-registered cache has its spill tier closed (see
+    /// [`ShardOps::close_spill`] — a cache already closed via
+    /// `crate::cache::Cache::close` is a no-op here, and one never
+    /// explicitly closed gets its tier closed now instead of leaking its
+    /// flusher thread until the process exits), then chitchat departs and
+    /// the data plane closes its connections. No further calls on any clone
+    /// of this handle.
     ///
     /// Cache handles opened before this call keep working for local
     /// reads/writes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shard registry lock is poisoned.
     pub async fn shutdown(self) {
         self.inner.cancel.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
+        for shard in self
+            .inner
+            .shards
+            .read()
+            .expect("invariant: shard registry lock is never poisoned")
+            .values()
+        {
+            shard.close_spill();
+        }
         self.inner.membership.clone().shutdown().await;
         self.inner.mesh.clone().shutdown().await;
         tracing::info!(node = %self.inner.node, cluster = %self.inner.name, "cluster shut down");

@@ -252,6 +252,12 @@ async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
         .await;
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "folds in the spill metrics pin (Q8) behind feature = \"spill\"; see \
+              spill_writes_and_promotes_pin_metrics's own doc for why it can't be a separate \
+              #[tokio::test]"
+)]
 #[tokio::test]
 async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     let metrics_addr = reserve_tcp_addr().await;
@@ -279,6 +285,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_sketch_mismatch(&cluster, &peer).await;
     seed_part_mismatch(&cluster, &peer).await;
     count_hits_and_misses(&cluster).await;
+    #[cfg(feature = "spill")]
+    let spill_dir = spill_writes_and_promotes_pin_metrics(&cluster).await;
 
     // `sundog_open_caches` comes from a periodic background routine and the
     // sketch/parts counters from an anti-entropy round, so poll until every
@@ -293,13 +301,17 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             && body.contains("sundog_cache_entries")
             && scraped_metric_value(&body, "sundog_ae_sketch_total", ("outcome", "decoded"))
                 .is_some()
+            && (cfg!(not(feature = "spill"))
+                || scraped_metric_value(&body, "sundog_spill_writes_total", ("cache", "spilled"))
+                    .is_some())
         {
             break body;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
             "metrics endpoint never served sundog_open_caches, sundog_live_peers, \
-             sundog_cache_entries, and a decoded sundog_ae_sketch_total within the bound"
+             sundog_cache_entries, a decoded sundog_ae_sketch_total, and (feature = \"spill\") \
+             sundog_spill_writes_total within the bound"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
@@ -329,6 +341,31 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected at least one part listing on the 'parts' cache; got body:\n{body}"
     );
 
+    #[cfg(feature = "spill")]
+    {
+        assert_eq!(
+            scraped_metric_value(&body, "sundog_spill_writes_total", ("cache", "spilled")),
+            Some(1.0),
+            "expected exactly one spill install; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(&body, "sundog_spill_reads_total", ("outcome", "hit")),
+            Some(1.0),
+            "expected exactly one disk hit; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(&body, "sundog_spill_promotions_total", ("cache", "spilled")),
+            Some(1.0),
+            "expected exactly one promotion; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(&body, "sundog_spill_entries", ("cache", "spilled")),
+            Some(0.0),
+            "the promoted key is resident again, so zero currently-spilled entries remain; \
+             got body:\n{body}"
+        );
+    }
+
     // `users` warmed during `seed_sketch_mismatch` above: `is_ready()` and
     // `/readyz` on the same listener must both already agree.
     assert!(cluster.is_ready(), "the open Replicated caches are warm");
@@ -349,6 +386,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
 
     peer.shutdown().await;
     cluster.shutdown().await;
+    #[cfg(feature = "spill")]
+    let _ = std::fs::remove_dir_all(&spill_dir);
 }
 
 /// [`sundog::prometheus_handle`], the no-listener install, for a caller that
@@ -387,4 +426,60 @@ async fn prometheus_handle_exposes_cache_hits_without_a_listener() {
     // recorder first; there is no handle to render from here.
 
     cluster.shutdown().await;
+}
+
+/// Q8's metrics pin: a tiny `max_capacity` plus a `spill` tier on `cluster`
+/// forces exactly one eviction-to-spill, and a single `get` of the spilled
+/// key forces exactly one disk hit and one promotion.
+///
+/// Runs inside `metrics_endpoint_serves_sundog_metrics_after_cache_ops`
+/// rather than as its own `#[tokio::test]`, for the same reason
+/// `seed_sketch_mismatch`/`seed_part_mismatch`/`count_hits_and_misses`
+/// above do: a cache's `hits`/`misses`-style `metrics::Counter` handles
+/// bind to whichever recorder is installed at the moment
+/// `Shard::new`/`with_spill` calls `metrics::counter!`, not whatever gets
+/// installed later, so only the one test in this binary that reliably owns
+/// the process-global recorder from the start (via `prometheus_listen`,
+/// synchronously early in `Cluster::builder(..).build()`) can pin exact
+/// metric values — a second, independent `#[tokio::test]` racing for the
+/// same slot is either a no-op (if it loses) or breaks the first test's own
+/// `build()` (if it wins).
+///
+/// Returns the tier's scratch directory for the caller to clean up.
+#[cfg(feature = "spill")]
+async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sundog-it-prometheus-spill-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos()
+    ));
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let cache = cluster
+        .cache::<u32, String>("spilled")
+        .mode(Mode::Local)
+        .max_capacity(1)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("cache opens");
+
+    cache.insert(1, "one".to_string()).await.expect("insert 1");
+    cache.insert(2, "two".to_string()).await.expect("insert 2");
+    common::eventually(Duration::from_secs(5), || async {
+        cache.get_sync(&1).is_none() || cache.get_sync(&2).is_none()
+    })
+    .await;
+    let spilled_key = if cache.get_sync(&1).is_none() {
+        1u32
+    } else {
+        2u32
+    };
+
+    // Exactly one promotion: a single disk read of the spilled key.
+    let _ = cache.get(&spilled_key).await;
+
+    dir
 }

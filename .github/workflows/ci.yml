@@ -44,6 +44,13 @@ jobs:
       - name: cargo clippy (spill feature)
         run: cargo clippy --package sundog --all-targets --features spill -- -D warnings -W clippy::pedantic
 
+      # `spill,prometheus` together: the exporter pin test
+      # (tests/prometheus_exporter.rs's spill metrics scenario) only
+      # compiles under both features at once, so this is the lane that
+      # actually lints it.
+      - name: cargo clippy (spill,prometheus features)
+        run: cargo clippy --package sundog --all-targets --features spill,prometheus -- -D warnings -W clippy::pedantic
+
       # The fuzz crate sits outside the workspace; a wire change that misses
       # its seed generator or a target would otherwise surface only nightly.
       - name: cargo check (fuzz crate)
