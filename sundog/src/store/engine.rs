@@ -699,11 +699,8 @@ where
         out
     }
 
-    /// [`Engine::keys`] without materializing them all at once: for each
-    /// stripe, takes its read lock only long enough to clone that stripe's
-    /// live keys into a small buffer, releases the lock, then calls `f` for
-    /// each. `f` never runs with a stripe lock held. Still O(entries)
-    /// overall, but peak extra memory is one stripe's worth of keys.
+    /// [`Engine::keys`] one stripe at a time: each stripe's live keys are
+    /// cloned under its read lock, then `f` runs on them with no lock held.
     pub(crate) fn for_each_key(&self, now_ms: u64, mut f: impl FnMut(K)) {
         for stripe_lock in &self.stripes {
             let stripe_keys: Vec<K> = {

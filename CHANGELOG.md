@@ -31,6 +31,8 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- A `Mode::Local` cache no longer queues every written key for a fan-out task
+  it never runs; that queue grew without bound with the write count.
 - `SUNDOG_SEEDS` selects static discovery on its own; before, a build without
   `.seeds()` ignored it and browsed mDNS.
 - A pooled request connection idle for more than 30 s is dropped instead of

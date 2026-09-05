@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -96,21 +97,34 @@ const EVENTS_CAPACITY: usize = 1024;
 /// Keys this node wrote locally and has not yet fanned out to
 /// `cluster::fan_out_task`. A write appends its key; a drain takes the whole
 /// backlog at once, so no channel ever drops a write. Holds keys, not values:
-/// `records_for_typed` re-fetches fresh wire bytes.
+/// `records_for_typed` re-fetches fresh wire bytes. A queue nothing drains, a
+/// `Mode::Local` shard's or a closed cache's, accepts nothing.
 pub(crate) struct FanOutQueue<K> {
     pending: StdMutex<Vec<K>>,
     notify: tokio::sync::Notify,
+    accepting: AtomicBool,
 }
 
 impl<K> FanOutQueue<K> {
-    fn new() -> Self {
+    fn new(accepting: bool) -> Self {
         Self {
             pending: StdMutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
+            accepting: AtomicBool::new(accepting),
         }
     }
 
+    /// Stops accepting keys and drops the backlog: nothing drains this queue
+    /// any more.
+    pub(crate) fn close(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.drain();
+    }
+
     fn push(&self, key: K) {
+        if !self.accepting.load(Ordering::Acquire) {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -119,6 +133,9 @@ impl<K> FanOutQueue<K> {
     }
 
     fn extend(&self, keys: impl IntoIterator<Item = K>) {
+        if !self.accepting.load(Ordering::Acquire) {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -559,7 +576,7 @@ where
             mode,
             engine,
             events: broadcast::channel(EVENTS_CAPACITY).0,
-            fan_out: Arc::new(FanOutQueue::new()),
+            fan_out: Arc::new(FanOutQueue::new(!matches!(mode, Mode::Local))),
             clock: StdMutex::new(HlcClock::new(node)),
             clock_fn: Arc::new(now_ms),
             ttl,
@@ -762,8 +779,7 @@ where
         self.get_sync(key)
     }
 
-    /// [`Shard::get`], synchronous, for a caller with no async runtime handy.
-    /// Same hit/miss counting.
+    /// [`Shard::get`] without an async runtime: same hit and miss counting.
     pub fn get_sync(&self, key: &K) -> Option<V> {
         if let Some(value) = self.engine.get(key, self.now_ms()) {
             self.hits.increment(1);
@@ -783,7 +799,7 @@ where
         self.contains_key_sync(key)
     }
 
-    /// [`Shard::contains_key`], synchronous.
+    /// [`Shard::contains_key`] without an async runtime.
     pub fn contains_key_sync(&self, key: &K) -> bool {
         self.engine.contains_key(key, self.now_ms())
     }
@@ -807,9 +823,8 @@ where
         self.engine.keys(self.now_ms())
     }
 
-    /// A weakly consistent, point-in-time scan of this node's local live
-    /// keys, like [`Shard::keys`] but without materializing them all into one
-    /// `Vec`: `f` runs once per key, with no stripe lock held while it runs.
+    /// [`Shard::keys`] as a visitor: `f` runs once per local live key, never
+    /// under a stripe lock, and no `Vec` of every key is built.
     pub fn for_each_key(&self, f: impl FnMut(K)) {
         self.engine.for_each_key(self.now_ms(), f);
     }
@@ -945,8 +960,7 @@ where
         self.insert_sync(key, value)
     }
 
-    /// [`Shard::insert`], synchronous, for a caller with no async runtime
-    /// handy. Same fan-out and events.
+    /// [`Shard::insert`] without an async runtime: same fan-out and events.
     ///
     /// # Errors
     ///
@@ -1125,8 +1139,7 @@ where
         self.remove_sync(key)
     }
 
-    /// [`Shard::remove`], synchronous, for a caller with no async runtime
-    /// handy. Same fan-out and events.
+    /// [`Shard::remove`] without an async runtime: same fan-out and events.
     ///
     /// # Errors
     ///
@@ -2755,7 +2768,7 @@ mod tests {
 
     #[tokio::test]
     async fn fan_out_queue_wakes_a_waiter_for_a_push_before_or_after_the_wait() {
-        let queue = Arc::new(FanOutQueue::<u32>::new());
+        let queue = Arc::new(FanOutQueue::<u32>::new(true));
         queue.push(7);
         tokio::time::timeout(Duration::from_secs(1), queue.wait_nonempty())
             .await
@@ -2997,6 +3010,31 @@ mod tests {
         s.insert_sync(1, "a".into()).expect("insert_sync");
         s.remove_sync(&1).expect("remove_sync");
         assert_eq!(s.get_sync(&1), None);
+    }
+
+    #[test]
+    fn a_local_mode_shard_queues_nothing_for_fan_out() {
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("local"),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        s.insert_sync(1, "a".into()).expect("insert");
+        s.remove_sync(&1).expect("remove");
+        assert!(s.fan_out.drain().is_empty(), "nothing drains a Local shard");
+    }
+
+    #[test]
+    fn a_closed_fan_out_queue_drops_its_backlog_and_accepts_nothing() {
+        let s = shard::<u32, String>(1);
+        s.insert_sync(1, "a".into()).expect("insert");
+        s.fan_out_queue().close();
+        s.insert_sync(2, "b".into()).expect("insert after close");
+        assert!(s.fan_out.drain().is_empty());
+        assert_eq!(s.get_sync(&2), Some("b".to_string()), "writes still land");
     }
 
     #[tokio::test]

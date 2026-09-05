@@ -187,9 +187,6 @@ where
             cluster.mark_warm(&name);
         }
 
-        // A child of the cluster's own shutdown token, so cancelling it
-        // stops only this cache's background tasks: `Cache::close` cancels
-        // it directly, and `Cluster::shutdown` cancels it transitively.
         let cancel = cluster.cancel_token().child_token();
 
         if !matches!(mode, Mode::Local) {
@@ -304,7 +301,7 @@ where
         self.shard.get(key).await
     }
 
-    /// [`Cache::get`], synchronous, for a caller with no async runtime handy.
+    /// [`Cache::get`] without an async runtime.
     #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
         self.shard.get_sync(key)
@@ -316,7 +313,7 @@ where
         self.shard.contains_key(key).await
     }
 
-    /// [`Cache::contains_key`], synchronous.
+    /// [`Cache::contains_key`] without an async runtime.
     #[must_use]
     pub fn contains_key_sync(&self, key: &K) -> bool {
         self.shard.contains_key_sync(key)
@@ -335,8 +332,8 @@ where
         self.shard.keys()
     }
 
-    /// [`Cache::keys`] as a visitor: `f` runs once per local live key without
-    /// materializing them all into one `Vec`.
+    /// [`Cache::keys`] as a visitor: `f` runs once per local live key, never
+    /// under a lock, and no `Vec` of every key is built.
     pub fn for_each_key(&self, f: impl FnMut(K)) {
         self.shard.for_each_key(f);
     }
@@ -381,8 +378,7 @@ where
         self.shard.insert(key, value).await
     }
 
-    /// [`Cache::insert`], synchronous, for a caller with no async runtime
-    /// handy. Same fan-out and events.
+    /// [`Cache::insert`] without an async runtime: same fan-out and events.
     ///
     /// # Errors
     ///
@@ -439,8 +435,7 @@ where
         self.shard.remove(key).await
     }
 
-    /// [`Cache::remove`], synchronous, for a caller with no async runtime
-    /// handy. Same fan-out and events.
+    /// [`Cache::remove`] without an async runtime: same fan-out and events.
     ///
     /// # Errors
     ///
@@ -489,15 +484,13 @@ where
     /// replication traffic for it. The name is free to `open()` again as
     /// soon as this returns.
     ///
-    /// Closing is idempotent, and closing one clone never disturbs another:
-    /// a clone kept past `close()` keeps working as a local, detached
-    /// cache — its reads and writes still reach the same in-memory
-    /// [`Shard`], just with no cluster membership behind it.
-    // No `.await` inside today, but `async` matches every other lifecycle
-    // method on `Cache`/`Cluster` and leaves room for a future await here.
+    /// Closing is idempotent. A clone kept past `close` keeps working as a
+    /// local, detached cache: its reads and writes reach the same in-memory
+    /// [`Shard`], and nothing replicates.
     #[allow(clippy::unused_async)]
     pub async fn close(self) {
         self.cancel.cancel();
+        self.shard.fan_out_queue().close();
         self.cluster.forget_cache(self.shard.name());
     }
 }
@@ -579,6 +572,10 @@ mod tests {
             surviving.get(&2).await,
             Some("still here".to_string()),
             "a surviving clone keeps reading locally after another clone closes"
+        );
+        assert!(
+            surviving.shard.fan_out_queue().drain().is_empty(),
+            "a detached clone queues nothing for a fan-out task that no longer runs"
         );
 
         cluster.shutdown().await;
