@@ -280,10 +280,22 @@ where
         self.shard.get(key).await
     }
 
+    /// [`Cache::get`], synchronous, for a caller with no async runtime handy.
+    #[must_use]
+    pub fn get_sync(&self, key: &K) -> Option<V> {
+        self.shard.get_sync(key)
+    }
+
     /// Reads whether `key` has a live entry, honoring expiry, without cloning
     /// it.
     pub async fn contains_key(&self, key: &K) -> bool {
         self.shard.contains_key(key).await
+    }
+
+    /// [`Cache::contains_key`], synchronous.
+    #[must_use]
+    pub fn contains_key_sync(&self, key: &K) -> bool {
+        self.shard.contains_key_sync(key)
     }
 
     /// The number of live entries in this node's local copy; nodes may
@@ -297,6 +309,12 @@ where
     #[must_use]
     pub fn keys(&self) -> Vec<K> {
         self.shard.keys()
+    }
+
+    /// [`Cache::keys`] as a visitor: `f` runs once per local live key without
+    /// materializing them all into one `Vec`.
+    pub fn for_each_key(&self, f: impl FnMut(K)) {
+        self.shard.for_each_key(f);
     }
 
     /// Reads `key`, invoking `loader` on a miss; concurrent misses collapse
@@ -337,6 +355,16 @@ where
     /// the frame cap, or [`CacheError::Codec`] if `key` fails to encode.
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.insert(key, value).await
+    }
+
+    /// [`Cache::insert`], synchronous, for a caller with no async runtime
+    /// handy. Same fan-out and events.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::insert`].
+    pub fn insert_sync(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.shard.insert_sync(key, value)
     }
 
     /// [`Cache::insert`] with a lifespan for this entry alone; `ttl`
@@ -385,6 +413,16 @@ where
     /// Returns a [`CacheError`] if the removal cannot apply or fan out.
     pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
         self.shard.remove(key).await
+    }
+
+    /// [`Cache::remove`], synchronous, for a caller with no async runtime
+    /// handy. Same fan-out and events.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::remove`].
+    pub fn remove_sync(&self, key: &K) -> Result<(), CacheError> {
+        self.shard.remove_sync(key)
     }
 
     /// [`Cache::remove`] for many keys at once, the tombstone counterpart of

@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `Cache::get_sync`, `Cache::contains_key_sync`, `Cache::insert_sync`, and
+  `Cache::remove_sync` (and the matching `Shard` methods): synchronous twins
+  of `get`, `contains_key`, `insert`, and `remove` for a caller with no async
+  runtime handy. Same hit/miss counting, fan-out, and events as their async
+  counterparts.
+- `Cache::for_each_key` (and `Shard::for_each_key`): a weakly consistent,
+  point-in-time visitor over this node's local live keys, like `Cache::keys`
+  but without materializing them all into one `Vec`.
+
 ## [0.4.0] – 2026-09-04
 
 ### Fixed

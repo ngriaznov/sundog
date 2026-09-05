@@ -734,14 +734,7 @@ where
     /// Equal versions are always a no-op: a given `(wall_ms, logical, node)`
     /// triple comes from at most one write ever, so an equal-version
     /// incoming record is already the one stored.
-    async fn apply(
-        &self,
-        key: K,
-        key_bytes: Bytes,
-        ver: Hlc,
-        incoming: Incoming<V>,
-        origin: Origin,
-    ) {
+    fn apply(&self, key: K, key_bytes: Bytes, ver: Hlc, incoming: Incoming<V>, origin: Origin) {
         let hash = engine::hash_key_bytes(key_bytes.as_ref());
         let bucket = engine::stripe_index_from_hash(hash);
         let outcome = self
@@ -766,6 +759,12 @@ where
     /// Counts `sundog_cache_hits_total{cache}` on `Some`,
     /// `sundog_cache_misses_total{cache}` on `None`.
     pub async fn get(&self, key: &K) -> Option<V> {
+        self.get_sync(key)
+    }
+
+    /// [`Shard::get`], synchronous, for a caller with no async runtime handy.
+    /// Same hit/miss counting.
+    pub fn get_sync(&self, key: &K) -> Option<V> {
         if let Some(value) = self.engine.get(key, self.now_ms()) {
             self.hits.increment(1);
             Some(value)
@@ -781,6 +780,11 @@ where
     /// existence check, not a read: it moves neither
     /// `sundog_cache_hits_total` nor `sundog_cache_misses_total`.
     pub async fn contains_key(&self, key: &K) -> bool {
+        self.contains_key_sync(key)
+    }
+
+    /// [`Shard::contains_key`], synchronous.
+    pub fn contains_key_sync(&self, key: &K) -> bool {
         self.engine.contains_key(key, self.now_ms())
     }
 
@@ -801,6 +805,13 @@ where
     #[must_use]
     pub fn keys(&self) -> Vec<K> {
         self.engine.keys(self.now_ms())
+    }
+
+    /// A weakly consistent, point-in-time scan of this node's local live
+    /// keys, like [`Shard::keys`] but without materializing them all into one
+    /// `Vec`: `f` runs once per key, with no stripe lock held while it runs.
+    pub fn for_each_key(&self, f: impl FnMut(K)) {
+        self.engine.for_each_key(self.now_ms(), f);
     }
 
     /// Reads `key`, invoking `loader` on a miss. Concurrent callers racing on
@@ -931,7 +942,17 @@ where
     /// replicate as exceeds the configured frame cap. See
     /// [`Shard::with_max_frame`], default [`MAX_FRAME`].
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
-        self.insert_expiring(key, value, None).await
+        self.insert_sync(key, value)
+    }
+
+    /// [`Shard::insert`], synchronous, for a caller with no async runtime
+    /// handy. Same fan-out and events.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::insert`].
+    pub fn insert_sync(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.insert_expiring(key, value, None)
     }
 
     /// [`Shard::insert`] with a lifespan for this entry alone, overriding the
@@ -941,15 +962,10 @@ where
     ///
     /// As [`Shard::insert`].
     pub async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
-        self.insert_expiring(key, value, Some(ttl)).await
+        self.insert_expiring(key, value, Some(ttl))
     }
 
-    async fn insert_expiring(
-        &self,
-        key: K,
-        value: V,
-        ttl: Option<Duration>,
-    ) -> Result<(), CacheError> {
+    fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> Result<(), CacheError> {
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let ver = self.stamp_local();
@@ -972,8 +988,7 @@ where
                 encoded,
             },
             Origin::Local,
-        )
-        .await;
+        );
         Ok(())
     }
 
@@ -1107,6 +1122,16 @@ where
     ///
     /// Returns a [`CacheError`] if the key cannot be encoded for the wire.
     pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
+        self.remove_sync(key)
+    }
+
+    /// [`Shard::remove`], synchronous, for a caller with no async runtime
+    /// handy. Same fan-out and events.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::remove`].
+    pub fn remove_sync(&self, key: &K) -> Result<(), CacheError> {
         let key_bytes = encode_key(key)?;
         let ver = self.stamp_local();
         self.apply(
@@ -1115,8 +1140,7 @@ where
             ver,
             Incoming::Tombstone,
             Origin::Local,
-        )
-        .await;
+        );
         Ok(())
     }
 
@@ -2920,6 +2944,59 @@ mod tests {
         let mut keys = s.keys();
         keys.sort_unstable();
         assert_eq!(keys, vec![0, 1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn for_each_key_visits_the_same_set_as_keys() {
+        let s = shard::<u32, String>(1);
+        for k in 0..5u32 {
+            s.insert(k, k.to_string()).await.expect("insert");
+        }
+        s.remove(&2).await.expect("remove");
+
+        let mut visited = Vec::new();
+        s.for_each_key(|k| visited.push(k));
+        visited.sort_unstable();
+        let mut keys = s.keys();
+        keys.sort_unstable();
+        assert_eq!(visited, keys);
+    }
+
+    #[tokio::test]
+    async fn get_sync_reads_exactly_what_get_would() {
+        let s = shard::<u32, String>(1);
+        assert_eq!(s.get_sync(&1), None, "missing key");
+
+        s.insert(1, "a".into()).await.expect("insert");
+        assert_eq!(s.get_sync(&1), Some("a".to_string()));
+        assert_eq!(s.get_sync(&1), s.get(&1).await);
+    }
+
+    #[tokio::test]
+    async fn contains_key_sync_reflects_insert_and_remove() {
+        let s = shard::<u32, String>(1);
+        assert!(!s.contains_key_sync(&1), "missing key");
+
+        s.insert(1, "a".into()).await.expect("insert");
+        assert!(s.contains_key_sync(&1), "present after insert");
+
+        s.remove(&1).await.expect("remove");
+        assert!(!s.contains_key_sync(&1), "gone after remove");
+    }
+
+    #[test]
+    fn insert_sync_writes_a_value_with_no_async_runtime() {
+        let s = shard::<u32, String>(1);
+        s.insert_sync(1, "a".into()).expect("insert_sync");
+        assert_eq!(s.get_sync(&1), Some("a".to_string()));
+    }
+
+    #[test]
+    fn remove_sync_tombstones_a_value_with_no_async_runtime() {
+        let s = shard::<u32, String>(1);
+        s.insert_sync(1, "a".into()).expect("insert_sync");
+        s.remove_sync(&1).expect("remove_sync");
+        assert_eq!(s.get_sync(&1), None);
     }
 
     #[tokio::test]

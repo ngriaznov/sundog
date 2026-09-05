@@ -1129,6 +1129,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_insert_sync_and_get_sync_round_trip_with_no_await() {
+        let cluster = Cluster::builder("cluster-it-insert-sync")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("solo")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+
+        cache.insert_sync(1, "a".into()).expect("insert_sync");
+        assert_eq!(cache.get_sync(&1), Some("a".to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_contains_key_sync_and_remove_sync_agree_with_their_async_twins() {
+        let cluster = Cluster::builder("cluster-it-contains-remove-sync")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("solo")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+
+        assert!(!cache.contains_key_sync(&1), "missing key");
+        cache.insert(1, "a".into()).await.expect("insert");
+        assert!(cache.contains_key_sync(&1), "present after insert");
+
+        cache.remove_sync(&1).expect("remove_sync");
+        assert!(!cache.contains_key(&1).await, "gone after remove_sync");
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_for_each_key_visits_the_same_set_as_keys() {
+        let cluster = Cluster::builder("cluster-it-for-each-key")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("solo")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+
+        for k in 0..5u32 {
+            cache.insert(k, k.to_string()).await.expect("insert");
+        }
+        cache.remove(&2).await.expect("remove");
+
+        let mut visited = Vec::new();
+        cache.for_each_key(|k| visited.push(k));
+        visited.sort_unstable();
+        let mut keys = cache.keys();
+        keys.sort_unstable();
+        assert_eq!(visited, keys);
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn open_rejects_replicated_mode_combined_with_a_finite_max_capacity() {
         let cluster = Cluster::builder("cluster-it-replicated-capacity-guard")
             .seeds(std::iter::empty())
@@ -1515,6 +1591,44 @@ mod tests {
         let mut events_b = cache_b.events();
 
         cache_a.insert(1, "hello".into()).await.expect("a inserts");
+
+        let event = tokio::time::timeout(Duration::from_secs(10), events_b.recv())
+            .await
+            .expect("event arrives within the bound")
+            .expect("event channel stays open");
+        match event {
+            Event::Created {
+                key: 1,
+                value,
+                origin: Origin::Remote(_),
+            } => assert_eq!(value, "hello"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(cache_b.get(&1).await, Some("hello".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replicated_mode_fans_a_sync_insert_out_to_the_peer() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-replicate-sync").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+        let mut events_b = cache_b.events();
+
+        cache_a.insert_sync(1, "hello".into()).expect("a inserts");
 
         let event = tokio::time::timeout(Duration::from_secs(10), events_b.recv())
             .await
