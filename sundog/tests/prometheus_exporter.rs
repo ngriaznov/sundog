@@ -46,6 +46,22 @@ async fn scrape_metrics(addr: SocketAddr) -> Option<String> {
     Some(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// A minimal raw-socket `GET` against `path`, returning the status line.
+/// `None` if the listener is not accepting connections yet.
+async fn scrape_status(addr: SocketAddr, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(addr).await.ok()?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .ok()?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).await.ok()?;
+    let response = String::from_utf8_lossy(&body).into_owned();
+    Some(response.lines().next()?.to_string())
+}
+
 /// Finds `metric{label="value"} <number>` in Prometheus text-exposition
 /// `body`, tolerant of label ordering and integer-vs-float rendering.
 fn scraped_metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
@@ -311,6 +327,24 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         scraped_metric_value(&body, "sundog_ae_parts_total", ("cache", "parts"))
             .is_some_and(|listings| listings >= 1.0),
         "expected at least one part listing on the 'parts' cache; got body:\n{body}"
+    );
+
+    // `users` warmed during `seed_sketch_mismatch` above: `is_ready()` and
+    // `/readyz` on the same listener must both already agree.
+    assert!(cluster.is_ready(), "the open Replicated caches are warm");
+    let readyz_status = scrape_status(metrics_addr, "/readyz")
+        .await
+        .expect("readyz answers once the cluster is up");
+    assert!(
+        readyz_status.contains("200"),
+        "expected /readyz to answer 200 once warm; got {readyz_status}"
+    );
+    let healthz_status = scrape_status(metrics_addr, "/healthz")
+        .await
+        .expect("healthz answers once the cluster is up");
+    assert!(
+        healthz_status.contains("200"),
+        "expected /healthz to always answer 200 while the process serves; got {healthz_status}"
     );
 
     peer.shutdown().await;

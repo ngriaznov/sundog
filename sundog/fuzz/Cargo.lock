@@ -1223,6 +1223,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hickory-resolver",
  "hostname",
+ "if-addrs",
  "mdns-sd",
  "metrics",
  "parking_lot",

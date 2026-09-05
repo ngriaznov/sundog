@@ -77,7 +77,7 @@ pub mod telemetry;
 pub mod wire;
 
 pub use cache::{Cache, CacheBuilder};
-pub use cluster::{Cluster, ClusterBuilder};
+pub use cluster::{CacheHealth, Cluster, ClusterBuilder, Health};
 pub use config::ClusterConfig;
 #[cfg(feature = "tls")]
 pub use config::TlsConfig;

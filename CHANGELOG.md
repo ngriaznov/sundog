@@ -7,13 +7,32 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
-- A pooled request connection past `ReqPool::checkin`'s check-in instant by
-  more than 30s, half the server's 60s `REQ_CONN_IDLE_TIMEOUT`, is dropped
-  at checkout instead of handed out: the server may already have closed it.
-  `Mesh::acquire_conn` also catches an immediate `EOF` on a reused
-  connection's first reply, the case a connection just under that bound
-  still slips through, and retries the request on a fresh dial rather than
-  failing it.
+## [Unreleased]
+
+### Added
+
+- `ClusterConfig::advertise_ip`: the address a node advertises for gossip
+  and the data plane, for NAT and container port mappings. Unset, the
+  outbound-interface probe now falls back to the first routable interface
+  address, then loopback, instead of failing `ClusterBuilder::build`.
+- `ClusterBuilder::node_id` and `NodeId: FromStr`: a persisted identity, so a
+  restarted process rejoins as the same member. `Cluster::shutdown` gossips a
+  graceful departure first, and a member that leaves this way no longer holds
+  tombstone garbage collection back for `tombstone_max_ttl`; only a crash
+  does.
+- `Cluster::is_ready` and `Cluster::health`: ready once every open
+  `Mode::Replicated` cache has finished warming. With the `prometheus`
+  feature the metrics listener also serves `GET /readyz` (200 or 503) and
+  `GET /healthz`.
+
+### Fixed
+
+- `SUNDOG_SEEDS` selects static discovery on its own; before, a build without
+  `.seeds()` ignored it and browsed mDNS.
+- A pooled request connection idle for more than 30 s is dropped instead of
+  reused, and one the peer has already closed is retried on a fresh dial
+  rather than failing the anti-entropy round.
+
 
 ## [0.4.0] – 2026-09-04
 

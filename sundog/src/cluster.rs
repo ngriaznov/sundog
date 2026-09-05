@@ -76,8 +76,9 @@ struct ClusterInner {
     mesh: Mesh,
     shards: ShardRegistry,
     /// The [`Mode`] each open cache was opened under; [`mode_conflict_task`]'s
-    /// local half.
-    local_modes: RwLock<HashMap<SmolStr, Mode>>,
+    /// local half. `Arc`-wrapped so the `prometheus` feature's `/readyz`
+    /// listener, built before this struct exists, can share it.
+    local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
     config: ClusterConfig,
     absence: absence::AbsenceTracker,
     /// When each peer last streamed replicate traffic in; see
@@ -144,6 +145,44 @@ impl Warmth {
     }
 }
 
+/// One open cache's contribution to [`Cluster::health`]: its mode and
+/// whether it has finished warming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheHealth {
+    /// The cache's name, as opened.
+    pub name: SmolStr,
+    /// The [`Mode`] the cache was opened under.
+    pub mode: Mode,
+    /// Whether the cache has finished warming: for a [`Mode::Replicated`]
+    /// cache, whether its state transfer has completed; always `true` for
+    /// `Local`/`Invalidation` caches, which are warm from the moment they
+    /// open.
+    pub warm: bool,
+}
+
+/// A snapshot of one node's health, returned by [`Cluster::health`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Health {
+    /// Whether this node is ready to serve; see [`Cluster::is_ready`].
+    pub ready: bool,
+    /// The current live peer count.
+    pub live_peers: usize,
+    /// Every open cache's mode and warmth.
+    pub caches: Vec<CacheHealth>,
+}
+
+/// The pure decision behind [`Cluster::is_ready`]: ready once every
+/// [`Mode::Replicated`] cache in `caches` is warm. A `Local`/`Invalidation`
+/// cache never gates readiness; it is warm synchronously on open.
+fn is_ready_from(caches: &[CacheHealth]) -> bool {
+    caches
+        .iter()
+        .filter(|cache| cache.mode == Mode::Replicated)
+        .all(|cache| cache.warm)
+}
+
 /// Builds a [`Cluster`]: own-and-return. `.build()` alone forms a working LAN
 /// cluster.
 #[must_use]
@@ -151,6 +190,7 @@ pub struct ClusterBuilder {
     name: SmolStr,
     discovery: Option<DiscoveryKind>,
     config: ClusterConfig,
+    node_id: Option<NodeId>,
     #[cfg(feature = "prometheus")]
     prometheus_listen: Option<SocketAddr>,
 }
@@ -162,6 +202,7 @@ impl Cluster {
             name: name.into(),
             discovery: None,
             config: ClusterConfig::default(),
+            node_id: None,
             #[cfg(feature = "prometheus")]
             prometheus_listen: None,
         }
@@ -205,6 +246,43 @@ impl Cluster {
     #[must_use]
     pub fn peers(&self) -> Vec<Peer> {
         self.inner.membership.peers().borrow().clone()
+    }
+
+    /// Whether this node is ready to serve: the data-plane listener is bound
+    /// (always true once `build()` has returned) and every open
+    /// [`Mode::Replicated`] cache has finished warming; see
+    /// [`Cluster::health`] for the detail behind this summary.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.health().ready
+    }
+
+    /// A snapshot of this node's health: readiness, the live peer count, and
+    /// every open cache's mode and warmth.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the local cache-mode map lock is poisoned.
+    #[must_use]
+    pub fn health(&self) -> Health {
+        let modes = self
+            .inner
+            .local_modes
+            .read()
+            .expect("invariant: local cache-mode map lock is never poisoned");
+        let caches: Vec<CacheHealth> = modes
+            .iter()
+            .map(|(name, &mode)| CacheHealth {
+                name: name.clone(),
+                mode,
+                warm: self.inner.warmth.is_warm(name),
+            })
+            .collect();
+        Health {
+            ready: is_ready_from(&caches),
+            live_peers: self.peers().len(),
+            caches,
+        }
     }
 
     /// Records `mode` as this node's [`Mode`] for cache `name` and gossips it
@@ -315,6 +393,18 @@ impl ClusterBuilder {
         self
     }
 
+    /// Uses `id` as this node's identity instead of a fresh
+    /// [`NodeId::random`]. Persist `id` yourself (it round-trips through
+    /// `Display`/`FromStr`, e.g. via a file written on first boot) and pass
+    /// the same value back here on restart: a restarted node with the same
+    /// id resumes as the same cluster member rather than joining as a new
+    /// one, so `absence` doesn't hold its old tombstones absent-length for
+    /// `tombstone_max_ttl` after every rolling restart.
+    pub fn node_id(mut self, id: NodeId) -> Self {
+        self.node_id = Some(id);
+        self
+    }
+
     /// Installs a Prometheus recorder and serves `GET /metrics` on `addr` for
     /// the life of the process, once [`build`](Self::build) succeeds.
     ///
@@ -348,51 +438,31 @@ impl ClusterBuilder {
             name,
             discovery,
             config,
+            node_id,
             #[cfg(feature = "prometheus")]
             prometheus_listen,
         } = self;
 
+        validate_config(&config)?;
+
+        // Created before the readiness-serving prometheus listener below, so
+        // its `/readyz` route can share them with the `Cluster` built later.
+        let local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let warmth = Arc::new(Warmth::default());
+
         #[cfg(feature = "prometheus")]
         if let Some(addr) = prometheus_listen {
-            crate::telemetry::install_listener(addr).map_err(|source| JoinError::Bind {
-                addr,
-                source: std::io::Error::other(source),
-            })?;
+            install_readiness_listener(addr, &local_modes, &warmth)?;
         }
 
-        if config.max_frame > wire::MAX_FRAME {
-            return Err(JoinError::InvalidConfig(format!(
-                "ClusterConfig::max_frame ({}) exceeds the wire codec's hard cap of {} bytes",
-                config.max_frame,
-                wire::MAX_FRAME
-            )));
-        }
-        // Sized for a cache name of up to 255 bytes; the wire codec still
-        // refuses a frame that a longer name pushes past `max_frame`.
-        let sketch_frame = wire::ae_sketch_frame_max_len(255, config.ae_sketch_cells);
-        if sketch_frame > config.max_frame {
-            return Err(JoinError::InvalidConfig(format!(
-                "ClusterConfig::ae_sketch_cells ({}) encodes to up to {sketch_frame} bytes, \
-                 more than max_frame ({}) allows",
-                config.ae_sketch_cells, config.max_frame
-            )));
-        }
-
-        let node = NodeId::random();
+        let node = node_id.unwrap_or_else(NodeId::random);
         let hostname = local_hostname();
         let node_name = NodeName::new(&hostname, node);
-
-        let discovery = discovery
-            .unwrap_or_else(|| DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string())));
+        let discovery = resolve_discovery(discovery, &name, &node_name);
 
         let data_bind_addr = reserve_data_bind_addr(config.data_bind_addr).await?;
-        let advertise_ip =
-            crate::membership::resolve_advertise_ip(data_bind_addr.ip()).map_err(|source| {
-                JoinError::Bind {
-                    addr: data_bind_addr,
-                    source,
-                }
-            })?;
+        let advertise_ip = crate::membership::advertise_ip_for(&config, data_bind_addr.ip());
         let advertise_data_addr = SocketAddr::new(advertise_ip, data_bind_addr.port());
 
         let membership = Membership::spawn(
@@ -412,7 +482,6 @@ impl ClusterBuilder {
 
         let incarnation = membership.local_peer().incarnation;
         let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::new()));
-        let warmth = Arc::new(Warmth::default());
         let handler: Arc<dyn RequestHandler> = Arc::new(ClusterRequestHandler {
             shards: Arc::clone(&shards),
             warmth: Arc::clone(&warmth),
@@ -430,7 +499,7 @@ impl ClusterBuilder {
                 membership,
                 mesh,
                 shards,
-                local_modes: RwLock::new(HashMap::new()),
+                local_modes,
                 config,
                 absence: absence::AbsenceTracker::default(),
                 inbound_activity: Arc::new(InboundActivity::default()),
@@ -454,6 +523,107 @@ impl ClusterBuilder {
     }
 }
 
+/// Feeds `local_modes`/`warmth`, shared with the eventual [`Cluster`], to
+/// [`crate::telemetry::install_listener`]'s `/readyz` route: built and
+/// installed before the `Cluster` it will describe exists.
+#[cfg(feature = "prometheus")]
+struct ClusterReadiness {
+    local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
+    warmth: Arc<Warmth>,
+}
+
+#[cfg(feature = "prometheus")]
+impl crate::telemetry::ReadinessSource for ClusterReadiness {
+    fn is_ready(&self) -> bool {
+        let modes = self
+            .local_modes
+            .read()
+            .expect("invariant: local cache-mode map lock is never poisoned");
+        let caches: Vec<CacheHealth> = modes
+            .iter()
+            .map(|(name, &mode)| CacheHealth {
+                name: name.clone(),
+                mode,
+                warm: self.warmth.is_warm(name),
+            })
+            .collect();
+        is_ready_from(&caches)
+    }
+}
+
+/// Whether an unset discovery mechanism falls back to
+/// [`Static::from_env`] instead of the zeroconf [`Mdns`] default: `true`
+/// exactly when no discovery source was configured and `SUNDOG_SEEDS` names
+/// at least one seed.
+fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
+    !discovery_set && seeds_env.is_some_and(|raw| !raw.trim().is_empty())
+}
+
+/// Validates the `ClusterConfig` invariants `build()` cannot recover from:
+/// `max_frame` against the wire codec's hard cap, and the sketch frame size
+/// it implies.
+fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
+    if config.max_frame > wire::MAX_FRAME {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::max_frame ({}) exceeds the wire codec's hard cap of {} bytes",
+            config.max_frame,
+            wire::MAX_FRAME
+        )));
+    }
+    // Sized for a cache name of up to 255 bytes; the wire codec still
+    // refuses a frame that a longer name pushes past `max_frame`.
+    let sketch_frame = wire::ae_sketch_frame_max_len(255, config.ae_sketch_cells);
+    if sketch_frame > config.max_frame {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::ae_sketch_cells ({}) encodes to up to {sketch_frame} bytes, \
+             more than max_frame ({}) allows",
+            config.ae_sketch_cells, config.max_frame
+        )));
+    }
+    Ok(())
+}
+
+/// Resolves the discovery mechanism `build()` uses: the caller's explicit
+/// choice, else [`use_static_from_env`]'s pick between `Static::from_env()`
+/// and the zeroconf `Mdns` default.
+fn resolve_discovery(
+    discovery: Option<DiscoveryKind>,
+    name: &SmolStr,
+    node_name: &NodeName,
+) -> DiscoveryKind {
+    let discovery_set = discovery.is_some();
+    // "SUNDOG_SEEDS": the same variable name `discovery::statics::Static`
+    // reads; duplicated here rather than imported, since that constant is
+    // private to that module.
+    let seeds_env = std::env::var("SUNDOG_SEEDS").ok();
+    discovery.unwrap_or_else(|| {
+        if use_static_from_env(discovery_set, seeds_env.as_deref()) {
+            DiscoveryKind::Static(Static::from_env())
+        } else {
+            DiscoveryKind::Mdns(Mdns::new(name.clone(), node_name.to_string()))
+        }
+    })
+}
+
+/// Builds the readiness view over `local_modes`/`warmth` and installs the
+/// `prometheus` feature's `/metrics`, `/readyz`, `/healthz` listener on
+/// `addr`, before the `Cluster` those maps belong to exists.
+#[cfg(feature = "prometheus")]
+fn install_readiness_listener(
+    addr: SocketAddr,
+    local_modes: &Arc<RwLock<HashMap<SmolStr, Mode>>>,
+    warmth: &Arc<Warmth>,
+) -> Result<(), JoinError> {
+    let readiness: Arc<dyn crate::telemetry::ReadinessSource> = Arc::new(ClusterReadiness {
+        local_modes: Arc::clone(local_modes),
+        warmth: Arc::clone(warmth),
+    });
+    crate::telemetry::install_listener(addr, readiness).map_err(|source| JoinError::Bind {
+        addr,
+        source: std::io::Error::other(source),
+    })
+}
+
 /// Spawns every background loop a freshly built [`Cluster`] keeps running: peer
 /// republishing, the mode-mismatch sweep, absence tracking, inbound dispatch,
 /// and the open-cache gauge.
@@ -466,6 +636,7 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     cluster.spawn_tracked(mode_conflict_task(cluster.clone(), cluster.cancel_token()));
     cluster.spawn_tracked(absence::tracking_task(
         cluster.inner.membership.peers(),
+        cluster.inner.membership.departing_flags(),
         cluster.absence_tracker(),
         cluster.cancel_token(),
     ));
@@ -1105,6 +1276,24 @@ mod tests {
         })
         .await
         .expect("peers converge within the bound");
+    }
+
+    /// Waits until `cluster`'s live peer set is empty, for a departure or
+    /// crash scenario the failure detector needs a little time to notice.
+    async fn wait_for_no_peers(cluster: &Cluster) {
+        let mut peers = cluster.inner.membership.peers();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if peers.borrow().is_empty() {
+                    return;
+                }
+                if peers.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the peer disappears from the live set within the bound");
     }
 
     #[tokio::test]
@@ -2856,5 +3045,203 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn use_static_from_env_only_when_no_discovery_is_set_and_seeds_env_is_nonempty() {
+        assert!(
+            use_static_from_env(false, Some("host:4000")),
+            "no discovery configured and a populated SUNDOG_SEEDS: fall back to Static"
+        );
+        assert!(
+            !use_static_from_env(true, Some("host:4000")),
+            "an explicit .seeds()/.discovery() call always wins"
+        );
+        assert!(
+            !use_static_from_env(false, None),
+            "SUNDOG_SEEDS unset: stay on the mDNS default"
+        );
+        assert!(
+            !use_static_from_env(false, Some("   ")),
+            "SUNDOG_SEEDS set but blank: stay on the mDNS default"
+        );
+    }
+
+    #[test]
+    fn is_ready_from_gates_only_on_replicated_caches() {
+        let all_warm = [
+            CacheHealth {
+                name: SmolStr::new("sessions"),
+                mode: Mode::Invalidation,
+                warm: true,
+            },
+            CacheHealth {
+                name: SmolStr::new("users"),
+                mode: Mode::Replicated,
+                warm: true,
+            },
+        ];
+        assert!(is_ready_from(&all_warm));
+
+        let one_cold_replicated = [
+            CacheHealth {
+                name: SmolStr::new("scratch"),
+                mode: Mode::Local,
+                warm: false,
+            },
+            CacheHealth {
+                name: SmolStr::new("users"),
+                mode: Mode::Replicated,
+                warm: false,
+            },
+        ];
+        assert!(
+            !is_ready_from(&one_cold_replicated),
+            "a cold Replicated cache blocks readiness even if a Local one is also cold"
+        );
+
+        assert!(is_ready_from(&[]), "no open caches at all: vacuously ready");
+    }
+
+    #[tokio::test]
+    async fn node_id_builder_overrides_the_generated_identity() {
+        let fixed = NodeId::random();
+        let cluster = Cluster::builder("cluster-it-node-id-override")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .node_id(fixed)
+            .build()
+            .await
+            .expect("build succeeds with a caller-supplied node id");
+        assert_eq!(cluster.node_id(), fixed);
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn advertise_ip_override_skips_the_probe_and_covers_both_addresses() {
+        use std::net::IpAddr;
+
+        // TEST-NET-3, guaranteed unroutable: proves the outbound probe never
+        // ran, since it would otherwise fail `build()` or resolve to
+        // loopback.
+        let forced = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5));
+        let config = ClusterConfig {
+            advertise_ip: Some(forced),
+            ..loopback_config()
+        };
+
+        let cluster = Cluster::builder("cluster-it-advertise-ip")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("build succeeds even though the forced advertise ip is unroutable");
+
+        let local = cluster.inner.membership.local_peer();
+        assert_eq!(local.gossip_addr.ip(), forced);
+        assert_eq!(local.data_addr.ip(), forced);
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_never_counts_absent_but_a_crash_does() {
+        let hard_cap = Duration::from_secs(3600);
+
+        let cluster_a = Cluster::builder("cluster-it-absence-graceful-vs-crash")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+
+        // Graceful case: b leaves through `Cluster::shutdown`.
+        let cluster_b = Cluster::builder("cluster-it-absence-graceful-vs-crash")
+            .seeds([gossip_a])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_a, 1).await;
+
+        cluster_b.shutdown().await;
+        wait_for_no_peers(&cluster_a).await;
+        assert!(
+            !cluster_a.absence_tracker().any_absent(hard_cap),
+            "a graceful departure is never counted absent"
+        );
+
+        // Crash case: c's background tasks are cancelled and it is dropped
+        // with no `shutdown()` call, so its membership loop's channel
+        // closes without ever gossiping a departure, indistinguishable
+        // from a process that just died.
+        let cluster_c = Cluster::builder("cluster-it-absence-graceful-vs-crash")
+            .seeds([gossip_a])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node c builds");
+        wait_for_peer_count(&cluster_a, 1).await;
+
+        cluster_c.inner.cancel.cancel();
+        drop(cluster_c);
+        wait_for_no_peers(&cluster_a).await;
+        assert!(
+            cluster_a.absence_tracker().any_absent(hard_cap),
+            "a crash, with no graceful departure gossiped, is counted absent"
+        );
+
+        cluster_a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn readiness_flips_true_once_a_replicated_cache_finishes_warming() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-readiness").await;
+
+        assert!(cluster_a.is_ready(), "no caches open yet: vacuously ready");
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens and is warm immediately: no peer holds this cache yet");
+        assert!(cluster_a.is_ready());
+        let health_a = cluster_a.health();
+        assert!(health_a.ready);
+        assert_eq!(health_a.live_peers, 1);
+        assert_eq!(health_a.caches.len(), 1);
+        assert_eq!(health_a.caches[0].mode, Mode::Replicated);
+        assert!(health_a.caches[0].warm);
+
+        cache_a.insert(1, "hello".into()).await.expect("a inserts");
+        wait_for_cache_advertised(&cluster_b, "users").await;
+
+        // b's own open() runs state transfer against a, so it may already be
+        // warm by the time `open()` returns; either way `is_ready` must
+        // agree with `health().caches[0].warm` throughout.
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !cluster_b.is_ready() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b's replicated cache finishes warming within the bound");
+        let health_b = cluster_b.health();
+        assert!(health_b.ready);
+        assert_eq!(health_b.caches.len(), 1);
+        assert!(health_b.caches[0].warm);
+        assert_eq!(cache_b.get(&1).await, Some("hello".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
     }
 }

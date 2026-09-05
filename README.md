@@ -175,7 +175,7 @@ previous release's node against the current one in both roles.
 | Mechanism | Default? | What it does | Use it for |
 |---|---|---|---|
 | `Mdns` | yes | registers `_sundog._udp.local.` and browses for it continuously, via `mdns-sd` | a real LAN, office network, or anywhere multicast works |
-| `Static` | no, `.seeds(..)` or `SUNDOG_SEEDS=host:port,host:port` | a fixed seed list, re-resolved periodically | tests, and anywhere mDNS can't reach |
+| `Static` | no, but wins over `Mdns` if either `.seeds(..)` is called or `SUNDOG_SEEDS=host:port,host:port` is set with no other discovery configured | a fixed seed list, re-resolved periodically | tests, and anywhere mDNS can't reach |
 | `DnsSrv` | no, `.discovery(DnsSrv::new(..))` | polls SRV records for a service name, falls back to A/AAAA | Kubernetes: point it at a headless service and you're done |
 
 Discovery keeps running after startup: if the whole cluster reboots at once and
@@ -187,6 +187,15 @@ state.
 usually not AP-isolated Wi-Fi either, since multicast doesn't route there. If
 you're demoing this with `docker compose`, use `Static` seeds; save `Mdns` for
 host networking or bare-metal LANs.
+
+**Behind NAT or a container port mapping**, the interface address a node finds
+on its own — via its outbound-interface probe, or the `if-addrs` fallback
+behind it — is not always the address peers must dial: a cloud instance's
+public IP while the process binds its private one, or a container's
+externally published port. Set `ClusterConfig::advertise_ip` to the address
+peers should use; it covers both the gossip and data-plane addresses, and no
+probe runs. Under Kubernetes host networking, or any setup where the bind
+address is already correct, leave it unset.
 
 ## Feature flags
 
@@ -208,6 +217,14 @@ reconciliation; `outcome` is `listing`, `sketch`, or `fallback`. Without
 `prometheus` they fall into the `metrics` crate's no-op default recorder. A
 ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
+
+`Cluster::is_ready()` and `Cluster::health()` report whether every open
+`Mode::Replicated` cache has finished its state transfer; a `Local` or
+`Invalidation` cache is warm from the moment it opens, so it never holds
+readiness back. With the `prometheus` feature, the same listener that serves
+`GET /metrics` also serves `GET /readyz` (200 once ready, 503 otherwise) and
+`GET /healthz` (200 for as long as the process serves), for a container
+orchestrator's readiness and liveness probes.
 
 ## Testing
 

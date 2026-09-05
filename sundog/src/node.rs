@@ -40,6 +40,17 @@ impl fmt::Display for NodeId {
     }
 }
 
+impl std::str::FromStr for NodeId {
+    type Err = std::num::ParseIntError;
+
+    /// Parses the hex text [`NodeId`]'s `Display` produces, so a persisted
+    /// id (see [`crate::cluster::ClusterBuilder::node_id`]) round-trips
+    /// through a file across a restart.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        u64::from_str_radix(s, 16).map(Self)
+    }
+}
+
 /// The human-readable, cluster-unique name derived from a node's hostname and
 /// [`NodeId`]: `{hostname}-{nodeid-hex}`. This is the string chitchat uses as
 /// its node id.
@@ -114,5 +125,26 @@ mod tests {
         let decoded: NodeId =
             postcard::from_bytes(&bytes).expect("invariant: freshly encoded bytes decode");
         assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn roundtrips_through_display_and_from_str() {
+        let id = NodeId::random();
+        let parsed: NodeId = id.to_string().parse().expect("Display output is valid hex");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn roundtrips_through_a_persisted_file() {
+        let id = NodeId::from(0xabc_def);
+        let path = std::env::temp_dir().join(format!("sundog-node-id-test-{id}"));
+        std::fs::write(&path, id.to_string()).expect("write persists the id");
+        let read_back = std::fs::read_to_string(&path).expect("read back the persisted file");
+        std::fs::remove_file(&path).ok();
+        let restarted: NodeId = read_back
+            .trim()
+            .parse()
+            .expect("persisted text is valid hex");
+        assert_eq!(id, restarted, "a restarted node reads back the same id");
     }
 }

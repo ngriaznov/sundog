@@ -38,6 +38,11 @@ const INCARNATION_KEY: &str = "incarnation";
 /// The peer's [`crate::wire::PROTOCOL_VERSION`]; absent on a 0.3 node,
 /// which speaks protocol 1.
 const PROTOCOL_KEY: &str = "protocol";
+/// Set by [`Membership::shutdown`] before it tells chitchat to leave, and
+/// never cleared afterward since the process exits shortly after. A peer
+/// that observes this key before this node drops out of the live set knows
+/// the departure was graceful, not a crash; see [`crate::cluster::absence`].
+const DEPARTING_KEY: &str = "departing";
 /// Prefix for the per-cache mode keys `Membership::set_cache_mode` sets:
 /// the full key is `cache:<name>`.
 const CACHE_KEY_PREFIX: &str = "cache:";
@@ -87,6 +92,10 @@ enum Command {
 pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
     cache_modes: watch::Receiver<CacheModes>,
+    /// Which live peers have gossiped [`DEPARTING_KEY`], published in
+    /// lockstep with `peers`; `pub(crate)`: only `cluster::absence` consumes
+    /// it, via [`Membership::departing_flags`].
+    departing: watch::Receiver<HashMap<NodeId, bool>>,
     local: Peer,
     commands: mpsc::UnboundedSender<Command>,
 }
@@ -133,11 +142,7 @@ impl Membership {
             bind_addr.port()
         };
         let listen_addr = SocketAddr::new(bind_addr.ip(), port);
-        let advertise_ip =
-            resolve_advertise_ip(listen_addr.ip()).map_err(|source| JoinError::Bind {
-                addr: listen_addr,
-                source,
-            })?;
+        let advertise_ip = advertise_ip_for(config, listen_addr.ip());
         let gossip_advertise_addr = SocketAddr::new(advertise_ip, port);
 
         let incarnation = now_incarnation_ms();
@@ -198,20 +203,32 @@ impl Membership {
 
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
         let (cache_modes_tx, cache_modes_rx) = watch::channel(HashMap::new());
+        let (departing_tx, departing_rx) = watch::channel(HashMap::new());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
+        // A departing node's `DEPARTING_KEY` write needs at least one full
+        // gossip round to reach every peer before this node actually leaves;
+        // three rounds is generous headroom against a dropped packet or two.
+        let departure_notice = config.gossip_interval.saturating_mul(3);
+
+        let publishers = Publishers {
+            peers: peers_tx,
+            cache_modes: cache_modes_tx,
+            departing: departing_tx,
+        };
         tokio::spawn(run(
             handle,
             seeds,
-            peers_tx,
-            cache_modes_tx,
+            publishers,
             chitchat_id,
             commands_rx,
+            departure_notice,
         ));
 
         Ok(Self {
             peers: peers_rx,
             cache_modes: cache_modes_rx,
+            departing: departing_rx,
             local,
             commands: commands_tx,
         })
@@ -235,6 +252,13 @@ impl Membership {
     /// in lockstep with [`Membership::peers`].
     pub(crate) fn cache_modes(&self) -> watch::Receiver<CacheModes> {
         self.cache_modes.clone()
+    }
+
+    /// A live-updating view of which live peers have gossiped a graceful
+    /// departure, published in lockstep with [`Membership::peers`]. A peer
+    /// absent from the map has not signaled departure.
+    pub(crate) fn departing_flags(&self) -> watch::Receiver<HashMap<NodeId, bool>> {
+        self.departing.clone()
     }
 
     /// Advertises `mode` as this node's [`Mode`] for cache `name`, under
@@ -280,15 +304,42 @@ async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Ve
     seed_nodes
 }
 
-/// The address peers use to reach this node's gossip
-/// socket. A concrete bind IP is used as-is; the zeroconf default resolves
-/// to the OS-chosen outbound interface via a UDP "connect", which never
-/// sends a packet on a datagram socket. `pub(crate)`: `cluster.rs` reuses
-/// this for the data-plane's address.
-pub(crate) fn resolve_advertise_ip(bind_ip: IpAddr) -> io::Result<IpAddr> {
+/// The advertise IP for a socket bound to `bind_ip`: `config.advertise_ip`
+/// verbatim when set (no probe runs at all), otherwise
+/// [`resolve_advertise_ip`]'s automatic chain. `pub(crate)`: `cluster.rs`
+/// reuses this for the data-plane's address, so both addresses honor the
+/// same override.
+pub(crate) fn advertise_ip_for(config: &ClusterConfig, bind_ip: IpAddr) -> IpAddr {
+    config
+        .advertise_ip
+        .unwrap_or_else(|| resolve_advertise_ip(bind_ip))
+}
+
+/// The address peers use to reach this node's gossip socket, when
+/// [`crate::config::ClusterConfig::advertise_ip`] leaves it unset. A
+/// concrete bind IP is used as-is; the zeroconf default probes the
+/// OS-chosen outbound interface via a UDP "connect" toward a public address
+/// (which never sends a packet on a datagram socket), and, on any probe
+/// failure — an unplugged cable, a network with no route to the internet —
+/// falls back to the first non-loopback, non-link-local address `if-addrs`
+/// reports for the same family, then to loopback: this never fails.
+fn resolve_advertise_ip(bind_ip: IpAddr) -> IpAddr {
     if !bind_ip.is_unspecified() {
-        return Ok(bind_ip);
+        return bind_ip;
     }
+    if let Ok(probed) = probe_outbound_ip(bind_ip) {
+        return probed;
+    }
+    let candidates: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .map(|interfaces| interfaces.into_iter().map(|iface| iface.ip()).collect())
+        .unwrap_or_default();
+    fallback_advertise_ip(&candidates, bind_ip.is_ipv6())
+}
+
+/// The outbound-interface probe: a UDP "connect" toward a public address,
+/// which never sends a packet on a datagram socket but makes the kernel pick
+/// a source address as if it were about to.
+fn probe_outbound_ip(bind_ip: IpAddr) -> io::Result<IpAddr> {
     let probe_target: SocketAddr = if bind_ip.is_ipv6() {
         (
             Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888),
@@ -301,6 +352,35 @@ pub(crate) fn resolve_advertise_ip(bind_ip: IpAddr) -> io::Result<IpAddr> {
     let probe = std::net::UdpSocket::bind((bind_ip, 0))?;
     probe.connect(probe_target)?;
     probe.local_addr().map(|addr| addr.ip())
+}
+
+/// The pure fallback order [`resolve_advertise_ip`] applies once its outbound
+/// probe fails: the first `candidates` entry of the requested family (`true`
+/// for IPv6) that is neither loopback nor link-local, or that family's
+/// loopback address if none qualifies.
+fn fallback_advertise_ip(candidates: &[IpAddr], want_ipv6: bool) -> IpAddr {
+    candidates
+        .iter()
+        .copied()
+        .find(|ip| ip.is_ipv6() == want_ipv6 && !ip.is_loopback() && !is_link_local(ip))
+        .unwrap_or(if want_ipv6 {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        })
+}
+
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+    }
+}
+
+/// Whether `state` carries [`DEPARTING_KEY`], i.e. its owner gossiped a
+/// graceful departure before leaving.
+fn is_departing(state: &NodeState) -> bool {
+    state.get(DEPARTING_KEY).is_some()
 }
 
 fn now_incarnation_ms() -> u64 {
@@ -381,14 +461,27 @@ fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
 /// addresses into gossip, republishes live-set changes as `Vec<Peer>`, and
 /// performs shutdown on request. Spawned once, so `ChitchatHandle::shutdown`
 /// has exactly one owner regardless of how many [`Membership`] clones exist.
+/// The three watch channels [`run`] republishes membership state on, bundled
+/// to keep its argument count down.
+struct Publishers {
+    peers: watch::Sender<Vec<Peer>>,
+    cache_modes: watch::Sender<CacheModes>,
+    departing: watch::Sender<HashMap<NodeId, bool>>,
+}
+
 async fn run(
     handle: ChitchatHandle,
     seeds: BoxStream<'static, SocketAddr>,
-    peers_tx: watch::Sender<Vec<Peer>>,
-    cache_modes_tx: watch::Sender<CacheModes>,
+    publishers: Publishers,
     self_chitchat_id: ChitchatId,
     mut commands_rx: mpsc::UnboundedReceiver<Command>,
+    departure_notice: Duration,
 ) {
+    let Publishers {
+        peers: peers_tx,
+        cache_modes: cache_modes_tx,
+        departing: departing_tx,
+    } = publishers;
     let mut seeds = seeds.fuse();
     let chitchat = handle.chitchat();
     let mut live_nodes = chitchat.lock().await.live_nodes_watch_stream().fuse();
@@ -406,6 +499,7 @@ async fn run(
             live = live_nodes.select_next_some() => {
                 let mut peers: Vec<Peer> = Vec::new();
                 let mut cache_modes: CacheModes = HashMap::new();
+                let mut departing: HashMap<NodeId, bool> = HashMap::new();
                 for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
                     let Some(peer) = parse_peer(id, state) else { continue };
                     if let Some(notice) = protocol_notice(peer.protocol)
@@ -414,10 +508,12 @@ async fn run(
                         tracing::warn!(peer = %peer.node, peer_protocol = peer.protocol, "{notice}");
                     }
                     cache_modes.insert(peer.node, parse_cache_modes(state));
+                    departing.insert(peer.node, is_departing(state));
                     peers.push(peer);
                 }
                 tracing::debug!(count = peers.len(), "membership view updated");
                 let _ = cache_modes_tx.send(cache_modes);
+                let _ = departing_tx.send(departing);
                 let _ = peers_tx.send(peers);
             }
             command = commands_rx.recv() => {
@@ -430,6 +526,17 @@ async fn run(
                             .set(cache_key(&name), mode.as_token());
                     }
                     Some(Command::Shutdown(reply)) => {
+                        // Gossips the departure before actually leaving, and
+                        // waits for it to reach peers: `AbsenceTracker`
+                        // reads it off the last state a peer had before
+                        // dropping out of the live set, never counting a
+                        // graceful leave as absence.
+                        chitchat
+                            .lock()
+                            .await
+                            .self_node_state()
+                            .set(DEPARTING_KEY, "1");
+                        time::sleep(departure_notice).await;
                         if let Err(error) = handle.shutdown().await {
                             tracing::warn!(%error, "chitchat shutdown reported an error");
                         }
@@ -437,7 +544,15 @@ async fn run(
                         let _ = reply.send(());
                         return;
                     }
-                    None => return,
+                    None => {
+                        // Every `Membership` clone (hence its `commands`
+                        // sender) is gone with no graceful `shutdown()`
+                        // call: a crash. Abort the chitchat server outright
+                        // rather than leaving it gossiping on, detached from
+                        // anything this process still holds.
+                        handle.abort();
+                        return;
+                    }
                 }
             }
         }
@@ -446,7 +561,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
     use chitchat::NodeState;
@@ -599,6 +714,13 @@ mod tests {
         assert!(!caches.contains_key("bogus"));
     }
 
+    #[test]
+    fn is_departing_reads_the_departing_key() {
+        let state = state_with(&[(DEPARTING_KEY, "1")]);
+        assert!(is_departing(&state));
+        assert!(!is_departing(&NodeState::for_test()));
+    }
+
     #[tokio::test]
     async fn collect_initial_seeds_dedupes_and_stops_at_window() {
         let a = addr(1);
@@ -619,9 +741,60 @@ mod tests {
     }
 
     #[test]
-    fn resolve_advertise_ip_keeps_explicit_ip() {
+    fn advertise_ip_for_keeps_explicit_bind_ip() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
-        assert_eq!(resolve_advertise_ip(ip).unwrap(), ip);
+        assert_eq!(advertise_ip_for(&ClusterConfig::default(), ip), ip);
+    }
+
+    #[test]
+    fn advertise_ip_for_honors_the_config_override_and_skips_resolution() {
+        let configured = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let config = ClusterConfig {
+            advertise_ip: Some(configured),
+            ..ClusterConfig::default()
+        };
+        // The bind ip is unspecified, which would otherwise trigger the
+        // probe/fallback chain; the override must short-circuit it.
+        assert_eq!(
+            advertise_ip_for(&config, IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            configured
+        );
+    }
+
+    #[test]
+    fn fallback_advertise_ip_picks_the_first_routable_candidate_of_the_family() {
+        let loopback_v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let link_local_v4 = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let lan_v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7));
+        let lan_v6 = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        let candidates = [loopback_v4, link_local_v4, lan_v4, lan_v6];
+
+        assert_eq!(fallback_advertise_ip(&candidates, false), lan_v4);
+        assert_eq!(fallback_advertise_ip(&candidates, true), lan_v6);
+    }
+
+    #[test]
+    fn fallback_advertise_ip_falls_back_to_loopback_with_no_routable_candidate() {
+        let link_local_v4 = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let link_local_v6 = IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        let candidates = [link_local_v4, link_local_v6];
+
+        assert_eq!(
+            fallback_advertise_ip(&candidates, false),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            fallback_advertise_ip(&candidates, true),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn fallback_advertise_ip_on_an_empty_candidate_list_is_loopback() {
+        assert_eq!(
+            fallback_advertise_ip(&[], false),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
     }
 
     fn repeating_stream(addr: SocketAddr) -> BoxStream<'static, SocketAddr> {
