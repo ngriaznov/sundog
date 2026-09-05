@@ -392,25 +392,6 @@ impl ConflictResolver for LwwResolver {
     }
 }
 
-/// A stored value paired with the version it was last written at, folded into
-/// the per-key version table, and its absolute expiry, so every replica
-/// converts the same origin-stamped deadline into a local remaining duration.
-#[derive(Debug, Clone)]
-pub struct Stored<V> {
-    /// The current value.
-    pub value: V,
-    /// `value`'s postcard-encoded bytes: the first encode's bytes on the
-    /// local-origin path (`insert`/`insert_many`/`get_or_load`'s fill), the
-    /// verbatim wire bytes on the replica-apply path
-    /// (`apply_remote_batch`). Always equal to `postcard::to_stdvec(&
-    /// value)`, or to wire bytes decoding to a structurally equal `value`.
-    pub encoded: Bytes,
-    /// The version this value was written at.
-    pub ver: Hlc,
-    /// Absolute expiry in epoch milliseconds, or `None` for no TTL.
-    pub expires_at_ms: Option<u64>,
-}
-
 /// A tombstone: the version of the delete that created it, and its two GC
 /// deadlines. `ttl_deadline_ms` is when it becomes eligible for ordinary
 /// collection; `max_deadline_ms` is the hard cap past which it collects
@@ -428,8 +409,12 @@ enum Incoming<V> {
     Put {
         value: V,
         expires_at_ms: Option<u64>,
-        /// `value`'s postcard-encoded bytes. See [`Stored::encoded`] for which
-        /// bytes this is on each apply path.
+        /// `value`'s postcard-encoded bytes: the first encode's bytes on the
+        /// local-origin path (`insert`/`insert_many`/`get_or_load`'s fill),
+        /// the verbatim wire bytes on the replica-apply path
+        /// (`apply_remote_batch`). Always equal to `postcard::to_stdvec(&
+        /// value)`, or to wire bytes decoding to a structurally equal
+        /// `value`.
         encoded: Bytes,
     },
     Tombstone,
@@ -648,6 +633,37 @@ where
             Some(Box::new(weigher)),
         ));
         self
+    }
+
+    /// Opens a local SSD/NVMe spill tier at `cfg` and attaches it to this
+    /// shard's engine: once `max_capacity` is exceeded, eviction demotes the
+    /// coldest entries onto disk instead of discarding them. Call this last
+    /// in the builder chain, right after [`Shard::with_weigher`] if both are
+    /// used — [`Shard::with_weigher`] rebuilds the engine from scratch, and
+    /// the tier attaches to whichever engine is current when this runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`std::io::Error`] if the tier's directory or
+    /// a region file cannot be created; see `spill::SpillTier::open`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a prior clone of this shard's engine `Arc` already exists —
+    /// an invariant of calling this only from [`crate::cache::CacheBuilder::open`],
+    /// before the shard itself is ever wrapped in an `Arc` or shared.
+    #[cfg(feature = "spill")]
+    pub fn with_spill(mut self, cfg: &spill::SpillConfig) -> Result<Self, std::io::Error> {
+        let tier = Arc::new(spill::SpillTier::open(cfg, &self.name)?);
+        Arc::get_mut(&mut self.engine)
+            .expect(
+                "invariant: with_spill runs immediately after Shard::new/with_weigher, before \
+                 any clone of the engine's Arc exists",
+            )
+            .set_spill(Arc::clone(&tier));
+        let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
+        tier.attach(Arc::downgrade(&sink));
+        Ok(self)
     }
 
     /// Overrides the clock every timestamp this shard stamps reads from, in
@@ -2539,6 +2555,42 @@ mod tests {
             weight, 7,
             "a custom weigher drives the engine's total weight, not the default of 1 per entry"
         );
+    }
+
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn with_spill_lets_eviction_extend_capacity_onto_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-with-spill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test-spill"),
+            Mode::Local,
+            NodeId::from(1),
+            3, // a tiny weight cap: at most 3 one-weight entries fit resident
+            None,
+            None,
+        )
+        .with_spill(&cfg)
+        .expect("the tier's directory and region files open");
+
+        for k in 0..20u32 {
+            s.insert(k, format!("value-{k}")).await.expect("insert");
+        }
+
+        assert_eq!(
+            s.entry_count().await,
+            20,
+            "eviction demotes the coldest entries onto disk instead of deleting them once a \
+             spill tier is configured, so live_count never shrinks below what was written"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A resolver where the longer value wins, `Hlc` breaking ties on equal

@@ -30,8 +30,8 @@ pub const TOMBSTONE_MAX_TTL_MS: u64 = 2_000;
 pub const START_CLOCK_MS: u64 = 1_000_000;
 
 /// One entry the model holds for a key: a live value or a tombstone,
-/// carrying the same bookkeeping [`super::Stored`] and [`super::Tombstone`]
-/// carry.
+/// carrying the same bookkeeping the engine's own `Live` and
+/// [`super::Tombstone`] carry.
 #[derive(Debug, Clone)]
 enum ModelEntry {
     Live {

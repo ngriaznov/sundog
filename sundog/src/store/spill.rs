@@ -46,16 +46,17 @@
 //!
 //! # A note on this module's `pub(crate)` surface
 //!
-//! `SpillTier`, `SpillJob`, `SpillSink`, `SpillLoc`, `SpilledBytes`, and
-//! `spilled_is_current` are consumed by `store::engine`'s `Payload::Spilled`
-//! integration (eviction handing a victim to `try_spill`, the flusher
-//! installing through `SpillSink`, `get`/`get_or_load` promoting through
-//! `read_at`), which lands as a parallel change. Until that lands, this
-//! module's only caller is its own test suite below, so a non-test build sees
-//! no call site for any of it. `#![allow(dead_code)]` covers exactly that gap
-//! and is expected to come off once the engine integration lands and gives
-//! every item here a real, non-test caller. [`SpillConfig`] is exempt: it is
-//! re-exported at the crate root, so it is already live.
+//! `store::engine`'s `Payload::Spilled` integration consumes most of this
+//! module already: eviction hands a victim to `try_spill`, `Engine`'s
+//! `SpillSink` impl installs and reclaims through `spilled_is_current`, and
+//! `open`/`attach` are called from `Shard::with_spill`. What's still
+//! uncalled outside this module's own test suite is the async read path —
+//! `read_at`, `bytes_used`, and `SpilledBytes` — which lands as a parallel
+//! change wiring `get`/`get_or_load`'s promotion through `spawn_blocking`.
+//! `#![allow(dead_code)]` covers exactly that remaining gap and is expected
+//! to come off once that change gives every item here a real, non-test
+//! caller. [`crate::store::spill::SpillConfig`] is exempt: it is re-exported
+//! at the crate root, so it is already live.
 #![allow(dead_code)]
 
 use std::fs::{self, File, OpenOptions};
@@ -520,6 +521,13 @@ impl SpillTier {
     /// Live (un-reclaimed) bytes across all regions.
     pub(crate) fn bytes_used(&self) -> u64 {
         self.inner.bytes_used.load(Ordering::Acquire)
+    }
+
+    /// The cache name this tier was [`SpillTier::open`]ed under — the
+    /// `cache` label every metric this module or its `SpillSink` caller
+    /// (`engine::Engine`) publishes carries.
+    pub(crate) fn cache_name(&self) -> &str {
+        &self.inner.cache_name
     }
 
     /// Stops accepting new spills and drops the flusher's sender, so its

@@ -9,16 +9,16 @@
 //!
 //! Decoding a raw-record frame slices `Bytes` views out of the received
 //! buffer with no payload copy. Encoding assembles one exact-size `BytesMut`
-//! from bytes the caller already owns, including the cached
-//! `store::Stored::encoded` value.
+//! from bytes the caller already owns, including a resident entry's cached
+//! encoded value (`engine::Live::payload`'s `Resident::encoded`).
 //!
 //! Under feature `tls`, rustls copies application bytes through its own
 //! buffers; the zero-copy path holds only up to the TCP framing layer.
 //!
 //! A [`WireRecord`] decoded from a raw-record frame borrows from that frame's
-//! buffer. A replica that caches the value as `store::Stored::encoded` keeps
-//! the whole frame alive while the entry lives. A frame is capped under
-//! [`MAX_FRAME`], so the retention is bounded.
+//! buffer. A replica that caches the value as its resident entry's encoded
+//! bytes keeps the whole frame alive while the entry lives. A frame is
+//! capped under [`MAX_FRAME`], so the retention is bounded.
 
 use std::mem::size_of;
 
