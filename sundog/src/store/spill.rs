@@ -22,7 +22,8 @@
 //! flip an *existing* entry's payload in place, and only when the entry's
 //! current state still matches what was spilled (`spilled_is_current`).
 //! Reads are positional (`pread`/`pwrite`-style, one syscall each, no `open()`
-//! on the hot path) and platform-gated (Q9/CLAUDE.md's unix/windows split).
+//! on the hot path), with a `read_exact_at`/`write_all_at` unix
+//! implementation and a `seek_read`/`seek_write` windows one below.
 //!
 //! # No wire effect
 //!
@@ -78,11 +79,13 @@ const DEFAULT_REGION_BYTES: u64 = 64 * 1024 * 1024;
 /// by anything in this module.
 const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// Bound on the flusher's job queue: a scheduling buffer, not a capacity
-/// knob. Config-independent by design (Q4) — every [`SpillConfig`] gets the
-/// same bound regardless of `capacity_bytes`.
+/// knob. Config-independent by design — every [`SpillConfig`] gets the same
+/// bound regardless of `capacity_bytes`.
 const FLUSH_QUEUE_CAPACITY: usize = 256;
 /// Corruption/format-skew guard at the front of every [`SpillRecordHeader`].
-const SPILL_MAGIC: u32 = 0x5350_494c; // b"SPIL", read little-endian
+/// Built from its ASCII bytes so the constant's value and its on-disk byte
+/// order always agree: `SPILL_MAGIC.to_le_bytes() == *b"SPIL"`.
+const SPILL_MAGIC: u32 = u32::from_le_bytes(*b"SPIL");
 /// Fixed on-disk header size preceding every record's key and value bytes.
 const HEADER_LEN: usize = size_of::<SpillRecordHeader>();
 
@@ -176,7 +179,7 @@ impl SpillConfig {
 
 /// Where one spilled record lives: which region, at what offset and length,
 /// stamped with the region's generation at write time. A read whose region
-/// generation has since moved on treats the record as gone (Q3).
+/// generation has since moved on treats the record as gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpillLoc {
     pub(crate) region: u32,
@@ -305,7 +308,7 @@ pub(crate) fn spilled_is_current(
     stored_tombstone_ver.is_none() && stored_live_ver == Some(spilled_ver)
 }
 
-/// Per-region mutable state: the pre-opened file handle (Q2 — one syscall per
+/// Per-region mutable state: the pre-opened file handle (one syscall per
 /// read/write, no `open()` on the hot path), the write cursor, the
 /// generation, and the reverse index of keys currently pointing into this
 /// region (populated on every install that returns `true`, drained whenever
@@ -334,6 +337,14 @@ struct Inner {
 }
 
 impl Inner {
+    /// Increments `sundog_spill_dropped_total{cache,reason}`. `reason` is
+    /// one of: `"too_large"` (the record can never fit any region, checked
+    /// by [`record_too_large`] before it is ever queued), `"closed"` (a
+    /// [`SpillTier::try_spill`] call after [`SpillTier::close`]),
+    /// `"queue_full"` (the flusher's bounded channel has no room, or was
+    /// never attached), or `"obsolete"` (the flusher wrote the record, but
+    /// [`SpillSink::install`] rejected it because the key's state had
+    /// already moved on).
     fn record_dropped(&self, reason: &'static str) {
         metrics::counter!(
             "sundog_spill_dropped_total",
@@ -472,17 +483,20 @@ impl SpillTier {
     }
 
     /// Non-blocking, best-effort: `false` means the record can never fit any
-    /// region, the tier has no attached flusher (never attached, or
-    /// [`SpillTier::close`]d), or the flusher's queue is full — the caller
-    /// must fall back to an unconditional delete. Never touches disk on this
-    /// call, so it is safe to call while holding a stripe write lock.
+    /// region (`reason = "too_large"`), [`SpillTier::close`] has run
+    /// (`reason = "closed"`), or the flusher's queue has no room, or was
+    /// never attached in the first place (`reason = "queue_full"` either
+    /// way) — the caller must fall back to an unconditional delete. Never
+    /// touches disk on this call, so it is safe to call while holding a
+    /// stripe write lock.
     pub(crate) fn try_spill(&self, job: SpillJob) -> bool {
         if self.inner.closed.load(Ordering::Acquire) {
+            self.inner.record_dropped("closed");
             return false;
         }
         let record_len = HEADER_LEN as u64 + job.key_bytes.len() as u64 + job.encoded.len() as u64;
         if record_too_large(record_len, u64::from(self.inner.region_bytes)) {
-            self.inner.record_dropped("queue_full");
+            self.inner.record_dropped("too_large");
             return false;
         }
         let sent = {
@@ -545,6 +559,14 @@ impl SpillTier {
     pub(crate) fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         *self.sender.lock() = None;
+    }
+
+    /// Whether [`SpillTier::close`] has run. Test-facing: production code
+    /// only ever needs `try_spill`'s own `false` return to know a tier is
+    /// unusable, never a direct closed check.
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
     }
 }
 
@@ -877,7 +899,7 @@ mod tests {
     }
 
     // --- SpillTier: I/O tests. Real disk, real thread; never combined with
-    // `sim` (Q9) since `sim`'s virtual clock gives no determinism over real
+    // `sim` since its virtual clock gives no determinism over real
     // filesystem I/O or the flusher's OS thread.
     #[cfg(not(feature = "sim"))]
     mod io {
@@ -1196,6 +1218,182 @@ mod tests {
 
             assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 5));
 
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// A [`SpillSink`] whose `install` always rejects the flush, so
+        /// `flush_one` counts `sundog_spill_dropped_total{reason="obsolete"}`
+        /// instead of `sundog_spill_writes_total`.
+        struct RejectingSink;
+
+        impl SpillSink for RejectingSink {
+            fn install(&self, _: usize, _: &Bytes, _: u64, _: Hlc, _: SpillLoc) -> bool {
+                false
+            }
+
+            fn reclaim(&self, _: u32, _: u32, _: &[(usize, Bytes)]) -> usize {
+                0
+            }
+        }
+
+        /// Captures `sundog_spill_dropped_total{reason}` increments by
+        /// `reason`, ignoring every other metric.
+        #[derive(Clone, Default)]
+        struct DropCounts(Arc<StdMutex<StdHashMap<String, u64>>>);
+
+        impl DropCounts {
+            fn get(&self, reason: &str) -> u64 {
+                *self.0.lock().unwrap().get(reason).unwrap_or(&0)
+            }
+        }
+
+        struct ReasonCounter {
+            reason: String,
+            counts: DropCounts,
+        }
+
+        impl metrics::CounterFn for ReasonCounter {
+            fn increment(&self, value: u64) {
+                *self
+                    .counts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .entry(self.reason.clone())
+                    .or_insert(0) += value;
+            }
+
+            fn absolute(&self, value: u64) {
+                *self
+                    .counts
+                    .0
+                    .lock()
+                    .unwrap()
+                    .entry(self.reason.clone())
+                    .or_insert(0) = value;
+            }
+        }
+
+        struct DropRecorder {
+            counts: DropCounts,
+        }
+
+        impl metrics::Recorder for DropRecorder {
+            fn describe_counter(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn describe_gauge(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn describe_histogram(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                if key.name() != "sundog_spill_dropped_total" {
+                    return metrics::Counter::noop();
+                }
+                let reason = key
+                    .labels()
+                    .find(|l| l.key() == "reason")
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_default();
+                metrics::Counter::from_arc(Arc::new(ReasonCounter {
+                    reason,
+                    counts: self.counts.clone(),
+                }))
+            }
+
+            fn register_gauge(
+                &self,
+                _key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+
+            fn register_histogram(
+                &self,
+                _key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        #[test]
+        fn try_spill_and_flush_record_the_documented_drop_reason_for_each_case() {
+            let counts = DropCounts::default();
+            // `metrics::set_global_recorder` is a single process-global
+            // slot: if another test in this binary already won it, this one
+            // silently observes nothing and skips its assertions, the same
+            // way `tests/prometheus_exporter.rs`'s own tests tolerate
+            // losing that race rather than assuming they run first.
+            let installed = metrics::set_global_recorder(DropRecorder {
+                counts: counts.clone(),
+            })
+            .is_ok();
+            if !installed {
+                return;
+            }
+
+            // too_large: a record too big for the tier's own region size.
+            let dir = temp_dir("reasons-too-large");
+            let cfg = SpillConfig::new(&dir, 128).region_bytes(64);
+            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let sink: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&sink));
+            assert!(!tier.try_spill(job("k", &[0u8; 100], hlc(1, 0))));
+            assert_eq!(counts.get("too_large"), 1);
+            assert_eq!(counts.get("closed"), 0);
+            let _ = fs::remove_dir_all(&dir);
+
+            // closed: try_spill after SpillTier::close.
+            let dir = temp_dir("reasons-closed");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let sink: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&sink));
+            tier.close();
+            assert!(!tier.try_spill(job("k", b"v", hlc(1, 0))));
+            assert_eq!(counts.get("closed"), 1);
+            let _ = fs::remove_dir_all(&dir);
+
+            // queue_full: never attached, so there is no channel to send on.
+            let dir = temp_dir("reasons-queue-full");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            assert!(!tier.try_spill(job("k", b"v", hlc(1, 0))));
+            assert_eq!(counts.get("queue_full"), 1);
+            let _ = fs::remove_dir_all(&dir);
+
+            // obsolete: the flusher writes the record, but the sink rejects
+            // installing it.
+            let dir = temp_dir("reasons-obsolete");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let tier = SpillTier::open(&cfg, "reasons").unwrap();
+            let sink: Arc<dyn SpillSink> = Arc::new(RejectingSink);
+            tier.attach(Arc::downgrade(&sink));
+            assert!(tier.try_spill(job("k", b"v", hlc(1, 0))));
+            assert!(poll_until(POLL_TIMEOUT, || counts.get("obsolete") == 1));
             let _ = fs::remove_dir_all(&dir);
         }
     }

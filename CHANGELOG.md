@@ -5,6 +5,8 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+Both changes below are breaking; the next release is 0.5.0.
+
 ### Added
 
 - `spill` feature: a local SSD/NVMe spill tier. `CacheBuilder::spill(SpillConfig::new(dir,
@@ -18,6 +20,13 @@ All notable changes to this project are documented in this file. Format follows
   — eviction demotes rather than deletes, so anti-entropy no longer needs to
   silently re-pull evicted entries back; `tti` stays rejected for `Replicated`
   regardless, since it is local-only by design.
+
+### Changed
+
+- **Breaking**: `store::Stored` is gone; its fields moved into the engine's
+  own entry representation.
+- **Breaking**: `CacheError` is `#[non_exhaustive]`, so a downstream `match`
+  without a wildcard arm needs one added.
 
 ## [0.4.1] – 2026-09-05
 

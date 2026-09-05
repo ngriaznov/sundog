@@ -211,19 +211,14 @@ where
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
-        // Validated above; attaches after `with_weigher` per `Shard::with_spill`'s
-        // own doc, since `with_weigher` rebuilds the engine from scratch.
-        #[cfg(feature = "spill")]
-        if let Some(cfg) = &spill {
-            shard = shard
-                .with_spill(cfg)
-                .map_err(|source| CacheError::SpillUnavailable {
-                    cache: name.clone(),
-                    source,
-                })?;
-        }
         let shard = Arc::new(shard);
 
+        // The registry check-and-reserve runs before any spill I/O: two
+        // `open()` calls for the same already-open name would otherwise both
+        // wipe and preallocate the same `<dir>/<cache>/` region files before
+        // either learns it lost to `AlreadyOpen`, corrupting whichever cache
+        // is already running. Reserving this name first means a losing
+        // `open()` never touches disk for it at all.
         let registry = cluster.shards();
         {
             let mut guard = registry
@@ -234,6 +229,27 @@ where
             }
             guard.insert(name.clone(), Arc::clone(&shard) as Arc<dyn ShardOps>);
         }
+
+        // Only the `open()` that won the reservation above ever attaches a
+        // spill tier. `Shard::attach_spill` runs through `&self` (its
+        // `Engine`/`SpillRead` fields are `OnceLock`s for exactly this),
+        // so it works fine on a shard already `Arc`-shared in the registry.
+        // A failure here rolls the reservation back: nothing has advertised
+        // or scheduled tasks for this name yet, so removing it is enough.
+        #[cfg(feature = "spill")]
+        if let Some(cfg) = &spill
+            && let Err(source) = shard.attach_spill(cfg)
+        {
+            registry
+                .write()
+                .expect("invariant: shard registry lock is never poisoned")
+                .remove(&name);
+            return Err(CacheError::SpillUnavailable {
+                cache: name.clone(),
+                source,
+            });
+        }
+
         cluster.advertise_cache_mode(&name, mode);
         // Only a `Replicated` cache has anything to receive before it can
         // donate; the other modes are warm the moment they open.
@@ -719,6 +735,35 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn open_returns_spill_unavailable_when_dir_is_a_regular_file() {
+            let cluster = Cluster::builder("cache-it-spill-dir-is-a-file")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let path = fresh_spill_dir("dir-is-a-file");
+            std::fs::write(&path, b"not a directory")
+                .expect("create a regular file at the spill dir path");
+
+            let cfg = SpillConfig::new(&path, 1 << 20).region_bytes(4096);
+            let err = cluster
+                .cache::<u32, String>("scratch")
+                .spill(cfg)
+                .open()
+                .await
+                .expect_err("a spill dir that is actually a regular file cannot be created under");
+            assert!(
+                matches!(err, CacheError::SpillUnavailable { .. }),
+                "expected SpillUnavailable, got {err:?}"
+            );
+
+            let _ = std::fs::remove_file(&path);
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn open_rejects_a_spill_config_whose_capacity_is_under_two_regions() {
             let cluster = Cluster::builder("cache-it-spill-under-two-regions")
                 .seeds(std::iter::empty())
@@ -891,6 +936,123 @@ mod tests {
         #[tokio::test]
         async fn spill_composes_with_max_capacity_under_mode_invalidation() {
             spill_composes_with_max_capacity(Mode::Invalidation, "compose-invalidation").await;
+        }
+
+        /// A second `open()` of an already-open name, with a spill tier
+        /// configured, returns `AlreadyOpen` without ever touching the
+        /// first cache's region files: `Shard::attach_spill` runs only for
+        /// the `open()` that wins the registry reservation, so the second
+        /// call never reaches it at all.
+        #[tokio::test]
+        async fn reopening_the_same_spill_cache_name_returns_already_open_without_corrupting_it() {
+            let cluster = Cluster::builder("cache-it-spill-reopen-guard")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let dir = fresh_spill_dir("reopen-guard");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let cache = cluster
+                .cache::<u32, String>("scratch")
+                .max_capacity(1)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("first open succeeds");
+
+            cache.insert(1, "one".to_string()).await.expect("insert 1");
+            cache.insert(2, "two".to_string()).await.expect("insert 2");
+            assert!(
+                poll_until(Duration::from_secs(5), || {
+                    cache.get_sync(&1).is_none() || cache.get_sync(&2).is_none()
+                })
+                .await,
+                "eviction spills exactly one of the two keys under a tiny max_capacity"
+            );
+            let (spilled_key, expected) = if cache.get_sync(&1).is_none() {
+                (1u32, "one".to_string())
+            } else {
+                (2u32, "two".to_string())
+            };
+
+            // Same name, same SpillConfig (same directory): the registry
+            // reservation must reject this second open before
+            // `Shard::attach_spill` ever wipes and preallocates the first
+            // cache's region files.
+            let cfg2 = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let err = cluster
+                .cache::<u32, String>("scratch")
+                .max_capacity(1)
+                .spill(cfg2)
+                .open()
+                .await
+                .expect_err("the name is already open");
+            assert!(
+                matches!(err, CacheError::AlreadyOpen { .. }),
+                "expected AlreadyOpen, got {err:?}"
+            );
+
+            assert_eq!(
+                cache.get(&spilled_key).await,
+                Some(expected),
+                "the first cache's spilled value must still be readable after the rejected \
+                 second open"
+            );
+
+            cache.close().await;
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn close_stops_the_tier_and_a_surviving_clone_evicts_by_deleting() {
+            let cluster = Cluster::builder("cache-it-spill-close-stops-tier")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let cfg =
+                SpillConfig::new(fresh_spill_dir("close-stops-tier"), 1 << 20).region_bytes(4096);
+            let cache = cluster
+                .cache::<u32, String>("scratch")
+                .max_capacity(1)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("opens with spill");
+            let surviving = cache.clone();
+
+            assert!(!surviving.shard.spill_tier_closed(), "the tier starts open");
+            cache.close().await;
+            assert!(
+                surviving.shard.spill_tier_closed(),
+                "Cache::close stops the engine's attached spill tier, visible through any \
+                 surviving clone since they share one Shard"
+            );
+
+            // A surviving clone keeps working locally; capacity eviction on
+            // it can no longer hand a victim to the now-closed tier, so it
+            // falls back to an ordinary delete instead of spilling. A
+            // spilled entry would still count as live, so `entry_count`
+            // tells them apart.
+            surviving
+                .insert(1, "one".to_string())
+                .await
+                .expect("insert 1");
+            surviving
+                .insert(2, "two".to_string())
+                .await
+                .expect("insert 2");
+            assert_eq!(
+                surviving.entry_count().await,
+                1,
+                "eviction deletes rather than spills once the tier is closed"
+            );
+
+            cluster.shutdown().await;
         }
     }
 }

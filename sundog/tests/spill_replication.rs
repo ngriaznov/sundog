@@ -1,8 +1,8 @@
-//! The Q1 repair-loop resolution, end to end: a spilled entry's digest
-//! fingerprint is bit-for-bit identical to a resident one, so anti-entropy
-//! repairs a peer's dropped copy from a donor whose own copy is, by the time
-//! the repair runs, sitting on disk rather than in RAM — exercising the
-//! AE-pull-reply path's off-lock spilled-value read (Amendment A6).
+//! A spilled entry's digest fingerprint is bit-for-bit identical to a
+//! resident one, so anti-entropy repairs a peer's dropped copy from a donor
+//! whose own copy is, by the time the repair runs, sitting on disk rather
+//! than in RAM — exercising the AE-pull-reply path's off-lock spilled-value
+//! read, end to end.
 //!
 //! Its own test binary (a separate process from every other `tests/*.rs`
 //! file), so installing the process-global Prometheus recorder here never
@@ -40,7 +40,7 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
 /// entries without a tombstone means only anti-entropy can bring it back —
 /// and by the time it runs, `a`'s own copy may already be on disk, so the
 /// repair only succeeds if the AE-pull-reply path's spilled-value read
-/// (`ShardOps::records_for`, Amendment A6) works. Once repaired, further
+/// (`ShardOps::records_for`) works. Once repaired, further
 /// anti-entropy rounds with nothing new to reconcile settle the repair
 /// counter at a fixed value.
 #[tokio::test]
@@ -130,8 +130,15 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     );
 
     // Steady state: with nothing left to reconcile, the repair counter
-    // stops moving across further anti-entropy rounds. `fast_config`'s
-    // 150ms ae_interval means two 500ms windows span several rounds each.
+    // stops moving across further anti-entropy rounds. This is a quiescence
+    // check — "nothing happens for a while" — which a bounded poll cannot
+    // express (a poll returns the instant its condition first holds, so it
+    // could observe `before == after` after only one round, missing a
+    // repair that lands one round later); two fixed windows are the
+    // deliberate exception to this file's own bounded-poll rule. `fast_
+    // config`'s 150ms ae_interval means two 500ms windows span several
+    // rounds each, giving the counter ample opportunity to move if it were
+    // going to.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let before = metric_value(
         &handle.render(),

@@ -55,6 +55,7 @@ pub enum JoinError {
 
 /// Errors from operating on a named [`crate::cache::Cache`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CacheError {
     /// A value or key exceeded the configured max frame size and was
     /// rejected at the API boundary rather than fragmented.
