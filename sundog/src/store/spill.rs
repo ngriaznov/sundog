@@ -21,10 +21,14 @@
 //! flusher never re-inserts a key into the engine's tables. It calls back
 //! through `SpillSink` to flip an *existing* entry's payload in place, and
 //! only when the entry's current state still matches what was spilled,
-//! verified via `spilled_is_current`. Reads are positional, `pread`/
-//! `pwrite`-style, one syscall each, with no `open()` on the hot path,
-//! using a `read_exact_at`/`write_all_at` unix implementation and a
-//! `seek_read`/`seek_write` windows one below.
+//! verified via `spilled_is_current`. A victim's weight is zeroed and freed
+//! from `total_weight` the moment eviction hands it off, before this
+//! thread ever touches it, so a queued-but-unwritten job that never
+//! reaches `install`, a failed region write, calls back through
+//! `SpillSink::abandon` instead, to put that weight back. Reads are
+//! positional, `pread`/`pwrite`-style, one syscall each, with no `open()`
+//! on the hot path, using a `read_exact_at`/`write_all_at` unix
+//! implementation and a `seek_read`/`seek_write` windows one below.
 //!
 //! # No wire effect
 //!
@@ -50,7 +54,8 @@
 //!
 //! `store::engine`'s `Payload::Spilled` integration consumes every item
 //! here: eviction hands a victim to `try_spill`, `Engine`'s `SpillSink` impl
-//! installs and reclaims through `spilled_is_current`, `open`/`attach` are
+//! installs and reclaims through `spilled_is_current`, and abandons a job
+//! whose write never reached `install`, `open`/`attach` are
 //! called from `Shard::with_spill`, and `read_at`/`bytes_used`/
 //! `SpilledBytes` back `Shard::get`/`Shard::get_or_load`'s promotion path
 //! and the anti-entropy/snapshot read path, both behind `spawn_blocking`.
@@ -81,8 +86,17 @@ const DEFAULT_REGION_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// Bound on the flusher's job queue: a scheduling buffer, not a capacity
 /// knob. Config-independent by design: every [`SpillConfig`] gets the same
-/// bound regardless of `capacity_bytes`.
-const FLUSH_QUEUE_CAPACITY: usize = 256;
+/// bound regardless of `capacity_bytes`. A bulk insert can evict thousands
+/// of entries under one `enforce_capacity` lock hold, all queued in a
+/// burst; at the old bound of 256 most of a large burst overflowed the
+/// queue and was dropped with `reason = "queue_full"` instead of spilled.
+/// 8192 absorbs that: a [`SpillJob`] holds two refcounted [`Bytes`] handles
+/// plus a few words, so the queue's own memory footprint stays small even
+/// at this depth, and the bytes those handles point at are already
+/// resident in RAM regardless of whether the job sits in this queue or the
+/// entry sits in `live` — queuing it costs nothing beyond what is already
+/// paid for.
+const FLUSH_QUEUE_CAPACITY: usize = 8192;
 /// Corruption/format-skew guard at the front of every [`SpillRecordHeader`].
 /// Built from its ASCII bytes so the constant's value and its on-disk byte
 /// order always agree: `SPILL_MAGIC.to_le_bytes() == *b"SPIL"`.
@@ -238,6 +252,19 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
     /// generation`, XOR its fingerprint out of the digest, and decrement
     /// `live_count`. Returns how many were removed.
     fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize;
+
+    /// A queued job for `key_bytes` was never installed: its region write
+    /// failed, or the tier stopped accepting jobs while this one was still
+    /// queued unwritten. Either way the victim's weight, zeroed at
+    /// hand-off, needs restoring. Under the stripe write lock, finds a
+    /// `Resident` entry at exactly `ver` with weight `0`, recomputes its
+    /// weight through the weigher, stores it, and adds it back to
+    /// `total_weight`. A key whose stored state changed in the meantime, a
+    /// fresh write, a tombstone, or (impossible in practice, but never
+    /// assumed) an install that already ran, is left untouched: that
+    /// change already accounted for the weight this job would have
+    /// restored.
+    fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc);
 }
 
 /// Fixed header preceding one record's key and value bytes on disk:
@@ -689,6 +716,7 @@ fn flush_one(inner: &Inner, sink: &dyn SpillSink, job: SpillJob) {
             error = %err,
             "sundog spill: region write failed, dropping the write"
         );
+        sink.abandon(job.stripe_idx, &job.key_bytes, job.hash, job.ver);
         return;
     }
     region
@@ -986,6 +1014,13 @@ mod tests {
                 }
                 removed
             }
+
+            fn abandon(&self, _stripe_idx: usize, _key_bytes: &Bytes, _hash: u64, _ver: Hlc) {
+                // No production caller of this test double ever fails a
+                // write, so there is nothing for a real sink to restore
+                // here; the engine-level `abandon` behavior itself is
+                // covered directly in `store::engine`'s tests.
+            }
         }
 
         fn temp_dir(label: &str) -> PathBuf {
@@ -1238,6 +1273,8 @@ mod tests {
             fn reclaim(&self, _: u32, _: u32, _: &[(usize, Bytes)]) -> usize {
                 0
             }
+
+            fn abandon(&self, _: usize, _: &Bytes, _: u64, _: Hlc) {}
         }
 
         /// Captures `sundog_spill_dropped_total{reason}` increments by
