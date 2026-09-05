@@ -603,7 +603,7 @@ mod tests {
         cache.close().await;
 
         assert!(tasks.is_closed() && tasks.is_empty());
-        assert!(!cluster.is_warm(&SmolStr::new("orders")));
+        assert!(cluster.health().caches.is_empty());
         cluster.shutdown().await;
     }
 

@@ -1664,6 +1664,7 @@ mod tests {
 
     /// Polls [`super::probe_reused`] until it stops reporting `Pending`, for
     /// a connection whose peer has already acted.
+    #[cfg(not(feature = "sim"))]
     async fn probe_settled(framed: &mut PeerFramed) -> super::ReusedProbe {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
