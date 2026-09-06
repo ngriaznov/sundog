@@ -3800,6 +3800,7 @@ mod tests {
                     len: 4,
                     generation: 0,
                 },
+                0,
             );
             assert!(!installed, "a late flush never resurrects a removed key");
             assert_eq!(shard.get_sync(&1), None, "the tombstone still wins");

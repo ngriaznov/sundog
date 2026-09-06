@@ -837,18 +837,10 @@ pub(crate) struct Engine<K, V> {
     /// check adds this to `total_weight`, so RAM a lagging flusher hasn't
     /// caught up on still counts against the cap; see the doc on that
     /// method. Always `0` in a non-`spill` build, which never creates a
-    /// hand-off in the first place.
-    ///
-    /// Known gap: only `install` and `abandon` ever release a hand-off's
-    /// share of this. A fresh write, tombstone, `invalidate`, or expiry
-    /// that displaces a still-pending key before its job resolves either
-    /// way leaves that share stranded here rather than releasing it on the
-    /// spot. Each stranded share is small and bounded by one victim's
-    /// weight, and landing it takes a write racing a hand-off inside one
-    /// flush's short real-disk latency, so it grows far slower than, and
-    /// independently of, the flush backlog itself; a sustained, adversarial
-    /// enough churn could still accumulate it over a long enough run. Left
-    /// as a follow-up rather than fixed here.
+    /// hand-off in the first place. Every job carries its own weight, and
+    /// `install` and `abandon` release exactly that amount whether or not
+    /// the entry still matches, so a write, tombstone, or expiry that
+    /// displaces a pending key strands nothing here.
     #[cfg(feature = "spill")]
     pending_spill_weight: AtomicU64,
     #[cfg(test)]
@@ -1539,6 +1531,7 @@ where
         if !tier.would_accept(victim_bytes.len(), encoded.len()) {
             return None;
         }
+        let weight = live.weight;
         let job = SpillJob {
             stripe_idx: bucket,
             hash,
@@ -1546,8 +1539,8 @@ where
             ver: live.ver,
             expires_at_ms: live.expires_at_ms,
             encoded: encoded.clone(),
+            weight,
         };
-        let weight = live.weight;
         live.weight = 0;
         Some((weight, job))
     }
@@ -1568,8 +1561,10 @@ where
         let stripe_idx = job.stripe_idx;
         let hash = job.hash;
         let ver = job.ver;
+        let weight = job.weight;
         if let Err(job) = tier.enqueue(job) {
-            self.abandon(stripe_idx, &job.key_bytes, hash, ver);
+            let job = *job;
+            self.abandon(stripe_idx, &job.key_bytes, hash, ver, weight);
         }
     }
 
@@ -2154,6 +2149,9 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// Resolves the job either way: `weight` leaves `pending_spill_weight`
+    /// whether the flip happens or the key moved on, so a write, tombstone,
+    /// or expiry that displaced a pending key never strands its share.
     fn install(
         &self,
         stripe_idx: usize,
@@ -2161,73 +2159,61 @@ where
         hash: u64,
         ver: Hlc,
         loc: SpillLoc,
+        weight: u32,
     ) -> bool {
-        let released_weight = {
+        let flipped = {
             let mut stripe = self.stripes[stripe_idx].write();
             let stored_tombstone_ver = stripe.tombstones.get(key_bytes.as_ref()).map(|t| t.ver);
-            let Some(live) = stripe
+            match stripe
                 .live
                 .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
-            else {
-                return false;
-            };
-            if !spilled_is_current(stored_tombstone_ver, Some(live.ver), ver) {
-                return false;
-            }
-            // The victim's weight was already zeroed on this entry, and
-            // moved from `total_weight` into `pending_spill_weight`, at
-            // hand-off time in `Engine::try_spill_victim`; `Spilled`'s
-            // invariant is that weight is always `0`, which already holds
-            // here.
-            debug_assert_eq!(
-                live.weight, 0,
-                "invariant: a spill candidate's weight is zeroed at hand-off"
-            );
-            let weight = match &live.payload {
-                Payload::Resident { value, .. } => {
-                    self.weigher.as_ref().map_or(1, |w| w(&live.key, value))
+            {
+                Some(live)
+                    if spilled_is_current(stored_tombstone_ver, Some(live.ver), ver)
+                        && live.weight == 0
+                        && matches!(live.payload, Payload::Resident { .. }) =>
+                {
+                    live.payload = Payload::Spilled(loc);
+                    true
                 }
-                Payload::Spilled(_) => return false,
-            };
-            live.payload = Payload::Spilled(loc);
-            weight
-        };
-        self.pending_spill_weight
-            .fetch_sub(u64::from(released_weight), Ordering::Relaxed);
-        self.note_spill_arrival();
-        true
-    }
-
-    fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc) {
-        let weight = {
-            let mut stripe = self.stripes[stripe_idx].write();
-            let Some(live) = stripe
-                .live
-                .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
-            else {
-                return;
-            };
-            if live.ver != ver || live.weight != 0 {
-                // The key's stored state has already moved on: a fresh
-                // write, a tombstone, or (impossible in practice, but
-                // never assumed) an install that already ran. Whatever it
-                // was already accounted for the weight this job would have
-                // restored; leave it alone.
-                return;
+                _ => false,
             }
-            let weight = match &live.payload {
-                Payload::Resident { value, .. } => {
-                    self.weigher.as_ref().map_or(1, |w| w(&live.key, value))
-                }
-                Payload::Spilled(_) => return,
-            };
-            live.weight = weight;
-            weight
         };
-        self.total_weight
-            .fetch_add(u64::from(weight), Ordering::Relaxed);
         self.pending_spill_weight
             .fetch_sub(u64::from(weight), Ordering::Relaxed);
+        if flipped {
+            self.note_spill_arrival();
+        }
+        flipped
+    }
+
+    /// Resolves a job the tier could not write: `weight` leaves
+    /// `pending_spill_weight` unconditionally, and goes back onto the entry
+    /// and `total_weight` only while the entry is still the pending one.
+    fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc, weight: u32) {
+        let restored = {
+            let mut stripe = self.stripes[stripe_idx].write();
+            match stripe
+                .live
+                .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+            {
+                Some(live)
+                    if live.ver == ver
+                        && live.weight == 0
+                        && matches!(live.payload, Payload::Resident { .. }) =>
+                {
+                    live.weight = weight;
+                    true
+                }
+                _ => false,
+            }
+        };
+        self.pending_spill_weight
+            .fetch_sub(u64::from(weight), Ordering::Relaxed);
+        if restored {
+            self.total_weight
+                .fetch_add(u64::from(weight), Ordering::Relaxed);
+        }
     }
 
     fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize {
@@ -4141,7 +4127,7 @@ mod tests {
             );
 
             let installed =
-                SpillSink::install(&engine, bucket, &kb, hash, old_ver, loc(0, 0, 4, 0));
+                SpillSink::install(&engine, bucket, &kb, hash, old_ver, loc(0, 0, 4, 0), 0);
             assert!(
                 !installed,
                 "a stale flush is discarded once a newer write has landed"
@@ -4184,7 +4170,7 @@ mod tests {
                 );
             }
 
-            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0));
+            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0), 0);
             assert!(
                 !installed,
                 "a stale flush is discarded once a tombstone has landed"
@@ -4321,7 +4307,7 @@ mod tests {
                 "the hand-off's weight moved into pending_spill_weight"
             );
 
-            SpillSink::abandon(&engine, bucket, &kb, hash, ver);
+            SpillSink::abandon(&engine, bucket, &kb, hash, ver, 7);
 
             let (_, weight_after) = engine.debug_totals();
             assert_eq!(
@@ -4374,7 +4360,7 @@ mod tests {
             let (_, weight_before_abandon) = engine.debug_totals();
             assert_eq!(weight_before_abandon, 5, "\"fresh\".len() == 5");
 
-            SpillSink::abandon(&engine, bucket, &kb, hash, old_ver);
+            SpillSink::abandon(&engine, bucket, &kb, hash, old_ver, 7);
 
             let (_, weight_after) = engine.debug_totals();
             assert_eq!(
@@ -4384,11 +4370,8 @@ mod tests {
             assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
             assert_eq!(
                 engine.debug_pending_spill_weight(),
-                7,
-                "documented gap: the fresh write's own weight bookkeeping already \
-                 resolved total_weight correctly, but nothing releases the original \
-                 hand-off's share of pending_spill_weight once its key/version can no \
-                 longer match; see pending_spill_weight's own doc comment"
+                0,
+                "the job's weight leaves pending_spill_weight even though the key moved on"
             );
         }
 
@@ -4400,7 +4383,7 @@ mod tests {
             let bucket = stripe_index_from_hash(hash);
             let (_, weight_before) = engine.debug_totals();
 
-            SpillSink::abandon(&engine, bucket, &kb, hash, hlc(1, 1));
+            SpillSink::abandon(&engine, bucket, &kb, hash, hlc(1, 1), 0);
 
             let (_, weight_after) = engine.debug_totals();
             assert_eq!(weight_after, weight_before);
@@ -4420,7 +4403,7 @@ mod tests {
             simulate_pending_handoff(&engine, bucket, hash, &kb, 9);
             assert_eq!(engine.debug_pending_spill_weight(), 9);
 
-            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0));
+            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0), 9);
             assert!(installed);
 
             assert_eq!(
@@ -4434,6 +4417,89 @@ mod tests {
                 weight_after, 0,
                 "install never adds to total_weight; the entry stays at weight 0, Spilled"
             );
+        }
+
+        #[test]
+        fn install_releases_pending_weight_even_when_a_newer_write_displaced_the_key() {
+            let weigher: Weigher<u32, String> =
+                Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let old_ver = hlc(1, 1);
+            let _ = put(&engine, key, kb.clone(), "x".repeat(9), old_ver, None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 9);
+            let _ = put(
+                &engine,
+                key,
+                kb.clone(),
+                "fresh".to_string(),
+                hlc(2, 1),
+                None,
+                0,
+            );
+
+            let installed =
+                SpillSink::install(&engine, bucket, &kb, hash, old_ver, loc(0, 0, 4, 0), 9);
+
+            assert!(!installed, "the newer write wins; nothing flips to Spilled");
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                0,
+                "the job's weight leaves pending_spill_weight even though the key moved on"
+            );
+            let (_, weight_after) = engine.debug_totals();
+            assert_eq!(
+                weight_after, 5,
+                "total_weight holds only the fresh value's weight"
+            );
+        }
+
+        #[test]
+        fn abandon_releases_pending_weight_even_when_a_tombstone_displaced_the_key() {
+            let weigher: Weigher<u32, String> =
+                Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let old_ver = hlc(1, 1);
+            let _ = put(&engine, key, kb.clone(), "x".repeat(9), old_ver, None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 9);
+            let resolver = LwwResolver;
+            {
+                let mut stripe = engine.stripe_lock(bucket).write();
+                let _ = apply_locked(
+                    &mut stripe,
+                    &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
+                    &engine.total_weight,
+                    &engine.live_count,
+                    engine.weigher.as_ref(),
+                    engine.tti_ms,
+                    hash,
+                    key,
+                    kb.clone(),
+                    hlc(2, 1),
+                    Incoming::Tombstone,
+                    &resolver,
+                    60_000,
+                    600_000,
+                    0,
+                );
+            }
+
+            SpillSink::abandon(&engine, bucket, &kb, hash, old_ver, 9);
+
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                0,
+                "the job's weight leaves pending_spill_weight although the key is tombstoned"
+            );
+            let (_, weight_after) = engine.debug_totals();
+            assert_eq!(weight_after, 0, "nothing is restored onto a tombstoned key");
         }
 
         #[test]
@@ -4864,6 +4930,7 @@ mod tests {
                         ver: hlc(0, 0),
                         expires_at_ms: None,
                         encoded: Bytes::from_static(b"f"),
+                        weight: 1,
                     };
                     tier.enqueue(filler)
                         .unwrap_or_else(|_| panic!("channel has room for filler {i}"));

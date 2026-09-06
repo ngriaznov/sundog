@@ -292,6 +292,11 @@ pub(crate) struct SpillJob {
     pub(crate) ver: Hlc,
     pub(crate) expires_at_ms: Option<u64>,
     pub(crate) encoded: Bytes,
+    /// The weight the eviction site zeroed on the entry and moved into the
+    /// engine's pending hand-off total. The job carries it so the sink
+    /// releases exactly this amount when the job resolves, whatever
+    /// happened to the entry in the meantime.
+    pub(crate) weight: u32,
 }
 
 /// A record read back off disk: everything a promotion needs to reconstruct
@@ -321,6 +326,7 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
         hash: u64,
         ver: Hlc,
         loc: SpillLoc,
+        weight: u32,
     ) -> bool;
 
     /// `region` at `generation` is about to be reused. Under each stripe
@@ -341,7 +347,7 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
     /// assumed) an install that already ran, is left untouched: that
     /// change already accounted for the weight this job would have
     /// restored.
-    fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc);
+    fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc, weight: u32);
 }
 
 /// Fixed header preceding one record's key and value bytes on disk:
@@ -761,13 +767,13 @@ impl SpillTier {
     /// while holding a stripe write lock. A successful send adds `job`'s
     /// record length to `queued_bytes`; [`flusher_loop`] subtracts it back
     /// out the instant the flusher takes the job off the channel again.
-    pub(crate) fn enqueue(&self, job: SpillJob) -> Result<(), SpillJob> {
+    pub(crate) fn enqueue(&self, job: SpillJob) -> Result<(), Box<SpillJob>> {
         let record_len = job_record_len_or_zero(&job) as u64;
         let sent = {
             let sender = self.sender.lock();
             let Some(tx) = sender.as_ref() else {
                 self.inner.record_dropped("queue_full");
-                return Err(job);
+                return Err(Box::new(job));
             };
             tx.try_send(job)
         };
@@ -780,7 +786,7 @@ impl SpillTier {
             }
             Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
                 self.inner.record_dropped("queue_full");
-                Err(job)
+                Err(Box::new(job))
             }
         }
     }
@@ -1119,7 +1125,13 @@ fn write_segment(
         );
         for prepared in segment {
             let job = prepared.job;
-            sink.abandon(job.stripe_idx, &job.key_bytes, job.hash, job.ver);
+            sink.abandon(
+                job.stripe_idx,
+                &job.key_bytes,
+                job.hash,
+                job.ver,
+                job.weight,
+            );
         }
         return (0, 0);
     }
@@ -1134,9 +1146,10 @@ fn write_segment(
             hash,
             key_bytes,
             ver,
+            weight,
             ..
         } = prepared.job;
-        if sink.install(stripe_idx, &key_bytes, hash, ver, loc) {
+        if sink.install(stripe_idx, &key_bytes, hash, ver, loc, weight) {
             installed_count += 1;
             installed_bytes += u64::from(loc.len);
             newly_indexed.push((stripe_idx, key_bytes));
@@ -1472,6 +1485,7 @@ mod tests {
                 _hash: u64,
                 ver: Hlc,
                 loc: SpillLoc,
+                _weight: u32,
             ) -> bool {
                 self.installs
                     .lock()
@@ -1503,7 +1517,14 @@ mod tests {
                 removed
             }
 
-            fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc) {
+            fn abandon(
+                &self,
+                stripe_idx: usize,
+                key_bytes: &Bytes,
+                hash: u64,
+                ver: Hlc,
+                _weight: u32,
+            ) {
                 // The engine-level weight-restoring behavior itself is
                 // covered directly in `store::engine`'s tests; this test
                 // double only records that the call happened, for this
@@ -1533,6 +1554,7 @@ mod tests {
                 ver,
                 expires_at_ms: Some(999),
                 encoded: Bytes::copy_from_slice(value),
+                weight: 1,
             }
         }
 
@@ -2046,7 +2068,7 @@ mod tests {
         struct RejectingSink;
 
         impl SpillSink for RejectingSink {
-            fn install(&self, _: usize, _: &Bytes, _: u64, _: Hlc, _: SpillLoc) -> bool {
+            fn install(&self, _: usize, _: &Bytes, _: u64, _: Hlc, _: SpillLoc, _: u32) -> bool {
                 false
             }
 
@@ -2054,7 +2076,7 @@ mod tests {
                 0
             }
 
-            fn abandon(&self, _: usize, _: &Bytes, _: u64, _: Hlc) {}
+            fn abandon(&self, _: usize, _: &Bytes, _: u64, _: Hlc, _: u32) {}
         }
 
         /// Captures `sundog_spill_dropped_total{reason}` increments by
