@@ -221,7 +221,11 @@ RAM. Four knobs: `capacity_bytes`, the disk budget the tier stays within;
 `flush_queue_bytes`, the cap on how many queued-but-unwritten bytes a lagging
 flusher may hold in RAM before eviction falls back to an ordinary delete
 instead (one region's worth by default), which keeps a slow disk a
-plain-eviction problem rather than an unbounded-RSS one.
+plain-eviction problem rather than an unbounded-RSS one. A `Replicated` cache
+keeps a refused victim resident, at its full weight, for a later eviction pass
+to retry instead, since every peer still holds the entry and a local delete
+would only have anti-entropy repair it back in; a `Local` or `Invalidation`
+cache evicts it as described above.
 
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,

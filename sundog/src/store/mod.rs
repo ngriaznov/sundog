@@ -688,7 +688,10 @@ where
     /// coldest entries onto disk instead of discarding them. Call this last
     /// in the builder chain, right after [`Shard::with_weigher`] if both are
     /// used. [`Shard::with_weigher`] rebuilds the engine from scratch, and
-    /// the tier attaches to whichever engine is current when this runs.
+    /// the tier attaches to whichever engine is current when this runs. A
+    /// hand-off the tier refuses leaves the victim resident, to be retried
+    /// by a later eviction pass, for a `Mode::Replicated` shard, and evicts
+    /// it exactly as before for `Mode::Local`/`Mode::Invalidation`.
     ///
     /// # Errors
     ///
@@ -730,6 +733,7 @@ where
     #[cfg(feature = "spill")]
     pub(crate) fn attach_spill(&self, cfg: &spill::SpillConfig) -> Result<(), std::io::Error> {
         let tier = Arc::new(spill::SpillTier::open(cfg, &self.name)?);
+        tier.set_keep_resident_when_refused(matches!(self.mode, Mode::Replicated));
         self.engine.set_spill(Arc::clone(&tier));
         let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
         tier.attach(Arc::downgrade(&sink));
@@ -3566,6 +3570,59 @@ mod tests {
             .with_spill(&cfg)
             .expect("tier opens");
             (shard, dir)
+        }
+
+        /// `Shard::attach_spill` sets the tier's `keep_resident_when_refused`
+        /// policy from the shard's own `Mode`: `true` for `Mode::Replicated`,
+        /// since every peer still holds the entry and a local delete would
+        /// just have anti-entropy repair it back in, `false` for
+        /// `Mode::Local`, which has no peer to repair from and so keeps the
+        /// original delete fallback.
+        #[test]
+        fn with_spill_sets_keep_resident_when_refused_from_mode() {
+            let dir = temp_dir("keep-resident-replicated");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let replicated = Shard::<u32, String>::new(
+                SmolStr::new("spill-test-replicated"),
+                Mode::Replicated,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            assert!(
+                replicated
+                    .engine
+                    .spill()
+                    .expect("with_spill attaches a tier")
+                    .keep_resident_when_refused(),
+                "Mode::Replicated sets the tier's keep_resident_when_refused policy"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let dir = temp_dir("keep-resident-local");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let local = Shard::<u32, String>::new(
+                SmolStr::new("spill-test-local"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            assert!(
+                !local
+                    .engine
+                    .spill()
+                    .expect("with_spill attaches a tier")
+                    .keep_resident_when_refused(),
+                "Mode::Local leaves the tier's keep_resident_when_refused policy at its default"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// Inserts two entries under `max_capacity == 1`, forcing eviction to

@@ -42,13 +42,20 @@
 //! [`super::spill::SpillSink::abandon`]. A `Resident` entry at weight `0`
 //! is a hand-off already in flight and is never sampled as a victim again;
 //! nor is a `Payload::Spilled` one. If the record can never fit any region,
-//! or the tier is closed, the ordinary delete-and-XOR path runs instead,
-//! weight and all, exactly as without a tier — decided under the stripe
-//! lock, before hand-off, via `SpillTier::would_accept`. A queue with no
-//! room right now is different: that can only be discovered by actually
-//! trying to send, so `Engine::evict_victim_locked` commits to the
-//! hand-off first, and the actual channel send, `SpillTier::enqueue`, runs
-//! only once the stripe lock is released, in
+//! the tier is closed, or its flush-queue byte bound is reached, decided
+//! under the stripe lock, before hand-off, via `SpillTier::would_accept`,
+//! `Engine::evict_victim_locked` consults `SpillTier::keep_resident_when_refused`
+//! (set by `Shard::attach_spill` from the cache's `Mode`): a
+//! `Mode::Local`/`Mode::Invalidation` cache falls through to the ordinary
+//! delete-and-XOR path, weight and all, exactly as without a tier, while a
+//! `Mode::Replicated` cache leaves the victim resident, at its untouched
+//! weight, `VictimOutcome::Deferred`, for a later `enforce_capacity` pass
+//! to retry — deleting it there would only have anti-entropy repair it back
+//! in from every peer that still holds it. A queue with no room right now
+//! can also surface later than `would_accept`: that can only be discovered
+//! by actually trying to send, so `Engine::evict_victim_locked` commits to
+//! the hand-off first, and the actual channel send, `SpillTier::enqueue`,
+//! runs only once the stripe lock is released, in
 //! `Engine::finish_spill_handoff`. A full queue found there is handled
 //! exactly like a downstream failed write: `SpillSink::abandon` restores
 //! the weight, the entry stays resident, never a physical removal.
@@ -402,6 +409,35 @@ fn defer_to_flusher(pending_spill_weight: u64) -> bool {
     pending_spill_weight > 0
 }
 
+/// What a resident victim's spill refusal ([`SpillTier::would_accept`]
+/// declining) means for the victim itself: [`Engine::evict_victim_locked`]'s
+/// decision, driven by [`SpillTier::keep_resident_when_refused`] as set by
+/// `Shard::attach_spill` from the cache's `Mode`. Pure; unit tested
+/// directly.
+#[cfg(feature = "spill")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VictimRefusal {
+    /// Leave the victim fully resident, at its current weight, for a later
+    /// eviction pass to retry: the `Mode::Replicated` policy, since a local
+    /// delete here is exactly what anti-entropy would just repair back in
+    /// from every peer that still holds the entry.
+    LeaveResident,
+    /// Fall back to the ordinary physical delete, the only behavior every
+    /// mode had before this policy existed, and still correct for
+    /// `Mode::Local`/`Mode::Invalidation`: no peer will ever repair the
+    /// entry back in, so deleting it is what keeps RAM bounded.
+    Delete,
+}
+
+#[cfg(feature = "spill")]
+fn spill_refusal_outcome(keep_resident_when_refused: bool) -> VictimRefusal {
+    if keep_resident_when_refused {
+        VictimRefusal::LeaveResident
+    } else {
+        VictimRefusal::Delete
+    }
+}
+
 /// How many of `sampled_weights` (coldest first) one lock hold evicts: the
 /// fewest that clear `over_by`, at most [`EVICTION_BATCH`], and never more
 /// than the colder half of the sample, so recency still decides under a
@@ -460,9 +496,39 @@ enum VictimOutcome {
     /// can be handed off in the first place.
     #[cfg(feature = "spill")]
     PendingSpill(u32, SpillJob),
+    /// A configured spill tier refused this victim's hand-off
+    /// ([`SpillTier::would_accept`] declining: too large, closed, or the
+    /// flush queue is full), and [`spill_refusal_outcome`] says to leave it
+    /// resident rather than delete it — the `Mode::Replicated` policy `Shard
+    /// ::attach_spill` sets on the tier. `stripe.live` is untouched: the
+    /// entry keeps its full weight and stays a spill candidate for a later
+    /// eviction pass to sample and retry, once the tier has room again.
+    /// Reported to the caller exactly like [`VictimOutcome::Vanished`], no
+    /// weight or count to fold in, since nothing here changed. Only ever
+    /// constructed under `feature = "spill"`.
+    #[cfg(feature = "spill")]
+    Deferred,
     /// Vanished between sampling and this call, a race with another
     /// writer on the same stripe; nothing to do.
     Vanished,
+}
+
+/// What [`Engine::try_spill_victim`] found for a resident victim.
+#[cfg(feature = "spill")]
+enum SpillAttempt {
+    /// The tier commits to taking the victim; see
+    /// [`Engine::try_spill_victim`]'s docs for what the two fields mean.
+    Committed(u32, SpillJob),
+    /// [`SpillTier::would_accept`] declined outright: too large, closed, or
+    /// the flush queue is full. `keep_resident` is the tier's own
+    /// [`SpillTier::keep_resident_when_refused`] policy at the moment of
+    /// refusal, carried back here so the caller need not re-look it up.
+    Refused { keep_resident: bool },
+    /// No tier configured, or the victim raced away — removed, or no
+    /// longer [`Payload::Resident`] — between sampling and this call. The
+    /// ordinary remove-and-XOR path runs exactly as it did before this
+    /// policy existed.
+    NotApplicable,
 }
 
 /// The outcome of [`apply_locked`]: the caller's `key` back plus what changed,
@@ -1490,29 +1556,32 @@ where
 
     /// Whether a configured spill tier commits to taking `victim_bytes`,
     /// found at `hash` in `bucket` with `stripe` already write-locked, in
-    /// place of physically removing it. `None` with no tier configured, a
-    /// victim that has since stopped being [`Payload::Resident`], or a
-    /// record [`SpillTier::would_accept`] declines outright, too large to
-    /// ever fit a region or the tier closed; the ordinary remove-and-XOR
-    /// path runs in every one of those cases, exactly as before. On
-    /// `Some((weight, job))`, `weight` is the victim's weight *before* this
-    /// call, already zeroed on the entry in place and thus already excluded
-    /// from what a fresh read of `live.weight` would report, and `job` is
-    /// the caller's to hand to [`Engine::finish_spill_handoff`] once the
-    /// stripe lock is released.
+    /// place of physically removing it. [`SpillAttempt::NotApplicable`] with
+    /// no tier configured, a victim that has since stopped being
+    /// [`Payload::Resident`], or vanished outright; the ordinary remove-and-
+    /// XOR path runs in every one of those cases, exactly as before.
+    /// [`SpillAttempt::Refused`] when [`SpillTier::would_accept`] declines
+    /// outright, too large to ever fit a region, the tier closed, or its
+    /// flush queue full; [`Engine::evict_victim_locked`] decides the
+    /// victim's fate from there via [`spill_refusal_outcome`]. On
+    /// [`SpillAttempt::Committed`], the first field is the victim's weight
+    /// *before* this call, already zeroed on the entry in place and thus
+    /// already excluded from what a fresh read of `live.weight` would
+    /// report, and the second is the caller's job to hand to
+    /// [`Engine::finish_spill_handoff`] once the stripe lock is released.
     ///
     /// Deliberately does not call [`SpillTier::enqueue`] itself: that is
     /// the one part of a hand-off that touches the flusher's channel, worth
     /// keeping off this lock, and it is safe to defer because
-    /// `SpillTier::would_accept`'s checks — too large, closed — are the
-    /// only ways this decision could otherwise need to unwind, and both are
-    /// already settled here, under the lock, before the weight is zeroed. A
-    /// full queue, the only way `enqueue` can still fail, is handled
-    /// exactly like a downstream write or install failure already is:
-    /// [`SpillSink::abandon`] restores the weight, never a physical
-    /// removal — seeing `would_accept` succeed here is not a guarantee the
-    /// record ever reaches disk, only that it is now this victim's only
-    /// path off `live`.
+    /// `SpillTier::would_accept`'s checks — too large, closed, queue full —
+    /// are the only ways this decision could otherwise need to unwind, and
+    /// all are already settled here, under the lock, before the weight is
+    /// zeroed. A full queue discovered later, the only way `enqueue` can
+    /// still fail, is handled exactly like a downstream write or install
+    /// failure already is: [`SpillSink::abandon`] restores the weight,
+    /// never a physical removal — seeing `would_accept` succeed here is not
+    /// a guarantee the record ever reaches disk, only that it is now this
+    /// victim's only path off `live`.
     #[cfg(feature = "spill")]
     fn try_spill_victim(
         &self,
@@ -1520,16 +1589,23 @@ where
         bucket: usize,
         hash: u64,
         victim_bytes: &Bytes,
-    ) -> Option<(u32, SpillJob)> {
-        let tier = self.spill()?;
-        let live = stripe
+    ) -> SpillAttempt {
+        let Some(tier) = self.spill() else {
+            return SpillAttempt::NotApplicable;
+        };
+        let Some(live) = stripe
             .live
-            .find_mut(hash, |l| l.key_bytes.as_ref() == victim_bytes.as_ref())?;
+            .find_mut(hash, |l| l.key_bytes.as_ref() == victim_bytes.as_ref())
+        else {
+            return SpillAttempt::NotApplicable;
+        };
         let Payload::Resident { encoded, .. } = &live.payload else {
-            return None;
+            return SpillAttempt::NotApplicable;
         };
         if !tier.would_accept(victim_bytes.len(), encoded.len()) {
-            return None;
+            return SpillAttempt::Refused {
+                keep_resident: tier.keep_resident_when_refused(),
+            };
         }
         let weight = live.weight;
         let job = SpillJob {
@@ -1542,7 +1618,7 @@ where
             weight,
         };
         live.weight = 0;
-        Some((weight, job))
+        SpillAttempt::Committed(weight, job)
     }
 
     /// Finishes a hand-off [`Engine::evict_victim_locked`] committed to via
@@ -1576,12 +1652,16 @@ where
     /// still to enqueue, while `stripe.live`, the digest, and `live_count`
     /// stay untouched until the flusher, `Engine`'s [`SpillSink`] impl,
     /// installs it. The entry stays resident, at weight `0`, until then.
-    /// Otherwise runs the ordinary remove-and-XOR path,
-    /// [`VictimOutcome::Removed`]. A [`Payload::Spilled`] victim, or a
-    /// `Resident` one already at weight `0`, a hand-off already pending, is
-    /// never handed here: the sampling passes above filter both out via
-    /// [`is_spill_candidate`]. A race where the entry vanished between
-    /// sampling and this call reports [`VictimOutcome::Vanished`].
+    /// When the tier refuses instead, [`spill_refusal_outcome`] decides
+    /// between [`VictimOutcome::Deferred`], leaving the victim resident at
+    /// its untouched weight, and falling through to the ordinary
+    /// remove-and-XOR path, [`VictimOutcome::Removed`], which also runs
+    /// whenever [`try_spill_victim`] finds nothing to hand off in the first
+    /// place. A [`Payload::Spilled`] victim, or a `Resident` one already at
+    /// weight `0`, a hand-off already pending, is never handed here: the
+    /// sampling passes above filter both out via [`is_spill_candidate`]. A
+    /// race where the entry vanished between sampling and this call reports
+    /// [`VictimOutcome::Vanished`].
     ///
     /// Total weight and `live_count` are the caller's job: this only
     /// mutates `stripe.live` and the digest, so a batch caller can fold
@@ -1599,8 +1679,16 @@ where
     ) -> VictimOutcome {
         let hash = hash_key_bytes(victim_bytes.as_ref());
         #[cfg(feature = "spill")]
-        if let Some((weight, job)) = self.try_spill_victim(stripe, bucket, hash, victim_bytes) {
-            return VictimOutcome::PendingSpill(weight, job);
+        match self.try_spill_victim(stripe, bucket, hash, victim_bytes) {
+            SpillAttempt::Committed(weight, job) => {
+                return VictimOutcome::PendingSpill(weight, job);
+            }
+            SpillAttempt::Refused { keep_resident } => {
+                if spill_refusal_outcome(keep_resident) == VictimRefusal::LeaveResident {
+                    return VictimOutcome::Deferred;
+                }
+            }
+            SpillAttempt::NotApplicable => {}
         }
         let Entry::Occupied(occ) = stripe.live.entry(
             hash,
@@ -1659,6 +1747,8 @@ where
                     removed_weight: u64::from(weight),
                 }
             }
+            #[cfg(feature = "spill")]
+            VictimOutcome::Deferred => EvictOutcome::default(),
             VictimOutcome::Vanished => EvictOutcome::default(),
         }
     }
@@ -1724,6 +1814,8 @@ where
                     pending_weight_added += u64::from(weight);
                     pending_spills.push(job);
                 }
+                #[cfg(feature = "spill")]
+                VictimOutcome::Deferred => {}
                 VictimOutcome::Vanished => {}
             }
         }
@@ -4980,6 +5072,11 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
+            // The mirror of `enforce_capacity_leaves_a_refused_victim_resident_
+            // and_retries_once_the_queue_drains` below: `keep_resident_when_
+            // refused` is left at its default of `false` (never set), so a
+            // refused hand-off falls back to the ordinary delete exactly as
+            // every mode did before that policy existed.
             #[test]
             fn enforce_capacity_via_real_hand_off_bounds_ram_and_falls_back_to_queue_full() {
                 let dir = temp_dir("real-backlog");
@@ -5090,6 +5187,136 @@ mod tests {
                     &engine,
                     &key_bytes(keys[0])
                 )));
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The `Mode::Replicated` mirror of the test just above:
+            /// identical setup, `tier.set_keep_resident_when_refused(true)`
+            /// the only difference, so the second victim's refused hand-off
+            /// leaves it fully resident instead of falling back to a
+            /// delete, and a later `enforce_capacity` pass, once the queue
+            /// has room again, retries and spills it.
+            #[test]
+            fn enforce_capacity_leaves_a_refused_victim_resident_and_retries_once_the_queue_drains()
+            {
+                let dir = temp_dir("real-backlog-keep-resident");
+                let record_len_upper_bound = 300u64;
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(record_len_upper_bound);
+                let tier =
+                    Arc::new(SpillTier::open(&cfg, "backlog-keep-resident").expect("tier opens"));
+                tier.set_keep_resident_when_refused(true);
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                // A cap well under either single entry's own weight (200),
+                // unlike the flag-off mirror's 250: that test only needs
+                // one hand-off to land to fall back under its cap, but this
+                // one means to keep the deferred victim's weight alone
+                // over the cap even after the first hand-off fully
+                // resolves, so the later retry has something left to do.
+                let engine = Engine::<u32, String>::new(50, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                let mut same_bucket: HashMap<usize, Vec<u32>> = HashMap::new();
+                let mut keys = Vec::new();
+                for k in 1..100_000u32 {
+                    let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref()));
+                    let group = same_bucket.entry(bucket).or_default();
+                    group.push(k);
+                    if group.len() == 2 {
+                        keys = group.clone();
+                        break;
+                    }
+                }
+                assert_eq!(
+                    keys.len(),
+                    2,
+                    "1024 stripes; two collisions are found quickly"
+                );
+                let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(keys[0]).as_ref()));
+
+                let _ = put(
+                    &engine,
+                    keys[0],
+                    key_bytes(keys[0]),
+                    "x".repeat(200),
+                    hlc(1, 1),
+                    None,
+                    0,
+                );
+                let _ = put(
+                    &engine,
+                    keys[1],
+                    key_bytes(keys[1]),
+                    "y".repeat(200),
+                    hlc(2, 1),
+                    None,
+                    1,
+                );
+
+                // First eviction: the colder key hands off cleanly, the
+                // queue was empty.
+                engine.evict_one_sampled(bucket);
+                assert_eq!(engine.debug_pending_spill_weight(), 200);
+
+                // Second eviction: the queue already holds one record's
+                // worth and the flusher is paused, so `would_accept`
+                // refuses again — but this tier's `keep_resident_when_
+                // refused` is set, so the victim is left fully resident
+                // instead of deleted.
+                engine.evict_one_sampled(bucket);
+                assert_eq!(
+                    engine.get(&keys[1], 0),
+                    Some("y".repeat(200)),
+                    "a Mode::Replicated victim refused by the tier stays fully resident, never \
+                     deleted"
+                );
+                let (total_after, pending_after) =
+                    (engine.debug_totals().1, engine.debug_pending_spill_weight());
+                assert_eq!(
+                    total_after, 200,
+                    "the deferred victim's weight is untouched, still counted in total_weight"
+                );
+                assert_eq!(pending_after, 200, "unchanged from the first hand-off");
+                assert!(
+                    total_after + pending_after > 50,
+                    "combined weight is still over the cap: nothing was freed by deferring"
+                );
+                {
+                    let stripe = engine.stripe_lock(bucket).read();
+                    let live = stripe
+                        .live
+                        .iter()
+                        .find(|l| l.key_bytes.as_ref() == key_bytes(keys[1]).as_ref())
+                        .expect("the deferred entry is still present");
+                    assert_eq!(live.weight, 200, "its own weight field is untouched too");
+                }
+
+                // The public entry point sees the same combined accounting,
+                // finds no further progress to make while a hand-off is
+                // still pending, and returns rather than spin.
+                engine.enforce_capacity(bucket);
+                assert_eq!(
+                    engine.debug_totals().1,
+                    200,
+                    "enforce_capacity made no further change: still over the cap"
+                );
+
+                // Once the flusher drains the first job, `would_accept` has
+                // room again for the deferred victim, and the next
+                // `enforce_capacity` pass spills it.
+                tier.resume_flusher();
+                assert!(poll_until(POLL_TIMEOUT, || tier.queued_bytes() == 0));
+                engine.enforce_capacity(bucket);
+                assert!(
+                    poll_until(POLL_TIMEOUT, || is_spilled(&engine, &key_bytes(keys[1]))),
+                    "the retried victim is spilled once the tier has room again"
+                );
 
                 let _ = std::fs::remove_dir_all(&dir);
             }

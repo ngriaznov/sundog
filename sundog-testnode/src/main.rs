@@ -17,13 +17,15 @@
 //! filesystem path) and `SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES` (a `u64` byte
 //! budget), both required together, `"it"` opens with a `SpillConfig` tier
 //! under that directory and capacity; `SUNDOG_TESTNODE_SPILL_REGION_BYTES`,
-//! an optional `u64`, overrides its default region size. These three spill
-//! variables only exist when this binary is built with sundog's `spill`
-//! feature; setting `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` alone, with no spill
-//! dir, opens `Mode::Replicated` with a finite `max_capacity` and no spill
-//! tier, which `open()` rejects — a test never does this. With none of these
-//! four set, `"it"` opens exactly as it always has: unbounded, no weigher, no
-//! spill.
+//! an optional `u64`, overrides its default region size, and
+//! `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`, also optional, overrides the
+//! flush-queue byte bound (default: one region's worth) independently of
+//! `region_bytes`. These four spill variables only exist when this binary is
+//! built with sundog's `spill` feature; setting
+//! `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` alone, with no spill dir, opens
+//! `Mode::Replicated` with a finite `max_capacity` and no spill tier, which
+//! `open()` rejects — a test never does this. With none of these set, `"it"`
+//! opens exactly as it always has: unbounded, no weigher, no spill.
 //!
 //! Built with the `prometheus` feature, every run also serves `GET /metrics`
 //! (and `/readyz`, `/healthz`) on `METRICS_PORT` via
@@ -165,9 +167,10 @@ fn byte_weight(key: &str, value: &str) -> u32 {
 
 /// Builds `"it"`'s optional spill tier from
 /// `SUNDOG_TESTNODE_SPILL_DIR`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
-/// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`'s already-parsed values: `None` when
-/// no spill dir is set, so the cache opens spill-free exactly as it always
-/// has.
+/// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`/
+/// `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`'s already-parsed values: `None`
+/// when no spill dir is set, so the cache opens spill-free exactly as it
+/// always has.
 ///
 /// # Panics
 ///
@@ -178,6 +181,7 @@ fn spill_config_from_env(
     dir: Option<String>,
     capacity_bytes: Option<u64>,
     region_bytes: Option<u64>,
+    flush_queue_bytes: Option<u64>,
 ) -> Option<SpillConfig> {
     let dir = dir?;
     let capacity_bytes = capacity_bytes.expect(
@@ -186,6 +190,9 @@ fn spill_config_from_env(
     let mut cfg = SpillConfig::new(dir, capacity_bytes);
     if let Some(region_bytes) = region_bytes {
         cfg = cfg.region_bytes(region_bytes);
+    }
+    if let Some(flush_queue_bytes) = flush_queue_bytes {
+        cfg = cfg.flush_queue_bytes(flush_queue_bytes);
     }
     Some(cfg)
 }
@@ -234,6 +241,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             env::var("SUNDOG_TESTNODE_SPILL_DIR").ok(),
             u64_env("SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES"),
             u64_env("SUNDOG_TESTNODE_SPILL_REGION_BYTES"),
+            u64_env("SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES"),
         );
         if let Some(spill_cfg) = spill_cfg {
             it_builder = it_builder.spill(spill_cfg);
@@ -522,17 +530,18 @@ mod tests {
 
         #[test]
         fn spill_config_from_env_is_none_without_a_dir() {
-            assert!(spill_config_from_env(None, None, None).is_none());
+            assert!(spill_config_from_env(None, None, None, None).is_none());
             assert!(
-                spill_config_from_env(None, Some(1 << 20), None).is_none(),
+                spill_config_from_env(None, Some(1 << 20), None, None).is_none(),
                 "a capacity with no dir still opens spill-free"
             );
         }
 
         #[test]
         fn spill_config_from_env_builds_from_a_dir_and_capacity() {
-            let cfg = spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None)
-                .expect("dir plus capacity builds a config");
+            let cfg =
+                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None, None)
+                    .expect("dir plus capacity builds a config");
             assert_eq!(cfg.dir, std::path::PathBuf::from("/tmp/spill-it"));
             assert_eq!(cfg.capacity_bytes, 4096);
         }
@@ -540,12 +549,16 @@ mod tests {
         #[test]
         fn spill_config_from_env_applies_the_region_override() {
             let default_region =
-                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None)
+                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None, None)
                     .expect("builds")
                     .region_bytes_value();
-            let cfg =
-                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), Some(512))
-                    .expect("builds");
+            let cfg = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                Some(512),
+                None,
+            )
+            .expect("builds");
             assert_eq!(cfg.region_bytes_value(), 512);
             assert_ne!(
                 cfg.region_bytes_value(),
@@ -555,9 +568,30 @@ mod tests {
         }
 
         #[test]
+        fn spill_config_from_env_applies_the_flush_queue_bytes_override() {
+            let default_flush_queue =
+                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None, None)
+                    .expect("builds")
+                    .flush_queue_bytes_value();
+            let cfg = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                None,
+                Some(1024),
+            )
+            .expect("builds");
+            assert_eq!(cfg.flush_queue_bytes_value(), 1024);
+            assert_ne!(
+                cfg.flush_queue_bytes_value(),
+                default_flush_queue,
+                "the override actually changes the flush-queue bound from the default"
+            );
+        }
+
+        #[test]
         #[should_panic(expected = "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES")]
         fn spill_config_from_env_panics_when_the_dir_is_set_without_a_capacity() {
-            let _ = spill_config_from_env(Some("/tmp/spill-it".to_string()), None, None);
+            let _ = spill_config_from_env(Some("/tmp/spill-it".to_string()), None, None, None);
         }
     }
 }

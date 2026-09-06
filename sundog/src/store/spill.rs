@@ -145,7 +145,10 @@ const HEADER_LEN: usize = size_of::<SpillRecordHeader>();
 /// any default with the matching builder method;
 /// [`SpillConfig::region_bytes_value`], [`SpillConfig::read_concurrency_value`],
 /// and [`SpillConfig::flush_queue_bytes_value`] read back whatever is in
-/// effect.
+/// effect. When the tier this config opens refuses a hand-off, a
+/// `Mode::Replicated` cache keeps the victim resident, at its full weight,
+/// for a later eviction pass to retry, while a `Mode::Local` or
+/// `Mode::Invalidation` cache evicts it exactly as it always has.
 #[derive(Debug, Clone)]
 pub struct SpillConfig {
     /// Directory the tier's region files live under. `SpillTier::open`
@@ -415,6 +418,24 @@ pub(crate) fn record_fits_queue(
         .is_some_and(|total| total <= flush_queue_bytes)
 }
 
+/// The `sundog_spill_dropped_total` reason a refusal is recorded under:
+/// `"deferred"` when `keep_resident_when_refused` is set, since the caller
+/// leaves the victim resident and retries it on a later eviction pass
+/// rather than deleting it, so an operator sees backpressure instead of a
+/// delete reason that no longer describes what happened; `specific`
+/// (`"too_large"`, `"closed"`, or `"queue_full"`) unchanged otherwise,
+/// exactly as before this policy existed. Pure; unit tested directly.
+pub(crate) fn refusal_drop_reason(
+    keep_resident_when_refused: bool,
+    specific: &'static str,
+) -> &'static str {
+    if keep_resident_when_refused {
+        "deferred"
+    } else {
+        specific
+    }
+}
+
 /// The flusher's batch-splitting rule: how many of `record_lens`, taken in
 /// order, fit consecutively in a region of `region_bytes` bytes whose write
 /// cursor already sits at `write_cursor`, before the first one that does
@@ -503,6 +524,14 @@ struct Inner {
     /// so a slot-count-only bound does nothing to cap the bytes a lagging
     /// flusher lets pile up.
     queued_bytes: AtomicU64,
+    /// Set by [`SpillTier::set_keep_resident_when_refused`], `false` until
+    /// then. `true` means a refused hand-off ([`SpillTier::would_accept`]
+    /// or [`SpillTier::enqueue`] declining) leaves its victim resident
+    /// instead of the caller falling back to a delete: `Shard::attach_spill`
+    /// sets this for a `Mode::Replicated` shard, where a local delete would
+    /// just have anti-entropy repair the entry back in from every peer that
+    /// still holds it.
+    keep_resident_when_refused: AtomicBool,
     /// Test-only: [`flusher_loop`] blocks here instead of pulling its next
     /// job, so a test can hold a job queued, and its bytes counted against
     /// `flush_queue_bytes`, for as long as it needs to.
@@ -516,9 +545,12 @@ impl Inner {
     /// by [`record_too_large`] before it is ever queued; `"closed"`, a
     /// [`SpillTier::try_spill`] call after [`SpillTier::close`];
     /// `"queue_full"`, the flusher's bounded channel has no room, or was
-    /// never attached; or `"obsolete"`, the flusher wrote the record, but
+    /// never attached; `"obsolete"`, the flusher wrote the record, but
     /// [`SpillSink::install`] rejected it because the key's state had
-    /// already moved on.
+    /// already moved on; or `"deferred"`, one of the first three refusals
+    /// but recorded under this reason instead because
+    /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
+    /// policy — see [`refusal_drop_reason`].
     fn record_dropped(&self, reason: &'static str) {
         metrics::counter!(
             "sundog_spill_dropped_total",
@@ -665,6 +697,7 @@ impl SpillTier {
             cache_name: cache_name.to_string(),
             flush_queue_bytes: cfg.flush_queue_bytes_value(),
             queued_bytes: AtomicU64::new(0),
+            keep_resident_when_refused: AtomicBool::new(false),
             #[cfg(test)]
             flusher_paused: AtomicBool::new(false),
         });
@@ -698,6 +731,45 @@ impl SpillTier {
         }
     }
 
+    /// Sets this tier's refusal policy: whether a resident victim whose
+    /// hand-off [`SpillTier::would_accept`] or [`SpillTier::enqueue`]
+    /// declines is left resident, to be retried on a later eviction pass,
+    /// rather than the caller falling back to a delete. `Shard::attach_spill`
+    /// calls this once, right after [`SpillTier::open`], from the shard's
+    /// `Mode`: `Mode::Replicated` passes `true`, since every peer still
+    /// holds the entry and a local delete would just have anti-entropy
+    /// repair it back in; `Mode::Local`/`Mode::Invalidation` never call
+    /// this, leaving the default of `false`, the delete fallback those
+    /// modes have always used and still need, to keep RAM bounded with no
+    /// repair loop to guard against. Also steers which reason
+    /// [`SpillTier::would_accept`]/[`SpillTier::enqueue`] record a refusal
+    /// under: `"deferred"` in place of `"too_large"`/`"closed"`/
+    /// `"queue_full"` once this is `true`, so an operator sees backpressure
+    /// rather than a delete reason that no longer describes what happened.
+    pub(crate) fn set_keep_resident_when_refused(&self, keep: bool) {
+        self.inner
+            .keep_resident_when_refused
+            .store(keep, Ordering::Release);
+    }
+
+    /// Whether [`SpillTier::set_keep_resident_when_refused`] set this
+    /// tier's policy to leave a refused victim resident. Read by
+    /// `engine::Engine::try_spill_victim` to decide a refused victim's
+    /// fate, and by this tier's own refusal-reason bookkeeping via
+    /// [`refusal_drop_reason`].
+    pub(crate) fn keep_resident_when_refused(&self) -> bool {
+        self.inner
+            .keep_resident_when_refused
+            .load(Ordering::Acquire)
+    }
+
+    /// [`refusal_drop_reason`] bound to this tier's own policy: the reason
+    /// [`SpillTier::would_accept`]/[`SpillTier::enqueue`] record a refusal
+    /// of `specific` under.
+    fn refusal_reason(&self, specific: &'static str) -> &'static str {
+        refusal_drop_reason(self.keep_resident_when_refused(), specific)
+    }
+
     /// Non-blocking, best-effort: `false` means the record can never fit any
     /// region, `reason = "too_large"`, or [`SpillTier::close`] has run,
     /// `reason = "closed"`, or the flusher's queue has no room, or was
@@ -729,7 +801,11 @@ impl SpillTier {
     /// [`SpillTier::enqueue`], this is cheap enough to call while holding a
     /// stripe write lock. `false` increments `sundog_spill_dropped_total`
     /// with `reason = "too_large"`, `reason = "closed"`, or `reason =
-    /// "queue_full"` for the byte bound, whichever applied. The byte-bound
+    /// "queue_full"` for the byte bound, whichever applied — or `reason =
+    /// "deferred"` in place of any of those three once
+    /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
+    /// policy, since the caller then leaves the victim resident instead of
+    /// deleting it; see [`refusal_drop_reason`]. The byte-bound
     /// check races the same way the channel-capacity one already does:
     /// this reads `queued_bytes` before the caller's own hand-off, if
     /// accepted, ever adds to it via `enqueue`, so a burst of callers that
@@ -740,17 +816,17 @@ impl SpillTier {
     /// backlog itself.
     pub(crate) fn would_accept(&self, key_len: usize, value_len: usize) -> bool {
         if self.inner.closed.load(Ordering::Acquire) {
-            self.inner.record_dropped("closed");
+            self.inner.record_dropped(self.refusal_reason("closed"));
             return false;
         }
         let record_len = HEADER_LEN as u64 + key_len as u64 + value_len as u64;
         if record_too_large(record_len, u64::from(self.inner.region_bytes)) {
-            self.inner.record_dropped("too_large");
+            self.inner.record_dropped(self.refusal_reason("too_large"));
             return false;
         }
         let queued_bytes = self.inner.queued_bytes.load(Ordering::Acquire);
         if !record_fits_queue(queued_bytes, record_len, self.inner.flush_queue_bytes) {
-            self.inner.record_dropped("queue_full");
+            self.inner.record_dropped(self.refusal_reason("queue_full"));
             return false;
         }
         true
@@ -762,7 +838,9 @@ impl SpillTier {
     /// this can fail; a caller with no further use for the job on failure
     /// can discard it, exactly like `try_spill`'s plain `bool`. `reason =
     /// "queue_full"` covers both a full queue and one that was never
-    /// attached. Never touches disk, but does take the channel's own lock,
+    /// attached, or `reason = "deferred"` in either case once
+    /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
+    /// policy. Never touches disk, but does take the channel's own lock,
     /// so, unlike [`SpillTier::would_accept`], this is not meant to run
     /// while holding a stripe write lock. A successful send adds `job`'s
     /// record length to `queued_bytes`; [`flusher_loop`] subtracts it back
@@ -772,7 +850,7 @@ impl SpillTier {
         let sent = {
             let sender = self.sender.lock();
             let Some(tx) = sender.as_ref() else {
-                self.inner.record_dropped("queue_full");
+                self.inner.record_dropped(self.refusal_reason("queue_full"));
                 return Err(Box::new(job));
             };
             tx.try_send(job)
@@ -785,7 +863,7 @@ impl SpillTier {
                 Ok(())
             }
             Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
-                self.inner.record_dropped("queue_full");
+                self.inner.record_dropped(self.refusal_reason("queue_full"));
                 Err(Box::new(job))
             }
         }
@@ -1316,6 +1394,20 @@ mod tests {
     fn record_fits_queue_never_wraps_on_a_pathological_record_len() {
         assert!(!record_fits_queue(u64::MAX - 1, u64::MAX, 64));
         assert!(!record_fits_queue(10, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn refusal_drop_reason_passes_through_the_specific_reason_by_default() {
+        assert_eq!(refusal_drop_reason(false, "too_large"), "too_large");
+        assert_eq!(refusal_drop_reason(false, "closed"), "closed");
+        assert_eq!(refusal_drop_reason(false, "queue_full"), "queue_full");
+    }
+
+    #[test]
+    fn refusal_drop_reason_reports_deferred_when_keep_resident_when_refused_is_set() {
+        assert_eq!(refusal_drop_reason(true, "too_large"), "deferred");
+        assert_eq!(refusal_drop_reason(true, "closed"), "deferred");
+        assert_eq!(refusal_drop_reason(true, "queue_full"), "deferred");
     }
 
     #[test]
@@ -2244,6 +2336,62 @@ mod tests {
             tier.attach(Arc::downgrade(&sink));
             assert!(tier.try_spill(job("k", b"v", hlc(1, 0))));
             assert!(poll_until(POLL_TIMEOUT, || counts.get("obsolete") == 1));
+            let _ = fs::remove_dir_all(&dir);
+
+            // deferred: the same three refusals, but recorded under
+            // "deferred" instead once `set_keep_resident_when_refused(true)`
+            // is in effect, and the specific reason's own count stays put.
+            let dir = temp_dir("reasons-deferred-too-large");
+            let cfg = SpillConfig::new(&dir, 128).region_bytes(64);
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
+            tier.set_keep_resident_when_refused(true);
+            let sink: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&sink));
+            assert!(!tier.try_spill(job("k", &[0u8; 100], hlc(1, 0))));
+            assert_eq!(counts.get("deferred"), 1);
+            assert_eq!(
+                counts.get("too_large"),
+                1,
+                "unchanged from the earlier case"
+            );
+            let _ = fs::remove_dir_all(&dir);
+
+            let dir = temp_dir("reasons-deferred-closed");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
+            tier.set_keep_resident_when_refused(true);
+            let sink: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&sink));
+            tier.close();
+            assert!(!tier.try_spill(job("k", b"v", hlc(1, 0))));
+            assert_eq!(counts.get("deferred"), 2);
+            assert_eq!(counts.get("closed"), 1, "unchanged from the earlier case");
+            let _ = fs::remove_dir_all(&dir);
+
+            let dir = temp_dir("reasons-deferred-queue-full");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let tier = SpillTier::open(&cfg, DROP_REASONS_CACHE).unwrap();
+            tier.set_keep_resident_when_refused(true);
+            assert!(!tier.try_spill(job("k", b"v", hlc(1, 0))));
+            assert_eq!(counts.get("deferred"), 3);
+            assert_eq!(
+                counts.get("queue_full"),
+                1,
+                "unchanged from the earlier case"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn keep_resident_when_refused_defaults_to_false_and_reflects_the_setter() {
+            let dir = temp_dir("keep-resident-flag");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            assert!(!tier.keep_resident_when_refused());
+            tier.set_keep_resident_when_refused(true);
+            assert!(tier.keep_resident_when_refused());
+            tier.set_keep_resident_when_refused(false);
+            assert!(!tier.keep_resident_when_refused());
             let _ = fs::remove_dir_all(&dir);
         }
     }

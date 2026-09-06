@@ -1149,10 +1149,17 @@ const SPILL_DIR: &str = "/spill";
 /// the byte-counting weigher, and `SUNDOG_TESTNODE_SPILL_DIR`/
 /// `..._SPILL_CAPACITY_BYTES`/`..._SPILL_REGION_BYTES` compose a spill tier
 /// under [`SPILL_DIR`] sized to `spill_capacity_bytes`/`region_bytes`.
+/// `..._SPILL_FLUSH_QUEUE_BYTES` sets the flusher's byte backlog bound to
+/// `flush_queue_bytes` explicitly, rather than the default of one region's
+/// worth: with `region_bytes` set as small as [`SPILL_REGION_BYTES`] for
+/// these tests, that default would bound the backlog far tighter than the
+/// disk budget it is meant to protect, refusing hand-offs the tier has
+/// ample room for.
 fn spill_node_env(
     ram_budget_bytes: u64,
     spill_capacity_bytes: u64,
     region_bytes: u64,
+    flush_queue_bytes: u64,
 ) -> Vec<(String, String)> {
     vec![
         (
@@ -1170,6 +1177,10 @@ fn spill_node_env(
         (
             "SUNDOG_TESTNODE_SPILL_REGION_BYTES".to_string(),
             region_bytes.to_string(),
+        ),
+        (
+            "SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES".to_string(),
+            flush_queue_bytes.to_string(),
         ),
     ]
 }
@@ -1223,7 +1234,12 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
     let total_weight = fill_weight_bytes(FILL_COUNT);
     let ram_budget_bytes = total_weight / 3;
     let spill_capacity_bytes = (total_weight + u64::from(FILL_COUNT) * 64) * 2;
-    let a_env = spill_node_env(ram_budget_bytes, spill_capacity_bytes, SPILL_REGION_BYTES);
+    let a_env = spill_node_env(
+        ram_budget_bytes,
+        spill_capacity_bytes,
+        SPILL_REGION_BYTES,
+        spill_capacity_bytes,
+    );
     let a_env_refs: Vec<(&str, &str)> = a_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1251,12 +1267,23 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
         "a's tiny RAM budget ({ram_budget_bytes} bytes for {total_weight} bytes of fill) should \
          have spilled some of the {FILL_COUNT} entries, got {spilled}"
     );
+    // `it` is `Mode::Replicated`, so `SpillTier::keep_resident_when_refused`
+    // is set: a refused hand-off leaves its victim resident and retried
+    // instead of falling back to a delete, so this can no longer happen at
+    // all, unlike before this policy existed.
     let dropped_queue_full =
         scrape_metric(&a, "sundog_spill_dropped_total", ("reason", "queue_full")).await;
-    assert!(
-        dropped_queue_full * 100 <= u64::from(FILL_COUNT),
-        "a dropped {dropped_queue_full} writes to a full flush queue, more than a tiny fraction \
-         of the {FILL_COUNT} entries written"
+    assert_eq!(
+        dropped_queue_full, 0,
+        "a Mode::Replicated victim refused by the spill tier is deferred, never deleted, so \
+         reason=\"queue_full\" must never be recorded"
+    );
+    let dropped_deferred =
+        scrape_metric(&a, "sundog_spill_dropped_total", ("reason", "deferred")).await;
+    eprintln!(
+        "a deferred {dropped_deferred} hand-offs the spill tier refused, out of {FILL_COUNT} \
+         entries written (backpressure, not a failure: each stays resident until a later \
+         eviction pass retries it)"
     );
 
     let mismatches = sample_mismatches(&a, (0..FILL_COUNT).collect()).await;
@@ -1329,7 +1356,12 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
     let total_weight = fill_weight_bytes(FILL_COUNT);
     let ram_budget_bytes = total_weight / 3;
     let spill_capacity_bytes = (total_weight + u64::from(FILL_COUNT) * 64) * 2;
-    let a_env = spill_node_env(ram_budget_bytes, spill_capacity_bytes, SPILL_REGION_BYTES);
+    let a_env = spill_node_env(
+        ram_budget_bytes,
+        spill_capacity_bytes,
+        SPILL_REGION_BYTES,
+        spill_capacity_bytes,
+    );
     let a_env_refs: Vec<(&str, &str)> = a_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
