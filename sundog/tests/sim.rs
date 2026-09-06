@@ -2492,9 +2492,21 @@ fn distributed_rebalance_under_churn() {
     // clock is stamped from real `Instant::now()`, not turmoil's virtual
     // clock (matching tombstone retention's own real-time deadline
     // elsewhere in this file), so real time — not simulated steps — must
-    // actually pass before a rebalance tick has anything to release.
-    std::thread::sleep(Duration::from_millis(300) * 3);
-    run_steps(&mut sim, steps_for(Duration::from_millis(300) * 3));
+    // actually pass before a rebalance tick has anything to release; the
+    // ticks themselves then need simulated time. Both are repeated until
+    // no node has a bucket left mid grace, bounded, since a bounced
+    // node's loop may need more than one window to reach its tick.
+    let grace = Duration::from_millis(300);
+    for _ in 0..10 {
+        std::thread::sleep(grace);
+        run_steps(&mut sim, steps_for(grace * 3));
+        if nodes
+            .iter()
+            .all(|n| n.residency.expired(Duration::ZERO).is_empty())
+        {
+            break;
+        }
+    }
 
     let mut union: HashSet<u32> = HashSet::new();
     for key in 0..80u32 {
