@@ -1164,7 +1164,9 @@ async fn fan_out_batch<K, V>(
     let records = shard.records_for_typed(&keys).await;
     let peers = cluster.live_peer_ids();
     let (class, msgs): (MsgClass, Vec<Msg>) = match mode {
-        Mode::Local => return,
+        // A Distributed cache fans nothing out yet: it currently behaves
+        // like Local for both reads and writes.
+        Mode::Local | Mode::Distributed { .. } => return,
         Mode::Invalidation => (
             MsgClass::Invalidate,
             records

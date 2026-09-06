@@ -147,6 +147,20 @@ pub struct ClusterConfig {
     /// means the mesh runs plaintext. See [`TlsConfig`].
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
+    /// How many anti-entropy intervals a `Mode::Distributed` node keeps a
+    /// disowned bucket's data resident before physically releasing it, so a
+    /// new owner's rebalance pull has time to land against it as donor
+    /// first. Default: 3.
+    pub distributed_disown_grace_rounds: u32,
+    /// Per-owner-attempt timeout for a `Mode::Distributed` cache's read
+    /// against a remote owner. Deliberately shorter than a general request
+    /// timeout: a read tries owners in sequence, so each attempt should
+    /// fail fast. Default: 750ms.
+    pub fetch_timeout: Duration,
+    /// Maximum simultaneous bucket-transfer streams one rebalance pass
+    /// opens for a `Mode::Distributed` cache, so a mass membership change
+    /// can't spawn dozens of concurrent transfers at once. Default: 4.
+    pub rebalance_concurrency: usize,
 }
 
 impl ClusterConfig {
@@ -191,6 +205,9 @@ impl Default for ClusterConfig {
             advertise_ip: None,
             #[cfg(feature = "tls")]
             tls: None,
+            distributed_disown_grace_rounds: 3,
+            fetch_timeout: Duration::from_millis(750),
+            rebalance_concurrency: 4,
         }
     }
 }
@@ -252,6 +269,24 @@ mod tests {
     #[test]
     fn default_advertise_ip_is_none() {
         assert_eq!(ClusterConfig::default().advertise_ip, None);
+    }
+
+    #[test]
+    fn default_distributed_disown_grace_rounds_is_three() {
+        assert_eq!(ClusterConfig::default().distributed_disown_grace_rounds, 3);
+    }
+
+    #[test]
+    fn default_fetch_timeout_is_750_ms() {
+        assert_eq!(
+            ClusterConfig::default().fetch_timeout,
+            Duration::from_millis(750)
+        );
+    }
+
+    #[test]
+    fn default_rebalance_concurrency_is_four() {
+        assert_eq!(ClusterConfig::default().rebalance_concurrency, 4);
     }
 
     #[test]

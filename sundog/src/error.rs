@@ -125,6 +125,20 @@ pub enum CacheError {
         #[source]
         source: io::Error,
     },
+    /// The cache was opened as [`crate::store::Mode::Distributed`] with
+    /// `owners` under 2: a single owner is a lost bucket the instant it
+    /// leaves.
+    #[error("cache {cache:?} distributed mode needs at least 2 owners, got {owners}")]
+    TooFewOwners {
+        cache: SmolStr,
+        owners: std::num::NonZeroU8,
+    },
+    /// A `Cache::fetch` on a [`crate::store::Mode::Distributed`] cache found
+    /// no reachable owner of the key's bucket within
+    /// [`crate::config::ClusterConfig::fetch_timeout`], across every
+    /// candidate. Distinct from a genuine miss, which returns `Ok(None)`.
+    #[error("cache {cache:?} found no reachable owner for the requested key")]
+    FetchUnavailable { cache: SmolStr },
 }
 
 #[cfg(test)]
@@ -138,5 +152,24 @@ mod tests {
             limit: 4 * 1024 * 1024,
         };
         assert!(err.to_string().contains("5000000"));
+    }
+
+    #[test]
+    fn too_few_owners_message_names_the_cache_and_owners_count() {
+        let err = CacheError::TooFewOwners {
+            cache: SmolStr::new("prices"),
+            owners: std::num::NonZeroU8::new(1).expect("nonzero"),
+        };
+        let text = err.to_string();
+        assert!(text.contains("prices"));
+        assert!(text.contains('1'));
+    }
+
+    #[test]
+    fn fetch_unavailable_message_names_the_cache() {
+        let err = CacheError::FetchUnavailable {
+            cache: SmolStr::new("prices"),
+        };
+        assert!(err.to_string().contains("prices"));
     }
 }

@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::num::NonZeroU8;
 #[cfg(feature = "spill")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,7 @@ use crate::error::{CacheError, CodecError};
 use crate::hlc::{Hlc, HlcClock};
 use crate::net::REPLICATE_BATCH_COUNT;
 use crate::node::NodeId;
+use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
@@ -182,6 +184,7 @@ impl<K> FanOutQueue<K> {
 
 /// A named cache's clustering behavior: how writes fan out to other nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mode {
     /// No cluster traffic; entries live only on this node.
     Local,
@@ -191,17 +194,26 @@ pub enum Mode {
     /// Every node holds every entry; writes broadcast the full
     /// [`crate::wire::Msg::Replicate`].
     Replicated,
+    /// Each key lives on exactly `owners` live nodes, chosen by rendezvous
+    /// hashing over the cache's live, protocol-compatible peers.
+    Distributed {
+        /// How many live nodes each bucket is replicated to. Must be at
+        /// least 2: `CacheBuilder::open` rejects 1, since a single owner is
+        /// a lost bucket the instant it leaves.
+        owners: NonZeroU8,
+    },
 }
 
 impl Mode {
     /// The wire token gossiped for this mode under a `cache:<name>` chitchat
     /// key. A stable string, not a `Debug`/`Display` impl, so renaming a
     /// variant never changes the wire.
-    pub(crate) const fn as_token(self) -> &'static str {
+    pub(crate) fn as_token(self) -> SmolStr {
         match self {
-            Self::Local => "local",
-            Self::Invalidation => "invalidation",
-            Self::Replicated => "replicated",
+            Self::Local => SmolStr::new_static("local"),
+            Self::Invalidation => SmolStr::new_static("invalidation"),
+            Self::Replicated => SmolStr::new_static("replicated"),
+            Self::Distributed { owners } => smol_str::format_smolstr!("distributed:{owners}"),
         }
     }
 
@@ -213,7 +225,11 @@ impl Mode {
             "local" => Some(Self::Local),
             "invalidation" => Some(Self::Invalidation),
             "replicated" => Some(Self::Replicated),
-            _ => None,
+            _ => token
+                .strip_prefix("distributed:")
+                .and_then(|n| n.parse::<u8>().ok())
+                .and_then(NonZeroU8::new)
+                .map(|owners| Self::Distributed { owners }),
         }
     }
 }
@@ -327,6 +343,17 @@ pub trait ShardOps: Send + Sync {
     /// `crate::cluster::Cluster::shutdown` for every cache still registered
     /// when the cluster shuts down without an explicit `close`.
     fn close_spill(&self) {}
+
+    /// This shard's current bucket-ownership view, for a `Mode::Distributed`
+    /// cache that has one attached. `None` for every other mode, and for a
+    /// `Distributed` cache before its tracker is attached.
+    #[allow(
+        private_interfaces,
+        reason = "OwnershipView has no public fields or methods; only this crate can act on the returned value regardless of this trait's own visibility"
+    )]
+    fn ownership_view(&self) -> Option<Arc<OwnershipView>> {
+        None
+    }
 }
 
 /// One side of a [`ConflictResolver::winner`] comparison: everything a resolver
@@ -539,6 +566,18 @@ where
     hits: metrics::Counter,
     /// Handle for `sundog_cache_misses_total{cache}`, same reason as `hits`.
     misses: metrics::Counter,
+    /// `Some` only for `Mode::Distributed`, set once at construction via
+    /// [`Shard::with_ownership`], before this shard is ever shared. Backs
+    /// [`ShardOps::ownership_view`].
+    ownership: Option<OwnershipTracker>,
+    /// `Some` only for `Mode::Distributed`. Drives anti-entropy's cohort
+    /// widening and the donor-serving exception; never consulted by the
+    /// inbound-apply guard, which stays strict current-view ownership.
+    #[allow(
+        dead_code,
+        reason = "read by anti-entropy's cohort widening and donor-serving exception once they are wired up"
+    )]
+    residency: Option<Arc<ResidencySet>>,
     /// Set by `Shard::attach_spill`: the semaphore bounding concurrent
     /// disk reads and the metric handles the spilled-key read path counts
     /// against. Unset until then, and always unset in a non-`spill` build.
@@ -624,6 +663,8 @@ where
             tti,
             hits,
             misses,
+            ownership: None,
+            residency: None,
             #[cfg(feature = "spill")]
             spill_read: OnceLock::new(),
         }
@@ -663,6 +704,22 @@ where
     #[must_use]
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
+        self
+    }
+
+    /// Attaches this shard's `Mode::Distributed` bucket-ownership tracker
+    /// and its disown-grace residency set. Call this once, right after
+    /// construction and before the shard is ever shared, so
+    /// [`ShardOps::ownership_view`] never observes anything but a real,
+    /// already-computed view. Every other mode leaves both unset.
+    #[must_use]
+    pub(crate) fn with_ownership(
+        mut self,
+        tracker: OwnershipTracker,
+        residency: Arc<ResidencySet>,
+    ) -> Self {
+        self.ownership = Some(tracker);
+        self.residency = Some(residency);
         self
     }
 
@@ -781,6 +838,14 @@ where
     #[must_use]
     pub const fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Whether [`Shard::with_ownership`] attached a residency set to this
+    /// shard. Test-only: production code reads `residency` directly once
+    /// anti-entropy's cohort widening consumes it.
+    #[cfg(test)]
+    fn has_residency(&self) -> bool {
+        self.residency.is_some()
     }
 
     /// The timestamp, in epoch milliseconds, this shard stamps its writes,
@@ -1848,6 +1913,14 @@ where
     fn close_spill(&self) {
         Shard::close_spill(self);
     }
+
+    #[allow(
+        private_interfaces,
+        reason = "OwnershipView has no public fields or methods; only this crate can act on the returned value regardless of this trait's own visibility"
+    )]
+    fn ownership_view(&self) -> Option<Arc<OwnershipView>> {
+        self.ownership.as_ref().map(OwnershipTracker::current)
+    }
 }
 
 #[cfg(test)]
@@ -1895,6 +1968,55 @@ mod tests {
     fn mode_is_copy_and_comparable() {
         assert_eq!(Mode::Local, Mode::Local);
         assert_ne!(Mode::Local, Mode::Replicated);
+    }
+
+    #[test]
+    fn mode_as_token_and_from_token_round_trip_every_variant() {
+        let distributed = Mode::Distributed {
+            owners: NonZeroU8::new(3).expect("nonzero"),
+        };
+        for mode in [
+            Mode::Local,
+            Mode::Invalidation,
+            Mode::Replicated,
+            distributed,
+        ] {
+            assert_eq!(Mode::from_token(&mode.as_token()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn mode_as_token_distributed_carries_the_owners_count() {
+        let mode = Mode::Distributed {
+            owners: NonZeroU8::new(5).expect("nonzero"),
+        };
+        assert_eq!(mode.as_token().as_str(), "distributed:5");
+    }
+
+    #[test]
+    fn mode_from_token_rejects_zero_owners() {
+        assert_eq!(Mode::from_token("distributed:0"), None);
+    }
+
+    #[test]
+    fn mode_from_token_rejects_a_non_numeric_owners_suffix() {
+        assert_eq!(Mode::from_token("distributed:abc"), None);
+    }
+
+    #[test]
+    fn mode_from_token_rejects_a_missing_owners_suffix() {
+        assert_eq!(Mode::from_token("distributed:"), None);
+        assert_eq!(Mode::from_token("distributed"), None);
+    }
+
+    #[test]
+    fn mode_from_token_rejects_an_owners_count_past_u8() {
+        assert_eq!(Mode::from_token("distributed:256"), None);
+    }
+
+    #[test]
+    fn mode_from_token_rejects_an_unrecognized_token() {
+        assert_eq!(Mode::from_token("bogus"), None);
     }
 
     #[test]
@@ -3511,6 +3633,42 @@ mod tests {
             0,
             "the sweep ran against the injected clock, not real time"
         );
+    }
+
+    #[test]
+    fn shard_ownership_view_is_none_without_with_ownership() {
+        let s = shard::<u32, String>(1);
+        assert!(ShardOps::ownership_view(&s).is_none());
+        assert!(!s.has_residency());
+    }
+
+    #[test]
+    fn shard_ownership_view_returns_the_current_view_after_with_ownership() {
+        let self_node = NodeId::from(1);
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (tracker, _tx) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &std::collections::HashMap::new(),
+            &SmolStr::new("test"),
+            k,
+        );
+        let expected_hash = tracker.current().view_hash();
+        let residency = Arc::new(ResidencySet::new());
+
+        let s = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Local,
+            self_node,
+            10_000,
+            None,
+            None,
+        )
+        .with_ownership(tracker, residency);
+
+        assert!(s.has_residency());
+        let view = ShardOps::ownership_view(&s).expect("ownership view attached");
+        assert_eq!(view.view_hash(), expected_hash);
     }
 
     /// `Shard`-layer coverage of the spill read path: every method here

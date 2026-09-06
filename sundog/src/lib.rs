@@ -71,6 +71,7 @@ pub mod hlc;
 pub mod membership;
 pub mod net;
 pub mod node;
+pub(crate) mod ownership;
 pub mod store;
 #[cfg(feature = "prometheus")]
 pub mod telemetry;

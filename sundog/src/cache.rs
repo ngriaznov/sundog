@@ -19,6 +19,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::cluster::Cluster;
 use crate::error::CacheError;
+use crate::ownership::{OwnershipTracker, ResidencySet};
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher};
@@ -124,17 +125,26 @@ where
     /// `ClusterConfig::state_transfer_budget`. A cache too large to finish
     /// inside the budget opens with a partial copy anti-entropy tops up.
     ///
+    /// A [`Mode::Distributed`] cache computes and attaches its bucket-
+    /// ownership view before it is ever shared, but for now reads and
+    /// writes on it behave exactly like [`Mode::Local`], and it opens warm
+    /// immediately rather than pulling anything from a donor.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::AlreadyOpen`] if a cache named `name` is
     /// already open in this process.
     ///
+    /// Returns [`CacheError::TooFewOwners`] if `mode` is
+    /// [`Mode::Distributed`] with an `owners` count under 2.
+    ///
     /// Returns [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
-    /// [`Mode::Replicated`] and `tti` was set, or `max_capacity` was set
-    /// with no `spill` tier configured via `CacheBuilder::spill`. A local
-    /// eviction would be silently re-pulled by the next anti-entropy
-    /// round. `tti` is rejected unconditionally, spill or not. It is
-    /// local-only by design, and spilling does nothing to reconcile it.
+    /// [`Mode::Replicated`] or [`Mode::Distributed`] and `tti` was set, or
+    /// `max_capacity` was set with no `spill` tier configured via
+    /// `CacheBuilder::spill`. A local eviction would be silently re-pulled
+    /// by the next anti-entropy round. `tti` is rejected unconditionally,
+    /// spill or not. It is local-only by design, and spilling does nothing
+    /// to reconcile it.
     ///
     /// Returns `CacheError::InvalidSpillConfig`, with the `spill` feature
     /// compiled in, if `spill` was configured with a `region_bytes` of
@@ -167,11 +177,7 @@ where
         #[cfg(not(feature = "spill"))]
         let spill_configured = false;
 
-        if matches!(mode, Mode::Replicated)
-            && (tti.is_some() || (max_capacity != u64::MAX && !spill_configured))
-        {
-            return Err(CacheError::ReplicatedWithLocalEviction { cache: name });
-        }
+        validate_mode(&name, mode, tti, max_capacity, spill_configured)?;
 
         #[cfg(feature = "spill")]
         if let Some(cfg) = &spill
@@ -210,6 +216,7 @@ where
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
+        let shard = attach_ownership(shard, &cluster, &name, mode);
         let shard = Arc::new(shard);
 
         // The registry check-and-reserve runs before any spill I/O: two
@@ -267,6 +274,67 @@ where
             tasks,
         })
     }
+}
+
+/// Rejects a `Mode::Distributed` cache opened with `owners` under 2, and
+/// rejects a `Replicated` or `Distributed` cache combined with local
+/// eviction: any `tti`, or a finite `max_capacity` with no spill tier
+/// configured. Anti-entropy would silently re-pull an evicted entry back
+/// for either mode, since every owner is expected to hold what it owns.
+fn validate_mode(
+    name: &SmolStr,
+    mode: Mode,
+    tti: Option<Duration>,
+    max_capacity: u64,
+    spill_configured: bool,
+) -> Result<(), CacheError> {
+    if let Mode::Distributed { owners } = mode
+        && owners.get() < 2
+    {
+        return Err(CacheError::TooFewOwners {
+            cache: name.clone(),
+            owners,
+        });
+    }
+    if matches!(mode, Mode::Replicated | Mode::Distributed { .. })
+        && (tti.is_some() || (max_capacity != u64::MAX && !spill_configured))
+    {
+        return Err(CacheError::ReplicatedWithLocalEviction {
+            cache: name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Attaches a freshly seeded bucket-ownership tracker and residency set to
+/// `shard`, for a `Mode::Distributed` cache; every other mode leaves both
+/// unset. Runs before `shard` is ever shared, so no reader can observe
+/// anything but a real, already-computed view.
+fn attach_ownership<K, V>(
+    mut shard: Shard<K, V>,
+    cluster: &Cluster,
+    name: &SmolStr,
+    mode: Mode,
+) -> Shard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    if let Mode::Distributed { owners } = mode {
+        let (ownership, view_tx) = OwnershipTracker::seed(
+            cluster.node_id(),
+            &cluster.peers(),
+            &cluster.advertised_cache_modes(),
+            name,
+            owners,
+        );
+        let residency = Arc::new(ResidencySet::new());
+        shard = shard.with_ownership(ownership, residency);
+        // The background loop that republishes this view on membership and
+        // cache-mode changes consumes `view_tx`; nothing reads it yet.
+        let _ = view_tx;
+    }
+    shard
 }
 
 /// The background loops one opened cache runs: fan-out for a clustered
@@ -715,6 +783,113 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn distributed_cache_rejects_owners_below_two() {
+        let cluster = Cluster::builder("cache-it-distributed-owners-below-two")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let err = cluster
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(1).expect("nonzero"),
+            })
+            .open()
+            .await
+            .expect_err("a single owner is rejected");
+
+        assert!(
+            matches!(err, CacheError::TooFewOwners { .. }),
+            "expected TooFewOwners, got {err:?}"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn distributed_cache_open_attaches_an_ownership_view() {
+        let cluster = Cluster::builder("cache-it-distributed-attaches-view")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let cache = cluster
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+            })
+            .open()
+            .await
+            .expect("open succeeds");
+
+        assert!(
+            ShardOps::ownership_view(&*cache.shard).is_some(),
+            "opening a Distributed cache attaches a real ownership view before it's shared"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn distributed_cache_rejects_tti() {
+        let cluster = Cluster::builder("cache-it-distributed-rejects-tti")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let err = cluster
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+            })
+            .tti(Duration::from_secs(30))
+            .open()
+            .await
+            .expect_err("tti is rejected for Distributed just like Replicated");
+
+        assert!(
+            matches!(err, CacheError::ReplicatedWithLocalEviction { .. }),
+            "expected ReplicatedWithLocalEviction, got {err:?}"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn distributed_cache_rejects_finite_max_capacity_without_spill() {
+        let cluster = Cluster::builder("cache-it-distributed-no-spill-max-capacity")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let err = cluster
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+            })
+            .max_capacity(100)
+            .open()
+            .await
+            .expect_err("Distributed + finite max_capacity + no spill is rejected");
+
+        assert!(
+            matches!(err, CacheError::ReplicatedWithLocalEviction { .. }),
+            "expected ReplicatedWithLocalEviction, got {err:?}"
+        );
+
+        cluster.shutdown().await;
+    }
+
     #[cfg(feature = "spill")]
     mod spill_gate {
         use super::*;
@@ -831,6 +1006,34 @@ mod tests {
                 .open()
                 .await
                 .expect("Replicated + finite max_capacity is accepted once spill is configured");
+
+            cache.close().await;
+            cluster.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn distributed_cache_opens_with_spill_and_a_capacity() {
+            let cluster = Cluster::builder("cache-it-distributed-spill-relaxes-gate")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let cfg = SpillConfig::new(
+                fresh_spill_dir("distributed-relaxes-gate"),
+                256 * 1024 * 1024,
+            );
+            let cache = cluster
+                .cache::<u32, String>("scratch")
+                .mode(Mode::Distributed {
+                    owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+                })
+                .max_capacity(100)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("Distributed + finite max_capacity is accepted once spill is configured");
 
             cache.close().await;
             cluster.shutdown().await;
