@@ -106,3 +106,17 @@ pub use cluster::anti_entropy::{diff_decoded, mismatched_parts};
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};
+
+/// `ownership` is `pub(crate)`: nothing outside the crate's own composition
+/// normally builds or reads a `Mode::Distributed` cache's ownership view
+/// directly. `tests/sim.rs` is the one exception, driving `store::Shard`
+/// directly rather than through `Cluster`, so it needs these to seed and
+/// republish a shard's ownership view and residency set the same way
+/// `cluster::rebalance` reacts to a real membership change. `#[doc(hidden)]`
+/// and gated on `feature = "sim"` for the same reason as the re-exports
+/// above.
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub use ownership::{
+    OwnershipTracker, OwnershipView, ResidencySet, eligible_owners, ownership_diff,
+};
