@@ -39,7 +39,9 @@ where a joiner pulls its snapshot from and which peer a node reconciles with:
 both pick by node id today. A `zone` key in gossip state, set from
 `ClusterConfig::zone`, lets a joiner prefer a warm donor in its own zone and
 lets anti-entropy weight same-zone peers, which is where the bulk transfers
-happen. For distribution mode, the same key places replicas across zones.
+happen. `Mode::Distributed`'s rendezvous scoring has no such input today; the
+same `zone` key would extend it to spread a bucket's owners across zones
+instead of scoring every eligible peer the same regardless of where it runs.
 
 **Cost:** a few hundred lines; membership, state transfer, and the scheduler's
 peer choice.
@@ -65,54 +67,38 @@ under last-write-wins.
 
 ## Distribution mode
 
-A consistent-hash ring over the live member set, `numOwners` primary and backup
-replicas per key instead of every node holding every entry, and the hard part:
-rebalancing the ring and streaming ownership transfers on every membership
-change without dropping a write or serving a stale primary mid-transition.
-`Replicated` mode sidesteps nearly all of this: every node is trivially owner of
-everything, so join and leave need only a snapshot pull plus anti-entropy, never
-a rebalance, which is why state transfer fits in a page of design instead of a
-subsystem. A rebalancing coordinator, conflict resolution during rebalance, and
-partial-rebalance-on-partition logic are the hardest parts of building a
-distribution mode.
+Ships as `Mode::Distributed { owners }` / `Mode::distributed()`. Ownership
+lives at the anti-entropy bucket, `xxh3(key) & 1023`, not the key: rendezvous
+(highest-random-weight) hashing over the cache's live, protocol-3 peers
+advertising the same cache under the same mode and owner count picks each
+bucket's `k` owners as a pure function of the live peer set, recomputed from
+gossip membership on every change, no ring to maintain. `Cache::fetch` is the
+network-aware read, local if this node owns the key's bucket and a request to
+a live owner in rendezvous order otherwise; `Cache::get` stays local-only, and
+a write for a bucket this node doesn't own is forwarded to its owners and
+never applied locally. Rebalance pulls a gained bucket from its previous
+owners and keeps a lost one resident for `distributed_disown_grace_rounds`
+anti-entropy intervals before releasing it, so a new owner's pull has
+somewhere to land. Anti-entropy scopes itself to the buckets two peers
+co-own instead of pairing every live peer against every other, and every
+ownership-scoped RPC carries the requester's view hash: a responder whose own
+view disagrees declines with `Msg::StaleView` rather than answering against a
+stale owner set.
 
-**Feasibility, assessed against the code:** feasible with restrictions.
-Ownership belongs at the anti-entropy bucket, `xxh3(key) & 1023`, not the key:
-the 1,024 buckets already have digests, entry enumeration, and chunked
-streaming, so "who owns bucket b" is the only new question. Rendezvous hashing
-answers it as a pure function of the live `Peer` list: no ring to maintain,
-adding or losing one node moves about `1/n` of the buckets, and `owners = k` is
-"the top k scores." The mesh's per-peer outboxes and pooled request-response
-path carry a non-owner read as one more request shape. Fan-out groups records by
-owner set instead of broadcasting; anti-entropy pairs only peers sharing a
-bucket; state transfer runs on every membership change, scoped to newly owned
-buckets, not once at `open()`; tombstone-GC deferral asks whether an *owner* of
-the bucket is absent, not whether any member is.
+### What is still open
 
-Three gaps are real, not paperwork. `NodeId` is generated fresh per process, so
-a rolling restart with no capacity change would rehash nearly every bucket: a
-persisted node identity is a prerequisite. Gossip membership has no quorum, so a
-partition lets each side compute its own owner set and both accept writes;
-convergence after the heal is by version only, and the design must say so
-plainly. Nothing tracks an ownership epoch, so a transfer can complete against a
-stale owner set when membership changes twice mid-flight. Restrictions that keep
-the mode honest: `owners >= 2` always, since a single lost owner is a lost
-bucket; no finite `max_capacity` on a distributed cache, the same guard
-`Replicated` has, for the same reason; and a non-owner read as a separately
-typed operation, not a silent network hop inside `get`.
-
-**Cost:** roughly 3,000-5,000 lines plus a comparable volume of sim and property
-coverage, and a new invariant class for the test stack: the union across owners
-converges, and a non-owner never applies a record it was not sent, alongside
-rebalance-under-churn and partition-then-heal scenarios that reconcile
-ownership, not only versions. On the order of 8-14 weeks for one engineer at
-this repository's verification bar.
-
-**Trigger:** replicated memory footprint, every node holding every entry,
-becomes the binding constraint on cluster size or value volume, not that it
-would be more efficient, but a deployment that has hit the ceiling `Replicated`
-mode imposes. Until that's observed, `Invalidation` mode covers the common case
-of bounding per-node memory while keeping cross-node correctness.
+- **Node identity resets on restart.** `NodeId` is generated fresh per
+  process, so a rolling restart with no capacity change reshuffles nearly
+  every bucket. A persisted node identity is a follow-up.
+- **No quorum.** Gossip membership lets each side of a partition compute its
+  own owner set and accept writes; the two sides converge by version alone,
+  the same rule every other mode's conflicting writes resolve by, once the
+  partition heals.
+- **A transfer can race a second membership change.** If membership changes
+  twice while a bucket transfer is in flight, the transfer can complete
+  against an owner set that has already gone stale again; the `view_hash`
+  epoch check mitigates this by having a donor whose own view has since
+  moved decline the transfer outright.
 
 ## QUIC data plane
 
@@ -142,12 +128,14 @@ A local SSD/NVMe tier behind the in-memory tables is the `spill` feature,
 off by default. `CacheBuilder::spill(SpillConfig::new(dir,
 capacity_bytes))` lets eviction demote cold entries onto a FIFO ring of
 region files instead of discarding them, and a later read promotes a
-spilled entry back into RAM. It composes with `Mode::Replicated`'s capacity
-bound: eviction demotes rather than deletes, so anti-entropy does not need
-to silently re-pull an evicted entry back. It does nothing about the reason
-a replicated cluster runs out of memory: every node still holds every
-entry. Distribution mode removes that reason; the spill tier only extends
-how much of it one node's disk, rather than its RAM, can hold.
+spilled entry back into RAM. It composes with `Mode::Replicated`'s and
+`Mode::Distributed`'s capacity bound alike: eviction demotes rather than
+deletes, so anti-entropy does not need to silently re-pull an evicted entry
+back. It does nothing about the reason a replicated cluster runs out of
+memory: every node still holds every entry. `Mode::Distributed` removes that
+reason, since a node only holds the buckets it owns; the spill tier only
+extends how much of what a node does hold its disk, rather than its RAM, can
+carry.
 
 A spilled entry still keeps its full key resident. Only the value moves to
 disk, so the fixed per-key bookkeeping stays in RAM regardless of how cold
