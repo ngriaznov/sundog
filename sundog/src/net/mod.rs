@@ -1444,6 +1444,7 @@ mod tests {
         fetch_fixture: FetchFixture,
         ae_scoped_fixture: AeScopedFixture,
         st_buckets_available: bool,
+        st_buckets_cold: bool,
         st_bucket_chunks: Vec<Vec<WireRecord>>,
     }
 
@@ -1463,6 +1464,7 @@ mod tests {
                 fetch_fixture: FetchFixture::Unavailable,
                 ae_scoped_fixture: AeScopedFixture::Unavailable,
                 st_buckets_available: false,
+                st_buckets_cold: false,
                 st_bucket_chunks: Vec::new(),
             }
         }
@@ -1614,6 +1616,10 @@ mod tests {
 
         fn st_buckets_available(&self, _cache: SmolStr, _view_hash: u64) -> BoxFuture<'_, bool> {
             Box::pin(async { self.st_buckets_available })
+        }
+
+        fn st_buckets_cold(&self, _cache: SmolStr, _buckets: Vec<u16>) -> BoxFuture<'_, bool> {
+            Box::pin(async { self.st_buckets_cold })
         }
 
         fn st_bucket_chunks(
@@ -2672,7 +2678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_degrades_to_a_miss_against_the_default_handler_body() {
+    async fn fetch_is_declined_against_the_default_handler_body() {
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
         client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
@@ -2859,6 +2865,33 @@ mod tests {
         );
         // The declined connection went back to the pool: an unrelated
         // request on the same peer still works.
+        let digests = requester
+            .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
+            .await
+            .expect("the pooled connection serves the next request");
+        assert!(digests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_buckets_declines_cold_when_the_donor_has_not_pulled_the_buckets() {
+        let handler = Arc::new(FixtureHandler {
+            st_buckets_available: true,
+            st_buckets_cold: true,
+            ownership_view_hash: Some(42),
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        let declined = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0], 42)
+            .await
+            .expect("request accepted");
+        assert!(
+            matches!(declined, BucketPull::Cold),
+            "a donor that has not pulled a requested bucket declines as cold, not stale"
+        );
         let digests = requester
             .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
             .await
