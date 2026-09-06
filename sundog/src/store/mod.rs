@@ -233,6 +233,20 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// How many owners [`Mode::distributed`] gives each bucket.
+    pub const DEFAULT_OWNERS: NonZeroU8 = NonZeroU8::new(2).expect("2 is nonzero");
+
+    /// [`Mode::Distributed`] with [`Mode::DEFAULT_OWNERS`] owners per
+    /// bucket: one replica to lose without losing the bucket. The cluster
+    /// itself is discovered, never configured; `owners` is the one number
+    /// a caller may still want to raise, by spelling the variant out.
+    #[must_use]
+    pub const fn distributed() -> Self {
+        Self::Distributed {
+            owners: Self::DEFAULT_OWNERS,
+        }
+    }
+
     /// The wire token gossiped for this mode under a `cache:<name>` chitchat
     /// key. A stable string, not a `Debug`/`Display` impl, so renaming a
     /// variant never changes the wire.
@@ -2448,6 +2462,22 @@ mod tests {
     fn mode_is_copy_and_comparable() {
         assert_eq!(Mode::Local, Mode::Local);
         assert_ne!(Mode::Local, Mode::Replicated);
+    }
+
+    #[test]
+    fn mode_distributed_defaults_to_two_owners_and_round_trips_its_token() {
+        assert_eq!(Mode::DEFAULT_OWNERS.get(), 2);
+        assert_eq!(
+            Mode::distributed(),
+            Mode::Distributed {
+                owners: Mode::DEFAULT_OWNERS
+            }
+        );
+        assert_eq!(Mode::distributed().as_token(), "distributed:2");
+        assert_eq!(
+            Mode::from_token(&Mode::distributed().as_token()),
+            Some(Mode::distributed())
+        );
     }
 
     #[test]

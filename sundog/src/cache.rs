@@ -994,7 +994,7 @@ mod tests {
     /// nodes total once this and the seed and a later joiner are all up, so
     /// `owners = 2` leaves each bucket owned by exactly two of the three,
     /// and every node fails to own a real share of buckets) and opens
-    /// `cache_name` as `Mode::Distributed { owners: 2 }` on it.
+    /// `cache_name` as `Mode::distributed()`, two owners, on it.
     async fn join_distributed(
         seed_addr: SocketAddr,
         cluster_name: &'static str,
@@ -1012,9 +1012,7 @@ mod tests {
             Duration::from_secs(20),
             cluster
                 .cache::<u32, String>(cache_name)
-                .mode(Mode::Distributed {
-                    owners: NonZeroU8::new(2).expect("nonzero"),
-                })
+                .mode(Mode::distributed())
                 .open(),
         )
         .await
