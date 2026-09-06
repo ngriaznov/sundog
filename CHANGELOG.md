@@ -17,9 +17,10 @@ All notable changes to this project are documented in this file. Format follows
   write for a bucket this node doesn't own is forwarded to that bucket's
   owners and never applied locally.
 - `ClusterConfig::distributed_disown_grace_rounds` (default 3): anti-entropy
-  intervals a node keeps a disowned bucket's data resident before releasing
-  it, giving the new owner's rebalance pull time to land against it as
-  donor. `ClusterConfig::fetch_timeout` (default 750ms): per-owner-attempt
+  intervals a node keeps a disowned bucket's data resident before handing it
+  to each new owner in one anti-entropy round and releasing it, so the new
+  owner's rebalance pull, or that hand-off, has landed before the data
+  goes. `ClusterConfig::fetch_timeout` (default 750ms): per-owner-attempt
   timeout for `Cache::fetch`. `ClusterConfig::rebalance_concurrency`
   (default 4): maximum simultaneous bucket-transfer streams one rebalance
   pass opens.
@@ -41,10 +42,10 @@ All notable changes to this project are documented in this file. Format follows
 - A `Mode::Distributed` scenario in the deterministic simulation suite:
   membership churning under message loss and reordering, checking that
   every bucket's data converges across its current owners alone. New
-  container scenarios covering bucket ownership settling across joins and
-  leaves, a rebalance pull landing after a new owner joins, and a disowned
-  bucket still answering `fetch` through its grace period, plus the chaos
-  lane's `chaos_distributed_crashes_churn_and_drops_still_converge`.
+  container scenarios: a five-node fill landing every key on exactly two
+  owners, one owner crashing with every key still fetchable and then
+  re-owned, and a fourth node joining a filled cluster and taking its share,
+  plus the chaos lane's `chaos_distributed_crashes_churn_and_drops_still_converge`.
 
 ### Changed
 

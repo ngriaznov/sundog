@@ -94,11 +94,13 @@ stale owner set.
   own owner set and accept writes; the two sides converge by version alone,
   the same rule every other mode's conflicting writes resolve by, once the
   partition heals.
-- **A transfer can race a second membership change.** If membership changes
-  twice while a bucket transfer is in flight, the transfer can complete
-  against an owner set that has already gone stale again; the `view_hash`
-  epoch check mitigates this by having a donor whose own view has since
-  moved decline the transfer outright.
+- **Two owners is a narrow margin under back-to-back failures.** A bucket
+  pull the view moves past is planned again against the current view, and a
+  release hands a bucket to each new owner before dropping it, so two
+  membership changes in a row lose nothing on their own. Two owners of the
+  same bucket dying inside one rebalance window still take its last copy;
+  `owners` above 2 is the only answer, and a pull from a node outside the
+  current owner set is not attempted.
 
 ## QUIC data plane
 

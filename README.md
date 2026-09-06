@@ -167,8 +167,10 @@ hashing over the peers that advertise the same cache under the same mode and
 owner count. The view recomputes from gossip membership, so ownership
 converges a few gossip intervals after a join or leave, not instantly. A node
 that gains a bucket pulls it from the previous owners; one that loses a bucket
-keeps serving it for `distributed_disown_grace_rounds` anti-entropy intervals
-before dropping it, giving the new owner's pull time to land. A write for a
+keeps serving it for `distributed_disown_grace_rounds` anti-entropy intervals,
+then hands it to each new owner in one anti-entropy round and drops it only
+once every owner has answered. Until a gained bucket's pull lands, a `fetch`
+that misses it locally asks the other owners first. A write for a
 bucket this node doesn't own is forwarded to that bucket's owners and never
 applied locally, so no external routing is required — though a local `get`
 right after a forwarded write still misses, since only the owners hold it.
@@ -329,10 +331,11 @@ Five layers, cheapest and highest-signal first:
    cost pinned via `netstats` under a lowered `ae_part_min_bucket`, a bulk
    fill's wire cost pinned via `netstats` against the fan-out queue
    duplicating it, high-churn add/remove/TTL workloads draining to zero, and
-   64 KiB values verified byte-for-byte, and, for `Mode::Distributed`, bucket
-   ownership settling correctly across joins and leaves, a rebalance pull
-   landing after a new owner joins, and a disowned bucket still answering
-   `fetch` through its grace period. Each node is `sundog-testnode`, a tiny
+   64 KiB values verified byte-for-byte, and, for `Mode::Distributed`, a
+   five-node fill landing every key on exactly two owners, one owner crashing
+   with every key still fetchable and then re-owned, and a fourth node
+   joining a filled cluster and taking its share. Each node is
+   `sundog-testnode`, a tiny
    static/musl binary driven over a line-based control protocol, and reads
    `SUNDOG_TESTNODE_MODE=distributed` (with `SUNDOG_TESTNODE_OWNERS` to pick
    `owners`, default 2) to open `"it"` as a distributed cache instead of
