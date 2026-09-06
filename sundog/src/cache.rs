@@ -1258,6 +1258,15 @@ mod tests {
         })
         .await
         .expect("the write reaches its other owner");
+        // Both warm-up pulls have landed: nothing re-delivers a copy the
+        // steps below drop by hand.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !(a.is_warm(&SmolStr::new(name)) && b.is_warm(&SmolStr::new(name))) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both nodes finish warming up");
         let bucket = bucket_of(&encode_key(&7u32).expect("u32 encodes"));
         let residency_a = cache_a.shard.residency().expect("a is distributed");
         let residency_b = cache_b.shard.residency().expect("b is distributed");
