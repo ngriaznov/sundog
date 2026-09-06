@@ -3,6 +3,58 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Distribution mode**: `Mode::Distributed { owners }` and
+  `Mode::distributed()` / `Mode::DEFAULT_OWNERS`. Each cache key lives on
+  exactly `owners` live nodes, chosen by rendezvous hashing over the cache's
+  live, protocol-3 peers advertising it under the same mode and owner count.
+  `Cache::fetch` reads a key from an owner (local if this node owns its
+  bucket, otherwise the network), returning `Ok(None)` for a genuine miss;
+  `Cache::owners_of` reports a key's current owners in rendezvous order. A
+  write for a bucket this node doesn't own is forwarded to that bucket's
+  owners and never applied locally.
+- `ClusterConfig::distributed_disown_grace_rounds` (default 3): anti-entropy
+  intervals a node keeps a disowned bucket's data resident before releasing
+  it, giving the new owner's rebalance pull time to land against it as
+  donor. `ClusterConfig::fetch_timeout` (default 750ms): per-owner-attempt
+  timeout for `Cache::fetch`. `ClusterConfig::rebalance_concurrency`
+  (default 4): maximum simultaneous bucket-transfer streams one rebalance
+  pass opens.
+- `CacheError::TooFewOwners`: `CacheBuilder::open` rejects a `Mode::Distributed`
+  cache with `owners` under 2. `CacheError::FetchUnavailable`: every owner of
+  a `Cache::fetch`'s key was unreachable or timed out.
+- Six new metrics: `sundog_owned_buckets{cache}`, `sundog_rebalance_buckets_total{
+  cache, direction}` (`in`/`out`), `sundog_fetch_total{cache, outcome}`
+  (`local`/`remote`/`miss`/`error`), `sundog_forwarded_writes_total{cache}`,
+  `sundog_stale_view_total{cache}`, and `sundog_unowned_inbound_dropped_total{
+  cache}`.
+- Wire messages `Fetch`, `FetchReply`, `AeDigestScoped`, `StBuckets`,
+  `StBucketChunk`, and `StaleView`, all gated on the peer's protocol from its
+  hello: a peer speaking less than `wire::PROTOCOL_DISTRIBUTED` never
+  receives one.
+- `sundog-testnode` reads `SUNDOG_TESTNODE_MODE=distributed` (with
+  `SUNDOG_TESTNODE_OWNERS` to pick `owners`) to open `"it"` as a distributed
+  cache, and serves the routes the new container scenarios drive it through.
+- A `Mode::Distributed` scenario in the deterministic simulation suite:
+  membership churning under message loss and reordering, checking that
+  every bucket's data converges across its current owners alone. New
+  container scenarios covering bucket ownership settling across joins and
+  leaves, a rebalance pull landing after a new owner joins, and a disowned
+  bucket still answering `fetch` through its grace period, plus the chaos
+  lane's `chaos_distributed_crashes_churn_and_drops_still_converge`.
+
+### Changed
+
+- **Breaking**: `Mode` is `#[non_exhaustive]` and gains `Distributed`; a
+  downstream `match` without a wildcard arm needs one added.
+- `wire::Msg` gains the six variants above; already `#[non_exhaustive]` since
+  0.3.0, so no downstream `match` needs a change for them.
+- `wire::PROTOCOL_VERSION` is 3; the current release interoperates with
+  protocol 2.
+
 ## [0.5.0] – 2026-09-06
 
 ### Added
