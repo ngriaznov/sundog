@@ -231,8 +231,9 @@ outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
 tags anti-entropy's IBLT-sketch reconciliation on large buckets; `outcome` is
 `decoded` or `fallback`. The second tags the part-digest path's per-part
 reconciliation; `outcome` is `listing`, `sketch`, or `fallback`. Without
-`prometheus` they fall into the `metrics` crate's no-op default recorder. A
-ready-made Grafana dashboard lives at
+`prometheus` they fall into the `metrics` crate's no-op default recorder.
+Install the recorder before opening a cache: a cache binds its per-cache
+handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
 `Cluster::is_ready()` and `Cluster::health()` report whether every open

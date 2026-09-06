@@ -109,6 +109,10 @@ async fn open_spilling_cache(
     capacity_bytes: u64,
     read_concurrency: usize,
 ) -> Cache<u32, String> {
+    // A cache binds its per-cache metric handles when it opens, so the
+    // recorder has to exist first; otherwise those handles stay on the
+    // no-op recorder and the scrapes below read zero.
+    let _ = metrics_handle();
     let cfg = SpillConfig::new(dir, capacity_bytes)
         .region_bytes(region_bytes)
         .read_concurrency(read_concurrency);
