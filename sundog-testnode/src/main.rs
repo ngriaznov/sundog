@@ -55,6 +55,23 @@
 //! content, computed as [`digest_it`] describes. `crash` -> `ok`, then the
 //! process exits with status 3 without leaving the cluster gracefully, the
 //! closest a control command can get to a process actually being killed.
+//!
+//! `SUNDOG_TESTNODE_MODE` selects `"it"`'s clustering mode: `"replicated"`
+//! (the default, byte-for-byte the behavior above) or `"distributed"`,
+//! which opens `"it"` as `Mode::Distributed` instead. `SUNDOG_TESTNODE_OWNERS`,
+//! an optional `u8` at least 2, sets the owners-per-bucket count in
+//! distributed mode; absent, distributed mode uses `Mode::distributed()`'s
+//! default of two. Either variable set to anything else fails startup with
+//! a clear message. `"churn"` always stays `Mode::Replicated` regardless of
+//! this setting.
+//!
+//! Three more control routes, meaningful on any mode but only ever
+//! interesting on a distributed `"it"`: `fetch k` -> `val <v>` | `none` |
+//! `err <e>` ([`Cache::fetch`]); `owners k` -> `k`'s owning node ids, as
+//! space-separated decimal `u64`s in rendezvous score order
+//! ([`Cache::owners_of`]; on a non-distributed cache this is just this
+//! node's own id); `id` -> this node's own [`sundog::NodeId`] as a decimal
+//! `u64`.
 
 use std::env;
 use std::io::Write as _;
@@ -156,6 +173,34 @@ fn u64_env(name: &str) -> Option<u64> {
     parse_u64_override(env::var(name).ok().as_deref())
 }
 
+/// Decides `"it"`'s [`Mode`] from `SUNDOG_TESTNODE_MODE`/`SUNDOG_TESTNODE_OWNERS`'s
+/// already-read values: `mode` absent or `"replicated"` is always
+/// `Mode::Replicated` (`owners` is only meaningful in distributed mode, so
+/// it is ignored here rather than rejected); `"distributed"` is
+/// `Mode::distributed()` when `owners` is absent, or `Mode::Distributed`
+/// with that count when present and at least 2. Any other `mode` string, or
+/// an `owners` under 2, is an `Err` naming the problem.
+fn mode_from_env(mode: Option<&str>, owners: Option<u8>) -> Result<Mode, String> {
+    match mode {
+        None | Some("replicated") => Ok(Mode::Replicated),
+        Some("distributed") => match owners {
+            None => Ok(Mode::distributed()),
+            Some(owners) => std::num::NonZeroU8::new(owners)
+                .filter(|owners| owners.get() >= 2)
+                .map(|owners| Mode::Distributed { owners })
+                .ok_or_else(|| {
+                    format!(
+                        "SUNDOG_TESTNODE_OWNERS must be at least 2, got {owners}: a single owner \
+                         is a lost bucket the instant it leaves"
+                    )
+                }),
+        },
+        Some(other) => Err(format!(
+            "SUNDOG_TESTNODE_MODE must be \"replicated\" or \"distributed\", got {other:?}"
+        )),
+    }
+}
+
 /// Weighs one entry by its UTF-8 byte length, key plus value: the
 /// byte-counting weigher `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` installs on
 /// `"it"` so its `max_capacity` bounds bytes rather than entry count.
@@ -204,6 +249,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let seeds = resolve_seeds(&env::var("SUNDOG_SEEDS").unwrap_or_default()).await;
     let ae_part_min_bucket = usize_env("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET");
     let ae_sketch_min_bucket = usize_env("SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET");
+    let owners = match env::var("SUNDOG_TESTNODE_OWNERS").ok() {
+        None => None,
+        Some(raw) => Some(
+            raw.parse::<u8>()
+                .map_err(|error| format!("SUNDOG_TESTNODE_OWNERS must be a u8: {error}"))?,
+        ),
+    };
+    let it_mode = mode_from_env(env::var("SUNDOG_TESTNODE_MODE").ok().as_deref(), owners)?;
 
     let config = ClusterConfig::default().with(|c| {
         c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
@@ -227,9 +280,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cluster = builder.build().await?;
 
     let max_capacity_bytes = u64_env("SUNDOG_TESTNODE_MAX_CAPACITY_BYTES");
-    let mut it_builder = cluster
-        .cache::<String, String>(CACHE_NAME)
-        .mode(Mode::Replicated);
+    let mut it_builder = cluster.cache::<String, String>(CACHE_NAME).mode(it_mode);
     if let Some(max_capacity_bytes) = max_capacity_bytes {
         it_builder = it_builder
             .max_capacity(max_capacity_bytes)
@@ -364,6 +415,8 @@ async fn dispatch(
             cache.invalidate_local(&key.to_string()).await;
             Reply::Line("ok".to_string())
         }
+        "fetch" | "owners" => ownership_command(cache, command, parts.next()).await,
+        "id" => Reply::Line(cluster.node_id().as_u64().to_string()),
         "netstats" => Reply::Line(format!(
             "{} {}",
             sundog::net::frames_sent_total(),
@@ -423,6 +476,33 @@ async fn big_command(
                 None => "none".to_string(),
             }
         }
+    })
+}
+
+/// `fetch`/`owners`, the two routes that read `"it"`'s ownership state
+/// rather than its content: `fetch` answers via [`Cache::fetch`], `owners`
+/// via [`Cache::owners_of`] rendered as space-separated decimal ids.
+async fn ownership_command(
+    cache: &Cache<String, String>,
+    command: &str,
+    key: Option<&str>,
+) -> Reply {
+    let Some(key) = key else {
+        return Reply::Line(format!("err {command} needs a key"));
+    };
+    let key = key.to_string();
+    Reply::Line(match command {
+        "fetch" => match cache.fetch(&key).await {
+            Ok(Some(value)) => format!("val {value}"),
+            Ok(None) => "none".to_string(),
+            Err(error) => format!("err {error}"),
+        },
+        _ => cache
+            .owners_of(&key)
+            .into_iter()
+            .map(|id| id.as_u64().to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
     })
 }
 
@@ -514,6 +594,57 @@ mod tests {
             parse_u64_override(Some("-1")),
             None,
             "u64 rejects a negative value"
+        );
+    }
+
+    #[test]
+    fn mode_from_env_defaults_to_replicated() {
+        assert_eq!(mode_from_env(None, None), Ok(Mode::Replicated));
+    }
+
+    #[test]
+    fn mode_from_env_replicated_is_explicit_too() {
+        assert_eq!(
+            mode_from_env(Some("replicated"), None),
+            Ok(Mode::Replicated)
+        );
+    }
+
+    #[test]
+    fn mode_from_env_distributed_defaults_to_two_owners() {
+        assert_eq!(
+            mode_from_env(Some("distributed"), None),
+            Ok(Mode::distributed())
+        );
+    }
+
+    #[test]
+    fn mode_from_env_distributed_takes_an_explicit_owners_count() {
+        assert_eq!(
+            mode_from_env(Some("distributed"), Some(4)),
+            Ok(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(4).expect("4 is nonzero")
+            })
+        );
+    }
+
+    #[test]
+    fn mode_from_env_rejects_a_single_owner() {
+        let error = mode_from_env(Some("distributed"), Some(1))
+            .expect_err("one owner is a lost bucket the instant it leaves");
+        assert!(
+            error.contains("at least 2"),
+            "error should explain the minimum: {error:?}"
+        );
+    }
+
+    #[test]
+    fn mode_from_env_rejects_an_unknown_mode() {
+        let error = mode_from_env(Some("gossiped"), None)
+            .expect_err("an unrecognized mode string fails startup");
+        assert!(
+            error.contains("gossiped"),
+            "error should name the bad value: {error:?}"
         );
     }
 
