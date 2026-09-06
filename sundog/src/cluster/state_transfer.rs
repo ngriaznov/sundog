@@ -4,21 +4,24 @@
 //! `Invalidation` caches skip it: their nodes hold different subsets by
 //! design, so there is no snapshot to warm from.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt as _;
+use futures::{Stream, StreamExt as _};
 use smol_str::SmolStr;
 
 use super::{Cluster, anti_entropy};
+use crate::error::CodecError;
 use crate::net::Mesh;
 use crate::node::NodeId;
 use crate::store::ShardOps;
+use crate::wire::WireRecord;
 
 /// Delay between retrying the same still-live donor after a transient failure.
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
-fn per_donor_budget(total: Duration) -> Duration {
+pub(crate) fn per_donor_budget(total: Duration) -> Duration {
     total * 2 / 5
 }
 
@@ -60,14 +63,16 @@ impl Outcome {
     }
 }
 
-/// Timed-out transfers [`warm_up_task`] retries before it marks the cache
-/// warm with what has landed and leaves the rest to anti-entropy.
-const MAX_WARM_UP_ATTEMPTS: u32 = 3;
+/// Timed-out transfers [`warm_up_task`] (and `rebalance::warm_up_task`)
+/// retries before marking the cache warm with what has landed and leaving
+/// the rest to anti-entropy.
+pub(crate) const MAX_WARM_UP_ATTEMPTS: u32 = 3;
 
 /// What [`warm_up_task`] does after one [`run`] that ended `outcome` on its
-/// `attempt`th try.
+/// `attempt`th try. Shared with `rebalance::warm_up_task`'s analogous
+/// bucket-scoped retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WarmUpStep {
+pub(crate) enum WarmUpStep {
     /// The cache is warm; the task ends.
     Done,
     /// Nobody to receive from yet; wait for a first peer, then run again.
@@ -79,7 +84,7 @@ enum WarmUpStep {
     WarmAnyway,
 }
 
-fn next_warm_up_step(outcome: Outcome, attempt: u32) -> WarmUpStep {
+pub(crate) fn next_warm_up_step(outcome: Outcome, attempt: u32) -> WarmUpStep {
     match outcome {
         Outcome::Completed | Outcome::NoDonor | Outcome::Skipped => WarmUpStep::Done,
         Outcome::NoPeers => WarmUpStep::WaitForPeer,
@@ -113,14 +118,18 @@ impl DeclineClock {
     }
 }
 
-/// One donor's answer within a pass over the candidates.
+/// One donor's answer within a pass over the candidates: shared by a
+/// whole-cache pull ([`try_donor`]) and a bucket-scoped one
+/// (`rebalance::try_donor_buckets`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DonorResult {
-    /// The whole snapshot landed.
+pub(crate) enum DonorResult {
+    /// The whole transfer landed.
     Done,
-    /// The donor declined: it is not warm for this cache.
+    /// The donor declined: it is not warm for this cache (or, bucket-scoped,
+    /// not a valid source right now).
     Declined,
-    /// The request or stream failed part way; the donor may be warm.
+    /// The request or stream failed part way; the donor may still be a
+    /// valid source.
     Failed,
 }
 
@@ -363,21 +372,36 @@ async fn wait_for_a_peer(cluster: &Cluster, limit: Duration) -> bool {
     .unwrap_or(false)
 }
 
-async fn try_donor(
+/// Pulls whatever `pull` resolves to from `donor` and applies each chunk to
+/// `shard` through the same versioned-apply path live traffic uses,
+/// classifying the outcome the way every per-donor transfer here does:
+/// [`DonorResult::Done`] once the stream ends cleanly, [`DonorResult::Declined`]
+/// if the donor never had a stream to give, [`DonorResult::Failed`] if the
+/// request or stream broke. Returns the count of records applied alongside
+/// the classification, for a caller's own metric.
+///
+/// The scope-parametrized core [`try_donor`] (a whole-cache pull via
+/// [`Mesh::request_state`]) and `rebalance::try_donor_buckets` (a
+/// bucket-scoped pull via [`Mesh::request_buckets`]) share: they differ only
+/// in what `pull` asks the donor for, never in how the reply is drained and
+/// applied.
+pub(crate) async fn pull_from_donor<S>(
     shard: &Arc<dyn ShardOps>,
-    mesh: &Mesh,
-    cache: &SmolStr,
     donor: NodeId,
-) -> DonorResult {
-    let mut stream = match mesh.request_state(donor, cache.clone()).await {
+    pull: impl Future<Output = Result<Option<S>, CodecError>>,
+) -> (DonorResult, u64)
+where
+    S: Stream<Item = Result<Vec<WireRecord>, CodecError>> + Unpin,
+{
+    let mut stream = match pull.await {
         Ok(Some(stream)) => stream,
         Ok(None) => {
-            tracing::debug!(%donor, "donor declined: not warm for this cache");
-            return DonorResult::Declined;
+            tracing::debug!(%donor, "donor declined: not a valid source right now");
+            return (DonorResult::Declined, 0);
         }
         Err(error) => {
-            tracing::debug!(%donor, %error, "state transfer request failed");
-            return DonorResult::Failed;
+            tracing::debug!(%donor, %error, "transfer request failed");
+            return (DonorResult::Failed, 0);
         }
     };
 
@@ -396,18 +420,29 @@ async fn try_donor(
                     %donor,
                     %error,
                     applied,
-                    "state transfer stream broke mid-transfer; will retry"
+                    "transfer stream broke mid-transfer"
                 );
-                return DonorResult::Failed;
+                return (DonorResult::Failed, applied);
             }
-            None => {
-                metrics::counter!("sundog_state_transfer_records_total", "cache" => cache.to_string())
-                    .increment(applied);
-                tracing::info!(%donor, applied, "state transfer complete");
-                return DonorResult::Done;
-            }
+            None => return (DonorResult::Done, applied),
         }
     }
+}
+
+async fn try_donor(
+    shard: &Arc<dyn ShardOps>,
+    mesh: &Mesh,
+    cache: &SmolStr,
+    donor: NodeId,
+) -> DonorResult {
+    let (result, applied) =
+        pull_from_donor(shard, donor, mesh.request_state(donor, cache.clone())).await;
+    if result == DonorResult::Done {
+        metrics::counter!("sundog_state_transfer_records_total", "cache" => cache.to_string())
+            .increment(applied);
+        tracing::info!(%donor, applied, "state transfer complete");
+    }
+    result
 }
 
 // Real-transport-only: this builds a live `Cluster` with a real `Mesh`.
