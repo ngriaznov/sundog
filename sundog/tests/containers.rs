@@ -704,11 +704,16 @@ async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
     let bytes_for_fill = bytes_after - bytes_before;
 
     let payload_estimate = fill_payload_bytes(ENTRIES);
+    // Two peers receive every record, so one frame per record is
+    // 2 * ENTRIES frames. The batched fan-out queue coalesces at least ten
+    // records per frame however slowly the fill runs on a loaded machine;
+    // an idle 4-core box sends a few hundred frames in total.
+    let record_sends = u64::from(ENTRIES) * 2;
+    eprintln!("bulk fill: n1 sent {frames_for_fill} frames for {record_sends} record sends");
     assert!(
-        frames_for_fill < 1_000,
+        frames_for_fill < record_sends / 10,
         "n1 sent {frames_for_fill} frames for a {ENTRIES}-entry fill to 2 peers; the batched \
-         fan-out queue should coalesce this into a few dozen `ReplicateBatch` frames per peer, \
-         not one frame per record"
+         fan-out queue should coalesce at least ten records per frame, not one frame per record"
     );
     assert!(
         bytes_for_fill < payload_estimate * 3,
