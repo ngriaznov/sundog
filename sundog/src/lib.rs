@@ -2,10 +2,11 @@
 //! your process; there is no cache server to deploy.
 //!
 //! Instances of a service on one network find each other, form a cluster over
-//! gossip, and keep named caches coherent by invalidation or full replication.
-//! Writes are last-writer-wins on a hybrid logical clock. Anti-entropy heals
-//! whatever the network drops. There is no consensus and no operator action on
-//! join, leave, crash, or partition.
+//! gossip, and keep named caches coherent by invalidation, full replication,
+//! or distribution across the live nodes. Writes are last-writer-wins on a
+//! hybrid logical clock. Anti-entropy heals whatever the network drops. There
+//! is no consensus and no operator action on join, leave, crash, or
+//! partition.
 //!
 //! # Example
 //!
@@ -32,7 +33,7 @@
 //!
 //! let users = cluster
 //!     .cache::<UserId, Profile>("users")
-//!     .mode(Mode::Replicated) // or Mode::Invalidation (default), Mode::Local
+//!     .mode(Mode::Replicated) // or Mode::Invalidation (default), Mode::Local, Mode::distributed()
 //!     .max_capacity(200_000)
 //!     .ttl(Duration::from_secs(600))
 //!     .open()
