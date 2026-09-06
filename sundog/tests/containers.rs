@@ -1735,6 +1735,14 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
 
     let sample = sample_kv_entries(0xdead_b17e, FILL_KEYS, SAMPLE_SIZE);
 
+    // Baselined before the crash: the survivors pull the moment gossip
+    // drops the victim, the same moment `wait_for_peers` below returns.
+    let mut in_before = Vec::with_capacity(nodes.len() - 1);
+    for node in &nodes[1..] {
+        in_before
+            .push(scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await);
+    }
+
     let victim = nodes.remove(0);
     victim
         .crash()
@@ -1758,12 +1766,6 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
     }
 
     wait_for_peers(&live, NODE_COUNT - 2).await;
-
-    let mut in_before = Vec::with_capacity(live.len());
-    for node in &live {
-        in_before
-            .push(scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await);
-    }
 
     let ids = collect_node_ids(&live).await;
     let tagged: Vec<(&Node, u64)> = live.iter().copied().zip(ids).collect();
@@ -1876,22 +1878,21 @@ async fn distributed_join_and_rebalance() {
     })
     .await;
 
-    let mut donor_out_moved = false;
-    for (node, before) in node_refs[..ALIASES.len()].iter().zip(out_before.iter()) {
-        let after =
-            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
-        if after > *before {
-            donor_out_moved = true;
-        }
-    }
-    assert!(
-        donor_out_moved,
-        "at least one original node should have donated buckets to the joiner"
-    );
-
-    // Let the disown grace period elapse so previous owners drop what they
-    // no longer own, then every key settles on exactly OWNERS nodes.
+    // A previous owner keeps a lost bucket for the disown grace, hands it
+    // to the joiner, and only then drops it: `direction="out"` moves at
+    // that point, not when the joiner's pull lands.
     tokio::time::sleep(DISOWN_GRACE_WAIT).await;
+    eventually(SETTLE_WAIT, || async {
+        for (node, before) in node_refs[..ALIASES.len()].iter().zip(out_before.iter()) {
+            let after =
+                scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
+            if after > *before {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
 
     let ids = collect_node_ids(&node_refs).await;
     let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
@@ -1994,6 +1995,7 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
     const REFILL_COUNT: u32 = 500;
     const BURST_COUNT: u32 = 20;
     const CONVERGENCE_WAIT: Duration = Duration::from_secs(180);
+    const RESETTLE_WAIT: Duration = Duration::from_secs(180);
     const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4"];
     const CLUSTER: &str = "chaos-distributed-cluster";
 
@@ -2055,6 +2057,17 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
                 Some(OWNERS),
             )
             .await;
+            // With two owners per bucket, a crash leaves every bucket the
+            // victim owned on one live node until its new owner has pulled
+            // it; a second crash inside that window can take the last copy,
+            // which no design with two owners survives. The next action
+            // waits until every key is back on two owners.
+            let expected_sum = usize::from(OWNERS) * (FILL_KEYS as usize + burst_entries.len());
+            eventually(RESETTLE_WAIT, || async {
+                sum_counts(&nodes.iter().collect::<Vec<_>>()).await == Some(expected_sum)
+            })
+            .await;
+            eprintln!("chaos[{iteration}]: every key is back on {OWNERS} owners");
         } else {
             if let ChaosAction::Burst { count, .. } = action {
                 for j in 0..count {
