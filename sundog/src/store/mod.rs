@@ -844,7 +844,7 @@ where
 
     /// The residency set [`Shard::with_ownership`] attached, for a test
     /// that marks a bucket cold or releasing by hand.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn residency(&self) -> Option<&Arc<ResidencySet>> {
         self.residency.as_ref()
     }
