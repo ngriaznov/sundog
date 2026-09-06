@@ -1691,3 +1691,113 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
     net.close().await.expect("network closes");
 }
 
+/// Crashing one owner never makes a key unfetchable — the surviving owner
+/// keeps answering `fetch` through the dead peer's stale entry in the
+/// ownership view — and once gossip notices the death and rebalance runs,
+/// every key resettles on exactly `OWNERS` of the four survivors, with at
+/// least one of them having pulled buckets in.
+#[tokio::test]
+async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned() {
+    const NODE_COUNT: usize = 5;
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 100;
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4", "n5"];
+    const CLUSTER: &str = "dist-kill-cluster";
+    const FILL_WAIT: Duration = Duration::from_secs(60);
+    const IMMEDIATE_CHECK_WINDOW: Duration = Duration::from_secs(10);
+    const REOWNED_WAIT: Duration = Duration::from_secs(240);
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+    }
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), NODE_COUNT - 1).await;
+
+    nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    // Every write during the fill landed straight on its real owners (a
+    // non-owner write is forwarded, never applied locally), so the fill
+    // itself converges as soon as the forwards land, well before any
+    // rebalance is involved.
+    eventually(FILL_WAIT, || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+
+    let sample = sample_kv_entries(0xdead_b17e, FILL_KEYS, SAMPLE_SIZE);
+
+    let victim = nodes.remove(0);
+    victim
+        .crash()
+        .await
+        .expect("crashed node dies and is removed cleanly");
+    let live: Vec<&Node> = nodes.iter().collect();
+
+    // Immediately and repeatedly, before gossip has even had a chance to
+    // notice the death: every key stays fetchable from every surviving
+    // node, since fetch tries owners in order and the still-live one
+    // answers.
+    let immediate_deadline = tokio::time::Instant::now() + IMMEDIATE_CHECK_WINDOW;
+    while tokio::time::Instant::now() < immediate_deadline {
+        let mismatches = fetch_mismatches(&live, &sample).await;
+        assert!(
+            mismatches.is_empty(),
+            "every key must stay fetchable through the surviving owner right after a crash: \
+             {mismatches:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    wait_for_peers(&live, NODE_COUNT - 2).await;
+
+    let mut in_before = Vec::with_capacity(live.len());
+    for node in &live {
+        in_before
+            .push(scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await);
+    }
+
+    let ids = collect_node_ids(&live).await;
+    let tagged: Vec<(&Node, u64)> = live.iter().copied().zip(ids).collect();
+
+    eventually(REOWNED_WAIT, || async {
+        if sum_counts(&live).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await
+    })
+    .await;
+
+    let mut in_moved = false;
+    for (node, before) in live.iter().zip(in_before.iter()) {
+        let after =
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await;
+        if after > *before {
+            in_moved = true;
+        }
+    }
+    assert!(
+        in_moved,
+        "at least one surviving node should have pulled rebalanced buckets in after the crash"
+    );
+
+    let mismatches = fetch_mismatches(&live, &sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every sampled key must still be fetchable with the right value: {mismatches:?}"
+    );
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
