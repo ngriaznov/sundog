@@ -1505,3 +1505,116 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
     c_stopped.expect("c stops");
     net.close().await.expect("network closes");
 }
+
+/// Node ids for `nodes`, in the same order, read via each node's own `id`
+/// control route.
+async fn collect_node_ids(nodes: &[&Node]) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        ids.push(
+            node.node_id()
+                .await
+                .expect("id replies with this node's own NodeId as a decimal u64"),
+        );
+    }
+    ids
+}
+
+/// [`fill`][Node::fill]'s deterministic `k{i}` -> `v{i}` pair for index `i`.
+fn kv_entry(index: u32) -> (String, String) {
+    (format!("k{index}"), format!("v{index}"))
+}
+
+/// [`kv_entry`] for every index in `0..count`: the full key/value set one
+/// `fill(count)` call writes.
+fn kv_range(count: u32) -> Vec<(String, String)> {
+    (0..count).map(kv_entry).collect()
+}
+
+/// A uniform random sample of `sample_size` [`kv_entry`] pairs with indices
+/// in `0..fill_keys`, from a fixed seed so a failing run's sample is
+/// reproducible.
+fn sample_kv_entries(seed: u64, fill_keys: u32, sample_size: usize) -> Vec<(String, String)> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..sample_size)
+        .map(|_| kv_entry(rng.random_range(0..fill_keys)))
+        .collect()
+}
+
+/// True once `reader`'s `owners k` names exactly `owners` ids for every
+/// `(key, value)` pair in `entries`, and exactly the nodes among `tagged`
+/// (each paired with its own [`collect_node_ids`] id) whose id is named
+/// answer `get k` with `value`, every other one answering `None`. Concurrent
+/// over `entries`, so a poll of this against a few hundred keys stays fast
+/// despite the container network's per-connection round trip.
+async fn ownership_snapshot_matches(
+    reader: &Node,
+    tagged: &[(&Node, u64)],
+    entries: &[(String, String)],
+    owners: usize,
+) -> bool {
+    stream::iter(entries.iter())
+        .map(|(key, value)| async move {
+            let Ok(owner_ids) = reader.owners(key).await else {
+                return false;
+            };
+            if owner_ids.len() != owners {
+                return false;
+            }
+            for &(node, id) in tagged {
+                let want = owner_ids.contains(&id).then(|| value.clone());
+                if node.get(key).await != Ok(want) {
+                    return false;
+                }
+            }
+            true
+        })
+        .buffer_unordered(16)
+        .all(|matched| async move { matched })
+        .await
+}
+
+/// Concurrently reads every `(key, value)` in `entries` from every one of
+/// `nodes` via [`Node::fetch`], returning a description of every reply that
+/// wasn't `Ok(Some(value))` (empty on full agreement). Concurrent over the
+/// full node-by-entry cross product for the same reason
+/// [`ownership_snapshot_matches`] is: many container round trips otherwise
+/// add up fast.
+async fn fetch_mismatches(nodes: &[&Node], entries: &[(String, String)]) -> Vec<String> {
+    let pairs: Vec<(&Node, &(String, String))> = nodes
+        .iter()
+        .flat_map(|&node| entries.iter().map(move |entry| (node, entry)))
+        .collect();
+    stream::iter(pairs)
+        .map(|(node, (key, value))| async move {
+            let got = node.fetch(key).await;
+            (node.name().to_string(), key.clone(), value.clone(), got)
+        })
+        .buffer_unordered(64)
+        .filter_map(|(name, key, expected, got)| async move {
+            (got != Ok(Some(expected.clone())))
+                .then(|| format!("{name}/{key}: expected Ok(Some({expected:?})), got {got:?}"))
+        })
+        .collect()
+        .await
+}
+
+/// Sum of `count` across every node in `nodes`, `None` if any read fails —
+/// the shared building block every distributed scenario's convergence poll
+/// below sums to `owners * fill_keys`.
+async fn sum_counts(nodes: &[&Node]) -> Option<usize> {
+    let mut sum = 0usize;
+    for node in nodes {
+        sum += node.count().await.ok()?;
+    }
+    Some(sum)
+}
+
+/// Every `sundog-testnode` opens `"it"`'s `Mode::Distributed` bucket space
+/// over `sundog::store::BUCKET_COUNT` buckets; with `owners` owners per
+/// bucket, the summed `sundog_owned_buckets` gauge across every live node
+/// settles at this many bucket-ownership assignments.
+fn expected_owned_buckets_sum(owners: u64) -> u64 {
+    sundog::store::BUCKET_COUNT as u64 * owners
+}
+
