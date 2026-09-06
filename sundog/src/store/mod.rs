@@ -4347,6 +4347,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_guard_returns_nothing_for_an_unowned_bucket_on_every_serving_method() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let unowned_key = find_key_by_ownership(&view, false);
+        let unowned_bucket = bucket_of(&key_bytes(&unowned_key));
+
+        assert_eq!(
+            ShardOps::bucket_lens(&s, vec![unowned_bucket]).await,
+            vec![(unowned_bucket, 0)],
+            "bucket_lens reports zero for an unowned bucket"
+        );
+        assert_eq!(
+            ShardOps::part_digests(&s, vec![unowned_bucket]).await,
+            vec![(unowned_bucket, Vec::new())],
+            "part_digests reports nothing for an unowned bucket"
+        );
+        let part = (unowned_bucket, 0u8);
+        assert_eq!(
+            ShardOps::entries_for_parts(&s, vec![part]).await,
+            vec![(part, Vec::new())],
+            "entries_for_parts reports nothing for an unowned bucket's part"
+        );
+        assert!(
+            ShardOps::records_for(&s, vec![key_bytes(&unowned_key)])
+                .await
+                .is_empty(),
+            "records_for never answers a key in an unowned bucket"
+        );
+        let snapshot: Vec<WireRecord> = ShardOps::snapshot_chunks(&s)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            snapshot
+                .iter()
+                .all(|rec| bucket_of(rec.key.as_ref()) != unowned_bucket),
+            "snapshot_chunks never includes a record from an unowned bucket"
+        );
+    }
+
+    #[tokio::test]
     async fn a_releasing_bucket_still_answers_digests_and_entries() {
         let self_node = NodeId::from(1);
         // Self starts as the sole eligible node: it owns every bucket, so an
