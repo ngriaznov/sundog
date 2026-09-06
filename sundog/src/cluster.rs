@@ -12,6 +12,7 @@
 
 pub(crate) mod absence;
 pub(crate) mod anti_entropy;
+pub(crate) mod rebalance;
 pub(crate) mod sketch;
 pub(crate) mod state_transfer;
 
@@ -47,7 +48,9 @@ use crate::net::{
 };
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
-use crate::store::{FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of};
+use crate::store::{
+    FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of, chunk_records_for_snapshot,
+};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
@@ -313,6 +316,12 @@ impl Cluster {
         self.inner.membership.cache_modes().borrow().clone()
     }
 
+    /// A fresh watch subscription on every live peer's advertised cache
+    /// modes, for [`crate::ownership::refresh_task`]'s trigger.
+    pub(crate) fn cache_modes_watch(&self) -> watch::Receiver<CacheModes> {
+        self.inner.membership.cache_modes()
+    }
+
     /// Records that this node can donate a snapshot of `cache` from now on;
     /// see [`Warmth`].
     pub(crate) fn mark_warm(&self, cache: &SmolStr) {
@@ -323,6 +332,13 @@ impl Cluster {
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn is_warm(&self, cache: &SmolStr) -> bool {
         self.inner.warmth.is_warm(cache)
+    }
+
+    /// This node's own gossip address, for a test harness that seeds a
+    /// second node against a running one.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(crate) fn local_gossip_addr(&self) -> SocketAddr {
+        self.inner.membership.local_peer().gossip_addr
     }
 
     /// The cluster-side half of [`crate::cache::Cache::close`]: drops `name`
@@ -836,18 +852,32 @@ impl RequestHandler for ClusterRequestHandler {
         self.ae_sketch_cells
     }
 
-    // Distribution-mode stubs: stand in for the real shard-backed bodies
-    // until the shard side of ownership serving lands. Each returns exactly
-    // its `RequestHandler` default, so a peer sees the same "unavailable"
-    // degradation it would see for an unrecognized cache.
+    // Distribution-mode serving: every method here answers `Unavailable`
+    // (or its shape's equivalent) for a cache that isn't registered, or one
+    // registered but not a `Mode::Distributed` cache (`ownership_view_hash`
+    // is `None` either way) — the same "unknown cache degrades gracefully"
+    // convention every other method on this trait already has.
     fn ownership_view_hash(&self, cache: SmolStr) -> Option<u64> {
-        let _ = cache;
-        None
+        self.lookup(&cache)
+            .and_then(|shard| shard.ownership_view_hash())
     }
 
     fn fetch(&self, cache: SmolStr, key: Bytes, view_hash: u64) -> BoxFuture<'_, FetchServe> {
-        let _ = (cache, key, view_hash);
-        Box::pin(async { FetchServe::Unavailable })
+        Box::pin(async move {
+            let Some(shard) = self.lookup(&cache) else {
+                return FetchServe::Unavailable;
+            };
+            let Some(local_hash) = shard.ownership_view_hash() else {
+                return FetchServe::Unavailable;
+            };
+            if local_hash != view_hash {
+                return FetchServe::Stale {
+                    responder_view_hash: local_hash,
+                };
+            }
+            let rec = shard.records_for(vec![key]).await.into_iter().next();
+            FetchServe::Found(rec)
+        })
     }
 
     fn ae_digest_scoped(
@@ -856,13 +886,32 @@ impl RequestHandler for ClusterRequestHandler {
         view_hash: u64,
         buckets: Vec<(u16, u64)>,
     ) -> BoxFuture<'_, AeServeOutcome> {
-        let _ = (cache, view_hash, buckets);
-        Box::pin(async { AeServeOutcome::Unavailable })
+        // The requester's own bucket list only matters once its epoch is
+        // confirmed current; the mismatch classification against it happens
+        // one layer up, in `conn::serve_ae_digest_scoped`.
+        let _ = buckets;
+        Box::pin(async move {
+            let Some(shard) = self.lookup(&cache) else {
+                return AeServeOutcome::Unavailable;
+            };
+            let Some(local_hash) = shard.ownership_view_hash() else {
+                return AeServeOutcome::Unavailable;
+            };
+            if local_hash != view_hash {
+                return AeServeOutcome::Stale {
+                    responder_view_hash: local_hash,
+                };
+            }
+            AeServeOutcome::Digests(shard.digests().await)
+        })
     }
 
     fn st_buckets_available(&self, cache: SmolStr, view_hash: u64) -> BoxFuture<'_, bool> {
-        let _ = (cache, view_hash);
-        Box::pin(async { false })
+        Box::pin(async move {
+            self.lookup(&cache)
+                .and_then(|shard| shard.ownership_view_hash())
+                .is_some_and(|local_hash| local_hash == view_hash)
+        })
     }
 
     fn st_bucket_chunks(
@@ -870,8 +919,19 @@ impl RequestHandler for ClusterRequestHandler {
         cache: SmolStr,
         buckets: Vec<u16>,
     ) -> BoxStream<'static, Vec<WireRecord>> {
-        let _ = (cache, buckets);
-        stream::empty().boxed()
+        let Some(shard) = self.lookup(&cache) else {
+            return stream::empty().boxed();
+        };
+        let fut = async move {
+            let entries = shard.entries_for_buckets(buckets).await;
+            let keys: Vec<Bytes> = entries
+                .into_iter()
+                .flat_map(|(_, entries)| entries.into_iter().map(|(key, _)| key))
+                .collect();
+            let recs = shard.records_for(keys).await;
+            chunk_records_for_snapshot(recs)
+        };
+        Box::pin(stream::once(fut).flat_map(stream::iter))
     }
 }
 
@@ -1351,7 +1411,10 @@ async fn fan_out_batch<K, V>(
 /// `tombstone_ttl` defers via [`absence::should_defer_gc`]: while a
 /// recently known member is absent, a `Mode::Replicated` tombstone survives
 /// up to `tombstone_max_ttl`, so that member can't resurrect the entry on
-/// return. `Mode::Local`/`Mode::Invalidation` never defer.
+/// return. A `Mode::Distributed` cache narrows the same rule to an absent
+/// member that currently co-owns at least one bucket this node also owns,
+/// read off `shard`'s own current ownership view each tick.
+/// `Mode::Local`/`Mode::Invalidation` never defer.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
@@ -1369,7 +1432,8 @@ pub(crate) async fn tombstone_gc_task(
             () = cancel.cancelled() => return,
             _ = ticker.tick() => {
                 shard.run_pending_tasks().await;
-                let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl);
+                let view = shard.ownership_view();
+                let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl, view.as_deref());
                 shard.gc_tombstones(defer).await;
             }
         }
@@ -3456,6 +3520,295 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_task_republishes_on_a_membership_change_and_skips_an_unchanged_hash() {
+        let cluster_a = Cluster::builder("cluster-it-refresh-task")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("a builds");
+        let name = SmolStr::new("prices");
+        let k = std::num::NonZeroU8::new(2).expect("nonzero");
+
+        let (tracker, tx) = crate::ownership::OwnershipTracker::seed(
+            cluster_a.node_id(),
+            &cluster_a.peers(),
+            &cluster_a.advertised_cache_modes(),
+            &name,
+            k,
+        );
+        let mut sub = tracker.subscribe();
+        let initial_hash = sub.borrow().view_hash();
+
+        let cancel = CancellationToken::new();
+        tokio::spawn(crate::ownership::refresh_task(
+            cluster_a.clone(),
+            name.clone(),
+            k,
+            tx,
+            cancel.clone(),
+        ));
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-refresh-task")
+            .seeds([gossip_a])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        cluster_b.advertise_cache_mode(&name, Mode::Distributed { owners: k });
+        wait_for_peer_count(&cluster_a, 1).await;
+
+        tokio::time::timeout(Duration::from_secs(10), sub.changed())
+            .await
+            .expect("refresh_task republishes within the bound")
+            .expect("the sender stays alive");
+        let republished_hash = sub.borrow_and_update().view_hash();
+        assert_ne!(
+            republished_hash, initial_hash,
+            "b becoming eligible changes the computed view"
+        );
+
+        // Re-advertising the exact same mode bumps b's gossip version (a
+        // real membership change `cache_modes_watch` fires on) without
+        // changing the eligible set at all: the recomputed view hash is
+        // identical, so `send_if_modified` never republishes. A bounded
+        // quiescence window with no further `changed()` is the direct
+        // observation of that skip.
+        cluster_b.advertise_cache_mode(&name, Mode::Distributed { owners: k });
+        let unchanged = tokio::time::timeout(Duration::from_millis(800), sub.changed()).await;
+        assert!(
+            unchanged.is_err(),
+            "an unchanged eligible set never republishes a new view"
+        );
+        assert_eq!(
+            tracker.current().view_hash(),
+            republished_hash,
+            "the view stayed exactly what it was"
+        );
+
+        cancel.cancel();
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_round_against_ends_on_stale_without_pushing_or_pulling() {
+        // Two solo `Mode::Distributed` clusters, never gossip-joined to each
+        // other, so each independently computes its own view over just
+        // itself — genuinely different view hashes, since their `NodeId`s
+        // differ. `Mesh::update_peers` (a real, public mesh API) registers
+        // `b` on `a`'s mesh directly, the deterministic way to drive a real
+        // `AeDigestScoped` exchange to a real `StaleView` reply without
+        // racing gossip's own convergence timing.
+        let cluster_a = Cluster::builder("cluster-it-ae-stale-a")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let cluster_b = Cluster::builder("cluster-it-ae-stale-b")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        let name = SmolStr::new("prices");
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let cache_a = cluster_a
+            .cache::<u32, String>(name.as_str())
+            .mode(Mode::Distributed { owners })
+            .open()
+            .await
+            .expect("a opens alone");
+        let cache_b = cluster_b
+            .cache::<u32, String>(name.as_str())
+            .mode(Mode::Distributed { owners })
+            .open()
+            .await
+            .expect("b opens alone");
+        cache_b
+            .insert(1, "b-only".to_string())
+            .await
+            .expect("insert");
+
+        let peer_b = cluster_b.inner.membership.local_peer();
+        assert_ne!(
+            peer_b.gossip_addr,
+            cluster_a.inner.membership.local_peer().gossip_addr,
+            "distinct real nodes"
+        );
+        cluster_a.mesh().update_peers(vec![peer_b.clone()]);
+
+        let shard_a = registered_shard(&cluster_a, &name);
+        let shard_b = registered_shard(&cluster_b, &name);
+        let hash_a = shard_a.ownership_view_hash().expect("a is distributed");
+        let hash_b = shard_b.ownership_view_hash().expect("b is distributed");
+        assert_ne!(
+            hash_a, hash_b,
+            "two independently-solo nodes compute different view hashes"
+        );
+
+        crate::cluster::anti_entropy::run_round_against(&cluster_a, &shard_a, &name, peer_b.node)
+            .await;
+
+        assert_eq!(
+            cache_a.get(&1).await,
+            None,
+            "a stale round ends before any push or pull lands b's key on a"
+        );
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    /// A short-`ae_interval`, short-disown-grace config for the rebalance
+    /// tests below: fast enough that a real grace elapses within a few
+    /// hundred milliseconds, not the default 30 seconds.
+    fn rebalance_config() -> ClusterConfig {
+        ClusterConfig {
+            ae_interval: Duration::from_millis(50),
+            distributed_disown_grace_rounds: 4,
+            ..loopback_config()
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scripted three-node join-then-release scenario"
+    )]
+    #[tokio::test]
+    async fn rebalance_moves_a_bucket_to_a_joiner_and_the_old_owner_releases_it_after_the_grace() {
+        let config = rebalance_config();
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let name = SmolStr::new("prices");
+
+        let cluster_a = Cluster::builder("cluster-it-rebalance-join")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>(name.as_str())
+            .mode(Mode::Distributed { owners })
+            .open()
+            .await
+            .expect("a opens alone");
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-rebalance-join")
+            .seeds([gossip_a])
+            .config(config.clone())
+            .build()
+            .await
+            .expect("b builds");
+        wait_for_peer_count(&cluster_a, 1).await;
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(10),
+            cluster_b
+                .cache::<u32, String>(name.as_str())
+                .mode(Mode::Distributed { owners })
+                .open(),
+        )
+        .await
+        .expect("b opens within the bound")
+        .expect("b opens");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        // With only a and b live, owners = 2 means both hold everything.
+        cache_a
+            .insert_many((0..500u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("a fills the cache before c ever joins");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cache_b.entry_count().await == 500 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("b holds everything too, before c joins");
+
+        let cluster_c = Cluster::builder("cluster-it-rebalance-join")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("c builds");
+        let cache_c = tokio::time::timeout(
+            Duration::from_secs(10),
+            cluster_c
+                .cache::<u32, String>(name.as_str())
+                .mode(Mode::Distributed { owners })
+                .open(),
+        )
+        .await
+        .expect("c opens within the bound")
+        .expect("c opens");
+        wait_for_peer_count(&cluster_a, 2).await;
+        wait_for_peer_count(&cluster_b, 2).await;
+        wait_for_peer_count(&cluster_c, 2).await;
+
+        // A key whose bucket c has newly gained, once c's own ownership
+        // view has recomputed around a and b's cache-mode gossip landing.
+        let (moved_key, a_displaced) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for key in 0..500u32 {
+                    let owners_now = cache_c.owners_of(&key);
+                    if owners_now.contains(&cluster_c.node_id()) {
+                        let a_displaced = !owners_now.contains(&cluster_a.node_id());
+                        return (key, a_displaced);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("c's view converges to own at least one of the 500 keys' buckets");
+        let displaced_cache = if a_displaced { &cache_a } else { &cache_b };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cache_c.get(&moved_key).await == Some(moved_key.to_string()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("c's rebalance pull lands the moved key's value");
+
+        // A brief, deliberate quiescence window: right after the pull lands
+        // (necessarily well inside the several-hundred-millisecond disown
+        // grace, since the pull is triggered immediately on the ownership
+        // change while the grace only starts counting down from the same
+        // moment), the displaced node has not released anything yet.
+        assert_eq!(
+            displaced_cache.get(&moved_key).await,
+            Some(moved_key.to_string()),
+            "the displaced owner still resides the key mid disown-grace"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if displaced_cache.get(&moved_key).await.is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the displaced owner releases the key once the disown grace elapses");
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+        cluster_c.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn records_for_hashes_answers_exactly_the_records_whose_hash_matches() {
         let cluster = Cluster::builder("cluster-it-records-for-hashes")
             .seeds(std::iter::empty())
@@ -3508,11 +3861,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_request_handler_distribution_mode_stubs_degrade_gracefully() {
-        // These five methods are stand-ins for the shard-backed bodies that
-        // land once distribution mode is fully wired up: each must answer
-        // exactly its `RequestHandler` default, for any cache name,
-        // regardless of the (here, empty) shard registry.
+    async fn cluster_request_handler_degrades_gracefully_for_an_unregistered_cache() {
+        // An unregistered cache name answers every distribution-mode method
+        // with its `Unavailable` shape, the same "unknown cache degrades
+        // gracefully" convention every other method on this trait already
+        // has.
         let handler = ClusterRequestHandler {
             shards: Arc::new(RwLock::new(HashMap::new())),
             warmth: Arc::new(Warmth::default()),
@@ -3537,8 +3890,93 @@ mod tests {
         let mut chunks = handler.st_bucket_chunks(name, vec![0]);
         assert!(
             chunks.next().await.is_none(),
-            "the stub chunk stream is immediately empty"
+            "an unregistered cache's chunk stream is immediately empty"
         );
+    }
+
+    #[tokio::test]
+    async fn cluster_request_handler_serves_a_distributed_cache_by_view_hash() {
+        let cluster = Cluster::builder("cluster-it-request-handler-distributed")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("prices")
+            .mode(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+            })
+            .open()
+            .await
+            .expect("a solo node opens a distributed cache, owning every bucket");
+        cache.insert(1, "one".to_string()).await.expect("insert");
+
+        let handler = ClusterRequestHandler {
+            shards: cluster.shards(),
+            warmth: Arc::clone(&cluster.inner.warmth),
+            ae_part_min_bucket: cluster.config().ae_part_min_bucket,
+            ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
+            ae_sketch_cells: cluster.config().ae_sketch_cells,
+        };
+        let name = SmolStr::new("prices");
+        let view_hash = handler
+            .ownership_view_hash(name.clone())
+            .expect("a distributed cache reports a view hash");
+        let key_one = Bytes::from(postcard::to_stdvec(&1u32).expect("test key encodes"));
+
+        let FetchServe::Found(Some(rec)) = handler
+            .fetch(name.clone(), key_one.clone(), view_hash)
+            .await
+        else {
+            panic!("expected a found record for a key this sole owner holds");
+        };
+        assert_eq!(rec.key, key_one);
+        assert!(matches!(
+            handler
+                .fetch(name.clone(), key_one.clone(), view_hash.wrapping_add(1))
+                .await,
+            FetchServe::Stale { responder_view_hash } if responder_view_hash == view_hash
+        ));
+
+        let AeServeOutcome::Digests(digests) = handler
+            .ae_digest_scoped(name.clone(), view_hash, Vec::new())
+            .await
+        else {
+            panic!("expected the sole owner's own digests when the view hash matches");
+        };
+        assert!(
+            !digests.is_empty(),
+            "the sole owner reports digests for every bucket it owns"
+        );
+        assert!(matches!(
+            handler
+                .ae_digest_scoped(name.clone(), view_hash.wrapping_add(1), Vec::new())
+                .await,
+            AeServeOutcome::Stale { responder_view_hash } if responder_view_hash == view_hash
+        ));
+
+        assert!(handler.st_buckets_available(name.clone(), view_hash).await);
+        assert!(
+            !handler
+                .st_buckets_available(name.clone(), view_hash.wrapping_add(1))
+                .await
+        );
+
+        let owned_bucket = bucket_of_u32(1);
+        let mut chunks = handler.st_bucket_chunks(name, vec![owned_bucket]);
+        let mut got_key = false;
+        while let Some(chunk) = chunks.next().await {
+            if chunk.iter().any(|r| r.key == key_one) {
+                got_key = true;
+            }
+        }
+        assert!(
+            got_key,
+            "st_bucket_chunks streams the requested owned bucket's contents"
+        );
+
+        cluster.shutdown().await;
     }
 
     #[tokio::test]

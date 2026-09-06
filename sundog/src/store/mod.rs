@@ -76,7 +76,7 @@ const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 /// `Msg::StChunk`. Splits on cumulative wire-encoded size as well as
 /// [`SNAPSHOT_CHUNK_SIZE`], since a fixed record count alone undercounts caches
 /// whose average value exceeds a few KiB.
-fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
+pub(crate) fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
     let budget = MAX_FRAME.saturating_sub(SNAPSHOT_CHUNK_ENVELOPE_HEADROOM);
     let mut chunks = Vec::new();
     let mut current = Vec::new();
@@ -553,7 +553,7 @@ impl std::error::Error for SharedLoaderFailure {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -586,7 +586,7 @@ fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
 /// Debug builds assert the encoding round-trips to itself. A key type whose
 /// `Serialize` impl is not canonical, such as an iteration-order-dependent
 /// `HashMap`-typed key, would silently corrupt digests and break wire identity.
-fn encode_key<K>(key: &K) -> Result<Bytes, CodecError>
+pub(crate) fn encode_key<K>(key: &K) -> Result<Bytes, CodecError>
 where
     K: Serialize + DeserializeOwned,
 {
@@ -650,10 +650,6 @@ where
     /// `Some` only for `Mode::Distributed`. Drives anti-entropy's cohort
     /// widening and the donor-serving exception; never consulted by the
     /// inbound-apply guard, which stays strict current-view ownership.
-    #[allow(
-        dead_code,
-        reason = "read by anti-entropy's cohort widening and donor-serving exception once they are wired up"
-    )]
     residency: Option<Arc<ResidencySet>>,
     /// Set by `Shard::attach_spill`: the semaphore bounding concurrent
     /// disk reads and the metric handles the spilled-key read path counts
