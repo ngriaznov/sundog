@@ -1216,10 +1216,14 @@ mod tests {
         // both are warm, `a` drops its copy of a key and marks the bucket
         // cold again by hand, so a fetch on `a` has to ask `b`; then `b`
         // does the same, and `a`'s fetch is a miss rather than an error.
+        // Anti-entropy is effectively off: it would repair a dropped copy
+        // from the co-owner and race every step below.
         let name = "distributed-cold-fetch";
+        let mut config = loopback_config();
+        config.ae_interval = Duration::from_secs(3600);
         let a = Cluster::builder(name)
             .seeds(std::iter::empty())
-            .config(loopback_config())
+            .config(config.clone())
             .build()
             .await
             .expect("node a builds");
@@ -1229,7 +1233,19 @@ mod tests {
             .open()
             .await
             .expect("a opens alone");
-        let (b, cache_b) = join_distributed(a.local_gossip_addr(), name, name, 1).await;
+        let b = Cluster::builder(name)
+            .seeds([a.local_gossip_addr()])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&b, 1).await;
+        let cache_b = b
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens");
         wait_for_peer_count(&a, 1).await;
         cache_b
             .insert(7, "seven".to_string())
