@@ -13,9 +13,10 @@
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroU8;
 use std::time::Duration;
 
-use sundog::{Cluster, Mode};
+use sundog::{CacheError, Cluster, Mode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -263,6 +264,216 @@ async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
         .await;
 }
 
+/// Opens `prices` as `Mode::Distributed { owners: 2 }` across `cluster`,
+/// `peer`, and two more nodes joined just for this scenario, driving every
+/// `sundog_fetch_total` outcome, a forwarded write, and both
+/// `sundog_rebalance_buckets_total` directions on `cluster` itself — the
+/// only node whose metrics this test scrapes. Folded into the main test
+/// rather than its own `#[tokio::test]`, for the same process-global
+/// recorder reason `spill_writes_and_promotes_pin_metrics` is.
+#[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
+async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: SocketAddr) {
+    let owners = NonZeroU8::new(2).expect("nonzero");
+    let name = "prices";
+
+    // `peer` and a fresh third node stabilize a two-way distributed cache
+    // (both own everything with only two eligible nodes) before `cluster`
+    // ever opens it, so `cluster`'s own open() pulls a real share of the
+    // 1,024 buckets from a real donor: the open()-time initial pull is
+    // `sundog_rebalance_buckets_total{direction="in"}`'s natural trigger.
+    let third = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(node_config(common::reserve_gossip_addr().await))
+        .build()
+        .await
+        .expect("third node builds");
+    common::wait_for_peer_count(&third, 1, Duration::from_secs(15)).await;
+    // Both real peers, not just third's own view of the mesh: cluster's
+    // own membership must include third before it ever opens prices.
+    common::wait_for_peer_count(cluster, 2, Duration::from_secs(15)).await;
+
+    let peer_prices = peer
+        .cache::<u32, String>(name)
+        .mode(Mode::Distributed { owners })
+        .open()
+        .await
+        .expect("peer opens prices");
+    let third_prices = third
+        .cache::<u32, String>(name)
+        .mode(Mode::Distributed { owners })
+        .open()
+        .await
+        .expect("third opens prices");
+    peer_prices
+        .insert_many((0..500u32).map(|k| (k, k.to_string())))
+        .await
+        .expect("peer fills prices before cluster ever opens it");
+    common::eventually(Duration::from_secs(15), || async {
+        third_prices.entry_count().await == 500
+    })
+    .await;
+
+    // A short, documented quiescence window: gossip needs a couple of
+    // rounds past peer liveness to also carry peer's and third's cache-mode
+    // advertisements to `cluster`, so `cluster`'s very first computed view
+    // already reflects both real co-owners instead of transiently
+    // believing itself the sole one.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let cluster_prices = cluster
+        .cache::<u32, String>(name)
+        .mode(Mode::Distributed { owners })
+        .open()
+        .await
+        .expect("cluster opens prices, pulling its share from peer/third");
+
+    // outcome="local": a key cluster owns after its view converges.
+    let owned_key = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(k) =
+                (0..500u32).find(|&k| cluster_prices.owners_of(&k).contains(&cluster.node_id()))
+            {
+                return k;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cluster owns at least one of the 500 keys");
+    // Owning a bucket per the current view and already holding its data
+    // are separate facts: the initial pull for this particular bucket may
+    // still be in flight, or the round it landed on may have declined and
+    // await a retry, so this polls rather than asserting the very first
+    // fetch.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(Some(value)) = cluster_prices.fetch(&owned_key).await
+                && value == owned_key.to_string()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("outcome=local eventually reads the owned key's value");
+
+    // outcome="remote": cluster reads an unowned key's value back over the
+    // wire from a real owner — proof the open()-time pull, or a live fetch
+    // to peer/third, delivers it.
+    let unowned_key = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(k) =
+                (0..500u32).find(|&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
+            {
+                return k;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cluster's view excludes it from at least one of the 500 keys");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(Some(value)) = cluster_prices.fetch(&unowned_key).await
+                && value == unowned_key.to_string()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("outcome=remote reaches a real owner");
+
+    // outcome="miss": a key nobody ever wrote, in a bucket cluster still
+    // does not own.
+    let miss_key = (10_000..20_000u32)
+        .find(|&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
+        .expect("some never-written key's bucket excludes cluster too");
+    assert_eq!(
+        cluster_prices
+            .fetch(&miss_key)
+            .await
+            .expect("fetch succeeds"),
+        None,
+        "outcome=miss"
+    );
+
+    // sundog_forwarded_writes_total: a write through cluster for a key it
+    // does not own forwards rather than ever applying locally.
+    cluster_prices
+        .insert(unowned_key, "forwarded".to_string())
+        .await
+        .expect("insert forwards");
+    assert_eq!(
+        cluster_prices.get(&unowned_key).await,
+        None,
+        "a forwarded write never lands locally on cluster"
+    );
+
+    // sundog_rebalance_buckets_total{direction="out"}: a fourth node joins
+    // and, for at least one of cluster's owned buckets, displaces it;
+    // cluster releases that bucket once the disown grace elapses.
+    let owned_before: Vec<u32> = (0..500u32)
+        .filter(|&k| cluster_prices.owners_of(&k).contains(&cluster.node_id()))
+        .collect();
+    let fourth = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(node_config(common::reserve_gossip_addr().await))
+        .build()
+        .await
+        .expect("fourth node builds");
+    let _fourth_prices = fourth
+        .cache::<u32, String>(name)
+        .mode(Mode::Distributed { owners })
+        .open()
+        .await
+        .expect("fourth opens prices");
+    let displaced_key = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(&k) = owned_before
+                .iter()
+                .find(|&&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
+            {
+                return k;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fourth's arrival displaces cluster from at least one previously-owned bucket");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if cluster_prices.get(&displaced_key).await.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cluster releases the displaced bucket once the disown grace elapses");
+
+    // outcome="error": every real owner of some key cluster never owned
+    // goes down; both dials fail before gossip has time to react.
+    let error_key = (20_000..30_000u32)
+        .find(|&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
+        .expect("some key's bucket excludes cluster among four real nodes");
+    let error_owners = cluster_prices.owners_of(&error_key);
+    for down in [peer.clone(), third.clone(), fourth.clone()] {
+        if error_owners.contains(&down.node_id()) {
+            down.shutdown().await;
+        }
+    }
+    assert!(
+        matches!(
+            cluster_prices.fetch(&error_key).await,
+            Err(CacheError::FetchUnavailable { .. })
+        ),
+        "outcome=error"
+    );
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "folds in the spill metrics pin behind feature = \"spill\"; see \
@@ -298,6 +509,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     count_hits_and_misses(&cluster).await;
     #[cfg(feature = "spill")]
     let spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
+    // Runs last: it shuts down two of its own scenario-local nodes once it
+    // no longer needs them, and `peer` isn't touched by anything after it.
+    seed_distributed_metrics(&cluster, &peer, gossip_a).await;
 
     // `sundog_open_caches` comes from a periodic background routine and the
     // sketch/parts counters from an anti-entropy round, so poll until every
@@ -355,6 +569,46 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             .is_some_and(|listings| listings >= 1.0),
         "expected at least one part listing on the 'parts' cache; got body:\n{body}"
     );
+
+    assert!(
+        scraped_metric_value(&body, "sundog_owned_buckets", &[("cache", "prices")])
+            .is_some_and(|owned| owned > 0.0),
+        "expected a positive sundog_owned_buckets for the distributed 'prices' cache; got \
+         body:\n{body}"
+    );
+    for outcome in ["local", "remote", "miss", "error"] {
+        assert!(
+            scraped_metric_value(
+                &body,
+                "sundog_fetch_total",
+                &[("cache", "prices"), ("outcome", outcome)]
+            )
+            .is_some_and(|count| count >= 1.0),
+            "expected sundog_fetch_total{{cache=\"prices\",outcome=\"{outcome}\"}} >= 1; got \
+             body:\n{body}"
+        );
+    }
+    assert!(
+        scraped_metric_value(
+            &body,
+            "sundog_forwarded_writes_total",
+            &[("cache", "prices")]
+        )
+        .is_some_and(|count| count >= 1.0),
+        "expected at least one forwarded write on the 'prices' cache; got body:\n{body}"
+    );
+    for direction in ["in", "out"] {
+        assert!(
+            scraped_metric_value(
+                &body,
+                "sundog_rebalance_buckets_total",
+                &[("cache", "prices"), ("direction", direction)]
+            )
+            .is_some_and(|count| count >= 1.0),
+            "expected sundog_rebalance_buckets_total{{cache=\"prices\",direction=\"{direction}\"}} \
+             >= 1; got body:\n{body}"
+        );
+    }
 
     #[cfg(feature = "spill")]
     {
