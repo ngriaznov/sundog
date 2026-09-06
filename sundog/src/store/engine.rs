@@ -48,10 +48,11 @@
 //! (set by `Shard::attach_spill` from the cache's `Mode`): a
 //! `Mode::Local`/`Mode::Invalidation` cache falls through to the ordinary
 //! delete-and-XOR path, weight and all, exactly as without a tier, while a
-//! `Mode::Replicated` cache leaves the victim resident, at its untouched
-//! weight, `VictimOutcome::Deferred`, for a later `enforce_capacity` pass
-//! to retry — deleting it there would only have anti-entropy repair it back
-//! in from every peer that still holds it. A queue with no room right now
+//! `Mode::Replicated` or `Mode::Distributed` cache leaves the victim
+//! resident, at its untouched weight, `VictimOutcome::Deferred`, for a
+//! later `enforce_capacity` pass to retry — deleting it there would only
+//! have anti-entropy, or a rebalance donor pull, repair it back in from
+//! every peer that still holds it. A queue with no room right now
 //! can also surface later than `would_accept`: that can only be discovered
 //! by actually trying to send, so `Engine::evict_victim_locked` commits to
 //! the hand-off first, and the actual channel send, `SpillTier::enqueue`,
@@ -418,9 +419,10 @@ fn defer_to_flusher(pending_spill_weight: u64) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VictimRefusal {
     /// Leave the victim fully resident, at its current weight, for a later
-    /// eviction pass to retry: the `Mode::Replicated` policy, since a local
-    /// delete here is exactly what anti-entropy would just repair back in
-    /// from every peer that still holds the entry.
+    /// eviction pass to retry: the `Mode::Replicated`/`Mode::Distributed`
+    /// policy, since a local delete here is exactly what anti-entropy, or a
+    /// rebalance donor pull, would just repair back in from every peer that
+    /// still holds the entry.
     LeaveResident,
     /// Fall back to the ordinary physical delete, the only behavior every
     /// mode had before this policy existed, and still correct for
@@ -499,8 +501,9 @@ enum VictimOutcome {
     /// A configured spill tier refused this victim's hand-off
     /// ([`SpillTier::would_accept`] declining: too large, closed, or the
     /// flush queue is full), and [`spill_refusal_outcome`] says to leave it
-    /// resident rather than delete it — the `Mode::Replicated` policy `Shard
-    /// ::attach_spill` sets on the tier. `stripe.live` is untouched: the
+    /// resident rather than delete it — the `Mode::Replicated`/
+    /// `Mode::Distributed` policy `Shard::attach_spill` sets on the tier.
+    /// `stripe.live` is untouched: the
     /// entry keeps its full weight and stays a spill candidate for a later
     /// eviction pass to sample and retry, once the tier has room again.
     /// Reported to the caller exactly like [`VictimOutcome::Vanished`], no
@@ -1992,6 +1995,66 @@ where
         }
     }
 
+    /// Removes every locally held entry, live or tombstone, in each of
+    /// `buckets`: one write-lock hold per bucket, resetting that stripe's
+    /// digest atomics, [`Engine::live_count`], [`Engine::total_weight`], and
+    /// spill bookkeeping to match, the same accounting a per-key removal
+    /// keeps, batched here per stripe instead of per key. Writes no
+    /// tombstone of its own, so a released bucket carries nothing for
+    /// anti-entropy or replication to fan back out; a peer later applying a
+    /// fresh write for a key in a released bucket lands it under the
+    /// ordinary ownership-gated apply path, never a resurrection of what
+    /// was here. A bucket at or past [`BUCKET_COUNT`], which only a
+    /// misbehaving caller names, is skipped. Returns the total number of
+    /// entries removed, live and tombstoned together, across every bucket
+    /// given.
+    pub(crate) fn release_buckets(&self, buckets: &[u16]) -> u64 {
+        let mut removed_total = 0u64;
+        for &bucket in buckets {
+            if usize::from(bucket) >= BUCKET_COUNT {
+                continue;
+            }
+            let bucket_idx = usize::from(bucket);
+            let (removed_weight, removed_live, removed_tombstones, removed_spilled) = {
+                let mut stripe = self.stripes[bucket_idx].write();
+                let mut removed_weight = 0u64;
+                let mut removed_live = 0u64;
+                let mut removed_spilled = 0usize;
+                for live in stripe.live.drain() {
+                    removed_weight += u64::from(live.weight);
+                    removed_live += 1;
+                    if is_spilled(&live) {
+                        removed_spilled += 1;
+                    }
+                }
+                let removed_tombstones = stripe.tombstones.len();
+                stripe.tombstones.clear();
+                stripe.next_expiry_ms = u64::MAX;
+                (
+                    removed_weight,
+                    removed_live,
+                    removed_tombstones,
+                    removed_spilled,
+                )
+            };
+            for part in 0..PART_COUNT {
+                self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
+            }
+            if removed_weight > 0 {
+                self.total_weight
+                    .fetch_sub(removed_weight, Ordering::Relaxed);
+            }
+            if removed_live > 0 {
+                self.live_count.fetch_sub(removed_live, Ordering::Relaxed);
+            }
+            self.note_spill_departures(removed_spilled);
+            removed_total = removed_total
+                .saturating_add(removed_live)
+                .saturating_add(u64::try_from(removed_tombstones).unwrap_or(u64::MAX));
+        }
+        removed_total
+    }
+
     /// The lock-protected first half of [`super::Shard::get_or_load`]: a
     /// fast-path re-check, then either joining an already in-flight load or
     /// registering as the new owner.
@@ -2592,6 +2655,36 @@ mod tests {
         outcome
     }
 
+    /// [`put`]'s tombstone counterpart, for a test that needs a real
+    /// tombstone in place rather than a live entry.
+    fn tombstone<K, V>(engine: &Engine<K, V>, key: K, key_bytes: Bytes, ver: Hlc, now_ms: u64)
+    where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let hash = hash_key_bytes(key_bytes.as_ref());
+        let bucket = stripe_index_from_hash(hash);
+        let mut stripe = engine.stripes[bucket].write();
+        let resolver = LwwResolver;
+        let _ = apply_locked(
+            &mut stripe,
+            &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
+            &engine.total_weight,
+            &engine.live_count,
+            engine.weigher.as_ref(),
+            engine.tti_ms,
+            hash,
+            key,
+            key_bytes,
+            ver,
+            Incoming::Tombstone,
+            &resolver,
+            60_000,
+            600_000,
+            now_ms,
+        );
+    }
+
     #[test]
     fn read_of_an_expired_entry_is_absent_before_any_sweep() {
         let engine = engine_u32_string(u64::MAX, None);
@@ -2787,6 +2880,121 @@ mod tests {
                 .any(|(k, ver)| k.as_ref() == kb.as_ref() && *ver == hlc(2, 1)),
             "a removed key still appears in its bucket's entries, carrying the tombstone's \
              version: {records:?}"
+        );
+    }
+
+    /// A pair of `u32` keys, scanned from `1` up to `limit`, that land in
+    /// the same bucket, plus that bucket's own index.
+    fn same_bucket_pair(limit: u32) -> (u32, u32, usize) {
+        let mut by_bucket: HashMap<usize, Vec<u32>> = HashMap::new();
+        for k in 1..limit {
+            let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref()));
+            let group = by_bucket.entry(bucket).or_default();
+            group.push(k);
+            if group.len() == 2 {
+                return (group[0], group[1], bucket);
+            }
+        }
+        panic!("no colliding pair found within the first {limit} keys");
+    }
+
+    #[test]
+    fn release_buckets_removes_every_live_entry_and_tombstone_and_resets_the_digest() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let (live_key, tomb_key, bucket) = same_bucket_pair(100_000);
+        let bucket_u16 = u16::try_from(bucket).expect("invariant: bucket < BUCKET_COUNT");
+
+        let _ = put(
+            &engine,
+            live_key,
+            key_bytes(live_key),
+            "live".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        tombstone(&engine, tomb_key, key_bytes(tomb_key), hlc(1, 1), 0);
+
+        let removed = engine.release_buckets(&[bucket_u16]);
+
+        assert_eq!(removed, 2, "one live entry and one tombstone removed");
+        assert_eq!(engine.get(&live_key, 0), None, "the live entry is gone");
+        assert!(
+            engine.collect_buckets(&[bucket_u16], 0)[0].1.is_empty(),
+            "the tombstone is gone too: nothing is left in the released bucket"
+        );
+        assert_eq!(engine.debug_totals(), (0, 0));
+        for part in 0..PART_COUNT {
+            assert_eq!(
+                engine.digest[digest_slot(bucket, part)].load(Ordering::Relaxed),
+                0,
+                "every part digest in the released bucket is reset to zero"
+            );
+        }
+    }
+
+    #[test]
+    fn release_buckets_leaves_a_different_buckets_digest_and_entry_untouched() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let (live_key, _, released_bucket) = same_bucket_pair(100_000);
+        let other_key = (1..100_000u32)
+            .find(|&k| {
+                stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) != released_bucket
+            })
+            .expect("a distinct bucket is found quickly");
+        let other_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(other_key).as_ref()));
+        let other_part = part_index_from_hash(hash_key_bytes(key_bytes(other_key).as_ref()));
+
+        let _ = put(
+            &engine,
+            live_key,
+            key_bytes(live_key),
+            "live".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        let _ = put(
+            &engine,
+            other_key,
+            key_bytes(other_key),
+            "untouched".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        let digest_before =
+            engine.digest[digest_slot(other_bucket, other_part)].load(Ordering::Relaxed);
+
+        let removed =
+            engine.release_buckets(&[u16::try_from(released_bucket).expect("invariant: fits")]);
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            engine.digest[digest_slot(other_bucket, other_part)].load(Ordering::Relaxed),
+            digest_before,
+            "an untouched bucket's digest is unaffected"
+        );
+        assert_eq!(
+            engine.get(&other_key, 0),
+            Some("untouched".to_string()),
+            "a different bucket's entry survives release"
+        );
+    }
+
+    #[test]
+    fn release_buckets_skips_a_bucket_at_or_past_bucket_count_and_returns_zero() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 0);
+        let out_of_range = u16::try_from(BUCKET_COUNT).expect("invariant: BUCKET_COUNT fits u16");
+
+        let removed = engine.release_buckets(&[out_of_range]);
+
+        assert_eq!(removed, 0, "a bucket past BUCKET_COUNT removes nothing");
+        assert_eq!(
+            engine.get(&1, 0),
+            Some("a".to_string()),
+            "an out-of-range bucket touches nothing"
         );
     }
 
@@ -3939,6 +4147,30 @@ mod tests {
                 len,
                 generation,
             }
+        }
+
+        #[test]
+        fn release_buckets_decrements_the_spilled_entries_gauge_for_a_departing_spilled_entry() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            assert_eq!(engine.debug_spill_entries_count(), 1);
+
+            let removed =
+                engine.release_buckets(&[u16::try_from(bucket).expect("invariant: fits")]);
+
+            assert_eq!(
+                removed, 1,
+                "the spilled entry counts toward the removed total same as a resident one"
+            );
+            assert_eq!(
+                engine.debug_spill_entries_count(),
+                0,
+                "release_buckets corrects the spilled-entries gauge for a departing spilled entry"
+            );
+            assert_eq!(engine.live_entry_count(), 0);
         }
 
         #[test]

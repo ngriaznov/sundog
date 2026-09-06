@@ -43,7 +43,8 @@ use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler, batch_replicate};
 use crate::node::{NodeId, NodeName};
-use crate::store::{FanOutQueue, Mode, Shard, ShardOps};
+use crate::ownership::OwnershipView;
+use crate::store::{FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
@@ -1115,7 +1116,7 @@ async fn inbound_loop(
 pub(crate) async fn fan_out_task<K, V>(
     shard: Arc<Shard<K, V>>,
     cluster: Cluster,
-    queue: Arc<FanOutQueue<K>>,
+    queue: Arc<FanOutQueue<FanOutItem<K>>>,
     cache_name: SmolStr,
     mode: Mode,
     cancel: CancellationToken,
@@ -1128,9 +1129,72 @@ pub(crate) async fn fan_out_task<K, V>(
             biased;
             () = cancel.cancelled() => return,
             () = queue.wait_nonempty() => {
-                let keys = queue.drain();
-                fan_out_batch(&shard, &cluster, &cache_name, mode, keys).await;
+                let items = queue.drain();
+                fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
             }
+        }
+    }
+}
+
+/// Groups `records` by the exact target-peer set each should replicate to —
+/// its bucket's live owners under `view`, self excluded — pure and
+/// mesh-free, so [`fan_out_by_owner_set`] and its own unit tests both build
+/// on it directly. Two records whose buckets share the same owner set land
+/// in the same group, so replicating them costs one round trip per group,
+/// not one per record.
+fn group_by_owner_set(
+    view: &OwnershipView,
+    self_node: NodeId,
+    records: Vec<WireRecord>,
+) -> Vec<(Vec<NodeId>, Vec<WireRecord>)> {
+    let mut groups: Vec<(Vec<NodeId>, Vec<WireRecord>)> = Vec::new();
+    for rec in records {
+        let bucket = bucket_of(rec.key.as_ref());
+        let mut owners: Vec<NodeId> = view
+            .owners_of(bucket)
+            .iter()
+            .copied()
+            .filter(|&n| n != self_node)
+            .collect();
+        owners.sort_unstable();
+        match groups.iter_mut().find(|(peers, _)| *peers == owners) {
+            Some((_, recs)) => recs.push(rec),
+            None => groups.push((owners, vec![rec])),
+        }
+    }
+    groups
+}
+
+/// Groups `records` by the exact target-peer set each should replicate to —
+/// its bucket's live owners under `view`, self excluded — then sends each
+/// group as coalesced `Replicate`/`ReplicateBatch` frames through the
+/// mesh's existing per-peer outboxes ([`Mesh::send_frames`]). The single
+/// function both an owner's normal fan-out and a non-owner's forwarded
+/// writes route through: "group by owner set instead of broadcast" has one
+/// implementation, not two.
+fn fan_out_by_owner_set(
+    mesh: &Mesh,
+    cache_name: &SmolStr,
+    view: &OwnershipView,
+    self_node: NodeId,
+    records: Vec<WireRecord>,
+) {
+    for (owners, recs) in group_by_owner_set(view, self_node, records) {
+        if owners.is_empty() {
+            continue;
+        }
+        let frames: Vec<OutFrame> = batch_replicate(cache_name, recs)
+            .into_iter()
+            .filter_map(|msg| match OutFrame::new(msg) {
+                Ok(frame) => Some(frame),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode outbound message; dropped");
+                    None
+                }
+            })
+            .collect();
+        for peer in owners {
+            mesh.send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
         }
     }
 }
@@ -1140,32 +1204,60 @@ async fn fan_out_batch<K, V>(
     cluster: &Cluster,
     cache_name: &SmolStr,
     mode: Mode,
-    notified: Vec<K>,
+    notified: Vec<FanOutItem<K>>,
 ) where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    // The queue carries local writes only, so this only dedups the drained
-    // burst.
-    let mut seen: HashSet<&K> = HashSet::new();
-    let mut keys: Vec<K> = Vec::new();
-    for key in &notified {
-        if seen.insert(key) {
-            keys.push(key.clone());
+    // The queue carries local writes (every mode) and, under
+    // `Mode::Distributed`, forwarded non-owner writes. This only dedups the
+    // drained burst's applied keys; a forwarded record is used as-is, never
+    // re-fetched — there is nothing to re-fetch.
+    let mut seen: HashSet<K> = HashSet::new();
+    let mut applied_keys: Vec<K> = Vec::new();
+    let mut forwarded: Vec<WireRecord> = Vec::new();
+    for item in notified {
+        match item {
+            FanOutItem::Applied(key) => {
+                if seen.insert(key.clone()) {
+                    applied_keys.push(key);
+                }
+            }
+            FanOutItem::Forward(rec) => forwarded.push(rec),
         }
     }
-    if keys.is_empty() {
+    if applied_keys.is_empty() && forwarded.is_empty() {
         return;
     }
 
-    // Re-fetches through `Shard::records_for_typed` rather than carrying the
-    // `Hlc`/wire bytes on `Event` itself. A missing key on re-fetch means a
-    // later write or GC already covers it, so nothing stale needs fanning out.
-    let records = shard.records_for_typed(&keys).await;
+    // Re-fetches applied keys through `Shard::records_for_typed` rather
+    // than carrying the `Hlc`/wire bytes on `Event` itself. A missing key
+    // on re-fetch means a later write or GC already covers it, so nothing
+    // stale needs fanning out. A forwarded record was never applied
+    // locally, so it travels exactly as built.
+    let mut records = shard.records_for_typed(&applied_keys).await;
+    records.extend(forwarded);
+    if records.is_empty() {
+        return;
+    }
+
+    if let Mode::Distributed { .. } = mode {
+        let Some(view) = shard.ownership_view() else {
+            return;
+        };
+        fan_out_by_owner_set(
+            cluster.mesh(),
+            cache_name,
+            &view,
+            cluster.node_id(),
+            records,
+        );
+        return;
+    }
+
     let peers = cluster.live_peer_ids();
     let (class, msgs): (MsgClass, Vec<Msg>) = match mode {
-        // A Distributed cache fans nothing out yet: it currently behaves
-        // like Local for both reads and writes.
+        // Distributed is handled, and returned, above.
         Mode::Local | Mode::Distributed { .. } => return,
         Mode::Invalidation => (
             MsgClass::Invalidate,
@@ -2616,6 +2708,109 @@ mod tests {
         let bytes = postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes");
         let bucket = xxhash_rust::xxh3::xxh3_64(&bytes) & (crate::store::BUCKET_COUNT as u64 - 1);
         u16::try_from(bucket).expect("masked to BUCKET_COUNT - 1, always fits in u16")
+    }
+
+    // --- Distribution mode fan-out grouping (`cluster::group_by_owner_set`) ---
+
+    /// A `WireRecord` for `key`, its own postcard-encoded bytes as `key`.
+    fn wire_record_for_u32(key: u32) -> WireRecord {
+        WireRecord {
+            key: postcard::to_stdvec(&key)
+                .expect("a u32 key always postcard-encodes")
+                .into(),
+            value: Some(Bytes::from_static(b"\x01v")),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    /// `group_by_owner_set`'s grouping is a pure function of an
+    /// `OwnershipView` and a record list, with no `Mesh` or live cluster
+    /// involved: this is `fan_out_by_owner_set`'s own test, and the
+    /// pointed regression for "an owner's write fans out only to the
+    /// bucket's other owners, never to every live peer."
+    #[test]
+    fn insert_on_an_owner_fans_out_only_to_the_bucket_other_owners_not_every_live_peer() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
+        let k = std::num::NonZeroU8::new(2).expect("nonzero");
+        let view = OwnershipView::compute(self_node, eligible.clone(), k);
+
+        // Two keys in different buckets, so their owner sets can differ.
+        let key_a = 0u32;
+        let key_b = (1u32..100_000)
+            .find(|&k| bucket_of_u32(k) != bucket_of_u32(key_a))
+            .expect("a second, distinct bucket is found quickly");
+
+        let groups = group_by_owner_set(
+            &view,
+            self_node,
+            vec![wire_record_for_u32(key_a), wire_record_for_u32(key_b)],
+        );
+
+        let mut total = 0usize;
+        for (peers, recs) in &groups {
+            assert!(
+                !peers.contains(&self_node),
+                "self is never its own fan-out target"
+            );
+            assert!(
+                peers.len() < eligible.len(),
+                "a group's peer set is never every eligible/live node, only a bucket's other \
+                 owners: {peers:?}"
+            );
+            for rec in recs {
+                let key: u32 = postcard::from_bytes(&rec.key).expect("test key decodes");
+                let bucket = bucket_of_u32(key);
+                let mut expected: Vec<NodeId> = view
+                    .owners_of(bucket)
+                    .iter()
+                    .copied()
+                    .filter(|&n| n != self_node)
+                    .collect();
+                expected.sort_unstable();
+                assert_eq!(
+                    peers, &expected,
+                    "a record's group is exactly its bucket's live owners minus self"
+                );
+            }
+            total += recs.len();
+        }
+        assert_eq!(total, 2, "every record lands in exactly one group");
+    }
+
+    #[test]
+    fn group_by_owner_set_coalesces_records_sharing_the_same_owner_set() {
+        let self_node = NodeId::from(1);
+        // A single eligible peer besides self, so every bucket's owner set
+        // minus self is either empty (self is sole owner) or exactly that
+        // one peer — every non-empty group is the same peer set.
+        let eligible = vec![self_node, NodeId::from(2)];
+        let k = std::num::NonZeroU8::new(1).expect("nonzero");
+        let view = OwnershipView::compute(self_node, eligible, k);
+
+        let records: Vec<WireRecord> = (0u32..50).map(wire_record_for_u32).collect();
+        let groups = group_by_owner_set(&view, self_node, records.clone());
+
+        let non_empty_groups: Vec<_> = groups
+            .iter()
+            .filter(|(peers, _)| !peers.is_empty())
+            .collect();
+        assert!(
+            non_empty_groups.len() <= 1,
+            "with only one other eligible node, every non-empty group is the same one peer set: \
+             {non_empty_groups:?}"
+        );
+        let total: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+        assert_eq!(
+            total,
+            records.len(),
+            "no record is lost or duplicated by grouping"
+        );
     }
 
     /// Among `0..n`, every key in a bucket holding more than `min_count` of
