@@ -23,7 +23,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::Cluster;
 use super::sketch::{Cell, Decoded, Iblt};
 use crate::hlc::Hlc;
-use crate::net::{AeMismatch, AePartReply, MsgClass};
+use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, MsgClass};
 use crate::node::NodeId;
 use crate::store::ShardOps;
 
@@ -44,7 +44,7 @@ pub(crate) async fn scheduler_task(
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(jittered(ae_interval)) => {}
         }
-        let Some((peer, was_dirty)) = pick_peer(&cluster) else {
+        let Some((peer, was_dirty)) = pick_peer(&cluster, &shard) else {
             continue;
         };
         let skips = skipped.entry(peer).or_insert(0);
@@ -113,11 +113,16 @@ fn choose_peer(
 }
 
 /// The peer for this round, and whether it came from the dirty set; a
-/// skipped round can hand the mark back.
-fn pick_peer(cluster: &Cluster) -> Option<(NodeId, bool)> {
+/// skipped round can hand the mark back. `shard`'s
+/// [`ShardOps::ae_peer_filter`] narrows both candidate sets to its current
+/// cohort first — identity for every mode but `Mode::Distributed`, whose
+/// override drops a peer sharing no bucket this shard currently owns or is
+/// mid disown-grace on, since such a peer has nothing to reconcile.
+fn pick_peer(cluster: &Cluster, shard: &Arc<dyn ShardOps>) -> Option<(NodeId, bool)> {
     let mut rng = rand::rng();
     let dirty = cluster.mesh().take_dirty_peers();
     let live = cluster.live_peer_ids();
+    let (dirty, live) = shard.ae_peer_filter(dirty, live);
     let (peer, was_dirty, give_back) = choose_peer(dirty, live, &mut rng)?;
     for other in give_back {
         cluster.mesh().mark_dirty(other);
@@ -129,6 +134,16 @@ fn pick_peer(cluster: &Cluster) -> Option<(NodeId, bool)> {
 /// mismatched buckets. Keys this node has newer, or `peer` lacks, push via
 /// the normal `Replicate` path; keys `peer` has newer, or this node lacks,
 /// pull and apply directly.
+///
+/// For a `Mode::Distributed` shard (one reporting an
+/// [`ShardOps::ownership_view_hash`]), the digest exchange goes through
+/// [`Mesh::ae_round_scoped`] instead of [`Mesh::ae_round`], carrying this
+/// shard's view hash for the epoch check; a `Stale` reply ends the round
+/// immediately, `sundog_stale_view_total` counted, with no push or pull
+/// attempted — the next scheduled round retries with a freshly re-borrowed
+/// view. Every tier past the initial digest exchange — part digests,
+/// sketches, listings — runs exactly the same regardless of how the round
+/// was scoped.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
 pub(crate) async fn run_round_against(
     cluster: &Cluster,
@@ -138,12 +153,37 @@ pub(crate) async fn run_round_against(
 ) {
     let local_buckets = shard.digests().await;
     let mesh = cluster.mesh();
-    let mismatched = match mesh.ae_round(peer, cache.clone(), local_buckets).await {
-        Ok(mismatched) => mismatched,
-        Err(error) => {
-            tracing::debug!(%error, "anti-entropy digest exchange failed");
-            return;
+    let mismatched = match shard.ownership_view_hash() {
+        Some(view_hash) => {
+            match mesh
+                .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
+                .await
+            {
+                Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
+                Ok(AeRoundOutcome::Stale {
+                    responder_view_hash,
+                }) => {
+                    metrics::counter!("sundog_stale_view_total", "cache" => cache.to_string())
+                        .increment(1);
+                    tracing::debug!(
+                        responder_view_hash,
+                        "anti-entropy round ended: responder's view has diverged"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "anti-entropy scoped digest exchange failed");
+                    return;
+                }
+            }
         }
+        None => match mesh.ae_round(peer, cache.clone(), local_buckets).await {
+            Ok(mismatched) => mismatched,
+            Err(error) => {
+                tracing::debug!(%error, "anti-entropy digest exchange failed");
+                return;
+            }
+        },
     };
     if mismatched.is_empty() {
         tracing::trace!("no mismatched buckets");

@@ -362,10 +362,6 @@ impl AePartReply {
 /// One reply to [`Mesh::fetch`]: the responder's answer to a
 /// distribution-mode read for a key it may or may not currently own.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "constructed by conn::collect_fetch_reply and read by Cache::fetch once it is wired up"
-)]
 pub(crate) enum FetchOutcome {
     /// The responder answered: `Some` record, or `None` for a definitive
     /// miss.
@@ -378,10 +374,6 @@ pub(crate) enum FetchOutcome {
 /// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest
 /// exchange's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "constructed by conn::collect_ae_round_scoped and read by anti-entropy's scoped round once it is wired up"
-)]
 pub(crate) enum AeRoundOutcome {
     /// Every mismatched bucket's reply, exactly like [`Mesh::ae_round`]'s.
     Mismatches(Vec<AeMismatch>),
@@ -395,16 +387,8 @@ pub(crate) enum AeRoundOutcome {
 pub(crate) enum FetchServe {
     /// The responder currently owns the bucket: `Some` record, or `None`
     /// for a definitive miss.
-    #[allow(
-        dead_code,
-        reason = "constructed once ClusterRequestHandler serves real distribution-mode reads"
-    )]
     Found(Option<WireRecord>),
     /// The responder's own view hash differs from the requester's.
-    #[allow(
-        dead_code,
-        reason = "constructed once ClusterRequestHandler serves real distribution-mode reads"
-    )]
     Stale { responder_view_hash: u64 },
     /// The named cache is not open here, or not a distribution-mode cache:
     /// the same "unknown cache degrades gracefully" shape every other
@@ -418,16 +402,8 @@ pub(crate) enum FetchServe {
 /// does), or a decline.
 pub(crate) enum AeServeOutcome {
     /// The responder's own owned-bucket digests, view hashes matching.
-    #[allow(
-        dead_code,
-        reason = "constructed once ClusterRequestHandler serves real distribution-mode anti-entropy"
-    )]
     Digests(Vec<(u16, u64)>),
     /// The responder's own view hash differs from the requester's.
-    #[allow(
-        dead_code,
-        reason = "constructed once ClusterRequestHandler serves real distribution-mode anti-entropy"
-    )]
     Stale { responder_view_hash: u64 },
     /// The named cache is not open here, or not a distribution-mode cache.
     Unavailable,
@@ -983,10 +959,6 @@ impl Mesh {
     ///
     /// Returns [`CodecError::Io`] if `peer` is unknown, or if it is known
     /// but speaks a protocol older than `since`.
-    #[allow(
-        dead_code,
-        reason = "called by Mesh::fetch/ae_round_scoped/request_buckets, read by anti-entropy/rebalance/Cache::fetch once they are wired up"
-    )]
     fn require_peer_protocol(
         &self,
         peer: NodeId,
@@ -1247,7 +1219,6 @@ impl Mesh {
     ///
     /// Returns [`CodecError`] if `owner` is unknown, speaks a protocol
     /// older than [`wire::PROTOCOL_DISTRIBUTED`], or the exchange fails.
-    #[allow(dead_code, reason = "read by Cache::fetch once it is wired up")]
     pub(crate) async fn fetch(
         &self,
         owner: NodeId,
@@ -1286,10 +1257,6 @@ impl Mesh {
     ///
     /// Returns [`CodecError`] if `peer` is unknown, speaks a protocol older
     /// than [`wire::PROTOCOL_DISTRIBUTED`], or the exchange fails.
-    #[allow(
-        dead_code,
-        reason = "read by anti-entropy's scoped round once it is wired up"
-    )]
     pub(crate) async fn ae_round_scoped(
         &self,
         peer: NodeId,
@@ -1337,10 +1304,6 @@ impl Mesh {
     /// Returns [`CodecError`] if `donor` is unknown, speaks a protocol
     /// older than [`wire::PROTOCOL_DISTRIBUTED`], or the request cannot be
     /// sent.
-    #[allow(
-        dead_code,
-        reason = "read by rebalance's bucket pull once it is wired up"
-    )]
     pub(crate) async fn request_buckets(
         &self,
         donor: NodeId,

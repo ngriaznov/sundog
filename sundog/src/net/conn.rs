@@ -1288,7 +1288,6 @@ pub(super) async fn collect_pulled_records(
 /// [`collect_ae_buckets`].
 ///
 /// [`Mesh::fetch`]: super::Mesh::fetch
-#[allow(dead_code, reason = "called by Mesh::fetch once it is wired up")]
 pub(super) async fn collect_fetch_reply(
     mut framed: PeerFramed,
     pool: &ReqPool,
@@ -1327,10 +1326,6 @@ pub(super) async fn collect_fetch_reply(
 /// collector, the epoch-checked counterpart of [`collect_ae_mismatches`].
 ///
 /// [`Mesh::ae_round_scoped`]: super::Mesh::ae_round_scoped
-#[allow(
-    dead_code,
-    reason = "called by Mesh::ae_round_scoped once it is wired up"
-)]
 pub(super) async fn collect_ae_round_scoped(
     mut framed: PeerFramed,
     pool: &ReqPool,
@@ -1446,10 +1441,6 @@ pub(super) fn state_stream(
 /// Adapts a rebalance bucket-pull connection into a lazy stream of record
 /// chunks, the `StBucketChunk` counterpart of [`state_stream`]: identical
 /// shape, keyed on [`Msg::StBucketChunk`] instead of [`Msg::StChunk`].
-#[allow(
-    dead_code,
-    reason = "called by Mesh::request_buckets once it is wired up"
-)]
 pub(super) fn bucket_stream(
     framed: PeerFramed,
     pool: Arc<ReqPool>,
