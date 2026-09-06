@@ -922,16 +922,24 @@ impl RequestHandler for ClusterRequestHandler {
         let Some(shard) = self.lookup(&cache) else {
             return stream::empty().boxed();
         };
-        let fut = async move {
-            let entries = shard.entries_for_buckets(buckets).await;
-            let keys: Vec<Bytes> = entries
-                .into_iter()
-                .flat_map(|(_, entries)| entries.into_iter().map(|(key, _)| key))
-                .collect();
-            let recs = shard.records_for(keys).await;
-            chunk_records_for_snapshot(recs)
-        };
-        Box::pin(stream::once(fut).flat_map(stream::iter))
+        // One bucket materialized at a time: a pull for a whole owner-set
+        // group never holds more than a bucket's records in memory here.
+        Box::pin(
+            stream::iter(buckets)
+                .then(move |bucket| {
+                    let shard = Arc::clone(&shard);
+                    async move {
+                        let entries = shard.entries_for_buckets(vec![bucket]).await;
+                        let keys: Vec<Bytes> = entries
+                            .into_iter()
+                            .flat_map(|(_, entries)| entries.into_iter().map(|(key, _)| key))
+                            .collect();
+                        let recs = shard.records_for(keys).await;
+                        chunk_records_for_snapshot(recs)
+                    }
+                })
+                .flat_map(stream::iter),
+        )
     }
 }
 
@@ -3895,6 +3903,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one handler walk-through per RPC")]
     async fn cluster_request_handler_serves_a_distributed_cache_by_view_hash() {
         let cluster = Cluster::builder("cluster-it-request-handler-distributed")
             .seeds(std::iter::empty())
@@ -3911,6 +3920,13 @@ mod tests {
             .await
             .expect("a solo node opens a distributed cache, owning every bucket");
         cache.insert(1, "one".to_string()).await.expect("insert");
+        let other_key = (2..1_000u32)
+            .find(|k| bucket_of_u32(*k) != bucket_of_u32(1))
+            .expect("a key in another bucket is found within a generous scan range");
+        cache
+            .insert(other_key, "other".to_string())
+            .await
+            .expect("insert");
 
         let handler = ClusterRequestHandler {
             shards: cluster.shards(),
@@ -3964,7 +3980,7 @@ mod tests {
         );
 
         let owned_bucket = bucket_of_u32(1);
-        let mut chunks = handler.st_bucket_chunks(name, vec![owned_bucket]);
+        let mut chunks = handler.st_bucket_chunks(name.clone(), vec![owned_bucket]);
         let mut got_key = false;
         while let Some(chunk) = chunks.next().await {
             if chunk.iter().any(|r| r.key == key_one) {
@@ -3974,6 +3990,28 @@ mod tests {
         assert!(
             got_key,
             "st_bucket_chunks streams the requested owned bucket's contents"
+        );
+
+        // A multi-bucket pull streams one bucket at a time, in request
+        // order, each bucket's records in their own chunks.
+        let key_other = Bytes::from(postcard::to_stdvec(&other_key).expect("test key encodes"));
+        let mut chunks =
+            handler.st_bucket_chunks(name, vec![bucket_of_u32(other_key), owned_bucket]);
+        let mut order: Vec<Bytes> = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            assert!(
+                chunk
+                    .iter()
+                    .all(|r| crate::store::bucket_of(&r.key)
+                        == crate::store::bucket_of(&chunk[0].key)),
+                "a chunk never spans two buckets"
+            );
+            order.extend(chunk.into_iter().map(|r| r.key));
+        }
+        assert_eq!(
+            order,
+            vec![key_other, key_one],
+            "buckets stream in request order, one at a time"
         );
 
         cluster.shutdown().await;
