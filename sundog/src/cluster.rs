@@ -168,9 +168,10 @@ pub struct CacheHealth {
     /// The [`Mode`] the cache was opened under.
     pub mode: Mode,
     /// Whether the cache has finished warming: for a [`Mode::Replicated`]
-    /// cache, whether its state transfer has completed; always `true` for
-    /// `Local`/`Invalidation` caches, which are warm from the moment they
-    /// open.
+    /// cache, whether its state transfer has completed; for a
+    /// [`Mode::Distributed`] cache, whether the buckets it owns have been
+    /// pulled from a co-owner; always `true` for `Local`/`Invalidation`
+    /// caches, which are warm from the moment they open.
     pub warm: bool,
 }
 

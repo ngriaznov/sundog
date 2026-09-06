@@ -211,8 +211,9 @@ pub(crate) async fn pull_buckets(
 
 /// Retries [`pull_buckets`] for whatever this node's [`OwnershipTracker`]
 /// currently owns, after an initial `open()`-time pull that
-/// [`state_transfer::Outcome::needs_warm_up`] left cold: waits for a first
-/// peer when there is none, then pulls again every `retry_interval` until a
+/// [`state_transfer::Outcome::needs_warm_up`] left cold: with no co-owner
+/// in the current view it waits for the view to change, since only a new
+/// view can bring one, then pulls again every `retry_interval` until a
 /// pass lands or repeated timeouts give up and mark the cache warm with
 /// whatever landed, leaving the rest to anti-entropy. The bucket-scoped
 /// analogue of [`state_transfer::warm_up_task`], sharing its
@@ -229,24 +230,9 @@ pub(crate) async fn warm_up_task(
 ) {
     let retry_interval = cluster.config().ae_interval;
     let mut attempt: u32 = 0;
+    let mut view_rx = ownership.subscribe();
     loop {
-        let mut peers = cluster.peers_watch();
-        loop {
-            if !peers.borrow_and_update().is_empty() {
-                break;
-            }
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                changed = peers.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-        tracing::info!(cache = %cache, "peers present; retrying the rebalance pull to warm this cache");
-        let buckets: Vec<u16> = ownership.current().owned_buckets().collect();
+        let buckets: Vec<u16> = view_rx.borrow_and_update().owned_buckets().collect();
         let outcome = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
@@ -254,8 +240,22 @@ pub(crate) async fn warm_up_task(
         };
         attempt += 1;
         match state_transfer::next_warm_up_step(outcome, attempt) {
-            state_transfer::WarmUpStep::Done => return,
-            state_transfer::WarmUpStep::WaitForPeer => {}
+            state_transfer::WarmUpStep::Done => {
+                cluster.mark_warm(&cache);
+                return;
+            }
+            state_transfer::WarmUpStep::WaitForPeer => {
+                tracing::debug!(cache = %cache, "no co-owner for any owned bucket yet; waiting for the ownership view to change");
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    changed = view_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
             state_transfer::WarmUpStep::RetryLater => {
                 tokio::select! {
                     biased;
@@ -467,6 +467,64 @@ mod tests {
         .await;
         assert_eq!(outcome, Outcome::NoPeers);
 
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn warm_up_task_waits_for_a_co_owner_and_warms_once_its_pulls_give_up() {
+        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-warm-up")
+            .seeds(std::iter::empty())
+            .config(crate::config::ClusterConfig {
+                gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+                data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+                ae_interval: Duration::from_millis(50),
+                ..crate::config::ClusterConfig::default()
+            })
+            .build()
+            .await
+            .expect("solo cluster builds");
+        let name = SmolStr::new("prices");
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (tracker, tx) = OwnershipTracker::seed(
+            cluster.node_id(),
+            &cluster.peers(),
+            &cluster.advertised_cache_modes(),
+            &name,
+            k,
+        );
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(warm_up_task(
+            cluster.clone(),
+            empty_shard(),
+            tracker,
+            name.clone(),
+            Duration::from_millis(150),
+            4,
+            cancel.clone(),
+        ));
+
+        // Self-only view: no co-owner anywhere, so the task waits on the
+        // view instead of spinning or marking the cache warm.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!cluster.is_warm(&name), "no co-owner in sight: still cold");
+        assert!(!task.is_finished(), "the task waits for a view change");
+
+        // A view with an unreachable co-owner: every pull times out, and
+        // after the attempt cap the cache opens warm with what landed.
+        let phantom = NodeId::from(u64::MAX);
+        tx.send(Arc::new(view(
+            cluster.node_id(),
+            vec![cluster.node_id(), phantom],
+            2,
+        )))
+        .expect("the task still holds its receiver");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the task ends within the bound")
+            .expect("the task does not panic");
+        assert!(cluster.is_warm(&name), "warm after the pulls gave up");
+
+        cancel.cancel();
         cluster.shutdown().await;
     }
 

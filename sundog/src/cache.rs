@@ -478,10 +478,12 @@ async fn spawn_cache_tasks<K, V>(
 /// node's initially owned buckets from their current owners before the
 /// cache is marked warm, the bucket-scoped analogue of
 /// [`warm_and_repair`]'s whole-cache transfer, then starts the
-/// ownership-refresh and rebalance loops. A timed-out initial pull leaves
+/// ownership-refresh and rebalance loops. An initial pull that times out,
+/// or finds no co-owner because gossip has not shown a peer yet, leaves
 /// warming to [`crate::cluster::rebalance::warm_up_task`], the same
-/// "retry a few times, then open warm with what landed" shape
-/// [`state_transfer::warm_up_task`] already has for `Mode::Replicated`.
+/// "wait for a peer, retry a few times, then open warm with what landed"
+/// shape [`state_transfer::warm_up_task`] already has for
+/// `Mode::Replicated`.
 ///
 /// [`state_transfer::warm_up_task`]: crate::cluster::state_transfer::warm_up_task
 async fn distributed_warm_and_rebalance(
@@ -512,7 +514,7 @@ async fn distributed_warm_and_rebalance(
         concurrency,
     )
     .await;
-    if matches!(outcome, crate::cluster::state_transfer::Outcome::TimedOut) {
+    if outcome.needs_warm_up() {
         cluster.spawn_tracked_in(
             tasks,
             crate::cluster::rebalance::warm_up_task(
@@ -1342,6 +1344,89 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    /// A free loopback UDP port: bound and released, so a node can be
+    /// seeded with a peer that does not exist yet.
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind a loopback udp socket")
+            .local_addr()
+            .expect("bound socket has an address")
+            .port()
+    }
+
+    #[tokio::test]
+    async fn distributed_cache_opened_before_any_peer_is_known_pulls_its_buckets_once_one_appears()
+    {
+        // `a` is seeded with the port `b` binds later, so `b` opens its
+        // cache before anyone has gossiped to it: its first view is the
+        // self-only one, owning every bucket with no co-owner to pull from.
+        // Anti-entropy is effectively off, so only the warm-up pull can
+        // bring `a`'s entries over.
+        let name = "distributed-late-peer";
+        let port_b = free_udp_port();
+        let mut config = loopback_config();
+        config.ae_interval = Duration::from_secs(3600);
+        config.gossip_interval = Duration::from_millis(200);
+        let a = Cluster::builder(name)
+            .seeds([SocketAddr::from((Ipv4Addr::LOCALHOST, port_b))])
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = a
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("a opens alone");
+        assert!(
+            !a.is_warm(&SmolStr::new(name)),
+            "a cache with no co-owner in sight is not warm yet"
+        );
+        for key in 0..200u32 {
+            cache_a
+                .insert(key, format!("v{key}"))
+                .await
+                .expect("a owns every bucket while alone");
+        }
+
+        config.gossip_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port_b));
+        let b = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        let cache_b = b
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens before it knows a");
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mut held = 0;
+                for key in 0..200u32 {
+                    if cache_b.get(&key).await.as_deref() == Some(format!("v{key}").as_str()) {
+                        held += 1;
+                    }
+                }
+                if held == 200 && b.is_warm(&SmolStr::new(name)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("b pulls every bucket it owns from a once gossip shows a, and is warm");
+
+        cache_b.close().await;
+        cache_a.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
     }
 
     #[tokio::test]
