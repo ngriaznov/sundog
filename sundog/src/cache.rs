@@ -402,8 +402,15 @@ where
         owners,
     );
     let residency = Arc::new(ResidencySet::new());
-    let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
-    residency.mark_cold(&initially_owned);
+    // Cold until pulled: every initially owned bucket with a co-owner to
+    // pull from. A bucket owned alone has no other copy; a node that opens
+    // before gossip shows any peer holds nothing yet either way.
+    let seed = ownership.current();
+    let cold: Vec<u16> = seed
+        .owned_buckets()
+        .filter(|&bucket| seed.owners_of(bucket).len() > 1)
+        .collect();
+    residency.mark_cold(&cold);
     shard = shard.with_ownership(ownership.clone(), Arc::clone(&residency));
     (
         shard,

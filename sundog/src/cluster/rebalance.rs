@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::Cluster;
 use super::anti_entropy::{self, RoundOutcome};
 use super::state_transfer::{self, DonorResult, Outcome};
-use crate::net::Mesh;
+use crate::net::{BucketPull, Mesh};
 use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
 use crate::store::ShardOps;
@@ -64,14 +64,23 @@ async fn try_donor_buckets(
     donor: NodeId,
     buckets: Vec<u16>,
     view_hash: u64,
-) -> (DonorResult, u64) {
-    state_transfer::pull_from_donor(
-        shard,
-        donor,
-        mesh.request_buckets(donor, cache.clone(), buckets, view_hash),
-    )
-    .await
+) -> (DonorResult, u64, bool) {
+    let pull = mesh
+        .request_buckets(donor, cache.clone(), buckets, view_hash)
+        .await;
+    let cold = matches!(pull, Ok(BucketPull::Cold));
+    let stream = pull.map(|answer| match answer {
+        BucketPull::Stream(stream) => Some(stream),
+        BucketPull::Stale | BucketPull::Cold => None,
+    });
+    let (result, count) = state_transfer::pull_from_donor(shard, donor, async { stream }).await;
+    (result, count, cold)
 }
+
+/// Passes over a group's donors in which every one declined as cold before
+/// the pull gives the group up: nobody warm holds the buckets, so what has
+/// landed here by other means is all there is.
+const ALL_COLD_PASSES: u32 = 3;
 
 /// Delay between retry passes over a group's whole donor list once every
 /// candidate has declined or failed once: long enough for both sides'
@@ -103,22 +112,38 @@ async fn pull_one_group(
     view_hash: u64,
     per_donor: Duration,
 ) -> Option<u64> {
+    let mut all_cold_passes = 0u32;
     loop {
+        let mut every_donor_cold = !donors.is_empty();
         for &donor in &donors {
-            let (result, count) = tokio::time::timeout(
+            let (result, count, cold) = tokio::time::timeout(
                 per_donor,
                 try_donor_buckets(shard, mesh, cache, donor, buckets.clone(), view_hash),
             )
             .await
             .unwrap_or_else(|_| {
                 tracing::debug!(%donor, "rebalance bucket pull to donor timed out; trying the next");
-                (DonorResult::Failed, 0)
+                (DonorResult::Failed, 0, false)
             });
             if result == DonorResult::Done {
                 residency.clear_cold(&buckets);
                 tracing::debug!(cache = %cache, %donor, buckets = buckets.len(), records = count, "bucket pull landed");
                 return Some(u64::try_from(buckets.len()).unwrap_or(u64::MAX));
             }
+            every_donor_cold &= cold;
+        }
+        if every_donor_cold {
+            all_cold_passes += 1;
+            if all_cold_passes >= ALL_COLD_PASSES {
+                // Every donor is itself waiting on a pull for these buckets:
+                // there is no warm copy anywhere to pull. Whatever a
+                // hand-off or a forwarded write lands here is all there is.
+                tracing::debug!(cache = %cache, buckets = buckets.len(), "every donor is cold for these buckets; nothing warm to pull");
+                residency.clear_cold(&buckets);
+                return Some(0);
+            }
+        } else {
+            all_cold_passes = 0;
         }
         if ownership.current().view_hash() != view_hash {
             tracing::debug!(cache = %cache, "ownership view moved mid-pull; this pull is superseded");
@@ -142,7 +167,11 @@ async fn pull_one_group(
 /// pull. A zero `budget` short-circuits to [`Outcome::Skipped`], matching
 /// [`state_transfer::run`]'s same rule. A bucket set whose every group has
 /// no donor at all (every owner is this node alone, the degenerate
-/// small-cluster case) answers [`Outcome::NoPeers`]. Otherwise the whole
+/// small-cluster case) answers [`Outcome::NoPeers`]. Cold marks are the
+/// caller's: `attach_ownership` and [`rebalance_task`] mark a bucket cold
+/// when it is gained from a co-owner, and a landed pull clears it here; a
+/// warm-up retry never marks, since this node may be the origin of what it
+/// holds. Otherwise the whole
 /// operation races `budget`: every group either lands or declines within it
 /// and this returns [`Outcome::Completed`], or the budget runs out first
 /// and this returns [`Outcome::TimedOut`], leaving the rest to a retry or
@@ -164,10 +193,6 @@ pub(crate) async fn pull_buckets(
     if buckets.is_empty() {
         return Outcome::Completed;
     }
-    // Cold until each group's pull lands: a local miss in one of these is
-    // not an answer yet. Marking a bucket that already holds forwarded
-    // writes is harmless, since only a miss consults the mark.
-    residency.mark_cold(&buckets);
     if budget.is_zero() {
         tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained buckets to anti-entropy");
         return Outcome::Skipped;
@@ -468,6 +493,8 @@ pub(crate) async fn rebalance_task(
                 let outcome = if plan.to_pull.is_empty() {
                     Outcome::Completed
                 } else {
+                    // Gained from a co-owner: cold until the pull lands.
+                    residency.mark_cold(&plan.to_pull);
                     tracing::debug!(cache = %cache, count = plan.to_pull.len(), "buckets gained; pulling from current owners");
                     pull_buckets(&cluster, &shard, &ownership, &residency, &cache, plan.to_pull, budget, concurrency).await
                 };

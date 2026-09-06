@@ -375,6 +375,17 @@ pub(crate) enum FetchOutcome {
     Declined,
 }
 
+/// How a donor answered [`Mesh::request_buckets`].
+pub(crate) enum BucketPull {
+    /// The donor is transferring: its chunk stream.
+    Stream(BoxStream<'static, Result<Vec<WireRecord>, CodecError>>),
+    /// The donor's own view hash differs from the request's.
+    Stale,
+    /// The donor owns a requested bucket but has not pulled it yet, so its
+    /// copy is not a source; the requester tries its next donor.
+    Cold,
+}
+
 /// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest
 /// exchange's outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1323,7 +1334,7 @@ impl Mesh {
         cache: SmolStr,
         buckets: Vec<u16>,
         view_hash: u64,
-    ) -> Result<Option<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>>, CodecError> {
+    ) -> Result<BucketPull, CodecError> {
         self.require_peer_protocol(donor, wire::PROTOCOL_DISTRIBUTED, "a rebalance bucket pull")?;
         // Only the checkout-or-dial step and the donor's first reply are
         // bounded here; the caller's own transfer budget governs the full
@@ -1348,11 +1359,15 @@ impl Mesh {
                 .await
                 .map_err(|_| request_timeout_error("rebalance bucket request", timeout))?,
         };
-        if let Some(Ok(Msg::StaleView { .. } | Msg::StUnavailable { .. })) = first {
+        if let Some(Ok(Msg::StaleView { .. })) = first {
             pool.checkin(framed);
-            return Ok(None);
+            return Ok(BucketPull::Stale);
         }
-        Ok(Some(conn::bucket_stream(framed, pool, first)))
+        if let Some(Ok(Msg::StUnavailable { .. })) = first {
+            pool.checkin(framed);
+            return Ok(BucketPull::Cold);
+        }
+        Ok(BucketPull::Stream(conn::bucket_stream(framed, pool, first)))
     }
 
     /// Shuts down the mesh: stops accepting, cancels every per-peer writer.
@@ -2807,11 +2822,13 @@ mod tests {
         let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
         requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
 
-        let mut stream = requester
+        let BucketPull::Stream(mut stream) = requester
             .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0, 1], 42)
             .await
             .expect("request accepted")
-            .expect("an available donor streams");
+        else {
+            panic!("an available donor streams");
+        };
         let mut got = Vec::new();
         while let Some(chunk) = stream.next().await {
             got.extend(chunk.expect("chunk decodes"));
@@ -2837,8 +2854,8 @@ mod tests {
             .await
             .expect("request accepted");
         assert!(
-            declined.is_none(),
-            "a donor whose view has diverged, or that cannot serve, declines with StaleView"
+            matches!(declined, BucketPull::Stale),
+            "a donor whose view has diverged declines with StaleView"
         );
         // The declined connection went back to the pool: an unrelated
         // request on the same peer still works.
@@ -2860,7 +2877,7 @@ mod tests {
             .await
             .expect("request accepted even against a handler that never overrode it");
         assert!(
-            declined.is_none(),
+            matches!(declined, BucketPull::Stale),
             "the default RequestHandler::st_buckets_available body degrades to false"
         );
     }
