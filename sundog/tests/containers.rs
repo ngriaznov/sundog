@@ -801,31 +801,64 @@ fn pick_chaos_action(
     }
 }
 
+/// Spawns one node under `alias`, seeded from `seeds`: `Mode::Distributed`
+/// with `owners` owners per bucket when `owners` is `Some`, or
+/// `Mode::Replicated` (a plain [`Node::spawn`]) when `None`. The one spawn
+/// decision [`spawn_chaos_cluster_mode`] and [`crash_and_respawn_mode`] both
+/// need, so a chaos cluster and its mid-run replacements always agree on
+/// which mode they run.
+async fn spawn_chaos_node(
+    net: &Arc<Network>,
+    cluster: &str,
+    alias: &str,
+    seeds: &[&str],
+    owners: Option<u8>,
+) -> Node {
+    match owners {
+        Some(owners) => Node::spawn_distributed(net, cluster, alias, seeds, Some(owners)).await,
+        None => Node::spawn(net, cluster, alias, seeds).await,
+    }
+}
+
 /// Spawns `aliases.len()` nodes on `cluster`, each seeded from the aliases
-/// already spawned before it, and waits for all of them to see every other
-/// one as a peer.
-async fn spawn_chaos_cluster(net: &Arc<Network>, cluster: &str, aliases: &[&str]) -> Vec<Node> {
+/// already spawned before it, in the mode [`spawn_chaos_node`] decides from
+/// `owners`, and waits for all of them to see every other one as a peer.
+async fn spawn_chaos_cluster_mode(
+    net: &Arc<Network>,
+    cluster: &str,
+    aliases: &[&str],
+    owners: Option<u8>,
+) -> Vec<Node> {
     let mut nodes = Vec::with_capacity(aliases.len());
     for (i, alias) in aliases.iter().enumerate() {
         let seeds: Vec<String> = aliases[..i].iter().map(|a| seed(a)).collect();
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-        nodes.push(Node::spawn(net, cluster, alias, &seed_refs).await);
+        nodes.push(spawn_chaos_node(net, cluster, alias, &seed_refs, owners).await);
     }
     wait_for_peers(&nodes.iter().collect::<Vec<_>>(), aliases.len() - 1).await;
     nodes
 }
 
+/// [`spawn_chaos_cluster_mode`] with `owners: None`, `Mode::Replicated`
+/// throughout: [`chaos_crashes_churn_and_drops_still_converge`]'s own,
+/// unchanged entry point.
+async fn spawn_chaos_cluster(net: &Arc<Network>, cluster: &str, aliases: &[&str]) -> Vec<Node> {
+    spawn_chaos_cluster_mode(net, cluster, aliases, None).await
+}
+
 /// Crashes `nodes[idx]`, respawns it under the same alias seeded from the
-/// other still-live aliases, and waits for every node to see the rest of
-/// the cluster again before returning — the point past which the next
-/// chaos iteration may pick another node to crash.
-async fn crash_and_respawn(
+/// other still-live aliases in the mode [`spawn_chaos_node`] decides from
+/// `owners`, and waits for every node to see the rest of the cluster again
+/// before returning — the point past which the next chaos iteration may pick
+/// another node to crash.
+async fn crash_and_respawn_mode(
     nodes: &mut Vec<Node>,
     net: &Arc<Network>,
     cluster: &str,
     aliases: &[&str],
     idx: usize,
     iteration: u64,
+    owners: Option<u8>,
 ) {
     let alias = aliases[idx];
     eprintln!("chaos[{iteration}]: crashing {alias}");
@@ -841,13 +874,30 @@ async fn crash_and_respawn(
         .map(|(_, a)| seed(a))
         .collect();
     let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-    nodes.insert(idx, Node::spawn(net, cluster, alias, &seed_refs).await);
+    nodes.insert(
+        idx,
+        spawn_chaos_node(net, cluster, alias, &seed_refs, owners).await,
+    );
 
     wait_for_peers(&nodes.iter().collect::<Vec<_>>(), aliases.len() - 1).await;
     eprintln!(
         "chaos[{iteration}]: {alias} respawned and saw {} peers",
         aliases.len() - 1
     );
+}
+
+/// [`crash_and_respawn_mode`] with `owners: None`,
+/// [`chaos_crashes_churn_and_drops_still_converge`]'s own, unchanged entry
+/// point.
+async fn crash_and_respawn(
+    nodes: &mut Vec<Node>,
+    net: &Arc<Network>,
+    cluster: &str,
+    aliases: &[&str],
+    idx: usize,
+    iteration: u64,
+) {
+    crash_and_respawn_mode(nodes, net, cluster, aliases, idx, iteration, None).await;
 }
 
 /// Runs one non-crash [`ChaosAction`] and logs it; crashes are handled
@@ -1453,5 +1503,585 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
     a_stopped.expect("a stops");
     b_stopped.expect("b stops");
     c_stopped.expect("c stops");
+    net.close().await.expect("network closes");
+}
+
+/// Node ids for `nodes`, in the same order, read via each node's own `id`
+/// control route.
+async fn collect_node_ids(nodes: &[&Node]) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        ids.push(
+            node.node_id()
+                .await
+                .expect("id replies with this node's own NodeId as a decimal u64"),
+        );
+    }
+    ids
+}
+
+/// [`fill`][Node::fill]'s deterministic `k{i}` -> `v{i}` pair for index `i`.
+fn kv_entry(index: u32) -> (String, String) {
+    (format!("k{index}"), format!("v{index}"))
+}
+
+/// [`kv_entry`] for every index in `0..count`: the full key/value set one
+/// `fill(count)` call writes.
+fn kv_range(count: u32) -> Vec<(String, String)> {
+    (0..count).map(kv_entry).collect()
+}
+
+/// A uniform random sample of `sample_size` [`kv_entry`] pairs with indices
+/// in `0..fill_keys`, from a fixed seed so a failing run's sample is
+/// reproducible.
+fn sample_kv_entries(seed: u64, fill_keys: u32, sample_size: usize) -> Vec<(String, String)> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..sample_size)
+        .map(|_| kv_entry(rng.random_range(0..fill_keys)))
+        .collect()
+}
+
+/// True once `reader`'s `owners k` names exactly `owners` ids for every
+/// `(key, value)` pair in `entries`, and exactly the nodes among `tagged`
+/// (each paired with its own [`collect_node_ids`] id) whose id is named
+/// answer `get k` with `value`, every other one answering `None`. Concurrent
+/// over `entries`, so a poll of this against a few hundred keys stays fast
+/// despite the container network's per-connection round trip.
+async fn ownership_snapshot_matches(
+    reader: &Node,
+    tagged: &[(&Node, u64)],
+    entries: &[(String, String)],
+    owners: usize,
+) -> bool {
+    stream::iter(entries.iter())
+        .map(|(key, value)| async move {
+            let Ok(owner_ids) = reader.owners(key).await else {
+                return false;
+            };
+            if owner_ids.len() != owners {
+                return false;
+            }
+            for &(node, id) in tagged {
+                let want = owner_ids.contains(&id).then(|| value.clone());
+                if node.get(key).await != Ok(want) {
+                    return false;
+                }
+            }
+            true
+        })
+        .buffer_unordered(16)
+        .all(|matched| async move { matched })
+        .await
+}
+
+/// Concurrently reads every `(key, value)` in `entries` from every one of
+/// `nodes` via [`Node::fetch`], returning a description of every reply that
+/// wasn't `Ok(Some(value))` (empty on full agreement). Concurrent over the
+/// full node-by-entry cross product for the same reason
+/// [`ownership_snapshot_matches`] is: many container round trips otherwise
+/// add up fast.
+async fn fetch_mismatches(nodes: &[&Node], entries: &[(String, String)]) -> Vec<String> {
+    let pairs: Vec<(&Node, &(String, String))> = nodes
+        .iter()
+        .flat_map(|&node| entries.iter().map(move |entry| (node, entry)))
+        .collect();
+    stream::iter(pairs)
+        .map(|(node, (key, value))| async move {
+            let got = node.fetch(key).await;
+            (node.name().to_string(), key.clone(), value.clone(), got)
+        })
+        .buffer_unordered(64)
+        .filter_map(|(name, key, expected, got)| async move {
+            (got != Ok(Some(expected.clone())))
+                .then(|| format!("{name}/{key}: expected Ok(Some({expected:?})), got {got:?}"))
+        })
+        .collect()
+        .await
+}
+
+/// Sum of `count` across every node in `nodes`, `None` if any read fails —
+/// the shared building block every distributed scenario's convergence poll
+/// below sums to `owners * fill_keys`.
+async fn sum_counts(nodes: &[&Node]) -> Option<usize> {
+    let mut sum = 0usize;
+    for node in nodes {
+        sum += node.count().await.ok()?;
+    }
+    Some(sum)
+}
+
+/// Every `sundog-testnode` opens `"it"`'s `Mode::Distributed` bucket space
+/// over `sundog::store::BUCKET_COUNT` buckets; with `owners` owners per
+/// bucket, the summed `sundog_owned_buckets` gauge across every live node
+/// settles at this many bucket-ownership assignments.
+fn expected_owned_buckets_sum(owners: u64) -> u64 {
+    sundog::store::BUCKET_COUNT as u64 * owners
+}
+
+/// Five distributed nodes fill a shared keyspace from one writer, and every
+/// key lands on exactly `OWNERS` owners: `owners k` from any node names
+/// exactly two ids, exactly those nodes' `get k` answers with the value and
+/// every other node answers `none`, every node's `fetch k` returns the
+/// value, the summed local `count` is `OWNERS * FILL_KEYS`, and the summed
+/// `sundog_owned_buckets` gauge is every bucket assigned exactly `OWNERS`
+/// times.
+#[tokio::test]
+async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_owners() {
+    const NODE_COUNT: usize = 5;
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 200;
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4", "n5"];
+    const CLUSTER: &str = "dist-fill-cluster";
+    const CONVERGE_WAIT: Duration = Duration::from_secs(180);
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+    }
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    wait_for_peers(&node_refs, NODE_COUNT - 1).await;
+
+    node_refs[0]
+        .fill(FILL_KEYS)
+        .await
+        .expect("bulk fill succeeds");
+
+    let ids = collect_node_ids(&node_refs).await;
+    let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
+    let sample = sample_kv_entries(0xd157_fe11, FILL_KEYS, SAMPLE_SIZE);
+    let expected_owned_sum = expected_owned_buckets_sum(u64::from(OWNERS));
+
+    eventually(CONVERGE_WAIT, || async {
+        let Some(sum) = sum_counts(&node_refs).await else {
+            return false;
+        };
+        if sum != usize::from(OWNERS) * FILL_KEYS as usize {
+            return false;
+        }
+        if !ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await {
+            return false;
+        }
+        let mut owned_sum = 0u64;
+        for node in &node_refs {
+            owned_sum += scrape_metric(node, "sundog_owned_buckets", ("cache", "it")).await;
+        }
+        owned_sum == expected_owned_sum
+    })
+    .await;
+
+    let all_entries = kv_range(FILL_KEYS);
+    let mismatches = fetch_mismatches(&node_refs, &all_entries).await;
+    assert!(
+        mismatches.is_empty(),
+        "every fill key must be fetchable with the right value from every node: {mismatches:?}"
+    );
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
+/// Crashing one owner never makes a key unfetchable — the surviving owner
+/// keeps answering `fetch` through the dead peer's stale entry in the
+/// ownership view — and once gossip notices the death and rebalance runs,
+/// every key resettles on exactly `OWNERS` of the four survivors, with at
+/// least one of them having pulled buckets in.
+#[tokio::test]
+async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned() {
+    const NODE_COUNT: usize = 5;
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 100;
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4", "n5"];
+    const CLUSTER: &str = "dist-kill-cluster";
+    const FILL_WAIT: Duration = Duration::from_secs(60);
+    const IMMEDIATE_CHECK_WINDOW: Duration = Duration::from_secs(10);
+    const REOWNED_WAIT: Duration = Duration::from_secs(240);
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+    }
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), NODE_COUNT - 1).await;
+
+    nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    // Every write during the fill landed straight on its real owners (a
+    // non-owner write is forwarded, never applied locally), so the fill
+    // itself converges as soon as the forwards land, well before any
+    // rebalance is involved.
+    eventually(FILL_WAIT, || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+
+    let sample = sample_kv_entries(0xdead_b17e, FILL_KEYS, SAMPLE_SIZE);
+
+    let victim = nodes.remove(0);
+    victim
+        .crash()
+        .await
+        .expect("crashed node dies and is removed cleanly");
+    let live: Vec<&Node> = nodes.iter().collect();
+
+    // Immediately and repeatedly, before gossip has even had a chance to
+    // notice the death: every key stays fetchable from every surviving
+    // node, since fetch tries owners in order and the still-live one
+    // answers.
+    let immediate_deadline = tokio::time::Instant::now() + IMMEDIATE_CHECK_WINDOW;
+    while tokio::time::Instant::now() < immediate_deadline {
+        let mismatches = fetch_mismatches(&live, &sample).await;
+        assert!(
+            mismatches.is_empty(),
+            "every key must stay fetchable through the surviving owner right after a crash: \
+             {mismatches:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    wait_for_peers(&live, NODE_COUNT - 2).await;
+
+    let mut in_before = Vec::with_capacity(live.len());
+    for node in &live {
+        in_before
+            .push(scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await);
+    }
+
+    let ids = collect_node_ids(&live).await;
+    let tagged: Vec<(&Node, u64)> = live.iter().copied().zip(ids).collect();
+
+    eventually(REOWNED_WAIT, || async {
+        if sum_counts(&live).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await
+    })
+    .await;
+
+    let mut in_moved = false;
+    for (node, before) in live.iter().zip(in_before.iter()) {
+        let after =
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await;
+        if after > *before {
+            in_moved = true;
+        }
+    }
+    assert!(
+        in_moved,
+        "at least one surviving node should have pulled rebalanced buckets in after the crash"
+    );
+
+    let mismatches = fetch_mismatches(&live, &sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every sampled key must still be fetchable with the right value: {mismatches:?}"
+    );
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
+/// A fourth node joins a filled three-node distributed cluster: it pulls
+/// roughly a quarter of the 1,024-bucket space (`sundog_owned_buckets` near
+/// `BUCKET_COUNT * OWNERS / 4`) and at least one original node's
+/// `direction="out"` counter moves to match. Once the disown grace period
+/// (`distributed_disown_grace_rounds` anti-entropy intervals) has passed, the
+/// donors have dropped what they no longer own and every key sits on exactly
+/// `OWNERS` of the four nodes, fetchable from all of them.
+#[tokio::test]
+async fn distributed_join_and_rebalance() {
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 150;
+    const ALIASES: [&str; 3] = ["n1", "n2", "n3"];
+    const JOINER: &str = "n4";
+    const CLUSTER: &str = "dist-join-cluster";
+    /// `BUCKET_COUNT * OWNERS / 4` nodes: the even split a fresh joiner
+    /// should land close to, rendezvous hashing balancing buckets roughly
+    /// uniformly rather than exactly.
+    const JOINER_BUCKETS_TOLERANCE: u64 = 200;
+    const REBALANCE_WAIT: Duration = Duration::from_secs(240);
+    // sundog-testnode sets ae_interval to 2s; distributed_disown_grace_
+    // rounds defaults to 3, so a previous owner keeps serving for 6s past
+    // losing a bucket. Generous past that for the anti-entropy round itself.
+    const DISOWN_GRACE_WAIT: Duration = Duration::from_secs(16);
+    const SETTLE_WAIT: Duration = Duration::from_secs(180);
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = Vec::with_capacity(4);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+    }
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), ALIASES.len() - 1).await;
+
+    nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    eventually(Duration::from_secs(60), || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+
+    let mut out_before = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        out_before.push(
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await,
+        );
+    }
+
+    let all_seeds: Vec<String> = ALIASES.iter().map(|a| seed(a)).collect();
+    let all_seed_refs: Vec<&str> = all_seeds.iter().map(String::as_str).collect();
+    nodes.push(Node::spawn_distributed(&net, CLUSTER, JOINER, &all_seed_refs, Some(OWNERS)).await);
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    wait_for_peers(&node_refs, ALIASES.len()).await;
+    let joiner: &Node = node_refs.last().expect("just pushed the joiner");
+
+    let expected_joiner_buckets = expected_owned_buckets_sum(u64::from(OWNERS)) / 4;
+    eventually(REBALANCE_WAIT, || async {
+        let owned = scrape_metric(joiner, "sundog_owned_buckets", ("cache", "it")).await;
+        let pulled_in = scrape_metric(
+            joiner,
+            "sundog_rebalance_buckets_total",
+            ("direction", "in"),
+        )
+        .await
+            > 0;
+        pulled_in && owned.abs_diff(expected_joiner_buckets) <= JOINER_BUCKETS_TOLERANCE
+    })
+    .await;
+
+    let mut donor_out_moved = false;
+    for (node, before) in node_refs[..ALIASES.len()].iter().zip(out_before.iter()) {
+        let after =
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
+        if after > *before {
+            donor_out_moved = true;
+        }
+    }
+    assert!(
+        donor_out_moved,
+        "at least one original node should have donated buckets to the joiner"
+    );
+
+    // Let the disown grace period elapse so previous owners drop what they
+    // no longer own, then every key settles on exactly OWNERS nodes.
+    tokio::time::sleep(DISOWN_GRACE_WAIT).await;
+
+    let ids = collect_node_ids(&node_refs).await;
+    let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
+    let sample = sample_kv_entries(0x5ca1_ab1e, FILL_KEYS, SAMPLE_SIZE);
+
+    eventually(SETTLE_WAIT, || async {
+        if sum_counts(&node_refs).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await
+    })
+    .await;
+
+    let mismatches = fetch_mismatches(&node_refs, &sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every sampled key must be fetchable with the right value from every node: {mismatches:?}"
+    );
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
+/// [`chaos_crashes_churn_and_drops_still_converge`]'s convergence check
+/// (agreement on `count`/`digest`) assumes `Mode::Replicated`, where every
+/// node holds everything; a distributed cluster instead settles with each
+/// key on exactly `owners` nodes. `fill_keys` is `0..fill_keys`'s `k{i}`/
+/// `v{i}` keyspace (surviving `Drop` — a dropped bucket's other owner, or an
+/// anti-entropy repair, still has it — and `Fill`, which only ever rewrites
+/// a prefix of it to the same deterministic values); `burst_entries` is
+/// every distinct-key put [`perform_chaos_action`]'s `Burst` arm wrote,
+/// collected by the caller since those keys carry no predictable index.
+/// Polled by [`eventually`] the same way [`assert_converged`] is, since
+/// ownership catching up after the last action needs a few anti-entropy
+/// intervals same as anywhere else.
+async fn assert_converged_distributed(
+    nodes: &[Node],
+    fill_keys: u32,
+    burst_entries: &[(String, String)],
+    owners: usize,
+    wait: Duration,
+) {
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    let ids = collect_node_ids(&node_refs).await;
+    let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
+    let expected_sum = owners * (fill_keys as usize + burst_entries.len());
+
+    let fill_sample = kv_range(fill_keys);
+    eventually(wait, || async {
+        if sum_counts(&node_refs).await != Some(expected_sum) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &fill_sample, owners).await
+            && ownership_snapshot_matches(tagged[0].0, &tagged, burst_entries, owners).await
+    })
+    .await;
+    eprintln!(
+        "chaos-distributed: every node converged, {fill_keys} fill keys and {} burst keys each \
+         on exactly {owners} owners",
+        burst_entries.len()
+    );
+
+    let mismatches = fetch_mismatches(&node_refs, &fill_sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every fill key must be fetchable with the right value from every node: {mismatches:?}"
+    );
+    let burst_mismatches = fetch_mismatches(&node_refs, burst_entries).await;
+    assert!(
+        burst_mismatches.is_empty(),
+        "every burst key must be fetchable with the right value from every node: \
+         {burst_mismatches:?}"
+    );
+}
+
+/// The distributed-mode counterpart to
+/// [`chaos_crashes_churn_and_drops_still_converge`]: same seeded action mix
+/// (crash+respawn, churn on the always-replicated `"churn"` cache, drop,
+/// refill, put bursts) against a distributed `"it"`, converging on
+/// [`assert_converged_distributed`]'s ownership-aware check instead of
+/// content agreement across every node. Shares every helper the replicated
+/// chaos test uses — [`ChaosAction`], [`pick_chaos_action`],
+/// [`perform_chaos_action`], [`spawn_chaos_cluster_mode`],
+/// [`crash_and_respawn_mode`] — parametrized on `owners` rather than
+/// duplicated.
+///
+/// Gated the same way: `SUNDOG_CONTAINER_TESTS=1` and `SUNDOG_CHAOS_SECS`;
+/// `SUNDOG_CHAOS_SEED` pins the run for a repeatable replay. Named with the
+/// `chaos_` prefix so `nightly-chaos.yml` picks it up alongside the
+/// replicated one.
+#[tokio::test]
+async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
+    const NODE_COUNT: usize = 4;
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 2_000;
+    const FILL_WAIT: Duration = Duration::from_secs(90);
+    const CHURN_OPS: u32 = 500;
+    const REFILL_COUNT: u32 = 500;
+    const BURST_COUNT: u32 = 20;
+    const CONVERGENCE_WAIT: Duration = Duration::from_secs(180);
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4"];
+    const CLUSTER: &str = "chaos-distributed-cluster";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+    let Ok(secs_raw) = std::env::var("SUNDOG_CHAOS_SECS") else {
+        eprintln!("skipping: SUNDOG_CHAOS_SECS not set");
+        return;
+    };
+    let secs: u64 = secs_raw
+        .parse()
+        .expect("SUNDOG_CHAOS_SECS is a u64 seconds count");
+
+    let run_seed = chaos_seed(secs);
+    let mut rng = StdRng::seed_from_u64(run_seed);
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = spawn_chaos_cluster_mode(&net, CLUSTER, &ALIASES, Some(OWNERS)).await;
+
+    nodes[0]
+        .fill(FILL_KEYS)
+        .await
+        .expect("initial fill succeeds");
+    eventually(FILL_WAIT, || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+    eprintln!("chaos-distributed: {FILL_KEYS} keys filled, each on exactly {OWNERS} owners");
+
+    // Every burst key this run ever wrote, mirroring `perform_chaos_action`'s
+    // own `Burst` arm's key/value format exactly, so the convergence check
+    // below knows the full expected keyspace beyond `0..FILL_KEYS`.
+    let mut burst_entries: Vec<(String, String)> = Vec::new();
+    let mut crashes = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut iteration = 0u64;
+    while std::time::Instant::now() < deadline {
+        iteration += 1;
+        let action = pick_chaos_action(
+            &mut rng,
+            nodes.len(),
+            FILL_KEYS,
+            CHURN_OPS,
+            REFILL_COUNT,
+            BURST_COUNT,
+        );
+        if let ChaosAction::Crash { node: idx } = action {
+            crashes += 1;
+            crash_and_respawn_mode(
+                &mut nodes,
+                &net,
+                CLUSTER,
+                &ALIASES,
+                idx,
+                iteration,
+                Some(OWNERS),
+            )
+            .await;
+        } else {
+            if let ChaosAction::Burst { count, .. } = action {
+                for j in 0..count {
+                    let key = format!("burst-{run_seed:x}-{iteration}-{j}");
+                    let value = format!("v-{run_seed:x}-{iteration}-{j}");
+                    burst_entries.push((key, value));
+                }
+            }
+            perform_chaos_action(&nodes, action, iteration, run_seed).await;
+        }
+    }
+    eprintln!(
+        "chaos-distributed: ran {iteration} actions over {secs}s, including {crashes} \
+         crash/respawn cycles"
+    );
+
+    assert_converged_distributed(
+        &nodes,
+        FILL_KEYS,
+        &burst_entries,
+        usize::from(OWNERS),
+        CONVERGENCE_WAIT,
+    )
+    .await;
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
     net.close().await.expect("network closes");
 }

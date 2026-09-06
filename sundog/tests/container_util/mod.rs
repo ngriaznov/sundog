@@ -214,6 +214,28 @@ impl Node {
         Self::spawn_binary(net, cluster_name, alias, seeds, extra_env, build_testnode()).await
     }
 
+    /// [`Node::spawn`] for a `Mode::Distributed` `"it"`:
+    /// `SUNDOG_TESTNODE_MODE=distributed`, plus `SUNDOG_TESTNODE_OWNERS` set
+    /// to `owners` when given (absent means the two-owner default).
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never becomes ready.
+    pub async fn spawn_distributed(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        owners: Option<u8>,
+    ) -> Node {
+        let owners_str;
+        let mut env = vec![("SUNDOG_TESTNODE_MODE", "distributed")];
+        if let Some(owners) = owners {
+            owners_str = owners.to_string();
+            env.push(("SUNDOG_TESTNODE_OWNERS", owners_str.as_str()));
+        }
+        Self::spawn_with_env(net, cluster_name, alias, seeds, &env).await
+    }
+
     /// [`Node::spawn_with_env`] running `bin` instead of this checkout's
     /// test node: [`build_previous_testnode`] for a mixed-version cluster.
     /// # Panics
@@ -349,6 +371,48 @@ impl Node {
                 .map(Some)
                 .ok_or(reply),
         }
+    }
+
+    /// `fetch k`, returning `Some(value)` on `val <v>` and `None` on `none`.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails, or the reply is `err ...` or
+    /// matches neither `val <v>` nor `none`.
+    pub async fn fetch(&self, key: &str) -> Result<Option<String>, String> {
+        match self.command(&format!("fetch {key}")).await? {
+            reply if reply == "none" => Ok(None),
+            reply => reply
+                .strip_prefix("val ")
+                .map(str::to_string)
+                .map(Some)
+                .ok_or(reply),
+        }
+    }
+
+    /// `owners k`, the key's owning node ids in rendezvous score order.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or any id fails to parse.
+    pub async fn owners(&self, key: &str) -> Result<Vec<u64>, String> {
+        let reply = self.command(&format!("owners {key}")).await?;
+        reply
+            .split_whitespace()
+            .map(|id| {
+                id.parse()
+                    .map_err(|error| format!("bad owner id {id:?}: {error}"))
+            })
+            .collect()
+    }
+
+    /// `id`, this node's own `NodeId` as a decimal `u64`.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not numeric.
+    pub async fn node_id(&self) -> Result<u64, String> {
+        self.command("id")
+            .await?
+            .parse()
+            .map_err(|error| format!("bad id reply: {error}"))
     }
 
     /// `del k`.
