@@ -18,10 +18,13 @@ mod container_util;
 use std::sync::Arc;
 use std::time::Duration;
 
-use container_util::{Node, build_previous_testnode, container_tests_enabled, eventually};
+use container_util::{
+    METRICS_PORT, Node, build_previous_testnode, container_tests_enabled, eventually,
+};
+use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
 use rand::{RngExt as _, SeedableRng as _};
-use rightsize::Network;
+use rightsize::{Network, Wait};
 
 /// Every `sundog-testnode` binds gossip on this fixed port; seed strings
 /// below are `<alias>:<GOSSIP_PORT>`, resolved via DNS against the alias.
@@ -1077,5 +1080,341 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
     old.stop().await.expect("old node stops");
     new.stop().await.expect("new node stops");
     old2.stop().await.expect("second old node stops");
+    net.close().await.expect("network closes");
+}
+
+/// Finds `metric{...,label="value",...} <number>` in Prometheus
+/// text-exposition `body`, tolerant of label ordering and
+/// integer-vs-float rendering. Mirrors `tests/spill_replication.rs`'s own
+/// copy, kept local since integration test binaries don't share code beyond
+/// `mod container_util`.
+fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
+    let wanted = format!("{}=\"{}\"", label.0, label.1);
+    body.lines().find_map(|line| {
+        let rest = line.strip_prefix(metric)?;
+        let rest = rest.strip_prefix('{')?;
+        let (labels, value) = rest.split_once('}')?;
+        if !labels.split(',').any(|pair| pair == wanted) {
+            return None;
+        }
+        value.trim().parse::<f64>().ok()
+    })
+}
+
+/// Scrapes `node`'s `/metrics` and reads one `metric{label}` value, `0` if
+/// the scrape fails or the series has never been touched (a metric with no
+/// writes yet is absent from the exposition, not printed as zero). Every
+/// `sundog_spill_*`/`sundog_ae_repaired_total` series this file reads is an
+/// exact-integer count in practice, so rounding it to `u64` here sidesteps
+/// `clippy::float_cmp` entirely: every comparison below compares `u64`s,
+/// never `f64`s, mirroring `tests/spill_bench.rs`'s `metric_count`.
+async fn scrape_metric(node: &Node, metric: &str, label: (&str, &str)) -> u64 {
+    let value = node
+        .metrics()
+        .await
+        .ok()
+        .and_then(|body| metric_value(&body, metric, label));
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "every metric read here is a nonnegative counter or gauge"
+    )]
+    let count = value.unwrap_or(0.0).round() as u64;
+    count
+}
+
+/// Sum of [`fill`][Node::fill]'s `k{i}`/`v{i}` UTF-8 byte lengths (key plus
+/// value) over `0..count`: the exact formula `sundog-testnode`'s
+/// `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` weigher applies per entry, so a RAM
+/// budget or spill capacity computed from this holds a known, exact
+/// fraction of `fill`'s entries rather than a guess.
+fn fill_weight_bytes(count: u32) -> u64 {
+    (0..count)
+        .map(|i| (format!("k{i}").len() + format!("v{i}").len()) as u64)
+        .sum()
+}
+
+/// Directory the spill tier lives under inside a spilling node's container;
+/// a fresh, empty filesystem every time a container starts, so reusing this
+/// same path across a restart never sees the previous container's files.
+const SPILL_DIR: &str = "/spill";
+
+/// The `SUNDOG_TESTNODE_*` env vars for a spilling `Mode::Replicated` node:
+/// `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` bounds RAM to `ram_budget_bytes` via
+/// the byte-counting weigher, and `SUNDOG_TESTNODE_SPILL_DIR`/
+/// `..._SPILL_CAPACITY_BYTES`/`..._SPILL_REGION_BYTES` compose a spill tier
+/// under [`SPILL_DIR`] sized to `spill_capacity_bytes`/`region_bytes`.
+fn spill_node_env(
+    ram_budget_bytes: u64,
+    spill_capacity_bytes: u64,
+    region_bytes: u64,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            "SUNDOG_TESTNODE_MAX_CAPACITY_BYTES".to_string(),
+            ram_budget_bytes.to_string(),
+        ),
+        (
+            "SUNDOG_TESTNODE_SPILL_DIR".to_string(),
+            SPILL_DIR.to_string(),
+        ),
+        (
+            "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES".to_string(),
+            spill_capacity_bytes.to_string(),
+        ),
+        (
+            "SUNDOG_TESTNODE_SPILL_REGION_BYTES".to_string(),
+            region_bytes.to_string(),
+        ),
+    ]
+}
+
+/// Reads `fill_keys` random `k{i}`/`v{i}` entries through `node`,
+/// concurrently, and returns a description of every one that came back
+/// wrong (empty on full agreement). Concurrent rather than sequential so a
+/// large sample stays fast across the container network's per-connection
+/// round trip.
+async fn sample_mismatches(node: &Node, keys: Vec<u32>) -> Vec<String> {
+    stream::iter(keys)
+        .map(|i| async move {
+            let key = format!("k{i}");
+            let expected = format!("v{i}");
+            let got = node.get(&key).await;
+            (key, expected, got)
+        })
+        .buffer_unordered(64)
+        .filter_map(|(key, expected, got)| async move {
+            (got != Ok(Some(expected.clone())))
+                .then(|| format!("{key}: expected Ok(Some({expected:?})), got {got:?}"))
+        })
+        .collect()
+        .await
+}
+
+/// A tiny RAM budget on node `a`, backed by a spill tier generously sized to
+/// hold everything eviction demotes to it, still serves a full 3-node
+/// `Mode::Replicated` cluster's writes correctly, and the cluster settles
+/// with no anti-entropy repair loop once nothing is left to reconcile:
+/// `sundog_ae_repaired_total` never moves on either node absent an actual
+/// gap, spilling or not.
+#[tokio::test]
+async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_loops() {
+    const FILL_COUNT: u32 = 3_000;
+    /// Small enough that the computed capacity below (tens of KB) still
+    /// clears `SpillConfig::validate`'s `capacity_bytes >= 2 * region_bytes`.
+    const SPILL_REGION_BYTES: u64 = 16 * 1024;
+    const CLUSTER: &str = "spill-cluster";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    // A third holds roughly a third of the fill's entries; the capacity
+    // budget below covers every entry's key/value bytes plus a generous
+    // per-record on-disk header allowance (the real header is much
+    // smaller), doubled again, so eviction never needs to reclaim a region
+    // still holding live data.
+    let total_weight = fill_weight_bytes(FILL_COUNT);
+    let ram_budget_bytes = total_weight / 3;
+    let spill_capacity_bytes = (total_weight + u64::from(FILL_COUNT) * 64) * 2;
+    let a_env = spill_node_env(ram_budget_bytes, spill_capacity_bytes, SPILL_REGION_BYTES);
+    let a_env_refs: Vec<(&str, &str)> = a_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let net = Arc::new(Network::new_network());
+    let a = Node::spawn_with_env(&net, CLUSTER, "a", &[], &a_env_refs).await;
+    let b = Node::spawn(&net, CLUSTER, "b", &[&seed("a")]).await;
+    let c = Node::spawn(&net, CLUSTER, "c", &[&seed("a"), &seed("b")]).await;
+    wait_for_peers(&[&a, &b, &c], 2).await;
+
+    b.fill(FILL_COUNT)
+        .await
+        .expect("bulk fill through b succeeds");
+    for node in [&a, &b, &c] {
+        eventually(CONVERGE_WAIT, || async {
+            node.count().await == Ok(FILL_COUNT as usize)
+        })
+        .await;
+    }
+
+    let spilled = scrape_metric(&a, "sundog_spill_entries", ("cache", "it")).await;
+    assert!(
+        spilled > 0,
+        "a's tiny RAM budget ({ram_budget_bytes} bytes for {total_weight} bytes of fill) should \
+         have spilled some of the {FILL_COUNT} entries, got {spilled}"
+    );
+    let dropped_queue_full =
+        scrape_metric(&a, "sundog_spill_dropped_total", ("reason", "queue_full")).await;
+    assert!(
+        dropped_queue_full * 100 <= u64::from(FILL_COUNT),
+        "a dropped {dropped_queue_full} writes to a full flush queue, more than a tiny fraction \
+         of the {FILL_COUNT} entries written"
+    );
+
+    let mismatches = sample_mismatches(&a, (0..FILL_COUNT).collect()).await;
+    assert!(
+        mismatches.is_empty(),
+        "every fill key must read correctly through a, resident or spilled: {mismatches:?}"
+    );
+
+    // Quiescence check: with nothing left to reconcile, `sundog_ae_repaired_
+    // total` must not move across several further anti-entropy intervals. A
+    // bounded poll cannot express "nothing happens for a while", so these
+    // two fixed windows are a deliberate exception to this file's own
+    // bounded-poll rule. sundog-testnode's `ae_interval` is 2s; two 6s
+    // windows span three rounds each. Each node's repair count travels as a
+    // `(a, b)` pair rather than four similarly-named bindings.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let repaired_before = (
+        scrape_metric(&a, "sundog_ae_repaired_total", ("cache", "it")).await,
+        scrape_metric(&b, "sundog_ae_repaired_total", ("cache", "it")).await,
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let repaired_after = (
+        scrape_metric(&a, "sundog_ae_repaired_total", ("cache", "it")).await,
+        scrape_metric(&b, "sundog_ae_repaired_total", ("cache", "it")).await,
+    );
+    assert_eq!(
+        repaired_before.0, repaired_after.0,
+        "a's repair counter must settle once the cluster has nothing left to reconcile, spilling \
+         or not"
+    );
+    assert_eq!(
+        repaired_before.1, repaired_after.1,
+        "b's repair counter must settle once the cluster has nothing left to reconcile"
+    );
+
+    let io_errors = scrape_metric(&a, "sundog_spill_reads_total", ("outcome", "io_error")).await;
+    assert_eq!(
+        io_errors, 0,
+        "no spilled-value read on a should ever hit a disk io_error in this run"
+    );
+
+    // Concurrent, not sequential: each `stop()` waits out the container's
+    // ungraceful-shutdown grace period (`sundog-testnode` does not trap
+    // `SIGTERM`), so stopping three nodes one after another would triple
+    // that wait for no reason.
+    let (a_stopped, b_stopped, c_stopped) = tokio::join!(a.stop(), b.stop(), c.stop());
+    a_stopped.expect("a stops");
+    b_stopped.expect("b stops");
+    c_stopped.expect("c stops");
+    net.close().await.expect("network closes");
+}
+
+/// A spilling node's tier is discarded, not restored, across a restart: the
+/// freshly reopened tier starts at zero `sundog_spill_entries`, then the node
+/// rewarms to a full copy via state transfer from its still-live peers and,
+/// once its RAM budget is exceeded again, resumes serving some of its reads
+/// from disk.
+#[tokio::test]
+async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
+    const FILL_COUNT: u32 = 3_000;
+    const SPILL_REGION_BYTES: u64 = 16 * 1024;
+    const SAMPLE_SIZE: usize = 300;
+    const CLUSTER: &str = "spill-restart-cluster";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let total_weight = fill_weight_bytes(FILL_COUNT);
+    let ram_budget_bytes = total_weight / 3;
+    let spill_capacity_bytes = (total_weight + u64::from(FILL_COUNT) * 64) * 2;
+    let a_env = spill_node_env(ram_budget_bytes, spill_capacity_bytes, SPILL_REGION_BYTES);
+    let a_env_refs: Vec<(&str, &str)> = a_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let net = Arc::new(Network::new_network());
+    let a = Node::spawn_with_env(&net, CLUSTER, "a", &[], &a_env_refs).await;
+    let b = Node::spawn(&net, CLUSTER, "b", &[&seed("a")]).await;
+    let c = Node::spawn(&net, CLUSTER, "c", &[&seed("a"), &seed("b")]).await;
+    wait_for_peers(&[&a, &b, &c], 2).await;
+
+    b.fill(FILL_COUNT)
+        .await
+        .expect("bulk fill through b succeeds");
+    for node in [&a, &b, &c] {
+        eventually(CONVERGE_WAIT, || async {
+            node.count().await == Ok(FILL_COUNT as usize)
+        })
+        .await;
+    }
+    let spilled_before_restart = scrape_metric(&a, "sundog_spill_entries", ("cache", "it")).await;
+    assert!(
+        spilled_before_restart > 0,
+        "a should already be spilling some of the {FILL_COUNT} entries before the restart"
+    );
+
+    a.stop().await.expect("a stops ahead of its restart");
+    wait_for_peers(&[&b, &c], 1).await;
+
+    // A fresh container filesystem under the same alias and the same spill
+    // dir: the point is that `attach_spill` always opens a brand new tier
+    // from scratch (`SpillTier::open` "recreates them from scratch every
+    // time"), so this stands in for that discard-and-reopen either way.
+    //
+    // Waits for `GET /metrics` rather than the usual `testnode-ready` log
+    // line: `ClusterBuilder::prometheus_listen`'s HTTP server comes up
+    // during `Cluster::builder(..).build()`, well before the `Mode::
+    // Replicated` cache's state transfer even starts, let alone finishes
+    // re-filling and re-spilling past the RAM budget. Racing a scrape
+    // against `testnode-ready` (printed only once state transfer has
+    // already landed) would never observe a genuine zero; this does.
+    let a = Node::spawn_with_env_and_wait(
+        &net,
+        CLUSTER,
+        "a",
+        &[&seed("b"), &seed("c")],
+        &a_env_refs,
+        Wait::for_http("/metrics").for_port(METRICS_PORT),
+    )
+    .await;
+
+    let spill_entries_at_start = scrape_metric(&a, "sundog_spill_entries", ("cache", "it")).await;
+    assert_eq!(
+        spill_entries_at_start, 0,
+        "a freshly reopened spill tier starts empty, discarding whatever was on disk before the \
+         restart rather than resuming it"
+    );
+
+    // The control port is not necessarily up yet at this point (state
+    // transfer, then `churn`'s own open, run before it binds), so `count`
+    // failing early is expected and `eventually` simply keeps retrying.
+    eventually(CONVERGE_WAIT, || async {
+        a.count().await == Ok(FILL_COUNT as usize)
+    })
+    .await;
+
+    // Once the RAM budget is exceeded again by the rewarmed content, a
+    // should resume spilling.
+    eventually(Duration::from_secs(30), || async {
+        scrape_metric(&a, "sundog_spill_entries", ("cache", "it")).await > 0
+    })
+    .await;
+
+    let mut rng = StdRng::seed_from_u64(0x5111_2357);
+    let sample: Vec<u32> = (0..SAMPLE_SIZE)
+        .map(|_| rng.random_range(0..FILL_COUNT))
+        .collect();
+    let mismatches = sample_mismatches(&a, sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every sampled key must read correctly through the restarted a, resident or spilled: \
+         {mismatches:?}"
+    );
+
+    // Concurrent, not sequential: see the first scenario's own comment on
+    // why stopping three nodes one after another wastes two full shutdown
+    // grace periods for nothing.
+    let (a_stopped, b_stopped, c_stopped) = tokio::join!(a.stop(), b.stop(), c.stop());
+    a_stopped.expect("a stops");
+    b_stopped.expect("b stops");
+    c_stopped.expect("c stops");
     net.close().await.expect("network closes");
 }

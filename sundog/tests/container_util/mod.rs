@@ -13,11 +13,18 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rightsize::{Container, ContainerGuard, MountableFile, Network, Wait};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use rightsize::{Container, ContainerGuard, MountableFile, Network, Wait, WaitStrategy};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::TcpStream;
 
 const CONTROL_PORT: u16 = 8080;
+/// `sundog-testnode`'s `GET /metrics` port, served once it is built with
+/// sundog's `prometheus` feature (see [`build_testnode`]); unused, but
+/// harmlessly exposed, on a [`build_previous_testnode`] binary that predates
+/// it. `pub` so a caller can build its own [`rightsize::WaitStrategy`]
+/// against it, e.g. [`Wait::for_http`] for a wait that does not require the
+/// control port to be up yet.
+pub const METRICS_PORT: u16 = 9090;
 const READY_LOG: &str = "testnode-ready";
 /// Bound on [`Node::crash`]'s wait for the backend to confirm the container
 /// process actually died.
@@ -39,7 +46,10 @@ fn base_image() -> String {
 
 /// Builds `sundog-testnode` for the musl target, once per test process, and
 /// returns its release binary path. `chitchat` pulls `zstd-sys`, which needs
-/// `CC_x86_64_unknown_linux_musl` to point at a musl-capable `cc`.
+/// `CC_x86_64_unknown_linux_musl` to point at a musl-capable `cc`. Built with
+/// sundog's `spill` and `prometheus` features on, so every container run has
+/// both the spill tier (`SUNDOG_TESTNODE_SPILL_DIR` and friends) and a
+/// `GET /metrics` endpoint available, whether or not a given test uses them.
 /// # Panics
 ///
 /// Panics if the build command cannot be spawned or exits non-zero.
@@ -54,6 +64,8 @@ pub fn build_testnode() -> &'static Path {
                 "x86_64-unknown-linux-musl",
                 "-p",
                 "sundog-testnode",
+                "--features",
+                "spill,prometheus",
             ])
             .env("CC_x86_64_unknown_linux_musl", "musl-gcc")
             .current_dir(workspace_root())
@@ -167,6 +179,7 @@ fn workspace_root() -> PathBuf {
 pub struct Node {
     guard: ContainerGuard,
     control_port: u16,
+    metrics_port: u16,
 }
 
 impl Node {
@@ -214,12 +227,70 @@ impl Node {
         extra_env: &[(&str, &str)],
         bin: &Path,
     ) -> Node {
+        Self::spawn_binary_with_wait(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            extra_env,
+            bin,
+            Wait::for_log_message(READY_LOG, 1),
+        )
+        .await
+    }
+
+    /// [`Node::spawn_with_env`], but returns as soon as `wait` reports ready
+    /// instead of waiting for the `testnode-ready` log line — for a caller
+    /// that wants the guard back before the node has finished its cache
+    /// warm-up, e.g. to observe `/metrics` the moment it starts serving,
+    /// well before a `Mode::Replicated` cache's state transfer runs. A
+    /// `Node` returned this way may not have a live control port yet: its
+    /// own [`Node::command`] connections fail until `sundog-testnode`'s
+    /// listener binds, same as connecting too early to any other port.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never satisfies `wait`.
+    pub async fn spawn_with_env_and_wait(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        wait: impl WaitStrategy + 'static,
+    ) -> Node {
+        Self::spawn_binary_with_wait(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            extra_env,
+            build_testnode(),
+            wait,
+        )
+        .await
+    }
+
+    /// The actual container-boot logic every `spawn*` constructor shares,
+    /// parametrized on the readiness check so [`Node::spawn_with_env_and_wait`]
+    /// can substitute its own without duplicating the rest.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never satisfies `wait`.
+    async fn spawn_binary_with_wait(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        bin: &Path,
+        wait: impl WaitStrategy + 'static,
+    ) -> Node {
         rightsize_modules::register_default_backends();
 
         let mut container = Container::new(&base_image())
             .with_network(net)
             .with_network_aliases(&[alias])
-            .with_exposed_ports(&[CONTROL_PORT])
+            .with_exposed_ports(&[CONTROL_PORT, METRICS_PORT])
             .with_copy_file_to_container(
                 MountableFile::for_host_path(&bin.to_string_lossy()),
                 "/sundog-testnode",
@@ -230,7 +301,7 @@ impl Node {
             container = container.with_env(key, value);
         }
         let guard = container
-            .waiting_for(Wait::for_log_message(READY_LOG, 1))
+            .waiting_for(wait)
             .start()
             .await
             .expect("test-node container starts and becomes ready");
@@ -238,9 +309,13 @@ impl Node {
         let control_port = guard
             .get_mapped_port(CONTROL_PORT)
             .expect("invariant: control port was declared via with_exposed_ports");
+        let metrics_port = guard
+            .get_mapped_port(METRICS_PORT)
+            .expect("invariant: metrics port was declared via with_exposed_ports");
         Node {
             guard,
             control_port,
+            metrics_port,
         }
     }
 
@@ -428,6 +503,34 @@ impl Node {
     pub async fn digest(&self) -> Result<u64, String> {
         let reply = self.command("digest").await?;
         u64::from_str_radix(&reply, 16).map_err(|error| format!("bad digest reply: {error}"))
+    }
+
+    /// `GET /metrics` on this node's mapped `METRICS_PORT`, returning the raw
+    /// Prometheus text-exposition body: `sundog-testnode` built with
+    /// sundog's `prometheus` feature serves it via
+    /// `ClusterBuilder::prometheus_listen`. A fresh connection per call, like
+    /// [`Node::command`].
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails, or the response has no
+    /// `\r\n\r\n` header/body separator.
+    pub async fn metrics(&self) -> Result<String, String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.metrics_port))
+            .await
+            .map_err(|error| format!("connect to {}: {error}", self.metrics_port))?;
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .map_err(|error| format!("write: {error}"))?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .map_err(|error| format!("read: {error}"))?;
+        response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .ok_or_else(|| format!("no header/body separator in metrics response: {response:?}"))
     }
 
     /// `crash`: sends the command, waits for the backend to confirm the

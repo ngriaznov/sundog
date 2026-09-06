@@ -11,6 +11,26 @@
 //! `Mode::Replicated` cache named `"it"` and prints `testnode-ready` once
 //! the control listener is up.
 //!
+//! `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`, an optional `u64`, bounds `"it"`
+//! with a byte-counting weigher (`byte_weight`) instead of the default
+//! unbounded entry count. Combined with `SUNDOG_TESTNODE_SPILL_DIR` (a
+//! filesystem path) and `SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES` (a `u64` byte
+//! budget), both required together, `"it"` opens with a `SpillConfig` tier
+//! under that directory and capacity; `SUNDOG_TESTNODE_SPILL_REGION_BYTES`,
+//! an optional `u64`, overrides its default region size. These three spill
+//! variables only exist when this binary is built with sundog's `spill`
+//! feature; setting `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` alone, with no spill
+//! dir, opens `Mode::Replicated` with a finite `max_capacity` and no spill
+//! tier, which `open()` rejects — a test never does this. With none of these
+//! four set, `"it"` opens exactly as it always has: unbounded, no weigher, no
+//! spill.
+//!
+//! Built with the `prometheus` feature, every run also serves `GET /metrics`
+//! (and `/readyz`, `/healthz`) on `METRICS_PORT` via
+//! `sundog::ClusterBuilder::prometheus_listen`, exposing every
+//! `sundog_spill_*`/`sundog_ae_repaired_total` counter and gauge the store
+//! emits for `"it"`.
+//!
 //! Control protocol, one command per line, one line-terminated reply each:
 //! `put k v` -> `ok`; `get k` -> `val <v>` | `none`; `del k` -> `ok`;
 //! `count` -> `<n>`; `fill n` -> `ok`, bulk-inserting `k0..kn` = `v0..vn`;
@@ -39,6 +59,8 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+#[cfg(feature = "spill")]
+use sundog::SpillConfig;
 use sundog::{Cache, Cluster, ClusterConfig, Mode};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -46,6 +68,10 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const GOSSIP_PORT: u16 = 7946;
 const CONTROL_PORT: u16 = 8080;
+/// Bound only with the `prometheus` feature: `GET /metrics`/`/readyz`/
+/// `/healthz` via `sundog::ClusterBuilder::prometheus_listen`.
+#[cfg(feature = "prometheus")]
+const METRICS_PORT: u16 = 9090;
 const CACHE_NAME: &str = "it";
 const CHURN_CACHE_NAME: &str = "churn";
 /// Short enough that early `churn` writes expire while the run continues.
@@ -116,6 +142,54 @@ fn usize_env(name: &str) -> Option<usize> {
     parse_usize_override(env::var(name).ok().as_deref())
 }
 
+/// [`parse_usize_override`] for a `u64`, backing
+/// `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
+/// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`.
+fn parse_u64_override(raw: Option<&str>) -> Option<u64> {
+    raw?.parse().ok()
+}
+
+/// Reads `name` as a `u64` env override via [`parse_u64_override`].
+fn u64_env(name: &str) -> Option<u64> {
+    parse_u64_override(env::var(name).ok().as_deref())
+}
+
+/// Weighs one entry by its UTF-8 byte length, key plus value: the
+/// byte-counting weigher `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` installs on
+/// `"it"` so its `max_capacity` bounds bytes rather than entry count.
+/// Saturates at `u32::MAX` rather than panicking on a pathologically large
+/// single entry.
+fn byte_weight(key: &str, value: &str) -> u32 {
+    (key.len() + value.len()).try_into().unwrap_or(u32::MAX)
+}
+
+/// Builds `"it"`'s optional spill tier from
+/// `SUNDOG_TESTNODE_SPILL_DIR`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
+/// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`'s already-parsed values: `None` when
+/// no spill dir is set, so the cache opens spill-free exactly as it always
+/// has.
+///
+/// # Panics
+///
+/// Panics if `dir` is set but `capacity_bytes` is not: a spill dir with no
+/// budget is a misconfigured test run, not a state to open a node in.
+#[cfg(feature = "spill")]
+fn spill_config_from_env(
+    dir: Option<String>,
+    capacity_bytes: Option<u64>,
+    region_bytes: Option<u64>,
+) -> Option<SpillConfig> {
+    let dir = dir?;
+    let capacity_bytes = capacity_bytes.expect(
+        "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES must be set alongside SUNDOG_TESTNODE_SPILL_DIR",
+    );
+    let mut cfg = SpillConfig::new(dir, capacity_bytes);
+    if let Some(region_bytes) = region_bytes {
+        cfg = cfg.region_bytes(region_bytes);
+    }
+    Some(cfg)
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_name = env::args()
         .nth(1)
@@ -137,16 +211,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let cluster = Cluster::builder(cluster_name)
-        .seeds(seeds)
-        .config(config)
-        .build()
-        .await?;
-    let cache = cluster
+    #[cfg_attr(not(feature = "prometheus"), allow(unused_mut))]
+    let mut builder = Cluster::builder(cluster_name).seeds(seeds).config(config);
+    #[cfg(feature = "prometheus")]
+    {
+        builder = builder.prometheus_listen(SocketAddr::from(([0, 0, 0, 0], METRICS_PORT)));
+    }
+    let cluster = builder.build().await?;
+
+    let max_capacity_bytes = u64_env("SUNDOG_TESTNODE_MAX_CAPACITY_BYTES");
+    let mut it_builder = cluster
         .cache::<String, String>(CACHE_NAME)
-        .mode(Mode::Replicated)
-        .open()
-        .await?;
+        .mode(Mode::Replicated);
+    if let Some(max_capacity_bytes) = max_capacity_bytes {
+        it_builder = it_builder
+            .max_capacity(max_capacity_bytes)
+            .weigher(|key: &String, value: &String| byte_weight(key, value));
+    }
+    #[cfg(feature = "spill")]
+    {
+        let spill_cfg = spill_config_from_env(
+            env::var("SUNDOG_TESTNODE_SPILL_DIR").ok(),
+            u64_env("SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES"),
+            u64_env("SUNDOG_TESTNODE_SPILL_REGION_BYTES"),
+        );
+        if let Some(spill_cfg) = spill_cfg {
+            it_builder = it_builder.spill(spill_cfg);
+        }
+    }
+    let cache = it_builder.open().await?;
     let churn = cluster
         .cache::<String, String>(CHURN_CACHE_NAME)
         .mode(Mode::Replicated)
@@ -396,5 +489,75 @@ mod tests {
         let value = big_value(3, 16);
         assert_eq!(verdict(&value, 3, 16), "ok");
         assert_ne!(verdict("wrong", 3, 16), "ok");
+    }
+
+    #[test]
+    fn parse_u64_override_reads_a_valid_number() {
+        assert_eq!(parse_u64_override(Some("1073741824")), Some(1_073_741_824));
+        assert_eq!(parse_u64_override(Some("0")), Some(0));
+    }
+
+    #[test]
+    fn parse_u64_override_is_none_for_absent_or_unparsable_input() {
+        assert_eq!(parse_u64_override(None), None);
+        assert_eq!(parse_u64_override(Some("")), None);
+        assert_eq!(parse_u64_override(Some("not-a-number")), None);
+        assert_eq!(
+            parse_u64_override(Some("-1")),
+            None,
+            "u64 rejects a negative value"
+        );
+    }
+
+    #[test]
+    fn byte_weight_sums_key_and_value_utf8_lengths() {
+        assert_eq!(byte_weight("k0", "v0"), 4);
+        assert_eq!(byte_weight("", ""), 0);
+        assert_eq!(byte_weight("abc", "de"), 5);
+    }
+
+    #[cfg(feature = "spill")]
+    mod spill_env {
+        use super::*;
+
+        #[test]
+        fn spill_config_from_env_is_none_without_a_dir() {
+            assert!(spill_config_from_env(None, None, None).is_none());
+            assert!(
+                spill_config_from_env(None, Some(1 << 20), None).is_none(),
+                "a capacity with no dir still opens spill-free"
+            );
+        }
+
+        #[test]
+        fn spill_config_from_env_builds_from_a_dir_and_capacity() {
+            let cfg = spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None)
+                .expect("dir plus capacity builds a config");
+            assert_eq!(cfg.dir, std::path::PathBuf::from("/tmp/spill-it"));
+            assert_eq!(cfg.capacity_bytes, 4096);
+        }
+
+        #[test]
+        fn spill_config_from_env_applies_the_region_override() {
+            let default_region =
+                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None)
+                    .expect("builds")
+                    .region_bytes_value();
+            let cfg =
+                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), Some(512))
+                    .expect("builds");
+            assert_eq!(cfg.region_bytes_value(), 512);
+            assert_ne!(
+                cfg.region_bytes_value(),
+                default_region,
+                "the override actually changes the region size from the default"
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES")]
+        fn spill_config_from_env_panics_when_the_dir_is_set_without_a_capacity() {
+            let _ = spill_config_from_env(Some("/tmp/spill-it".to_string()), None, None);
+        }
     }
 }

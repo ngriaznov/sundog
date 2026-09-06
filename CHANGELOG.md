@@ -20,6 +20,19 @@ Both changes below are breaking; the next release is 0.5.0.
   Eviction demotes rather than deletes, so anti-entropy does not need to
   silently re-pull evicted entries back. `tti` stays rejected for `Replicated`
   regardless, since it is local-only by design.
+- **Container coverage for the spill tier**: `sundog-testnode` is now built with
+  the `spill` and `prometheus` features in every container run, reads
+  `SUNDOG_TESTNODE_SPILL_DIR`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
+  `SUNDOG_TESTNODE_SPILL_REGION_BYTES`/`SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` to
+  open `"it"` with a spill tier and a byte-counting weigher, and serves
+  `GET /metrics`. Two new scenarios in `tests/containers.rs`:
+  `replicated_cluster_serves_spilled_entries_and_settles_without_repair_loops`
+  drives a three-node `Mode::Replicated` cluster through a tiny RAM budget on
+  one node and checks every key still reads correctly, resident or spilled,
+  and that anti-entropy settles with no repair loop; `spilling_node_survives_
+  a_restart_and_rewarms_from_peers` restarts the spilling node and confirms
+  its tier starts empty (discarded, not resumed) before rewarming from its
+  peers and resuming disk-backed reads.
 
 ### Changed
 
