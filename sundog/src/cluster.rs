@@ -878,18 +878,23 @@ impl RequestHandler for ClusterRequestHandler {
             let Some(local_hash) = shard.ownership_view_hash() else {
                 return FetchServe::Unavailable;
             };
+            let bucket = bucket_of(&key);
+            // A held record is an answer whatever the two views say: it is
+            // what a local `get` here would return. Only a miss depends on
+            // this node being a current, warm owner of the bucket.
+            if let Some(rec) = shard.records_for(vec![key]).await.into_iter().next() {
+                return FetchServe::Found(Some(rec));
+            }
             if local_hash != view_hash {
                 return FetchServe::Stale {
                     responder_view_hash: local_hash,
                 };
             }
-            let bucket = bucket_of(&key);
-            let rec = shard.records_for(vec![key]).await.into_iter().next();
-            if rec.is_none() && shard.is_cold_bucket(bucket) {
+            if shard.is_cold_bucket(bucket) {
                 // Owned but not yet pulled: a miss here is not an answer.
                 return FetchServe::Unavailable;
             }
-            FetchServe::Found(rec)
+            FetchServe::Found(None)
         })
     }
 
@@ -3977,11 +3982,24 @@ mod tests {
             panic!("expected a found record for a key this sole owner holds");
         };
         assert_eq!(rec.key, key_one);
+        // A held record answers even against a mismatched view hash; only
+        // a miss is declined as stale.
         assert!(matches!(
             handler
                 .fetch(name.clone(), key_one.clone(), view_hash.wrapping_add(1))
                 .await,
+            FetchServe::Found(Some(rec)) if rec.key == key_one
+        ));
+        let key_absent = Bytes::from(postcard::to_stdvec(&999_999u32).expect("test key encodes"));
+        assert!(matches!(
+            handler
+                .fetch(name.clone(), key_absent.clone(), view_hash.wrapping_add(1))
+                .await,
             FetchServe::Stale { responder_view_hash } if responder_view_hash == view_hash
+        ));
+        assert!(matches!(
+            handler.fetch(name.clone(), key_absent, view_hash).await,
+            FetchServe::Found(None)
         ));
 
         let AeServeOutcome::Digests(digests) = handler

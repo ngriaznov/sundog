@@ -28,12 +28,16 @@ use crate::store::ShardOps;
 /// `cluster::group_by_owner_set`, grouping bucket numbers instead of
 /// records, and preserving rendezvous order (not sorting it) since that
 /// order is exactly this group's donor try-order.
+/// One pull group: the donors to try, in rendezvous order, and the buckets
+/// they all co-own.
+type DonorGroup = (Vec<NodeId>, Vec<u16>);
+
 fn group_buckets_by_donor_set(
     view: &OwnershipView,
     self_node: NodeId,
     buckets: Vec<u16>,
-) -> Vec<(Vec<NodeId>, Vec<u16>)> {
-    let mut groups: Vec<(Vec<NodeId>, Vec<u16>)> = Vec::new();
+) -> Vec<DonorGroup> {
+    let mut groups: Vec<DonorGroup> = Vec::new();
     for bucket in buckets {
         let donors: Vec<NodeId> = view
             .owners_of(bucket)
@@ -170,11 +174,16 @@ pub(crate) async fn pull_buckets(
 
     let view = ownership.current();
     let view_hash = view.view_hash();
-    let groups: Vec<(Vec<NodeId>, Vec<u16>)> =
+    let (groups, no_donor): (Vec<DonorGroup>, Vec<DonorGroup>) =
         group_buckets_by_donor_set(&view, cluster.node_id(), buckets)
             .into_iter()
-            .filter(|(donors, _)| !donors.is_empty())
-            .collect();
+            .partition(|(donors, _)| !donors.is_empty());
+    // A bucket this node owns alone has nobody to pull from: what is here
+    // is all there is, so it is not cold either.
+    let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
+    if !alone.is_empty() {
+        residency.clear_cold(&alone);
+    }
     if groups.is_empty() {
         tracing::debug!(cache = %cache, "no live co-owner for any gained bucket; nothing to pull");
         return Outcome::NoPeers;

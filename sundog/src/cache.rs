@@ -1321,7 +1321,9 @@ mod tests {
             cancel: CancellationToken::new(),
             tasks: TaskTracker::new(),
         };
-        let key = (0..1_000_000u32)
+        // A key `b` does not hold: a held record answers a fetch whatever
+        // the views say, so only a miss exercises the stale retry.
+        let key = (2..1_000_000u32)
             .find(|key| {
                 let bucket = bucket_of(&encode_key(key).expect("u32 encodes"));
                 !view.owns(bucket) && view.owners_of(bucket).contains(&peer_b.node)
