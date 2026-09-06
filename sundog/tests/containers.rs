@@ -801,31 +801,64 @@ fn pick_chaos_action(
     }
 }
 
+/// Spawns one node under `alias`, seeded from `seeds`: `Mode::Distributed`
+/// with `owners` owners per bucket when `owners` is `Some`, or
+/// `Mode::Replicated` (a plain [`Node::spawn`]) when `None`. The one spawn
+/// decision [`spawn_chaos_cluster_mode`] and [`crash_and_respawn_mode`] both
+/// need, so a chaos cluster and its mid-run replacements always agree on
+/// which mode they run.
+async fn spawn_chaos_node(
+    net: &Arc<Network>,
+    cluster: &str,
+    alias: &str,
+    seeds: &[&str],
+    owners: Option<u8>,
+) -> Node {
+    match owners {
+        Some(owners) => Node::spawn_distributed(net, cluster, alias, seeds, Some(owners)).await,
+        None => Node::spawn(net, cluster, alias, seeds).await,
+    }
+}
+
 /// Spawns `aliases.len()` nodes on `cluster`, each seeded from the aliases
-/// already spawned before it, and waits for all of them to see every other
-/// one as a peer.
-async fn spawn_chaos_cluster(net: &Arc<Network>, cluster: &str, aliases: &[&str]) -> Vec<Node> {
+/// already spawned before it, in the mode [`spawn_chaos_node`] decides from
+/// `owners`, and waits for all of them to see every other one as a peer.
+async fn spawn_chaos_cluster_mode(
+    net: &Arc<Network>,
+    cluster: &str,
+    aliases: &[&str],
+    owners: Option<u8>,
+) -> Vec<Node> {
     let mut nodes = Vec::with_capacity(aliases.len());
     for (i, alias) in aliases.iter().enumerate() {
         let seeds: Vec<String> = aliases[..i].iter().map(|a| seed(a)).collect();
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-        nodes.push(Node::spawn(net, cluster, alias, &seed_refs).await);
+        nodes.push(spawn_chaos_node(net, cluster, alias, &seed_refs, owners).await);
     }
     wait_for_peers(&nodes.iter().collect::<Vec<_>>(), aliases.len() - 1).await;
     nodes
 }
 
+/// [`spawn_chaos_cluster_mode`] with `owners: None`, `Mode::Replicated`
+/// throughout: [`chaos_crashes_churn_and_drops_still_converge`]'s own,
+/// unchanged entry point.
+async fn spawn_chaos_cluster(net: &Arc<Network>, cluster: &str, aliases: &[&str]) -> Vec<Node> {
+    spawn_chaos_cluster_mode(net, cluster, aliases, None).await
+}
+
 /// Crashes `nodes[idx]`, respawns it under the same alias seeded from the
-/// other still-live aliases, and waits for every node to see the rest of
-/// the cluster again before returning — the point past which the next
-/// chaos iteration may pick another node to crash.
-async fn crash_and_respawn(
+/// other still-live aliases in the mode [`spawn_chaos_node`] decides from
+/// `owners`, and waits for every node to see the rest of the cluster again
+/// before returning — the point past which the next chaos iteration may pick
+/// another node to crash.
+async fn crash_and_respawn_mode(
     nodes: &mut Vec<Node>,
     net: &Arc<Network>,
     cluster: &str,
     aliases: &[&str],
     idx: usize,
     iteration: u64,
+    owners: Option<u8>,
 ) {
     let alias = aliases[idx];
     eprintln!("chaos[{iteration}]: crashing {alias}");
@@ -841,13 +874,30 @@ async fn crash_and_respawn(
         .map(|(_, a)| seed(a))
         .collect();
     let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-    nodes.insert(idx, Node::spawn(net, cluster, alias, &seed_refs).await);
+    nodes.insert(
+        idx,
+        spawn_chaos_node(net, cluster, alias, &seed_refs, owners).await,
+    );
 
     wait_for_peers(&nodes.iter().collect::<Vec<_>>(), aliases.len() - 1).await;
     eprintln!(
         "chaos[{iteration}]: {alias} respawned and saw {} peers",
         aliases.len() - 1
     );
+}
+
+/// [`crash_and_respawn_mode`] with `owners: None`,
+/// [`chaos_crashes_churn_and_drops_still_converge`]'s own, unchanged entry
+/// point.
+async fn crash_and_respawn(
+    nodes: &mut Vec<Node>,
+    net: &Arc<Network>,
+    cluster: &str,
+    aliases: &[&str],
+    idx: usize,
+    iteration: u64,
+) {
+    crash_and_respawn_mode(nodes, net, cluster, aliases, idx, iteration, None).await;
 }
 
 /// Runs one non-crash [`ChaosAction`] and logs it; crashes are handled
