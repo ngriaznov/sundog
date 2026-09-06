@@ -7,22 +7,30 @@
 
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rand::RngExt as _;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::cluster::Cluster;
 use crate::error::CacheError;
-use crate::ownership::{OwnershipTracker, ResidencySet};
+use crate::net::FetchOutcome;
+use crate::node::NodeId;
+use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
-use crate::store::{ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher};
+use crate::store::{
+    ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher, bucket_of, encode_key,
+    now_ms,
+};
+use crate::wire::WireRecord;
 
 /// Builds a [`Cache`]: own-and-return, per house style.
 #[must_use]
@@ -125,10 +133,14 @@ where
     /// `ClusterConfig::state_transfer_budget`. A cache too large to finish
     /// inside the budget opens with a partial copy anti-entropy tops up.
     ///
-    /// A [`Mode::Distributed`] cache computes and attaches its bucket-
-    /// ownership view before it is ever shared, but for now reads and
-    /// writes on it behave exactly like [`Mode::Local`], and it opens warm
-    /// immediately rather than pulling anything from a donor.
+    /// For [`Mode::Distributed`], `open()` computes and attaches its
+    /// bucket-ownership view before the shard is ever shared, then pulls
+    /// every bucket that view assigns to this node from a current owner —
+    /// the same open()-time transfer shape as [`Mode::Replicated`], scoped
+    /// to this node's own buckets rather than the whole cache. A transfer
+    /// that lands, or finds nothing to pull, opens the cache warm; one that
+    /// times out repeatedly opens warm anyway once anti-entropy and
+    /// rebalance have somewhere to carry on from.
     ///
     /// # Errors
     ///
@@ -216,7 +228,7 @@ where
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
-        let shard = attach_ownership(shard, &cluster, &name, mode);
+        let (shard, distributed) = attach_ownership(shard, &cluster, &name, mode);
         let shard = Arc::new(shard);
 
         // The registry check-and-reserve runs before any spill I/O: two
@@ -257,15 +269,16 @@ where
         }
 
         cluster.advertise_cache_mode(&name, mode);
-        // Only a `Replicated` cache has anything to receive before it can
-        // donate; the other modes are warm the moment they open.
-        if !matches!(mode, Mode::Replicated) {
+        // `Replicated` and `Distributed` both have something to receive
+        // before they can donate; every other mode is warm the moment it
+        // opens.
+        if matches!(mode, Mode::Local | Mode::Invalidation) {
             cluster.mark_warm(&name);
         }
 
         let cancel = cluster.cancel_token().child_token();
         let tasks = TaskTracker::new();
-        spawn_cache_tasks(&cluster, &shard, &name, mode, &cancel, &tasks).await;
+        spawn_cache_tasks(&cluster, &shard, &name, mode, &cancel, &tasks, distributed).await;
 
         Ok(Cache {
             shard,
@@ -306,40 +319,98 @@ fn validate_mode(
     Ok(())
 }
 
+/// Attempts [`Cache::fetch`] retries against the same still-`Stale`-but-
+/// unchanged owner before moving to the next candidate.
+const MAX_FETCH_ATTEMPTS_PER_OWNER: u32 = 3;
+
+/// A small jittered backoff between retrying the same [`Cache::fetch`]
+/// owner after it reports its view as stale but this node's own view has
+/// not itself changed: uniformly in `[10, 50)` ms.
+fn fetch_retry_backoff() -> Duration {
+    Duration::from_millis(rand::rng().random_range(10..50))
+}
+
+/// Emits `sundog_fetch_total{cache, outcome}` for one [`Cache::fetch`] call.
+fn record_fetch_outcome(cache: &str, outcome: &'static str) {
+    metrics::counter!(
+        "sundog_fetch_total",
+        "cache" => cache.to_string(),
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
+/// Decodes a [`Cache::fetch`] reply's record into its value, re-checking
+/// expiry client-side (defense in depth against the responder's own expiry
+/// sweep lagging) and treating a tombstone or undecodable value as a miss.
+fn decode_live_value<V: DeserializeOwned>(rec: &WireRecord) -> Option<V> {
+    if rec.is_tombstone() {
+        return None;
+    }
+    if let Some(expires_at_ms) = rec.expires_at_ms
+        && expires_at_ms <= now_ms()
+    {
+        return None;
+    }
+    rec.value
+        .as_deref()
+        .and_then(|bytes| postcard::from_bytes::<V>(bytes).ok())
+}
+
+/// The handles `attach_ownership` produces for a `Mode::Distributed` cache
+/// and `spawn_cache_tasks` threads through to the background loops that
+/// need them: the tracker and residency set already attached to the shard,
+/// the `watch::Sender` its refresh loop publishes through, and the
+/// `owners` count its view recomputes with.
+struct DistributedContext {
+    ownership: OwnershipTracker,
+    view_tx: watch::Sender<Arc<OwnershipView>>,
+    residency: Arc<ResidencySet>,
+    owners: NonZeroU8,
+}
+
 /// Attaches a freshly seeded bucket-ownership tracker and residency set to
 /// `shard`, for a `Mode::Distributed` cache; every other mode leaves both
-/// unset. Runs before `shard` is ever shared, so no reader can observe
-/// anything but a real, already-computed view.
+/// unset and returns `None`. Runs before `shard` is ever shared, so no
+/// reader can observe anything but a real, already-computed view.
 fn attach_ownership<K, V>(
     mut shard: Shard<K, V>,
     cluster: &Cluster,
     name: &SmolStr,
     mode: Mode,
-) -> Shard<K, V>
+) -> (Shard<K, V>, Option<DistributedContext>)
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    if let Mode::Distributed { owners } = mode {
-        let (ownership, view_tx) = OwnershipTracker::seed(
-            cluster.node_id(),
-            &cluster.peers(),
-            &cluster.advertised_cache_modes(),
-            name,
+    let Mode::Distributed { owners } = mode else {
+        return (shard, None);
+    };
+    let (ownership, view_tx) = OwnershipTracker::seed(
+        cluster.node_id(),
+        &cluster.peers(),
+        &cluster.advertised_cache_modes(),
+        name,
+        owners,
+    );
+    let residency = Arc::new(ResidencySet::new());
+    shard = shard.with_ownership(ownership.clone(), Arc::clone(&residency));
+    (
+        shard,
+        Some(DistributedContext {
+            ownership,
+            view_tx,
+            residency,
             owners,
-        );
-        let residency = Arc::new(ResidencySet::new());
-        shard = shard.with_ownership(ownership, residency);
-        // The background loop that republishes this view on membership and
-        // cache-mode changes consumes `view_tx`; nothing reads it yet.
-        let _ = view_tx;
-    }
-    shard
+        }),
+    )
 }
 
 /// The background loops one opened cache runs: fan-out for a clustered
-/// mode, warm-up and anti-entropy for `Replicated`, tombstone GC, and the
-/// entry gauge, all under `cancel` and tracked by `tasks`.
+/// mode, warm-up and anti-entropy for `Replicated`, the analogous
+/// bucket-scoped pull, refresh, and rebalance loops for `Distributed`,
+/// tombstone GC, and the entry gauge, all under `cancel` and tracked by
+/// `tasks`.
 async fn spawn_cache_tasks<K, V>(
     cluster: &Cluster,
     shard: &Arc<Shard<K, V>>,
@@ -347,6 +418,7 @@ async fn spawn_cache_tasks<K, V>(
     mode: Mode,
     cancel: &CancellationToken,
     tasks: &TaskTracker,
+    distributed: Option<DistributedContext>,
 ) where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -374,6 +446,17 @@ async fn spawn_cache_tasks<K, V>(
         )
         .await;
     }
+    if let Some(distributed) = distributed {
+        distributed_warm_and_rebalance(
+            cluster,
+            Arc::clone(shard) as Arc<dyn ShardOps>,
+            name,
+            distributed,
+            cancel.clone(),
+            tasks,
+        )
+        .await;
+    }
     cluster.spawn_tracked_in(
         tasks,
         crate::cluster::tombstone_gc_task(
@@ -388,6 +471,98 @@ async fn spawn_cache_tasks<K, V>(
     cluster.spawn_tracked_in(
         tasks,
         crate::cluster::cache_entries_gauge_task(Arc::clone(shard), name.clone(), cancel.clone()),
+    );
+}
+
+/// The `Mode::Distributed`-only half of [`spawn_cache_tasks`]: pulls this
+/// node's initially owned buckets from their current owners before the
+/// cache is marked warm, the bucket-scoped analogue of
+/// [`warm_and_repair`]'s whole-cache transfer, then starts the
+/// ownership-refresh and rebalance loops. A timed-out initial pull leaves
+/// warming to [`crate::cluster::rebalance::warm_up_task`], the same
+/// "retry a few times, then open warm with what landed" shape
+/// [`state_transfer::warm_up_task`] already has for `Mode::Replicated`.
+///
+/// [`state_transfer::warm_up_task`]: crate::cluster::state_transfer::warm_up_task
+async fn distributed_warm_and_rebalance(
+    cluster: &Cluster,
+    shard_ops: Arc<dyn ShardOps>,
+    name: &SmolStr,
+    distributed: DistributedContext,
+    cancel: CancellationToken,
+    tasks: &TaskTracker,
+) {
+    let DistributedContext {
+        ownership,
+        view_tx,
+        residency,
+        owners,
+    } = distributed;
+
+    let budget = cluster.config().state_transfer_budget;
+    let concurrency = cluster.config().rebalance_concurrency;
+    let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
+    let outcome = crate::cluster::rebalance::pull_buckets(
+        cluster,
+        &shard_ops,
+        &ownership,
+        name,
+        initially_owned,
+        budget,
+        concurrency,
+    )
+    .await;
+    if matches!(outcome, crate::cluster::state_transfer::Outcome::TimedOut) {
+        cluster.spawn_tracked_in(
+            tasks,
+            crate::cluster::rebalance::warm_up_task(
+                cluster.clone(),
+                Arc::clone(&shard_ops),
+                ownership.clone(),
+                name.clone(),
+                budget,
+                concurrency,
+                cancel.clone(),
+            ),
+        );
+    } else {
+        cluster.mark_warm(name);
+    }
+
+    let disown_grace =
+        cluster.config().ae_interval * cluster.config().distributed_disown_grace_rounds;
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::ownership::refresh_task(
+            cluster.clone(),
+            name.clone(),
+            owners,
+            view_tx,
+            cancel.clone(),
+        ),
+    );
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::cluster::rebalance::rebalance_task(
+            cluster.clone(),
+            Arc::clone(&shard_ops),
+            ownership,
+            residency,
+            name.clone(),
+            disown_grace,
+            concurrency,
+            cancel.clone(),
+        ),
+    );
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::cluster::anti_entropy::scheduler_task(
+            cluster.clone(),
+            shard_ops,
+            name.clone(),
+            cluster.config().ae_interval,
+            cancel,
+        ),
     );
 }
 
@@ -474,6 +649,114 @@ where
     #[must_use]
     pub fn get_sync(&self, key: &K) -> Option<V> {
         self.shard.get_sync(key)
+    }
+
+    /// Reads `key`: local if this node owns its bucket (no network,
+    /// counted `sundog_fetch_total{outcome="local"}`), otherwise one request
+    /// to a live owner, tried in rendezvous-score order until one answers.
+    /// Never promotes the fetched value into the local store —
+    /// [`Cache::get`] for the same key immediately afterward is still a
+    /// miss on this node. On a cache that isn't [`Mode::Distributed`] this
+    /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
+    /// unconditionally, so callers don't need to branch on mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to encode.
+    ///
+    /// Returns [`CacheError::FetchUnavailable`] if every owner is
+    /// unreachable or times out
+    /// (`crate::config::ClusterConfig::fetch_timeout` per attempt) —
+    /// distinct from a genuine miss, which returns `Ok(None)`.
+    pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
+        let Some(view) = self.shard.ownership_view() else {
+            let value = self.shard.get(key).await;
+            record_fetch_outcome(self.shard.name(), "local");
+            return Ok(value);
+        };
+        let key_bytes = encode_key(key)?;
+        let bucket = bucket_of(&key_bytes);
+        if view.owns(bucket) {
+            let value = self.shard.get(key).await;
+            record_fetch_outcome(self.shard.name(), "local");
+            return Ok(value);
+        }
+
+        let cache_name = SmolStr::new(self.shard.name());
+        let mesh = self.cluster.mesh();
+        let attempt_timeout = self.cluster.config().fetch_timeout;
+
+        let mut view = view;
+        let mut owners = view.owners_of(bucket).to_vec();
+        let mut owner_idx = 0usize;
+        let mut attempt = 0u32;
+
+        while owner_idx < owners.len() {
+            let owner = owners[owner_idx];
+            attempt += 1;
+            let outcome = tokio::time::timeout(
+                attempt_timeout,
+                mesh.fetch(
+                    owner,
+                    cache_name.clone(),
+                    key_bytes.clone(),
+                    view.view_hash(),
+                ),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(FetchOutcome::Found(rec))) => {
+                    let value = rec.and_then(|rec| decode_live_value::<V>(&rec));
+                    record_fetch_outcome(
+                        &cache_name,
+                        if value.is_some() { "remote" } else { "miss" },
+                    );
+                    return Ok(value);
+                }
+                Ok(Ok(FetchOutcome::Stale { .. })) => {
+                    if let Some(fresh) = self.shard.ownership_view()
+                        && fresh.view_hash() != view.view_hash()
+                    {
+                        view = fresh;
+                        if view.owns(bucket) {
+                            let value = self.shard.get(key).await;
+                            record_fetch_outcome(&cache_name, "local");
+                            return Ok(value);
+                        }
+                        owners = view.owners_of(bucket).to_vec();
+                        owner_idx = 0;
+                        attempt = 0;
+                        continue;
+                    }
+                    if attempt >= MAX_FETCH_ATTEMPTS_PER_OWNER {
+                        owner_idx += 1;
+                        attempt = 0;
+                        continue;
+                    }
+                    tokio::time::sleep(fetch_retry_backoff()).await;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    owner_idx += 1;
+                    attempt = 0;
+                }
+            }
+        }
+        record_fetch_outcome(&cache_name, "error");
+        Err(CacheError::FetchUnavailable { cache: cache_name })
+    }
+
+    /// The live owners of `key`'s bucket, in rendezvous score order.
+    /// `vec![self.cluster.node_id()]` on a cache that isn't
+    /// [`Mode::Distributed`].
+    #[must_use]
+    pub fn owners_of(&self, key: &K) -> Vec<NodeId> {
+        let Some(view) = self.shard.ownership_view() else {
+            return vec![self.cluster.node_id()];
+        };
+        let Ok(key_bytes) = encode_key(key) else {
+            return Vec::new();
+        };
+        view.owners_of(bucket_of(&key_bytes)).to_vec()
     }
 
     /// Reads whether `key` has a live entry, honoring expiry, without cloning
@@ -688,6 +971,282 @@ mod tests {
             state_transfer_budget: Duration::from_secs(5),
             ..ClusterConfig::default()
         }
+    }
+
+    async fn wait_for_peer_count(cluster: &Cluster, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if cluster.peers().len() >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peers converge within the bound");
+    }
+
+    /// Joins a fresh node onto `cluster_name`'s chitchat cluster (three
+    /// nodes total once this and the seed and a later joiner are all up, so
+    /// `owners = 2` leaves each bucket owned by exactly two of the three,
+    /// and every node fails to own a real share of buckets) and opens
+    /// `cache_name` as `Mode::Distributed { owners: 2 }` on it.
+    async fn join_distributed(
+        seed_addr: SocketAddr,
+        cluster_name: &'static str,
+        cache_name: &'static str,
+        peer_count: usize,
+    ) -> (Cluster, Cache<u32, String>) {
+        let cluster = Cluster::builder(cluster_name)
+            .seeds([seed_addr])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        wait_for_peer_count(&cluster, peer_count).await;
+        let cache = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster
+                .cache::<u32, String>(cache_name)
+                .mode(Mode::Distributed {
+                    owners: NonZeroU8::new(2).expect("nonzero"),
+                })
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("open succeeds");
+        (cluster, cache)
+    }
+
+    /// A three-node `Mode::Distributed { owners: 2 }` cluster, all open on
+    /// `cache_name`, plus a key whose bucket the first node does not own
+    /// (its live owners are exactly the second and third nodes).
+    async fn three_node_distributed(
+        cluster_name: &'static str,
+        cache_name: &'static str,
+    ) -> (
+        (Cluster, Cache<u32, String>),
+        (Cluster, Cache<u32, String>),
+        (Cluster, Cache<u32, String>),
+        u32,
+    ) {
+        let a = Cluster::builder(cluster_name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = a
+            .cache::<u32, String>(cache_name)
+            .mode(Mode::Distributed {
+                owners: NonZeroU8::new(2).expect("nonzero"),
+            })
+            .open()
+            .await
+            .expect("a opens alone, owning everything");
+        let seed = a.local_gossip_addr();
+
+        let (b, cache_b) = join_distributed(seed, cluster_name, cache_name, 1).await;
+        wait_for_peer_count(&a, 1).await;
+        let (c, cache_c) = join_distributed(seed, cluster_name, cache_name, 2).await;
+        wait_for_peer_count(&a, 2).await;
+        wait_for_peer_count(&b, 2).await;
+
+        // A key whose bucket `a` does not own: with three eligible nodes and
+        // owners = 2, roughly a third of keys land here. `a`'s ownership
+        // view only recomputes once its background refresh task has
+        // observed both the membership change above and the gossiped
+        // cache-mode advertisement `b`/`c` sent on their own `open()` —
+        // strictly a separate, slightly later event than peer liveness —
+        // so this polls rather than searching the instant peers converge.
+        let unowned_key = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(key) =
+                    (0..10_000u32).find(|&k| !cache_a.owners_of(&k).contains(&a.node_id()))
+                {
+                    return key;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a's ownership view converges to include b and c within the bound");
+
+        ((a, cache_a), (b, cache_b), (c, cache_c), unowned_key)
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_local_value_without_a_network_request_when_this_node_owns_the_bucket() {
+        let cluster = Cluster::builder("cache-it-fetch-local")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("prices")
+            .mode(Mode::Distributed {
+                owners: NonZeroU8::new(2).expect("nonzero"),
+            })
+            .open()
+            .await
+            .expect("a solo node opens warm, owning every bucket");
+        cache.insert(1, "one".to_string()).await.expect("insert");
+
+        assert_eq!(
+            cache.fetch(&1).await.expect("fetch succeeds"),
+            Some("one".to_string()),
+            "a solo node owns every bucket, so fetch reads locally"
+        );
+        assert_eq!(
+            cache.fetch(&2).await.expect("fetch succeeds"),
+            None,
+            "a genuine local miss is Ok(None), not an error"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_reaches_a_remote_owner_and_returns_its_value() {
+        let ((a, cache_a), (b, _cache_b), (c, cache_c), unowned_key) =
+            three_node_distributed("cache-it-fetch-remote", "prices").await;
+
+        // Written through whichever of the two real owners it lands on;
+        // `insert` on a non-owner forwards, so writing through `c` (an
+        // owner or not) always reaches the true owners either way.
+        cache_c
+            .insert(unowned_key, "remote".to_string())
+            .await
+            .expect("insert");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(Some(value)) = cache_a.fetch(&unowned_key).await
+                    && value == "remote"
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fetch reaches a real owner and returns its value within the bound");
+
+        assert_eq!(
+            cache_a.get(&unowned_key).await,
+            None,
+            "fetch never promotes the value into a's own local store"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_fetch_unavailable_when_every_owner_is_down() {
+        let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) =
+            three_node_distributed("cache-it-fetch-unavailable", "prices").await;
+        cache_b
+            .insert(unowned_key, "value".to_string())
+            .await
+            .expect("insert");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(Some(value)) = cache_a.fetch(&unowned_key).await
+                    && value == "value"
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the value reaches a real owner first, proving the key is genuinely resident");
+
+        // Both of the key's real owners go down; `a` never owned it and
+        // gossip has not yet had time to recompute `a`'s view around their
+        // departure, so every dial fails outright.
+        b.shutdown().await;
+        c.shutdown().await;
+
+        assert!(matches!(
+            cache_a.fetch(&unowned_key).await,
+            Err(CacheError::FetchUnavailable { cache }) if cache == "prices"
+        ));
+
+        a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owners_of_matches_the_ownership_view_for_the_keys_bucket() {
+        let ((a, cache_a), (b, _cache_b), (c, _cache_c), unowned_key) =
+            three_node_distributed("cache-it-owners-of", "prices").await;
+
+        let owners = cache_a.owners_of(&unowned_key);
+        assert_eq!(owners.len(), 2, "owners = 2 for this cache");
+        assert!(
+            !owners.contains(&a.node_id()),
+            "this key was chosen specifically because a does not own it"
+        );
+        // Every owner reported is a real, live node in this cluster.
+        for owner in &owners {
+            assert!(*owner == a.node_id() || *owner == b.node_id() || *owner == c.node_id());
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    /// The end-to-end proof that the write forward, the fan-out group-by-
+    /// owner-set, and the fetch read path all compose: a write through a
+    /// node that does not own the key's bucket never becomes locally
+    /// visible on the writer, forwards to the real owners, and both the
+    /// writer and another non-owner read the value back correctly through
+    /// [`Cache::fetch`].
+    #[tokio::test]
+    async fn write_through_a_non_owner_composes_with_fetch_on_every_node() {
+        let ((a, cache_a), (b, cache_b), (c, cache_c), unowned_key) =
+            three_node_distributed("cache-it-write-through-non-owner", "prices").await;
+
+        // `a` was chosen specifically because it does not own this key's
+        // bucket: this insert never touches a's engine, only forwards.
+        cache_a
+            .insert(unowned_key, "through-a".to_string())
+            .await
+            .expect("insert forwards");
+        assert_eq!(
+            cache_a.get(&unowned_key).await,
+            None,
+            "a forwarded write never becomes locally visible on the writer"
+        );
+
+        // Every node, owner or not, reads the same value back through
+        // fetch: the writer itself, and whichever of b/c is not a real
+        // owner either.
+        let owners = cache_a.owners_of(&unowned_key);
+        for cache in [&cache_a, &cache_b, &cache_c] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(Some(value)) = cache.fetch(&unowned_key).await
+                        && value == "through-a"
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("fetch converges to the forwarded value on every node");
+        }
+        assert_eq!(owners.len(), 2);
+
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
     }
 
     #[tokio::test]
