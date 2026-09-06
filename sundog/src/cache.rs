@@ -656,9 +656,13 @@ where
     /// to a live owner, tried in rendezvous-score order until one answers.
     /// Never promotes the fetched value into the local store —
     /// [`Cache::get`] for the same key immediately afterward is still a
-    /// miss on this node. On a cache that isn't [`Mode::Distributed`] this
-    /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
-    /// unconditionally, so callers don't need to branch on mode.
+    /// miss on this node. An owner answers from its own copy alone, this
+    /// node included: a bucket this node gained but has not yet pulled from
+    /// its previous owners reads `Ok(None)` until that pull lands, never a
+    /// fallback to another owner. On a cache that isn't
+    /// [`Mode::Distributed`] this is [`Cache::get`] wrapped in `Ok`, counted
+    /// `outcome="local"` unconditionally, so callers don't need to branch
+    /// on mode.
     ///
     /// # Errors
     ///
