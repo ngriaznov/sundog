@@ -52,6 +52,15 @@
 //! `Engine::finish_spill_handoff`. A full queue found there is handled
 //! exactly like a downstream failed write: `SpillSink::abandon` restores
 //! the weight, the entry stays resident, never a physical removal.
+//!
+//! `total_weight` freeing a hand-off's weight immediately does not mean
+//! that RAM is actually free: the victim's value stays fully resident
+//! until the flusher's `install` runs. `Engine::pending_spill_weight`
+//! tracks exactly that gap, gaining a victim's weight at hand-off and
+//! losing it again at `install` or `abandon`, and `Engine::enforce_capacity`
+//! weighs `total_weight` plus this against `max_capacity`, so a lagging
+//! flusher's backlog still counts against the cap instead of vanishing
+//! from the budget while sitting fully resident in RAM.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -378,6 +387,19 @@ fn absent_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool 
         }
     }
     false
+}
+
+/// [`Engine::enforce_capacity`]'s stop rule once one pass evicted nothing:
+/// whether to return immediately, rather than pay for
+/// [`Engine::evict_one_scanning`]'s full-stripe scan, and instead let the
+/// flusher's own installs bring `pending_spill_weight` down on their own.
+/// `true` whenever `pending_spill_weight` is still positive: some hand-off
+/// is in flight, and it will resolve, install or abandon, shortly with no
+/// further eviction needed on this call's part. `false` once it is back to
+/// zero, this loop's ordinary cue to fall back to the scan exactly as it
+/// always has, spill tier configured or not. Pure; unit tested directly.
+fn defer_to_flusher(pending_spill_weight: u64) -> bool {
+    pending_spill_weight > 0
 }
 
 /// How many of `sampled_weights` (coldest first) one lock hold evicts: the
@@ -805,6 +827,30 @@ pub(crate) struct Engine<K, V> {
     /// assert against without installing a real Prometheus recorder.
     #[cfg(all(feature = "spill", test))]
     spill_entries_test_count: AtomicI64,
+    /// Weight already zeroed out of `total_weight` by a spill hand-off,
+    /// [`Engine::evict_one_sampled`]/[`Engine::evict_batch_sampled`]
+    /// committing to [`VictimOutcome::PendingSpill`], but not yet
+    /// resolved: the entry stays fully resident in RAM until
+    /// [`SpillSink::install`] flips it to [`Payload::Spilled`], which
+    /// subtracts its share back out, or [`SpillSink::abandon`] restores it
+    /// to `total_weight` instead. `Engine::enforce_capacity`'s over-cap
+    /// check adds this to `total_weight`, so RAM a lagging flusher hasn't
+    /// caught up on still counts against the cap; see the doc on that
+    /// method. Always `0` in a non-`spill` build, which never creates a
+    /// hand-off in the first place.
+    ///
+    /// Known gap: only `install` and `abandon` ever release a hand-off's
+    /// share of this. A fresh write, tombstone, `invalidate`, or expiry
+    /// that displaces a still-pending key before its job resolves either
+    /// way leaves that share stranded here rather than releasing it on the
+    /// spot. Each stranded share is small and bounded by one victim's
+    /// weight, and landing it takes a write racing a hand-off inside one
+    /// flush's short real-disk latency, so it grows far slower than, and
+    /// independently of, the flush backlog itself; a sustained, adversarial
+    /// enough churn could still accumulate it over a long enough run. Left
+    /// as a follow-up rather than fixed here.
+    #[cfg(feature = "spill")]
+    pending_spill_weight: AtomicU64,
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
 }
@@ -841,6 +887,8 @@ where
             spill_entries_gauge: OnceLock::new(),
             #[cfg(all(feature = "spill", test))]
             spill_entries_test_count: AtomicI64::new(0),
+            #[cfg(feature = "spill")]
+            pending_spill_weight: AtomicU64::new(0),
             #[cfg(test)]
             eviction_lock_acquisitions: AtomicU64::new(0),
         }
@@ -927,6 +975,39 @@ where
     #[cfg(feature = "spill")]
     pub(crate) fn spill(&self) -> Option<&Arc<SpillTier>> {
         self.spill.get()
+    }
+
+    /// `pending_spill_weight`'s current value, for
+    /// [`Engine::enforce_capacity`]'s over-cap check: RAM a spill hand-off
+    /// has already zeroed out of `total_weight` but that a lagging
+    /// flusher has not yet actually freed. Always `0` in a non-`spill`
+    /// build, which never creates a hand-off to begin with, so this
+    /// leaves `enforce_capacity`'s behavior there exactly as it was.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_self,
+            reason = "the field this reads only exists under feature = \"spill\""
+        )
+    )]
+    fn pending_spill_weight_or_zero(&self) -> u64 {
+        #[cfg(feature = "spill")]
+        {
+            self.pending_spill_weight.load(Ordering::Relaxed)
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            0
+        }
+    }
+
+    /// [`Engine::pending_spill_weight_or_zero`], for tests: this engine's
+    /// current `pending_spill_weight`, only ever nonzero once a spill
+    /// hand-off has zeroed a victim's weight and before its flusher
+    /// install or abandon resolves it.
+    #[cfg(all(feature = "spill", test))]
+    pub(crate) fn debug_pending_spill_weight(&self) -> u64 {
+        self.pending_spill_weight_or_zero()
     }
 
     fn is_absent(&self, live: &Live<K, V>, now_ms: u64) -> bool {
@@ -1576,6 +1657,8 @@ where
             VictimOutcome::PendingSpill(weight, job) => {
                 self.total_weight
                     .fetch_sub(u64::from(weight), Ordering::Relaxed);
+                self.pending_spill_weight
+                    .fetch_add(u64::from(weight), Ordering::Relaxed);
                 self.finish_spill_handoff(job);
                 EvictOutcome {
                     removed_weight: u64::from(weight),
@@ -1632,6 +1715,8 @@ where
         let mut removed_count = 0u64;
         #[cfg(feature = "spill")]
         let mut pending_spills: Vec<SpillJob> = Vec::new();
+        #[cfg(feature = "spill")]
+        let mut pending_weight_added = 0u64;
         for (key_bytes, _, _) in sampled.into_iter().take(victims) {
             match self.evict_victim_locked(&mut stripe, bucket, &key_bytes) {
                 VictimOutcome::Removed(weight) => {
@@ -1641,12 +1726,18 @@ where
                 #[cfg(feature = "spill")]
                 VictimOutcome::PendingSpill(weight, job) => {
                     removed_weight += u64::from(weight);
+                    pending_weight_added += u64::from(weight);
                     pending_spills.push(job);
                 }
                 VictimOutcome::Vanished => {}
             }
         }
         drop(stripe);
+        #[cfg(feature = "spill")]
+        if pending_weight_added > 0 {
+            self.pending_spill_weight
+                .fetch_add(pending_weight_added, Ordering::Relaxed);
+        }
         // Every victim's channel send waits until here, past the stripe
         // lock this whole batch shared: cloning a victim's bytes and
         // deciding its fate needs that lock, but handing the job to the
@@ -1676,25 +1767,39 @@ where
     /// left to evict. Never holds two stripe locks at once; a no-op when
     /// `max_capacity` is [`u64::MAX`].
     ///
-    /// A spill hand-off frees its victim's weight from `total_weight` at
-    /// the same instant a physical removal would, so this loop's own
-    /// `total_weight` re-check at the top of every iteration already sees
-    /// a spilling pass's progress; with a spill tier configured, this
-    /// behaves exactly as it does without one.
+    /// The over-cap check weighs `total_weight` plus `pending_spill_weight`:
+    /// a spill hand-off zeroes and frees its victim's weight from
+    /// `total_weight` the instant it commits, but the victim stays fully
+    /// resident until the flusher's install actually resolves it, so
+    /// `pending_spill_weight` is what keeps that still-resident RAM
+    /// counting against the cap in the meantime. When a pass evicts
+    /// nothing and some hand-off is still pending, [`defer_to_flusher`]
+    /// has this return rather than pay for
+    /// [`Engine::evict_one_scanning`]'s full-stripe scan, trusting the
+    /// flusher's own installs to bring `pending_spill_weight` back down
+    /// shortly with no further eviction needed. With nothing pending, the
+    /// scan runs exactly as it always has, spill tier configured or not.
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
         if self.max_capacity == u64::MAX {
             return;
         }
         let mut bucket = start_bucket;
         loop {
-            let current = self.total_weight.load(Ordering::Relaxed);
+            let total = self.total_weight.load(Ordering::Relaxed);
+            let pending = self.pending_spill_weight_or_zero();
+            let current = total.saturating_add(pending);
             if current <= self.max_capacity {
                 return;
             }
             let over_by = current - self.max_capacity;
             let batch_outcome = self.evict_batch_sampled(bucket, over_by);
-            if batch_outcome.made_no_progress() && self.evict_one_scanning(bucket).is_none() {
-                return;
+            if batch_outcome.made_no_progress() {
+                if defer_to_flusher(self.pending_spill_weight_or_zero()) {
+                    return;
+                }
+                if self.evict_one_scanning(bucket).is_none() {
+                    return;
+                }
             }
             bucket = self.next_pseudo_random_bucket();
         }
@@ -2057,7 +2162,7 @@ where
         ver: Hlc,
         loc: SpillLoc,
     ) -> bool {
-        {
+        let released_weight = {
             let mut stripe = self.stripes[stripe_idx].write();
             let stored_tombstone_ver = stripe.tombstones.get(key_bytes.as_ref()).map(|t| t.ver);
             let Some(live) = stripe
@@ -2066,21 +2171,29 @@ where
             else {
                 return false;
             };
-            if !spilled_is_current(stored_tombstone_ver, Some(live.ver), ver)
-                || !matches!(live.payload, Payload::Resident { .. })
-            {
+            if !spilled_is_current(stored_tombstone_ver, Some(live.ver), ver) {
                 return false;
             }
             // The victim's weight was already zeroed on this entry, and
-            // subtracted from `total_weight`, at hand-off time in
-            // `Engine::try_spill_victim`; `Spilled`'s invariant is that
-            // weight is always `0`, which already holds here.
+            // moved from `total_weight` into `pending_spill_weight`, at
+            // hand-off time in `Engine::try_spill_victim`; `Spilled`'s
+            // invariant is that weight is always `0`, which already holds
+            // here.
             debug_assert_eq!(
                 live.weight, 0,
                 "invariant: a spill candidate's weight is zeroed at hand-off"
             );
+            let weight = match &live.payload {
+                Payload::Resident { value, .. } => {
+                    self.weigher.as_ref().map_or(1, |w| w(&live.key, value))
+                }
+                Payload::Spilled(_) => return false,
+            };
             live.payload = Payload::Spilled(loc);
-        }
+            weight
+        };
+        self.pending_spill_weight
+            .fetch_sub(u64::from(released_weight), Ordering::Relaxed);
         self.note_spill_arrival();
         true
     }
@@ -2113,6 +2226,8 @@ where
         };
         self.total_weight
             .fetch_add(u64::from(weight), Ordering::Relaxed);
+        self.pending_spill_weight
+            .fetch_sub(u64::from(weight), Ordering::Relaxed);
     }
 
     fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize {
@@ -3175,6 +3290,19 @@ mod tests {
     }
 
     #[test]
+    fn defer_to_flusher_true_only_while_pending_spill_weight_is_positive() {
+        assert!(
+            !defer_to_flusher(0),
+            "nothing pending: enforce_capacity's ordinary scanning fallback runs"
+        );
+        assert!(
+            defer_to_flusher(1),
+            "anything still pending: trust the flusher rather than scan every stripe"
+        );
+        assert!(defer_to_flusher(u64::MAX));
+    }
+
+    #[test]
     fn eviction_batch_size_takes_the_fewest_entries_that_clear_the_overage() {
         assert_eq!(
             eviction_batch_size(0, &[3, 3, 3]),
@@ -4140,12 +4268,13 @@ mod tests {
             assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
         }
 
-        /// Puts `live.weight` at `hash`/`kb` back to `0` and subtracts
-        /// `weight` from `total_weight`, exactly the state a successful
-        /// hand-off to a spill tier leaves behind while the flusher's write
-        /// is still in flight. Lets a test drive `SpillSink::abandon`
-        /// directly, the same way this module already drives `install` and
-        /// `reclaim` directly, with no real disk or flusher thread needed.
+        /// Puts `live.weight` at `hash`/`kb` back to `0`, moves `weight` out
+        /// of `total_weight` and into `pending_spill_weight`, exactly the
+        /// state a successful hand-off to a spill tier leaves behind while
+        /// the flusher's write is still in flight. Lets a test drive
+        /// `SpillSink::abandon`/`SpillSink::install` directly, the same way
+        /// this module already drives `reclaim` directly, with no real disk
+        /// or flusher thread needed.
         fn simulate_pending_handoff(
             engine: &Engine<u32, String>,
             bucket: usize,
@@ -4164,6 +4293,9 @@ mod tests {
             engine
                 .total_weight
                 .fetch_sub(u64::from(weight), Ordering::Relaxed);
+            engine
+                .pending_spill_weight
+                .fetch_add(u64::from(weight), Ordering::Relaxed);
         }
 
         #[test]
@@ -4183,6 +4315,11 @@ mod tests {
             simulate_pending_handoff(&engine, bucket, hash, &kb, 7);
             let (_, weight_pending) = engine.debug_totals();
             assert_eq!(weight_pending, 0);
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                7,
+                "the hand-off's weight moved into pending_spill_weight"
+            );
 
             SpillSink::abandon(&engine, bucket, &kb, hash, ver);
 
@@ -4191,6 +4328,11 @@ mod tests {
                 weight_after, 7,
                 "abandon recomputes the weight through the weigher and adds it back to \
                  total_weight"
+            );
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                0,
+                "abandon moves the weight back out of pending_spill_weight too"
             );
             let stripe = engine.stripe_lock(bucket).read();
             let live = stripe
@@ -4240,6 +4382,14 @@ mod tests {
                 "a key whose stored state changed since hand-off is left alone"
             );
             assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                7,
+                "documented gap: the fresh write's own weight bookkeeping already \
+                 resolved total_weight correctly, but nothing releases the original \
+                 hand-off's share of pending_spill_weight once its key/version can no \
+                 longer match; see pending_spill_weight's own doc comment"
+            );
         }
 
         #[test]
@@ -4254,6 +4404,73 @@ mod tests {
 
             let (_, weight_after) = engine.debug_totals();
             assert_eq!(weight_after, weight_before);
+        }
+
+        #[test]
+        fn install_releases_its_share_of_pending_spill_weight() {
+            let weigher: Weigher<u32, String> =
+                Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let ver = hlc(1, 1);
+            let _ = put(&engine, key, kb.clone(), "x".repeat(9), ver, None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 9);
+            assert_eq!(engine.debug_pending_spill_weight(), 9);
+
+            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0));
+            assert!(installed);
+
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                0,
+                "install moves the hand-off's weight out of pending_spill_weight, not just \
+                 the entry's own payload"
+            );
+            let (_, weight_after) = engine.debug_totals();
+            assert_eq!(
+                weight_after, 0,
+                "install never adds to total_weight; the entry stays at weight 0, Spilled"
+            );
+        }
+
+        #[test]
+        fn enforce_capacity_counts_pending_spill_weight_toward_the_cap_and_defers_to_the_flusher() {
+            let weigher: Weigher<u32, String> =
+                Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+            let engine = Engine::<u32, String>::new(50, None, Some(weigher));
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let _ = put(&engine, key, kb.clone(), "x".repeat(80), hlc(1, 1), None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 80);
+            // total_weight alone (0) already fits the 50-unit cap; only
+            // adding pending_spill_weight (80) back in shows this bucket is
+            // still, in effect, 30 units over.
+            assert_eq!(engine.debug_totals().1, 0);
+            assert_eq!(engine.debug_pending_spill_weight(), 80);
+
+            engine.enforce_capacity(bucket);
+
+            assert_eq!(
+                engine.debug_eviction_lock_acquisitions(),
+                1,
+                "one batch pass finds nothing else to evict in this bucket; the stop rule \
+                 returns immediately rather than paying for a full-stripe scan"
+            );
+            assert_eq!(
+                engine.get(&key, 0),
+                Some("x".repeat(80)),
+                "the pending entry itself is left alone: still resident, still readable"
+            );
+            assert_eq!(
+                engine.debug_pending_spill_weight(),
+                80,
+                "still nobody resolved it"
+            );
         }
 
         #[test]
@@ -4577,6 +4794,17 @@ mod tests {
                     "the victim keeps weight 0 from the hand-off, resident or spilled"
                 );
 
+                // A second sampling pass, called before the flusher's
+                // install is known to have landed, must not pick the same
+                // key again: whether it is still the pending hand-off or
+                // has already been flipped to `Spilled` by now, either way
+                // `is_spill_candidate` excludes it.
+                assert!(
+                    engine.evict_one_sampled(bucket).made_no_progress(),
+                    "the only entry in this stripe is either still pending or already \
+                     spilled; double-sampling before install must find nothing"
+                );
+
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
                     "the flusher installs the spilled entry"
@@ -4597,6 +4825,204 @@ mod tests {
                     "install only flips the payload to Spilled; the weight was already zeroed \
                      and freed at hand-off, so total_weight does not move again here"
                 );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full() {
+                let dir = temp_dir("enqueue-err-abandon");
+                // A generous flush_queue_bytes, well past what
+                // FLUSH_QUEUE_CAPACITY fillers plus the real victim's own
+                // record could ever total: this test means to exercise the
+                // channel's own slot-count limit, not the byte bound.
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(1 << 20);
+                let tier = Arc::new(SpillTier::open(&cfg, "channel-full").expect("tier opens"));
+                // Paused before the flusher thread is even spawned, so it
+                // never gets a chance to drain any of the filler jobs
+                // below before the real eviction's own `enqueue` needs the
+                // channel to still be completely full.
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                // Fill the flusher's channel to its exact slot capacity
+                // with throwaway jobs, so the real eviction below finds no
+                // room: the one way `finish_spill_handoff` reaches
+                // `abandon` rather than `install`.
+                for i in 0..crate::store::spill::FLUSH_QUEUE_CAPACITY {
+                    let filler = SpillJob {
+                        stripe_idx: 0,
+                        hash: 0,
+                        key_bytes: Bytes::from(format!("filler-{i}")),
+                        ver: hlc(0, 0),
+                        expires_at_ms: None,
+                        encoded: Bytes::from_static(b"f"),
+                    };
+                    tier.enqueue(filler)
+                        .unwrap_or_else(|_| panic!("channel has room for filler {i}"));
+                }
+
+                let key = 1u32;
+                let kb = key_bytes(key);
+                let hash = hash_key_bytes(kb.as_ref());
+                let bucket = stripe_index_from_hash(hash);
+                let _ = put(&engine, key, kb.clone(), "x".repeat(30), hlc(1, 1), None, 0);
+
+                let outcome = engine.evict_one_sampled(bucket);
+                assert_eq!(
+                    outcome.removed_weight, 30,
+                    "the hand-off still commits and frees the weight from total_weight \
+                     right away, exactly as a physical removal would; abandon only puts it \
+                     back once the enqueue that follows is found to have failed"
+                );
+
+                assert_eq!(
+                    engine.get(&key, 0),
+                    Some("x".repeat(30)),
+                    "abandon restores full residency: the value is still there and readable"
+                );
+                let (_, weight_after) = engine.debug_totals();
+                assert_eq!(
+                    weight_after, 30,
+                    "abandon restores the victim's weight to total_weight"
+                );
+                assert_eq!(
+                    engine.debug_pending_spill_weight(),
+                    0,
+                    "abandon moves the weight back out of pending_spill_weight too"
+                );
+                let stripe = engine.stripe_lock(bucket).read();
+                let live = stripe
+                    .live
+                    .iter()
+                    .find(|l| l.key_bytes.as_ref() == kb.as_ref())
+                    .expect("entry is present");
+                assert_eq!(
+                    live.weight, 30,
+                    "the entry's own weight field is restored, not just the total"
+                );
+                drop(stripe);
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn enforce_capacity_via_real_hand_off_bounds_ram_and_falls_back_to_queue_full() {
+                let dir = temp_dir("real-backlog");
+                // A flush queue that holds one small record but not two, so
+                // `would_accept` refuses a second hand-off while the first
+                // is still queued: the flusher is paused, so nothing ever
+                // drains it.
+                let record_len_upper_bound = 300u64;
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(record_len_upper_bound);
+                let tier = Arc::new(SpillTier::open(&cfg, "backlog").expect("tier opens"));
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(250, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                // Two keys landing in the same stripe, so a single bucket's
+                // sampling sees both, colder one first.
+                let mut same_bucket: HashMap<usize, Vec<u32>> = HashMap::new();
+                let mut keys = Vec::new();
+                for k in 1..100_000u32 {
+                    let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref()));
+                    let group = same_bucket.entry(bucket).or_default();
+                    group.push(k);
+                    if group.len() == 2 {
+                        keys = group.clone();
+                        break;
+                    }
+                }
+                assert_eq!(
+                    keys.len(),
+                    2,
+                    "1024 stripes; two collisions are found quickly"
+                );
+                let bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(keys[0]).as_ref()));
+
+                let _ = put(
+                    &engine,
+                    keys[0],
+                    key_bytes(keys[0]),
+                    "x".repeat(200),
+                    hlc(1, 1),
+                    None,
+                    0,
+                );
+                let _ = put(
+                    &engine,
+                    keys[1],
+                    key_bytes(keys[1]),
+                    "y".repeat(200),
+                    hlc(2, 1),
+                    None,
+                    1,
+                );
+
+                // First eviction: the colder key (`now_ms: 0`) hands off
+                // cleanly, the queue was empty.
+                engine.evict_one_sampled(bucket);
+                assert_eq!(
+                    engine.get(&keys[0], 0),
+                    Some("x".repeat(200)),
+                    "still fully resident: a hand-off, not a removal"
+                );
+                assert_eq!(engine.debug_pending_spill_weight(), 200);
+                let combined_after_first =
+                    engine.debug_totals().1 + engine.debug_pending_spill_weight();
+                assert!(
+                    combined_after_first <= 250 + 200,
+                    "combined weight {combined_after_first} exceeds the cap by more than one \
+                     victim's worth"
+                );
+
+                // Second eviction: the queue already holds one record's
+                // worth and the flusher is paused, so `would_accept` now
+                // refuses; the victim falls back to an ordinary delete
+                // instead of piling up a second fully-resident value.
+                engine.evict_one_sampled(bucket);
+                assert_eq!(
+                    engine.get(&keys[1], 0),
+                    None,
+                    "queue_full falls back to the ordinary delete-and-XOR path"
+                );
+                let (total_after, pending_after) =
+                    (engine.debug_totals().1, engine.debug_pending_spill_weight());
+                assert_eq!(total_after, 0);
+                assert_eq!(pending_after, 200);
+                assert!(
+                    total_after + pending_after <= 250 + 200,
+                    "combined weight never exceeds the cap by more than one victim's worth"
+                );
+
+                // The public entry point sees the same combined accounting
+                // and returns immediately: nothing left to evict in this
+                // bucket, and pending_spill_weight is still positive.
+                engine.enforce_capacity(bucket);
+
+                // Once the flusher is allowed to run, the one queued job
+                // installs and pending_spill_weight drains back to zero.
+                tier.resume_flusher();
+                assert!(poll_until(POLL_TIMEOUT, || engine
+                    .debug_pending_spill_weight()
+                    == 0));
+                assert!(poll_until(POLL_TIMEOUT, || is_spilled(
+                    &engine,
+                    &key_bytes(keys[0])
+                )));
 
                 let _ = std::fs::remove_dir_all(&dir);
             }

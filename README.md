@@ -215,9 +215,13 @@ address is already correct, leave it unset.
 With `spill` configured, eviction writes cold entries to a FIFO ring of region
 files on local disk instead of discarding them, so a cache's effective size
 extends past its RAM budget; a later read promotes a spilled entry back into
-RAM. Three knobs: `capacity_bytes`, the disk budget the tier stays within;
-`region_bytes`, the size of each region file in the ring (64 MiB default); and
-`read_concurrency`, how many spilled-value reads run at once (16 default).
+RAM. Four knobs: `capacity_bytes`, the disk budget the tier stays within;
+`region_bytes`, the size of each region file in the ring (64 MiB default);
+`read_concurrency`, how many spilled-value reads run at once (16 default); and
+`flush_queue_bytes`, the cap on how many queued-but-unwritten bytes a lagging
+flusher may hold in RAM before eviction falls back to an ordinary delete
+instead (one region's worth by default), which keeps a slow disk a
+plain-eviction problem rather than an unbounded-RSS one.
 
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,

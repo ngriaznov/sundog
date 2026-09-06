@@ -87,6 +87,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Weak};
 use std::thread;
+#[cfg(test)]
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -116,7 +118,7 @@ const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// resident in RAM regardless of whether the job sits in this queue or the
 /// entry sits in `live` — queuing it costs nothing beyond what is already
 /// paid for.
-const FLUSH_QUEUE_CAPACITY: usize = 8192;
+pub(crate) const FLUSH_QUEUE_CAPACITY: usize = 8192;
 /// Bound on how many jobs one flusher batch coalesces into as few
 /// positional writes as its rotations require. After a blocking `recv`
 /// returns the first job, [`flusher_loop`] drains the channel greedily with
@@ -138,10 +140,12 @@ const HEADER_LEN: usize = size_of::<SpillRecordHeader>();
 /// Disk budget and layout knobs for a cache's optional spill tier.
 ///
 /// `dir`/`capacity_bytes` have no default, since a disk budget is never
-/// safe to assume, but `region_bytes` and `read_concurrency` do. Construct
-/// with [`SpillConfig::new`] and adjust either default with the matching
-/// builder method; [`SpillConfig::region_bytes_value`] and
-/// [`SpillConfig::read_concurrency_value`] read back whatever is in effect.
+/// safe to assume, but `region_bytes`, `read_concurrency`, and
+/// `flush_queue_bytes` do. Construct with [`SpillConfig::new`] and adjust
+/// any default with the matching builder method;
+/// [`SpillConfig::region_bytes_value`], [`SpillConfig::read_concurrency_value`],
+/// and [`SpillConfig::flush_queue_bytes_value`] read back whatever is in
+/// effect.
 #[derive(Debug, Clone)]
 pub struct SpillConfig {
     /// Directory the tier's region files live under. `SpillTier::open`
@@ -154,11 +158,20 @@ pub struct SpillConfig {
     pub capacity_bytes: u64,
     region_bytes: u64,
     read_concurrency: usize,
+    /// `None` tracks `region_bytes`, one region's worth, the documented
+    /// default; `Some` is an explicit [`SpillConfig::flush_queue_bytes`]
+    /// override. Tracking rather than snapshotting `region_bytes` at
+    /// [`SpillConfig::new`] time means a later [`SpillConfig::region_bytes`]
+    /// call keeps this bound automatically at most half of
+    /// `capacity_bytes`, since `validate` already requires `capacity_bytes`
+    /// be at least twice `region_bytes`.
+    flush_queue_bytes: Option<u64>,
 }
 
 impl SpillConfig {
-    /// Starts a config with the default `region_bytes`, 64 MiB, and
-    /// `read_concurrency`, 16.
+    /// Starts a config with the default `region_bytes`, 64 MiB,
+    /// `read_concurrency`, 16, and `flush_queue_bytes`, one region (so it
+    /// tracks `region_bytes` for as long as neither is overridden).
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>, capacity_bytes: u64) -> Self {
         Self {
@@ -166,6 +179,7 @@ impl SpillConfig {
             capacity_bytes,
             region_bytes: DEFAULT_REGION_BYTES,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
+            flush_queue_bytes: None,
         }
     }
 
@@ -184,6 +198,19 @@ impl SpillConfig {
         self
     }
 
+    /// Overrides the bound on the flusher's queued-but-unwritten backlog,
+    /// in bytes, default one region. A hand-off that would push the
+    /// tier's queued bytes past this falls back to an ordinary delete
+    /// (`sundog_spill_dropped_total{reason="queue_full"}`) instead of
+    /// piling up fully-resident, unwritten values in RAM: this is what
+    /// keeps a lagging disk a plain-eviction problem rather than an
+    /// unbounded-RSS one. Own-and-return.
+    #[must_use]
+    pub fn flush_queue_bytes(mut self, bytes: u64) -> Self {
+        self.flush_queue_bytes = Some(bytes);
+        self
+    }
+
     /// The region size currently in effect.
     #[must_use]
     pub fn region_bytes_value(&self) -> u64 {
@@ -196,11 +223,23 @@ impl SpillConfig {
         self.read_concurrency
     }
 
+    /// The flush-queue byte bound currently in effect: an explicit
+    /// [`SpillConfig::flush_queue_bytes`] override, or `region_bytes_value()`
+    /// otherwise.
+    #[must_use]
+    pub fn flush_queue_bytes_value(&self) -> u64 {
+        self.flush_queue_bytes.unwrap_or(self.region_bytes)
+    }
+
     /// Checks this config before it is used to [`SpillTier::open`] a tier.
     ///
     /// Rejects a zero `region_bytes`, a `region_bytes` too large to address
-    /// with the tier's 32-bit on-disk offsets, and a `capacity_bytes` less
-    /// than twice `region_bytes`. The last rule prevents a hazard where a
+    /// with the tier's 32-bit on-disk offsets, a `capacity_bytes` less than
+    /// twice `region_bytes`, a `flush_queue_bytes` too small to ever hold
+    /// even the smallest possible record (header plus a zero-length key and
+    /// value), and a `flush_queue_bytes` bigger than `capacity_bytes`
+    /// itself, since a flush backlog larger than the whole disk budget
+    /// bounds nothing. The `capacity_bytes` rule prevents a hazard where a
     /// single region would be both the active writer and the only candidate
     /// for FIFO reclaim, so `next_region_index` would immediately reclaim the
     /// region it is currently writing to. With this held, `region_count_for`
@@ -218,6 +257,13 @@ impl SpillConfig {
         }
         if self.capacity_bytes < 2 * self.region_bytes {
             return Err("capacity_bytes must be at least twice region_bytes");
+        }
+        let flush_queue_bytes = self.flush_queue_bytes_value();
+        if flush_queue_bytes < HEADER_LEN as u64 {
+            return Err("flush_queue_bytes must hold at least one record");
+        }
+        if flush_queue_bytes > self.capacity_bytes {
+            return Err("flush_queue_bytes must not exceed capacity_bytes");
         }
         Ok(())
     }
@@ -346,6 +392,23 @@ pub(crate) fn record_too_large(record_len: u64, region_bytes: u64) -> bool {
     record_len > region_bytes
 }
 
+/// Whether a `record_len`-byte record can be queued right now without
+/// pushing the tier's queued-but-unwritten backlog past `flush_queue_bytes`.
+/// [`SpillTier::would_accept`] refuses a job this returns `false` for,
+/// `reason = "queue_full"`, exactly like a channel with no room, so a
+/// lagging flusher becomes an ordinary eviction rather than an unbounded
+/// RAM backlog. Checked arithmetic: a pathological `record_len` never wraps
+/// into a false "yes". Pure; unit tested directly.
+pub(crate) fn record_fits_queue(
+    queued_bytes: u64,
+    record_len: u64,
+    flush_queue_bytes: u64,
+) -> bool {
+    queued_bytes
+        .checked_add(record_len)
+        .is_some_and(|total| total <= flush_queue_bytes)
+}
+
 /// The flusher's batch-splitting rule: how many of `record_lens`, taken in
 /// order, fit consecutively in a region of `region_bytes` bytes whose write
 /// cursor already sits at `write_cursor`, before the first one that does
@@ -420,6 +483,25 @@ struct Inner {
     /// through to the caller's unconditional-delete fallback.
     closed: AtomicBool,
     cache_name: String,
+    /// `SpillConfig::flush_queue_bytes_value()`, validated. The bound
+    /// [`SpillTier::would_accept`] checks `queued_bytes` against.
+    flush_queue_bytes: u64,
+    /// Summed record length, header included, of every job currently
+    /// sitting in the flusher's channel: added in
+    /// [`SpillTier::enqueue`] once a job is actually sent, subtracted in
+    /// [`flusher_loop`] the instant the flusher takes it back off the
+    /// channel, whether or not it has been written yet. Bounds the
+    /// flusher's RAM backlog independently of
+    /// [`FLUSH_QUEUE_CAPACITY`]'s slot count: a job holds two refcounted
+    /// [`Bytes`] handles regardless of how large the value behind them is,
+    /// so a slot-count-only bound does nothing to cap the bytes a lagging
+    /// flusher lets pile up.
+    queued_bytes: AtomicU64,
+    /// Test-only: [`flusher_loop`] blocks here instead of pulling its next
+    /// job, so a test can hold a job queued, and its bytes counted against
+    /// `flush_queue_bytes`, for as long as it needs to.
+    #[cfg(test)]
+    flusher_paused: AtomicBool,
 }
 
 impl Inner {
@@ -501,6 +583,34 @@ impl SpillTier {
     /// directory cannot be created or listed, a stale `*.reg` file cannot be
     /// removed, or a region file cannot be created or preallocated.
     pub(crate) fn open(cfg: &SpillConfig, cache_name: &str) -> io::Result<Self> {
+        Self::open_impl(cfg, cache_name, &[])
+    }
+
+    /// [`SpillTier::open`], but every region index in `readonly_regions` is
+    /// reopened read-only after being preallocated, so a later write to it
+    /// fails deterministically, EBADF rather than any real filesystem
+    /// permission, without needing root or leaving the test's own process
+    /// unable to preallocate the file in the first place. Test-only: lets a
+    /// test force [`write_segment`]'s write to fail and prove every job in
+    /// that segment reaches [`SpillSink::abandon`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`SpillTier::open`].
+    #[cfg(test)]
+    pub(crate) fn open_with_readonly_regions_for_test(
+        cfg: &SpillConfig,
+        cache_name: &str,
+        readonly_regions: &[u32],
+    ) -> io::Result<Self> {
+        Self::open_impl(cfg, cache_name, readonly_regions)
+    }
+
+    fn open_impl(
+        cfg: &SpillConfig,
+        cache_name: &str,
+        readonly_regions: &[u32],
+    ) -> io::Result<Self> {
         cfg.validate()
             .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
 
@@ -525,6 +635,12 @@ impl SpillTier {
                 .truncate(true)
                 .open(&path)?;
             file.set_len(region_bytes)?;
+            let file = if readonly_regions.contains(&idx) {
+                drop(file);
+                OpenOptions::new().read(true).write(false).open(&path)?
+            } else {
+                file
+            };
             regions.push(RegionState {
                 file,
                 write_cursor: AtomicU32::new(0),
@@ -541,6 +657,10 @@ impl SpillTier {
             bytes_used: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             cache_name: cache_name.to_string(),
+            flush_queue_bytes: cfg.flush_queue_bytes_value(),
+            queued_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            flusher_paused: AtomicBool::new(false),
         });
 
         Ok(Self {
@@ -597,11 +717,21 @@ impl SpillTier {
 
     /// Whether a record built from `key_len` and `value_len` bytes could be
     /// queued right now, judged purely from this tier's own state: not
-    /// closed, and small enough to ever fit a region. Never touches the
-    /// flusher's channel, so, unlike [`SpillTier::enqueue`], this is cheap
-    /// enough to call while holding a stripe write lock. `false` increments
-    /// `sundog_spill_dropped_total` with `reason = "too_large"` or
-    /// `reason = "closed"`, whichever applied.
+    /// closed, small enough to ever fit a region, and small enough that
+    /// queuing it would not push the flusher's byte backlog past
+    /// `flush_queue_bytes`. Never touches the flusher's channel, so, unlike
+    /// [`SpillTier::enqueue`], this is cheap enough to call while holding a
+    /// stripe write lock. `false` increments `sundog_spill_dropped_total`
+    /// with `reason = "too_large"`, `reason = "closed"`, or `reason =
+    /// "queue_full"` for the byte bound, whichever applied. The byte-bound
+    /// check races the same way the channel-capacity one already does:
+    /// this reads `queued_bytes` before the caller's own hand-off, if
+    /// accepted, ever adds to it via `enqueue`, so a burst of callers that
+    /// all pass this check under their own stripe lock can, together,
+    /// still push the tier somewhat past `flush_queue_bytes` before the
+    /// next call sees the total catch up. That slack is bounded by how
+    /// many stripes race the check at once, not by the size of the flush
+    /// backlog itself.
     pub(crate) fn would_accept(&self, key_len: usize, value_len: usize) -> bool {
         if self.inner.closed.load(Ordering::Acquire) {
             self.inner.record_dropped("closed");
@@ -610,6 +740,11 @@ impl SpillTier {
         let record_len = HEADER_LEN as u64 + key_len as u64 + value_len as u64;
         if record_too_large(record_len, u64::from(self.inner.region_bytes)) {
             self.inner.record_dropped("too_large");
+            return false;
+        }
+        let queued_bytes = self.inner.queued_bytes.load(Ordering::Acquire);
+        if !record_fits_queue(queued_bytes, record_len, self.inner.flush_queue_bytes) {
+            self.inner.record_dropped("queue_full");
             return false;
         }
         true
@@ -623,8 +758,11 @@ impl SpillTier {
     /// "queue_full"` covers both a full queue and one that was never
     /// attached. Never touches disk, but does take the channel's own lock,
     /// so, unlike [`SpillTier::would_accept`], this is not meant to run
-    /// while holding a stripe write lock.
+    /// while holding a stripe write lock. A successful send adds `job`'s
+    /// record length to `queued_bytes`; [`flusher_loop`] subtracts it back
+    /// out the instant the flusher takes the job off the channel again.
     pub(crate) fn enqueue(&self, job: SpillJob) -> Result<(), SpillJob> {
+        let record_len = job_record_len_or_zero(&job) as u64;
         let sent = {
             let sender = self.sender.lock();
             let Some(tx) = sender.as_ref() else {
@@ -634,12 +772,41 @@ impl SpillTier {
             tx.try_send(job)
         };
         match sent {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.inner
+                    .queued_bytes
+                    .fetch_add(record_len, Ordering::AcqRel);
+                Ok(())
+            }
             Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
                 self.inner.record_dropped("queue_full");
                 Err(job)
             }
         }
+    }
+
+    /// Bytes currently sitting in the flusher's channel, queued but not yet
+    /// taken off it: the same total [`SpillTier::would_accept`] checks
+    /// against `flush_queue_bytes`. Test-facing.
+    #[cfg(test)]
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        self.inner.queued_bytes.load(Ordering::Acquire)
+    }
+
+    /// Test-only: blocks [`flusher_loop`] before it pulls its next job off
+    /// the channel, so a job's bytes stay counted in `queued_bytes` (and,
+    /// upstream, a hand-off's weight stays in
+    /// `crate::store::engine::Engine::pending_spill_weight`) for as long as
+    /// the test needs. [`SpillTier::resume_flusher`] undoes this.
+    #[cfg(test)]
+    pub(crate) fn pause_flusher(&self) {
+        self.inner.flusher_paused.store(true, Ordering::Release);
+    }
+
+    /// Undoes [`SpillTier::pause_flusher`].
+    #[cfg(test)]
+    pub(crate) fn resume_flusher(&self) {
+        self.inner.flusher_paused.store(false, Ordering::Release);
     }
 
     /// One positional read of the record at `loc`. `Ok(None)` when the
@@ -770,22 +937,46 @@ fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
 }
 
 fn flusher_loop(inner: &Arc<Inner>, rx: &Receiver<SpillJob>, sink: &Weak<dyn SpillSink>) {
-    while let Ok(first) = rx.recv() {
+    loop {
+        wait_while_flusher_paused(inner);
+        let Ok(first) = rx.recv() else {
+            return;
+        };
         let Some(sink) = sink.upgrade() else {
             return;
         };
+        inner
+            .queued_bytes
+            .fetch_sub(job_record_len_or_zero(&first) as u64, Ordering::AcqRel);
         let mut batch_bytes = job_record_len_or_zero(&first);
         let mut batch = vec![first];
         while batch.len() < FLUSH_BATCH_MAX_JOBS && batch_bytes < FLUSH_BATCH_MAX_BYTES {
             let Ok(job) = rx.try_recv() else {
                 break;
             };
+            inner
+                .queued_bytes
+                .fetch_sub(job_record_len_or_zero(&job) as u64, Ordering::AcqRel);
             batch_bytes += job_record_len_or_zero(&job);
             batch.push(job);
         }
         flush_batch(inner, sink.as_ref(), batch);
     }
 }
+
+/// Test-only hook [`flusher_loop`] polls before pulling its next job off
+/// the channel: spins while [`SpillTier::pause_flusher`] is in effect, a
+/// no-op otherwise. Always a no-op outside `cfg(test)`, so this costs
+/// nothing in production.
+#[cfg(test)]
+fn wait_while_flusher_paused(inner: &Inner) {
+    while inner.flusher_paused.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_while_flusher_paused(_inner: &Inner) {}
 
 /// A job's on-disk record length, header plus key plus value, together with
 /// the header's own `key_len`/`value_len` fields, computed once per job and
@@ -1101,6 +1292,20 @@ mod tests {
     }
 
     #[test]
+    fn record_fits_queue_at_the_exact_boundary_and_one_byte_over() {
+        assert!(record_fits_queue(60, 4, 64));
+        assert!(!record_fits_queue(61, 4, 64));
+        assert!(record_fits_queue(0, 64, 64));
+        assert!(!record_fits_queue(0, 65, 64));
+    }
+
+    #[test]
+    fn record_fits_queue_never_wraps_on_a_pathological_record_len() {
+        assert!(!record_fits_queue(u64::MAX - 1, u64::MAX, 64));
+        assert!(!record_fits_queue(10, u64::MAX, u64::MAX));
+    }
+
+    #[test]
     fn next_region_index_wraps_from_the_last_region_to_the_first() {
         assert_eq!(next_region_index(0, 3), 1);
         assert_eq!(next_region_index(1, 3), 2);
@@ -1145,19 +1350,23 @@ mod tests {
     // --- SpillConfig / validate ---
 
     #[test]
-    fn spill_config_defaults_are_64_mib_regions_and_16_way_read_concurrency() {
+    fn spill_config_defaults_are_64_mib_regions_16_way_read_concurrency_and_one_region_of_flush_queue()
+     {
         let cfg = SpillConfig::new("/tmp/does-not-matter", 1 << 30);
         assert_eq!(cfg.region_bytes_value(), 64 * 1024 * 1024);
         assert_eq!(cfg.read_concurrency_value(), 16);
+        assert_eq!(cfg.flush_queue_bytes_value(), 64 * 1024 * 1024);
     }
 
     #[test]
     fn spill_config_builder_methods_override_the_defaults() {
         let cfg = SpillConfig::new("/tmp/does-not-matter", 1 << 30)
             .region_bytes(4096)
-            .read_concurrency(4);
+            .read_concurrency(4)
+            .flush_queue_bytes(8192);
         assert_eq!(cfg.region_bytes_value(), 4096);
         assert_eq!(cfg.read_concurrency_value(), 4);
+        assert_eq!(cfg.flush_queue_bytes_value(), 8192);
     }
 
     #[test]
@@ -1177,6 +1386,30 @@ mod tests {
         let cfg = SpillConfig::new("/tmp/x", 100).region_bytes(64);
         assert!(cfg.validate().is_err());
         let ok = SpillConfig::new("/tmp/x", 128).region_bytes(64);
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_flush_queue_bytes_under_one_record() {
+        let cfg = SpillConfig::new("/tmp/x", 1 << 20)
+            .region_bytes(4096)
+            .flush_queue_bytes(HEADER_LEN as u64 - 1);
+        assert!(cfg.validate().is_err());
+        let ok = SpillConfig::new("/tmp/x", 1 << 20)
+            .region_bytes(4096)
+            .flush_queue_bytes(HEADER_LEN as u64);
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_flush_queue_bytes_over_capacity_bytes() {
+        let cfg = SpillConfig::new("/tmp/x", 1024)
+            .region_bytes(64)
+            .flush_queue_bytes(1025);
+        assert!(cfg.validate().is_err());
+        let ok = SpillConfig::new("/tmp/x", 1024)
+            .region_bytes(64)
+            .flush_queue_bytes(1024);
         assert!(ok.validate().is_ok());
     }
 
@@ -1218,11 +1451,16 @@ mod tests {
             installs: StdMutex<Vec<(usize, Bytes, Hlc, SpillLoc)>>,
             reclaims: StdMutex<Vec<ReclaimCall>>,
             live: StdMutex<StdHashMap<Bytes, (Hlc, SpillLoc)>>,
+            abandons: StdMutex<Vec<(usize, Bytes, u64, Hlc)>>,
         }
 
         impl RecordingSink {
             fn install_count(&self) -> usize {
                 self.installs.lock().unwrap().len()
+            }
+
+            fn abandon_count(&self) -> usize {
+                self.abandons.lock().unwrap().len()
             }
         }
 
@@ -1265,11 +1503,15 @@ mod tests {
                 removed
             }
 
-            fn abandon(&self, _stripe_idx: usize, _key_bytes: &Bytes, _hash: u64, _ver: Hlc) {
-                // No production caller of this test double ever fails a
-                // write, so there is nothing for a real sink to restore
-                // here; the engine-level `abandon` behavior itself is
-                // covered directly in `store::engine`'s tests.
+            fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc) {
+                // The engine-level weight-restoring behavior itself is
+                // covered directly in `store::engine`'s tests; this test
+                // double only records that the call happened, for this
+                // module's own write-failure test.
+                self.abandons
+                    .lock()
+                    .unwrap()
+                    .push((stripe_idx, key_bytes.clone(), hash, ver));
             }
         }
 
@@ -1323,7 +1565,12 @@ mod tests {
         #[test]
         fn read_at_returns_none_for_a_stale_generation() {
             // Each region holds one record, so writing a third job rotates
-            // region 0 out from under the first job's pointer.
+            // region 0 out from under the first job's pointer. Waiting for
+            // each job's install before sending the next keeps this
+            // deterministic under the default flush_queue_bytes bound
+            // too, one region's worth here: only one record is ever
+            // queued at a time, and the rotation this test depends on is
+            // unaffected by writes landing one at a time versus batched.
             let dir = temp_dir("stale-gen");
             let record_len = HEADER_LEN as u64 + 1 + 1; // 1-byte key, 1-byte value
             let cfg = SpillConfig::new(&dir, 2 * record_len).region_bytes(record_len);
@@ -1332,7 +1579,9 @@ mod tests {
             tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
 
             assert!(tier.try_spill(job("a", b"1", hlc(1, 0))));
+            assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 1));
             assert!(tier.try_spill(job("b", b"2", hlc(2, 0))));
+            assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 2));
             assert!(tier.try_spill(job("c", b"3", hlc(3, 0))));
             assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 3));
 
@@ -1371,7 +1620,12 @@ mod tests {
         fn rotation_reclaims_the_oldest_region_and_reports_its_keys() {
             // region_bytes fits two records; five writes force a rotation
             // into region 1, empty, and then back into region 0, which by
-            // then holds the first two jobs' keys.
+            // then holds the first two jobs' keys. Waiting for each job's
+            // own install before sending the next keeps this deterministic
+            // under the default flush_queue_bytes bound, one region's
+            // worth here (room for two records): the rotations this test
+            // depends on are unaffected by writes landing one at a time
+            // versus batched.
             let dir = temp_dir("rotation");
             let record_len = HEADER_LEN as u64 + 6 + 4; // fixed-width key/value
             let region_bytes = record_len * 2;
@@ -1383,8 +1637,11 @@ mod tests {
             for i in 0..5u32 {
                 let key = format!("key-{i:02}");
                 assert!(tier.try_spill(job(&key, b"1234", hlc(u64::from(i) + 1, 0))));
+                let installed_so_far = i as usize + 1;
+                assert!(poll_until(POLL_TIMEOUT, || {
+                    sink.install_count() == installed_so_far
+                }));
             }
-            assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 5));
             assert!(poll_until(POLL_TIMEOUT, || sink
                 .reclaims
                 .lock()
@@ -1604,6 +1861,9 @@ mod tests {
         #[test]
         fn bytes_used_reflects_confirmed_installs_and_drops_on_reclaim() {
             // Same layout as the rotation test: two records per region.
+            // Waiting for each job's own install before sending the next
+            // keeps this deterministic under the default
+            // flush_queue_bytes bound, one region's worth here.
             let dir = temp_dir("bytes-used");
             let record_len = HEADER_LEN as u64 + 6 + 4;
             let region_bytes = record_len * 2;
@@ -1615,8 +1875,11 @@ mod tests {
             for i in 0..4u32 {
                 let key = format!("key-{i:02}");
                 assert!(tier.try_spill(job(&key, b"1234", hlc(u64::from(i) + 1, 0))));
+                let installed_so_far = i as usize + 1;
+                assert!(poll_until(POLL_TIMEOUT, || {
+                    sink.install_count() == installed_so_far
+                }));
             }
-            assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 4));
             assert!(poll_until(POLL_TIMEOUT, || tier.bytes_used() == record_len * 4));
 
             // A fifth job rotates region 0 out from under the first two
@@ -1638,6 +1901,78 @@ mod tests {
             let oversized = job("k", &[0u8; 100], hlc(1, 0));
             assert!(!tier.try_spill(oversized));
             assert_eq!(sink.install_count(), 0);
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn would_accept_refuses_once_the_flush_queue_bytes_bound_would_be_exceeded() {
+            let dir = temp_dir("byte-bound");
+            let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            // Paused before the flusher thread is even spawned, so it never
+            // gets a chance to race this test and drain the job the
+            // assertions below depend on staying queued.
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+            assert!(tier.would_accept(4, 4));
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+            assert_eq!(tier.queued_bytes(), record_len);
+            assert!(
+                !tier.would_accept(4, 4),
+                "the queue already holds one record's worth; a same-size second job would \
+                 push it past flush_queue_bytes"
+            );
+
+            tier.resume_flusher();
+            assert!(poll_until(POLL_TIMEOUT, || sink.install_count() == 1));
+            assert!(
+                poll_until(POLL_TIMEOUT, || tier.queued_bytes() == 0),
+                "queued_bytes drains back to zero once the flusher takes the job"
+            );
+            assert!(
+                tier.would_accept(4, 4),
+                "room again once the backlog has drained"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn write_segment_failure_abandons_every_job_in_the_failed_segment() {
+            // Three fixed-width records that all fit in one region, so one
+            // `flush_batch` call writes them as a single segment; the
+            // region's file handle is reopened read-only, so the segment's
+            // one positional write fails deterministically for every job it
+            // holds, not just the first.
+            let dir = temp_dir("write-fails");
+            let record_len = HEADER_LEN as u64 + 6 + 4; // fixed-width key/value
+            let region_bytes = record_len * 4;
+            let cfg = SpillConfig::new(&dir, region_bytes * 2).region_bytes(region_bytes);
+            let tier =
+                SpillTier::open_with_readonly_regions_for_test(&cfg, "cache-a", &[0]).unwrap();
+            let sink = Arc::new(RecordingSink::default());
+
+            let jobs: Vec<SpillJob> = (0..3u32)
+                .map(|i| job(&format!("key-{i:02}"), b"1234", hlc(u64::from(i) + 1, 0)))
+                .collect();
+            flush_batch(&tier.inner, &*sink, jobs);
+
+            assert_eq!(
+                sink.install_count(),
+                0,
+                "the failed write never installs anything"
+            );
+            assert_eq!(
+                sink.abandon_count(),
+                3,
+                "every job in the failed segment reaches abandon, not just the first"
+            );
 
             let _ = fs::remove_dir_all(&dir);
         }
