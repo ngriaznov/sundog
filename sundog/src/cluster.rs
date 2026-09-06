@@ -41,7 +41,10 @@ use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
-use crate::net::{InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler, batch_replicate};
+use crate::net::{
+    AeServeOutcome, FetchServe, InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler,
+    batch_replicate,
+};
 use crate::node::{NodeId, NodeName};
 use crate::store::{FanOutQueue, Mode, Shard, ShardOps};
 use crate::wire::{self, Msg, WireRecord};
@@ -831,6 +834,44 @@ impl RequestHandler for ClusterRequestHandler {
     fn ae_sketch_cells(&self) -> usize {
         self.ae_sketch_cells
     }
+
+    // Distribution-mode stubs: stand in for the real shard-backed bodies
+    // until the shard side of ownership serving lands. Each returns exactly
+    // its `RequestHandler` default, so a peer sees the same "unavailable"
+    // degradation it would see for an unrecognized cache.
+    fn ownership_view_hash(&self, cache: SmolStr) -> Option<u64> {
+        let _ = cache;
+        None
+    }
+
+    fn fetch(&self, cache: SmolStr, key: Bytes, view_hash: u64) -> BoxFuture<'_, FetchServe> {
+        let _ = (cache, key, view_hash);
+        Box::pin(async { FetchServe::Unavailable })
+    }
+
+    fn ae_digest_scoped(
+        &self,
+        cache: SmolStr,
+        view_hash: u64,
+        buckets: Vec<(u16, u64)>,
+    ) -> BoxFuture<'_, AeServeOutcome> {
+        let _ = (cache, view_hash, buckets);
+        Box::pin(async { AeServeOutcome::Unavailable })
+    }
+
+    fn st_buckets_available(&self, cache: SmolStr, view_hash: u64) -> BoxFuture<'_, bool> {
+        let _ = (cache, view_hash);
+        Box::pin(async { false })
+    }
+
+    fn st_bucket_chunks(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxStream<'static, Vec<WireRecord>> {
+        let _ = (cache, buckets);
+        stream::empty().boxed()
+    }
 }
 
 fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
@@ -1095,6 +1136,12 @@ async fn inbound_loop(
                 | Msg::AePart { .. }
                 | Msg::AePartSketch { .. }
                 | Msg::StUnavailable { .. }
+                | Msg::Fetch { .. }
+                | Msg::FetchReply { .. }
+                | Msg::AeDigestScoped { .. }
+                | Msg::StBuckets { .. }
+                | Msg::StBucketChunk { .. }
+                | Msg::StaleView { .. }
                 | Msg::ReqDone => {}
             }
         }
@@ -3263,6 +3310,40 @@ mod tests {
         assert!(none.is_empty(), "a hash matching nothing yields nothing");
 
         cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_request_handler_distribution_mode_stubs_degrade_gracefully() {
+        // These five methods are stand-ins for the shard-backed bodies that
+        // land once distribution mode is fully wired up: each must answer
+        // exactly its `RequestHandler` default, for any cache name,
+        // regardless of the (here, empty) shard registry.
+        let handler = ClusterRequestHandler {
+            shards: Arc::new(RwLock::new(HashMap::new())),
+            warmth: Arc::new(Warmth::default()),
+            ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+            ae_sketch_min_bucket: ClusterConfig::default().ae_sketch_min_bucket,
+            ae_sketch_cells: ClusterConfig::default().ae_sketch_cells,
+        };
+        let name = SmolStr::new("users");
+
+        assert_eq!(handler.ownership_view_hash(name.clone()), None);
+        assert!(matches!(
+            handler
+                .fetch(name.clone(), Bytes::from_static(b"k1"), 1)
+                .await,
+            FetchServe::Unavailable
+        ));
+        assert!(matches!(
+            handler.ae_digest_scoped(name.clone(), 1, Vec::new()).await,
+            AeServeOutcome::Unavailable
+        ));
+        assert!(!handler.st_buckets_available(name.clone(), 1).await);
+        let mut chunks = handler.st_bucket_chunks(name, vec![0]);
+        assert!(
+            chunks.next().await.is_none(),
+            "the stub chunk stream is immediately empty"
+        );
     }
 
     #[tokio::test]

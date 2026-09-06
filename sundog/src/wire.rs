@@ -2,10 +2,10 @@
 //!
 //! Every frame starts with a one-byte discriminant. Control messages carry
 //! `FRAME_KIND_POSTCARD` and are postcard-encoded. The record-carrying
-//! variants [`Msg::Replicate`], [`Msg::ReplicateBatch`], and [`Msg::StChunk`]
-//! carry `FRAME_KIND_RAW_RECORD`: a fixed header read through `zerocopy`'s
-//! [`FromBytes`] and [`IntoBytes`] views, then each record's key and value
-//! bytes back to back.
+//! variants [`Msg::Replicate`], [`Msg::ReplicateBatch`], [`Msg::StChunk`],
+//! and [`Msg::StBucketChunk`] carry `FRAME_KIND_RAW_RECORD`: a fixed header
+//! read through `zerocopy`'s [`FromBytes`] and [`IntoBytes`] views, then
+//! each record's key and value bytes back to back.
 //!
 //! Decoding a raw-record frame slices `Bytes` views out of the received
 //! buffer with no payload copy. Encoding assembles one exact-size `BytesMut`
@@ -47,7 +47,10 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 1: the 0.3 releases. [`Msg::Hello`] has no `protocol` field.
 /// - 2: 0.4. Adds [`Msg::AePartDigests`], [`Msg::AeParts`],
 ///   [`Msg::AePart`], [`Msg::AePartSketch`], and [`Msg::StUnavailable`].
-pub const PROTOCOL_VERSION: u16 = 2;
+/// - 3: 0.6. Adds distribution mode's [`Msg::Fetch`], [`Msg::FetchReply`],
+///   [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`],
+///   and [`Msg::StaleView`].
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -59,6 +62,14 @@ pub const PROTOCOL_PART_DIGESTS: u16 = 2;
 /// The protocol that introduced [`Msg::StUnavailable`]; a cold donor serves
 /// an older peer rather than declining it.
 pub const PROTOCOL_ST_UNAVAILABLE: u16 = 2;
+
+/// The protocol that introduced distribution mode's wire messages:
+/// [`Msg::Fetch`], [`Msg::FetchReply`], [`Msg::AeDigestScoped`],
+/// [`Msg::StBuckets`], [`Msg::StBucketChunk`], and [`Msg::StaleView`]. A
+/// peer speaking less never receives one of these — moot in practice, since
+/// such a peer never becomes eligible to own a bucket in the first place,
+/// but gated at the wire layer regardless as the hard guarantee.
+pub const PROTOCOL_DISTRIBUTED: u16 = 3;
 
 /// Whether a peer speaking `peer_protocol` understands a message kind
 /// introduced in protocol `since`.
@@ -216,6 +227,57 @@ pub enum Msg {
     /// `cache` yet: it has not completed its own state transfer for it, or
     /// never opened it. The requester moves on to its next candidate.
     StUnavailable { cache: SmolStr },
+    /// Distribution-mode read: "I don't own `key`'s bucket under my view; do
+    /// you?" Sent to a candidate owner in rendezvous-score order, carrying
+    /// the requester's `view_hash` for the epoch check. Introduced in
+    /// protocol 3.
+    Fetch {
+        cache: SmolStr,
+        key: Bytes,
+        view_hash: u64,
+    },
+    /// Answers [`Msg::Fetch`]: the record if the responder currently owns
+    /// the bucket and holds one, `None` for a definitive miss. Never sent
+    /// when the responder's own view hash differs from the request's —
+    /// [`Msg::StaleView`] instead.
+    FetchReply { rec: Option<WireRecord> },
+    /// Anti-entropy round, step 1, distribution-mode: like [`Msg::AeDigest`],
+    /// but scoped to the sender's own owned buckets and carrying its
+    /// `view_hash` for the epoch check. A brand-new variant, not a field
+    /// added to [`Msg::AeDigest`]: mutating that struct variant's fields
+    /// would change the wire encoding of every mode's anti-entropy traffic,
+    /// not just distribution mode's.
+    AeDigestScoped {
+        cache: SmolStr,
+        view_hash: u64,
+        buckets: Vec<(u16, u64)>,
+    },
+    /// Rebalance: "send me everything you hold for these buckets," the
+    /// bucket-scoped counterpart of [`Msg::StRequest`]. Carries the
+    /// requester's `view_hash` so a donor whose own view has since diverged
+    /// can answer [`Msg::StaleView`] instead of transferring against a
+    /// stale owner set.
+    StBuckets {
+        cache: SmolStr,
+        buckets: Vec<u16>,
+        view_hash: u64,
+    },
+    /// One chunk of an [`Msg::StBuckets`] reply, the bucket-scoped
+    /// counterpart of [`Msg::StChunk`]; `done` marks the final chunk.
+    /// Raw-record layout, not postcard.
+    StBucketChunk {
+        cache: SmolStr,
+        recs: Vec<WireRecord>,
+        done: bool,
+    },
+    /// Any ownership-scoped request's requester and responder computed
+    /// different view hashes: the responder declines outright, sent
+    /// instead of a [`Msg::FetchReply`], an [`Msg::AeDigestScoped`] reply,
+    /// or an [`Msg::StBucketChunk`] stream.
+    StaleView {
+        cache: SmolStr,
+        responder_view_hash: u64,
+    },
 }
 
 /// Frame discriminant: everything after this byte is a postcard-encoded
@@ -228,6 +290,7 @@ const FRAME_KIND_RAW_RECORD: u8 = 1;
 const RAW_KIND_REPLICATE: u8 = 0;
 const RAW_KIND_REPLICATE_BATCH: u8 = 1;
 const RAW_KIND_ST_CHUNK: u8 = 2;
+const RAW_KIND_ST_BUCKET_CHUNK: u8 = 3;
 
 /// Record-level flag: this record is a tombstone (`WireRecord::value` is
 /// `None`).
@@ -321,6 +384,9 @@ pub fn encode(msg: &Msg) -> Result<Bytes, CodecError> {
         }
         Msg::StChunk { cache, recs, done } => {
             encode_raw_frame(RAW_KIND_ST_CHUNK, cache, recs, *done)
+        }
+        Msg::StBucketChunk { cache, recs, done } => {
+            encode_raw_frame(RAW_KIND_ST_BUCKET_CHUNK, cache, recs, *done)
         }
         _ => encode_postcard(msg),
     }
@@ -489,6 +555,11 @@ fn decode_raw_frame(body: &Bytes) -> Result<Msg, CodecError> {
             recs,
             done: header.done != 0,
         }),
+        RAW_KIND_ST_BUCKET_CHUNK => Ok(Msg::StBucketChunk {
+            cache,
+            recs,
+            done: header.done != 0,
+        }),
         _ => Err(CodecError::MalformedFrame(
             "unknown raw-record message kind",
         )),
@@ -641,6 +712,13 @@ mod tests {
         assert!(peer_supports(3, PROTOCOL_ST_UNAVAILABLE));
         assert!(!peer_supports(1, PROTOCOL_PART_DIGESTS));
         assert!(!peer_supports(1, PROTOCOL_ST_UNAVAILABLE));
+    }
+
+    #[test]
+    fn a_protocol_two_peer_never_supports_distribution_mode() {
+        assert!(!peer_supports(2, PROTOCOL_DISTRIBUTED));
+        assert!(!peer_supports(1, PROTOCOL_DISTRIBUTED));
+        assert!(peer_supports(3, PROTOCOL_DISTRIBUTED));
     }
 
     #[test]
@@ -848,6 +926,136 @@ mod tests {
         roundtrip(&Msg::StUnavailable {
             cache: SmolStr::new("users"),
         });
+    }
+
+    #[test]
+    fn roundtrip_fetch() {
+        roundtrip(&Msg::Fetch {
+            cache: SmolStr::new("users"),
+            key: Bytes::from_static(b"k1"),
+            view_hash: 12345,
+        });
+    }
+
+    #[test]
+    fn roundtrip_fetch_reply_found() {
+        roundtrip(&Msg::FetchReply {
+            rec: Some(sample_record(Some("v1"))),
+        });
+    }
+
+    #[test]
+    fn roundtrip_fetch_reply_miss() {
+        roundtrip(&Msg::FetchReply { rec: None });
+    }
+
+    #[test]
+    fn roundtrip_ae_digest_scoped() {
+        roundtrip(&Msg::AeDigestScoped {
+            cache: SmolStr::new("users"),
+            view_hash: 999,
+            buckets: vec![(0, 111), (1023, 222)],
+        });
+    }
+
+    #[test]
+    fn roundtrip_ae_digest_scoped_empty_buckets() {
+        roundtrip(&Msg::AeDigestScoped {
+            cache: SmolStr::new("users"),
+            view_hash: 0,
+            buckets: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_st_buckets() {
+        roundtrip(&Msg::StBuckets {
+            cache: SmolStr::new("users"),
+            buckets: vec![0, 42, 1023],
+            view_hash: 777,
+        });
+    }
+
+    #[test]
+    fn roundtrip_st_bucket_chunk() {
+        roundtrip(&Msg::StBucketChunk {
+            cache: SmolStr::new("users"),
+            recs: vec![sample_record(Some("v1")), sample_record(None)],
+            done: true,
+        });
+    }
+
+    #[test]
+    fn roundtrip_st_bucket_chunk_empty() {
+        roundtrip(&Msg::StBucketChunk {
+            cache: SmolStr::new("users"),
+            recs: Vec::new(),
+            done: false,
+        });
+    }
+
+    #[test]
+    fn roundtrip_stale_view() {
+        roundtrip(&Msg::StaleView {
+            cache: SmolStr::new("users"),
+            responder_view_hash: 42,
+        });
+    }
+
+    /// [`Msg::StBucketChunk`] shares the raw-record layout with
+    /// [`Msg::StChunk`] but is its own `msg_kind`, so a chunk of one never
+    /// decodes as the other.
+    #[test]
+    fn st_bucket_chunk_and_st_chunk_do_not_cross_decode() {
+        let bucket_chunk = encode(&Msg::StBucketChunk {
+            cache: SmolStr::new("users"),
+            recs: vec![sample_record(Some("v1"))],
+            done: true,
+        })
+        .expect("encodes");
+        assert!(matches!(
+            decode(&bucket_chunk).expect("decodes"),
+            Msg::StBucketChunk { .. }
+        ));
+
+        let st_chunk = encode(&Msg::StChunk {
+            cache: SmolStr::new("users"),
+            recs: vec![sample_record(Some("v1"))],
+            done: true,
+        })
+        .expect("encodes");
+        assert!(matches!(
+            decode(&st_chunk).expect("decodes"),
+            Msg::StChunk { .. }
+        ));
+    }
+
+    /// A [`Msg::StBucketChunk`] frame's raw-record payload decodes a
+    /// key/value `Bytes` sharing the frame's backing storage, the same
+    /// zero-copy guarantee [`Msg::Replicate`] already has.
+    #[test]
+    fn st_bucket_chunk_record_bytes_are_zero_copy_slices_of_the_frame() {
+        let cache = SmolStr::new("users");
+        let rec = sample_record(Some("v1"));
+        let frame = encode(&Msg::StBucketChunk {
+            cache: cache.clone(),
+            recs: vec![rec.clone()],
+            done: true,
+        })
+        .expect("encodes");
+        let key_offset = 1 + size_of::<RawFrameHeader>() + cache.len() + RECORD_HEADER_LEN;
+        let expected_key_ptr = frame.as_ptr().wrapping_add(key_offset);
+
+        let Msg::StBucketChunk { mut recs, .. } = decode(&frame).expect("decodes") else {
+            panic!("decoded back to something other than StBucketChunk");
+        };
+        assert_eq!(recs.len(), 1);
+        let decoded_rec = recs.remove(0);
+        assert_eq!(
+            decoded_rec.key.as_ptr(),
+            expected_key_ptr,
+            "decoded key must be a zero-copy slice into the received frame"
+        );
     }
 
     #[test]
