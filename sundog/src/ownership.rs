@@ -23,11 +23,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::membership::{CacheModes, Peer};
 use crate::node::NodeId;
 use crate::store::{BUCKET_COUNT, Mode};
-
-/// The minimum wire protocol version a peer must speak to be eligible to own
-/// a bucket: a peer speaking less can neither decode distribution-mode wire
-/// traffic nor be trusted to hold a shard for it.
-const MIN_OWNER_PROTOCOL: u16 = 3;
+use crate::wire;
 
 /// The rendezvous (highest-random-weight) score of `node` for `bucket`:
 /// `xxh3_64(node ++ bucket)`. Pure, total, and deterministic across
@@ -82,7 +78,7 @@ pub(crate) fn view_hash(eligible: &[NodeId]) -> u64 {
 }
 
 /// The nodes eligible to own a bucket for `cache`: live peers speaking at
-/// least [`MIN_OWNER_PROTOCOL`] that currently advertise `cache` under
+/// least [`wire::PROTOCOL_DISTRIBUTED`] that currently advertise `cache` under
 /// `Mode::Distributed` with this same `k`, plus `self_node` unconditionally
 /// — a node is always eligible for its own view regardless of what it
 /// advertises about itself. A peer that's live but hasn't opened `cache`
@@ -98,7 +94,7 @@ pub(crate) fn eligible_owners(
 ) -> Vec<NodeId> {
     let mut eligible: Vec<NodeId> = peers
         .iter()
-        .filter(|peer| peer.protocol >= MIN_OWNER_PROTOCOL)
+        .filter(|peer| peer.protocol >= wire::PROTOCOL_DISTRIBUTED)
         .filter(|peer| {
             modes
                 .get(&peer.node)

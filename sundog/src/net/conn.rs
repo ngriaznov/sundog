@@ -586,6 +586,9 @@ async fn handle_accepted(
                 | Msg::AeEntries { .. }
                 | Msg::AePullHashes { .. }
                 | Msg::AeParts { .. }
+                | Msg::Fetch { .. }
+                | Msg::AeDigestScoped { .. }
+                | Msg::StBuckets { .. }
         );
         let stop = dispatch_one(
             msg,
@@ -657,8 +660,35 @@ async fn dispatch_one(
         Msg::AeParts { cache, parts } => {
             serve_ae_parts(framed, cache, parts, handler, cancel).await
         }
+        Msg::Fetch {
+            cache,
+            key,
+            view_hash,
+        } => serve_fetch(framed, cache, key, view_hash, handler, cancel).await,
+        Msg::AeDigestScoped {
+            cache,
+            view_hash,
+            buckets,
+        } => {
+            serve_ae_digest_scoped(
+                framed,
+                cache,
+                view_hash,
+                buckets,
+                handler,
+                cancel,
+                peer_protocol,
+            )
+            .await
+        }
+        Msg::StBuckets {
+            cache,
+            buckets,
+            view_hash,
+        } => serve_st_buckets(framed, cache, buckets, view_hash, handler, cancel).await,
         // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
-        // `AePartDigests`/`AePart`/`AePartSketch`/`StUnavailable`/`ReqDone` sent only as
+        // `AePartDigests`/`AePart`/`AePartSketch`/`StUnavailable`/
+        // `FetchReply`/`StBucketChunk`/`StaleView`/`ReqDone` sent only as
         // replies on a connection this node initiated, never on one being
         // served here.
         Msg::Hello { .. }
@@ -669,6 +699,9 @@ async fn dispatch_one(
         | Msg::AePart { .. }
         | Msg::AePartSketch { .. }
         | Msg::StUnavailable { .. }
+        | Msg::FetchReply { .. }
+        | Msg::StBucketChunk { .. }
+        | Msg::StaleView { .. }
         | Msg::ReqDone => false,
     }
 }
@@ -733,24 +766,23 @@ async fn serve_state_transfer(
     .await
 }
 
-/// Serves one anti-entropy digest exchange, feeding every mismatched
-/// bucket's reply plus a trailing [`Msg::ReqDone`] and flushing once. The
-/// three-tier responder rule: a bucket whose local entry count exceeds
-/// `handler.ae_part_min_bucket()` replies with its 64 part digests
-/// ([`Msg::AePartDigests`]) without ever materializing its listing; a
-/// smaller mismatched bucket falls back to the existing rule, an IBLT
-/// sketch past `handler.ae_sketch_min_bucket()` entries or else the full
-/// [`Msg::AeBucket`] listing. Returns `true` when this connection is done.
-async fn serve_ae_digest(
-    framed: &mut PeerFramed,
-    cache: SmolStr,
+/// The mismatched-bucket reply messages for one digest exchange, given the
+/// responder's own `local` digests and the requester's `remote_buckets`:
+/// shared by [`serve_ae_digest`] and [`serve_ae_digest_scoped`], whose only
+/// difference is where `local` comes from. The three-tier responder rule: a
+/// bucket whose local entry count exceeds `handler.ae_part_min_bucket()`
+/// replies with its 64 part digests ([`Msg::AePartDigests`]) without ever
+/// materializing its listing; a smaller mismatched bucket falls back to the
+/// existing rule, an IBLT sketch past `handler.ae_sketch_min_bucket()`
+/// entries or else the full [`Msg::AeBucket`] listing. Does not append the
+/// trailing [`Msg::ReqDone`]; callers add it.
+async fn ae_mismatch_replies(
+    cache: &SmolStr,
+    local: &std::collections::HashMap<u16, u64>,
     remote_buckets: Vec<(u16, u64)>,
     handler: &dyn RequestHandler,
-    cancel: &CancellationToken,
     peer_protocol: u16,
-) -> bool {
-    let local: std::collections::HashMap<u16, u64> =
-        handler.digests(cache.clone()).await.into_iter().collect();
+) -> Vec<Msg> {
     let mismatched: Vec<u16> = remote_buckets
         .into_iter()
         .filter(|&(bucket, remote_digest)| {
@@ -820,8 +852,157 @@ async fn serve_ae_digest(
             );
         }
     }
+    replies
+}
+
+/// Serves one anti-entropy digest exchange, feeding every mismatched
+/// bucket's reply plus a trailing [`Msg::ReqDone`] and flushing once.
+/// Returns `true` when this connection is done.
+async fn serve_ae_digest(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    remote_buckets: Vec<(u16, u64)>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+    peer_protocol: u16,
+) -> bool {
+    let local: std::collections::HashMap<u16, u64> =
+        handler.digests(cache.clone()).await.into_iter().collect();
+    let mut replies =
+        ae_mismatch_replies(&cache, &local, remote_buckets, handler, peer_protocol).await;
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// Serves a `Fetch`: answers with the responder's record (or a definitive
+/// miss), or declines with `StaleView` if its own view has diverged from
+/// the requester's. Always followed by [`Msg::ReqDone`], so the connection
+/// stays poolable.
+async fn serve_fetch(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    key: Bytes,
+    view_hash: u64,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    let reply = match handler.fetch(cache.clone(), key, view_hash).await {
+        super::FetchServe::Found(rec) => Msg::FetchReply { rec },
+        super::FetchServe::Stale {
+            responder_view_hash,
+        } => Msg::StaleView {
+            cache,
+            responder_view_hash,
+        },
+        // An unrecognized or non-distributed cache degrades to a plain
+        // miss, the same shape a genuine absence of the key would take.
+        super::FetchServe::Unavailable => Msg::FetchReply { rec: None },
+    };
+    send_batch_or_cancelled(framed, &[reply, Msg::ReqDone], cancel).await
+}
+
+/// Serves an `AeDigestScoped`: an epoch check ahead of an ordinary digest
+/// exchange. `handler.ae_digest_scoped` folds both together — its `Digests`
+/// case is this responder's own owned-bucket digests, view hashes already
+/// confirmed to match, fed into the same [`ae_mismatch_replies`] tiering
+/// [`serve_ae_digest`] uses. A `Stale` or `Unavailable` answer short-circuits
+/// before any bucket is ever touched.
+async fn serve_ae_digest_scoped(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    view_hash: u64,
+    remote_buckets: Vec<(u16, u64)>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+    peer_protocol: u16,
+) -> bool {
+    match handler
+        .ae_digest_scoped(cache.clone(), view_hash, remote_buckets.clone())
+        .await
+    {
+        super::AeServeOutcome::Unavailable => {
+            send_batch_or_cancelled(framed, &[Msg::ReqDone], cancel).await
+        }
+        super::AeServeOutcome::Stale {
+            responder_view_hash,
+        } => {
+            send_batch_or_cancelled(
+                framed,
+                &[
+                    Msg::StaleView {
+                        cache,
+                        responder_view_hash,
+                    },
+                    Msg::ReqDone,
+                ],
+                cancel,
+            )
+            .await
+        }
+        super::AeServeOutcome::Digests(local) => {
+            let local: std::collections::HashMap<u16, u64> = local.into_iter().collect();
+            let mut replies =
+                ae_mismatch_replies(&cache, &local, remote_buckets, handler, peer_protocol).await;
+            replies.push(Msg::ReqDone);
+            send_batch_or_cancelled(framed, &replies, cancel).await
+        }
+    }
+}
+
+/// Serves an `StBuckets` rebalance pull: streams every chunk
+/// [`RequestHandler::st_bucket_chunks`] yields once
+/// [`RequestHandler::st_buckets_available`] agrees, the bucket-scoped
+/// counterpart of [`serve_state_transfer`]; declines with `StaleView`
+/// otherwise (an unrecognized cache, one not open in distribution mode, or
+/// a view hash that no longer matches the requester's). Returns `true` when
+/// this connection is done.
+async fn serve_st_buckets(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    buckets: Vec<u16>,
+    view_hash: u64,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    if !handler.st_buckets_available(cache.clone(), view_hash).await {
+        let responder_view_hash = handler.ownership_view_hash(cache.clone()).unwrap_or(0);
+        return send_or_cancelled(
+            framed,
+            &Msg::StaleView {
+                cache,
+                responder_view_hash,
+            },
+            cancel,
+        )
+        .await;
+    }
+    let mut chunks = handler.st_bucket_chunks(cache.clone(), buckets);
+    loop {
+        let next = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return true,
+            next = chunks.next() => next,
+        };
+        let Some(recs) = next else { break };
+        let msg = Msg::StBucketChunk {
+            cache: cache.clone(),
+            recs,
+            done: false,
+        };
+        if send_or_cancelled(framed, &msg, cancel).await {
+            return true;
+        }
+    }
+    send_or_cancelled(
+        framed,
+        &Msg::StBucketChunk {
+            cache,
+            recs: Vec::new(),
+            done: true,
+        },
+        cancel,
+    )
+    .await
 }
 
 /// Serves an `AeParts` request: the part-grained counterpart of
@@ -1102,6 +1283,99 @@ pub(super) async fn collect_pulled_records(
     }
 }
 
+/// Reads a `FetchReply`/`StaleView` reply until [`Msg::ReqDone`]:
+/// [`Mesh::fetch`]'s collector. Same pool-checkin rules as
+/// [`collect_ae_buckets`].
+///
+/// [`Mesh::fetch`]: super::Mesh::fetch
+#[allow(dead_code, reason = "called by Mesh::fetch once it is wired up")]
+pub(super) async fn collect_fetch_reply(
+    mut framed: PeerFramed,
+    pool: &ReqPool,
+    first: Option<Result<Msg, CodecError>>,
+) -> Result<super::FetchOutcome, CodecError> {
+    let mut outcome: Option<super::FetchOutcome> = None;
+    let mut pending = first;
+    loop {
+        let received = match pending.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
+            Some(Ok(Msg::ReqDone)) => {
+                pool.checkin(framed);
+                return outcome.ok_or_else(|| unexpected_close("fetch reply"));
+            }
+            Some(Ok(Msg::FetchReply { rec })) => outcome = Some(super::FetchOutcome::Found(rec)),
+            Some(Ok(Msg::StaleView {
+                responder_view_hash,
+                ..
+            })) => {
+                outcome = Some(super::FetchOutcome::Stale {
+                    responder_view_hash,
+                });
+            }
+            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
+            Some(Err(err)) => return Err(err),
+            None => return Err(unexpected_close("fetch reply")),
+        }
+    }
+}
+
+/// Reads `AeBucket`/`AeSketch`/`AePartDigests` replies, or a single
+/// `StaleView`, until [`Msg::ReqDone`]: [`Mesh::ae_round_scoped`]'s
+/// collector, the epoch-checked counterpart of [`collect_ae_mismatches`].
+///
+/// [`Mesh::ae_round_scoped`]: super::Mesh::ae_round_scoped
+#[allow(
+    dead_code,
+    reason = "called by Mesh::ae_round_scoped once it is wired up"
+)]
+pub(super) async fn collect_ae_round_scoped(
+    mut framed: PeerFramed,
+    pool: &ReqPool,
+    first: Option<Result<Msg, CodecError>>,
+) -> Result<super::AeRoundOutcome, CodecError> {
+    let mut result = Vec::new();
+    let mut stale: Option<u64> = None;
+    let mut pending = first;
+    loop {
+        let received = match pending.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
+            Some(Ok(Msg::ReqDone)) => {
+                pool.checkin(framed);
+                return Ok(match stale {
+                    Some(responder_view_hash) => super::AeRoundOutcome::Stale {
+                        responder_view_hash,
+                    },
+                    None => super::AeRoundOutcome::Mismatches(result),
+                });
+            }
+            Some(Ok(Msg::StaleView {
+                responder_view_hash,
+                ..
+            })) => stale = Some(responder_view_hash),
+            Some(Ok(Msg::AeBucket {
+                bucket, entries, ..
+            })) => result.push(super::AeMismatch::Bucket(bucket, entries)),
+            Some(Ok(Msg::AeSketch { bucket, cells, .. })) => {
+                result.push(super::AeMismatch::Sketch(bucket, cells));
+            }
+            Some(Ok(Msg::AePartDigests {
+                bucket, digests, ..
+            })) => {
+                result.push(super::AeMismatch::PartDigests(bucket, digests));
+            }
+            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
+            Some(Err(err)) => return Err(err),
+            None => return Err(unexpected_close("scoped anti-entropy digest reply")),
+        }
+    }
+}
+
 fn unexpected_close(what: &str) -> CodecError {
     CodecError::Io(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
@@ -1159,6 +1433,60 @@ pub(super) fn state_stream(
                             let err = CodecError::Io(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 "state-transfer connection closed before the final chunk",
+                            ));
+                            return Some((Err(err), None));
+                        }
+                    }
+                }
+            }
+        },
+    ))
+}
+
+/// Adapts a rebalance bucket-pull connection into a lazy stream of record
+/// chunks, the `StBucketChunk` counterpart of [`state_stream`]: identical
+/// shape, keyed on [`Msg::StBucketChunk`] instead of [`Msg::StChunk`].
+#[allow(
+    dead_code,
+    reason = "called by Mesh::request_buckets once it is wired up"
+)]
+pub(super) fn bucket_stream(
+    framed: PeerFramed,
+    pool: Arc<ReqPool>,
+    first: Option<Result<Msg, CodecError>>,
+) -> futures::stream::BoxStream<'static, Result<Vec<WireRecord>, CodecError>> {
+    Box::pin(futures::stream::unfold(
+        Some((framed, first)),
+        move |state| {
+            let pool = Arc::clone(&pool);
+            async move {
+                let (mut framed, mut pending) = state?;
+                loop {
+                    let received = match pending.take() {
+                        Some(first) => Some(first),
+                        None => recv_msg(&mut framed).await,
+                    };
+                    match received {
+                        Some(Ok(Msg::StBucketChunk { recs, done, .. })) => {
+                            if recs.is_empty() {
+                                if done {
+                                    pool.checkin(framed);
+                                    return None;
+                                }
+                                continue;
+                            }
+                            if done {
+                                pool.checkin(framed);
+                                return Some((Ok(recs), None));
+                            }
+                            return Some((Ok(recs), Some((framed, None))));
+                        }
+                        Some(Ok(_)) => {} // unexpected message on this stream; keep reading
+                        Some(Err(err)) => return Some((Err(err), None)),
+                        None => {
+                            let err = CodecError::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "rebalance bucket-transfer connection closed before the final chunk",
                             ));
                             return Some((Err(err), None));
                         }

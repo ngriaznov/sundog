@@ -26,7 +26,7 @@ mod tls;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -359,6 +359,80 @@ impl AePartReply {
     }
 }
 
+/// One reply to [`Mesh::fetch`]: the responder's answer to a
+/// distribution-mode read for a key it may or may not currently own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "constructed by conn::collect_fetch_reply and read by Cache::fetch once it is wired up"
+)]
+pub(crate) enum FetchOutcome {
+    /// The responder answered: `Some` record, or `None` for a definitive
+    /// miss.
+    Found(Option<WireRecord>),
+    /// The responder's own view hash differs from the request's; it
+    /// declined rather than risk answering against a stale owner set.
+    Stale { responder_view_hash: u64 },
+}
+
+/// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest
+/// exchange's outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "constructed by conn::collect_ae_round_scoped and read by anti-entropy's scoped round once it is wired up"
+)]
+pub(crate) enum AeRoundOutcome {
+    /// Every mismatched bucket's reply, exactly like [`Mesh::ae_round`]'s.
+    Mismatches(Vec<AeMismatch>),
+    /// The responder's own view hash differs from the request's; it
+    /// declined the round rather than answer against a stale owner set.
+    /// The next scheduled round retries with a freshly re-borrowed view.
+    Stale { responder_view_hash: u64 },
+}
+
+/// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::Fetch`].
+pub(crate) enum FetchServe {
+    /// The responder currently owns the bucket: `Some` record, or `None`
+    /// for a definitive miss.
+    #[allow(
+        dead_code,
+        reason = "constructed once ClusterRequestHandler serves real distribution-mode reads"
+    )]
+    Found(Option<WireRecord>),
+    /// The responder's own view hash differs from the requester's.
+    #[allow(
+        dead_code,
+        reason = "constructed once ClusterRequestHandler serves real distribution-mode reads"
+    )]
+    Stale { responder_view_hash: u64 },
+    /// The named cache is not open here, or not a distribution-mode cache:
+    /// the same "unknown cache degrades gracefully" shape every other
+    /// method on this trait already has.
+    Unavailable,
+}
+
+/// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::AeDigestScoped`]:
+/// either the responder's current per-bucket digests (for the caller to
+/// diff against the requester's, exactly as an ordinary digest exchange
+/// does), or a decline.
+pub(crate) enum AeServeOutcome {
+    /// The responder's own owned-bucket digests, view hashes matching.
+    #[allow(
+        dead_code,
+        reason = "constructed once ClusterRequestHandler serves real distribution-mode anti-entropy"
+    )]
+    Digests(Vec<(u16, u64)>),
+    /// The responder's own view hash differs from the requester's.
+    #[allow(
+        dead_code,
+        reason = "constructed once ClusterRequestHandler serves real distribution-mode anti-entropy"
+    )]
+    Stale { responder_view_hash: u64 },
+    /// The named cache is not open here, or not a distribution-mode cache.
+    Unavailable,
+}
+
 /// What the net layer needs from the local shard registry to answer
 /// another node's state-transfer or anti-entropy request. An unknown cache
 /// degrades to an empty result rather than an error: a normal race, not a
@@ -457,6 +531,65 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn ae_sketch_cells(&self) -> usize {
         crate::config::ClusterConfig::default().ae_sketch_cells
     }
+
+    /// The requester's `view_hash` for `cache`, if this node has one —
+    /// i.e. `cache` is a distribution-mode cache this node has opened.
+    /// Default `None`: every existing implementor keeps compiling and
+    /// simply never answers a distribution-mode epoch check, which is
+    /// correct, since none of them ever open a distribution-mode cache.
+    fn ownership_view_hash(&self, cache: SmolStr) -> Option<u64> {
+        let _ = cache;
+        None
+    }
+
+    /// Serves a [`crate::wire::Msg::Fetch`]. Default: `FetchServe::Unavailable`,
+    /// the same "unknown cache degrades gracefully" shape every existing
+    /// method here already has.
+    ///
+    /// `FetchServe` is `pub(crate)`, deliberately: distribution mode is
+    /// served only by this crate's own `ClusterRequestHandler` for now, so
+    /// an external implementor overrides every other method on this trait
+    /// but leaves this one at its default.
+    #[allow(private_interfaces, reason = "see the doc comment above")]
+    fn fetch(&self, cache: SmolStr, key: Bytes, view_hash: u64) -> BoxFuture<'_, FetchServe> {
+        let _ = (cache, key, view_hash);
+        Box::pin(async { FetchServe::Unavailable })
+    }
+
+    /// Serves a [`crate::wire::Msg::AeDigestScoped`]. Default:
+    /// `AeServeOutcome::Unavailable`. `AeServeOutcome` is `pub(crate)` for
+    /// the same reason `FetchServe` is; see [`RequestHandler::fetch`].
+    #[allow(private_interfaces, reason = "see RequestHandler::fetch's doc comment")]
+    fn ae_digest_scoped(
+        &self,
+        cache: SmolStr,
+        view_hash: u64,
+        buckets: Vec<(u16, u64)>,
+    ) -> BoxFuture<'_, AeServeOutcome> {
+        let _ = (cache, view_hash, buckets);
+        Box::pin(async { AeServeOutcome::Unavailable })
+    }
+
+    /// Whether this node can donate `cache`'s named `buckets` right now, at
+    /// `view_hash`: the [`crate::wire::Msg::StBuckets`] availability check.
+    /// Default `false`.
+    fn st_buckets_available(&self, cache: SmolStr, view_hash: u64) -> BoxFuture<'_, bool> {
+        let _ = (cache, view_hash);
+        Box::pin(async { false })
+    }
+
+    /// Streams the reply chunks once
+    /// [`RequestHandler::st_buckets_available`] said yes. Default: an
+    /// immediately-empty stream, never actually polled unless the caller
+    /// ignores the availability check.
+    fn st_bucket_chunks(
+        &self,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+    ) -> BoxStream<'static, Vec<WireRecord>> {
+        let _ = (cache, buckets);
+        Box::pin(futures::stream::empty())
+    }
 }
 
 struct PeerHandle {
@@ -474,6 +607,12 @@ struct PeerHandle {
     /// Pooled request/response connections for this peer, dialed on
     /// demand, dropped with this handle when the peer departs.
     req_pool: Arc<conn::ReqPool>,
+    /// This peer's last-known [`crate::wire::Msg::Hello`] protocol, from its
+    /// [`Peer::protocol`] gossip field. Refreshed on every
+    /// [`Mesh::update_peers`] call, read by
+    /// [`MeshInner::require_peer_protocol`] to gate a distribution-mode
+    /// send before ever dialing.
+    protocol: AtomicU16,
 }
 
 struct MeshInner {
@@ -636,10 +775,10 @@ impl Mesh {
     ///
     /// Panics if the peer-table lock is poisoned.
     pub fn update_peers(&self, peers: Vec<Peer>) {
-        let incoming: HashMap<NodeId, SocketAddr> = peers
+        let incoming: HashMap<NodeId, (SocketAddr, u16)> = peers
             .into_iter()
             .filter(|peer| peer.node != self.inner.node)
-            .map(|peer| (peer.node, peer.data_addr))
+            .map(|peer| (peer.node, (peer.data_addr, peer.protocol)))
             .collect();
 
         let mut table = self
@@ -648,20 +787,27 @@ impl Mesh {
             .write()
             .expect("invariant: peers lock is never poisoned");
         table.retain(|node, handle| {
-            let keep = incoming.get(node) == Some(&handle.data_addr);
-            if !keep {
+            let Some(&(data_addr, protocol)) = incoming.get(node) else {
                 handle.cancel.cancel();
+                return false;
+            };
+            if data_addr != handle.data_addr {
+                handle.cancel.cancel();
+                return false;
             }
-            keep
+            // The peer is unchanged; its gossiped protocol may still have
+            // moved (a rolling upgrade), so it is refreshed regardless.
+            handle.protocol.store(protocol, Ordering::Relaxed);
+            true
         });
-        for (node, data_addr) in incoming {
+        for (node, (data_addr, protocol)) in incoming {
             table
                 .entry(node)
-                .or_insert_with(|| self.spawn_peer_handle(data_addr));
+                .or_insert_with(|| self.spawn_peer_handle(data_addr, protocol));
         }
     }
 
-    fn spawn_peer_handle(&self, data_addr: SocketAddr) -> PeerHandle {
+    fn spawn_peer_handle(&self, data_addr: SocketAddr, protocol: u16) -> PeerHandle {
         let invalidate = Arc::new(DropOldestQueue::new(self.inner.outbox_capacity));
         let (replicate_tx, replicate_rx) = mpsc::channel(self.inner.outbox_capacity);
         let cancel = CancellationToken::new();
@@ -683,6 +829,7 @@ impl Mesh {
             ae_deferrals: AtomicU32::new(0),
             cancel,
             req_pool: Arc::new(conn::ReqPool::new()),
+            protocol: AtomicU16::new(protocol),
         }
     }
 
@@ -824,6 +971,49 @@ impl Mesh {
                     format!("peer {peer} is not a known mesh member"),
                 ))
             })
+    }
+
+    /// Checks `peer`'s last-known gossiped protocol against `since` before
+    /// a distribution-mode send ever dials: the hard wire-layer guarantee
+    /// that a peer speaking less than [`wire::PROTOCOL_DISTRIBUTED`] never
+    /// receives one of these messages, independent of whether the caller's
+    /// own eligibility filtering is correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::Io`] if `peer` is unknown, or if it is known
+    /// but speaks a protocol older than `since`.
+    #[allow(
+        dead_code,
+        reason = "called by Mesh::fetch/ae_round_scoped/request_buckets, read by anti-entropy/rebalance/Cache::fetch once they are wired up"
+    )]
+    fn require_peer_protocol(
+        &self,
+        peer: NodeId,
+        since: u16,
+        what: &str,
+    ) -> Result<(), CodecError> {
+        let protocol = self
+            .inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned")
+            .get(&peer)
+            .map(|handle| handle.protocol.load(Ordering::Relaxed))
+            .ok_or_else(|| {
+                CodecError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("peer {peer} is not a known mesh member"),
+                ))
+            })?;
+        if wire::peer_supports(protocol, since) {
+            Ok(())
+        } else {
+            Err(CodecError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("peer {peer} speaks protocol {protocol}, too old for {what}"),
+            )))
+        }
     }
 
     /// Checks a pooled, already-`Hello`'d connection out of `peer`'s pool
@@ -1050,6 +1240,145 @@ impl Mesh {
         .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull-by-hash", timeout)))
     }
 
+    /// Distribution-mode read: requests `key`'s record from `owner`,
+    /// carrying this node's `view_hash` for the epoch check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `owner` is unknown, speaks a protocol
+    /// older than [`wire::PROTOCOL_DISTRIBUTED`], or the exchange fails.
+    #[allow(dead_code, reason = "read by Cache::fetch once it is wired up")]
+    pub(crate) async fn fetch(
+        &self,
+        owner: NodeId,
+        cache: SmolStr,
+        key: Bytes,
+        view_hash: u64,
+    ) -> Result<FetchOutcome, CodecError> {
+        self.require_peer_protocol(
+            owner,
+            wire::PROTOCOL_DISTRIBUTED,
+            "a distribution-mode fetch",
+        )?;
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
+            let (framed, pool, first) = self
+                .acquire_conn(
+                    owner,
+                    Msg::Fetch {
+                        cache,
+                        key,
+                        view_hash,
+                    },
+                )
+                .await?;
+            conn::collect_fetch_reply(framed, &pool, first).await
+        })
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("distribution-mode fetch", timeout)))
+    }
+
+    /// Distribution-mode anti-entropy round, step 1: like [`Mesh::ae_round`],
+    /// but sends only `local_buckets` — never every bucket of the cache —
+    /// with `view_hash` for the epoch check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `peer` is unknown, speaks a protocol older
+    /// than [`wire::PROTOCOL_DISTRIBUTED`], or the exchange fails.
+    #[allow(
+        dead_code,
+        reason = "read by anti-entropy's scoped round once it is wired up"
+    )]
+    pub(crate) async fn ae_round_scoped(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        view_hash: u64,
+        local_buckets: Vec<(u16, u64)>,
+    ) -> Result<AeRoundOutcome, CodecError> {
+        self.require_peer_protocol(
+            peer,
+            wire::PROTOCOL_DISTRIBUTED,
+            "a scoped anti-entropy digest exchange",
+        )?;
+        let timeout = request_timeout();
+        tokio::time::timeout(timeout, async {
+            let (framed, pool, first) = self
+                .acquire_conn(
+                    peer,
+                    Msg::AeDigestScoped {
+                        cache,
+                        view_hash,
+                        buckets: local_buckets,
+                    },
+                )
+                .await?;
+            conn::collect_ae_round_scoped(framed, &pool, first).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(request_timeout_error(
+                "scoped anti-entropy digest exchange",
+                timeout,
+            ))
+        })
+    }
+
+    /// Rebalance: requests everything `donor` holds for `buckets`, the
+    /// bucket-scoped counterpart of [`Mesh::request_state`], carrying this
+    /// node's `view_hash` so a donor whose own view has since diverged can
+    /// decline instead of transferring against a stale owner set. `Ok(None)`
+    /// is a decline (the donor is not a valid source right now, or the view
+    /// hashes disagree); the caller moves on to its next candidate donor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `donor` is unknown, speaks a protocol
+    /// older than [`wire::PROTOCOL_DISTRIBUTED`], or the request cannot be
+    /// sent.
+    #[allow(
+        dead_code,
+        reason = "read by rebalance's bucket pull once it is wired up"
+    )]
+    pub(crate) async fn request_buckets(
+        &self,
+        donor: NodeId,
+        cache: SmolStr,
+        buckets: Vec<u16>,
+        view_hash: u64,
+    ) -> Result<Option<BoxStream<'static, Result<Vec<WireRecord>, CodecError>>>, CodecError> {
+        self.require_peer_protocol(donor, wire::PROTOCOL_DISTRIBUTED, "a rebalance bucket pull")?;
+        // Only the checkout-or-dial step and the donor's first reply are
+        // bounded here; the caller's own transfer budget governs the full
+        // chunk stream instead, exactly as `request_state` does.
+        let timeout = request_timeout();
+        let (mut framed, pool, pre_read) = tokio::time::timeout(
+            timeout,
+            self.acquire_conn(
+                donor,
+                Msg::StBuckets {
+                    cache,
+                    buckets,
+                    view_hash,
+                },
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error("rebalance bucket request", timeout)))?;
+        let first = match pre_read {
+            Some(result) => Some(result),
+            None => tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
+                .await
+                .map_err(|_| request_timeout_error("rebalance bucket request", timeout))?,
+        };
+        if let Some(Ok(Msg::StaleView { .. })) = first {
+            pool.checkin(framed);
+            return Ok(None);
+        }
+        Ok(Some(conn::bucket_stream(framed, pool, first)))
+    }
+
     /// Shuts down the mesh: stops accepting, cancels every per-peer writer.
     /// Signals the spawned background work to stop without waiting on sockets.
     ///
@@ -1092,6 +1421,22 @@ mod tests {
     use crate::node::NodeName;
     use crate::wire::{self, MAX_FRAME};
 
+    /// [`FixtureHandler::fetch_fixture`]'s controllable outcome, one
+    /// variant per [`FetchServe`] shape.
+    enum FetchFixture {
+        Found(Option<WireRecord>),
+        Stale(u64),
+        Unavailable,
+    }
+
+    /// [`FixtureHandler::ae_scoped_fixture`]'s controllable outcome, one
+    /// variant per [`AeServeOutcome`] shape.
+    enum AeScopedFixture {
+        Digests(Vec<(u16, u64)>),
+        Stale(u64),
+        Unavailable,
+    }
+
     struct FixtureHandler {
         records: Vec<WireRecord>,
         digests: Vec<(u16, u64)>,
@@ -1104,6 +1449,11 @@ mod tests {
         /// Declines every state-transfer request, the way a node still
         /// warming does.
         snapshot_unavailable: bool,
+        ownership_view_hash: Option<u64>,
+        fetch_fixture: FetchFixture,
+        ae_scoped_fixture: AeScopedFixture,
+        st_buckets_available: bool,
+        st_bucket_chunks: Vec<Vec<WireRecord>>,
     }
 
     impl Default for FixtureHandler {
@@ -1118,6 +1468,11 @@ mod tests {
                 part_entries: Vec::new(),
                 ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
                 snapshot_unavailable: false,
+                ownership_view_hash: None,
+                fetch_fixture: FetchFixture::Unavailable,
+                ae_scoped_fixture: AeScopedFixture::Unavailable,
+                st_buckets_available: false,
+                st_bucket_chunks: Vec::new(),
             }
         }
     }
@@ -1226,6 +1581,56 @@ mod tests {
 
         fn ae_part_min_bucket(&self) -> usize {
             self.ae_part_min_bucket
+        }
+
+        fn ownership_view_hash(&self, _cache: SmolStr) -> Option<u64> {
+            self.ownership_view_hash
+        }
+
+        fn fetch(
+            &self,
+            _cache: SmolStr,
+            _key: Bytes,
+            _view_hash: u64,
+        ) -> BoxFuture<'_, FetchServe> {
+            Box::pin(async move {
+                match &self.fetch_fixture {
+                    FetchFixture::Found(rec) => FetchServe::Found(rec.clone()),
+                    FetchFixture::Stale(responder_view_hash) => FetchServe::Stale {
+                        responder_view_hash: *responder_view_hash,
+                    },
+                    FetchFixture::Unavailable => FetchServe::Unavailable,
+                }
+            })
+        }
+
+        fn ae_digest_scoped(
+            &self,
+            _cache: SmolStr,
+            _view_hash: u64,
+            _buckets: Vec<(u16, u64)>,
+        ) -> BoxFuture<'_, AeServeOutcome> {
+            Box::pin(async move {
+                match &self.ae_scoped_fixture {
+                    AeScopedFixture::Digests(digests) => AeServeOutcome::Digests(digests.clone()),
+                    AeScopedFixture::Stale(responder_view_hash) => AeServeOutcome::Stale {
+                        responder_view_hash: *responder_view_hash,
+                    },
+                    AeScopedFixture::Unavailable => AeServeOutcome::Unavailable,
+                }
+            })
+        }
+
+        fn st_buckets_available(&self, _cache: SmolStr, _view_hash: u64) -> BoxFuture<'_, bool> {
+            Box::pin(async { self.st_buckets_available })
+        }
+
+        fn st_bucket_chunks(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> BoxStream<'static, Vec<WireRecord>> {
+            Box::pin(futures::stream::iter(self.st_bucket_chunks.clone()))
         }
     }
 
@@ -2191,6 +2596,315 @@ mod tests {
         assert!(
             mesh.take_dirty_peers().is_empty(),
             "an unknown peer is ignored"
+        );
+    }
+
+    /// Builds a `Peer` speaking `protocol` instead of the current build's,
+    /// for testing distribution-mode's protocol gate.
+    fn peer_at_protocol(node: NodeId, addr: SocketAddr, protocol: u16) -> Peer {
+        Peer {
+            protocol,
+            ..peer_at(node, addr)
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_the_responders_record_when_found() {
+        let rec = sample_record(1);
+        let handler = Arc::new(FixtureHandler {
+            fetch_fixture: FetchFixture::Found(Some(rec.clone())),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .fetch(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                Bytes::from_static(b"k1"),
+                42,
+            )
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(outcome, FetchOutcome::Found(Some(rec)));
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_a_definitive_miss() {
+        let handler = Arc::new(FixtureHandler {
+            fetch_fixture: FetchFixture::Found(None),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .fetch(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                Bytes::from_static(b"k1"),
+                42,
+            )
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(outcome, FetchOutcome::Found(None));
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_stale_when_the_responders_view_hash_differs() {
+        let handler = Arc::new(FixtureHandler {
+            fetch_fixture: FetchFixture::Stale(999),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .fetch(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                Bytes::from_static(b"k1"),
+                1,
+            )
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(
+            outcome,
+            FetchOutcome::Stale {
+                responder_view_hash: 999
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_degrades_to_a_miss_against_the_default_handler_body() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let outcome = client
+            .fetch(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                Bytes::from_static(b"k1"),
+                1,
+            )
+            .await
+            .expect("fetch succeeds even against a handler that never overrode it");
+        assert_eq!(
+            outcome,
+            FetchOutcome::Found(None),
+            "the default RequestHandler::fetch body degrades to a plain miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_to_dial_a_peer_that_does_not_speak_distribution_mode() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at_protocol(
+            NodeId::from(1),
+            server.local_addr(),
+            wire::PROTOCOL_DISTRIBUTED - 1,
+        )]);
+
+        let result = client
+            .fetch(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                Bytes::from_static(b"k1"),
+                1,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a peer that does not speak PROTOCOL_DISTRIBUTED must never be dialed for a fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_scoped_returns_only_mismatched_buckets() {
+        let entries = vec![(
+            Bytes::from_static(b"k1"),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+        )];
+        let handler = Arc::new(FixtureHandler {
+            ae_scoped_fixture: AeScopedFixture::Digests(vec![(0, 111), (1, 222)]),
+            bucket_entries: entries.clone(),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let result = client
+            .ae_round_scoped(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                1,
+                vec![(0, 111), (1, 999)],
+            )
+            .await
+            .expect("scoped ae round succeeds");
+        assert_eq!(
+            result,
+            AeRoundOutcome::Mismatches(vec![AeMismatch::Bucket(1, entries)])
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_scoped_reports_stale_when_the_responders_view_hash_differs() {
+        let handler = Arc::new(FixtureHandler {
+            ae_scoped_fixture: AeScopedFixture::Stale(777),
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let result = client
+            .ae_round_scoped(NodeId::from(1), SmolStr::new("users"), 1, Vec::new())
+            .await
+            .expect("scoped ae round succeeds");
+        assert_eq!(
+            result,
+            AeRoundOutcome::Stale {
+                responder_view_hash: 777
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_scoped_reports_no_mismatches_against_the_default_handler_body() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let result = client
+            .ae_round_scoped(NodeId::from(1), SmolStr::new("users"), 1, vec![(0, 111)])
+            .await
+            .expect("scoped ae round succeeds even against a handler that never overrode it");
+        assert_eq!(
+            result,
+            AeRoundOutcome::Mismatches(Vec::new()),
+            "the default RequestHandler::ae_digest_scoped body degrades to no mismatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_scoped_refuses_to_dial_a_peer_that_does_not_speak_distribution_mode() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at_protocol(
+            NodeId::from(1),
+            server.local_addr(),
+            wire::PROTOCOL_DISTRIBUTED - 1,
+        )]);
+
+        let result = client
+            .ae_round_scoped(NodeId::from(1), SmolStr::new("users"), 1, Vec::new())
+            .await;
+        assert!(
+            result.is_err(),
+            "a peer that does not speak PROTOCOL_DISTRIBUTED must never be dialed for a scoped ae round"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_buckets_streams_multiple_chunks_to_done() {
+        let chunk_a = vec![sample_record(1)];
+        let chunk_b = vec![sample_record(2), sample_record(3)];
+        let handler = Arc::new(FixtureHandler {
+            st_buckets_available: true,
+            st_bucket_chunks: vec![chunk_a.clone(), chunk_b.clone()],
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        let mut stream = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0, 1], 42)
+            .await
+            .expect("request accepted")
+            .expect("an available donor streams");
+        let mut got = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            got.extend(chunk.expect("chunk decodes"));
+        }
+        let mut expected = chunk_a;
+        expected.extend(chunk_b);
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn request_buckets_declines_when_the_donor_is_unavailable() {
+        let handler = Arc::new(FixtureHandler {
+            st_buckets_available: false,
+            ownership_view_hash: Some(123),
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        let declined = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0], 999)
+            .await
+            .expect("request accepted");
+        assert!(
+            declined.is_none(),
+            "a donor whose view has diverged, or that cannot serve, declines with StaleView"
+        );
+        // The declined connection went back to the pool: an unrelated
+        // request on the same peer still works.
+        let digests = requester
+            .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
+            .await
+            .expect("the pooled connection serves the next request");
+        assert!(digests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_buckets_declines_against_the_default_handler_body() {
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        let declined = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0], 1)
+            .await
+            .expect("request accepted even against a handler that never overrode it");
+        assert!(
+            declined.is_none(),
+            "the default RequestHandler::st_buckets_available body degrades to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_buckets_refuses_to_dial_a_peer_that_does_not_speak_distribution_mode() {
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at_protocol(
+            NodeId::from(1),
+            donor.local_addr(),
+            wire::PROTOCOL_DISTRIBUTED - 1,
+        )]);
+
+        let result = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0], 1)
+            .await;
+        assert!(
+            result.is_err(),
+            "a peer that does not speak PROTOCOL_DISTRIBUTED must never be dialed for a bucket pull"
         );
     }
 
