@@ -1917,3 +1917,171 @@ async fn distributed_join_and_rebalance() {
     net.close().await.expect("network closes");
 }
 
+/// [`chaos_crashes_churn_and_drops_still_converge`]'s convergence check
+/// (agreement on `count`/`digest`) assumes `Mode::Replicated`, where every
+/// node holds everything; a distributed cluster instead settles with each
+/// key on exactly `owners` nodes. `fill_keys` is `0..fill_keys`'s `k{i}`/
+/// `v{i}` keyspace (surviving `Drop` — a dropped bucket's other owner, or an
+/// anti-entropy repair, still has it — and `Fill`, which only ever rewrites
+/// a prefix of it to the same deterministic values); `burst_entries` is
+/// every distinct-key put [`perform_chaos_action`]'s `Burst` arm wrote,
+/// collected by the caller since those keys carry no predictable index.
+/// Polled by [`eventually`] the same way [`assert_converged`] is, since
+/// ownership catching up after the last action needs a few anti-entropy
+/// intervals same as anywhere else.
+async fn assert_converged_distributed(
+    nodes: &[Node],
+    fill_keys: u32,
+    burst_entries: &[(String, String)],
+    owners: usize,
+    wait: Duration,
+) {
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    let ids = collect_node_ids(&node_refs).await;
+    let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
+    let expected_sum = owners * (fill_keys as usize + burst_entries.len());
+
+    let fill_sample = kv_range(fill_keys);
+    eventually(wait, || async {
+        if sum_counts(&node_refs).await != Some(expected_sum) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &fill_sample, owners).await
+            && ownership_snapshot_matches(tagged[0].0, &tagged, burst_entries, owners).await
+    })
+    .await;
+    eprintln!(
+        "chaos-distributed: every node converged, {fill_keys} fill keys and {} burst keys each \
+         on exactly {owners} owners",
+        burst_entries.len()
+    );
+
+    let mismatches = fetch_mismatches(&node_refs, &fill_sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every fill key must be fetchable with the right value from every node: {mismatches:?}"
+    );
+    let burst_mismatches = fetch_mismatches(&node_refs, burst_entries).await;
+    assert!(
+        burst_mismatches.is_empty(),
+        "every burst key must be fetchable with the right value from every node: \
+         {burst_mismatches:?}"
+    );
+}
+
+/// The distributed-mode counterpart to
+/// [`chaos_crashes_churn_and_drops_still_converge`]: same seeded action mix
+/// (crash+respawn, churn on the always-replicated `"churn"` cache, drop,
+/// refill, put bursts) against a distributed `"it"`, converging on
+/// [`assert_converged_distributed`]'s ownership-aware check instead of
+/// content agreement across every node. Shares every helper the replicated
+/// chaos test uses — [`ChaosAction`], [`pick_chaos_action`],
+/// [`perform_chaos_action`], [`spawn_chaos_cluster_mode`],
+/// [`crash_and_respawn_mode`] — parametrized on `owners` rather than
+/// duplicated.
+///
+/// Gated the same way: `SUNDOG_CONTAINER_TESTS=1` and `SUNDOG_CHAOS_SECS`;
+/// `SUNDOG_CHAOS_SEED` pins the run for a repeatable replay. Named with the
+/// `chaos_` prefix so `nightly-chaos.yml` picks it up alongside the
+/// replicated one.
+#[tokio::test]
+async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
+    const NODE_COUNT: usize = 4;
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 2_000;
+    const FILL_WAIT: Duration = Duration::from_secs(90);
+    const CHURN_OPS: u32 = 500;
+    const REFILL_COUNT: u32 = 500;
+    const BURST_COUNT: u32 = 20;
+    const CONVERGENCE_WAIT: Duration = Duration::from_secs(180);
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4"];
+    const CLUSTER: &str = "chaos-distributed-cluster";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+    let Ok(secs_raw) = std::env::var("SUNDOG_CHAOS_SECS") else {
+        eprintln!("skipping: SUNDOG_CHAOS_SECS not set");
+        return;
+    };
+    let secs: u64 = secs_raw
+        .parse()
+        .expect("SUNDOG_CHAOS_SECS is a u64 seconds count");
+
+    let run_seed = chaos_seed(secs);
+    let mut rng = StdRng::seed_from_u64(run_seed);
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = spawn_chaos_cluster_mode(&net, CLUSTER, &ALIASES, Some(OWNERS)).await;
+
+    nodes[0]
+        .fill(FILL_KEYS)
+        .await
+        .expect("initial fill succeeds");
+    eventually(FILL_WAIT, || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+    eprintln!("chaos-distributed: {FILL_KEYS} keys filled, each on exactly {OWNERS} owners");
+
+    // Every burst key this run ever wrote, mirroring `perform_chaos_action`'s
+    // own `Burst` arm's key/value format exactly, so the convergence check
+    // below knows the full expected keyspace beyond `0..FILL_KEYS`.
+    let mut burst_entries: Vec<(String, String)> = Vec::new();
+    let mut crashes = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    let mut iteration = 0u64;
+    while std::time::Instant::now() < deadline {
+        iteration += 1;
+        let action = pick_chaos_action(
+            &mut rng,
+            nodes.len(),
+            FILL_KEYS,
+            CHURN_OPS,
+            REFILL_COUNT,
+            BURST_COUNT,
+        );
+        if let ChaosAction::Crash { node: idx } = action {
+            crashes += 1;
+            crash_and_respawn_mode(
+                &mut nodes,
+                &net,
+                CLUSTER,
+                &ALIASES,
+                idx,
+                iteration,
+                Some(OWNERS),
+            )
+            .await;
+        } else {
+            if let ChaosAction::Burst { count, .. } = action {
+                for j in 0..count {
+                    let key = format!("burst-{run_seed:x}-{iteration}-{j}");
+                    let value = format!("v-{run_seed:x}-{iteration}-{j}");
+                    burst_entries.push((key, value));
+                }
+            }
+            perform_chaos_action(&nodes, action, iteration, run_seed).await;
+        }
+    }
+    eprintln!(
+        "chaos-distributed: ran {iteration} actions over {secs}s, including {crashes} \
+         crash/respawn cycles"
+    );
+
+    assert_converged_distributed(
+        &nodes,
+        FILL_KEYS,
+        &burst_entries,
+        usize::from(OWNERS),
+        CONVERGENCE_WAIT,
+    )
+    .await;
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
