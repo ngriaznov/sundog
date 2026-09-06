@@ -213,8 +213,8 @@ upgrades one node at a time with replication and repair running throughout.
 The current release speaks protocol 3 and serves protocol 2, the release
 before it; a container test runs the previous release's node against the
 current one in both roles. Distribution mode's message kinds — `Fetch`,
-`FetchReply`, `AeDigestScoped`, `StBuckets`, `StBucketChunk`, and `StaleView`
-— are gated on protocol 3: a distributed cache forms only among protocol-3
+`FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
+`StBucketChunk`, and `StaleView` — are gated on protocol 3: a distributed cache forms only among protocol-3
 peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
 own a bucket and never receives one of these messages at all.
 

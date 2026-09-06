@@ -700,6 +700,7 @@ async fn dispatch_one(
         | Msg::AePartSketch { .. }
         | Msg::StUnavailable { .. }
         | Msg::FetchReply { .. }
+        | Msg::FetchDeclined { .. }
         | Msg::StBucketChunk { .. }
         | Msg::StaleView { .. }
         | Msg::ReqDone => false,
@@ -894,9 +895,10 @@ async fn serve_fetch(
             cache,
             responder_view_hash,
         },
-        // An unrecognized or non-distributed cache degrades to a plain
-        // miss, the same shape a genuine absence of the key would take.
-        super::FetchServe::Unavailable => Msg::FetchReply { rec: None },
+        // A responder that cannot vouch for a miss declines outright, so
+        // the requester tries its next owner instead of taking `None` as
+        // the answer.
+        super::FetchServe::Unavailable => Msg::FetchDeclined { cache },
     };
     send_batch_or_cancelled(framed, &[reply, Msg::ReqDone], cancel).await
 }
@@ -975,6 +977,14 @@ async fn serve_st_buckets(
             cancel,
         )
         .await;
+    }
+    if handler
+        .st_buckets_cold(cache.clone(), buckets.clone())
+        .await
+    {
+        // Owned but not yet pulled: not a source. The requester tries its
+        // next donor.
+        return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
     }
     let mut chunks = handler.st_bucket_chunks(cache.clone(), buckets);
     loop {
@@ -1306,6 +1316,7 @@ pub(super) async fn collect_fetch_reply(
                 return outcome.ok_or_else(|| unexpected_close("fetch reply"));
             }
             Some(Ok(Msg::FetchReply { rec })) => outcome = Some(super::FetchOutcome::Found(rec)),
+            Some(Ok(Msg::FetchDeclined { .. })) => outcome = Some(super::FetchOutcome::Declined),
             Some(Ok(Msg::StaleView {
                 responder_view_hash,
                 ..

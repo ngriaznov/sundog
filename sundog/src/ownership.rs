@@ -791,15 +791,16 @@ mod tests {
     fn residency_set_flap_resets_the_release_clock_instead_of_accumulating() {
         let set = ResidencySet::new();
         set.mark_releasing(&[5]);
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(400));
         // The bucket regains ownership before its grace elapses.
         set.unmark(&[5]);
         // It's lost again immediately: the clock must restart from here,
-        // not continue running from the first mark 60ms ago.
+        // not continue running from the first mark 400ms ago. A 200ms
+        // grace leaves scheduler jitter a wide margin either way.
         set.mark_releasing(&[5]);
 
         assert!(
-            !set.expired(Duration::from_millis(40)).contains(&5),
+            !set.expired(Duration::from_millis(200)).contains(&5),
             "a flap resets the release clock rather than letting it accumulate across the gap"
         );
     }

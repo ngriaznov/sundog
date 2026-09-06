@@ -932,6 +932,13 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
+    fn st_buckets_cold(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, bool> {
+        Box::pin(async move {
+            self.lookup(&cache)
+                .is_some_and(|shard| buckets.iter().any(|&bucket| shard.is_cold_bucket(bucket)))
+        })
+    }
+
     fn st_bucket_chunks(
         &self,
         cache: SmolStr,
@@ -1225,6 +1232,7 @@ async fn inbound_loop(
                 | Msg::StUnavailable { .. }
                 | Msg::Fetch { .. }
                 | Msg::FetchReply { .. }
+                | Msg::FetchDeclined { .. }
                 | Msg::AeDigestScoped { .. }
                 | Msg::StBuckets { .. }
                 | Msg::StBucketChunk { .. }
@@ -1369,6 +1377,7 @@ async fn fan_out_batch<K, V>(
     // stale needs fanning out. A forwarded record was never applied
     // locally, so it travels exactly as built.
     let mut records = shard.records_for_typed(&applied_keys).await;
+    let applied_keys_bytes: HashSet<Bytes> = records.iter().map(|rec| rec.key.clone()).collect();
     records.extend(forwarded);
     if records.is_empty() {
         return;
@@ -1378,6 +1387,21 @@ async fn fan_out_batch<K, V>(
         let Some(view) = shard.ownership_view() else {
             return;
         };
+        // A write forwarded while this node did not own its bucket, whose
+        // bucket this node owns by the time the queue drains, lands here
+        // too: sending it only to the other owners, or to nobody when this
+        // node is the sole owner, would lose the one copy that exists.
+        let mine: Vec<WireRecord> = records
+            .iter()
+            .filter(|rec| {
+                view.owns(bucket_of(rec.key.as_ref()))
+                    && !applied_keys_bytes.contains(rec.key.as_ref())
+            })
+            .cloned()
+            .collect();
+        if !mine.is_empty() {
+            shard.apply_remote_batch(mine).await;
+        }
         fan_out_by_owner_set(
             cluster.mesh(),
             cache_name,
@@ -4020,6 +4044,12 @@ mod tests {
         ));
 
         assert!(handler.st_buckets_available(name.clone(), view_hash).await);
+        assert!(
+            !handler
+                .st_buckets_cold(name.clone(), vec![bucket_of_u32(1)])
+                .await,
+            "a warm owner is a source for its bucket"
+        );
         assert!(
             !handler
                 .st_buckets_available(name.clone(), view_hash.wrapping_add(1))

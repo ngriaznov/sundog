@@ -32,8 +32,8 @@ All notable changes to this project are documented in this file. Format follows
   (`local`/`remote`/`miss`/`error`), `sundog_forwarded_writes_total{cache}`,
   `sundog_stale_view_total{cache}`, and `sundog_unowned_inbound_dropped_total{
   cache}`.
-- Wire messages `Fetch`, `FetchReply`, `AeDigestScoped`, `StBuckets`,
-  `StBucketChunk`, and `StaleView`, all gated on the peer's protocol from its
+- Wire messages `Fetch`, `FetchReply`, `FetchDeclined`, `AeDigestScoped`,
+  `StBuckets`, `StBucketChunk`, and `StaleView`, all gated on the peer's protocol from its
   hello: a peer speaking less than `wire::PROTOCOL_DISTRIBUTED` never
   receives one.
 - `sundog-testnode` reads `SUNDOG_TESTNODE_MODE=distributed` (with

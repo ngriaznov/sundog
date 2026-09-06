@@ -48,6 +48,7 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 2: 0.4. Adds [`Msg::AePartDigests`], [`Msg::AeParts`],
 ///   [`Msg::AePart`], [`Msg::AePartSketch`], and [`Msg::StUnavailable`].
 /// - 3: 0.6. Adds distribution mode's [`Msg::Fetch`], [`Msg::FetchReply`],
+///   [`Msg::FetchDeclined`],
 ///   [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`],
 ///   and [`Msg::StaleView`].
 pub const PROTOCOL_VERSION: u16 = 3;
@@ -64,8 +65,9 @@ pub const PROTOCOL_PART_DIGESTS: u16 = 2;
 pub const PROTOCOL_ST_UNAVAILABLE: u16 = 2;
 
 /// The protocol that introduced distribution mode's wire messages:
-/// [`Msg::Fetch`], [`Msg::FetchReply`], [`Msg::AeDigestScoped`],
-/// [`Msg::StBuckets`], [`Msg::StBucketChunk`], and [`Msg::StaleView`]. A
+/// [`Msg::Fetch`], [`Msg::FetchReply`], [`Msg::FetchDeclined`],
+/// [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`], and
+/// [`Msg::StaleView`]. A
 /// peer speaking less never receives one of these — moot in practice, since
 /// such a peer never becomes eligible to own a bucket in the first place,
 /// but gated at the wire layer regardless as the hard guarantee.
@@ -241,6 +243,13 @@ pub enum Msg {
     /// when the responder's own view hash differs from the request's —
     /// [`Msg::StaleView`] instead.
     FetchReply { rec: Option<WireRecord> },
+    /// Declines a [`Msg::Fetch`] without answering it: the responder has
+    /// `cache` open but cannot vouch for a miss, because it owns the key's
+    /// bucket and has not yet pulled it from a co-owner, or does not have
+    /// the cache open at all. Distinct from a [`Msg::FetchReply`] carrying
+    /// `None`, which is a definitive miss; the requester moves on to its
+    /// next candidate owner. Introduced in protocol 3.
+    FetchDeclined { cache: SmolStr },
     /// Anti-entropy round, step 1, distribution-mode: like [`Msg::AeDigest`],
     /// but scoped to the sender's own owned buckets and carrying its
     /// `view_hash` for the epoch check. A brand-new variant, not a field
@@ -947,6 +956,9 @@ mod tests {
     #[test]
     fn roundtrip_fetch_reply_miss() {
         roundtrip(&Msg::FetchReply { rec: None });
+        roundtrip(&Msg::FetchDeclined {
+            cache: SmolStr::new("prices"),
+        });
     }
 
     #[test]

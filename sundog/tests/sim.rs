@@ -2614,8 +2614,10 @@ fn distributed_partition_then_heal_reconciles_ownership() {
             value_of(&n.shard, shared_key).as_deref() != Some("side1")
                 && (!view.owns(bucket_of_u32(shared_key))
                     || value_of(&n.shard, shared_key).as_deref() == Some("side2"))
-                && (!view.owns(bucket_of_u32(111)) || value_of(&n.shard, 111).is_some())
-                && (!view.owns(bucket_of_u32(222)) || value_of(&n.shard, 222).is_some())
+                && (!view.owns(bucket_of_u32(111))
+                    || value_of(&n.shard, 111).as_deref() == Some("only-side1"))
+                && (!view.owns(bucket_of_u32(222))
+                    || value_of(&n.shard, 222).as_deref() == Some("only-side2"))
         })
     })
     .expect("reconciliation lands the higher-version write and both private writes on every owner");

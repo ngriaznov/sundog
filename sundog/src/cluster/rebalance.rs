@@ -116,7 +116,8 @@ async fn pull_one_group(
             });
             if result == DonorResult::Done {
                 residency.clear_cold(&buckets);
-                return Some(count);
+                tracing::debug!(cache = %cache, %donor, buckets = buckets.len(), records = count, "bucket pull landed");
+                return Some(u64::try_from(buckets.len()).unwrap_or(u64::MAX));
             }
         }
         if ownership.current().view_hash() != view_hash {
@@ -234,6 +235,7 @@ pub(crate) async fn pull_buckets(
 
     match tokio::time::timeout(budget, run_all).await {
         Ok((landed, superseded)) => {
+            // `landed` counts buckets whose pull landed, not records.
             if landed > 0 {
                 metrics::counter!(
                     "sundog_rebalance_buckets_total",
@@ -407,7 +409,7 @@ pub(crate) fn buckets_to_release(
 /// elapsed: one anti-entropy round against each of their live current
 /// owners ([`hand_off_owners`]), pushing what an owner lacks, then
 /// [`ShardOps::release_buckets`] for the buckets every owner answered
-/// ([`buckets_to_release`]), counting
+/// ([`buckets_to_release`]), counting each released bucket in
 /// `sundog_rebalance_buckets_total{direction="out"}`. A bucket whose owner
 /// did not answer stays resident until the next tick: for as long as the
 /// owner's view differs from this node's, or up to twice the grace when
@@ -446,6 +448,16 @@ pub(crate) async fn rebalance_task(
                 let new_view = view_rx.borrow_and_update().clone();
                 let plan = plan_view_change(&prev_view, &pulled_view, &new_view);
                 prev_view = Arc::clone(&new_view);
+                // A bucket this node now owns alone has nobody left to pull
+                // it from: whatever is here is all there is, so it is not
+                // cold, and a miss in it is an answer.
+                let alone: Vec<u16> = new_view
+                    .owned_buckets()
+                    .filter(|&bucket| new_view.owners_of(bucket).len() == 1)
+                    .collect();
+                if !alone.is_empty() {
+                    residency.clear_cold(&alone);
+                }
                 if !plan.lost.is_empty() {
                     residency.mark_releasing(&plan.lost);
                     tracing::debug!(cache = %cache, count = plan.lost.len(), "buckets lost; disown grace started");
@@ -504,14 +516,12 @@ pub(crate) async fn rebalance_task(
                     }
                     let removed = shard.release_buckets(&due).await;
                     residency.unmark(&due);
-                    if removed > 0 {
-                        metrics::counter!(
-                            "sundog_rebalance_buckets_total",
-                            "cache" => cache.to_string(),
-                            "direction" => "out"
-                        )
-                        .increment(removed);
-                    }
+                    metrics::counter!(
+                        "sundog_rebalance_buckets_total",
+                        "cache" => cache.to_string(),
+                        "direction" => "out"
+                    )
+                    .increment(u64::try_from(due.len()).unwrap_or(u64::MAX));
                     tracing::debug!(cache = %cache, buckets = due.len(), removed, "released buckets past their disown grace");
                 }
             }

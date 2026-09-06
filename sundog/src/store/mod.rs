@@ -1557,7 +1557,10 @@ where
     /// Stamps and applies a local write, then fans it out per [`Mode`]:
     /// `Invalidate` for `Mode::Invalidation`, `Replicate` for
     /// `Mode::Replicated`, nothing for `Mode::Local`, through the
-    /// composition layer's subscription to [`Shard::events`].
+    /// composition layer's subscription to [`Shard::events`]. Under
+    /// `Mode::Distributed` a write for a bucket this node does not own is
+    /// never applied here: it is built as a record and forwarded to the
+    /// bucket's owners through the same queue.
     ///
     /// # Errors
     ///

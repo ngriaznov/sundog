@@ -319,6 +319,16 @@ fn validate_mode(
     Ok(())
 }
 
+/// `bucket`'s owners under `view` other than `self_node`: the candidates a
+/// [`Cache::fetch`] asks, in rendezvous order.
+fn other_owners(view: &OwnershipView, bucket: u16, self_node: NodeId) -> Vec<NodeId> {
+    view.owners_of(bucket)
+        .iter()
+        .copied()
+        .filter(|owner| *owner != self_node)
+        .collect()
+}
+
 /// A small jittered backoff between retrying the same [`Cache::fetch`]
 /// owner after it reports its view as stale but this node's own view has
 /// not itself changed: uniformly in `[10, 50)` ms. The retries against one
@@ -666,9 +676,11 @@ where
     /// [`Cache::get`] for the same key immediately afterward is still a
     /// miss on this node. A bucket this node owns but has not yet pulled
     /// from a co-owner is cold: a local miss there asks the other owners
-    /// before answering `Ok(None)`, and a remote owner answers a miss for a
-    /// cold bucket of its own with a decline, so the next owner is tried.
-    /// On a cache that isn't
+    /// before answering `Ok(None)`, a remote owner declines instead of
+    /// answering a miss for a cold bucket of its own, so the next owner is
+    /// tried, and a cold owner whose every other owner is unreachable
+    /// returns [`CacheError::FetchUnavailable`] rather than a miss it
+    /// cannot vouch for. On a cache that isn't
     /// [`Mode::Distributed`] this is [`Cache::get`] wrapped in `Ok`, counted
     /// `outcome="local"` unconditionally, so callers don't need to branch
     /// on mode.
@@ -694,7 +706,7 @@ where
         };
         let key_bytes = encode_key(key)?;
         let bucket = bucket_of(&key_bytes);
-        let owns = view.owns(bucket);
+        let mut owns = view.owns(bucket);
         if owns {
             let value = self.shard.get(key).await;
             // A miss in a bucket not yet pulled from a co-owner is not an
@@ -711,16 +723,17 @@ where
 
         let self_node = self.cluster.node_id();
         let mut view = view;
-        let mut owners: Vec<NodeId> = view
-            .owners_of(bucket)
-            .iter()
-            .copied()
-            .filter(|owner| *owner != self_node)
-            .collect();
+        let mut owners = other_owners(&view, bucket, self_node);
         let mut owner_idx = 0usize;
         // When the current owner first answered `Stale` with this node's
         // view unchanged: its retry window runs from here.
         let mut stale_since: Option<tokio::time::Instant> = None;
+        // Whether any owner answered at all, a decline included, as opposed
+        // to every attempt ending in a transport error or timeout: the
+        // difference between a miss and `FetchUnavailable` for a bucket
+        // this node owns but has not pulled yet. With nobody else to ask,
+        // this node's own copy is all there is.
+        let mut any_answered = owners.is_empty();
 
         while owner_idx < owners.len() {
             let owner = owners[owner_idx];
@@ -743,6 +756,11 @@ where
                     );
                     return Ok(value);
                 }
+                Ok(Ok(FetchOutcome::Declined)) => {
+                    any_answered = true;
+                    owner_idx += 1;
+                    stale_since = None;
+                }
                 Ok(Ok(FetchOutcome::Stale { .. })) => {
                     if let Some(fresh) = self.shard.ownership_view()
                         && fresh.view_hash() != view.view_hash()
@@ -750,17 +768,16 @@ where
                         view = fresh;
                         if view.owns(bucket) {
                             let value = self.shard.get(key).await;
-                            record_fetch_outcome(&cache_name, "local");
-                            return Ok(value);
+                            if value.is_some() || !self.shard.is_cold_bucket(bucket) {
+                                record_fetch_outcome(&cache_name, "local");
+                                return Ok(value);
+                            }
                         }
-                        owners = view
-                            .owners_of(bucket)
-                            .iter()
-                            .copied()
-                            .filter(|owner| *owner != self_node)
-                            .collect();
+                        owns = view.owns(bucket);
+                        owners = other_owners(&view, bucket, self_node);
                         owner_idx = 0;
                         stale_since = None;
+                        any_answered = owners.is_empty();
                         continue;
                     }
                     let since = *stale_since.get_or_insert_with(tokio::time::Instant::now);
@@ -777,9 +794,9 @@ where
                 }
             }
         }
-        if owns {
-            // Every other owner is cold or unreachable too: this owner's
-            // own miss is the best answer there is.
+        if owns && any_answered {
+            // Every other owner declined too, or there is none: this
+            // owner's own miss is the best answer there is.
             record_fetch_outcome(&cache_name, "miss");
             return Ok(None);
         }
@@ -1329,6 +1346,32 @@ mod tests {
                 !view.owns(bucket) && view.owners_of(bucket).contains(&peer_b.node)
             })
             .expect("a key owned by b and not by a");
+
+        // A bucket `a` owns with only the phantom as co-owner: cold, its
+        // one co-owner unreachable, a miss `a` cannot vouch for; warm, its
+        // own miss is the answer.
+        let cold_key = (2..1_000_000u32)
+            .find(|key| {
+                let bucket = bucket_of(&encode_key(key).expect("u32 encodes"));
+                view.owns(bucket) && !view.owners_of(bucket).contains(&peer_b.node)
+            })
+            .expect("a key owned by a and the phantom");
+        let cold_bucket = bucket_of(&encode_key(&cold_key).expect("u32 encodes"));
+        let residency = cache_a.shard.residency().expect("a is distributed");
+        residency.mark_cold(&[cold_bucket]);
+        assert!(
+            matches!(
+                cache_a.fetch(&cold_key).await,
+                Err(CacheError::FetchUnavailable { .. })
+            ),
+            "a cold owner with its only co-owner unreachable cannot vouch for a miss"
+        );
+        residency.clear_cold(&[cold_bucket]);
+        assert_eq!(
+            cache_a.fetch(&cold_key).await.expect("local"),
+            None,
+            "a warm owner answers its own miss"
+        );
 
         let started = tokio::time::Instant::now();
         let result = cache_a.fetch(&key).await;

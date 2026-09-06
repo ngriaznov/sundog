@@ -369,6 +369,10 @@ pub(crate) enum FetchOutcome {
     /// The responder's own view hash differs from the request's; it
     /// declined rather than risk answering against a stale owner set.
     Stale { responder_view_hash: u64 },
+    /// The responder declined without answering: it cannot vouch for a miss
+    /// (a bucket it owns but has not pulled yet, or a cache it does not
+    /// have open). The requester moves on to the next owner.
+    Declined,
 }
 
 /// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest
@@ -549,6 +553,15 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// Whether this node can donate `cache`'s named `buckets` right now, at
     /// `view_hash`: the [`crate::wire::Msg::StBuckets`] availability check.
     /// Default `false`.
+    /// Whether this node owns any of `buckets` without having pulled it
+    /// from a co-owner yet, so its copy is not a source to transfer from:
+    /// the responder declines with [`Msg::StUnavailable`] and the requester
+    /// tries its next donor. Default: `false`.
+    fn st_buckets_cold(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, bool> {
+        let _ = (cache, buckets);
+        Box::pin(async { false })
+    }
+
     fn st_buckets_available(&self, cache: SmolStr, view_hash: u64) -> BoxFuture<'_, bool> {
         let _ = (cache, view_hash);
         Box::pin(async { false })
@@ -1335,7 +1348,7 @@ impl Mesh {
                 .await
                 .map_err(|_| request_timeout_error("rebalance bucket request", timeout))?,
         };
-        if let Some(Ok(Msg::StaleView { .. })) = first {
+        if let Some(Ok(Msg::StaleView { .. } | Msg::StUnavailable { .. })) = first {
             pool.checkin(framed);
             return Ok(None);
         }
@@ -2660,8 +2673,8 @@ mod tests {
             .expect("fetch succeeds even against a handler that never overrode it");
         assert_eq!(
             outcome,
-            FetchOutcome::Found(None),
-            "the default RequestHandler::fetch body degrades to a plain miss"
+            FetchOutcome::Declined,
+            "the default RequestHandler::fetch body declines, so the requester tries the next owner"
         );
     }
 
