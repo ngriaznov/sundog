@@ -2030,18 +2030,43 @@ where
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            // The inbound-apply guard: a `Mode::Distributed` shard drops
-            // any record for a bucket its own *current* view does not own,
-            // before decoding it — strict current-view ownership, with no
-            // widening for a bucket mid disown-grace, per the store
-            // module's write-path docs. The single choke point every
-            // inbound record path (live replication, an anti-entropy pull
-            // reply, a rebalance transfer chunk) funnels through.
+            // The inbound-apply guard: a `Mode::Distributed` shard never
+            // applies a record for a bucket its own *current* view does not
+            // own — strict current-view ownership, before decoding, the
+            // single choke point every inbound record path (live
+            // replication, an anti-entropy pull reply, a rebalance transfer
+            // chunk) funnels through. A record for a bucket this node is
+            // mid disown-grace on came from a sender whose view still lists
+            // this node as an owner; this node's view is the newer one, so
+            // the record is forwarded on to the bucket's current owners,
+            // never applied here and never dropped. A record for a bucket
+            // this node never held is dropped and counted.
             let recs = match self.ownership.as_ref().map(OwnershipTracker::current) {
                 Some(view) => {
-                    let (owned, dropped): (Vec<_>, Vec<_>) = recs
+                    let (owned, unowned): (Vec<_>, Vec<_>) = recs
                         .into_iter()
                         .partition(|rec| view.owns(bucket_of(rec.key.as_ref())));
+                    let (redirected, dropped): (Vec<_>, Vec<_>) =
+                        unowned.into_iter().partition(|rec| {
+                            self.residency
+                                .as_ref()
+                                .is_some_and(|r| r.is_releasing(bucket_of(rec.key.as_ref())))
+                        });
+                    if !redirected.is_empty() {
+                        metrics::counter!(
+                            "sundog_forwarded_writes_total",
+                            "cache" => self.name.to_string()
+                        )
+                        .increment(u64::try_from(redirected.len()).unwrap_or(u64::MAX));
+                        tracing::debug!(
+                            cache = %self.name,
+                            redirected = redirected.len(),
+                            "apply_remote_batch: forwarded records for a releasing bucket on \
+                             to its current owners"
+                        );
+                        self.fan_out
+                            .extend(redirected.into_iter().map(FanOutItem::Forward));
+                    }
                     if !dropped.is_empty() {
                         metrics::counter!(
                             "sundog_unowned_inbound_dropped_total",
@@ -4422,7 +4447,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_remote_batch_still_drops_a_record_for_a_bucket_this_node_is_releasing() {
+    async fn apply_remote_batch_forwards_a_record_for_a_releasing_bucket_on_instead_of_applying_it()
+    {
         let self_node = NodeId::from(1);
         let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
         let residency = Arc::new(ResidencySet::new());
@@ -4431,17 +4457,33 @@ mod tests {
 
         let unowned_key = find_key_by_ownership(&view, false);
         let unowned_bucket = bucket_of(&key_bytes(&unowned_key));
-        // Mid disown-grace: outbound `is_resident` (owns || releasing) would
-        // say yes for this bucket, but the inbound-apply guard must stay
-        // strict current-view ownership regardless — the point of this test.
+        // Mid disown-grace: outbound `is_resident` (owns || releasing) says
+        // yes for this bucket, but the inbound-apply guard stays strict
+        // current-view ownership: the record goes on to the current owners
+        // through the fan-out queue and never lands here.
         residency.mark_releasing(&[unowned_bucket]);
 
-        let rec = wire_record(unowned_key, "dropped", hlc(1, 9));
-        ShardOps::apply_remote_batch(&s, vec![rec]).await;
+        let rec = wire_record(unowned_key, "redirected", hlc(1, 9));
+        ShardOps::apply_remote_batch(&s, vec![rec.clone()]).await;
 
         assert!(
             s.get(&unowned_key).await.is_none(),
-            "residency never widens what the inbound-apply guard accepts"
+            "residency never widens what the inbound-apply guard applies"
+        );
+        assert_eq!(
+            s.fan_out_queue().drain(),
+            vec![FanOutItem::Forward(rec)],
+            "the record is queued for the bucket's current owners"
+        );
+
+        // A bucket this node never held is still dropped outright.
+        residency.unmark(&[unowned_bucket]);
+        let rec = wire_record(unowned_key, "dropped", hlc(2, 9));
+        ShardOps::apply_remote_batch(&s, vec![rec]).await;
+        assert!(s.get(&unowned_key).await.is_none());
+        assert!(
+            s.fan_out_queue().drain().is_empty(),
+            "nothing is queued for a dropped record"
         );
     }
 
