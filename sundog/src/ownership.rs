@@ -87,7 +87,8 @@ pub(crate) fn view_hash(eligible: &[NodeId]) -> u64 {
 /// yet, or opened it with a different `owners` count, is excluded: routing
 /// a forwarded write or a rebalance pull to a node that can't decode it, or
 /// has no shard to apply it to, is worse than never trying.
-pub(crate) fn eligible_owners(
+#[must_use]
+pub fn eligible_owners(
     self_node: NodeId,
     peers: &[Peer],
     modes: &CacheModes,
@@ -123,8 +124,9 @@ pub(crate) fn shared_owned_buckets(view: &OwnershipView, peer: NodeId) -> Vec<u1
 
 /// The buckets gained and lost between two successive [`OwnershipView`]s for
 /// the same cache: a pure set difference over each view's owned-bucket set.
-/// [`crate::cluster::rebalance::rebalance_task`]'s trigger input.
-pub(crate) fn ownership_diff(old: &OwnershipView, new: &OwnershipView) -> (Vec<u16>, Vec<u16>) {
+/// `cluster::rebalance::rebalance_task`'s trigger input.
+#[must_use]
+pub fn ownership_diff(old: &OwnershipView, new: &OwnershipView) -> (Vec<u16>, Vec<u16>) {
     let gained: Vec<u16> = new.owned_buckets().filter(|&b| !old.owns(b)).collect();
     let lost: Vec<u16> = old.owned_buckets().filter(|&b| !new.owns(b)).collect();
     (gained, lost)
@@ -140,7 +142,7 @@ pub(crate) type OwnerSet = Vec<NodeId>;
 /// mutation, so a reader holding an `Arc<OwnershipView>` sees a consistent
 /// snapshot for the whole of one operation.
 #[derive(Debug)]
-pub(crate) struct OwnershipView {
+pub struct OwnershipView {
     view_hash: u64,
     self_node: NodeId,
     owners: Vec<OwnerSet>,
@@ -152,7 +154,13 @@ impl OwnershipView {
     /// [`eligible_owners`]'s output). Folds `self_node` into `eligible` and
     /// dedups before ranking, so this is correct even when called directly
     /// with `self_node` omitted from `eligible`, such as from a test.
-    pub(crate) fn compute(self_node: NodeId, eligible: Vec<NodeId>, k: NonZeroU8) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics only on the platform-impossible case of [`BUCKET_COUNT`] not
+    /// fitting a `u16`.
+    #[must_use]
+    pub fn compute(self_node: NodeId, eligible: Vec<NodeId>, k: NonZeroU8) -> Self {
         let mut eligible = eligible;
         if !eligible.contains(&self_node) {
             eligible.push(self_node);
@@ -184,27 +192,35 @@ impl OwnershipView {
     /// This view's identity: two views with equal `view_hash` (and equal
     /// `k`, which is gossip-validated before either view is built) hold
     /// identical per-bucket ownership.
-    pub(crate) const fn view_hash(&self) -> u64 {
+    #[must_use]
+    pub const fn view_hash(&self) -> u64 {
         self.view_hash
     }
 
     /// Whether `self_node` owns `bucket`. `false` for a bucket at or past
     /// [`BUCKET_COUNT`].
-    pub(crate) fn owns(&self, bucket: u16) -> bool {
+    #[must_use]
+    pub fn owns(&self, bucket: u16) -> bool {
         let idx = usize::from(bucket);
         idx < BUCKET_COUNT && self.owned[idx / 64] & (1u64 << (idx % 64)) != 0
     }
 
     /// `bucket`'s live owners, highest rendezvous score first. Empty for a
     /// bucket at or past [`BUCKET_COUNT`].
-    pub(crate) fn owners_of(&self, bucket: u16) -> &[NodeId] {
+    #[must_use]
+    pub fn owners_of(&self, bucket: u16) -> &[NodeId] {
         self.owners
             .get(usize::from(bucket))
             .map_or(&[], Vec::as_slice)
     }
 
     /// Every bucket `self_node` owns, ascending.
-    pub(crate) fn owned_buckets(&self) -> impl Iterator<Item = u16> + '_ {
+    ///
+    /// # Panics
+    ///
+    /// Panics only on the platform-impossible case of [`BUCKET_COUNT`] not
+    /// fitting a `u16`.
+    pub fn owned_buckets(&self) -> impl Iterator<Item = u16> + '_ {
         (0..BUCKET_COUNT).filter_map(move |i| {
             let bucket = u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
             self.owns(bucket).then_some(bucket)
@@ -218,7 +234,7 @@ impl OwnershipView {
 /// reader, and every reader agrees with every other reader on the current
 /// view at all times.
 #[derive(Debug, Clone)]
-pub(crate) struct OwnershipTracker {
+pub struct OwnershipTracker {
     view: watch::Receiver<Arc<OwnershipView>>,
 }
 
@@ -228,7 +244,8 @@ impl OwnershipTracker {
     /// Returns the tracker plus the `watch::Sender` half a later refresh
     /// loop publishes new views through as membership and cache modes
     /// change.
-    pub(crate) fn seed(
+    #[must_use]
+    pub fn seed(
         self_node: NodeId,
         peers: &[Peer],
         modes: &CacheModes,
@@ -244,13 +261,15 @@ impl OwnershipTracker {
     /// The current view: a `watch::Receiver::borrow()` plus one cheap `Arc`
     /// clone. Synchronous, so it's safe to call from a write path with no
     /// lock over shard or network state.
-    pub(crate) fn current(&self) -> Arc<OwnershipView> {
+    #[must_use]
+    pub fn current(&self) -> Arc<OwnershipView> {
         Arc::clone(&self.view.borrow())
     }
 
     /// A fresh subscription for a caller that awaits the next change, such
     /// as a rebalance trigger.
-    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<OwnershipView>> {
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<Arc<OwnershipView>> {
         self.view.clone()
     }
 }
@@ -262,7 +281,7 @@ impl OwnershipTracker {
 /// land before the data disappears. Read by anti-entropy's cohort widening
 /// and the donor-serving exception; never read by the inbound-apply guard,
 /// which stays strict current-view ownership.
-pub(crate) struct ResidencySet {
+pub struct ResidencySet {
     releasing: RwLock<HashMap<u16, Instant>>,
     /// Buckets this node owns but has not yet pulled from a co-owner: a
     /// local miss there says nothing about the key, so a fetch asks the
@@ -272,8 +291,15 @@ pub(crate) struct ResidencySet {
     cold: RwLock<HashSet<u16>>,
 }
 
+impl Default for ResidencySet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ResidencySet {
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             releasing: RwLock::new(HashMap::new()),
             cold: RwLock::new(HashSet::new()),
@@ -307,7 +333,7 @@ impl ResidencySet {
     /// Marks each of `buckets` as releasing, starting its grace clock. A
     /// bucket already releasing keeps its original clock: only a call to
     /// [`ResidencySet::unmark`] in between resets it.
-    pub(crate) fn mark_releasing(&self, buckets: &[u16]) {
+    pub fn mark_releasing(&self, buckets: &[u16]) {
         let now = Instant::now();
         let mut releasing = self.releasing.write();
         for &bucket in buckets {
@@ -318,7 +344,7 @@ impl ResidencySet {
     /// Clears the release clock for each of `buckets`: for one that regains
     /// ownership before its grace elapsed, so a flap never accumulates
     /// toward release.
-    pub(crate) fn unmark(&self, buckets: &[u16]) {
+    pub fn unmark(&self, buckets: &[u16]) {
         let mut releasing = self.releasing.write();
         for bucket in buckets {
             releasing.remove(bucket);
@@ -326,12 +352,12 @@ impl ResidencySet {
     }
 
     /// Whether `bucket` is currently mid disown-grace.
-    pub(crate) fn is_releasing(&self, bucket: u16) -> bool {
+    pub fn is_releasing(&self, bucket: u16) -> bool {
         self.releasing.read().contains_key(&bucket)
     }
 
     /// Buckets whose grace has elapsed: due for physical release.
-    pub(crate) fn expired(&self, grace: Duration) -> Vec<u16> {
+    pub fn expired(&self, grace: Duration) -> Vec<u16> {
         let now = Instant::now();
         self.releasing
             .read()

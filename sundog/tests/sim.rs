@@ -12,24 +12,28 @@
 
 #![cfg(feature = "sim")]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 use smol_str::SmolStr;
 use sundog::config::ClusterConfig;
 use sundog::hlc::Hlc;
 use sundog::membership::Peer;
 use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
-use sundog::store::{Mode, Shard, ShardOps};
+use sundog::store::{Mode, Shard, ShardOps, SimFanOut};
 use sundog::wire::{Msg, WireRecord};
+use sundog::{OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
+use tokio::sync::watch;
 use turmoil::{Builder, Sim};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -1621,9 +1625,13 @@ fn donor_crash_mid_state_transfer_repicks_and_completes() {
 /// Mirrors `store::bucket_of`'s formula so a fixed key range can be
 /// searched for a dense bucket without that private function; `cluster.rs`'s
 /// own tests carry the identical helper for the same reason.
-fn bucket_of_u32(key: u32) -> u16 {
-    let bucket = xxh3_64(&key_bytes(key)) & (sundog::store::BUCKET_COUNT as u64 - 1);
+fn bucket_of_bytes(key_bytes: &[u8]) -> u16 {
+    let bucket = xxh3_64(key_bytes) & (sundog::store::BUCKET_COUNT as u64 - 1);
     u16::try_from(bucket).expect("invariant: masked to BUCKET_COUNT - 1, always fits in u16")
+}
+
+fn bucket_of_u32(key: u32) -> u16 {
+    bucket_of_bytes(&key_bytes(key))
 }
 
 /// Among `0..n`, every key in a bucket holding more than `min_count` of
@@ -1877,6 +1885,1210 @@ fn part_reconciliation_repairs_one_key_under_loss() {
             counter.load(Ordering::Relaxed),
             0,
             "node-{label}'s rounds never carried a full bucket listing"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Distribution mode (`Mode::Distributed`): deterministic turmoil
+// simulations of ownership under churn, partition, owner loss, the
+// non-owner write guard, and residency's disown-grace window.
+//
+// `OwnershipTracker`, `OwnershipView`, `ResidencySet`,
+// `ownership::ownership_diff`, `Shard::with_ownership`, and a shard's
+// fan-out queue are all `pub(crate)`; the pieces this file needs are
+// re-exported under the `sim` feature the same way `cluster::anti_entropy`'s
+// pieces are above: `sundog::{OwnershipTracker, OwnershipView,
+// ResidencySet, ownership_diff}`, `Shard::with_ownership_for_sim`,
+// `Shard::drain_fan_out_for_sim`, and `store::SimFanOut`.
+//
+// Ownership itself is driven the same way membership already is in this
+// file: hand-scripted from the test, via each node's own
+// `watch::Sender<Arc<OwnershipView>>`, rather than through a live
+// `refresh_task`/gossip loop this harness has no chitchat layer to run.
+// `republish_view` mirrors `cluster::rebalance::rebalance_task`'s own
+// reaction to a view change — mark newly lost buckets releasing, unmark
+// newly regained ones — so residency behaves exactly as it does in
+// production. Bucket transfer to a newly owning node goes through the same
+// self-healing anti-entropy backstop `cluster::rebalance`'s own doc calls
+// out — `ae_round_with_sketch` above — rather than an eager
+// `Mesh::request_buckets` pull (`pub(crate)`, out of reach here): once a
+// gained bucket starts appearing in the new owner's own `ShardOps::digests`,
+// the previous owner's own round shows a mismatch and the ordinary push
+// path lands it.
+
+/// A distribution-mode scenario's per-node handle to what the test driver
+/// keeps outside any node's own async loop: the shard, its ownership
+/// view's publish side, and its residency set. A real cluster keeps all
+/// three behind `cluster::rebalance`'s task; here the test drives them
+/// directly.
+struct DistNode {
+    node: NodeId,
+    host: &'static str,
+    port: u16,
+    shard: Arc<TestShard>,
+    tx: watch::Sender<Arc<OwnershipView>>,
+    residency: Arc<ResidencySet>,
+}
+
+/// Builds one `Mode::Distributed` node: a fresh shard with an ownership
+/// tracker and residency set attached via `Shard::with_ownership_for_sim`,
+/// seeded to the solo view `OwnershipTracker::seed` always starts from —
+/// see the `distributed_shard` fixture in `store/mod.rs`'s own tests for
+/// the identical construction. The caller republishes the scenario's real
+/// starting view immediately after, via `republish_view`/`republish_all`.
+fn new_dist_node(node: NodeId, host: &'static str, port: u16, owners: u8) -> DistNode {
+    let k = NonZeroU8::new(owners).expect("owners is nonzero");
+    let (tracker, tx) = OwnershipTracker::seed(
+        node,
+        &[],
+        &HashMap::<NodeId, HashMap<SmolStr, Mode>>::new(),
+        &cache_name(),
+        k,
+    );
+    let residency = Arc::new(ResidencySet::new());
+    let shard = Arc::new(
+        Shard::new(
+            cache_name(),
+            Mode::Distributed { owners: k },
+            node,
+            100_000,
+            None,
+            None,
+        )
+        .with_ownership_for_sim(tracker, Arc::clone(&residency)),
+    );
+    DistNode {
+        node,
+        host,
+        port,
+        shard,
+        tx,
+        residency,
+    }
+}
+
+/// The `(NodeId, host, port)` entries of `roster` other than `self_node`,
+/// for wiring one distribution-mode node's own peer list.
+fn peers_excluding(
+    roster: &[(NodeId, &'static str, u16)],
+    self_node: NodeId,
+) -> Vec<(NodeId, &'static str, u16)> {
+    roster
+        .iter()
+        .copied()
+        .filter(|&(node, _, _)| node != self_node)
+        .collect()
+}
+
+/// The `Arc<TestShard>` for the node named `id` in `nodes`.
+fn shard_of(nodes: &[DistNode], id: NodeId) -> &Arc<TestShard> {
+    &nodes
+        .iter()
+        .find(|n| n.node == id)
+        .expect("known node id")
+        .shard
+}
+
+/// Recomputes and republishes one node's ownership view over `eligible`,
+/// updating its residency set exactly as
+/// `cluster::rebalance::rebalance_task` reacts to a real view change: a
+/// newly lost bucket starts its disown-grace clock, a newly regained one
+/// clears it, so a flap never accumulates toward release.
+fn republish_view(
+    self_node: NodeId,
+    tx: &watch::Sender<Arc<OwnershipView>>,
+    residency: &ResidencySet,
+    eligible: Vec<NodeId>,
+    k: NonZeroU8,
+) {
+    let new_view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+    tx.send_if_modified(|current| {
+        if current.view_hash() == new_view.view_hash() {
+            return false;
+        }
+        let (gained, lost) = ownership_diff(current, &new_view);
+        if !lost.is_empty() {
+            residency.mark_releasing(&lost);
+        }
+        if !gained.is_empty() {
+            residency.unmark(&gained);
+        }
+        *current = Arc::clone(&new_view);
+        true
+    });
+}
+
+/// [`republish_view`] for every node in `nodes` whose id is in `live`, all
+/// against the view computed over exactly `live`: the hand-scripted
+/// membership feed's counterpart to a real gossip round converging on a
+/// new peer set. A node not in `live` is left untouched — it may be
+/// crashed, in which case nothing reads its tracker until it bounces back
+/// and this is called again with it included.
+fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
+    for node in nodes {
+        if live.contains(&node.node) {
+            republish_view(node.node, &node.tx, &node.residency, live.to_vec(), k);
+        }
+    }
+}
+
+/// One `Mode::Distributed` write's fan-out: drains the shard's fan-out
+/// queue and sends each item to its bucket's current owners (`self_node`
+/// excluded), the per-write counterpart of
+/// `cluster::group_by_owner_set`/`fan_out_by_owner_set`'s owner-set
+/// grouping, without that function's batching since this harness drains at
+/// most a handful of items per tick. An `Applied` item re-fetches its
+/// current record via `ShardOps::records_for`, exactly as `Replicated`
+/// mode's own [`fan_out`] helper above does; a `Forward` item already
+/// carries its record, since a non-owner write is never applied to
+/// `engine` in the first place.
+///
+/// A `Forward` item's send is duplicated a few times: the forwarding node
+/// keeps no local copy once it has forwarded, so a lost send has no
+/// anti-entropy backstop the way a lost `Applied` send does (the owner
+/// that issued it still holds a copy anti-entropy can push again next
+/// round), matching this file's existing `dup_factor` pattern for
+/// `Replicated` mode's own lossy scenarios above.
+fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &WireRecord) {
+    let bucket = bucket_of_bytes(rec.key.as_ref());
+    for &owner in view.owners_of(bucket) {
+        if owner != self_node {
+            mesh.send(
+                owner,
+                MsgClass::Replicate,
+                Msg::Replicate {
+                    cache: cache_name(),
+                    rec: rec.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// Drains the shard's fan-out queue: an `Applied` item re-fetches its
+/// current record via `ShardOps::records_for`, exactly as `Replicated`
+/// mode's own [`fan_out`] helper above does, and is sent once (a lost send
+/// still self-heals via anti-entropy, since the writing owner keeps its
+/// own copy to push again next round); a `Forward` item already carries
+/// its record, since a non-owner write is never applied to `engine` in the
+/// first place, and is returned to the caller to retry across several
+/// ticks via [`dist_node_loop`]'s own retry pool — a forwarding node keeps
+/// no local copy once it has forwarded, so a lost send has no
+/// anti-entropy backstop the way a lost `Applied` send does.
+async fn fan_out_owned(
+    shard: &TestShard,
+    mesh: &Mesh,
+    view: &OwnershipView,
+    self_node: NodeId,
+) -> Vec<WireRecord> {
+    let mut forwards = Vec::new();
+    for item in shard.drain_fan_out_for_sim() {
+        match item {
+            SimFanOut::Applied(key) => {
+                if let Some(rec) = ShardOps::records_for(shard, vec![key_bytes(key)])
+                    .await
+                    .into_iter()
+                    .next()
+                {
+                    send_to_owners(mesh, view, self_node, &rec);
+                }
+            }
+            SimFanOut::Forward(rec) => forwards.push(rec),
+        }
+    }
+    forwards
+}
+
+/// One scripted write for a distribution-mode node's own op list; see
+/// [`DistNodeParams::ops`].
+#[derive(Clone, Copy)]
+enum DistOp {
+    Insert(u32),
+    Remove(u32),
+}
+
+/// One distribution-mode node's role: like [`NodeParams`] for
+/// `Mode::Replicated`, but fanning writes out to a key's current owners
+/// (via [`fan_out_owned`]) instead of broadcasting to every peer, gating
+/// anti-entropy's peer choice through `ShardOps::ae_peer_filter`, and
+/// releasing buckets whose disown grace has elapsed on its own tick —
+/// mirroring `cluster::rebalance::rebalance_task`'s release half. The
+/// gained half is left to anti-entropy's self-healing backstop; see this
+/// section's own doc.
+#[derive(Clone)]
+struct DistNodeParams {
+    node: NodeId,
+    label: &'static str,
+    port: u16,
+    peers: Vec<(NodeId, &'static str, u16)>,
+    /// May be empty: a scenario that drives every write itself, directly on
+    /// a node's `Arc<TestShard>` from outside this loop, still needs the
+    /// loop running so its own `fan_out_tick`/`ae_tick`/`rebalance_tick`
+    /// pick the write up. Shared, not owned outright: `sim.host`'s closure
+    /// re-clones `DistNodeParams` on every restart (a bounce included), and
+    /// an owned `Vec` would replay every already-issued op from scratch on
+    /// each one, re-inserting an already-removed key with a fresh,
+    /// LWW-winning `Hlc` — a real bug this harness hit once already. A
+    /// shared queue keeps the harness's own restart honest: a bounced node
+    /// resumes issuing its remaining ops, the way a real node resumes
+    /// serving already-accepted API calls rather than an external caller
+    /// replaying them.
+    ops: Arc<StdMutex<VecDeque<DistOp>>>,
+    write_period: Duration,
+    /// Drains and dispatches the fan-out queue, decoupled from
+    /// `write_period` so an externally issued write (never produced by this
+    /// node's own `ops`) still gets picked up promptly.
+    fan_out_period: Duration,
+    ae_period: Duration,
+    rebalance_period: Duration,
+    disown_grace: Duration,
+    ops_issued: Option<Arc<AtomicUsize>>,
+}
+
+/// How many `ae_tick`s a still-undelivered `Forward` item is retried for,
+/// spread one attempt per tick rather than several copies back to back in
+/// one tick, so each attempt gets an independent chance against a single
+/// bad connection state instead of risking every copy failing together;
+/// see [`fan_out_owned`]'s own doc for why a `Forward` item needs this and
+/// an `Applied` one does not.
+const FORWARD_RETRIES: u8 = 15;
+
+async fn dist_node_loop(
+    params: DistNodeParams,
+    shard: Arc<TestShard>,
+    residency: Arc<ResidencySet>,
+) -> SimResult {
+    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(Arc::clone(&shard)));
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], params.port));
+    let (mesh, mut inbound) = Mesh::spawn(
+        bind_addr,
+        params.node,
+        1,
+        &ClusterConfig::default(),
+        handler,
+    )
+    .await?;
+
+    let peer_list = peer_list_of(&params.peers);
+    mesh.update_peers(peer_list.clone());
+    let peer_ids: Vec<NodeId> = peer_list.iter().map(|peer| peer.node).collect();
+
+    // Forwarded writes not yet confirmed delivered, retried once per
+    // `ae_tick` for `FORWARD_RETRIES` ticks each: see `fan_out_owned`'s own
+    // doc for why a `Forward` item needs this and an `Applied` one does
+    // not.
+    let mut pending_forwards: Vec<(WireRecord, u8)> = Vec::new();
+
+    let ops = params.ops;
+    let mut write_tick = tokio::time::interval(params.write_period);
+    write_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut fan_out_tick = tokio::time::interval(params.fan_out_period);
+    fan_out_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ae_tick = tokio::time::interval(params.ae_period);
+    ae_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut rebalance_tick = tokio::time::interval(params.rebalance_period);
+    rebalance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(InboundMsg { msg, .. }) = inbound.recv() => {
+                dispatch_inbound(shard.as_ref(), msg).await;
+            }
+            _ = write_tick.tick() => {
+                let next_op = ops
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front();
+                if let Some(op) = next_op {
+                    match op {
+                        DistOp::Insert(key) => {
+                            let _ = shard.insert(key, format!("{}:{key}", params.label)).await;
+                        }
+                        DistOp::Remove(key) => {
+                            let _ = shard.remove(&key).await;
+                        }
+                    }
+                    if let Some(counter) = params.ops_issued.as_ref() {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            _ = fan_out_tick.tick() => {
+                if let Some(view) = ShardOps::ownership_view(shard.as_ref()) {
+                    let new_forwards = fan_out_owned(shard.as_ref(), &mesh, &view, params.node).await;
+                    for rec in &new_forwards {
+                        send_to_owners(&mesh, &view, params.node, rec);
+                    }
+                    pending_forwards.extend(new_forwards.into_iter().map(|rec| (rec, FORWARD_RETRIES)));
+                }
+            }
+            _ = ae_tick.tick() => {
+                let (_, cohort) =
+                    ShardOps::ae_peer_filter(shard.as_ref(), peer_ids.clone(), peer_ids.clone());
+                for peer in cohort {
+                    ae_round_with_sketch(&mesh, shard.as_ref(), peer, None).await;
+                }
+                // Retries for still-pending forwards, spaced at the AE
+                // interval rather than the much tighter `fan_out_period`:
+                // turmoil's `fail_rate` breaks the whole underlying
+                // connection rather than dropping one frame with
+                // retransmission, so several attempts fired close together
+                // land on the same broken connection and all fail
+                // together; spacing them out gives each one an independent
+                // chance once the connection has had time to reconnect.
+                if let Some(view) = ShardOps::ownership_view(shard.as_ref()) {
+                    pending_forwards.retain_mut(|(rec, attempts_left)| {
+                        send_to_owners(&mesh, &view, params.node, rec);
+                        *attempts_left -= 1;
+                        *attempts_left > 0
+                    });
+                }
+            }
+            _ = rebalance_tick.tick() => {
+                let due = residency.expired(params.disown_grace);
+                if !due.is_empty() {
+                    ShardOps::release_buckets(shard.as_ref(), &due).await;
+                    residency.unmark(&due);
+                }
+            }
+        }
+    }
+}
+
+/// Whether every live node's local content is contained in its own current
+/// owned (and, when `allow_releasing`, also releasing) bucket set. Shared by
+/// the churn and non-owner-property scenarios below.
+fn assert_holds_only_owned_or_releasing(
+    label: &str,
+    nodes: &[DistNode],
+    key_space: u32,
+    allow_releasing: bool,
+) {
+    for n in nodes {
+        let Some(view) = ShardOps::ownership_view(n.shard.as_ref()) else {
+            continue;
+        };
+        for key in 0..key_space {
+            if value_of(&n.shard, key).is_some() {
+                let bucket = bucket_of_u32(key);
+                let ok = view.owns(bucket) || (allow_releasing && n.residency.is_releasing(bucket));
+                assert!(
+                    ok,
+                    "{label}: node {:?} holds key {key} (bucket {bucket}) it neither owns nor is releasing (is_releasing={})",
+                    n.node,
+                    n.residency.is_releasing(bucket)
+                );
+            }
+        }
+    }
+}
+
+/// Whether every key in `expected` is present on at least one node that
+/// currently owns its bucket: the data-safety convergence signal churn
+/// scenarios wait on, since distinct nodes legitimately hold different
+/// buckets and a plain digest-equality check (as the replicated-mode
+/// scenarios above use) does not apply.
+fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
+    expected.iter().all(|&key| {
+        let bucket = bucket_of_u32(key);
+        nodes.iter().any(|n| {
+            ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(bucket))
+                && value_of(&n.shard, key).is_some()
+        })
+    })
+}
+
+/// [`dist_data_settled`]'s counterpart for a key removed rather than
+/// surviving: every current owner of the key's bucket has actually
+/// forgotten it. A removed key's own writer applies its tombstone
+/// instantly, but the co-owner only learns of it via the ordinary
+/// `Applied`-item fan-out (or, if that one send is lost, the next
+/// anti-entropy round) — [`dist_data_settled`] never looks at a removed
+/// key at all, so this is the churn scenario's own explicit wait for that
+/// second hop to land before treating the pre-churn baseline as settled.
+fn dist_removals_settled(nodes: &[DistNode], removed: &HashSet<u32>) -> bool {
+    removed.iter().all(|&key| {
+        let bucket = bucket_of_u32(key);
+        nodes.iter().all(|n| {
+            !ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(bucket))
+                || value_of(&n.shard, key).is_none()
+        })
+    })
+}
+
+/// Spawns `nodes[i]`'s `dist_node_loop` as a turmoil host for every `i`,
+/// using the same `params` for each but for `node`/`port`/`peers`, which
+/// come from the node itself.
+fn spawn_dist_nodes(
+    sim: &mut Sim<'_>,
+    nodes: &[DistNode],
+    mut params_for: impl FnMut(&DistNode) -> DistNodeParams,
+) {
+    for node in nodes {
+        let params = params_for(node);
+        let shard = Arc::clone(&node.shard);
+        let residency = Arc::clone(&node.residency);
+        sim.host(node.host, move || {
+            let params = params.clone();
+            let shard = Arc::clone(&shard);
+            let residency = Arc::clone(&residency);
+            async move { dist_node_loop(params, shard, residency).await }
+        });
+    }
+}
+
+/// Nodes join and leave a distributed cache (`owners=2`) repeatedly under
+/// message loss and reordering. Each of four nodes writes a disjoint key
+/// range, then removes every fourth key of its own range, so the surviving
+/// set is deliberately not "every key ever inserted." One node at a time is
+/// crashed and bounced back (never taking the live count below three, so
+/// every bucket always keeps a live owner), with the self-healing
+/// anti-entropy backstop given time to rebalance between each crash and the
+/// next. Once churn stops and every disown grace has elapsed, the union of
+/// every live node's content equals exactly the surviving set, and every
+/// live node holds only buckets it currently owns.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario's full setup, churn schedule, and assertions read best kept together"
+)]
+fn distributed_rebalance_under_churn() {
+    const OWNERS: u8 = 2;
+    let k = NonZeroU8::new(OWNERS).expect("nonzero");
+    let port = 5100;
+    let roster: Vec<(NodeId, &'static str, u16)> = vec![
+        (NodeId::from(1001), "churn-node-a", port),
+        (NodeId::from(1002), "churn-node-b", port),
+        (NodeId::from(1003), "churn-node-c", port),
+        (NodeId::from(1004), "churn-node-d", port),
+    ];
+    let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
+
+    let nodes: Vec<DistNode> = roster
+        .iter()
+        .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
+        .collect();
+    republish_all(&nodes, &node_ids, k);
+
+    // Message loss turns on only once the initial write/remove plans have
+    // settled (below), so that churn — the thing this scenario actually
+    // tests — runs under real loss and reordering without also fighting
+    // the transport's own worst case for a one-shot forward: turmoil's
+    // `fail_rate` breaks a link outright until *some* further traffic on
+    // it happens to trigger a repair check, which a forward that only ever
+    // needs to reach its bucket's two owners once may never do on its own.
+    // Reordering (the latency spread below) is in effect throughout.
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0xD157_C001))
+        .tick_duration(TICK)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(60))
+        .build();
+
+    let ranges: [std::ops::Range<u32>; 4] = [0..20, 20..40, 40..60, 60..80];
+    let labels = ["a", "b", "c", "d"];
+    let mut expected: HashSet<u32> = HashSet::new();
+    let mut removed_keys: HashSet<u32> = HashSet::new();
+    let ops_counters: Vec<Arc<AtomicUsize>> =
+        (0..4).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+    let mut op_lens = vec![0usize; 4];
+    let mut plans: Vec<Vec<DistOp>> = Vec::new();
+    for (i, range) in ranges.iter().enumerate() {
+        let removed: Vec<u32> = range.clone().step_by(4).collect();
+        for key in range.clone() {
+            if removed.contains(&key) {
+                removed_keys.insert(key);
+            } else {
+                expected.insert(key);
+            }
+        }
+        let mut ops: Vec<DistOp> = range.clone().map(DistOp::Insert).collect();
+        ops.extend(removed.into_iter().map(DistOp::Remove));
+        op_lens[i] = ops.len();
+        plans.push(ops);
+    }
+
+    spawn_dist_nodes(&mut sim, &nodes, {
+        let roster = roster.clone();
+        let counters = ops_counters.clone();
+        let mut plans = plans.into_iter();
+        let mut idx = 0usize;
+        move |node| {
+            let i = idx;
+            idx += 1;
+            DistNodeParams {
+                node: node.node,
+                label: labels[i],
+                port: node.port,
+                peers: peers_excluding(&roster, node.node),
+                ops: Arc::new(StdMutex::new(VecDeque::from(
+                    plans.next().expect("one plan per node"),
+                ))),
+                write_period: Duration::from_millis(20),
+                // Deliberately not equal to `write_period`: both this and
+                // `write_tick`'s own handler body complete synchronously
+                // (no network await), so an identical period keeps them
+                // perpetually in lock step and `biased`'s deterministic
+                // tie-break would starve this tick forever.
+                fan_out_period: Duration::from_millis(13),
+                ae_period: Duration::from_millis(150),
+                rebalance_period: Duration::from_millis(150),
+                disown_grace: Duration::from_millis(300),
+                ops_issued: Some(Arc::clone(&counters[i])),
+            }
+        }
+    });
+
+    // Phase 1: every node finishes issuing its own plan, then replication
+    // settles onto every current owner before churn starts.
+    run_until(&mut sim, steps_for(Duration::from_secs(15)), || {
+        ops_counters
+            .iter()
+            .zip(&op_lens)
+            .all(|(c, &len)| c.load(Ordering::Relaxed) >= len)
+    })
+    .expect("every node finishes its write/remove plan within the budget");
+    run_until(&mut sim, steps_for(Duration::from_secs(10)), || {
+        dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
+    })
+    .expect("every surviving key lands on at least one owner and every removal has landed before churn starts");
+
+    // Churn itself now runs under message loss, on top of the reordering
+    // already in effect: see this test's own setup comment for why loss is
+    // held off until the plans above have cleanly settled. `repair_rate`
+    // keeps `Builder`'s own default (1.0): any further traffic on a
+    // link heals it on the very next attempt, so churn's own repeated
+    // anti-entropy rounds are always enough to recover, without needing a
+    // one-shot forward to itself get as lucky as the win it was denied.
+    sim.set_fail_rate(0.03);
+
+    // Phase 2: churn. One node down at a time, never below three live, each
+    // window long enough for the self-healing AE backstop to rebalance
+    // before the next crash.
+    let mut live: Vec<NodeId> = node_ids.clone();
+    let settle = Duration::from_secs(6);
+    for &idx in &[2usize, 3usize] {
+        let victim = node_ids[idx];
+        live.retain(|&n| n != victim);
+        republish_all(&nodes, &live, k);
+        sim.crash(nodes[idx].host);
+        run_until(&mut sim, steps_for(settle), || {
+            dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
+        })
+        .expect("data safety holds immediately after a node leaves");
+
+        sim.bounce(nodes[idx].host);
+        live.push(victim);
+        republish_all(&nodes, &live, k);
+        run_until(&mut sim, steps_for(settle), || {
+            dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
+        })
+        .expect("data safety holds once the node rejoins");
+    }
+
+    // Phase 3: let every disown grace fully elapse. `ResidencySet`'s grace
+    // clock is stamped from real `Instant::now()`, not turmoil's virtual
+    // clock (matching tombstone retention's own real-time deadline
+    // elsewhere in this file), so real time — not simulated steps — must
+    // actually pass before a rebalance tick has anything to release.
+    std::thread::sleep(Duration::from_millis(300) * 3);
+    run_steps(&mut sim, steps_for(Duration::from_millis(300) * 3));
+
+    let mut union: HashSet<u32> = HashSet::new();
+    for key in 0..80u32 {
+        if nodes.iter().any(|n| value_of(&n.shard, key).is_some()) {
+            union.insert(key);
+        }
+    }
+    assert_eq!(
+        union, expected,
+        "the union of every live node's content is exactly the surviving set"
+    );
+    assert_holds_only_owned_or_releasing("after churn settles", &nodes, 80, false);
+}
+
+/// Splits the cluster into two halves, writes on both sides — including a
+/// conflicting write to the same key, side two's strictly later so its
+/// `Hlc` wins — then heals. `owners=2` over a two-node eligible set
+/// degenerates to both sides owning everything while split (see
+/// `owners_of_bucket`'s doc), so each side's writes apply locally without
+/// forwarding. After healing, every node's independently computed view has
+/// the same `view_hash`, and every write survives by version: the
+/// conflicting key resolves to side two's value everywhere it lands, and
+/// each side's private write survives on every node that ends up owning it.
+#[test]
+fn distributed_partition_then_heal_reconciles_ownership() {
+    const OWNERS: u8 = 2;
+    let k = NonZeroU8::new(OWNERS).expect("nonzero");
+    let port = 5200;
+    let roster: Vec<(NodeId, &'static str, u16)> = vec![
+        (NodeId::from(2001), "part-node-a", port),
+        (NodeId::from(2002), "part-node-b", port),
+        (NodeId::from(2003), "part-node-c", port),
+        (NodeId::from(2004), "part-node-d", port),
+    ];
+    let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
+    let side1 = [node_ids[0], node_ids[1]];
+    let side2 = [node_ids[2], node_ids[3]];
+
+    let nodes: Vec<DistNode> = roster
+        .iter()
+        .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
+        .collect();
+    republish_all(&nodes, &node_ids, k);
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x9A27_1102))
+        .tick_duration(TICK)
+        .max_message_latency(Duration::from_millis(20))
+        .build();
+
+    spawn_dist_nodes(&mut sim, &nodes, {
+        let roster = roster.clone();
+        move |node| DistNodeParams {
+            node: node.node,
+            label: "n",
+            port: node.port,
+            peers: peers_excluding(&roster, node.node),
+            ops: Arc::new(StdMutex::new(VecDeque::new())),
+            write_period: Duration::from_secs(3600),
+            fan_out_period: Duration::from_millis(20),
+            ae_period: Duration::from_millis(100),
+            rebalance_period: Duration::from_millis(100),
+            disown_grace: Duration::from_millis(300),
+            ops_issued: None,
+        }
+    });
+
+    // Everyone converges on the single four-node view before the split.
+    run_steps(&mut sim, steps_for(Duration::from_millis(200)));
+
+    for &a in &side1 {
+        for &b in &side2 {
+            let host_a = nodes.iter().find(|n| n.node == a).unwrap().host;
+            let host_b = nodes.iter().find(|n| n.node == b).unwrap().host;
+            sim.partition(host_a, host_b);
+        }
+    }
+    republish_all(&nodes, &side1, k);
+    republish_all(&nodes, &side2, k);
+    run_steps(&mut sim, steps_for(Duration::from_millis(100)));
+
+    let shared_key = 999u32;
+    block_on(shard_of(&nodes, side1[0]).insert(shared_key, "side1".to_string())).expect("insert");
+    // Real time passing, not turmoil's virtual clock, so side two's Hlc is
+    // strictly later.
+    std::thread::sleep(Duration::from_millis(5));
+    block_on(shard_of(&nodes, side2[0]).insert(shared_key, "side2".to_string())).expect("insert");
+    block_on(shard_of(&nodes, side1[0]).insert(111u32, "only-side1".to_string())).expect("insert");
+    block_on(shard_of(&nodes, side2[0]).insert(222u32, "only-side2".to_string())).expect("insert");
+
+    run_until(&mut sim, steps_for(Duration::from_secs(5)), || {
+        value_of(shard_of(&nodes, side1[1]), shared_key).is_some()
+            && value_of(shard_of(&nodes, side2[1]), shared_key).is_some()
+            && value_of(shard_of(&nodes, side1[1]), 111).is_some()
+            && value_of(shard_of(&nodes, side2[1]), 222).is_some()
+    })
+    .expect("each side replicates its own writes to its other member before healing");
+
+    for &a in &side1 {
+        for &b in &side2 {
+            let host_a = nodes.iter().find(|n| n.node == a).unwrap().host;
+            let host_b = nodes.iter().find(|n| n.node == b).unwrap().host;
+            sim.repair(host_a, host_b);
+        }
+    }
+    republish_all(&nodes, &node_ids, k);
+
+    // Every node that currently owns a given key's bucket holds the
+    // correct, fully reconciled value for it; a node that does not own it
+    // is free to have already released it (residency's disown-grace is
+    // shorter than this budget) but must not still be holding the losing
+    // side's stale value while it waits to either self-correct or release.
+    run_until(&mut sim, steps_for(Duration::from_secs(10)), || {
+        nodes.iter().all(|n| {
+            let view =
+                ShardOps::ownership_view(n.shard.as_ref()).expect("distributed shard has a view");
+            value_of(&n.shard, shared_key).as_deref() != Some("side1")
+                && (!view.owns(bucket_of_u32(shared_key))
+                    || value_of(&n.shard, shared_key).as_deref() == Some("side2"))
+                && (!view.owns(bucket_of_u32(111)) || value_of(&n.shard, 111).is_some())
+                && (!view.owns(bucket_of_u32(222)) || value_of(&n.shard, 222).is_some())
+        })
+    })
+    .expect("reconciliation lands the higher-version write and both private writes on every owner");
+
+    let hashes: HashSet<u64> = nodes
+        .iter()
+        .map(|n| {
+            ShardOps::ownership_view_hash(n.shard.as_ref())
+                .expect("distributed shard has a view hash")
+        })
+        .collect();
+    assert_eq!(hashes.len(), 1, "every node's view_hash agrees once healed");
+
+    for n in &nodes {
+        if let Some(value) = value_of(&n.shard, shared_key) {
+            assert_eq!(
+                value, "side2",
+                "the conflicting write survives by version: the strictly later write wins"
+            );
+        }
+    }
+}
+
+/// With `owners=2`, kills one of a chosen bucket's two owners. The
+/// surviving owner keeps answering for every one of the bucket's keys
+/// throughout the outage — checked repeatedly while the cluster
+/// rebalances, not only once at the end — and once the vacated slot's new
+/// third owner has pulled the bucket via the anti-entropy self-healing
+/// backstop, its content for those keys matches the survivor's exactly.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario's full setup, kill, and rebalance-matching checks read best kept together"
+)]
+fn distributed_owner_loss_k_two_loses_nothing() {
+    const OWNERS: u8 = 2;
+    let k = NonZeroU8::new(OWNERS).expect("nonzero");
+    let port = 5300;
+    let roster: Vec<(NodeId, &'static str, u16)> = vec![
+        (NodeId::from(3001), "loss-node-a", port),
+        (NodeId::from(3002), "loss-node-b", port),
+        (NodeId::from(3003), "loss-node-c", port),
+        (NodeId::from(3004), "loss-node-d", port),
+    ];
+    let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
+    let target_bucket = 0u16;
+
+    let initial_owners = OwnershipView::compute(node_ids[0], node_ids.clone(), k)
+        .owners_of(target_bucket)
+        .to_vec();
+    assert_eq!(
+        initial_owners.len(),
+        2,
+        "k=2 over four eligible nodes always gives two owners"
+    );
+    let leaving = initial_owners[0];
+    let staying = initial_owners[1];
+
+    let bucket_keys: Vec<u32> = (0..20_000)
+        .filter(|&key| bucket_of_u32(key) == target_bucket)
+        .take(5)
+        .collect();
+    assert!(
+        !bucket_keys.is_empty(),
+        "test setup sanity: some key maps to the target bucket"
+    );
+
+    let nodes: Vec<DistNode> = roster
+        .iter()
+        .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
+        .collect();
+    republish_all(&nodes, &node_ids, k);
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x1055_3001))
+        .tick_duration(TICK)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(30))
+        .build();
+
+    spawn_dist_nodes(&mut sim, &nodes, {
+        let roster = roster.clone();
+        move |node| DistNodeParams {
+            node: node.node,
+            label: "n",
+            port: node.port,
+            peers: peers_excluding(&roster, node.node),
+            ops: Arc::new(StdMutex::new(VecDeque::new())),
+            write_period: Duration::from_secs(3600),
+            fan_out_period: Duration::from_millis(15),
+            ae_period: Duration::from_millis(80),
+            rebalance_period: Duration::from_millis(80),
+            disown_grace: Duration::from_millis(250),
+            ops_issued: None,
+        }
+    });
+
+    for &key in &bucket_keys {
+        block_on(shard_of(&nodes, leaving).insert(key, format!("v:{key}"))).expect("insert");
+    }
+    run_until(&mut sim, steps_for(Duration::from_secs(5)), || {
+        bucket_keys
+            .iter()
+            .all(|&key| value_of(shard_of(&nodes, staying), key).is_some())
+    })
+    .expect("the surviving owner has every key before the kill");
+
+    sim.crash(nodes.iter().find(|n| n.node == leaving).unwrap().host);
+    let live: Vec<NodeId> = node_ids.iter().copied().filter(|&n| n != leaving).collect();
+    republish_all(&nodes, &live, k);
+
+    let new_owners = OwnershipView::compute(staying, live, k)
+        .owners_of(target_bucket)
+        .to_vec();
+    assert!(
+        new_owners.contains(&staying),
+        "the surviving original owner keeps the bucket"
+    );
+    assert!(
+        !new_owners.contains(&leaving),
+        "the killed node is no longer eligible"
+    );
+    let new_third = *new_owners
+        .iter()
+        .find(|&&n| n != staying)
+        .expect("k=2 gives a second owner");
+
+    for _ in 0..5 {
+        run_steps(&mut sim, steps_for(Duration::from_millis(200)));
+        for &key in &bucket_keys {
+            assert!(
+                value_of(shard_of(&nodes, staying), key).is_some(),
+                "the surviving owner still answers for key {key} while rebalancing"
+            );
+        }
+    }
+
+    run_until(&mut sim, steps_for(Duration::from_secs(10)), || {
+        bucket_keys.iter().all(|&key| {
+            value_of(shard_of(&nodes, new_third), key) == value_of(shard_of(&nodes, staying), key)
+        })
+    })
+    .expect("the new owner's content matches the survivor's within the budget");
+
+    for &key in &bucket_keys {
+        assert_eq!(
+            value_of(shard_of(&nodes, new_third), key),
+            value_of(shard_of(&nodes, staying), key),
+            "the new owner's content matches the survivor's exactly for key {key}"
+        );
+    }
+}
+
+/// For a seeded, randomized sequence of membership toggles (crash/bounce,
+/// never below two live nodes) and writes/removes on random live nodes,
+/// checks after every step that every node's local content is contained in
+/// its own current owned-or-releasing bucket set — equivalently, that a
+/// node holding neither ownership nor a residency grace on a bucket holds
+/// nothing in it.
+#[test]
+fn distributed_non_owner_never_applies_as_a_property() {
+    const OWNERS: u8 = 2;
+    const KEY_SPACE: u32 = 40;
+    let k = NonZeroU8::new(OWNERS).expect("nonzero");
+    let port = 5400;
+    let roster: Vec<(NodeId, &'static str, u16)> = vec![
+        (NodeId::from(4001), "prop-node-a", port),
+        (NodeId::from(4002), "prop-node-b", port),
+        (NodeId::from(4003), "prop-node-c", port),
+        (NodeId::from(4004), "prop-node-d", port),
+    ];
+    let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
+
+    let nodes: Vec<DistNode> = roster
+        .iter()
+        .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
+        .collect();
+    republish_all(&nodes, &node_ids, k);
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x9A2C_0104))
+        .tick_duration(TICK)
+        .fail_rate(0.02)
+        .repair_rate(0.8)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(40))
+        .build();
+
+    spawn_dist_nodes(&mut sim, &nodes, {
+        let roster = roster.clone();
+        move |node| DistNodeParams {
+            node: node.node,
+            label: "n",
+            port: node.port,
+            peers: peers_excluding(&roster, node.node),
+            ops: Arc::new(StdMutex::new(VecDeque::new())),
+            write_period: Duration::from_secs(3600),
+            fan_out_period: Duration::from_millis(15),
+            ae_period: Duration::from_millis(80),
+            rebalance_period: Duration::from_millis(80),
+            disown_grace: Duration::from_millis(150),
+            ops_issued: None,
+        }
+    });
+
+    let mut rng = StdRng::seed_from_u64(sim_seed(0xC0DE_5555));
+    let mut live: Vec<NodeId> = node_ids.clone();
+
+    for step in 0..40 {
+        if rng.random_range(0..3u32) == 0 {
+            let idx = rng.random_range(0..node_ids.len());
+            let target = node_ids[idx];
+            let host = nodes[idx].host;
+            if live.contains(&target) {
+                if live.len() > 2 {
+                    live.retain(|&n| n != target);
+                    republish_all(&nodes, &live, k);
+                    sim.crash(host);
+                }
+            } else {
+                sim.bounce(host);
+                live.push(target);
+                republish_all(&nodes, &live, k);
+            }
+        } else {
+            let writer = live[rng.random_range(0..live.len())];
+            let key = rng.random_range(0..KEY_SPACE);
+            let shard = shard_of(&nodes, writer);
+            if rng.random_range(0..4u32) == 0 {
+                let _ = block_on(shard.remove(&key));
+            } else {
+                let _ = block_on(shard.insert(key, format!("v{step}:{key}")));
+            }
+        }
+        run_steps(&mut sim, steps_for(Duration::from_millis(30)));
+        assert_holds_only_owned_or_releasing(
+            &format!("checkpoint {step}"),
+            &nodes,
+            KEY_SPACE,
+            true,
+        );
+    }
+
+    for &id in &node_ids {
+        if !live.contains(&id) {
+            sim.bounce(nodes.iter().find(|n| n.node == id).unwrap().host);
+            live.push(id);
+        }
+    }
+    republish_all(&nodes, &node_ids, k);
+    run_steps(&mut sim, steps_for(Duration::from_secs(2)));
+    assert_holds_only_owned_or_releasing("final", &nodes, KEY_SPACE, true);
+}
+
+/// Displaces one of a bucket's two owners with a phantom fourth node —
+/// advertised into the eligible set but never run as a real host, since
+/// only the rendezvous computation, not its reachability, matters here —
+/// so the departed owner enters disown-grace while its former co-owner
+/// keeps the bucket. A one-shot prober dials the departed owner directly,
+/// well within the grace window, proving it still answers a digest
+/// mismatch (`Mesh::ae_round`) and an explicit entries listing
+/// (`Mesh::ae_entries`) with real data, then sends it a fresh `Replicate`
+/// for a new key in the same bucket, proving the inbound-apply guard drops
+/// it. The bucket's pre-existing data survives untouched through the grace
+/// window, then is actually released once the grace period elapses.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario's setup, prober, and phased assertions read best kept together"
+)]
+fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_fresh_apply() {
+    const OWNERS: u8 = 2;
+    let k = NonZeroU8::new(OWNERS).expect("nonzero");
+    let port = 5500;
+    let roster: Vec<(NodeId, &'static str, u16)> = vec![
+        (NodeId::from(5001), "grace-node-a", port),
+        (NodeId::from(5002), "grace-node-b", port),
+        (NodeId::from(5003), "grace-node-c", port),
+    ];
+    let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
+    let target_bucket = 0u16;
+
+    let initial_owners = OwnershipView::compute(node_ids[0], node_ids.clone(), k)
+        .owners_of(target_bucket)
+        .to_vec();
+    assert_eq!(initial_owners.len(), 2);
+    // `owners_of` is ordered by descending rendezvous score: index 0 is the
+    // strictly higher-scoring owner. Adding one more eligible node can only
+    // ever displace the *weaker* of the two from the top-2 — the stronger
+    // owner would have to be outscored by the newcomer to fall out, which
+    // would put the newcomer in its place instead, not remove it outright —
+    // so `leaving` must be the weaker owner for the phantom search below to
+    // have a solution.
+    let staying = initial_owners[0];
+    let leaving = initial_owners[1];
+
+    // A phantom fourth node: never run as a real host, chosen purely so
+    // the rendezvous computation displaces `leaving` from `target_bucket`
+    // without displacing `staying`.
+    let phantom = (9_000_000u64..9_001_000)
+        .map(NodeId::from)
+        .find(|&candidate| {
+            let mut eligible = node_ids.clone();
+            eligible.push(candidate);
+            let owners = OwnershipView::compute(candidate, eligible, k)
+                .owners_of(target_bucket)
+                .to_vec();
+            owners.contains(&staying) && !owners.contains(&leaving)
+        })
+        .expect("some candidate id displaces the leaving owner alone");
+
+    let all_bucket_keys: Vec<u32> = (0..20_000)
+        .filter(|&key| bucket_of_u32(key) == target_bucket)
+        .take(4)
+        .collect();
+    assert_eq!(
+        all_bucket_keys.len(),
+        4,
+        "test setup sanity: enough keys map to the target bucket"
+    );
+    let bucket_keys = &all_bucket_keys[0..3];
+    let fresh_key = all_bucket_keys[3];
+
+    let nodes: Vec<DistNode> = roster
+        .iter()
+        .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
+        .collect();
+    republish_all(&nodes, &node_ids, k);
+
+    let mut sim = Builder::new()
+        .rng_seed(sim_seed(0x9BAC_E505))
+        .tick_duration(TICK)
+        .min_message_latency(Duration::from_millis(1))
+        .max_message_latency(Duration::from_millis(20))
+        .build();
+
+    let disown_grace = Duration::from_millis(400);
+    spawn_dist_nodes(&mut sim, &nodes, {
+        let roster = roster.clone();
+        move |node| DistNodeParams {
+            node: node.node,
+            label: "n",
+            port: node.port,
+            peers: peers_excluding(&roster, node.node),
+            ops: Arc::new(StdMutex::new(VecDeque::new())),
+            write_period: Duration::from_secs(3600),
+            fan_out_period: Duration::from_millis(15),
+            ae_period: Duration::from_millis(60),
+            rebalance_period: Duration::from_millis(60),
+            disown_grace,
+            ops_issued: None,
+        }
+    });
+
+    for &key in bucket_keys {
+        block_on(shard_of(&nodes, leaving).insert(key, format!("v:{key}"))).expect("insert");
+    }
+    run_until(&mut sim, steps_for(Duration::from_secs(5)), || {
+        bucket_keys
+            .iter()
+            .all(|&key| value_of(shard_of(&nodes, staying), key).is_some())
+    })
+    .expect("both original owners hold the bucket's keys before the membership change");
+
+    // Advertise the phantom fourth node: `leaving` loses `target_bucket`
+    // and starts its disown-grace clock; `staying` keeps it.
+    let mut eligible = node_ids.clone();
+    eligible.push(phantom);
+    republish_all(&nodes, &eligible, k);
+    assert!(
+        nodes
+            .iter()
+            .find(|n| n.node == leaving)
+            .unwrap()
+            .residency
+            .is_releasing(target_bucket),
+        "the departed owner marks the bucket releasing immediately on the view change"
+    );
+
+    // A legitimate record for a brand-new key in the same bucket, built
+    // from the current owner's own applied copy rather than hand-rolling a
+    // wire frame.
+    block_on(shard_of(&nodes, staying).insert(fresh_key, "fresh".to_string())).expect("insert");
+    let fresh_rec = block_on(ShardOps::records_for(
+        shard_of(&nodes, staying).as_ref(),
+        vec![key_bytes(fresh_key)],
+    ))
+    .into_iter()
+    .next()
+    .expect("just inserted");
+
+    let leaving_host = nodes.iter().find(|n| n.node == leaving).unwrap().host;
+    let leaving_port = nodes.iter().find(|n| n.node == leaving).unwrap().port;
+    let prober_id = NodeId::from(5999);
+    let ae_mismatch_count = Arc::new(AtomicUsize::new(0));
+    let entries_count = Arc::new(AtomicUsize::new(0));
+    let probe_done = Arc::new(AtomicBool::new(false));
+    let ae_mismatch_count_probe = Arc::clone(&ae_mismatch_count);
+    let entries_count_probe = Arc::clone(&entries_count);
+    let probe_done_probe = Arc::clone(&probe_done);
+    sim.client("grace-prober", async move {
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(ShardHandler::new(Arc::new(new_shard(prober_id))));
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0], 5599));
+        let (mesh, _inbound) =
+            Mesh::spawn(bind_addr, prober_id, 1, &ClusterConfig::default(), handler).await?;
+        mesh.update_peers(peer_list_of(&[(leaving, leaving_host, leaving_port)]));
+
+        // A deliberately wrong digest forces a mismatch reply carrying
+        // real entries, proving the responder still answers.
+        if let Ok(mismatched) = mesh
+            .ae_round(leaving, cache_name(), vec![(target_bucket, 0)])
+            .await
+        {
+            ae_mismatch_count_probe.fetch_add(mismatched.len(), Ordering::Relaxed);
+        }
+        if let Ok(listing) = mesh
+            .ae_entries(leaving, cache_name(), vec![target_bucket])
+            .await
+        {
+            let count: usize = listing.into_iter().map(|(_, entries)| entries.len()).sum();
+            entries_count_probe.fetch_add(count, Ordering::Relaxed);
+        }
+
+        // A fresh key in the same bucket, sent as a live `Replicate`:
+        // the inbound-apply guard must drop it.
+        mesh.send(
+            leaving,
+            MsgClass::Replicate,
+            Msg::Replicate {
+                cache: cache_name(),
+                rec: fresh_rec,
+            },
+        );
+        probe_done_probe.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+
+    run_until(&mut sim, steps_for(Duration::from_secs(3)), || {
+        probe_done.load(Ordering::Relaxed)
+    })
+    .expect("the prober completes within the budget");
+    run_steps(&mut sim, steps_for(Duration::from_millis(100)));
+
+    assert!(
+        ae_mismatch_count.load(Ordering::Relaxed) > 0,
+        "the releasing node still answers a digest mismatch with real entries"
+    );
+    assert!(
+        entries_count.load(Ordering::Relaxed) > 0,
+        "the releasing node still answers an explicit entries listing"
+    );
+    assert!(
+        value_of(shard_of(&nodes, leaving), fresh_key).is_none(),
+        "the releasing node drops a fresh inbound apply for its released bucket"
+    );
+    for &key in bucket_keys {
+        assert!(
+            value_of(shard_of(&nodes, leaving), key).is_some(),
+            "existing data for a releasing bucket is not wiped before grace elapses"
+        );
+    }
+
+    // Once the grace period fully elapses, the bucket is actually released.
+    // `ResidencySet`'s grace clock is stamped from real `Instant::now()`,
+    // not turmoil's virtual clock, so real time must actually pass — see
+    // `distributed_rebalance_under_churn`'s identical comment.
+    std::thread::sleep(disown_grace * 3);
+    run_steps(&mut sim, steps_for(disown_grace * 3));
+    for &key in bucket_keys {
+        assert!(
+            value_of(shard_of(&nodes, leaving), key).is_none(),
+            "the bucket's content is dropped once disown grace elapses"
         );
     }
 }

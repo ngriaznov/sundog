@@ -210,6 +210,18 @@ pub(crate) enum FanOutItem<K> {
     Forward(WireRecord),
 }
 
+/// Sim-only mirror of [`FanOutItem`], reachable from `tests/sim.rs` under
+/// the `sim` feature since `FanOutItem` itself is not; see
+/// [`Shard::drain_fan_out_for_sim`].
+#[cfg(feature = "sim")]
+#[doc(hidden)]
+pub enum SimFanOut<K> {
+    /// Mirrors [`FanOutItem::Applied`].
+    Applied(K),
+    /// Mirrors [`FanOutItem::Forward`].
+    Forward(WireRecord),
+}
+
 /// A named cache's clustering behavior: how writes fan out to other nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -835,6 +847,39 @@ where
     #[cfg(test)]
     pub(crate) fn residency(&self) -> Option<&Arc<ResidencySet>> {
         self.residency.as_ref()
+    }
+
+    /// Test-only mirror of [`Shard::with_ownership`], reachable from
+    /// `tests/sim.rs`, which lives outside this crate and cannot otherwise
+    /// reach a `pub(crate)` builder method. Never call this outside the sim
+    /// harness.
+    #[cfg(feature = "sim")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_ownership_for_sim(
+        self,
+        tracker: OwnershipTracker,
+        residency: Arc<ResidencySet>,
+    ) -> Self {
+        self.with_ownership(tracker, residency)
+    }
+
+    /// Test-only mirror of [`Shard::fan_out_queue`]'s drain, translating
+    /// each [`FanOutItem`] into the sim-visible [`SimFanOut`] shape so the
+    /// harness never needs `FanOutItem`/`FanOutQueue` themselves made
+    /// reachable. Reachable from `tests/sim.rs` for the same reason as
+    /// [`Shard::with_ownership_for_sim`].
+    #[cfg(feature = "sim")]
+    #[doc(hidden)]
+    pub fn drain_fan_out_for_sim(&self) -> Vec<SimFanOut<K>> {
+        self.fan_out_queue()
+            .drain()
+            .into_iter()
+            .map(|item| match item {
+                FanOutItem::Applied(key) => SimFanOut::Applied(key),
+                FanOutItem::Forward(rec) => SimFanOut::Forward(rec),
+            })
+            .collect()
     }
 
     /// Installs a custom per-entry weigher for size-bounded eviction, in place
