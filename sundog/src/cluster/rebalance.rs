@@ -301,6 +301,34 @@ pub(crate) async fn warm_up_task(
     }
 }
 
+/// What one published view change asks of [`rebalance_task`]: `lost` and
+/// `regained` are the differences from the view published just before
+/// (`prev`), so a bucket held from any earlier view starts or stops its
+/// disown grace; `to_pull` is the difference from the last view whose pull
+/// was not superseded (`pulled`), so a bucket gained under a view that
+/// moved on mid-pull is pulled again under the current one rather than
+/// skipped. With no superseded pull in between, `prev` and `pulled` are
+/// the same view and `to_pull` equals `regained`.
+pub(crate) struct ViewChangePlan {
+    pub(crate) lost: Vec<u16>,
+    pub(crate) regained: Vec<u16>,
+    pub(crate) to_pull: Vec<u16>,
+}
+
+pub(crate) fn plan_view_change(
+    prev: &OwnershipView,
+    pulled: &OwnershipView,
+    new: &OwnershipView,
+) -> ViewChangePlan {
+    let (regained, lost) = ownership_diff(prev, new);
+    let (to_pull, _) = ownership_diff(pulled, new);
+    ViewChangePlan {
+        lost,
+        regained,
+        to_pull,
+    }
+}
+
 /// The distinct live current owners, other than `self_node`, of the
 /// buckets in `due`: the peers a release hands each bucket to first.
 pub(crate) fn hand_off_owners(
@@ -378,7 +406,11 @@ pub(crate) async fn rebalance_task(
     let budget = cluster.config().state_transfer_budget;
     let ae_interval = cluster.config().ae_interval;
     let mut view_rx = ownership.subscribe();
-    let mut old_view = view_rx.borrow_and_update().clone();
+    // `prev_view` is the view published just before the current one;
+    // `pulled_view` the last one whose pull was not superseded. See
+    // `plan_view_change` for why the two differ.
+    let mut prev_view = view_rx.borrow_and_update().clone();
+    let mut pulled_view = Arc::clone(&prev_view);
     let mut ticker = tokio::time::interval(ae_interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -390,23 +422,26 @@ pub(crate) async fn rebalance_task(
                     return; // the tracker's sender dropped
                 }
                 let new_view = view_rx.borrow_and_update().clone();
-                let (gained, lost) = ownership_diff(&old_view, &new_view);
-                if !lost.is_empty() {
-                    residency.mark_releasing(&lost);
-                    tracing::debug!(cache = %cache, count = lost.len(), "buckets lost; disown grace started");
+                let plan = plan_view_change(&prev_view, &pulled_view, &new_view);
+                prev_view = Arc::clone(&new_view);
+                if !plan.lost.is_empty() {
+                    residency.mark_releasing(&plan.lost);
+                    tracing::debug!(cache = %cache, count = plan.lost.len(), "buckets lost; disown grace started");
                 }
-                let outcome = if gained.is_empty() {
+                if !plan.regained.is_empty() {
+                    residency.unmark(&plan.regained);
+                }
+                let outcome = if plan.to_pull.is_empty() {
                     Outcome::Completed
                 } else {
-                    residency.unmark(&gained);
-                    tracing::debug!(cache = %cache, count = gained.len(), "buckets gained; pulling from current owners");
-                    pull_buckets(&cluster, &shard, &ownership, &cache, gained, budget, concurrency).await
+                    tracing::debug!(cache = %cache, count = plan.to_pull.len(), "buckets gained; pulling from current owners");
+                    pull_buckets(&cluster, &shard, &ownership, &cache, plan.to_pull, budget, concurrency).await
                 };
                 // A pull the view moved past is planned again from the
                 // same starting point on the next change, which has
                 // already been published, so nothing gained is skipped.
                 if outcome != Outcome::Superseded {
-                    old_view = new_view;
+                    pulled_view = new_view;
                 }
             }
             _ = ticker.tick() => {
@@ -513,6 +548,53 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert!(groups[0].0.is_empty());
+    }
+
+    #[test]
+    fn plan_view_change_marks_a_bucket_lost_since_the_previous_view_even_when_its_pull_was_superseded()
+     {
+        let self_node = NodeId::from(1);
+        let k = 2;
+        // v0: three nodes. v1: node 3 died, so self gained its share. v2:
+        // node 4 joined, taking some of those just-gained buckets away.
+        let v0 = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
+        let v1 = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
+        let v2 = view(self_node, [1u64, 2, 4].map(NodeId::from).to_vec(), k);
+        let owned = |v: &OwnershipView| v.owned_buckets().collect::<HashSet<u16>>();
+        let (o0, o1, o2) = (owned(&v0), owned(&v1), owned(&v2));
+
+        // v0 -> v1 pulled cleanly: prev and pulled agree.
+        let plan = plan_view_change(&v0, &v0, &v1);
+        assert_eq!(
+            plan.to_pull.iter().copied().collect::<HashSet<_>>(),
+            plan.regained.iter().copied().collect::<HashSet<_>>()
+        );
+        for &b in &plan.lost {
+            assert!(o0.contains(&b) && !o1.contains(&b));
+        }
+
+        // v1's pull was superseded by v2: lost is measured from v1, so a
+        // bucket gained under v1 and gone in v2 starts its grace, while
+        // the pull covers everything v2 owns that v0 did not.
+        let plan = plan_view_change(&v1, &v0, &v2);
+        let gained_then_lost: Vec<u16> = o1
+            .iter()
+            .copied()
+            .filter(|b| !o0.contains(b) && !o2.contains(b))
+            .collect();
+        assert!(
+            !gained_then_lost.is_empty(),
+            "the fixture has a bucket gained under v1 and lost in v2"
+        );
+        for b in &gained_then_lost {
+            assert!(plan.lost.contains(b), "bucket {b} starts its disown grace");
+        }
+        for &b in &plan.to_pull {
+            assert!(o2.contains(&b) && !o0.contains(&b));
+        }
+        for b in o2.iter().filter(|b| !o0.contains(b)) {
+            assert!(plan.to_pull.contains(b), "bucket {b} is pulled under v2");
+        }
     }
 
     #[test]
