@@ -151,10 +151,14 @@ pub(crate) async fn run_round_against(
     cache: &SmolStr,
     peer: NodeId,
 ) {
-    let local_buckets = shard.digests().await;
     let mesh = cluster.mesh();
     let mismatched = match shard.ownership_view_hash() {
         Some(view_hash) => {
+            // Only the buckets `peer` co-owns: the whole resident list
+            // would have every other bucket reported as a mismatch and
+            // its entries pushed only to be dropped by the peer's inbound
+            // guard.
+            let local_buckets = shard.ae_digests_for(peer).await;
             match mesh
                 .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
                 .await
@@ -177,7 +181,10 @@ pub(crate) async fn run_round_against(
                 }
             }
         }
-        None => match mesh.ae_round(peer, cache.clone(), local_buckets).await {
+        None => match mesh
+            .ae_round(peer, cache.clone(), shard.digests().await)
+            .await
+        {
             Ok(mismatched) => mismatched,
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy digest exchange failed");

@@ -115,10 +115,6 @@ pub(crate) fn eligible_owners(
 /// anti-entropy's pairing predicate. A residency-widened cohort is a
 /// separate, time-based layer on top of this, never a change to this
 /// function.
-#[allow(
-    dead_code,
-    reason = "read by anti-entropy peer/digest scoping once it is wired up"
-)]
 pub(crate) fn shared_owned_buckets(view: &OwnershipView, peer: NodeId) -> Vec<u16> {
     view.owned_buckets()
         .filter(|&bucket| view.owners_of(bucket).contains(&peer))

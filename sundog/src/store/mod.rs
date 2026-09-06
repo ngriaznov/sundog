@@ -338,6 +338,18 @@ pub trait ShardOps: Send + Sync {
     /// [`BUCKET_COUNT`] buckets. The first step of an anti-entropy round.
     fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>>;
 
+    /// [`ShardOps::digests`] narrowed to what one anti-entropy round with
+    /// `peer` has to reconcile. The full list for every mode but
+    /// `Mode::Distributed`, whose override keeps only the buckets `peer`
+    /// owns in this shard's current view and this shard holds (owned or
+    /// mid disown-grace): a bucket the peer does not own would be reported
+    /// as a mismatch every round and its entries pushed only to be dropped
+    /// by the peer's inbound guard.
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+        let _ = peer;
+        self.digests()
+    }
+
     /// `(key, version)` for every live entry and un-GC'd tombstone in `bucket`,
     /// for a peer that reported a digest mismatch there.
     fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
@@ -2063,6 +2075,26 @@ where
                 .collect(),
             None => digests,
         };
+        Box::pin(async move { digests })
+    }
+
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+        let Some(residency) = self.residency_check() else {
+            return self.digests();
+        };
+        let (view, releasing) = &residency;
+        let shared: HashSet<u16> = crate::ownership::shared_owned_buckets(view, peer)
+            .into_iter()
+            .collect();
+        let digests: Vec<(u16, u64)> = self
+            .engine
+            .digests()
+            .into_iter()
+            .filter(|&(bucket, _)| {
+                shared.contains(&bucket)
+                    || (releasing.is_releasing(bucket) && view.owners_of(bucket).contains(&peer))
+            })
+            .collect();
         Box::pin(async move { digests })
     }
 
@@ -4560,6 +4592,82 @@ mod tests {
         assert_eq!(
             ShardOps::ae_peer_filter(&s, peers.clone(), peers.clone()),
             (peers.clone(), peers)
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_digests_for_is_the_full_digest_list_for_a_non_distributed_shard() {
+        let s = shard::<u32, String>(1);
+        s.insert(7, "v".to_string()).await.expect("insert");
+        let all = ShardOps::digests(&s).await;
+        assert_eq!(all.len(), BUCKET_COUNT);
+        assert_eq!(ShardOps::ae_digests_for(&s, NodeId::from(2)).await, all);
+    }
+
+    #[tokio::test]
+    async fn ae_digests_for_keeps_only_buckets_the_peer_co_owns_or_this_shard_is_releasing_to() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) =
+            distributed_shard::<u32, String>(self_node, eligible, 2, Arc::clone(&residency));
+        let peer = NodeId::from(2);
+        let bucket_at = |i: usize| u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
+        let shared_owned = (0..BUCKET_COUNT)
+            .map(bucket_at)
+            .find(|&b| view.owns(b) && view.owners_of(b).contains(&peer))
+            .expect("some bucket is owned by both self and the peer");
+        let owned_not_shared = (0..BUCKET_COUNT)
+            .map(bucket_at)
+            .find(|&b| view.owns(b) && !view.owners_of(b).contains(&peer))
+            .expect("some bucket is owned by self but not the peer");
+        let peer_only = (0..BUCKET_COUNT)
+            .map(bucket_at)
+            .find(|&b| !view.owns(b) && view.owners_of(b).contains(&peer))
+            .expect("some bucket is owned by the peer but not self");
+        let neither = (0..BUCKET_COUNT)
+            .map(bucket_at)
+            .find(|&b| !view.owns(b) && !view.owners_of(b).contains(&peer))
+            .expect("some bucket is owned by neither self nor the peer");
+        // A bucket mid disown-grace that the peer now owns stays in the
+        // round: the anti-entropy backstop for a lost rebalance pull.
+        residency.mark_releasing(&[peer_only, neither]);
+
+        let listed: HashSet<u16> = ShardOps::ae_digests_for(&s, peer)
+            .await
+            .into_iter()
+            .map(|(bucket, _)| bucket)
+            .collect();
+        assert!(
+            listed.contains(&shared_owned),
+            "a co-owned bucket is listed"
+        );
+        assert!(
+            listed.contains(&peer_only),
+            "a releasing bucket the peer owns is listed"
+        );
+        assert!(
+            !listed.contains(&owned_not_shared),
+            "an owned bucket the peer does not own is not listed"
+        );
+        assert!(
+            !listed.contains(&neither),
+            "a releasing bucket the peer does not own is not listed"
+        );
+        for bucket in &listed {
+            assert!(
+                view.owners_of(*bucket).contains(&peer),
+                "every listed bucket is owned by the peer: {bucket}"
+            );
+            assert!(
+                view.owns(*bucket) || residency.is_releasing(*bucket),
+                "every listed bucket is resident here: {bucket}"
+            );
+        }
+        let full = ShardOps::digests(&s).await;
+        assert!(
+            listed.len() < full.len(),
+            "the peer-scoped list is a strict subset"
         );
     }
 
