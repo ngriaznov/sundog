@@ -39,9 +39,13 @@ All notable changes to this project are documented in this file. Format follows
 - `sundog-testnode` reads `SUNDOG_TESTNODE_MODE=distributed` (with
   `SUNDOG_TESTNODE_OWNERS` to pick `owners`) to open `"it"` as a distributed
   cache, and serves the routes the new container scenarios drive it through.
-- A `Mode::Distributed` scenario in the deterministic simulation suite:
-  membership churning under message loss and reordering, checking that
-  every bucket's data converges across its current owners alone. New
+- Five `Mode::Distributed` scenarios in the deterministic simulation suite:
+  rebalance under membership churn with message loss and reordering, a
+  partition healing back to one ownership view with every write kept, one
+  of a bucket's two owners lost with nothing lost, a property check that
+  no node ever holds a bucket outside its own owned-or-releasing set, and a
+  releasing bucket still answering anti-entropy while refusing a fresh
+  apply. New
   container scenarios: a five-node fill landing every key on exactly two
   owners, one owner crashing with every key still fetchable and then
   re-owned, and a fourth node joining a filled cluster and taking its share,

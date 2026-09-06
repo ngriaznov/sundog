@@ -743,7 +743,7 @@ fn diff_bucket(
 }
 
 /// The initiator's push/pull classification once an `AeSketch` reply
-/// decodes: mirrors [`diff_bucket`]'s rules over [`Iblt::peel`]'s peeled
+/// decodes: mirrors `diff_bucket`'s rules over [`Iblt::peel`]'s peeled
 /// element lists instead of two full listings. A key newer in
 /// `decoded.only_left` (this node) than in `only_right` (the peer's) pushes;
 /// newer on the peer's side pulls; present in only one side follows suit.
@@ -753,7 +753,7 @@ fn diff_bucket(
 ///
 /// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
 /// re-exports it as `crate::diff_decoded` under `feature = "sim"`, to
-/// reconcile a peeled sketch the same way [`handle_sketch_mismatch`] does
+/// reconcile a peeled sketch the same way `handle_sketch_mismatch` does
 /// here, without duplicating this classification.
 pub fn diff_decoded(
     local_entries: &[(Bytes, Hlc)],
