@@ -1801,3 +1801,119 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
     net.close().await.expect("network closes");
 }
 
+/// A fourth node joins a filled three-node distributed cluster: it pulls
+/// roughly a quarter of the 1,024-bucket space (`sundog_owned_buckets` near
+/// `BUCKET_COUNT * OWNERS / 4`) and at least one original node's
+/// `direction="out"` counter moves to match. Once the disown grace period
+/// (`distributed_disown_grace_rounds` anti-entropy intervals) has passed, the
+/// donors have dropped what they no longer own and every key sits on exactly
+/// `OWNERS` of the four nodes, fetchable from all of them.
+#[tokio::test]
+async fn distributed_join_and_rebalance() {
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 150;
+    const ALIASES: [&str; 3] = ["n1", "n2", "n3"];
+    const JOINER: &str = "n4";
+    const CLUSTER: &str = "dist-join-cluster";
+    /// `BUCKET_COUNT * OWNERS / 4` nodes: the even split a fresh joiner
+    /// should land close to, rendezvous hashing balancing buckets roughly
+    /// uniformly rather than exactly.
+    const JOINER_BUCKETS_TOLERANCE: u64 = 200;
+    const REBALANCE_WAIT: Duration = Duration::from_secs(240);
+    // sundog-testnode sets ae_interval to 2s; distributed_disown_grace_
+    // rounds defaults to 3, so a previous owner keeps serving for 6s past
+    // losing a bucket. Generous past that for the anti-entropy round itself.
+    const DISOWN_GRACE_WAIT: Duration = Duration::from_secs(16);
+    const SETTLE_WAIT: Duration = Duration::from_secs(180);
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = Vec::with_capacity(4);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+    }
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), ALIASES.len() - 1).await;
+
+    nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    eventually(Duration::from_secs(60), || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+
+    let mut out_before = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        out_before.push(
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await,
+        );
+    }
+
+    let all_seeds: Vec<String> = ALIASES.iter().map(|a| seed(a)).collect();
+    let all_seed_refs: Vec<&str> = all_seeds.iter().map(String::as_str).collect();
+    nodes.push(Node::spawn_distributed(&net, CLUSTER, JOINER, &all_seed_refs, Some(OWNERS)).await);
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    wait_for_peers(&node_refs, ALIASES.len()).await;
+    let joiner: &Node = node_refs.last().expect("just pushed the joiner");
+
+    let expected_joiner_buckets = expected_owned_buckets_sum(u64::from(OWNERS)) / 4;
+    eventually(REBALANCE_WAIT, || async {
+        let owned = scrape_metric(joiner, "sundog_owned_buckets", ("cache", "it")).await;
+        let pulled_in = scrape_metric(
+            joiner,
+            "sundog_rebalance_buckets_total",
+            ("direction", "in"),
+        )
+        .await
+            > 0;
+        pulled_in && owned.abs_diff(expected_joiner_buckets) <= JOINER_BUCKETS_TOLERANCE
+    })
+    .await;
+
+    let mut donor_out_moved = false;
+    for (node, before) in node_refs[..ALIASES.len()].iter().zip(out_before.iter()) {
+        let after =
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
+        if after > *before {
+            donor_out_moved = true;
+        }
+    }
+    assert!(
+        donor_out_moved,
+        "at least one original node should have donated buckets to the joiner"
+    );
+
+    // Let the disown grace period elapse so previous owners drop what they
+    // no longer own, then every key settles on exactly OWNERS nodes.
+    tokio::time::sleep(DISOWN_GRACE_WAIT).await;
+
+    let ids = collect_node_ids(&node_refs).await;
+    let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
+    let sample = sample_kv_entries(0x5ca1_ab1e, FILL_KEYS, SAMPLE_SIZE);
+
+    eventually(SETTLE_WAIT, || async {
+        if sum_counts(&node_refs).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await
+    })
+    .await;
+
+    let mismatches = fetch_mismatches(&node_refs, &sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every sampled key must be fetchable with the right value from every node: {mismatches:?}"
+    );
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
