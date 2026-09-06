@@ -5,6 +5,7 @@
 //! pull and this module's ongoing loop share one mechanism,
 //! [`pull_buckets`], scoped to whichever bucket set is at hand.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use super::Cluster;
+use super::anti_entropy::{self, RoundOutcome};
 use super::state_transfer::{self, DonorResult, Outcome};
 use crate::net::Mesh;
 use crate::node::NodeId;
@@ -79,18 +81,23 @@ const GROUP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// set right after a membership change — see
 /// [`crate::store::ShardOps::ae_peer_filter`]'s doc for the same race — so a
 /// pass where every donor declines or fails retries the whole list after
-/// [`GROUP_RETRY_BACKOFF`] rather than giving up; the caller's own `budget`
+/// [`GROUP_RETRY_BACKOFF`] rather than giving up, unless this node's own
+/// view has moved on from `view_hash` since the pull was planned: then no
+/// donor will ever agree, and the pull answers `None` so the caller plans
+/// afresh against the current view; the caller's own `budget`
 /// timeout is the only bound on how long this keeps trying. Returns the
 /// count of records actually landed once a donor succeeds.
+#[allow(clippy::too_many_arguments)]
 async fn pull_one_group(
     shard: &Arc<dyn ShardOps>,
     mesh: &Mesh,
     cache: &SmolStr,
+    ownership: &OwnershipTracker,
     donors: Vec<NodeId>,
     buckets: Vec<u16>,
     view_hash: u64,
     per_donor: Duration,
-) -> u64 {
+) -> Option<u64> {
     loop {
         for &donor in &donors {
             let (result, count) = tokio::time::timeout(
@@ -103,8 +110,12 @@ async fn pull_one_group(
                 (DonorResult::Failed, 0)
             });
             if result == DonorResult::Done {
-                return count;
+                return Some(count);
             }
+        }
+        if ownership.current().view_hash() != view_hash {
+            tracing::debug!(cache = %cache, "ownership view moved mid-pull; this pull is superseded");
+            return None;
         }
         tokio::time::sleep(GROUP_RETRY_BACKOFF).await;
     }
@@ -128,7 +139,10 @@ async fn pull_one_group(
 /// operation races `budget`: every group either lands or declines within it
 /// and this returns [`Outcome::Completed`], or the budget runs out first
 /// and this returns [`Outcome::TimedOut`], leaving the rest to a retry or
-/// to anti-entropy's self-healing backstop.
+/// to anti-entropy's self-healing backstop. A view that moves on from
+/// `ownership.current()` mid-pull answers [`Outcome::Superseded`] once
+/// every group has landed or given up: the caller plans afresh against
+/// the current view.
 pub(crate) async fn pull_buckets(
     cluster: &Cluster,
     shard: &Arc<dyn ShardOps>,
@@ -169,6 +183,7 @@ pub(crate) async fn pull_buckets(
             let shard = Arc::clone(shard);
             let mesh = mesh.clone();
             let cache = cache.clone();
+            let ownership = ownership.clone();
             set.spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()
@@ -178,6 +193,7 @@ pub(crate) async fn pull_buckets(
                     &shard,
                     &mesh,
                     &cache,
+                    &ownership,
                     donors,
                     group_buckets,
                     view_hash,
@@ -187,14 +203,18 @@ pub(crate) async fn pull_buckets(
             });
         }
         let mut landed = 0u64;
+        let mut superseded = false;
         while let Some(result) = set.join_next().await {
-            landed += result.unwrap_or(0);
+            match result.ok().flatten() {
+                Some(count) => landed += count,
+                None => superseded = true,
+            }
         }
-        landed
+        (landed, superseded)
     };
 
     match tokio::time::timeout(budget, run_all).await {
-        Ok(landed) => {
+        Ok((landed, superseded)) => {
             if landed > 0 {
                 metrics::counter!(
                     "sundog_rebalance_buckets_total",
@@ -203,7 +223,11 @@ pub(crate) async fn pull_buckets(
                 )
                 .increment(landed);
             }
-            Outcome::Completed
+            if superseded {
+                Outcome::Superseded
+            } else {
+                Outcome::Completed
+            }
         }
         Err(_) => Outcome::TimedOut,
     }
@@ -256,6 +280,7 @@ pub(crate) async fn warm_up_task(
                     }
                 }
             }
+            state_transfer::WarmUpStep::RetryNow => {}
             state_transfer::WarmUpStep::RetryLater => {
                 tokio::select! {
                     biased;
@@ -276,13 +301,69 @@ pub(crate) async fn warm_up_task(
     }
 }
 
+/// The distinct live current owners, other than `self_node`, of the
+/// buckets in `due`: the peers a release hands each bucket to first.
+pub(crate) fn hand_off_owners(
+    view: &OwnershipView,
+    self_node: NodeId,
+    due: &[u16],
+    live: &HashSet<NodeId>,
+) -> Vec<NodeId> {
+    let mut owners: Vec<NodeId> = Vec::new();
+    for &bucket in due {
+        for &owner in view.owners_of(bucket) {
+            if owner != self_node && live.contains(&owner) && !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+    }
+    owners
+}
+
+/// The buckets in `due` a release may drop now: those whose every other
+/// current owner either is in `reconciled` (an anti-entropy round against
+/// it completed since the bucket came due, so it holds what this node
+/// held) or, for a bucket in `overdue` (held past the hard cap), is in
+/// `unreachable` (its round failed outright, or it is not a live peer), so
+/// an owner that never answers cannot pin memory forever. An owner whose
+/// view still differs from this node's is neither: its round ends `Stale`,
+/// the bucket stays resident, and the next tick tries again once the views
+/// converge, however long that takes.
+pub(crate) fn buckets_to_release(
+    view: &OwnershipView,
+    self_node: NodeId,
+    due: &[u16],
+    overdue: &[u16],
+    reconciled: &HashSet<NodeId>,
+    unreachable: &HashSet<NodeId>,
+) -> Vec<u16> {
+    due.iter()
+        .copied()
+        .filter(|&bucket| {
+            view.owners_of(bucket).iter().all(|owner| {
+                *owner == self_node
+                    || reconciled.contains(owner)
+                    || (overdue.contains(&bucket) && unreachable.contains(owner))
+            })
+        })
+        .collect()
+}
+
 /// Reacts to every change in `ownership`'s view for as long as `cancel`
 /// stays live: marks newly lost buckets releasing, unmarks newly regained
 /// ones (a flap never accumulates toward release), and pulls newly gained
 /// ones from their current owners. On a tick piggybacked on `ae_interval`
-/// (no separate ticker), releases whichever buckets' disown grace has
-/// elapsed via [`ShardOps::release_buckets`], counting
-/// `sundog_rebalance_buckets_total{direction="out"}`.
+/// (no separate ticker), hands off whichever buckets' disown grace has
+/// elapsed: one anti-entropy round against each of their live current
+/// owners ([`hand_off_owners`]), pushing what an owner lacks, then
+/// [`ShardOps::release_buckets`] for the buckets every owner answered
+/// ([`buckets_to_release`]), counting
+/// `sundog_rebalance_buckets_total{direction="out"}`. A bucket whose owner
+/// did not answer stays resident until the next tick: for as long as the
+/// owner's view differs from this node's, or up to twice the grace when
+/// the owner is unreachable. The hand-off closes the one gap a pull alone
+/// leaves: two nodes joining at once can both own a bucket neither has
+/// yet, each pulling it from the other.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn rebalance_task(
     cluster: Cluster,
@@ -310,20 +391,60 @@ pub(crate) async fn rebalance_task(
                 }
                 let new_view = view_rx.borrow_and_update().clone();
                 let (gained, lost) = ownership_diff(&old_view, &new_view);
-                old_view = new_view;
                 if !lost.is_empty() {
                     residency.mark_releasing(&lost);
                     tracing::debug!(cache = %cache, count = lost.len(), "buckets lost; disown grace started");
                 }
-                if !gained.is_empty() {
+                let outcome = if gained.is_empty() {
+                    Outcome::Completed
+                } else {
                     residency.unmark(&gained);
                     tracing::debug!(cache = %cache, count = gained.len(), "buckets gained; pulling from current owners");
-                    pull_buckets(&cluster, &shard, &ownership, &cache, gained, budget, concurrency).await;
+                    pull_buckets(&cluster, &shard, &ownership, &cache, gained, budget, concurrency).await
+                };
+                // A pull the view moved past is planned again from the
+                // same starting point on the next change, which has
+                // already been published, so nothing gained is skipped.
+                if outcome != Outcome::Superseded {
+                    old_view = new_view;
                 }
             }
             _ = ticker.tick() => {
                 let due = residency.expired(disown_grace);
                 if !due.is_empty() {
+                    let view = ownership.current();
+                    let self_node = cluster.node_id();
+                    let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
+                    let mut reconciled: HashSet<NodeId> = HashSet::new();
+                    // An owner gossip no longer lists is unreachable by
+                    // definition; the view drops it on its next refresh.
+                    let mut unreachable: HashSet<NodeId> = due
+                        .iter()
+                        .flat_map(|&bucket| view.owners_of(bucket).iter().copied())
+                        .filter(|owner| *owner != self_node && !live.contains(owner))
+                        .collect();
+                    for owner in hand_off_owners(&view, self_node, &due, &live) {
+                        let outcome = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => return,
+                            outcome = anti_entropy::run_round_against(&cluster, &shard, &cache, owner) => outcome,
+                        };
+                        match outcome {
+                            RoundOutcome::Reconciled => {
+                                reconciled.insert(owner);
+                            }
+                            RoundOutcome::Failed => {
+                                unreachable.insert(owner);
+                            }
+                            RoundOutcome::Stale => {}
+                        }
+                    }
+                    let overdue = residency.expired(disown_grace * 2);
+                    let due = buckets_to_release(&view, self_node, &due, &overdue, &reconciled, &unreachable);
+                    if due.is_empty() {
+                        tracing::debug!(cache = %cache, "no released bucket's owners all answered its hand-off; holding until the next tick");
+                        continue;
+                    }
                     let removed = shard.release_buckets(&due).await;
                     residency.unmark(&due);
                     if removed > 0 {
@@ -392,6 +513,106 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert!(groups[0].0.is_empty());
+    }
+
+    #[test]
+    fn hand_off_owners_lists_each_live_current_owner_once_and_never_self() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
+        let view = view(self_node, eligible.clone(), 2);
+        let due: Vec<u16> = (0..256).collect();
+        let live: HashSet<NodeId> = eligible
+            .iter()
+            .copied()
+            .filter(|n| *n != self_node)
+            .collect();
+
+        let owners = hand_off_owners(&view, self_node, &due, &live);
+        let distinct: HashSet<NodeId> = owners.iter().copied().collect();
+        assert_eq!(owners.len(), distinct.len(), "each owner listed once");
+        assert!(
+            !owners.contains(&self_node),
+            "self is never a hand-off target"
+        );
+        for owner in &owners {
+            assert!(
+                due.iter().any(|&b| view.owners_of(b).contains(owner)),
+                "every listed owner owns a due bucket: {owner:?}"
+            );
+        }
+        for &bucket in &due {
+            for owner in view.owners_of(bucket) {
+                if *owner != self_node {
+                    assert!(
+                        owners.contains(owner),
+                        "every other owner of a due bucket is listed"
+                    );
+                }
+            }
+        }
+
+        let dead = eligible[1];
+        let mut live_minus_one = live.clone();
+        live_minus_one.remove(&dead);
+        assert!(
+            !hand_off_owners(&view, self_node, &due, &live_minus_one).contains(&dead),
+            "a dead owner is skipped"
+        );
+    }
+
+    #[test]
+    fn buckets_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
+        let view = view(self_node, eligible, 2);
+        let due: Vec<u16> = (0..256).collect();
+
+        let none: HashSet<NodeId> = HashSet::new();
+        let held = buckets_to_release(&view, self_node, &due, &[], &none, &none);
+        for &bucket in &held {
+            assert!(
+                view.owners_of(bucket).iter().all(|o| *o == self_node),
+                "with no owner answered, only a bucket owned by self alone is released: {bucket}"
+            );
+        }
+
+        let answered: HashSet<NodeId> = [NodeId::from(2)].into_iter().collect();
+        let released = buckets_to_release(&view, self_node, &due, &[], &answered, &none);
+        for &bucket in &due {
+            let all_answered = view
+                .owners_of(bucket)
+                .iter()
+                .all(|o| *o == self_node || answered.contains(o));
+            assert_eq!(
+                released.contains(&bucket),
+                all_answered,
+                "bucket {bucket} is released exactly when every other owner answered"
+            );
+        }
+        assert!(
+            released.len() < due.len(),
+            "some bucket waits on an owner that did not answer"
+        );
+
+        // Overdue: a stale owner still holds the bucket, an unreachable
+        // one no longer does.
+        let overdue: Vec<u16> = due.clone();
+        let still_held = buckets_to_release(&view, self_node, &due, &overdue, &none, &none);
+        assert_eq!(
+            still_held, held,
+            "an overdue bucket whose owners are merely stale stays resident"
+        );
+        let everyone: HashSet<NodeId> = (2..=5u64).map(NodeId::from).collect();
+        let dropped = buckets_to_release(&view, self_node, &due, &overdue, &none, &everyone);
+        assert_eq!(
+            dropped, due,
+            "an overdue bucket whose owners are all unreachable is released"
+        );
+        let mixed = buckets_to_release(&view, self_node, &due, &overdue, &answered, &everyone);
+        assert_eq!(
+            mixed, due,
+            "reconciled and unreachable owners together release"
+        );
     }
 
     #[tokio::test]

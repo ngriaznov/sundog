@@ -52,6 +52,11 @@ pub(crate) enum Outcome {
     /// The budget ran out before any donor finished; the cache stays cold
     /// and keeps trying.
     TimedOut,
+    /// The ownership view a bucket-scoped pull was planned against moved
+    /// on before every group landed: the pull is stale and a fresh one
+    /// against the current view runs at once. Never answered by a
+    /// whole-cache transfer, which has no view to move.
+    Superseded,
 }
 
 impl Outcome {
@@ -59,7 +64,7 @@ impl Outcome {
     /// cache to warm, or an origin that receives the cache should a peer
     /// with it appear.
     pub(crate) const fn needs_warm_up(self) -> bool {
-        matches!(self, Self::NoPeers | Self::TimedOut)
+        matches!(self, Self::NoPeers | Self::TimedOut | Self::Superseded)
     }
 }
 
@@ -79,6 +84,9 @@ pub(crate) enum WarmUpStep {
     WaitForPeer,
     /// The transfer timed out; wait one `ae_interval`, then run again.
     RetryLater,
+    /// The ownership view moved mid-pull; run again at once against the
+    /// current view.
+    RetryNow,
     /// Timed out [`MAX_WARM_UP_ATTEMPTS`] times running; mark the cache warm
     /// with what landed and end.
     WarmAnyway,
@@ -88,6 +96,7 @@ pub(crate) fn next_warm_up_step(outcome: Outcome, attempt: u32) -> WarmUpStep {
     match outcome {
         Outcome::Completed | Outcome::NoDonor | Outcome::Skipped => WarmUpStep::Done,
         Outcome::NoPeers => WarmUpStep::WaitForPeer,
+        Outcome::Superseded => WarmUpStep::RetryNow,
         Outcome::TimedOut if attempt >= MAX_WARM_UP_ATTEMPTS => WarmUpStep::WarmAnyway,
         Outcome::TimedOut => WarmUpStep::RetryLater,
     }
@@ -280,7 +289,10 @@ pub(crate) async fn warm_up_task(
         attempt += 1;
         match next_warm_up_step(outcome, attempt) {
             WarmUpStep::Done => return,
-            WarmUpStep::WaitForPeer => {}
+            // A whole-cache transfer has no view to move, so `RetryNow`
+            // never comes back here; running again at once is the right
+            // reaction regardless.
+            WarmUpStep::WaitForPeer | WarmUpStep::RetryNow => {}
             WarmUpStep::RetryLater => {
                 tokio::select! {
                     biased;
@@ -478,6 +490,10 @@ mod tests {
             WarmUpStep::WaitForPeer
         );
         assert_eq!(
+            next_warm_up_step(Outcome::Superseded, MAX_WARM_UP_ATTEMPTS + 1),
+            WarmUpStep::RetryNow
+        );
+        assert_eq!(
             next_warm_up_step(Outcome::TimedOut, 1),
             WarmUpStep::RetryLater
         );
@@ -495,6 +511,7 @@ mod tests {
     fn needs_warm_up_only_after_no_peers_or_a_timeout() {
         assert!(Outcome::NoPeers.needs_warm_up());
         assert!(Outcome::TimedOut.needs_warm_up());
+        assert!(Outcome::Superseded.needs_warm_up());
         assert!(!Outcome::Completed.needs_warm_up());
         assert!(!Outcome::NoDonor.needs_warm_up());
         assert!(!Outcome::Skipped.needs_warm_up());

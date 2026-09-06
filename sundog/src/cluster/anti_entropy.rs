@@ -25,7 +25,7 @@ use super::sketch::{Cell, Decoded, Iblt};
 use crate::hlc::Hlc;
 use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, MsgClass};
 use crate::node::NodeId;
-use crate::store::ShardOps;
+use crate::store::{ShardOps, bucket_of};
 
 /// Runs anti-entropy for one shard while `cancel` stays live: every jittered
 /// `ae_interval`, picks one live peer, a dirty-marked one first, and runs
@@ -62,7 +62,7 @@ pub(crate) async fn scheduler_task(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            () = run_round_against(&cluster, &shard, &cache, peer) => {}
+            _ = run_round_against(&cluster, &shard, &cache, peer) => {}
         }
     }
 }
@@ -130,6 +130,22 @@ fn pick_peer(cluster: &Cluster, shard: &Arc<dyn ShardOps>) -> Option<(NodeId, bo
     Some((peer, was_dirty))
 }
 
+/// How one [`run_round_against`] ended: whether the digest exchange with
+/// the peer completed, so its repairs ran, or the round stopped before any
+/// repair. A bucket hand-off in `rebalance::rebalance_task` releases a
+/// bucket only once a round against each of its new owners reports
+/// [`RoundOutcome::Reconciled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoundOutcome {
+    /// The digest exchange completed and every mismatch was repaired as far
+    /// as the peer answered.
+    Reconciled,
+    /// The peer's ownership view differs from this node's: no repair ran.
+    Stale,
+    /// The digest exchange itself failed: no repair ran.
+    Failed,
+}
+
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
 /// mismatched buckets. Keys this node has newer, or `peer` lacks, push via
 /// the normal `Replicate` path; keys `peer` has newer, or this node lacks,
@@ -150,7 +166,7 @@ pub(crate) async fn run_round_against(
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
-) {
+) -> RoundOutcome {
     let mesh = cluster.mesh();
     let mismatched = match shard.ownership_view_hash() {
         Some(view_hash) => {
@@ -173,11 +189,11 @@ pub(crate) async fn run_round_against(
                         responder_view_hash,
                         "anti-entropy round ended: responder's view has diverged"
                     );
-                    return;
+                    return RoundOutcome::Stale;
                 }
                 Err(error) => {
                     tracing::debug!(%error, "anti-entropy scoped digest exchange failed");
-                    return;
+                    return RoundOutcome::Failed;
                 }
             }
         }
@@ -188,13 +204,13 @@ pub(crate) async fn run_round_against(
             Ok(mismatched) => mismatched,
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy digest exchange failed");
-                return;
+                return RoundOutcome::Failed;
             }
         },
     };
     if mismatched.is_empty() {
         tracing::trace!("no mismatched buckets");
-        return;
+        return RoundOutcome::Reconciled;
     }
 
     // Buckets past `ae_part_min_bucket` answered with part digests never
@@ -267,7 +283,25 @@ pub(crate) async fn run_round_against(
         }
     }
 
+    retain_owned_pulls(shard, &mut pull_keys, &mut pull_hashes);
     apply_repairs(mesh, shard, cache, peer, push_keys, pull_keys, pull_hashes).await;
+    RoundOutcome::Reconciled
+}
+
+/// Drops every queued pull for a bucket a `Mode::Distributed` shard does
+/// not own: a round against a new owner of a bucket this node is releasing
+/// pushes what the owner lacks and leaves the owner's own entries where
+/// they are, instead of pulling them into the inbound guard. Identity for
+/// a shard with no ownership view.
+fn retain_owned_pulls(
+    shard: &Arc<dyn ShardOps>,
+    pull_keys: &mut Vec<Bytes>,
+    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+) {
+    if let Some(view) = shard.ownership_view() {
+        pull_keys.retain(|key| view.owns(bucket_of(key)));
+        pull_hashes.retain(|(bucket, _)| view.owns(*bucket));
+    }
 }
 
 /// Classifies buckets answered with a listing or sketch

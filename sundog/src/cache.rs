@@ -503,6 +503,36 @@ async fn distributed_warm_and_rebalance(
 
     let budget = cluster.config().state_transfer_budget;
     let concurrency = cluster.config().rebalance_concurrency;
+    let disown_grace =
+        cluster.config().ae_interval * cluster.config().distributed_disown_grace_rounds;
+    // The refresh and rebalance loops run from before the first pull: a
+    // membership change during it moves the view under the pull, which then
+    // answers `Superseded` and is planned again, instead of the view
+    // standing still until the pull's whole budget has passed.
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::ownership::refresh_task(
+            cluster.clone(),
+            name.clone(),
+            owners,
+            view_tx,
+            cancel.clone(),
+        ),
+    );
+    cluster.spawn_tracked_in(
+        tasks,
+        crate::cluster::rebalance::rebalance_task(
+            cluster.clone(),
+            Arc::clone(&shard_ops),
+            ownership.clone(),
+            residency,
+            name.clone(),
+            disown_grace,
+            concurrency,
+            cancel.clone(),
+        ),
+    );
+
     let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
     let outcome = crate::cluster::rebalance::pull_buckets(
         cluster,
@@ -520,7 +550,7 @@ async fn distributed_warm_and_rebalance(
             crate::cluster::rebalance::warm_up_task(
                 cluster.clone(),
                 Arc::clone(&shard_ops),
-                ownership.clone(),
+                ownership,
                 name.clone(),
                 budget,
                 concurrency,
@@ -530,32 +560,6 @@ async fn distributed_warm_and_rebalance(
     } else {
         cluster.mark_warm(name);
     }
-
-    let disown_grace =
-        cluster.config().ae_interval * cluster.config().distributed_disown_grace_rounds;
-    cluster.spawn_tracked_in(
-        tasks,
-        crate::ownership::refresh_task(
-            cluster.clone(),
-            name.clone(),
-            owners,
-            view_tx,
-            cancel.clone(),
-        ),
-    );
-    cluster.spawn_tracked_in(
-        tasks,
-        crate::cluster::rebalance::rebalance_task(
-            cluster.clone(),
-            Arc::clone(&shard_ops),
-            ownership,
-            residency,
-            name.clone(),
-            disown_grace,
-            concurrency,
-            cancel.clone(),
-        ),
-    );
     cluster.spawn_tracked_in(
         tasks,
         crate::cluster::anti_entropy::scheduler_task(
@@ -1425,6 +1429,134 @@ mod tests {
 
         cache_b.close().await;
         cache_a.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// Polls until every key in `0..total` is held by exactly the two
+    /// owners every node's view agrees on, or panics after 30 seconds with
+    /// a histogram of keys by holder count.
+    async fn wait_until_settled_on_agreed_owners(
+        nodes: &[(NodeId, &Cache<u32, String>)],
+        total: u32,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut by_holders = [0u32; 4];
+            let mut settled = 0u32;
+            for key in 0..total {
+                let expected = format!("v{key}");
+                let mut owners: Vec<Vec<NodeId>> = Vec::new();
+                let mut holders: Vec<NodeId> = Vec::new();
+                for (node, cache) in nodes {
+                    let mut view_owners = cache.owners_of(&key);
+                    view_owners.sort_unstable();
+                    owners.push(view_owners);
+                    if cache.get(&key).await.as_deref() == Some(expected.as_str()) {
+                        holders.push(*node);
+                    }
+                }
+                holders.sort_unstable();
+                by_holders[holders.len()] += 1;
+                if owners.iter().all(|o| *o == owners[0])
+                    && owners[0].len() == 2
+                    && holders == owners[0]
+                {
+                    settled += 1;
+                }
+            }
+            if settled == total {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "every key settles on exactly its two agreed owners with nothing lost; settled {settled} of {total}, keys by holder count [0, 1, 2, 3]: {by_holders:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn two_nodes_joining_at_once_lose_no_bucket_the_origin_releases() {
+        // `a` holds everything alone. `b` and `c` learn of each other and of
+        // `a` before either opens the cache, so both first views already
+        // place about a third of the buckets on {b, c}: a pull from the
+        // other joiner finds nothing there. `a`'s release hands those
+        // buckets off before dropping them.
+        let name = "distributed-double-join";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = a
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("a opens alone");
+        let total = 300u32;
+        for key in 0..total {
+            cache_a
+                .insert(key, format!("v{key}"))
+                .await
+                .expect("a owns every bucket while alone");
+        }
+        let seed = a.local_gossip_addr();
+        let b = Cluster::builder(name)
+            .seeds([seed])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        let c = Cluster::builder(name)
+            .seeds([seed])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node c builds");
+        wait_for_peer_count(&b, 2).await;
+        wait_for_peer_count(&c, 2).await;
+        let (cache_b, cache_c) = tokio::join!(
+            b.cache::<u32, String>(name)
+                .mode(Mode::distributed())
+                .open(),
+            c.cache::<u32, String>(name)
+                .mode(Mode::distributed())
+                .open(),
+        );
+        let cache_b = cache_b.expect("b opens");
+        let cache_c = cache_c.expect("c opens");
+
+        // Past the disown grace (three anti-entropy intervals) plus the
+        // hand-off, every key is held by exactly the two owners every view
+        // agrees on: nothing lost, nothing lingering on the origin.
+        let nodes = [
+            (a.node_id(), &cache_a),
+            (b.node_id(), &cache_b),
+            (c.node_id(), &cache_c),
+        ];
+        let caches = [&cache_a, &cache_b, &cache_c];
+        wait_until_settled_on_agreed_owners(&nodes, total).await;
+        for key in 0..total {
+            for cache in caches {
+                assert_eq!(
+                    cache
+                        .fetch(&key)
+                        .await
+                        .expect("fetch reaches an owner")
+                        .as_deref(),
+                    Some(format!("v{key}").as_str()),
+                    "key {key} is fetchable from every node"
+                );
+            }
+        }
+
+        cache_c.close().await;
+        cache_b.close().await;
+        cache_a.close().await;
+        c.shutdown().await;
         b.shutdown().await;
         a.shutdown().await;
     }

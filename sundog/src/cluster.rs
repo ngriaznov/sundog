@@ -3418,7 +3418,11 @@ mod tests {
 
         let name = SmolStr::new("users");
         let shard_b = registered_shard(&cluster_b, &name);
-        crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a).await;
+        assert_eq!(
+            crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a)
+                .await,
+            crate::cluster::anti_entropy::RoundOutcome::Reconciled
+        );
 
         assert_eq!(
             cache_b.get(&target_key).await,
@@ -3510,7 +3514,11 @@ mod tests {
         assert_eq!(cache_b.get(&extra_key).await, Some(extra_value.clone()));
         assert_eq!(cache_a.get(&extra_key).await, None, "a never had this key");
 
-        crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a).await;
+        assert_eq!(
+            crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a)
+                .await,
+            crate::cluster::anti_entropy::RoundOutcome::Reconciled
+        );
 
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3658,8 +3666,16 @@ mod tests {
             "two independently-solo nodes compute different view hashes"
         );
 
-        crate::cluster::anti_entropy::run_round_against(&cluster_a, &shard_a, &name, peer_b.node)
-            .await;
+        assert_eq!(
+            crate::cluster::anti_entropy::run_round_against(
+                &cluster_a,
+                &shard_a,
+                &name,
+                peer_b.node
+            )
+            .await,
+            crate::cluster::anti_entropy::RoundOutcome::Stale
+        );
 
         assert_eq!(
             cache_a.get(&1).await,
