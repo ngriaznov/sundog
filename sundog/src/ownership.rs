@@ -18,8 +18,10 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use smol_str::SmolStr;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::cluster::Cluster;
 use crate::membership::{CacheModes, Peer};
 use crate::node::NodeId;
 use crate::store::{BUCKET_COUNT, Mode};
@@ -125,10 +127,7 @@ pub(crate) fn shared_owned_buckets(view: &OwnershipView, peer: NodeId) -> Vec<u1
 
 /// The buckets gained and lost between two successive [`OwnershipView`]s for
 /// the same cache: a pure set difference over each view's owned-bucket set.
-#[allow(
-    dead_code,
-    reason = "read by the rebalance trigger once it is wired up"
-)]
+/// [`crate::cluster::rebalance::rebalance_task`]'s trigger input.
 pub(crate) fn ownership_diff(old: &OwnershipView, new: &OwnershipView) -> (Vec<u16>, Vec<u16>) {
     let gained: Vec<u16> = new.owned_buckets().filter(|&b| !old.owns(b)).collect();
     let lost: Vec<u16> = old.owned_buckets().filter(|&b| !new.owns(b)).collect();
@@ -147,10 +146,6 @@ pub(crate) type OwnerSet = Vec<NodeId>;
 #[derive(Debug)]
 pub(crate) struct OwnershipView {
     view_hash: u64,
-    #[allow(
-        dead_code,
-        reason = "kept for the donor-exclusion and debug-logging uses the rebalance and anti-entropy paths add once they are wired up"
-    )]
     self_node: NodeId,
     owners: Vec<OwnerSet>,
     owned: [u64; BUCKET_COUNT / 64],
@@ -193,20 +188,12 @@ impl OwnershipView {
     /// This view's identity: two views with equal `view_hash` (and equal
     /// `k`, which is gossip-validated before either view is built) hold
     /// identical per-bucket ownership.
-    #[allow(
-        dead_code,
-        reason = "read by the epoch check on the fetch/anti-entropy/rebalance wire paths once they are wired up"
-    )]
     pub(crate) const fn view_hash(&self) -> u64 {
         self.view_hash
     }
 
     /// Whether `self_node` owns `bucket`. `false` for a bucket at or past
     /// [`BUCKET_COUNT`].
-    #[allow(
-        dead_code,
-        reason = "read by the write/inbound guards and outbound serving once they are wired up"
-    )]
     pub(crate) fn owns(&self, bucket: u16) -> bool {
         let idx = usize::from(bucket);
         idx < BUCKET_COUNT && self.owned[idx / 64] & (1u64 << (idx % 64)) != 0
@@ -214,10 +201,6 @@ impl OwnershipView {
 
     /// `bucket`'s live owners, highest rendezvous score first. Empty for a
     /// bucket at or past [`BUCKET_COUNT`].
-    #[allow(
-        dead_code,
-        reason = "read by fetch's owner ordering and fan-out grouping once they are wired up"
-    )]
     pub(crate) fn owners_of(&self, bucket: u16) -> &[NodeId] {
         self.owners
             .get(usize::from(bucket))
@@ -225,10 +208,6 @@ impl OwnershipView {
     }
 
     /// Every bucket `self_node` owns, ascending.
-    #[allow(
-        dead_code,
-        reason = "read by rebalance's initial pull and ownership_diff once they are wired up"
-    )]
     pub(crate) fn owned_buckets(&self) -> impl Iterator<Item = u16> + '_ {
         (0..BUCKET_COUNT).filter_map(move |i| {
             let bucket = u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
@@ -275,10 +254,6 @@ impl OwnershipTracker {
 
     /// A fresh subscription for a caller that awaits the next change, such
     /// as a rebalance trigger.
-    #[allow(
-        dead_code,
-        reason = "subscribed to by the rebalance trigger once it is wired up"
-    )]
     pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<OwnershipView>> {
         self.view.clone()
     }
@@ -305,7 +280,6 @@ impl ResidencySet {
     /// Marks each of `buckets` as releasing, starting its grace clock. A
     /// bucket already releasing keeps its original clock: only a call to
     /// [`ResidencySet::unmark`] in between resets it.
-    #[allow(dead_code, reason = "called by the rebalance loop once it is wired up")]
     pub(crate) fn mark_releasing(&self, buckets: &[u16]) {
         let now = Instant::now();
         let mut releasing = self.releasing.write();
@@ -317,7 +291,6 @@ impl ResidencySet {
     /// Clears the release clock for each of `buckets`: for one that regains
     /// ownership before its grace elapsed, so a flap never accumulates
     /// toward release.
-    #[allow(dead_code, reason = "called by the rebalance loop once it is wired up")]
     pub(crate) fn unmark(&self, buckets: &[u16]) {
         let mut releasing = self.releasing.write();
         for bucket in buckets {
@@ -326,16 +299,11 @@ impl ResidencySet {
     }
 
     /// Whether `bucket` is currently mid disown-grace.
-    #[allow(
-        dead_code,
-        reason = "read by anti-entropy's cohort widening and donor-serving exception once they are wired up"
-    )]
     pub(crate) fn is_releasing(&self, bucket: u16) -> bool {
         self.releasing.read().contains_key(&bucket)
     }
 
     /// Buckets whose grace has elapsed: due for physical release.
-    #[allow(dead_code, reason = "called by the rebalance loop once it is wired up")]
     pub(crate) fn expired(&self, grace: Duration) -> Vec<u16> {
         let now = Instant::now();
         self.releasing
@@ -344,6 +312,68 @@ impl ResidencySet {
             .filter(|&(_, since)| now.saturating_duration_since(*since) >= grace)
             .map(|(&bucket, _)| bucket)
             .collect()
+    }
+}
+
+/// Recomputes and republishes `cache`'s view on every change to `cluster`'s
+/// live peer set or its advertised cache modes, for as long as `cancel`
+/// stays live. Spawned once [`Shard::with_ownership`](crate::store::Shard::with_ownership)
+/// has already installed `tx`'s receiver half, so this task's first publish
+/// is already the second view a reader could ever see, never the first.
+/// Publishes with [`watch::Sender::send_if_modified`], keyed on
+/// `view_hash`, so a peer's unrelated gossip key changing never ripples
+/// through this cache: the `sundog_owned_buckets` gauge only moves on a
+/// real ownership change.
+pub(crate) async fn refresh_task(
+    cluster: Cluster,
+    cache: SmolStr,
+    k: NonZeroU8,
+    tx: watch::Sender<Arc<OwnershipView>>,
+    cancel: CancellationToken,
+) {
+    let self_node = cluster.node_id();
+    let mut peers = cluster.peers_watch();
+    let mut modes = cluster.cache_modes_watch();
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            changed = peers.changed() => {
+                if changed.is_err() {
+                    return; // membership shut down
+                }
+            }
+            changed = modes.changed() => {
+                if changed.is_err() {
+                    return; // membership shut down
+                }
+            }
+        }
+        let peers_snapshot = peers.borrow_and_update().clone();
+        let modes_snapshot = modes.borrow_and_update().clone();
+        let eligible = eligible_owners(self_node, &peers_snapshot, &modes_snapshot, &cache, k);
+        let view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+        let new_hash = view.view_hash();
+        let published = tx.send_if_modified(|current| {
+            if current.view_hash() == new_hash {
+                false
+            } else {
+                *current = Arc::clone(&view);
+                true
+            }
+        });
+        if published {
+            let owned = u32::try_from(view.owned_buckets().count()).unwrap_or(u32::MAX);
+            metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string())
+                .set(f64::from(owned));
+            tracing::debug!(
+                cache = %cache,
+                self_node = %view.self_node,
+                view_hash = new_hash,
+                owned_buckets = owned,
+                "ownership view republished"
+            );
+        }
     }
 }
 
