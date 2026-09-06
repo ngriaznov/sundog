@@ -10,8 +10,8 @@
 sundog is an embedded, replicated cache for Rust services. Every instance on the
 network finds the others, forms a cluster over gossip, and keeps named caches
 coherent between them. No cache server, no coordinator, no config beyond a
-cluster name. Caches run in one of three modes: invalidation, full replication,
-or local-only.
+cluster name. Caches run in one of four modes: invalidation, full replication,
+distributed, or local-only.
 
 It's named for the [parhelion](https://en.wikipedia.org/wiki/Sun_dog), the
 optical effect where ice crystals render extra copies of the sun next to the
@@ -145,13 +145,14 @@ listing-or-sketch rule at part scale. That third tier is what keeps repairing
 one changed key in a 100M-entry cache cheap: a bucket-level listing there costs
 megabytes, a part digest exchange costs a few hundred bytes.
 
-## The three modes
+## The four modes
 
 | Mode | Each node stores | On write | On read | Pick this when |
 |---|---|---|---|---|
 | `Local` | its own data, nothing shared | nothing sent | local only | you want a fast in-process cache with TTL and bounded size, and no cluster traffic at all |
 | `Invalidation` (default) | its own working set | broadcasts "this key changed" | local, may be momentarily stale | the dataset is big or expensive to hold everywhere, and each node mostly cares about its own hot keys |
 | `Replicated` | a full copy of everything | broadcasts the value | always local, never waits on the network | the dataset is small enough to duplicate, and you want reads to never touch the network |
+| `Distributed` | the buckets it owns, `k` live owners per key (2 by default, via `Mode::distributed()`) | forwarded to the key's owners, applied only there | `get` is local-only; `fetch` asks an owner | the dataset is too big to hold on every node, but must survive a node loss |
 
 `Invalidation` never sends values between nodes: a write on A tells B "your copy
 of this key is stale," and B drops it or reloads it on next access. `Replicated`
@@ -159,6 +160,41 @@ alone runs state transfer on join, a new node pulling a full snapshot from an
 existing peer that has finished its own, then reconciling with every other
 peer once. It also keeps a background anti-entropy loop running while the
 cache is open.
+
+`Distributed` splits a cache into 1,024 anti-entropy buckets
+(`xxh3(key) & 1023`), each assigned to its `k` live owners by rendezvous
+hashing over the peers that advertise the same cache under the same mode and
+owner count. The view recomputes from gossip membership, so ownership
+converges a few gossip intervals after a join or leave, not instantly. A node
+that gains a bucket pulls it from the previous owners; one that loses a bucket
+keeps serving it for `distributed_disown_grace_rounds` anti-entropy intervals
+before dropping it, giving the new owner's pull time to land. A write for a
+bucket this node doesn't own is forwarded to that bucket's owners and never
+applied locally, so no external routing is required — though a local `get`
+right after a forwarded write still misses, since only the owners hold it.
+`get` stays local-only everywhere, returning `None` off a non-owner; `fetch`
+is the network-aware read, trying live owners in rendezvous order and
+returning `Ok(None)` for a genuine miss or `CacheError::FetchUnavailable` once
+every owner has timed out inside `fetch_timeout`. `owners_of` reports a key's
+current owners in that same order. `owners` must be at least 2
+(`CacheError::TooFewOwners` otherwise), a finite `max_capacity` needs a
+`spill` tier exactly as `Replicated` requires, `tti` is rejected outright, and
+two peers disagreeing on `owners` for the same cache name hit
+`CacheError::ModeMismatch` like any other mode conflict.
+
+```rust
+let prices = cluster
+    .cache::<Sku, Price>("prices")
+    .mode(Mode::distributed()) // k = 2 owners per bucket
+    .open()
+    .await?;
+
+prices.insert(sku.clone(), Price(999)).await?; // forwarded if this node isn't an owner
+match prices.fetch(&sku).await? {
+    Some(price) => { /* found: local, or read from an owner */ }
+    None => { /* a genuine miss */ }
+}
+```
 
 Every node gossips the mode of each cache it has open; opening a name under a
 mode that conflicts with a live peer fails with `CacheError::ModeMismatch`. TTL
@@ -172,8 +208,13 @@ answers a peer only with what that peer's version understands: an older peer
 never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
-0.4 speaks protocol 2 and serves 0.3's protocol 1; a container test runs the
-previous release's node against the current one in both roles.
+The current release speaks protocol 3 and serves protocol 2, the release
+before it; a container test runs the previous release's node against the
+current one in both roles. Distribution mode's message kinds — `Fetch`,
+`FetchReply`, `AeDigestScoped`, `StBuckets`, `StBucketChunk`, and `StaleView`
+— are gated on protocol 3: a distributed cache forms only among protocol-3
+peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
+own a bucket and never receives one of these messages at all.
 
 ## How nodes find each other
 
@@ -240,6 +281,16 @@ Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
+A `Mode::Distributed` cache adds six more: `sundog_owned_buckets{cache}`, this
+node's current bucket count; `sundog_rebalance_buckets_total{cache,
+direction}`, buckets rebalance pulled in or released out; `sundog_fetch_total{
+cache, outcome}`, each `Cache::fetch` call's outcome (`local`, `remote`,
+`miss`, or `error`); `sundog_forwarded_writes_total{cache}`, writes this node
+forwarded to a bucket's owners instead of applying; `sundog_stale_view_total{
+cache}`, anti-entropy rounds a peer declined over a mismatched ownership view;
+and `sundog_unowned_inbound_dropped_total{cache}`, inbound records dropped for
+a bucket this node neither owns nor is mid disown-grace on.
+
 `Cluster::is_ready()` and `Cluster::health()` report whether every open
 `Mode::Replicated` cache has finished its state transfer; a `Local` or
 `Invalidation` cache is warm from the moment it opens, so it never holds
@@ -264,7 +315,9 @@ Five layers, cheapest and highest-signal first:
    loss, reordering, duplication; a donor dying mid-state-transfer; a forced
    low `ae_sketch_min_bucket` driving the IBLT sketch path itself, and a forced
    low `ae_part_min_bucket` driving the part-digest path, both under the same
-   loss and reordering.
+   loss and reordering; and a `Mode::Distributed` cluster churning membership
+   under loss and reordering, checking that every bucket's data converges
+   across its current owners with no non-owner ever holding one.
 3. **Container integration** runs via
    [`rightsize`](https://crates.io/crates/rightsize) in
    `sundog/tests/containers.rs`, no Docker CLI, no `bollard`. Multi-node
@@ -276,10 +329,15 @@ Five layers, cheapest and highest-signal first:
    cost pinned via `netstats` under a lowered `ae_part_min_bucket`, a bulk
    fill's wire cost pinned via `netstats` against the fan-out queue
    duplicating it, high-churn add/remove/TTL workloads draining to zero, and
-   64 KiB values verified byte-for-byte. Each node is `sundog-testnode`, a tiny
-   static/musl binary driven over a line-based control protocol. It sits behind
-   an env var, so plain `cargo test --workspace` still compiles without a
-   container backend:
+   64 KiB values verified byte-for-byte, and, for `Mode::Distributed`, bucket
+   ownership settling correctly across joins and leaves, a rebalance pull
+   landing after a new owner joins, and a disowned bucket still answering
+   `fetch` through its grace period. Each node is `sundog-testnode`, a tiny
+   static/musl binary driven over a line-based control protocol, and reads
+   `SUNDOG_TESTNODE_MODE=distributed` (with `SUNDOG_TESTNODE_OWNERS` to pick
+   `owners`, default 2) to open `"it"` as a distributed cache instead of
+   `Mode::Replicated`. It sits behind an env var, so plain `cargo test
+   --workspace` still compiles without a container backend:
 
    ```sh
    SUNDOG_CONTAINER_TESTS=1 cargo test --release -p sundog --test containers -- --test-threads=1
@@ -294,7 +352,10 @@ Five layers, cheapest and highest-signal first:
    - **Chaos lane**: `chaos_crashes_churn_and_drops_still_converge` runs a
      seeded random mix of crashes, churn, dropped keys, refills, and put
      bursts against a four-node cluster for `SUNDOG_CHAOS_SECS` seconds, then
-     checks that every node converges to the same content. `SUNDOG_CHAOS_SEED`
+     checks that every node converges to the same content.
+     `chaos_distributed_crashes_churn_and_drops_still_converge` runs the same
+     mix against a `Mode::Distributed` cluster instead, checking that every
+     bucket converges across its current owners alone. `SUNDOG_CHAOS_SEED`
      pins a run for replay; `nightly-chaos.yml` runs it for ten minutes with a
      fresh seed, logged so a red night replays with
      `SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=<secs>
