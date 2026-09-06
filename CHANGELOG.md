@@ -3,9 +3,7 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
-
-Both changes below are breaking; the next release is 0.5.0.
+## [0.5.0] – 2026-09-06
 
 ### Added
 

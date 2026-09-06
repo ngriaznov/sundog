@@ -78,7 +78,7 @@ pub fn build_testnode() -> &'static Path {
 
 /// The release whose test node [`build_previous_testnode`] builds: the one
 /// this checkout must interoperate with across a rolling upgrade.
-pub const PREVIOUS_RELEASE_TAG: &str = "v0.4.0";
+pub const PREVIOUS_RELEASE_TAG: &str = "v0.4.1";
 
 /// Builds the previous release's `sundog-testnode` from its git tag, once per
 /// test process, into `target/prev-release/` and returns the musl binary
