@@ -2096,6 +2096,15 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
             BURST_COUNT,
         );
         if let ChaosAction::Crash { node: idx } = action {
+            // A crash right after a burst can take the only copy of a key
+            // whose fan-out has not left the node yet, and a crash right
+            // after a drop takes the second copy of a key anti-entropy has
+            // not repaired yet: two failures against two owners, which no
+            // design with two owners survives. Every crash therefore waits
+            // for the cluster to be settled first, exactly as it waits
+            // afterwards.
+            let expected_sum = usize::from(OWNERS) * (FILL_KEYS as usize + burst_entries.len());
+            wait_for_entry_sum(&nodes, expected_sum, RESETTLE_WAIT, iteration).await;
             crashes += 1;
             crash_and_respawn_mode(
                 &mut nodes,
@@ -2109,10 +2118,8 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
             .await;
             // With two owners per bucket, a crash leaves every bucket the
             // victim owned on one live node until its new owner has pulled
-            // it; a second crash inside that window can take the last copy,
-            // which no design with two owners survives. The next action
-            // waits until every key is back on two owners.
-            let expected_sum = usize::from(OWNERS) * (FILL_KEYS as usize + burst_entries.len());
+            // it; a second crash inside that window can take the last copy.
+            // The next action waits until every key is back on two owners.
             wait_for_entry_sum(&nodes, expected_sum, RESETTLE_WAIT, iteration).await;
             eprintln!("chaos[{iteration}]: every key is back on {OWNERS} owners");
         } else {
