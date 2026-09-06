@@ -2988,25 +2988,36 @@ mod tests {
         });
 
         // Drop all but the last 5 keys on B: a true difference of 25
-        // elements in one bucket, past what a 6-cell sketch can peel.
-        for &key in &colliding_keys[..colliding_keys.len() - 5] {
-            cache_b.invalidate_local(&key).await;
-        }
-        assert_eq!(cache_b.entry_count().await, 5);
-
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if cache_b.entry_count().await == total {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        // elements in one bucket, past what a 6-cell sketch can peel. A
+        // round that lands in the middle of the drops sees a smaller
+        // difference the sketch still peels, so the cycle repeats until the
+        // oversized difference reaches the fallback path.
+        for attempt in 1..=5 {
+            for &key in &colliding_keys[..colliding_keys.len() - 5] {
+                cache_b.invalidate_local(&key).await;
             }
-        })
-        .await
-        .expect("the fallback listing path repairs every dropped entry within the bound");
 
-        for &key in &colliding_keys {
-            assert_eq!(cache_b.get(&key).await, Some(key.to_string()));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if cache_b.entry_count().await == total {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "attempt {attempt}: anti-entropy repairs every dropped entry within the bound"
+                )
+            });
+
+            for &key in &colliding_keys {
+                assert_eq!(cache_b.get(&key).await, Some(key.to_string()));
+            }
+            if fallback.load(Ordering::SeqCst) > 0 {
+                break;
+            }
         }
 
         assert!(
