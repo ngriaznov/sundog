@@ -448,6 +448,14 @@ pub trait ShardOps: Send + Sync {
         Box::pin(async { 0 })
     }
 
+    /// Whether `bucket` is owned by this `Mode::Distributed` shard but not
+    /// yet pulled from a co-owner, so a local miss there is not an answer.
+    /// `false` for every other mode.
+    fn is_cold_bucket(&self, bucket: u16) -> bool {
+        let _ = bucket;
+        false
+    }
+
     /// Narrows anti-entropy's `dirty`/`live` peer candidates to this
     /// shard's current cohort before `pick_peer`'s random choice runs.
     /// Identity for every mode but `Mode::Distributed`, whose override
@@ -820,6 +828,13 @@ where
         self.ownership = Some(tracker);
         self.residency = Some(residency);
         self
+    }
+
+    /// The residency set [`Shard::with_ownership`] attached, for a test
+    /// that marks a bucket cold or releasing by hand.
+    #[cfg(test)]
+    pub(crate) fn residency(&self) -> Option<&Arc<ResidencySet>> {
+        self.residency.as_ref()
     }
 
     /// Installs a custom per-entry weigher for size-bounded eviction, in place
@@ -2334,6 +2349,12 @@ where
     fn release_buckets(&self, buckets: &[u16]) -> BoxFuture<'_, u64> {
         let removed = self.engine.release_buckets(buckets);
         Box::pin(async move { removed })
+    }
+
+    fn is_cold_bucket(&self, bucket: u16) -> bool {
+        self.residency
+            .as_ref()
+            .is_some_and(|residency| residency.is_cold(bucket))
     }
 
     fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
@@ -4613,6 +4634,25 @@ mod tests {
             Some(0),
             "the released bucket's digest resets to zero"
         );
+    }
+
+    #[test]
+    fn is_cold_bucket_follows_the_residency_set_and_is_false_elsewhere() {
+        let plain = shard::<u32, String>(1);
+        assert!(!ShardOps::is_cold_bucket(&plain, 7));
+
+        let residency = Arc::new(ResidencySet::new());
+        let (s, _view, _tx) = distributed_shard::<u32, String>(
+            NodeId::from(1),
+            (1..=3u64).map(NodeId::from).collect(),
+            2,
+            Arc::clone(&residency),
+        );
+        assert!(!ShardOps::is_cold_bucket(&s, 7));
+        residency.mark_cold(&[7]);
+        assert!(ShardOps::is_cold_bucket(&s, 7));
+        residency.clear_cold(&[7]);
+        assert!(!ShardOps::is_cold_bucket(&s, 7));
     }
 
     #[test]

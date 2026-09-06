@@ -10,7 +10,7 @@
 //! keeps serving for a grace period, so a new owner's transfer has time to
 //! land.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -264,13 +264,44 @@ impl OwnershipTracker {
 /// which stays strict current-view ownership.
 pub(crate) struct ResidencySet {
     releasing: RwLock<HashMap<u16, Instant>>,
+    /// Buckets this node owns but has not yet pulled from a co-owner: a
+    /// local miss there says nothing about the key, so a fetch asks the
+    /// other owners before answering `None`, and this node declines to
+    /// answer a remote fetch's miss for them. Cleared bucket by bucket as
+    /// each pull lands, or wholesale when the warm-up gives up.
+    cold: RwLock<HashSet<u16>>,
 }
 
 impl ResidencySet {
     pub(crate) fn new() -> Self {
         Self {
             releasing: RwLock::new(HashMap::new()),
+            cold: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Marks each of `buckets` cold: owned here, not yet pulled.
+    pub(crate) fn mark_cold(&self, buckets: &[u16]) {
+        self.cold.write().extend(buckets.iter().copied());
+    }
+
+    /// Clears the cold mark from each of `buckets`: their pull landed.
+    pub(crate) fn clear_cold(&self, buckets: &[u16]) {
+        let mut cold = self.cold.write();
+        for bucket in buckets {
+            cold.remove(bucket);
+        }
+    }
+
+    /// Clears every cold mark: the warm-up gave up, so what is here is what
+    /// there is.
+    pub(crate) fn clear_all_cold(&self) {
+        self.cold.write().clear();
+    }
+
+    /// Whether `bucket` is owned here but not yet pulled.
+    pub(crate) fn is_cold(&self, bucket: u16) -> bool {
+        self.cold.read().contains(&bucket)
     }
 
     /// Marks each of `buckets` as releasing, starting its grace clock. A
@@ -698,6 +729,22 @@ mod tests {
         set.unmark(&[3]);
         assert!(!set.is_releasing(3));
         assert!(set.is_releasing(4));
+    }
+
+    #[test]
+    fn residency_set_cold_marks_clear_per_bucket_or_all_at_once() {
+        let set = ResidencySet::new();
+        assert!(!set.is_cold(1));
+        set.mark_cold(&[1, 2, 3]);
+        assert!(set.is_cold(1) && set.is_cold(2) && set.is_cold(3));
+        assert!(
+            !set.is_releasing(1),
+            "cold and releasing are separate marks"
+        );
+        set.clear_cold(&[2]);
+        assert!(set.is_cold(1) && !set.is_cold(2) && set.is_cold(3));
+        set.clear_all_cold();
+        assert!(!set.is_cold(1) && !set.is_cold(3));
     }
 
     #[test]

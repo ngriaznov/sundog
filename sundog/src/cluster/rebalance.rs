@@ -93,6 +93,7 @@ async fn pull_one_group(
     mesh: &Mesh,
     cache: &SmolStr,
     ownership: &OwnershipTracker,
+    residency: &ResidencySet,
     donors: Vec<NodeId>,
     buckets: Vec<u16>,
     view_hash: u64,
@@ -110,6 +111,7 @@ async fn pull_one_group(
                 (DonorResult::Failed, 0)
             });
             if result == DonorResult::Done {
+                residency.clear_cold(&buckets);
                 return Some(count);
             }
         }
@@ -143,10 +145,12 @@ async fn pull_one_group(
 /// `ownership.current()` mid-pull answers [`Outcome::Superseded`] once
 /// every group has landed or given up: the caller plans afresh against
 /// the current view.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn pull_buckets(
     cluster: &Cluster,
     shard: &Arc<dyn ShardOps>,
     ownership: &OwnershipTracker,
+    residency: &Arc<ResidencySet>,
     cache: &SmolStr,
     buckets: Vec<u16>,
     budget: Duration,
@@ -155,6 +159,10 @@ pub(crate) async fn pull_buckets(
     if buckets.is_empty() {
         return Outcome::Completed;
     }
+    // Cold until each group's pull lands: a local miss in one of these is
+    // not an answer yet. Marking a bucket that already holds forwarded
+    // writes is harmless, since only a miss consults the mark.
+    residency.mark_cold(&buckets);
     if budget.is_zero() {
         tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained buckets to anti-entropy");
         return Outcome::Skipped;
@@ -184,6 +192,7 @@ pub(crate) async fn pull_buckets(
             let mesh = mesh.clone();
             let cache = cache.clone();
             let ownership = ownership.clone();
+            let residency = Arc::clone(residency);
             set.spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()
@@ -194,6 +203,7 @@ pub(crate) async fn pull_buckets(
                     &mesh,
                     &cache,
                     &ownership,
+                    &residency,
                     donors,
                     group_buckets,
                     view_hash,
@@ -243,10 +253,12 @@ pub(crate) async fn pull_buckets(
 /// analogue of [`state_transfer::warm_up_task`], sharing its
 /// [`state_transfer::next_warm_up_step`] decision and
 /// [`state_transfer::MAX_WARM_UP_ATTEMPTS`] cap.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn warm_up_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
     ownership: OwnershipTracker,
+    residency: Arc<ResidencySet>,
     cache: SmolStr,
     budget: Duration,
     concurrency: usize,
@@ -260,7 +272,7 @@ pub(crate) async fn warm_up_task(
         let outcome = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            outcome = pull_buckets(&cluster, &shard, &ownership, &cache, buckets, budget, concurrency) => outcome,
+            outcome = pull_buckets(&cluster, &shard, &ownership, &residency, &cache, buckets, budget, concurrency) => outcome,
         };
         attempt += 1;
         match state_transfer::next_warm_up_step(outcome, attempt) {
@@ -294,6 +306,7 @@ pub(crate) async fn warm_up_task(
                     attempts = attempt,
                     "rebalance pull timed out repeatedly; opening warm with what landed, anti-entropy carries the rest"
                 );
+                residency.clear_all_cold();
                 cluster.mark_warm(&cache);
                 return;
             }
@@ -435,7 +448,7 @@ pub(crate) async fn rebalance_task(
                     Outcome::Completed
                 } else {
                     tracing::debug!(cache = %cache, count = plan.to_pull.len(), "buckets gained; pulling from current owners");
-                    pull_buckets(&cluster, &shard, &ownership, &cache, plan.to_pull, budget, concurrency).await
+                    pull_buckets(&cluster, &shard, &ownership, &residency, &cache, plan.to_pull, budget, concurrency).await
                 };
                 // A pull the view moved past is planned again from the
                 // same starting point on the next change, which has
@@ -724,6 +737,7 @@ mod tests {
             &cluster,
             &shard,
             &tracker,
+            &Arc::new(ResidencySet::new()),
             &name,
             Vec::new(),
             Duration::from_secs(1),
@@ -762,6 +776,7 @@ mod tests {
             &cluster,
             &shard,
             &tracker,
+            &Arc::new(ResidencySet::new()),
             &name,
             vec![0, 1, 2],
             Duration::from_secs(1),
@@ -800,6 +815,7 @@ mod tests {
             cluster.clone(),
             empty_shard(),
             tracker,
+            Arc::new(ResidencySet::new()),
             name.clone(),
             Duration::from_millis(150),
             4,
@@ -858,6 +874,7 @@ mod tests {
             &cluster,
             &shard,
             &tracker,
+            &Arc::new(ResidencySet::new()),
             &name,
             vec![0],
             Duration::ZERO,

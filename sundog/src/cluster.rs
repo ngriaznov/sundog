@@ -883,7 +883,12 @@ impl RequestHandler for ClusterRequestHandler {
                     responder_view_hash: local_hash,
                 };
             }
+            let bucket = bucket_of(&key);
             let rec = shard.records_for(vec![key]).await.into_iter().next();
+            if rec.is_none() && shard.is_cold_bucket(bucket) {
+                // Owned but not yet pulled: a miss here is not an answer.
+                return FetchServe::Unavailable;
+            }
             FetchServe::Found(rec)
         })
     }

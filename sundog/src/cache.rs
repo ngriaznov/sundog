@@ -392,6 +392,8 @@ where
         owners,
     );
     let residency = Arc::new(ResidencySet::new());
+    let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
+    residency.mark_cold(&initially_owned);
     shard = shard.with_ownership(ownership.clone(), Arc::clone(&residency));
     (
         shard,
@@ -523,7 +525,7 @@ async fn distributed_warm_and_rebalance(
             cluster.clone(),
             Arc::clone(&shard_ops),
             ownership.clone(),
-            residency,
+            Arc::clone(&residency),
             name.clone(),
             disown_grace,
             concurrency,
@@ -536,6 +538,7 @@ async fn distributed_warm_and_rebalance(
         cluster,
         &shard_ops,
         &ownership,
+        &residency,
         name,
         initially_owned,
         budget,
@@ -549,6 +552,7 @@ async fn distributed_warm_and_rebalance(
                 cluster.clone(),
                 Arc::clone(&shard_ops),
                 ownership,
+                residency,
                 name.clone(),
                 budget,
                 concurrency,
@@ -660,10 +664,11 @@ where
     /// to a live owner, tried in rendezvous-score order until one answers.
     /// Never promotes the fetched value into the local store —
     /// [`Cache::get`] for the same key immediately afterward is still a
-    /// miss on this node. An owner answers from its own copy alone, this
-    /// node included: a bucket this node gained but has not yet pulled from
-    /// its previous owners reads `Ok(None)` until that pull lands, never a
-    /// fallback to another owner. On a cache that isn't
+    /// miss on this node. A bucket this node owns but has not yet pulled
+    /// from a co-owner is cold: a local miss there asks the other owners
+    /// before answering `Ok(None)`, and a remote owner answers a miss for a
+    /// cold bucket of its own with a decline, so the next owner is tried.
+    /// On a cache that isn't
     /// [`Mode::Distributed`] this is [`Cache::get`] wrapped in `Ok`, counted
     /// `outcome="local"` unconditionally, so callers don't need to branch
     /// on mode.
@@ -689,18 +694,29 @@ where
         };
         let key_bytes = encode_key(key)?;
         let bucket = bucket_of(&key_bytes);
-        if view.owns(bucket) {
+        let owns = view.owns(bucket);
+        if owns {
             let value = self.shard.get(key).await;
-            record_fetch_outcome(self.shard.name(), "local");
-            return Ok(value);
+            // A miss in a bucket not yet pulled from a co-owner is not an
+            // answer: the other owners are asked first.
+            if value.is_some() || !self.shard.is_cold_bucket(bucket) {
+                record_fetch_outcome(self.shard.name(), "local");
+                return Ok(value);
+            }
         }
 
         let cache_name = SmolStr::new(self.shard.name());
         let mesh = self.cluster.mesh();
         let attempt_timeout = self.cluster.config().fetch_timeout;
 
+        let self_node = self.cluster.node_id();
         let mut view = view;
-        let mut owners = view.owners_of(bucket).to_vec();
+        let mut owners: Vec<NodeId> = view
+            .owners_of(bucket)
+            .iter()
+            .copied()
+            .filter(|owner| *owner != self_node)
+            .collect();
         let mut owner_idx = 0usize;
         // When the current owner first answered `Stale` with this node's
         // view unchanged: its retry window runs from here.
@@ -737,7 +753,12 @@ where
                             record_fetch_outcome(&cache_name, "local");
                             return Ok(value);
                         }
-                        owners = view.owners_of(bucket).to_vec();
+                        owners = view
+                            .owners_of(bucket)
+                            .iter()
+                            .copied()
+                            .filter(|owner| *owner != self_node)
+                            .collect();
                         owner_idx = 0;
                         stale_since = None;
                         continue;
@@ -755,6 +776,12 @@ where
                     stale_since = None;
                 }
             }
+        }
+        if owns {
+            // Every other owner is cold or unreachable too: this owner's
+            // own miss is the best answer there is.
+            record_fetch_outcome(&cache_name, "miss");
+            return Ok(None);
         }
         record_fetch_outcome(&cache_name, "error");
         Err(CacheError::FetchUnavailable { cache: cache_name })
@@ -1159,6 +1186,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_asks_the_other_owner_for_a_miss_in_a_cold_bucket_and_answers_a_miss_once_every_owner_is_cold()
+     {
+        // Two nodes, two owners per bucket: both own every bucket. Once
+        // both are warm, `a` drops its copy of a key and marks the bucket
+        // cold again by hand, so a fetch on `a` has to ask `b`; then `b`
+        // does the same, and `a`'s fetch is a miss rather than an error.
+        let name = "distributed-cold-fetch";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = a
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("a opens alone");
+        let (b, cache_b) = join_distributed(a.local_gossip_addr(), name, name, 1).await;
+        wait_for_peer_count(&a, 1).await;
+        cache_b
+            .insert(7, "seven".to_string())
+            .await
+            .expect("insert");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_a.get(&7).await.is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the write reaches its other owner");
+        let bucket = bucket_of(&encode_key(&7u32).expect("u32 encodes"));
+        let residency_a = cache_a.shard.residency().expect("a is distributed");
+        let residency_b = cache_b.shard.residency().expect("b is distributed");
+        // Both views list both nodes, or the fetch below ends `Stale`.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_a.owners_of(&7).len() != 2 || cache_b.owners_of(&7).len() != 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both views settle on two owners");
+
+        cache_a.invalidate_local(&7).await;
+        residency_a.mark_cold(&[bucket]);
+        assert_eq!(
+            cache_a.fetch(&7).await.expect("fetch reaches b").as_deref(),
+            Some("seven"),
+            "a cold local miss is answered by the other owner"
+        );
+        assert_eq!(cache_a.get(&7).await, None, "fetch never promotes locally");
+
+        cache_b.invalidate_local(&7).await;
+        residency_b.mark_cold(&[bucket]);
+        assert_eq!(
+            cache_a.fetch(&7).await.expect("a miss, not an error"),
+            None,
+            "every owner cold and empty is a miss"
+        );
+
+        residency_a.clear_cold(&[bucket]);
+        assert_eq!(
+            cache_a.fetch(&7).await.expect("local"),
+            None,
+            "a warm bucket answers its own miss without asking anyone"
+        );
+
+        cache_b.close().await;
+        cache_a.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fetch_retries_a_stale_owner_for_one_fetch_timeout_before_giving_up() {
         // Two solo clusters that never gossip, `b` injected into `a`'s mesh
         // by hand, so `b`'s view hash never matches the one `a` sends: every
@@ -1463,40 +1565,54 @@ mod tests {
         // Anti-entropy is effectively off, so only the warm-up pull can
         // bring `a`'s entries over.
         let name = "distributed-late-peer";
-        let port_b = free_udp_port();
         let mut config = loopback_config();
         config.ae_interval = Duration::from_secs(3600);
         config.gossip_interval = Duration::from_millis(200);
-        let a = Cluster::builder(name)
-            .seeds([SocketAddr::from((Ipv4Addr::LOCALHOST, port_b))])
-            .config(config.clone())
-            .build()
-            .await
-            .expect("node a builds");
-        let cache_a = a
-            .cache::<u32, String>(name)
-            .mode(Mode::distributed())
-            .open()
-            .await
-            .expect("a opens alone");
-        assert!(
-            !a.is_warm(&SmolStr::new(name)),
-            "a cache with no co-owner in sight is not warm yet"
-        );
-        for key in 0..200u32 {
-            cache_a
-                .insert(key, format!("v{key}"))
-                .await
-                .expect("a owns every bucket while alone");
-        }
-
-        config.gossip_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port_b));
-        let b = Cluster::builder(name)
-            .seeds(std::iter::empty())
-            .config(config)
-            .build()
-            .await
-            .expect("node b builds");
+        // The released port can be taken by a test running alongside before
+        // `b` binds it; then the pair is torn down and set up on a new one.
+        let (a, cache_a, b) = 'setup: {
+            for _ in 0..5 {
+                let port_b = free_udp_port();
+                let a = Cluster::builder(name)
+                    .seeds([SocketAddr::from((Ipv4Addr::LOCALHOST, port_b))])
+                    .config(config.clone())
+                    .build()
+                    .await
+                    .expect("node a builds");
+                let cache_a = a
+                    .cache::<u32, String>(name)
+                    .mode(Mode::distributed())
+                    .open()
+                    .await
+                    .expect("a opens alone");
+                assert!(
+                    !a.is_warm(&SmolStr::new(name)),
+                    "a cache with no co-owner in sight is not warm yet"
+                );
+                for key in 0..200u32 {
+                    cache_a
+                        .insert(key, format!("v{key}"))
+                        .await
+                        .expect("a owns every bucket while alone");
+                }
+                let mut config_b = config.clone();
+                config_b.gossip_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port_b));
+                match Cluster::builder(name)
+                    .seeds(std::iter::empty())
+                    .config(config_b)
+                    .build()
+                    .await
+                {
+                    Ok(b) => break 'setup (a, cache_a, b),
+                    Err(error) => {
+                        eprintln!("port {port_b} was taken before b bound it ({error}); retrying");
+                        cache_a.close().await;
+                        a.shutdown().await;
+                    }
+                }
+            }
+            panic!("five pre-picked ports were all taken before b could bind one");
+        };
         let cache_b = b
             .cache::<u32, String>(name)
             .mode(Mode::distributed())
