@@ -1618,3 +1618,76 @@ fn expected_owned_buckets_sum(owners: u64) -> u64 {
     sundog::store::BUCKET_COUNT as u64 * owners
 }
 
+/// Five distributed nodes fill a shared keyspace from one writer, and every
+/// key lands on exactly `OWNERS` owners: `owners k` from any node names
+/// exactly two ids, exactly those nodes' `get k` answers with the value and
+/// every other node answers `none`, every node's `fetch k` returns the
+/// value, the summed local `count` is `OWNERS * FILL_KEYS`, and the summed
+/// `sundog_owned_buckets` gauge is every bucket assigned exactly `OWNERS`
+/// times.
+#[tokio::test]
+async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_owners() {
+    const NODE_COUNT: usize = 5;
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 200;
+    const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4", "n5"];
+    const CLUSTER: &str = "dist-fill-cluster";
+    const CONVERGE_WAIT: Duration = Duration::from_secs(180);
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+    }
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    wait_for_peers(&node_refs, NODE_COUNT - 1).await;
+
+    node_refs[0]
+        .fill(FILL_KEYS)
+        .await
+        .expect("bulk fill succeeds");
+
+    let ids = collect_node_ids(&node_refs).await;
+    let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
+    let sample = sample_kv_entries(0xd157_fe11, FILL_KEYS, SAMPLE_SIZE);
+    let expected_owned_sum = expected_owned_buckets_sum(u64::from(OWNERS));
+
+    eventually(CONVERGE_WAIT, || async {
+        let Some(sum) = sum_counts(&node_refs).await else {
+            return false;
+        };
+        if sum != usize::from(OWNERS) * FILL_KEYS as usize {
+            return false;
+        }
+        if !ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await {
+            return false;
+        }
+        let mut owned_sum = 0u64;
+        for node in &node_refs {
+            owned_sum += scrape_metric(node, "sundog_owned_buckets", ("cache", "it")).await;
+        }
+        owned_sum == expected_owned_sum
+    })
+    .await;
+
+    let all_entries = kv_range(FILL_KEYS);
+    let mismatches = fetch_mismatches(&node_refs, &all_entries).await;
+    assert!(
+        mismatches.is_empty(),
+        "every fill key must be fetchable with the right value from every node: {mismatches:?}"
+    );
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
