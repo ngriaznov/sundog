@@ -342,6 +342,13 @@ impl Cluster {
         self.inner.membership.local_peer().gossip_addr
     }
 
+    /// This node's own [`Peer`] record, for a test harness that injects it
+    /// into another node's mesh by hand.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(crate) fn local_peer(&self) -> Peer {
+        self.inner.membership.local_peer().clone()
+    }
+
     /// The cluster-side half of [`crate::cache::Cache::close`]: drops `name`
     /// from the shard registry, this node's local mode map and warmth set,
     /// and clears its gossiped mode so live peers stop seeing it advertised.

@@ -319,13 +319,11 @@ fn validate_mode(
     Ok(())
 }
 
-/// Attempts [`Cache::fetch`] retries against the same still-`Stale`-but-
-/// unchanged owner before moving to the next candidate.
-const MAX_FETCH_ATTEMPTS_PER_OWNER: u32 = 3;
-
 /// A small jittered backoff between retrying the same [`Cache::fetch`]
 /// owner after it reports its view as stale but this node's own view has
-/// not itself changed: uniformly in `[10, 50)` ms.
+/// not itself changed: uniformly in `[10, 50)` ms. The retries against one
+/// owner span at most `ClusterConfig::fetch_timeout`, the same bound one
+/// request gets, before the next owner is tried.
 fn fetch_retry_backoff() -> Duration {
     Duration::from_millis(rand::rng().random_range(10..50))
 }
@@ -677,7 +675,12 @@ where
     /// Returns [`CacheError::FetchUnavailable`] if every owner is
     /// unreachable or times out
     /// (`crate::config::ClusterConfig::fetch_timeout` per attempt) —
-    /// distinct from a genuine miss, which returns `Ok(None)`.
+    /// distinct from a genuine miss, which returns `Ok(None)`. An owner
+    /// whose ownership view differs from this node's, the state both are
+    /// in for a moment after a membership change, is retried with a short
+    /// jittered backoff for one `fetch_timeout` before the next owner is
+    /// tried, and at once against a fresh view when this node's own view
+    /// moves first.
     pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
         let Some(view) = self.shard.ownership_view() else {
             let value = self.shard.get(key).await;
@@ -699,11 +702,12 @@ where
         let mut view = view;
         let mut owners = view.owners_of(bucket).to_vec();
         let mut owner_idx = 0usize;
-        let mut attempt = 0u32;
+        // When the current owner first answered `Stale` with this node's
+        // view unchanged: its retry window runs from here.
+        let mut stale_since: Option<tokio::time::Instant> = None;
 
         while owner_idx < owners.len() {
             let owner = owners[owner_idx];
-            attempt += 1;
             let outcome = tokio::time::timeout(
                 attempt_timeout,
                 mesh.fetch(
@@ -735,19 +739,20 @@ where
                         }
                         owners = view.owners_of(bucket).to_vec();
                         owner_idx = 0;
-                        attempt = 0;
+                        stale_since = None;
                         continue;
                     }
-                    if attempt >= MAX_FETCH_ATTEMPTS_PER_OWNER {
+                    let since = *stale_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= attempt_timeout {
                         owner_idx += 1;
-                        attempt = 0;
+                        stale_since = None;
                         continue;
                     }
                     tokio::time::sleep(fetch_retry_backoff()).await;
                 }
                 Ok(Err(_)) | Err(_) => {
                     owner_idx += 1;
-                    attempt = 0;
+                    stale_since = None;
                 }
             }
         }
@@ -1151,6 +1156,95 @@ mod tests {
         a.shutdown().await;
         b.shutdown().await;
         c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_retries_a_stale_owner_for_one_fetch_timeout_before_giving_up() {
+        // Two solo clusters that never gossip, `b` injected into `a`'s mesh
+        // by hand, so `b`'s view hash never matches the one `a` sends: every
+        // fetch to `b` is answered `Stale`. `a`'s own view lists `b` and a
+        // phantom third node, so it has buckets it does not own to fetch.
+        let name = "distributed-fetch-stale";
+        let mut config = loopback_config();
+        config.fetch_timeout = Duration::from_millis(300);
+        let a = Cluster::builder("distributed-fetch-stale-a")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("node a builds");
+        let b = Cluster::builder("distributed-fetch-stale-b")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node b builds");
+        let cache_b = b
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone");
+        cache_b.insert(1, "one".to_string()).await.expect("insert");
+        let peer_b = b.local_peer();
+        a.mesh().update_peers(vec![peer_b.clone()]);
+
+        let phantom = NodeId::from(u64::MAX);
+        let owners = Mode::DEFAULT_OWNERS;
+        let (tracker, tx) = crate::ownership::OwnershipTracker::seed(
+            a.node_id(),
+            &[],
+            &std::collections::HashMap::new(),
+            &SmolStr::new(name),
+            owners,
+        );
+        let view = Arc::new(crate::ownership::OwnershipView::compute(
+            a.node_id(),
+            vec![a.node_id(), peer_b.node, phantom],
+            owners,
+        ));
+        tx.send(Arc::clone(&view)).expect("receiver alive");
+        let shard = Shard::<u32, String>::new(
+            SmolStr::new(name),
+            Mode::distributed(),
+            a.node_id(),
+            u64::MAX,
+            None,
+            None,
+        )
+        .with_ownership(tracker, Arc::new(crate::ownership::ResidencySet::new()));
+        let cache_a = Cache {
+            shard: Arc::new(shard),
+            cluster: a.clone(),
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        };
+        let key = (0..1_000_000u32)
+            .find(|key| {
+                let bucket = bucket_of(&encode_key(key).expect("u32 encodes"));
+                !view.owns(bucket) && view.owners_of(bucket).contains(&peer_b.node)
+            })
+            .expect("a key owned by b and not by a");
+
+        let started = tokio::time::Instant::now();
+        let result = cache_a.fetch(&key).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(CacheError::FetchUnavailable { .. })),
+            "a permanently stale owner and an unreachable one leave nothing to answer: {result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "the stale owner is retried for a whole fetch_timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the retries are bounded by the owners' windows: {elapsed:?}"
+        );
+
+        cache_b.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
     }
 
     #[tokio::test]
