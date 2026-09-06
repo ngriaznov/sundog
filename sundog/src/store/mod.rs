@@ -98,6 +98,19 @@ fn chunk_records_for_snapshot(records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> 
     chunks
 }
 
+/// The anti-entropy bucket a precomputed key hash belongs to, `u16`-sized to
+/// match every bucket-carrying wire and `ShardOps` shape.
+fn bucket_of_hash(hash: u64) -> u16 {
+    u16::try_from(engine::stripe_index_from_hash(hash)).expect("invariant: BUCKET_COUNT fits u16")
+}
+
+/// The anti-entropy bucket `key_bytes` hashes into: `Mode::Distributed`'s
+/// unit of ownership, ownership-guard and fan-out grouping alike consult
+/// this rather than decoding the key.
+pub(crate) fn bucket_of(key_bytes: &[u8]) -> u16 {
+    bucket_of_hash(engine::hash_key_bytes(key_bytes))
+}
+
 /// Capacity of each shard's [`Event`] broadcast channel. A subscriber that
 /// falls this far behind misses events (`broadcast::error::RecvError::Lagged`)
 /// instead of applying backpressure to writers.
@@ -182,6 +195,21 @@ impl<K> FanOutQueue<K> {
     }
 }
 
+/// One entry in a shard's fan-out queue. `Applied` is every write this
+/// shard actually holds: every mode's own local write, and an owner's
+/// write under `Mode::Distributed`. `cluster::fan_out_batch` re-fetches its
+/// current record via `Shard::records_for_typed`, unchanged from every
+/// other mode. `Forward` is a `Mode::Distributed` non-owner write: the
+/// record was never applied, so there is nothing to re-fetch, and the
+/// fully built [`WireRecord`] travels with the queue entry itself. One
+/// queue, one drain, for every mode: this generalizes [`FanOutQueue`]'s
+/// item type rather than adding a second queue and a second task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FanOutItem<K> {
+    Applied(K),
+    Forward(WireRecord),
+}
+
 /// A named cache's clustering behavior: how writes fan out to other nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -255,13 +283,33 @@ pub enum Event<K, V> {
     Removed { key: K, origin: Origin },
 }
 
+/// A second-level anti-entropy part: a bucket and one of its
+/// [`PART_COUNT`] parts.
+pub type Part = (u16, u8);
+
 /// Entries per bucket, as an anti-entropy exchange reports them: every
 /// requested bucket present, empty lists included.
 pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
 
 /// Entries per part, as a second-level anti-entropy exchange reports them:
 /// every requested `(bucket, part)` pair present, empty lists included.
-pub type PartEntries = Vec<((u16, u8), Vec<(Bytes, Hlc)>)>;
+pub type PartEntries = Vec<(Part, Vec<(Bytes, Hlc)>)>;
+
+/// One inbound [`WireRecord`], decoded down to what
+/// [`ShardOps::apply_remote_batch`]'s per-stripe grouping needs: its
+/// precomputed hash, typed key, raw key bytes, version, and the value or
+/// tombstone it carries, plus which peer (or local call) it came from.
+type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
+
+/// One bulk `Mode::Distributed` write already prepared by
+/// `Shard::insert_many_expiring`, not yet decided owner-vs-forward: its
+/// precomputed hash, typed key, raw key bytes, version, value, expiry, and
+/// postcard-encoded value bytes.
+type PreparedPut<K, V> = (u64, K, Bytes, Hlc, V, Option<u64>, Bytes);
+
+/// One bulk `Mode::Distributed` tombstone already prepared by
+/// `Shard::remove_many`, not yet decided owner-vs-forward.
+type PreparedTombstone<K> = (u64, K, Bytes, Hlc);
 
 /// The type-erased surface the network layer drives a shard through, wire bytes
 /// in and out. This is the boundary where postcard (de)serialization happens;
@@ -315,7 +363,7 @@ pub trait ShardOps: Send + Sync {
     /// [`ShardOps::entries_for_buckets`] at part granularity: `(key, version)`
     /// for every live entry and un-GC'd tombstone in each requested
     /// `(bucket, part)` pair.
-    fn entries_for_parts(&self, parts: Vec<(u16, u8)>) -> BoxFuture<'_, PartEntries>;
+    fn entries_for_parts(&self, parts: Vec<Part>) -> BoxFuture<'_, PartEntries>;
 
     /// The full [`WireRecord`] for each of `keys` this shard holds, present
     /// entries and tombstones alike, answering an `AePull`.
@@ -353,6 +401,35 @@ pub trait ShardOps: Send + Sync {
     )]
     fn ownership_view(&self) -> Option<Arc<OwnershipView>> {
         None
+    }
+
+    /// This shard's current bucket-ownership `view_hash`, for a
+    /// `Mode::Distributed` cache that has one attached. `None` for every
+    /// other mode, and for a `Distributed` cache before its tracker is
+    /// attached. A thin projection of [`ShardOps::ownership_view`] for a
+    /// caller that only needs the epoch check, not the whole view.
+    fn ownership_view_hash(&self) -> Option<u64> {
+        None
+    }
+
+    /// Removes every locally held entry, live or tombstone, in each of
+    /// `buckets`, for a `Mode::Distributed` cache whose disown-grace has
+    /// elapsed for them. A no-op returning `0` for every other mode, which
+    /// never disowns a bucket in the first place. See
+    /// `engine::Engine::release_buckets` for the accounting this resets.
+    fn release_buckets(&self, buckets: &[u16]) -> BoxFuture<'_, u64> {
+        let _ = buckets;
+        Box::pin(async { 0 })
+    }
+
+    /// Narrows anti-entropy's `dirty`/`live` peer candidates to this
+    /// shard's current cohort before `pick_peer`'s random choice runs.
+    /// Identity for every mode but `Mode::Distributed`, whose override
+    /// narrows both lists to peers sharing at least one bucket this shard
+    /// currently owns or is mid disown-grace on: a peer sharing nothing
+    /// with this shard has nothing to reconcile.
+    fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
+        (dirty, live)
     }
 }
 
@@ -544,7 +621,7 @@ where
     /// Keys written locally and not yet fanned out; see [`FanOutQueue`]. Kept
     /// separate from `events` so its `receiver_count()` reflects only real
     /// external subscribers.
-    fan_out: Arc<FanOutQueue<K>>,
+    fan_out: Arc<FanOutQueue<FanOutItem<K>>>,
     /// Guards only the synchronous HLC bump itself, never held across `.await`.
     clock: StdMutex<HlcClock>,
     /// The deterministic-clock hook every timestamp this shard stamps reads, in
@@ -747,8 +824,9 @@ where
     /// used. [`Shard::with_weigher`] rebuilds the engine from scratch, and
     /// the tier attaches to whichever engine is current when this runs. A
     /// hand-off the tier refuses leaves the victim resident, to be retried
-    /// by a later eviction pass, for a `Mode::Replicated` shard, and evicts
-    /// it exactly as before for `Mode::Local`/`Mode::Invalidation`.
+    /// by a later eviction pass, for a `Mode::Replicated` or
+    /// `Mode::Distributed` shard, and evicts it exactly as before for
+    /// `Mode::Local`/`Mode::Invalidation`.
     ///
     /// # Errors
     ///
@@ -790,7 +868,10 @@ where
     #[cfg(feature = "spill")]
     pub(crate) fn attach_spill(&self, cfg: &spill::SpillConfig) -> Result<(), std::io::Error> {
         let tier = Arc::new(spill::SpillTier::open(cfg, &self.name)?);
-        tier.set_keep_resident_when_refused(matches!(self.mode, Mode::Replicated));
+        tier.set_keep_resident_when_refused(matches!(
+            self.mode,
+            Mode::Replicated | Mode::Distributed { .. }
+        ));
         self.engine.set_spill(Arc::clone(&tier));
         let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
         tier.attach(Arc::downgrade(&sink));
@@ -899,7 +980,7 @@ where
                 created,
             } => {
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    self.fan_out.push(key.clone());
+                    self.fan_out.push(FanOutItem::Applied(key.clone()));
                 }
                 if self.events.receiver_count() > 0 {
                     let event = if created {
@@ -912,7 +993,7 @@ where
             }
             ApplyOutcome::Tombstoned { key } => {
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    self.fan_out.push(key.clone());
+                    self.fan_out.push(FanOutItem::Applied(key.clone()));
                 }
                 if self.events.receiver_count() > 0 {
                     let _ = self.events.send(Event::Removed { key, origin });
@@ -949,6 +1030,151 @@ where
             .next()
             .expect("invariant: apply_many returns exactly one outcome per entry given");
         self.handle_apply_outcome(outcome, origin, true);
+    }
+
+    /// Whether this shard's own current bucket-ownership view owns
+    /// `key_bytes`' bucket. `true` unconditionally for every mode but
+    /// `Mode::Distributed`, which has no [`OwnershipTracker`] attached at
+    /// all: every other mode owns everything it holds.
+    fn owns_key(&self, key_bytes: &[u8]) -> bool {
+        self.ownership
+            .as_ref()
+            .is_none_or(|tracker| tracker.current().owns(bucket_of(key_bytes)))
+    }
+
+    /// This shard's current ownership view and residency set together, for
+    /// the outbound-serving guard and `ae_peer_filter`: `None` for every
+    /// mode but `Mode::Distributed`. Both are cheap `Arc` clones, so a
+    /// caller in an async block that must own its captures (`snapshot_chunks`)
+    /// and one that only borrows for the call's duration use the same
+    /// accessor.
+    fn residency_check(&self) -> Option<(Arc<OwnershipView>, Arc<ResidencySet>)> {
+        match (&self.ownership, &self.residency) {
+            (Some(tracker), Some(residency)) => Some((tracker.current(), Arc::clone(residency))),
+            _ => None,
+        }
+    }
+
+    /// Whether `bucket` is currently resident for outbound anti-entropy or
+    /// snapshot serving: owned, or mid disown-grace. `is_resident = owns ||
+    /// residency.is_releasing`, used only by the outbound-serving guard and
+    /// the donor-serving exception — never by the inbound-apply guard,
+    /// which stays strict current-view ownership.
+    fn is_resident_bucket(
+        residency: &(Arc<OwnershipView>, Arc<ResidencySet>),
+        bucket: u16,
+    ) -> bool {
+        let (view, res) = residency;
+        view.owns(bucket) || res.is_releasing(bucket)
+    }
+
+    /// Non-owner write path: builds the [`WireRecord`] a
+    /// `Mode::Distributed` write for a bucket this node does not own fans
+    /// out, without ever touching `engine` — see the store module's
+    /// write-path docs for the no-window proof this relies on. Emits
+    /// [`Event::Created`]/[`Event::Removed`] directly from the
+    /// caller-supplied value: a non-owner holds no prior copy to tell a
+    /// create from an update, so a forwarded write never emits
+    /// [`Event::Updated`], a documented, deliberate difference from every
+    /// other write path here. The caller pushes the returned record onto
+    /// [`Shard::fan_out`] as [`FanOutItem::Forward`] and counts
+    /// `sundog_forwarded_writes_total{cache}`; this method only builds the
+    /// record and emits the event.
+    fn forward_write(
+        &self,
+        key: K,
+        key_bytes: Bytes,
+        incoming: Incoming<V>,
+        ver: Hlc,
+    ) -> WireRecord {
+        match incoming {
+            Incoming::Put {
+                value,
+                expires_at_ms,
+                encoded,
+            } => {
+                let rec = WireRecord {
+                    key: key_bytes,
+                    value: Some(encoded),
+                    ver,
+                    expires_at_ms,
+                };
+                if self.events.receiver_count() > 0 {
+                    let _ = self.events.send(Event::Created {
+                        key,
+                        value,
+                        origin: Origin::Local,
+                    });
+                }
+                rec
+            }
+            Incoming::Tombstone => {
+                let rec = WireRecord {
+                    key: key_bytes,
+                    value: None,
+                    ver,
+                    expires_at_ms: None,
+                };
+                if self.events.receiver_count() > 0 {
+                    let _ = self.events.send(Event::Removed {
+                        key,
+                        origin: Origin::Local,
+                    });
+                }
+                rec
+            }
+        }
+    }
+
+    /// [`Shard::insert_many`]'s bulk counterpart to [`Shard::forward_write`]:
+    /// forwards every already-prepared, unowned put in `prepared`, chunked
+    /// into the fan-out queue the same [`REPLICATE_BATCH_COUNT`] increments
+    /// [`Shard::hand_off_bulk`] already flushes at, so a large mixed batch
+    /// never holds every forwarded record in memory until the end.
+    fn forward_prepared_puts(&self, prepared: Vec<PreparedPut<K, V>>) {
+        if prepared.is_empty() {
+            return;
+        }
+        let total = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
+        let mut landed = Vec::new();
+        for (_, key, key_bytes, ver, value, expires_at_ms, encoded) in prepared {
+            let incoming = Incoming::Put {
+                value,
+                expires_at_ms,
+                encoded,
+            };
+            landed.push(self.forward_write(key, key_bytes, incoming, ver));
+            if landed.len() >= REPLICATE_BATCH_COUNT {
+                self.fan_out
+                    .extend(landed.drain(..).map(FanOutItem::Forward));
+            }
+        }
+        self.fan_out
+            .extend(landed.drain(..).map(FanOutItem::Forward));
+        metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
+            .increment(total);
+    }
+
+    /// [`Shard::remove_many`]'s bulk counterpart to
+    /// [`Shard::forward_prepared_puts`]: forwards every already-prepared,
+    /// unowned tombstone in `prepared`, chunked the same way.
+    fn forward_prepared_tombstones(&self, prepared: Vec<PreparedTombstone<K>>) {
+        if prepared.is_empty() {
+            return;
+        }
+        let total = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
+        let mut landed = Vec::new();
+        for (_, key, key_bytes, ver) in prepared {
+            landed.push(self.forward_write(key, key_bytes, Incoming::Tombstone, ver));
+            if landed.len() >= REPLICATE_BATCH_COUNT {
+                self.fan_out
+                    .extend(landed.drain(..).map(FanOutItem::Forward));
+            }
+        }
+        self.fan_out
+            .extend(landed.drain(..).map(FanOutItem::Forward));
+        metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
+            .increment(total);
     }
 
     /// Reads `key`, without triggering read-through. A deleted key is never
@@ -1200,7 +1426,7 @@ where
                                 &inflight,
                             );
                             guard.complete();
-                            self.fan_out.push(key.clone());
+                            self.fan_out.push(FanOutItem::Applied(key.clone()));
                             if self.events.receiver_count() > 0 {
                                 let _ = self.events.send(Event::Created {
                                     key: key.clone(),
@@ -1292,17 +1518,19 @@ where
                 limit: self.max_frame,
             });
         }
-        self.apply(
-            key,
-            key_bytes,
-            ver,
-            Incoming::Put {
-                value,
-                expires_at_ms,
-                encoded,
-            },
-            Origin::Local,
-        );
+        let incoming = Incoming::Put {
+            value,
+            expires_at_ms,
+            encoded,
+        };
+        if !self.owns_key(key_bytes.as_ref()) {
+            let rec = self.forward_write(key, key_bytes, incoming, ver);
+            self.fan_out.push(FanOutItem::Forward(rec));
+            metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
+                .increment(1);
+            return Ok(());
+        }
+        self.apply(key, key_bytes, ver, incoming, Origin::Local);
         Ok(())
     }
 
@@ -1380,8 +1608,23 @@ where
             prepared.push((hash, key, key_bytes, ver, value, expires_at_ms, encoded));
         }
 
+        // A `Mode::Distributed` shard splits off every entry whose bucket
+        // this node does not own before the owned group's ordinary
+        // by-stripe apply below: a forwarded entry never reaches `engine`,
+        // matching `Shard::insert`'s single-write guard.
+        let (owned_prepared, forwarded_prepared) = match &self.ownership {
+            Some(tracker) => {
+                let view = tracker.current();
+                prepared
+                    .into_iter()
+                    .partition(|entry| view.owns(bucket_of_hash(entry.0)))
+            }
+            None => (prepared, Vec::new()),
+        };
+        self.forward_prepared_puts(forwarded_prepared);
+
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for entry in prepared {
+        for entry in owned_prepared {
             by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
         }
         let now = self.now_ms();
@@ -1447,6 +1690,13 @@ where
     pub fn remove_sync(&self, key: &K) -> Result<(), CacheError> {
         let key_bytes = encode_key(key)?;
         let ver = self.stamp_local();
+        if !self.owns_key(key_bytes.as_ref()) {
+            let rec = self.forward_write(key.clone(), key_bytes, Incoming::Tombstone, ver);
+            self.fan_out.push(FanOutItem::Forward(rec));
+            metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
+                .increment(1);
+            return Ok(());
+        }
         self.apply(
             key.clone(),
             key_bytes,
@@ -1473,8 +1723,21 @@ where
             prepared.push((hash, key, key_bytes, ver));
         }
 
+        // Same owner-vs-forward split as `Shard::insert_many_expiring`: a
+        // forwarded tombstone never reaches `engine`.
+        let (owned_prepared, forwarded_prepared) = match &self.ownership {
+            Some(tracker) => {
+                let view = tracker.current();
+                prepared
+                    .into_iter()
+                    .partition(|entry| view.owns(bucket_of_hash(entry.0)))
+            }
+            None => (prepared, Vec::new()),
+        };
+        self.forward_prepared_tombstones(forwarded_prepared);
+
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for entry in prepared {
+        for entry in owned_prepared {
             by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
         }
         let now = self.now_ms();
@@ -1514,7 +1777,8 @@ where
         if landed.is_empty() || (!flush && landed.len() < REPLICATE_BATCH_COUNT) {
             return;
         }
-        self.fan_out.extend(landed.drain(..));
+        self.fan_out
+            .extend(landed.drain(..).map(FanOutItem::Applied));
     }
 
     /// Tombstones every key this node currently holds, via
@@ -1548,9 +1812,9 @@ where
 
     /// The queue of locally written keys awaiting fan-out. `fan_out_task`'s
     /// cheaper alternative to subscribing on [`Shard::events`], since it
-    /// never reads `Event`'s `value`. Carries local writes only; see
-    /// [`FanOutQueue`].
-    pub(crate) fn fan_out_queue(&self) -> Arc<FanOutQueue<K>> {
+    /// never reads `Event`'s `value`. Carries local writes and forwarded
+    /// non-owner writes; see [`FanOutQueue`] and [`FanOutItem`].
+    pub(crate) fn fan_out_queue(&self) -> Arc<FanOutQueue<FanOutItem<K>>> {
         Arc::clone(&self.fan_out)
     }
 
@@ -1684,10 +1948,38 @@ where
 
     fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            // The inbound-apply guard: a `Mode::Distributed` shard drops
+            // any record for a bucket its own *current* view does not own,
+            // before decoding it — strict current-view ownership, with no
+            // widening for a bucket mid disown-grace, per the store
+            // module's write-path docs. The single choke point every
+            // inbound record path (live replication, an anti-entropy pull
+            // reply, a rebalance transfer chunk) funnels through.
+            let recs = match self.ownership.as_ref().map(OwnershipTracker::current) {
+                Some(view) => {
+                    let (owned, dropped): (Vec<_>, Vec<_>) = recs
+                        .into_iter()
+                        .partition(|rec| view.owns(bucket_of(rec.key.as_ref())));
+                    if !dropped.is_empty() {
+                        metrics::counter!(
+                            "sundog_unowned_inbound_dropped_total",
+                            "cache" => self.name.to_string()
+                        )
+                        .increment(u64::try_from(dropped.len()).unwrap_or(u64::MAX));
+                        tracing::debug!(
+                            cache = %self.name,
+                            dropped = dropped.len(),
+                            "apply_remote_batch: dropped records for a bucket this node does \
+                             not own"
+                        );
+                    }
+                    owned
+                }
+                None => recs,
+            };
             // Grouping by raw key bytes' stripe needs no decode. Each group
             // keeps `recs`' relative order, so the same key always
             // lands in the same stripe in arrival order.
-            type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
             let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
                 (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
             for rec in recs {
@@ -1766,10 +2058,24 @@ where
 
     fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>> {
         let digests = self.engine.digests();
+        // The outbound-serving guard: a `Mode::Distributed` shard never
+        // reports a bucket it neither owns nor is releasing.
+        let digests = match self.residency_check() {
+            Some(residency) => digests
+                .into_iter()
+                .filter(|&(bucket, _)| Self::is_resident_bucket(&residency, bucket))
+                .collect(),
+            None => digests,
+        };
         Box::pin(async move { digests })
     }
 
     fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+        if let Some(residency) = self.residency_check()
+            && !Self::is_resident_bucket(&residency, bucket)
+        {
+            return Box::pin(async { Vec::new() });
+        }
         let now = self.now_ms();
         let entries = self
             .engine
@@ -1790,7 +2096,18 @@ where
             .into_iter()
             .collect();
         wanted.sort_unstable();
-        let entries = self.engine.collect_buckets(&wanted, now);
+        let entries = match self.residency_check() {
+            Some(residency) => {
+                let (resident, unresident): (Vec<u16>, Vec<u16>) = wanted
+                    .into_iter()
+                    .partition(|&b| Self::is_resident_bucket(&residency, b));
+                let mut entries = self.engine.collect_buckets(&resident, now);
+                entries.extend(unresident.into_iter().map(|b| (b, Vec::new())));
+                entries.sort_unstable_by_key(|&(b, _)| b);
+                entries
+            }
+            None => self.engine.collect_buckets(&wanted, now),
+        };
         Box::pin(async move { entries })
     }
 
@@ -1801,9 +2118,16 @@ where
             .into_iter()
             .collect();
         wanted.sort_unstable();
+        let residency = self.residency_check();
         let out = wanted
             .into_iter()
-            .map(|bucket| (bucket, self.engine.bucket_len(bucket)))
+            .map(|bucket| {
+                let len = match &residency {
+                    Some(residency) if !Self::is_resident_bucket(residency, bucket) => 0,
+                    _ => self.engine.bucket_len(bucket),
+                };
+                (bucket, len)
+            })
             .collect();
         Box::pin(async move { out })
     }
@@ -1815,22 +2139,40 @@ where
             .into_iter()
             .collect();
         wanted.sort_unstable();
+        let residency = self.residency_check();
         let out = wanted
             .into_iter()
-            .map(|bucket| (bucket, self.engine.part_digests(bucket)))
+            .map(|bucket| {
+                let digests = match &residency {
+                    Some(residency) if !Self::is_resident_bucket(residency, bucket) => Vec::new(),
+                    _ => self.engine.part_digests(bucket),
+                };
+                (bucket, digests)
+            })
             .collect();
         Box::pin(async move { out })
     }
 
-    fn entries_for_parts(&self, parts: Vec<(u16, u8)>) -> BoxFuture<'_, PartEntries> {
+    fn entries_for_parts(&self, parts: Vec<Part>) -> BoxFuture<'_, PartEntries> {
         let now = self.now_ms();
-        let mut wanted: Vec<(u16, u8)> = parts
+        let mut wanted: Vec<Part> = parts
             .into_iter()
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         wanted.sort_unstable();
-        let entries = self.engine.collect_parts(&wanted, now);
+        let entries = match self.residency_check() {
+            Some(residency) => {
+                let (resident, unresident): (Vec<Part>, Vec<Part>) = wanted
+                    .into_iter()
+                    .partition(|&(b, _)| Self::is_resident_bucket(&residency, b));
+                let mut entries = self.engine.collect_parts(&resident, now);
+                entries.extend(unresident.into_iter().map(|p| (p, Vec::new())));
+                entries.sort_unstable_by_key(|&(p, _)| p);
+                entries
+            }
+            None => self.engine.collect_parts(&wanted, now),
+        };
         Box::pin(async move { entries })
     }
 
@@ -1841,6 +2183,16 @@ where
     /// repopulate RAM as fast as eviction drains it.
     fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
         let now = self.now_ms();
+        // The outbound-serving guard, at the key level: a key whose bucket
+        // this shard neither owns nor is releasing is dropped from the
+        // request before it ever reaches `engine`.
+        let keys = match self.residency_check() {
+            Some(residency) => keys
+                .into_iter()
+                .filter(|k| Self::is_resident_bucket(&residency, bucket_of(k.as_ref())))
+                .collect(),
+            None => keys,
+        };
         #[cfg(feature = "spill")]
         {
             let (records, spilled) = self.engine.records_for_or_spilled(&keys, now);
@@ -1875,6 +2227,7 @@ where
     fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>> {
         let engine = Arc::clone(&self.engine);
         let now = self.now_ms();
+        let residency = self.residency_check();
         #[cfg(feature = "spill")]
         let spill_read = self.spill_read.get().cloned();
         #[cfg(feature = "spill")]
@@ -1892,6 +2245,14 @@ where
                     );
                 }
                 records
+            };
+            // The outbound-serving guard, over a full snapshot's records.
+            let records = match residency {
+                Some(residency) => records
+                    .into_iter()
+                    .filter(|rec| Self::is_resident_bucket(&residency, bucket_of(rec.key.as_ref())))
+                    .collect(),
+                None => records,
             };
             chunk_records_for_snapshot(records)
         };
@@ -1921,13 +2282,97 @@ where
     fn ownership_view(&self) -> Option<Arc<OwnershipView>> {
         self.ownership.as_ref().map(OwnershipTracker::current)
     }
+
+    fn ownership_view_hash(&self) -> Option<u64> {
+        self.ownership
+            .as_ref()
+            .map(|tracker| tracker.current().view_hash())
+    }
+
+    fn release_buckets(&self, buckets: &[u16]) -> BoxFuture<'_, u64> {
+        let removed = self.engine.release_buckets(buckets);
+        Box::pin(async move { removed })
+    }
+
+    fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
+        let (Some(tracker), Some(residency)) = (self.ownership.as_ref(), self.residency.as_ref())
+        else {
+            return (dirty, live);
+        };
+        let view = tracker.current();
+        let mut cohort: HashSet<NodeId> = HashSet::new();
+        for i in 0..BUCKET_COUNT {
+            let bucket = u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
+            if view.owns(bucket) || residency.is_releasing(bucket) {
+                cohort.extend(view.owners_of(bucket).iter().copied());
+            }
+        }
+        let filter = |nodes: Vec<NodeId>| -> Vec<NodeId> {
+            nodes.into_iter().filter(|n| cohort.contains(n)).collect()
+        };
+        (filter(dirty), filter(live))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+    use tokio::sync::watch;
 
     use super::*;
+
+    /// A `Mode::Distributed` shard for `self_node`, its ownership view
+    /// computed directly from `eligible` via `OwnershipView::compute` — no
+    /// cluster, no `Peer`/`CacheModes` fixture — attached before the shard
+    /// is ever shared, matching production's `attach_ownership`. Returns
+    /// the shard's own view alongside for a test to compute expected
+    /// owned/unowned keys against, and the tracker's `watch::Sender` so a
+    /// test can publish a further view.
+    fn distributed_shard<K, V>(
+        self_node: NodeId,
+        eligible: Vec<NodeId>,
+        k: u8,
+        residency: Arc<ResidencySet>,
+    ) -> (
+        Shard<K, V>,
+        Arc<OwnershipView>,
+        watch::Sender<Arc<OwnershipView>>,
+    )
+    where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let owners = NonZeroU8::new(k).expect("nonzero");
+        let (tracker, tx) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &HashMap::new(),
+            &SmolStr::new("test"),
+            owners,
+        );
+        let view = Arc::new(OwnershipView::compute(self_node, eligible, owners));
+        tx.send(Arc::clone(&view)).expect("receiver still alive");
+        let shard = Shard::<K, V>::new(
+            SmolStr::new("test"),
+            Mode::Distributed { owners },
+            self_node,
+            u64::MAX,
+            None,
+            None,
+        )
+        .with_ownership(tracker, residency);
+        (shard, view, tx)
+    }
+
+    /// The first `u32` key, scanning from `0`, whose bucket `view.owns`
+    /// matches `owns`.
+    fn find_key_by_ownership(view: &OwnershipView, owns: bool) -> u32 {
+        (0..1_000_000u32)
+            .find(|&key| view.owns(bucket_of(&key_bytes(&key))) == owns)
+            .expect("a matching key is found within a generous scan range")
+    }
 
     fn shard<K, V>(node: u64) -> Shard<K, V>
     where
@@ -1956,12 +2401,19 @@ mod tests {
         Bytes::from(postcard::to_stdvec(key).expect("test key encodes"))
     }
 
-    /// The anti-entropy bucket `key_bytes` hashes into.
-    fn bucket_of(key_bytes: &[u8]) -> u16 {
-        u16::try_from(engine::stripe_index_from_hash(engine::hash_key_bytes(
-            key_bytes,
-        )))
-        .expect("invariant: masked to BUCKET_COUNT - 1, always fits in u16")
+    /// Unwraps every item as [`FanOutItem::Applied`], panicking on a
+    /// [`FanOutItem::Forward`] — every test that calls this drains an
+    /// owner's or a non-`Distributed` shard's queue, which never forwards.
+    fn applied_keys<K: std::fmt::Debug>(items: Vec<FanOutItem<K>>) -> Vec<K> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                FanOutItem::Applied(key) => key,
+                FanOutItem::Forward(rec) => {
+                    panic!("expected only FanOutItem::Applied, found a forwarded record: {rec:?}")
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -3298,7 +3750,7 @@ mod tests {
             .await
             .expect("bulk insert");
         assert_eq!(queue.len(), 10_000, "nothing is lost to a lagged channel");
-        let mut keys = queue.drain();
+        let mut keys = applied_keys(queue.drain());
         keys.sort_unstable();
         assert_eq!(keys, (0..10_000u32).collect::<Vec<_>>());
         assert_eq!(queue.len(), 0);
@@ -3308,7 +3760,7 @@ mod tests {
         s.insert(1, "one".into()).await.expect("insert");
         s.insert(1, "one again".into()).await.expect("insert");
         assert_eq!(
-            queue.drain(),
+            applied_keys(queue.drain()),
             vec![1, 1],
             "single writes queue their key each time"
         );
@@ -3361,7 +3813,7 @@ mod tests {
         let mut remainder = vec![1, 2, 3];
         s.hand_off_bulk(&mut remainder, true);
         assert!(remainder.is_empty(), "a flush hands off whatever is left");
-        assert_eq!(s.fan_out.drain(), vec![1, 2, 3]);
+        assert_eq!(applied_keys(s.fan_out.drain()), vec![1, 2, 3]);
 
         let mut nothing: Vec<u32> = Vec::new();
         s.hand_off_bulk(&mut nothing, true);
@@ -3384,7 +3836,7 @@ mod tests {
             .expect("insert_many");
 
         assert_eq!(
-            s.fan_out.drain(),
+            applied_keys(s.fan_out.drain()),
             vec![2],
             "only the write that landed is queued for replication"
         );
@@ -3401,7 +3853,7 @@ mod tests {
         s.remove_many([1, 3]).await.expect("remove_many");
 
         assert_eq!(
-            s.fan_out.drain(),
+            applied_keys(s.fan_out.drain()),
             vec![3],
             "the rejected tombstone never reaches the fan-out queue"
         );
@@ -3639,6 +4091,7 @@ mod tests {
     fn shard_ownership_view_is_none_without_with_ownership() {
         let s = shard::<u32, String>(1);
         assert!(ShardOps::ownership_view(&s).is_none());
+        assert!(ShardOps::ownership_view_hash(&s).is_none());
         assert!(!s.has_residency());
     }
 
@@ -3669,6 +4122,496 @@ mod tests {
         assert!(s.has_residency());
         let view = ShardOps::ownership_view(&s).expect("ownership view attached");
         assert_eq!(view.view_hash(), expected_hash);
+        assert_eq!(
+            ShardOps::ownership_view_hash(&s),
+            Some(expected_hash),
+            "ownership_view_hash mirrors ownership_view's own view_hash"
+        );
+    }
+
+    /// A `WireRecord` for `key`/`value` at `ver`, matching this test
+    /// module's other hand-built remote records.
+    fn wire_record(key: u32, value: &str, ver: Hlc) -> WireRecord {
+        WireRecord {
+            key: key_bytes(&key),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&value.to_string()).expect("test value encodes"),
+            )),
+            ver,
+            expires_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_on_a_non_owner_never_becomes_visible_to_local_get() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let unowned_keys: Vec<u32> = (0..5_000u32)
+            .filter(|&key| !view.owns(bucket_of(&key_bytes(&key))))
+            .take(200)
+            .collect();
+        assert!(
+            !unowned_keys.is_empty(),
+            "some unowned key is found within a 5,000-key scan"
+        );
+
+        for &key in &unowned_keys {
+            s.insert(key, "v".to_string())
+                .await
+                .expect("a non-owner's insert never errors");
+            assert!(
+                s.get(&key).await.is_none(),
+                "a non-owner's write for key {key} must never become locally visible"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_on_a_distributed_cache_only_tombstones_owned_buckets() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let owned_key = find_key_by_ownership(&view, true);
+        let unowned_key = find_key_by_ownership(&view, false);
+        s.insert(owned_key, "owned".to_string())
+            .await
+            .expect("owner's insert lands");
+        s.insert(unowned_key, "forwarded".to_string())
+            .await
+            .expect("a non-owner's insert never errors");
+
+        assert_eq!(s.get(&owned_key).await, Some("owned".to_string()));
+        assert!(
+            s.get(&unowned_key).await.is_none(),
+            "the forwarded write never became locally visible in the first place"
+        );
+
+        s.clear().await.expect("clear");
+
+        assert!(
+            s.get(&owned_key).await.is_none(),
+            "clear tombstones the owned key"
+        );
+        assert!(
+            s.get(&unowned_key).await.is_none(),
+            "still absent: nothing was ever held for the unowned bucket to begin with"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_many_on_a_distributed_cache_forwards_unowned_entries_and_applies_owned_ones() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let owned_key = find_key_by_ownership(&view, true);
+        let unowned_key = find_key_by_ownership(&view, false);
+
+        s.insert_many([
+            (owned_key, "owned".to_string()),
+            (unowned_key, "forwarded".to_string()),
+        ])
+        .await
+        .expect("bulk insert");
+
+        assert_eq!(s.get(&owned_key).await, Some("owned".to_string()));
+        assert!(
+            s.get(&unowned_key).await.is_none(),
+            "a bulk write forwarded for an unowned bucket never becomes locally visible"
+        );
+        let forwarded = s.fan_out_queue().drain();
+        assert!(
+            forwarded.iter().any(|item| matches!(
+                item,
+                FanOutItem::Forward(rec) if rec.key.as_ref() == key_bytes(&unowned_key).as_ref()
+            )),
+            "the unowned key lands on the fan-out queue as a Forward item: {forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_many_on_a_distributed_cache_forwards_unowned_tombstones_and_applies_owned_ones()
+    {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let owned_key = find_key_by_ownership(&view, true);
+        let unowned_key = find_key_by_ownership(&view, false);
+        s.insert(owned_key, "owned".to_string())
+            .await
+            .expect("owner's insert lands");
+        let _ = s.fan_out_queue().drain();
+
+        s.remove_many([owned_key, unowned_key])
+            .await
+            .expect("bulk remove");
+
+        assert!(
+            s.get(&owned_key).await.is_none(),
+            "the owned key is tombstoned"
+        );
+        assert!(
+            s.get(&unowned_key).await.is_none(),
+            "still absent: it was never held to begin with"
+        );
+        let forwarded = s.fan_out_queue().drain();
+        assert!(
+            forwarded.iter().any(|item| matches!(
+                item,
+                FanOutItem::Forward(rec) if rec.key.as_ref() == key_bytes(&unowned_key).as_ref()
+            )),
+            "the unowned tombstone lands on the fan-out queue as a Forward item: {forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_remote_batch_drops_records_for_an_unowned_bucket_and_counts_them() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let owned_key = find_key_by_ownership(&view, true);
+        let unowned_key = find_key_by_ownership(&view, false);
+        let owned_rec = wire_record(owned_key, "owned", hlc(1, 9));
+        let unowned_rec = wire_record(unowned_key, "dropped", hlc(1, 9));
+
+        ShardOps::apply_remote_batch(&s, vec![owned_rec, unowned_rec]).await;
+
+        assert_eq!(
+            s.get(&owned_key).await,
+            Some("owned".to_string()),
+            "a record for a bucket this node owns still applies"
+        );
+        assert!(
+            s.get(&unowned_key).await.is_none(),
+            "a record for a bucket this node does not own is dropped, never applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_remote_batch_still_drops_a_record_for_a_bucket_this_node_is_releasing() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) =
+            distributed_shard::<u32, String>(self_node, eligible, 2, Arc::clone(&residency));
+
+        let unowned_key = find_key_by_ownership(&view, false);
+        let unowned_bucket = bucket_of(&key_bytes(&unowned_key));
+        // Mid disown-grace: outbound `is_resident` (owns || releasing) would
+        // say yes for this bucket, but the inbound-apply guard must stay
+        // strict current-view ownership regardless — the point of this test.
+        residency.mark_releasing(&[unowned_bucket]);
+
+        let rec = wire_record(unowned_key, "dropped", hlc(1, 9));
+        ShardOps::apply_remote_batch(&s, vec![rec]).await;
+
+        assert!(
+            s.get(&unowned_key).await.is_none(),
+            "residency never widens what the inbound-apply guard accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn digests_never_reports_an_unowned_bucket() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let reported: HashSet<u16> = ShardOps::digests(&s)
+            .await
+            .into_iter()
+            .map(|(bucket, _)| bucket)
+            .collect();
+        for &bucket in &reported {
+            assert!(
+                view.owns(bucket),
+                "digests reported unowned bucket {bucket}"
+            );
+        }
+        assert!(
+            reported.len() < BUCKET_COUNT,
+            "a 5-eligible/k=2 view owns a strict subset of buckets, so at least one is never \
+             reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_guard_returns_nothing_for_an_unowned_bucket_on_every_serving_method() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let unowned_key = find_key_by_ownership(&view, false);
+        let unowned_bucket = bucket_of(&key_bytes(&unowned_key));
+
+        assert_eq!(
+            ShardOps::bucket_lens(&s, vec![unowned_bucket]).await,
+            vec![(unowned_bucket, 0)],
+            "bucket_lens reports zero for an unowned bucket"
+        );
+        assert_eq!(
+            ShardOps::part_digests(&s, vec![unowned_bucket]).await,
+            vec![(unowned_bucket, Vec::new())],
+            "part_digests reports nothing for an unowned bucket"
+        );
+        let part = (unowned_bucket, 0u8);
+        assert_eq!(
+            ShardOps::entries_for_parts(&s, vec![part]).await,
+            vec![(part, Vec::new())],
+            "entries_for_parts reports nothing for an unowned bucket's part"
+        );
+        assert!(
+            ShardOps::records_for(&s, vec![key_bytes(&unowned_key)])
+                .await
+                .is_empty(),
+            "records_for never answers a key in an unowned bucket"
+        );
+        let snapshot: Vec<WireRecord> = ShardOps::snapshot_chunks(&s)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            snapshot
+                .iter()
+                .all(|rec| bucket_of(rec.key.as_ref()) != unowned_bucket),
+            "snapshot_chunks never includes a record from an unowned bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_releasing_bucket_still_answers_digests_and_entries() {
+        let self_node = NodeId::from(1);
+        // Self starts as the sole eligible node: it owns every bucket, so an
+        // ordinary insert lands for real.
+        let residency = Arc::new(ResidencySet::new());
+        let (s, initial_view, tx) =
+            distributed_shard::<u32, String>(self_node, vec![self_node], 1, Arc::clone(&residency));
+
+        let new_view = OwnershipView::compute(
+            self_node,
+            vec![self_node, NodeId::from(2)],
+            NonZeroU8::new(1).expect("nonzero"),
+        );
+        let key = (0..1_000_000u32)
+            .find(|&k| !new_view.owns(bucket_of(&key_bytes(&k))))
+            .expect("some bucket flips ownership once a second node joins");
+        let bucket = bucket_of(&key_bytes(&key));
+        assert!(initial_view.owns(bucket));
+
+        s.insert(key, "still here".to_string())
+            .await
+            .expect("owner's insert lands");
+
+        // Membership widens and this bucket moves to the other node —
+        // exactly what `rebalance_task` reacts to by starting this bucket's
+        // disown grace.
+        tx.send(Arc::new(new_view)).expect("receiver still alive");
+        residency.mark_releasing(&[bucket]);
+        assert!(
+            !ShardOps::ownership_view(&s).expect("attached").owns(bucket),
+            "sanity: this node no longer owns the bucket under the new view"
+        );
+
+        let digests: HashSet<u16> = ShardOps::digests(&s)
+            .await
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect();
+        assert!(
+            digests.contains(&bucket),
+            "a releasing bucket still answers digests"
+        );
+
+        let entries = ShardOps::entries_for_buckets(&s, vec![bucket]).await;
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .1
+                .iter()
+                .any(|(k, _)| k.as_ref() == key_bytes(&key).as_ref()),
+            "the pre-existing entry in a releasing bucket is still served"
+        );
+    }
+
+    #[test]
+    fn fan_out_item_applied_and_forward_both_drain_through_one_queue() {
+        let queue = FanOutQueue::<FanOutItem<u32>>::new(true);
+        let rec = wire_record(7, "v", hlc(1, 1));
+        queue.push(FanOutItem::Applied(1));
+        queue.push(FanOutItem::Forward(rec.clone()));
+
+        assert_eq!(
+            queue.drain(),
+            vec![FanOutItem::Applied(1), FanOutItem::Forward(rec)],
+            "one queue drains both applied and forwarded items, in push order"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_writes_emit_created_and_removed_events_and_never_updated() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+        let mut events = s.events();
+
+        let key = find_key_by_ownership(&view, false);
+        s.insert(key, "first".to_string())
+            .await
+            .expect("forwarded insert");
+        match events.recv().await.expect("an event was published") {
+            Event::Created {
+                key: k,
+                value,
+                origin,
+            } => {
+                assert_eq!(k, key);
+                assert_eq!(value, "first");
+                assert_eq!(origin, Origin::Local);
+            }
+            other => panic!("expected Event::Created, got {other:?}"),
+        }
+
+        // A second forwarded insert for the same key: a non-owner holds no
+        // prior copy, so it still cannot distinguish create from update —
+        // this stays Created, never Updated, the documented difference from
+        // every other write path.
+        s.insert(key, "second".to_string())
+            .await
+            .expect("forwarded insert");
+        match events.recv().await.expect("an event was published") {
+            Event::Created { key: k, .. } => assert_eq!(k, key),
+            other => panic!("a forwarded write never emits Event::Updated, got {other:?}"),
+        }
+
+        s.remove(&key).await.expect("forwarded remove");
+        match events.recv().await.expect("an event was published") {
+            Event::Removed { key: k, origin } => {
+                assert_eq!(k, key);
+                assert_eq!(origin, Origin::Local);
+            }
+            other => panic!("expected Event::Removed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn release_buckets_removes_every_entry_and_tombstone_and_corrects_the_digest() {
+        let s = shard::<u32, String>(1);
+        let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
+        let mut pair: Vec<u32> = Vec::new();
+        for k in 0..100_000u32 {
+            let bucket = bucket_of(&key_bytes(&k));
+            let group = by_bucket.entry(bucket).or_default();
+            group.push(k);
+            if group.len() == 2 {
+                pair = group.clone();
+                break;
+            }
+        }
+        assert_eq!(
+            pair.len(),
+            2,
+            "1024 buckets; a same-bucket pair is found quickly"
+        );
+        let released_bucket = bucket_of(&key_bytes(&pair[0]));
+
+        s.insert(pair[0], "live".to_string()).await.expect("insert");
+        s.insert(pair[1], "gone".to_string()).await.expect("insert");
+        s.remove(&pair[1]).await.expect("remove");
+
+        let other_key = (0..100_000u32)
+            .find(|&k| bucket_of(&key_bytes(&k)) != released_bucket)
+            .expect("a distinct bucket is found quickly");
+        s.insert(other_key, "untouched".to_string())
+            .await
+            .expect("insert");
+
+        let removed = ShardOps::release_buckets(&s, &[released_bucket]).await;
+
+        assert_eq!(removed, 2, "one live entry and one tombstone removed");
+        assert!(s.get(&pair[0]).await.is_none());
+        assert_eq!(s.get(&other_key).await, Some("untouched".to_string()));
+        let digest_for_released = ShardOps::digests(&s)
+            .await
+            .into_iter()
+            .find(|&(b, _)| b == released_bucket)
+            .map(|(_, d)| d);
+        assert_eq!(
+            digest_for_released,
+            Some(0),
+            "the released bucket's digest resets to zero"
+        );
+    }
+
+    #[test]
+    fn ae_peer_filter_is_identity_for_a_non_distributed_shard() {
+        let s = shard::<u32, String>(1);
+        let peers = vec![NodeId::from(2), NodeId::from(3)];
+        assert_eq!(
+            ShardOps::ae_peer_filter(&s, peers.clone(), peers.clone()),
+            (peers.clone(), peers)
+        );
+    }
+
+    #[test]
+    fn ae_peer_filter_narrows_to_the_current_cohort() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) =
+            distributed_shard::<u32, String>(self_node, eligible.clone(), 2, residency);
+
+        let mut cohort: HashSet<NodeId> = HashSet::new();
+        for i in 0..BUCKET_COUNT {
+            let bucket = u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
+            if view.owns(bucket) {
+                cohort.extend(view.owners_of(bucket).iter().copied());
+            }
+        }
+        cohort.remove(&self_node);
+        assert!(!cohort.is_empty(), "some peer co-owns a bucket with self");
+
+        let candidates: Vec<NodeId> = eligible
+            .iter()
+            .copied()
+            .filter(|&n| n != self_node)
+            .collect();
+        let stranger = candidates.iter().copied().find(|n| !cohort.contains(n));
+
+        let (dirty, live) = ShardOps::ae_peer_filter(&s, candidates.clone(), candidates.clone());
+
+        for peer in dirty.iter().chain(live.iter()) {
+            assert!(
+                cohort.contains(peer),
+                "ae_peer_filter kept a peer sharing no owned bucket with this shard: {peer:?}"
+            );
+        }
+        if let Some(stranger) = stranger {
+            assert!(
+                !dirty.contains(&stranger) && !live.contains(&stranger),
+                "a peer sharing nothing with this shard is filtered out"
+            );
+        }
+        for peer in candidates.iter().filter(|n| cohort.contains(n)) {
+            assert!(
+                dirty.contains(peer) && live.contains(peer),
+                "a co-owning peer stays in the cohort"
+            );
+        }
     }
 
     /// `Shard`-layer coverage of the spill read path: every method here
@@ -3731,11 +4674,12 @@ mod tests {
         }
 
         /// `Shard::attach_spill` sets the tier's `keep_resident_when_refused`
-        /// policy from the shard's own `Mode`: `true` for `Mode::Replicated`,
-        /// since every peer still holds the entry and a local delete would
-        /// just have anti-entropy repair it back in, `false` for
-        /// `Mode::Local`, which has no peer to repair from and so keeps the
-        /// original delete fallback.
+        /// policy from the shard's own `Mode`: `true` for `Mode::Replicated`
+        /// and `Mode::Distributed`, since every peer, or every co-owner,
+        /// still holds the entry and a local delete would just have
+        /// anti-entropy, or a rebalance donor pull, repair it back in,
+        /// `false` for `Mode::Local`, which has no peer to repair from and
+        /// so keeps the original delete fallback.
         #[test]
         fn with_spill_sets_keep_resident_when_refused_from_mode() {
             let dir = temp_dir("keep-resident-replicated");
@@ -3760,6 +4704,30 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
 
+            let dir = temp_dir("keep-resident-distributed");
+            let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+            let distributed = Shard::<u32, String>::new(
+                SmolStr::new("spill-test-distributed"),
+                Mode::Distributed {
+                    owners: NonZeroU8::new(2).expect("nonzero"),
+                },
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            assert!(
+                distributed
+                    .engine
+                    .spill()
+                    .expect("with_spill attaches a tier")
+                    .keep_resident_when_refused(),
+                "Mode::Distributed sets the tier's keep_resident_when_refused policy too"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+
             let dir = temp_dir("keep-resident-local");
             let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
             let local = Shard::<u32, String>::new(
@@ -3780,6 +4748,35 @@ mod tests {
                     .keep_resident_when_refused(),
                 "Mode::Local leaves the tier's keep_resident_when_refused policy at its default"
             );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn release_buckets_corrects_the_spilled_entries_gauge_on_a_shard_with_spill() {
+            let (s, dir) = spill_shard("release-buckets-spill", 1);
+            s.insert(1, "one".to_string()).await.expect("insert 1");
+            s.insert(2, "two".to_string()).await.expect("insert 2");
+            assert!(
+                poll_until(POLL_TIMEOUT, || s.engine.debug_spill_entries_count() > 0).await,
+                "one of the two entries spills under a capacity of 1"
+            );
+
+            let bucket1 = bucket_of(&key_bytes(&1u32));
+            let bucket2 = bucket_of(&key_bytes(&2u32));
+            let removed = ShardOps::release_buckets(&s, &[bucket1, bucket2]).await;
+
+            assert_eq!(
+                removed, 2,
+                "both entries removed, whichever one had spilled"
+            );
+            assert_eq!(
+                s.engine.debug_spill_entries_count(),
+                0,
+                "release_buckets corrects the spilled-entries gauge for its own bucket set"
+            );
+            assert!(s.get(&1).await.is_none());
+            assert!(s.get(&2).await.is_none());
+
             let _ = std::fs::remove_dir_all(&dir);
         }
 

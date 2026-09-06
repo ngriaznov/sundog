@@ -11,11 +11,13 @@
 #![no_main]
 
 use std::collections::HashSet;
+use std::num::NonZeroU8;
 
 use arbitrary::Arbitrary;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use sundog::hlc::Hlc;
+use sundog::node::NodeId;
 use sundog::store::model::{self, RemoteRecord};
 use sundog::store::{BUCKET_COUNT, Shard, ShardOps};
 use sundog::wire::WireRecord;
@@ -102,7 +104,7 @@ fuzz_target!(|input: Input| {
     let order_a = shuffled_with_duplicates(&base, input.seed_a);
     let order_b = shuffled_with_duplicates(&base, input.seed_b);
 
-    futures::executor::block_on(ShardOps::apply_remote_batch(&shard_a, order_a));
+    futures::executor::block_on(ShardOps::apply_remote_batch(&shard_a, order_a.clone()));
     futures::executor::block_on(ShardOps::apply_remote_batch(&shard_b, order_b));
 
     assert_eq!(
@@ -115,4 +117,21 @@ fuzz_target!(|input: Input| {
         entry_set(&shard_b),
         "entries_for_buckets diverged across permutation/duplication of the same record multiset"
     );
+
+    // A third, `Mode::Distributed` shard, a minority owner among three
+    // eligible nodes, driven by the same permutation: convergence with
+    // shard_a/shard_b is not asserted (a non-owner drops what it does not
+    // own), but no entry for a bucket outside its own view may ever land.
+    let eligible = vec![NodeId::from(10), NodeId::from(11), NodeId::from(12)];
+    let owners = NonZeroU8::new(1).expect("nonzero");
+    let (shard_c, model_c) =
+        model::new_shard_and_model_with_ownership("fuzz-apply-permutation-c", 10, eligible, owners);
+    futures::executor::block_on(ShardOps::apply_remote_batch(&shard_c, order_a));
+    for (key_bytes, _) in entry_set(&shard_c) {
+        let key = model::key_from_bytes(&key_bytes).expect("model keys are u8");
+        assert!(
+            model_c.owns(key),
+            "a non-owner accumulated an entry for key {key}, outside its own ownership view"
+        );
+    }
 });

@@ -7,6 +7,7 @@
 //! model side by side, asserting agreement after every step.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,10 +17,31 @@ use smol_str::SmolStr;
 
 use crate::hlc::{Hlc, HlcClock};
 use crate::node::NodeId;
+use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::wire::WireRecord;
 
 use super::engine::{hash_key_bytes, stripe_index_from_hash};
 use super::{BUCKET_COUNT, Mode, Shard, ShardOps, entry_fingerprint};
+
+/// The anti-entropy bucket a model key hashes into, mirroring `Shard`'s own
+/// key encoding. `pub` so the out-of-workspace fuzz crate can group
+/// generated keys by bucket without reaching into `store::engine`.
+#[must_use]
+pub fn bucket_of(key: u8) -> u16 {
+    u16::try_from(stripe_index_from_hash(hash_key_bytes(
+        key_bytes(key).as_ref(),
+    )))
+    .expect("invariant: BUCKET_COUNT fits u16")
+}
+
+/// Decodes a model key back from the wire bytes [`ShardOps::entries_for_buckets`]
+/// et al. report it as, `None` on anything that isn't one of this model's own
+/// `key_bytes(k)` encodings. `pub` so the out-of-workspace fuzz crate can
+/// decode an observed key without a direct `postcard` dependency of its own.
+#[must_use]
+pub fn key_from_bytes(bytes: &[u8]) -> Option<u8> {
+    postcard::from_bytes(bytes).ok()
+}
 
 /// Tombstone retention for every [`new_shard_and_model`] pair. Short
 /// enough that [`Op::AdvanceClock`] routinely crosses both deadlines.
@@ -58,6 +80,13 @@ pub struct Model {
     hlc_clock: HlcClock,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
+    /// `Some` only for [`new_shard_and_model_with_ownership`]'s pair: the
+    /// same view attached to the paired `Shard`, so [`Model::owns`] answers
+    /// exactly what that shard's own inbound/write guards would. `None`
+    /// (every other constructor) means "every node owns everything," the
+    /// default that keeps every fuzz target and property test written
+    /// before this axis existed behaving byte-for-byte the same.
+    ownership: Option<Arc<OwnershipView>>,
 }
 
 impl Model {
@@ -71,7 +100,19 @@ impl Model {
             hlc_clock: HlcClock::new(node),
             tombstone_ttl_ms,
             tombstone_max_ttl_ms,
+            ownership: None,
         }
+    }
+
+    /// Whether this model's attached ownership view (if any) owns `key`'s
+    /// bucket. `true` unconditionally when no view is attached — the
+    /// default for every constructor but
+    /// [`new_shard_and_model_with_ownership`].
+    #[must_use]
+    pub fn owns(&self, key: u8) -> bool {
+        self.ownership
+            .as_ref()
+            .is_none_or(|view| view.owns(bucket_of(key)))
     }
 
     /// The clock-reading closure to install via [`Shard::with_clock`], so
@@ -342,6 +383,46 @@ pub fn new_shard_and_model(name: &str, node: u64) -> (Shard<u8, u8>, Model) {
     .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
     .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS))
     .with_clock(model.clock_fn());
+    (shard, model)
+}
+
+/// Like [`new_shard_and_model`], but for a `Mode::Distributed` cache: a
+/// bucket-ownership view computed directly from `eligible` (`node` folded
+/// in automatically, matching [`OwnershipView::compute`]'s own contract)
+/// and `owners` is attached to both the returned shard and the returned
+/// model, so a fuzz target can assert convergence never smuggles an entry
+/// into a bucket outside that view via [`Model::owns`]. Every other
+/// constructor here leaves both at "every node owns everything."
+#[must_use]
+pub fn new_shard_and_model_with_ownership(
+    name: &str,
+    node: u64,
+    eligible: Vec<NodeId>,
+    owners: NonZeroU8,
+) -> (Shard<u8, u8>, Model) {
+    let node = NodeId::from(node);
+    let view = Arc::new(OwnershipView::compute(node, eligible, owners));
+
+    let mut model = Model::new(node, TOMBSTONE_TTL_MS, TOMBSTONE_MAX_TTL_MS);
+    model.ownership = Some(Arc::clone(&view));
+
+    let (tracker, tx) =
+        OwnershipTracker::seed(node, &[], &HashMap::new(), &SmolStr::new(name), owners);
+    tx.send(Arc::clone(&view)).expect("receiver still alive");
+    let residency = Arc::new(ResidencySet::new());
+
+    let shard = Shard::<u8, u8>::new(
+        SmolStr::new(name),
+        Mode::Distributed { owners },
+        node,
+        u64::MAX,
+        None,
+        None,
+    )
+    .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
+    .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS))
+    .with_clock(model.clock_fn())
+    .with_ownership(tracker, residency);
     (shard, model)
 }
 
