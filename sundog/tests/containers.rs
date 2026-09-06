@@ -1599,6 +1599,56 @@ async fn fetch_mismatches(nodes: &[&Node], entries: &[(String, String)]) -> Vec<
         .await
 }
 
+/// One line per node of `count`, `peers`, `sundog_owned_buckets`, and the
+/// rebalance in/out counters, for a convergence wait's progress report.
+async fn describe_distributed_state(nodes: &[&Node]) -> String {
+    let mut parts = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let count = node
+            .count()
+            .await
+            .map_or_else(|_| "?".to_string(), |c| c.to_string());
+        let peers = node
+            .peers()
+            .await
+            .map_or_else(|_| "?".to_string(), |c| c.to_string());
+        let owned = scrape_metric(node, "sundog_owned_buckets", ("cache", "it")).await;
+        let pulled =
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await;
+        let released =
+            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
+        parts.push(format!(
+            "{}: count={count} peers={peers} owned={owned} in={pulled} out={released}",
+            node.name()
+        ));
+    }
+    parts.join("; ")
+}
+
+/// Polls until the summed `count` across `nodes` is `expected_sum`, printing
+/// [`describe_distributed_state`] every few seconds while it is not, so a
+/// timed-out wait's output says which node held what.
+async fn wait_for_entry_sum(nodes: &[Node], expected_sum: usize, wait: Duration, iteration: u64) {
+    let node_refs: Vec<&Node> = nodes.iter().collect();
+    let node_refs = &node_refs;
+    let mut polls = 0u32;
+    eventually(wait, || {
+        polls += 1;
+        let report = polls.is_multiple_of(25);
+        async move {
+            let sum = sum_counts(node_refs).await;
+            if report && sum != Some(expected_sum) {
+                eprintln!(
+                    "chaos[{iteration}]: waiting for {expected_sum} entries, {}",
+                    describe_distributed_state(node_refs).await
+                );
+            }
+            sum == Some(expected_sum)
+        }
+    })
+    .await;
+}
+
 /// Sum of `count` across every node in `nodes`, `None` if any read fails —
 /// the shared building block every distributed scenario's convergence poll
 /// below sums to `owners * fill_keys`.
@@ -2063,10 +2113,7 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
             // which no design with two owners survives. The next action
             // waits until every key is back on two owners.
             let expected_sum = usize::from(OWNERS) * (FILL_KEYS as usize + burst_entries.len());
-            eventually(RESETTLE_WAIT, || async {
-                sum_counts(&nodes.iter().collect::<Vec<_>>()).await == Some(expected_sum)
-            })
-            .await;
+            wait_for_entry_sum(&nodes, expected_sum, RESETTLE_WAIT, iteration).await;
             eprintln!("chaos[{iteration}]: every key is back on {OWNERS} owners");
         } else {
             if let ChaosAction::Burst { count, .. } = action {
