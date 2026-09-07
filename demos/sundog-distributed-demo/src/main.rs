@@ -7,6 +7,7 @@
 mod app;
 mod cli;
 mod convergence;
+mod headless;
 mod load;
 mod node;
 mod preload;
@@ -26,6 +27,11 @@ use tokio::sync::mpsc;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = cli::parse(std::env::args().skip(1))?;
+
+    if let Some(duration) = args.headless {
+        let code = headless::run(&args, duration).await?;
+        std::process::exit(code);
+    }
 
     run_tui(&args).await
 }
