@@ -431,6 +431,42 @@ then prints a convergence report and exits nonzero if anything diverged. That's
 the soak-test rig: run it for 24h and memory stays flat. It doubles as a
 CI-friendly smoke check.
 
+## Distributed demo
+
+`demos/sundog-distributed-demo` is the same shape of demo built around
+`Mode::Distributed` instead: it preloads a large key set across N in-process
+nodes, then runs a steady write load and random `fetch` sampling against it
+while you kill and restart nodes and watch buckets move:
+
+```sh
+cargo run --release -p sundog-distributed-demo -- --nodes 5 --keys 2000000
+```
+
+It preloads `--keys` keys (`k{i}` = `v{i}`, two million by default) in
+batches spread round-robin across the live nodes via `Cache::insert_many`
+before the write load starts, printing preload throughput and this
+process's RSS once it lands. Flags: `--owners <N>` (live owners per bucket,
+default 2), `--cluster <NAME>`, `--write-interval-ms <N>`,
+`--gossip-base-port <PORT>`; `--help` lists everything. The TUI shows a
+progress bar during preload, then per node: entry count, an estimated
+owned-bucket share, warmth, and restarts, plus cluster-wide fetch hit/miss/
+error counts and latency. Same keys as the chaos demo: arrow keys or `j`/`k`
+to move, `1`-`9`/Enter to pick a node, `K` to kill it, `R` to restart it, `P`
+to pause the load, `q` to quit.
+
+Watch entries per node settle around `owners / N` of the key count; kill a
+node and watch the survivors' owned-bucket counts and entry counts climb as
+they pull its buckets; restart it and watch it take its share back.
+
+`--headless <SECS>` preloads, runs the load for `SECS` seconds — killing one
+node at the midpoint and restarting it three-quarters through, to exercise a
+real rebalance — then pauses it, polls the sum of live nodes' entry counts
+against `owners * surviving keys` under a bound wide enough for
+`distributed_disown_grace_rounds` to run out, verifies a random sample of
+surviving keys against their expected value, and prints one report line
+each for the preload, the fetch counters, the sample check, and
+convergence, exiting nonzero on either a divergence or a failed sample.
+
 ## MSRV
 
 Rust edition 2024, `rust-version = "1.97"`, resolver `3`.

@@ -50,6 +50,20 @@ All notable changes to this project are documented in this file. Format follows
   owners, one owner crashing with every key still fetchable and then
   re-owned, and a fourth node joining a filled cluster and taking its share,
   plus the chaos lane's `chaos_distributed_crashes_churn_and_drops_still_converge`.
+- `demos/sundog-demo` moved under `demos/`, alongside the new distributed
+  demo below, out of the repository root.
+- **`sundog-distributed-demo`**: a `ratatui` demo for `Mode::Distributed`, a
+  sibling of `sundog-demo`. Preloads a large key set (two million `k{i}` =
+  `v{i}` pairs by default) across N in-process nodes in batches spread
+  round-robin via `Cache::insert_many`, then runs a steady write load plus
+  random `fetch` sampling against it; the TUI shows a preload progress bar,
+  each node's entry count and estimated owned-bucket share, and
+  cluster-wide fetch hit/miss/error counts and latency, with the same
+  interactive kill/restart/pause controls as the chaos demo. Its
+  `--headless <SECS>` mode kills and restarts a node mid-run to exercise
+  rebalance, then checks the sum of live nodes' entry counts against
+  `owners * surviving keys` and a random sample of surviving keys against
+  their expected value.
 
 ### Changed
 

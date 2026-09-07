@@ -1,0 +1,22 @@
+[package]
+name = "sundog-distributed-demo"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "CLI demo for sundog's distribution mode: preload millions of keys, watch buckets rebalance across nodes"
+publish = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+rand = "0.10.2"
+ratatui = "0.30.2"
+sundog = { version = "0.5.0", path = "../../sundog" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "io-std", "signal"] }
+tracing-subscriber = "0.3.23"
