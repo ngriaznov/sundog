@@ -146,11 +146,11 @@ pub(super) fn record_frame_sent(len: usize) {
     metrics::counter!("sundog_bytes_sent_total").increment(len as u64);
 }
 
-/// Splits a run of records into `Msg::ReplicateBatch` chunks by the same
-/// budget and count cap `net::conn`'s coalescer enforces
-/// ([`REPLICATE_BATCH_BUDGET`]/[`REPLICATE_BATCH_COUNT`]). A chunk of
-/// exactly one record stays a plain [`Msg::Replicate`].
-pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
+/// Splits a run of records into chunks by the same budget and count cap
+/// `net::conn`'s coalescer enforces
+/// ([`REPLICATE_BATCH_BUDGET`]/[`REPLICATE_BATCH_COUNT`]), the shared core
+/// of [`batch_replicate`] and [`batch_forward`].
+fn chunk_records(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Vec<WireRecord>> {
     let mut chunks: Vec<Vec<WireRecord>> = Vec::new();
     let mut current: Vec<WireRecord> = Vec::new();
     let mut current_bytes = 0usize;
@@ -174,6 +174,14 @@ pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) ->
         chunks.push(current);
     }
     chunks
+}
+
+/// Splits a run of records into `Msg::ReplicateBatch` chunks by the same
+/// budget and count cap `net::conn`'s coalescer enforces
+/// ([`REPLICATE_BATCH_BUDGET`]/[`REPLICATE_BATCH_COUNT`]). A chunk of
+/// exactly one record stays a plain [`Msg::Replicate`].
+pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) -> Vec<Msg> {
+    chunk_records(cache_name, records)
         .into_iter()
         .map(|mut recs| {
             if recs.len() == 1 {
@@ -187,6 +195,27 @@ pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) ->
                     recs,
                 }
             }
+        })
+        .collect()
+}
+
+/// [`batch_replicate`] for a `Mode::Distributed` fan-out: every chunk is a
+/// [`Msg::ForwardBatch`] stamped with the sender's `view_hash` and `hops`,
+/// a lone record included, so the receiver always sees the view the batch
+/// was routed under.
+pub(crate) fn batch_forward(
+    cache_name: &SmolStr,
+    view_hash: u64,
+    hops: u8,
+    records: Vec<WireRecord>,
+) -> Vec<Msg> {
+    chunk_records(cache_name, records)
+        .into_iter()
+        .map(|recs| Msg::ForwardBatch {
+            cache: cache_name.clone(),
+            view_hash,
+            hops,
+            recs,
         })
         .collect()
 }
@@ -2576,6 +2605,48 @@ mod tests {
             msgs.len(),
             2,
             "the byte budget splits four third-budget records two and two"
+        );
+    }
+
+    #[test]
+    fn batch_forward_stamps_every_chunk_and_keeps_a_singleton_a_forward_batch() {
+        let cache = SmolStr::new("users");
+        let tiny = |i: u32| WireRecord {
+            key: Bytes::from(i.to_le_bytes().to_vec()),
+            value: Some(Bytes::from_static(b"v")),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        };
+        assert!(
+            matches!(
+                batch_forward(&cache, 9, 1, vec![tiny(0)]).as_slice(),
+                [Msg::ForwardBatch { view_hash: 9, hops: 1, recs, .. }] if recs.len() == 1
+            ),
+            "a lone record still travels as a ForwardBatch, never a plain Replicate"
+        );
+        let msgs = batch_forward(
+            &cache,
+            9,
+            0,
+            (0..u32::try_from(REPLICATE_BATCH_COUNT + 1).expect("fits"))
+                .map(tiny)
+                .collect(),
+        );
+        assert_eq!(msgs.len(), 2, "the count cap splits like batch_replicate");
+        assert!(msgs.iter().all(|msg| matches!(
+            msg,
+            Msg::ForwardBatch {
+                view_hash: 9,
+                hops: 0,
+                ..
+            }
+        )));
+        assert!(
+            matches!(&msgs[0], Msg::ForwardBatch { recs, .. } if recs.len() == REPLICATE_BATCH_COUNT)
         );
     }
 

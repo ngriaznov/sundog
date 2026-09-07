@@ -44,7 +44,7 @@ use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
     AeServeOutcome, FetchServe, InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler,
-    batch_replicate,
+    batch_forward, batch_replicate,
 };
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
@@ -717,6 +717,8 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     cluster.spawn_tracked(inbound_loop(
         cluster.shards(),
         Arc::clone(&cluster.inner.inbound_activity),
+        cluster.inner.mesh.clone(),
+        cluster.node_id(),
         inbound_rx,
         cluster.cancel_token(),
     ));
@@ -1152,17 +1154,62 @@ async fn apply_pending_replicate(
     }
 }
 
+/// Appends `recs` to the pending same-cache run, or applies the run in
+/// progress first when `cache` differs and starts a new one.
+async fn queue_replicate(
+    shards: &ShardRegistry,
+    shard_cache: &mut HashMap<SmolStr, Option<Arc<dyn ShardOps>>>,
+    pending: &mut Option<(SmolStr, Vec<WireRecord>)>,
+    cache: SmolStr,
+    mut recs: Vec<WireRecord>,
+) {
+    match pending {
+        Some((pending_cache, pending_recs)) if *pending_cache == cache => {
+            pending_recs.append(&mut recs);
+        }
+        _ => {
+            if let Some((old_cache, old_recs)) = pending.take() {
+                apply_pending_replicate(shards, shard_cache, old_cache, old_recs).await;
+            }
+            *pending = Some((cache, recs));
+        }
+    }
+}
+
+/// Notes every peer with a record-carrying message in `drained` as
+/// streaming toward this node, once per peer per drain.
+fn note_streaming_peers(activity: &InboundActivity, drained: &[InboundMsg]) {
+    let mut streaming_from: HashSet<NodeId> = HashSet::new();
+    for InboundMsg { from, msg } in drained {
+        if matches!(
+            msg,
+            Msg::Replicate { .. } | Msg::ReplicateBatch { .. } | Msg::ForwardBatch { .. }
+        ) {
+            streaming_from.insert(*from);
+        }
+    }
+    for from in streaming_from {
+        activity.note(from);
+    }
+}
+
 /// The single consumer of `Mesh`'s inbound-message channel: dispatches
-/// `Invalidate`/`Replicate`/`ReplicateBatch` to the named shard. A message
-/// for an unregistered cache is dropped with a trace event.
+/// `Invalidate`/`Replicate`/`ReplicateBatch`/`ForwardBatch` to the named
+/// shard. A message for an unregistered cache is dropped with a trace
+/// event.
 ///
 /// Drains a bounded batch per wake with `recv_many`, so a cache name is
 /// looked up at most once per batch and a run of same-cache
-/// `Replicate`/`ReplicateBatch` messages coalesces into one
-/// `apply_remote_batch` call, applied in drain order.
+/// `Replicate`/`ReplicateBatch`/`ForwardBatch` messages coalesces into one
+/// `apply_remote_batch` call, applied in drain order. A `ForwardBatch`
+/// routed under a view hash other than the shard's own is first
+/// re-forwarded to its records' owners under this node's view (see
+/// [`reforward_stale_view`]), then applied like any other.
 async fn inbound_loop(
     shards: ShardRegistry,
     activity: Arc<InboundActivity>,
+    mesh: Mesh,
+    self_node: NodeId,
     mut inbound: mpsc::Receiver<InboundMsg>,
     cancel: CancellationToken,
 ) {
@@ -1179,42 +1226,43 @@ async fn inbound_loop(
             }
         }
 
-        let mut streaming_from: HashSet<NodeId> = HashSet::new();
-        for InboundMsg { from, msg } in &drained {
-            if matches!(msg, Msg::Replicate { .. } | Msg::ReplicateBatch { .. }) {
-                streaming_from.insert(*from);
-            }
-        }
-        for from in streaming_from {
-            activity.note(from);
-        }
+        note_streaming_peers(&activity, &drained);
 
         let mut shard_cache: HashMap<SmolStr, Option<Arc<dyn ShardOps>>> = HashMap::new();
         let mut pending: Option<(SmolStr, Vec<WireRecord>)> = None;
         for InboundMsg { from, msg } in drained.drain(..) {
             match msg {
-                Msg::Replicate { cache, rec } => match &mut pending {
-                    Some((pending_cache, recs)) if *pending_cache == cache => recs.push(rec),
-                    _ => {
-                        if let Some((old_cache, old_recs)) = pending.take() {
-                            apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
-                                .await;
-                        }
-                        pending = Some((cache, vec![rec]));
+                Msg::Replicate { cache, rec } => {
+                    queue_replicate(&shards, &mut shard_cache, &mut pending, cache, vec![rec])
+                        .await;
+                }
+                Msg::ReplicateBatch { cache, recs } => {
+                    queue_replicate(&shards, &mut shard_cache, &mut pending, cache, recs).await;
+                }
+                Msg::ForwardBatch {
+                    cache,
+                    view_hash,
+                    hops,
+                    recs,
+                } => {
+                    let shard = shard_cache
+                        .entry(cache.clone())
+                        .or_insert_with(|| lookup_shard(&shards, &cache));
+                    if let Some(shard) = shard {
+                        reforward_stale_view(
+                            &mesh,
+                            self_node,
+                            from,
+                            shard.as_ref(),
+                            &cache,
+                            view_hash,
+                            hops,
+                            &recs,
+                        )
+                        .await;
                     }
-                },
-                Msg::ReplicateBatch { cache, mut recs } => match &mut pending {
-                    Some((pending_cache, pending_recs)) if *pending_cache == cache => {
-                        pending_recs.append(&mut recs);
-                    }
-                    _ => {
-                        if let Some((old_cache, old_recs)) = pending.take() {
-                            apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
-                                .await;
-                        }
-                        pending = Some((cache, recs));
-                    }
-                },
+                    queue_replicate(&shards, &mut shard_cache, &mut pending, cache, recs).await;
+                }
                 Msg::Invalidate { cache, key, ver } => {
                     if let Some((old_cache, old_recs)) = pending.take() {
                         apply_pending_replicate(&shards, &mut shard_cache, old_cache, old_recs)
@@ -1256,6 +1304,113 @@ async fn inbound_loop(
         }
         if let Some((cache, recs)) = pending.take() {
             apply_pending_replicate(&shards, &mut shard_cache, cache, recs).await;
+        }
+    }
+}
+
+/// The most hops a `Mode::Distributed` write travels: one from the writer
+/// to the owners under its view, and at most one more from a receiver
+/// whose view disagrees to the owners under its own. A receiver never
+/// re-forwards a batch already at this count, so two disagreeing views
+/// cost one extra hop and never a loop.
+const MAX_FORWARD_HOPS: u8 = 1;
+
+/// Which peers a `ForwardBatch` received from `from` under a view hash
+/// other than this node's own re-forwards to: each record's owners under
+/// `view`, this node and `from` excluded (this node applies its own share
+/// directly; `from` is either an owner that already holds the record or a
+/// non-owner that never wanted it), grouped by target set like
+/// [`group_by_owner_set`]. Pure and mesh-free. `None` when `hops` already
+/// reached [`MAX_FORWARD_HOPS`] or the hashes agree, so the caller sends
+/// nothing.
+fn reforward_groups(
+    view: &OwnershipView,
+    self_node: NodeId,
+    from: NodeId,
+    sender_view_hash: u64,
+    hops: u8,
+    records: &[WireRecord],
+) -> Option<Vec<(Vec<NodeId>, Vec<WireRecord>)>> {
+    if hops >= MAX_FORWARD_HOPS || sender_view_hash == view.view_hash() {
+        return None;
+    }
+    let groups: Vec<(Vec<NodeId>, Vec<WireRecord>)> =
+        group_by_owner_set(view, self_node, records.to_vec())
+            .into_iter()
+            .map(|(owners, recs)| {
+                (
+                    owners
+                        .into_iter()
+                        .filter(|&n| n != from)
+                        .collect::<Vec<_>>(),
+                    recs,
+                )
+            })
+            .filter(|(owners, _)| !owners.is_empty())
+            .collect();
+    Some(groups)
+}
+
+/// Re-forwards a `ForwardBatch` the sender routed under a stale (or simply
+/// different) ownership view to the records' owners under this node's
+/// view, so a write whose target set the writer got wrong still reaches
+/// every current owner: a tombstone from a writer that has not yet seen a
+/// replacement owner join lands on that owner too, instead of waiting for
+/// an anti-entropy round to pair the two, and a record for a bucket this
+/// node no longer owns at all travels on instead of being dropped by the
+/// inbound guard. Sent as a `hops + 1` batch stamped with this node's own
+/// view hash. A no-op for a shard without an ownership view (every mode
+/// but `Mode::Distributed`).
+#[allow(clippy::too_many_arguments)]
+async fn reforward_stale_view(
+    mesh: &Mesh,
+    self_node: NodeId,
+    from: NodeId,
+    shard: &dyn ShardOps,
+    cache_name: &SmolStr,
+    sender_view_hash: u64,
+    hops: u8,
+    records: &[WireRecord],
+) {
+    let Some(view) = shard.ownership_view() else {
+        return;
+    };
+    let Some(groups) = reforward_groups(&view, self_node, from, sender_view_hash, hops, records)
+    else {
+        return;
+    };
+    if groups.is_empty() {
+        return;
+    }
+    let forwarded: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+    metrics::counter!(
+        "sundog_forwarded_writes_total",
+        "cache" => cache_name.to_string()
+    )
+    .increment(u64::try_from(forwarded).unwrap_or(u64::MAX));
+    tracing::debug!(
+        cache = %cache_name,
+        peer = %from,
+        sender_view_hash,
+        local_view_hash = view.view_hash(),
+        records = forwarded,
+        "forward batch routed under another view; re-forwarded to its owners under ours"
+    );
+    let deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
+    for (owners, recs) in groups {
+        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, recs)
+            .into_iter()
+            .filter_map(|msg| match OutFrame::new(msg) {
+                Ok(frame) => Some(frame),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode outbound message; dropped");
+                    None
+                }
+            })
+            .collect();
+        for peer in owners {
+            mesh.send_frames_awaiting(peer, frames.clone(), deadline)
+                .await;
         }
     }
 }
@@ -1332,7 +1487,7 @@ fn group_by_owner_set(
 
 /// Groups `records` by the exact target-peer set each should replicate to —
 /// its bucket's live owners under `view`, self excluded — then sends each
-/// group as coalesced `Replicate`/`ReplicateBatch` frames through the
+/// group as `ForwardBatch` frames stamped with `view`'s hash through the
 /// mesh's existing per-peer outboxes ([`Mesh::send_frames_awaiting`],
 /// waiting for space rather than dropping on overflow, since a forwarded
 /// write's only copy is the frame). The single function both an owner's
@@ -1350,7 +1505,7 @@ async fn fan_out_by_owner_set(
         if owners.is_empty() {
             continue;
         }
-        let frames: Vec<OutFrame> = batch_replicate(cache_name, recs)
+        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), 0, recs)
             .into_iter()
             .filter_map(|msg| match OutFrame::new(msg) {
                 Ok(frame) => Some(frame),
@@ -2999,6 +3154,67 @@ mod tests {
             total,
             records.len(),
             "no record is lost or duplicated by grouping"
+        );
+    }
+
+    /// A batch routed under another view hash at hop zero re-forwards to
+    /// every current owner but this node and its sender; the same batch at
+    /// the hop cap, or under this node's own hash, re-forwards to nobody.
+    #[test]
+    fn reforward_groups_exclude_self_and_sender_and_stop_at_the_hop_cap() {
+        let self_node = NodeId::from(1);
+        let sender = NodeId::from(2);
+        let third = NodeId::from(3);
+        let eligible = vec![self_node, sender, third];
+        let k = std::num::NonZeroU8::new(2).expect("nonzero");
+        let view = OwnershipView::compute(self_node, eligible, k);
+        let stale_hash = view.view_hash() ^ 1;
+
+        let records: Vec<WireRecord> = (0u32..200).map(wire_record_for_u32).collect();
+        let groups = reforward_groups(&view, self_node, sender, stale_hash, 0, &records)
+            .expect("a hop-zero batch under another view re-forwards");
+        assert!(
+            !groups.is_empty(),
+            "some bucket has an owner besides self and the sender"
+        );
+        for (owners, recs) in &groups {
+            assert_eq!(
+                owners.as_slice(),
+                [third],
+                "with three eligible nodes the only other target is the third node"
+            );
+            for rec in recs {
+                assert!(
+                    view.owners_of(bucket_of(rec.key.as_ref())).contains(&third),
+                    "a record only re-forwards to a node that owns its bucket"
+                );
+            }
+        }
+        let re_forwarded: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+        let expected = records
+            .iter()
+            .filter(|rec| view.owners_of(bucket_of(rec.key.as_ref())).contains(&third))
+            .count();
+        assert_eq!(
+            re_forwarded, expected,
+            "every record the third node owns, and no other"
+        );
+
+        assert!(
+            reforward_groups(
+                &view,
+                self_node,
+                sender,
+                stale_hash,
+                MAX_FORWARD_HOPS,
+                &records
+            )
+            .is_none(),
+            "a batch at the hop cap never re-forwards"
+        );
+        assert!(
+            reforward_groups(&view, self_node, sender, view.view_hash(), 0, &records).is_none(),
+            "a batch routed under this node's own view needs no re-forward"
         );
     }
 

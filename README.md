@@ -174,6 +174,10 @@ that misses it locally asks the other owners first. A write for a
 bucket this node doesn't own is forwarded to that bucket's owners and never
 applied locally, so no external routing is required — though a local `get`
 right after a forwarded write still misses, since only the owners hold it.
+Every forwarded batch carries the writer's view hash; an owner whose own
+view differs passes the batch on once more to the owners it knows, so a
+write routed under a view that has since changed still lands on every
+current owner.
 `get` stays local-only everywhere, returning `None` off a non-owner; `fetch`
 is the network-aware read, trying live owners in rendezvous order and
 returning `Ok(None)` for a genuine miss or `CacheError::FetchUnavailable` once
@@ -214,7 +218,7 @@ The current release speaks protocol 3 and serves protocol 2, the release
 before it; a container test runs the previous release's node against the
 current one in both roles. Distribution mode's message kinds — `Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
-`StBucketChunk`, and `StaleView` — are gated on protocol 3: a distributed cache forms only among protocol-3
+`StBucketChunk`, `ForwardBatch`, and `StaleView` — are gated on protocol 3: a distributed cache forms only among protocol-3
 peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
 own a bucket and never receives one of these messages at all.
 
@@ -288,7 +292,8 @@ node's current bucket count; `sundog_rebalance_buckets_total{cache,
 direction}`, buckets rebalance pulled in or released out; `sundog_fetch_total{
 cache, outcome}`, each `Cache::fetch` call's outcome (`local`, `remote`,
 `miss`, or `error`); `sundog_forwarded_writes_total{cache}`, writes this node
-forwarded to a bucket's owners instead of applying; `sundog_stale_view_total{
+forwarded to a bucket's owners instead of applying, or passed on because they
+arrived under another node's view; `sundog_stale_view_total{
 cache}`, anti-entropy rounds a peer declined over a mismatched ownership view;
 and `sundog_unowned_inbound_dropped_total{cache}`, inbound records dropped for
 a bucket this node neither owns nor is mid disown-grace on.

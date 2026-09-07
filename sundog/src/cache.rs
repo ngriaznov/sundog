@@ -1938,6 +1938,185 @@ mod tests {
         a.shutdown().await;
     }
 
+    /// Three nodes under `config`, each with `name` open as a
+    /// `Mode::distributed()` cache and every peer count settled.
+    async fn three_node_distributed_with(
+        name: &'static str,
+        config: ClusterConfig,
+    ) -> (
+        (Cluster, Cache<u32, String>),
+        (Cluster, Cache<u32, String>),
+        (Cluster, Cache<u32, String>),
+    ) {
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = a
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("a opens alone");
+        let seed = a.local_gossip_addr();
+        let join = |peer_count: usize| {
+            let config = config.clone();
+            async move {
+                let cluster = Cluster::builder(name)
+                    .seeds([seed])
+                    .config(config)
+                    .build()
+                    .await
+                    .expect("node builds");
+                wait_for_peer_count(&cluster, peer_count).await;
+                let cache = cluster
+                    .cache::<u32, String>(name)
+                    .mode(Mode::distributed())
+                    .open()
+                    .await
+                    .expect("node opens");
+                (cluster, cache)
+            }
+        };
+        let (b, cache_b) = join(1).await;
+        wait_for_peer_count(&a, 1).await;
+        let (c, cache_c) = join(2).await;
+        wait_for_peer_count(&a, 2).await;
+        wait_for_peer_count(&b, 2).await;
+        ((a, cache_a), (b, cache_b), (c, cache_c))
+    }
+
+    /// A `WireRecord` for `key`/`value` as `node` would write it now.
+    fn wire_record_from(key: u32, value: &str, node: NodeId) -> crate::wire::WireRecord {
+        crate::wire::WireRecord {
+            key: encode_key(&key).expect("u32 encodes"),
+            value: Some(bytes::Bytes::from(
+                postcard::to_stdvec(&value.to_string()).expect("string encodes"),
+            )),
+            ver: crate::hlc::Hlc {
+                wall_ms: u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock past the epoch")
+                        .as_millis(),
+                )
+                .expect("fits"),
+                logical: 0,
+                node,
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    /// A write fanned out under a stale ownership view reaches only the
+    /// owners that view names. The receiver's inbound loop notices the
+    /// batch's view hash is not its own and re-forwards the records to
+    /// their owners under its view, so the owner the writer missed gets
+    /// the record without waiting for an anti-entropy round to pair the
+    /// two; a batch already re-forwarded once travels no further.
+    #[tokio::test]
+    async fn a_forward_batch_under_a_stale_view_reaches_the_owner_the_writer_missed() {
+        use crate::net::OutFrame;
+        use crate::wire::{Msg, WireRecord};
+
+        // Anti-entropy is effectively off: it would repair the missing
+        // copy and hide whether the re-forward did.
+        let name = "distributed-stale-forward";
+        let mut config = loopback_config();
+        config.ae_interval = Duration::from_secs(3600);
+        let ((a, cache_a), (b, cache_b), (c, cache_c)) =
+            three_node_distributed_with(name, config).await;
+
+        // Two keys whose owners are exactly `b` and `c`, under every node's
+        // settled view.
+        let mut keys = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let found: Vec<u32> = (0..100_000u32)
+                    .filter(|key| {
+                        let owners = cache_a.owners_of(key);
+                        owners.len() == 2
+                            && !owners.contains(&a.node_id())
+                            && cache_b.owners_of(key) == owners
+                            && cache_c.owners_of(key) == owners
+                    })
+                    .take(2)
+                    .collect();
+                if found.len() == 2 {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("every view settles on b and c owning some bucket");
+        let hop_one_key = keys.pop().expect("two keys");
+        let key = keys.pop().expect("two keys");
+        let cache_name = SmolStr::new(name);
+        let stale_hash = cache_b
+            .shard
+            .ownership_view_hash()
+            .expect("b is distributed")
+            ^ 1;
+        let record = |key: u32, value: &str| wire_record_from(key, value, a.node_id());
+        let forward = |hops: u8, rec: WireRecord| {
+            let frame = OutFrame::new(Msg::ForwardBatch {
+                cache: cache_name.clone(),
+                view_hash: stale_hash,
+                hops,
+                recs: vec![rec],
+            })
+            .expect("encodes");
+            let mesh = a.mesh().clone();
+            let to = b.node_id();
+            async move {
+                mesh.send_frames_awaiting(
+                    to,
+                    vec![frame],
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await;
+            }
+        };
+
+        // As if `a` still believed `b` and a departed node owned the
+        // bucket: the batch reaches `b` alone, under a hash `b` does not
+        // recognise, and `b` passes it on to `c`.
+        forward(0, record(key, "stale-routed")).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_c.get(&key).await.as_deref() != Some("stale-routed") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b re-forwards the batch to c, the owner a's stale view missed");
+        assert_eq!(cache_b.get(&key).await.as_deref(), Some("stale-routed"));
+
+        // The same batch already one hop past its writer stops at `b`.
+        forward(1, record(hop_one_key, "hop-one")).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache_b.get(&hop_one_key).await.as_deref() != Some("hop-one") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("b applies the hop-one batch");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            cache_c.get(&hop_one_key).await,
+            None,
+            "a batch at the hop cap is applied where it lands and re-forwarded no further"
+        );
+
+        cache_c.close().await;
+        cache_b.close().await;
+        cache_a.close().await;
+        c.shutdown().await;
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
     #[tokio::test]
     async fn distributed_cache_rejects_owners_below_two() {
         let cluster = Cluster::builder("cache-it-distributed-owners-below-two")

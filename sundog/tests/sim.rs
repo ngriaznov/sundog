@@ -116,7 +116,9 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
     match msg {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
-        Msg::ReplicateBatch { recs, .. } => ShardOps::apply_remote_batch(shard, recs).await,
+        Msg::ReplicateBatch { recs, .. } | Msg::ForwardBatch { recs, .. } => {
+            ShardOps::apply_remote_batch(shard, recs).await;
+        }
         // `Hello`, request/response messages, and `ReqDone` are a no-op here.
         _ => {}
     }

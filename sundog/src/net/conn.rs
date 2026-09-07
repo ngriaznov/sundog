@@ -629,7 +629,10 @@ async fn dispatch_one(
     cancel: &CancellationToken,
 ) -> bool {
     match msg {
-        Msg::Invalidate { .. } | Msg::Replicate { .. } | Msg::ReplicateBatch { .. } => {
+        Msg::Invalidate { .. }
+        | Msg::Replicate { .. }
+        | Msg::ReplicateBatch { .. }
+        | Msg::ForwardBatch { .. } => {
             let _ = inbound_tx.send(InboundMsg { from, msg }).await;
             false
         }

@@ -3,9 +3,12 @@
 //! Every frame starts with a one-byte discriminant. Control messages carry
 //! `FRAME_KIND_POSTCARD` and are postcard-encoded. The record-carrying
 //! variants [`Msg::Replicate`], [`Msg::ReplicateBatch`], [`Msg::StChunk`],
-//! and [`Msg::StBucketChunk`] carry `FRAME_KIND_RAW_RECORD`: a fixed header
-//! read through `zerocopy`'s [`FromBytes`] and [`IntoBytes`] views, then
-//! each record's key and value bytes back to back.
+//! [`Msg::StBucketChunk`], and [`Msg::ForwardBatch`] carry
+//! `FRAME_KIND_RAW_RECORD`: a fixed header read through `zerocopy`'s
+//! [`FromBytes`] and [`IntoBytes`] views, then each record's key and value
+//! bytes back to back. A [`Msg::ForwardBatch`] frame carries one more fixed
+//! header between the cache name and the records: the sender's view hash
+//! and the batch's hop count.
 //!
 //! Decoding a raw-record frame slices `Bytes` views out of the received
 //! buffer with no payload copy. Encoding assembles one exact-size `BytesMut`
@@ -48,9 +51,8 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 2: 0.4. Adds [`Msg::AePartDigests`], [`Msg::AeParts`],
 ///   [`Msg::AePart`], [`Msg::AePartSketch`], and [`Msg::StUnavailable`].
 /// - 3: 0.6. Adds distribution mode's [`Msg::Fetch`], [`Msg::FetchReply`],
-///   [`Msg::FetchDeclined`],
-///   [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`],
-///   and [`Msg::StaleView`].
+///   [`Msg::FetchDeclined`], [`Msg::AeDigestScoped`], [`Msg::StBuckets`],
+///   [`Msg::StBucketChunk`], [`Msg::ForwardBatch`], and [`Msg::StaleView`].
 pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The oldest peer protocol this build still serves in full.
@@ -66,7 +68,8 @@ pub const PROTOCOL_ST_UNAVAILABLE: u16 = 2;
 
 /// The protocol that introduced distribution mode's wire messages:
 /// [`Msg::Fetch`], [`Msg::FetchReply`], [`Msg::FetchDeclined`],
-/// [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`], and
+/// [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`],
+/// [`Msg::ForwardBatch`], and
 /// [`Msg::StaleView`]. A
 /// peer speaking less never receives one of these — moot in practice, since
 /// such a peer never becomes eligible to own a bucket in the first place,
@@ -287,6 +290,22 @@ pub enum Msg {
         cache: SmolStr,
         responder_view_hash: u64,
     },
+    /// Distribution-mode fan-out: records for the receiver to apply as an
+    /// owner, stamped with the sender's `view_hash` so the receiver can
+    /// tell a write routed under a stale owner set from one routed under
+    /// its own. A receiver whose view hash differs re-forwards a `hops == 0`
+    /// batch to the records' owners under its own view, sender excluded, as
+    /// a `hops == 1` batch; a batch at `hops == 1` is applied and never
+    /// re-forwarded, so a disagreement between two views costs one extra
+    /// hop, never a loop. Raw-record layout, not postcard. Introduced in
+    /// protocol 3; a distribution-mode cache never fans out to an older
+    /// peer.
+    ForwardBatch {
+        cache: SmolStr,
+        view_hash: u64,
+        hops: u8,
+        recs: Vec<WireRecord>,
+    },
 }
 
 /// Frame discriminant: everything after this byte is a postcard-encoded
@@ -300,6 +319,7 @@ const RAW_KIND_REPLICATE: u8 = 0;
 const RAW_KIND_REPLICATE_BATCH: u8 = 1;
 const RAW_KIND_ST_CHUNK: u8 = 2;
 const RAW_KIND_ST_BUCKET_CHUNK: u8 = 3;
+const RAW_KIND_FORWARD_BATCH: u8 = 4;
 
 /// Record-level flag: this record is a tombstone (`WireRecord::value` is
 /// `None`).
@@ -309,11 +329,12 @@ const RECORD_FLAG_TOMBSTONE: u8 = 0b01;
 /// real expiry of `0` is never ambiguous with "no expiry."
 const RECORD_FLAG_HAS_EXPIRY: u8 = 0b10;
 
-/// Fixed header preceding a raw-record frame's payload: which of the three
+/// Fixed header preceding a raw-record frame's payload: which of the
 /// record-carrying [`Msg`] variants this is, the state-transfer `done` flag
-/// (always `0` outside [`Msg::StChunk`]), the cache name's byte length, and
-/// how many [`RecordHeader`]-prefixed records follow. Every field is a
-/// byte-order-explicit, alignment-1 `zerocopy` integer: no implicit padding.
+/// (always `0` outside [`Msg::StChunk`]/[`Msg::StBucketChunk`]), the cache
+/// name's byte length, and how many [`RecordHeader`]-prefixed records
+/// follow. Every field is a byte-order-explicit, alignment-1 `zerocopy`
+/// integer: no implicit padding.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
 #[repr(C)]
 struct RawFrameHeader {
@@ -321,6 +342,16 @@ struct RawFrameHeader {
     done: u8,
     cache_len: U16,
     record_count: U32,
+}
+
+/// The extra fixed header a [`Msg::ForwardBatch`] frame carries between
+/// the cache name and its records: the sender's ownership view hash and
+/// the batch's hop count.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug)]
+#[repr(C)]
+struct ForwardHeader {
+    view_hash: U64,
+    hops: u8,
 }
 
 /// Fixed header preceding one record's key bytes (and, unless the tombstone
@@ -385,18 +416,35 @@ fn check_frame_len(len: usize) -> Result<(), CodecError> {
 /// cache name or record count overflows the layout's fixed-width fields.
 pub fn encode(msg: &Msg) -> Result<Bytes, CodecError> {
     match msg {
-        Msg::Replicate { cache, rec } => {
-            encode_raw_frame(RAW_KIND_REPLICATE, cache, std::slice::from_ref(rec), false)
-        }
+        Msg::Replicate { cache, rec } => encode_raw_frame(
+            RAW_KIND_REPLICATE,
+            cache,
+            std::slice::from_ref(rec),
+            RawExtra::None,
+        ),
         Msg::ReplicateBatch { cache, recs } => {
-            encode_raw_frame(RAW_KIND_REPLICATE_BATCH, cache, recs, false)
+            encode_raw_frame(RAW_KIND_REPLICATE_BATCH, cache, recs, RawExtra::None)
         }
         Msg::StChunk { cache, recs, done } => {
-            encode_raw_frame(RAW_KIND_ST_CHUNK, cache, recs, *done)
+            encode_raw_frame(RAW_KIND_ST_CHUNK, cache, recs, RawExtra::Done(*done))
         }
         Msg::StBucketChunk { cache, recs, done } => {
-            encode_raw_frame(RAW_KIND_ST_BUCKET_CHUNK, cache, recs, *done)
+            encode_raw_frame(RAW_KIND_ST_BUCKET_CHUNK, cache, recs, RawExtra::Done(*done))
         }
+        Msg::ForwardBatch {
+            cache,
+            view_hash,
+            hops,
+            recs,
+        } => encode_raw_frame(
+            RAW_KIND_FORWARD_BATCH,
+            cache,
+            recs,
+            RawExtra::Forward {
+                view_hash: *view_hash,
+                hops: *hops,
+            },
+        ),
         _ => encode_postcard(msg),
     }
 }
@@ -410,12 +458,27 @@ fn encode_postcard(msg: &Msg) -> Result<Bytes, CodecError> {
     Ok(buf.freeze())
 }
 
+/// What a raw-record frame carries beyond its cache name and records: the
+/// state-transfer `done` flag in the fixed header, or a
+/// [`Msg::ForwardBatch`]'s [`ForwardHeader`] after the cache name.
+#[derive(Clone, Copy)]
+enum RawExtra {
+    None,
+    Done(bool),
+    Forward { view_hash: u64, hops: u8 },
+}
+
 fn encode_raw_frame(
     kind: u8,
     cache: &SmolStr,
     recs: &[WireRecord],
-    done: bool,
+    extra: RawExtra,
 ) -> Result<Bytes, CodecError> {
+    let done = matches!(extra, RawExtra::Done(true));
+    let extra_len = match extra {
+        RawExtra::Forward { .. } => size_of::<ForwardHeader>(),
+        RawExtra::None | RawExtra::Done(_) => 0,
+    };
     let cache_bytes = cache.as_bytes();
     let cache_len = u16::try_from(cache_bytes.len())
         .map_err(|_| CodecError::MalformedFrame("cache name exceeds 64 KiB"))?;
@@ -423,7 +486,7 @@ fn encode_raw_frame(
         .map_err(|_| CodecError::MalformedFrame("record count exceeds u32::MAX"))?;
 
     let total = recs.iter().fold(
-        1 + size_of::<RawFrameHeader>() + cache_bytes.len(),
+        1 + size_of::<RawFrameHeader>() + cache_bytes.len() + extra_len,
         |acc, rec| {
             acc + RECORD_HEADER_LEN + rec.key.len() + rec.value.as_ref().map_or(0, Bytes::len)
         },
@@ -441,6 +504,15 @@ fn encode_raw_frame(
         .as_bytes(),
     );
     buf.extend_from_slice(cache_bytes);
+    if let RawExtra::Forward { view_hash, hops } = extra {
+        buf.extend_from_slice(
+            ForwardHeader {
+                view_hash: U64::new(view_hash),
+                hops,
+            }
+            .as_bytes(),
+        );
+    }
 
     for rec in recs {
         let key_len = u32::try_from(rec.key.len())
@@ -510,6 +582,15 @@ fn decode_raw_frame(body: &Bytes) -> Result<Msg, CodecError> {
             .map_err(|_| CodecError::MalformedFrame("cache name is not valid utf-8"))?,
     );
 
+    let forward = if header.msg_kind == RAW_KIND_FORWARD_BATCH {
+        let (fh, _) = ForwardHeader::read_from_prefix(&body.as_ref()[offset.min(body.len())..])
+            .map_err(|_| CodecError::MalformedFrame("forward header truncated"))?;
+        offset += size_of::<ForwardHeader>();
+        Some(fh)
+    } else {
+        None
+    };
+
     let record_count = usize::try_from(header.record_count.get()).unwrap_or(usize::MAX);
     let mut recs = Vec::with_capacity(record_count.min(RECORD_COUNT_PREALLOC_CAP));
     for _ in 0..record_count {
@@ -569,6 +650,17 @@ fn decode_raw_frame(body: &Bytes) -> Result<Msg, CodecError> {
             recs,
             done: header.done != 0,
         }),
+        RAW_KIND_FORWARD_BATCH => {
+            let fh = forward.ok_or(CodecError::MalformedFrame(
+                "ForwardBatch frame carries no forward header",
+            ))?;
+            Ok(Msg::ForwardBatch {
+                cache,
+                view_hash: fh.view_hash.get(),
+                hops: fh.hops,
+                recs,
+            })
+        }
         _ => Err(CodecError::MalformedFrame(
             "unknown raw-record message kind",
         )),
@@ -1012,6 +1104,82 @@ mod tests {
             cache: SmolStr::new("users"),
             responder_view_hash: 42,
         });
+    }
+
+    #[test]
+    fn roundtrip_forward_batch() {
+        roundtrip(&Msg::ForwardBatch {
+            cache: SmolStr::new("users"),
+            view_hash: 0xDEAD_BEEF_CAFE_F00D,
+            hops: 1,
+            recs: vec![sample_record(Some("v1")), sample_record(None)],
+        });
+    }
+
+    #[test]
+    fn roundtrip_forward_batch_empty() {
+        roundtrip(&Msg::ForwardBatch {
+            cache: SmolStr::new("users"),
+            view_hash: 0,
+            hops: 0,
+            recs: Vec::new(),
+        });
+    }
+
+    /// A [`Msg::ForwardBatch`] frame is the raw-record layout plus its
+    /// forward header, never postcard, and its `msg_kind` keeps it apart
+    /// from a [`Msg::ReplicateBatch`] carrying the same records.
+    #[test]
+    fn forward_batch_is_a_raw_record_frame_of_its_own_kind() {
+        let recs = vec![sample_record(Some("v1"))];
+        let forward = encode(&Msg::ForwardBatch {
+            cache: SmolStr::new("users"),
+            view_hash: 7,
+            hops: 0,
+            recs: recs.clone(),
+        })
+        .expect("encodes");
+        assert_eq!(forward[0], FRAME_KIND_RAW_RECORD);
+        let replicate = encode(&Msg::ReplicateBatch {
+            cache: SmolStr::new("users"),
+            recs,
+        })
+        .expect("encodes");
+        assert_eq!(
+            forward.len(),
+            replicate.len() + size_of::<ForwardHeader>(),
+            "the forward header is the only extra byte cost"
+        );
+        assert!(matches!(
+            decode(&forward).expect("decodes"),
+            Msg::ForwardBatch {
+                view_hash: 7,
+                hops: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(&replicate).expect("decodes"),
+            Msg::ReplicateBatch { .. }
+        ));
+    }
+
+    /// A [`Msg::ForwardBatch`] frame cut off inside its forward header is
+    /// a malformed frame, not a panic.
+    #[test]
+    fn forward_batch_truncated_inside_the_forward_header_is_malformed() {
+        let frame = encode(&Msg::ForwardBatch {
+            cache: SmolStr::new("users"),
+            view_hash: 7,
+            hops: 0,
+            recs: Vec::new(),
+        })
+        .expect("encodes");
+        let truncated = frame.slice(..frame.len() - 1);
+        assert!(matches!(
+            decode(&truncated),
+            Err(CodecError::MalformedFrame("forward header truncated"))
+        ));
     }
 
     /// [`Msg::StBucketChunk`] shares the raw-record layout with

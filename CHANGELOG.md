@@ -33,9 +33,15 @@ All notable changes to this project are documented in this file. Format follows
   `sundog_stale_view_total{cache}`, and `sundog_unowned_inbound_dropped_total{
   cache}`.
 - Wire messages `Fetch`, `FetchReply`, `FetchDeclined`, `AeDigestScoped`,
-  `StBuckets`, `StBucketChunk`, and `StaleView`, all gated on the peer's protocol from its
-  hello: a peer speaking less than `wire::PROTOCOL_DISTRIBUTED` never
-  receives one.
+  `StBuckets`, `StBucketChunk`, `ForwardBatch`, and `StaleView`, all gated on
+  the peer's protocol from its hello: a peer speaking less than
+  `wire::PROTOCOL_DISTRIBUTED` never receives one. A distributed fan-out
+  travels as `ForwardBatch`, stamped with the writer's ownership view hash;
+  a receiver whose own view differs re-forwards the batch once more to the
+  records' owners under its view, so a write routed under a stale view (a
+  delete issued before the writer saw a replacement owner join, say) still
+  reaches every current owner instead of waiting on an anti-entropy round
+  to pair the two, and never resurfaces after the tombstone is collected.
 - `sundog-testnode` reads `SUNDOG_TESTNODE_MODE=distributed` (with
   `SUNDOG_TESTNODE_OWNERS` to pick `owners`) to open `"it"` as a distributed
   cache, and serves the routes the new container scenarios drive it through.
