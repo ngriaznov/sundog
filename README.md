@@ -31,7 +31,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-sundog = "0.5"
+sundog = "0.6"
 ```
 
 sundog is async, on [tokio](https://tokio.rs); the examples below assume a tokio

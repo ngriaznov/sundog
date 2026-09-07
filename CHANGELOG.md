@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.0] – 2026-09-07
 
 ### Added
 
@@ -81,8 +81,9 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
-- **Breaking**: `Mode` is `#[non_exhaustive]` and gains `Distributed`; a
-  downstream `match` without a wildcard arm needs one added.
+- **Breaking**: `Mode` is `#[non_exhaustive]` and gains the struct variant
+  `Distributed`; a downstream `match` without a wildcard arm needs one added,
+  and a numeric cast of a `Mode` (`as isize`) no longer compiles.
 - `wire::Msg` gains the six variants above; already `#[non_exhaustive]` since
   0.3.0, so no downstream `match` needs a change for them.
 - `wire::PROTOCOL_VERSION` is 3; the current release interoperates with
