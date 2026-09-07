@@ -14,6 +14,8 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
+use crate::sample::{self, BUCKET_COUNT, PROBE_COUNT};
+
 pub(crate) const CACHE_NAME: &str = "demo";
 
 /// A node keeps a disowned bucket around for two anti-entropy rounds before
@@ -27,14 +29,16 @@ struct Handle {
     cache: Cache<String, String>,
 }
 
-/// Live counters for one node slot: refreshed on a timer from the store,
-/// since events alone can lag or coalesce.
+/// Live counters for one node slot: refreshed on a timer from the store and
+/// cluster health, since events alone can lag or coalesce.
 #[derive(Debug, Default)]
 pub(crate) struct NodeStatus {
     pub(crate) alive: AtomicBool,
     busy: AtomicBool,
     pub(crate) node_id: AtomicU64,
     pub(crate) entry_count: AtomicI64,
+    pub(crate) owned_buckets: AtomicI64,
+    pub(crate) warm: AtomicBool,
     pub(crate) writes_applied: AtomicU64,
     pub(crate) restarts: AtomicU32,
 }
@@ -137,6 +141,8 @@ impl NodeSlot {
             .node_id
             .store(handle.cluster.node_id().as_u64(), Ordering::Relaxed);
         self.status.entry_count.store(0, Ordering::Relaxed);
+        self.status.owned_buckets.store(0, Ordering::Relaxed);
+        self.status.warm.store(false, Ordering::Relaxed);
         let listener = spawn_listener(Arc::clone(self), handle.cache.events(), feed_tx.clone());
         self.install(handle, listener);
         self.status.alive.store(true, Ordering::Relaxed);
@@ -185,6 +191,8 @@ impl NodeSlot {
                     .node_id
                     .store(handle.cluster.node_id().as_u64(), Ordering::Relaxed);
                 self.status.entry_count.store(0, Ordering::Relaxed);
+                self.status.owned_buckets.store(0, Ordering::Relaxed);
+                self.status.warm.store(false, Ordering::Relaxed);
                 let listener =
                     spawn_listener(Arc::clone(self), handle.cache.events(), feed_tx.clone());
                 self.install(handle, listener);
@@ -257,9 +265,11 @@ fn spawn_listener(
     feed_tx: UnboundedSender<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Entry counts read from the store on a timer, since events can lag.
+        // Entry counts, warmth and owned-bucket share read on a timer,
+        // since events can lag and don't carry ownership information.
         let mut refresh = tokio::time::interval(Duration::from_millis(300));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let probes = sample::probe_keys();
         loop {
             tokio::select! {
                 received = events.recv() => match received {
@@ -281,6 +291,26 @@ fn spawn_listener(
                     node.status
                         .entry_count
                         .store(i64::try_from(count).unwrap_or(i64::MAX), Ordering::Relaxed);
+
+                    let node_id = sundog::NodeId::from(node.status.node_id.load(Ordering::Relaxed));
+                    let hits = sample::count_hits(
+                        &probes.iter().map(|k| cache.owners_of(k)).collect::<Vec<_>>(),
+                        node_id,
+                    );
+                    let owned = sample::estimate_owned_buckets(hits, PROBE_COUNT, BUCKET_COUNT);
+                    node.status
+                        .owned_buckets
+                        .store(i64::try_from(owned).unwrap_or(i64::MAX), Ordering::Relaxed);
+
+                    let Some(handle) = node.read_handle() else { break };
+                    let warm = handle
+                        .cluster
+                        .health()
+                        .caches
+                        .iter()
+                        .find(|c| c.name == CACHE_NAME)
+                        .is_some_and(|c| c.warm);
+                    node.status.warm.store(warm, Ordering::Relaxed);
                 }
             }
         }
@@ -357,9 +387,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_slot_starts_dead_with_no_entries() {
+    fn fresh_slot_starts_dead_with_no_entries_or_buckets() {
         let slots = build_slots(1, 42_000);
         assert!(!slots[0].is_alive());
         assert_eq!(slots[0].status.entry_count.load(Ordering::Relaxed), 0);
+        assert_eq!(slots[0].status.owned_buckets.load(Ordering::Relaxed), 0);
+        assert!(!slots[0].status.warm.load(Ordering::Relaxed));
     }
 }

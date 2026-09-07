@@ -1,53 +1,96 @@
 //! `sundog-distributed-demo`: a distribution-mode TUI for a `sundog`
 //! cluster. Spawns N in-process nodes over static loopback seeds, preloads
-//! a large key set, and drives a background write load and fetch sampler
-//! against it.
+//! a large key set spread across the cluster's owned buckets, drives a
+//! background write load and fetch sampler, and lets you kill/restart nodes
+//! to watch rebalancing move buckets live.
 
+mod app;
 mod cli;
+mod convergence;
 mod load;
 mod node;
 mod preload;
 mod rss;
+mod sample;
 mod setup;
+mod ui;
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use crossterm::event::{self, Event as TermEvent};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = cli::parse(std::env::args().skip(1))?;
 
-    let demo = setup::bootstrap(&args).await?;
-    println!(
-        "sundog-distributed-demo: {} nodes formed cluster {:?} ({} owners per bucket)",
-        demo.nodes.len(),
-        demo.cluster_name,
-        demo.owners.get()
-    );
+    run_tui(&args).await
+}
 
-    let report = demo.wait_for_preload().await;
-    println!(
-        "preload: {} keys in {:.1}s ({:.0} keys/s), RSS {}",
-        report.keys,
-        report.elapsed.as_secs_f64(),
-        report.keys_per_sec(),
-        rss::format_rss(rss::read_rss_kb())
-    );
+async fn run_tui(args: &cli::Args) -> anyhow::Result<()> {
+    let demo = setup::bootstrap(args).await?;
+    let mut app = app::App::new(demo);
 
-    // No TUI or --headless dispatch yet: run the load for a few seconds so
-    // there is something to report.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    demo.paused.store(true, Ordering::Relaxed);
+    let mut terminal = ratatui::try_init()?;
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<TermEvent>();
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let input_thread = spawn_input_thread(input_tx, Arc::clone(&stop_input));
 
-    let (p50_us, p99_us) = demo.state.latency_percentiles();
-    println!(
-        "fetch: {} hits, {} misses, {} errors, p50={p50_us}us p99={p99_us}us",
-        demo.state.fetch_hits.load(Ordering::Relaxed),
-        demo.state.fetch_misses.load(Ordering::Relaxed),
-        demo.state.fetch_errors.load(Ordering::Relaxed),
-    );
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut draw_error = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                app.drain_feed();
+                if let Err(error) = terminal.draw(|frame| ui::draw(frame, &app)) {
+                    draw_error = Some(error);
+                    break;
+                }
+            }
+            maybe_event = input_rx.recv() => {
+                match maybe_event {
+                    Some(event) => app.handle_term_event(&event),
+                    None => break,
+                }
+            }
+        }
+        if app.quit {
+            break;
+        }
+    }
 
-    demo.shutdown().await;
+    stop_input.store(true, Ordering::Relaxed);
+    ratatui::try_restore()?;
+    drop(input_thread);
+
+    app.demo.shutdown().await;
+    if let Some(error) = draw_error {
+        return Err(error.into());
+    }
     Ok(())
+}
+
+fn spawn_input_thread(
+    tx: mpsc::UnboundedSender<TermEvent>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(term_event) => {
+                        if tx.send(term_event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    })
 }
