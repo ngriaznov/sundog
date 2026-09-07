@@ -124,7 +124,16 @@ const EVENTS_CAPACITY: usize = 1024;
 pub(crate) struct FanOutQueue<K> {
     pending: StdMutex<Vec<K>>,
     notify: tokio::sync::Notify,
+    /// Whether a push lands in `pending` at all: `false` for a
+    /// `Mode::Local` shard, whose writes never fan out and are not errors.
     accepting: AtomicBool,
+    /// Set by [`FanOutQueue::seal`] and [`FanOutQueue::close`]: the cache is
+    /// closing, and a write from here on is refused with
+    /// [`CacheError::Closed`] rather than accepted and never sent. Read and
+    /// written under `pending`'s lock, so a push and a seal never
+    /// interleave: every push that returns `true` lands before the seal's
+    /// final drain.
+    closed: StdMutex<bool>,
 }
 
 impl<K> FanOutQueue<K> {
@@ -133,36 +142,63 @@ impl<K> FanOutQueue<K> {
             pending: StdMutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
             accepting: AtomicBool::new(accepting),
+            closed: StdMutex::new(false),
         }
+    }
+
+    /// Stops accepting writes but keeps the backlog for the fan-out task's
+    /// final drain, and wakes that task: the first step of a close or a
+    /// cluster shutdown, before the task is cancelled.
+    pub(crate) fn seal(&self) {
+        let _pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.notify.notify_one();
     }
 
     /// Stops accepting keys and drops the backlog: nothing drains this queue
     /// any more.
     pub(crate) fn close(&self) {
         self.accepting.store(false, Ordering::Release);
-        self.drain();
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        pending.clear();
     }
 
-    fn push(&self, key: K) {
-        if !self.accepting.load(Ordering::Acquire) {
-            return;
-        }
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(key);
-        self.notify.notify_one();
+    /// Whether a write may still be accepted: `false` once sealed or
+    /// closed.
+    fn is_open(&self) -> bool {
+        !*self.closed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn extend(&self, keys: impl IntoIterator<Item = K>) {
-        if !self.accepting.load(Ordering::Acquire) {
-            return;
+    /// Queues `key`, or returns `false` once the queue is sealed or closed.
+    /// A `Mode::Local` shard's queue accepts nothing and returns `true`.
+    #[must_use]
+    fn push(&self, key: K) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.is_open() {
+            return false;
         }
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(keys);
+        if !self.accepting.load(Ordering::Acquire) {
+            return true;
+        }
+        pending.push(key);
         self.notify.notify_one();
+        true
+    }
+
+    /// [`FanOutQueue::push`] for many keys at once.
+    #[must_use]
+    fn extend(&self, keys: impl IntoIterator<Item = K>) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.is_open() {
+            return false;
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return true;
+        }
+        pending.extend(keys);
+        self.notify.notify_one();
+        true
     }
 
     /// Takes every pending key, leaving the queue empty.
@@ -429,6 +465,12 @@ pub trait ShardOps: Send + Sync {
     /// `crate::cluster::Cluster::shutdown` for every cache still registered
     /// when the cluster shuts down without an explicit `close`.
     fn close_spill(&self) {}
+
+    /// Stops accepting writes while keeping the fan-out backlog for the
+    /// fan-out task's final drain: the first step of a cluster shutdown,
+    /// before its tasks are cancelled. A write from here on fails with
+    /// [`CacheError::Closed`] instead of being accepted and never sent.
+    fn seal_fan_out(&self) {}
 
     /// This shard's current bucket-ownership view, for a `Mode::Distributed`
     /// cache that has one attached. `None` for every other mode, and for a
@@ -1061,8 +1103,10 @@ where
                 value,
                 created,
             } => {
+                // A refusal means the cache is closing: the write landed
+                // here, as a detached local write, and fans out nowhere.
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    self.fan_out.push(FanOutItem::Applied(key.clone()));
+                    let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
                 }
                 if self.events.receiver_count() > 0 {
                     let event = if created {
@@ -1074,8 +1118,10 @@ where
                 }
             }
             ApplyOutcome::Tombstoned { key } => {
+                // A refusal means the cache is closing: the write landed
+                // here, as a detached local write, and fans out nowhere.
                 if notify_fan_out && matches!(origin, Origin::Local) {
-                    self.fan_out.push(FanOutItem::Applied(key.clone()));
+                    let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
                 }
                 if self.events.receiver_count() > 0 {
                     let _ = self.events.send(Event::Removed { key, origin });
@@ -1112,6 +1158,58 @@ where
             .next()
             .expect("invariant: apply_many returns exactly one outcome per entry given");
         self.handle_apply_outcome(outcome, origin, true);
+    }
+
+    /// The inbound-apply guard, applied to a batch before decoding: keeps
+    /// the records this node's current view owns, forwards the ones for a
+    /// bucket mid disown-grace on to its current owners, and drops the rest.
+    fn guard_inbound(&self, recs: Vec<WireRecord>) -> Vec<WireRecord> {
+        match self.ownership.as_ref().map(OwnershipTracker::current) {
+            Some(view) => {
+                let (owned, unowned): (Vec<_>, Vec<_>) = recs
+                    .into_iter()
+                    .partition(|rec| view.owns(bucket_of(rec.key.as_ref())));
+                let (redirected, dropped): (Vec<_>, Vec<_>) =
+                    unowned.into_iter().partition(|rec| {
+                        self.residency
+                            .as_ref()
+                            .is_some_and(|r| r.is_releasing(bucket_of(rec.key.as_ref())))
+                    });
+                if !redirected.is_empty() {
+                    metrics::counter!(
+                        "sundog_forwarded_writes_total",
+                        "cache" => self.name.to_string()
+                    )
+                    .increment(u64::try_from(redirected.len()).unwrap_or(u64::MAX));
+                    tracing::debug!(
+                        cache = %self.name,
+                        redirected = redirected.len(),
+                        "apply_remote_batch: forwarded records for a releasing bucket on \
+                         to its current owners"
+                    );
+                    // A refusal means the cache is closing: nothing
+                    // forwards from a node on its way out.
+                    let _ = self
+                        .fan_out
+                        .extend(redirected.into_iter().map(FanOutItem::Forward));
+                }
+                if !dropped.is_empty() {
+                    metrics::counter!(
+                        "sundog_unowned_inbound_dropped_total",
+                        "cache" => self.name.to_string()
+                    )
+                    .increment(u64::try_from(dropped.len()).unwrap_or(u64::MAX));
+                    tracing::debug!(
+                        cache = %self.name,
+                        dropped = dropped.len(),
+                        "apply_remote_batch: dropped records for a bucket this node does \
+                         not own"
+                    );
+                }
+                owned
+            }
+            None => recs,
+        }
     }
 
     /// Whether this shard's own current bucket-ownership view owns
@@ -1213,9 +1311,9 @@ where
     /// into the fan-out queue the same [`REPLICATE_BATCH_COUNT`] increments
     /// [`Shard::hand_off_bulk`] already flushes at, so a large mixed batch
     /// never holds every forwarded record in memory until the end.
-    fn forward_prepared_puts(&self, prepared: Vec<PreparedPut<K, V>>) {
+    fn forward_prepared_puts(&self, prepared: Vec<PreparedPut<K, V>>) -> bool {
         if prepared.is_empty() {
-            return;
+            return true;
         }
         let total = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
         let mut landed = Vec::new();
@@ -1226,37 +1324,53 @@ where
                 encoded,
             };
             landed.push(self.forward_write(key, key_bytes, incoming, ver));
-            if landed.len() >= REPLICATE_BATCH_COUNT {
-                self.fan_out
-                    .extend(landed.drain(..).map(FanOutItem::Forward));
+            if landed.len() >= REPLICATE_BATCH_COUNT
+                && !self
+                    .fan_out
+                    .extend(landed.drain(..).map(FanOutItem::Forward))
+            {
+                return false;
             }
         }
-        self.fan_out
-            .extend(landed.drain(..).map(FanOutItem::Forward));
+        if !self
+            .fan_out
+            .extend(landed.drain(..).map(FanOutItem::Forward))
+        {
+            return false;
+        }
         metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
             .increment(total);
+        true
     }
 
     /// [`Shard::remove_many`]'s bulk counterpart to
     /// [`Shard::forward_prepared_puts`]: forwards every already-prepared,
     /// unowned tombstone in `prepared`, chunked the same way.
-    fn forward_prepared_tombstones(&self, prepared: Vec<PreparedTombstone<K>>) {
+    fn forward_prepared_tombstones(&self, prepared: Vec<PreparedTombstone<K>>) -> bool {
         if prepared.is_empty() {
-            return;
+            return true;
         }
         let total = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
         let mut landed = Vec::new();
         for (_, key, key_bytes, ver) in prepared {
             landed.push(self.forward_write(key, key_bytes, Incoming::Tombstone, ver));
-            if landed.len() >= REPLICATE_BATCH_COUNT {
-                self.fan_out
-                    .extend(landed.drain(..).map(FanOutItem::Forward));
+            if landed.len() >= REPLICATE_BATCH_COUNT
+                && !self
+                    .fan_out
+                    .extend(landed.drain(..).map(FanOutItem::Forward))
+            {
+                return false;
             }
         }
-        self.fan_out
-            .extend(landed.drain(..).map(FanOutItem::Forward));
+        if !self
+            .fan_out
+            .extend(landed.drain(..).map(FanOutItem::Forward))
+        {
+            return false;
+        }
         metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
             .increment(total);
+        true
     }
 
     /// Reads `key`, without triggering read-through. A deleted key is never
@@ -1508,7 +1622,9 @@ where
                                 &inflight,
                             );
                             guard.complete();
-                            self.fan_out.push(FanOutItem::Applied(key.clone()));
+                            // A refusal means the cache is closing; the
+                            // loaded value still answers this read.
+                            let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
                             if self.events.receiver_count() > 0 {
                                 let _ = self.events.send(Event::Created {
                                     key: key.clone(),
@@ -1610,7 +1726,9 @@ where
         };
         if !self.owns_key(key_bytes.as_ref()) {
             let rec = self.forward_write(key, key_bytes, incoming, ver);
-            self.fan_out.push(FanOutItem::Forward(rec));
+            if !self.fan_out.push(FanOutItem::Forward(rec)) {
+                return Err(self.closed());
+            }
             metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
                 .increment(1);
             return Ok(());
@@ -1706,7 +1824,9 @@ where
             }
             None => (prepared, Vec::new()),
         };
-        self.forward_prepared_puts(forwarded_prepared);
+        if !self.forward_prepared_puts(forwarded_prepared) {
+            return Err(self.closed());
+        }
 
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
         for entry in owned_prepared {
@@ -1777,7 +1897,9 @@ where
         let ver = self.stamp_local();
         if !self.owns_key(key_bytes.as_ref()) {
             let rec = self.forward_write(key.clone(), key_bytes, Incoming::Tombstone, ver);
-            self.fan_out.push(FanOutItem::Forward(rec));
+            if !self.fan_out.push(FanOutItem::Forward(rec)) {
+                return Err(self.closed());
+            }
             metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
                 .increment(1);
             return Ok(());
@@ -1819,7 +1941,9 @@ where
             }
             None => (prepared, Vec::new()),
         };
-        self.forward_prepared_tombstones(forwarded_prepared);
+        if !self.forward_prepared_tombstones(forwarded_prepared) {
+            return Err(self.closed());
+        }
 
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
         for entry in owned_prepared {
@@ -1862,8 +1986,21 @@ where
         if landed.is_empty() || (!flush && landed.len() < REPLICATE_BATCH_COUNT) {
             return;
         }
-        self.fan_out
+        // A refusal means the cache is closing: these writes landed here,
+        // as detached local writes, and fan out nowhere.
+        let _ = self
+            .fan_out
             .extend(landed.drain(..).map(FanOutItem::Applied));
+    }
+
+    /// The error a forwarded write gets once the cache is closing: it
+    /// lands nowhere locally, so refusing it is the only honest answer. A
+    /// write this node applies itself still succeeds, as a detached local
+    /// write.
+    fn closed(&self) -> CacheError {
+        CacheError::Closed {
+            cache: self.name.clone(),
+        }
     }
 
     /// Tombstones every key this node currently holds, via
@@ -2044,49 +2181,7 @@ where
             // the record is forwarded on to the bucket's current owners,
             // never applied here and never dropped. A record for a bucket
             // this node never held is dropped and counted.
-            let recs = match self.ownership.as_ref().map(OwnershipTracker::current) {
-                Some(view) => {
-                    let (owned, unowned): (Vec<_>, Vec<_>) = recs
-                        .into_iter()
-                        .partition(|rec| view.owns(bucket_of(rec.key.as_ref())));
-                    let (redirected, dropped): (Vec<_>, Vec<_>) =
-                        unowned.into_iter().partition(|rec| {
-                            self.residency
-                                .as_ref()
-                                .is_some_and(|r| r.is_releasing(bucket_of(rec.key.as_ref())))
-                        });
-                    if !redirected.is_empty() {
-                        metrics::counter!(
-                            "sundog_forwarded_writes_total",
-                            "cache" => self.name.to_string()
-                        )
-                        .increment(u64::try_from(redirected.len()).unwrap_or(u64::MAX));
-                        tracing::debug!(
-                            cache = %self.name,
-                            redirected = redirected.len(),
-                            "apply_remote_batch: forwarded records for a releasing bucket on \
-                             to its current owners"
-                        );
-                        self.fan_out
-                            .extend(redirected.into_iter().map(FanOutItem::Forward));
-                    }
-                    if !dropped.is_empty() {
-                        metrics::counter!(
-                            "sundog_unowned_inbound_dropped_total",
-                            "cache" => self.name.to_string()
-                        )
-                        .increment(u64::try_from(dropped.len()).unwrap_or(u64::MAX));
-                        tracing::debug!(
-                            cache = %self.name,
-                            dropped = dropped.len(),
-                            "apply_remote_batch: dropped records for a bucket this node does \
-                             not own"
-                        );
-                    }
-                    owned
-                }
-                None => recs,
-            };
+            let recs = self.guard_inbound(recs);
             // Grouping by raw key bytes' stripe needs no decode. Each group
             // keeps `recs`' relative order, so the same key always
             // lands in the same stripe in arrival order.
@@ -2403,6 +2498,10 @@ where
 
     fn close_spill(&self) {
         Shard::close_spill(self);
+    }
+
+    fn seal_fan_out(&self) {
+        self.fan_out.seal();
     }
 
     #[allow(
@@ -3921,7 +4020,7 @@ mod tests {
     #[tokio::test]
     async fn fan_out_queue_wakes_a_waiter_for_a_push_before_or_after_the_wait() {
         let queue = Arc::new(FanOutQueue::<u32>::new(true));
-        queue.push(7);
+        let _ = queue.push(7);
         tokio::time::timeout(Duration::from_secs(1), queue.wait_nonempty())
             .await
             .expect("a push before the wait is not missed");
@@ -3935,7 +4034,7 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
-        queue.extend([1, 2]);
+        let _ = queue.extend([1, 2]);
         let drained = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("a push after the wait wakes it")
@@ -4164,6 +4263,48 @@ mod tests {
         assert_eq!(s.get_sync(&1), None);
     }
 
+    #[tokio::test]
+    async fn a_sealed_fan_out_queue_keeps_its_backlog_and_refuses_a_forwarded_write() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+        let owned = find_key_by_ownership(&view, true);
+        let unowned = find_key_by_ownership(&view, false);
+        s.insert(unowned, "before".to_string())
+            .await
+            .expect("a forward before the seal is accepted");
+
+        s.fan_out.seal();
+        assert!(
+            matches!(
+                s.insert(unowned, "after".to_string()).await,
+                Err(CacheError::Closed { .. })
+            ),
+            "a forwarded write after the seal is refused, not accepted and never sent"
+        );
+        assert!(matches!(
+            s.remove(&unowned).await,
+            Err(CacheError::Closed { .. })
+        ));
+        assert!(matches!(
+            s.insert_many(vec![(unowned, "bulk".to_string())]).await,
+            Err(CacheError::Closed { .. })
+        ));
+        s.insert(owned, "local".to_string())
+            .await
+            .expect("a write this node applies itself still lands, detached");
+        assert_eq!(s.get(&owned).await.as_deref(), Some("local"));
+
+        let backlog = s.fan_out.drain();
+        assert_eq!(
+            backlog.len(),
+            1,
+            "the forward from before the seal is still there for the final drain"
+        );
+        assert!(matches!(backlog[0], FanOutItem::Forward(_)));
+    }
+
     #[test]
     fn a_local_mode_shard_queues_nothing_for_fan_out() {
         let s = Shard::<u32, String>::new(
@@ -4184,7 +4325,8 @@ mod tests {
         let s = shard::<u32, String>(1);
         s.insert_sync(1, "a".into()).expect("insert");
         s.fan_out_queue().close();
-        s.insert_sync(2, "b".into()).expect("insert after close");
+        s.insert_sync(2, "b".into())
+            .expect("a write this node applies itself still lands after close, detached");
         assert!(s.fan_out.drain().is_empty());
         assert_eq!(s.get_sync(&2), Some("b".to_string()), "writes still land");
     }
@@ -4620,8 +4762,8 @@ mod tests {
     fn fan_out_item_applied_and_forward_both_drain_through_one_queue() {
         let queue = FanOutQueue::<FanOutItem<u32>>::new(true);
         let rec = wire_record(7, "v", hlc(1, 1));
-        queue.push(FanOutItem::Applied(1));
-        queue.push(FanOutItem::Forward(rec.clone()));
+        let _ = queue.push(FanOutItem::Applied(1));
+        let _ = queue.push(FanOutItem::Forward(rec.clone()));
 
         assert_eq!(
             queue.drain(),

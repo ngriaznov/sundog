@@ -139,6 +139,14 @@ pub enum CacheError {
     /// candidate. Distinct from a genuine miss, which returns `Ok(None)`.
     #[error("cache {cache:?} found no reachable owner for the requested key")]
     FetchUnavailable { cache: SmolStr },
+    /// The cache is closing, or its cluster is shutting down, and the write
+    /// was for a `Mode::Distributed` bucket this node does not own: it has
+    /// no local copy to land in, so it was refused rather than accepted
+    /// and never sent. A caller that must land it retries on another node.
+    /// A write this node applies itself still succeeds, as a detached
+    /// local write.
+    #[error("cache {cache:?} is closing; the forwarded write was refused")]
+    Closed { cache: SmolStr },
 }
 
 #[cfg(test)]
@@ -163,6 +171,14 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("prices"));
         assert!(text.contains('1'));
+    }
+
+    #[test]
+    fn closed_message_names_the_cache() {
+        let err = CacheError::Closed {
+            cache: SmolStr::new("prices"),
+        };
+        assert!(err.to_string().contains("prices"));
     }
 
     #[test]

@@ -437,6 +437,20 @@ impl Cluster {
     ///
     /// Panics if the shard registry lock is poisoned.
     pub async fn shutdown(self) {
+        // Every cache's fan-out queue is sealed before any task is
+        // cancelled: a write accepted until now stays in the backlog its
+        // fan-out task drains on the way out, and a write from now on
+        // fails with `CacheError::Closed` instead of being accepted and
+        // never sent.
+        for shard in self
+            .inner
+            .shards
+            .read()
+            .expect("invariant: shard registry lock is never poisoned")
+            .values()
+        {
+            shard.seal_fan_out();
+        }
         self.inner.cancel.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;

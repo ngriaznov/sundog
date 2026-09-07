@@ -1006,9 +1006,16 @@ where
     ///
     /// Closing is idempotent. A clone kept past `close` keeps working as a
     /// local, detached cache: its reads and writes reach the same in-memory
-    /// [`Shard`], and nothing replicates. A cache never explicitly closed
+    /// [`Shard`], and nothing replicates. The one exception is a
+    /// `Mode::Distributed` write for a bucket this node does not own, which
+    /// has no local copy to land in: it fails with [`CacheError::Closed`]
+    /// rather than being accepted and never sent. A cache never explicitly closed
     /// still has its spill tier closed by `Cluster::shutdown`.
     pub async fn close(self) {
+        // Sealed before the tasks are cancelled: a write accepted until
+        // now is in the backlog the fan-out task drains on its way out,
+        // and a write from now on fails with `CacheError::Closed`.
+        self.shard.fan_out_queue().seal();
         self.cancel.cancel();
         self.tasks.close();
         self.tasks.wait().await;
@@ -1891,6 +1898,44 @@ mod tests {
         cache_b.close().await;
         c.shutdown().await;
         b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_write_after_close_fails_with_closed_instead_of_vanishing() {
+        let ((a, cache_a), (b, cache_b), (c, cache_c), key_a_does_not_own) =
+            three_node_distributed("distributed-write-after-close", "write-after-close").await;
+        let owned_by_a = (0..1_000_000u32)
+            .find(|key| cache_a.owners_of(key).contains(&a.node_id()))
+            .expect("a owns some bucket");
+        let late_handle = cache_a.clone();
+        cache_a.close().await;
+        assert!(
+            matches!(
+                late_handle
+                    .insert(key_a_does_not_own, "late".to_string())
+                    .await,
+                Err(CacheError::Closed { .. })
+            ),
+            "a forwarded write after close is refused"
+        );
+        assert!(matches!(
+            late_handle.remove(&key_a_does_not_own).await,
+            Err(CacheError::Closed { .. })
+        ));
+        late_handle
+            .insert(owned_by_a, "detached".to_string())
+            .await
+            .expect("a write this node applies itself still lands, detached");
+        assert_eq!(
+            late_handle.get(&owned_by_a).await.as_deref(),
+            Some("detached")
+        );
+
+        cache_c.close().await;
+        cache_b.close().await;
+        c.shutdown().await;
+        b.shutdown().await;
+        a.shutdown().await;
     }
 
     #[tokio::test]
