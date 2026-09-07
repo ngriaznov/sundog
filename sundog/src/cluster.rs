@@ -1266,16 +1266,26 @@ pub(crate) async fn fan_out_task<K, V>(
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     loop {
-        tokio::select! {
+        // A batch in flight is never raced against `cancel`: a write the
+        // caller was told succeeded goes out, or is forwarded, before this
+        // task ends. Cancellation is observed between batches, and one last
+        // drain covers what arrived after the final wake-up.
+        let items = tokio::select! {
             biased;
-            () = cancel.cancelled() => return,
-            () = queue.wait_nonempty() => {
-                let items = queue.drain();
-                fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
-            }
-        }
+            () = cancel.cancelled() => break,
+            () = queue.wait_nonempty() => queue.drain(),
+        };
+        fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
+    }
+    let items = queue.drain();
+    if !items.is_empty() {
+        fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
     }
 }
+
+/// How long one `Mode::Distributed` fan-out batch waits for outbox space
+/// across all its target peers before dropping what still does not fit.
+const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Groups `records` by the exact target-peer set each should replicate to —
 /// its bucket's live owners under `view`, self excluded — pure and
@@ -1309,17 +1319,19 @@ fn group_by_owner_set(
 /// Groups `records` by the exact target-peer set each should replicate to —
 /// its bucket's live owners under `view`, self excluded — then sends each
 /// group as coalesced `Replicate`/`ReplicateBatch` frames through the
-/// mesh's existing per-peer outboxes ([`Mesh::send_frames`]). The single
-/// function both an owner's normal fan-out and a non-owner's forwarded
-/// writes route through: "group by owner set instead of broadcast" has one
-/// implementation, not two.
-fn fan_out_by_owner_set(
+/// mesh's existing per-peer outboxes ([`Mesh::send_frames_awaiting`],
+/// waiting for space rather than dropping on overflow, since a forwarded
+/// write's only copy is the frame). The single function both an owner's
+/// normal fan-out and a non-owner's forwarded writes route through: "group
+/// by owner set instead of broadcast" has one implementation, not two.
+async fn fan_out_by_owner_set(
     mesh: &Mesh,
     cache_name: &SmolStr,
     view: &OwnershipView,
     self_node: NodeId,
     records: Vec<WireRecord>,
 ) {
+    let deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
     for (owners, recs) in group_by_owner_set(view, self_node, records) {
         if owners.is_empty() {
             continue;
@@ -1335,7 +1347,8 @@ fn fan_out_by_owner_set(
             })
             .collect();
         for peer in owners {
-            mesh.send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
+            mesh.send_frames_awaiting(peer, frames.clone(), deadline)
+                .await;
         }
     }
 }
@@ -1408,7 +1421,8 @@ async fn fan_out_batch<K, V>(
             &view,
             cluster.node_id(),
             records,
-        );
+        )
+        .await;
         return;
     }
 

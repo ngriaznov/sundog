@@ -39,6 +39,11 @@ All notable changes to this project are documented in this file. Format follows
 - `sundog-testnode` reads `SUNDOG_TESTNODE_MODE=distributed` (with
   `SUNDOG_TESTNODE_OWNERS` to pick `owners`) to open `"it"` as a distributed
   cache, and serves the routes the new container scenarios drive it through.
+- A cache close or cluster shutdown finishes the fan-out batch in flight,
+  drains the fan-out queue, and flushes queued frames to their peers before
+  cancelling the writers, so a write accepted just before shutdown still
+  reaches its owners. A `Mode::Distributed` fan-out waits for outbox space,
+  bounded, instead of dropping a forwarded write on overflow.
 - Five `Mode::Distributed` scenarios in the deterministic simulation suite:
   rebalance under membership churn with message loss and reordering, a
   partition healing back to one ownership view with every write kept, one

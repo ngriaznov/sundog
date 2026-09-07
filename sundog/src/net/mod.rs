@@ -123,6 +123,12 @@ fn build_tls_ctx(_config: &ClusterConfig) -> TlsCtx {
 /// [`ClusterConfig::outbox_capacity`]'s default.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 
+/// How long [`Mesh::shutdown`] waits for queued replicate frames to reach
+/// their writers before cancelling them, and the moment it then leaves for
+/// the writers' last frames to go out.
+const OUTBOX_FLUSH_DEADLINE: Duration = Duration::from_millis(500);
+const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
+
 /// Process-wide wire-frame counters, incremented at [`conn::send_msg`], the
 /// single choke point every outbound frame passes through:
 /// [`frames_sent_total`] and [`bytes_sent_total`] sum every `Mesh` in this
@@ -599,7 +605,7 @@ struct PeerHandle {
     dirty: Arc<AtomicBool>,
     /// [`mono_ms`] + 1 of the last `Replicate` frame enqueued, `0` if none.
     /// Read by [`Mesh::replicate_in_flight`].
-    last_replicate_enqueued: AtomicU64,
+    last_replicate_enqueued: Arc<AtomicU64>,
     /// Anti-entropy digests from this peer answered empty in a row, for
     /// [`MeshInner::defers_ae_digest_from`]'s bound.
     ae_deferrals: AtomicU32,
@@ -825,7 +831,7 @@ impl Mesh {
             invalidate,
             replicate_tx,
             dirty: Arc::new(AtomicBool::new(false)),
-            last_replicate_enqueued: AtomicU64::new(0),
+            last_replicate_enqueued: Arc::new(AtomicU64::new(0)),
             ae_deferrals: AtomicU32::new(0),
             cancel,
             req_pool: Arc::new(conn::ReqPool::new()),
@@ -908,6 +914,78 @@ impl Mesh {
                 .last_replicate_enqueued
                 .store(mono_ms() + 1, Ordering::Relaxed);
         }
+    }
+
+    /// [`Mesh::send_frames`] for records the sender keeps no copy of: a
+    /// `Mode::Distributed` fan-out, where a forwarded write's only copy is
+    /// the frame itself. Waits for outbox space instead of dropping on
+    /// overflow, up to `deadline` for the whole batch; a frame that still
+    /// finds no space by then is dropped and counted in
+    /// `sundog_backlog_dropped_total`, and the peer marked dirty. A `peer`
+    /// the mesh doesn't know about is a silent no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock is poisoned.
+    pub(crate) async fn send_frames_awaiting(
+        &self,
+        peer: NodeId,
+        frames: Vec<OutFrame>,
+        deadline: tokio::time::Instant,
+    ) {
+        let (tx, dirty, enqueued_stamp) = {
+            let table = self
+                .inner
+                .peers
+                .read()
+                .expect("invariant: peers lock is never poisoned");
+            let Some(handle) = table.get(&peer) else {
+                return;
+            };
+            (
+                handle.replicate_tx.clone(),
+                Arc::clone(&handle.dirty),
+                Arc::clone(&handle.last_replicate_enqueued),
+            )
+        };
+        let mut dropped = 0u64;
+        for frame in frames {
+            match tokio::time::timeout_at(deadline, tx.reserve()).await {
+                Ok(Ok(permit)) => permit.send(frame),
+                Ok(Err(_)) | Err(_) => dropped += 1,
+            }
+        }
+        enqueued_stamp.store(mono_ms() + 1, Ordering::Relaxed);
+        if dropped > 0 {
+            dirty.store(true, Ordering::Relaxed);
+            metrics::counter!("sundog_backlog_dropped_total", "peer" => peer.to_string())
+                .increment(dropped);
+            tracing::warn!(%peer, dropped, "outbox stayed full past the fan-out deadline; frames dropped");
+        }
+    }
+
+    /// Waits, up to `deadline`, until every peer's replicate outbox has been
+    /// handed to its writer, then a moment more for the writer's last
+    /// frames to leave: what [`Mesh::shutdown`] runs before cancelling the
+    /// writers, so a frame accepted just before shutdown still goes out.
+    async fn flush_outboxes(&self, deadline: tokio::time::Instant) {
+        loop {
+            let pending = {
+                let table = self
+                    .inner
+                    .peers
+                    .read()
+                    .expect("invariant: peers lock is never poisoned");
+                table
+                    .values()
+                    .any(|h| h.replicate_tx.capacity() < h.replicate_tx.max_capacity())
+            };
+            if !pending || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(OUTBOX_FLUSH_TAIL).await;
     }
 
     /// Whether replicate traffic toward `peer` is still in motion: frames
@@ -1378,6 +1456,8 @@ impl Mesh {
     /// Panics if the peer-table lock is poisoned.
     pub async fn shutdown(self) {
         self.inner.accept_cancel.cancel();
+        self.flush_outboxes(tokio::time::Instant::now() + OUTBOX_FLUSH_DEADLINE)
+            .await;
         let table = std::mem::take(
             &mut *self
                 .inner
@@ -2813,6 +2893,91 @@ mod tests {
             result.is_err(),
             "a peer that does not speak PROTOCOL_DISTRIBUTED must never be dialed for a scoped ae round"
         );
+    }
+
+    /// Records carried by every `Replicate`/`ReplicateBatch` message read
+    /// off `inbound` within `wait`.
+    async fn count_replicated(inbound: &mut mpsc::Receiver<InboundMsg>, wait: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut count = 0usize;
+        while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, inbound.recv()).await {
+            match msg.msg {
+                Msg::Replicate { .. } => count += 1,
+                Msg::ReplicateBatch { recs, .. } => count += recs.len(),
+                _ => {}
+            }
+        }
+        count
+    }
+
+    fn replicate_msgs(count: usize) -> Vec<Msg> {
+        (0..count)
+            .map(|i| Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: WireRecord {
+                    key: Bytes::from(format!("k{i}")),
+                    value: Some(Bytes::from_static(b"v")),
+                    ver: Hlc {
+                        wall_ms: 1,
+                        logical: u32::try_from(i).expect("small"),
+                        node: NodeId::from(1),
+                    },
+                    expires_at_ms: None,
+                },
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_replicate_frames_queued_just_before_it() {
+        let (receiver, mut inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        let (sender, _sender_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        sender.update_peers(vec![peer_at(NodeId::from(2), receiver.local_addr())]);
+
+        sender.send_many(NodeId::from(2), MsgClass::Replicate, replicate_msgs(2_000));
+        sender.shutdown().await;
+
+        let got = count_replicated(&mut inbound, Duration::from_secs(3)).await;
+        assert_eq!(
+            got, 2_000,
+            "every frame queued before shutdown reaches the peer"
+        );
+        receiver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn send_frames_awaiting_waits_for_outbox_space_instead_of_dropping() {
+        let (receiver, mut inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+        let config = ClusterConfig {
+            outbox_capacity: 4,
+            ..ClusterConfig::default()
+        };
+        let (sender, _sender_inbound) =
+            Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+                .await
+                .expect("bind loopback");
+        sender.update_peers(vec![peer_at(NodeId::from(2), receiver.local_addr())]);
+
+        let frames: Vec<OutFrame> = replicate_msgs(200)
+            .into_iter()
+            .map(|msg| OutFrame::new(msg).expect("encodes"))
+            .collect();
+        sender
+            .send_frames_awaiting(
+                NodeId::from(2),
+                frames,
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+        sender.shutdown().await;
+
+        let got = count_replicated(&mut inbound, Duration::from_secs(3)).await;
+        assert_eq!(
+            got, 200,
+            "a four-slot outbox carries two hundred frames when the sender waits for space"
+        );
+        receiver.shutdown().await;
     }
 
     #[tokio::test]

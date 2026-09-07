@@ -1849,6 +1849,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarded_writes_reach_their_owners_when_the_writer_shuts_down_at_once() {
+        // `a` forwards thousands of writes for buckets it does not own and
+        // shuts down in the same breath: the fan-out task finishes the
+        // batch, the mesh flushes it, and every key lands on the survivors,
+        // which own everything between them once `a` is gone.
+        let ((a, cache_a), (b, cache_b), (c, cache_c), _) =
+            three_node_distributed("distributed-forward-flush", "forward-flush").await;
+        let keys: Vec<u32> = (0..1_000_000u32)
+            .filter(|key| !cache_a.owners_of(key).contains(&a.node_id()))
+            .take(3_000)
+            .collect();
+        cache_a
+            .insert_many(keys.iter().map(|&key| (key, format!("v{key}"))))
+            .await
+            .expect("insert_many forwards");
+        cache_a.close().await;
+        a.shutdown().await;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut landed = 0usize;
+                for key in &keys {
+                    let expected = format!("v{key}");
+                    if cache_b.get(key).await.as_deref() == Some(expected.as_str())
+                        && cache_c.get(key).await.as_deref() == Some(expected.as_str())
+                    {
+                        landed += 1;
+                    }
+                }
+                if landed == keys.len() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("every forwarded write lands on both survivors");
+
+        cache_c.close().await;
+        cache_b.close().await;
+        c.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn distributed_cache_rejects_owners_below_two() {
         let cluster = Cluster::builder("cache-it-distributed-owners-below-two")
             .seeds(std::iter::empty())
