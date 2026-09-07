@@ -1,9 +1,9 @@
-//! [`Model`] is a sequential last-writer-wins map over `u8` keys that
-//! reimplements [`Shard::apply`]'s versioned-write rule,
-//! [`ShardOps::gc_tombstones`]'s retention rule, and TTL expiry without
+//! `Model` is a sequential last-writer-wins map over `u8` keys that
+//! reimplements `Shard::apply`'s versioned-write rule,
+//! `ShardOps::gc_tombstones`'s retention rule, and TTL expiry without
 //! touching `engine::Engine`. A divergence between the two is a bug.
 //!
-//! [`Op`] is the `Arbitrary` vocabulary [`run`] applies to a shard and its
+//! `Op` is the `Arbitrary` vocabulary `run` applies to a shard and its
 //! model side by side, asserting agreement after every step.
 
 use std::collections::{HashMap, HashSet};
@@ -316,7 +316,7 @@ pub struct RemoteRecord {
 pub enum Op {
     /// [`Shard::insert`] or [`Shard::insert_with_ttl`], stamped by the
     /// shard's own [`crate::hlc::HlcClock`]. [`run`]'s driver predicts the
-    /// stamp via [`Model::stamp_local`] rather than reading it back, since
+    /// stamp via `Model::stamp_local` rather than reading it back, since
     /// an already-expired write is invisible to [`ShardOps::records_for`].
     LocalInsert {
         key: u8,

@@ -18,8 +18,8 @@ use crate::wire::MAX_FRAME;
 ///
 /// A node with `tls: None` and one with `tls: Some(_)` cannot join the same
 /// mesh: every connection between them fails outright rather than silently
-/// downgrading. Every certificate must carry [`crate::net::MESH_SERVER_NAME`]
-/// as a DNS SAN. A `sim`-feature build stays plaintext regardless of this
+/// downgrading. Every certificate must carry `net::MESH_SERVER_NAME` as a
+/// DNS SAN. A `sim`-feature build stays plaintext regardless of this
 /// field.
 #[cfg(feature = "tls")]
 #[derive(Debug, Clone, PartialEq, Eq)]

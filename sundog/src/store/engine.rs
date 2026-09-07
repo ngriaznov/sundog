@@ -4138,7 +4138,9 @@ mod tests {
     #[cfg(feature = "spill")]
     mod spill_payload {
         use super::*;
-        use crate::store::spill::{SpillConfig, SpillSink, SpillTier};
+        use crate::store::spill::SpillSink;
+        #[cfg(not(feature = "sim"))]
+        use crate::store::spill::{SpillConfig, SpillTier};
 
         fn loc(region: u32, offset: u32, len: u32, generation: u32) -> SpillLoc {
             SpillLoc {

@@ -2072,7 +2072,7 @@ where
     /// that [`Cache::close`] stopped the tier a surviving clone still
     /// shares, without needing to drive an eviction and infer it
     /// indirectly.
-    #[cfg(all(feature = "spill", test))]
+    #[cfg(all(feature = "spill", test, not(feature = "sim")))]
     pub(crate) fn spill_tier_closed(&self) -> bool {
         self.engine.spill().is_none_or(|tier| tier.is_closed())
     }

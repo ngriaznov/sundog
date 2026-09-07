@@ -635,7 +635,7 @@ impl SpillTier {
     /// # Errors
     ///
     /// Same as [`SpillTier::open`].
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn open_with_readonly_regions_for_test(
         cfg: &SpillConfig,
         cache_name: &str,
@@ -785,7 +785,7 @@ impl SpillTier {
     /// the channel, runs after the lock is released. See the module docs.
     /// Test-only: production has exactly one caller of either half, and it
     /// needs them split.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn try_spill(&self, job: SpillJob) -> bool {
         if !self.would_accept(job.key_bytes.len(), job.encoded.len()) {
             return false;
@@ -872,7 +872,7 @@ impl SpillTier {
     /// Bytes currently sitting in the flusher's channel, queued but not yet
     /// taken off it: the same total [`SpillTier::would_accept`] checks
     /// against `flush_queue_bytes`. Test-facing.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn queued_bytes(&self) -> u64 {
         self.inner.queued_bytes.load(Ordering::Acquire)
     }
@@ -882,13 +882,13 @@ impl SpillTier {
     /// upstream, a hand-off's weight stays in
     /// `crate::store::engine::Engine::pending_spill_weight`) for as long as
     /// the test needs. [`SpillTier::resume_flusher`] undoes this.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn pause_flusher(&self) {
         self.inner.flusher_paused.store(true, Ordering::Release);
     }
 
     /// Undoes [`SpillTier::pause_flusher`].
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn resume_flusher(&self) {
         self.inner.flusher_paused.store(false, Ordering::Release);
     }
@@ -949,7 +949,7 @@ impl SpillTier {
     /// Whether [`SpillTier::close`] has run. Test-facing: production code
     /// only ever needs `try_spill`'s own `false` return to know a tier is
     /// unusable, never a direct closed check.
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
