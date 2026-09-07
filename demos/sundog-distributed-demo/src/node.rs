@@ -162,6 +162,12 @@ impl NodeSlot {
 
     /// Tears down whatever is running and opens a fresh `Cluster` on the
     /// same gossip port, rejoining via the same seeds like a real restart.
+    /// Returns `true` if the reopen succeeded, `false` if it failed (a
+    /// failure is still reported on `feed_tx`, but the caller needs the
+    /// outcome too rather than only a narrated event).
+    ///
+    /// A concurrent kill/restart call that finds this node already busy
+    /// returns `false` without touching anything — no cluster was reopened.
     pub(crate) async fn restart(
         self: &Arc<Self>,
         cluster_name: &str,
@@ -170,13 +176,13 @@ impl NodeSlot {
         tombstone_ttl: Duration,
         owners: NonZeroU8,
         feed_tx: &UnboundedSender<String>,
-    ) {
+    ) -> bool {
         if self.status.busy.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         self.teardown().await;
         let _ = feed_tx.send(format!("node{}: restarting…", self.index));
-        match open(
+        let succeeded = match open(
             cluster_name,
             self.gossip_addr,
             seeds,
@@ -202,12 +208,15 @@ impl NodeSlot {
                     "node{}: restarted, pulling its share of buckets",
                     self.index
                 ));
+                true
             }
             Err(error) => {
                 let _ = feed_tx.send(format!("node{}: restart failed: {error:#}", self.index));
+                false
             }
-        }
+        };
         self.status.busy.store(false, Ordering::Release);
+        succeeded
     }
 
     async fn teardown(&self) {
@@ -393,5 +402,28 @@ mod tests {
         assert_eq!(slots[0].status.entry_count.load(Ordering::Relaxed), 0);
         assert_eq!(slots[0].status.owned_buckets.load(Ordering::Relaxed), 0);
         assert!(!slots[0].status.warm.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn restart_of_a_busy_node_reports_failure() {
+        let slots = build_slots(1, 43_000);
+        let seeds = seed_list(&slots);
+        let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Simulate a restart already in flight: the guard must bail out
+        // before touching the network and report the outcome as `false`.
+        slots[0].status.busy.store(true, Ordering::Release);
+        let restarted = slots[0]
+            .restart(
+                "test-cluster",
+                &seeds,
+                Duration::from_millis(50),
+                Duration::from_secs(30),
+                NonZeroU8::new(1).expect("1 is nonzero"),
+                &feed_tx,
+            )
+            .await;
+        assert!(!restarted);
+        drop(feed_tx);
+        assert!(feed_rx.recv().await.is_none());
     }
 }

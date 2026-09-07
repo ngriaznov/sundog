@@ -94,11 +94,18 @@ impl LoadState {
     }
 
     /// Marks `index` removed. Returns `true` if this call is the one that
-    /// removed it (idempotent: a key already removed stays removed).
+    /// removed it (idempotent: a key already removed stays removed). Drops
+    /// any recorded write for `index`, since a removed key never needs an
+    /// expected value again and the map would otherwise keep every touched
+    /// key's `String` alive for the life of the run.
     fn mark_removed(&self, index: usize) -> bool {
         let was_removed = self.removed[index].swap(true, Ordering::Relaxed);
         if !was_removed {
             self.removed_count.fetch_add(1, Ordering::Relaxed);
+            self.touched
+                .lock()
+                .expect("invariant: touched map lock is never poisoned")
+                .remove(&index);
         }
         !was_removed
     }
@@ -300,6 +307,24 @@ mod tests {
         assert_eq!(state.expected_value(7), "v7");
         state.touch(7, "v7-updated".to_owned());
         assert_eq!(state.expected_value(7), "v7-updated");
+    }
+
+    #[test]
+    fn marking_removed_drops_the_touched_entry() {
+        let state = LoadState::new(10);
+        state.touch(4, "v4-updated".to_owned());
+        assert_eq!(state.expected_value(4), "v4-updated");
+        assert!(state.mark_removed(4));
+        assert!(
+            !state
+                .touched
+                .lock()
+                .expect("invariant: touched map lock is never poisoned")
+                .contains_key(&4)
+        );
+        // No entry left behind: expected_value falls back to the preload
+        // value rather than keeping the stale write alive.
+        assert_eq!(state.expected_value(4), "v4");
     }
 
     #[test]

@@ -70,7 +70,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     );
 
     tokio::time::sleep(three_quarter.saturating_sub(half)).await;
-    demo.nodes[killed_index]
+    let restarted = demo.nodes[killed_index]
         .restart(
             &demo.cluster_name,
             &demo.seeds,
@@ -80,10 +80,17 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
             &demo.feed_tx,
         )
         .await;
-    println!(
-        "headless: restarted node{killed_index} at {}s",
-        three_quarter.as_secs()
-    );
+    if restarted {
+        println!(
+            "headless: restarted node{killed_index} at {}s",
+            three_quarter.as_secs()
+        );
+    } else {
+        println!(
+            "headless: restart of node{killed_index} at {}s FAILED",
+            three_quarter.as_secs()
+        );
+    }
 
     tokio::time::sleep(duration.saturating_sub(three_quarter)).await;
     demo.paused.store(true, Ordering::Relaxed);
@@ -113,7 +120,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
 
     let diverged = convergence_report.is_diverged();
     let sample_failed = sample_ok != sample_checked || sample_checked == 0;
-    let exit_code = i32::from(diverged || sample_failed);
+    let exit_code = i32::from(diverged || sample_failed || !restarted);
 
     demo.shutdown().await;
     Ok(exit_code)
