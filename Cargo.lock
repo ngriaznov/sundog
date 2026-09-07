@@ -2954,6 +2954,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sundog-distributed-demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "rand 0.10.2",
+ "ratatui",
+ "sundog",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sundog-testnode"
 version = "0.1.0"
 dependencies = [
