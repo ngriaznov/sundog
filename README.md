@@ -412,7 +412,7 @@ SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
 
 ## Chaos demo
 
-`sundog-demo` spins up N in-process nodes on loopback and runs a background
+`demos/sundog-demo` spins up N in-process nodes on loopback and runs a background
 write load against a shared key space. It lets you kill and restart nodes
 interactively, watching replication and anti-entropy repair the damage in a
 `ratatui` TUI:
