@@ -5,12 +5,16 @@
   routine gets its decision logic split into a pure function with a unit test,
   and a new metric gets its value pinned in the exporter test. Before reporting
   a feature done, check each new symbol by name for a test that exercises it.
-- Run every local lane before pushing: `cargo fmt --all --check`, the three
-  clippy lanes (`--workspace`, `--features sim`, `--features tls,prometheus`)
-  with `-D warnings -W clippy::pedantic`, `cargo check --manifest-path
-  sundog/fuzz/Cargo.toml --all-targets` for the out-of-workspace fuzz crate,
-  `cargo test --workspace`, the sim suite, the tls+prometheus suite,
-  `RUSTDOCFLAGS="-D warnings" cargo doc`, and the rightsize container suite. Repeat timing-sensitive new tests ten times. CI
+- Run every local lane before pushing, with `RUSTFLAGS="-D warnings"` and
+  `RUSTDOCFLAGS="-D warnings"` exported so any warning fails the lane as it
+  does in CI: `cargo fmt --all --check`, the five clippy lanes
+  (`--workspace`, `--features sim`, `--features tls,prometheus`,
+  `--features spill`, `--features spill,prometheus`) with `-D warnings -W
+  clippy::pedantic`, `cargo check --manifest-path sundog/fuzz/Cargo.toml
+  --all-targets` for the out-of-workspace fuzz crate, `cargo test
+  --workspace`, the sim suite, the tls+prometheus suite, the
+  spill+prometheus suite, `cargo doc --workspace --no-deps` and `cargo doc -p
+  sundog --no-deps --all-features`, and the rightsize container suite. Repeat timing-sensitive new tests ten times. CI
   is the end gate; dispatch it on the branch and wait for green.
 - Run `cargo semver-checks --baseline-version <last release> --release-type
   minor` before a minor release; only intentional, changelog-listed breaks may

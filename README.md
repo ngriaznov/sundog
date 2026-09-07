@@ -413,7 +413,9 @@ SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
 ```
 
 `cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic` and
-`cargo fmt --all --check` are both enforced in CI.
+`cargo fmt --all --check` are both enforced in CI, and every CI lane builds with
+`RUSTFLAGS="-D warnings"` and `RUSTDOCFLAGS="-D warnings"`: a compiler or
+rustdoc warning fails the build.
 
 ## Chaos demo
 

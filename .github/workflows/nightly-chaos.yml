@@ -14,6 +14,7 @@ jobs:
   chaos-fresh-seed:
     runs-on: ubuntu-latest
     env:
+      RUSTFLAGS: -D warnings
       RIGHTSIZE_BACKEND: docker
       SUNDOG_CONTAINER_TESTS: "1"
       SUNDOG_CHAOS_SECS: "600"
