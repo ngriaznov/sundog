@@ -269,6 +269,7 @@ fn decode_sketch_into(
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
+    merging: bool,
 ) {
     let mut local_sketch = sundog::Iblt::new(cells.len());
     for (key, ver) in local_entries {
@@ -280,7 +281,7 @@ fn decode_sketch_into(
     {
         Ok(decoded) => {
             let mut hashes = Vec::new();
-            sundog::diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
+            sundog::diff_decoded(local_entries, &decoded, push_keys, &mut hashes, merging);
             if !hashes.is_empty() {
                 pull_hashes.push((bucket, hashes));
             }
@@ -304,6 +305,7 @@ async fn classify_ae_mismatches<S: ShardOps>(
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
     wanted_parts: &mut Vec<(u16, u8)>,
+    merging: bool,
 ) {
     for mismatch in mismatched {
         match mismatch {
@@ -311,7 +313,7 @@ async fn classify_ae_mismatches<S: ShardOps>(
                 if let Some(counter) = bucket_listings {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-                diff_bucket(shard, bucket, &peer_entries, push_keys, pull_keys).await;
+                diff_bucket(shard, bucket, &peer_entries, push_keys, pull_keys, merging).await;
             }
             AeMismatch::Sketch(bucket, cells) => {
                 let local_entries = ShardOps::bucket_entries(shard, bucket).await;
@@ -322,6 +324,7 @@ async fn classify_ae_mismatches<S: ShardOps>(
                     push_keys,
                     pull_hashes,
                     undecodable_buckets,
+                    merging,
                 );
             }
             AeMismatch::PartDigests(bucket, remote_parts) => {
@@ -356,6 +359,7 @@ async fn resolve_wanted_parts<S: ShardOps>(
     pull_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
+    merging: bool,
 ) -> bool {
     match tokio::time::timeout(
         NET_TIMEOUT,
@@ -378,7 +382,7 @@ async fn resolve_wanted_parts<S: ShardOps>(
                             .get(&(bucket, part))
                             .cloned()
                             .unwrap_or_default();
-                        diff_part(&local_entries, &peer_entries, push_keys, pull_keys);
+                        diff_part(&local_entries, &peer_entries, push_keys, pull_keys, merging);
                     }
                     AePartReply::Sketch {
                         bucket,
@@ -396,6 +400,7 @@ async fn resolve_wanted_parts<S: ShardOps>(
                             push_keys,
                             pull_hashes,
                             undecodable_buckets,
+                            merging,
                         );
                     }
                     // `AePartReply` is `#[non_exhaustive]`: an unmodelled
@@ -426,12 +431,22 @@ async fn resolve_wanted_parts<S: ShardOps>(
 /// `AeMismatch::Bucket`/`Msg::AeBucket`-shaped reply this round receives, so
 /// a scenario can assert the part path never carries one. Exactly mirrors
 /// `run_round_against`'s own shape.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one round's whole digest-exchange-through-repair sequence reads best kept together, \
+              mirroring cluster::anti_entropy::run_round_against's own allow"
+)]
 async fn ae_round_with_sketch<S: ShardOps>(
     mesh: &Mesh,
     shard: &S,
     peer: NodeId,
     bucket_listings: Option<&AtomicUsize>,
 ) -> bool {
+    // Read once per round, exactly as `run_round_against` reads
+    // `shard.merges()`: a merging resolver has both sides exchange a
+    // mismatched key in the same round instead of only the greater version
+    // pushing to the lesser side.
+    let merging = ShardOps::merges(shard);
     let local_buckets = ShardOps::digests(shard).await;
     let Ok(Ok(mismatched)) = tokio::time::timeout(
         NET_TIMEOUT,
@@ -457,6 +472,7 @@ async fn ae_round_with_sketch<S: ShardOps>(
         &mut pull_hashes,
         &mut undecodable_buckets,
         &mut wanted_parts,
+        merging,
     )
     .await;
 
@@ -470,6 +486,7 @@ async fn ae_round_with_sketch<S: ShardOps>(
             &mut pull_keys,
             &mut pull_hashes,
             &mut undecodable_buckets,
+            merging,
         )
         .await
     {
@@ -485,7 +502,15 @@ async fn ae_round_with_sketch<S: ShardOps>(
         {
             Ok(Ok(fallback)) => {
                 for (bucket, peer_entries) in fallback {
-                    diff_bucket(shard, bucket, &peer_entries, &mut push_keys, &mut pull_keys).await;
+                    diff_bucket(
+                        shard,
+                        bucket,
+                        &peer_entries,
+                        &mut push_keys,
+                        &mut pull_keys,
+                        merging,
+                    )
+                    .await;
                 }
             }
             Ok(Err(_)) | Err(_) => return false,
@@ -533,12 +558,21 @@ async fn ae_round_with_sketch<S: ShardOps>(
     ok
 }
 
+/// Mirrors `cluster::anti_entropy::diff_bucket`: `merging` is
+/// `ShardOps::merges(shard)`, read once per round by [`ae_round_with_sketch`]
+/// and threaded through every classification call in this file the same way
+/// `run_round_against` threads it through its own. `false` keeps the
+/// greater-version-only push/pull rule; `true` additionally queues the
+/// other direction too for a key present on both sides under different
+/// versions, so a merging resolver's two replicas exchange records in one
+/// round instead of needing a second round to carry a minted result back.
 async fn diff_bucket<S: ShardOps>(
     shard: &S,
     bucket: u16,
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
+    merging: bool,
 ) {
     let peer_by_key: HashMap<Bytes, Hlc> = peer_entries.iter().cloned().collect();
     let mut local_keys = HashSet::with_capacity(peer_by_key.len());
@@ -546,8 +580,14 @@ async fn diff_bucket<S: ShardOps>(
     for (key, local_ver) in ShardOps::bucket_entries(shard, bucket).await {
         local_keys.insert(key.clone());
         match peer_by_key.get(&key) {
-            Some(&peer_ver) if local_ver > peer_ver => push_keys.push(key),
-            Some(&peer_ver) if local_ver < peer_ver => pull_keys.push(key),
+            Some(&peer_ver) if local_ver != peer_ver => {
+                if local_ver > peer_ver || merging {
+                    push_keys.push(key.clone());
+                }
+                if local_ver < peer_ver || merging {
+                    pull_keys.push(key.clone());
+                }
+            }
             Some(_) => {}
             None => push_keys.push(key),
         }
@@ -562,12 +602,14 @@ async fn diff_bucket<S: ShardOps>(
 /// [`diff_bucket`]'s comparison, but over an already-fetched local entry
 /// list rather than a fresh `ShardOps::bucket_entries` call: the part path's
 /// counterpart, since `AePartReply::Listing`'s local side comes from one
-/// batched `ShardOps::entries_for_parts` call up front.
+/// batched `ShardOps::entries_for_parts` call up front. `merging` is
+/// [`diff_bucket`]'s same flag.
 fn diff_part(
     local_entries: &[(Bytes, Hlc)],
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
+    merging: bool,
 ) {
     let peer_by_key: HashMap<&Bytes, Hlc> = peer_entries.iter().map(|(k, v)| (k, *v)).collect();
     let mut local_keys = HashSet::with_capacity(local_entries.len());
@@ -575,8 +617,14 @@ fn diff_part(
     for (key, local_ver) in local_entries {
         local_keys.insert(key);
         match peer_by_key.get(key) {
-            Some(&peer_ver) if *local_ver > peer_ver => push_keys.push(key.clone()),
-            Some(&peer_ver) if *local_ver < peer_ver => pull_keys.push(key.clone()),
+            Some(&peer_ver) if *local_ver != peer_ver => {
+                if *local_ver > peer_ver || merging {
+                    push_keys.push(key.clone());
+                }
+                if *local_ver < peer_ver || merging {
+                    pull_keys.push(key.clone());
+                }
+            }
             Some(_) => {}
             None => push_keys.push(key.clone()),
         }
@@ -3454,6 +3502,26 @@ fn partition_heal_pn_counter_converges_to_exact_totals() {
         "pn_counter: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
         metrics.ae_rounds
     );
+
+    // `PnCounterResolver::merges()` is `true`, so `ae_round_with_sketch`'s
+    // `diff_bucket`/`diff_decoded` exchange both sides of a mismatched
+    // counter in the same round instead of only the greater version
+    // pushing to the lesser side (see `store::ConflictResolver::merges`'s
+    // and `engine::merge_version`'s docs for why that halves the round trip
+    // a divergent key costs). The sim is deterministic under a fixed seed,
+    // so re-running the decomposed control here, seeded and ported exactly
+    // as `partition_heal_lww_decomposed_reports_lost_updates` runs it, gives
+    // a same-process, directly comparable `ae_rounds` figure rather than one
+    // read off a separate test run.
+    let decomposed = run_lww_decomposed_partition_heal(sim_seed(0xC0DE_6502), 4910);
+    assert!(
+        metrics.ae_rounds <= decomposed.ae_rounds,
+        "pn_counter: the bidirectional merging exchange spent {} anti-entropy rounds repairing \
+         the partition, more than lww_decomposed's {} -- exchanging both sides on a mismatch \
+         should let merging match or beat the decomposed control, not fall behind it",
+        metrics.ae_rounds,
+        decomposed.ae_rounds
+    );
 }
 
 /// The decomposed variant: `counters * 3` keys under the default
@@ -3466,13 +3534,15 @@ fn partition_heal_pn_counter_converges_to_exact_totals() {
 /// [`partition_heal_pn_counter_converges_to_exact_totals`]'s single-key
 /// merge, not a claim that decomposition can lose updates. `lost_updates`
 /// is reported on its `BENCH` line but never asserted to a specific value.
-#[test]
-fn partition_heal_lww_decomposed_reports_lost_updates() {
+/// Factored into [`run_lww_decomposed_partition_heal`] so the merged
+/// variant's test can re-run this exact scenario for its own comparison
+/// without duplicating the write/read closures.
+fn run_lww_decomposed_partition_heal(seed: u64, port: u16) -> PartitionHealMetrics {
     let counters = sim_counter_count();
-    let metrics = run_partition_heal::<String, _, _>(
+    run_partition_heal::<String, _, _>(
         "lww_decomposed",
-        sim_seed(0xC0DE_6502),
-        4910,
+        seed,
+        port,
         None,
         counters,
         |shard, _node, index, counters, rounds| {
@@ -3499,7 +3569,12 @@ fn partition_heal_lww_decomposed_reports_lost_updates() {
                 total
             })
         },
-    );
+    )
+}
+
+#[test]
+fn partition_heal_lww_decomposed_reports_lost_updates() {
+    let metrics = run_lww_decomposed_partition_heal(sim_seed(0xC0DE_6502), 4910);
 
     assert!(
         metrics.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,

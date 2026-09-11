@@ -75,6 +75,27 @@ cluster with `PnCounterResolver` installed converges concurrent, unpaced
 blind increments to the exact sum with no lost updates, unlike the default
 last-write-wins resolver on the same workload.
 
+`ConflictResolver::merges` (`ShardOps::merges` forwards a shard's own
+resolver's answer) tells `cluster::anti_entropy` whether a resolver can
+ever return `Merged`, `true` on `PnCounterResolver` and `OrSetResolver`.
+Anti-entropy's ordinary direction rule pushes only the greater of two
+mismatched versions to the lesser side, so a merging resolver's minted
+result needs a second round to reach the replica that mints behind the
+other. When `merges` is `true`, a version-mismatched key exchanges in
+both directions in the same round instead: `diff_bucket` and
+`diff_decoded` queue it for both push and pull, so both replicas fold
+each other's pre-round record into their own in that one round.
+`merge_version`'s doc proves this converges in one round on every
+outcome, mint included: the merge itself is commutative and the mint's
+`wall_ms`/`logical`/`node` are each a function of the unordered pair of
+inputs, not of which side calls which argument `sv` and which `ver`, so
+both replicas mint (or adopt) byte-for-byte, `Hlc`-for-`Hlc` identical
+results. The partition-heal sim confirms it end to end: `pn_counter`
+repairs a 2,000-counter partition split in 10 anti-entropy rounds
+against `lww_decomposed`'s 11, down from 17 before this exchange
+shipped — fewer rounds than the decomposed control, the opposite of the
+naive expectation that merging costs more.
+
 **What is still open:**
 
 - **`OrSet` never compacts.** Adds and tombstones accumulate forever; there

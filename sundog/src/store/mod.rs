@@ -527,6 +527,20 @@ pub trait ShardOps: Send + Sync {
     fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
         (dirty, live)
     }
+
+    /// Whether this shard's [`ConflictResolver`] can return
+    /// [`Winner::Merged`], forwarded straight from
+    /// [`ConflictResolver::merges`]. `cluster::anti_entropy` reads this once
+    /// per round and, when `true`, has `diff_bucket`/`diff_decoded` queue a
+    /// key present on both sides under different versions for both push and
+    /// pull instead of only pushing the greater side to the lesser one, so
+    /// two replicas each holding half of a merge exchange records in the
+    /// same round rather than needing a second round to carry the minted
+    /// result back. `false` for every shard without a resolver set, since
+    /// [`LwwResolver::merges`] is `false`.
+    fn merges(&self) -> bool {
+        false
+    }
 }
 
 /// One side of a [`ConflictResolver::winner`] comparison: everything a resolver
@@ -628,6 +642,32 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// resolver that can return [`Winner::Merged`]: see the trait docs.
     fn needs_value_bytes(&self) -> bool {
         true
+    }
+
+    /// Whether this resolver can ever return [`Winner::Merged`]. Defaults to
+    /// `false`, matching [`LwwResolver`] and any other pick-a-side-only
+    /// resolver. A resolver that overrides `winner` to return `Merged` must
+    /// override this to `true` — nothing enforces the override, but
+    /// `ShardOps::merges` (via `Shard::with_resolver`) forwards it straight
+    /// into anti-entropy's direction rule, so a resolver claiming `false`
+    /// while returning `Merged` only loses the optimization below, never
+    /// correctness.
+    ///
+    /// Anti-entropy's `diff_bucket`/`diff_decoded` push only the greater of
+    /// two differently-versioned records to the lesser side by default,
+    /// costing a merging resolver two rounds per divergent key: the lesser
+    /// side merges and mints a version above both inputs, and only the next
+    /// round carries the fuller content back (see `merge_version`'s doc for
+    /// why the mint always dominates both inputs). When `merges` is `true`,
+    /// anti-entropy instead exchanges both records on a version mismatch —
+    /// each side folds the other's record into its own — so both sides mint
+    /// (or adopt) the identical result in the same round: see
+    /// `merge_version`'s doc for why the mint arm is symmetric in its two
+    /// input stamps. `true` is always correct to return, even for a
+    /// resolver that never actually returns `Merged`; it only ever costs an
+    /// extra exchange, never a correctness issue.
+    fn merges(&self) -> bool {
+        false
     }
 }
 
@@ -2599,6 +2639,10 @@ where
         };
         (filter(dirty), filter(live))
     }
+
+    fn merges(&self) -> bool {
+        self.resolver.merges()
+    }
 }
 
 #[cfg(test)]
@@ -3966,6 +4010,44 @@ mod tests {
         assert_ne!(a, Winner::B);
     }
 
+    #[test]
+    fn conflict_resolver_merges_defaults_to_false_and_is_overridable() {
+        assert!(
+            !LwwResolver.merges(),
+            "the default resolver never returns Merged"
+        );
+        assert!(
+            !LongestValueWins.merges(),
+            "a custom A/B-only resolver inherits the false default without overriding it"
+        );
+        assert!(
+            AlwaysMerge {
+                value: Bytes::from_static(b"x"),
+                expires_at_ms: None,
+            }
+            .merges(),
+            "a resolver that returns Merged overrides merges() to true"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_merges_reflects_the_resolvers_merges_flag() {
+        let default_resolver = shard::<u32, Vec<u8>>(1);
+        assert!(
+            !ShardOps::merges(&default_resolver),
+            "a shard with no resolver set carries LwwResolver's false"
+        );
+
+        let merging = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(AlwaysMerge {
+            value: Bytes::from_static(b"x"),
+            expires_at_ms: None,
+        }));
+        assert!(
+            ShardOps::merges(&merging),
+            "a shard forwards its resolver's merges() through ShardOps"
+        );
+    }
+
     #[tokio::test]
     async fn custom_resolver_overrides_plain_hlc_order() {
         let s = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(LongestValueWins));
@@ -4078,6 +4160,10 @@ mod tests {
                 value: self.value.clone(),
                 expires_at_ms: self.expires_at_ms,
             }
+        }
+
+        fn merges(&self) -> bool {
+            true
         }
     }
 

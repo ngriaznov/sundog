@@ -3,7 +3,12 @@
 //! 1,024 bucket digests; for each mismatch the peer answers with the bucket's
 //! entry listing, or an IBLT sketch for a large bucket. The initiator diffs,
 //! pushes what it has newer, and pulls what the peer has newer, so both sides
-//! converge in one round. Tombstones take part as records with no value.
+//! converge in one round. When the shard's resolver can return
+//! `Winner::Merged` (`ShardOps::merges` is `true`), a version-mismatched key
+//! is pushed *and* pulled instead of only in the greater side's direction, so
+//! two replicas each holding half of a merge exchange records in this same
+//! round rather than needing a second round to carry the minted result back.
+//! Tombstones take part as records with no value.
 //!
 //! A sketch that fails to peel is retried once as a full listing, after every
 //! other reply in the round is handled. `Invalidation` caches never run this:
@@ -149,7 +154,12 @@ pub(crate) enum RoundOutcome {
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
 /// mismatched buckets. Keys this node has newer, or `peer` lacks, push via
 /// the normal `Replicate` path; keys `peer` has newer, or this node lacks,
-/// pull and apply directly.
+/// pull and apply directly. When `shard`'s resolver reports
+/// [`ShardOps::merges`] as `true`, a key present on both sides under
+/// different versions is pushed *and* pulled rather than only in the
+/// greater side's direction, so two replicas each holding half of a merge
+/// converge in this one round instead of needing a second round to carry
+/// the minted result back.
 ///
 /// For a `Mode::Distributed` shard (one reporting an
 /// [`ShardOps::ownership_view_hash`]), the digest exchange goes through
@@ -161,6 +171,10 @@ pub(crate) enum RoundOutcome {
 /// sketches, listings — runs exactly the same regardless of how the round
 /// was scoped.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one round's whole digest-exchange-through-repair sequence reads best kept together"
+)]
 pub(crate) async fn run_round_against(
     cluster: &Cluster,
     shard: &Arc<dyn ShardOps>,
@@ -168,6 +182,12 @@ pub(crate) async fn run_round_against(
     peer: NodeId,
 ) -> RoundOutcome {
     let mesh = cluster.mesh();
+    // Read once per round: a resolver that can return `Winner::Merged` has
+    // both sides exchange a mismatched key instead of only the greater
+    // version pushing to the lesser side, so two replicas each holding half
+    // of a merge converge in this one round rather than needing a second
+    // round to carry the minted result back. See `ShardOps::merges`.
+    let merging = shard.merges();
     let mismatched = match shard.ownership_view_hash() {
         Some(view_hash) => {
             // Only the buckets `peer` co-owns: the whole resident list
@@ -237,6 +257,7 @@ pub(crate) async fn run_round_against(
         &mut pull_keys,
         &mut pull_hashes,
         &mut undecodable_buckets,
+        merging,
     )
     .await;
     classify_part_digest_mismatches(
@@ -249,6 +270,7 @@ pub(crate) async fn run_round_against(
         &mut pull_keys,
         &mut pull_hashes,
         &mut undecodable_buckets,
+        merging,
     )
     .await;
 
@@ -274,6 +296,7 @@ pub(crate) async fn run_round_against(
                         &peer_entries,
                         &mut push_keys,
                         &mut pull_keys,
+                        merging,
                     );
                 }
             }
@@ -309,7 +332,10 @@ fn retain_owned_pulls(
 /// once, not one per bucket, since a mostly-divergent peer mismatches many
 /// and per-bucket scans would be quadratic; each is then classified into
 /// `push_keys`/`pull_keys` directly, or, for a sketch, via
-/// [`handle_sketch_mismatch`]. A no-op when `mismatches` is empty.
+/// [`handle_sketch_mismatch`]. `merging` is [`ShardOps::merges`]'s answer for
+/// this round, forwarded into [`diff_bucket`]/[`handle_sketch_mismatch`]. A
+/// no-op when `mismatches` is empty.
+#[allow(clippy::too_many_arguments)]
 async fn classify_bucket_mismatches(
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
@@ -318,6 +344,7 @@ async fn classify_bucket_mismatches(
     pull_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
+    merging: bool,
 ) {
     if mismatches.is_empty() {
         return;
@@ -335,6 +362,7 @@ async fn classify_bucket_mismatches(
                     &peer_entries,
                     push_keys,
                     pull_keys,
+                    merging,
                 );
             }
             AeMismatch::Sketch(bucket, cells) => {
@@ -348,6 +376,7 @@ async fn classify_bucket_mismatches(
                     push_keys,
                     pull_hashes,
                     undecodable_buckets,
+                    merging,
                 );
             }
             AeMismatch::PartDigests(..) => {
@@ -361,7 +390,9 @@ async fn classify_bucket_mismatches(
 /// compares each against this node's own part digests for the same bucket,
 /// one shard call for all of them, then one [`Mesh::ae_parts`] request for
 /// every part that actually differs, classifying each reply the same way
-/// [`classify_bucket_mismatches`] does at bucket scale. A no-op when
+/// [`classify_bucket_mismatches`] does at bucket scale. `merging` is
+/// [`ShardOps::merges`]'s answer for this round, forwarded into
+/// [`diff_bucket`]/[`handle_part_sketch_mismatch`]. A no-op when
 /// `mismatches` is empty.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
@@ -376,6 +407,7 @@ async fn classify_part_digest_mismatches(
     pull_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
+    merging: bool,
 ) {
     if mismatches.is_empty() {
         return;
@@ -426,6 +458,7 @@ async fn classify_part_digest_mismatches(
                             &entries,
                             &mut slot.push_keys,
                             &mut slot.pull_keys,
+                            merging,
                         );
                         metrics::counter!(
                             "sundog_ae_parts_total",
@@ -457,6 +490,7 @@ async fn classify_part_digest_mismatches(
                             &mut slot.push_keys,
                             &mut slot.pull_hashes,
                             &mut undecodable,
+                            merging,
                         );
                         slot.undecodable |= !undecodable.is_empty();
                     }
@@ -541,10 +575,12 @@ async fn apply_repairs(
 
 /// Classifies one `AeMismatch::Sketch(bucket, cells)` reply: builds a local
 /// comparison sketch, subtracts the received one, and peels it. On success,
-/// [`diff_decoded`] classifies the result into `push_keys`/`pull_hashes`; on
+/// [`diff_decoded`] classifies the result into `push_keys`/`pull_hashes`,
+/// with `merging` forwarded the same way [`diff_bucket`] takes it; on
 /// failure queues `bucket` into `undecodable_buckets` for the
 /// `Msg::AeEntries` fallback. Emits `sundog_ae_sketch_total{outcome}` either
 /// way.
+#[allow(clippy::too_many_arguments)]
 fn handle_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,
@@ -553,6 +589,7 @@ fn handle_sketch_mismatch(
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
+    merging: bool,
 ) {
     if !peel_sketch_into(
         SketchScope::Bucket,
@@ -562,6 +599,7 @@ fn handle_sketch_mismatch(
         local_entries,
         push_keys,
         pull_hashes,
+        merging,
     ) {
         undecodable_buckets.push(bucket);
     }
@@ -597,7 +635,12 @@ impl SketchScope {
 /// and peels. On success [`diff_decoded`] classifies the result into
 /// `push_keys` and `pull_hashes`, scoped to `bucket`, and this returns
 /// `true`; on failure it returns `false` and the caller queues the fallback.
-/// Emits `scope`'s metric either way.
+/// `merging` is [`ShardOps::merges`]'s answer for this round, passed
+/// straight through to [`diff_decoded`]: when `true`, a key hash the peeled
+/// sketch shows present on both sides under different versions queues for
+/// both push and pull instead of only the greater version's side. Emits
+/// `scope`'s metric either way.
+#[allow(clippy::too_many_arguments)]
 fn peel_sketch_into(
     scope: SketchScope,
     cache: &SmolStr,
@@ -606,6 +649,7 @@ fn peel_sketch_into(
     local_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+    merging: bool,
 ) -> bool {
     // Sized from the received sketch's cell count, not this node's own
     // config, so the two sketches stay shape-compatible if configs drift. A
@@ -629,7 +673,7 @@ fn peel_sketch_into(
         return false;
     };
     let mut hashes = Vec::new();
-    diff_decoded(local_entries, &decoded, push_keys, &mut hashes);
+    diff_decoded(local_entries, &decoded, push_keys, &mut hashes, merging);
     if !hashes.is_empty() {
         pull_hashes.push((bucket, hashes));
     }
@@ -656,9 +700,11 @@ pub fn mismatched_parts(local: &[u64], remote: &[u64]) -> Vec<u8> {
 }
 
 /// Classifies one part's `AePartReply::Sketch` reply through
-/// [`peel_sketch_into`] at part scope. On failure, `bucket` queues into
-/// `undecodable_buckets` for the whole-bucket `Msg::AeEntries` fallback: a
-/// part sketch never gets its own part-scoped fallback.
+/// [`peel_sketch_into`] at part scope, `merging` forwarded the same way. On
+/// failure, `bucket` queues into `undecodable_buckets` for the whole-bucket
+/// `Msg::AeEntries` fallback: a part sketch never gets its own part-scoped
+/// fallback.
+#[allow(clippy::too_many_arguments)]
 fn handle_part_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,
@@ -667,6 +713,7 @@ fn handle_part_sketch_mismatch(
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
     undecodable_buckets: &mut Vec<u16>,
+    merging: bool,
 ) {
     if !peel_sketch_into(
         SketchScope::Part,
@@ -676,6 +723,7 @@ fn handle_part_sketch_mismatch(
         local_entries,
         push_keys,
         pull_hashes,
+        merging,
     ) {
         undecodable_buckets.push(bucket);
     }
@@ -717,11 +765,24 @@ fn settle_bucket_parts(
     }
 }
 
+/// Classifies one bucket's local listing against `peer_entries`: a key newer
+/// locally pushes, a key newer on the peer pulls, and a key only one side
+/// holds follows suit on that side. `merging` is [`ShardOps::merges`]'s
+/// answer for this round: `false` keeps that greater-version-only behavior
+/// unchanged (anti-entropy's ordinary direction rule, costing a merging
+/// resolver a second round to carry a minted result back — see
+/// `engine::merge_version`'s doc); `true` additionally queues a key present
+/// on *both* sides under different versions for the *other* direction too,
+/// so both replicas fold each other's record into their own merge in this
+/// same round rather than only the lesser side pulling ahead. A key only one
+/// side holds is never a version mismatch between two records, so `merging`
+/// leaves that case alone either way.
 fn diff_bucket(
     local_entries: &[(Bytes, Hlc)],
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
     pull_keys: &mut Vec<Bytes>,
+    merging: bool,
 ) {
     let peer_by_key: HashMap<&Bytes, Hlc> = peer_entries.iter().map(|(k, v)| (k, *v)).collect();
     let mut local_keys = HashSet::with_capacity(local_entries.len());
@@ -729,8 +790,14 @@ fn diff_bucket(
     for (key, local_ver) in local_entries {
         local_keys.insert(key);
         match peer_by_key.get(key) {
-            Some(&peer_ver) if *local_ver > peer_ver => push_keys.push(key.clone()),
-            Some(&peer_ver) if *local_ver < peer_ver => pull_keys.push(key.clone()),
+            Some(&peer_ver) if *local_ver != peer_ver => {
+                if *local_ver > peer_ver || merging {
+                    push_keys.push(key.clone());
+                }
+                if *local_ver < peer_ver || merging {
+                    pull_keys.push(key.clone());
+                }
+            }
             Some(_) => {}
             None => push_keys.push(key.clone()),
         }
@@ -746,10 +813,20 @@ fn diff_bucket(
 /// decodes: mirrors `diff_bucket`'s rules over [`Iblt::peel`]'s peeled
 /// element lists instead of two full listings. A key newer in
 /// `decoded.only_left` (this node) than in `only_right` (the peer's) pushes;
-/// newer on the peer's side pulls; present in only one side follows suit.
-/// A sketch carries no key bytes, only a `key_hash`, so every pull queues a
+/// newer on the peer's side pulls; present in only one side follows suit. A
+/// sketch carries no key bytes, only a `key_hash`, so every pull queues a
 /// hash into `pull_hashes`; only a push resolves its hash back to
 /// `local_entries` and queues actual key bytes.
+///
+/// `merging` is [`ShardOps::merges`]'s answer for this round, exactly as
+/// `diff_bucket` takes it: `false` keeps the greater-version-only behavior
+/// above; `true` additionally queues the other direction too for a
+/// `key_hash` [`Iblt::peel`] shows on *both* sides under different
+/// versions — present in `only_left` and `only_right` at once, since an
+/// identical `(key_hash, ver)` element on both sides would have cancelled
+/// out of the sketch subtraction and never reached `decoded` at all. A
+/// `key_hash` only one side's sketch peeled is never such a mismatch — it
+/// stays a plain pull either way, `merging` or not.
 ///
 /// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
 /// re-exports it as `crate::diff_decoded` under `feature = "sim"`, to
@@ -760,6 +837,7 @@ pub fn diff_decoded(
     decoded: &Decoded,
     push_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<u64>,
+    merging: bool,
 ) {
     let local_by_hash: HashMap<u64, &Bytes> = local_entries
         .iter()
@@ -778,7 +856,16 @@ pub fn diff_decoded(
 
     for (&key_hash, &local_ver) in &local_only {
         match remote_only.get(&key_hash) {
-            Some(&remote_ver) if remote_ver > local_ver => pull_hashes.push(key_hash),
+            Some(&remote_ver) if remote_ver != local_ver => {
+                if remote_ver > local_ver || merging {
+                    pull_hashes.push(key_hash);
+                }
+                if (local_ver > remote_ver || merging)
+                    && let Some(&key) = local_by_hash.get(&key_hash)
+                {
+                    push_keys.push(key.clone());
+                }
+            }
             _ => {
                 if let Some(&key) = local_by_hash.get(&key_hash) {
                     push_keys.push(key.clone());
@@ -895,7 +982,7 @@ mod tests {
             }],
         };
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
         assert_eq!(push, vec![key]);
         assert!(pull.is_empty());
     }
@@ -915,7 +1002,7 @@ mod tests {
             }],
         };
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
         assert!(push.is_empty());
         assert_eq!(pull, vec![hash]);
     }
@@ -932,9 +1019,58 @@ mod tests {
             only_right: Vec::new(),
         };
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
         assert_eq!(push, vec![key]);
         assert!(pull.is_empty());
+    }
+
+    #[test]
+    fn diff_decoded_queues_both_directions_for_a_both_sides_mismatch_when_merging() {
+        let (key, hash) = entry(b"k1");
+        let local_entries = vec![(key.clone(), hlc(10))];
+        let decoded = Decoded {
+            only_left: vec![Elem {
+                key_hash: hash,
+                ver: hlc(10),
+            }],
+            only_right: vec![Elem {
+                key_hash: hash,
+                ver: hlc(20),
+            }],
+        };
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, true);
+        assert_eq!(
+            push,
+            vec![key],
+            "merging queues the push even though the peer's version is greater"
+        );
+        assert_eq!(
+            pull,
+            vec![hash],
+            "merging keeps the pull the non-merging rule already queues"
+        );
+    }
+
+    #[test]
+    fn diff_decoded_leaves_a_one_sided_key_alone_regardless_of_merging() {
+        // Present only on this node's side of the peel: not a differing
+        // version present on both sides, so `merging` changes nothing.
+        let (key, hash) = entry(b"k2");
+        let local_entries = vec![(key.clone(), hlc(5))];
+        let decoded = Decoded {
+            only_left: vec![Elem {
+                key_hash: hash,
+                ver: hlc(5),
+            }],
+            only_right: Vec::new(),
+        };
+        for merging in [false, true] {
+            let (mut push, mut pull) = (Vec::new(), Vec::new());
+            diff_decoded(&local_entries, &decoded, &mut push, &mut pull, merging);
+            assert_eq!(push, vec![key.clone()]);
+            assert!(pull.is_empty());
+        }
     }
 
     fn mismatch_of(cells: Vec<Cell>, local_entries: &[(Bytes, Hlc)]) -> SketchOutcome {
@@ -947,6 +1083,7 @@ mod tests {
             &mut out.push_keys,
             &mut out.pull_hashes,
             &mut out.undecodable_buckets,
+            false,
         );
         out
     }
@@ -1022,6 +1159,7 @@ mod tests {
             &mut out.push_keys,
             &mut out.pull_hashes,
             &mut out.undecodable_buckets,
+            false,
         );
         out
     }
@@ -1101,8 +1239,74 @@ mod tests {
             }],
         };
         let (mut push, mut pull) = (Vec::new(), Vec::new());
-        diff_decoded(&local_entries, &decoded, &mut push, &mut pull);
+        diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
         assert!(push.is_empty());
         assert_eq!(pull, vec![hash]);
+    }
+
+    fn bucket_entry(key: &[u8], wall_ms: u64) -> (Bytes, Hlc) {
+        (Bytes::copy_from_slice(key), hlc(wall_ms))
+    }
+
+    #[test]
+    fn diff_bucket_pushes_only_the_greater_local_version_when_not_merging() {
+        let local = vec![bucket_entry(b"k1", 20)];
+        let peer = vec![bucket_entry(b"k1", 10)];
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_bucket(&local, &peer, &mut push, &mut pull, false);
+        assert_eq!(push, vec![Bytes::from_static(b"k1")]);
+        assert!(pull.is_empty());
+    }
+
+    #[test]
+    fn diff_bucket_pulls_only_the_greater_peer_version_when_not_merging() {
+        let local = vec![bucket_entry(b"k1", 10)];
+        let peer = vec![bucket_entry(b"k1", 20)];
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_bucket(&local, &peer, &mut push, &mut pull, false);
+        assert!(push.is_empty());
+        assert_eq!(pull, vec![Bytes::from_static(b"k1")]);
+    }
+
+    #[test]
+    fn diff_bucket_queues_both_directions_for_a_mismatch_when_merging() {
+        let local = vec![bucket_entry(b"k1", 10)];
+        let peer = vec![bucket_entry(b"k1", 20)];
+        let (mut push, mut pull) = (Vec::new(), Vec::new());
+        diff_bucket(&local, &peer, &mut push, &mut pull, true);
+        assert_eq!(
+            push,
+            vec![Bytes::from_static(b"k1")],
+            "merging pushes this side's record even though the peer's version is greater"
+        );
+        assert_eq!(
+            pull,
+            vec![Bytes::from_static(b"k1")],
+            "merging keeps the pull the non-merging rule already queues"
+        );
+    }
+
+    #[test]
+    fn diff_bucket_agreeing_versions_queue_neither_direction_regardless_of_merging() {
+        let local = vec![bucket_entry(b"k1", 10)];
+        let peer = vec![bucket_entry(b"k1", 10)];
+        for merging in [false, true] {
+            let (mut push, mut pull) = (Vec::new(), Vec::new());
+            diff_bucket(&local, &peer, &mut push, &mut pull, merging);
+            assert!(push.is_empty());
+            assert!(pull.is_empty());
+        }
+    }
+
+    #[test]
+    fn diff_bucket_a_key_only_one_side_holds_is_unaffected_by_merging() {
+        let local_only = vec![bucket_entry(b"local-key", 1)];
+        let peer_only = vec![bucket_entry(b"peer-key", 1)];
+        for merging in [false, true] {
+            let (mut push, mut pull) = (Vec::new(), Vec::new());
+            diff_bucket(&local_only, &peer_only, &mut push, &mut pull, merging);
+            assert_eq!(push, vec![Bytes::from_static(b"local-key")]);
+            assert_eq!(pull, vec![Bytes::from_static(b"peer-key")]);
+        }
     }
 }

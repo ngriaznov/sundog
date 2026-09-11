@@ -332,6 +332,10 @@ impl ConflictResolver for SumCounterResolver {
             }
         }
     }
+
+    fn merges(&self) -> bool {
+        true
+    }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -855,6 +859,14 @@ mod tests {
             }
             other => panic!("expected Winner::Merged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merges_is_true() {
+        assert!(
+            SumCounterResolver.merges(),
+            "SumCounterResolver returns Winner::Merged, so it must advertise merges()"
+        );
     }
 
     #[test]

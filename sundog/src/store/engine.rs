@@ -521,6 +521,58 @@ enum MergedVersion {
 /// an input already folded into what's stored lands on the no-op arm (or the
 /// first arm with `sv` already the greater version) rather than re-minting,
 /// so it never re-triggers this growth.
+///
+/// # One-round convergence under a bidirectional exchange
+///
+/// The two-round shape above comes entirely from anti-entropy's ordinary
+/// direction rule pushing only the greater of two versions to the lesser
+/// side: whichever replica merges first mints ahead of the other, and the
+/// mint has to make a second round trip before the other replica ever sees
+/// it. `cluster::anti_entropy`'s `diff_bucket`/`diff_decoded` have a second
+/// mode, gated on [`crate::store::ShardOps::merges`], that instead queues a
+/// key present on both sides under different versions for both push *and*
+/// pull, so X and Y above each fold the other's *pre-round* record into
+/// their own stored one in the very same round X and Y each call this
+/// function once, with `(sv, ver)` equal to `(vx, vy)` on one side and
+/// `(vy, vx)` on the other, over the identical unordered pair of records.
+///
+/// This still converges in one round on every arm above, and the mint arm
+/// does so by producing byte-for-byte, `Hlc`-for-`Hlc` identical output on
+/// both sides, not merely two outputs that happen to agree once compared:
+///
+/// - The content merge itself is symmetric — `winner`'s commutativity
+///   contract requires `merge(a, b) == merge(b, a)` byte-for-byte — so both
+///   sides mint from the identical `merged` bytes, which alone fixes
+///   `node` (`NodeId::merge_derived` of the same `xxh3_64`) equal on both
+///   sides.
+/// - `wall_ms`/`logical` are each a `max` over the *same* two inputs
+///   (`{sv, ver} == {vx, vy}` on both sides, only the `sv`/`ver` labels
+///   swap), and `max` does not care which argument carries which label, so
+///   `base_wall`/`base_logical`, and therefore the minted `(wall_ms,
+///   logical)`, come out identical too.
+///
+/// So a mint is symmetric in its two input stamps in exactly the sense that
+/// matters here: it is a function of the *unordered pair* of `(version,
+/// bytes)` inputs, not of which one arrived as `sv` and which as `ver`. The
+/// two adopt-verbatim arms converge in one round by that same
+/// swapped-argument symmetry, when they fire at all: if the merge reduces
+/// to one side's exact content and that same side's real clock is the
+/// greater of the two, that side's own exchange call lands on the no-op
+/// arm (content matches `stored`, `sv` the greater) while the other side's
+/// call lands on the adopt-verbatim arm (content matches `incoming`, `ver`
+/// the greater) over the same swapped `(sv, ver)` labels, so both land on
+/// the no-op side's exact `(version, bytes)` in this one round, no mint
+/// needed. The remaining case — the merge reduces to neither side's
+/// content, or it reduces to one side's but that side's real clock is the
+/// *lesser* of the two — is exactly what routes *both* calls to the mint
+/// arm instead (the content-vs-clock disagreement the two-replica
+/// argument's second bullet describes), which the paragraph above already
+/// covers: both sides mint the identical result. Every case therefore
+/// converges in this one round, never needing a second. A resolver that
+/// returns `Merged` without ever actually needing the two-round path can
+/// safely report [`crate::store::ConflictResolver::merges`] as `true`
+/// unconditionally: the bidirectional exchange is never wrong, only
+/// sometimes redundant.
 fn merge_version(
     sv: Hlc,
     ver: Hlc,

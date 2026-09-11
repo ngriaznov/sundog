@@ -152,6 +152,10 @@ impl ConflictResolver for PnCounterResolver {
             }
         }
     }
+
+    fn merges(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +355,13 @@ mod tests {
     #[test]
     fn needs_value_bytes_is_true() {
         assert!(PnCounterResolver.needs_value_bytes());
+    }
+
+    #[test]
+    fn merges_is_true() {
+        assert!(
+            PnCounterResolver.merges(),
+            "PnCounterResolver returns Winner::Merged, so it must advertise merges()"
+        );
     }
 }

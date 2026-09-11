@@ -220,6 +220,10 @@ where
             }
         }
     }
+
+    fn merges(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -485,5 +489,13 @@ mod tests {
     #[test]
     fn needs_value_bytes_is_true() {
         assert!(OrSetResolver::<String>::new().needs_value_bytes());
+    }
+
+    #[test]
+    fn merges_is_true() {
+        assert!(
+            OrSetResolver::<String>::new().merges(),
+            "OrSetResolver returns Winner::Merged, so it must advertise merges()"
+        );
     }
 }

@@ -930,3 +930,125 @@ proptest! {
         });
     }
 }
+
+/// One full pass of the bidirectional exchange anti-entropy's
+/// `merging = true` path applies (`cluster::anti_entropy`'s
+/// `diff_bucket`/`diff_decoded` with `merging` set), emulated the same way
+/// [`gossip_until_fixed_point`] emulates the unidirectional rule: for every
+/// unordered pair of `shards`, each side's *current* record for `key_bytes`
+/// is applied to the other, rather than only the greater version pushing to
+/// the lesser side. A single call processes every pair exactly once.
+///
+/// This converges the whole set in that one pass, not merely each pair in
+/// isolation: `engine::merge_version`'s doc proves any two replicas that
+/// trade records this way land on an identical `(version, bytes)` pair in
+/// one exchange regardless of which arm fires (the content merge and the
+/// `wall_ms`/`logical` max are both symmetric in the two inputs, and the
+/// minted `node` is a function of the merged bytes alone), and since the
+/// underlying `PnCounter` join is associative and idempotent, chaining that
+/// pairwise guarantee across every pair in one pass (in any order) carries
+/// every origin's write to every shard by the last pair that touches it.
+async fn bidirectional_gossip_pass(shards: &[Arc<Shard<u8, PnCounter>>], key_bytes: &Bytes) {
+    for i in 0..shards.len() {
+        for j in (i + 1)..shards.len() {
+            let from_i = ShardOps::records_for(shards[i].as_ref(), vec![key_bytes.clone()])
+                .await
+                .into_iter()
+                .next();
+            let from_j = ShardOps::records_for(shards[j].as_ref(), vec![key_bytes.clone()])
+                .await
+                .into_iter()
+                .next();
+            if let Some(rec) = from_j {
+                ShardOps::apply_remote(shards[i].as_ref(), rec).await;
+            }
+            if let Some(rec) = from_i {
+                ShardOps::apply_remote(shards[j].as_ref(), rec).await;
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Bidirectional analog of
+    /// [`pn_counter_gossip_converges_to_the_exact_sum_within_bounded_rounds`]:
+    /// the same per-origin seeding (each shard starts having seen only its
+    /// own origin's, possibly redelivered and reordered, write), but driven
+    /// through exactly one [`bidirectional_gossip_pass`] instead of a
+    /// bounded loop of unidirectional rounds. Every pair of shards must hold
+    /// an identical `(version, bytes)` pair after that one pass — the
+    /// one-round convergence property `engine::merge_version`'s doc proves
+    /// for a symmetric bidirectional exchange — and that shared value must
+    /// be the exact sum of every generated increment, with no lost updates.
+    #[test]
+    fn pn_counter_bidirectional_gossip_converges_in_one_round(
+        deltas in proptest::collection::vec(0u64..1_000, usize::from(NUM_NODES)),
+        seeds in proptest::collection::vec(any::<u64>(), usize::from(NUM_NODES)),
+    ) {
+        let records = build_pn_counter_records(&deltas);
+        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let key_bytes = records[0].key.clone();
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let shards: Vec<Arc<Shard<u8, PnCounter>>> = (0..records.len())
+                .map(|i| {
+                    Arc::new(
+                        Shard::<u8, PnCounter>::new(
+                            SmolStr::new("pn-counter-bidi-gossip"),
+                            Mode::Replicated,
+                            NodeId::from(4000 + u64::try_from(i).expect("small")),
+                            10_000,
+                            None,
+                            None,
+                        )
+                        .with_resolver(Arc::new(PnCounterResolver)),
+                    )
+                })
+                .collect();
+
+            // Each shard starts having seen only its own origin's write --
+            // possibly redelivered, in a generated order -- exactly as
+            // `pn_counter_gossip_converges_to_the_exact_sum_within_bounded_rounds`
+            // seeds it, so the one pass below is the only thing carrying
+            // every other origin's increment to a given shard.
+            for ((shard, own_record), &seed) in shards.iter().zip(&records).zip(&seeds) {
+                let redelivered = shuffled_with_duplicates(std::slice::from_ref(own_record), seed);
+                apply_mixed(shard, redelivered, seed).await;
+            }
+
+            bidirectional_gossip_pass(&shards, &key_bytes).await;
+
+            let mut final_records = Vec::with_capacity(shards.len());
+            for shard in &shards {
+                let rec = ShardOps::records_for(shard.as_ref(), vec![key_bytes.clone()])
+                    .await
+                    .into_iter()
+                    .next()
+                    .expect("every shard holds the key after one bidirectional pass");
+                let counter = PnCounter::decode(
+                    rec.value.as_deref().expect("a live PnCounter record carries a value"),
+                )
+                .expect("PnCounter always decodes");
+                assert_eq!(
+                    counter.value(),
+                    expected_total,
+                    "one bidirectional pass must converge every shard to the exact sum of \
+                     every generated increment, with no lost updates"
+                );
+                final_records.push((rec.ver, rec.value));
+            }
+            for i in 0..final_records.len() {
+                for j in (i + 1)..final_records.len() {
+                    assert_eq!(
+                        final_records[i], final_records[j],
+                        "every pair of shards must hold an identical (version, bytes) pair \
+                         after exactly one bidirectional pass"
+                    );
+                }
+            }
+        });
+    }
+}
