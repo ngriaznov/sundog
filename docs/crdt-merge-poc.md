@@ -8,8 +8,7 @@ built on this — `PnCounter`/`PnCounterResolver` for an increment/decrement
 counter and `OrSet`/`OrSetResolver` for an observed-remove set — as reference
 implementations of the contract, not the only merge types a cache can use.
 `ROADMAP.md`'s "Merge resolvers" section under Next covers the full design,
-including the open provenance limitation this document's benchmark run
-exercises directly.
+including what a production version of the mechanism still needs.
 
 ## API and engine change
 
@@ -25,47 +24,77 @@ The engine enforces the one invariant a resolver's convention alone can't
 guarantee: `Merged` is only honored when both the stored and incoming records
 carry a value. Against a tombstone or a spill-degraded side, `resolve_conflict`
 degrades to keeping the existing record — a resolver that misbehaves can never
-resurrect a deleted key or fabricate content against a spilled record. The
-version an accepted merge lands under is computed inside the engine, never by
-the resolver: `merge_version` takes the componentwise maximum of the stored
-and incoming `Hlc`'s `wall_ms` and `logical` fields under a reserved sentinel
-node id (`NodeId::MERGE_SENTINEL`), so two nodes that fold the same two inputs
-land on byte-identical stamps regardless of arrival order, and a merge result
-never collides with a real single-writer stamp. `resolve_and_rebind` treats a
-redelivered merge as a true no-op — nothing re-applied, no event published,
-nothing re-replicated — whenever the merge reproduces the stored bytes under
-the stored version exactly; a resolver-driven merge whose computed version
-happens to collapse onto the stored version but whose bytes differ still
-stores the new content, since rejecting it would silently drop a legitimate
-concurrent write.
+resurrect a deleted key or fabricate content against a spilled record.
+
+The version an accepted merge lands under is computed inside the engine,
+never by the resolver, and — unlike a scheme that stamps a merge from the two
+input versions alone — it depends on the merged content itself. `merge_version`
+picks among four outcomes by comparing the merged bytes against each side's
+own bytes: when nothing about the value changed (`merged == stored ==
+incoming`), it adopts whichever input `Hlc` is greater, or does nothing if
+the stored one already is; when the merge reduces to the incoming side and
+that side's own clock really is newer, it adopts the incoming `(version,
+bytes)` pair verbatim; when the merge reduces to the stored side and that
+side's clock really is newer, it does nothing — the incoming write is
+already fully absorbed; otherwise — the merged bytes are genuinely new
+relative to at least one side, or the real-clock order disagrees with which
+side the content-level merge favors — it mints a version: `wall_ms` is the
+max of both inputs' and `logical` is that max plus one (carrying into
+`wall_ms` on a `logical` overflow), under a `node` id built from a hash of
+the merged bytes themselves (`NodeId::merge_derived`). `resolve_and_rebind`
+treats a redelivered merge as a true no-op — nothing re-applied, no event
+published, nothing re-replicated — whenever the merge reproduces the stored
+bytes under the stored version exactly.
+
+A real node id and a merge-derived id can never collide: `NodeId` reserves
+its top bit as a private `MERGE_BIT`, `NodeId::random` clears it
+unconditionally, the explicit-id builder path (`ClusterBuilder::node_id`)
+rejects any id with the bit set, and only `NodeId::merge_derived` sets it.
+`HlcClock::observe` is unaffected by any of this — it only ever copies
+`wall_ms`/`logical` from a remote stamp and stamps its own real node id, so a
+live clock's `logical` counter grows by one per real tick, never by a hash.
+On the wire, `Origin::Remote(node)` for a record a merge produced now names
+no member of the cluster; this is documented on `Origin::Remote` itself.
 
 ## Convergence argument
 
-Componentwise max is commutative and associative field-by-field, independent
-of grouping or fold order, so any two replicas folding the same concurrent
-writes pairwise — in any order, with any duplication — reach the identical
-stamped version. The sentinel node id guarantees a merge result never equals
-a real write's stamp (equality on `Hlc` requires all three fields to match),
-and it makes a merge result strictly dominate both of its inputs under `Hlc`'s
-existing `Ord`, so anti-entropy's push/pull routing always treats a merge as
-the newer side to fetch. Folding a merge result back in with one of its own
-inputs reproduces the same stamp exactly, which is what stops a redelivered,
-already-absorbed record from re-publishing forever.
+This is `merge_version`'s own doc comment, restated here rather than
+paraphrased. Take two replicas X and Y holding `(vx, Cx)` and `(vy, Cy)` for
+the same key, `vx > vy`, any content. Anti-entropy pushes X's record to Y,
+which folds `C = Cx ⊔ Cy` (the resolver's join):
 
-The one gap this argument leaves open, stated plainly rather than glossed
-over: `merge_version` depends only on the two inputs' versions, never on the
-merged content. Componentwise max is not injective — it keeps the field-wise
-maxima and discards which input contributed them — so two different pairs of
-concurrent writes can fold to the identical `(wall_ms, logical)` once the
-sentinel erases the node field that would otherwise disambiguate them. When a
-merge's computed version collapses onto the version already stored, the
-engine still stores the correct merged bytes locally, but `entry_fingerprint`
-and every anti-entropy digest are functions of the version alone, never the
-value — so a peer whose digest already matches sees nothing to fetch and never
-receives content that changed underneath an unchanged version. This is a
-known, documented gap in the current scheme (`ROADMAP.md`), not an
-implementation bug, and the benchmark run below reproduces it directly under
-real anti-entropy rather than only arguing it in the abstract.
+- `C == Cx`: the merge reduces to the incoming side and `vx > vy`, so Y
+  adopts `(vx, Cx)` verbatim. Converged.
+- `C == Cy != Cx`: the merge reduces to Y's own stored side, but `vy` is
+  *not* greater than `vx` — the real-clock order disagrees with which side
+  the content-level merge favors — so this falls to the mint arm: Y stores a
+  freshly minted `v' > vx` for `Cy`. The next round carries `(v', Cy)` to X,
+  whose own merge of `Cy` against its stored `Cx` reduces to the incoming
+  side with `v' > vx`, and X adopts it. Converged.
+- `C` differs from both `Cx` and `Cy`: the mint arm fires on Y, minting
+  `v' > vx` for `C`. X receives `(v', C)`; its own merge of `C` against its
+  stored `Cx` reduces to the incoming side (the resolver's join is
+  idempotent, so folding `C`'s superset back in reproduces `C`) with
+  `v' > vx`, and X adopts it. Converged.
+
+Every mint strictly grows the version and either grows content on some
+replica or is immediately followed by verbatim adoption on the peer, and
+content itself is a join over a finite set of writes, so repeating this
+exchange terminates at one shared `(version, bytes)` pair. A redelivery of an
+input already folded into what's stored lands on the no-op arm (or the first
+arm with the stored side already the greater version) rather than
+re-minting, so it never re-triggers this growth.
+
+The mint arm's dominance over both inputs holds unconditionally: `wall_ms` is
+at least either input's, and on a `wall_ms` tie `logical` exceeds either
+input's because it is a real input's max *plus one*, not the max itself —
+the same `+ 1` that keeps a merge folding in more content than the last one
+strictly ahead of it even when `wall_ms` doesn't move. Its `node` being a
+function of the merged content is what makes the second bullet above safe:
+two nodes minting for the same bytes mint the same id and so the identical
+version, and a merge-derived id can never equal a real node's id, so a
+minted version can never be short-circuited by the engine's `sv == ver` fast
+path against a genuine single-writer stamp.
 
 ## Property suite
 
@@ -78,11 +107,12 @@ Four tiers, mirroring the levels the crate already tests resolvers at:
   which is why a writer must track its own cumulative total) and the
   observed-remove scope rule (a concurrent add survives a concurrent remove
   of the same element).
-- **`merge_version` combinator**, in `engine.rs`: commutativity, three-way
-  associativity across all six orderings, that a merge result never carries
-  a real node id and strictly dominates both inputs under `Hlc`'s `Ord`, and
-  the fixed-point property a redelivery no-op depends on — folding a merge
-  result back in with one of its own inputs reproduces it exactly.
+- **`merge_version` combinator**, in `engine.rs`: that the mint arm strictly
+  dominates both inputs under `Hlc`'s `Ord` and is always recognizable as
+  merge-derived; that two mints for different merged bytes mint different
+  `node` components; that each of the other three arms returns exactly what
+  the rule says; and a targeted corner case where a `logical` overflow at a
+  `wall_ms` tie still carries into `wall_ms` correctly.
 - **Resolver and engine-guard level**: both `PnCounterResolver` and
   `OrSetResolver` merge regardless of argument order and fall back to plain
   `Hlc` order against a tombstone, a spilled side, or a decode failure;
@@ -94,43 +124,35 @@ Four tiers, mirroring the levels the crate already tests resolvers at:
   independent shards, and asserts every shard converges to byte-identical
   state and to the exact sum of every increment — a stronger oracle than
   digest equality alone, since last-write-wins can converge every replica to
-  the same wrong value. A targeted regression pins the redelivery no-op. At
-  the `Cluster` level, a three-node integration test drives concurrent blind
-  increments from all three real nodes and asserts convergence to the exact
-  total; its writers are deliberately paced on staggered, coprime-ish
-  intervals to keep three independent HLC clocks from landing on the same
-  `(wall_ms, logical)` pair, an explicit acknowledgment, in the test itself,
-  of the same collapse this document's benchmark run triggers under
-  unpaced, high-throughput concurrent writes.
+  the same wrong value. A second property test drives a gossip emulation:
+  three shards, each starting from only its own origin's (possibly
+  redelivered, reordered) write, are driven to a fixed point by repeatedly
+  applying, for every ordered pair, the record with the greater version to
+  the lesser side — exactly `diff_bucket`'s anti-entropy direction rule —
+  and every shard must land on the identical `(version, bytes)` pair and the
+  exact expected total within a bounded number of rounds. A targeted
+  regression pins the redelivery no-op. At the `Cluster` level, a three-node
+  integration test drives concurrent, unpaced blind increments from all
+  three real nodes and asserts convergence to the exact total, with no
+  staggering needed to keep independent HLC clocks from colliding.
 
-Every property test above passes; they establish that the merge algebra and
-the version combinator each satisfy their stated laws given the full set of
-records. None of them constructs an actual anti-entropy digest exchange
-between real peers under unpaced concurrent load, which is why the collapse
-case survives the property suite and shows up empirically in the benchmark.
+Every test above passes; together they establish that the merge algebra, the
+version combinator in isolation, and repeated pairwise folding under
+anti-entropy's own push-direction rule all converge to the exact expected
+state — not merely to some shared state every replica happens to agree on.
 
 ## Benchmark
 
 `sundog/tests/crdt_bench.rs`, `SUNDOG_BENCH=1 cargo test --release -p sundog
 --features prometheus --test crdt_bench -- --test-threads=1 --nocapture`, run
-three times at the default `WRITERS=8`/`ITERS=200` (each run took 2m33s–2m52s,
-under the 10-minute budget, so `ITERS` was left at its default). Six of the
-eight scenarios succeed on every run and each printed line is already the
-median of 3 internal repetitions; the number reported per scenario below is
-the median of those three already-medianed runs.
-
-The remaining two scenarios, `merged_counter_blind` and `merged_counter_rmw`,
-did not complete on any of the three full runs: every run hit the version-
-collapse gap described above during at least one of its three internal
-repetitions and panicked on the 30-second convergence wait rather than
-printing a `BENCH` line. Isolated single-repetition retries at the same
-`WRITERS=8`/`ITERS=200` scale converged within 30 seconds on 3 of 11 attempts
-for `merged_counter_blind` and 3 of 6 for `merged_counter_rmw`; a longer
-30-to-180-second wait on the failing attempts showed the stuck replicas never
-catching up at all, plateaued below the expected total, confirming this is
-permanent non-convergence at that version, not merely slow anti-entropy. The
-figures below for these two scenarios are the median of the three converged
-single-repetition attempts each did produce.
+three times at the default `WRITERS=8`/`ITERS=200`. Each run finished in
+217.7–218.1 seconds, comfortably under the 15-minute budget, so `SUNDOG_BENCH_KEYS`
+stayed at its scenario defaults throughout. All 12 tests passed on all three
+runs — `merged_counter_blind` and `merged_counter_rmw` included, both
+converging inside their 30-second wait on every one of the 9 internal
+repetitions (3 runs × 3 reps each) — with no timeout and no plateau. Each
+printed line is already the median of 3 internal repetitions; the figures
+below are the median of those three already-medianed runs, taken per field.
 
 ### Machine
 
@@ -144,28 +166,28 @@ per scenario):
 
 | Scenario | keys | writes/sec | p50 write | p99 write | lost updates | converge |
 |---|---|---:|---:|---:|---:|---:|
-| `naive_lww_counter` (control) | 1 | 607,975 | 2.4 µs | 118.2 µs | 574 | 0.021 s |
-| `decomposed_counter` | 8 | 1,159,820 | 0.9 µs | 47.8 µs | 0 | 0.000 s |
-| `merged_counter_blind` | 1 | 109,381 | 17.9 µs | 684.3 µs | 0 | 0.021 s |
-| `merged_counter_rmw` (control) | 1 | 163,441 | 14.6 µs | 321.9 µs | 0 | 0.021 s |
+| `naive_lww_counter` (control) | 1 | 625,203 | 2.7 µs | 105.8 µs | 592 | 0.021 s |
+| `decomposed_counter` | 8 | 1,397,419 | 1.0 µs | 25.9 µs | 0 | 0.021 s |
+| `merged_counter_blind` | 1 | 110,185 | 17.2 µs | 663.3 µs | 0 | 0.021 s |
+| `merged_counter_rmw` (control) | 1 | 143,718 | 17.9 µs | 393.6 µs | 0 | 0.021 s |
 
 **Wire cost**, same runs:
 
 | Scenario | frames sent | bytes sent | AE repairs |
 |---|---:|---:|---:|
-| `naive_lww_counter` | 7 | 1,969 | 0 |
-| `decomposed_counter` | 6 | 4,426 | 0 |
-| `merged_counter_blind` | 2 | 180 | 0 |
-| `merged_counter_rmw` | 2 | 304 | 0 |
+| `naive_lww_counter` | 10 | 2,567 | 0 |
+| `decomposed_counter` | 7 | 3,864 | 0 |
+| `merged_counter_blind` | 7 | 1,578 | 0 |
+| `merged_counter_rmw` | 8 | 2,648 | 0 |
 
 **Per-apply CPU cost**, no network, 20,000 always-colliding applies against
 one pre-populated key:
 
 | Scenario | ns/apply | p50 | p99 |
 |---|---:|---:|---:|
-| `apply_ns_lww` | 559.1 | 488.0 ns | 817.0 ns |
-| `apply_ns_lww_forced_bytes` | 568.6 | 498.0 ns | 724.0 ns |
-| `apply_ns_merge` | 1,181.3 | 918.0 ns | 1,987.0 ns |
+| `apply_ns_lww` | 583.8 | 493.0 ns | 685.0 ns |
+| `apply_ns_lww_forced_bytes` | 562.5 | 493.0 ns | 763.0 ns |
+| `apply_ns_merge` | 1,034.5 | 915.0 ns | 1,702.0 ns |
 
 **Resident state at rest**, after convergence, no further writes:
 
@@ -174,77 +196,104 @@ one pre-populated key:
 | Resident keys | 8 | 1 |
 | AE repairs at rest | 0 | 0 |
 
+**Cold-join initial replication** (a warm 3-node trio, then a fourth node
+joins and pulls the resulting state; `keys=2000`, `3 × keys` logical
+increments either way):
+
+| Variant | resident-side keys | join time | frames | bytes | entries received |
+|---|---:|---:|---:|---:|---:|
+| `decomposed` (`3N` per-writer keys, `LwwResolver`) | 6,000 | 0.614 s | 46 | 466,516 | 6,000 |
+| `merged` (`N` keys, `PnCounterResolver`) | 2,000 | 0.609 s | 38 | 230,069 | 2,000 |
+
+**Large-entity convergence** (a warm 3-node trio, `N=4,000` entities written
+concurrently from all three nodes with anti-entropy live throughout,
+`converge_secs` timed from the last write; `lost_updates` is a snapshot taken
+immediately after the writers finish and *before* the convergence wait — the
+transient post-write, pre-convergence gap, not a permanent loss: both
+variants reach the exact expected total by the time `converge_secs` elapses):
+
+| Variant | resident keys | converge time | frames | bytes | pre-convergence gap |
+|---|---:|---:|---:|---:|---:|
+| `decomposed` (`3N` per-writer keys) | 12,000 | 0.038 s | 6 | 1,265,562 | 8,000 |
+| `merged` (`N` keys) | 4,000 | 0.049 s | 6 | 1,031,430 | 8,000 |
+
+**Partition-heal** (`sim` suite, one run: three simulated nodes, node `a`
+split from `b`/`c`, 2,000 counters each incremented 3 times per side while
+partitioned, then healed; metrics cover anti-entropy from the heal onward):
+
+| Variant | AE rounds | steps to converge | frames | bytes | expected total | actual total | lost updates |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `lww_decomposed` (per-writer keys) | 11 | 18 | 6,797 | 1,356,029 | 18,000 | 18,000 | 0 |
+| `pn_counter` (merged) | 17 | 36 | 9,456 | 1,563,004 | 18,000 | 18,000 | 0 |
+
 ## Where merge wins
 
-**No lost updates, ever, when it converges.** `naive_lww_counter` drops
-roughly a third of 1,600 concurrent blind increments (median 574 lost) since
-last-write-wins keeps only one side of every colliding pair. Both merge
-scenarios and the decomposed-key workaround lose none — merge's value algebra
-is exact whenever the anti-entropy path actually delivers a merge, which the
-property suite proves happens under any record delivery order.
+**No lost updates, ever, when it converges — and it converges.** Both
+`naive_lww_counter`'s companion `decomposed_counter` control and the merged
+scenarios lose nothing; `naive_lww_counter` itself drops roughly 37% of
+1,600 concurrent blind increments (median 592 lost) since last-write-wins
+keeps only one side of every colliding pair. `merged_counter_blind` and
+`merged_counter_rmw` converged inside their 30-second wait on all 9 internal
+repetitions across the three full runs, and the sim partition-heal run
+confirms the same result under an actual network partition and a real
+anti-entropy repair: `pn_counter` lands on the exact expected total with
+zero lost updates, matching the `lww_decomposed` control exactly.
 
-**One resident key instead of `WRITERS`.** `resident_keys_at_rest` is the
-clearest, most durable axis: the merged workload holds its whole concurrent
-counter in a single key, one digest slot, one fingerprint — the decomposed
-workaround needs one key per writer and that count grows with writer count.
-Wire cost per write is comparable between the two (both send roughly one
-frame per insert), so this is a fixed-slot win that compounds as the writer
-count grows, not a per-write one.
+**One resident key instead of `WRITERS`, and it holds under a cold join.**
+`resident_keys_at_rest` is the clearest, most durable axis: the merged
+workload holds its whole concurrent counter in a single key, one digest
+slot, one fingerprint, where the decomposed workaround needs one key per
+writer. Cold-join initial replication shows the same shape scaling with
+entity count rather than writer count: at `N=2,000` entities, the merged
+variant transfers 2,000 records over 38 frames and 230 KB, while the
+decomposed variant carries 6,000 records (`3N`, one per writer per entity)
+over 46 frames and 467 KB — roughly double the bytes for triple the
+resident-side keys. This is a fixed-slot win that compounds as either the
+writer count or the entity count grows, not a per-write one.
 
 **No read round trip.** `merged_counter_blind` (blind writes, no `get`
-before `insert`) reaches roughly two thirds of `merged_counter_rmw`'s
-throughput in this run, and both comfortably beat `naive_lww_counter`'s
-correctness. The gap between blind and read-modify-write within the merge
-scenarios is the read round trip's cost, isolated from the resolver.
+before `insert`) reaches about 77% of `merged_counter_rmw`'s throughput in
+this run, and both comfortably beat `naive_lww_counter`'s correctness. The
+gap between blind and read-modify-write within the merge scenarios is the
+read round trip's cost, isolated from the resolver.
 
 ## Where merge loses
 
-**Permanent non-convergence at benchmark-realistic write rates, not just
-lost updates.** This is the load-bearing finding of this run. At default
-scale, both merge scenarios failed to converge within 30 seconds on every
-one of three full three-repetition runs, and isolated single-repetition
-retries converged only 27–50% of the time; the failing attempts plateau
-below the expected total and stay there rather than eventually catching up.
-The mechanism is the version-collapse gap in the convergence argument above:
-`merge_version` depends only on the two input versions, so a version-collision
-between two different concurrent merges freezes the anti-entropy digest at
-its old value while the underlying content has genuinely changed, and a peer
-comparing digests sees nothing to fetch. The `Cluster`-level integration test
-for this same resolver avoids the collision by pacing its three writers on
-staggered intervals specifically to keep independent clocks from landing on
-the same version — an unpaced, thousand-writes-per-second workload like this
-benchmark's has no such pacing, and hits the gap routinely.
-
-**Slower per-apply CPU.** `apply_ns_merge` costs roughly double
-`apply_ns_lww`'s ns/apply (1,181.3 ns vs. 559.1 ns) and both its p50 and p99
+**Slower per-apply CPU.** `apply_ns_merge` costs roughly 1.8x
+`apply_ns_lww`'s ns/apply (1,034.5 ns vs. 583.8 ns) and both its p50 and p99
 run higher. `PnCounterResolver::needs_value_bytes()` is `true`, forcing a
 decode of both sides and a re-encode on every collision, against LWW's
 version-only comparison; `apply_ns_lww_forced_bytes` (LWW forced through the
-same byte-materialization path) lands close to plain LWW, confirming the gap
-is the merge logic itself, not byte materialization.
+same byte-materialization path) lands close to plain LWW (562.5 ns), confirming
+the gap is the merge logic itself, not byte materialization.
 
 **Single shared-key stripe-lock contention.** `merged_counter_blind`'s median
-throughput (109,381 writes/sec) trails `decomposed_counter`'s (1,159,820
-writes/sec) by roughly 10x in this run — both funnel eight writers through
-one lock per stripe-holding key, but merge concentrates every writer onto
-one stripe while decomposition spreads them across up to eight. This
-benchmark's writer count is small enough that other effects (the value-merge
-CPU cost above, and the version-collapse failures competing for the same
-CPU budget) are entangled with pure lock contention in this particular
-number; the direction is consistent with a stripe-lock contention argument, but
-the magnitude here should not be read as a clean measurement of contention
-alone.
+throughput (110,185 writes/sec) trails `decomposed_counter`'s (1,397,419
+writes/sec) by roughly 12.7x — both funnel eight writers through one lock per
+stripe-holding key, but merge concentrates every writer onto one stripe
+while decomposition spreads them across up to eight. The apply-CPU
+measurement above accounts for less than a 2x share of that gap, so most of
+it is genuine lock contention on the single hot key rather than the
+per-collision decode/re-encode cost; this benchmark's writer count (8) is
+still small enough that the two effects aren't cleanly separable, so the
+factor here should be read as directionally consistent with stripe
+contention, not as an exact decomposition of it.
+
+**Slower anti-entropy repair under partition.** In the sim partition-heal
+run, the merged variant took more anti-entropy rounds and steps to converge
+than the decomposed control (17 rounds / 36 steps vs. 11 / 18) and moved
+more bytes (1.56 MB vs. 1.36 MB) to repair the same 2,000-counter split,
+even though both reached the identical exact total with zero lost updates.
+Every counter's key was touched by both partition sides here, so every one
+of the 2,000 keys needs an actual merge (decode both sides, re-encode, mint
+or adopt a version) on repair, where the decomposed variant's per-writer
+keys have at most one real writer each and mostly resolve as plain
+last-write-wins adoptions — the same per-collision CPU and version-minting
+cost the throughput benchmarks show, now paid during the repair path
+instead of the write path.
 
 ## What a production version still needs
 
-- **Version provenance for merges.** Closing the collapse gap needs the
-  merged version to depend on the merged content itself, not only on the two
-  input versions — either an `Hlc`-like scheme that retains provenance across
-  repeated merges, or a byte-aware tie-break when the fast path's versions
-  already match. Until this lands, a resolver capable of `Merged` should be
-  treated as eventually consistent only under write rates low enough, or
-  paced enough, to keep concurrent version collisions rare — not as a
-  drop-in replacement for last-write-wins under arbitrary load.
 - **`OrSet` compaction.** Adds and tombstones never shrink; a long-lived
   `OrSet` key's metadata grows without bound, and the crate's weigher and
   capacity accounting don't yet account for that growth.
@@ -260,8 +309,6 @@ alone.
   make merge's raw throughput competitive with key decomposition rather than
   only equal to it: folding multiple concurrent writers' records for one key
   before the stripe lock is acquired, rather than one collision at a time.
-- **Turmoil coverage under partition and reorder.** The property suite's
-  in-process permutation/duplication/concurrency harness covers ordering
-  independence; it does not exercise merge under real network partition,
-  packet loss, or reordering the way `sim.rs` does for the rest of the
-  engine.
+- **No resolver for a map or a register**, only a counter and a set; a user
+  needing either writes their own `ConflictResolver` against the same
+  `Merged` contract in the meantime.

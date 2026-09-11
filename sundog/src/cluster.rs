@@ -496,9 +496,10 @@ impl ClusterBuilder {
     /// the same member, so its earlier incarnation is not tracked absent
     /// for `tombstone_max_ttl` after every restart.
     ///
-    /// `id` is validated at [`build`](Self::build): the reserved
-    /// merge-version sentinel id is rejected with
-    /// [`JoinError::ReservedNodeId`] rather than silently remapped.
+    /// `id` is validated at [`build`](Self::build): a merge-derived id (one
+    /// only the engine's merge-version combinator ever mints, never a real
+    /// node) is rejected with [`JoinError::ReservedNodeId`] rather than
+    /// silently remapped.
     pub fn node_id(mut self, id: NodeId) -> Self {
         self.node_id = Some(id);
         self
@@ -533,7 +534,8 @@ impl ClusterBuilder {
     ///
     /// Returns [`JoinError`] if the gossip or data-plane sockets cannot bind,
     /// the membership backend fails to start, or [`Self::node_id`] was given
-    /// the reserved merge-version sentinel id.
+    /// a merge-derived id (one only the engine's merge-version combinator
+    /// ever mints, never a real node).
     pub async fn build(self) -> Result<Cluster, JoinError> {
         let Self {
             name,
@@ -545,8 +547,8 @@ impl ClusterBuilder {
         } = self;
 
         validate_config(&config)?;
-        if node_id == Some(NodeId::MERGE_SENTINEL) {
-            return Err(JoinError::ReservedNodeId(NodeId::MERGE_SENTINEL));
+        if let Some(id) = node_id.filter(|id| id.is_merge_derived()) {
+            return Err(JoinError::ReservedNodeId(id));
         }
 
         let local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>> =
@@ -2135,14 +2137,7 @@ mod tests {
         // beforehand and no coordination between them, concurrently: each
         // writer runs as its own spawned task so it interleaves fairly with
         // every cluster's own gossip/anti-entropy/fan-out background tasks,
-        // not just with the other two writers. Each writer paces its own
-        // increments on a distinct period (23/29/37ms, pairwise coprime-ish)
-        // so the three writers' physical write times drift apart rather than
-        // staying in lockstep — three real, independent HLC clocks that
-        // never observe each other mid-burst can otherwise land on the same
-        // `(wall_ms, logical)` pair once componentwise-maxed under the
-        // shared merge sentinel, which the plain `sv == ver` fast path would
-        // then (wrongly) treat as the same content already stored.
+        // not just with the other two writers.
         let write_a = {
             let cache_a = cache_a.clone();
             async move {
@@ -2151,7 +2146,6 @@ mod tests {
                         .insert(1, PnCounter::local_delta(node_a, cumulative))
                         .await
                         .expect("a's blind increment applies");
-                    tokio::time::sleep(Duration::from_millis(23)).await;
                 }
             }
         };
@@ -2163,7 +2157,6 @@ mod tests {
                         .insert(1, PnCounter::local_delta(node_b, cumulative))
                         .await
                         .expect("b's blind increment applies");
-                    tokio::time::sleep(Duration::from_millis(29)).await;
                 }
             }
         };
@@ -2175,7 +2168,6 @@ mod tests {
                         .insert(1, PnCounter::local_delta(node_c, cumulative))
                         .await
                         .expect("c's blind increment applies");
-                    tokio::time::sleep(Duration::from_millis(37)).await;
                 }
             }
         };
@@ -4723,17 +4715,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_id_builder_rejects_the_merge_sentinel() {
-        let err = Cluster::builder("cluster-it-node-id-sentinel-rejected")
+    async fn node_id_builder_rejects_a_merge_derived_id() {
+        let derived = NodeId::merge_derived(0x1234_5678_u64);
+        let err = Cluster::builder("cluster-it-node-id-merge-derived-rejected")
             .seeds(std::iter::empty())
             .config(loopback_config())
-            .node_id(NodeId::MERGE_SENTINEL)
+            .node_id(derived)
             .build()
             .await
-            .expect_err("the reserved merge-version sentinel must never become a real node id");
+            .expect_err("a merge-derived id must never become a real node id");
         assert!(matches!(
             err,
-            JoinError::ReservedNodeId(id) if id == NodeId::MERGE_SENTINEL
+            JoinError::ReservedNodeId(id) if id == derived
         ));
     }
 

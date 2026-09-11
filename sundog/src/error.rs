@@ -51,8 +51,9 @@ pub enum JoinError {
     /// A [`crate::config::ClusterConfig`] field failed validation.
     #[error("invalid cluster config: {0}")]
     InvalidConfig(String),
-    /// [`crate::ClusterBuilder::node_id`] was given the reserved
-    /// merge-version sentinel id, which no real node may use.
+    /// [`crate::ClusterBuilder::node_id`] was given a merge-derived node id
+    /// (one only the engine's merge-version combinator ever mints), which
+    /// no real node may use.
     #[error("node id {0} is reserved for merge versions and cannot be used as a real node id")]
     ReservedNodeId(NodeId),
 }

@@ -335,6 +335,10 @@ pub enum Origin {
     /// Caused by a local `insert`/`remove`/`get_or_load` call.
     Local,
     /// Caused by an inbound wire message from the given peer.
+    ///
+    /// For a record a [`Winner::Merged`] resolver produced, `NodeId` here is
+    /// the merge-derived id the engine minted for it, not the id of any node
+    /// that actually authored a write: it names no member of the cluster.
     Remote(NodeId),
 }
 
@@ -592,8 +596,14 @@ pub enum Winner {
 /// a `RecordView { value: None, .. }` on both sides, with nothing to merge.
 ///
 /// The version assigned to a `Merged` outcome is not this trait's concern —
-/// it's computed by the engine as a pure function of `a.ver`/`b.ver`, never
-/// by the resolver.
+/// the engine decides it from `a.ver`, `b.ver`, and how the merged bytes
+/// compare to each side's own bytes, never from the resolver. A merge that
+/// reduces to one side's exact bytes adopts that side's own version only
+/// when that side's own `Hlc` is also the greater of the two; otherwise —
+/// the merge produces bytes neither side had, or the real-clock order
+/// disagrees with which side the content-level merge favors — it is
+/// stamped with a fresh version no real node's clock could ever produce, so
+/// anti-entropy always recognizes it as something to fetch.
 ///
 /// The default [`LwwResolver`] returns only `A`/`B` and satisfies
 /// antisymmetry and transitivity by comparing [`Hlc`] alone.
@@ -4241,7 +4251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merged_outcome_stores_the_merged_bytes_under_the_sentinel_version_and_publishes_one_event()
+    async fn merged_outcome_stores_the_merged_bytes_under_a_merge_derived_version_and_publishes_one_event()
      {
         let s = shard::<u32, u32>(1).with_resolver(Arc::new(AlwaysMerge {
             value: Bytes::from(postcard::to_stdvec(&42u32).expect("encode")),
@@ -4284,10 +4294,10 @@ mod tests {
             .engine
             .record_for(key_bytes(&1u32).as_ref(), 0)
             .expect("merged key is live");
-        assert_eq!(
-            stored.ver.node,
-            NodeId::MERGE_SENTINEL,
-            "the merged record is stored under the sentinel-stamped version"
+        assert!(
+            stored.ver.node.is_merge_derived(),
+            "the merged bytes match neither side's own bytes, so the engine mints a fresh \
+             version no real node's clock could produce"
         );
     }
 

@@ -351,8 +351,10 @@ enum Resolution {
     IncomingLoses,
     /// `incoming` won outright: proceed with `incoming` exactly as given.
     IncomingWins,
-    /// The resolver folded both sides into a new value, to be stored under a
-    /// version [`merge_version`] computes from `sv` and `ver`.
+    /// The resolver folded both sides into a new value, to be stored (or
+    /// not, if [`merge_version`] finds nothing to do) under a version it
+    /// decides from `sv`, `ver`, and how the merged bytes compare to each
+    /// side's own bytes.
     Merged {
         value: Bytes,
         expires_at_ms: Option<u64>,
@@ -422,37 +424,146 @@ fn resolve_conflict<V>(
     }
 }
 
-/// The version a [`Winner::Merged`] outcome is stored under: componentwise
-/// max of `sv` and `ver`'s `wall_ms`/`logical`, stamped with the reserved
-/// [`NodeId::MERGE_SENTINEL`] rather than either input's real node.
+/// What a resolver's [`Winner::Merged`] reply becomes once [`merge_version`]
+/// has weighed the two inputs' versions against how the merged bytes compare
+/// to each side's own bytes.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum MergedVersion {
+    /// The merge changes nothing this node doesn't already have at a version
+    /// at least as high: no write.
+    NoOp,
+    /// Store the merged bytes under this version.
+    Store(Hlc),
+}
+
+/// Decides the version and disposition of a [`Winner::Merged`] reply: `sv`
+/// and `stored` are the stripe's own version and bytes for the key, `ver`
+/// and `incoming` the colliding write's, and `merged` the resolver's folded
+/// bytes. Called only once [`resolve_conflict`]'s guard has confirmed both
+/// `stored` and `incoming` are real values, never a tombstone or a spilled
+/// view, so a comparison against either is always meaningful.
 ///
-/// Pure and clock-free by necessity, not convenience: `apply_locked` has no
-/// `HlcClock` access, and even if it did, two replicas independently merging
-/// the same `(sv, ver)` pair must land on byte-identical versions or
-/// [`super::entry_fingerprint`] (a function of the version alone) would
-/// disagree between them forever, since it never inspects the value. Reusing
-/// `sv.max(ver)` verbatim would instead risk colliding with a real future
-/// single-writer stamp, which would wrongly short-circuit that later write
-/// through the `sv == ver` fast path above and skip the resolver entirely; the
-/// sentinel node makes that impossible, since it never appears in a
-/// real write's version. Componentwise max is commutative, associative, and
-/// idempotent by construction (`max` is, on each of two totally ordered
-/// fields, and `node` is a fixed constant), which is what makes repeated
-/// pairwise folding of concurrent versions in arbitrary order converge.
-fn merge_version(sv: Hlc, ver: Hlc) -> Hlc {
-    Hlc {
-        wall_ms: sv.wall_ms.max(ver.wall_ms),
-        logical: sv.logical.max(ver.logical),
-        node: NodeId::MERGE_SENTINEL,
+/// Two simpler rules both fall short. Reusing `sv.max(ver)` verbatim risks
+/// reproducing a real future single-writer stamp bit for bit, which would
+/// wrongly short-circuit that later write through the `sv == ver` fast path
+/// in [`resolve_conflict`] and skip the resolver entirely. Stamping every
+/// merge with a fixed reserved node id and componentwise-max
+/// `wall_ms`/`logical`, independent of the merged bytes, avoids that
+/// collision but not a subtler one: two nodes folding the same two inputs
+/// into different merged content (a buggy resolver, or two different but
+/// equally-valid resolvers on a mixed-version cluster) mint the exact same
+/// version for different bytes, and [`super::entry_fingerprint`] (a function
+/// of the version alone) never notices they diverged. Every claim this
+/// function relies on is checked by the property tests below rather than
+/// assumed from the construction, precisely to catch a version-rule bug of
+/// this shape before it ships.
+///
+/// The rule below closes both gaps by choosing among four outcomes:
+///
+/// - **Same content everywhere** (`merged == stored == incoming`): nothing
+///   about the value changed, so this is purely a version reconciliation.
+///   Adopt whichever of `sv`/`ver` is greater under [`Hlc`]'s `Ord`; if `sv`
+///   already is, there is nothing left to do.
+/// - **The merge reduces to `incoming`** (`merged == incoming`) and `ver`
+///   truly is newer (`ver > sv`): store `incoming`'s own `(ver, merged)`
+///   pair verbatim, exactly as an outright win would.
+/// - **The merge reduces to `stored`** (`merged == stored`) and `sv` truly
+///   is newer (`sv > ver`): nothing to do, the incoming write is already
+///   fully absorbed.
+/// - **Otherwise**: the merged bytes are genuinely new content relative to
+///   at least one side, or the two inputs' real-clock order disagrees with
+///   which side the content-level merge favors. Mint a version: `wall_ms` is
+///   the max of both inputs' and `logical` is that max plus one, except when
+///   `logical` is already `u32::MAX`, where the `+ 1` carries into `wall_ms`
+///   instead and `logical` resets to zero. `node` is [`NodeId::merge_derived`]
+///   of the merged bytes' `xxh3_64`.
+///
+/// The mint arm is the only one that produces a version neither input's real
+/// clock could have stamped, and it is what makes the other three arms safe:
+/// `node` being a function of the merged content means two nodes minting for
+/// the same bytes mint the same id, and being merge-derived means the result
+/// can never collide with, and so never be short-circuited by, a real
+/// node's future stamp. It strictly dominates both `sv` and `ver` under
+/// `Hlc`'s `Ord` unconditionally: `wall_ms` is at least either input's, and
+/// on a `wall_ms` tie `logical` exceeds either input's, since it is a real
+/// input's max *plus one* rather than the max itself — the `+ 1` is what
+/// keeps a merge that folds in more content than the last one strictly
+/// ahead of it even when `wall_ms` does not move, closing the gap a bare
+/// componentwise max leaves open. The carry into `wall_ms` on a `logical`
+/// overflow keeps this true even in that corner case: `wall_ms` is then
+/// strictly greater than either input's, so dominance no longer needs
+/// `logical` to have room left to grow.
+///
+/// # Why repeated pairwise folding converges
+///
+/// Take two replicas X and Y holding `(vx, Cx)` and `(vy, Cy)` for the same
+/// key, `vx > vy`, any content. Anti-entropy pushes X's record to Y, which
+/// folds `C = Cx ⊔ Cy` (the resolver's join):
+///
+/// - `C == Cx`: the merge reduces to the incoming side and `vx > vy`, so Y
+///   adopts `(vx, Cx)` verbatim. Converged.
+/// - `C == Cy != Cx`: the merge reduces to Y's own stored side, but `vy`
+///   is *not* greater than `vx` — the real-clock order disagrees with which
+///   side the content favors — so this falls to the mint arm: Y stores a
+///   freshly minted `v' > vx` for `Cy`. The next round carries `(v', Cy)` to
+///   X, whose own merge reduces to its incoming side with `v' > vx`, and X
+///   adopts it. Converged.
+/// - `C` differs from both `Cx` and `Cy`: the mint arm fires on Y, minting
+///   `v' > vx` for `C`. X receives `(v', C)`; its own merge of `C` against
+///   its stored `Cx` reduces to the incoming side (the resolver's join is
+///   idempotent, so folding `C`'s superset back in reproduces `C`) with
+///   `v' > vx`, and X adopts it. Converged.
+///
+/// Every mint strictly grows the version and either grows content on some
+/// replica or is immediately followed by verbatim adoption on the peer, and
+/// content itself is a join over a finite set of writes, so repeating this
+/// exchange terminates at one shared `(version, bytes)` pair. A redelivery of
+/// an input already folded into what's stored lands on the no-op arm (or the
+/// first arm with `sv` already the greater version) rather than re-minting,
+/// so it never re-triggers this growth.
+fn merge_version(
+    sv: Hlc,
+    ver: Hlc,
+    stored: &[u8],
+    incoming: &[u8],
+    merged: &[u8],
+) -> MergedVersion {
+    if merged == stored && merged == incoming {
+        let v = sv.max(ver);
+        if v == sv {
+            MergedVersion::NoOp
+        } else {
+            MergedVersion::Store(v)
+        }
+    } else if merged == incoming && ver > sv {
+        MergedVersion::Store(ver)
+    } else if merged == stored && sv > ver {
+        MergedVersion::NoOp
+    } else {
+        let base_wall = sv.wall_ms.max(ver.wall_ms);
+        let base_logical = sv.logical.max(ver.logical);
+        let (wall_ms, logical) = match base_logical.checked_add(1) {
+            Some(logical) => (base_wall, logical),
+            // `logical` has no room left to grow within this `wall_ms`: carry
+            // into `wall_ms` instead so the minted stamp still strictly
+            // dominates both inputs (see this function's doc).
+            None => (base_wall.saturating_add(1), 0),
+        };
+        MergedVersion::Store(Hlc {
+            wall_ms,
+            logical,
+            node: NodeId::merge_derived(xxh3_64(merged)),
+        })
     }
 }
 
 /// [`apply_locked`]'s full collision decision: consults [`resolve_conflict`]
-/// and, on [`Resolution::Merged`], rebinds `ver`/`incoming` to the merged
-/// version and value. Returns `None` for a rejected write (outright loss, the
-/// engine-enforced tombstone/spill guard, a redelivered already-absorbed
-/// merge, or bytes that fail to decode as `V`) and `Some((ver, incoming))`
-/// otherwise — unchanged for an outright win, rebound for a merge.
+/// and, on [`Resolution::Merged`], rebinds `ver`/`incoming` to the version
+/// and value [`merge_version`] decides. Returns `None` for a rejected write
+/// (outright loss, the engine-enforced tombstone/spill guard, a redelivered
+/// already-absorbed merge, or bytes that fail to decode as `V`) and
+/// `Some((ver, incoming))` otherwise — unchanged for an outright win, rebound
+/// for a merge.
 fn resolve_and_rebind<V: DeserializeOwned>(
     resolver: &dyn ConflictResolver,
     key_bytes: &[u8],
@@ -477,49 +588,35 @@ fn resolve_and_rebind<V: DeserializeOwned>(
             value,
             expires_at_ms,
         } => {
-            let merged_ver = merge_version(sv, ver);
-            // Redelivery no-op: `merge_version` never reproduces a real
-            // stamp bitwise (see its docs), so an already-absorbed input
-            // re-invokes the resolver on every redelivery instead of hitting
-            // the `sv == ver` fast path in `resolve_conflict`; for an
-            // idempotent merge this reproduces the same bytes under the same
-            // version, which this check turns into the true no-op it is —
-            // otherwise a redelivered record would re-publish forever.
-            //
-            // `merged_ver == sv` alone is not sufficient to detect this:
-            // componentwise max is not injective (it keeps only the
-            // field-wise maxima, discarding which inputs contributed), so
-            // `ver`'s `wall_ms`/`logical` can both be dominated by `sv`'s
-            // while `ver` still contributes content `sv` never saw — real
-            // HLC clocks cluster closely enough under concurrent writers for
-            // this to happen. That case must still store the merged bytes
-            // (a resolver-driven `Merged` reply always wins a real
-            // collision; rejecting it would silently drop a legitimate
-            // concurrent write), so the byte comparison below, not the
-            // version alone, is what decides a true no-op. The known
-            // consequence: when this happens, the merged bytes land under
-            // `sv` unchanged, and `entry_fingerprint`/every anti-entropy
-            // digest (functions of the version alone, never the value) do
-            // not reflect that the content grew — a peer that never
-            // receives `ver` can show a matching digest for genuinely
-            // different content. Closing that gap needs the merged version
-            // itself to depend on the merged content, not just `sv`/`ver`;
-            // this combinator does not attempt that.
-            if merged_ver == sv && stored_encoded == Some(value.as_ref()) {
-                return None;
-            }
-            // Never trust a resolver's bytes blindly: reject, don't panic.
-            let Ok(decoded): Result<V, _> = postcard::from_bytes(&value) else {
+            // `resolve_conflict`'s guard already confirmed both sides carry
+            // a real value whenever it returns `Merged`, so these are
+            // always `Some`/`Put` in practice; falling back to rejecting
+            // rather than trusting that invariant blindly costs nothing.
+            let stored = stored_encoded?;
+            let Incoming::Put {
+                encoded: incoming_encoded,
+                ..
+            } = &incoming
+            else {
                 return None;
             };
-            Some((
-                merged_ver,
-                Incoming::Put {
-                    value: decoded,
-                    expires_at_ms,
-                    encoded: value,
-                },
-            ))
+            match merge_version(sv, ver, stored, incoming_encoded, &value) {
+                MergedVersion::NoOp => None,
+                MergedVersion::Store(new_ver) => {
+                    // Never trust a resolver's bytes blindly: reject, don't panic.
+                    let Ok(decoded): Result<V, _> = postcard::from_bytes(&value) else {
+                        return None;
+                    };
+                    Some((
+                        new_ver,
+                        Incoming::Put {
+                            value: decoded,
+                            expires_at_ms,
+                            encoded: value,
+                        },
+                    ))
+                }
+            }
         }
     }
 }
@@ -2940,7 +3037,48 @@ mod tests {
     }
 
     #[test]
-    fn apply_locked_stores_a_merge_under_the_sentinel_stamped_componentwise_max_version() {
+    fn apply_locked_merge_of_identical_content_adopts_the_greater_version_or_no_ops() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let resolver = MaxStringResolver;
+        let va = hlc(1, 1);
+        let vb = hlc(5, 2);
+        let created =
+            put_with_resolver(&engine, 1, key_bytes(1), "x".into(), va, None, 0, &resolver);
+        assert!(matches!(created, ApplyOutcome::Put { created: true, .. }));
+
+        // `max("x", "x") == "x"`: the merge reduces to bytes both sides
+        // already share, so this is pure version reconciliation. `vb` is the
+        // real greater version, so it is adopted verbatim.
+        let reconciled =
+            put_with_resolver(&engine, 1, key_bytes(1), "x".into(), vb, None, 0, &resolver);
+        assert!(matches!(reconciled, ApplyOutcome::Put { .. }));
+        let after_vb = engine
+            .record_for(key_bytes(1).as_ref(), 0)
+            .expect("key is live");
+        assert_eq!(
+            after_vb.ver, vb,
+            "identical content adopts whichever input version is greater"
+        );
+
+        // `vc` carries the same content again but is the lesser version:
+        // `sv` (now `vb`) is already the greater side, so this no-ops.
+        let vc = hlc(3, 3);
+        let no_op = put_with_resolver(&engine, 1, key_bytes(1), "x".into(), vc, None, 0, &resolver);
+        assert!(
+            matches!(no_op, ApplyOutcome::Rejected),
+            "identical content at a lesser version is a no-op once the greater version is stored"
+        );
+        let still_stored = engine
+            .record_for(key_bytes(1).as_ref(), 0)
+            .expect("key is still live");
+        assert_eq!(
+            still_stored.ver, vb,
+            "the stored version is untouched by the no-op"
+        );
+    }
+
+    #[test]
+    fn apply_locked_merge_that_reduces_to_incoming_adopts_its_exact_version() {
         let engine = engine_u32_string(u64::MAX, None);
         let resolver = MaxStringResolver;
         let va = hlc(1, 1);
@@ -2961,36 +3099,87 @@ mod tests {
         let stored = engine
             .record_for(key_bytes(1).as_ref(), 0)
             .expect("merged key is live");
-        let expected = merge_version(va, vb);
         assert_eq!(
-            stored.ver, expected,
-            "stored version is the componentwise max of both inputs"
+            stored.ver, vb,
+            "the merge reduces to incoming's own bytes and incoming is the real greater \
+             version, so its exact version is adopted verbatim"
         );
-        assert_eq!(
-            stored.ver.node,
-            NodeId::MERGE_SENTINEL,
-            "a merged version is stamped with the reserved sentinel, never a real node"
+        assert!(
+            !stored.ver.node.is_merge_derived(),
+            "adopting incoming's own version carries its real node id, never a minted one"
         );
     }
 
     #[test]
-    fn apply_locked_treats_a_redelivered_absorbed_merge_as_a_no_op() {
+    fn apply_locked_merge_that_reduces_to_stored_is_a_no_op_when_stored_already_dominates() {
         let engine = engine_u32_string(u64::MAX, None);
         let resolver = MaxStringResolver;
+        let va = hlc(5, 1);
+        let created =
+            put_with_resolver(&engine, 1, key_bytes(1), "z".into(), va, None, 0, &resolver);
+        assert!(matches!(created, ApplyOutcome::Put { created: true, .. }));
+
+        // `max("z", "a") == "z"`: the merge reduces to what's already
+        // stored, and `sv` is the real greater version, so nothing changes.
+        let vb = hlc(1, 2);
+        let no_op = put_with_resolver(&engine, 1, key_bytes(1), "a".into(), vb, None, 0, &resolver);
+        assert!(
+            matches!(no_op, ApplyOutcome::Rejected),
+            "incoming's content and version are both already fully absorbed"
+        );
+        let after = engine
+            .record_for(key_bytes(1).as_ref(), 0)
+            .expect("key is still live");
+        assert_eq!(after.ver, va);
+        assert_eq!(engine.get(&1, 0), Some("z".to_string()));
+    }
+
+    #[test]
+    fn apply_locked_treats_a_redelivered_absorbed_merge_as_a_no_op() {
+        let engine: Engine<u32, std::collections::BTreeSet<String>> =
+            Engine::new(u64::MAX, None, None);
+        let resolver = UnionSetResolver;
         let va = hlc(1, 1);
-        let vb = hlc(2, 2);
-        let _ = put_with_resolver(&engine, 1, key_bytes(1), "a".into(), va, None, 0, &resolver);
-        let _ = put_with_resolver(&engine, 1, key_bytes(1), "z".into(), vb, None, 0, &resolver);
+        let vb = hlc(5, 2);
+        let _ = put_with_resolver(
+            &engine,
+            1,
+            key_bytes(1),
+            string_set(&["a"]),
+            va,
+            None,
+            0,
+            &resolver,
+        );
+        let _ = put_with_resolver(
+            &engine,
+            1,
+            key_bytes(1),
+            string_set(&["b"]),
+            vb,
+            None,
+            0,
+            &resolver,
+        );
         let before = engine
             .record_for(key_bytes(1).as_ref(), 0)
             .expect("merged key is live");
 
-        // Redeliver the same input that was already folded into the stored
-        // merge. `merge("z", "z") == "z"` (idempotent), and `merge_version`
-        // of the stored version against itself's inputs is a fixed point, so
-        // this must be rejected as a no-op, not re-applied and re-published.
-        let redelivered =
-            put_with_resolver(&engine, 1, key_bytes(1), "z".into(), vb, None, 0, &resolver);
+        // Redeliver `vb`'s own value: its content is already fully absorbed
+        // into the stored union (the merge reduces to stored), and the mint
+        // above strictly outranks `vb` under `Hlc`'s real order even though
+        // their `wall_ms` ties — the mint's `logical` is one higher — so
+        // this lands on the no-op arm rather than re-publishing.
+        let redelivered = put_with_resolver(
+            &engine,
+            1,
+            key_bytes(1),
+            string_set(&["b"]),
+            vb,
+            None,
+            0,
+            &resolver,
+        );
         assert!(
             matches!(redelivered, ApplyOutcome::Rejected),
             "an absorbed input redelivered unchanged is a no-op, not a fresh write"
@@ -3043,31 +3232,9 @@ mod tests {
         elems.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// Documents a known, unresolved limitation rather than a fix: a third,
-    /// genuinely new write whose `wall_ms`/`logical` are both dominated by
-    /// an already-merged, sentinel-stamped stored version still gets its
-    /// content folded in — `apply_locked` never drops a resolver-driven
-    /// merge of two real values, matching the shard-level convergence
-    /// property (`prop_tests::pn_counter_merge_converges_to_the_exact_sum_under_any_order`)
-    /// that a genuinely concurrent write is never lost. But
-    /// `merge_version(sv, vc) == sv` bitwise here (componentwise max is not
-    /// injective: it keeps only the field-wise maxima, discarding which
-    /// inputs contributed), so the merged bytes land under the *stored*
-    /// version unchanged. `entry_fingerprint` and every anti-entropy digest
-    /// are functions of the version alone, never the value, so a peer that
-    /// never receives `vc` can show a matching digest for this key despite
-    /// holding different content — anti-entropy has no signal to repair it.
-    /// An earlier attempt to reject this case outright regressed the
-    /// no-lost-updates property instead (rejection is order-dependent: which
-    /// concurrent write "collides" and gets dropped depends on arrival
-    /// order, so two replicas that absorb the same writes in different
-    /// orders diverge in content under the identical version — the exact
-    /// failure this test's version equality below would otherwise mask).
-    /// Closing the gap for real needs the merged version to depend on the
-    /// merged content, not just `sv`/`vc`; this combinator does not attempt
-    /// that.
     #[test]
-    fn apply_locked_accepts_a_merge_whose_version_collapses_onto_the_stored_version() {
+    fn apply_locked_merge_that_grows_content_mints_a_strictly_greater_version_even_on_a_wall_ms_tie()
+     {
         let engine: Engine<u32, std::collections::BTreeSet<String>> =
             Engine::new(u64::MAX, None, None);
         let resolver = UnionSetResolver;
@@ -3084,7 +3251,7 @@ mod tests {
             0,
             &resolver,
         );
-        let merged = put_with_resolver(
+        let first = put_with_resolver(
             &engine,
             1,
             key_bytes(1),
@@ -3094,23 +3261,31 @@ mod tests {
             0,
             &resolver,
         );
-        assert!(matches!(merged, ApplyOutcome::Put { .. }));
+        assert!(matches!(first, ApplyOutcome::Put { .. }));
 
-        let sv = merge_version(va, vb);
-        let before = engine
+        let after_first = engine
             .record_for(key_bytes(1).as_ref(), 0)
             .expect("merged key is live");
+        let first_bytes =
+            postcard::to_stdvec(&string_set(&["a", "b"])).expect("test value encodes");
         assert_eq!(
-            before.ver, sv,
-            "the union of {{a}} and {{b}} lands under their componentwise-max version"
+            after_first.ver,
+            Hlc {
+                wall_ms: 5,
+                logical: 1,
+                node: NodeId::merge_derived(xxh3_64(&first_bytes)),
+            },
+            "the union of two disjoint sides mints wall_ms = max(inputs), \
+             logical = max(inputs) + 1, and a node derived from the merged bytes"
         );
 
-        // `vc` is a genuinely new write — its own content, "c", is absent
-        // from both prior inputs — but its `wall_ms` is dominated by `sv`'s,
-        // so `merge_version(sv, vc) == sv` bitwise even though the union
-        // with "c" changes the content.
-        let vc = hlc(3, 3);
-        let accepted = put_with_resolver(
+        // `vc`'s own content, "c", is absent from both prior inputs, and its
+        // `wall_ms` ties the stored version's exactly — the case a bare
+        // componentwise max cannot tell apart from a no-op. The `+ 1` on
+        // `logical` at mint time is what keeps this merge strictly ahead of
+        // the one before it despite the tie.
+        let vc = hlc(5, 3);
+        let second = put_with_resolver(
             &engine,
             1,
             key_bytes(1),
@@ -3121,23 +3296,21 @@ mod tests {
             &resolver,
         );
         assert!(
-            matches!(accepted, ApplyOutcome::Put { .. }),
-            "a resolver-driven merge of two real values is never dropped, even when its version \
-             doesn't move past what's stored"
+            matches!(second, ApplyOutcome::Put { .. }),
+            "a resolver-driven merge of two real values is never dropped"
         );
 
-        let after = engine
+        let after_second = engine
             .record_for(key_bytes(1).as_ref(), 0)
             .expect("key is still live");
-        assert_eq!(
-            after.ver, sv,
-            "the merged bytes land under the version already on record: componentwise max left \
-             it unchanged"
+        assert!(
+            after_second.ver > after_first.ver,
+            "the second merge's version strictly outranks the first, even though wall_ms tied"
         );
         assert_eq!(
             engine.get(&1, 0),
             Some(string_set(&["a", "b", "c"])),
-            "the write's content is never lost, even though the version above didn't move"
+            "the write's content is never lost"
         );
     }
 
@@ -6084,103 +6257,180 @@ mod tests {
         }
     }
 
-    /// Property coverage for [`merge_version`] alone: the convergence
-    /// argument in its doc comment rests on commutativity, 3-way
-    /// associativity under every grouping, never reproducing a real
-    /// single-writer stamp, strictly dominating both inputs under `Hlc`'s
-    /// derived `Ord`, and landing on a fixed point when a merge result is
-    /// folded again with one of its own inputs (the redelivery no-op
-    /// [`resolve_and_rebind`] relies on). Every claim is checked here rather
-    /// than assumed from the componentwise-`max` construction.
+    /// Property coverage for [`merge_version`] alone: every claim its doc
+    /// comment's convergence argument rests on is checked here rather than
+    /// assumed from the construction — that the mint arm strictly dominates
+    /// both inputs, that different merged bytes mint different nodes, that
+    /// each of the other three arms returns exactly what the rule says, and
+    /// that a mint is always recognizable as one (never a real node's id).
     mod merge_version {
         use proptest::prelude::*;
 
         use super::*;
 
         /// A real single-writer stamp: `wall_ms`/`logical` unconstrained,
-        /// `node` drawn from everything [`NodeId::random`] can ever produce
-        /// (the full `u64` range minus [`NodeId::MERGE_SENTINEL`], which it
-        /// rerolls on draw and [`crate::ClusterBuilder::node_id`] rejects
-        /// outright). `merge_version`'s own outputs, which do carry the
-        /// sentinel, are never generated here directly — they show up as
-        /// `m` in [`fixed_point_on_redelivery`], produced by the function
-        /// itself, exactly as a real merge record would be.
+        /// `node` drawn from the lower half of the `u64` range only —
+        /// everything [`NodeId::random`] can ever produce. A generated pair
+        /// here can never itself be merge-derived, so any `Store` arm that
+        /// reproduces one of `sv`/`ver` verbatim carries a real node id, and
+        /// only the mint arm ever introduces one that isn't.
         fn arb_real_hlc() -> impl Strategy<Value = Hlc> {
-            (any::<u64>(), any::<u32>(), 0..u64::MAX).prop_map(|(wall_ms, logical, node)| Hlc {
+            (any::<u64>(), any::<u32>(), 0..(1u64 << 63)).prop_map(|(wall_ms, logical, node)| Hlc {
                 wall_ms,
                 logical,
                 node: NodeId::from(node),
             })
         }
 
+        /// Short byte strings, generated independently for `stored`,
+        /// `incoming`, and `merged` so the mint-arm tests below can assume
+        /// pairwise inequality without biasing the distribution.
+        fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
+            proptest::collection::vec(any::<u8>(), 0..8)
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(512))]
 
+            /// (a) + (d): whenever the merged bytes match neither side's own
+            /// bytes, the mint arm fires unconditionally — none of the other
+            /// three arms' equality preconditions can hold — and its result
+            /// both strictly dominates `sv` and `ver` under `Hlc`'s `Ord`
+            /// and is recognizable as a mint, never a real node's stamp.
             #[test]
-            fn commutative(a in arb_real_hlc(), b in arb_real_hlc()) {
-                prop_assert_eq!(merge_version(a, b), merge_version(b, a));
+            fn mint_arm_dominates_both_inputs_and_is_always_merge_derived(
+                sv in arb_real_hlc(),
+                ver in arb_real_hlc(),
+                stored in arb_bytes(),
+                incoming in arb_bytes(),
+                merged in arb_bytes(),
+            ) {
+                prop_assume!(merged != stored);
+                prop_assume!(merged != incoming);
+                let MergedVersion::Store(minted) =
+                    merge_version(sv, ver, &stored, &incoming, &merged)
+                else {
+                    panic!("merged bytes matching neither side always mints a version");
+                };
+                prop_assert!(minted > sv);
+                prop_assert!(minted > ver);
+                prop_assert!(minted.node.is_merge_derived());
             }
 
-            /// All six orderings of a 3-way fold land on the same `Hlc`,
-            /// which is what lets `apply_locked`'s strictly-pairwise folding
-            /// converge no matter what order replicas apply concurrent
-            /// writes in.
+            /// (b): two mints for merged bytes that differ from each other
+            /// (and from both sides, so both trigger the mint arm) mint
+            /// different node components — the property that keeps two
+            /// nodes minting for genuinely different content from ever
+            /// colliding on the same version.
             #[test]
-            fn associative_three_way_all_six_orderings(
-                a in arb_real_hlc(),
-                b in arb_real_hlc(),
-                c in arb_real_hlc(),
+            fn mint_arm_different_merged_bytes_mint_different_nodes(
+                sv in arb_real_hlc(),
+                ver in arb_real_hlc(),
+                stored in arb_bytes(),
+                incoming in arb_bytes(),
+                merged_a in arb_bytes(),
+                merged_b in arb_bytes(),
             ) {
-                let ab_c = merge_version(merge_version(a, b), c);
-                let a_bc = merge_version(a, merge_version(b, c));
-                let ac_b = merge_version(merge_version(a, c), b);
-                let a_cb = merge_version(a, merge_version(c, b));
-                let ba_c = merge_version(merge_version(b, a), c);
-                let b_ac = merge_version(b, merge_version(a, c));
-                let bc_a = merge_version(merge_version(b, c), a);
-                let b_ca = merge_version(b, merge_version(c, a));
-                let ca_b = merge_version(merge_version(c, a), b);
-                let c_ab = merge_version(c, merge_version(a, b));
-                let cb_a = merge_version(merge_version(c, b), a);
-                let c_ba = merge_version(c, merge_version(b, a));
+                prop_assume!(merged_a != stored && merged_a != incoming);
+                prop_assume!(merged_b != stored && merged_b != incoming);
+                prop_assume!(merged_a != merged_b);
+                let MergedVersion::Store(a) =
+                    merge_version(sv, ver, &stored, &incoming, &merged_a)
+                else {
+                    panic!("merged bytes matching neither side always mints a version");
+                };
+                let MergedVersion::Store(b) =
+                    merge_version(sv, ver, &stored, &incoming, &merged_b)
+                else {
+                    panic!("merged bytes matching neither side always mints a version");
+                };
+                prop_assert_ne!(a.node, b.node);
+            }
 
-                for grouping in [ab_c, a_bc, ac_b, a_cb, ba_c, b_ac, bc_a, b_ca, ca_b, c_ab, cb_a, c_ba] {
-                    prop_assert_eq!(grouping, ab_c);
+            /// (c), first arm: identical content on both sides is pure
+            /// version reconciliation — adopt whichever of `sv`/`ver` is
+            /// greater, or do nothing if `sv` already is.
+            #[test]
+            fn identical_content_arm_adopts_the_greater_version_or_no_ops(
+                sv in arb_real_hlc(),
+                ver in arb_real_hlc(),
+                content in arb_bytes(),
+            ) {
+                prop_assume!(sv != ver);
+                let result = merge_version(sv, ver, &content, &content, &content);
+                let greater = sv.max(ver);
+                if greater == sv {
+                    prop_assert_eq!(result, MergedVersion::NoOp);
+                } else {
+                    prop_assert_eq!(result, MergedVersion::Store(greater));
                 }
             }
 
-            /// `merge_version` never mints a triple a real write could ever
-            /// stamp: the sentinel `node` alone rules that out, regardless
-            /// of what `wall_ms`/`logical` happen to be.
+            /// (c), second arm: the merge reducing to incoming's own bytes,
+            /// with incoming genuinely newer, adopts incoming's `(ver,
+            /// merged)` pair verbatim.
             #[test]
-            fn never_a_real_single_writer_stamp(a in arb_real_hlc(), b in arb_real_hlc()) {
-                let merged = merge_version(a, b);
-                prop_assert_eq!(merged.node, NodeId::MERGE_SENTINEL);
-                prop_assert_ne!(merged.node, a.node);
-                prop_assert_ne!(merged.node, b.node);
+            fn reduces_to_incoming_arm_adopts_incoming_verbatim(
+                sv in arb_real_hlc(),
+                ver in arb_real_hlc(),
+                stored in arb_bytes(),
+                incoming in arb_bytes(),
+            ) {
+                prop_assume!(ver > sv);
+                prop_assume!(stored != incoming);
+                let result = merge_version(sv, ver, &stored, &incoming, &incoming);
+                prop_assert_eq!(result, MergedVersion::Store(ver));
             }
 
-            /// A merge result outranks both of its inputs under `Hlc`'s
-            /// existing `Ord`, so anti-entropy's `Ord`-based push/pull
-            /// routing always treats it as the newer side to fetch.
+            /// (c), third arm: the merge reducing to stored's own bytes,
+            /// with stored genuinely newer, is a no-op — incoming is fully
+            /// absorbed already.
             #[test]
-            fn strictly_dominates_both_inputs(a in arb_real_hlc(), b in arb_real_hlc()) {
-                prop_assume!(a != b);
-                let merged = merge_version(a, b);
-                prop_assert!(merged > a);
-                prop_assert!(merged > b);
+            fn reduces_to_stored_arm_is_a_no_op(
+                sv in arb_real_hlc(),
+                ver in arb_real_hlc(),
+                stored in arb_bytes(),
+                incoming in arb_bytes(),
+            ) {
+                prop_assume!(sv > ver);
+                prop_assume!(stored != incoming);
+                let result = merge_version(sv, ver, &stored, &incoming, &stored);
+                prop_assert_eq!(result, MergedVersion::NoOp);
             }
+        }
 
-            /// Folding a merge result `m` back in with one of the inputs it
-            /// was built from reproduces `m` exactly, not merely something
-            /// `>= m`: the concrete no-op `resolve_and_rebind` needs so a
-            /// redelivered, already-absorbed record never re-publishes.
-            #[test]
-            fn fixed_point_on_redelivery(a in arb_real_hlc(), b in arb_real_hlc()) {
-                let m = merge_version(a, b);
-                prop_assert_eq!(merge_version(m, a), m);
-                prop_assert_eq!(merge_version(m, b), m);
-            }
+        /// (a) at the one corner `arb_real_hlc`'s random `logical` values
+        /// have negligible odds of ever hitting: both inputs' `logical` is
+        /// already `u32::MAX`, tied on `wall_ms` too. The `+ 1` has no room
+        /// to grow `logical`, so it must carry into `wall_ms` instead for
+        /// the mint to still strictly dominate both inputs.
+        #[test]
+        fn mint_arm_dominates_on_a_logical_overflow_at_a_wall_ms_tie() {
+            let sv = Hlc {
+                wall_ms: 1_000,
+                logical: u32::MAX,
+                node: NodeId::from(1u64),
+            };
+            let ver = Hlc {
+                wall_ms: 1_000,
+                logical: u32::MAX,
+                node: NodeId::from(2u64),
+            };
+            let stored = b"stored".to_vec();
+            let incoming = b"incoming".to_vec();
+            let merged = b"merged".to_vec();
+            let MergedVersion::Store(minted) = merge_version(sv, ver, &stored, &incoming, &merged)
+            else {
+                panic!("merged bytes matching neither side always mints a version");
+            };
+            assert!(minted > sv, "{minted:?} must dominate {sv:?}");
+            assert!(minted > ver, "{minted:?} must dominate {ver:?}");
+            assert_eq!(
+                minted.wall_ms, 1_001,
+                "the overflow must carry into wall_ms"
+            );
+            assert_eq!(minted.logical, 0, "logical resets once it carries");
+            assert!(minted.node.is_merge_derived());
         }
     }
 }

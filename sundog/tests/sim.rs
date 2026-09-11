@@ -24,15 +24,18 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 use sundog::config::ClusterConfig;
+use sundog::crdt::{PnCounter, PnCounterResolver};
 use sundog::hlc::Hlc;
 use sundog::membership::Peer;
 use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
 use sundog::store::{Mode, Shard, ShardOps, SimFanOut};
 use sundog::wire::{Msg, WireRecord};
-use sundog::{OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
+use sundog::{ConflictResolver, OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
 use tokio::sync::watch;
 use turmoil::{Builder, Sim};
 use xxhash_rust::xxh3::xxh3_64;
@@ -112,7 +115,7 @@ fn peer_list_of(peers: &[(NodeId, &'static str, u16)]) -> Vec<Peer> {
         .collect()
 }
 
-async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
+async fn dispatch_inbound<S: ShardOps>(shard: &S, msg: Msg) {
     match msg {
         Msg::Invalidate { key, ver, .. } => ShardOps::invalidate(shard, key, ver).await,
         Msg::Replicate { rec, .. } => ShardOps::apply_remote(shard, rec).await,
@@ -130,17 +133,17 @@ async fn dispatch_inbound(shard: &TestShard, msg: Msg) {
 /// name on `ClusterConfig`, letting a scenario force a low threshold so a
 /// mismatched bucket answers with `AeMismatch::Sketch`/`PartDigests` instead
 /// of a full listing.
-struct ShardHandler {
-    shard: Arc<TestShard>,
+struct ShardHandler<S: ShardOps + 'static> {
+    shard: Arc<S>,
     ae_part_min_bucket: usize,
     ae_sketch_min_bucket: usize,
 }
 
-impl ShardHandler {
+impl<S: ShardOps + 'static> ShardHandler<S> {
     /// Both thresholds at [`ClusterConfig::default`]'s values: every
     /// scenario but the sketch/part ones want this, since their buckets
     /// never grow past either.
-    fn new(shard: Arc<TestShard>) -> Self {
+    fn new(shard: Arc<S>) -> Self {
         let defaults = ClusterConfig::default();
         Self::with_min_buckets(
             shard,
@@ -150,7 +153,7 @@ impl ShardHandler {
     }
 
     fn with_min_buckets(
-        shard: Arc<TestShard>,
+        shard: Arc<S>,
         ae_part_min_bucket: usize,
         ae_sketch_min_bucket: usize,
     ) -> Self {
@@ -162,7 +165,7 @@ impl ShardHandler {
     }
 }
 
-impl RequestHandler for ShardHandler {
+impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
     fn snapshot_chunks(&self, _cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
         ShardOps::snapshot_chunks(self.shard.as_ref())
     }
@@ -225,7 +228,13 @@ impl RequestHandler for ShardHandler {
 
 /// Fans `key`'s current record out to `peers`, `dup_factor` times each,
 /// standing in for `cluster::fan_out_one`'s `Mode::Replicated` arm.
-async fn fan_out(shard: &TestShard, mesh: &Mesh, peers: &[NodeId], key: u32, dup_factor: usize) {
+async fn fan_out<S: ShardOps>(
+    shard: &S,
+    mesh: &Mesh,
+    peers: &[NodeId],
+    key: u32,
+    dup_factor: usize,
+) {
     let Some(rec) = ShardOps::records_for(shard, vec![key_bytes(key)])
         .await
         .into_iter()
@@ -286,8 +295,8 @@ fn decode_sketch_into(
 /// function's own line count down. `bucket_listings` counts every
 /// `AeMismatch::Bucket` reply seen.
 #[allow(clippy::too_many_arguments)]
-async fn classify_ae_mismatches(
-    shard: &TestShard,
+async fn classify_ae_mismatches<S: ShardOps>(
+    shard: &S,
     mismatched: Vec<AeMismatch>,
     bucket_listings: Option<&AtomicUsize>,
     push_keys: &mut Vec<Bytes>,
@@ -338,9 +347,9 @@ async fn classify_ae_mismatches(
 /// reason. Returns `false` on a failed exchange, mirroring
 /// `run_round_against`'s own give-up-this-round handling.
 #[allow(clippy::too_many_arguments)]
-async fn resolve_wanted_parts(
+async fn resolve_wanted_parts<S: ShardOps>(
     mesh: &Mesh,
-    shard: &TestShard,
+    shard: &S,
     peer: NodeId,
     wanted_parts: Vec<(u16, u8)>,
     push_keys: &mut Vec<Bytes>,
@@ -417,9 +426,9 @@ async fn resolve_wanted_parts(
 /// `AeMismatch::Bucket`/`Msg::AeBucket`-shaped reply this round receives, so
 /// a scenario can assert the part path never carries one. Exactly mirrors
 /// `run_round_against`'s own shape.
-async fn ae_round_with_sketch(
+async fn ae_round_with_sketch<S: ShardOps>(
     mesh: &Mesh,
-    shard: &TestShard,
+    shard: &S,
     peer: NodeId,
     bucket_listings: Option<&AtomicUsize>,
 ) -> bool {
@@ -524,8 +533,8 @@ async fn ae_round_with_sketch(
     ok
 }
 
-async fn diff_bucket(
-    shard: &TestShard,
+async fn diff_bucket<S: ShardOps>(
+    shard: &S,
     bucket: u16,
     peer_entries: &[(Bytes, Hlc)],
     push_keys: &mut Vec<Bytes>,
@@ -3107,4 +3116,394 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
             "the bucket's content is dropped once disown grace elapses"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Partition-heal counter family: three nodes, `N` counters, a two-way
+// partition (node `a` split from `b`/`c`, which stay mutually connected)
+// during which every node increments every counter, then a heal. Run in
+// two variants over the same shape — one merged `PnCounter` key per counter
+// under `PnCounterResolver`, and per-writer keys decomposed under the
+// default `LwwResolver` — measuring anti-entropy rounds, frames, and bytes
+// spent reconciling after the heal, and the lost-update count against the
+// exact expected total. `N` defaults to 2000 and is overridable via
+// `SUNDOG_SIM_KEYS`, mirroring `SUNDOG_SIM_SEED`'s override convention.
+// ---------------------------------------------------------------------
+
+/// Counters this family drives per run. `SUNDOG_SIM_KEYS` overrides the
+/// default so a heavier run is possible without touching the source.
+fn sim_counter_count() -> u32 {
+    std::env::var("SUNDOG_SIM_KEYS").map_or(2000, |raw| {
+        raw.parse().expect("SUNDOG_SIM_KEYS is a u32 counter count")
+    })
+}
+
+/// Cumulative rounds each node writes to every counter while partitioned:
+/// each round's write carries that node's new running total, matching
+/// `PnCounter::local_delta`'s cumulative-write contract, so only the final
+/// round's value survives the merge — the earlier rounds exist to exercise
+/// repeated concurrent increments, not to contribute to the expected total.
+const PARTITION_HEAL_ROUNDS: u64 = 3;
+
+/// A partition-heal counter node's whole role: dispatch inbound traffic and
+/// run anti-entropy against every peer on a timer. Writes are applied
+/// directly to the shard from outside this loop, the same direct-write
+/// pattern `run_partition_delete_scenario` uses, so this loop only has to
+/// keep the mesh alive and reconcile; `ae_rounds` counts every anti-entropy
+/// exchange this node's ticks attempt, peer failures included.
+#[derive(Clone)]
+struct CounterAeParams {
+    node: NodeId,
+    port: u16,
+    peers: Vec<(NodeId, &'static str, u16)>,
+    ae_period: Duration,
+    ae_rounds: Arc<AtomicUsize>,
+}
+
+async fn counter_ae_loop<S: ShardOps + 'static>(
+    params: CounterAeParams,
+    shard: Arc<S>,
+) -> SimResult {
+    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(Arc::clone(&shard)));
+    let bind_addr = SocketAddr::from(([0, 0, 0, 0], params.port));
+    let (mesh, mut inbound) = Mesh::spawn(
+        bind_addr,
+        params.node,
+        1,
+        &ClusterConfig::default(),
+        handler,
+    )
+    .await?;
+
+    let peer_list = peer_list_of(&params.peers);
+    mesh.update_peers(peer_list.clone());
+    let peer_ids: Vec<NodeId> = peer_list.iter().map(|peer| peer.node).collect();
+
+    let mut ae_tick = tokio::time::interval(params.ae_period);
+    ae_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(InboundMsg { msg, .. }) = inbound.recv() => {
+                dispatch_inbound(shard.as_ref(), msg).await;
+            }
+            _ = ae_tick.tick() => {
+                for &peer in &peer_ids {
+                    ae_round_with_sketch(&mesh, shard.as_ref(), peer, None).await;
+                    params.ae_rounds.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// One partition-heal run's reported metrics; see [`print_partition_heal_bench`].
+struct PartitionHealMetrics {
+    variant: &'static str,
+    counters: u32,
+    ae_rounds: usize,
+    steps_to_converge: usize,
+    frames: u64,
+    bytes: u64,
+    expected_total: i64,
+    actual_total: i64,
+    lost_updates: i64,
+}
+
+fn print_partition_heal_bench(m: &PartitionHealMetrics) {
+    eprintln!(
+        "BENCH partition_heal variant={} counters={} ae_rounds={} steps_to_converge={} \
+         frames={} bytes={} expected_total={} actual_total={} lost_updates={}",
+        m.variant,
+        m.counters,
+        m.ae_rounds,
+        m.steps_to_converge,
+        m.frames,
+        m.bytes,
+        m.expected_total,
+        m.actual_total,
+        m.lost_updates
+    );
+}
+
+/// Shared driver for the partition-heal counter family: builds three
+/// `Shard<u32, V>`s (`resolver` overriding the default `LwwResolver` when
+/// `Some`), partitions node `a` from `b`/`c` (who stay mutually connected),
+/// runs `write_all` on each node to increment every one of `counters`
+/// counters `PARTITION_HEAL_ROUNDS` times, heals, then waits for all three
+/// digests to agree. `write_all`'s third argument is the node's index
+/// (0/1/2) among the three, for a variant that decomposes into per-writer
+/// keys; `total_of` reads a shard's converged grand total back out.
+///
+/// Frames, bytes, and anti-entropy rounds are measured from the heal
+/// onward, after node `b`/`c` — never partitioned from each other — have
+/// already had time to settle between themselves, so the reported cost is
+/// anti-entropy repairing node `a`'s side of the split rather than the
+/// ordinary in-partition traffic between the two nodes that stayed
+/// connected throughout.
+///
+/// `frames`/`bytes` read [`sundog::net`]'s process-wide wire counters, shared
+/// with every other test in this binary; [`PARTITION_HEAL_WIRE_METRICS_LOCK`]
+/// keeps this family's own measurement windows from overlapping each other,
+/// so the `pn_counter`/`lww_decomposed` comparison stays meaningful under
+/// `cargo test`'s default parallelism. It cannot shield the window from any
+/// *other* concurrently-running sim test's traffic; run this binary with
+/// `--test-threads=1` for an absolute frame/byte count free of that noise.
+static PARTITION_HEAL_WIRE_METRICS_LOCK: StdMutex<()> = StdMutex::new(());
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one scenario driver's full setup, write/heal schedule, and convergence check read best kept together"
+)]
+fn run_partition_heal<V, W, T>(
+    variant: &'static str,
+    seed: u64,
+    port: u16,
+    resolver: Option<&Arc<dyn ConflictResolver>>,
+    counters: u32,
+    write_all: W,
+    total_of: T,
+) -> PartitionHealMetrics
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    W: Fn(&Shard<u32, V>, NodeId, u32, u32, u64),
+    T: Fn(&Shard<u32, V>, u32) -> i64,
+{
+    let host_a = "heal-a";
+    let host_b = "heal-b";
+    let host_c = "heal-c";
+    let node_a = NodeId::from(u64::from(port) * 10 + 1);
+    let node_b = NodeId::from(u64::from(port) * 10 + 2);
+    let node_c = NodeId::from(u64::from(port) * 10 + 3);
+
+    let build_shard = |node: NodeId| -> Shard<u32, V> {
+        let shard = Shard::new(cache_name(), Mode::Replicated, node, 200_000, None, None);
+        match resolver {
+            Some(r) => shard.with_resolver(Arc::clone(r)),
+            None => shard,
+        }
+    };
+    let shard_a = Arc::new(build_shard(node_a));
+    let shard_b = Arc::new(build_shard(node_b));
+    let shard_c = Arc::new(build_shard(node_c));
+
+    let ae_period = Duration::from_millis(100);
+    let mut sim = Builder::new()
+        .rng_seed(seed)
+        .tick_duration(TICK)
+        .max_message_latency(Duration::from_millis(20))
+        .build();
+
+    let roster: Vec<(NodeId, &'static str, u16)> = vec![
+        (node_a, host_a, port),
+        (node_b, host_b, port),
+        (node_c, host_c, port),
+    ];
+    let ae_rounds = Arc::new(AtomicUsize::new(0));
+
+    for &(node, host, _) in &roster {
+        let peers: Vec<(NodeId, &'static str, u16)> = roster
+            .iter()
+            .filter(|&&(id, _, _)| id != node)
+            .copied()
+            .collect();
+        let node_shard = if node == node_a {
+            Arc::clone(&shard_a)
+        } else if node == node_b {
+            Arc::clone(&shard_b)
+        } else {
+            Arc::clone(&shard_c)
+        };
+        let params = CounterAeParams {
+            node,
+            port,
+            peers,
+            ae_period,
+            ae_rounds: Arc::clone(&ae_rounds),
+        };
+        sim.host(host, move || {
+            let shard = Arc::clone(&node_shard);
+            let params = params.clone();
+            async move { counter_ae_loop(params, shard).await }
+        });
+    }
+
+    // Let mesh connections establish before partitioning.
+    run_steps(&mut sim, steps_for(Duration::from_millis(100)));
+
+    // Two-way split: node-a alone on one side, node-b/node-c together on
+    // the other, mirroring the two-node scenarios' partition/heal shape at
+    // one remove.
+    sim.partition(host_a, host_b);
+    sim.partition(host_a, host_c);
+
+    write_all(&shard_a, node_a, 0, counters, PARTITION_HEAL_ROUNDS);
+    write_all(&shard_b, node_b, 1, counters, PARTITION_HEAL_ROUNDS);
+    write_all(&shard_c, node_c, 2, counters, PARTITION_HEAL_ROUNDS);
+
+    // Give node-b/node-c, never partitioned from each other, time to settle
+    // between themselves before the measurement window starts: see this
+    // function's own doc for why.
+    run_steps(&mut sim, steps_for(Duration::from_millis(500)));
+
+    let wire_metrics_guard = PARTITION_HEAL_WIRE_METRICS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+    let ae_rounds_before = ae_rounds.load(Ordering::Relaxed);
+
+    sim.repair(host_a, host_b);
+    sim.repair(host_a, host_c);
+
+    let budget = steps_for(ae_period * 40 + Duration::from_secs(2));
+    let steps_to_converge = run_until(&mut sim, budget, || {
+        let da = block_on(ShardOps::digests(shard_a.as_ref()));
+        let db = block_on(ShardOps::digests(shard_b.as_ref()));
+        let dc = block_on(ShardOps::digests(shard_c.as_ref()));
+        da == db && db == dc
+    })
+    .unwrap_or_else(|| panic!("{variant}: partition-heal did not converge within the budget"));
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+    let ae_rounds_spent = ae_rounds.load(Ordering::Relaxed) - ae_rounds_before;
+    drop(wire_metrics_guard);
+
+    let expected_total = i64::from(counters)
+        * 3
+        * i64::try_from(PARTITION_HEAL_ROUNDS).expect("PARTITION_HEAL_ROUNDS fits an i64");
+    let actual_total = total_of(&shard_a, counters);
+    assert_eq!(
+        actual_total,
+        total_of(&shard_b, counters),
+        "{variant}: node-a and node-b disagree on the converged total"
+    );
+    assert_eq!(
+        actual_total,
+        total_of(&shard_c, counters),
+        "{variant}: node-a and node-c disagree on the converged total"
+    );
+
+    let metrics = PartitionHealMetrics {
+        variant,
+        counters,
+        ae_rounds: ae_rounds_spent,
+        steps_to_converge,
+        frames,
+        bytes,
+        expected_total,
+        actual_total,
+        lost_updates: expected_total - actual_total,
+    };
+    print_partition_heal_bench(&metrics);
+    metrics
+}
+
+/// Every anti-entropy round in this family runs against at most two peers
+/// on a 100ms tick; five ticks per side of the heal comfortably covers the
+/// convergence this family's shape needs, so a run spending more than this
+/// many rounds signals a regression rather than ordinary scheduling noise.
+const PARTITION_HEAL_MAX_AE_ROUNDS: usize = 60;
+
+/// The merged variant: one `PnCounter` key per counter under
+/// `PnCounterResolver`. Both partition sides increment every counter
+/// concurrently; the merge rule's fourth arm (see `store::mod`'s
+/// `ConflictResolver` docs) mints a fresh version for the folded result, so
+/// anti-entropy always recognizes it as something to fetch, and the merged
+/// total never drops an update regardless of apply order or how many times
+/// a record is redelivered.
+#[test]
+fn partition_heal_pn_counter_converges_to_exact_totals() {
+    let counters = sim_counter_count();
+    let metrics = run_partition_heal::<PnCounter, _, _>(
+        "pn_counter",
+        sim_seed(0xC0DE_6501),
+        4900,
+        Some(&(Arc::new(PnCounterResolver) as Arc<dyn ConflictResolver>)),
+        counters,
+        |shard, node, _index, counters, rounds| {
+            block_on(async {
+                for round in 1..=rounds {
+                    for key in 0..counters {
+                        let _ = shard.insert(key, PnCounter::local_delta(node, round)).await;
+                    }
+                }
+            });
+        },
+        |shard, counters| {
+            block_on(async {
+                let mut total = 0i64;
+                for key in 0..counters {
+                    if let Some(counter) = shard.get(&key).await {
+                        total += counter.value();
+                    }
+                }
+                total
+            })
+        },
+    );
+
+    assert_eq!(
+        metrics.lost_updates, 0,
+        "pn_counter: the merged variant converges to the exact total with zero lost updates"
+    );
+    assert!(
+        metrics.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,
+        "pn_counter: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
+        metrics.ae_rounds
+    );
+}
+
+/// The decomposed variant: `counters * 3` keys under the default
+/// `LwwResolver`, one per `(counter, writer)` pair, each written by exactly
+/// one node — a hand-rolled G-counter built entirely from single-writer
+/// keys and plain last-write-wins, with no [`Winner::Merged`] involved.
+/// Every sub-key has one writer, so `LwwResolver`'s total order never has a
+/// real conflict to lose a side of, and this variant is not expected to
+/// lose updates; the point of running it here is the comparison against
+/// [`partition_heal_pn_counter_converges_to_exact_totals`]'s single-key
+/// merge, not a claim that decomposition can lose updates. `lost_updates`
+/// is reported on its `BENCH` line but never asserted to a specific value.
+#[test]
+fn partition_heal_lww_decomposed_reports_lost_updates() {
+    let counters = sim_counter_count();
+    let metrics = run_partition_heal::<String, _, _>(
+        "lww_decomposed",
+        sim_seed(0xC0DE_6502),
+        4910,
+        None,
+        counters,
+        |shard, _node, index, counters, rounds| {
+            block_on(async {
+                for round in 1..=rounds {
+                    for key in 0..counters {
+                        let subkey = key * 3 + index;
+                        let _ = shard.insert(subkey, round.to_string()).await;
+                    }
+                }
+            });
+        },
+        |shard, counters| {
+            block_on(async {
+                let mut total = 0i64;
+                for key in 0..counters {
+                    for index in 0..3u32 {
+                        let subkey = key * 3 + index;
+                        if let Some(value) = shard.get(&subkey).await {
+                            total += value.parse::<i64>().unwrap_or(0);
+                        }
+                    }
+                }
+                total
+            })
+        },
+    );
+
+    assert!(
+        metrics.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,
+        "lww_decomposed: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
+        metrics.ae_rounds
+    );
 }

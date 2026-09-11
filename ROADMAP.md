@@ -53,37 +53,44 @@ or repairs.
 
 `ConflictResolver::winner` no longer only picks one of two records: the
 `Winner::Merged { value, expires_at_ms }` variant lets it fold the stored and
-incoming records into a third value, and the engine stamps that value's
-version with the componentwise-max `Hlc` of both inputs under a reserved
-sentinel node id, so a merge never collides with a real single-writer stamp
-and redelivering an already-absorbed merge is a no-op rather than an
-unbounded re-broadcast. `Winner` is `#[non_exhaustive]`, so this shipped
-as a minor-version addition rather than waiting on a major. The `sundog::crdt`
+incoming records into a third value. The engine derives that value's version
+from the merged bytes themselves, not only from the two inputs' versions:
+when the merge reduces to one side outright it adopts that side's own
+`(version, bytes)` pair (or does nothing, if that side is already what's
+stored), and only when the merged bytes are genuinely new relative to both
+sides does it mint a version — `wall_ms`/`logical` strictly ahead of both
+inputs and a `node` derived from a hash of the merged bytes itself
+(`NodeId::merge_derived`), so two nodes minting for the same bytes mint the
+same id and two nodes minting for different bytes never collide on the same
+version. A merge-derived id can never equal a real node's id (a private high
+bit distinguishes the two), so a minted version never falls into the
+equal-version fast path against a genuine single-writer stamp, and
+redelivering an already-absorbed merge is a no-op rather than an unbounded
+re-broadcast. `Winner` is `#[non_exhaustive]`, so this shipped as a
+minor-version addition rather than waiting on a major. The `sundog::crdt`
 module ships `PnCounter`/`PnCounterResolver` and `OrSet`/`OrSetResolver` as
 reference types proving the mechanism: both merge commutatively,
 associatively, and idempotently under any delivery order, and a three-node
-cluster with `PnCounterResolver` installed converges concurrent blind
-increments to the exact sum with no lost updates, unlike the default
+cluster with `PnCounterResolver` installed converges concurrent, unpaced
+blind increments to the exact sum with no lost updates, unlike the default
 last-write-wins resolver on the same workload.
 
 **What is still open:**
 
-- **`merge_version`'s sentinel scheme has no per-merge provenance.** Two
-  different nodes independently folding the same two inputs land on the
-  identical stamped `Hlc` by design, but two nodes folding *different* pairs
-  of concurrent writes into a real, byte-different merge result can also
-  collide on the same `(wall_ms, logical)` pair once the sentinel node id
-  erases the field that would otherwise disambiguate them. When that
-  happens the engine's equal-version fast path treats the second merge as an
-  already-applied duplicate and drops it without ever invoking the
-  resolver, losing that merge. Closing this needs either an `Hlc`-like
-  scheme that retains provenance across merges or a byte-aware tie-break
-  when the fast path's versions match.
 - **`OrSet` never compacts.** Adds and tombstones accumulate forever; there
   is no tag garbage collection.
 - **No CRDT resolver ships for a map or a register**, only a counter and a
   set; a user needing either writes their own `ConflictResolver` against the
-  same `Merged` contract.
+  same `Merged` contract, or a `MergeResolver<V, F>` generic adapter over an
+  arbitrary join-semilattice `V` would remove the boilerplate both reference
+  resolvers currently duplicate.
+- **A resolver's bytes that fail to decode are rejected silently.** There is
+  no dedicated counter for this path, so it is observable only as an absent
+  write.
+- **Every collision folds one write at a time under the stripe lock.**
+  Pre-folding multiple pending writers' records for a key before acquiring
+  the lock would let merge's raw throughput approach key decomposition's
+  instead of only converging to the same correctness.
 
 **Trigger for the open items above:** none yet observed in a real
 deployment; each is a known limitation of the mechanism as it stands, not a

@@ -15,28 +15,46 @@ use serde::{Deserialize, Serialize};
 pub struct NodeId(u64);
 
 impl NodeId {
-    /// Reserved node id, never assigned to a real node.
-    ///
-    /// The engine's merge-version combinator stamps a merged record's `Hlc`
-    /// with this id as the final tiebreaker, so a merged version can never
-    /// collide with a real single-writer stamp. [`Self::random`] rerolls if
-    /// it ever draws this value, and the explicit-id path
-    /// ([`crate::ClusterBuilder::node_id`]) rejects it outright, so no live
-    /// node is ever assigned this identity.
-    pub(crate) const MERGE_SENTINEL: NodeId = NodeId(u64::MAX);
+    /// Partitions the `u64` id space in two: a real node's id always has
+    /// this bit clear, and the engine's merge-version combinator always sets
+    /// it when minting a version for a resolver's [`crate::store::Winner::Merged`]
+    /// reply. The two halves never overlap, so a minted version can never
+    /// collide with a real single-writer stamp: [`Self::random`] clears the
+    /// bit unconditionally, and the explicit-id path
+    /// ([`crate::ClusterBuilder::node_id`]) rejects any id with the bit set.
+    const MERGE_BIT: u64 = 1 << 63;
 
     /// Generates a new random node id.
     ///
-    /// Never returns the reserved merge-version sentinel id: drawing it is
-    /// rerolled.
+    /// Clears the top bit unconditionally, so a real node's id always falls
+    /// in the lower half of the `u64` range and can never collide with a
+    /// merge-derived id, minted only by the engine's merge-version
+    /// combinator.
     #[must_use]
     pub fn random() -> Self {
-        loop {
-            let candidate = Self(rand::rng().random());
-            if candidate != Self::MERGE_SENTINEL {
-                return candidate;
-            }
-        }
+        Self(rand::rng().random::<u64>() & !Self::MERGE_BIT)
+    }
+
+    /// Builds the node id a minted merge version is stamped with: `hash`
+    /// (the merged bytes' `xxh3_64`, in the engine's actual use) with
+    /// [`Self::MERGE_BIT`] set.
+    ///
+    /// Setting the bit puts the result in the half of the id space
+    /// [`Self::random`] never draws from and the explicit-id builder path
+    /// never accepts, so it can never collide with a real node's identity;
+    /// keeping `hash` as the rest of the value makes the id a deterministic
+    /// function of the merged content, so two nodes minting a version for
+    /// the same merged bytes mint the same id.
+    #[must_use]
+    pub(crate) const fn merge_derived(hash: u64) -> Self {
+        Self(hash | Self::MERGE_BIT)
+    }
+
+    /// Whether this id names a merge the engine minted, never a member of
+    /// the cluster. See [`Self::merge_derived`].
+    #[must_use]
+    pub(crate) const fn is_merge_derived(self) -> bool {
+        self.0 & Self::MERGE_BIT != 0
     }
 
     /// Returns the raw numeric value.
@@ -112,9 +130,34 @@ mod tests {
     }
 
     #[test]
-    fn random_never_yields_the_merge_sentinel() {
+    fn random_never_produces_a_merge_derived_id() {
         for _ in 0..10_000 {
-            assert_ne!(NodeId::random(), NodeId::MERGE_SENTINEL);
+            assert!(
+                !NodeId::random().is_merge_derived(),
+                "a real node id must never carry the merge bit"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_derived_always_sets_the_merge_bit() {
+        for hash in [0u64, 1, 42, u64::MAX / 2, u64::MAX] {
+            assert!(
+                NodeId::merge_derived(hash).is_merge_derived(),
+                "merge_derived({hash}) must be recognized as merge-derived"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_and_a_merge_derived_id_never_collide() {
+        for hash in [0u64, 1, 42, u64::MAX] {
+            let real = NodeId::random();
+            let derived = NodeId::merge_derived(hash);
+            assert_ne!(
+                real, derived,
+                "a real node id and a merge-derived id live in disjoint halves of the id space"
+            );
         }
     }
 

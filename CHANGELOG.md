@@ -21,15 +21,20 @@ All notable changes to this project are documented in this file. Format follows
   order when either side is a tombstone, a spilled view, or fails to decode.
 - `Winner::Merged { value, expires_at_ms }`: a resolver can fold the stored
   and incoming records into a third value instead of picking one of the two.
-  The engine stamps a merged record's version with the componentwise-max
-  `Hlc` of the two inputs under a reserved sentinel node id, so a merge never
-  collides with a real single-writer stamp and a merge folded from the same
-  two inputs in either order lands on the same version. A `Merged` outcome
-  is only honored when both the stored and incoming records carry a value;
-  against a tombstone or a spilled side it degrades to keeping the existing
-  record. A redelivered record whose merge result reproduces the stored
-  bytes and version exactly is a no-op: nothing is re-applied, no event is
-  published, and nothing is re-replicated.
+  The engine derives the merged record's version from the merged bytes
+  themselves: a merge that reduces to one side outright adopts that side's
+  own `(version, bytes)` pair verbatim (or is a no-op, if that side is
+  already what's stored), and a merge that produces genuinely new content
+  mints a version strictly ahead of both inputs under a `node` id derived
+  from a hash of the merged bytes (`NodeId::merge_derived`) — never a real
+  node's id, so a minted version never collides with a real single-writer
+  stamp, and two nodes minting for the same merged bytes always land on the
+  same version regardless of fold order. A `Merged` outcome is only honored
+  when both the stored and incoming records carry a value; against a
+  tombstone or a spilled side it degrades to keeping the existing record. A
+  redelivered record whose merge result reproduces the stored bytes and
+  version exactly is a no-op: nothing is re-applied, no event is published,
+  and nothing is re-replicated.
 
 ### Changed
 

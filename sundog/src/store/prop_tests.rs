@@ -21,6 +21,9 @@ const NUM_NODES: u8 = 3;
 const NUM_REPLICAS: usize = 4;
 /// Keyspace size, small enough that writes from different origins collide.
 const KEYSPACE: u8 = 8;
+/// Upper bound on gossip rounds the fixed-point loop may take before the
+/// test treats non-convergence as a failure of the merge rule itself.
+const MAX_GOSSIP_ROUNDS: usize = 20;
 
 #[derive(Debug, Clone, Copy)]
 enum OpKind {
@@ -764,10 +767,9 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
         .into_iter()
         .next()
         .expect("the merged key has a stored record");
-    assert_eq!(
-        merged.ver.node,
-        NodeId::MERGE_SENTINEL,
-        "a real merge stamps the reserved sentinel node, never either input's own node"
+    assert!(
+        merged.ver.node.is_merge_derived(),
+        "a real merge that grows content mints a version, never either input's own node"
     );
 
     // Redeliver `b`: already fully absorbed into the merge above, so this
@@ -799,4 +801,132 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
         events.try_recv().is_err(),
         "a redelivery no-op must not publish an Event"
     );
+}
+
+/// Applies, for every ordered shard pair, the anti-entropy direction rule
+/// `diff_bucket` uses: the side holding the strictly greater [`Hlc`] version
+/// for `key_bytes` pushes its record to the lesser side (a side missing the
+/// key entirely counts as lesser). Repeats full rounds until one changes
+/// nothing, and returns the round count that took. Callers bound that count
+/// to turn "does gossip converge" into a property a hang can't dodge.
+async fn gossip_until_fixed_point(
+    shards: &[Arc<Shard<u8, PnCounter>>],
+    key_bytes: &Bytes,
+) -> usize {
+    for round in 0..MAX_GOSSIP_ROUNDS {
+        let mut changed = false;
+        for i in 0..shards.len() {
+            for j in 0..shards.len() {
+                if i == j {
+                    continue;
+                }
+                let from = ShardOps::records_for(shards[i].as_ref(), vec![key_bytes.clone()])
+                    .await
+                    .into_iter()
+                    .next();
+                let Some(from) = from else { continue };
+                let to = ShardOps::records_for(shards[j].as_ref(), vec![key_bytes.clone()])
+                    .await
+                    .into_iter()
+                    .next();
+                let should_push = match &to {
+                    Some(to) => from.ver > to.ver,
+                    None => true,
+                };
+                if should_push {
+                    ShardOps::apply_remote(shards[j].as_ref(), from).await;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return round;
+        }
+    }
+    panic!(
+        "gossip did not reach a fixed point within {MAX_GOSSIP_ROUNDS} rounds; the merge \
+         rule may be failing to converge"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Shard-level gossip-emulation property: `NUM_NODES` shards, each
+    /// seeded with only its own origin's concurrent write to a shared key
+    /// (redelivered and reordered per [`shuffled_with_duplicates`] and
+    /// [`apply_mixed`]), then driven to a fixed point by
+    /// [`gossip_until_fixed_point`] -- the same "greater version flows to
+    /// the lesser side" rule anti-entropy's `diff_bucket` applies. Every
+    /// shard must end at the identical `(version, bytes)` pair and the
+    /// exact sum of every generated increment, with no lost updates, within
+    /// a bounded number of rounds.
+    #[test]
+    fn pn_counter_gossip_converges_to_the_exact_sum_within_bounded_rounds(
+        deltas in proptest::collection::vec(0u64..1_000, usize::from(NUM_NODES)),
+        seeds in proptest::collection::vec(any::<u64>(), usize::from(NUM_NODES)),
+    ) {
+        let records = build_pn_counter_records(&deltas);
+        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let key_bytes = records[0].key.clone();
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let shards: Vec<Arc<Shard<u8, PnCounter>>> = (0..records.len())
+                .map(|i| {
+                    Arc::new(
+                        Shard::<u8, PnCounter>::new(
+                            SmolStr::new("pn-counter-gossip"),
+                            Mode::Replicated,
+                            NodeId::from(1000 + u64::try_from(i).expect("small")),
+                            10_000,
+                            None,
+                            None,
+                        )
+                        .with_resolver(Arc::new(PnCounterResolver)),
+                    )
+                })
+                .collect();
+
+            // Each shard starts having seen only its own origin's write --
+            // possibly redelivered, in a generated order -- so every other
+            // origin's increment can only reach it through gossip.
+            for ((shard, own_record), &seed) in shards.iter().zip(&records).zip(&seeds) {
+                let redelivered = shuffled_with_duplicates(std::slice::from_ref(own_record), seed);
+                apply_mixed(shard, redelivered, seed).await;
+            }
+
+            let rounds = gossip_until_fixed_point(&shards, &key_bytes).await;
+            assert!(
+                rounds <= MAX_GOSSIP_ROUNDS,
+                "gossip took {rounds} rounds, exceeding the {MAX_GOSSIP_ROUNDS}-round bound"
+            );
+
+            let mut final_records = Vec::with_capacity(shards.len());
+            for shard in &shards {
+                let rec = ShardOps::records_for(shard.as_ref(), vec![key_bytes.clone()])
+                    .await
+                    .into_iter()
+                    .next()
+                    .expect("every shard holds the key once gossip has reached a fixed point");
+                let counter = PnCounter::decode(
+                    rec.value.as_deref().expect("a live PnCounter record carries a value"),
+                )
+                .expect("PnCounter always decodes");
+                assert_eq!(
+                    counter.value(),
+                    expected_total,
+                    "every shard must converge to the exact sum of every generated increment, \
+                     with no lost updates"
+                );
+                final_records.push((rec.ver, rec.value));
+            }
+            for pair in final_records.windows(2) {
+                assert_eq!(
+                    pair[0], pair[1],
+                    "gossip must converge every shard to the identical (version, bytes) pair"
+                );
+            }
+        });
+    }
 }
