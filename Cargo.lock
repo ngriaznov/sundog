@@ -2970,6 +2970,8 @@ dependencies = [
 name = "sundog-testnode"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "postcard",
  "sundog",
  "tokio",
  "xxhash-rust",

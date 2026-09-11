@@ -1138,6 +1138,72 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
     net.close().await.expect("network closes");
 }
 
+/// A merge on the current release's node stamps its version with sundog's
+/// reserved merge-version node id rather than a real single writer's; this
+/// pins that the previous release's node, whose own resolver knows nothing
+/// of merges, still stores and serves a record stamped that way, and the two
+/// nodes converge on the merged value.
+///
+/// `new` opens `"it"` with `sundog-testnode`'s interop-only merge resolver
+/// (`SUNDOG_TESTNODE_RESOLVER=sum_counter`), which sums two conflicting
+/// decimal-string counters on merge rather than picking whichever write is
+/// most recent. `old` writes first; `new` then writes a conflicting value of
+/// its own, merging it against what it just replicated from `old` instead of
+/// overwriting it. The merged sum differs from both inputs, so `old` ending
+/// up there proves it applied the sentinel-stamped merged bytes it received
+/// rather than coincidentally already holding the right value.
+#[tokio::test]
+async fn the_previous_release_stores_and_serves_a_sentinel_stamped_merge_from_the_current_node() {
+    const KEY: &str = "counter";
+    const OLD_VALUE: &str = "3";
+    const NEW_VALUE: &str = "5";
+    const MERGED_VALUE: &str = "8";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let previous = build_previous_testnode();
+    let net = Arc::new(Network::new_network());
+    let old = Node::spawn_binary(&net, "sentinel-cluster", "n1", &[], &[], previous).await;
+    let new = Node::spawn_with_env(
+        &net,
+        "sentinel-cluster",
+        "n2",
+        &[&seed("n1")],
+        &[("SUNDOG_TESTNODE_RESOLVER", "sum_counter")],
+    )
+    .await;
+    wait_for_peers(&[&old, &new], 1).await;
+
+    old.put(KEY, OLD_VALUE)
+        .await
+        .expect("the old node writes the counter first");
+    eventually(CONVERGE_WAIT, || async {
+        new.get(KEY).await == Ok(Some(OLD_VALUE.to_string()))
+    })
+    .await;
+
+    // A second, conflicting write on the new node: its own resolver merges it
+    // against the value it just replicated from `old` instead of overwriting
+    // it, storing the sum under a sentinel-stamped version and fanning that
+    // out to `old`.
+    new.put(KEY, NEW_VALUE)
+        .await
+        .expect("the new node merges its own write in");
+
+    eventually(CONVERGE_WAIT, || async {
+        old.get(KEY).await == Ok(Some(MERGED_VALUE.to_string()))
+            && new.get(KEY).await == Ok(Some(MERGED_VALUE.to_string()))
+    })
+    .await;
+
+    old.stop().await.expect("old node stops");
+    new.stop().await.expect("new node stops");
+    net.close().await.expect("network closes");
+}
+
 /// Finds `metric{...,label="value",...} <number>` in Prometheus
 /// text-exposition `body`, tolerant of label ordering and
 /// integer-vs-float rendering. Mirrors `tests/spill_replication.rs`'s own

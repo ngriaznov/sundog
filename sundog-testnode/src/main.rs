@@ -72,15 +72,27 @@
 //! ([`Cache::owners_of`]; on a non-distributed cache this is just this
 //! node's own id); `id` -> this node's own [`sundog::NodeId`] as a decimal
 //! `u64`.
+//!
+//! `SUNDOG_TESTNODE_RESOLVER` selects `"it"`'s `ConflictResolver`: absent or
+//! `"lww"` keeps the default; `"sum_counter"` installs [`SumCounterResolver`],
+//! which merges two decimal-string counters by addition on a genuine version
+//! conflict instead of picking the most recent write. It exists to drive the
+//! mixed-version container test's sentinel-stamped-merge scenario: a merge on
+//! this node's `"it"` stamps its version with sundog's reserved merge-version
+//! node id, and the container test installs this resolver on the current
+//! release's node to confirm the previous release's node stores and serves
+//! what it receives.
 
 use std::env;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 #[cfg(feature = "spill")]
 use sundog::SpillConfig;
-use sundog::{Cache, Cluster, ClusterConfig, Mode};
+use sundog::{Cache, Cluster, ClusterConfig, ConflictResolver, Mode, RecordView, Winner};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use xxhash_rust::xxh3::xxh3_64;
@@ -242,6 +254,86 @@ fn spill_config_from_env(
     Some(cfg)
 }
 
+/// Which `ConflictResolver` `"it"` opens with, decided from
+/// `SUNDOG_TESTNODE_RESOLVER`'s raw string by [`resolver_kind_from_env`]; the
+/// actual `Arc<dyn ConflictResolver>` this maps to is built separately in
+/// [`run`], mirroring [`mode_from_env`]'s own split between deciding and
+/// constructing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolverKind {
+    /// `"it"` opens with no resolver override, keeping `CacheBuilder`'s
+    /// default `LwwResolver`.
+    Lww,
+    /// `"it"` opens with [`SumCounterResolver`] installed.
+    SumCounter,
+}
+
+/// Decides [`ResolverKind`] from `SUNDOG_TESTNODE_RESOLVER`'s already-read
+/// value: absent or `"lww"` keeps the default resolver, `"sum_counter"`
+/// installs [`SumCounterResolver`]. Any other value is an `Err` naming the
+/// problem.
+fn resolver_kind_from_env(raw: Option<&str>) -> Result<ResolverKind, String> {
+    match raw {
+        None | Some("lww") => Ok(ResolverKind::Lww),
+        Some("sum_counter") => Ok(ResolverKind::SumCounter),
+        Some(other) => Err(format!(
+            "SUNDOG_TESTNODE_RESOLVER must be \"lww\" or \"sum_counter\", got {other:?}"
+        )),
+    }
+}
+
+/// Decodes a postcard-encoded `String` and parses it as a decimal `u64`
+/// counter; `None` if either step fails.
+fn decode_counter(bytes: &[u8]) -> Option<u64> {
+    postcard::from_bytes::<String>(bytes)
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// The merged counter's postcard-encoded decimal-string bytes when both `a`
+/// and `b` parse as `u64` counters via [`decode_counter`], `None` otherwise:
+/// the pure decision [`SumCounterResolver::winner`] wraps around a real
+/// `RecordView` pair.
+fn merge_counter_bytes(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
+    let (a, b) = (decode_counter(a)?, decode_counter(b)?);
+    postcard::to_stdvec(&(a + b).to_string()).ok()
+}
+
+/// Merges two decimal-string counters by addition on a genuine version
+/// conflict, rather than picking whichever write is most recent, so a real
+/// `Winner::Merged` outcome — and the sentinel-stamped `Hlc` sundog stamps it
+/// with — reaches the wire. Falls back to plain `Hlc` order whenever either
+/// side fails to parse as a `u64` (a tombstone, a spilled view, or a
+/// non-numeric value), matching `sundog::crdt`'s own resolvers'
+/// decode-failure fallback.
+///
+/// Summing on every merge is not idempotent (`merge(a, a) != a`), so this is
+/// not a general-purpose CRDT resolver the way `sundog::crdt`'s are: it
+/// exists only to drive one interop scenario in the container test suite,
+/// which triggers exactly one merge on one key and never redelivers it.
+struct SumCounterResolver;
+
+impl ConflictResolver for SumCounterResolver {
+    fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        let (Some(av), Some(bv)) = (a.value, b.value) else {
+            return if a.ver >= b.ver { Winner::A } else { Winner::B };
+        };
+        match merge_counter_bytes(av, bv) {
+            Some(merged) => Winner::Merged {
+                value: Bytes::from(merged),
+                expires_at_ms: None,
+            },
+            None => {
+                if a.ver >= b.ver {
+                    Winner::A
+                } else {
+                    Winner::B
+                }
+            }
+        }
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_name = env::args()
         .nth(1)
@@ -257,6 +349,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
     let it_mode = mode_from_env(env::var("SUNDOG_TESTNODE_MODE").ok().as_deref(), owners)?;
+    let it_resolver = resolver_kind_from_env(env::var("SUNDOG_TESTNODE_RESOLVER").ok().as_deref())?;
 
     let config = ClusterConfig::default().with(|c| {
         c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
@@ -281,6 +374,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let max_capacity_bytes = u64_env("SUNDOG_TESTNODE_MAX_CAPACITY_BYTES");
     let mut it_builder = cluster.cache::<String, String>(CACHE_NAME).mode(it_mode);
+    if it_resolver == ResolverKind::SumCounter {
+        it_builder = it_builder.resolver(Arc::new(SumCounterResolver));
+    }
     if let Some(max_capacity_bytes) = max_capacity_bytes {
         it_builder = it_builder
             .max_capacity(max_capacity_bytes)
@@ -543,6 +639,8 @@ async fn serve(
 
 #[cfg(test)]
 mod tests {
+    use sundog::{Hlc, NodeId};
+
     use super::*;
 
     #[test]
@@ -653,6 +751,144 @@ mod tests {
         assert_eq!(byte_weight("k0", "v0"), 4);
         assert_eq!(byte_weight("", ""), 0);
         assert_eq!(byte_weight("abc", "de"), 5);
+    }
+
+    #[test]
+    fn resolver_kind_from_env_defaults_to_lww() {
+        assert_eq!(resolver_kind_from_env(None), Ok(ResolverKind::Lww));
+        assert_eq!(resolver_kind_from_env(Some("lww")), Ok(ResolverKind::Lww));
+    }
+
+    #[test]
+    fn resolver_kind_from_env_reads_sum_counter() {
+        assert_eq!(
+            resolver_kind_from_env(Some("sum_counter")),
+            Ok(ResolverKind::SumCounter)
+        );
+    }
+
+    #[test]
+    fn resolver_kind_from_env_rejects_an_unknown_resolver() {
+        let error = resolver_kind_from_env(Some("crdt"))
+            .expect_err("an unrecognized resolver string fails startup");
+        assert!(
+            error.contains("crdt"),
+            "error should name the bad value: {error:?}"
+        );
+    }
+
+    #[test]
+    fn decode_counter_parses_a_postcard_encoded_decimal_string() {
+        let bytes = postcard::to_stdvec(&"42".to_string()).expect("encodes");
+        assert_eq!(decode_counter(&bytes), Some(42));
+    }
+
+    #[test]
+    fn decode_counter_is_none_for_non_numeric_or_undecodable_bytes() {
+        let non_numeric = postcard::to_stdvec(&"not-a-number".to_string()).expect("encodes");
+        assert_eq!(decode_counter(&non_numeric), None);
+        assert_eq!(
+            decode_counter(b"\xff\xff\xff\xff\xff\xff\xff\xff\xff"),
+            None
+        );
+    }
+
+    #[test]
+    fn merge_counter_bytes_sums_two_decodable_counters() {
+        let a = postcard::to_stdvec(&"3".to_string()).expect("encodes");
+        let b = postcard::to_stdvec(&"5".to_string()).expect("encodes");
+        let merged = merge_counter_bytes(&a, &b).expect("both sides decode");
+        assert_eq!(
+            postcard::from_bytes::<String>(&merged).expect("merged bytes decode"),
+            "8"
+        );
+    }
+
+    #[test]
+    fn merge_counter_bytes_is_none_when_either_side_is_not_a_counter() {
+        let counter = postcard::to_stdvec(&"3".to_string()).expect("encodes");
+        let not_a_counter = postcard::to_stdvec(&"hello".to_string()).expect("encodes");
+        assert_eq!(merge_counter_bytes(&counter, &not_a_counter), None);
+        assert_eq!(merge_counter_bytes(&not_a_counter, &counter), None);
+    }
+
+    /// Postcard-encodes `a_value`/`b_value` as the decimal-string counters
+    /// [`SumCounterResolver::winner`]'s tests below build `RecordView`s from.
+    fn counter_bytes(a_value: &str, b_value: &str) -> (Vec<u8>, Vec<u8>) {
+        (
+            postcard::to_stdvec(&a_value.to_string()).expect("encodes"),
+            postcard::to_stdvec(&b_value.to_string()).expect("encodes"),
+        )
+    }
+
+    fn hlc_at(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            node: NodeId::random(),
+        }
+    }
+
+    #[test]
+    fn sum_counter_resolver_merges_two_decodable_counters() {
+        let (a_bytes, b_bytes) = counter_bytes("3", "5");
+        let a = RecordView {
+            value: Some(&a_bytes),
+            ver: hlc_at(1),
+            expires_at_ms: None,
+        };
+        let b = RecordView {
+            value: Some(&b_bytes),
+            ver: hlc_at(2),
+            expires_at_ms: None,
+        };
+        match SumCounterResolver.winner(b"key", a, b) {
+            Winner::Merged {
+                value,
+                expires_at_ms,
+            } => {
+                assert_eq!(
+                    postcard::from_bytes::<String>(&value).expect("merged bytes decode"),
+                    "8"
+                );
+                assert_eq!(expires_at_ms, None);
+            }
+            other => panic!("expected Winner::Merged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_counter_resolver_falls_back_to_hlc_order_on_a_tombstone() {
+        let (_, b_bytes) = counter_bytes("3", "5");
+        let a = RecordView {
+            value: None,
+            ver: hlc_at(1),
+            expires_at_ms: None,
+        };
+        let b = RecordView {
+            value: Some(&b_bytes),
+            ver: hlc_at(2),
+            expires_at_ms: None,
+        };
+        assert_eq!(SumCounterResolver.winner(b"key", a, b), Winner::B);
+        assert_eq!(SumCounterResolver.winner(b"key", b, a), Winner::A);
+    }
+
+    #[test]
+    fn sum_counter_resolver_falls_back_to_hlc_order_on_a_non_numeric_value() {
+        let a_bytes = postcard::to_stdvec(&"not-a-number".to_string()).expect("encodes");
+        let (_, b_bytes) = counter_bytes("3", "5");
+        let a = RecordView {
+            value: Some(&a_bytes),
+            ver: hlc_at(1),
+            expires_at_ms: None,
+        };
+        let b = RecordView {
+            value: Some(&b_bytes),
+            ver: hlc_at(2),
+            expires_at_ms: None,
+        };
+        assert_eq!(SumCounterResolver.winner(b"key", a, b), Winner::B);
     }
 
     #[cfg(feature = "spill")]

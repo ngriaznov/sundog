@@ -3,6 +3,39 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`crdt` module**: reference CRDT value types and the resolvers that merge
+  them through `Winner::Merged`, reachable as `sundog::crdt::{PnCounter,
+  PnCounterResolver, OrSet, OrSetResolver}`. `PnCounter` is a per-node
+  increment/decrement counter that merges by taking the componentwise
+  maximum of each node's cumulative counts; `OrSet` is an observed-remove
+  set whose `remove` tombstones only the add-tags it has actually observed,
+  so a concurrent add of the same element survives a concurrent remove.
+  Both encode canonically over `BTreeMap`/`BTreeSet` state, so two logically
+  equal values always produce identical bytes, and both merge commutatively,
+  associatively, and idempotently under any delivery order. `PnCounterResolver`
+  and `OrSetResolver` merge two decodable values and fall back to plain `Hlc`
+  order when either side is a tombstone, a spilled view, or fails to decode.
+- `Winner::Merged { value, expires_at_ms }`: a resolver can fold the stored
+  and incoming records into a third value instead of picking one of the two.
+  The engine stamps a merged record's version with the componentwise-max
+  `Hlc` of the two inputs under a reserved sentinel node id, so a merge never
+  collides with a real single-writer stamp and a merge folded from the same
+  two inputs in either order lands on the same version. A `Merged` outcome
+  is only honored when both the stored and incoming records carry a value;
+  against a tombstone or a spilled side it degrades to keeping the existing
+  record. A redelivered record whose merge result reproduces the stored
+  bytes and version exactly is a no-op: nothing is re-applied, no event is
+  published, and nothing is re-replicated.
+
+### Changed
+
+- **Breaking**: `Winner` is `#[non_exhaustive]` and gains the `Merged`
+  variant; a downstream `match` without a wildcard arm needs one added.
+
 ## [0.6.0] – 2026-09-07
 
 ### Added

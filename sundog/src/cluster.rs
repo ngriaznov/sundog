@@ -495,6 +495,10 @@ impl ClusterBuilder {
     /// `FromStr`) and pass the same value on restart: the node rejoins as
     /// the same member, so its earlier incarnation is not tracked absent
     /// for `tombstone_max_ttl` after every restart.
+    ///
+    /// `id` is validated at [`build`](Self::build): the reserved
+    /// merge-version sentinel id is rejected with
+    /// [`JoinError::ReservedNodeId`] rather than silently remapped.
     pub fn node_id(mut self, id: NodeId) -> Self {
         self.node_id = Some(id);
         self
@@ -528,7 +532,8 @@ impl ClusterBuilder {
     /// # Errors
     ///
     /// Returns [`JoinError`] if the gossip or data-plane sockets cannot bind,
-    /// or the membership backend fails to start.
+    /// the membership backend fails to start, or [`Self::node_id`] was given
+    /// the reserved merge-version sentinel id.
     pub async fn build(self) -> Result<Cluster, JoinError> {
         let Self {
             name,
@@ -540,6 +545,9 @@ impl ClusterBuilder {
         } = self;
 
         validate_config(&config)?;
+        if node_id == Some(NodeId::MERGE_SENTINEL) {
+            return Err(JoinError::ReservedNodeId(NodeId::MERGE_SENTINEL));
+        }
 
         let local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -1715,6 +1723,7 @@ mod tests {
 
     use super::*;
     use crate::error::CacheError;
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
     use crate::store::{ConflictResolver, Event, Origin, RecordView, Winner};
 
     /// Loopback-only config: skips the outbound-interface probe and keeps
@@ -2090,6 +2099,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pn_counter_resolver_converges_a_three_node_cluster_to_the_exact_concurrent_total() {
+        const INCREMENTS_PER_NODE: u64 = 5;
+
+        let (cluster_a, cluster_b, cluster_c) =
+            three_node_cluster("cluster-it-crdt-pncounter").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, PnCounter>("counters")
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, PnCounter>("counters")
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("b opens");
+        let cache_c = cluster_c
+            .cache::<u32, PnCounter>("counters")
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("c opens");
+
+        let node_a = cluster_a.node_id();
+        let node_b = cluster_b.node_id();
+        let node_c = cluster_c.node_id();
+
+        // Every node blindly increments the same key with no read
+        // beforehand and no coordination between them, concurrently: each
+        // writer runs as its own spawned task so it interleaves fairly with
+        // every cluster's own gossip/anti-entropy/fan-out background tasks,
+        // not just with the other two writers. Each writer paces its own
+        // increments on a distinct period (23/29/37ms, pairwise coprime-ish)
+        // so the three writers' physical write times drift apart rather than
+        // staying in lockstep — three real, independent HLC clocks that
+        // never observe each other mid-burst can otherwise land on the same
+        // `(wall_ms, logical)` pair once componentwise-maxed under the
+        // shared merge sentinel, which the plain `sv == ver` fast path would
+        // then (wrongly) treat as the same content already stored.
+        let write_a = {
+            let cache_a = cache_a.clone();
+            async move {
+                for cumulative in 1..=INCREMENTS_PER_NODE {
+                    cache_a
+                        .insert(1, PnCounter::local_delta(node_a, cumulative))
+                        .await
+                        .expect("a's blind increment applies");
+                    tokio::time::sleep(Duration::from_millis(23)).await;
+                }
+            }
+        };
+        let write_b = {
+            let cache_b = cache_b.clone();
+            async move {
+                for cumulative in 1..=INCREMENTS_PER_NODE {
+                    cache_b
+                        .insert(1, PnCounter::local_delta(node_b, cumulative))
+                        .await
+                        .expect("b's blind increment applies");
+                    tokio::time::sleep(Duration::from_millis(29)).await;
+                }
+            }
+        };
+        let write_c = {
+            let cache_c = cache_c.clone();
+            async move {
+                for cumulative in 1..=INCREMENTS_PER_NODE {
+                    cache_c
+                        .insert(1, PnCounter::local_delta(node_c, cumulative))
+                        .await
+                        .expect("c's blind increment applies");
+                    tokio::time::sleep(Duration::from_millis(37)).await;
+                }
+            }
+        };
+        let ta = tokio::spawn(write_a);
+        let tb = tokio::spawn(write_b);
+        let tc = tokio::spawn(write_c);
+        ta.await.expect("a's writer task doesn't panic");
+        tb.await.expect("b's writer task doesn't panic");
+        tc.await.expect("c's writer task doesn't panic");
+
+        let expected_total = i64::try_from(INCREMENTS_PER_NODE * 3).expect("small total fits i64");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let vals = [
+                cache_a.get(&1).await.map(|c| c.value()),
+                cache_b.get(&1).await.map(|c| c.value()),
+                cache_c.get(&1).await.map(|c| c.value()),
+            ];
+            if vals.iter().all(|v| *v == Some(expected_total)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "every node converges to the exact concurrent total with no lost \
+                 updates, last seen {vals:?} (expected {expected_total})"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+        cluster_c.shutdown().await;
+    }
+
+    /// Contrast with the merged test above: a plain get-then-insert
+    /// read-modify-write, the pattern [`PnCounterResolver`] exists to
+    /// replace, loses updates under the default [`LwwResolver`] even
+    /// though every node's write lands. The three reads below are staged
+    /// to happen before any of the three writes rather than raced against
+    /// each other, so the loss this demonstrates is deterministic — never
+    /// a matter of which write happens to land first.
+    #[tokio::test]
+    async fn get_then_insert_read_modify_write_loses_updates_under_the_default_lww_resolver() {
+        let (cluster_a, cluster_b, cluster_c) = three_node_cluster("cluster-it-crdt-lww-rmw").await;
+
+        // Default resolver: no `.resolver(...)` call, i.e. `LwwResolver`.
+        let cache_a = cluster_a
+            .cache::<u32, u64>("plain-counter")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, u64>("plain-counter")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+        let cache_c = cluster_c
+            .cache::<u32, u64>("plain-counter")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("c opens");
+
+        cache_a.insert(1, 0).await.expect("baseline write");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if cache_a.get(&1).await == Some(0)
+                && cache_b.get(&1).await == Some(0)
+                && cache_c.get(&1).await == Some(0)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the baseline replicates to every node"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // All three nodes read the same pre-increment value...
+        let read_a = cache_a.get(&1).await.expect("a reads the baseline");
+        let read_b = cache_b.get(&1).await.expect("b reads the baseline");
+        let read_c = cache_c.get(&1).await.expect("c reads the baseline");
+
+        // ...then each writes back its own "+1", unaware of the others.
+        cache_a
+            .insert(1, read_a + 1)
+            .await
+            .expect("a writes its increment");
+        cache_b
+            .insert(1, read_b + 1)
+            .await
+            .expect("b writes its increment");
+        cache_c
+            .insert(1, read_c + 1)
+            .await
+            .expect("c writes its increment");
+
+        // Three concurrent "+1"s from a shared base of 0 sum to 3 if none
+        // are lost. Every write here carries the same value (1), so
+        // whichever one LWW keeps, the converged total is 1 regardless of
+        // arrival order — the other two increments are gone.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let vals = [
+                cache_a.get(&1).await,
+                cache_b.get(&1).await,
+                cache_c.get(&1).await,
+            ];
+            if vals.iter().all(|v| *v == Some(1)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "every node converges to the one surviving write, last seen {vals:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+        cluster_c.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn reopening_the_same_cache_name_fails_cleanly() {
         let cluster = Cluster::builder("cluster-it-reopen")
             .seeds(std::iter::empty())
@@ -2209,6 +2422,24 @@ mod tests {
         wait_for_peer_count(&cluster_a, 1).await;
         wait_for_peer_count(&cluster_b, 1).await;
         (cluster_a, cluster_b)
+    }
+
+    /// A fresh 3-node cluster, all-to-all: every node sees the other two
+    /// before this returns.
+    async fn three_node_cluster(cluster_name: &str) -> (Cluster, Cluster, Cluster) {
+        let (cluster_a, cluster_b) = two_node_cluster(cluster_name).await;
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let gossip_b = cluster_b.inner.membership.local_peer().gossip_addr;
+        let cluster_c = Cluster::builder(cluster_name)
+            .seeds([gossip_a, gossip_b])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node c builds");
+        wait_for_peer_count(&cluster_a, 2).await;
+        wait_for_peer_count(&cluster_b, 2).await;
+        wait_for_peer_count(&cluster_c, 2).await;
+        (cluster_a, cluster_b, cluster_c)
     }
 
     /// Polls until `cluster` sees a live peer advertising `cache` under some
@@ -4487,6 +4718,36 @@ mod tests {
             .await
             .expect("build succeeds with a caller-supplied node id");
         assert_eq!(cluster.node_id(), fixed);
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn node_id_builder_rejects_the_merge_sentinel() {
+        let err = Cluster::builder("cluster-it-node-id-sentinel-rejected")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .node_id(NodeId::MERGE_SENTINEL)
+            .build()
+            .await
+            .expect_err("the reserved merge-version sentinel must never become a real node id");
+        assert!(matches!(
+            err,
+            JoinError::ReservedNodeId(id) if id == NodeId::MERGE_SENTINEL
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_id_builder_accepts_a_normal_id() {
+        let normal = NodeId::from(0x1234_5678_u64);
+        let cluster = Cluster::builder("cluster-it-node-id-normal-accepted")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .node_id(normal)
+            .build()
+            .await
+            .expect("a non-reserved node id is accepted");
+        assert_eq!(cluster.node_id(), normal);
 
         cluster.shutdown().await;
     }

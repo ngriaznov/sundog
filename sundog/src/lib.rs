@@ -87,6 +87,7 @@ pub use discovery::Discovery;
 pub use error::{CacheError, CodecError, JoinError};
 pub use hlc::{Hlc, HlcClock};
 pub use node::{NodeId, NodeName};
+pub use store::crdt;
 #[cfg(feature = "spill")]
 pub use store::spill::SpillConfig;
 pub use store::{ConflictResolver, Event, LwwResolver, Mode, Origin, RecordView, Winner};

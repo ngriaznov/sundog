@@ -34,6 +34,10 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
+/// Reference CRDT value types — a PN-Counter today — and the
+/// [`ConflictResolver`]s that merge them through [`Winner::Merged`].
+pub mod crdt;
+
 /// The optional local SSD/NVMe spill tier. Off by default; see
 /// [`spill::SpillConfig`] and [`crate::cache::CacheBuilder::spill`].
 #[cfg(feature = "spill")]
@@ -536,19 +540,31 @@ pub struct RecordView<'a> {
 }
 
 /// The outcome of a [`ConflictResolver::winner`] call: which argument record
-/// wins, by position rather than role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// wins, by position rather than role, or a synthesized merge of both.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Winner {
     /// The first record (`a`) wins; `b` is discarded.
     A,
     /// The second record (`b`) wins; `a` is discarded.
     B,
+    /// Neither `a` nor `b`: the resolver folded both into a new value.
+    /// Legal **only** when both `a.value` and `b.value` were `Some` — a real
+    /// tombstone or a spilled (`value: None`) side on either input makes
+    /// `Merged` a contract violation; the engine enforces this rather than
+    /// trusting the resolver. `expires_at_ms` is the merged record's own
+    /// TTL, decided explicitly by the resolver — the engine never infers
+    /// one from `a`/`b`.
+    Merged {
+        /// The merged record's postcard-encoded value bytes.
+        value: Bytes,
+        /// The merged record's own TTL; never derived from `a`/`b`.
+        expires_at_ms: Option<u64>,
+    },
 }
 
-/// Picks a winner between two differently-versioned records for the same key. A
-/// resolver picks; it never merges, since a synthesized value would make
-/// `Shard::apply`'s outcome depend on which two versions happened to collide
-/// locally.
+/// Picks a winner between two differently-versioned records for the same
+/// key, or folds both into a new value via [`Winner::Merged`].
 ///
 /// # Correctness contract
 ///
@@ -557,23 +573,49 @@ pub enum Winner {
 /// antisymmetric (`winner(key, a, b) == A` iff `winner(key, b, a) == B`, never
 /// favoring argument position), and total and transitive (the "beats" relation
 /// over any set of distinct-version records for one key is a strict total
-/// order, with no cycle). `Shard::apply` calls `winner` only when `a.ver !=
-/// b.ver`.
+/// order, with no cycle) whenever it decides between `A` and `B`.
+/// `Shard::apply` calls `winner` only when `a.ver != b.ver`.
 ///
-/// The default [`LwwResolver`] satisfies all three by comparing [`Hlc`] alone.
-/// A resolver that violates antisymmetry or transitivity is not safe on more
-/// than one replica: nothing in this crate detects the violation, and
-/// convergence stops holding.
+/// A resolver that ever returns [`Winner::Merged`] additionally commits its
+/// merge to the join-semilattice laws: **commutative**
+/// (`merge(a, b) == merge(b, a)` byte-for-byte — the engine calls `winner`
+/// with the stored record first and the incoming record second, an accident
+/// of arrival order, never semantics), **associative** across repeated
+/// pairwise folds (the engine only ever folds one collision at a time, so an
+/// N-way concurrent write converges only if arbitrary fold order and
+/// grouping give the same result), and **idempotent** (`merge(a, a) == a`,
+/// since a redelivered, already-absorbed input must be a no-op).
+///
+/// [`Winner::Merged`] is legal **only** when both `a.value` and `b.value` are
+/// `Some`. A resolver must never override [`ConflictResolver::needs_value_bytes`]
+/// to return `false` if it can ever return `Merged`: doing so hands `winner`
+/// a `RecordView { value: None, .. }` on both sides, with nothing to merge.
+///
+/// The version assigned to a `Merged` outcome is not this trait's concern —
+/// it's computed by the engine as a pure function of `a.ver`/`b.ver`, never
+/// by the resolver.
+///
+/// The default [`LwwResolver`] returns only `A`/`B` and satisfies
+/// antisymmetry and transitivity by comparing [`Hlc`] alone.
+///
+/// The resolver is local, per-`Shard` configuration, never wire-negotiated —
+/// every node in a cluster must run an identical resolver for a given cache,
+/// `Merged`-capable resolvers included. A mid-rollout cluster with some
+/// nodes still on [`LwwResolver`] silently drops the merge property on those
+/// nodes rather than erroring: nothing in this crate detects a
+/// mixed-resolver cluster, exactly as nothing detects one node violating
+/// antisymmetry or transitivity while others don't.
 pub trait ConflictResolver: Send + Sync + 'static {
     /// Decides which of `a`, `b`, two different versions of the record stored
-    /// at `key`'s wire-encoded bytes, wins. See the trait docs for the
-    /// correctness contract.
+    /// at `key`'s wire-encoded bytes, wins, or returns a merge of both. See
+    /// the trait docs for the correctness contract.
     fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner;
 
     /// Whether `winner` reads `RecordView::value`. Defaults to `true`. Override
     /// to `false` for a resolver that, like [`LwwResolver`], only compares
     /// `ver`/`expires_at_ms`, so the versioned apply skips encoding both
-    /// records' values on every apply.
+    /// records' values on every apply. Never override to `false` for a
+    /// resolver that can return [`Winner::Merged`]: see the trait docs.
     fn needs_value_bytes(&self) -> bool {
         true
     }
@@ -3871,6 +3913,49 @@ mod tests {
         assert_eq!(broken.winner(b"k", y, x), Winner::A);
     }
 
+    #[test]
+    fn winner_merged_carries_the_resolvers_value_and_ttl() {
+        let merged = Winner::Merged {
+            value: Bytes::from_static(b"merged-bytes"),
+            expires_at_ms: Some(42),
+        };
+        match merged {
+            Winner::Merged {
+                value,
+                expires_at_ms,
+            } => {
+                assert_eq!(value, Bytes::from_static(b"merged-bytes"));
+                assert_eq!(expires_at_ms, Some(42));
+            }
+            _ => panic!("expected Winner::Merged"),
+        }
+    }
+
+    #[test]
+    fn winner_merged_equality_compares_value_and_ttl() {
+        let a = Winner::Merged {
+            value: Bytes::from_static(b"x"),
+            expires_at_ms: None,
+        };
+        let b = Winner::Merged {
+            value: Bytes::from_static(b"x"),
+            expires_at_ms: None,
+        };
+        let different_value = Winner::Merged {
+            value: Bytes::from_static(b"y"),
+            expires_at_ms: None,
+        };
+        let different_ttl = Winner::Merged {
+            value: Bytes::from_static(b"x"),
+            expires_at_ms: Some(1),
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, different_value);
+        assert_ne!(a, different_ttl);
+        assert_ne!(a, Winner::A);
+        assert_ne!(a, Winner::B);
+    }
+
     #[tokio::test]
     async fn custom_resolver_overrides_plain_hlc_order() {
         let s = shard::<u32, Vec<u8>>(1).with_resolver(Arc::new(LongestValueWins));
@@ -3962,6 +4047,247 @@ mod tests {
             ShardOps::digests(&a).await,
             ShardOps::digests(&b).await,
             "digests diverged between replicas under the same custom resolver"
+        );
+    }
+
+    /// A resolver that always claims to have merged both sides into fixed
+    /// bytes, regardless of whether either side actually carries a value or
+    /// whether those bytes decode as the shard's value type. `resolve_conflict`
+    /// itself is private to `engine.rs`, so this is how its engine-enforced
+    /// tombstone/spill guard and decode-failure rejection get exercised from
+    /// out here, through the public `Shard`/`ShardOps` surface only.
+    #[derive(Debug, Clone)]
+    struct AlwaysMerge {
+        value: Bytes,
+        expires_at_ms: Option<u64>,
+    }
+
+    impl ConflictResolver for AlwaysMerge {
+        fn winner(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Winner {
+            Winner::Merged {
+                value: self.value.clone(),
+                expires_at_ms: self.expires_at_ms,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_against_a_tombstone_degrades_to_keeping_the_stored_record() {
+        let s = shard::<u32, u32>(1).with_resolver(Arc::new(AlwaysMerge {
+            value: Bytes::from(postcard::to_stdvec(&99u32).expect("encode")),
+            expires_at_ms: None,
+        }));
+        // Subscribed before the setup write below: a receiver created after
+        // it fires would never see it and `recv().await` would hang.
+        let mut events = s.events();
+
+        // A bare tombstone for a key that has never existed: `stored_ver` is
+        // `None` going in, so this never consults `AlwaysMerge` at all — it
+        // would otherwise see its own tombstone as a value-less "incoming"
+        // and have the engine's guard reject it, same as the colliding write
+        // below, which is exactly what this test means to isolate instead.
+        ShardOps::apply_remote(
+            &s,
+            WireRecord {
+                key: key_bytes(&1u32),
+                value: None,
+                ver: hlc(1, 1),
+                expires_at_ms: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            s.get(&1).await,
+            None,
+            "tombstoned before the colliding write arrives"
+        );
+        let _ = events
+            .recv()
+            .await
+            .expect("Removed for the setup tombstone");
+        let (_, weight_before) = s.engine.debug_totals();
+
+        let incoming = WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(postcard::to_stdvec(&42u32).expect("encode"))),
+            ver: hlc(u64::MAX, 2),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, incoming).await;
+
+        assert_eq!(
+            s.get(&1).await,
+            None,
+            "a Merged reply against a tombstone is rejected: a deleted key never resurrects"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "the rejected merge publishes no event"
+        );
+        let (_, weight_after) = s.engine.debug_totals();
+        assert_eq!(
+            weight_before, weight_after,
+            "a rejected merge leaves the engine's bookkeeping untouched"
+        );
+    }
+
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn merge_against_a_spilled_side_degrades_to_keeping_the_stored_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-merge-spill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+
+        let s = Shard::<u32, u32>::new(
+            SmolStr::new("merge-spill-test"),
+            Mode::Local,
+            NodeId::from(1),
+            1, // capacity 1: the second insert spills the first
+            None,
+            None,
+        )
+        .with_spill(&cfg)
+        .expect("the tier's directory and region files open")
+        .with_resolver(Arc::new(AlwaysMerge {
+            value: Bytes::from(postcard::to_stdvec(&999u32).expect("encode")),
+            expires_at_ms: None,
+        }));
+
+        s.insert(1, 10).await.expect("insert 1");
+        s.insert(2, 20).await.expect("insert 2");
+
+        // Eviction to disk runs on the flusher thread, off this call's path,
+        // so poll rather than assume it is already done. Polls with
+        // `get_sync`, never `get`: `get` promotes a spilled entry back to
+        // residency on a hit (see its docs), which would silently undo the
+        // very spilled state this test needs in place when the colliding
+        // write arrives below.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let spilled_key = loop {
+            if s.get_sync(&1).is_none() {
+                break 1u32;
+            }
+            if s.get_sync(&2).is_none() {
+                break 2u32;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "neither key spilled within the poll bound"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // The value each key was inserted with, known from the setup above
+        // rather than read back: reading it here (`get`, or `get_sync` on a
+        // spilled key returning a miss) would either promote the entry or
+        // require touching disk, either way risking exactly the promotion
+        // this test must avoid before the colliding write below.
+        let stored_before: u32 = if spilled_key == 1 { 10 } else { 20 };
+        assert!(
+            s.get_sync(&spilled_key).is_none(),
+            "the key must still be spilled when the colliding write arrives"
+        );
+
+        let incoming = WireRecord {
+            key: key_bytes(&spilled_key),
+            value: Some(Bytes::from(postcard::to_stdvec(&123u32).expect("encode"))),
+            ver: hlc(u64::MAX, 9),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, incoming).await;
+
+        // `get` here, after the collision has already been resolved, reads
+        // the still-spilled record back off disk (promoting it in the
+        // process) to confirm its content is exactly what was inserted.
+        assert_eq!(
+            s.get(&spilled_key).await,
+            Some(stored_before),
+            "a Merged reply against a spilled, value-less side is rejected: the stored record is kept"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn merge_with_bytes_that_fail_to_decode_rejects_the_incoming_record() {
+        let s = shard::<u32, u32>(1).with_resolver(Arc::new(AlwaysMerge {
+            value: Bytes::from_static(&[0x80]), // truncated varint: never decodes as u32
+            expires_at_ms: None,
+        }));
+        s.insert(1, 7).await.expect("insert");
+        let (_, weight_before) = s.engine.debug_totals();
+
+        let incoming = WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(postcard::to_stdvec(&5u32).expect("encode"))),
+            ver: hlc(u64::MAX, 2),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, incoming).await;
+
+        assert_eq!(
+            s.get(&1).await,
+            Some(7),
+            "a Merged reply whose bytes fail to decode as V is rejected, not stored"
+        );
+        let (_, weight_after) = s.engine.debug_totals();
+        assert_eq!(
+            weight_before, weight_after,
+            "a rejected decode failure leaves the engine's bookkeeping untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_outcome_stores_the_merged_bytes_under_the_sentinel_version_and_publishes_one_event()
+     {
+        let s = shard::<u32, u32>(1).with_resolver(Arc::new(AlwaysMerge {
+            value: Bytes::from(postcard::to_stdvec(&42u32).expect("encode")),
+            expires_at_ms: None,
+        }));
+        // Subscribed before the setup insert: a receiver created after it
+        // fires would never see it and `recv().await` would hang.
+        let mut events = s.events();
+        s.insert(1, 7).await.expect("insert");
+        let _ = events.recv().await.expect("Created for the setup insert");
+
+        let incoming = WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(postcard::to_stdvec(&5u32).expect("encode"))),
+            ver: hlc(u64::MAX, 2),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote(&s, incoming).await;
+
+        assert_eq!(
+            s.get(&1).await,
+            Some(42),
+            "the resolver's merged value lands, not either input's raw value"
+        );
+
+        match events.recv().await.expect("exactly one event is published") {
+            Event::Updated { key, value, origin } => {
+                assert_eq!(key, 1);
+                assert_eq!(value, 42);
+                assert_eq!(origin, Origin::Remote(NodeId::from(2)));
+            }
+            other => panic!("expected Event::Updated for a merge, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "a merge outcome publishes exactly one event, never a second for the same write"
+        );
+
+        let stored = s
+            .engine
+            .record_for(key_bytes(&1u32).as_ref(), 0)
+            .expect("merged key is live");
+        assert_eq!(
+            stored.ver.node,
+            NodeId::MERGE_SENTINEL,
+            "the merged record is stored under the sentinel-stamped version"
         );
     }
 

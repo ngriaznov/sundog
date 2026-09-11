@@ -15,10 +15,28 @@ use serde::{Deserialize, Serialize};
 pub struct NodeId(u64);
 
 impl NodeId {
+    /// Reserved node id, never assigned to a real node.
+    ///
+    /// The engine's merge-version combinator stamps a merged record's `Hlc`
+    /// with this id as the final tiebreaker, so a merged version can never
+    /// collide with a real single-writer stamp. [`Self::random`] rerolls if
+    /// it ever draws this value, and the explicit-id path
+    /// ([`crate::ClusterBuilder::node_id`]) rejects it outright, so no live
+    /// node is ever assigned this identity.
+    pub(crate) const MERGE_SENTINEL: NodeId = NodeId(u64::MAX);
+
     /// Generates a new random node id.
+    ///
+    /// Never returns the reserved merge-version sentinel id: drawing it is
+    /// rerolled.
     #[must_use]
     pub fn random() -> Self {
-        Self(rand::rng().random())
+        loop {
+            let candidate = Self(rand::rng().random());
+            if candidate != Self::MERGE_SENTINEL {
+                return candidate;
+            }
+        }
     }
 
     /// Returns the raw numeric value.
@@ -91,6 +109,13 @@ mod tests {
     #[test]
     fn random_ids_differ() {
         assert_ne!(NodeId::random(), NodeId::random());
+    }
+
+    #[test]
+    fn random_never_yields_the_merge_sentinel() {
+        for _ in 0..10_000 {
+            assert_ne!(NodeId::random(), NodeId::MERGE_SENTINEL);
+        }
     }
 
     #[test]

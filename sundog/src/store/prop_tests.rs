@@ -602,3 +602,201 @@ proptest! {
         model::run(&ops, &shard, &mut model);
     }
 }
+
+use crdt::{PnCounter, PnCounterResolver};
+
+/// Builds one [`WireRecord`] per origin, each carrying a
+/// [`PnCounter::local_delta`] write for the same fixed key, staggered and
+/// gossip-observed exactly like [`build_records`] so the resulting versions
+/// interleave the way a live cluster's would. `deltas[i]` is the cumulative
+/// increment origin `i` writes.
+fn build_pn_counter_records(deltas: &[u64]) -> Vec<WireRecord> {
+    let mut clocks: Vec<HlcClock> = (0..deltas.len())
+        .map(|i| HlcClock::new(NodeId::from(u64::try_from(i).expect("small") + 1)))
+        .collect();
+    let mut physical_ms: u64 = 1_700_000_000_000;
+    let key_bytes = Bytes::from(postcard::to_stdvec(&0u8).expect("u8 key encodes"));
+
+    deltas
+        .iter()
+        .enumerate()
+        .map(|(origin, &delta)| {
+            physical_ms += 1;
+            let node = NodeId::from(u64::try_from(origin).expect("small") + 1);
+            let ver = clocks[origin].now(physical_ms);
+            let gossip_idx = (origin + 1) % clocks.len();
+            clocks[gossip_idx].observe(physical_ms, ver);
+            let counter = PnCounter::local_delta(node, delta);
+            WireRecord {
+                key: key_bytes.clone(),
+                value: Some(Bytes::from(
+                    counter.encode().expect("PnCounter always encodes"),
+                )),
+                ver,
+                expires_at_ms: None,
+            }
+        })
+        .collect()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// Shard-level convergence under [`PnCounterResolver`]: a multiset of
+    /// concurrent per-origin increments to one shared key, replayed with
+    /// arbitrary permutation, duplication (redelivery), and mixed
+    /// single/batch/concurrent apply order across several shards, converges
+    /// everywhere to byte-identical state — and to the exact sum of every
+    /// generated increment, the "no lost updates" oracle a digest match
+    /// alone doesn't check.
+    #[test]
+    fn pn_counter_merge_converges_to_the_exact_sum_under_any_order(
+        deltas in proptest::collection::vec(0u64..1_000, usize::from(NUM_NODES)),
+        seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
+    ) {
+        let records = build_pn_counter_records(&deltas);
+        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            let mut states = Vec::with_capacity(seeds.len());
+            for &seed in &seeds {
+                let shard = Arc::new(
+                    Shard::<u8, PnCounter>::new(
+                        SmolStr::new("pn-counter-conv"),
+                        Mode::Replicated,
+                        NodeId::from(1000),
+                        10_000,
+                        None,
+                        None,
+                    )
+                    .with_resolver(Arc::new(PnCounterResolver)),
+                );
+                let permuted = shuffled_with_duplicates(&records, seed);
+                if seed % 2 == 0 {
+                    apply_mixed(&shard, permuted, seed).await;
+                } else {
+                    apply_concurrent(&shard, permuted, seed).await;
+                }
+
+                let converged = shard
+                    .get(&0u8)
+                    .await
+                    .expect("at least one origin's write landed");
+                assert_eq!(
+                    converged.value(),
+                    expected_total,
+                    "converged value must equal the exact sum of every generated increment, \
+                     with no lost updates, under seed {seed}"
+                );
+
+                states.push(canonical_state(&shard));
+            }
+            for state in &states[1..] {
+                assert_eq!(
+                    &states[0], state,
+                    "shards diverged under the same PnCounterResolver despite permutation, \
+                     duplication, and mixed apply order"
+                );
+            }
+        });
+    }
+}
+
+/// Targeted example test: a redelivery of an input already folded into a
+/// prior merge is a byte-for-byte, version-for-version no-op. This is the
+/// property that stops a redelivered record from re-broadcasting forever —
+/// a merged version never equals either input's own version (so the
+/// `sv == ver` fast path never fires on redelivery), so the resolver runs
+/// again on every redelivery and must recognize the result as unchanged.
+#[tokio::test]
+async fn pn_counter_redelivery_after_merge_is_a_no_op() {
+    let shard = Shard::<u8, PnCounter>::new(
+        SmolStr::new("pn-counter-redelivery"),
+        Mode::Replicated,
+        NodeId::from(1000),
+        10_000,
+        None,
+        None,
+    )
+    .with_resolver(Arc::new(PnCounterResolver));
+
+    let key_bytes = Bytes::from(postcard::to_stdvec(&0u8).expect("u8 key encodes"));
+    let a = WireRecord {
+        key: key_bytes.clone(),
+        value: Some(Bytes::from(
+            PnCounter::local_delta(NodeId::from(1), 3)
+                .encode()
+                .expect("encodes"),
+        )),
+        ver: Hlc {
+            wall_ms: 100,
+            logical: 0,
+            node: NodeId::from(1),
+        },
+        expires_at_ms: None,
+    };
+    let b = WireRecord {
+        key: key_bytes.clone(),
+        value: Some(Bytes::from(
+            PnCounter::local_delta(NodeId::from(2), 4)
+                .encode()
+                .expect("encodes"),
+        )),
+        ver: Hlc {
+            wall_ms: 200,
+            logical: 0,
+            node: NodeId::from(2),
+        },
+        expires_at_ms: None,
+    };
+
+    ShardOps::apply_remote(&shard, a).await;
+    ShardOps::apply_remote(&shard, b.clone()).await;
+
+    assert_eq!(
+        shard.get(&0u8).await.map(|c| c.value()),
+        Some(7),
+        "two concurrent increments merge to their sum"
+    );
+    let merged = ShardOps::records_for(&shard, vec![key_bytes.clone()])
+        .await
+        .into_iter()
+        .next()
+        .expect("the merged key has a stored record");
+    assert_eq!(
+        merged.ver.node,
+        NodeId::MERGE_SENTINEL,
+        "a real merge stamps the reserved sentinel node, never either input's own node"
+    );
+
+    // Redeliver `b`: already fully absorbed into the merge above, so this
+    // must change nothing — no event, and nothing queued for re-fan-out.
+    let _ = shard.fan_out.drain();
+    let mut events = shard.events();
+
+    ShardOps::apply_remote(&shard, b).await;
+
+    assert_eq!(
+        shard.get(&0u8).await.map(|c| c.value()),
+        Some(7),
+        "redelivering an already-absorbed input does not change the converged value"
+    );
+    let after = ShardOps::records_for(&shard, vec![key_bytes])
+        .await
+        .into_iter()
+        .next()
+        .expect("still stored");
+    assert_eq!(
+        after.ver, merged.ver,
+        "a redelivery no-op leaves the stored version exactly as it was, never re-stamped"
+    );
+    assert!(
+        shard.fan_out.drain().is_empty(),
+        "a redelivery no-op must not be queued for re-fan-out, or it would re-broadcast forever"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "a redelivery no-op must not publish an Event"
+    );
+}
