@@ -453,6 +453,101 @@ async fn cold_join_warms_a_million_entry_cluster() {
     net.close().await.expect("network closes");
 }
 
+/// The million-entry cold-join scenario's counter analogue: three nodes
+/// under `sundog::crdt::PnCounterResolver` (`sundog-testnode`'s `"pn"`
+/// cache) each increment every one of a million counters once,
+/// concurrently, then a fourth node joins cold. Every node must converge
+/// to the exact total (`WRITERS`) on every counter — not merely to some
+/// value every replica happens to agree on — and the cold-joining node's
+/// state transfer must carry that merged total to every key, the same bar
+/// [`cold_join_warms_a_million_entry_cluster`] sets for plain LWW entries.
+#[tokio::test]
+async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
+    const COUNTERS: u32 = 1_000_000;
+    const WRITERS: i64 = 3;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn(&net, "pncounter-cluster", "n1", &[]).await;
+    let n2 = Node::spawn(&net, "pncounter-cluster", "n2", &[&seed("n1")]).await;
+    let n3 = Node::spawn(&net, "pncounter-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
+    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+
+    // Every node increments every counter once, concurrently: `pn0..pn(COUNTERS
+    // - 1)` must converge to a total of `WRITERS`, not just whichever
+    // increment's write happens to land last.
+    let (r1, r2, r3) = tokio::join!(
+        n1.pn_fill(COUNTERS),
+        n2.pn_fill(COUNTERS),
+        n3.pn_fill(COUNTERS)
+    );
+    r1.expect("n1 pnfill succeeds");
+    r2.expect("n2 pnfill succeeds");
+    r3.expect("n3 pnfill succeeds");
+
+    for node in [&n1, &n2, &n3] {
+        eventually(CONVERGE_WAIT, || async {
+            node.pn_count().await == Ok(COUNTERS as usize)
+        })
+        .await;
+    }
+    let last_key = format!("pn{}", COUNTERS - 1);
+    for node in [&n1, &n2, &n3] {
+        eventually(CONVERGE_WAIT, || async {
+            node.pn_get("pn0").await == Ok(Some(WRITERS))
+                && node.pn_get(&last_key).await == Ok(Some(WRITERS))
+        })
+        .await;
+    }
+
+    let (f1_before, b1_before) = n1.netstats().await.expect("n1 netstats before the join");
+    let (f2_before, b2_before) = n2.netstats().await.expect("n2 netstats before the join");
+    let (f3_before, b3_before) = n3.netstats().await.expect("n3 netstats before the join");
+
+    let started = std::time::Instant::now();
+    let n4 = Node::spawn(
+        &net,
+        "pncounter-cluster",
+        "n4",
+        &[&seed("n1"), &seed("n2"), &seed("n3")],
+    )
+    .await;
+    eventually(Duration::from_secs(300), || async {
+        n4.pn_count().await == Ok(COUNTERS as usize)
+    })
+    .await;
+    let warm = started.elapsed();
+
+    let (f1_after, b1_after) = n1.netstats().await.expect("n1 netstats after the join");
+    let (f2_after, b2_after) = n2.netstats().await.expect("n2 netstats after the join");
+    let (f3_after, b3_after) = n3.netstats().await.expect("n3 netstats after the join");
+    let frames_for_join = (f1_after - f1_before) + (f2_after - f2_before) + (f3_after - f3_before);
+    let bytes_for_join = (b1_after - b1_before) + (b2_after - b2_before) + (b3_after - b3_before);
+    let resident_entries = n4.pn_count().await.expect("pncount");
+    println!(
+        "cold join warmed {COUNTERS} counters in {warm:?} (incl. container boot); donors sent \
+         {frames_for_join} frames / {bytes_for_join} bytes; n4 holds {resident_entries} \
+         resident entries"
+    );
+    assert!(
+        warm < Duration::from_secs(120),
+        "cold join took {warm:?}, past the million-counter bar"
+    );
+
+    assert_eq!(n4.pn_get("pn0").await, Ok(Some(WRITERS)));
+    assert_eq!(n4.pn_get(&last_key).await, Ok(Some(WRITERS)));
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    n3.stop().await.expect("n3 stops");
+    n4.stop().await.expect("n4 stops");
+    net.close().await.expect("network closes");
+}
+
 /// A cold node joining a populated cluster warms via state transfer in
 /// seconds, at 100k-entry scale; the printed duration is the number to watch.
 #[tokio::test]

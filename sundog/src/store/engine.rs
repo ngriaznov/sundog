@@ -369,11 +369,16 @@ enum Resolution {
 /// A [`Winner::Merged`] reply is trusted only when both sides actually carry
 /// a value: this is an engine-enforced guard, not just a resolver-authoring
 /// convention, so a resolver that (by bug, or because either side is a real
-/// tombstone or a spill-degraded view) tries to merge against a value-less
-/// side degrades to [`Resolution::IncomingLoses`] rather than ever reaching
-/// [`apply_put`]/[`apply_tombstone`] — a deleted or spilled entry never gets
-/// resurrected or overwritten with a fabricated value, no matter what the
-/// resolver returns.
+/// tombstone, or a spilled side with no tier attached or whose disk read
+/// failed) tries to merge against a value-less side degrades to
+/// [`Resolution::IncomingLoses`] rather than ever reaching
+/// [`apply_put`]/[`apply_tombstone`] — a deleted key never resurrects, and a
+/// spilled entry whose bytes cannot actually be produced is never
+/// overwritten with a fabricated value, no matter what the resolver
+/// returns. A spilled side whose bytes *can* be read back — [`apply_locked`]
+/// does this before ever calling here, via [`read_spilled_for_conflict`] —
+/// is not value-less: the resolver merges against its real content exactly
+/// as it would against a resident record.
 fn resolve_conflict<V>(
     resolver: &dyn ConflictResolver,
     key_bytes: &[u8],
@@ -1110,6 +1115,35 @@ impl<K, V> ApplyOutcome<K, V> {
     }
 }
 
+/// Reads a currently-[`Payload::Spilled`] stored record's value bytes off
+/// disk, so [`resolve_conflict`]'s collision decision can fold a
+/// value-aware resolver against them instead of degrading to its
+/// value-less guard against a spilled side.
+///
+/// Called by [`apply_locked`] under the stripe write lock it already holds
+/// for this key, and only for that one key's own pointer: unlike
+/// [`Engine::spilled_loc`]'s promote-on-read path, which reads off-lock and
+/// must re-validate its pointer afterward against whatever raced it, the
+/// lock here never drops between finding `loc` and this read, so `loc`
+/// cannot go stale out from under it — every path that could invalidate it
+/// (a tombstone, an overwrite, a region reclaim) itself needs this same
+/// stripe's write lock, already held. No re-validation is needed, or done.
+///
+/// `None` on anything [`SpillTier::read_at`] itself treats as an ordinary,
+/// expected outcome rather than a hard error — a torn write, a failed
+/// checksum, or (impossible while this lock holds, but handled identically)
+/// a region rotated past `loc.generation` — or on a genuine I/O error.
+/// Either degrades exactly like a value-less stored side already does in
+/// [`resolve_conflict`]'s guard: never panics, never propagates, and never
+/// blocks the write on anything but this one positional read.
+#[cfg(feature = "spill")]
+fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
+    tier.read_at(loc)
+        .ok()
+        .flatten()
+        .map(|spilled| spilled.encoded)
+}
+
 /// The versioned-apply core: applies `incoming` at `ver` for `key`
 /// (`key_bytes`/`hash` its postcard-encoded bytes and their xxh3 hash) iff
 /// `resolver` picks it over whatever `stripe` currently holds, updating
@@ -1125,6 +1159,14 @@ impl<K, V> ApplyOutcome<K, V> {
 /// `Rejected` outcome, which changes nothing. The caller uses it to keep
 /// `sundog_spill_entries{cache}` correct; see
 /// [`Engine::note_spill_departure`].
+///
+/// `spill`, present only in a `spill`-featured build, is this engine's
+/// attached tier, if any: when the stored side turns out to be
+/// [`Payload::Spilled`] and `resolver` actually reads value bytes
+/// ([`ConflictResolver::needs_value_bytes`]), this reads that side's real
+/// bytes back via [`read_spilled_for_conflict`] instead of handing the
+/// resolver the value-less view a tombstone gets. `None` here — no tier
+/// attached — keeps the old degraded behavior exactly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -1139,6 +1181,7 @@ pub(crate) fn apply_locked<K, V>(
     mut ver: Hlc,
     mut incoming: Incoming<V>,
     resolver: &dyn ConflictResolver,
+    #[cfg(feature = "spill")] spill: Option<&SpillTier>,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
     now_ms: u64,
@@ -1156,14 +1199,20 @@ where
             .live
             .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
             .map(|l| {
-                // A currently-spilled entry has no value bytes to offer a
-                // resolver; it gets the same degraded view a tombstone
-                // already gets: a value-aware `ConflictResolver` sees
-                // `stored_view.value == None`.
+                // A currently-spilled entry has no value bytes resident in
+                // RAM. When `resolver` actually reads them and a tier is
+                // attached, read them back off disk right here, still under
+                // this stripe's write lock — see `read_spilled_for_conflict`.
+                // A resolver that never inspects `stored_view.value`, a key
+                // spilled with no tier attached, or a read that comes back
+                // empty (an already-degraded outcome, not a new one) all
+                // keep the same value-less view a tombstone already gets.
                 let encoded = match &l.payload {
                     Payload::Resident { encoded, .. } => Some(encoded.clone()),
                     #[cfg(feature = "spill")]
-                    Payload::Spilled(_) => None,
+                    Payload::Spilled(loc) => spill
+                        .filter(|_| resolver.needs_value_bytes())
+                        .and_then(|tier| read_spilled_for_conflict(tier, *loc)),
                 };
                 (
                     l.ver,
@@ -1474,10 +1523,10 @@ pub(crate) struct Engine<K, V> {
     pending_spill_weight: AtomicU64,
     /// Whether [`Engine::apply_many`] pre-folds a batch by key ahead of the
     /// stripe lock, for a resolver whose [`ConflictResolver::merges`] is
-    /// `true`. `true` by default; [`Engine::set_prefold_enabled`] (test-only)
-    /// is the only way to turn it off, to compare pre-fold's effect on
-    /// throughput against the unfolded per-record path it otherwise always
-    /// takes. Has no effect at all on a resolver that doesn't merge — see
+    /// `true`. `true` by default; [`Engine::set_prefold_enabled`] is the
+    /// only way to turn it off, to compare pre-fold's effect on throughput
+    /// against the unfolded per-record path it otherwise always takes. Has
+    /// no effect at all on a resolver that doesn't merge — see
     /// `apply_many`'s docs.
     prefold_enabled: AtomicBool,
     #[cfg(test)]
@@ -2464,13 +2513,24 @@ where
         }
     }
 
-    /// Test-only: flips [`Engine::apply_many`]'s pre-fold on or off, `true`
-    /// by default. Only a test ever needs it off, to compare pre-fold's
+    /// Flips [`Engine::apply_many`]'s pre-fold on or off, `true` by default.
+    /// Only a benchmark or test ever needs it off, to compare pre-fold's
     /// effect on throughput against the unfolded per-record path it
-    /// otherwise always takes; nothing else in this crate ever calls it.
-    #[cfg(test)]
+    /// otherwise always takes; nothing on a real write path ever calls it.
+    /// [`super::Shard::with_prefold_enabled`] is the `#[doc(hidden)]` seam
+    /// that reaches this from `crate::cache::CacheBuilder::prefold_enabled`,
+    /// in turn reachable from an integration-test binary outside this
+    /// crate, which is why this can no longer be `#[cfg(test)]`-gated.
     pub(crate) fn set_prefold_enabled(&self, enabled: bool) {
         self.prefold_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The current value of [`Engine::set_prefold_enabled`]'s flag. Only a
+    /// test reads it back; the write path only ever needs the flag itself,
+    /// via [`Self::apply_many`].
+    #[cfg(test)]
+    pub(crate) fn prefold_enabled(&self) -> bool {
+        self.prefold_enabled.load(Ordering::Relaxed)
     }
 
     /// Applies a batch of versioned writes that all hash into `bucket`, under
@@ -2479,8 +2539,10 @@ where
     /// iff the batch put anything.
     ///
     /// When `resolver`'s [`ConflictResolver::merges`] is `true` and
-    /// pre-folding is enabled (`prefold_enabled`, on by default outside a
-    /// test), `entries` is first grouped into runs and, for every run long
+    /// pre-folding is enabled (`prefold_enabled`, on by default, off only
+    /// when a caller has reached [`Engine::set_prefold_enabled`] through
+    /// [`super::Shard::with_prefold_enabled`]), `entries` is first grouped
+    /// into runs and, for every run long
     /// enough to fold, has its key's real stored record peeked under a
     /// brief stripe *read* lock (dropped again before any decode or fold
     /// work runs), then folded through [`prefold_batch`] entirely outside
@@ -2544,6 +2606,8 @@ where
                     ver,
                     incoming,
                     resolver,
+                    #[cfg(feature = "spill")]
+                    self.spill().map(Arc::as_ref),
                     tombstone_ttl_ms,
                     tombstone_max_ttl_ms,
                     now_ms,
@@ -3259,6 +3323,8 @@ mod tests {
                     encoded,
                 },
                 &resolver,
+                #[cfg(feature = "spill")]
+                engine.spill().map(Arc::as_ref),
                 60_000,
                 600_000,
                 now_ms,
@@ -3295,6 +3361,8 @@ mod tests {
             ver,
             Incoming::Tombstone,
             &resolver,
+            #[cfg(feature = "spill")]
+            engine.spill().map(Arc::as_ref),
             60_000,
             600_000,
             now_ms,
@@ -3340,6 +3408,8 @@ mod tests {
                     encoded,
                 },
                 resolver,
+                #[cfg(feature = "spill")]
+                engine.spill().map(Arc::as_ref),
                 60_000,
                 600_000,
                 now_ms,
@@ -3936,6 +4006,8 @@ mod tests {
                 hlc(2, 1),
                 Incoming::Tombstone,
                 &resolver,
+                #[cfg(feature = "spill")]
+                engine.spill().map(Arc::as_ref),
                 60_000,
                 600_000,
                 0,
@@ -4349,6 +4421,8 @@ mod tests {
                 hlc(2, 1),
                 Incoming::Tombstone,
                 &resolver,
+                #[cfg(feature = "spill")]
+                engine.spill().map(Arc::as_ref),
                 60_000,
                 600_000,
                 0,
@@ -4479,6 +4553,8 @@ mod tests {
                         encoded,
                     },
                     &resolver,
+                    #[cfg(feature = "spill")]
+                    engine.spill().map(Arc::as_ref),
                     60_000,
                     600_000,
                     0,
@@ -4815,6 +4891,8 @@ mod tests {
                             encoded,
                         },
                         &resolver,
+                        #[cfg(feature = "spill")]
+                        engine.spill().map(Arc::as_ref),
                         1_000,
                         10_000,
                         now,
@@ -4839,6 +4917,8 @@ mod tests {
                         ver,
                         Incoming::Tombstone,
                         &resolver,
+                        #[cfg(feature = "spill")]
+                        engine.spill().map(Arc::as_ref),
                         1_000,
                         10_000,
                         now,
@@ -5019,6 +5099,8 @@ mod tests {
                 hlc(2, 1),
                 Incoming::Tombstone,
                 &resolver,
+                #[cfg(feature = "spill")]
+                engine.spill().map(Arc::as_ref),
                 60_000,
                 600_000,
                 0,
@@ -5563,6 +5645,8 @@ mod tests {
                     hlc(2, 1),
                     Incoming::Tombstone,
                     &resolver,
+                    #[cfg(feature = "spill")]
+                    engine.spill().map(Arc::as_ref),
                     60_000,
                     600_000,
                     0,
@@ -5884,6 +5968,8 @@ mod tests {
                     hlc(2, 1),
                     Incoming::Tombstone,
                     &resolver,
+                    #[cfg(feature = "spill")]
+                    engine.spill().map(Arc::as_ref),
                     60_000,
                     600_000,
                     0,
@@ -6007,6 +6093,8 @@ mod tests {
                     hlc(2, 1),
                     Incoming::Tombstone,
                     &resolver,
+                    #[cfg(feature = "spill")]
+                    engine.spill().map(Arc::as_ref),
                     60_000,
                     600_000,
                     0,
@@ -6187,7 +6275,10 @@ mod tests {
 
             const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
-            fn is_spilled(engine: &Engine<u32, String>, kb: &Bytes) -> bool {
+            fn is_spilled<V>(engine: &Engine<u32, V>, kb: &Bytes) -> bool
+            where
+                V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+            {
                 let hash = hash_key_bytes(kb.as_ref());
                 let bucket = stripe_index_from_hash(hash);
                 let stripe = engine.stripe_lock(bucket).read();
@@ -6623,6 +6714,96 @@ mod tests {
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, &key_bytes(keys[1]))),
                     "the retried victim is spilled once the tier has room again"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// `resolve_conflict`'s tombstone/spill guard only ever degrades a
+            /// misbehaving resolver's own `Winner::Merged` reply; a
+            /// well-behaved value-aware resolver's *own* fallback (returning
+            /// `A`/`B` by `Hlc` order whenever it is handed a value-less
+            /// side) must never fire here just because the stored side
+            /// happens to be spilled rather than actually value-less. This
+            /// pins that `apply_locked` reads a spilled stored record's real
+            /// bytes back off disk before consulting the resolver, so a
+            /// merge against it folds exactly as it would against a resident
+            /// record, rather than discarding whichever side loses the
+            /// outright `Hlc` fallback.
+            #[test]
+            fn merge_against_a_spilled_counter_folds_the_stored_side_instead_of_dropping_it() {
+                use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+                let dir = temp_dir("merge-spilled");
+                let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+                let tier = Arc::new(SpillTier::open(&cfg, "merge-spilled").expect("tier opens"));
+                let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                let resolver = PnCounterResolver;
+                let key = 1u32;
+                let kb = key_bytes(key);
+                let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+                let node_a = NodeId::from(11);
+                let node_b = NodeId::from(22);
+
+                let _ = put_with_resolver(
+                    &engine,
+                    key,
+                    kb.clone(),
+                    PnCounter::local_delta(node_a, 3),
+                    hlc(1, 1),
+                    None,
+                    0,
+                    &resolver,
+                );
+
+                let _ = engine.evict_one_sampled(bucket);
+                assert!(
+                    poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
+                    "the flusher installs the spilled entry"
+                );
+
+                // Colliding write from a second, disjoint writer: before the
+                // spilled-value read existed, the stored side's value-less
+                // view would send `PnCounterResolver` to its plain-`Hlc`
+                // fallback, and this strictly newer incoming version would
+                // win outright, discarding node_a's spilled contribution
+                // instead of folding it in.
+                let outcome = put_with_resolver(
+                    &engine,
+                    key,
+                    kb.clone(),
+                    PnCounter::local_delta(node_b, 4),
+                    hlc(5, 2),
+                    None,
+                    0,
+                    &resolver,
+                );
+
+                match outcome {
+                    ApplyOutcome::Put { value, .. } => {
+                        assert_eq!(
+                            value.value(),
+                            7,
+                            "merging against a spilled stored record folds its contribution \
+                             instead of dropping it"
+                        );
+                    }
+                    ApplyOutcome::Rejected => {
+                        panic!("expected a Put outcome carrying the merged counter, got Rejected")
+                    }
+                    ApplyOutcome::Tombstoned { .. } => {
+                        panic!("expected a Put outcome carrying the merged counter, got Tombstoned")
+                    }
+                }
+                assert_eq!(
+                    engine.get(&key, 0).map(|c| c.value()),
+                    Some(7),
+                    "the merged counter reads back resident, carrying both sides' \
+                     contributions"
                 );
 
                 let _ = std::fs::remove_dir_all(&dir);
@@ -7082,6 +7263,21 @@ mod tests {
                 "pre-fold changes only which position carries the real outcome, \
                  never the final stored record"
             );
+        }
+
+        #[test]
+        fn set_prefold_enabled_toggles_the_flag_the_getter_reports() {
+            let engine: SetEngine = Engine::new(u64::MAX, None, None);
+            assert!(
+                engine.prefold_enabled(),
+                "pre-fold defaults to on, matching apply_many's own default"
+            );
+
+            engine.set_prefold_enabled(false);
+            assert!(!engine.prefold_enabled());
+
+            engine.set_prefold_enabled(true);
+            assert!(engine.prefold_enabled());
         }
     }
 }

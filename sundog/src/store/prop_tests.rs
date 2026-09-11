@@ -706,6 +706,79 @@ proptest! {
     }
 }
 
+#[cfg(feature = "spill")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    /// [`pn_counter_merge_converges_to_the_exact_sum_under_any_order`]'s own
+    /// workload, replayed against a shard with a real spill tier attached
+    /// and a weight cap tight enough that its one counter key spills and
+    /// re-residents repeatedly under capacity pressure as the workload
+    /// replays: a merge that lands while the stored side is spilled must
+    /// fold against it exactly as it would resident, so convergence to the
+    /// exact sum, with no lost updates, still holds.
+    /// `Engine::debug_snapshot` (`canonical_state`'s source) panics once a
+    /// spill tier is attached, so this checks convergence via `Shard::get`
+    /// alone, without the byte-identical cross-replica compare the
+    /// non-spill property makes.
+    #[test]
+    fn pn_counter_merge_converges_to_the_exact_sum_with_a_spill_tier_under_capacity_pressure(
+        deltas in proptest::collection::vec(0u64..1_000, usize::from(NUM_NODES)),
+        seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
+    ) {
+        let records = build_pn_counter_records(&deltas);
+        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let rt = current_thread_runtime();
+
+        rt.block_on(async {
+            for &seed in &seeds {
+                let dir = std::env::temp_dir().join(format!(
+                    "sundog-prop-merge-spill-{}-{:?}-{seed}",
+                    std::process::id(),
+                    std::thread::current().id(),
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                let cfg = spill::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+                let shard = Arc::new(
+                    Shard::<u8, PnCounter>::new(
+                        SmolStr::new("pn-counter-conv-spill"),
+                        Mode::Replicated,
+                        NodeId::from(1000),
+                        1, // a tiny weight cap: the weigher below always exceeds it
+                        None,
+                        None,
+                    )
+                    .with_resolver(Arc::new(PnCounterResolver))
+                    .with_weigher(|_key: &u8, _value: &PnCounter| 2)
+                    .with_spill(&cfg)
+                    .expect("the tier's directory and region files open"),
+                );
+
+                let permuted = shuffled_with_duplicates(&records, seed);
+                if seed % 2 == 0 {
+                    apply_mixed(&shard, permuted, seed).await;
+                } else {
+                    apply_concurrent(&shard, permuted, seed).await;
+                }
+
+                let converged = shard
+                    .get(&0u8)
+                    .await
+                    .expect("at least one origin's write landed");
+                assert_eq!(
+                    converged.value(),
+                    expected_total,
+                    "converged value must equal the exact sum of every generated increment, \
+                     with no lost updates, under seed {seed}, with a spill tier attached under \
+                     capacity pressure"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        });
+    }
+}
+
 /// Targeted example test: a redelivery of an input already folded into a
 /// prior merge is a byte-for-byte, version-for-version no-op. This is the
 /// property that stops a redelivered record from re-broadcasting forever —

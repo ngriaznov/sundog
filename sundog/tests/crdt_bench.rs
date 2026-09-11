@@ -63,34 +63,46 @@
 //! Lever A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine.rs`)
 //! in scenarios 9 and 10, Lever B (`Cache::merge`'s coalescing window) in
 //! scenarios 11 and 12. Both levers' on/off (or window) comparisons are
-//! measured through public API alone, since `Engine::set_prefold_enabled`
-//! is `pub(crate)` and `#[cfg(test)]`-only inside the library crate — this
-//! binary links against it as an ordinary downstream crate and has no seam
-//! to flip that engine-level flag. Scenario 9 (`apply_many_prefold`)
-//! approximates pre-fold "off" as the same batch applied one record at a
-//! time through `Cache::insert` (itself always a singleton `apply_many`
-//! call, `sundog/src/store/mod.rs`'s `insert_expiring`): a batch of one can
-//! never contain a same-key run for pre-fold to fold regardless of the real
-//! flag's state, so this reproduces pre-fold's structural effect (one full
-//! `apply_locked` cycle per record instead of one per run) without the
-//! internal flag, at the cost of also paying one stripe-lock acquisition
-//! and cache-layer call per record that a true toggle-off, still batched
-//! under one call, would not — see the scenario's own doc for the resulting
-//! per-op inflation on that side. Scenario 10
-//! (`replicated_hot_counter_receive`) has no such proxy on the replication
-//! receive path — a receiving node's batch shape comes from the sender's
-//! own fan-out, not from anything this crate controls — so it reports only
-//! today's real (pre-fold-on) apply count and convergence time, with the
-//! "off" comparison left unmeasured from here; see the scenario's own doc.
-//! Scenarios 11 and 12 use `Cache::merge` and `CacheBuilder::merge_coalesce_window`
-//! directly, both genuinely public, so no such proxy is needed there.
+//! measured through the real toggle now: `CacheBuilder::prefold_enabled`
+//! (`#[doc(hidden)]`, `sundog/src/cache.rs`) threads down to
+//! `Shard::with_prefold_enabled` and `Engine::set_prefold_enabled`, so this
+//! binary, an ordinary downstream crate, can open a cache with pre-fold
+//! genuinely off rather than approximating it. Scenario 9
+//! (`apply_many_prefold`) runs the identical `insert_many` batch against
+//! two caches that differ only in that flag — "on" the default, "off"
+//! `.prefold_enabled(false)` — so both sides pay the same single stripe-lock
+//! acquisition and the same batch shape; only whether `apply_many` folds a
+//! same-key run before applying it differs. Scenario 10
+//! (`replicated_hot_counter_receive`) applies the same toggle to the two
+//! *receiving* nodes: a receiving node's batch shape comes from the
+//! sender's own fan-out, not from anything this crate builds directly, but
+//! `CacheBuilder::prefold_enabled` reaches that node's engine exactly the
+//! same way regardless of who assembled the batch, so both an "on" and a
+//! real "off" run are reported. Scenarios 11 and 12 use `Cache::merge` and
+//! `CacheBuilder::merge_coalesce_window` directly, both genuinely public, so
+//! neither needed a new seam.
 //! Scenarios 9-12 all report "engine applies" as `Cache::events()`'s own
 //! count: one event per non-no-op apply, the only public-API signal for
 //! how many times the engine actually applied, per `Cache::merge`'s and the
 //! resolver contract's own docs.
+//!
+//! Scenario 13 (`sketch_path_convergence`) checks `docs/crdt-merge-poc.md`'s
+//! scale-hardening item on the IBLT sketch path: `ClusterConfig::ae_sketch_min_bucket`
+//! lowered, and `keys` filler entries forced into one anti-entropy bucket,
+//! so a deliberately seeded mismatch there (`Cache::invalidate_local` on one
+//! node, past state transfer entirely) answers with a sketch
+//! (`cluster::sketch::Iblt`) rather than a listing. `lww` (non-merging) and
+//! `pn_counter` (merging) both run it, sharing the `keys` knob. It reports
+//! `sundog_ae_sketch_total`'s existing `decoded`/`fallback` outcome
+//! counters — no new metric, since that counter already covers a peel
+//! success and a peel fallback exactly — as "`sketch_peeled`" and
+//! "`sketch_fallback`", plus their sum as "`sketch_rounds`": how many times
+//! this scenario's bucket answered a mismatch through the sketch mechanism
+//! at all, successfully or not, before it reconverged.
 
 mod common;
 
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +112,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sundog::crdt::{PnCounter, PnCounterResolver};
 use sundog::{Cluster, ClusterConfig, ConflictResolver, Mode, NodeId, RecordView, Winner};
+use xxhash_rust::xxh3::xxh3_64;
 
 #[cfg(feature = "prometheus")]
 use std::sync::OnceLock;
@@ -217,7 +230,8 @@ async fn local_cluster(name: &str) -> Cluster {
 }
 
 /// Builds three loopback `Mode::Replicated` caches of the same name across
-/// `cluster_a`/`cluster_b`/`cluster_c`, sharing one `resolver`.
+/// `cluster_a`/`cluster_b`/`cluster_c`, sharing one `resolver`, pre-fold on
+/// (the default) for all three.
 async fn open_replicated_trio<V>(
     cluster_a: &Cluster,
     cluster_b: &Cluster,
@@ -232,21 +246,59 @@ async fn open_replicated_trio<V>(
 where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    open_replicated_trio_with_prefold(
+        cluster_a,
+        cluster_b,
+        cluster_c,
+        cache_name,
+        resolver,
+        [true, true, true],
+    )
+    .await
+}
+
+/// Like [`open_replicated_trio`], but opens each node's cache with
+/// `CacheBuilder::prefold_enabled` (`sundog/src/cache.rs`'s `#[doc(hidden)]`
+/// mirror of `Engine::set_prefold_enabled`) set from `prefold_enabled`,
+/// node a/b/c in order. Scenario 10 uses this to build its two *receiving*
+/// nodes with the flag genuinely off, rather than scenario 9's
+/// identical-batch, differently-toggled-cache comparison — there is no
+/// local batch to build differently on the receive path, only the real
+/// flag each receiving node opens with.
+async fn open_replicated_trio_with_prefold<V>(
+    cluster_a: &Cluster,
+    cluster_b: &Cluster,
+    cluster_c: &Cluster,
+    cache_name: &str,
+    resolver: Arc<dyn ConflictResolver>,
+    prefold_enabled: [bool; 3],
+) -> (
+    sundog::Cache<u32, V>,
+    sundog::Cache<u32, V>,
+    sundog::Cache<u32, V>,
+)
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let [a_prefold, b_prefold, c_prefold] = prefold_enabled;
     let (a, b, c) = tokio::join!(
         cluster_a
             .cache::<u32, V>(cache_name)
             .mode(Mode::Replicated)
             .resolver(resolver.clone())
+            .prefold_enabled(a_prefold)
             .open(),
         cluster_b
             .cache::<u32, V>(cache_name)
             .mode(Mode::Replicated)
             .resolver(resolver.clone())
+            .prefold_enabled(b_prefold)
             .open(),
         cluster_c
             .cache::<u32, V>(cache_name)
             .mode(Mode::Replicated)
             .resolver(resolver)
+            .prefold_enabled(c_prefold)
             .open(),
     );
     (
@@ -425,6 +477,61 @@ fn ae_repaired_field_named(label: &str, median: u64) -> String {
 
 #[cfg(not(feature = "prometheus"))]
 fn ae_repaired_field_named(_label: &str, _median: u64) -> String {
+    String::new()
+}
+
+/// The current value of `sundog_ae_sketch_total{cache=cache_name,outcome=outcome}`
+/// — scenario 13's own peel-success (`outcome="decoded"`) and fallback
+/// (`outcome="fallback"`) counts, the existing metric
+/// `cluster::anti_entropy::handle_sketch_mismatch` already emits, reused
+/// here rather than adding a new one — or 0 if the recorder never installed
+/// or the counter never incremented.
+#[cfg(feature = "prometheus")]
+fn sketch_outcome_total(cache_name: &str, outcome: &str) -> u64 {
+    let value = metrics_handle().and_then(|h| {
+        scraped_metric(
+            &h.render(),
+            "sundog_ae_sketch_total",
+            &[("cache", cache_name), ("outcome", outcome)],
+        )
+    });
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "sundog_ae_sketch_total is a nonnegative counter"
+    )]
+    let count = value.unwrap_or(0.0).round() as u64;
+    count
+}
+
+/// [`ae_repaired_snapshot`]'s counterpart for [`sketch_outcome_total`], for
+/// a before/after delta around one repetition's writes and convergence
+/// wait.
+#[cfg(feature = "prometheus")]
+fn sketch_outcome_snapshot(cache_name: &str, outcome: &str) -> u64 {
+    sketch_outcome_total(cache_name, outcome)
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn sketch_outcome_snapshot(_cache_name: &str, _outcome: &str) -> u64 {
+    0
+}
+
+/// Renders scenario 13's own `sketch_rounds`/`sketch_peeled`/`sketch_fallback`
+/// fields: `sketch_rounds` is `decoded + fallback`, how many times this
+/// scenario's buckets answered a mismatch through the sketch mechanism at
+/// all, successfully or not. Empty under a build without `prometheus`,
+/// matching every other `prometheus`-gated field on a `BENCH` line.
+#[cfg(feature = "prometheus")]
+fn sketch_outcome_field(decoded: u64, fallback: u64) -> String {
+    format!(
+        " sketch_rounds={} sketch_peeled={decoded} sketch_fallback={fallback}",
+        decoded + fallback
+    )
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn sketch_outcome_field(_decoded: u64, _fallback: u64) -> String {
     String::new()
 }
 
@@ -1872,16 +1979,14 @@ where
 // to fold, so its only cost is the batch's own by-key grouping pass). Each
 // shape runs under both `LwwResolver` (`merges() == false`, pre-fold never
 // engages regardless of the flag) and `PnCounterResolver` (`merges() ==
-// true`) — the module doc above explains why "on" and "off" are measured
-// this way rather than through the real, unreachable engine flag: "on" is
-// one `insert_many` call over the whole batch (today's unconditional
-// default whenever the resolver merges), "off" is `batch_size` separate
-// `Cache::insert` calls, each already a singleton `apply_many` batch
-// (`sundog/src/store/mod.rs`'s `insert_expiring`) that pre-fold can
-// structurally never fold regardless of its flag's state. The `many_keys`
-// shape's on/off pair is expected to land close together for both
-// resolvers — there is nothing to fold either way, so it isolates pre-fold's
-// idle grouping-pass overhead from its `one_key` fold benefit.
+// true`) — "on" and "off" now open two caches that differ only in
+// `CacheBuilder::prefold_enabled`, both driven by the identical
+// `insert_many` call over the identical batch: the only thing that differs
+// between the two timed passes is whether `Engine::apply_many` folds a
+// same-key run before applying it. The `many_keys` shape's on/off pair is
+// expected to land close together for both resolvers — there is nothing to
+// fold either way, so it isolates pre-fold's idle grouping-pass overhead
+// from its `one_key` fold benefit.
 // ---------------------------------------------------------------------
 
 /// `SUNDOG_BENCH_KEYS` default for `apply_many_prefold`'s batch size,
@@ -1911,27 +2016,59 @@ fn print_prefold_bench(name: &str, batch_size: u32, reps: &[PrefoldRepMetrics]) 
     );
 }
 
-/// One `apply_many_prefold` rep for one (shape, resolver) combo: opens a
-/// fresh single-node cache, times the whole `batch_size`-record batch
-/// through one `insert_many` call ("on") and the identical batch through
-/// `batch_size` separate `insert` calls ("off"), with a `clear` between the
-/// two passes. `swap_order` runs "off" before "on" instead of the reverse —
-/// the caller alternates it across reps so whichever pass runs second on a
-/// freshly opened cache (and so benefits from the first pass's allocator/JIT
-/// warm-up) is not always the same one, canceling that bias out across reps
-/// rather than always favoring "off".
+/// One `apply_many_prefold` rep for one (shape, resolver) combo: opens two
+/// fresh single-node caches under the same name in turn — "on"
+/// (`CacheBuilder::prefold_enabled`'s default `true`) and "off"
+/// (`.prefold_enabled(false)`) — closing the first before opening the
+/// second so both can use the same `cache_name`, and times the identical
+/// `batch_size`-record `insert_many` call against each. `swap_order` runs
+/// "off" before "on" instead of the reverse — the caller alternates it
+/// across reps so whichever pass runs second on a freshly built cluster
+/// (and so benefits from the first pass's allocator/JIT warm-up) is not
+/// always the same one, canceling that bias out across reps rather than
+/// always favoring "off".
 ///
-/// This is a proxy for pre-fold's own effect, not an isolated measurement of
-/// it: `insert_many` already takes one stripe lock for the whole batch
-/// regardless of pre-fold (see `Engine::apply_many`), while the "off" loop
-/// pays `batch_size` separate lock acquisitions and immediate per-call
-/// fan-out pushes that a real pre-fold-off flag would not — `Engine::
-/// set_prefold_enabled` exists but is `#[cfg(test)]`, unreachable from this
-/// integration-test binary. `LwwResolver::merges()` is `false`, so it never
-/// triggers pre-fold at all: its own on/off gap, measured the identical way,
-/// is pure proxy overhead with no pre-fold effect in it, which is what
-/// `print_prefold_isolated_delta` subtracts from `PnCounterResolver`'s gap
-/// to estimate pre-fold's effect alone.
+/// Both passes take the identical single stripe-lock acquisition for the
+/// whole batch (`insert_many` always does, pre-fold or not — see
+/// `Engine::apply_many`) and pay the identical per-call fan-out push, so the
+/// only thing that can differ between them is whether `apply_many` actually
+/// folds a same-key run before applying it — a real measurement of the
+/// flag, not a proxy. `LwwResolver::merges()` is `false`, so it never
+/// triggers pre-fold at all regardless of the flag: its on/off gap is
+/// expected to land near zero, which `print_prefold_isolated_delta` checks
+/// by subtracting it from `PnCounterResolver`'s gap over the same shape.
+/// `run_prefold_rep`'s one timed pass: opens `cache_name` on `cluster` with
+/// `CacheBuilder::prefold_enabled` set from `prefold_enabled`, times one
+/// `insert_many(entries)` call against it, then closes the cache so the
+/// name is free for the other pass to reopen.
+async fn timed_insert_many<V>(
+    cluster: &Cluster,
+    cache_name: &str,
+    resolver: Arc<dyn ConflictResolver>,
+    prefold_enabled: bool,
+    entries: Vec<(u32, V)>,
+) -> Duration
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let cache = cluster
+        .cache::<u32, V>(cache_name)
+        .mode(Mode::Local)
+        .resolver(resolver)
+        .prefold_enabled(prefold_enabled)
+        .open()
+        .await
+        .expect("cache opens");
+    let started = Instant::now();
+    cache
+        .insert_many(entries)
+        .await
+        .expect("insert_many applies");
+    let elapsed = started.elapsed();
+    cache.close().await;
+    elapsed
+}
+
 async fn run_prefold_rep<V>(
     cluster_label: &str,
     cache_name: &str,
@@ -1948,62 +2085,31 @@ where
     let _ = metrics_handle();
 
     let cluster = local_cluster(cluster_label).await;
-    let cache = cluster
-        .cache::<u32, V>(cache_name)
-        .mode(Mode::Local)
-        .resolver(resolver)
-        .open()
-        .await
-        .expect("cache opens");
 
     let key_for = |i: u32| if one_key { 0 } else { i };
-    let on_entries: Vec<(u32, V)> = (0..batch_size).map(|i| (key_for(i), make(i))).collect();
+    let entries: Vec<(u32, V)> = (0..batch_size).map(|i| (key_for(i), make(i))).collect();
 
     let (on_elapsed, off_elapsed) = if swap_order {
-        let off_started = Instant::now();
-        for i in 0..batch_size {
-            cache
-                .insert(key_for(i), make(i))
-                .await
-                .expect("prefold-off singleton insert applies");
-        }
-        let off_elapsed = off_started.elapsed();
-
-        cache
-            .clear()
-            .await
-            .expect("clear resets state for the on pass");
-
-        let on_started = Instant::now();
-        cache
-            .insert_many(on_entries)
-            .await
-            .expect("prefold-on batch applies");
-        let on_elapsed = on_started.elapsed();
-
+        let off_elapsed = timed_insert_many(
+            &cluster,
+            cache_name,
+            resolver.clone(),
+            false,
+            entries.clone(),
+        )
+        .await;
+        let on_elapsed = timed_insert_many(&cluster, cache_name, resolver, true, entries).await;
         (on_elapsed, off_elapsed)
     } else {
-        let on_started = Instant::now();
-        cache
-            .insert_many(on_entries)
-            .await
-            .expect("prefold-on batch applies");
-        let on_elapsed = on_started.elapsed();
-
-        cache
-            .clear()
-            .await
-            .expect("clear resets state for the off pass");
-
-        let off_started = Instant::now();
-        for i in 0..batch_size {
-            cache
-                .insert(key_for(i), make(i))
-                .await
-                .expect("prefold-off singleton insert applies");
-        }
-        let off_elapsed = off_started.elapsed();
-
+        let on_elapsed = timed_insert_many(
+            &cluster,
+            cache_name,
+            resolver.clone(),
+            true,
+            entries.clone(),
+        )
+        .await;
+        let off_elapsed = timed_insert_many(&cluster, cache_name, resolver, false, entries).await;
         (on_elapsed, off_elapsed)
     };
 
@@ -2017,14 +2123,12 @@ where
     }
 }
 
-/// The proxy `run_prefold_rep` measures conflates pre-fold's own effect with
-/// batching/fan-out overhead the "off" loop pays and a real pre-fold-off
-/// flag would not (see `run_prefold_rep`'s doc). `LwwResolver` never
-/// triggers pre-fold (`merges()` is `false`), so its on/off gap, measured
-/// through the identical proxy, is that overhead alone; subtracting it from
-/// `PnCounterResolver`'s gap over the same shape and batch size estimates
-/// pre-fold's own contribution in isolation, rather than reporting either
-/// resolver's raw on/off numbers as pre-fold's own effect.
+/// `LwwResolver` never triggers pre-fold (`merges()` is `false`), so its
+/// on/off gap, measured through the identical `run_prefold_rep` toggle, is
+/// expected to land near zero; subtracting it from `PnCounterResolver`'s
+/// gap over the same shape and batch size is a sanity check on that
+/// expectation rather than a correction for proxy overhead, now that both
+/// resolvers' "on" and "off" passes run the identical `insert_many` call.
 fn print_prefold_isolated_delta(
     name: &str,
     batch_size: u32,
@@ -2110,13 +2214,12 @@ async fn apply_many_prefold() {
 // the resulting writes rather than the one issuing them, so a concurrent
 // writer burst on `cache_a` arrives at `cache_b`/`cache_c` as fan-out and
 // anti-entropy batches carrying several records for the same key —
-// `apply_remote_batch`'s own batch shape, exactly what pre-fold folds. The
-// module doc above explains why this scenario reports only today's real
-// (pre-fold-on) numbers: unlike scenario 9's local batch, a receiving
-// node's batch shape comes from the sender's own fan-out and this crate has
-// no public lever over it, so there is no honest "off" proxy to construct
-// here the way scenario 9's singleton-insert loop is for a batch this crate
-// builds itself.
+// `apply_remote_batch`'s own batch shape, exactly what pre-fold folds. Runs
+// twice, "on" (both receivers' default `prefold_enabled(true)`) and "off"
+// (both receivers opened with `.prefold_enabled(false)`, `cache_a` itself
+// left on since it is never the one instrumented) — a real off variant,
+// since `CacheBuilder::prefold_enabled` reaches a receiving node's engine
+// the same way regardless of who assembled the batch it applies.
 // ---------------------------------------------------------------------
 
 struct HotCounterReceiveRepMetrics {
@@ -2128,9 +2231,14 @@ struct HotCounterReceiveRepMetrics {
     lost_updates: u64,
 }
 
-fn print_hot_counter_receive_bench(writers: u32, iters: u32, reps: &[HotCounterReceiveRepMetrics]) {
+fn print_hot_counter_receive_bench(
+    variant: &str,
+    writers: u32,
+    iters: u32,
+    reps: &[HotCounterReceiveRepMetrics],
+) {
     println!(
-        "BENCH replicated_hot_counter_receive writers={writers} iters={iters} reps={} \
+        "BENCH replicated_hot_counter_receive_{variant} writers={writers} iters={iters} reps={} \
          applies_b={} applies_c={} converge_secs={:.3} frames_sent_total={} \
          bytes_sent_total={} lost_updates={}",
         reps.len(),
@@ -2147,6 +2255,7 @@ async fn run_hot_counter_receive_rep(
     writers: u32,
     iters: u32,
     cache_name: &str,
+    receivers_prefold_enabled: bool,
 ) -> HotCounterReceiveRepMetrics {
     #[cfg(feature = "prometheus")]
     let _ = metrics_handle();
@@ -2156,12 +2265,13 @@ async fn run_hot_counter_receive_rep(
     let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
         .unwrap_or_else(|_| panic!("peer_group(_, 3) returns exactly 3 clusters"));
 
-    let (cache_a, cache_b, cache_c) = Box::pin(open_replicated_trio::<PnCounter>(
+    let (cache_a, cache_b, cache_c) = Box::pin(open_replicated_trio_with_prefold::<PnCounter>(
         &cluster_a,
         &cluster_b,
         &cluster_c,
         cache_name,
         Arc::new(PnCounterResolver),
+        [true, receivers_prefold_enabled, receivers_prefold_enabled],
     ))
     .await;
 
@@ -2235,12 +2345,21 @@ async fn replicated_hot_counter_receive() {
     let reps = repetitions();
     let cache_name = "crdt-hot-counter-receive";
 
-    let mut rep_metrics = Vec::with_capacity(reps as usize);
-    for _ in 0..reps {
-        rep_metrics.push(Box::pin(run_hot_counter_receive_rep(writers, iters, cache_name)).await);
+    for (variant, receivers_prefold_enabled) in [("on", true), ("off", false)] {
+        let mut rep_metrics = Vec::with_capacity(reps as usize);
+        for _ in 0..reps {
+            rep_metrics.push(
+                Box::pin(run_hot_counter_receive_rep(
+                    writers,
+                    iters,
+                    cache_name,
+                    receivers_prefold_enabled,
+                ))
+                .await,
+            );
+        }
+        print_hot_counter_receive_bench(variant, writers, iters, &rep_metrics);
     }
-
-    print_hot_counter_receive_bench(writers, iters, &rep_metrics);
 }
 
 // ---------------------------------------------------------------------
@@ -2563,4 +2682,377 @@ async fn large_entity_convergence_coalesced() {
     }
 
     print_scale_convergence_bench("coalesced", keys, &rep_metrics);
+}
+
+// ---------------------------------------------------------------------
+// Scenario 13: sketch_path_convergence — `docs/crdt-merge-poc.md`'s
+// scale-hardening item on the IBLT sketch path (`sundog/src/cluster/sketch.rs`,
+// `sundog/src/cluster/anti_entropy.rs`). `ClusterConfig::ae_sketch_min_bucket`
+// is lowered to [`SKETCH_PATH_MIN_BUCKET`], and every one of `keys` filler
+// entries is forced into the *same* anti-entropy bucket
+// ([`keys_in_one_bucket`], the same deterministic technique
+// `tests/prometheus_exporter.rs`'s own `keys_in_one_bucket`/`bucket_of` pair
+// forces a dense bucket with — copied locally, integration test binaries
+// share nothing beyond `mod common`), so that one bucket clears the
+// lowered threshold regardless of `store::BUCKET_COUNT`'s usual averaging.
+// This sidesteps a write burst racing `cluster::fan_out_task`'s live
+// replication: at any key count this benchmark's budget can afford, that
+// live fan-out always finishes replicating before anti-entropy's own
+// `ae_interval` next fires, which is why scenarios 8/12 report zero
+// `ae_repaired_total` at their own defaults and why a bare write burst here
+// would too. Once every node holds the full dense bucket,
+// `Cache::invalidate_local` drops a quarter of it on `cache_b` only — an
+// escape hatch that removes a local copy without a tombstone or fan-out,
+// creating a real bucket digest mismatch with no write race involved —
+// mirroring `tests/prometheus_exporter.rs`'s own `seed_sketch_mismatch`.
+// The next anti-entropy round against a threshold this low answers with a
+// sketch. `lww` (default `LwwResolver`, non-merging) and `pn_counter`
+// (`PnCounterResolver`, merging) both run this, so `pn_counter`'s own
+// `sketch_peeled`/`sketch_fallback` counts are the bidirectional-exchange
+// sketch load `sketch.rs`'s `two_sided_version_mismatches_decode_at_the_default_shape`
+// and `anti_entropy`'s
+// `a_merging_bucket_above_the_threshold_converges_through_the_sketch_path`
+// pin at unit scale, now measured through a real, multi-round anti-entropy
+// loop instead. It reports `sundog_ae_sketch_total`'s existing `decoded`/
+// `fallback` outcome counters — no new metric, since that counter already
+// covers a peel success and a peel fallback exactly — as `sketch_peeled`
+// and `sketch_fallback`, plus their sum as `sketch_rounds`: how many times
+// this scenario's dense bucket answered a mismatch through the sketch
+// mechanism at all, successfully or not, over however many anti-entropy
+// rounds ran before it reconverged.
+// ---------------------------------------------------------------------
+
+/// `SUNDOG_BENCH_KEYS` default for `sketch_path_convergence`: the size of
+/// the single dense anti-entropy bucket this scenario builds. Comfortably
+/// under `cluster::sketch`'s rated 100-element symmetric difference once a
+/// quarter of it is invalidated (50 elements: see
+/// [`SKETCH_PATH_INVALIDATE_FRACTION`]), so the default run's sketch
+/// mismatch decodes rather than falling back; `SUNDOG_BENCH_KEYS` raises
+/// the dense bucket size (and so the invalidated fraction) past that rating
+/// to see fallbacks appear.
+const SKETCH_PATH_KEYS_DEFAULT: u32 = 200;
+
+/// `ClusterConfig::ae_sketch_min_bucket` this scenario's clusters run at —
+/// far under [`SKETCH_PATH_KEYS_DEFAULT`], so the one dense bucket this
+/// scenario builds always clears it and takes the sketch path rather than
+/// `ClusterConfig::default`'s 384-entry listing threshold, mirroring
+/// `tests/sim.rs`'s own forced `ae_sketch_min_bucket` of 4 for the same
+/// reason.
+const SKETCH_PATH_MIN_BUCKET: usize = 4;
+
+/// The fraction of the dense bucket [`sundog::Cache::invalidate_local`]
+/// drops on `cache_b` to seed this scenario's mismatch: a quarter, so the
+/// default `keys=200` run seeds a 50-element one-sided difference, half of
+/// `cluster::sketch`'s rated 100-element capacity.
+const SKETCH_PATH_INVALIDATE_FRACTION: usize = 4;
+
+/// The anti-entropy bucket a `u32` key hashes into, mirroring
+/// `store::stripe_index_from_hash`'s formula; `tests/prometheus_exporter.rs`
+/// carries the identical helper for the same reason (copied locally —
+/// integration test binaries share nothing beyond `mod common`).
+fn sketch_path_bucket_of(key: u32) -> u16 {
+    let bytes = postcard::to_stdvec(&key).expect("u32 key encodes");
+    let bucket = xxh3_64(&bytes) & (sundog::store::BUCKET_COUNT as u64 - 1);
+    u16::try_from(bucket).expect("invariant: masked to BUCKET_COUNT - 1, always fits in u16")
+}
+
+/// `count` keys guaranteed to land in the same anti-entropy bucket, so this
+/// scenario's dense bucket size is exactly `count` regardless of
+/// `store::BUCKET_COUNT`'s usual per-bucket averaging.
+fn keys_in_one_bucket(count: usize) -> Vec<u32> {
+    let target = sketch_path_bucket_of(0);
+    (0..)
+        .filter(|&k| sketch_path_bucket_of(k) == target)
+        .take(count)
+        .collect()
+}
+
+/// [`node_config`], but with `ae_sketch_min_bucket` lowered to `min_bucket`.
+fn sketch_node_config(gossip_bind_addr: SocketAddr, min_bucket: usize) -> ClusterConfig {
+    node_config(gossip_bind_addr).with(|c| {
+        c.ae_sketch_min_bucket = min_bucket;
+    })
+}
+
+/// [`peer_group`], but every node's config comes from [`sketch_node_config`]
+/// instead of [`node_config`], so every anti-entropy round in this
+/// scenario's cluster answers a mismatch with an IBLT sketch rather than a
+/// listing once a bucket clears `min_bucket`.
+async fn sketch_peer_group(cluster_name: &str, n: usize, min_bucket: usize) -> Vec<Cluster> {
+    let mut gossip_addrs = Vec::with_capacity(n);
+    for _ in 0..n {
+        gossip_addrs.push(reserve_gossip_addr().await);
+    }
+
+    let mut clusters = Vec::with_capacity(n);
+    for (i, &addr) in gossip_addrs.iter().enumerate() {
+        let seeds = gossip_addrs
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, &seed)| seed);
+        let cluster = Cluster::builder(cluster_name)
+            .seeds(seeds)
+            .config(sketch_node_config(addr, min_bucket))
+            .build()
+            .await
+            .unwrap_or_else(|error| panic!("node {i} builds: {error}"));
+        clusters.push(cluster);
+    }
+
+    for cluster in &clusters {
+        common::wait_for_peer_count(cluster, n - 1, Duration::from_secs(30)).await;
+    }
+    clusters
+}
+
+struct SketchPathRepMetrics {
+    converge_secs: f64,
+    frames: u64,
+    bytes: u64,
+    ae_repaired: u64,
+    sketch_peeled: u64,
+    sketch_fallback: u64,
+    lost_updates: u64,
+}
+
+fn print_sketch_path_bench(
+    variant: &str,
+    keys: u32,
+    min_bucket: usize,
+    reps: &[SketchPathRepMetrics],
+) {
+    println!(
+        "BENCH sketch_path_convergence_{variant} keys={keys} ae_sketch_min_bucket={min_bucket} \
+         reps={} converge_secs={:.3} frames_sent_total={} bytes_sent_total={} \
+         lost_updates={}{}{}",
+        reps.len(),
+        median_field_f64(reps, |m| m.converge_secs),
+        median_field_u64(reps, |m| m.frames),
+        median_field_u64(reps, |m| m.bytes),
+        median_field_u64(reps, |m| m.lost_updates),
+        ae_repaired_field(median_field_u64(reps, |m| m.ae_repaired)),
+        sketch_outcome_field(
+            median_field_u64(reps, |m| m.sketch_peeled),
+            median_field_u64(reps, |m| m.sketch_fallback),
+        ),
+    );
+}
+
+/// Waits for `cache_b`/`cache_c` to hold `dense_keys`' last entry (proof the
+/// whole dense bucket landed everywhere), invalidates
+/// [`SKETCH_PATH_INVALIDATE_FRACTION`] of it on `cache_b` alone, snapshots
+/// this scenario's metrics, then times `cache_b`'s reconvergence — the
+/// shape both variants below share once their own cache/resolver/dense
+/// bucket is built.
+async fn seed_and_time_sketch_mismatch(
+    cache_name: &str,
+    cache_b: &impl SketchProbe,
+    cache_c: &impl SketchProbe,
+    dense_keys: &[u32],
+) -> SketchPathRepMetrics {
+    let last_dense_key = *dense_keys.last().expect("keys is nonzero");
+    common::eventually(Duration::from_secs(30), || async {
+        cache_b.has(last_dense_key).await && cache_c.has(last_dense_key).await
+    })
+    .await;
+
+    let invalidate_count = (dense_keys.len() / SKETCH_PATH_INVALIDATE_FRACTION).max(1);
+    let invalidated = &dense_keys[..invalidate_count];
+    for &key in invalidated {
+        cache_b.drop_local(key).await;
+    }
+
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+    let ae_repaired_before = ae_repaired_snapshot(cache_name);
+    let sketch_peeled_before = sketch_outcome_snapshot(cache_name, "decoded");
+    let sketch_fallback_before = sketch_outcome_snapshot(cache_name, "fallback");
+
+    // A snapshot of how many of the invalidated keys are still missing on
+    // `cache_b`, immediately after the invalidation above and before the
+    // convergence wait below — every one of them, since `invalidate_local`
+    // just dropped their local copies; mirrors every other scenario's own
+    // `lost_updates`, the transient post-write, pre-convergence gap.
+    let mut lost_updates = 0u64;
+    for &key in invalidated {
+        if !cache_b.has(key).await {
+            lost_updates += 1;
+        }
+    }
+
+    let convergence_started = Instant::now();
+    common::eventually(Duration::from_secs(60), || async {
+        for &key in invalidated {
+            if !cache_b.has(key).await {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    let converge_secs = convergence_started.elapsed().as_secs_f64();
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+    let ae_repaired = ae_repaired_snapshot(cache_name).saturating_sub(ae_repaired_before);
+    let sketch_peeled =
+        sketch_outcome_snapshot(cache_name, "decoded").saturating_sub(sketch_peeled_before);
+    let sketch_fallback =
+        sketch_outcome_snapshot(cache_name, "fallback").saturating_sub(sketch_fallback_before);
+
+    SketchPathRepMetrics {
+        converge_secs,
+        frames,
+        bytes,
+        ae_repaired,
+        sketch_peeled,
+        sketch_fallback,
+        lost_updates,
+    }
+}
+
+/// [`seed_and_time_sketch_mismatch`]'s seam over the two variants' distinct
+/// cache value types: `has` a key, and `drop_local` it the way
+/// `Cache::invalidate_local` does.
+trait SketchProbe {
+    fn has(&self, key: u32) -> impl Future<Output = bool> + Send;
+    fn drop_local(&self, key: u32) -> impl Future<Output = ()> + Send;
+}
+
+impl SketchProbe for sundog::Cache<u32, u64> {
+    async fn has(&self, key: u32) -> bool {
+        self.get(&key).await.is_some()
+    }
+
+    async fn drop_local(&self, key: u32) {
+        self.invalidate_local(&key).await;
+    }
+}
+
+impl SketchProbe for sundog::Cache<u32, PnCounter> {
+    async fn has(&self, key: u32) -> bool {
+        self.get(&key).await.is_some()
+    }
+
+    async fn drop_local(&self, key: u32) {
+        self.invalidate_local(&key).await;
+    }
+}
+
+async fn run_sketch_path_lww_rep(keys: u32, min_bucket: usize) -> SketchPathRepMetrics {
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let cluster_label = "bench-crdt-sketch-path-lww";
+    let cache_name = "crdt-sketch-path-lww";
+    let clusters = sketch_peer_group(cluster_label, 3, min_bucket).await;
+    let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("sketch_peer_group(_, 3, _) returns exactly 3 clusters"));
+
+    let (cache_a, cache_b, cache_c) = tokio::join!(
+        cluster_a
+            .cache::<u32, u64>(cache_name)
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_b
+            .cache::<u32, u64>(cache_name)
+            .mode(Mode::Replicated)
+            .open(),
+        cluster_c
+            .cache::<u32, u64>(cache_name)
+            .mode(Mode::Replicated)
+            .open(),
+    );
+    let cache_a = cache_a.expect("a opens");
+    let cache_b = cache_b.expect("b opens");
+    let cache_c = cache_c.expect("c opens");
+
+    let dense_keys = keys_in_one_bucket(keys as usize);
+    cache_a
+        .insert_many(dense_keys.iter().map(|&k| (k, 1u64)))
+        .await
+        .expect("dense bulk insert succeeds");
+
+    let metrics = seed_and_time_sketch_mismatch(cache_name, &cache_b, &cache_c, &dense_keys).await;
+
+    for cluster in [cluster_a, cluster_b, cluster_c] {
+        cluster.shutdown().await;
+    }
+    metrics
+}
+
+async fn run_sketch_path_pn_counter_rep(keys: u32, min_bucket: usize) -> SketchPathRepMetrics {
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let cluster_label = "bench-crdt-sketch-path-pn-counter";
+    let cache_name = "crdt-sketch-path-pn-counter";
+    let clusters = sketch_peer_group(cluster_label, 3, min_bucket).await;
+    let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("sketch_peer_group(_, 3, _) returns exactly 3 clusters"));
+
+    let (cache_a, cache_b, cache_c) = Box::pin(open_replicated_trio::<PnCounter>(
+        &cluster_a,
+        &cluster_b,
+        &cluster_c,
+        cache_name,
+        Arc::new(PnCounterResolver),
+    ))
+    .await;
+
+    let dense_keys = keys_in_one_bucket(keys as usize);
+    let node = NodeId::from(0u64);
+    cache_a
+        .insert_many(
+            dense_keys
+                .iter()
+                .map(|&k| (k, PnCounter::local_delta(node, 1))),
+        )
+        .await
+        .expect("dense bulk insert succeeds");
+
+    let metrics = seed_and_time_sketch_mismatch(cache_name, &cache_b, &cache_c, &dense_keys).await;
+
+    for cluster in [cluster_a, cluster_b, cluster_c] {
+        cluster.shutdown().await;
+    }
+    metrics
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sketch_path_convergence_lww() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let keys = scale_keys(SKETCH_PATH_KEYS_DEFAULT);
+    let reps = repetitions();
+
+    let mut rep_metrics = Vec::with_capacity(reps as usize);
+    for _ in 0..reps {
+        rep_metrics.push(Box::pin(run_sketch_path_lww_rep(keys, SKETCH_PATH_MIN_BUCKET)).await);
+    }
+
+    print_sketch_path_bench("lww", keys, SKETCH_PATH_MIN_BUCKET, &rep_metrics);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sketch_path_convergence_pn_counter() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let keys = scale_keys(SKETCH_PATH_KEYS_DEFAULT);
+    let reps = repetitions();
+
+    let mut rep_metrics = Vec::with_capacity(reps as usize);
+    for _ in 0..reps {
+        rep_metrics
+            .push(Box::pin(run_sketch_path_pn_counter_rep(keys, SKETCH_PATH_MIN_BUCKET)).await);
+    }
+
+    print_sketch_path_bench("pn_counter", keys, SKETCH_PATH_MIN_BUCKET, &rep_metrics);
 }

@@ -364,4 +364,39 @@ mod tests {
             "PnCounterResolver returns Winner::Merged, so it must advertise merges()"
         );
     }
+
+    /// `docs/crdt-merge-poc.md`'s "Writer-slot growth" measurement: one `p`
+    /// slot per distinct writer, one node id and one `u64` total apiece, so
+    /// encoded size grows with how many nodes have ever incremented the
+    /// counter, never with how many times any one of them has. Prints each
+    /// size (`cargo test -p sundog --lib pn_counter:: -- --nocapture`)
+    /// rather than pinning an exact byte count, since postcard's varint
+    /// encoding of both the node id and the cumulative total depends on
+    /// their magnitude; asserts only that size grows with writer count and
+    /// that the slot count itself is exact.
+    #[test]
+    fn encoded_size_at_3_10_and_100_distinct_writers() {
+        let mut sizes = Vec::new();
+        for writers in [3u64, 10, 100] {
+            let mut counter = PnCounter::local_delta(NodeId::from(0), 1);
+            for node in 1..writers {
+                counter = counter.merge(&PnCounter::local_delta(NodeId::from(node), 1));
+            }
+            assert_eq!(
+                counter.p.len(),
+                usize::try_from(writers).expect("writers is a small literal, always fits"),
+                "one p slot per distinct writer, none shared"
+            );
+            let bytes = counter.encode().expect("encodes");
+            println!(
+                "MEASURE pn_counter_encoded_size writers={writers} bytes={}",
+                bytes.len()
+            );
+            sizes.push(bytes.len());
+        }
+        assert!(
+            sizes[0] < sizes[1] && sizes[1] < sizes[2],
+            "encoded size strictly grows with distinct writer count: {sizes:?}"
+        );
+    }
 }

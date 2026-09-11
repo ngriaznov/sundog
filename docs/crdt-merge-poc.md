@@ -126,17 +126,28 @@ or (with the coalescing window at its default zero) applying at once
 through the ordinary write path — `Cache::merge` at a zero window is
 `Cache::insert` under a merging resolver, nothing more.
 `CacheBuilder::merge_coalesce_window(Duration)` sets a nonzero window: the
-shard keeps a per-key `pending_merges` map, and a `merge` call to a key
+shard keeps `pending_merges`, `BUCKET_COUNT` independently locked stripes —
+one `PendingMergeStripe` per `engine::stripe_index_from_hash` bucket, the
+same split `engine::Engine`'s own stripes use — and a `merge` call to a key
 already pending folds the new value into that pending entry via the same
 `resolver.winner` call `apply_locked` itself uses, rather than opening a
 second pending entry or applying immediately. The first `merge` call to open
-a key's pending entry sets a deadline `merge_deadline_ms(now, window)`
-ahead; a background sweep (`flush_due_pending_merges`) applies every entry
-whose deadline has passed through the ordinary `Shard::apply` path, so
-replication and every `Event` this key gets during the window see one
-record, not one per call. `Cache::close`, and dropping this cache's last
-handle, both flush whatever is still pending (`flush_all_pending_merges`)
-regardless of the window, so no fold is ever lost to a shutdown.
+a key's pending entry sets a deadline `merge_deadline_ms(now, window)` ahead
+and records `(deadline_ms, seq) -> key` in its stripe's own `by_deadline:
+BTreeMap`, `seq` a per-stripe counter breaking a same-deadline tie without
+requiring the key type to be `Ord`; a background sweep
+(`flush_due_pending_merges`) visits each stripe in turn, locks it only long
+enough for `drain_due_deadlines` to pop `by_deadline`'s smallest entries
+while their deadline has passed, and applies each through the ordinary
+`Shard::apply` path, so replication and every `Event` this key gets during
+the window see one record, not one per call. Locking and popping one stripe
+at a time, from a deadline-ordered index rather than a linear scan, is what
+lets this sweep touch only the entries actually due even when many keys are
+coalescing at once — see "Coalescing turns `writers × iters` calls into one
+applied record per window" under "Where merge wins" for the effect at scale.
+`Cache::close`, and dropping this cache's last handle, both flush whatever is
+still pending (`flush_all_pending_merges`) regardless of the window, so no
+fold is ever lost to a shutdown.
 
 `Cache::get`/`Shard::get_sync` never consult the pending map: a value folded
 in but not yet flushed is invisible to a read for as long as it stays
@@ -300,7 +311,12 @@ the two write-path levers' own coverage below them.
   has a real stored record behind it before the comparison, the case
   `prefold_batch`'s seeding exists for. Targeted unit tests pin that a
   non-merging resolver never pre-folds, and that a run never folds across a
-  tombstone even when the surrounding entries share a key.
+  tombstone even when the surrounding entries share a key. The toggle itself
+  — `CacheBuilder::prefold_enabled`, `Shard::with_prefold_enabled`,
+  `Engine::set_prefold_enabled`/`Engine::prefold_enabled` — has its own test
+  at each layer: `Engine`'s setter/getter pair round-trips; `Shard`'s
+  builder method reaches the engine's flag; `Cache`'s builder method reaches
+  the shard's.
 - **Coalescing (lever B)**, at both `Shard` and `Cache`: a zero window
   applies immediately, byte-for-byte like `insert`; a nonzero window folds
   consecutive calls to one key in memory and applies exactly once, at the
@@ -310,7 +326,11 @@ the two write-path levers' own coverage below them.
   a losing call's own version never overwrites the pending entry's version,
   mirroring `resolve_and_rebind`'s own losing-write rule; and a fold against
   a resolver that falls back to plain `Hlc` order behaves exactly as
-  `Shard::insert` would.
+  `Shard::insert` would. `drain_due_deadlines`, the pure function behind the
+  flush sweep's per-stripe deadline index, has its own unit tests
+  independent of a live `Shard`: it pops exactly the due entries in deadline
+  order (a same-deadline tie broken by insertion order), and leaves a
+  not-yet-due entry untouched.
 
 Every test above passes; together they establish that the merge algebra, the
 version combinator in isolation, repeated pairwise folding under
@@ -318,6 +338,48 @@ anti-entropy's own push-direction rule, and both write-path levers all
 converge to the exact expected state — not merely to some shared state every
 replica happens to agree on — and that neither lever changes what gets
 stored, only how many times the engine does the work of storing it.
+
+## Writer-slot growth
+
+`PnCounter` carries one `p` slot and one `n` slot per distinct writer node,
+each a `(NodeId, u64)` pair — `merge`'s pointwise maximum never removes a
+slot, only grows or holds one, so a counter's encoded size tracks how many
+distinct nodes have ever written to it, never how many times any one of them
+has. `pn_counter::tests::encoded_size_at_3_10_and_100_distinct_writers`
+(`sundog/src/store/crdt/pn_counter.rs`) measures this directly: a counter
+built from `writers` distinct nodes each incrementing once, postcard-encoded,
+at `writers = 3, 10, 100`:
+
+| Distinct writers | Encoded size (bytes) |
+|---:|---:|
+| 3 | 8 |
+| 10 | 22 |
+| 100 | 202 |
+
+Growth is sublinear-looking here only because a fresh counter's `p` slots
+start at postcard's cheapest varint encoding (a one-byte `NodeId` and a
+one-byte cumulative total for `NodeId::from(0..9)` incrementing by 1) — the
+`n` side stays empty throughout, since every writer in this measurement only
+increments. A counter with `NodeId`s or cumulative totals large enough to
+need more LEB128 bytes, or with both `p` and `n` populated (mixed
+increment/decrement writers), grows faster per slot than this floor shows;
+the measurement pins the shape (one slot per distinct writer, no slot ever
+shrinks) rather than a byte-per-writer constant.
+
+The size no test here pins because no bound on it exists in the crate today:
+**writer-slot compaction for a departed member.** A node that stops writing
+to a counter leaves its slot behind forever — `merge`'s pointwise maximum
+has no notion of "this writer is gone," only ever-growing per-slot totals —
+so a `PnCounter` touched by a large, churning set of writer nodes over a
+long enough lifetime grows without bound the same way `OrSet`'s add/remove
+metadata does (see "What a production version still needs" below). Removing
+a departed writer's slot safely needs membership-wide agreement that no
+replica still holds a lower cumulative total for that writer's slot than the
+one about to be dropped — dropping it while even one replica has yet to fold
+in that writer's true final value would drop real, un-merged content, not
+compact it — and sundog's gossip layer has no primitive for that agreement
+today: membership tracks who is live, not which value every replica has
+folded for every slot of every key.
 
 ## Benchmark
 
@@ -341,7 +403,7 @@ scenario under test (`cargo test ... -- --nocapture <name filter>`) so a
 scale run's cost isolates to the scenarios that knob actually changes: one
 run each at `keys=50,000` for cold join and `N=100,000` for large-entity
 (both the `decomposed`/`merged` pair and the coalesced variant), finishing in
-56.77 s and 82.84 s respectively.
+56.77 s and 77.80 s respectively.
 
 ### Machine
 
@@ -379,48 +441,73 @@ one pre-populated key:
 | `apply_ns_merge` | 1,235.0 | 1,144.0 ns | 2,189.0 ns |
 
 **Pre-fold (lever A) on/off**, `apply_many_prefold`, `batch_size=1,000`, a
-single-node cache, one full `insert_many` batch ("on") against the identical
-batch through `batch_size` separate `insert` calls ("off") — the module's
-own doc explains why the "off" side is a structural proxy for the real
-`prefold_enabled` flag (not reachable from outside the crate) rather than an
-isolated measurement, and why the `many_keys` shape's on/off pair is
-expected to land close together for both resolvers regardless of the flag,
-since there is nothing to fold either way:
+single-node cache: the identical `insert_many` batch against two caches that
+differ only in `CacheBuilder::prefold_enabled` — the real, `#[doc(hidden)]`
+engine-level toggle, reachable from this integration-test binary through
+`Shard::with_prefold_enabled`/`Engine::set_prefold_enabled` — "on" its
+default `true`, "off" `.prefold_enabled(false)`. Both passes pay the
+identical single stripe-lock acquisition and the identical per-call fan-out
+push; only whether `apply_many` folds a same-key run before applying it
+differs, so the `many_keys` shape's on/off pair is expected to land close
+together for both resolvers — there is nothing to fold either way — while
+`one_key`'s pair isolates pre-fold's own effect directly, no proxy
+subtraction needed:
 
 | Shape | Resolver | record ns on | batch ns on | record ns off | batch ns off |
 |---|---|---:|---:|---:|---:|
-| one key | `LwwResolver` | 768.8 | 768,815 | 627.7 | 627,659 |
-| one key | `PnCounterResolver` | 900.1 | 900,135 | 1,166.6 | 1,166,601 |
-| many keys | `LwwResolver` | 804.6 | 804,574 | 736.8 | 736,801 |
-| many keys | `PnCounterResolver` | 1,114.5 | 1,114,478 | 1,094.4 | 1,094,433 |
+| one key | `LwwResolver` | 741.5 | 741,494 | 718.9 | 718,869 |
+| one key | `PnCounterResolver` | 891.9 | 891,893 | 1,117.9 | 1,117,905 |
+| many keys | `LwwResolver` | 665.5 | 665,544 | 631.8 | 631,825 |
+| many keys | `PnCounterResolver` | 990.3 | 990,257 | 787.3 | 787,283 |
 
-Isolating pre-fold's own effect from the proxy's batching overhead
-(`LwwResolver`'s on/off gap never triggers pre-fold at all, so subtracting
-its gap from `PnCounterResolver`'s gap over the same shape estimates
-pre-fold's own contribution alone):
+`LwwResolver`'s on/off gap (`batch_ns_off - batch_ns_on`) is a sanity check
+on the toggle rather than a correction to subtract: `merges()` is `false`,
+so pre-fold never engages for it regardless of the flag, and its gap should
+track noise alone. `PnCounterResolver`'s gap is pre-fold's own effect:
 
-| Shape | `LwwResolver` gap (ns) | `PnCounterResolver` gap (ns) | pre-fold's isolated gap (ns) |
-|---|---:|---:|---:|
-| one key | -239,641 | 310,353 | 591,034 |
-| many keys | -80,312 | -10,196 | 70,116 |
+| Shape | `LwwResolver` gap (ns) | `PnCounterResolver` gap (ns) |
+|---|---:|---:|
+| one key | -22,625 | 226,012 |
+| many keys | -33,719 | -202,974 |
 
-**Receive-side applies with pre-fold on**, `replicated_hot_counter_receive`
+`one_key` shows pre-fold's real win — `PnCounterResolver`'s 1,000-entry run
+folds to one survivor and applies roughly 226 µs faster than sequential
+per-entry application, against `LwwResolver`'s near-zero, noise-level gap on
+the identical toggle. `many_keys` inverts for `PnCounterResolver` (off
+faster than on) rather than landing at zero: with no repeated key in the
+batch there is nothing to fold either way, so both resolvers' gaps here are
+noise around zero, at this shape's own scale, not a real pre-fold cost —
+`LwwResolver`'s gap over the same shape is the same order of magnitude and
+sign-unstable across runs, confirming it.
+
+**Receive-side applies, pre-fold on/off**, `replicated_hot_counter_receive`
 (the eight-writer single-`PnCounter`-key shape, instrumented on the two
 nodes that only ever receive the resulting fan-out/anti-entropy batches).
-Pre-fold is on for every measurement in this crate outside the property
-tests' explicit toggle, and this scenario has no "off" comparison to report:
-a receiving node's batch shape comes from the sender's own fan-out, not from
-anything this crate's public API controls, so there is no honest off proxy
-to construct the way scenario 9's own local-batch loop is:
+"on" opens both receiving nodes with `CacheBuilder::prefold_enabled`'s
+default `true`; "off" opens them with `.prefold_enabled(false)` — a
+receiving node's batch shape still comes from the sender's own fan-out, but
+the toggle reaches that node's engine the same way regardless of who
+assembled the batch it applies, so this is a real off variant, not a proxy:
 
-| Metric | Value |
-|---|---:|
-| Applies on node b | 2 |
-| Applies on node c | 3 |
-| Converge time | 0.021 s |
-| Frames sent | 7 |
-| Bytes sent | 1,668 |
-| Lost updates | 0 |
+| Metric | on | off |
+|---|---:|---:|
+| Applies on node b | 2 | 9 |
+| Applies on node c | 2 | 9 |
+| Converge time | 0.021 s | 0.021 s |
+| Frames sent | 5 | 7 |
+| Bytes sent | 677 | 1,511 |
+| Lost updates | 0 | 0 |
+
+With pre-fold off, each receiving node applies every record in a fan-out
+batch individually rather than folding a same-key run to one survivor
+first — `applies_b`/`applies_c` roughly quadruple (2 → 9) for the identical
+eight-writer, 200-iteration workload, `Cache::events()`'s own count making
+pre-fold's effect on the receive path directly visible for the first time,
+rather than only inferred from the send-side proxy scenario 9 used before
+this toggle existed. Frames and bytes shift too, since more individual
+applies mean more individual `Event`s fanning back out; converge time itself
+is unaffected at this scale — either way converges inside the same
+sub-second window.
 
 **Coalescing (lever B)**, `merged_counter_coalesced`, the same eight-writer
 single-counter shape through `Cache::merge` instead of `insert`. `engine
@@ -471,17 +558,19 @@ the transient post-write, pre-convergence gap, not a permanent loss: every
 variant at every `N` below reaches the exact expected total by the time
 `converge_secs` elapses). `coalesced` uses `Cache::merge` with a 1 ms window
 in place of a direct `insert`. Default `N=4,000` is the median of the same
-three runs; `N=100,000` is one filtered run (82.84 s total for all three
-variants):
+three runs; `N=100,000` is one filtered run (77.80 s total for all three
+variants, measured against `Shard::flush_due_pending_merges`'s current,
+stripe-sharded, deadline-ordered sweep — see "Where merge loses" and "What
+a production version still needs" for what that replaced):
 
 | Variant | N | resident keys | converge time | frames | bytes | pre-convergence gap | AE repairs |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | `decomposed` (`3N` per-writer keys) | 4,000 | 12,000 | 0.039 s | 6 | 1,265,562 | 8,000 | 0 |
 | `merged` (`N` keys) | 4,000 | 4,000 | 0.049 s | 6 | 1,031,430 | 8,000 | 0 |
 | `coalesced` (`N` keys, 1 ms window) | 4,000 | 4,000 | 0.050 s | 6 | 1,031,448 | 12,000 | 0 |
-| `decomposed` (`3N` per-writer keys) | 100,000 | 300,000 | 1.138 s | 5,616 | 97,623,647 | 186,166 | 661,844 |
-| `merged` (`N` keys) | 100,000 | 100,000 | 1.315 s | 5,831 | 72,174,006 | 200,000 | 670,726 |
-| `coalesced` (`N` keys, 1 ms window) | 100,000 | 100,000 | 2.408 s | 5,200 | 66,307,093 | 300,000 | 683,774 |
+| `decomposed` (`3N` per-writer keys) | 100,000 | 300,000 | 1.011 s | 3,718 | 83,117,682 | 186,073 | 599,452 |
+| `merged` (`N` keys) | 100,000 | 100,000 | 1.240 s | 7,065 | 77,906,929 | 200,000 | 767,294 |
+| `coalesced` (`N` keys, 1 ms window) | 100,000 | 100,000 | 1.018 s | 2,793 | 52,429,486 | 290,727 | 434,266 |
 
 **Partition-heal** (`sim` suite, `cargo test -p sundog --features sim --test
 sim partition_heal -- --nocapture`: three simulated nodes, node `a` split
@@ -547,27 +636,41 @@ This is a fixed-slot win that compounds as either the writer count or the
 entity count grows, not a per-write one.
 
 **Pre-folding turns a batch's per-collision cost into roughly one entry's.**
-`apply_many_prefold`'s isolated gap (subtracting `LwwResolver`'s pure proxy
-overhead from `PnCounterResolver`'s) shows pre-fold saving on the order of
-590 µs across a 1,000-entry same-key batch — the decode/fold/encode/mint
-work `apply_locked` used to pay once per entry now happens once per run
-instead, with every other entry in that run absorbed for the cost of a
-group-by pass alone. The `many_keys` shape's isolated gap (70 µs, an order
-of magnitude smaller, over the same 1,000-entry batch) is the control this
-lever's benefit isolates against: with no repeated key in the batch there is
-nothing to fold, and the two shapes' gap sizes track that difference
-directly.
+`apply_many_prefold`'s `one_key` gap (the identical `insert_many` batch
+against the real `prefold_enabled` toggle) shows `PnCounterResolver` saving
+on the order of 226 µs across a 1,000-entry same-key batch — the
+decode/fold/encode/mint work `apply_locked` used to pay once per entry now
+happens once per run instead, with every other entry in that run absorbed
+for the cost of a group-by pass alone. `LwwResolver`'s gap over the same
+shape and toggle is noise-level (-22,625 ns): it never engages pre-fold
+regardless of the flag, confirming the `one_key` gap above is pre-fold's own
+effect, not batching or fan-out noise the old insert-loop proxy could not
+rule out. `replicated_hot_counter_receive`'s on/off comparison shows the
+same effect on the receive path directly: a receiving node's applies per
+key roughly quadruple with the toggle off (2 → 9) for the identical
+eight-writer workload.
 
 **Coalescing turns `writers × iters` calls into one applied record per
-window.** `merged_counter_coalesced`'s `engine applies` column drops from
-1,600 (every call applies) at a zero window to 1 at either a 1 ms or 10 ms
-window — every one of the 1,600 client-side `merge` calls across all eight
-writers folds into the single record the window flushes once. Both nonzero
-windows' per-call `merge` latency runs at roughly a third of the zero
-window's (no per-call engine round trip to wait on), and both still converge
-to the exact expected total inside the same 30-second wait the always-apply
-scenarios use — the staleness this lever trades away is bounded and never
-costs correctness.
+window, and now scales the flush that does it.** `merged_counter_coalesced`'s
+`engine applies` column drops from 1,600 (every call applies) at a zero
+window to 1 at either a 1 ms or 10 ms window — every one of the 1,600
+client-side `merge` calls across all eight writers folds into the single
+record the window flushes once. Both nonzero windows' per-call `merge`
+latency runs at roughly a third of the zero window's (no per-call engine
+round trip to wait on), and both still converge to the exact expected total
+inside the same 30-second wait the always-apply scenarios use — the
+staleness this lever trades away is bounded and never costs correctness.
+`Shard::flush_due_pending_merges`'s sweep now mirrors `engine::Engine`'s own
+`BUCKET_COUNT`-stripe split: `Shard::pending_merges` is
+`BUCKET_COUNT` independently locked stripes, one per `stripe_index_from_hash`
+bucket, each with its own `by_deadline: BTreeMap<(u64, u64), K>` index, so a
+flush locks and pops only the entries actually due in one stripe at a time
+rather than one shard-wide mutex guarding a single `HashMap` the sweep had
+to scan in full on every tick. `large_entity_convergence_coalesced` at
+`N=100,000` shows the result directly: 1.018 s, essentially tied with
+`decomposed`'s 1.011 s and faster than `merged`'s 1.240 s, rather than the
+scenario's slowest variant by a wide margin — see "What a production
+version still needs" for what this replaced.
 
 ## Where merge loses
 
@@ -592,25 +695,11 @@ each other, so the remaining gap here is the per-apply CPU cost above and
 genuine lock contention on the one hot key, not anything this batch-level
 lever reaches.
 
-**Coalescing's staleness cost compounds at scale, and can invert the win.**
-At the default `N=4,000`, `coalesced` (0.050 s) tracks `merged`'s own
-convergence time (0.049 s) closely — the 1 ms window barely shows. At
-`N=100,000`, `coalesced` takes 2.408 s against `merged`'s 1.315 s and
-`decomposed`'s 1.138 s — 1.8x `merged`'s own time and over 2x
-`decomposed`'s, and the scenario's *slowest* variant at this scale despite
-sending the fewest bytes
-(66.3 MB vs. `merged`'s 72.2 MB). Every one of the 100,000 keys' three
-concurrent writers each pay the coalescing window once, and at this many
-keys written this close together the window's own flush-sweep cadence
-becomes the bottleneck rather than the network: the same staleness bound
-that costs nothing measurable at 4,000 keys costs real wall-clock time once
-enough keys are coalescing at once.
-
 **More frames at scale, even as bytes fall.** `large_entity_convergence`'s
 frame count flips the same way its bytes don't: at `N=4,000` `merged` and
-`decomposed` send the same 6 frames, but at `N=100,000` `merged` sends 5,831
-against `decomposed`'s 5,616 — while still moving fewer total bytes (72.2 MB
-vs. 97.6 MB). `PnCounterResolver::merges()` being `true` makes every
+`decomposed` send the same 6 frames, but at `N=100,000` `merged` sends 7,065
+against `decomposed`'s 3,718 — while still moving fewer total bytes (77.9 MB
+vs. 83.1 MB). `PnCounterResolver::merges()` being `true` makes every
 version-mismatched key exchange in both directions every round instead of
 only the greater side pushing, so a key that keeps mismatching across
 several live anti-entropy rounds under concurrent write pressure costs more
@@ -646,11 +735,11 @@ documented trade-off; see "What a production version still needs" below.
   merge, and this is now measured evidence that the interaction can go the
   wrong way. Needs root-causing before the exchange can be trusted at this
   scale.
-- **Coalescing's flush cadence becomes the bottleneck at high key
-  concurrency.** `large_entity_convergence_coalesced` at `N=100,000` is
-  slower than both an uncoalesced merge and the decomposed control, the
-  opposite of its default-scale showing; nothing in this crate currently
-  adapts the flush sweep's own pace to how many keys are coalescing at once.
+- **`PnCounter` writer-slot compaction.** A departed writer's `p`/`n` slots
+  never shrink — see "Writer-slot growth" above for the measured per-writer
+  size and the constraint a safe compaction needs: membership-wide agreement
+  that every replica has already folded that writer's final value, which
+  sundog's gossip does not provide today.
 - **`OrSet` compaction.** Adds and tombstones never shrink; a long-lived
   `OrSet` key's metadata grows without bound, and the crate's weigher and
   capacity accounting don't yet account for that growth.

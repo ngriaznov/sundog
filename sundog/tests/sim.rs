@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::num::NonZeroU8;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -24,8 +24,6 @@ use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 use sundog::config::ClusterConfig;
 use sundog::crdt::{PnCounter, PnCounterResolver};
@@ -35,7 +33,10 @@ use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHa
 use sundog::node::{NodeId, NodeName};
 use sundog::store::{Mode, Shard, ShardOps, SimFanOut};
 use sundog::wire::{Msg, WireRecord};
-use sundog::{ConflictResolver, OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
+use sundog::{
+    ConflictResolver, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
+    ownership_diff,
+};
 use tokio::sync::watch;
 use turmoil::{Builder, Sim};
 use xxhash_rust::xxh3::xxh3_64;
@@ -101,7 +102,7 @@ fn seed_shard(node: NodeId, keys: impl IntoIterator<Item = u32>) -> TestShard {
     shard
 }
 
-fn peer_list_of(peers: &[(NodeId, &'static str, u16)]) -> Vec<Peer> {
+fn peer_list_of(peers: &[(NodeId, &str, u16)]) -> Vec<Peer> {
     peers
         .iter()
         .map(|&(node, host, port)| Peer {
@@ -3167,74 +3168,506 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
 }
 
 // ---------------------------------------------------------------------
-// Partition-heal counter family: three nodes, `N` counters, a two-way
-// partition (node `a` split from `b`/`c`, which stay mutually connected)
-// during which every node increments every counter, then a heal. Run in
+// Partition-heal family: three nodes, a two-way partition (node `a` split
+// from `b`/`c`, which stay mutually connected) during which side a and
+// side b each increment a share of `keys` counters, then a heal. Run in
 // two variants over the same shape — one merged `PnCounter` key per counter
 // under `PnCounterResolver`, and per-writer keys decomposed under the
-// default `LwwResolver` — measuring anti-entropy rounds, frames, and bytes
-// spent reconciling after the heal, and the lost-update count against the
-// exact expected total. `N` defaults to 2000 and is overridable via
-// `SUNDOG_SIM_KEYS`, mirroring `SUNDOG_SIM_SEED`'s override convention.
+// default `LwwResolver` — measuring anti-entropy rounds, virtual time,
+// frames, bytes, records, engine applies, resolver folds, and redundant
+// pulls spent reconciling after the heal, against the exact expected
+// total. See `docs/crdt-merge-poc.md`'s partition-heal section for the
+// full design and `SUNDOG_SIM_FULL`'s grid.
 // ---------------------------------------------------------------------
 
-/// Counters this family drives per run. `SUNDOG_SIM_KEYS` overrides the
-/// default so a heavier run is possible without touching the source.
-fn sim_counter_count() -> u32 {
-    std::env::var("SUNDOG_SIM_KEYS").map_or(2000, |raw| {
-        raw.parse().expect("SUNDOG_SIM_KEYS is a u32 counter count")
+/// Which side of the fair comparison a partition-heal run exercises: the
+/// same content, keyed either per-writer under [`LwwResolver`] (so no key is
+/// ever really contended) or on one shared key under [`PnCounterResolver`]
+/// (so every overlapping counter is a real, folded merge). See the module
+/// docs at `docs/crdt-merge-poc.md`'s partition-heal section for the full
+/// design this grid measures.
+///
+/// [`LwwResolver`]: sundog::LwwResolver
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    Decomposed,
+    Merged,
+}
+
+impl Variant {
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Decomposed => "decomposed",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+const HEAL_DEFAULT_KEYS: u32 = 2_000;
+const HEAL_DEFAULT_CONFLICT_FRACTIONS: [f64; 2] = [0.0, 1.0];
+const HEAL_FULL_KEYS: [u32; 2] = [2_000, 20_000];
+const HEAL_FULL_CONFLICT_FRACTIONS: [f64; 4] = [0.0, 0.1, 0.5, 1.0];
+const HEAL_FULL_SEEDS: [u64; 3] = [0xC0DE_7001, 0xC0DE_7002, 0xC0DE_7003];
+const HEAL_INCREMENTS_PER_SIDE: u32 = 3;
+const HEAL_PARTITION_MS: u64 = 500;
+/// Deliberately generous relative to a single round's own cost, even at
+/// this family's largest key count: a repair large enough to need several
+/// `REPAIR_BATCH` chunks spans several `sim.step()`s within one
+/// `run_round_against` call, and node b's and node c's own independent
+/// tick (never partitioned from node a, so *also* a candidate to relay
+/// node a's content, and just as capable of fully repairing a pair on its
+/// own as node a's own round against that same pair is) can fall on any
+/// step in between. A short tick period lets that race resolve differently
+/// depending on how many chunks a given key count happens to need -- the
+/// scale-sensitive non-determinism the "Findings" section's own
+/// non-monotonic figures came from. A period long enough that every node's
+/// own round, at every scale this grid drives, always finishes well before
+/// the next tick could possibly fire removes the race by removing the
+/// overlap: the ordering the two paths land in step order stays the same
+/// regardless of key count, since neither path is still running when
+/// the next tick becomes possible.
+const HEAL_AE_INTERVAL_MS: u64 = 1000;
+/// Every anti-entropy round in this family runs against at most two peers
+/// on a 1s tick; a generous multiple of the handful of rounds convergence
+/// actually needs at every scale this grid drives, so a run spending more
+/// than this many rounds signals a regression rather than ordinary
+/// scheduling noise.
+const HEAL_MAX_AE_ROUNDS: u64 = 60;
+const HEAL_MONOTONIC_KEYS: [u32; 4] = [2_000, 8_000, 16_000, 20_000];
+
+/// `SUNDOG_SIM_FULL=1` switches [`partition_heal_comparison`] from the fast
+/// default grid to the full one: more key counts, the whole conflict-fraction
+/// range, and three seeds instead of one.
+fn heal_sim_full() -> bool {
+    std::env::var("SUNDOG_SIM_FULL").is_ok_and(|v| v == "1")
+}
+
+/// One partition-heal scenario's full parameterization; see the module doc
+/// comment above [`run_partition_heal`] for what each field drives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HealConfig {
+    seed: u64,
+    variant: Variant,
+    keys: u32,
+    conflict_fraction: f64,
+    increments_per_side: u32,
+    partition_ms: u64,
+    ae_interval_ms: u64,
+}
+
+impl HealConfig {
+    fn new(seed: u64, variant: Variant, keys: u32, conflict_fraction: f64) -> Self {
+        Self {
+            seed,
+            variant,
+            keys,
+            conflict_fraction,
+            increments_per_side: HEAL_INCREMENTS_PER_SIDE,
+            partition_ms: HEAL_PARTITION_MS,
+            ae_interval_ms: HEAL_AE_INTERVAL_MS,
+        }
+    }
+}
+
+/// One [`run_partition_heal`] call's reported metrics, from the heal onward.
+/// `records`/`applies`/`folds`/`redundant_pulls` are this redesign's own
+/// additions over the harness's earlier `PartitionHealMetrics`: `records` is
+/// every record either direction actually applied (or attempted to apply),
+/// `applies` is the subset that changed the touched key's stored
+/// `(version, bytes)`, `folds` is how many times the resolver itself
+/// returned `Winner::Merged`, and `redundant_pulls` is the pull-direction
+/// subset of `records - applies` -- the "Findings" section's own
+/// redundant-pull cost of the bidirectional exchange, isolated from the
+/// push direction.
+#[derive(Debug, Clone, PartialEq)]
+struct HealMetrics {
+    variant: &'static str,
+    keys: u32,
+    conflict_fraction: f64,
+    seed: u64,
+    ae_rounds: u64,
+    virtual_ms: u64,
+    frames: u64,
+    bytes: u64,
+    records: u64,
+    applies: u64,
+    folds: u64,
+    redundant_pulls: u64,
+    expected_total: i64,
+    actual_total: i64,
+    lost_updates: i64,
+}
+
+/// Wraps a [`ConflictResolver`] to count every [`Winner::Merged`] outcome it
+/// returns: the "resolver folds" metric, a test-visible counter on the
+/// resolver itself rather than anything the production `ConflictResolver`
+/// contract exposes.
+struct CountingResolver<R> {
+    inner: R,
+    folds: AtomicU64,
+}
+
+impl<R> CountingResolver<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            folds: AtomicU64::new(0),
+        }
+    }
+
+    fn folds(&self) -> u64 {
+        self.folds.load(Ordering::Relaxed)
+    }
+}
+
+impl<R: ConflictResolver> ConflictResolver for CountingResolver<R> {
+    fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        let winner = self.inner.winner(key, a, b);
+        if matches!(winner, Winner::Merged { .. }) {
+            self.folds.fetch_add(1, Ordering::Relaxed);
+        }
+        winner
+    }
+
+    fn needs_value_bytes(&self) -> bool {
+        self.inner.needs_value_bytes()
+    }
+
+    fn merges(&self) -> bool {
+        self.inner.merges()
+    }
+}
+
+/// Wraps a shard's `ShardOps` surface to count, on THIS wrapper instance
+/// specifically, every record passed to `apply_remote`/`apply_remote_batch`
+/// and how many of them left the touched key's stored `(version, bytes)` --
+/// its exact `WireRecord` -- unchanged: a genuine no-op fold, by the same
+/// byte-exact criterion `resolve_and_rebind` itself uses to skip
+/// re-publishing and re-replicating a redelivered merge. A node keeps two
+/// independently-counting instances wrapping the very same inner shard: one
+/// given to `dispatch_inbound` for the push path, one given to
+/// `run_round_against` for the pull path -- `ShardOps::apply_remote_batch`'s
+/// own signature carries no tag saying which direction a call arrived
+/// through, so which wrapper instance a call lands on is the only thing
+/// that tells push apart from pull. [`HealNode`] pairs the two up around one
+/// real shard.
+struct CountingShard<S> {
+    inner: Arc<S>,
+    records: AtomicU64,
+    redundant: AtomicU64,
+}
+
+impl<S> CountingShard<S> {
+    fn new(inner: Arc<S>) -> Self {
+        Self {
+            inner,
+            records: AtomicU64::new(0),
+            redundant: AtomicU64::new(0),
+        }
+    }
+
+    fn records(&self) -> u64 {
+        self.records.load(Ordering::Relaxed)
+    }
+
+    fn redundant(&self) -> u64 {
+        self.redundant.load(Ordering::Relaxed)
+    }
+}
+
+impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
+    fn apply_remote(&self, rec: WireRecord) -> BoxFuture<'_, ()> {
+        self.apply_remote_batch(vec![rec])
+    }
+
+    fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if recs.is_empty() {
+                return;
+            }
+            self.records.fetch_add(recs.len() as u64, Ordering::Relaxed);
+            let keys: Vec<Bytes> = recs.iter().map(|rec| rec.key.clone()).collect();
+            let before: HashMap<Bytes, WireRecord> = self
+                .inner
+                .records_for(keys.clone())
+                .await
+                .into_iter()
+                .map(|rec| (rec.key.clone(), rec))
+                .collect();
+            self.inner.apply_remote_batch(recs).await;
+            let after = self.inner.records_for(keys).await;
+            let redundant = after
+                .into_iter()
+                .filter(|rec| before.get(&rec.key).is_some_and(|prior| prior == rec))
+                .count();
+            if redundant > 0 {
+                self.redundant
+                    .fetch_add(redundant as u64, Ordering::Relaxed);
+            }
+        })
+    }
+
+    fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
+        self.inner.invalidate(key, ver)
+    }
+
+    fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>> {
+        self.inner.digests()
+    }
+
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+        self.inner.ae_digests_for(peer)
+    }
+
+    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+        self.inner.bucket_entries(bucket)
+    }
+
+    fn entries_for_buckets(
+        &self,
+        buckets: Vec<u16>,
+    ) -> BoxFuture<'_, sundog::store::BucketEntries> {
+        self.inner.entries_for_buckets(buckets)
+    }
+
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        self.inner.bucket_lens(buckets)
+    }
+
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        self.inner.part_digests(buckets)
+    }
+
+    fn entries_for_parts(
+        &self,
+        parts: Vec<(u16, u8)>,
+    ) -> BoxFuture<'_, sundog::store::PartEntries> {
+        self.inner.entries_for_parts(parts)
+    }
+
+    fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
+        self.inner.records_for(keys)
+    }
+
+    fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>> {
+        self.inner.snapshot_chunks()
+    }
+
+    fn gc_tombstones(&self, any_member_absent: bool) -> BoxFuture<'_, ()> {
+        self.inner.gc_tombstones(any_member_absent)
+    }
+
+    fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
+        self.inner.run_pending_tasks()
+    }
+
+    fn merges(&self) -> bool {
+        self.inner.merges()
+    }
+}
+
+/// One node's three handles onto the same real shard: `real` for direct
+/// local writes and reads from the test driver, `push` wrapping it for the
+/// inbound-dispatch path, `pull`/`pull_dyn` wrapping it (the same instance,
+/// two views) for the anti-entropy-initiator path through
+/// `sundog::run_round_against`. See [`CountingShard`]'s own doc for why push
+/// and pull need separate wrapper instances at all.
+struct HealNode {
+    real: Arc<Shard<String, PnCounter>>,
+    push: Arc<CountingShard<Shard<String, PnCounter>>>,
+    pull: Arc<CountingShard<Shard<String, PnCounter>>>,
+    pull_dyn: Arc<dyn ShardOps>,
+}
+
+impl HealNode {
+    fn new(real: Arc<Shard<String, PnCounter>>) -> Self {
+        let push = Arc::new(CountingShard::new(Arc::clone(&real)));
+        let pull = Arc::new(CountingShard::new(Arc::clone(&real)));
+        let pull_dyn: Arc<dyn ShardOps> = Arc::clone(&pull) as Arc<dyn ShardOps>;
+        Self {
+            real,
+            push,
+            pull,
+            pull_dyn,
+        }
+    }
+
+    fn records(&self) -> u64 {
+        self.push.records() + self.pull.records()
+    }
+
+    fn redundant(&self) -> u64 {
+        self.push.redundant() + self.pull.redundant()
+    }
+
+    fn redundant_pulls(&self) -> u64 {
+        self.pull.redundant()
+    }
+}
+
+fn merged_key(i: u32) -> String {
+    format!("counter:{i}")
+}
+
+fn decomposed_key(i: u32, side: &str) -> String {
+    format!("counter:{i}:{side}")
+}
+
+/// How many of `keys` counters land in the both-sides-written overlap:
+/// `conflict_fraction * keys`, rounded and clamped into `0..=keys`.
+fn overlap_count(keys: u32, conflict_fraction: f64) -> u32 {
+    let scaled = (f64::from(keys) * conflict_fraction).round();
+    if scaled <= 0.0 {
+        return 0;
+    }
+    if scaled >= f64::from(keys) {
+        return keys;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "scaled is already clamped into (0.0, f64::from(keys)) by the checks above, so \
+                  this truncating, sign-losing cast can never actually truncate or flip sign"
+    )]
+    let overlap = scaled as u32;
+    overlap
+}
+
+/// The exact grand total every counter converges to: side A contributes
+/// `increments_per_side` to each of the `overlap_count` counters it writes,
+/// side B contributes `increments_per_side` to every one of `keys` counters
+/// (its write set is the overlap plus the rest), and `PnCounter::local_delta`
+/// is cumulative, so only each writer's final round survives the merge.
+fn expected_total(keys: u32, conflict_fraction: f64, increments_per_side: u32) -> i64 {
+    let overlap = overlap_count(keys, conflict_fraction);
+    let inc = i64::from(increments_per_side);
+    (i64::from(keys) + i64::from(overlap)) * inc
+}
+
+/// Writes `increments_per_side` cumulative rounds to every counter in
+/// `range` from `node`, under `side`'s label -- `"a"` or `"b"` -- keyed per
+/// [`Variant`]: merged writes the shared `counter:{i}` key every writer
+/// folds into; decomposed writes this side's own `counter:{i}:{side}` key,
+/// never contended since no other writer ever touches it.
+fn write_side(
+    shard: &Shard<String, PnCounter>,
+    node: NodeId,
+    side: &'static str,
+    range: std::ops::Range<u32>,
+    variant: Variant,
+    increments_per_side: u32,
+) {
+    block_on(async {
+        for round in 1..=increments_per_side {
+            for i in range.clone() {
+                let key = match variant {
+                    Variant::Merged => merged_key(i),
+                    Variant::Decomposed => decomposed_key(i, side),
+                };
+                let _ = shard
+                    .insert(key, PnCounter::local_delta(node, u64::from(round)))
+                    .await;
+            }
+        }
+    });
+}
+
+/// Reads a shard's converged grand total back out, matching [`write_side`]'s
+/// own key scheme per [`Variant`]: one shared key per counter for merged, two
+/// per-side keys per counter for decomposed.
+fn heal_digests_of(shard: &Shard<String, PnCounter>) -> Vec<(u16, u64)> {
+    block_on(ShardOps::digests(shard))
+}
+
+fn counter_total(shard: &Shard<String, PnCounter>, keys: u32, variant: Variant) -> i64 {
+    block_on(async {
+        let mut total = 0i64;
+        for i in 0..keys {
+            match variant {
+                Variant::Merged => {
+                    if let Some(counter) = shard.get(&merged_key(i)).await {
+                        total += counter.value();
+                    }
+                }
+                Variant::Decomposed => {
+                    for side in ["a", "b"] {
+                        if let Some(counter) = shard.get(&decomposed_key(i, side)).await {
+                            total += counter.value();
+                        }
+                    }
+                }
+            }
+        }
+        total
     })
 }
 
-/// Cumulative rounds each node writes to every counter while partitioned:
-/// each round's write carries that node's new running total, matching
-/// `PnCounter::local_delta`'s cumulative-write contract, so only the final
-/// round's value survives the merge — the earlier rounds exist to exercise
-/// repeated concurrent increments, not to contribute to the expected total.
-const PARTITION_HEAL_ROUNDS: u64 = 3;
-
-/// A partition-heal counter node's whole role: dispatch inbound traffic and
-/// run anti-entropy against every peer on a timer. Writes are applied
-/// directly to the shard from outside this loop, the same direct-write
-/// pattern `run_partition_delete_scenario` uses, so this loop only has to
-/// keep the mesh alive and reconcile; `ae_rounds` counts every anti-entropy
-/// exchange this node's ticks attempt, peer failures included.
-#[derive(Clone)]
-struct CounterAeParams {
-    node: NodeId,
-    port: u16,
-    peers: Vec<(NodeId, &'static str, u16)>,
-    ae_period: Duration,
-    ae_rounds: Arc<AtomicUsize>,
+/// A namespace unique to `cfg`: folded into every host name, the cache name,
+/// and every node id this run builds, so two `run_partition_heal` calls in
+/// one process -- sequential or, under `cargo test`'s default parallelism,
+/// concurrent -- never share a host, a cache-labeled metric, or a node id,
+/// regardless of how many fields they otherwise have in common.
+fn heal_run_id(cfg: &HealConfig) -> String {
+    let tag = cfg.variant.tag();
+    let hash = xxh3_64(
+        format!(
+            "{tag}-{}-{}-{}-{}-{}",
+            cfg.seed, cfg.keys, cfg.conflict_fraction, cfg.increments_per_side, cfg.ae_interval_ms
+        )
+        .as_bytes(),
+    );
+    format!("heal-{tag}-{hash:016x}")
 }
 
-async fn counter_ae_loop<S: ShardOps + 'static>(
-    params: CounterAeParams,
-    shard: Arc<S>,
+fn heal_node_id(run_id: &str, role: &str) -> NodeId {
+    NodeId::from(xxh3_64(format!("{run_id}-{role}").as_bytes()))
+}
+
+/// A partition-heal node's whole role: dispatch inbound traffic through its
+/// `push` [`CountingShard`], and run `sundog::run_round_against` -- the
+/// production anti-entropy round, not a reimplementation -- against every
+/// peer on `peers` on a timer through its `pull` one. Writes are applied
+/// directly to `real` from outside this loop, the same direct-write pattern
+/// `run_partition_delete_scenario` uses, so this loop only has to keep the
+/// mesh alive and reconcile.
+///
+/// `ae_rounds` only counts a round against a peer in `counted_peers`: node
+/// b and node c are never partitioned from each other, so their own mutual
+/// rounds settle before the measurement window opens and stay a routine,
+/// always-no-op background rate the same as with any other steady pair
+/// (see `run_partition_heal`'s own pre-heal settle step) -- counting them
+/// alongside the rounds that actually repair the a/b-c split would mix an
+/// irrelevant, scale-independent tick rate into a metric meant to measure
+/// the repair itself.
+#[derive(Clone)]
+struct HealNodeParams {
+    node: NodeId,
+    port: u16,
+    peers: Vec<(NodeId, String, u16)>,
+    counted_peers: Vec<NodeId>,
+    ae_period: Duration,
+    ae_rounds: Arc<AtomicU64>,
+    cache: SmolStr,
+    outbox_capacity: usize,
+}
+
+async fn heal_node_loop(
+    params: HealNodeParams,
+    real: Arc<Shard<String, PnCounter>>,
+    push: Arc<CountingShard<Shard<String, PnCounter>>>,
+    pull: Arc<dyn ShardOps>,
 ) -> SimResult {
-    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(Arc::clone(&shard)));
+    let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(real));
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], params.port));
-    // Sized past this family's worst-case single-round repair burst (up to
-    // three records per counter, for the decomposed variant) so a heal's
-    // repair never needs the outbox to actually backpressure. `Mesh::send`
-    // drops a frame outright on a full outbox rather than waiting for room
-    // (see its own doc), and `ae_round_with_sketch` below enqueues a whole
-    // round's `push_keys` in one synchronous burst with no yield in
-    // between; on a bounded outbox, how many of that burst land versus get
-    // dropped depends on how much of any earlier traffic the connection
-    // writer has drained by that instant -- real scheduling order this
-    // process's tokio runtime seeds independently of the sim's own seed, so
-    // a drop there would make the round count this family measures vary
-    // between runs that share a seed. Comfortably past the default
-    // `ClusterConfig::outbox_capacity` keeps every default-sized run
-    // (`SUNDOG_SIM_KEYS` unset) at that ordinary capacity.
-    let outbox_capacity = (sim_counter_count() as usize)
-        .saturating_mul(4)
-        .max(ClusterConfig::default().outbox_capacity);
-    let config = ClusterConfig::default().with(|c| c.outbox_capacity = outbox_capacity);
+    let config = ClusterConfig::default().with(|c| c.outbox_capacity = params.outbox_capacity);
     let (mesh, mut inbound) = Mesh::spawn(bind_addr, params.node, 1, &config, handler).await?;
 
-    let peer_list = peer_list_of(&params.peers);
+    let borrowed: Vec<(NodeId, &str, u16)> = params
+        .peers
+        .iter()
+        .map(|(node, host, port)| (*node, host.as_str(), *port))
+        .collect();
+    let peer_list = peer_list_of(&borrowed);
     mesh.update_peers(peer_list.clone());
     let peer_ids: Vec<NodeId> = peer_list.iter().map(|peer| peer.node).collect();
 
@@ -3245,375 +3678,541 @@ async fn counter_ae_loop<S: ShardOps + 'static>(
         tokio::select! {
             biased;
             Some(InboundMsg { msg, .. }) = inbound.recv() => {
-                dispatch_inbound(shard.as_ref(), msg).await;
+                dispatch_inbound(push.as_ref(), msg).await;
             }
             _ = ae_tick.tick() => {
                 for &peer in &peer_ids {
-                    ae_round_with_sketch(&mesh, shard.as_ref(), peer, None).await;
-                    params.ae_rounds.fetch_add(1, Ordering::Relaxed);
+                    sundog::run_round_against(&mesh, &pull, &params.cache, peer).await;
+                    if params.counted_peers.contains(&peer) {
+                        params.ae_rounds.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
     }
 }
 
-/// One partition-heal run's reported metrics; see [`print_partition_heal_bench`].
-struct PartitionHealMetrics {
-    variant: &'static str,
-    counters: u32,
-    ae_rounds: usize,
-    steps_to_converge: usize,
-    frames: u64,
-    bytes: u64,
-    expected_total: i64,
-    actual_total: i64,
-    lost_updates: i64,
-}
-
-fn print_partition_heal_bench(m: &PartitionHealMetrics) {
-    eprintln!(
-        "BENCH partition_heal variant={} counters={} ae_rounds={} steps_to_converge={} \
-         frames={} bytes={} expected_total={} actual_total={} lost_updates={}",
-        m.variant,
-        m.counters,
-        m.ae_rounds,
-        m.steps_to_converge,
-        m.frames,
-        m.bytes,
-        m.expected_total,
-        m.actual_total,
-        m.lost_updates
-    );
-}
-
-/// Shared driver for the partition-heal counter family: builds three
-/// `Shard<u32, V>`s (`resolver` overriding the default `LwwResolver` when
-/// `Some`), partitions node `a` from `b`/`c` (who stay mutually connected),
-/// runs `write_all` on each node to increment every one of `counters`
-/// counters `PARTITION_HEAL_ROUNDS` times, heals, then waits for all three
-/// digests to agree. `write_all`'s third argument is the node's index
-/// (0/1/2) among the three, for a variant that decomposes into per-writer
-/// keys; `total_of` reads a shard's converged grand total back out.
-///
-/// Frames, bytes, and anti-entropy rounds are measured from the heal
-/// onward, after node `b`/`c` — never partitioned from each other — have
-/// already had time to settle between themselves, so the reported cost is
-/// anti-entropy repairing node `a`'s side of the split rather than the
-/// ordinary in-partition traffic between the two nodes that stayed
-/// connected throughout.
-///
-/// `frames`/`bytes` read [`sundog::net`]'s process-wide wire counters, shared
-/// with every other test in this binary; [`PARTITION_HEAL_WIRE_METRICS_LOCK`]
-/// keeps this family's own measurement windows from overlapping each other,
-/// so the `pn_counter`/`lww_decomposed` comparison stays meaningful under
-/// `cargo test`'s default parallelism. It cannot shield the window from any
-/// *other* concurrently-running sim test's traffic; run this binary with
-/// `--test-threads=1` for an absolute frame/byte count free of that noise.
-static PARTITION_HEAL_WIRE_METRICS_LOCK: StdMutex<()> = StdMutex::new(());
 #[allow(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "one scenario driver's full setup, write/heal schedule, and convergence check read best kept together"
+    reason = "one node's registration: host, identity, its peer roster, the shared per-run \
+              counters, and its own counting-shard handles all belong together at one call site"
 )]
-fn run_partition_heal<V, W, T>(
-    variant: &'static str,
-    seed: u64,
+fn spawn_heal_host(
+    sim: &mut Sim<'_>,
+    host: &str,
+    node: NodeId,
     port: u16,
-    resolver: Option<&Arc<dyn ConflictResolver>>,
-    counters: u32,
-    write_all: W,
-    total_of: T,
-) -> PartitionHealMetrics
-where
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    W: Fn(&Shard<u32, V>, NodeId, u32, u32, u64),
-    T: Fn(&Shard<u32, V>, u32) -> i64,
-{
-    let host_a = "heal-a";
-    let host_b = "heal-b";
-    let host_c = "heal-c";
-    let node_a = NodeId::from(u64::from(port) * 10 + 1);
-    let node_b = NodeId::from(u64::from(port) * 10 + 2);
-    let node_c = NodeId::from(u64::from(port) * 10 + 3);
+    peers: Vec<(NodeId, String, u16)>,
+    counted_peers: Vec<NodeId>,
+    ae_period: Duration,
+    ae_rounds: Arc<AtomicU64>,
+    cache: SmolStr,
+    outbox_capacity: usize,
+    heal_node: &HealNode,
+) {
+    let params = HealNodeParams {
+        node,
+        port,
+        peers,
+        counted_peers,
+        ae_period,
+        ae_rounds,
+        cache,
+        outbox_capacity,
+    };
+    let real = Arc::clone(&heal_node.real);
+    let push = Arc::clone(&heal_node.push);
+    let pull = Arc::clone(&heal_node.pull_dyn);
+    sim.host(host, move || {
+        let params = params.clone();
+        let real = Arc::clone(&real);
+        let push = Arc::clone(&push);
+        let pull = Arc::clone(&pull);
+        async move { heal_node_loop(params, real, push, pull).await }
+    });
+}
 
-    let build_shard = |node: NodeId| -> Shard<u32, V> {
-        let shard = Shard::new(cache_name(), Mode::Replicated, node, 200_000, None, None);
-        match resolver {
+/// [`run_partition_heal`]'s wire-metrics measurement window, guarded the
+/// same way [`HEAL_WIRE_METRICS_LOCK`]'s predecessor was: `frames_sent_total`/
+/// `bytes_sent_total` are process-wide, shared with every other test in this
+/// binary, so only one partition-heal run's window is open at a time.
+static HEAL_WIRE_METRICS_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Runs one partition-heal scenario end to end and returns its metrics from
+/// the heal onward: a fresh `turmoil::Sim`, three nodes with node `a` split
+/// from `b`/`c` (who stay mutually connected), the write schedule
+/// `cfg.conflict_fraction` and `cfg.variant` select, a heal, then anti-entropy
+/// -- run through the production `sundog::run_round_against` entry point,
+/// never a reimplementation of it -- until every node's fingerprint agrees
+/// and every counter reads the exact expected total. See
+/// `docs/crdt-merge-poc.md`'s partition-heal section for the full design and
+/// the "Findings that shape the implementation" this driver embodies.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario driver's full setup, write/heal schedule, and convergence check read \
+              best kept together"
+)]
+fn run_partition_heal(cfg: HealConfig) -> HealMetrics {
+    const PORT: u16 = 4900;
+
+    let tag = cfg.variant.tag();
+    let run_id = heal_run_id(&cfg);
+    let cache = SmolStr::new(run_id.clone());
+    let node_a = heal_node_id(&run_id, "a");
+    let node_b = heal_node_id(&run_id, "b");
+    let node_c = heal_node_id(&run_id, "c");
+    let host_a = format!("{run_id}-a");
+    let host_b = format!("{run_id}-b");
+    let host_c = format!("{run_id}-c");
+
+    let counting_resolver = match cfg.variant {
+        Variant::Merged => Some(Arc::new(CountingResolver::new(PnCounterResolver))),
+        Variant::Decomposed => None,
+    };
+    let dyn_resolver: Option<Arc<dyn ConflictResolver>> = counting_resolver
+        .as_ref()
+        .map(|r| Arc::clone(r) as Arc<dyn ConflictResolver>);
+
+    let build_shard = |node: NodeId| -> Shard<String, PnCounter> {
+        let shard = Shard::new(cache.clone(), Mode::Replicated, node, 200_000, None, None);
+        match &dyn_resolver {
             Some(r) => shard.with_resolver(Arc::clone(r)),
             None => shard,
         }
     };
-    let shard_a = Arc::new(build_shard(node_a));
-    let shard_b = Arc::new(build_shard(node_b));
-    let shard_c = Arc::new(build_shard(node_c));
 
-    let ae_period = Duration::from_millis(100);
+    let a = HealNode::new(Arc::new(build_shard(node_a)));
+    let b = HealNode::new(Arc::new(build_shard(node_b)));
+    let c = HealNode::new(Arc::new(build_shard(node_c)));
+
+    let ae_period = Duration::from_millis(cfg.ae_interval_ms);
+    let outbox_capacity = (cfg.keys as usize)
+        .saturating_mul(4)
+        .max(ClusterConfig::default().outbox_capacity);
+    let ae_rounds = Arc::new(AtomicU64::new(0));
+
+    // Zero message latency, unlike every other scenario in this file: with
+    // it at the usual few milliseconds, the exact number of rounds counted
+    // before convergence is detected depends on how many random-latency
+    // draws a run's own frame count consumes -- itself a function of key
+    // count -- so the round count picks up scale-dependent scheduling noise
+    // having nothing to do with the anti-entropy protocol's own cost, the
+    // harness-artifact failure mode this redesign exists to remove. At zero
+    // latency every delivery lands in the same tick every run, so a
+    // config's round count depends only on the protocol and the data, not
+    // on how many bytes happened to shift a message's place in the RNG
+    // stream.
     let mut sim = Builder::new()
-        .rng_seed(seed)
+        .rng_seed(cfg.seed)
         .tick_duration(TICK)
-        .max_message_latency(Duration::from_millis(20))
+        .max_message_latency(Duration::ZERO)
         .build();
 
-    let roster: Vec<(NodeId, &'static str, u16)> = vec![
-        (node_a, host_a, port),
-        (node_b, host_b, port),
-        (node_c, host_c, port),
-    ];
-    let ae_rounds = Arc::new(AtomicUsize::new(0));
+    spawn_heal_host(
+        &mut sim,
+        &host_a,
+        node_a,
+        PORT,
+        vec![
+            (node_b, host_b.clone(), PORT),
+            (node_c, host_c.clone(), PORT),
+        ],
+        vec![node_b, node_c],
+        ae_period,
+        Arc::clone(&ae_rounds),
+        cache.clone(),
+        outbox_capacity,
+        &a,
+    );
+    spawn_heal_host(
+        &mut sim,
+        &host_b,
+        node_b,
+        PORT,
+        vec![
+            (node_a, host_a.clone(), PORT),
+            (node_c, host_c.clone(), PORT),
+        ],
+        vec![node_a],
+        ae_period,
+        Arc::clone(&ae_rounds),
+        cache.clone(),
+        outbox_capacity,
+        &b,
+    );
+    spawn_heal_host(
+        &mut sim,
+        &host_c,
+        node_c,
+        PORT,
+        vec![
+            (node_a, host_a.clone(), PORT),
+            (node_b, host_b.clone(), PORT),
+        ],
+        vec![node_a],
+        ae_period,
+        Arc::clone(&ae_rounds),
+        cache.clone(),
+        outbox_capacity,
+        &c,
+    );
 
-    for &(node, host, _) in &roster {
-        let peers: Vec<(NodeId, &'static str, u16)> = roster
-            .iter()
-            .filter(|&&(id, _, _)| id != node)
-            .copied()
-            .collect();
-        let node_shard = if node == node_a {
-            Arc::clone(&shard_a)
-        } else if node == node_b {
-            Arc::clone(&shard_b)
-        } else {
-            Arc::clone(&shard_c)
-        };
-        let params = CounterAeParams {
-            node,
-            port,
-            peers,
-            ae_period,
-            ae_rounds: Arc::clone(&ae_rounds),
-        };
-        sim.host(host, move || {
-            let shard = Arc::clone(&node_shard);
-            let params = params.clone();
-            async move { counter_ae_loop(params, shard).await }
-        });
-    }
-
-    // Two-way split: node-a alone on one side, node-b/node-c together on
-    // the other, mirroring the two-node scenarios' partition/heal shape at
-    // one remove. Applied before any step runs, so node-a's mesh never
-    // gets the chance to dial node-b/node-c at all -- and so never pools a
-    // request/response connection toward either that would then sit idle,
-    // aging in *real* wall-clock time (`net::conn::ReqPool` stamps and
-    // checks freshness with `Instant::now()`, deliberately unvirtualized
-    // since a real deployment's idle-connection policy has to mean real
-    // time), through the write phase below. That phase drives tens of
-    // thousands of direct, un-simulated `shard.insert` calls per node and
-    // so takes a real-time span this family's own scale knob
-    // (`SUNDOG_SIM_KEYS`) grows unboundedly: at a high enough key count it
-    // is long enough to occasionally cross `ReqPool`'s real 30s freshness
-    // window, so whether node-a's post-heal repair opens on a pooled
-    // connection or dials fresh becomes a coin flip on nothing the sim's
-    // own seed controls -- silently shifting how many anti-entropy rounds
-    // convergence takes. Node-b and node-c, never partitioned, keep
-    // exchanging real anti-entropy traffic with each other the whole time
-    // regardless of this ordering, so their own connection pool never goes
-    // idle long enough to matter.
-    sim.partition(host_a, host_b);
-    sim.partition(host_a, host_c);
+    // Two-way split: node-a alone on one side, node-b/node-c together on the
+    // other. Applied before any step runs, so node-a's mesh never gets the
+    // chance to dial node-b/node-c at all -- see the predecessor of this
+    // driver's own long-standing note on why that ordering matters for
+    // determinism (`ReqPool`'s freshness window is real wall-clock time,
+    // never virtualized).
+    sim.partition(host_a.as_str(), host_b.as_str());
+    sim.partition(host_a.as_str(), host_c.as_str());
 
     // Let the mesh's connections settle (node-b/node-c's with each other;
     // node-a's dial attempts toward either fail fast and back off, already
     // partitioned).
     run_steps(&mut sim, steps_for(Duration::from_millis(100)));
 
-    write_all(&shard_a, node_a, 0, counters, PARTITION_HEAL_ROUNDS);
-    write_all(&shard_b, node_b, 1, counters, PARTITION_HEAL_ROUNDS);
-    write_all(&shard_c, node_c, 2, counters, PARTITION_HEAL_ROUNDS);
+    let overlap = overlap_count(cfg.keys, cfg.conflict_fraction);
+    write_side(
+        a.real.as_ref(),
+        node_a,
+        "a",
+        0..overlap,
+        cfg.variant,
+        cfg.increments_per_side,
+    );
+    write_side(
+        b.real.as_ref(),
+        node_b,
+        "b",
+        0..cfg.keys,
+        cfg.variant,
+        cfg.increments_per_side,
+    );
 
     // Give node-b/node-c, never partitioned from each other, time to settle
-    // between themselves before the measurement window starts: see this
-    // function's own doc for why.
-    run_steps(&mut sim, steps_for(Duration::from_millis(500)));
+    // between themselves before the measurement window starts, so the
+    // reported cost is anti-entropy repairing node-a's side of the split
+    // rather than ordinary in-partition b/c traffic.
+    run_steps(&mut sim, steps_for(Duration::from_millis(cfg.partition_ms)));
 
-    let wire_metrics_guard = PARTITION_HEAL_WIRE_METRICS_LOCK
+    let wire_guard = HEAL_WIRE_METRICS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let frames_before = sundog::net::frames_sent_total();
     let bytes_before = sundog::net::bytes_sent_total();
     let ae_rounds_before = ae_rounds.load(Ordering::Relaxed);
+    let records_before = a.records() + b.records() + c.records();
+    let redundant_before = a.redundant() + b.redundant() + c.redundant();
+    let redundant_pulls_before = a.redundant_pulls() + b.redundant_pulls() + c.redundant_pulls();
+    let folds_before = counting_resolver.as_ref().map_or(0, |r| r.folds());
 
-    sim.repair(host_a, host_b);
-    sim.repair(host_a, host_c);
+    sim.repair(host_a.as_str(), host_b.as_str());
+    sim.repair(host_a.as_str(), host_c.as_str());
 
+    let expected = expected_total(cfg.keys, cfg.conflict_fraction, cfg.increments_per_side);
     let budget = steps_for(ae_period * 40 + Duration::from_secs(2));
     let steps_to_converge = run_until(&mut sim, budget, || {
-        let da = block_on(ShardOps::digests(shard_a.as_ref()));
-        let db = block_on(ShardOps::digests(shard_b.as_ref()));
-        let dc = block_on(ShardOps::digests(shard_c.as_ref()));
-        da == db && db == dc
+        let da = heal_digests_of(a.real.as_ref());
+        let db = heal_digests_of(b.real.as_ref());
+        let dc = heal_digests_of(c.real.as_ref());
+        da == db
+            && db == dc
+            && counter_total(a.real.as_ref(), cfg.keys, cfg.variant) == expected
+            && counter_total(b.real.as_ref(), cfg.keys, cfg.variant) == expected
+            && counter_total(c.real.as_ref(), cfg.keys, cfg.variant) == expected
     })
-    .unwrap_or_else(|| panic!("{variant}: partition-heal did not converge within the budget"));
+    .unwrap_or_else(|| {
+        panic!(
+            "{tag}: partition-heal did not converge within the budget (keys={}, conflict_fraction={})",
+            cfg.keys, cfg.conflict_fraction
+        )
+    });
 
     let frames = sundog::net::frames_sent_total() - frames_before;
     let bytes = sundog::net::bytes_sent_total() - bytes_before;
     let ae_rounds_spent = ae_rounds.load(Ordering::Relaxed) - ae_rounds_before;
-    drop(wire_metrics_guard);
+    let records = a.records() + b.records() + c.records() - records_before;
+    let redundant = a.redundant() + b.redundant() + c.redundant() - redundant_before;
+    let redundant_pulls =
+        a.redundant_pulls() + b.redundant_pulls() + c.redundant_pulls() - redundant_pulls_before;
+    let folds = counting_resolver.as_ref().map_or(0, |r| r.folds()) - folds_before;
+    drop(wire_guard);
 
-    let expected_total = i64::from(counters)
-        * 3
-        * i64::try_from(PARTITION_HEAL_ROUNDS).expect("PARTITION_HEAL_ROUNDS fits an i64");
-    let actual_total = total_of(&shard_a, counters);
-    assert_eq!(
-        actual_total,
-        total_of(&shard_b, counters),
-        "{variant}: node-a and node-b disagree on the converged total"
-    );
-    assert_eq!(
-        actual_total,
-        total_of(&shard_c, counters),
-        "{variant}: node-a and node-c disagree on the converged total"
-    );
+    let actual_total = counter_total(a.real.as_ref(), cfg.keys, cfg.variant);
 
-    let metrics = PartitionHealMetrics {
-        variant,
-        counters,
+    let metrics = HealMetrics {
+        variant: tag,
+        keys: cfg.keys,
+        conflict_fraction: cfg.conflict_fraction,
+        seed: cfg.seed,
         ae_rounds: ae_rounds_spent,
-        steps_to_converge,
+        virtual_ms: steps_to_ms(steps_to_converge),
         frames,
         bytes,
-        expected_total,
+        records,
+        applies: records.saturating_sub(redundant),
+        folds,
+        redundant_pulls,
+        expected_total: expected,
         actual_total,
-        lost_updates: expected_total - actual_total,
+        lost_updates: expected - actual_total,
     };
-    print_partition_heal_bench(&metrics);
+    print_heal_metrics(&metrics);
     metrics
 }
 
-/// Every anti-entropy round in this family runs against at most two peers
-/// on a 100ms tick; five ticks per side of the heal comfortably covers the
-/// convergence this family's shape needs, so a run spending more than this
-/// many rounds signals a regression rather than ordinary scheduling noise.
-const PARTITION_HEAL_MAX_AE_ROUNDS: usize = 60;
+fn steps_to_ms(steps: usize) -> u64 {
+    u64::try_from(steps)
+        .expect("test-scale step counts fit in a u64")
+        .saturating_mul(u64::try_from(TICK.as_millis()).expect("TICK's millis count fits in a u64"))
+}
 
-/// The merged variant: one `PnCounter` key per counter under
-/// `PnCounterResolver`. Both partition sides increment every counter
-/// concurrently; the merge rule's fourth arm (see `store::mod`'s
-/// `ConflictResolver` docs) mints a fresh version for the folded result, so
-/// anti-entropy always recognizes it as something to fetch, and the merged
-/// total never drops an update regardless of apply order or how many times
-/// a record is redelivered.
-///
-/// Also runs the decomposed control (below) and checks its own bound, in
-/// this same test rather than as a separate one: turmoil's `rng_seed` seeds
-/// its own network-level randomness deterministically, but not every
-/// scheduling choice downstream of it, so two separately built `Sim`s
-/// constructed from the same seed are not guaranteed to reproduce identical
-/// anti-entropy round counts at this scale, only a fresh, unshared one
-/// each. Comparing this test's own `pn_counter` figure against a
-/// `lww_decomposed` figure read off a *different* test's run stitches
-/// together two such unshared draws; running decomposed exactly once, here,
-/// keeps both assertions below reading off the one run that actually
-/// happened.
-#[test]
-fn partition_heal_pn_counter_converges_to_exact_totals() {
-    let counters = sim_counter_count();
-    let metrics = run_partition_heal::<PnCounter, _, _>(
-        "pn_counter",
-        sim_seed(0xC0DE_6501),
-        4900,
-        Some(&(Arc::new(PnCounterResolver) as Arc<dyn ConflictResolver>)),
-        counters,
-        |shard, node, _index, counters, rounds| {
-            block_on(async {
-                for round in 1..=rounds {
-                    for key in 0..counters {
-                        let _ = shard.insert(key, PnCounter::local_delta(node, round)).await;
-                    }
-                }
-            });
-        },
-        |shard, counters| {
-            block_on(async {
-                let mut total = 0i64;
-                for key in 0..counters {
-                    if let Some(counter) = shard.get(&key).await {
-                        total += counter.value();
-                    }
-                }
-                total
-            })
-        },
-    );
-
-    assert_eq!(
-        metrics.lost_updates, 0,
-        "pn_counter: the merged variant converges to the exact total with zero lost updates"
-    );
-    assert!(
-        metrics.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,
-        "pn_counter: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
-        metrics.ae_rounds
-    );
-
-    // `PnCounterResolver::merges()` is `true`, so `ae_round_with_sketch`'s
-    // `diff_bucket`/`diff_decoded` exchange both sides of a mismatched
-    // counter in the same round instead of only the greater version
-    // pushing to the lesser side (see `store::ConflictResolver::merges`'s
-    // and `engine::merge_version`'s docs for why that halves the round trip
-    // a divergent key costs). Run once, right here -- see this test's own
-    // doc for why a second, separately run copy of this scenario is not an
-    // interchangeable stand-in for this one.
-    let decomposed = run_lww_decomposed_partition_heal(sim_seed(0xC0DE_6502), 4910);
-    assert!(
-        decomposed.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,
-        "lww_decomposed: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
-        decomposed.ae_rounds
-    );
-    assert!(
-        metrics.ae_rounds <= decomposed.ae_rounds,
-        "pn_counter: the bidirectional merging exchange spent {} anti-entropy rounds repairing \
-         the partition, more than lww_decomposed's {} -- exchanging both sides on a mismatch \
-         should let merging match or beat the decomposed control, not fall behind it",
-        metrics.ae_rounds,
-        decomposed.ae_rounds
+fn print_heal_metrics(m: &HealMetrics) {
+    eprintln!(
+        "SIM partition_heal variant={} keys={} conflict_fraction={} seed={:#x} ae_rounds={} \
+         virtual_ms={} frames={} bytes={} records={} applies={} folds={} redundant_pulls={} \
+         expected_total={} actual_total={} lost_updates={}",
+        m.variant,
+        m.keys,
+        m.conflict_fraction,
+        m.seed,
+        m.ae_rounds,
+        m.virtual_ms,
+        m.frames,
+        m.bytes,
+        m.records,
+        m.applies,
+        m.folds,
+        m.redundant_pulls,
+        m.expected_total,
+        m.actual_total,
+        m.lost_updates
     );
 }
 
-/// The decomposed variant: `counters * 3` keys under the default
-/// `LwwResolver`, one per `(counter, writer)` pair, each written by exactly
-/// one node — a hand-rolled G-counter built entirely from single-writer
-/// keys and plain last-write-wins, with no [`Winner::Merged`] involved.
-/// Every sub-key has one writer, so `LwwResolver`'s total order never has a
-/// real conflict to lose a side of, and this variant is not expected to
-/// lose updates; the point of running it is the comparison against
-/// [`partition_heal_pn_counter_converges_to_exact_totals`]'s single-key
-/// merge, not a claim that decomposition can lose updates. `lost_updates`
-/// is reported on its `BENCH` line but never asserted to a specific value.
-/// Factored out of [`partition_heal_pn_counter_converges_to_exact_totals`],
-/// its one call site, so that test's own body reads as `pn_counter`'s
-/// scenario followed by decomposed's, without inlining decomposed's
-/// write/read closures into it.
-fn run_lww_decomposed_partition_heal(seed: u64, port: u16) -> PartitionHealMetrics {
-    let counters = sim_counter_count();
-    run_partition_heal::<String, _, _>(
-        "lww_decomposed",
-        seed,
-        port,
-        None,
-        counters,
-        |shard, _node, index, counters, rounds| {
-            block_on(async {
-                for round in 1..=rounds {
-                    for key in 0..counters {
-                        let subkey = key * 3 + index;
-                        let _ = shard.insert(subkey, round.to_string()).await;
-                    }
+/// A ratio only needs `f64`'s exact-integer range, up to 2^53, comfortably
+/// covering this family's counters at every scale this grid drives; mirrors
+/// `engine::count_f64` and `spill::bytes_used_f64`'s own precedent for the
+/// same allow.
+#[allow(clippy::cast_precision_loss)]
+fn heal_ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        f64::NAN
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn print_heal_comparison(decomposed: &HealMetrics, merged: &HealMetrics) {
+    eprintln!(
+        "SIM partition_heal_pair keys={} conflict_fraction={} seed={:#x} ae_rounds_ratio={:.3} \
+         virtual_ms_ratio={:.3} bytes_ratio={:.3}",
+        merged.keys,
+        merged.conflict_fraction,
+        merged.seed,
+        heal_ratio(merged.ae_rounds, decomposed.ae_rounds),
+        heal_ratio(merged.virtual_ms, decomposed.virtual_ms),
+        heal_ratio(merged.bytes, decomposed.bytes),
+    );
+}
+
+/// Correctness only, at the default grid: every combination of variant and
+/// conflict fraction converges to the exact expected total. The convergence
+/// loop inside `run_partition_heal` already gates on this (and on all three
+/// nodes' fingerprints agreeing) before it ever returns, so a `HealMetrics`
+/// this test receives at all already reflects a converged, correct run;
+/// `lost_updates == 0` restates that guarantee explicitly rather than
+/// relying on it being implicit.
+#[test]
+fn partition_heal_variant_reaches_exact_totals() {
+    let seed = sim_seed(0xC0DE_7100);
+    for variant in [Variant::Decomposed, Variant::Merged] {
+        for &conflict_fraction in &HEAL_DEFAULT_CONFLICT_FRACTIONS {
+            let metrics = run_partition_heal(HealConfig::new(
+                seed,
+                variant,
+                HEAL_DEFAULT_KEYS,
+                conflict_fraction,
+            ));
+            assert_eq!(
+                metrics.lost_updates,
+                0,
+                "{}: keys={} conflict_fraction={conflict_fraction} did not converge to the exact total",
+                variant.tag(),
+                metrics.keys
+            );
+        }
+    }
+}
+
+/// The fair decomposed-vs-merged comparison: for every config in the grid,
+/// runs decomposed then merged with the same seed, prints one `SIM` line
+/// per run and one `SIM partition_heal_pair` line per pair, and asserts only
+/// that both sides converged correctly and within
+/// [`HEAL_MAX_AE_ROUNDS`] -- never a specific ratio between them, which is a
+/// report to read (see `docs/crdt-merge-poc.md`), not a property to pin.
+/// `SUNDOG_SIM_FULL=1` swaps the fast default grid (2,000 keys, conflict
+/// fraction 0.0/1.0, one seed) for the full one (2,000 and 20,000 keys, the
+/// whole 0.0/0.1/0.5/1.0 conflict-fraction range, three seeds).
+#[test]
+fn partition_heal_comparison() {
+    let full = heal_sim_full();
+    let keys_grid: &[u32] = if full {
+        &HEAL_FULL_KEYS
+    } else {
+        &[HEAL_DEFAULT_KEYS]
+    };
+    let fractions: &[f64] = if full {
+        &HEAL_FULL_CONFLICT_FRACTIONS
+    } else {
+        &HEAL_DEFAULT_CONFLICT_FRACTIONS
+    };
+    let default_seed = [sim_seed(0xC0DE_7200)];
+    let seeds: &[u64] = if full {
+        &HEAL_FULL_SEEDS
+    } else {
+        &default_seed
+    };
+
+    for &keys in keys_grid {
+        for &conflict_fraction in fractions {
+            for &seed in seeds {
+                let decomposed = run_partition_heal(HealConfig::new(
+                    seed,
+                    Variant::Decomposed,
+                    keys,
+                    conflict_fraction,
+                ));
+                let merged = run_partition_heal(HealConfig::new(
+                    seed,
+                    Variant::Merged,
+                    keys,
+                    conflict_fraction,
+                ));
+
+                for metrics in [&decomposed, &merged] {
+                    assert_eq!(
+                        metrics.lost_updates, 0,
+                        "{}: keys={keys} conflict_fraction={conflict_fraction} seed={seed:#x} \
+                         did not converge to the exact total",
+                        metrics.variant
+                    );
+                    assert!(
+                        metrics.ae_rounds <= HEAL_MAX_AE_ROUNDS,
+                        "{}: keys={keys} conflict_fraction={conflict_fraction} seed={seed:#x} \
+                         spent {} anti-entropy rounds, over the {HEAL_MAX_AE_ROUNDS} sanity bound",
+                        metrics.variant,
+                        metrics.ae_rounds
+                    );
                 }
-            });
-        },
-        |shard, counters| {
-            block_on(async {
-                let mut total = 0i64;
-                for key in 0..counters {
-                    for index in 0..3u32 {
-                        let subkey = key * 3 + index;
-                        if let Some(value) = shard.get(&subkey).await {
-                            total += value.parse::<i64>().unwrap_or(0);
-                        }
-                    }
-                }
-                total
-            })
-        },
-    )
+                print_heal_comparison(&decomposed, &merged);
+            }
+        }
+    }
+}
+
+/// The same config, run twice in one process, must yield identical metrics
+/// on every field `run_partition_heal`'s own simulation determines:
+/// `run_partition_heal`'s per-run namespacing (see [`heal_run_id`]) is what
+/// makes two calls in one process share nothing, so nothing about the
+/// second run's `Sim`, shards, or counters can be influenced by the
+/// first's. `frames`/`bytes` are the one deliberate exception: they read
+/// `sundog::net`'s process-wide wire counters (see
+/// [`HEAL_WIRE_METRICS_LOCK`]'s own doc), so under `cargo test`'s default
+/// parallelism a wholly unrelated sim test running concurrently on another
+/// thread can add to those same two counters mid-window -- a real source of
+/// noise this test's own two `run_partition_heal` calls cannot serialize
+/// against, since it comes from other tests entirely. Every field this
+/// harness itself controls is still asserted equal.
+#[test]
+fn partition_heal_is_deterministic_for_a_fixed_config() {
+    let cfg = HealConfig::new(
+        sim_seed(0xC0DE_7300),
+        Variant::Merged,
+        HEAL_DEFAULT_KEYS,
+        1.0,
+    );
+    let first = run_partition_heal(cfg);
+    let second = run_partition_heal(cfg);
+    let msg = "the same partition-heal config run twice in one process must yield identical \
+               metrics on every field this harness itself controls (frames/bytes excepted -- \
+               see this test's own doc)";
+    assert_eq!(
+        (
+            first.variant,
+            first.keys,
+            first.conflict_fraction,
+            first.seed
+        ),
+        (
+            second.variant,
+            second.keys,
+            second.conflict_fraction,
+            second.seed
+        ),
+        "{msg}"
+    );
+    assert_eq!(
+        (
+            first.ae_rounds,
+            first.virtual_ms,
+            first.records,
+            first.applies
+        ),
+        (
+            second.ae_rounds,
+            second.virtual_ms,
+            second.records,
+            second.applies
+        ),
+        "{msg}"
+    );
+    assert_eq!(
+        (
+            first.folds,
+            first.redundant_pulls,
+            first.expected_total,
+            first.actual_total,
+            first.lost_updates,
+        ),
+        (
+            second.folds,
+            second.redundant_pulls,
+            second.expected_total,
+            second.actual_total,
+            second.lost_updates,
+        ),
+        "{msg}"
+    );
+}
+
+/// Pins the "Findings" section's own regression signature: the harness
+/// artifact that reimplemented anti-entropy produced non-monotonic round
+/// counts as key count grew (3 rounds at 8,000 keys, 19 at 16,000, 5 at
+/// 20,000). Driving rounds through the production `run_round_against` entry
+/// point instead should make rounds monotone non-decreasing in key count, at
+/// fixed full conflict, for both variants.
+#[test]
+fn partition_heal_rounds_are_monotone_in_key_count() {
+    let seed = sim_seed(0xC0DE_7400);
+    for variant in [Variant::Decomposed, Variant::Merged] {
+        let mut previous = 0u64;
+        for &keys in &HEAL_MONOTONIC_KEYS {
+            let metrics = run_partition_heal(HealConfig::new(seed, variant, keys, 1.0));
+            assert_eq!(
+                metrics.lost_updates,
+                0,
+                "{}: keys={keys} did not converge to the exact total",
+                variant.tag()
+            );
+            assert!(
+                metrics.ae_rounds >= previous,
+                "{}: ae_rounds regressed from {previous} at a smaller key count to {} at \
+                 keys={keys} -- rounds must be monotone non-decreasing in key count",
+                variant.tag(),
+                metrics.ae_rounds
+            );
+            previous = metrics.ae_rounds;
+        }
+    }
 }

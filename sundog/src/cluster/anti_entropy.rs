@@ -28,7 +28,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::Cluster;
 use super::sketch::{Cell, Decoded, Iblt};
 use crate::hlc::Hlc;
-use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, MsgClass};
+use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
 use crate::node::NodeId;
 use crate::store::{ShardOps, bucket_of};
 
@@ -67,7 +67,7 @@ pub(crate) async fn scheduler_task(
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            _ = run_round_against(&cluster, &shard, &cache, peer) => {}
+            _ = run_round_against(cluster.mesh(), &shard, &cache, peer) => {}
         }
     }
 }
@@ -141,7 +141,7 @@ fn pick_peer(cluster: &Cluster, shard: &Arc<dyn ShardOps>) -> Option<(NodeId, bo
 /// bucket only once a round against each of its new owners reports
 /// [`RoundOutcome::Reconciled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RoundOutcome {
+pub enum RoundOutcome {
     /// The digest exchange completed and every mismatch was repaired as far
     /// as the peer answered.
     Reconciled,
@@ -163,25 +163,33 @@ pub(crate) enum RoundOutcome {
 ///
 /// For a `Mode::Distributed` shard (one reporting an
 /// [`ShardOps::ownership_view_hash`]), the digest exchange goes through
-/// [`Mesh::ae_round_scoped`] instead of [`Mesh::ae_round`], carrying this
+/// `Mesh::ae_round_scoped` instead of [`Mesh::ae_round`], carrying this
 /// shard's view hash for the epoch check; a `Stale` reply ends the round
 /// immediately, `sundog_stale_view_total` counted, with no push or pull
 /// attempted — the next scheduled round retries with a freshly re-borrowed
 /// view. Every tier past the initial digest exchange — part digests,
 /// sketches, listings — runs exactly the same regardless of how the round
 /// was scoped.
+///
+/// Takes `mesh` directly rather than a whole `&Cluster`: every caller inside
+/// this crate already has one (`cluster.mesh()`), and this is also the seam
+/// `tests/sim.rs` calls under `feature = "sim"` (re-exported from `lib.rs`)
+/// to drive one round through the real digest-exchange-through-repair
+/// sequence against its own hand-built `Mesh`/`ShardOps` pair, instead of
+/// reimplementing it — see that module's own doc for why building a whole
+/// `Cluster` there would pull in gossip and discovery this suite never
+/// needs.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
 #[allow(
     clippy::too_many_lines,
     reason = "one round's whole digest-exchange-through-repair sequence reads best kept together"
 )]
-pub(crate) async fn run_round_against(
-    cluster: &Cluster,
+pub async fn run_round_against(
+    mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
 ) -> RoundOutcome {
-    let mesh = cluster.mesh();
     // Read once per round: a resolver that can return `Winner::Merged` has
     // both sides exchange a mismatched key instead of only the greater
     // version pushing to the lesser side, so two replicas each holding half
@@ -1125,6 +1133,59 @@ mod tests {
         assert!(out.push_keys.is_empty());
         assert!(out.pull_hashes.is_empty());
         assert_eq!(out.undecodable_buckets, vec![7]);
+    }
+
+    /// A merging bucket above the threshold that routes it to the sketch
+    /// path (`ClusterConfig::ae_sketch_min_bucket`) converges in this one
+    /// round: every one of its mismatched keys is a two-sided version
+    /// mismatch, the shape `sketch.rs`'s own
+    /// `two_sided_version_mismatches_decode_at_the_default_shape` pins as
+    /// decodable at this element count, so the peel here succeeds (no
+    /// fallback) and `merging` queues both directions for every key —
+    /// exactly the bidirectional exchange this module's doc argues
+    /// converges a divergent merged key in one round rather than two.
+    #[test]
+    fn a_merging_bucket_above_the_threshold_converges_through_the_sketch_path() {
+        const KEYS: u64 = 40;
+        let local_entries: Vec<(Bytes, Hlc)> = (0..KEYS)
+            .map(|i| bucket_entry(format!("k{i}").as_bytes(), 2 * i + 1))
+            .collect();
+        let mut remote = Iblt::new(240);
+        for i in 0..KEYS {
+            remote.insert(xxh3_64(format!("k{i}").as_bytes()), hlc(2 * i));
+        }
+
+        let mut out = SketchOutcome::default();
+        handle_sketch_mismatch(
+            &SmolStr::new("users"),
+            7,
+            remote.into_cells(),
+            &local_entries,
+            &mut out.push_keys,
+            &mut out.pull_hashes,
+            &mut out.undecodable_buckets,
+            true,
+        );
+
+        assert!(
+            out.undecodable_buckets.is_empty(),
+            "a two-sided diff this size peels at the default sketch shape, no fallback"
+        );
+        assert_eq!(
+            out.push_keys.len(),
+            KEYS as usize,
+            "merging pushes every mismatched key, not only the greater-version side"
+        );
+        let (bucket, hashes) = out
+            .pull_hashes
+            .first()
+            .expect("one bucket entry carries every pulled hash");
+        assert_eq!(*bucket, 7);
+        assert_eq!(
+            hashes.len(),
+            KEYS as usize,
+            "merging pulls every mismatched key's hash too, converging both directions in one round"
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ pub struct CacheBuilder<K, V> {
     #[cfg(feature = "spill")]
     spill: Option<SpillConfig>,
     merge_coalesce_window: Duration,
+    prefold_enabled: bool,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -72,6 +73,7 @@ where
             #[cfg(feature = "spill")]
             spill: None,
             merge_coalesce_window: Duration::ZERO,
+            prefold_enabled: true,
             marker: PhantomData,
         }
     }
@@ -127,6 +129,21 @@ where
     /// not what [`Cache::merge`]'s docs promise.
     pub fn merge_coalesce_window(mut self, window: Duration) -> Self {
         self.merge_coalesce_window = window;
+        self
+    }
+
+    /// Flips `engine::Engine::apply_many`'s pre-fold on or off for this
+    /// cache's shard, `true` (pre-folding on) by default. `#[doc(hidden)]`:
+    /// the real engine-level toggle, reachable from an integration-test
+    /// binary outside this crate through
+    /// [`crate::store::Shard::with_prefold_enabled`] — a benchmark
+    /// measuring pre-fold's own effect is the only caller that ever needs
+    /// it off, to compare against the unfolded per-record path
+    /// `apply_many` otherwise always takes. Never call this outside a
+    /// benchmark or test.
+    #[doc(hidden)]
+    pub fn prefold_enabled(mut self, enabled: bool) -> Self {
+        self.prefold_enabled = enabled;
         self
     }
 
@@ -208,6 +225,7 @@ where
             #[cfg(feature = "spill")]
             spill,
             merge_coalesce_window,
+            prefold_enabled,
             marker: _,
         } = self;
 
@@ -256,7 +274,8 @@ where
         .with_tombstone_max_ttl(cluster.config().tombstone_max_ttl)
         .with_max_frame(cluster.config().max_frame)
         .with_resolver(resolver)
-        .with_merge_coalesce_window(merge_coalesce_window);
+        .with_merge_coalesce_window(merge_coalesce_window)
+        .with_prefold_enabled(prefold_enabled);
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
@@ -1773,6 +1792,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefold_enabled_defaults_to_true_and_the_toggle_reaches_the_shard() {
+        let cluster = Cluster::builder("cache-it-prefold-enabled")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let on = cluster
+            .cache::<u32, u32>("counters-on")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert!(
+            on.shard.prefold_enabled(),
+            "pre-fold defaults to on, matching the engine's own default"
+        );
+
+        let off = cluster
+            .cache::<u32, u32>("counters-off")
+            .mode(Mode::Local)
+            .prefold_enabled(false)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert!(
+            !off.shard.prefold_enabled(),
+            "CacheBuilder::prefold_enabled(false) reaches the shard's engine"
+        );
+
+        on.close().await;
+        off.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn merge_with_a_zero_window_applies_immediately() {
         let cluster = Cluster::builder("cache-it-merge-zero-window")
             .seeds(std::iter::empty())
@@ -2864,6 +2920,63 @@ mod tests {
                 "eviction deletes rather than spills once the tier is closed"
             );
 
+            cluster.shutdown().await;
+        }
+
+        /// Cache-level counterpart to the engine- and shard-level spilled-merge
+        /// tests: a counter spills between two colliding `Cache::merge` calls,
+        /// and the second still folds against the spilled side's real bytes
+        /// instead of dropping them.
+        #[tokio::test]
+        async fn merging_into_a_spilled_counter_folds_instead_of_dropping_a_side() {
+            let cluster = Cluster::builder("cache-it-merge-spilled")
+                .seeds(std::iter::empty())
+                .config(loopback_config())
+                .build()
+                .await
+                .expect("build succeeds");
+
+            let cfg =
+                SpillConfig::new(fresh_spill_dir("merge-spilled"), 1 << 20).region_bytes(4096);
+            let cache = cluster
+                .cache::<u32, PnCounter>("counters")
+                .resolver(Arc::new(PnCounterResolver))
+                .max_capacity(1)
+                // Always exceeds the cap of 1 on its own, so the single
+                // counter key spills right after the first merge instead of
+                // needing a second key to create eviction pressure.
+                .weigher(|_k: &u32, _v: &PnCounter| 2)
+                .spill(cfg)
+                .open()
+                .await
+                .expect("opens with spill");
+
+            let node_a = NodeId::from(11);
+            let node_b = NodeId::from(22);
+
+            cache
+                .merge(1, PnCounter::local_delta(node_a, 3))
+                .await
+                .expect("first increment");
+
+            assert!(
+                poll_until(Duration::from_secs(5), || cache.get_sync(&1).is_none()).await,
+                "the over-weight entry spills once eviction runs"
+            );
+
+            cache
+                .merge(1, PnCounter::local_delta(node_b, 4))
+                .await
+                .expect("second increment, colliding with the spilled record");
+
+            assert_eq!(
+                cache.get(&1).await.map(|c| c.value()),
+                Some(7),
+                "merging into a spilled record folds both sides' contributions instead of \
+                 dropping the one that was on disk"
+            );
+
+            cache.close().await;
             cluster.shutdown().await;
         }
     }

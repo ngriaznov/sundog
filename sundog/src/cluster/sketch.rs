@@ -479,6 +479,51 @@ mod tests {
         );
     }
 
+    /// A merging resolver's mismatched key is never one-sided: it is
+    /// present on both replicas at different versions, so it contributes
+    /// *two* elements to the symmetric difference rather than one (see
+    /// `cluster::anti_entropy`'s bidirectional-exchange doc). This pins
+    /// `RATED_CAPACITY`'s claim for exactly that shape — every element a
+    /// two-sided version mismatch, none one-sided — at a key count whose
+    /// element count sits well under the rated 100, so a real decode is
+    /// expected rather than merely tolerated.
+    #[test]
+    fn two_sided_version_mismatches_decode_at_the_default_shape() {
+        const KEYS: u64 = 40; // 80 elements: 40 keys, 2 versions each.
+        let left: Vec<(u64, Hlc)> = (0..KEYS).map(|k| (k, ver(2 * k + 1))).collect();
+        let right: Vec<(u64, Hlc)> = (0..KEYS).map(|k| (k, ver(2 * k))).collect();
+        let decoded = sketch_of(&left, 240)
+            .subtract(&sketch_of(&right, 240))
+            .and_then(Iblt::peel)
+            .expect("80 two-sided elements decode at the default 240-cell shape");
+        assert_eq!(
+            decoded.only_left.iter().copied().collect::<HashSet<_>>(),
+            expect_elems(&left),
+            "a real decode must be exact"
+        );
+        assert_eq!(
+            decoded.only_right.iter().copied().collect::<HashSet<_>>(),
+            expect_elems(&right),
+            "a real decode must be exact"
+        );
+    }
+
+    /// The same two-sided-only shape, scaled far past what any cell count a
+    /// bucket-scale sketch would realistically use can peel: fails closed
+    /// to [`Undecodable`] rather than decoding wrong.
+    #[test]
+    fn two_sided_version_mismatches_far_beyond_capacity_are_undecodable_never_wrong() {
+        const KEYS: u64 = 150; // 300 elements against a 24-cell sketch.
+        let left: Vec<(u64, Hlc)> = (0..KEYS).map(|k| (k, ver(2 * k + 1))).collect();
+        let right: Vec<(u64, Hlc)> = (0..KEYS).map(|k| (k, ver(2 * k))).collect();
+        assert_eq!(
+            sketch_of(&left, 24)
+                .subtract(&sketch_of(&right, 24))
+                .and_then(Iblt::peel),
+            Err(Undecodable)
+        );
+    }
+
     #[test]
     fn from_cells_round_trips_through_into_cells() {
         let mut iblt = Iblt::new(240);

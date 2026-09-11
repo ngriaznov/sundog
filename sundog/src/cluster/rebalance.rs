@@ -523,7 +523,7 @@ pub(crate) async fn rebalance_task(
                         let outcome = tokio::select! {
                             biased;
                             () = cancel.cancelled() => return,
-                            outcome = anti_entropy::run_round_against(&cluster, &shard, &cache, owner) => outcome,
+                            outcome = anti_entropy::run_round_against(cluster.mesh(), &shard, &cache, owner) => outcome,
                         };
                         match outcome {
                             RoundOutcome::Reconciled => {

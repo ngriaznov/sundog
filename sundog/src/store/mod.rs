@@ -6,7 +6,7 @@
 //! cluster layer turns those into wire traffic.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::num::NonZeroU8;
@@ -750,7 +750,34 @@ struct PendingMerge<V> {
     /// since the flush itself, not any one call that built up to it, is the
     /// write that actually lands.
     ver: Hlc,
-    deadline_ms: u64,
+}
+
+/// One [`Shard::merge`] coalescing stripe: the pending folds whose key
+/// hashes into it, plus a deadline-ordered index into them.
+/// [`engine::stripe_index_from_hash`] picks the stripe, the same way it
+/// picks an anti-entropy bucket for the engine's own stripes, so
+/// [`Shard::flush_due_pending_merges`] locks and scans one stripe at a time
+/// rather than the whole shard's pending state under one mutex.
+struct PendingMergeStripe<K, V> {
+    entries: HashMap<K, PendingMerge<V>>,
+    /// `(deadline_ms, seq) -> key`, ordered by deadline so
+    /// [`drain_due_deadlines`] pops exactly the entries actually due
+    /// instead of scanning every entry in this stripe on every sweep.
+    /// `seq` (this stripe's own [`Self::next_seq`] at insertion) breaks a
+    /// tie between two entries that share a `deadline_ms` deterministically,
+    /// without requiring `K: Ord`.
+    by_deadline: BTreeMap<(u64, u64), K>,
+    next_seq: u64,
+}
+
+impl<K, V> PendingMergeStripe<K, V> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_deadline: BTreeMap::new(),
+            next_seq: 0,
+        }
+    }
 }
 
 /// Wraps a stampede-collapsed loader failure, the type-erased `Arc<dyn Error +
@@ -796,6 +823,29 @@ fn merge_deadline_ms(started_at_ms: u64, window: Duration) -> u64 {
 /// `tokio::time`.
 fn merge_window_elapsed(now_ms: u64, deadline_ms: u64) -> bool {
     now_ms >= deadline_ms
+}
+
+/// Pops every `(deadline_ms, seq) -> key` entry from `by_deadline` whose
+/// deadline has passed by `now_ms`, in ascending deadline order, stopping at
+/// the first entry not yet due. `BTreeMap` keeps `by_deadline` ordered by
+/// its `(deadline_ms, seq)` key, so this touches only the entries actually
+/// due rather than scanning every entry in the stripe — the fix for
+/// [`Shard::flush_due_pending_merges`]'s sweep serializing on a full scan at
+/// high key counts. Pure over the ordering structure alone (no `V`, no live
+/// `Shard`), split out for its own unit test the same way
+/// [`merge_window_elapsed`] is.
+fn drain_due_deadlines<K>(by_deadline: &mut BTreeMap<(u64, u64), K>, now_ms: u64) -> Vec<K> {
+    let mut due = Vec::new();
+    while let Some(&(deadline_ms, _)) = by_deadline.keys().next() {
+        if !merge_window_elapsed(now_ms, deadline_ms) {
+            break;
+        }
+        let (_, key) = by_deadline
+            .pop_first()
+            .expect("just peeked the smallest key");
+        due.push(key);
+    }
+    due
 }
 
 /// Worst-case postcard-encoded size of an [`Hlc`]: 10 LEB128 bytes for
@@ -873,9 +923,14 @@ where
     /// `crate::cache::CacheBuilder::merge_coalesce_window` is the validated
     /// entry point that sets this through a merging resolver only.
     merge_window: Duration,
-    /// Keys with an in-flight [`Shard::merge`] fold not yet applied. Only
-    /// ever non-empty while `merge_window` is non-zero.
-    pending_merges: StdMutex<HashMap<K, PendingMerge<V>>>,
+    /// Keys with an in-flight [`Shard::merge`] fold not yet applied, split
+    /// into [`BUCKET_COUNT`] independently locked stripes by the same
+    /// `xxh3(key_bytes)`-derived index [`engine::stripe_index_from_hash`]
+    /// gives the engine's own stripes, so many keys coalescing at once
+    /// spread their pending state — and the background sweep's own lock
+    /// contention — across many mutexes instead of one. Only ever non-empty
+    /// while `merge_window` is non-zero.
+    pending_merges: Box<[StdMutex<PendingMergeStripe<K, V>>]>,
     /// Notified whenever [`Shard::merge`] opens a fresh coalescing window
     /// (a key with nothing already pending), so
     /// `crate::cache::merge_coalesce_task`'s sweep can recompute its
@@ -982,7 +1037,10 @@ where
             resolver: Arc::new(LwwResolver),
             max_frame: MAX_FRAME,
             merge_window: Duration::ZERO,
-            pending_merges: StdMutex::new(HashMap::new()),
+            pending_merges: (0..BUCKET_COUNT)
+                .map(|_| StdMutex::new(PendingMergeStripe::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             merge_wake: Notify::new(),
             max_capacity,
             tti,
@@ -1049,6 +1107,28 @@ where
     /// `crate::cache`'s background sweep to decide whether to spawn at all.
     pub(crate) fn merge_window(&self) -> Duration {
         self.merge_window
+    }
+
+    /// Flips [`Engine::apply_many`]'s pre-fold on or off for this shard's
+    /// engine, `true` (pre-folding on) by default. `#[doc(hidden)]`:
+    /// reachable from `crate::cache::CacheBuilder::prefold_enabled`, in turn
+    /// reachable from an integration-test binary outside this crate — a
+    /// benchmark measuring pre-fold's own effect is the only caller that
+    /// ever needs it off, to compare against the unfolded per-record path
+    /// [`Engine::apply_many`] otherwise always takes. Never call this
+    /// outside a benchmark or test.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_prefold_enabled(self, enabled: bool) -> Self {
+        self.engine.set_prefold_enabled(enabled);
+        self
+    }
+
+    /// This shard's engine's current [`Shard::with_prefold_enabled`] flag,
+    /// for a test to confirm the toggle actually reached the engine.
+    #[cfg(test)]
+    pub(crate) fn prefold_enabled(&self) -> bool {
+        self.engine.prefold_enabled()
     }
 
     /// Attaches this shard's `Mode::Distributed` bucket-ownership tracker
@@ -1993,11 +2073,16 @@ where
                 },
             );
         }
-        let mut pending = self
-            .pending_merges
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        let mut stripe = self.pending_merges[engine::stripe_index_from_hash(hash)]
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        match pending.entry(key) {
+        let PendingMergeStripe {
+            entries,
+            by_deadline,
+            next_seq,
+        } = &mut *stripe;
+        match entries.entry(key) {
             Entry::Occupied(slot) => {
                 let winner = {
                     let existing = slot.get();
@@ -2044,15 +2129,17 @@ where
             }
             Entry::Vacant(slot) => {
                 let deadline_ms = merge_deadline_ms(self.now_ms(), self.merge_window);
+                let seq = *next_seq;
+                *next_seq += 1;
+                by_deadline.insert((deadline_ms, seq), slot.key().clone());
                 slot.insert(PendingMerge {
                     key_bytes,
                     value,
                     encoded,
                     expires_at_ms: self.expiry_for(None),
                     ver,
-                    deadline_ms,
                 });
-                drop(pending);
+                drop(stripe);
                 self.merge_wake.notify_one();
             }
         }
@@ -2435,28 +2522,27 @@ where
     }
 
     /// Flushes every key whose [`Shard::merge`] coalescing window has
-    /// elapsed by `now_ms`, via [`merge_window_elapsed`]. The background
+    /// elapsed by `now_ms`. Visits [`Shard::pending_merges`]'s
+    /// [`BUCKET_COUNT`] stripes one at a time, locking each only long
+    /// enough for [`drain_due_deadlines`] to pop that stripe's due entries
+    /// out of its deadline-ordered index — never one lock (or one linear
+    /// scan) for the whole shard's pending state, so many keys coalescing
+    /// at once don't serialize this sweep on each other. The background
     /// sweep (`crate::cache::merge_coalesce_task`) is the only production
     /// caller; `pub(crate)` so `crate::cache` can drive it without owning
     /// the pending map itself.
     pub(crate) fn flush_due_pending_merges(&self, now_ms: u64) {
-        let due: Vec<(K, PendingMerge<V>)> = {
-            let mut pending = self
-                .pending_merges
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let due_keys: Vec<K> = pending
-                .iter()
-                .filter(|(_, entry)| merge_window_elapsed(now_ms, entry.deadline_ms))
-                .map(|(key, _)| key.clone())
-                .collect();
-            due_keys
-                .into_iter()
-                .filter_map(|key| pending.remove(&key).map(|entry| (key, entry)))
-                .collect()
-        };
-        for (key, entry) in due {
-            self.flush_one_pending_merge(key, entry);
+        for stripe_lock in &*self.pending_merges {
+            let due: Vec<(K, PendingMerge<V>)> = {
+                let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+                drain_due_deadlines(&mut stripe.by_deadline, now_ms)
+                    .into_iter()
+                    .filter_map(|key| stripe.entries.remove(&key).map(|entry| (key, entry)))
+                    .collect()
+            };
+            for (key, entry) in due {
+                self.flush_one_pending_merge(key, entry);
+            }
         }
     }
 
@@ -2464,29 +2550,41 @@ where
     /// whether its window has elapsed: `crate::cache::Cache::close` and
     /// this shard's own `Drop` call this so nothing folded in stays
     /// invisible past the cache's own lifetime, closing the one gap
-    /// [`Shard::flush_due_pending_merges`]'s window-bound leaves.
+    /// [`Shard::flush_due_pending_merges`]'s window-bound leaves. Drains
+    /// each stripe in turn, the same one-stripe-at-a-time locking
+    /// [`Shard::flush_due_pending_merges`] uses.
     pub(crate) fn flush_all_pending_merges(&self) {
-        let due = std::mem::take(
-            &mut *self
-                .pending_merges
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        for (key, entry) in due {
-            self.flush_one_pending_merge(key, entry);
+        for stripe_lock in &*self.pending_merges {
+            let due: Vec<(K, PendingMerge<V>)> = {
+                let mut stripe = stripe_lock.lock().unwrap_or_else(PoisonError::into_inner);
+                stripe.by_deadline.clear();
+                std::mem::take(&mut stripe.entries).into_iter().collect()
+            };
+            for (key, entry) in due {
+                self.flush_one_pending_merge(key, entry);
+            }
         }
     }
 
-    /// The earliest deadline among every currently pending coalesced merge,
-    /// or `None` when nothing is pending. `crate::cache::merge_coalesce_task`
-    /// sleeps until this to flush right at the window's edge instead of
-    /// polling.
+    /// The earliest deadline among every currently pending coalesced merge
+    /// across every stripe, or `None` when nothing is pending anywhere.
+    /// `crate::cache::merge_coalesce_task` sleeps until this to flush right
+    /// at the window's edge instead of polling. Each stripe's own earliest
+    /// deadline is its `by_deadline` index's first key — no scan of that
+    /// stripe's entries needed — so this costs one brief lock per stripe,
+    /// not one lock over the whole shard's pending state.
     pub(crate) fn next_pending_merge_deadline_ms(&self) -> Option<u64> {
         self.pending_merges
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .map(|entry| entry.deadline_ms)
+            .iter()
+            .filter_map(|stripe_lock| {
+                stripe_lock
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .by_deadline
+                    .keys()
+                    .next()
+                    .map(|&(deadline_ms, _)| deadline_ms)
+            })
             .min()
     }
 
@@ -2497,6 +2595,21 @@ where
     /// last checked.
     pub(crate) fn merge_wake_notified(&self) -> impl Future<Output = ()> + '_ {
         self.merge_wake.notified()
+    }
+
+    /// Test-only: `(version, value)` of `key`'s currently pending
+    /// [`Shard::merge`] fold, if any, without the caller needing to know
+    /// which of [`Self::pending_merges`]'s stripes it hashes into.
+    #[cfg(test)]
+    fn pending_merge_snapshot(&self, key: &K) -> Option<(Hlc, V)> {
+        let key_bytes = encode_key(key).ok()?;
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        self.pending_merges[engine::stripe_index_from_hash(hash)]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .get(key)
+            .map(|entry| (entry.ver, entry.value.clone()))
     }
 }
 
@@ -4211,6 +4324,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Shard-level counterpart to `engine::tests::spill_payload::io::
+    /// merge_against_a_spilled_counter_folds_the_stored_side_instead_of_dropping_it`:
+    /// a merging resolver's stored side spills between two colliding
+    /// `Shard::merge` calls, and the second still folds against it instead
+    /// of the outright win/loss a value-less view would produce.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn merge_against_a_spilled_counter_folds_instead_of_dropping_a_side() {
+        use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-merge-spill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+
+        let s = Shard::<u32, PnCounter>::new(
+            SmolStr::new("test-merge-spill"),
+            Mode::Local,
+            NodeId::from(1),
+            1, // a tiny weight cap: the weigher below always exceeds it
+            None,
+            None,
+        )
+        .with_resolver(Arc::new(PnCounterResolver))
+        .with_weigher(|_key: &u32, _value: &PnCounter| 2)
+        .with_spill(&cfg)
+        .expect("the tier's directory and region files open");
+
+        let node_a = NodeId::from(11);
+        let node_b = NodeId::from(22);
+
+        s.merge(1, PnCounter::local_delta(node_a, 3))
+            .await
+            .expect("first increment");
+
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while s.get_sync(&1).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the single over-weight entry spills once eviction runs"
+        );
+
+        s.merge(1, PnCounter::local_delta(node_b, 4))
+            .await
+            .expect("second increment, colliding with the spilled record");
+
+        assert_eq!(
+            s.get(&1).await.map(|c| c.value()),
+            Some(7),
+            "merging into a spilled record folds both sides' contributions instead of \
+             dropping the one that was on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A resolver where the longer value wins, `Hlc` breaking ties on equal
     /// length. `(len, ver)` compared lexicographically satisfies
     /// `ConflictResolver::winner`'s contract.
@@ -4557,9 +4734,17 @@ mod tests {
         );
     }
 
+    /// A spilled stored side is no longer value-less once `apply_locked`
+    /// reads its bytes back off disk (see `engine::read_spilled_for_conflict`):
+    /// `AlwaysMerge` always returns `Winner::Merged`, and now that both
+    /// sides have real values, `resolve_conflict`'s guard has nothing to
+    /// reject, so the merge applies exactly as it would against a resident
+    /// stored side. `merge_against_a_tombstone_degrades_to_keeping_the_stored_record`,
+    /// just above, is the guard's remaining case: a tombstone is genuinely
+    /// value-less, spilled or not, and still degrades every time.
     #[cfg(feature = "spill")]
     #[tokio::test]
-    async fn merge_against_a_spilled_side_degrades_to_keeping_the_stored_record() {
+    async fn merge_against_a_spilled_side_folds_once_its_bytes_are_read_back() {
         let dir = std::env::temp_dir().join(format!(
             "sundog-shard-merge-spill-{}-{:?}",
             std::process::id(),
@@ -4606,12 +4791,10 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        // The value each key was inserted with, known from the setup above
-        // rather than read back: reading it here (`get`, or `get_sync` on a
-        // spilled key returning a miss) would either promote the entry or
-        // require touching disk, either way risking exactly the promotion
-        // this test must avoid before the colliding write below.
-        let stored_before: u32 = if spilled_key == 1 { 10 } else { 20 };
+        // `get_sync` never promotes, unlike `get`: reading the key here
+        // would either promote the spilled entry or require touching disk,
+        // either way risking exactly the promotion this test must avoid
+        // before the colliding write below.
         assert!(
             s.get_sync(&spilled_key).is_none(),
             "the key must still be spilled when the colliding write arrives"
@@ -4626,12 +4809,13 @@ mod tests {
         ShardOps::apply_remote(&s, incoming).await;
 
         // `get` here, after the collision has already been resolved, reads
-        // the still-spilled record back off disk (promoting it in the
-        // process) to confirm its content is exactly what was inserted.
+        // back whatever the merge actually stored.
         assert_eq!(
             s.get(&spilled_key).await,
-            Some(stored_before),
-            "a Merged reply against a spilled, value-less side is rejected: the stored record is kept"
+            Some(999),
+            "apply_locked reads the spilled stored side's real bytes back before consulting \
+             the resolver, so a Merged reply against it applies exactly as it would against a \
+             resident side, rather than degrading to the guard's value-less fallback"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4797,28 +4981,17 @@ mod tests {
             .with_merge_coalesce_window(Duration::from_secs(60));
 
         s.merge(1, 10).await.expect("merge 1: the eventual winner");
-        let ver_after_win = s
-            .pending_merges
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&1)
-            .expect("pending after the first call")
-            .ver;
+        let (ver_after_win, _) = s
+            .pending_merge_snapshot(&1)
+            .expect("pending after the first call");
 
         // Decodes to a smaller `u32`, so `MaxWinsResolver` picks `Winner::A`
         // (the already-pending 10 over this incoming 3): a losing call.
         s.merge(1, 3).await.expect("merge 2: loses against 10");
 
-        let (ver_now, value_now) = {
-            let pending = s
-                .pending_merges
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let entry = pending
-                .get(&1)
-                .expect("still pending: the window hasn't elapsed");
-            (entry.ver, entry.value)
-        };
+        let (ver_now, value_now) = s
+            .pending_merge_snapshot(&1)
+            .expect("still pending: the window hasn't elapsed");
         assert_eq!(
             ver_now, ver_after_win,
             "a losing merge call must not advance the pending entry's version, mirroring \
@@ -4913,6 +5086,41 @@ mod tests {
             "exactly at the deadline"
         );
         assert!(merge_window_elapsed(1_001, 1_000), "past the deadline");
+    }
+
+    #[test]
+    fn drain_due_deadlines_pops_only_the_entries_actually_due_in_deadline_order() {
+        let mut by_deadline = BTreeMap::from([
+            ((100, 0), "a"),
+            ((50, 0), "b"),
+            ((100, 1), "c"),
+            ((200, 0), "d"),
+        ]);
+
+        let due = drain_due_deadlines(&mut by_deadline, 100);
+        assert_eq!(
+            due,
+            vec!["b", "a", "c"],
+            "every entry at or before the deadline, in ascending deadline order, seq breaking \
+             the tie between the two sharing deadline 100"
+        );
+        assert_eq!(
+            by_deadline,
+            BTreeMap::from([((200, 0), "d")]),
+            "an entry past the deadline is left untouched"
+        );
+    }
+
+    #[test]
+    fn drain_due_deadlines_is_empty_when_nothing_is_due_or_pending() {
+        assert!(drain_due_deadlines(&mut BTreeMap::<(u64, u64), u32>::new(), 1_000).is_empty());
+
+        let mut by_deadline = BTreeMap::from([((1_000, 0), 1u32)]);
+        assert!(
+            drain_due_deadlines(&mut by_deadline, 999).is_empty(),
+            "nothing is due yet"
+        );
+        assert_eq!(by_deadline.len(), 1, "the not-yet-due entry stays put");
     }
 
     #[tokio::test]
@@ -5012,6 +5220,21 @@ mod tests {
     fn merge_coalesce_window_defaults_to_zero() {
         let s = shard::<u32, u32>(1);
         assert_eq!(s.merge_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn prefold_enabled_defaults_to_true_and_with_prefold_enabled_overrides_it() {
+        let s = shard::<u32, u32>(1);
+        assert!(
+            s.prefold_enabled(),
+            "pre-fold defaults to on, matching the engine's own default"
+        );
+
+        let s = s.with_prefold_enabled(false);
+        assert!(!s.prefold_enabled(), "the toggle reached the engine");
+
+        let s = s.with_prefold_enabled(true);
+        assert!(s.prefold_enabled());
     }
 
     #[test]

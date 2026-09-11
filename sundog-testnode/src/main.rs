@@ -82,6 +82,22 @@
 //! node id, and the container test installs this resolver on the current
 //! release's node to confirm the previous release's node stores and serves
 //! what it receives.
+//!
+//! A third `Mode::Replicated` cache named `"pn"` carries real
+//! [`sundog::crdt::PnCounter`] values under [`sundog::crdt::PnCounterResolver`]
+//! unconditionally, rather than gating it behind `SUNDOG_TESTNODE_RESOLVER`
+//! the way `"it"` does: [`SumCounterResolver`]'s decimal-string wire shape
+//! cannot stand in for it, since summing on every merge is not idempotent and
+//! a real anti-entropy repair can redeliver the same merge more than once,
+//! where `PnCounter::merge`'s pointwise-max join can absorb a redelivery for
+//! free. `pnfill n` -> `ok`, bulk-incrementing `pn0..pn(n-1)` by one from this
+//! node — a blind [`sundog::crdt::PnCounter::local_delta`] write, no read
+//! needed; `pncount` -> `<n>`, `"pn"`'s live-entry count; `pnget k` ->
+//! `val <n>` | `none`, key `k`'s current [`sundog::crdt::PnCounter::value`].
+//! It drives the million-counter cold-join container scenario: three nodes
+//! each increment every one of a million counters once, concurrently, and a
+//! cold-joining fourth node's state transfer must carry every counter's exact
+//! merged total, not any one writer's last write.
 
 use std::env;
 use std::io::Write as _;
@@ -92,6 +108,7 @@ use std::time::Duration;
 use bytes::Bytes;
 #[cfg(feature = "spill")]
 use sundog::SpillConfig;
+use sundog::crdt::{PnCounter, PnCounterResolver};
 use sundog::{Cache, Cluster, ClusterConfig, ConflictResolver, Mode, RecordView, Winner};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -105,6 +122,9 @@ const CONTROL_PORT: u16 = 8080;
 const METRICS_PORT: u16 = 9090;
 const CACHE_NAME: &str = "it";
 const CHURN_CACHE_NAME: &str = "churn";
+/// The dedicated `PnCounter` cache `pnfill`/`pncount`/`pnget` operate on,
+/// always merging under [`PnCounterResolver`].
+const PN_CACHE_NAME: &str = "pn";
 /// Short enough that early `churn` writes expire while the run continues.
 const CHURN_TTL: Duration = Duration::from_secs(2);
 /// `churn` wraps keys modulo this, so churners on different nodes collide.
@@ -405,6 +425,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ttl(CHURN_TTL)
         .open()
         .await?;
+    let pn = cluster
+        .cache::<String, PnCounter>(PN_CACHE_NAME)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await?;
 
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
     println!("testnode-ready");
@@ -412,7 +438,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (socket, _) = listener.accept().await?;
-        tokio::spawn(serve(socket, cache.clone(), churn.clone(), cluster.clone()));
+        tokio::spawn(serve(
+            socket,
+            cache.clone(),
+            churn.clone(),
+            pn.clone(),
+            cluster.clone(),
+        ));
     }
 }
 
@@ -441,6 +473,7 @@ enum Reply {
 async fn dispatch(
     cache: &Cache<String, String>,
     churn: &Cache<String, String>,
+    pn: &Cache<String, PnCounter>,
     cluster: &Cluster,
     line: &str,
 ) -> Reply {
@@ -507,6 +540,9 @@ async fn dispatch(
         "ccount" => Reply::Line(churn.entry_count().await.to_string()),
         "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
             big_command(cache, command, &mut parts).await
+        }
+        "pnfill" | "pncount" | "pnget" => {
+            pn_command(pn, cluster.node_id(), command, parts.next()).await
         }
         "drop" => {
             let Some(key) = parts.next() else {
@@ -579,6 +615,42 @@ async fn big_command(
     })
 }
 
+/// The `pn*` command family on `"pn"`: `pnfill n` bulk-increments
+/// `pn0..pn(n-1)` by one from `node_id` via a blind [`PnCounter::local_delta`]
+/// write (no read needed); `pncount` reads `"pn"`'s live-entry count;
+/// `pnget k` reads key `k`'s current [`PnCounter::value`].
+async fn pn_command(
+    pn: &Cache<String, PnCounter>,
+    node_id: sundog::NodeId,
+    command: &str,
+    arg: Option<&str>,
+) -> Reply {
+    match command {
+        "pnfill" => {
+            let Some(count) = arg.and_then(|raw| raw.parse::<u32>().ok()) else {
+                return Reply::Line("err pnfill needs a u32 count".to_string());
+            };
+            let entries =
+                (0..count).map(|i| (format!("pn{i}"), PnCounter::local_delta(node_id, 1)));
+            Reply::Line(match pn.insert_many(entries).await {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("err {error}"),
+            })
+        }
+        "pncount" => Reply::Line(pn.entry_count().await.to_string()),
+        // "pnget"
+        _ => {
+            let Some(key) = arg else {
+                return Reply::Line("err pnget needs a key".to_string());
+            };
+            Reply::Line(match pn.get(&key.to_string()).await {
+                Some(counter) => format!("val {}", counter.value()),
+                None => "none".to_string(),
+            })
+        }
+    }
+}
+
 /// `fetch`/`owners`, the two routes that read `"it"`'s ownership state
 /// rather than its content: `fetch` answers via [`Cache::fetch`], `owners`
 /// via [`Cache::owners_of`] rendered as space-separated decimal ids.
@@ -610,6 +682,7 @@ async fn serve(
     socket: TcpStream,
     cache: Cache<String, String>,
     churn: Cache<String, String>,
+    pn: Cache<String, PnCounter>,
     cluster: Cluster,
 ) {
     let (reader, mut writer) = socket.into_split();
@@ -618,7 +691,7 @@ async fn serve(
         let Ok(Some(line)) = lines.next_line().await else {
             return;
         };
-        match dispatch(&cache, &churn, &cluster, &line).await {
+        match dispatch(&cache, &churn, &pn, &cluster, &line).await {
             Reply::Line(reply) => {
                 if writer
                     .write_all(format!("{reply}\n").as_bytes())

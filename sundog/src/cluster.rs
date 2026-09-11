@@ -3927,8 +3927,13 @@ mod tests {
         let name = SmolStr::new("users");
         let shard_b = registered_shard(&cluster_b, &name);
         assert_eq!(
-            crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a)
-                .await,
+            crate::cluster::anti_entropy::run_round_against(
+                cluster_b.mesh(),
+                &shard_b,
+                &name,
+                node_a
+            )
+            .await,
             crate::cluster::anti_entropy::RoundOutcome::Reconciled
         );
 
@@ -4023,8 +4028,13 @@ mod tests {
         assert_eq!(cache_a.get(&extra_key).await, None, "a never had this key");
 
         assert_eq!(
-            crate::cluster::anti_entropy::run_round_against(&cluster_b, &shard_b, &name, node_a)
-                .await,
+            crate::cluster::anti_entropy::run_round_against(
+                cluster_b.mesh(),
+                &shard_b,
+                &name,
+                node_a
+            )
+            .await,
             crate::cluster::anti_entropy::RoundOutcome::Reconciled
         );
 
@@ -4176,7 +4186,7 @@ mod tests {
 
         assert_eq!(
             crate::cluster::anti_entropy::run_round_against(
-                &cluster_a,
+                cluster_a.mesh(),
                 &shard_a,
                 &name,
                 peer_b.node

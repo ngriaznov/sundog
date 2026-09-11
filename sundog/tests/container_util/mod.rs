@@ -515,6 +515,44 @@ impl Node {
         self.command(&format!("bigverify {bytes}")).await
     }
 
+    /// `pnfill n`, bulk-incrementing `pn0..pn(n-1)` by one from this node on
+    /// the `"pn"` `PnCounter` cache, no control round trip per entry.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the node reports an error.
+    pub async fn pn_fill(&self, count: u32) -> Result<(), String> {
+        match self.command(&format!("pnfill {count}")).await?.as_str() {
+            "ok" => Ok(()),
+            other => Err(other.to_string()),
+        }
+    }
+
+    /// `pncount`, the `"pn"` cache's live-entry count.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not numeric.
+    pub async fn pn_count(&self) -> Result<usize, String> {
+        self.command("pncount")
+            .await?
+            .parse()
+            .map_err(|error| format!("bad pncount reply: {error}"))
+    }
+
+    /// `pnget k`, returning `Some(value)` on `val <v>` and `None` on `none`.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply matches neither.
+    pub async fn pn_get(&self, key: &str) -> Result<Option<i64>, String> {
+        match self.command(&format!("pnget {key}")).await? {
+            reply if reply == "none" => Ok(None),
+            reply => reply
+                .strip_prefix("val ")
+                .and_then(|value| value.parse::<i64>().ok())
+                .map(Some)
+                .ok_or(reply),
+        }
+    }
+
     /// `drop k`, dropping `k`'s local copy with no tombstone and no fan-out,
     /// as if a `Replicate` for it never arrived.
     /// # Errors

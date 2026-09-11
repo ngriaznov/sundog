@@ -242,7 +242,7 @@ async fn reconcile_with_every_peer(
         }
         if tokio::time::timeout(
             remaining,
-            anti_entropy::run_round_against(cluster, shard, cache, peer),
+            anti_entropy::run_round_against(cluster.mesh(), shard, cache, peer),
         )
         .await
         .is_err()
