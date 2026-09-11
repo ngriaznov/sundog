@@ -592,9 +592,9 @@ async fn diff_bucket<S: ShardOps>(
             None => push_keys.push(key),
         }
     }
-    for key in peer_by_key.into_keys() {
-        if !local_keys.contains(&key) {
-            pull_keys.push(key);
+    for (key, _) in peer_entries {
+        if !local_keys.contains(key) {
+            pull_keys.push(key.clone());
         }
     }
 }
@@ -3214,14 +3214,25 @@ async fn counter_ae_loop<S: ShardOps + 'static>(
 ) -> SimResult {
     let handler: Arc<dyn RequestHandler> = Arc::new(ShardHandler::new(Arc::clone(&shard)));
     let bind_addr = SocketAddr::from(([0, 0, 0, 0], params.port));
-    let (mesh, mut inbound) = Mesh::spawn(
-        bind_addr,
-        params.node,
-        1,
-        &ClusterConfig::default(),
-        handler,
-    )
-    .await?;
+    // Sized past this family's worst-case single-round repair burst (up to
+    // three records per counter, for the decomposed variant) so a heal's
+    // repair never needs the outbox to actually backpressure. `Mesh::send`
+    // drops a frame outright on a full outbox rather than waiting for room
+    // (see its own doc), and `ae_round_with_sketch` below enqueues a whole
+    // round's `push_keys` in one synchronous burst with no yield in
+    // between; on a bounded outbox, how many of that burst land versus get
+    // dropped depends on how much of any earlier traffic the connection
+    // writer has drained by that instant -- real scheduling order this
+    // process's tokio runtime seeds independently of the sim's own seed, so
+    // a drop there would make the round count this family measures vary
+    // between runs that share a seed. Comfortably past the default
+    // `ClusterConfig::outbox_capacity` keeps every default-sized run
+    // (`SUNDOG_SIM_KEYS` unset) at that ordinary capacity.
+    let outbox_capacity = (sim_counter_count() as usize)
+        .saturating_mul(4)
+        .max(ClusterConfig::default().outbox_capacity);
+    let config = ClusterConfig::default().with(|c| c.outbox_capacity = outbox_capacity);
+    let (mesh, mut inbound) = Mesh::spawn(bind_addr, params.node, 1, &config, handler).await?;
 
     let peer_list = peer_list_of(&params.peers);
     mesh.update_peers(peer_list.clone());
@@ -3377,14 +3388,33 @@ where
         });
     }
 
-    // Let mesh connections establish before partitioning.
-    run_steps(&mut sim, steps_for(Duration::from_millis(100)));
-
     // Two-way split: node-a alone on one side, node-b/node-c together on
     // the other, mirroring the two-node scenarios' partition/heal shape at
-    // one remove.
+    // one remove. Applied before any step runs, so node-a's mesh never
+    // gets the chance to dial node-b/node-c at all -- and so never pools a
+    // request/response connection toward either that would then sit idle,
+    // aging in *real* wall-clock time (`net::conn::ReqPool` stamps and
+    // checks freshness with `Instant::now()`, deliberately unvirtualized
+    // since a real deployment's idle-connection policy has to mean real
+    // time), through the write phase below. That phase drives tens of
+    // thousands of direct, un-simulated `shard.insert` calls per node and
+    // so takes a real-time span this family's own scale knob
+    // (`SUNDOG_SIM_KEYS`) grows unboundedly: at a high enough key count it
+    // is long enough to occasionally cross `ReqPool`'s real 30s freshness
+    // window, so whether node-a's post-heal repair opens on a pooled
+    // connection or dials fresh becomes a coin flip on nothing the sim's
+    // own seed controls -- silently shifting how many anti-entropy rounds
+    // convergence takes. Node-b and node-c, never partitioned, keep
+    // exchanging real anti-entropy traffic with each other the whole time
+    // regardless of this ordering, so their own connection pool never goes
+    // idle long enough to matter.
     sim.partition(host_a, host_b);
     sim.partition(host_a, host_c);
+
+    // Let the mesh's connections settle (node-b/node-c's with each other;
+    // node-a's dial attempts toward either fail fast and back off, already
+    // partitioned).
+    run_steps(&mut sim, steps_for(Duration::from_millis(100)));
 
     write_all(&shard_a, node_a, 0, counters, PARTITION_HEAL_ROUNDS);
     write_all(&shard_b, node_b, 1, counters, PARTITION_HEAL_ROUNDS);
@@ -3462,6 +3492,18 @@ const PARTITION_HEAL_MAX_AE_ROUNDS: usize = 60;
 /// anti-entropy always recognizes it as something to fetch, and the merged
 /// total never drops an update regardless of apply order or how many times
 /// a record is redelivered.
+///
+/// Also runs the decomposed control (below) and checks its own bound, in
+/// this same test rather than as a separate one: turmoil's `rng_seed` seeds
+/// its own network-level randomness deterministically, but not every
+/// scheduling choice downstream of it, so two separately built `Sim`s
+/// constructed from the same seed are not guaranteed to reproduce identical
+/// anti-entropy round counts at this scale, only a fresh, unshared one
+/// each. Comparing this test's own `pn_counter` figure against a
+/// `lww_decomposed` figure read off a *different* test's run stitches
+/// together two such unshared draws; running decomposed exactly once, here,
+/// keeps both assertions below reading off the one run that actually
+/// happened.
 #[test]
 fn partition_heal_pn_counter_converges_to_exact_totals() {
     let counters = sim_counter_count();
@@ -3508,12 +3550,15 @@ fn partition_heal_pn_counter_converges_to_exact_totals() {
     // counter in the same round instead of only the greater version
     // pushing to the lesser side (see `store::ConflictResolver::merges`'s
     // and `engine::merge_version`'s docs for why that halves the round trip
-    // a divergent key costs). The sim is deterministic under a fixed seed,
-    // so re-running the decomposed control here, seeded and ported exactly
-    // as `partition_heal_lww_decomposed_reports_lost_updates` runs it, gives
-    // a same-process, directly comparable `ae_rounds` figure rather than one
-    // read off a separate test run.
+    // a divergent key costs). Run once, right here -- see this test's own
+    // doc for why a second, separately run copy of this scenario is not an
+    // interchangeable stand-in for this one.
     let decomposed = run_lww_decomposed_partition_heal(sim_seed(0xC0DE_6502), 4910);
+    assert!(
+        decomposed.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,
+        "lww_decomposed: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
+        decomposed.ae_rounds
+    );
     assert!(
         metrics.ae_rounds <= decomposed.ae_rounds,
         "pn_counter: the bidirectional merging exchange spent {} anti-entropy rounds repairing \
@@ -3530,13 +3575,14 @@ fn partition_heal_pn_counter_converges_to_exact_totals() {
 /// keys and plain last-write-wins, with no [`Winner::Merged`] involved.
 /// Every sub-key has one writer, so `LwwResolver`'s total order never has a
 /// real conflict to lose a side of, and this variant is not expected to
-/// lose updates; the point of running it here is the comparison against
+/// lose updates; the point of running it is the comparison against
 /// [`partition_heal_pn_counter_converges_to_exact_totals`]'s single-key
 /// merge, not a claim that decomposition can lose updates. `lost_updates`
 /// is reported on its `BENCH` line but never asserted to a specific value.
-/// Factored into [`run_lww_decomposed_partition_heal`] so the merged
-/// variant's test can re-run this exact scenario for its own comparison
-/// without duplicating the write/read closures.
+/// Factored out of [`partition_heal_pn_counter_converges_to_exact_totals`],
+/// its one call site, so that test's own body reads as `pn_counter`'s
+/// scenario followed by decomposed's, without inlining decomposed's
+/// write/read closures into it.
 fn run_lww_decomposed_partition_heal(seed: u64, port: u16) -> PartitionHealMetrics {
     let counters = sim_counter_count();
     run_partition_heal::<String, _, _>(
@@ -3570,15 +3616,4 @@ fn run_lww_decomposed_partition_heal(seed: u64, port: u16) -> PartitionHealMetri
             })
         },
     )
-}
-
-#[test]
-fn partition_heal_lww_decomposed_reports_lost_updates() {
-    let metrics = run_lww_decomposed_partition_heal(sim_seed(0xC0DE_6502), 4910);
-
-    assert!(
-        metrics.ae_rounds <= PARTITION_HEAL_MAX_AE_ROUNDS,
-        "lww_decomposed: convergence spent {} anti-entropy rounds, over the {PARTITION_HEAL_MAX_AE_ROUNDS} bound",
-        metrics.ae_rounds
-    );
 }

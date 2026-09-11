@@ -5,7 +5,9 @@
 //! shard's fan-out queue and publishes an `Origin::Local` [`Event`]; the
 //! cluster layer turns those into wire traffic.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::Hash;
 use std::num::NonZeroU8;
 #[cfg(feature = "spill")]
@@ -20,7 +22,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ClusterConfig;
@@ -339,6 +341,18 @@ pub enum Origin {
     /// For a record a [`Winner::Merged`] resolver produced, `NodeId` here is
     /// the merge-derived id the engine minted for it, not the id of any node
     /// that actually authored a write: it names no member of the cluster.
+    ///
+    /// `ShardOps::apply_remote_batch`'s pre-fold narrows this further for a
+    /// batch carrying several records for one key from distinct origins (a
+    /// peer's fan-out or anti-entropy-pull reply bundling more than one
+    /// node's writes to the same key): pre-fold collapses that whole run
+    /// into one real apply and one published event, and the event's
+    /// `NodeId` here names only the run's last record's origin — the other
+    /// contributors' `NodeId`s are folded into the stored content but never
+    /// surface on the event stream. This is an accepted cost of folding a
+    /// batch's own same-key records together before the stripe lock (see
+    /// `engine::prefold_batch`), not a bug: the alternative is one event
+    /// per contributing record, which is what pre-fold exists to avoid.
     Remote(NodeId),
 }
 
@@ -714,6 +728,31 @@ enum Incoming<V> {
     Tombstone,
 }
 
+/// One key's in-flight [`Shard::merge`] fold: accumulated in memory, across
+/// however many `merge` calls land inside the current coalescing window,
+/// until [`Shard::flush_due_pending_merges`] (or a close/drop flush that
+/// ignores the deadline) hands it to the ordinary write path as a single
+/// [`Shard::apply`] — the same versioned apply every other write goes
+/// through, so the fold gets its own fresh version and folds again, this
+/// time against whatever is actually stored.
+struct PendingMerge<V> {
+    /// `K`'s encoded bytes, kept so a flush never re-encodes the key.
+    key_bytes: Bytes,
+    value: V,
+    /// `value`'s postcard-encoded bytes, kept alongside `value` for the same
+    /// reason [`Incoming::Put::encoded`] is: a fold to fold again can reuse
+    /// them without a re-encode.
+    encoded: Bytes,
+    expires_at_ms: Option<u64>,
+    /// The version stamped by whichever `merge` call last folded into this
+    /// entry, used only as the "incoming" side of the next fold's
+    /// [`RecordView`] — discarded at flush time in favor of a fresh stamp,
+    /// since the flush itself, not any one call that built up to it, is the
+    /// write that actually lands.
+    ver: Hlc,
+    deadline_ms: u64,
+}
+
 /// Wraps a stampede-collapsed loader failure, the type-erased `Arc<dyn Error +
 /// Send + Sync>` `engine::Inflight` stores so every joined waiter returns the
 /// same failure the owner saw, as a boxable [`std::error::Error`] for
@@ -741,6 +780,22 @@ pub(crate) fn now_ms() -> u64 {
 
 fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The epoch millisecond at which a [`Shard::merge`] coalescing window
+/// opened at `started_at_ms` must flush. Pure so the scheduling math behind
+/// `Shard::merge`'s pending map has a unit test independent of a live clock.
+fn merge_deadline_ms(started_at_ms: u64, window: Duration) -> u64 {
+    started_at_ms.saturating_add(duration_ms(window))
+}
+
+/// Whether a pending coalesced merge whose window closes at `deadline_ms`
+/// must flush by `now_ms`. The one real decision
+/// [`Shard::flush_due_pending_merges`]'s background sweep makes, split out
+/// so it has its own unit test that needs neither a live `Shard` nor
+/// `tokio::time`.
+fn merge_window_elapsed(now_ms: u64, deadline_ms: u64) -> bool {
+    now_ms >= deadline_ms
 }
 
 /// Worst-case postcard-encoded size of an [`Hlc`]: 10 LEB128 bytes for
@@ -813,6 +868,20 @@ where
     tombstone_max_ttl_ms: u64,
     resolver: Arc<dyn ConflictResolver>,
     max_frame: usize,
+    /// [`Shard::with_merge_coalesce_window`]'s configured window. Zero (the
+    /// default) means every [`Shard::merge`] call applies at once;
+    /// `crate::cache::CacheBuilder::merge_coalesce_window` is the validated
+    /// entry point that sets this through a merging resolver only.
+    merge_window: Duration,
+    /// Keys with an in-flight [`Shard::merge`] fold not yet applied. Only
+    /// ever non-empty while `merge_window` is non-zero.
+    pending_merges: StdMutex<HashMap<K, PendingMerge<V>>>,
+    /// Notified whenever [`Shard::merge`] opens a fresh coalescing window
+    /// (a key with nothing already pending), so
+    /// `crate::cache::merge_coalesce_task`'s sweep can recompute its
+    /// sleep-until instead of parking past a deadline that did not exist
+    /// yet when it last checked.
+    merge_wake: Notify,
     /// Remembered, with `tti` below, so [`Shard::with_weigher`] can rebuild
     /// `engine::Engine` from scratch: a weigher installs only at
     /// construction.
@@ -912,6 +981,9 @@ where
             tombstone_max_ttl_ms: duration_ms(ClusterConfig::default().tombstone_max_ttl),
             resolver: Arc::new(LwwResolver),
             max_frame: MAX_FRAME,
+            merge_window: Duration::ZERO,
+            pending_merges: StdMutex::new(HashMap::new()),
+            merge_wake: Notify::new(),
             max_capacity,
             tti,
             hits,
@@ -958,6 +1030,25 @@ where
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
         self
+    }
+
+    /// Sets the window [`Shard::merge`] coalesces consecutive calls to one
+    /// key within: they fold in memory instead of each applying on its own,
+    /// and the fold applies once, when the window elapses. Zero, the
+    /// default, applies every `merge` call at once. A raw setter that
+    /// trusts the caller to have already checked the resolver merges —
+    /// [`crate::cache::CacheBuilder::merge_coalesce_window`] is the
+    /// validated entry point.
+    #[must_use]
+    pub fn with_merge_coalesce_window(mut self, window: Duration) -> Self {
+        self.merge_window = window;
+        self
+    }
+
+    /// This shard's configured [`Shard::with_merge_coalesce_window`], for
+    /// `crate::cache`'s background sweep to decide whether to spawn at all.
+    pub(crate) fn merge_window(&self) -> Duration {
+        self.merge_window
     }
 
     /// Attaches this shard's `Mode::Distributed` bucket-ownership tracker
@@ -1816,6 +1907,21 @@ where
             expires_at_ms,
             encoded,
         };
+        self.apply_or_forward(key, key_bytes, ver, incoming)
+    }
+
+    /// Applies a versioned write locally if this shard owns `key_bytes`'
+    /// bucket, or builds and forwards it to the bucket's current owners
+    /// otherwise — the tail every local-write entry point shares:
+    /// [`Shard::insert_expiring`] and a coalesced [`Shard::merge`] fold's
+    /// flush alike.
+    fn apply_or_forward(
+        &self,
+        key: K,
+        key_bytes: Bytes,
+        ver: Hlc,
+        incoming: Incoming<V>,
+    ) -> Result<(), CacheError> {
         if !self.owns_key(key_bytes.as_ref()) {
             let rec = self.forward_write(key, key_bytes, incoming, ver);
             if !self.fan_out.push(FanOutItem::Forward(rec)) {
@@ -1826,6 +1932,130 @@ where
             return Ok(());
         }
         self.apply(key, key_bytes, ver, incoming, Origin::Local);
+        Ok(())
+    }
+
+    /// Folds `value` into `key` through the configured [`ConflictResolver`]
+    /// without a read: unlike a get-modify-`insert` cycle, this never
+    /// touches whatever this shard already holds for `key` until the fold
+    /// actually applies. With [`Shard::with_merge_coalesce_window`] left at
+    /// its default zero, every call applies at once, through the same path
+    /// as [`Shard::insert`] — folding one call against whatever is stored
+    /// is exactly what the shard's ordinary versioned-apply conflict
+    /// resolution already does when the configured resolver's
+    /// [`ConflictResolver::merges`] is `true`.
+    ///
+    /// With a non-zero window, consecutive calls to the same key land in an
+    /// in-memory pending fold instead: each call folds its value into
+    /// whatever is already pending for that key through the same resolver,
+    /// and the result applies through the same versioned-apply path exactly
+    /// once, when the window that opened at the first of those calls
+    /// elapses — `crate::cache::merge_coalesce_task` drives that for an
+    /// open [`crate::cache::Cache`], and this shard's own pending-map flush
+    /// (`crate::cache::Cache::close`, and this shard's own `Drop`)
+    /// guarantees it regardless. Replication and every [`Event`] this key
+    /// gets during the window see exactly one record: the fold, not each
+    /// call that built it.
+    ///
+    /// # `get` during a window
+    ///
+    /// [`Shard::get`]/[`Shard::get_sync`] never consult the pending fold: a
+    /// value folded in but not yet flushed is invisible to a read for as
+    /// long as it stays pending — up to one whole window from the call
+    /// that opened it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] if `value`'s wire frame exceeds
+    /// the configured frame cap. See [`Shard::with_max_frame`].
+    pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
+        let key_bytes = encode_key(&key)?;
+        let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
+        let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
+        if wire_size > self.max_frame {
+            return Err(CacheError::ValueTooLarge {
+                cache: self.name.clone(),
+                size: encoded.len(),
+                limit: self.max_frame,
+            });
+        }
+        let ver = self.stamp_local();
+        if self.merge_window.is_zero() {
+            let expires_at_ms = self.expiry_for(None);
+            return self.apply_or_forward(
+                key,
+                key_bytes,
+                ver,
+                Incoming::Put {
+                    value,
+                    expires_at_ms,
+                    encoded,
+                },
+            );
+        }
+        let mut pending = self
+            .pending_merges
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match pending.entry(key) {
+            Entry::Occupied(slot) => {
+                let winner = {
+                    let existing = slot.get();
+                    let a = RecordView {
+                        value: Some(existing.encoded.as_ref()),
+                        ver: existing.ver,
+                        expires_at_ms: existing.expires_at_ms,
+                    };
+                    let b = RecordView {
+                        value: Some(encoded.as_ref()),
+                        ver,
+                        expires_at_ms: self.expiry_for(None),
+                    };
+                    self.resolver.winner(key_bytes.as_ref(), a, b)
+                };
+                match winner {
+                    Winner::Merged {
+                        value: merged_bytes,
+                        expires_at_ms,
+                    } => {
+                        let merged_value: V =
+                            postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
+                        let entry = slot.into_mut();
+                        entry.value = merged_value;
+                        entry.encoded = merged_bytes;
+                        entry.expires_at_ms = expires_at_ms;
+                        entry.ver = ver;
+                    }
+                    Winner::B => {
+                        let entry = slot.into_mut();
+                        entry.value = value;
+                        entry.encoded = encoded;
+                        entry.expires_at_ms = self.expiry_for(None);
+                        entry.ver = ver;
+                    }
+                    Winner::A => {
+                        // The incoming call lost outright: nothing about the
+                        // pending entry changes, version included, mirroring
+                        // `resolve_and_rebind`'s `IncomingLoses => None` in
+                        // the engine — a losing write never advances the
+                        // version of the record it lost against.
+                    }
+                }
+            }
+            Entry::Vacant(slot) => {
+                let deadline_ms = merge_deadline_ms(self.now_ms(), self.merge_window);
+                slot.insert(PendingMerge {
+                    key_bytes,
+                    value,
+                    encoded,
+                    expires_at_ms: self.expiry_for(None),
+                    ver,
+                    deadline_ms,
+                });
+                drop(pending);
+                self.merge_wake.notify_one();
+            }
+        }
         Ok(())
     }
 
@@ -2182,6 +2412,106 @@ where
                 self.engine.record_for(key_bytes.as_ref(), now)
             })
             .collect()
+    }
+
+    /// Applies one flushed [`PendingMerge`] through
+    /// [`Shard::apply_or_forward`], exactly as if its folded value had just
+    /// been [`Shard::insert`]ed: a fresh version stamped now, so
+    /// replication and events see the fold as one write happening at flush
+    /// time, not backdated to whichever `merge` call opened the window.
+    fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
+        let ver = self.stamp_local();
+        let incoming = Incoming::Put {
+            value: pending.value,
+            expires_at_ms: pending.expires_at_ms,
+            encoded: pending.encoded,
+        };
+        // Best-effort: a forward failure here means the cache is closing,
+        // and nothing calling this (the background sweep, `close`, or
+        // `Drop`) has anywhere to hand an error to — the same fate an
+        // ordinary local write racing a close already gets, documented on
+        // `Shard::insert`.
+        let _ = self.apply_or_forward(key, pending.key_bytes, ver, incoming);
+    }
+
+    /// Flushes every key whose [`Shard::merge`] coalescing window has
+    /// elapsed by `now_ms`, via [`merge_window_elapsed`]. The background
+    /// sweep (`crate::cache::merge_coalesce_task`) is the only production
+    /// caller; `pub(crate)` so `crate::cache` can drive it without owning
+    /// the pending map itself.
+    pub(crate) fn flush_due_pending_merges(&self, now_ms: u64) {
+        let due: Vec<(K, PendingMerge<V>)> = {
+            let mut pending = self
+                .pending_merges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let due_keys: Vec<K> = pending
+                .iter()
+                .filter(|(_, entry)| merge_window_elapsed(now_ms, entry.deadline_ms))
+                .map(|(key, _)| key.clone())
+                .collect();
+            due_keys
+                .into_iter()
+                .filter_map(|key| pending.remove(&key).map(|entry| (key, entry)))
+                .collect()
+        };
+        for (key, entry) in due {
+            self.flush_one_pending_merge(key, entry);
+        }
+    }
+
+    /// Flushes every currently pending coalesced merge, regardless of
+    /// whether its window has elapsed: `crate::cache::Cache::close` and
+    /// this shard's own `Drop` call this so nothing folded in stays
+    /// invisible past the cache's own lifetime, closing the one gap
+    /// [`Shard::flush_due_pending_merges`]'s window-bound leaves.
+    pub(crate) fn flush_all_pending_merges(&self) {
+        let due = std::mem::take(
+            &mut *self
+                .pending_merges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for (key, entry) in due {
+            self.flush_one_pending_merge(key, entry);
+        }
+    }
+
+    /// The earliest deadline among every currently pending coalesced merge,
+    /// or `None` when nothing is pending. `crate::cache::merge_coalesce_task`
+    /// sleeps until this to flush right at the window's edge instead of
+    /// polling.
+    pub(crate) fn next_pending_merge_deadline_ms(&self) -> Option<u64> {
+        self.pending_merges
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|entry| entry.deadline_ms)
+            .min()
+    }
+
+    /// Resolves the next time a [`Shard::merge`] call opens a fresh
+    /// coalescing window (a key with nothing already pending), so
+    /// `crate::cache::merge_coalesce_task` can recompute its sleep-until
+    /// instead of parking past a deadline that did not exist yet when it
+    /// last checked.
+    pub(crate) fn merge_wake_notified(&self) -> impl Future<Output = ()> + '_ {
+        self.merge_wake.notified()
+    }
+}
+
+impl<K, V> Drop for Shard<K, V>
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    /// Flushes every pending coalesced [`Shard::merge`] fold before this
+    /// shard's last reference goes away, so a fold nothing ever explicitly
+    /// closed still lands rather than vanishing silently. A no-op whenever
+    /// nothing is pending, which is every shard
+    /// [`Shard::with_merge_coalesce_window`] never touched.
+    fn drop(&mut self) {
+        self.flush_all_pending_merges();
     }
 }
 
@@ -4384,6 +4714,374 @@ mod tests {
             stored.ver.node.is_merge_derived(),
             "the merged bytes match neither side's own bytes, so the engine mints a fresh \
              version no real node's clock could produce"
+        );
+    }
+
+    /// A resolver whose merge sums both sides as `u32`, so repeated folding
+    /// — [`Shard::merge`]'s in-memory coalescing included — is observable
+    /// as an actual running total rather than just "some merge happened".
+    /// Falls back to plain `Hlc` order when either side lacks a value,
+    /// matching every other merging resolver's tombstone/spill guard.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SumResolver;
+
+    impl ConflictResolver for SumResolver {
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            let (Some(av), Some(bv)) = (a.value, b.value) else {
+                return if a.ver >= b.ver { Winner::A } else { Winner::B };
+            };
+            match (
+                postcard::from_bytes::<u32>(av),
+                postcard::from_bytes::<u32>(bv),
+            ) {
+                (Ok(x), Ok(y)) => Winner::Merged {
+                    value: Bytes::from(postcard::to_stdvec(&(x + y)).expect("u32 always encodes")),
+                    expires_at_ms: None,
+                },
+                _ => {
+                    if a.ver >= b.ver {
+                        Winner::A
+                    } else {
+                        Winner::B
+                    }
+                }
+            }
+        }
+
+        fn merges(&self) -> bool {
+            true
+        }
+    }
+
+    /// A resolver that keeps whichever side decodes to the greater `u32`
+    /// and never actually returns [`Winner::Merged`] — legal per
+    /// [`ConflictResolver::merges`]'s own doc ("`true` is always correct to
+    /// return, even for a resolver that never actually returns `Merged`")
+    /// and exactly the shape needed to drive [`Shard::merge`]'s pending
+    /// fold through a real `Winner::A`/`Winner::B` decision between two
+    /// real `Put` values, rather than only through the tombstone/decode-
+    /// failure fallback every other test resolver's `A`/`B` arm takes.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct MaxWinsResolver;
+
+    impl ConflictResolver for MaxWinsResolver {
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            let (Some(av), Some(bv)) = (a.value, b.value) else {
+                return if a.ver >= b.ver { Winner::A } else { Winner::B };
+            };
+            match (
+                postcard::from_bytes::<u32>(av),
+                postcard::from_bytes::<u32>(bv),
+            ) {
+                (Ok(x), Ok(y)) if x >= y => Winner::A,
+                (Ok(_), Ok(_)) => Winner::B,
+                _ => {
+                    if a.ver >= b.ver {
+                        Winner::A
+                    } else {
+                        Winner::B
+                    }
+                }
+            }
+        }
+
+        fn merges(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_a_losing_calls_own_version_never_overwrites_the_pending_entrys_version() {
+        let s = shard::<u32, u32>(1)
+            .with_resolver(Arc::new(MaxWinsResolver))
+            .with_merge_coalesce_window(Duration::from_secs(60));
+
+        s.merge(1, 10).await.expect("merge 1: the eventual winner");
+        let ver_after_win = s
+            .pending_merges
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&1)
+            .expect("pending after the first call")
+            .ver;
+
+        // Decodes to a smaller `u32`, so `MaxWinsResolver` picks `Winner::A`
+        // (the already-pending 10 over this incoming 3): a losing call.
+        s.merge(1, 3).await.expect("merge 2: loses against 10");
+
+        let (ver_now, value_now) = {
+            let pending = s
+                .pending_merges
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let entry = pending
+                .get(&1)
+                .expect("still pending: the window hasn't elapsed");
+            (entry.ver, entry.value)
+        };
+        assert_eq!(
+            ver_now, ver_after_win,
+            "a losing merge call must not advance the pending entry's version, mirroring \
+             resolve_and_rebind's IncomingLoses no-op in the engine — the record's stored \
+             version must keep describing its own content"
+        );
+        assert_eq!(
+            value_now, 10,
+            "nor may it touch the pending entry's content"
+        );
+
+        s.flush_all_pending_merges();
+        assert_eq!(
+            s.get(&1).await,
+            Some(10),
+            "the losing call never overwrote the winner's value once flushed either"
+        );
+    }
+
+    /// [`Engine::apply_many`]'s pre-fold (`engine::prefold_batch`) collapses
+    /// several same-key records in one `apply_remote_batch` call into one
+    /// real apply, so a fan-out batch carrying distinct origin nodes'
+    /// writes to the same key publishes exactly one event — not one per
+    /// contributing record, the pre-pre-fold behavior — and that event
+    /// names only the run's last record's origin, documented on
+    /// [`Origin::Remote`] as an accepted cost of the fold.
+    #[tokio::test]
+    async fn apply_remote_batch_prefold_publishes_one_event_naming_the_runs_last_origin() {
+        let s = shard::<u32, u32>(1).with_resolver(Arc::new(SumResolver));
+        let mut events = s.events();
+
+        let rec = |node: u64, wall_ms: u64, value: u32| WireRecord {
+            key: key_bytes(&1u32),
+            value: Some(Bytes::from(postcard::to_stdvec(&value).expect("encode"))),
+            ver: hlc(wall_ms, node),
+            expires_at_ms: None,
+        };
+
+        // Three records for one key, from three distinct origin nodes, in
+        // one batch — the shape a peer's fan-out or anti-entropy-pull reply
+        // bundling several nodes' writes to the same key takes.
+        let recs = vec![rec(2, 1, 2), rec(3, 2, 3), rec(4, 3, 4)];
+        ShardOps::apply_remote_batch(&s, recs).await;
+
+        assert_eq!(
+            s.get(&1).await,
+            Some(9),
+            "pre-fold still stores the full merge of every record in the run"
+        );
+
+        match events
+            .recv()
+            .await
+            .expect("one event for the whole folded run")
+        {
+            Event::Created { key, value, origin } => {
+                assert_eq!(key, 1);
+                assert_eq!(value, 9);
+                assert_eq!(
+                    origin,
+                    Origin::Remote(NodeId::from(4)),
+                    "the folded run's event names the run's last record's origin, not \
+                     every contributor's"
+                );
+            }
+            other => {
+                panic!("expected exactly one Event::Created for the folded run, got {other:?}")
+            }
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "three same-key records in one fan-out batch publish exactly one event under \
+             pre-fold, not three"
+        );
+    }
+
+    #[test]
+    fn merge_deadline_ms_adds_the_window_to_the_start_time() {
+        assert_eq!(merge_deadline_ms(1_000, Duration::from_millis(250)), 1_250);
+        assert_eq!(
+            merge_deadline_ms(u64::MAX, Duration::from_millis(1)),
+            u64::MAX,
+            "saturates rather than wrapping"
+        );
+    }
+
+    #[test]
+    fn merge_window_elapsed_is_true_at_and_after_the_deadline_only() {
+        assert!(!merge_window_elapsed(999, 1_000), "before the deadline");
+        assert!(
+            merge_window_elapsed(1_000, 1_000),
+            "exactly at the deadline"
+        );
+        assert!(merge_window_elapsed(1_001, 1_000), "past the deadline");
+    }
+
+    #[tokio::test]
+    async fn merge_with_a_zero_window_applies_at_once_like_insert() {
+        let s = shard::<u32, u32>(1).with_resolver(Arc::new(SumResolver));
+        let mut events = s.events();
+
+        s.merge(1, 5).await.expect("merge");
+        assert_eq!(
+            s.get(&1).await,
+            Some(5),
+            "a zero coalesce window applies every merge call immediately"
+        );
+        match events
+            .recv()
+            .await
+            .expect("one event for the immediate apply")
+        {
+            Event::Created { key, value, .. } => {
+                assert_eq!(key, 1);
+                assert_eq!(value, 5);
+            }
+            other => panic!("expected Event::Created, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_within_a_window_folds_in_memory_and_applies_once() {
+        let s = shard::<u32, u32>(1)
+            .with_resolver(Arc::new(SumResolver))
+            .with_merge_coalesce_window(Duration::from_secs(60));
+        let mut events = s.events();
+
+        s.merge(1, 2).await.expect("merge 1");
+        s.merge(1, 3).await.expect("merge 2");
+        s.merge(1, 4).await.expect("merge 3");
+
+        assert_eq!(
+            s.get(&1).await,
+            None,
+            "nothing has applied yet: the 60s window has not elapsed"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "nothing applies, so nothing publishes, before the flush"
+        );
+
+        s.flush_all_pending_merges();
+
+        assert_eq!(
+            s.get(&1).await,
+            Some(9),
+            "the fold of all three calls (2 + 3 + 4) lands as one write"
+        );
+        match events
+            .recv()
+            .await
+            .expect("exactly one event for the whole window")
+        {
+            Event::Created { key, value, .. } => {
+                assert_eq!(key, 1);
+                assert_eq!(value, 9);
+            }
+            other => panic!("expected one Event::Created for the fold, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "three merge calls in one window publish exactly one event, not three"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_does_not_read_the_stored_value_before_the_window_flushes() {
+        let s = shard::<u32, u32>(1)
+            .with_resolver(Arc::new(SumResolver))
+            .with_merge_coalesce_window(Duration::from_secs(60));
+        s.insert(1, 100).await.expect("setup insert");
+
+        s.merge(1, 5).await.expect("merge");
+        assert_eq!(
+            s.get(&1).await,
+            Some(100),
+            "merge never reads the stored value before its window flushes: the pending \
+             fold, not the sum, is what's in memory until then"
+        );
+
+        s.flush_all_pending_merges();
+        assert_eq!(
+            s.get(&1).await,
+            Some(105),
+            "the flush's ordinary apply folds the pending value against what was stored, \
+             through the same resolver"
+        );
+    }
+
+    #[test]
+    fn merge_coalesce_window_defaults_to_zero() {
+        let s = shard::<u32, u32>(1);
+        assert_eq!(s.merge_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn with_merge_coalesce_window_overrides_the_default() {
+        let s = shard::<u32, u32>(1).with_merge_coalesce_window(Duration::from_millis(7));
+        assert_eq!(s.merge_window(), Duration::from_millis(7));
+    }
+
+    #[tokio::test]
+    async fn flush_due_pending_merges_only_flushes_once_the_deadline_is_reached() {
+        let s = shard::<u32, u32>(1)
+            .with_resolver(Arc::new(SumResolver))
+            .with_clock(Arc::new(|| 0u64))
+            .with_merge_coalesce_window(Duration::from_millis(100));
+
+        s.merge(1, 1).await.expect("merge");
+        let deadline = s.next_pending_merge_deadline_ms().expect("one key pending");
+        assert_eq!(deadline, 100);
+
+        s.flush_due_pending_merges(deadline - 1);
+        assert_eq!(s.get(&1).await, None, "not due yet");
+
+        s.flush_due_pending_merges(deadline);
+        assert_eq!(s.get(&1).await, Some(1), "due exactly at the deadline");
+    }
+
+    #[tokio::test]
+    async fn merge_flushes_pending_folds_on_drop() {
+        let s = shard::<u32, u32>(1)
+            .with_resolver(Arc::new(SumResolver))
+            .with_merge_coalesce_window(Duration::from_secs(60));
+        // Subscribed before the merges below: a receiver created after they
+        // fire would never see the flush's event.
+        let mut events = s.events();
+
+        s.merge(1, 2).await.expect("merge 1");
+        s.merge(1, 3).await.expect("merge 2");
+        assert!(
+            events.try_recv().is_err(),
+            "still pending: nothing has applied yet"
+        );
+
+        drop(s);
+
+        match events.recv().await.expect("drop flushes the pending fold") {
+            Event::Created { key, value, .. } => {
+                assert_eq!(key, 1);
+                assert_eq!(value, 5);
+            }
+            other => panic!("expected Event::Created from the drop flush, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_falls_back_to_hlc_order_when_the_resolver_does_not_merge() {
+        // `Shard::with_merge_coalesce_window` is a raw setter with no
+        // validation of its own — `crate::cache::CacheBuilder` is the
+        // validated entry point — so a non-merging resolver combined with a
+        // window must still behave sanely: the pending fold degrades to
+        // picking a side, never panicking.
+        let s = shard::<u32, u32>(1).with_merge_coalesce_window(Duration::from_secs(60));
+
+        s.merge(1, 1).await.expect("merge 1");
+        s.merge(1, 2).await.expect("merge 2");
+        s.flush_all_pending_merges();
+
+        assert_eq!(
+            s.get(&1).await,
+            Some(2),
+            "LwwResolver::winner picks a side by Hlc order; the later call's own stamp wins"
         );
     }
 

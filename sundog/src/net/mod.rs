@@ -810,9 +810,20 @@ impl Mesh {
     ///
     /// Panics if the peer-table lock is poisoned.
     pub fn update_peers(&self, peers: Vec<Peer>) {
-        let incoming: HashMap<NodeId, (SocketAddr, u16)> = peers
+        // `incoming_peers` keeps `peers`' own order (minus self) so the
+        // spawn loop below creates each newly seen peer's writer in that
+        // deterministic order; `incoming` exists only for the O(1) lookups
+        // `retain` below needs, and is never itself iterated -- a `HashMap`
+        // iterated directly would order those spawns by this process's own
+        // per-instance hash-key randomization, not by anything about the
+        // peers themselves, letting two runs seeded identically schedule
+        // this node's writer tasks in a different relative order.
+        let incoming_peers: Vec<Peer> = peers
             .into_iter()
             .filter(|peer| peer.node != self.inner.node)
+            .collect();
+        let incoming: HashMap<NodeId, (SocketAddr, u16)> = incoming_peers
+            .iter()
             .map(|peer| (peer.node, (peer.data_addr, peer.protocol)))
             .collect();
 
@@ -835,10 +846,10 @@ impl Mesh {
             handle.protocol.store(protocol, Ordering::Relaxed);
             true
         });
-        for (node, (data_addr, protocol)) in incoming {
+        for peer in incoming_peers {
             table
-                .entry(node)
-                .or_insert_with(|| self.spawn_peer_handle(data_addr, protocol));
+                .entry(peer.node)
+                .or_insert_with(|| self.spawn_peer_handle(peer.data_addr, peer.protocol));
         }
     }
 

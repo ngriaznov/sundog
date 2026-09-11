@@ -75,7 +75,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 #[cfg(all(feature = "spill", test))]
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -673,6 +673,263 @@ fn resolve_and_rebind<V: DeserializeOwned>(
     }
 }
 
+/// One [`Engine::apply_many`] batch entry, before or after pre-fold:
+/// precomputed hash, the typed key, its wire-encoded bytes, the write's
+/// version, and the value or tombstone it carries. Named only to keep
+/// [`prefold_batch`]'s and [`Engine::apply_many`]'s signatures under
+/// clippy's type-complexity threshold; structurally identical to the plain
+/// tuple every caller already builds.
+type BatchEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>);
+
+/// [`prefold_batch`]'s per-run fold: `seed_ver`/`seed_incoming` and every
+/// subsequent `(ver, incoming)` in `rest`, in original order, folded into
+/// one survivor by repeatedly calling [`resolve_and_rebind`] — the exact
+/// function [`apply_locked`] itself calls against real stored state,
+/// applied here with the running accumulator standing in for "stored" and
+/// the next batch entry for "incoming". Every entry here is a real
+/// `Incoming::Put`: [`prefold_batch`] never lets an `Incoming::Tombstone`
+/// join a run, so the accumulator's own variant never changes across the
+/// fold and `stored_encoded` is always `Some`. This runs entirely outside
+/// any stripe lock, over the fold's own inputs, never touching the stripe
+/// itself — [`prefold_batch`] is the one that decides what `seed_ver`/
+/// `seed_incoming` start from, seeding with the key's real stored record
+/// when [`prefold_batch`] was handed one, and [`Engine::apply_many`]
+/// applies the returned survivor through the ordinary per-record path
+/// afterward, which is what actually reconciles it with real stored state
+/// (unchanged since the seed was read, in the common case, or once more if
+/// a concurrent writer moved it in between).
+///
+/// `resolve_and_rebind`'s own commutativity/associativity/idempotence
+/// contract (required of any resolver whose [`ConflictResolver::merges`] is
+/// `true`) is what makes `merge_version`'s *content* result fold-order
+/// independent: `(P ⊔ e0) ⊔ e1 == P ⊔ (e0 ⊔ e1)` in bytes, always. The
+/// *version* `merge_version` mints is a `max(..) + 1` chain, which is not
+/// associative the same way once more than one mint fires in the chain —
+/// see [`prefold_batch`]'s doc for why folding `P` in first, rather than
+/// last, is what keeps this fold's minted version identical to sequential
+/// application's too, not just its bytes.
+fn fold_run<V: DeserializeOwned>(
+    resolver: &dyn ConflictResolver,
+    key_bytes: &[u8],
+    seed_ver: Hlc,
+    seed_incoming: Incoming<V>,
+    rest: Vec<(Hlc, Incoming<V>)>,
+) -> (Hlc, Incoming<V>) {
+    let mut acc_ver = seed_ver;
+    let mut acc_incoming = seed_incoming;
+    for (ver, incoming) in rest {
+        let (stored_encoded, stored_expires_at_ms) = match &acc_incoming {
+            Incoming::Put {
+                encoded,
+                expires_at_ms,
+                ..
+            } => (Some(encoded.as_ref()), *expires_at_ms),
+            Incoming::Tombstone => (None, None),
+        };
+        if let Some((new_ver, new_incoming)) = resolve_and_rebind(
+            resolver,
+            key_bytes,
+            acc_ver,
+            stored_encoded,
+            stored_expires_at_ms,
+            ver,
+            incoming,
+        ) {
+            acc_ver = new_ver;
+            acc_incoming = new_incoming;
+        }
+    }
+    (acc_ver, acc_incoming)
+}
+
+/// Groups `entries` by key bytes, preserving each key's own relative order
+/// however its entries are interleaved with other keys' in the batch, and
+/// splits each key's indices into maximal runs of consecutive
+/// `Incoming::Put` entries. A run never crosses an `Incoming::Tombstone`: a
+/// tombstone always starts a singleton run of its own, on both sides of it
+/// — [`Winner::Merged`] is never legal against a tombstone's value-less
+/// side (see [`resolve_conflict`]) and pre-folding takes the same stance
+/// rather than relying on that guard alone. Shared by [`prefold_batch`] and
+/// [`Engine::apply_many`]'s seed lookup so both agree on exactly which runs
+/// are long enough to fold.
+fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<usize>> {
+    let mut by_key: HashMap<Bytes, Vec<usize>> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        by_key.entry(entry.2.clone()).or_default().push(i);
+    }
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for indices in by_key.into_values() {
+        let mut current: Vec<usize> = Vec::new();
+        for idx in indices {
+            match &entries[idx].4 {
+                Incoming::Put { .. } => current.push(idx),
+                Incoming::Tombstone => {
+                    if !current.is_empty() {
+                        runs.push(std::mem::take(&mut current));
+                    }
+                    runs.push(vec![idx]);
+                }
+            }
+        }
+        if !current.is_empty() {
+            runs.push(current);
+        }
+    }
+    runs
+}
+
+/// The key's real currently-stored record, in the same value-aware,
+/// tombstone/spill-degraded shape [`apply_locked`] itself reads before
+/// calling [`resolve_and_rebind`]: `None` against a tombstone, an absent
+/// key, or a currently-spilled entry (no value bytes to fold), `Some` with
+/// the stored `Hlc`, encoded bytes, and TTL otherwise. Read under a brief
+/// stripe read lock, before any decode or fold work runs — see
+/// [`Engine::apply_many`]'s call site.
+/// [`peek_stored_seed`]'s and [`peek_prefold_seeds`]'s result for one key:
+/// the real stored `(version, encoded bytes, TTL)` to seed
+/// [`prefold_batch`]'s fold with, or `None` when there is none to seed
+/// with. Named only to keep the two functions' signatures under clippy's
+/// type-complexity threshold.
+type PrefoldSeed = Option<(Hlc, Bytes, Option<u64>)>;
+
+fn peek_stored_seed<K, V>(stripe: &Stripe<K, V>, hash: u64, key_bytes: &[u8]) -> PrefoldSeed {
+    if stripe.tombstones.contains_key(key_bytes) {
+        return None;
+    }
+    let live = stripe
+        .live
+        .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
+    let encoded = match &live.payload {
+        Payload::Resident { encoded, .. } => encoded.clone(),
+        #[cfg(feature = "spill")]
+        Payload::Spilled(_) => return None,
+    };
+    Some((live.ver, encoded, live.expires_at_ms))
+}
+
+/// [`Engine::apply_many`]'s seed lookup: for every `runs` entry long enough
+/// to actually fold (`len() >= 2`), [`peek_stored_seed`]s that key once,
+/// keyed by its wire bytes. Takes the stripe read lock for exactly this
+/// pass — [`Engine::apply_many`] drops the guard immediately after this
+/// returns, before any decode or fold work, which all runs lock-free
+/// afterward in [`prefold_batch`].
+fn peek_prefold_seeds<K, V>(
+    stripe: &Stripe<K, V>,
+    entries: &[BatchEntry<K, V>],
+    runs: &[Vec<usize>],
+) -> HashMap<Bytes, PrefoldSeed> {
+    let mut seeds = HashMap::new();
+    for run in runs {
+        if run.len() < 2 {
+            continue;
+        }
+        let (hash, _, key_bytes, ..) = &entries[run[0]];
+        seeds
+            .entry(key_bytes.clone())
+            .or_insert_with(|| peek_stored_seed(stripe, *hash, key_bytes.as_ref()));
+    }
+    seeds
+}
+
+/// [`Engine::apply_many`]'s pre-fold, run only when the caller has already
+/// confirmed the resolver's [`ConflictResolver::merges`] is `true` and
+/// pre-folding is enabled: folds every maximal run [`group_prefold_runs`]
+/// found down to one survivor with [`fold_run`], entirely outside any
+/// stripe lock.
+///
+/// A run whose key has a real stored record — `stored_seeds` carries one,
+/// looked up by [`peek_prefold_seeds`] before this runs — folds that record
+/// in *first*, ahead of every entry the run itself carries, in original
+/// order: `P ⊔ e0 ⊔ e1 ⊔ ... ⊔ eN`, the exact left-to-right order
+/// sequential per-record application folds them in against real stored
+/// state one call at a time. This is what makes the survivor's minted
+/// `Hlc`, not only its bytes, land identical to sequential application's:
+/// `merge_version`'s content-join is fold-order independent by the
+/// resolver's own contract, but its mint arm's `wall_ms.max(..)`/
+/// `logical.max(..) + 1` is a running max, not a fixed function of the
+/// unordered input set, so folding `P` in last instead of first can mint a
+/// different (still correct — still strictly dominant over every input,
+/// still landing on byte-identical content) version than folding it in
+/// first does. Seeding here keeps the two paths minting the identical
+/// version, not just converging to the same content.
+///
+/// A run with no real stored record (a batch touching an entirely fresh
+/// key) folds starting from its own first entry instead, exactly as before
+/// seeding existed — there is no `P` to fold in.
+///
+/// Returns one slot per original index, in original order, so
+/// [`Engine::apply_many`]'s returned outcome vector always has exactly
+/// `entries.len()` entries: `Some` for every index that should still run
+/// through [`apply_locked`] as usual — every entry outside a multi-entry
+/// run, plus the *last* index of one, now holding that run's folded
+/// survivor in place of its own original `(ver, incoming)` — and `None` for
+/// every other index a multi-entry run absorbed, which contributed nothing
+/// beyond what the survivor already carries and so never reaches
+/// `apply_locked` at all; [`Engine::apply_many`] reports [`ApplyOutcome::Rejected`]
+/// for those directly. [`apply_locked`]'s own call against real stored
+/// state, once the survivor reaches it, still reconciles the rare case
+/// where a concurrent writer moved the stored record in between the read
+/// lock this seeded from and the write lock the survivor applies under —
+/// `resolve_and_rebind`'s contract makes that reconciliation a correct,
+/// idempotent no-op or verbatim adoption when nothing moved, and a normal
+/// merge when something did.
+fn prefold_batch<K, V: DeserializeOwned>(
+    entries: Vec<BatchEntry<K, V>>,
+    runs: Vec<Vec<usize>>,
+    resolver: &dyn ConflictResolver,
+    stored_seeds: &HashMap<Bytes, PrefoldSeed>,
+) -> Vec<Option<BatchEntry<K, V>>> {
+    let mut slots: Vec<Option<BatchEntry<K, V>>> = entries.into_iter().map(Some).collect();
+    for run in runs {
+        if run.len() < 2 {
+            // Alone for this run: nothing to fold, left exactly as given.
+            continue;
+        }
+        let last = *run.last().expect("checked run.len() >= 2 above");
+        let mut positions = run.into_iter();
+        let seed_idx = positions.next().expect("checked run.len() >= 2 above");
+        let (hash, key, key_bytes, seed_ver, seed_incoming) = slots[seed_idx]
+            .take()
+            .expect("each batch index belongs to at most one run");
+        let rest: Vec<(Hlc, Incoming<V>)> = positions
+            .map(|idx| {
+                let (_, _, _, ver, incoming) = slots[idx]
+                    .take()
+                    .expect("each batch index belongs to at most one run");
+                (ver, incoming)
+            })
+            .collect();
+
+        // Decoding the peeked stored bytes never happens under the read
+        // lock `peek_prefold_seeds` took — that lock is long gone by here.
+        let stored_decoded = stored_seeds
+            .get(key_bytes.as_ref())
+            .and_then(Option::as_ref)
+            .and_then(|(sv, encoded, expires_at_ms)| {
+                postcard::from_bytes::<V>(encoded)
+                    .ok()
+                    .map(|value| (*sv, value, encoded.clone(), *expires_at_ms))
+            });
+
+        let (folded_ver, folded_incoming) = match stored_decoded {
+            Some((sv, value, encoded, expires_at_ms)) => {
+                let stored_incoming = Incoming::Put {
+                    value,
+                    expires_at_ms,
+                    encoded,
+                };
+                let mut whole_run = Vec::with_capacity(rest.len() + 1);
+                whole_run.push((seed_ver, seed_incoming));
+                whole_run.extend(rest);
+                fold_run(resolver, key_bytes.as_ref(), sv, stored_incoming, whole_run)
+            }
+            None => fold_run(resolver, key_bytes.as_ref(), seed_ver, seed_incoming, rest),
+        };
+        slots[last] = Some((hash, key, key_bytes, folded_ver, folded_incoming));
+    }
+    slots
+}
+
 /// Whether a read of `live` at `now_ms` sees nothing: past its expiry, or
 /// idle for `tti_ms` or longer. Lazy expiry and idle eviction both hinge on
 /// this; a sweep only reclaims what it already reports absent.
@@ -1215,6 +1472,14 @@ pub(crate) struct Engine<K, V> {
     /// displaces a pending key strands nothing here.
     #[cfg(feature = "spill")]
     pending_spill_weight: AtomicU64,
+    /// Whether [`Engine::apply_many`] pre-folds a batch by key ahead of the
+    /// stripe lock, for a resolver whose [`ConflictResolver::merges`] is
+    /// `true`. `true` by default; [`Engine::set_prefold_enabled`] (test-only)
+    /// is the only way to turn it off, to compare pre-fold's effect on
+    /// throughput against the unfolded per-record path it otherwise always
+    /// takes. Has no effect at all on a resolver that doesn't merge — see
+    /// `apply_many`'s docs.
+    prefold_enabled: AtomicBool,
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
 }
@@ -1253,6 +1518,7 @@ where
             spill_entries_test_count: AtomicI64::new(0),
             #[cfg(feature = "spill")]
             pending_spill_weight: AtomicU64::new(0),
+            prefold_enabled: AtomicBool::new(true),
             #[cfg(test)]
             eviction_lock_acquisitions: AtomicU64::new(0),
         }
@@ -2198,24 +2464,71 @@ where
         }
     }
 
+    /// Test-only: flips [`Engine::apply_many`]'s pre-fold on or off, `true`
+    /// by default. Only a test ever needs it off, to compare pre-fold's
+    /// effect on throughput against the unfolded per-record path it
+    /// otherwise always takes; nothing else in this crate ever calls it.
+    #[cfg(test)]
+    pub(crate) fn set_prefold_enabled(&self, enabled: bool) {
+        self.prefold_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     /// Applies a batch of versioned writes that all hash into `bucket`, under
     /// one write-lock acquisition for the whole group. Runs
     /// [`Self::enforce_capacity`] once afterward, outside the write lock,
     /// iff the batch put anything.
+    ///
+    /// When `resolver`'s [`ConflictResolver::merges`] is `true` and
+    /// pre-folding is enabled (`prefold_enabled`, on by default outside a
+    /// test), `entries` is first grouped into runs and, for every run long
+    /// enough to fold, has its key's real stored record peeked under a
+    /// brief stripe *read* lock (dropped again before any decode or fold
+    /// work runs), then folded through [`prefold_batch`] entirely outside
+    /// any lock: several entries for the same key collapse to at most one
+    /// real [`apply_locked`] call rather than one per entry, with every
+    /// other index in that group reported [`ApplyOutcome::Rejected`] rather
+    /// than skipped from the returned `Vec` — this always has exactly one
+    /// outcome per entry given, pre-fold or not. The stripe ends up holding
+    /// byte-for-byte, `Hlc`-for-`Hlc` what applying every entry one at a
+    /// time against real stored state would have left it holding; see
+    /// [`prefold_batch`]'s and [`fold_run`]'s docs for why folding the real
+    /// stored record in first, rather than never or last, is what makes
+    /// that hold for the minted version too, not only the bytes. A
+    /// resolver that never merges, or a batch with no repeated key, pays
+    /// only the grouping and (on a repeated key) the read-lock peek, and
+    /// otherwise applies exactly as before pre-folding existed.
     pub(crate) fn apply_many(
         &self,
         bucket: usize,
-        entries: Vec<(u64, K, Bytes, Hlc, Incoming<V>)>,
+        entries: Vec<BatchEntry<K, V>>,
         resolver: &dyn ConflictResolver,
         tombstone_ttl_ms: u64,
         tombstone_max_ttl_ms: u64,
         now_ms: u64,
     ) -> Vec<ApplyOutcome<K, V>> {
+        let prefold = resolver.merges() && self.prefold_enabled.load(Ordering::Relaxed);
+        let entries: Vec<Option<BatchEntry<K, V>>> = if prefold {
+            let runs = group_prefold_runs(&entries);
+            let stored_seeds = {
+                let stripe = self.stripes[bucket].read();
+                peek_prefold_seeds(&stripe, &entries, &runs)
+            };
+            prefold_batch(entries, runs, resolver, &stored_seeds)
+        } else {
+            entries.into_iter().map(Some).collect()
+        };
         let mut outcomes = Vec::with_capacity(entries.len());
         let mut wrote = false;
         {
             let mut stripe = self.stripes[bucket].write();
-            for (hash, key, key_bytes, ver, incoming) in entries {
+            for entry in entries {
+                let Some((hash, key, key_bytes, ver, incoming)) = entry else {
+                    // Absorbed into its run's survivor by `prefold_batch`;
+                    // that survivor's own `apply_locked` call, elsewhere in
+                    // this same loop, is this entry's only real contribution.
+                    outcomes.push(ApplyOutcome::Rejected);
+                    continue;
+                };
                 let part = part_index_from_hash(hash);
                 let digest_bucket = &self.digest[digest_slot(bucket, part)];
                 let (outcome, displaced_spilled) = apply_locked(
@@ -3249,7 +3562,11 @@ mod tests {
     /// [`super::super::crdt::OrSet`] — content that grows whenever either
     /// side contributes an element the other lacks, unlike
     /// [`MaxStringResolver`]'s `max`, which can reproduce one side's bytes
-    /// exactly and so cannot exercise the case below.
+    /// exactly and so cannot exercise the case below. `merges()` is `true`:
+    /// besides the mint-arm test below, this is also `apply_many_prefold`'s
+    /// resolver, since set union is a real join-semilattice (commutative,
+    /// associative, idempotent) and so a fold-order-independence property
+    /// test can lean on it.
     struct UnionSetResolver;
 
     impl ConflictResolver for UnionSetResolver {
@@ -3277,6 +3594,10 @@ mod tests {
                     }
                 }
             }
+        }
+
+        fn merges(&self) -> bool {
+            true
         }
     }
 
@@ -6483,6 +6804,284 @@ mod tests {
             );
             assert_eq!(minted.logical, 0, "logical resets once it carries");
             assert!(minted.node.is_merge_derived());
+        }
+    }
+
+    /// Coverage for [`Engine::apply_many`]'s pre-fold: that a non-merging
+    /// resolver never triggers it, that a run never crosses a tombstone,
+    /// and — the property [`prefold_batch`]'s and [`fold_run`]'s docs
+    /// argue for from the resolver's join-semilattice contract — that
+    /// pre-fold changes only how many `apply_locked` calls a batch costs,
+    /// never the `(version, bytes)` it leaves stored or the set of keys it
+    /// reports a real outcome for.
+    mod apply_many_prefold {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        type SetEngine = Engine<u32, std::collections::BTreeSet<String>>;
+        type SetEntry = (
+            u64,
+            u32,
+            Bytes,
+            Hlc,
+            Incoming<std::collections::BTreeSet<String>>,
+        );
+
+        /// Builds one `apply_many` entry: a `Put` of the single element
+        /// `elem` for `key` under `ver`.
+        fn put_entry(key: u32, ver: Hlc, elem: &str) -> SetEntry {
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let value = string_set(&[elem]);
+            let encoded = Bytes::from(postcard::to_stdvec(&value).expect("test value encodes"));
+            (
+                hash,
+                key,
+                kb,
+                ver,
+                Incoming::Put {
+                    value,
+                    expires_at_ms: None,
+                    encoded,
+                },
+            )
+        }
+
+        /// Applies `entries` to `engine` the way a real caller does: grouped
+        /// by the stripe each entry's hash falls into, one
+        /// [`Engine::apply_many`] call per touched stripe.
+        /// [`Engine::apply_many`] itself trusts its caller to have already
+        /// grouped a batch by stripe; it never checks `bucket` against the
+        /// entries it's given.
+        fn apply_batch(
+            engine: &SetEngine,
+            entries: Vec<SetEntry>,
+            resolver: &dyn ConflictResolver,
+        ) -> Vec<ApplyOutcome<u32, std::collections::BTreeSet<String>>> {
+            let mut by_bucket: HashMap<usize, Vec<SetEntry>> = HashMap::new();
+            for entry in entries {
+                by_bucket
+                    .entry(stripe_index_from_hash(entry.0))
+                    .or_default()
+                    .push(entry);
+            }
+            let mut outcomes = Vec::new();
+            for (bucket, group) in by_bucket {
+                outcomes.extend(engine.apply_many(bucket, group, resolver, 60_000, 600_000, 0));
+            }
+            outcomes
+        }
+
+        fn arb_elem() -> impl Strategy<Value = &'static str> {
+            prop_oneof![Just("a"), Just("b"), Just("c"), Just("d")]
+        }
+
+        /// One batch entry spec: a small key, so several entries collide on
+        /// one key within a batch; a real per-writer [`Hlc`] over a narrow
+        /// `wall_ms` range and a handful of `node`s, so ties and near-ties —
+        /// the cases `merge_version` treats specially — are common; and a
+        /// one-element `Put`.
+        fn arb_entry_spec() -> impl Strategy<Value = (u32, u64, u64, &'static str)> {
+            (0u32..4, 0u64..12, 1u64..4, arb_elem())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// Replaying the identical batch through two fresh engines, one
+            /// pre-folding (the default) and one with it forced off, stores
+            /// byte-for-byte, `Hlc`-for-`Hlc` the same `(version, bytes)`
+            /// per key — `UnionSetResolver`'s join (set union) is
+            /// commutative, associative, and idempotent, which is exactly
+            /// what makes fold order irrelevant to the final *content*, the
+            /// same argument `merge_version`'s doc makes for two
+            /// anti-entropy replicas folding in either order, and
+            /// `prefold_batch`'s seeding with the key's real stored record
+            /// is what extends that fold-order independence to the minted
+            /// *version* too — and reports a real, non-
+            /// [`ApplyOutcome::Rejected`] outcome for exactly the same set
+            /// of keys either way.
+            ///
+            /// A `setup` batch is applied to both engines first, through
+            /// the exact same on/off split, so every key the later `main`
+            /// batch touches already has a real stored record with a
+            /// non-trivial version behind it — the case
+            /// [`prefold_batch`]'s seeding exists for: without it, folding
+            /// `main`'s own entries together before ever consulting that
+            /// stored record mints a different version than sequential
+            /// application, even though both still converge on the same
+            /// bytes.
+            #[test]
+            fn prefold_on_and_off_store_identical_state_and_publish_the_same_keys(
+                setup in proptest::collection::vec(arb_entry_spec(), 0..12),
+                main in proptest::collection::vec(arb_entry_spec(), 1..40),
+            ) {
+                let resolver = UnionSetResolver;
+                let build = |specs: &[(u32, u64, u64, &'static str)]| -> Vec<SetEntry> {
+                    specs
+                        .iter()
+                        .map(|&(key, wall_ms, node, elem)| put_entry(key, hlc(wall_ms, node), elem))
+                        .collect()
+                };
+
+                let on: SetEngine = Engine::new(u64::MAX, None, None);
+                let off: SetEngine = Engine::new(u64::MAX, None, None);
+                off.set_prefold_enabled(false);
+
+                // Seeds each engine with real stored state per key before
+                // the batch under comparison ever runs, through the same
+                // on/off split as `main` below.
+                apply_batch(&on, build(&setup), &resolver);
+                apply_batch(&off, build(&setup), &resolver);
+
+                let on_outcomes = apply_batch(&on, build(&main), &resolver);
+                let off_outcomes = apply_batch(&off, build(&main), &resolver);
+                prop_assert_eq!(on_outcomes.len(), main.len());
+                prop_assert_eq!(off_outcomes.len(), main.len());
+
+                let touched_keys: std::collections::BTreeSet<u32> = setup
+                    .iter()
+                    .chain(main.iter())
+                    .map(|&(key, ..)| key)
+                    .collect();
+                for key in touched_keys {
+                    let kb = key_bytes(key);
+                    prop_assert_eq!(
+                        on.record_for(kb.as_ref(), 0),
+                        off.record_for(kb.as_ref(), 0),
+                        "pre-fold changes only how many apply_locked calls a batch costs, \
+                         never the stored (version, bytes) — including once a key already \
+                         has a real stored record behind it"
+                    );
+                }
+
+                let on_keys: std::collections::BTreeSet<u32> =
+                    on_outcomes.iter().filter_map(ApplyOutcome::key).copied().collect();
+                let off_keys: std::collections::BTreeSet<u32> =
+                    off_outcomes.iter().filter_map(ApplyOutcome::key).copied().collect();
+                prop_assert_eq!(
+                    on_keys, off_keys,
+                    "pre-fold on and off publish a real outcome for the same set of keys"
+                );
+            }
+        }
+
+        #[test]
+        fn a_non_merging_resolver_never_prefolds() {
+            let engine: Engine<u32, String> = engine_u32_string(u64::MAX, None);
+            let resolver = LwwResolver;
+            let k = 1u32;
+            let kb = key_bytes(k);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let value_entry = |ver: Hlc, value: &str| {
+                let value = value.to_string();
+                let encoded = Bytes::from(postcard::to_stdvec(&value).expect("test value encodes"));
+                (
+                    hash,
+                    k,
+                    kb.clone(),
+                    ver,
+                    Incoming::Put {
+                        value,
+                        expires_at_ms: None,
+                        encoded,
+                    },
+                )
+            };
+            let entries = vec![
+                value_entry(hlc(1, 1), "a"),
+                value_entry(hlc(2, 1), "b"),
+                value_entry(hlc(3, 1), "c"),
+            ];
+
+            let outcomes = engine.apply_many(bucket, entries, &resolver, 60_000, 600_000, 0);
+            assert_eq!(outcomes.len(), 3);
+            assert!(
+                matches!(outcomes[0], ApplyOutcome::Put { created: true, .. }),
+                "the first entry for a fresh key always creates it"
+            );
+            // A pre-folding gate that (wrongly) fired here would report
+            // `Rejected` for every index a run absorbed; `LwwResolver`'s
+            // `merges()` is `false`, so every entry instead applies
+            // individually, exactly as before pre-fold existed.
+            assert!(
+                matches!(outcomes[1], ApplyOutcome::Put { created: false, .. }),
+                "a non-merging resolver applies every entry on its own, never folded away"
+            );
+            assert!(matches!(
+                outcomes[2],
+                ApplyOutcome::Put { created: false, .. }
+            ));
+            assert_eq!(engine.get(&k, 0), Some("c".to_string()));
+        }
+
+        #[test]
+        fn prefold_never_folds_a_run_across_a_tombstone() {
+            let resolver = UnionSetResolver;
+            let k = 1u32;
+            let kb = key_bytes(k);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let build = || -> Vec<SetEntry> {
+                vec![
+                    put_entry(k, hlc(1, 1), "a"),
+                    put_entry(k, hlc(2, 1), "b"),
+                    (hash, k, kb.clone(), hlc(3, 1), Incoming::Tombstone),
+                    put_entry(k, hlc(4, 1), "c"),
+                ]
+            };
+
+            let prefolded: SetEngine = Engine::new(u64::MAX, None, None);
+            let outcomes = prefolded.apply_many(bucket, build(), &resolver, 60_000, 600_000, 0);
+            assert_eq!(outcomes.len(), 4);
+            assert!(
+                matches!(outcomes[0], ApplyOutcome::Rejected),
+                "folded into the pre-tombstone run's survivor at index 1"
+            );
+            assert!(
+                matches!(outcomes[1], ApplyOutcome::Put { created: true, .. }),
+                "the pre-tombstone run's survivor: the union of the first two puts"
+            );
+            assert!(matches!(outcomes[2], ApplyOutcome::Tombstoned { .. }));
+            assert!(
+                matches!(outcomes[3], ApplyOutcome::Put { created: true, .. }),
+                "a fresh key again after the tombstone, never folded with anything before it"
+            );
+            assert_eq!(
+                prefolded.get(&k, 0),
+                Some(string_set(&["c"])),
+                "the tombstone must cut the fold: the post-tombstone put never sees \"a\"/\"b\""
+            );
+
+            let sequential: SetEngine = Engine::new(u64::MAX, None, None);
+            sequential.set_prefold_enabled(false);
+            let sequential_outcomes =
+                sequential.apply_many(bucket, build(), &resolver, 60_000, 600_000, 0);
+            assert!(matches!(
+                sequential_outcomes[0],
+                ApplyOutcome::Put { created: true, .. }
+            ));
+            assert!(matches!(
+                sequential_outcomes[1],
+                ApplyOutcome::Put { created: false, .. }
+            ));
+            assert!(matches!(
+                sequential_outcomes[2],
+                ApplyOutcome::Tombstoned { .. }
+            ));
+            assert!(matches!(
+                sequential_outcomes[3],
+                ApplyOutcome::Put { created: true, .. }
+            ));
+
+            assert_eq!(
+                prefolded.record_for(kb.as_ref(), 0),
+                sequential.record_for(kb.as_ref(), 0),
+                "pre-fold changes only which position carries the real outcome, \
+                 never the final stored record"
+            );
         }
     }
 }

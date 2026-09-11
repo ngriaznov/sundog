@@ -90,14 +90,43 @@ outcome, mint included: the merge itself is commutative and the mint's
 `wall_ms`/`logical`/`node` are each a function of the unordered pair of
 inputs, not of which side calls which argument `sv` and which `ver`, so
 both replicas mint (or adopt) byte-for-byte, `Hlc`-for-`Hlc` identical
-results. The partition-heal sim confirms it end to end: `pn_counter`
-repairs a 2,000-counter partition split in 10 anti-entropy rounds
-against `lww_decomposed`'s 11, down from 17 before this exchange
-shipped — fewer rounds than the decomposed control, the opposite of the
-naive expectation that merging costs more.
+results. The partition-heal sim confirms it end to end at default scale:
+`pn_counter` repairs a 2,000-counter partition split in 3 anti-entropy
+rounds against `lww_decomposed`'s 4 — fewer rounds than the decomposed
+control, the opposite of the naive expectation that merging costs more. At
+20,000 counters that inverts (`pn_counter` needs 5 rounds against
+`lww_decomposed`'s 3); see "What is still open" below.
+
+Two write-path levers sit on top of the same contract, both public API,
+neither changing the version rule or the wire format. `Engine::apply_many`
+groups a batch by key when the resolver's `merges()` is `true` and folds
+each same-key run down to one survivor with the resolver, entirely outside
+the stripe lock, before applying the run's single survivor through the
+ordinary path — a peer's replicated fan-out batch and a local
+`Cache::insert_many` call are where a real run appears; a singleton `insert`
+never contains one. `Cache::merge`/`CacheBuilder::merge_coalesce_window`
+coalesce a run of client-side `merge` calls to one key, within a bounded
+window, into a single record applied once the window elapses — a zero
+window (the default) applies at once, byte-for-byte like `insert` under a
+merging resolver; a nonzero window trades a bounded read-side staleness
+(`get` is blind to a pending fold until it flushes) for turning
+`writers × calls` client calls into one applied record per key per window.
 
 **What is still open:**
 
+- **The bidirectional exchange's round-count regression at scale.** The
+  partition-heal sim's own assertion that `pn_counter` matches or beats
+  `lww_decomposed`'s anti-entropy round count fails at `SUNDOG_SIM_KEYS=20000`
+  (`pn_counter` spends 5 rounds against `lww_decomposed`'s 3), reproducibly.
+  The per-key, one-round convergence argument above says nothing about how
+  the exchange's doubled per-round cost interacts with a partition where
+  every key needs a real merge; this needs root-causing before the exchange
+  can be trusted at this scale.
+- **Coalescing's flush cadence becomes the bottleneck at high key
+  concurrency.** `large_entity_convergence_coalesced` at `N=100,000` runs
+  slower than both an uncoalesced merge and the decomposed control, the
+  opposite of its default-scale showing; nothing today adapts the flush
+  sweep's pace to how many keys are coalescing at once.
 - **`OrSet` never compacts.** Adds and tombstones accumulate forever; there
   is no tag garbage collection.
 - **No CRDT resolver ships for a map or a register**, only a counter and a
@@ -108,10 +137,9 @@ naive expectation that merging costs more.
 - **A resolver's bytes that fail to decode are rejected silently.** There is
   no dedicated counter for this path, so it is observable only as an absent
   write.
-- **Every collision folds one write at a time under the stripe lock.**
-  Pre-folding multiple pending writers' records for a key before acquiring
-  the lock would let merge's raw throughput approach key decomposition's
-  instead of only converging to the same correctness.
+- **No metric for a coalesced fold.** `Cache::merge`'s pending-fold count and
+  flush cadence are observable today only through `Cache::events()` and
+  `entry_count`, not a dedicated counter.
 
 **Trigger for the open items above:** none yet observed in a real
 deployment; each is a known limitation of the mechanism as it stands, not a

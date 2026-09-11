@@ -7,6 +7,10 @@ of one silently overwriting the other. `sundog::crdt` ships two resolvers
 built on this — `PnCounter`/`PnCounterResolver` for an increment/decrement
 counter and `OrSet`/`OrSetResolver` for an observed-remove set — as reference
 implementations of the contract, not the only merge types a cache can use.
+Two write-path levers sit on top of the same contract: `Engine::apply_many`
+pre-folds a batch that repeats a key before the stripe lock, and
+`Cache::merge` with `CacheBuilder::merge_coalesce_window` coalesces a run of
+client-side `merge` calls to one key into a single applied record.
 `ROADMAP.md`'s "Merge resolvers" section under Next covers the full design,
 including what a production version of the mechanism still needs.
 
@@ -55,6 +59,98 @@ rejects any id with the bit set, and only `NodeId::merge_derived` sets it.
 live clock's `logical` counter grows by one per real tick, never by a hash.
 On the wire, `Origin::Remote(node)` for a record a merge produced now names
 no member of the cluster; this is documented on `Origin::Remote` itself.
+
+`ConflictResolver::merges` — `false` by default, `true` on
+`PnCounterResolver` and `OrSetResolver` — reports whether a resolver can ever
+return `Winner::Merged`; `ShardOps::merges` forwards a shard's configured
+resolver's answer, and both write-path levers below and `cluster::anti_entropy`
+read it to decide whether their own extra work (grouping a batch, coalescing
+a window, exchanging both directions of a mismatch) is worth doing at all.
+
+### Write-path lever A: pre-folding a batch before the stripe lock
+
+`Engine::apply_many` applies a batch of versioned writes that all hash into
+one bucket under a single write-lock acquisition. Before pre-folding
+existed, a batch holding several entries for the same key — a peer's
+fan-out batch carrying many increments to one key, or a local
+`Cache::insert_many` call — ran one full decode/fold/encode/mint cycle
+through `apply_locked` per entry, even though every entry after the first
+only ever folds into what the entries before it already produced.
+
+`apply_many` now checks `resolver.merges()` (and a `#[cfg(test)]`-only
+`prefold_enabled` flag the benchmark and property tests use to force it
+off) and, when both hold, groups the batch by key with `group_prefold_runs`
+into maximal runs of consecutive `Incoming::Put` entries — a run never
+crosses an `Incoming::Tombstone`, since `Winner::Merged` is never legal
+against a tombstone's value-less side and pre-folding takes the same stance
+rather than relying on that guard alone. For every run long enough to
+actually fold (two or more entries), `peek_prefold_seeds` looks up that
+key's real stored record under a brief stripe *read* lock, dropped again
+before any decode or fold work runs. `prefold_batch` then folds each run
+down to one survivor entirely outside any lock, with `fold_run` folding the
+key's real stored record in *first* when one exists, ahead of the run's own
+entries in original order — `P ⊔ e0 ⊔ e1 ⊔ ... ⊔ eN`, the same left-to-right
+order sequential per-entry application folds them in against real stored
+state one call at a time. That seeding is what makes the survivor's minted
+`Hlc`, not only its bytes, come out identical to sequential application's:
+`merge_version`'s content join is fold-order independent by the resolver's
+own contract, but its mint arm's `wall_ms.max(..)`/`logical.max(..) + 1` is a
+running max, not a fixed function of the unordered input set, so folding the
+stored record in last instead of first can mint a different — still
+correct, still byte-identical in content — version than sequential
+application does. Every run's survivor then applies through the ordinary
+per-entry path exactly once, under the batch's single write-lock
+acquisition; every other index the run absorbed is reported
+`ApplyOutcome::Rejected` rather than skipped, so `apply_many` always returns
+exactly one outcome per entry, pre-fold or not. `apply_locked`'s own call
+against real stored state, once the survivor reaches it, still reconciles
+the rare case where a concurrent writer moved the stored record in between
+the read lock the seed came from and the write lock the survivor applies
+under — `resolve_and_rebind`'s contract makes that reconciliation a correct,
+idempotent no-op or verbatim adoption when nothing moved, and a normal merge
+when something did.
+
+A non-merging resolver, or a batch with no repeated key, pays only the
+grouping pass (and, on a repeated key, the read-lock seed peek) and
+otherwise applies exactly as it did before pre-folding existed. `Cache::insert`
+is always a singleton `apply_many` call and so can never contain a same-key
+run to fold; `insert_many` and a peer's replicated fan-out batch
+(`apply_remote_batch`) are where a real run appears.
+
+### Write-path lever B: local delta coalescing
+
+`Cache::merge(key, value)` folds `value` into the configured resolver
+without a read, calling `ConflictResolver::winner` directly against the
+locally stamped incoming record and either the key's existing pending fold
+or (with the coalescing window at its default zero) applying at once
+through the ordinary write path — `Cache::merge` at a zero window is
+`Cache::insert` under a merging resolver, nothing more.
+`CacheBuilder::merge_coalesce_window(Duration)` sets a nonzero window: the
+shard keeps a per-key `pending_merges` map, and a `merge` call to a key
+already pending folds the new value into that pending entry via the same
+`resolver.winner` call `apply_locked` itself uses, rather than opening a
+second pending entry or applying immediately. The first `merge` call to open
+a key's pending entry sets a deadline `merge_deadline_ms(now, window)`
+ahead; a background sweep (`flush_due_pending_merges`) applies every entry
+whose deadline has passed through the ordinary `Shard::apply` path, so
+replication and every `Event` this key gets during the window see one
+record, not one per call. `Cache::close`, and dropping this cache's last
+handle, both flush whatever is still pending (`flush_all_pending_merges`)
+regardless of the window, so no fold is ever lost to a shutdown.
+
+`Cache::get`/`Shard::get_sync` never consult the pending map: a value folded
+in but not yet flushed is invisible to a read for as long as it stays
+pending — up to one whole window from the call that opened it. This is
+`Cache::merge`'s documented staleness bound, and it is the only place this
+lever trades anything away — the resolver still folds every call exactly
+once, in the same order it arrived, before any of it reaches the engine.
+
+`CacheBuilder::merge_coalesce_window` rejects a nonzero window on a cache
+whose resolver's `merges()` is `false` (`CacheError::MergeWindowRequiresMergingResolver`):
+coalescing multiple `merge` calls into one record only preserves every fold
+when the resolver can actually fold two values together rather than just
+pick a side, so a plain `LwwResolver` cache can only ever run this lever at
+the always-immediate zero window.
 
 ## Convergence argument
 
@@ -148,11 +244,16 @@ reduces to neither side's content, or it reduces to one side's but that
 side's real clock is the lesser of the two — is exactly what routes *both*
 calls to the mint arm instead, which the paragraph above already covers:
 both sides mint the identical result. Every case therefore converges in
-this one round, never needing a second.
+this one round, never needing a second — a bound on rounds *per divergent
+key*, not on how many rounds a whole partition of many divergent keys takes
+to drain; the benchmark's own partition-heal results below measure that
+larger, batch-level effect separately, and it does not always move the same
+direction this per-key bound does.
 
 ## Property suite
 
-Four tiers, mirroring the levels the crate already tests resolvers at:
+Four tiers, mirroring the levels the crate already tests resolvers at, plus
+the two write-path levers' own coverage below them.
 
 - **Value algebra**, no `Shard`: `PnCounter` and `OrSet<String>` each carry
   `proptest` coverage for `merge` commutativity, idempotence (byte-for-byte),
@@ -189,31 +290,58 @@ Four tiers, mirroring the levels the crate already tests resolvers at:
   integration test drives concurrent, unpaced blind increments from all
   three real nodes and asserts convergence to the exact total, with no
   staggering needed to keep independent HLC clocks from colliding.
+- **Pre-folding (lever A)**: a property test replays a `setup` batch and
+  then an arbitrary `main` batch of `UnionSetResolver` entries, small keys so
+  several entries collide within a batch, through two fresh engines — one
+  pre-folding (the default), one with `Engine::set_prefold_enabled(false)` —
+  and asserts every touched key's stored `(version, bytes)` and the set of
+  keys reported a real outcome are identical either way; running `setup`
+  first through the same on/off split means every key `main` touches already
+  has a real stored record behind it before the comparison, the case
+  `prefold_batch`'s seeding exists for. Targeted unit tests pin that a
+  non-merging resolver never pre-folds, and that a run never folds across a
+  tombstone even when the surrounding entries share a key.
+- **Coalescing (lever B)**, at both `Shard` and `Cache`: a zero window
+  applies immediately, byte-for-byte like `insert`; a nonzero window folds
+  consecutive calls to one key in memory and applies exactly once, at the
+  deadline, with `get` proven blind to the pending value until then;
+  `Cache::close` and a drop both flush every pending fold; the builder
+  rejects a nonzero window on a resolver whose `merges()` is `false`;
+  a losing call's own version never overwrites the pending entry's version,
+  mirroring `resolve_and_rebind`'s own losing-write rule; and a fold against
+  a resolver that falls back to plain `Hlc` order behaves exactly as
+  `Shard::insert` would.
 
 Every test above passes; together they establish that the merge algebra, the
-version combinator in isolation, and repeated pairwise folding under
-anti-entropy's own push-direction rule all converge to the exact expected
-state — not merely to some shared state every replica happens to agree on.
+version combinator in isolation, repeated pairwise folding under
+anti-entropy's own push-direction rule, and both write-path levers all
+converge to the exact expected state — not merely to some shared state every
+replica happens to agree on — and that neither lever changes what gets
+stored, only how many times the engine does the work of storing it.
 
 ## Benchmark
 
 `sundog/tests/crdt_bench.rs`, `SUNDOG_BENCH=1 cargo test --release -p sundog
 --features prometheus --test crdt_bench -- --test-threads=1 --nocapture`, run
 three times at the default `WRITERS=8`/`ITERS=200`. Each run finished in
-216.95–218.59 seconds, comfortably under the 15-minute budget, so
-`SUNDOG_BENCH_KEYS` stayed at its scenario defaults for these three runs. All
-12 tests passed on all three runs — `merged_counter_blind` and
-`merged_counter_rmw` included, both converging inside their 30-second wait on
-every one of the 9 internal repetitions (3 runs × 3 reps each) — with no
-timeout and no plateau. Each printed line is already the median of 3 internal
-repetitions; the figures below are the median of those three already-medianed
-runs, taken per field.
+332.30–334.58 seconds, comfortably under the 15-minute budget. All 16 tests
+passed on all three runs — `merged_counter_blind` and `merged_counter_rmw`
+included, both converging inside their 30-second wait on every one of the 9
+internal repetitions (3 runs × 3 reps each), and `merged_counter_coalesced`'s
+three windows converging inside the same wait — with no timeout and no
+plateau. Each printed line is already the median of 3 internal repetitions;
+the figures below are the median of those three already-medianed runs,
+taken per field.
 
-`SUNDOG_BENCH_KEYS` also drives two scale scenarios,
-`cold_join_initial_replication_*` and `large_entity_convergence_*`, past
-their defaults (`keys=2,000` and `keys=4,000`): one run each at
-`keys=50,000` and `keys=100,000` respectively, both finishing in under a
-minute (55 s and 53 s), so neither needed halving.
+`SUNDOG_BENCH_KEYS` drives four scale scenarios past their defaults —
+`cold_join_initial_replication_*` (`keys=2,000`), `large_entity_convergence_*`
+and `large_entity_convergence_coalesced` (`N=4,000`), and
+`apply_many_prefold` (`batch_size=1,000`) — filtered to run only the
+scenario under test (`cargo test ... -- --nocapture <name filter>`) so a
+scale run's cost isolates to the scenarios that knob actually changes: one
+run each at `keys=50,000` for cold join and `N=100,000` for large-entity
+(both the `decomposed`/`merged` pair and the coalesced variant), finishing in
+56.77 s and 82.84 s respectively.
 
 ### Machine
 
@@ -227,28 +355,94 @@ per scenario):
 
 | Scenario | keys | writes/sec | p50 write | p99 write | lost updates | converge |
 |---|---|---:|---:|---:|---:|---:|
-| `naive_lww_counter` (control) | 1 | 699,374 | 2.7 µs | 97.7 µs | 677 | 0.021 s |
-| `decomposed_counter` | 8 | 1,468,163 | 1.0 µs | 39.1 µs | 0 | 0.020 s |
-| `merged_counter_blind` | 1 | 109,468 | 20.4 µs | 552.1 µs | 0 | 0.021 s |
-| `merged_counter_rmw` (control) | 1 | 158,017 | 17.4 µs | 379.0 µs | 0 | 0.021 s |
+| `naive_lww_counter` (control) | 1 | 451,780 | 3.0 µs | 150.6 µs | 635 | 0.021 s |
+| `decomposed_counter` | 8 | 1,512,150 | 1.1 µs | 10.0 µs | 0 | 0.000 s |
+| `merged_counter_blind` | 1 | 214,309 | 5.4 µs | 296.0 µs | 0 | 0.021 s |
+| `merged_counter_rmw` (control) | 1 | 182,069 | 7.6 µs | 304.5 µs | 0 | 0.021 s |
 
 **Wire cost**, same runs:
 
 | Scenario | frames sent | bytes sent | AE repairs |
 |---|---:|---:|---:|
-| `naive_lww_counter` | 8 | 2,072 | 0 |
-| `decomposed_counter` | 5 | 1,718 | 0 |
-| `merged_counter_blind` | 8 | 1,772 | 0 |
-| `merged_counter_rmw` | 6 | 1,328 | 0 |
+| `naive_lww_counter` | 7 | 1,573 | 0 |
+| `decomposed_counter` | 5 | 2,528 | 0 |
+| `merged_counter_blind` | 7 | 1,750 | 0 |
+| `merged_counter_rmw` | 4 | 480 | 0 |
 
 **Per-apply CPU cost**, no network, 20,000 always-colliding applies against
 one pre-populated key:
 
 | Scenario | ns/apply | p50 | p99 |
 |---|---:|---:|---:|
-| `apply_ns_lww` | 572.2 | 493.0 ns | 827.0 ns |
-| `apply_ns_lww_forced_bytes` | 576.9 | 493.0 ns | 850.0 ns |
-| `apply_ns_merge` | 1,021.2 | 920.0 ns | 1,668.0 ns |
+| `apply_ns_lww` | 612.4 | 515.0 ns | 1,038.0 ns |
+| `apply_ns_lww_forced_bytes` | 585.4 | 522.0 ns | 802.0 ns |
+| `apply_ns_merge` | 1,235.0 | 1,144.0 ns | 2,189.0 ns |
+
+**Pre-fold (lever A) on/off**, `apply_many_prefold`, `batch_size=1,000`, a
+single-node cache, one full `insert_many` batch ("on") against the identical
+batch through `batch_size` separate `insert` calls ("off") — the module's
+own doc explains why the "off" side is a structural proxy for the real
+`prefold_enabled` flag (not reachable from outside the crate) rather than an
+isolated measurement, and why the `many_keys` shape's on/off pair is
+expected to land close together for both resolvers regardless of the flag,
+since there is nothing to fold either way:
+
+| Shape | Resolver | record ns on | batch ns on | record ns off | batch ns off |
+|---|---|---:|---:|---:|---:|
+| one key | `LwwResolver` | 768.8 | 768,815 | 627.7 | 627,659 |
+| one key | `PnCounterResolver` | 900.1 | 900,135 | 1,166.6 | 1,166,601 |
+| many keys | `LwwResolver` | 804.6 | 804,574 | 736.8 | 736,801 |
+| many keys | `PnCounterResolver` | 1,114.5 | 1,114,478 | 1,094.4 | 1,094,433 |
+
+Isolating pre-fold's own effect from the proxy's batching overhead
+(`LwwResolver`'s on/off gap never triggers pre-fold at all, so subtracting
+its gap from `PnCounterResolver`'s gap over the same shape estimates
+pre-fold's own contribution alone):
+
+| Shape | `LwwResolver` gap (ns) | `PnCounterResolver` gap (ns) | pre-fold's isolated gap (ns) |
+|---|---:|---:|---:|
+| one key | -239,641 | 310,353 | 591,034 |
+| many keys | -80,312 | -10,196 | 70,116 |
+
+**Receive-side applies with pre-fold on**, `replicated_hot_counter_receive`
+(the eight-writer single-`PnCounter`-key shape, instrumented on the two
+nodes that only ever receive the resulting fan-out/anti-entropy batches).
+Pre-fold is on for every measurement in this crate outside the property
+tests' explicit toggle, and this scenario has no "off" comparison to report:
+a receiving node's batch shape comes from the sender's own fan-out, not from
+anything this crate's public API controls, so there is no honest off proxy
+to construct the way scenario 9's own local-batch loop is:
+
+| Metric | Value |
+|---|---:|
+| Applies on node b | 2 |
+| Applies on node c | 3 |
+| Converge time | 0.021 s |
+| Frames sent | 7 |
+| Bytes sent | 1,668 |
+| Lost updates | 0 |
+
+**Coalescing (lever B)**, `merged_counter_coalesced`, the same eight-writer
+single-counter shape through `Cache::merge` instead of `insert`. `engine
+applies` is `Cache::events()`'s own count — how many times a coalesced fold
+actually reached the engine, against `writers × iters = 1,600` client-side
+`merge` calls. `lost updates` here is a snapshot taken immediately after the
+writers finish and before the convergence wait, so for a nonzero window it
+also counts every fold still sitting in the pending map, not yet visible to
+`get` — `Cache::merge`'s own documented staleness bound, not a real loss:
+every window converges to the exact total inside the same 30-second wait the
+blind/RMW scenarios use:
+
+| Window | merges/sec | p50 merge | p99 merge | engine applies | frames sent | bytes sent | converge time | lost updates (transient) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 ms | 175,695 | 9.0 µs | 322.3 µs | 1,600 | 10 | 2,588 | 0.021 s | 0 |
+| 1 ms | 190,045 | 2.7 µs | 225.8 µs | 1 | 2 | 196 | 0.021 s | 1,600 |
+| 10 ms | 163,062 | 2.8 µs | 228.9 µs | 1 | 2 | 198 | 0.021 s | 1,600 |
+
+A zero window's per-call latency is roughly 3x either nonzero window's,
+since every call pays the full engine round trip; both nonzero windows fold
+every one of the 1,600 calls into a single applied record (`engine
+applies=1`), the fold this lever exists for.
 
 **Resident state at rest**, after convergence, no further writes:
 
@@ -260,73 +454,83 @@ one pre-populated key:
 **Cold-join initial replication** (a warm 3-node trio, then a fourth node
 joins and pulls the resulting state; `3 × keys` logical increments either
 way). Default `keys=2,000` is the median of the same three runs; `keys=50,000`
-is one timed run (55 s):
+is one filtered run (56.77 s total for both variants):
 
 | Variant | keys | resident-side keys | join time | frames | bytes | entries received |
 |---|---:|---:|---:|---:|---:|---:|
-| `decomposed` (`3N` per-writer keys, `LwwResolver`) | 2,000 | 6,000 | 0.613 s | 44 | 455,348 | 6,000 |
-| `merged` (`N` keys, `PnCounterResolver`) | 2,000 | 2,000 | 0.610 s | 38 | 240,334 | 2,000 |
-| `decomposed` (`3N` per-writer keys, `LwwResolver`) | 50,000 | 150,000 | 0.846 s | 355 | 8,333,786 | 150,000 |
-| `merged` (`N` keys, `PnCounterResolver`) | 50,000 | 50,000 | 0.723 s | 145 | 2,585,553 | 50,000 |
+| `decomposed` (`3N` per-writer keys, `LwwResolver`) | 2,000 | 6,000 | 0.614 s | 42 | 455,276 | 6,000 |
+| `merged` (`N` keys, `PnCounterResolver`) | 2,000 | 2,000 | 0.609 s | 38 | 230,147 | 2,000 |
+| `decomposed` (`3N` per-writer keys, `LwwResolver`) | 50,000 | 150,000 | 0.912 s | 1,234 | 11,044,130 | 150,000 |
+| `merged` (`N` keys, `PnCounterResolver`) | 50,000 | 50,000 | 0.706 s | 139 | 2,561,448 | 50,000 |
 
 **Large-entity convergence** (a warm 3-node trio, `N` entities written
 concurrently from all three nodes with anti-entropy live throughout,
 `converge_secs` timed from the last write; `lost_updates` is a snapshot taken
-immediately after the writers finish and *before* the convergence wait — the
-transient post-write, pre-convergence gap, not a permanent loss: every
+immediately after the writers finish and *before* the convergence wait —
+the transient post-write, pre-convergence gap, not a permanent loss: every
 variant at every `N` below reaches the exact expected total by the time
-`converge_secs` elapses). Default `N=4,000` is the median of the same three
-runs; `N=100,000` is one timed run (53 s):
+`converge_secs` elapses). `coalesced` uses `Cache::merge` with a 1 ms window
+in place of a direct `insert`. Default `N=4,000` is the median of the same
+three runs; `N=100,000` is one filtered run (82.84 s total for all three
+variants):
 
-| Variant | N | resident keys | converge time | frames | bytes | pre-convergence gap |
-|---|---:|---:|---:|---:|---:|---:|
-| `decomposed` (`3N` per-writer keys) | 4,000 | 12,000 | 0.040 s | 6 | 1,265,562 | 8,000 |
-| `merged` (`N` keys) | 4,000 | 4,000 | 0.049 s | 6 | 1,031,430 | 8,000 |
-| `decomposed` (`3N` per-writer keys) | 100,000 | 300,000 | 1.181 s | 4,156 | 80,316,218 | 181,642 |
-| `merged` (`N` keys) | 100,000 | 100,000 | 1.097 s | 6,962 | 71,424,977 | 200,000 |
+| Variant | N | resident keys | converge time | frames | bytes | pre-convergence gap | AE repairs |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `decomposed` (`3N` per-writer keys) | 4,000 | 12,000 | 0.039 s | 6 | 1,265,562 | 8,000 | 0 |
+| `merged` (`N` keys) | 4,000 | 4,000 | 0.049 s | 6 | 1,031,430 | 8,000 | 0 |
+| `coalesced` (`N` keys, 1 ms window) | 4,000 | 4,000 | 0.050 s | 6 | 1,031,448 | 12,000 | 0 |
+| `decomposed` (`3N` per-writer keys) | 100,000 | 300,000 | 1.138 s | 5,616 | 97,623,647 | 186,166 | 661,844 |
+| `merged` (`N` keys) | 100,000 | 100,000 | 1.315 s | 5,831 | 72,174,006 | 200,000 | 670,726 |
+| `coalesced` (`N` keys, 1 ms window) | 100,000 | 100,000 | 2.408 s | 5,200 | 66,307,093 | 300,000 | 683,774 |
 
 **Partition-heal** (`sim` suite, `cargo test -p sundog --features sim --test
-sim partition_heal -- --nocapture`, one run: three simulated nodes, node `a`
-split from `b`/`c`, 2,000 counters each incremented 3 times per side while
-partitioned, then healed; metrics cover anti-entropy from the heal onward).
-"Before" is this same scenario prior to `ConflictResolver::merges` and the
-bidirectional exchange, when every divergent key needed a second
-anti-entropy round to carry a minted merge back to whichever side minted
-first:
+sim partition_heal -- --nocapture`: three simulated nodes, node `a` split
+from `b`/`c`, counters each incremented 3 times per side while partitioned,
+then healed; metrics cover anti-entropy from the heal onward). The sim
+harness itself was hardened for determinism since the historical `before`
+figures below were measured (the partition is now applied before the
+mesh's first connection-settling step, and the anti-entropy outbox is sized
+past this family's worst-case repair burst), which shifts every run's raw
+round/step/byte counts independently of the resolver logic — the `before`/
+`after` comparison at default scale still isolates the bidirectional
+exchange's own effect, since both rows on each side of it share one harness:
 
 | Variant | AE rounds | steps to converge | frames | bytes | expected total | actual total | lost updates |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `lww_decomposed`, before (per-writer keys) | 11 | 18 | 6,797 | 1,356,029 | 18,000 | 18,000 | 0 |
-| `pn_counter`, before (merged) | 17 | 36 | 9,456 | 1,563,004 | 18,000 | 18,000 | 0 |
-| `lww_decomposed`, after (per-writer keys) | 11 | 16 | 6,937 | 1,535,953 | 18,000 | 18,000 | 0 |
-| `pn_counter`, after (merged) | 10 | 20 | 6,210 | 1,413,103 | 18,000 | 18,000 | 0 |
+| `lww_decomposed`, before bidirectional exchange | 11 | 18 | 6,797 | 1,356,029 | 18,000 | 18,000 | 0 |
+| `pn_counter`, before bidirectional exchange | 17 | 36 | 9,456 | 1,563,004 | 18,000 | 18,000 | 0 |
+| `lww_decomposed`, current harness, 2,000 counters | 4 | 10 | 3,088 | 559,822 | 18,000 | 18,000 | 0 |
+| `pn_counter`, current harness, 2,000 counters | 3 | 9 | 2,663 | 486,500 | 18,000 | 18,000 | 0 |
+| `lww_decomposed`, current harness, 20,000 counters | 3 | 12–13 | 3,109–3,110 | 4,853,231–4,857,178 | 180,000 | 180,000 | 0 |
+| `pn_counter`, current harness, 20,000 counters | **5** | 14 | 3,107 | 4,095,689–4,095,780 | 180,000 | 180,000 | 0 |
 
-The bidirectional exchange takes `pn_counter` from *worse* than
-`lww_decomposed` on both axes (17 vs. 11 rounds, 36 vs. 18 steps) to *fewer*
-rounds (10 vs. 11) at the cost of still *more* steps (20 vs. 16) — the two
-axes measure different things: a round is one digest-exchange-through-repair
-pass between a fixed pair of nodes, while a step also counts every other
-tick of the simulated network (message delivery, timer firing) between
-rounds, so a scenario can spend fewer rounds and still more real steps
-reaching them.
+At 20,000 counters `pn_counter` takes *more* anti-entropy rounds than
+`lww_decomposed` (5 vs. 3) — the reverse of the default-scale result and a
+direct violation of the sim test's own assertion
+(`partition_heal_pn_counter_converges_to_exact_totals`, `sundog/tests/sim.rs:3562`),
+which requires the bidirectional exchange to match or beat the decomposed
+control. Both totals still converge exactly with zero lost updates either
+way; only the round count regresses. Reproduced identically across two
+independent runs at the same seed (`ae_rounds=5`/`3`, `steps=14`/`12` then
+`14`/`13`), so this is a real, scale-dependent regression in the round
+count, not run-to-run noise — see "Where merge loses" and "What a production
+version still needs" below.
 
 ## Where merge wins
 
 **No lost updates, ever, when it converges — and it converges.** Both
-`naive_lww_counter`'s companion `decomposed_counter` control and the merged
-scenarios lose nothing; `naive_lww_counter` itself drops roughly 42% of
-1,600 concurrent blind increments (median 677 lost) since last-write-wins
-keeps only one side of every colliding pair. `merged_counter_blind` and
-`merged_counter_rmw` converged inside their 30-second wait on all 9 internal
-repetitions across the three full runs, and the sim partition-heal run
-confirms the same result under an actual network partition and a real
-anti-entropy repair: `pn_counter` lands on the exact expected total with
+`naive_lww_counter`'s companion `decomposed_counter` control and every
+merged scenario — blind, read-modify-write, and every coalescing window —
+lose nothing; `naive_lww_counter` itself drops roughly 40% of 1,600
+concurrent blind increments (median 635 lost) since last-write-wins keeps
+only one side of every colliding pair. The sim partition-heal run confirms
+the same result under an actual network partition and a real anti-entropy
+repair at default scale: `pn_counter` lands on the exact expected total with
 zero lost updates, matching the `lww_decomposed` control exactly, and does
-so in fewer anti-entropy rounds (10 vs. 11) — the bidirectional exchange
-(`ConflictResolver::merges`, above) means a divergent key's repair no longer
-costs a second round to carry a minted merge back to whichever side mints
-first, taking `pn_counter` from 17 rounds before that exchange shipped to 10
-after, on the identical scenario.
+so in fewer anti-entropy rounds (3 vs. 4) — the bidirectional exchange means
+a divergent key's repair no longer costs a second round to carry a minted
+merge back to whichever side mints first. That advantage does not hold at
+every scale tested; see "Where merge loses" below.
 
 **One resident key instead of `WRITERS`, and it holds under a cold join, at
 any scale tested.** `resident_keys_at_rest` is the clearest, most durable
@@ -335,88 +539,118 @@ key, one digest slot, one fingerprint, where the decomposed workaround needs
 one key per writer. Cold-join initial replication shows the same shape
 scaling with entity count rather than writer count, and the bytes advantage
 compounds rather than staying fixed: at `N=2,000` entities the merged variant
-transfers 2,000 records over 38 frames and 235 KB against the decomposed
-variant's 6,000 records (`3N`) over 44 frames and 445 KB — 1.9x the bytes for
-3x the resident-side keys — and at `N=50,000` that gap widens to 3.2x the
-bytes (8.1 MB vs. 2.5 MB) for the same fixed 3x key ratio. This is a
-fixed-slot win that compounds as either the writer count or the entity count
-grows, not a per-write one.
+transfers 2,000 records over 38 frames and 230 KB against the decomposed
+variant's 6,000 records (`3N`) over 42 frames and 455 KB — roughly 2.0x the
+bytes for 3x the resident-side keys — and at `N=50,000` that gap widens to
+roughly 4.3x the bytes (11.0 MB vs. 2.6 MB) for the same fixed 3x key ratio.
+This is a fixed-slot win that compounds as either the writer count or the
+entity count grows, not a per-write one.
 
-**Wall-clock convergence under live write pressure, past a crossover
-point.** `large_entity_convergence` inverts between its two tested scales:
-at `N=4,000`, `merged` converges slower than `decomposed` (0.049 s vs.
-0.040 s, a small-N regime where merge's per-collision decode/re-encode cost
-dominates); at `N=100,000`, `merged` converges *faster* (1.097 s vs. 1.181 s).
-`decomposed`'s per-writer keys never collide with each other on the wire, but
-its cost is a flat `3N` resident-key and replication multiplier that grows
-linearly with `N` regardless of collision rate; `merged`'s cost is
-collision-bound but its resident-key and per-key state stay at a flat `N`.
-Past this benchmark's crossover point, the fixed-key win outweighs the
-per-collision cost.
+**Pre-folding turns a batch's per-collision cost into roughly one entry's.**
+`apply_many_prefold`'s isolated gap (subtracting `LwwResolver`'s pure proxy
+overhead from `PnCounterResolver`'s) shows pre-fold saving on the order of
+590 µs across a 1,000-entry same-key batch — the decode/fold/encode/mint
+work `apply_locked` used to pay once per entry now happens once per run
+instead, with every other entry in that run absorbed for the cost of a
+group-by pass alone. The `many_keys` shape's isolated gap (70 µs, an order
+of magnitude smaller, over the same 1,000-entry batch) is the control this
+lever's benefit isolates against: with no repeated key in the batch there is
+nothing to fold, and the two shapes' gap sizes track that difference
+directly.
 
-**No read round trip.** `merged_counter_blind` (blind writes, no `get`
-before `insert`) reaches about 69% of `merged_counter_rmw`'s throughput in
-this run, and both comfortably beat `naive_lww_counter`'s correctness. The
-gap between blind and read-modify-write within the merge scenarios is the
-read round trip's cost, isolated from the resolver.
+**Coalescing turns `writers × iters` calls into one applied record per
+window.** `merged_counter_coalesced`'s `engine applies` column drops from
+1,600 (every call applies) at a zero window to 1 at either a 1 ms or 10 ms
+window — every one of the 1,600 client-side `merge` calls across all eight
+writers folds into the single record the window flushes once. Both nonzero
+windows' per-call `merge` latency runs at roughly a third of the zero
+window's (no per-call engine round trip to wait on), and both still converge
+to the exact expected total inside the same 30-second wait the always-apply
+scenarios use — the staleness this lever trades away is bounded and never
+costs correctness.
 
 ## Where merge loses
 
-**Slower per-apply CPU.** `apply_ns_merge` costs roughly 1.8x
-`apply_ns_lww`'s ns/apply (1,021.2 ns vs. 572.2 ns) and both its p50 and p99
+**Slower per-apply CPU.** `apply_ns_merge` costs roughly 2x
+`apply_ns_lww`'s ns/apply (1,235.0 ns vs. 612.4 ns) and both its p50 and p99
 run higher. `PnCounterResolver::needs_value_bytes()` is `true`, forcing a
 decode of both sides and a re-encode on every collision, against LWW's
 version-only comparison; `apply_ns_lww_forced_bytes` (LWW forced through the
-same byte-materialization path) lands close to plain LWW (576.9 ns),
+same byte-materialization path) lands close to plain LWW (585.4 ns),
 confirming the gap is the merge logic itself, not byte materialization.
 
-**Single shared-key stripe-lock contention.** `merged_counter_blind`'s median
-throughput (109,468 writes/sec) trails `decomposed_counter`'s (1,468,163
-writes/sec) by roughly 13.4x — both funnel eight writers through one lock per
-stripe-holding key, but merge concentrates every writer onto one stripe
-while decomposition spreads them across up to eight. The apply-CPU
-measurement above accounts for less than a 2x share of that gap, so most of
-it is genuine lock contention on the single hot key rather than the
-per-collision decode/re-encode cost; this benchmark's writer count (8) is
-still small enough that the two effects aren't cleanly separable, so the
-factor here should be read as directionally consistent with stripe
-contention, not as an exact decomposition of it.
+**Single shared-key stripe-lock contention, pre-folding included.**
+`merged_counter_blind`'s median throughput (214,309 writes/sec) still trails
+`decomposed_counter`'s (1,512,150 writes/sec) by roughly 7x — both funnel
+eight writers through one lock per stripe-holding key, but merge
+concentrates every writer onto one stripe while decomposition spreads them
+across up to eight. Pre-folding does not close this gap: at `WRITERS=8`
+each writer's own `insert` is still a batch of one, and pre-folding only
+collapses entries that already arrive together in the *same* `apply_many`
+call — a single writer's own singleton calls have nothing to fold against
+each other, so the remaining gap here is the per-apply CPU cost above and
+genuine lock contention on the one hot key, not anything this batch-level
+lever reaches.
+
+**Coalescing's staleness cost compounds at scale, and can invert the win.**
+At the default `N=4,000`, `coalesced` (0.050 s) tracks `merged`'s own
+convergence time (0.049 s) closely — the 1 ms window barely shows. At
+`N=100,000`, `coalesced` takes 2.408 s against `merged`'s 1.315 s and
+`decomposed`'s 1.138 s — 1.8x `merged`'s own time and over 2x
+`decomposed`'s, and the scenario's *slowest* variant at this scale despite
+sending the fewest bytes
+(66.3 MB vs. `merged`'s 72.2 MB). Every one of the 100,000 keys' three
+concurrent writers each pay the coalescing window once, and at this many
+keys written this close together the window's own flush-sweep cadence
+becomes the bottleneck rather than the network: the same staleness bound
+that costs nothing measurable at 4,000 keys costs real wall-clock time once
+enough keys are coalescing at once.
 
 **More frames at scale, even as bytes fall.** `large_entity_convergence`'s
-frame count flips the same way its bytes don't: at `N=4,000` both variants
-send the same 6 frames, but at `N=100,000` `merged` sends 6,962 against
-`decomposed`'s 4,156 — 67% more — while still moving fewer total bytes (71.4
-MB vs. 80.3 MB). `PnCounterResolver::merges()` being `true` makes every
+frame count flips the same way its bytes don't: at `N=4,000` `merged` and
+`decomposed` send the same 6 frames, but at `N=100,000` `merged` sends 5,831
+against `decomposed`'s 5,616 — while still moving fewer total bytes (72.2 MB
+vs. 97.6 MB). `PnCounterResolver::merges()` being `true` makes every
 version-mismatched key exchange in both directions every round instead of
 only the greater side pushing, so a key that keeps mismatching across
 several live anti-entropy rounds under concurrent write pressure costs more
 round-trip messages even though each message carries less redundant data
 than decomposition's non-overlapping per-writer keys would.
 
-**More real-time steps to converge under partition, despite fewer rounds.**
-`PnCounterResolver::merges()` is `true`, so anti-entropy's bidirectional
-exchange (see "Bidirectional exchange erases the second round" above) takes
-`pn_counter`'s repair of the same 2,000-counter partition split from 17
-rounds (before that exchange shipped) to 10 (after) — fewer than
-`lww_decomposed`'s 11, the opposite of a naive expectation that merging
-costs more rounds, since a divergent key no longer needs a second round to
-carry a minted result back to whichever side mints first. `pn_counter`
-still takes more sim steps to reach that convergence (20 vs. 16). The
-exchange's step-count effect lands almost entirely on `pn_counter` itself,
-not on the control: `pn_counter`'s own step count drops by 44% (36 to 20)
-from before the exchange to after, while `lww_decomposed`'s stays flat (18
-to 16, within this benchmark's run-to-run noise) since `LwwResolver::merges`
-is `false` and its repair path never takes the bidirectional branch. Every
-counter's key was touched by both partition sides here, so every one of the
-2,000 keys needs an actual merge (decode both sides, re-encode, mint or
-adopt a version) on repair, where the decomposed variant's per-writer keys
-have at most one real writer each and mostly resolve as plain
-last-write-wins adoptions — the same per-collision CPU cost the throughput
-benchmarks show, still paid on the repair path, just no longer costing
-extra anti-entropy rounds too.
+**The bidirectional exchange's round advantage does not hold at every
+scale.** At the default 2,000 counters, `pn_counter` repairs a partition
+split in fewer anti-entropy rounds than the `lww_decomposed` control (3 vs.
+4), consistent with the bidirectional exchange's own per-key, one-round
+convergence argument above. At 20,000 counters that inverts: `pn_counter`
+needs 5 rounds against `lww_decomposed`'s 3, reproducibly, and fails the sim
+test's own assertion that bidirectional merging should match or beat
+decomposition. The per-key convergence argument bounds how many rounds *one*
+divergent key's own repair costs, not how many rounds it takes a whole
+partition's worth of simultaneously divergent keys to drain — every one of
+20,000 counters here was touched by both partition sides, so every one
+needs a real merge (decode both sides, re-encode, mint or adopt) on every
+round it is still exchanged in both directions, and at this key count that
+per-round cost evidently outweighs the exchange's round-count saving badly
+enough to flip which control wins. This is an open regression, not a
+documented trade-off; see "What a production version still needs" below.
 
 ## What a production version still needs
 
+- **The bidirectional exchange's round-count regression at scale.**
+  `partition_heal_pn_counter_converges_to_exact_totals` fails its own
+  assertion at `SUNDOG_SIM_KEYS=20000` (`pn_counter` spends 5 anti-entropy
+  rounds against `lww_decomposed`'s 3), reproducibly. The per-key
+  convergence argument this feature ships with only bounds one key's own
+  repair; it says nothing about how the bidirectional exchange's doubled
+  per-round cost interacts with a partition where every key needs a real
+  merge, and this is now measured evidence that the interaction can go the
+  wrong way. Needs root-causing before the exchange can be trusted at this
+  scale.
+- **Coalescing's flush cadence becomes the bottleneck at high key
+  concurrency.** `large_entity_convergence_coalesced` at `N=100,000` is
+  slower than both an uncoalesced merge and the decomposed control, the
+  opposite of its default-scale showing; nothing in this crate currently
+  adapts the flush sweep's own pace to how many keys are coalescing at once.
 - **`OrSet` compaction.** Adds and tombstones never shrink; a long-lived
   `OrSet` key's metadata grows without bound, and the crate's weigher and
   capacity accounting don't yet account for that growth.
@@ -428,10 +662,11 @@ extra anti-entropy rounds too.
   that fail to decode is rejected silently today, matching existing
   precedent elsewhere in the engine; a dedicated counter would make that
   failure mode observable rather than only inferable from an absent write.
-- **Batch pre-folding ahead of the stripe lock.** The one lever that could
-  make merge's raw throughput competitive with key decomposition rather than
-  only equal to it: folding multiple concurrent writers' records for one key
-  before the stripe lock is acquired, rather than one collision at a time.
+- **No metric for a coalesced fold.** `Cache::merge`'s pending-fold count and
+  flush cadence are observable today only through `Cache::events()`'s own
+  count (as the benchmark above does) and `entry_count`; a dedicated counter
+  for calls folded versus calls actually applied would make lever B's own
+  effect visible outside a benchmark.
 - **No resolver for a map or a register**, only a counter and a set; a user
   needing either writes their own `ConflictResolver` against the same
   `Merged` contract in the meantime.

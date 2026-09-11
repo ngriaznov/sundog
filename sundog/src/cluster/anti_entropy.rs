@@ -854,7 +854,9 @@ pub fn diff_decoded(
         .map(|elem| (elem.key_hash, elem.ver))
         .collect();
 
-    for (&key_hash, &local_ver) in &local_only {
+    for elem in &decoded.only_left {
+        let key_hash = elem.key_hash;
+        let local_ver = elem.ver;
         match remote_only.get(&key_hash) {
             Some(&remote_ver) if remote_ver != local_ver => {
                 if remote_ver > local_ver || merging {
@@ -873,9 +875,9 @@ pub fn diff_decoded(
             }
         }
     }
-    for &key_hash in remote_only.keys() {
-        if !local_only.contains_key(&key_hash) {
-            pull_hashes.push(key_hash);
+    for elem in &decoded.only_right {
+        if !local_only.contains_key(&elem.key_hash) {
+            pull_hashes.push(elem.key_hash);
         }
     }
 }

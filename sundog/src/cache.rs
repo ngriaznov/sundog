@@ -4,6 +4,11 @@
 //! [`CacheBuilder::open`] checks the requested [`Mode`] against what live
 //! peers advertise for the same name before registering the shard, and
 //! advertises its own choice on success.
+//!
+//! [`Cache::merge`] folds a value into the configured
+//! [`ConflictResolver`] without a read; [`CacheBuilder::merge_coalesce_window`]
+//! coalesces consecutive `merge` calls to one key into a single record per
+//! window instead of one per call.
 
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -45,6 +50,7 @@ pub struct CacheBuilder<K, V> {
     weigher: Option<Weigher<K, V>>,
     #[cfg(feature = "spill")]
     spill: Option<SpillConfig>,
+    merge_coalesce_window: Duration,
     marker: PhantomData<fn() -> (K, V)>,
 }
 
@@ -65,6 +71,7 @@ where
             weigher: None,
             #[cfg(feature = "spill")]
             spill: None,
+            merge_coalesce_window: Duration::ZERO,
             marker: PhantomData,
         }
     }
@@ -101,6 +108,25 @@ where
     /// [`LwwResolver`], last-write-wins by [`crate::Hlc`].
     pub fn resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
         self.resolver = resolver;
+        self
+    }
+
+    /// Sets the window [`Cache::merge`] coalesces consecutive calls to one
+    /// key within: instead of each call applying (and replicating) on its
+    /// own, they fold in memory through the configured
+    /// [`CacheBuilder::resolver`] and apply once, when the window that
+    /// opened at the first of those calls elapses. Default: zero, so every
+    /// `Cache::merge` call applies at once, equivalent to [`Cache::insert`]
+    /// under a merging resolver.
+    ///
+    /// [`CacheBuilder::open`] returns
+    /// [`CacheError::MergeWindowRequiresMergingResolver`] for a nonzero
+    /// window combined with a resolver whose [`ConflictResolver::merges`]
+    /// is `false`: a resolver that only ever picks a side would make
+    /// coalescing silently drop every fold but the one that looks newest,
+    /// not what [`Cache::merge`]'s docs promise.
+    pub fn merge_coalesce_window(mut self, window: Duration) -> Self {
+        self.merge_coalesce_window = window;
         self
     }
 
@@ -181,6 +207,7 @@ where
             weigher,
             #[cfg(feature = "spill")]
             spill,
+            merge_coalesce_window,
             marker: _,
         } = self;
 
@@ -190,6 +217,10 @@ where
         let spill_configured = false;
 
         validate_mode(&name, mode, tti, max_capacity, spill_configured)?;
+
+        if !validate_merge_window(merge_coalesce_window, resolver.merges()) {
+            return Err(CacheError::MergeWindowRequiresMergingResolver { cache: name });
+        }
 
         #[cfg(feature = "spill")]
         if let Some(cfg) = &spill
@@ -224,7 +255,8 @@ where
         .with_tombstone_ttl(cluster.config().tombstone_ttl)
         .with_tombstone_max_ttl(cluster.config().tombstone_max_ttl)
         .with_max_frame(cluster.config().max_frame)
-        .with_resolver(resolver);
+        .with_resolver(resolver)
+        .with_merge_coalesce_window(merge_coalesce_window);
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
@@ -317,6 +349,15 @@ fn validate_mode(
         });
     }
     Ok(())
+}
+
+/// Whether [`CacheBuilder::merge_coalesce_window`] combined with the
+/// resolver's [`ConflictResolver::merges`] answer is a valid configuration:
+/// a nonzero window needs a merging resolver, since coalescing multiple
+/// [`Cache::merge`] calls into one record only preserves every fold when
+/// the resolver can actually fold two values rather than just pick a side.
+fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
+    window.is_zero() || resolver_merges
 }
 
 /// `bucket`'s owners under `view` other than `self_node`: the candidates a
@@ -489,6 +530,43 @@ async fn spawn_cache_tasks<K, V>(
         tasks,
         crate::cluster::cache_entries_gauge_task(Arc::clone(shard), name.clone(), cancel.clone()),
     );
+    if !shard.merge_window().is_zero() {
+        cluster.spawn_tracked_in(
+            tasks,
+            merge_coalesce_task(Arc::clone(shard), cancel.clone()),
+        );
+    }
+}
+
+/// Drives [`Shard::flush_due_pending_merges`] for a cache configured with
+/// [`CacheBuilder::merge_coalesce_window`]: sleeps until the pending map's
+/// earliest deadline (or, with nothing pending, until either a fresh
+/// window opens via [`Shard::merge_wake_notified`] or `cancel` fires), then
+/// flushes everything due and loops. [`Cache::close`]'s own explicit flush
+/// and this shard's own `Drop` both guarantee every fold lands regardless,
+/// so this task's timing is never load-bearing for correctness — only for
+/// the staleness bound [`Cache::merge`]'s docs commit to.
+async fn merge_coalesce_task<K, V>(shard: Arc<Shard<K, V>>, cancel: CancellationToken)
+where
+    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    loop {
+        let sleep_for = match shard.next_pending_merge_deadline_ms() {
+            Some(deadline_ms) => Duration::from_millis(deadline_ms.saturating_sub(now_ms())),
+            // Nothing pending: park well past any realistic window rather
+            // than busy-polling, but still wake at once on a fresh window
+            // via the `select!` arm below.
+            None => Duration::from_secs(3600),
+        };
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = shard.merge_wake_notified() => {}
+            () = tokio::time::sleep(sleep_for) => {
+                shard.flush_due_pending_merges(now_ms());
+            }
+        }
+    }
 }
 
 /// The `Mode::Distributed`-only half of [`spawn_cache_tasks`]: pulls this
@@ -930,6 +1008,30 @@ where
         self.shard.insert_many(entries).await
     }
 
+    /// Folds `value` into `key` through the configured
+    /// [`CacheBuilder::resolver`] without a read. With
+    /// [`CacheBuilder::merge_coalesce_window`] left at its default zero,
+    /// every call applies (and replicates) at once, equivalent to
+    /// [`Cache::insert`] under a merging resolver. With a nonzero window,
+    /// consecutive calls to the same key fold in memory instead, and the
+    /// fold applies exactly once, when the window that opened at the first
+    /// of those calls elapses: replication and every [`Event`] this key
+    /// gets during the window see one record, not one per call.
+    /// [`Cache::close`], and dropping this cache's last handle, both flush
+    /// whatever is still pending regardless of the window.
+    ///
+    /// [`Cache::get`] never consults a pending fold: a value folded in but
+    /// not yet flushed is invisible to a read for as long as it stays
+    /// pending — up to one whole window from the call that opened it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds
+    /// the frame cap, or [`CacheError::Codec`] if `key` fails to encode.
+    pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.shard.merge(key, value).await
+    }
+
     /// [`Cache::insert_many`] with one lifespan applied to every entry,
     /// overriding the cache's default.
     ///
@@ -1012,6 +1114,10 @@ where
     /// rather than being accepted and never sent. A cache never explicitly closed
     /// still has its spill tier closed by `Cluster::shutdown`.
     pub async fn close(self) {
+        // Flushed before sealing: a pending coalesced merge this flush
+        // applies still gets a chance at the fan-out task's final drain,
+        // exactly like any other write landing right before close.
+        self.shard.flush_all_pending_merges();
         // Sealed before the tasks are cancelled: a write accepted until
         // now is in the backlog the fan-out task drains on its way out,
         // and a write from now on fails with `CacheError::Closed`.
@@ -1033,6 +1139,7 @@ mod tests {
     use super::*;
     use crate::cluster::Cluster;
     use crate::config::ClusterConfig;
+    use crate::store::crdt::{PnCounter, PnCounterResolver};
 
     fn loopback_config() -> ClusterConfig {
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
@@ -1625,6 +1732,176 @@ mod tests {
         assert!(
             surviving.shard.fan_out_queue().drain().is_empty(),
             "a detached clone queues nothing for a fan-out task that no longer runs"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[test]
+    fn validate_merge_window_accepts_zero_regardless_of_the_resolver() {
+        assert!(validate_merge_window(Duration::ZERO, false));
+        assert!(validate_merge_window(Duration::ZERO, true));
+    }
+
+    #[test]
+    fn validate_merge_window_requires_a_merging_resolver_once_nonzero() {
+        assert!(!validate_merge_window(Duration::from_millis(1), false));
+        assert!(validate_merge_window(Duration::from_millis(1), true));
+    }
+
+    #[tokio::test]
+    async fn merge_coalesce_window_rejects_a_non_merging_resolver() {
+        let cluster = Cluster::builder("cache-it-merge-window-rejects-non-merging")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let err = cluster
+            .cache::<u32, u32>("counters")
+            .merge_coalesce_window(Duration::from_millis(5))
+            .open()
+            .await
+            .expect_err("the default LwwResolver does not merge, so a nonzero window is rejected");
+        assert!(matches!(
+            err,
+            CacheError::MergeWindowRequiresMergingResolver { .. }
+        ));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_with_a_zero_window_applies_immediately() {
+        let cluster = Cluster::builder("cache-it-merge-zero-window")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let node = cluster.node_id();
+        let cache = cluster
+            .cache::<u32, PnCounter>("counters")
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("open succeeds");
+
+        cache
+            .merge(1, PnCounter::local_delta(node, 1))
+            .await
+            .expect("merge");
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(1),
+            "a zero coalesce window (the default) applies every merge call at once, \
+             like insert"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_within_a_window_coalesces_into_one_apply_and_one_event() {
+        let cluster = Cluster::builder("cache-it-merge-coalesce-window")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let node = cluster.node_id();
+        let window = Duration::from_millis(150);
+        let cache = cluster
+            .cache::<u32, PnCounter>("counters")
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open()
+            .await
+            .expect("open succeeds");
+        let mut events = cache.events();
+
+        cache
+            .merge(1, PnCounter::local_delta(node, 1))
+            .await
+            .expect("merge 1");
+        cache
+            .merge(1, PnCounter::local_delta(node, 2))
+            .await
+            .expect("merge 2");
+        cache
+            .merge(1, PnCounter::local_delta(node, 3))
+            .await
+            .expect("merge 3");
+
+        assert_eq!(
+            cache.get(&1).await,
+            None,
+            "a pending coalesced fold is invisible to get until its window flushes"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "nothing applies, so nothing publishes, before the window elapses"
+        );
+
+        tokio::time::sleep(window * 3).await;
+
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(3),
+            "the coalesced fold of all three calls lands as one write once the window \
+             elapses"
+        );
+        match events
+            .recv()
+            .await
+            .expect("exactly one event for the whole window")
+        {
+            Event::Created { key, .. } => assert_eq!(key, 1),
+            other => panic!("expected Event::Created for the window's one apply, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "three merge calls in one window publish exactly one event, not three"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn close_flushes_a_pending_coalesced_merge() {
+        let cluster = Cluster::builder("cache-it-merge-close-flush")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let node = cluster.node_id();
+        let cache = cluster
+            .cache::<u32, PnCounter>("counters")
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(Duration::from_secs(60))
+            .open()
+            .await
+            .expect("open succeeds");
+        let survivor = cache.clone();
+
+        cache
+            .merge(1, PnCounter::local_delta(node, 7))
+            .await
+            .expect("merge");
+        assert_eq!(
+            survivor.get(&1).await,
+            None,
+            "still pending: the 60s window has not elapsed"
+        );
+
+        cache.close().await;
+
+        assert_eq!(
+            survivor.get(&1).await.map(|c| c.value()),
+            Some(7),
+            "close flushes whatever was still pending, regardless of the window"
         );
 
         cluster.shutdown().await;

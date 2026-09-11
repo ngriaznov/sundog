@@ -22,13 +22,15 @@
 //! `WRITERS` (`SUNDOG_BENCH_WRITERS`, default 8), `ITERS`
 //! (`SUNDOG_BENCH_ITERS`, default 200) and the repetition count
 //! (`SUNDOG_BENCH_REPS`, default 3) are all env-overridable; the defaults
-//! finish every scenario in well under a minute. Scenarios 7 and 8 scale a
-//! third axis instead, the entity count `N` (`SUNDOG_BENCH_KEYS`), and fix
-//! the writer count at 3 (one per warm-cluster node) and each writer's
-//! contribution to each entity at a single increment, so `N` alone governs
-//! their cost; their defaults are lower than the plan's own (documented at
-//! each default's definition) to keep both variants of both scenarios
-//! inside a 3-minute budget on a 4-core box. A smoke run:
+//! finish every scenario in well under a minute. Scenarios 7, 8, and 9
+//! scale a third axis instead, an entity or batch count `N`
+//! (`SUNDOG_BENCH_KEYS`); scenarios 7 and 8 fix the writer count at 3 (one
+//! per warm-cluster node) and each writer's contribution to each entity at
+//! a single increment, so `N` alone governs their cost, and scenario 9
+//! reuses the same knob for its own batch size, no network or writer count
+//! involved. Their defaults are lower than the plan's own (documented at
+//! each default's definition) to keep every variant inside a 3-minute
+//! budget on a 4-core box. A smoke run:
 //!
 //! ```text
 //! SUNDOG_BENCH=1 SUNDOG_BENCH_WRITERS=2 SUNDOG_BENCH_ITERS=50 \
@@ -56,11 +58,42 @@
 //! to rule out a confound rather than leave it implicit. Every numeric
 //! field is the median of at least [`repetitions`] independent runs, so a
 //! single noisy run never skews a reported number.
+//!
+//! Scenarios 9-12 isolate `docs/crdt-merge-poc.md`'s two write-path levers:
+//! Lever A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine.rs`)
+//! in scenarios 9 and 10, Lever B (`Cache::merge`'s coalescing window) in
+//! scenarios 11 and 12. Both levers' on/off (or window) comparisons are
+//! measured through public API alone, since `Engine::set_prefold_enabled`
+//! is `pub(crate)` and `#[cfg(test)]`-only inside the library crate — this
+//! binary links against it as an ordinary downstream crate and has no seam
+//! to flip that engine-level flag. Scenario 9 (`apply_many_prefold`)
+//! approximates pre-fold "off" as the same batch applied one record at a
+//! time through `Cache::insert` (itself always a singleton `apply_many`
+//! call, `sundog/src/store/mod.rs`'s `insert_expiring`): a batch of one can
+//! never contain a same-key run for pre-fold to fold regardless of the real
+//! flag's state, so this reproduces pre-fold's structural effect (one full
+//! `apply_locked` cycle per record instead of one per run) without the
+//! internal flag, at the cost of also paying one stripe-lock acquisition
+//! and cache-layer call per record that a true toggle-off, still batched
+//! under one call, would not — see the scenario's own doc for the resulting
+//! per-op inflation on that side. Scenario 10
+//! (`replicated_hot_counter_receive`) has no such proxy on the replication
+//! receive path — a receiving node's batch shape comes from the sender's
+//! own fan-out, not from anything this crate controls — so it reports only
+//! today's real (pre-fold-on) apply count and convergence time, with the
+//! "off" comparison left unmeasured from here; see the scenario's own doc.
+//! Scenarios 11 and 12 use `Cache::merge` and `CacheBuilder::merge_coalesce_window`
+//! directly, both genuinely public, so no such proxy is needed there.
+//! Scenarios 9-12 all report "engine applies" as `Cache::events()`'s own
+//! count: one event per non-no-op apply, the only public-API signal for
+//! how many times the engine actually applied, per `Cache::merge`'s and the
+//! resolver contract's own docs.
 
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -1786,4 +1819,748 @@ async fn large_entity_convergence_merged() {
     }
 
     print_scale_convergence_bench("merged", keys, &rep_metrics);
+}
+
+// ---------------------------------------------------------------------
+// Shared by scenarios 9-12: counts every `Event` a cache's public
+// `Cache::events()` broadcast stream carries. One event publishes per
+// non-no-op apply — a redelivered merge that reproduces exactly what's
+// already stored publishes nothing, per `merge_version`'s own no-op arm
+// (`docs/crdt-merge-poc.md`) — so this is the one public-API signal for how
+// many times the engine actually applied, the "engine applies" field on
+// every `BENCH` line below. Runs until the cache's sender side drops (the
+// cache closes) or the caller aborts the returned handle; a lagged receiver
+// (the counting task falling behind the publish rate) adds the lagged count
+// rather than losing it, so a slow poll still reports the true total.
+// ---------------------------------------------------------------------
+
+fn spawn_event_counter<K, V>(
+    cache: &sundog::Cache<K, V>,
+) -> (tokio::task::JoinHandle<()>, Arc<AtomicU64>)
+where
+    K: std::hash::Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let mut events = cache.events();
+    let count = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&count);
+    let handle = tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(_) => {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    counted.fetch_add(n, Ordering::Relaxed);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    (handle, count)
+}
+
+// ---------------------------------------------------------------------
+// Scenario 9: apply_many_prefold — Lever A, batch pre-folding ahead of the
+// stripe lock (`Engine::apply_many`, `sundog/src/store/engine.rs`). No
+// network: a fresh single-node `Mode::Local` cluster per rep, matching
+// scenario 5's own isolation of apply cost from all network/AE noise. Two
+// batch shapes, both of `batch_size` (`SUNDOG_BENCH_KEYS`, default 1,000)
+// records: `one_key`, every record colliding on a single key (pre-fold's
+// best case, a run of `batch_size` puts folded to one survivor), and
+// `many_keys`, one record per distinct key (pre-fold's worst case: nothing
+// to fold, so its only cost is the batch's own by-key grouping pass). Each
+// shape runs under both `LwwResolver` (`merges() == false`, pre-fold never
+// engages regardless of the flag) and `PnCounterResolver` (`merges() ==
+// true`) — the module doc above explains why "on" and "off" are measured
+// this way rather than through the real, unreachable engine flag: "on" is
+// one `insert_many` call over the whole batch (today's unconditional
+// default whenever the resolver merges), "off" is `batch_size` separate
+// `Cache::insert` calls, each already a singleton `apply_many` batch
+// (`sundog/src/store/mod.rs`'s `insert_expiring`) that pre-fold can
+// structurally never fold regardless of its flag's state. The `many_keys`
+// shape's on/off pair is expected to land close together for both
+// resolvers — there is nothing to fold either way, so it isolates pre-fold's
+// idle grouping-pass overhead from its `one_key` fold benefit.
+// ---------------------------------------------------------------------
+
+/// `SUNDOG_BENCH_KEYS` default for `apply_many_prefold`'s batch size,
+/// matching the plan's own 1,000-record batch.
+const PREFOLD_BATCH_DEFAULT: u32 = 1_000;
+
+fn prefold_batch_size() -> u32 {
+    scale_keys(PREFOLD_BATCH_DEFAULT)
+}
+
+struct PrefoldRepMetrics {
+    record_ns_on: f64,
+    batch_ns_on: f64,
+    record_ns_off: f64,
+    batch_ns_off: f64,
+}
+
+fn print_prefold_bench(name: &str, batch_size: u32, reps: &[PrefoldRepMetrics]) {
+    println!(
+        "BENCH {name} batch_size={batch_size} reps={} record_ns_on={:.1} \
+         batch_ns_on={:.1} record_ns_off={:.1} batch_ns_off={:.1}",
+        reps.len(),
+        median_field_f64(reps, |m| m.record_ns_on),
+        median_field_f64(reps, |m| m.batch_ns_on),
+        median_field_f64(reps, |m| m.record_ns_off),
+        median_field_f64(reps, |m| m.batch_ns_off),
+    );
+}
+
+/// One `apply_many_prefold` rep for one (shape, resolver) combo: opens a
+/// fresh single-node cache, times the whole `batch_size`-record batch
+/// through one `insert_many` call ("on") and the identical batch through
+/// `batch_size` separate `insert` calls ("off"), with a `clear` between the
+/// two passes. `swap_order` runs "off" before "on" instead of the reverse —
+/// the caller alternates it across reps so whichever pass runs second on a
+/// freshly opened cache (and so benefits from the first pass's allocator/JIT
+/// warm-up) is not always the same one, canceling that bias out across reps
+/// rather than always favoring "off".
+///
+/// This is a proxy for pre-fold's own effect, not an isolated measurement of
+/// it: `insert_many` already takes one stripe lock for the whole batch
+/// regardless of pre-fold (see `Engine::apply_many`), while the "off" loop
+/// pays `batch_size` separate lock acquisitions and immediate per-call
+/// fan-out pushes that a real pre-fold-off flag would not — `Engine::
+/// set_prefold_enabled` exists but is `#[cfg(test)]`, unreachable from this
+/// integration-test binary. `LwwResolver::merges()` is `false`, so it never
+/// triggers pre-fold at all: its own on/off gap, measured the identical way,
+/// is pure proxy overhead with no pre-fold effect in it, which is what
+/// `print_prefold_isolated_delta` subtracts from `PnCounterResolver`'s gap
+/// to estimate pre-fold's effect alone.
+async fn run_prefold_rep<V>(
+    cluster_label: &str,
+    cache_name: &str,
+    resolver: Arc<dyn ConflictResolver>,
+    batch_size: u32,
+    one_key: bool,
+    swap_order: bool,
+    make: impl Fn(u32) -> V,
+) -> PrefoldRepMetrics
+where
+    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let cluster = local_cluster(cluster_label).await;
+    let cache = cluster
+        .cache::<u32, V>(cache_name)
+        .mode(Mode::Local)
+        .resolver(resolver)
+        .open()
+        .await
+        .expect("cache opens");
+
+    let key_for = |i: u32| if one_key { 0 } else { i };
+    let on_entries: Vec<(u32, V)> = (0..batch_size).map(|i| (key_for(i), make(i))).collect();
+
+    let (on_elapsed, off_elapsed) = if swap_order {
+        let off_started = Instant::now();
+        for i in 0..batch_size {
+            cache
+                .insert(key_for(i), make(i))
+                .await
+                .expect("prefold-off singleton insert applies");
+        }
+        let off_elapsed = off_started.elapsed();
+
+        cache
+            .clear()
+            .await
+            .expect("clear resets state for the on pass");
+
+        let on_started = Instant::now();
+        cache
+            .insert_many(on_entries)
+            .await
+            .expect("prefold-on batch applies");
+        let on_elapsed = on_started.elapsed();
+
+        (on_elapsed, off_elapsed)
+    } else {
+        let on_started = Instant::now();
+        cache
+            .insert_many(on_entries)
+            .await
+            .expect("prefold-on batch applies");
+        let on_elapsed = on_started.elapsed();
+
+        cache
+            .clear()
+            .await
+            .expect("clear resets state for the off pass");
+
+        let off_started = Instant::now();
+        for i in 0..batch_size {
+            cache
+                .insert(key_for(i), make(i))
+                .await
+                .expect("prefold-off singleton insert applies");
+        }
+        let off_elapsed = off_started.elapsed();
+
+        (on_elapsed, off_elapsed)
+    };
+
+    cluster.shutdown().await;
+
+    PrefoldRepMetrics {
+        record_ns_on: on_elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(batch_size),
+        batch_ns_on: on_elapsed.as_secs_f64() * 1_000_000_000.0,
+        record_ns_off: off_elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(batch_size),
+        batch_ns_off: off_elapsed.as_secs_f64() * 1_000_000_000.0,
+    }
+}
+
+/// The proxy `run_prefold_rep` measures conflates pre-fold's own effect with
+/// batching/fan-out overhead the "off" loop pays and a real pre-fold-off
+/// flag would not (see `run_prefold_rep`'s doc). `LwwResolver` never
+/// triggers pre-fold (`merges()` is `false`), so its on/off gap, measured
+/// through the identical proxy, is that overhead alone; subtracting it from
+/// `PnCounterResolver`'s gap over the same shape and batch size estimates
+/// pre-fold's own contribution in isolation, rather than reporting either
+/// resolver's raw on/off numbers as pre-fold's own effect.
+fn print_prefold_isolated_delta(
+    name: &str,
+    batch_size: u32,
+    lww: &[PrefoldRepMetrics],
+    pncounter: &[PrefoldRepMetrics],
+) {
+    let lww_gap_ns = median_field_f64(lww, |m| m.batch_ns_off - m.batch_ns_on);
+    let pncounter_gap_ns = median_field_f64(pncounter, |m| m.batch_ns_off - m.batch_ns_on);
+    println!(
+        "BENCH {name} batch_size={batch_size} lww_gap_ns={lww_gap_ns:.1} \
+         pncounter_gap_ns={pncounter_gap_ns:.1} \
+         prefold_isolated_gap_ns={:.1}",
+        pncounter_gap_ns - lww_gap_ns,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_many_prefold() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let batch_size = prefold_batch_size();
+    let reps = repetitions();
+    let node = NodeId::from(0u64);
+
+    for (shape_name, one_key) in [("one_key", true), ("many_keys", false)] {
+        let mut lww_metrics = Vec::with_capacity(reps as usize);
+        for rep_idx in 0..reps {
+            lww_metrics.push(
+                run_prefold_rep(
+                    &format!("bench-crdt-prefold-{shape_name}-lww"),
+                    &format!("crdt-prefold-{shape_name}-lww"),
+                    Arc::new(sundog::LwwResolver),
+                    batch_size,
+                    one_key,
+                    rep_idx % 2 == 1,
+                    u64::from,
+                )
+                .await,
+            );
+        }
+        print_prefold_bench(
+            &format!("apply_many_prefold_{shape_name}_lww"),
+            batch_size,
+            &lww_metrics,
+        );
+
+        let mut pncounter_metrics = Vec::with_capacity(reps as usize);
+        for rep_idx in 0..reps {
+            pncounter_metrics.push(
+                run_prefold_rep(
+                    &format!("bench-crdt-prefold-{shape_name}-pncounter"),
+                    &format!("crdt-prefold-{shape_name}-pncounter"),
+                    Arc::new(PnCounterResolver),
+                    batch_size,
+                    one_key,
+                    rep_idx % 2 == 1,
+                    move |i| PnCounter::local_delta(node, u64::from(i) + 1),
+                )
+                .await,
+            );
+        }
+        print_prefold_bench(
+            &format!("apply_many_prefold_{shape_name}_pncounter"),
+            batch_size,
+            &pncounter_metrics,
+        );
+        print_prefold_isolated_delta(
+            &format!("apply_many_prefold_{shape_name}"),
+            batch_size,
+            &lww_metrics,
+            &pncounter_metrics,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Scenario 10: replicated_hot_counter_receive — Lever A on the replication
+// receive path: the same eight-writer single-`PnCounter`-key shape as
+// scenarios 3/4, but instrumented on the two nodes that only ever *receive*
+// the resulting writes rather than the one issuing them, so a concurrent
+// writer burst on `cache_a` arrives at `cache_b`/`cache_c` as fan-out and
+// anti-entropy batches carrying several records for the same key —
+// `apply_remote_batch`'s own batch shape, exactly what pre-fold folds. The
+// module doc above explains why this scenario reports only today's real
+// (pre-fold-on) numbers: unlike scenario 9's local batch, a receiving
+// node's batch shape comes from the sender's own fan-out and this crate has
+// no public lever over it, so there is no honest "off" proxy to construct
+// here the way scenario 9's singleton-insert loop is for a batch this crate
+// builds itself.
+// ---------------------------------------------------------------------
+
+struct HotCounterReceiveRepMetrics {
+    applies_b: u64,
+    applies_c: u64,
+    converge_secs: f64,
+    frames: u64,
+    bytes: u64,
+    lost_updates: u64,
+}
+
+fn print_hot_counter_receive_bench(writers: u32, iters: u32, reps: &[HotCounterReceiveRepMetrics]) {
+    println!(
+        "BENCH replicated_hot_counter_receive writers={writers} iters={iters} reps={} \
+         applies_b={} applies_c={} converge_secs={:.3} frames_sent_total={} \
+         bytes_sent_total={} lost_updates={}",
+        reps.len(),
+        median_field_u64(reps, |m| m.applies_b),
+        median_field_u64(reps, |m| m.applies_c),
+        median_field_f64(reps, |m| m.converge_secs),
+        median_field_u64(reps, |m| m.frames),
+        median_field_u64(reps, |m| m.bytes),
+        median_field_u64(reps, |m| m.lost_updates),
+    );
+}
+
+async fn run_hot_counter_receive_rep(
+    writers: u32,
+    iters: u32,
+    cache_name: &str,
+) -> HotCounterReceiveRepMetrics {
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let key = 0u32;
+    let clusters = peer_group(cache_name, 3).await;
+    let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 3) returns exactly 3 clusters"));
+
+    let (cache_a, cache_b, cache_c) = Box::pin(open_replicated_trio::<PnCounter>(
+        &cluster_a,
+        &cluster_b,
+        &cluster_c,
+        cache_name,
+        Arc::new(PnCounterResolver),
+    ))
+    .await;
+
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+    let (applies_task_b, applies_count_b) = spawn_event_counter(&cache_b);
+    let (applies_task_c, applies_count_c) = spawn_event_counter(&cache_c);
+
+    let handles: Vec<_> = (0..writers)
+        .map(|w| {
+            let cache_a = cache_a.clone();
+            let node = NodeId::from(u64::from(w));
+            tokio::spawn(async move {
+                for i in 1..=iters {
+                    cache_a
+                        .insert(key, PnCounter::local_delta(node, u64::from(i)))
+                        .await
+                        .expect("insert succeeds");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.await.expect("writer worker did not panic");
+    }
+
+    let expected = i64::from(writers) * i64::from(iters);
+    let snapshot = cache_a.get(&key).await.map_or(0, |c| c.value());
+    let lost_updates = u64::try_from((expected - snapshot).max(0)).unwrap_or(0);
+
+    let convergence_started = Instant::now();
+    common::eventually(Duration::from_secs(30), || async {
+        cache_a.get(&key).await.map(|c| c.value()) == Some(expected)
+            && cache_b.get(&key).await.map(|c| c.value()) == Some(expected)
+            && cache_c.get(&key).await.map(|c| c.value()) == Some(expected)
+    })
+    .await;
+    let converge_secs = convergence_started.elapsed().as_secs_f64();
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+
+    applies_task_b.abort();
+    applies_task_c.abort();
+    let applies_b = applies_count_b.load(Ordering::Relaxed);
+    let applies_c = applies_count_c.load(Ordering::Relaxed);
+
+    for cluster in [cluster_a, cluster_b, cluster_c] {
+        cluster.shutdown().await;
+    }
+
+    HotCounterReceiveRepMetrics {
+        applies_b,
+        applies_c,
+        converge_secs,
+        frames,
+        bytes,
+        lost_updates,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn replicated_hot_counter_receive() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let writers = writers();
+    let iters = iters();
+    let reps = repetitions();
+    let cache_name = "crdt-hot-counter-receive";
+
+    let mut rep_metrics = Vec::with_capacity(reps as usize);
+    for _ in 0..reps {
+        rep_metrics.push(Box::pin(run_hot_counter_receive_rep(writers, iters, cache_name)).await);
+    }
+
+    print_hot_counter_receive_bench(writers, iters, &rep_metrics);
+}
+
+// ---------------------------------------------------------------------
+// Scenario 11: merged_counter_coalesced — Lever B, local delta coalescing
+// (`Cache::merge`, `CacheBuilder::merge_coalesce_window`). The same
+// eight-writer single-counter shape as scenarios 3/4, `Cache::merge`
+// replacing `insert`, across three coalescing windows: 0 (immediate apply,
+// `Cache::merge`'s own equivalent of `insert` under a merging resolver),
+// 1ms, and 10ms. "Engine applies" is `cache_a`'s own [`spawn_event_counter`]
+// total — the number of times the coalesced folds actually reached the
+// engine, expected to fall well below `writers * iters` (the number of
+// client-side `merge` calls) as the window widens. `lost_updates` is a
+// snapshot of `cache_a` taken immediately after the writers finish and
+// before the convergence wait, the same transient post-write,
+// pre-convergence gap scenario 8's own `lost_updates` measures — for a
+// nonzero window this also carries the write side's own coalescing delay
+// (a fold not yet flushed is invisible to `get`, `Cache::merge`'s own
+// documented staleness bound), not only replication lag. `converge_secs`
+// times from the last writer's last call to every one of the three nodes
+// reading the exact expected total, so it likewise includes that staleness
+// bound rather than only the network repair cost scenarios 3/4 isolate.
+// ---------------------------------------------------------------------
+
+/// The three `Cache::merge` coalescing windows this scenario compares, in
+/// milliseconds.
+const COALESCE_WINDOWS_MS: [u64; 3] = [0, 1, 10];
+
+struct CoalescedRepMetrics {
+    merges_per_sec: f64,
+    p50_micros: f64,
+    p99_micros: f64,
+    engine_applies: u64,
+    frames: u64,
+    bytes: u64,
+    converge_secs: f64,
+    lost_updates: u64,
+}
+
+fn print_coalesced_bench(
+    name: &str,
+    writers: u32,
+    iters: u32,
+    window_ms: u64,
+    reps: &[CoalescedRepMetrics],
+) {
+    println!(
+        "BENCH {name} writers={writers} iters={iters} window_ms={window_ms} reps={} \
+         merges_per_sec={:.1} p50_micros={:.1} p99_micros={:.1} engine_applies={} \
+         frames_sent_total={} bytes_sent_total={} converge_secs={:.3} lost_updates={}",
+        reps.len(),
+        median_field_f64(reps, |m| m.merges_per_sec),
+        median_field_f64(reps, |m| m.p50_micros),
+        median_field_f64(reps, |m| m.p99_micros),
+        median_field_u64(reps, |m| m.engine_applies),
+        median_field_u64(reps, |m| m.frames),
+        median_field_u64(reps, |m| m.bytes),
+        median_field_f64(reps, |m| m.converge_secs),
+        median_field_u64(reps, |m| m.lost_updates),
+    );
+}
+
+async fn run_coalesced_rep(
+    writers: u32,
+    iters: u32,
+    cache_name: &str,
+    window: Duration,
+) -> CoalescedRepMetrics {
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let key = 0u32;
+    let clusters = peer_group(cache_name, 3).await;
+    let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 3) returns exactly 3 clusters"));
+
+    let (a, b, c) = tokio::join!(
+        cluster_a
+            .cache::<u32, PnCounter>(cache_name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open(),
+        cluster_b
+            .cache::<u32, PnCounter>(cache_name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open(),
+        cluster_c
+            .cache::<u32, PnCounter>(cache_name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open(),
+    );
+    let cache_a = a.expect("a opens");
+    let cache_b = b.expect("b opens");
+    let cache_c = c.expect("c opens");
+
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+    let (applies_task, applies_count) = spawn_event_counter(&cache_a);
+
+    let started = Instant::now();
+    let handles: Vec<_> = (0..writers)
+        .map(|w| {
+            let cache_a = cache_a.clone();
+            let node = NodeId::from(u64::from(w));
+            tokio::spawn(async move {
+                let mut latencies = Vec::with_capacity(iters as usize);
+                for i in 1..=iters {
+                    let t0 = Instant::now();
+                    cache_a
+                        .merge(key, PnCounter::local_delta(node, u64::from(i)))
+                        .await
+                        .expect("merge succeeds");
+                    latencies.push(t0.elapsed());
+                }
+                latencies
+            })
+        })
+        .collect();
+
+    let mut all_latencies = Vec::with_capacity((writers * iters) as usize);
+    for handle in handles {
+        all_latencies.extend(handle.await.expect("writer worker did not panic"));
+    }
+    let elapsed = started.elapsed();
+    all_latencies.sort_unstable();
+
+    let expected = i64::from(writers) * i64::from(iters);
+    let snapshot = cache_a.get(&key).await.map_or(0, |c| c.value());
+    let lost_updates = u64::try_from((expected - snapshot).max(0)).unwrap_or(0);
+
+    let convergence_started = Instant::now();
+    common::eventually(Duration::from_secs(30), || async {
+        cache_a.get(&key).await.map(|c| c.value()) == Some(expected)
+            && cache_b.get(&key).await.map(|c| c.value()) == Some(expected)
+            && cache_c.get(&key).await.map(|c| c.value()) == Some(expected)
+    })
+    .await;
+    let converge_secs = convergence_started.elapsed().as_secs_f64();
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+
+    applies_task.abort();
+    let engine_applies = applies_count.load(Ordering::Relaxed);
+
+    for cluster in [cluster_a, cluster_b, cluster_c] {
+        cluster.shutdown().await;
+    }
+
+    CoalescedRepMetrics {
+        merges_per_sec: f64::from(writers * iters) / elapsed.as_secs_f64(),
+        p50_micros: percentile_of(&all_latencies, 50.0).as_secs_f64() * 1_000_000.0,
+        p99_micros: percentile_of(&all_latencies, 99.0).as_secs_f64() * 1_000_000.0,
+        engine_applies,
+        frames,
+        bytes,
+        converge_secs,
+        lost_updates,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn merged_counter_coalesced() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let writers = writers();
+    let iters = iters();
+    let reps = repetitions();
+
+    for window_ms in COALESCE_WINDOWS_MS {
+        let cache_name = format!("crdt-merged-coalesced-{window_ms}ms");
+        let window = Duration::from_millis(window_ms);
+
+        let mut rep_metrics = Vec::with_capacity(reps as usize);
+        for _ in 0..reps {
+            rep_metrics
+                .push(Box::pin(run_coalesced_rep(writers, iters, &cache_name, window)).await);
+        }
+
+        print_coalesced_bench(
+            "merged_counter_coalesced",
+            writers,
+            iters,
+            window_ms,
+            &rep_metrics,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Scenario 12: large_entity_convergence_coalesced — scenario 8's `merged`
+// variant with `Cache::merge` and a 1ms coalescing window replacing a
+// direct `insert` per write. Shares scenario 8's own `keys`
+// (`SUNDOG_BENCH_KEYS`) knob and default, so a full benchmark run covers
+// both entity counts the same way scenario 8's own doc run does — once at
+// the default, once at a larger scale.
+// ---------------------------------------------------------------------
+
+/// The coalescing window `large_entity_convergence_coalesced` runs at.
+const COALESCED_LARGE_ENTITY_WINDOW_MS: u64 = 1;
+
+async fn run_large_entity_coalesced_rep(keys: u32) -> ScaleConvergeRepMetrics {
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let cluster_label = "bench-crdt-large-entity-coalesced";
+    let cache_name = "crdt-large-entity-coalesced";
+    let window = Duration::from_millis(COALESCED_LARGE_ENTITY_WINDOW_MS);
+    let clusters = peer_group(cluster_label, 3).await;
+    let [cluster_a, cluster_b, cluster_c] = <[Cluster; 3]>::try_from(clusters)
+        .unwrap_or_else(|_| panic!("peer_group(_, 3) returns exactly 3 clusters"));
+
+    let (a, b, c) = tokio::join!(
+        cluster_a
+            .cache::<u32, PnCounter>(cache_name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open(),
+        cluster_b
+            .cache::<u32, PnCounter>(cache_name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open(),
+        cluster_c
+            .cache::<u32, PnCounter>(cache_name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .merge_coalesce_window(window)
+            .open(),
+    );
+    let cache_a = a.expect("a opens");
+    let cache_b = b.expect("b opens");
+    let cache_c = c.expect("c opens");
+
+    let frames_before = sundog::net::frames_sent_total();
+    let bytes_before = sundog::net::bytes_sent_total();
+    let ae_repaired_before = ae_repaired_snapshot(cache_name);
+
+    let handles: Vec<_> = [cache_a.clone(), cache_b.clone(), cache_c.clone()]
+        .into_iter()
+        .enumerate()
+        .map(|(writer, cache)| {
+            let writer = u32::try_from(writer).expect("3-element writer index fits in u32");
+            let node = NodeId::from(u64::from(writer));
+            tokio::spawn(async move {
+                for i in 0..keys {
+                    cache
+                        .merge(i, PnCounter::local_delta(node, SCALE_INCREMENTS_PER_WRITER))
+                        .await
+                        .expect("merged merge succeeds");
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.await.expect("writer task did not panic");
+    }
+
+    // Sampled immediately after the writers finish and before the
+    // convergence wait below, mirroring scenario 8's own `lost_updates`:
+    // for this scenario the gap also carries the coalescing window's own
+    // staleness bound on top of replication lag, since a pending fold is
+    // invisible to `get` until it flushes.
+    let mut lost_updates = 0u64;
+    for i in 0..keys {
+        let actual = cache_a.get(&i).await.map_or(0, |c| c.value());
+        let actual = u64::try_from(actual).unwrap_or(0);
+        lost_updates += scale_expected_total().saturating_sub(actual);
+    }
+
+    let expected = i64::try_from(scale_expected_total()).unwrap_or(i64::MAX);
+    let convergence_started = Instant::now();
+    common::eventually(Duration::from_secs(60), || async {
+        merged_all_converged(&[&cache_a, &cache_b, &cache_c], keys, expected).await
+    })
+    .await;
+    let converge_secs = convergence_started.elapsed().as_secs_f64();
+
+    let frames = sundog::net::frames_sent_total() - frames_before;
+    let bytes = sundog::net::bytes_sent_total() - bytes_before;
+    let ae_repaired = ae_repaired_snapshot(cache_name).saturating_sub(ae_repaired_before);
+    let resident_keys = cache_b.entry_count().await;
+
+    for cluster in [cluster_a, cluster_b, cluster_c] {
+        cluster.shutdown().await;
+    }
+
+    ScaleConvergeRepMetrics {
+        converge_secs,
+        frames,
+        bytes,
+        ae_repaired,
+        resident_keys,
+        lost_updates,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn large_entity_convergence_coalesced() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let keys = scale_keys(LARGE_ENTITY_KEYS_DEFAULT);
+    let reps = repetitions();
+
+    let mut rep_metrics = Vec::with_capacity(reps as usize);
+    for _ in 0..reps {
+        rep_metrics.push(Box::pin(run_large_entity_coalesced_rep(keys)).await);
+    }
+
+    print_scale_convergence_bench("coalesced", keys, &rep_metrics);
 }

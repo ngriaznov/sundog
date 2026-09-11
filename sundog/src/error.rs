@@ -152,6 +152,14 @@ pub enum CacheError {
     /// local write.
     #[error("cache {cache:?} is closing; the forwarded write was refused")]
     Closed { cache: SmolStr },
+    /// [`crate::cache::CacheBuilder::merge_coalesce_window`] was set to a
+    /// nonzero window on a cache whose [`crate::store::ConflictResolver`]
+    /// does not merge ([`crate::store::ConflictResolver::merges`] is
+    /// `false`): coalescing multiple [`crate::cache::Cache::merge`] calls
+    /// into one record only preserves every fold if the resolver can
+    /// actually fold two values, not just pick a side.
+    #[error("cache {cache:?} set a merge coalesce window but its resolver does not merge")]
+    MergeWindowRequiresMergingResolver { cache: SmolStr },
 }
 
 #[cfg(test)]
@@ -189,6 +197,14 @@ mod tests {
     #[test]
     fn fetch_unavailable_message_names_the_cache() {
         let err = CacheError::FetchUnavailable {
+            cache: SmolStr::new("prices"),
+        };
+        assert!(err.to_string().contains("prices"));
+    }
+
+    #[test]
+    fn merge_window_requires_merging_resolver_message_names_the_cache() {
+        let err = CacheError::MergeWindowRequiresMergingResolver {
             cache: SmolStr::new("prices"),
         };
         assert!(err.to_string().contains("prices"));

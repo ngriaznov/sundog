@@ -43,10 +43,37 @@ All notable changes to this project are documented in this file. Format follows
   only pushing the greater side to the lesser one, so two replicas each
   holding half of a merge converge in that one round rather than needing a
   second round to carry a minted result back to whichever side mints first.
-  The sim partition-heal suite repairs a 2,000-counter partition split in 10
-  anti-entropy rounds with this exchange, against 17 without it, and fewer
-  than the 11 a per-writer-key `LwwResolver` control takes on the same
-  split.
+  The sim partition-heal suite repairs a 2,000-counter partition split in 3
+  anti-entropy rounds with this exchange, fewer than the 4 a per-writer-key
+  `LwwResolver` control takes on the same split; at 20,000 counters that
+  inverts (5 rounds against the control's 3), a known regression tracked in
+  `ROADMAP.md`'s "Merge resolvers" section.
+- **`Engine::apply_many` pre-folds a batch that repeats a key.** When the
+  resolver's `ConflictResolver::merges` is `true`, a batch is grouped by key
+  into maximal runs of consecutive puts and each run long enough to fold
+  collapses to one survivor via the resolver, entirely outside the stripe
+  lock, before applying through the ordinary per-entry path — several
+  entries for the same key now cost one real `apply_locked` call instead of
+  one per entry. The survivor is seeded with the key's own real stored
+  record when one exists, ahead of the run's own entries, so the batch's
+  stored `(version, bytes)` comes out identical, `Hlc` included, to applying
+  every entry one at a time. A peer's replicated fan-out batch and
+  `Cache::insert_many` are where a real run appears; a singleton `insert`
+  never contains one, and a non-merging resolver never triggers the fold.
+- **`Cache::merge` and `CacheBuilder::merge_coalesce_window`.** `Cache::merge(key,
+  value)` folds `value` into the configured resolver without a read. Left at
+  the default zero window, every call applies (and replicates) at once,
+  equivalent to `insert` under a merging resolver. With
+  `merge_coalesce_window(Duration)` set to a nonzero window, consecutive
+  `merge` calls to one key fold in memory and apply exactly once, when the
+  window that opened at the first of those calls elapses, so replication and
+  every `Event` this key gets during the window see one record, not one per
+  call. `Cache::get` never consults a pending fold: a value folded in but
+  not yet flushed is invisible to a read for as long as it stays pending, up
+  to one whole window. `Cache::close`, and dropping a cache's last handle,
+  both flush whatever is still pending regardless of the window.
+  `CacheBuilder::merge_coalesce_window` rejects a nonzero window on a cache
+  whose resolver does not merge (`CacheError::MergeWindowRequiresMergingResolver`).
 
 ### Changed
 
