@@ -274,8 +274,10 @@ impl SpillConfig {
 
 /// Where one spilled record lives: which region, at what offset and length,
 /// stamped with the region's generation at write time. A read whose region
-/// generation has since moved on treats the record as gone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// generation has since moved on treats the record as gone. `Hash` lets a
+/// caller key a prefetched-bytes map by location, e.g.
+/// `engine::prefetch_spilled_conflict_bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SpillLoc {
     pub(crate) region: u32,
     pub(crate) offset: u32,

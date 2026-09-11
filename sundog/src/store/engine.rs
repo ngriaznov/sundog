@@ -786,9 +786,10 @@ fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<usize>> {
 /// The key's real currently-stored record, in the same value-aware,
 /// tombstone/spill-degraded shape [`apply_locked`] itself reads before
 /// calling [`resolve_and_rebind`]: `None` against a tombstone, an absent
-/// key, or a currently-spilled entry (no value bytes to fold), `Some` with
-/// the stored `Hlc`, encoded bytes, and TTL otherwise. Read under a brief
-/// stripe read lock, before any decode or fold work runs — see
+/// key, or a currently-spilled entry whose bytes weren't already prefetched
+/// into `prefetched_spilled` (no value bytes to fold), `Some` with the
+/// stored `Hlc`, encoded bytes, and TTL otherwise. Read under a brief stripe
+/// read lock, before any decode or fold work runs — see
 /// [`Engine::apply_many`]'s call site.
 /// [`peek_stored_seed`]'s and [`peek_prefold_seeds`]'s result for one key:
 /// the real stored `(version, encoded bytes, TTL)` to seed
@@ -797,7 +798,12 @@ fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<usize>> {
 /// type-complexity threshold.
 type PrefoldSeed = Option<(Hlc, Bytes, Option<u64>)>;
 
-fn peek_stored_seed<K, V>(stripe: &Stripe<K, V>, hash: u64, key_bytes: &[u8]) -> PrefoldSeed {
+fn peek_stored_seed<K, V>(
+    stripe: &Stripe<K, V>,
+    hash: u64,
+    key_bytes: &[u8],
+    #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
+) -> PrefoldSeed {
     if stripe.tombstones.contains_key(key_bytes) {
         return None;
     }
@@ -806,8 +812,15 @@ fn peek_stored_seed<K, V>(stripe: &Stripe<K, V>, hash: u64, key_bytes: &[u8]) ->
         .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
     let encoded = match &live.payload {
         Payload::Resident { encoded, .. } => encoded.clone(),
+        // `prefetched_spilled` was read entirely off-lock, before this
+        // stripe's read lock was even taken — see
+        // `prefetch_spilled_conflict_bytes`. A miss (never fetched because
+        // the resolver doesn't need value bytes, the read failed, or this
+        // entry moved to a different location since the prefetch pass)
+        // degrades to no seed, exactly as an always-value-less spilled entry
+        // did before prefetching existed.
         #[cfg(feature = "spill")]
-        Payload::Spilled(_) => return None,
+        Payload::Spilled(loc) => prefetched_spilled.get(loc).cloned()?,
     };
     Some((live.ver, encoded, live.expires_at_ms))
 }
@@ -817,11 +830,14 @@ fn peek_stored_seed<K, V>(stripe: &Stripe<K, V>, hash: u64, key_bytes: &[u8]) ->
 /// keyed by its wire bytes. Takes the stripe read lock for exactly this
 /// pass — [`Engine::apply_many`] drops the guard immediately after this
 /// returns, before any decode or fold work, which all runs lock-free
-/// afterward in [`prefold_batch`].
+/// afterward in [`prefold_batch`]. `prefetched_spilled`, when the `spill`
+/// feature is on, is [`prefetch_spilled_conflict_bytes`]'s result, computed
+/// before this same read lock was taken.
 fn peek_prefold_seeds<K, V>(
     stripe: &Stripe<K, V>,
     entries: &[BatchEntry<K, V>],
     runs: &[Vec<usize>],
+    #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
 ) -> HashMap<Bytes, PrefoldSeed> {
     let mut seeds = HashMap::new();
     for run in runs {
@@ -829,9 +845,15 @@ fn peek_prefold_seeds<K, V>(
             continue;
         }
         let (hash, _, key_bytes, ..) = &entries[run[0]];
-        seeds
-            .entry(key_bytes.clone())
-            .or_insert_with(|| peek_stored_seed(stripe, *hash, key_bytes.as_ref()));
+        seeds.entry(key_bytes.clone()).or_insert_with(|| {
+            peek_stored_seed(
+                stripe,
+                *hash,
+                key_bytes.as_ref(),
+                #[cfg(feature = "spill")]
+                prefetched_spilled,
+            )
+        });
     }
     seeds
 }
@@ -1120,28 +1142,75 @@ impl<K, V> ApplyOutcome<K, V> {
 /// value-aware resolver against them instead of degrading to its
 /// value-less guard against a spilled side.
 ///
-/// Called by [`apply_locked`] under the stripe write lock it already holds
-/// for this key, and only for that one key's own pointer: unlike
-/// [`Engine::spilled_loc`]'s promote-on-read path, which reads off-lock and
-/// must re-validate its pointer afterward against whatever raced it, the
-/// lock here never drops between finding `loc` and this read, so `loc`
-/// cannot go stale out from under it — every path that could invalidate it
-/// (a tombstone, an overwrite, a region reclaim) itself needs this same
-/// stripe's write lock, already held. No re-validation is needed, or done.
+/// Called by [`prefetch_spilled_conflict_bytes`], itself called before
+/// `stripes[bucket]`'s write lock is ever taken for the batch that follows —
+/// never under any stripe lock — for the overwhelming majority of calls, and
+/// by [`apply_locked`] itself, still under that write lock, only on the rare
+/// fallback where the prefetch pass missed this exact pointer (nothing found
+/// it spilled yet, or a concurrent flush moved it afterward): losing a real
+/// stored value to a stale prefetch would violate [`resolve_conflict`]'s own
+/// never-drop-a-real-value guarantee, so correctness wins over the fallback
+/// case alone still doing this under the lock.
 ///
 /// `None` on anything [`SpillTier::read_at`] itself treats as an ordinary,
 /// expected outcome rather than a hard error — a torn write, a failed
-/// checksum, or (impossible while this lock holds, but handled identically)
-/// a region rotated past `loc.generation` — or on a genuine I/O error.
-/// Either degrades exactly like a value-less stored side already does in
-/// [`resolve_conflict`]'s guard: never panics, never propagates, and never
-/// blocks the write on anything but this one positional read.
+/// checksum, a region rotated past `loc.generation` since the pointer was
+/// read, or a genuine I/O error. Either degrades exactly like a value-less
+/// stored side already does in [`resolve_conflict`]'s guard: never panics,
+/// never propagates.
 #[cfg(feature = "spill")]
 fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
     tier.read_at(loc)
         .ok()
         .flatten()
         .map(|spilled| spilled.encoded)
+}
+
+/// Reads back, off any stripe lock, the value bytes of every currently-
+/// [`Payload::Spilled`] stored record among `keys` that a merge might need
+/// to fold against — feeding both [`peek_stored_seed`]'s pre-fold seeding and
+/// [`apply_locked`]'s own stored-side lookup, so [`SpillTier::read_at`] is
+/// never called while `stripe_lock` (held for the write batch that follows)
+/// is held. A brief stripe *read* lock — dropped before any disk read runs —
+/// finds which keys are currently spilled; every actual read then happens
+/// entirely off-lock, keyed by [`SpillLoc`] rather than by key bytes so a
+/// later lookup naturally misses (degrading exactly like "no tier attached"
+/// already does) if the entry moved to a different location in the interim,
+/// rather than ever serving stale content.
+///
+/// Skips the read-lock pass entirely, with no lock taken at all, when
+/// `resolver` never inspects stored-side bytes
+/// ([`ConflictResolver::needs_value_bytes`] is `false`) or no tier is
+/// attached — the common case pays only that one check.
+#[cfg(feature = "spill")]
+fn prefetch_spilled_conflict_bytes<'a, K, V>(
+    stripe_lock: &RwLock<Stripe<K, V>>,
+    keys: impl IntoIterator<Item = (u64, &'a Bytes)>,
+    resolver: &dyn ConflictResolver,
+    spill: Option<&SpillTier>,
+) -> HashMap<SpillLoc, Bytes> {
+    let Some(tier) = spill.filter(|_| resolver.needs_value_bytes()) else {
+        return HashMap::new();
+    };
+    let mut locs: std::collections::HashSet<SpillLoc> = std::collections::HashSet::new();
+    {
+        let stripe = stripe_lock.read();
+        for (hash, key_bytes) in keys {
+            if stripe.tombstones.contains_key(key_bytes.as_ref()) {
+                continue;
+            }
+            if let Some(live) = stripe
+                .live
+                .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+                && let Payload::Spilled(loc) = &live.payload
+            {
+                locs.insert(*loc);
+            }
+        }
+    }
+    locs.into_iter()
+        .filter_map(|loc| read_spilled_for_conflict(tier, loc).map(|bytes| (loc, bytes)))
+        .collect()
 }
 
 /// The versioned-apply core: applies `incoming` at `ver` for `key`
@@ -1154,19 +1223,34 @@ fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
 /// anything downstream — the fingerprint, and the final store — ever runs,
 /// so a merge is written and fingerprinted exactly like any other `Put`.
 /// Fully synchronous: the caller holds `stripe`'s write lock for this call's
-/// entire duration. The returned `bool` is whether this call displaced a
-/// [`Payload::Spilled`] entry from `live`. It is `false` for a
+/// entire duration, and this never itself performs any disk I/O — see
+/// `prefetched_spilled` below. The returned `bool` is whether this call
+/// displaced a [`Payload::Spilled`] entry from `live`. It is `false` for a
 /// `Rejected` outcome, which changes nothing. The caller uses it to keep
 /// `sundog_spill_entries{cache}` correct; see
 /// [`Engine::note_spill_departure`].
 ///
-/// `spill`, present only in a `spill`-featured build, is this engine's
-/// attached tier, if any: when the stored side turns out to be
-/// [`Payload::Spilled`] and `resolver` actually reads value bytes
-/// ([`ConflictResolver::needs_value_bytes`]), this reads that side's real
-/// bytes back via [`read_spilled_for_conflict`] instead of handing the
-/// resolver the value-less view a tombstone gets. `None` here — no tier
-/// attached — keeps the old degraded behavior exactly.
+/// `prefetched_spilled`, present only in a `spill`-featured build, is
+/// [`prefetch_spilled_conflict_bytes`]'s result: bytes already read back off
+/// disk, keyed by [`SpillLoc`], before `stripe`'s write lock (held for the
+/// whole batch this call is part of, not only this one key) was ever taken.
+/// When the stored side turns out to be [`Payload::Spilled`] and `resolver`
+/// actually reads value bytes ([`ConflictResolver::needs_value_bytes`]), this
+/// looks up that side's location in the map first, so the overwhelming
+/// majority of calls — every one where nothing moved the entry between the
+/// prefetch pass and this write lock — never call [`SpillTier::read_at`]
+/// under this lock at all. `spill` is the fallback for the rare miss: the
+/// entry spilled, evicted, or was reclaimed into a new location by a
+/// concurrent flush after the prefetch pass read the old one, or a caller
+/// (a single-key write, or a test) skipped prefetching altogether. Losing
+/// that side's real content to a stale-pointer miss would violate the same
+/// contract [`resolve_conflict`]'s guard exists to protect — a merge must
+/// never silently drop a real value — so this reads it here, one more time,
+/// still correct even though, only in this narrow case, it is no longer
+/// off-lock. `None` — no tier attached, `resolver` never needs value bytes,
+/// or the fallback read itself comes back empty — keeps the old degraded
+/// behavior exactly: the resolver sees the same value-less view a tombstone
+/// gets.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -1181,6 +1265,7 @@ pub(crate) fn apply_locked<K, V>(
     mut ver: Hlc,
     mut incoming: Incoming<V>,
     resolver: &dyn ConflictResolver,
+    #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
     #[cfg(feature = "spill")] spill: Option<&SpillTier>,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
@@ -1200,19 +1285,26 @@ where
             .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
             .map(|l| {
                 // A currently-spilled entry has no value bytes resident in
-                // RAM. When `resolver` actually reads them and a tier is
-                // attached, read them back off disk right here, still under
-                // this stripe's write lock — see `read_spilled_for_conflict`.
-                // A resolver that never inspects `stored_view.value`, a key
-                // spilled with no tier attached, or a read that comes back
-                // empty (an already-degraded outcome, not a new one) all
-                // keep the same value-less view a tombstone already gets.
+                // RAM. Its bytes, if `resolver` actually reads them and a
+                // tier is attached, were almost always already read back off
+                // disk before this stripe's write lock was ever taken — see
+                // `prefetch_spilled_conflict_bytes`. Only on the rare miss (a
+                // concurrent flush moved the entry after the prefetch pass,
+                // or the caller never prefetched) does this fall back to
+                // reading it here, still under the lock — see
+                // `apply_locked`'s own doc for why a miss must not simply be
+                // treated as value-less. A resolver that never inspects
+                // `stored_view.value`, a key spilled with no tier attached,
+                // or a read that comes back empty either way still gets the
+                // same value-less view a tombstone already gets.
                 let encoded = match &l.payload {
                     Payload::Resident { encoded, .. } => Some(encoded.clone()),
                     #[cfg(feature = "spill")]
-                    Payload::Spilled(loc) => spill
-                        .filter(|_| resolver.needs_value_bytes())
-                        .and_then(|tier| read_spilled_for_conflict(tier, *loc)),
+                    Payload::Spilled(loc) => prefetched_spilled.get(loc).cloned().or_else(|| {
+                        spill
+                            .filter(|_| resolver.needs_value_bytes())
+                            .and_then(|tier| read_spilled_for_conflict(tier, *loc))
+                    }),
                 };
                 (
                     l.ver,
@@ -2559,6 +2651,16 @@ where
     /// resolver that never merges, or a batch with no repeated key, pays
     /// only the grouping and (on a repeated key) the read-lock peek, and
     /// otherwise applies exactly as before pre-folding existed.
+    ///
+    /// Before any of that, [`prefetch_spilled_conflict_bytes`] reads back
+    /// every entry's currently-spilled stored side, if any, entirely off any
+    /// stripe lock: both the pre-fold seed peek above and [`apply_locked`]'s
+    /// own stored-side lookup consult that prefetched map first, so a
+    /// `spill`-featured build calls [`crate::store::spill::SpillTier::read_at`]
+    /// under `bucket`'s write lock (held below for the whole batch) only on
+    /// the rare miss where a concurrent flush moved an entry after this
+    /// prefetch pass read its old location — see [`apply_locked`]'s own doc
+    /// for why that fallback exists rather than degrading to value-less.
     pub(crate) fn apply_many(
         &self,
         bucket: usize,
@@ -2569,11 +2671,26 @@ where
         now_ms: u64,
     ) -> Vec<ApplyOutcome<K, V>> {
         let prefold = resolver.merges() && self.prefold_enabled.load(Ordering::Relaxed);
+        #[cfg(feature = "spill")]
+        let prefetched_spilled = prefetch_spilled_conflict_bytes(
+            &self.stripes[bucket],
+            entries
+                .iter()
+                .map(|(hash, _, key_bytes, ..)| (*hash, key_bytes)),
+            resolver,
+            self.spill().map(Arc::as_ref),
+        );
         let entries: Vec<Option<BatchEntry<K, V>>> = if prefold {
             let runs = group_prefold_runs(&entries);
             let stored_seeds = {
                 let stripe = self.stripes[bucket].read();
-                peek_prefold_seeds(&stripe, &entries, &runs)
+                peek_prefold_seeds(
+                    &stripe,
+                    &entries,
+                    &runs,
+                    #[cfg(feature = "spill")]
+                    &prefetched_spilled,
+                )
             };
             prefold_batch(entries, runs, resolver, &stored_seeds)
         } else {
@@ -2606,6 +2723,8 @@ where
                     ver,
                     incoming,
                     resolver,
+                    #[cfg(feature = "spill")]
+                    &prefetched_spilled,
                     #[cfg(feature = "spill")]
                     self.spill().map(Arc::as_ref),
                     tombstone_ttl_ms,
@@ -3303,9 +3422,20 @@ mod tests {
         let hash = hash_key_bytes(key_bytes.as_ref());
         let encoded = Bytes::from(postcard::to_stdvec(&value).expect("test value encodes"));
         let bucket = stripe_index_from_hash(hash);
+        let resolver = LwwResolver;
+        // Mirrors `Engine::apply_many`'s own prefetch: reads any currently-
+        // spilled stored side back off disk before the write lock below is
+        // ever taken, so a test driving writes through this helper exercises
+        // `apply_locked`'s real lock discipline, not a shortcut around it.
+        #[cfg(feature = "spill")]
+        let prefetched_spilled = prefetch_spilled_conflict_bytes(
+            &engine.stripes[bucket],
+            std::iter::once((hash, &key_bytes)),
+            &resolver,
+            engine.spill().map(Arc::as_ref),
+        );
         let (outcome, displaced_spilled) = {
             let mut stripe = engine.stripes[bucket].write();
-            let resolver = LwwResolver;
             apply_locked(
                 &mut stripe,
                 &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
@@ -3323,6 +3453,8 @@ mod tests {
                     encoded,
                 },
                 &resolver,
+                #[cfg(feature = "spill")]
+                &prefetched_spilled,
                 #[cfg(feature = "spill")]
                 engine.spill().map(Arc::as_ref),
                 60_000,
@@ -3346,8 +3478,15 @@ mod tests {
     {
         let hash = hash_key_bytes(key_bytes.as_ref());
         let bucket = stripe_index_from_hash(hash);
-        let mut stripe = engine.stripes[bucket].write();
         let resolver = LwwResolver;
+        #[cfg(feature = "spill")]
+        let prefetched_spilled = prefetch_spilled_conflict_bytes(
+            &engine.stripes[bucket],
+            std::iter::once((hash, &key_bytes)),
+            &resolver,
+            engine.spill().map(Arc::as_ref),
+        );
+        let mut stripe = engine.stripes[bucket].write();
         let _ = apply_locked(
             &mut stripe,
             &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
@@ -3361,6 +3500,8 @@ mod tests {
             ver,
             Incoming::Tombstone,
             &resolver,
+            #[cfg(feature = "spill")]
+            &prefetched_spilled,
             #[cfg(feature = "spill")]
             engine.spill().map(Arc::as_ref),
             60_000,
@@ -3389,6 +3530,17 @@ mod tests {
         let hash = hash_key_bytes(key_bytes.as_ref());
         let encoded = Bytes::from(postcard::to_stdvec(&value).expect("test value encodes"));
         let bucket = stripe_index_from_hash(hash);
+        // Mirrors `Engine::apply_many`'s own prefetch — see `put` above —
+        // so a merge against an already-spilled stored side, exercised
+        // directly through this helper, reads its bytes back off-lock
+        // exactly as the real write path now does.
+        #[cfg(feature = "spill")]
+        let prefetched_spilled = prefetch_spilled_conflict_bytes(
+            &engine.stripes[bucket],
+            std::iter::once((hash, &key_bytes)),
+            resolver,
+            engine.spill().map(Arc::as_ref),
+        );
         let (outcome, displaced_spilled) = {
             let mut stripe = engine.stripes[bucket].write();
             apply_locked(
@@ -3408,6 +3560,8 @@ mod tests {
                     encoded,
                 },
                 resolver,
+                #[cfg(feature = "spill")]
+                &prefetched_spilled,
                 #[cfg(feature = "spill")]
                 engine.spill().map(Arc::as_ref),
                 60_000,
@@ -4007,7 +4161,9 @@ mod tests {
                 Incoming::Tombstone,
                 &resolver,
                 #[cfg(feature = "spill")]
-                engine.spill().map(Arc::as_ref),
+                &HashMap::new(),
+                #[cfg(feature = "spill")]
+                None,
                 60_000,
                 600_000,
                 0,
@@ -4422,7 +4578,9 @@ mod tests {
                 Incoming::Tombstone,
                 &resolver,
                 #[cfg(feature = "spill")]
-                engine.spill().map(Arc::as_ref),
+                &HashMap::new(),
+                #[cfg(feature = "spill")]
+                None,
                 60_000,
                 600_000,
                 0,
@@ -4554,7 +4712,9 @@ mod tests {
                     },
                     &resolver,
                     #[cfg(feature = "spill")]
-                    engine.spill().map(Arc::as_ref),
+                    &HashMap::new(),
+                    #[cfg(feature = "spill")]
+                    None,
                     60_000,
                     600_000,
                     0,
@@ -4892,7 +5052,9 @@ mod tests {
                         },
                         &resolver,
                         #[cfg(feature = "spill")]
-                        engine.spill().map(Arc::as_ref),
+                        &HashMap::new(),
+                        #[cfg(feature = "spill")]
+                        None,
                         1_000,
                         10_000,
                         now,
@@ -4918,7 +5080,9 @@ mod tests {
                         Incoming::Tombstone,
                         &resolver,
                         #[cfg(feature = "spill")]
-                        engine.spill().map(Arc::as_ref),
+                        &HashMap::new(),
+                        #[cfg(feature = "spill")]
+                        None,
                         1_000,
                         10_000,
                         now,
@@ -5100,7 +5264,9 @@ mod tests {
                 Incoming::Tombstone,
                 &resolver,
                 #[cfg(feature = "spill")]
-                engine.spill().map(Arc::as_ref),
+                &HashMap::new(),
+                #[cfg(feature = "spill")]
+                None,
                 60_000,
                 600_000,
                 0,
@@ -5646,7 +5812,9 @@ mod tests {
                     Incoming::Tombstone,
                     &resolver,
                     #[cfg(feature = "spill")]
-                    engine.spill().map(Arc::as_ref),
+                    &HashMap::new(),
+                    #[cfg(feature = "spill")]
+                    None,
                     60_000,
                     600_000,
                     0,
@@ -5969,7 +6137,9 @@ mod tests {
                     Incoming::Tombstone,
                     &resolver,
                     #[cfg(feature = "spill")]
-                    engine.spill().map(Arc::as_ref),
+                    &HashMap::new(),
+                    #[cfg(feature = "spill")]
+                    None,
                     60_000,
                     600_000,
                     0,
@@ -6094,7 +6264,9 @@ mod tests {
                     Incoming::Tombstone,
                     &resolver,
                     #[cfg(feature = "spill")]
-                    engine.spill().map(Arc::as_ref),
+                    &HashMap::new(),
+                    #[cfg(feature = "spill")]
+                    None,
                     60_000,
                     600_000,
                     0,
@@ -6804,6 +6976,199 @@ mod tests {
                     Some(7),
                     "the merged counter reads back resident, carrying both sides' \
                      contributions"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// `peek_stored_seed`'s prefold seeding is spill-aware exactly
+            /// like `apply_locked`'s own stored-side lookup: a same-key,
+            /// multi-entry batch landing on an already-spilled stored record
+            /// folds `P` in *first*, ahead of the batch's own entries, the
+            /// same left-to-right order sequential per-record application
+            /// uses — so the version the batched fold mints matches
+            /// sequential application's exactly, not only its content. Before
+            /// `peek_stored_seed` read spilled bytes back, it always treated
+            /// a spilled `P` as absent, seeding the fold with the batch's own
+            /// first entry instead and minting a version off that narrower
+            /// input set — still correct content (`apply_locked`'s own final
+            /// call still re-folds the real `P` in), but not the identical
+            /// `Hlc` sequential application mints.
+            /// This test's own `(version, value)` reader, shared by its
+            /// sequential-reference and batched-under-test engines.
+            fn stored_ver_and_value(
+                engine: &Engine<u32, crate::store::crdt::PnCounter>,
+                key: u32,
+                kb: &Bytes,
+                bucket: usize,
+            ) -> (Hlc, i64) {
+                let ver = engine
+                    .collect_buckets(&[u16::try_from(bucket).expect("bucket fits u16")], 0)
+                    .into_iter()
+                    .flat_map(|(_, entries)| entries)
+                    .find(|(k, _)| k.as_ref() == kb.as_ref())
+                    .map(|(_, ver)| ver)
+                    .expect("the key is live");
+                let value = engine
+                    .get(&key, 0)
+                    .expect("the key reads back resident")
+                    .value();
+                (ver, value)
+            }
+
+            /// A fresh engine, seeded with one `(seed, seed_ver)` record at
+            /// `key`, then evicted and confirmed spilled — this test's own
+            /// `P`, shared by its batched-under-test engine. Returns the temp
+            /// dir (removed by the caller once done) alongside the engine.
+            fn spilled_pn_counter_engine(
+                dir_name: &str,
+                key: u32,
+                kb: &Bytes,
+                bucket: usize,
+                seed: crate::store::crdt::PnCounter,
+                seed_ver: Hlc,
+                resolver: &dyn ConflictResolver,
+            ) -> (
+                std::path::PathBuf,
+                Arc<Engine<u32, crate::store::crdt::PnCounter>>,
+            ) {
+                let dir = temp_dir(dir_name);
+                let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+                let tier = Arc::new(SpillTier::open(&cfg, dir_name).expect("tier opens"));
+                let engine = Engine::new(u64::MAX, None, None);
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+                let _ =
+                    put_with_resolver(&engine, key, kb.clone(), seed, seed_ver, None, 0, resolver);
+                let _ = engine.evict_one_sampled(bucket);
+                assert!(
+                    poll_until(POLL_TIMEOUT, || is_spilled(&engine, kb)),
+                    "the flusher installs the spilled entry"
+                );
+                (dir, engine)
+            }
+
+            #[test]
+            fn prefold_seeds_a_spilled_stored_record_so_the_batch_matches_sequential_application() {
+                use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+                let resolver = PnCounterResolver;
+                let key = 1u32;
+                let kb = key_bytes(key);
+                let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+                let node_p = NodeId::from(1);
+                let node_b = NodeId::from(22);
+                let node_c = NodeId::from(33);
+                // A nonzero `logical` simulates `P` already carrying prior
+                // merge history (a realistic starting point for a spilled
+                // counter): with an all-fresh, all-zero-`logical` `P`, the
+                // mint arm's `max(..) + 1` chain lands on the identical
+                // `(wall_ms, logical)` regardless of fold order (both paths
+                // always cost exactly two total merge steps for three
+                // leaves), which would let this test pass even with the bug
+                // it's meant to catch.
+                let p_ver = Hlc {
+                    wall_ms: 1,
+                    logical: 5,
+                    node: node_p,
+                };
+                let e0 = (hlc(5, 2), PnCounter::local_delta(node_b, 4));
+                let e1 = (hlc(6, 3), PnCounter::local_delta(node_c, 9));
+
+                // The reference: `P`, then each batch entry, one real
+                // `apply_many` call at a time against a plain resident
+                // engine — never spilled, since spilling is this test's own
+                // artifact, not part of the CRDT history being compared.
+                let sequential = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+                for (value, ver) in [
+                    (PnCounter::local_delta(node_p, 3), p_ver),
+                    (e0.1.clone(), e0.0),
+                    (e1.1.clone(), e1.0),
+                ] {
+                    let _ = put_with_resolver(
+                        &sequential,
+                        key,
+                        kb.clone(),
+                        value,
+                        ver,
+                        None,
+                        0,
+                        &resolver,
+                    );
+                }
+                let (sequential_ver, sequential_value) =
+                    stored_ver_and_value(&sequential, key, &kb, bucket);
+
+                // The batch under test: `P` applied and spilled exactly like
+                // the sibling test above, then `e0` and `e1` folded through
+                // one real `apply_many` call — prefold-eligible, since both
+                // share a key and `PnCounterResolver::merges()` is `true`.
+                let (dir, batched) = spilled_pn_counter_engine(
+                    "prefold-seed-spilled",
+                    key,
+                    &kb,
+                    bucket,
+                    PnCounter::local_delta(node_p, 3),
+                    p_ver,
+                    &resolver,
+                );
+                assert!(
+                    batched.prefold_enabled(),
+                    "prefold is on by default: this batch must actually exercise it"
+                );
+
+                let hash = hash_key_bytes(kb.as_ref());
+                let e0_encoded = Bytes::from(postcard::to_stdvec(&e0.1).expect("encodes"));
+                let e1_encoded = Bytes::from(postcard::to_stdvec(&e1.1).expect("encodes"));
+                let outcomes = batched.apply_many(
+                    bucket,
+                    vec![
+                        (
+                            hash,
+                            key,
+                            kb.clone(),
+                            e0.0,
+                            Incoming::Put {
+                                value: e0.1,
+                                expires_at_ms: None,
+                                encoded: e0_encoded,
+                            },
+                        ),
+                        (
+                            hash,
+                            key,
+                            kb.clone(),
+                            e1.0,
+                            Incoming::Put {
+                                value: e1.1,
+                                expires_at_ms: None,
+                                encoded: e1_encoded,
+                            },
+                        ),
+                    ],
+                    &resolver,
+                    60_000,
+                    600_000,
+                    0,
+                );
+                assert_eq!(
+                    outcomes.len(),
+                    2,
+                    "one outcome per entry given, pre-fold or not"
+                );
+
+                let (batched_ver, batched_value) = stored_ver_and_value(&batched, key, &kb, bucket);
+
+                assert_eq!(
+                    batched_value, sequential_value,
+                    "both paths fold every side's contribution into the same total"
+                );
+                assert_eq!(
+                    batched_ver, sequential_ver,
+                    "seeding the fold with the real (spilled) stored record first mints the \
+                     exact version sequential per-record application would have, not merely \
+                     the same content"
                 );
 
                 let _ = std::fs::remove_dir_all(&dir);

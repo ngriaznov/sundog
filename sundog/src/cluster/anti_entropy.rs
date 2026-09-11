@@ -1173,7 +1173,7 @@ mod tests {
         );
         assert_eq!(
             out.push_keys.len(),
-            KEYS as usize,
+            usize::try_from(KEYS).expect("KEYS is a small literal, always fits"),
             "merging pushes every mismatched key, not only the greater-version side"
         );
         let (bucket, hashes) = out
@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(*bucket, 7);
         assert_eq!(
             hashes.len(),
-            KEYS as usize,
+            usize::try_from(KEYS).expect("KEYS is a small literal, always fits"),
             "merging pulls every mismatched key's hash too, converging both directions in one round"
         );
     }

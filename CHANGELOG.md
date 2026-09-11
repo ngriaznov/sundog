@@ -17,8 +17,11 @@ All notable changes to this project are documented in this file. Format follows
   Both encode canonically over `BTreeMap`/`BTreeSet` state, so two logically
   equal values always produce identical bytes, and both merge commutatively,
   associatively, and idempotently under any delivery order. `PnCounterResolver`
-  and `OrSetResolver` merge two decodable values and fall back to plain `Hlc`
-  order when either side is a tombstone, a spilled view, or fails to decode.
+  and `OrSetResolver` merge two decodable values — a spilled stored side's
+  real bytes included, read back off disk before the fold rather than
+  treated as value-less — and fall back to plain `Hlc` order only against a
+  tombstone, a spilled side whose bytes genuinely can't be read (no tier
+  attached, or the read fails), or a decode failure.
 - `Winner::Merged { value, expires_at_ms }`: a resolver can fold the stored
   and incoming records into a third value instead of picking one of the two.
   The engine derives the merged record's version from the merged bytes
@@ -31,10 +34,15 @@ All notable changes to this project are documented in this file. Format follows
   stamp, and two nodes minting for the same merged bytes always land on the
   same version regardless of fold order. A `Merged` outcome is only honored
   when both the stored and incoming records carry a value; against a
-  tombstone or a spilled side it degrades to keeping the existing record. A
-  redelivered record whose merge result reproduces the stored bytes and
-  version exactly is a no-op: nothing is re-applied, no event is published,
-  and nothing is re-replicated.
+  tombstone it degrades to keeping the existing record. A spilled stored
+  side is not value-less on that account: the engine reads its bytes back
+  off disk (via a prefetch pass keyed by spill location, ahead of the
+  stripe lock on the common path) so a value-aware resolver merges against
+  a spilled record's real content exactly as it would a resident one; only
+  a side whose bytes genuinely can't be produced still degrades to the
+  tombstone's treatment. A redelivered record whose merge result reproduces
+  the stored bytes and version exactly is a no-op: nothing is re-applied,
+  no event is published, and nothing is re-replicated.
 - `ConflictResolver::merges` and `ShardOps::merges` (the latter forwarding a
   shard's own resolver's answer): whether a resolver can ever return
   `Winner::Merged`, `false` by default and `true` on `PnCounterResolver` and
@@ -43,11 +51,14 @@ All notable changes to this project are documented in this file. Format follows
   only pushing the greater side to the lesser one, so two replicas each
   holding half of a merge converge in that one round rather than needing a
   second round to carry a minted result back to whichever side mints first.
-  The sim partition-heal suite repairs a 2,000-counter partition split in 3
-  anti-entropy rounds with this exchange, fewer than the 4 a per-writer-key
-  `LwwResolver` control takes on the same split; at 20,000 counters that
-  inverts (5 rounds against the control's 3), a known regression tracked in
-  `ROADMAP.md`'s "Merge resolvers" section.
+  The partition-heal sim, rebuilt to drive `run_round_against` (sundog's
+  real anti-entropy round, re-exported under `feature = "sim"` for exactly
+  this) instead of a reimplementation, repairs a fully-conflicting partition
+  split in 3 anti-entropy rounds against a per-writer-key `LwwResolver`
+  control's 4, at both 2,000 and 20,000 keys, with round counts pinned
+  non-decreasing in key count from 2,000 through 40,000. A partial conflict
+  mix can still cost more total bytes than the control despite an equal
+  round count — see `ROADMAP.md`'s "Merge resolvers" section.
 - **`Engine::apply_many` pre-folds a batch that repeats a key.** When the
   resolver's `ConflictResolver::merges` is `true`, a batch is grouped by key
   into maximal runs of consecutive puts and each run long enough to fold
@@ -71,7 +82,13 @@ All notable changes to this project are documented in this file. Format follows
   call. `Cache::get` never consults a pending fold: a value folded in but
   not yet flushed is invisible to a read for as long as it stays pending, up
   to one whole window. `Cache::close`, and dropping a cache's last handle,
-  both flush whatever is still pending regardless of the window.
+  both flush whatever is still pending regardless of the window. The flush
+  sweep itself is sharded the same way `engine::Engine`'s own stripes are —
+  one independently locked `pending_merges` stripe per bucket, each with its
+  own deadline-ordered index — rather than one shard-wide mutex a sweep had
+  to scan in full on every tick, so a flush locks and pops only the entries
+  actually due, in one stripe at a time, no matter how many keys are
+  coalescing at once.
   `CacheBuilder::merge_coalesce_window` rejects a nonzero window on a cache
   whose resolver does not merge (`CacheError::MergeWindowRequiresMergingResolver`).
 

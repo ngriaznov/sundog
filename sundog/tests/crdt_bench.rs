@@ -246,14 +246,14 @@ async fn open_replicated_trio<V>(
 where
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    open_replicated_trio_with_prefold(
+    Box::pin(open_replicated_trio_with_prefold(
         cluster_a,
         cluster_b,
         cluster_c,
         cache_name,
         resolver,
         [true, true, true],
-    )
+    ))
     .await
 }
 
@@ -2016,27 +2016,6 @@ fn print_prefold_bench(name: &str, batch_size: u32, reps: &[PrefoldRepMetrics]) 
     );
 }
 
-/// One `apply_many_prefold` rep for one (shape, resolver) combo: opens two
-/// fresh single-node caches under the same name in turn — "on"
-/// (`CacheBuilder::prefold_enabled`'s default `true`) and "off"
-/// (`.prefold_enabled(false)`) — closing the first before opening the
-/// second so both can use the same `cache_name`, and times the identical
-/// `batch_size`-record `insert_many` call against each. `swap_order` runs
-/// "off" before "on" instead of the reverse — the caller alternates it
-/// across reps so whichever pass runs second on a freshly built cluster
-/// (and so benefits from the first pass's allocator/JIT warm-up) is not
-/// always the same one, canceling that bias out across reps rather than
-/// always favoring "off".
-///
-/// Both passes take the identical single stripe-lock acquisition for the
-/// whole batch (`insert_many` always does, pre-fold or not — see
-/// `Engine::apply_many`) and pay the identical per-call fan-out push, so the
-/// only thing that can differ between them is whether `apply_many` actually
-/// folds a same-key run before applying it — a real measurement of the
-/// flag, not a proxy. `LwwResolver::merges()` is `false`, so it never
-/// triggers pre-fold at all regardless of the flag: its on/off gap is
-/// expected to land near zero, which `print_prefold_isolated_delta` checks
-/// by subtracting it from `PnCounterResolver`'s gap over the same shape.
 /// `run_prefold_rep`'s one timed pass: opens `cache_name` on `cluster` with
 /// `CacheBuilder::prefold_enabled` set from `prefold_enabled`, times one
 /// `insert_many(entries)` call against it, then closes the cache so the
@@ -2069,6 +2048,27 @@ where
     elapsed
 }
 
+/// One `apply_many_prefold` rep for one (shape, resolver) combo: opens two
+/// fresh single-node caches under the same name in turn — "on"
+/// (`CacheBuilder::prefold_enabled`'s default `true`) and "off"
+/// (`.prefold_enabled(false)`) — closing the first before opening the
+/// second so both can use the same `cache_name`, and times the identical
+/// `batch_size`-record `insert_many` call against each. `swap_order` runs
+/// "off" before "on" instead of the reverse — the caller alternates it
+/// across reps so whichever pass runs second on a freshly built cluster
+/// (and so benefits from the first pass's allocator/JIT warm-up) is not
+/// always the same one, canceling that bias out across reps rather than
+/// always favoring "off".
+///
+/// Both passes take the identical single stripe-lock acquisition for the
+/// whole batch (`insert_many` always does, pre-fold or not — see
+/// `Engine::apply_many`) and pay the identical per-call fan-out push, so the
+/// only thing that can differ between them is whether `apply_many` actually
+/// folds a same-key run before applying it — a real measurement of the
+/// flag, not a proxy. `LwwResolver::merges()` is `false`, so it never
+/// triggers pre-fold at all regardless of the flag: its on/off gap is
+/// expected to land near zero, which `print_prefold_isolated_delta` checks
+/// by subtracting it from `PnCounterResolver`'s gap over the same shape.
 async fn run_prefold_rep<V>(
     cluster_label: &str,
     cache_name: &str,

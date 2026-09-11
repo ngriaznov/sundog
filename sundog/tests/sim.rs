@@ -3226,6 +3226,22 @@ const HEAL_PARTITION_MS: u64 = 500;
 /// overlap: the ordering the two paths land in step order stays the same
 /// regardless of key count, since neither path is still running when
 /// the next tick becomes possible.
+///
+/// This is a deliberate trade-off, not an oversight: production's own
+/// default `ae_interval` is 200ms (`ClusterConfig::default`,
+/// `sundog/src/cluster.rs`), 5x shorter than this constant, specifically
+/// because a shorter tick can let node b/c's own independent round overlap
+/// the multi-step repair this family drives -- the exact race this constant
+/// is chosen to avoid. Every assertion in this family (determinism,
+/// monotonicity, exact convergence) therefore measures the resolver and
+/// anti-entropy logic in isolation from that scheduling race, not the
+/// bidirectional exchange's round count at production's actual tick
+/// cadence; it cannot by itself confirm the round-count regression
+/// `docs/crdt-merge-poc.md`'s "Where merge loses" describes is fixed at
+/// 200ms, only that nothing here regresses further under generous
+/// scheduling margin. A
+/// production-cadence variant, run at (or near) 200ms and tolerant of the
+/// resulting scheduling noise, would be needed to confirm that separately.
 const HEAL_AE_INTERVAL_MS: u64 = 1000;
 /// Every anti-entropy round in this family runs against at most two peers
 /// on a 1s tick; a generous multiple of the handful of rounds convergence
@@ -3233,7 +3249,10 @@ const HEAL_AE_INTERVAL_MS: u64 = 1000;
 /// than this many rounds signals a regression rather than ordinary
 /// scheduling noise.
 const HEAL_MAX_AE_ROUNDS: u64 = 60;
-const HEAL_MONOTONIC_KEYS: [u32; 4] = [2_000, 8_000, 16_000, 20_000];
+/// `40_000` sits past the `20_000` scale the original round-count
+/// regression was measured at, so this pin has headroom beyond the exact
+/// point that finding was made at, not just up to it.
+const HEAL_MONOTONIC_KEYS: [u32; 5] = [2_000, 8_000, 16_000, 20_000, 40_000];
 
 /// `SUNDOG_SIM_FULL=1` switches [`partition_heal_comparison`] from the fast
 /// default grid to the full one: more key counts, the whole conflict-fraction

@@ -90,12 +90,18 @@ outcome, mint included: the merge itself is commutative and the mint's
 `wall_ms`/`logical`/`node` are each a function of the unordered pair of
 inputs, not of which side calls which argument `sv` and which `ver`, so
 both replicas mint (or adopt) byte-for-byte, `Hlc`-for-`Hlc` identical
-results. The partition-heal sim confirms it end to end at default scale:
-`pn_counter` repairs a 2,000-counter partition split in 3 anti-entropy
-rounds against `lww_decomposed`'s 4 — fewer rounds than the decomposed
-control, the opposite of the naive expectation that merging costs more. At
-20,000 counters that inverts (`pn_counter` needs 5 rounds against
-`lww_decomposed`'s 3); see "What is still open" below.
+results. The partition-heal sim, rebuilt to drive `run_round_against` —
+sundog's real anti-entropy entry point, not a reimplementation — confirms
+it end to end: `merged` repairs a fully-conflicting partition split in 3
+anti-entropy rounds against `decomposed`'s 4, at both 2,000 and 20,000
+keys, and a monotonicity pin
+(`partition_heal_rounds_are_monotone_in_key_count`) holds both variants'
+round counts non-decreasing from 2,000 through 40,000 keys. This supersedes
+an earlier, since-replaced version of the sim that measured a round-count
+inversion at 20,000 keys under a race-prone anti-entropy tick; see
+`docs/crdt-merge-poc.md`'s partition-heal results and closing section for
+the byte-cost question that measurement did surface and that this rebuild
+does not resolve.
 
 Two write-path levers sit on top of the same contract, both public API,
 neither changing the version rule or the wire format. `Engine::apply_many`
@@ -114,19 +120,24 @@ merging resolver; a nonzero window trades a bounded read-side staleness
 
 **What is still open:**
 
-- **The bidirectional exchange's round-count regression at scale.** The
-  partition-heal sim's own assertion that `pn_counter` matches or beats
-  `lww_decomposed`'s anti-entropy round count fails at `SUNDOG_SIM_KEYS=20000`
-  (`pn_counter` spends 5 rounds against `lww_decomposed`'s 3), reproducibly.
-  The per-key, one-round convergence argument above says nothing about how
-  the exchange's doubled per-round cost interacts with a partition where
-  every key needs a real merge; this needs root-causing before the exchange
-  can be trusted at this scale.
-- **Coalescing's flush cadence becomes the bottleneck at high key
-  concurrency.** `large_entity_convergence_coalesced` at `N=100,000` runs
-  slower than both an uncoalesced merge and the decomposed control, the
-  opposite of its default-scale showing; nothing today adapts the flush
-  sweep's pace to how many keys are coalescing at once.
+- **Redundant pulls at a partial conflict fraction.** A key one side's pull
+  already converged can still mismatch the other side's sketch later in the
+  same repair, costing a second pull for content anti-entropy already
+  settled. At `conflict_fraction=0.5` and 20,000 keys this costs `merged`
+  more total bytes than `decomposed` despite an equal round count; the
+  per-key convergence argument bounds rounds for one divergent key, not
+  bytes for a whole partition's mix of converged and still-diverging keys.
+  Needs root-causing before the exchange's byte cost can be trusted at every
+  conflict mix. Separately, the partition-heal sim still runs at a longer,
+  race-free anti-entropy tick than production's 200ms default
+  (`HEAL_AE_INTERVAL_MS` in `sundog/tests/sim.rs`); a production-cadence
+  variant is still needed to confirm the round-count fix above holds there
+  too, not only under this harness's generous timing margin.
+- **`PnCounter` writer-slot compaction.** A departed writer's `p`/`n` slots
+  never shrink — `merge`'s pointwise maximum has no notion of "this writer
+  is gone." Safe compaction needs membership-wide agreement that every
+  replica has already folded that writer's final value, which sundog's
+  gossip layer does not provide today.
 - **`OrSet` never compacts.** Adds and tombstones accumulate forever; there
   is no tag garbage collection.
 - **No CRDT resolver ships for a map or a register**, only a counter and a
