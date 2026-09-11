@@ -365,7 +365,7 @@ mod tests {
         );
     }
 
-    /// `docs/crdt-merge-poc.md`'s "Writer-slot growth" measurement: one `p`
+    /// `docs/merge-resolvers.md`'s "Writer-slot growth" measurement: one `p`
     /// slot per distinct writer, one node id and one `u64` total apiece, so
     /// encoded size grows with how many nodes have ever incremented the
     /// counter, never with how many times any one of them has. Prints each

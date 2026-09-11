@@ -99,7 +99,7 @@ keys, and a monotonicity pin
 round counts non-decreasing from 2,000 through 40,000 keys. This supersedes
 an earlier, since-replaced version of the sim that measured a round-count
 inversion at 20,000 keys under a race-prone anti-entropy tick; see
-`docs/crdt-merge-poc.md`'s partition-heal results and closing section for
+`docs/merge-resolvers.md`'s partition-heal results and closing section for
 the byte-cost question that measurement did surface and that this rebuild
 does not resolve.
 

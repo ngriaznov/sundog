@@ -101,6 +101,16 @@ Writes are last-write-wins on a hybrid logical clock. If two nodes write the
 same key at nearly the same time, one write silently loses: no conflict error,
 no merge, the loser vanishes.
 
+A merge resolver changes that for values that combine. A `ConflictResolver`
+can return `Winner::Merged`, folding the stored and incoming records into a
+third value, and every node converges on the same result whatever order the
+writes arrive in. `sundog::crdt` ships `PnCounter` and `OrSet` with their
+resolvers; `Cache::merge` writes through one without a read, and
+`CacheBuilder::merge_coalesce_window` batches a writer's merges to one
+applied record per key per window. `docs/merge-resolvers.md` has the design,
+the convergence argument, and the benchmarks against last-write-wins from a
+hot counter to a million counters.
+
 Deletes and expiries differ. A TTL-expired entry never returns. Every record
 carries its own absolute `expires_at_ms`, and once a key is past it no peer
 accepts a stale copy back, partition or not. `.ttl(..)` sets a cache's default
@@ -389,13 +399,16 @@ Five layers, cheapest and highest-signal first:
    set must converge two shards to identical digests and entry sets.
 5. **Chaos demo** runs `sundog-demo` in headless mode; see below.
 
-Two benchmark suites sit outside these five layers, each gated on
+Three benchmark suites sit outside these five layers, each gated on
 `SUNDOG_BENCH=1` so a plain `cargo test` never pays their wall-clock cost:
 `sundog/tests/replication_bench.rs` (bulk write and read latency across a live
-cluster) and `sundog/tests/spill_bench.rs` (the optional SSD spill tier's
+cluster), `sundog/tests/spill_bench.rs` (the optional SSD spill tier's
 write path, RAM-hit versus tier-hit read latency, concurrent tier reads,
-region reclaim, and its hit-ratio case against plain eviction). Run the spill
-suite with:
+region reclaim, and its hit-ratio case against plain eviction), and
+`sundog/tests/crdt_bench.rs` (merge resolvers against last-write-wins:
+concurrent counters, per-apply cost, cold join, large-entity convergence,
+and the sketch path, with `SUNDOG_BENCH_KEYS` scaling the entity count). Run
+the spill suite with:
 
 ```sh
 SUNDOG_BENCH=1 cargo test --release -p sundog --features spill,prometheus \

@@ -3176,7 +3176,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
 // default `LwwResolver` — measuring anti-entropy rounds, virtual time,
 // frames, bytes, records, engine applies, resolver folds, and redundant
 // pulls spent reconciling after the heal, against the exact expected
-// total. See `docs/crdt-merge-poc.md`'s partition-heal section for the
+// total. See `docs/merge-resolvers.md`'s partition-heal section for the
 // full design and `SUNDOG_SIM_FULL`'s grid.
 // ---------------------------------------------------------------------
 
@@ -3184,7 +3184,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
 /// same content, keyed either per-writer under [`LwwResolver`] (so no key is
 /// ever really contended) or on one shared key under [`PnCounterResolver`]
 /// (so every overlapping counter is a real, folded merge). See the module
-/// docs at `docs/crdt-merge-poc.md`'s partition-heal section for the full
+/// docs at `docs/merge-resolvers.md`'s partition-heal section for the full
 /// design this grid measures.
 ///
 /// [`LwwResolver`]: sundog::LwwResolver
@@ -3237,7 +3237,7 @@ const HEAL_PARTITION_MS: u64 = 500;
 /// anti-entropy logic in isolation from that scheduling race, not the
 /// bidirectional exchange's round count at production's actual tick
 /// cadence; it cannot by itself confirm the round-count regression
-/// `docs/crdt-merge-poc.md`'s "Where merge loses" describes is fixed at
+/// `docs/merge-resolvers.md`'s "Where merge loses" describes is fixed at
 /// 200ms, only that nothing here regresses further under generous
 /// scheduling margin. A
 /// production-cadence variant, run at (or near) 200ms and tolerant of the
@@ -3764,7 +3764,7 @@ static HEAL_WIRE_METRICS_LOCK: StdMutex<()> = StdMutex::new(());
 /// -- run through the production `sundog::run_round_against` entry point,
 /// never a reimplementation of it -- until every node's fingerprint agrees
 /// and every counter reads the exact expected total. See
-/// `docs/crdt-merge-poc.md`'s partition-heal section for the full design and
+/// `docs/merge-resolvers.md`'s partition-heal section for the full design and
 /// the "Findings that shape the implementation" this driver embodies.
 #[allow(
     clippy::too_many_lines,
@@ -4069,7 +4069,7 @@ fn partition_heal_variant_reaches_exact_totals() {
 /// per run and one `SIM partition_heal_pair` line per pair, and asserts only
 /// that both sides converged correctly and within
 /// [`HEAL_MAX_AE_ROUNDS`] -- never a specific ratio between them, which is a
-/// report to read (see `docs/crdt-merge-poc.md`), not a property to pin.
+/// report to read (see `docs/merge-resolvers.md`), not a property to pin.
 /// `SUNDOG_SIM_FULL=1` swaps the fast default grid (2,000 keys, conflict
 /// fraction 0.0/1.0, one seed) for the full one (2,000 and 20,000 keys, the
 /// whole 0.0/0.1/0.5/1.0 conflict-fraction range, three seeds).
