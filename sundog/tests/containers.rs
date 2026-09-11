@@ -465,6 +465,10 @@ async fn cold_join_warms_a_million_entry_cluster() {
 async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     const COUNTERS: u32 = 1_000_000;
     const WRITERS: i64 = 3;
+    // Three million conflicting increments fold on every node before the
+    // join starts; that settle takes longer than the file-level wait on a
+    // four-core box, so this scenario sizes its own.
+    const CONVERGE_WAIT: Duration = Duration::from_secs(180);
 
     if !container_tests_enabled() {
         eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
@@ -489,6 +493,7 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     r2.expect("n2 pnfill succeeds");
     r3.expect("n3 pnfill succeeds");
 
+    let settle_started = std::time::Instant::now();
     for node in [&n1, &n2, &n3] {
         eventually(CONVERGE_WAIT, || async {
             node.pn_count().await == Ok(COUNTERS as usize)
@@ -503,6 +508,8 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
         })
         .await;
     }
+    let settle = settle_started.elapsed();
+    println!("three writers settled {COUNTERS} counters to the exact total in {settle:?}");
 
     let (f1_before, b1_before) = n1.netstats().await.expect("n1 netstats before the join");
     let (f2_before, b2_before) = n2.netstats().await.expect("n2 netstats before the join");

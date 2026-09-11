@@ -805,6 +805,40 @@ earns its keep over the fast default grid's `0.0`/`1.0` pair alone:
 count, and it is also the only row with a nonzero `redundant_pulls` at that
 scale (15,879) — see "Where merge loses" for the mechanism.
 
+**Million-counter scale.** Two runs past every default above, one in-process
+and one in containers, both with three writers incrementing every counter
+once and every variant reaching the exact total on every node.
+
+`large_entity_convergence` at `SUNDOG_BENCH_KEYS=1000000` (one run, 321 s
+for all three variants; `converge_secs` timed from the last write, the
+pre-convergence gap omitted since every variant closes it):
+
+| Variant | N | resident keys | converge time | frames | bytes | AE repairs |
+|---|---:|---:|---:|---:|---:|---:|
+| `decomposed` (`3N` per-writer keys) | 1,000,000 | 3,000,000 | 15.644 s | 27,256 | 1,359,939,450 | 8,623,241 |
+| `merged` (`N` keys) | 1,000,000 | 1,000,000 | 13.751 s | 29,378 | 939,941,852 | 9,319,484 |
+| `coalesced` (`N` keys, 1 ms window) | 1,000,000 | 1,000,000 | 19.682 s | 18,186 | 860,172,618 | 9,459,659 |
+
+`cold_join_warms_a_million_counter_cluster_with_exact_totals` in the
+container suite (`SUNDOG_CONTAINER_TESTS=1`, `RIGHTSIZE_BACKEND=docker`,
+`--test-threads=1`; three `sundog-testnode` containers on a `pn` cache under
+`PnCounterResolver`, each incrementing every one of a million counters once,
+then a cold fourth node), against `cold_join_warms_a_million_entry_cluster`,
+the same suite's single-writer last-write-wins bar:
+
+| Scenario | settle to exact totals | cold join (incl. container boot) | donor frames | donor bytes | joiner resident entries |
+|---|---:|---:|---:|---:|---:|
+| million single-writer entries, `LwwResolver` | n/a, one writer | 5.33 s | — | — | 1,000,000 |
+| million counters, three writers, `PnCounterResolver` | 61.1 s | 6.61 s | 2,817 | 208,486,980 | 1,000,000 |
+
+At a million counters merge converges faster than decomposition and moves
+31% fewer bytes; the resident-entry ratio is the writer count, as at every
+smaller size. The container join of a million merged counters costs 1.3 s
+more than a million single-writer entries, the price of a per-writer map in
+every record. The 61 s settle is three million conflicting folds across
+three containers on a four-core box, every one paying the per-apply cost
+above.
+
 ## Where merge wins
 
 **No lost updates, ever, when it converges — and it converges.** Both
@@ -945,7 +979,8 @@ crdt_bench -- --test-threads=1 --nocapture`) three times at `WRITERS=8`/
 (`cold_join_initial_replication`, `large_entity_convergence` plain and
 coalesced, `sketch_path_convergence`) rerun once each past their defaults via
 `SUNDOG_BENCH_KEYS` — 50,000 for cold join, 100,000 for large-entity and the
-sketch path; and the partition-heal sim's fast default grid (folded into the
+sketch path, and 1,000,000 for large-entity; the million-counter cold join in
+the container suite; and the partition-heal sim's fast default grid (folded into the
 crdt_bench runs above) plus its full `SUNDOG_SIM_FULL=1` sweep — 2,000 and
 20,000 keys, the whole 0.0/0.1/0.5/1.0 conflict-fraction range, three seeds,
 all four sim tests passing. What remains, past what this run covers:
