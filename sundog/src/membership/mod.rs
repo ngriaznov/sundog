@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chitchat::transport::UdpTransport;
 use chitchat::{
@@ -77,6 +77,14 @@ pub struct Peer {
 /// absent, never a placeholder value.
 pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 
+/// A live peer's flags [`cluster::absence`](crate::cluster::absence) needs
+/// captured at the instant it drops out of the live set: whether it
+/// gossiped a graceful departure ([`DEPARTING_KEY`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveFlags {
+    pub(crate) departing: bool,
+}
+
 /// A request to the background gossip loop, the sole owner of the chitchat
 /// handle.
 enum Command {
@@ -93,10 +101,10 @@ enum Command {
 pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
     cache_modes: watch::Receiver<CacheModes>,
-    /// Which live peers have gossiped [`DEPARTING_KEY`], published in
-    /// lockstep with `peers`; `pub(crate)`: only `cluster::absence` consumes
-    /// it, via [`Membership::departing_flags`].
-    departing: watch::Receiver<HashMap<NodeId, bool>>,
+    /// Each live peer's [`LiveFlags`], published in lockstep with `peers`;
+    /// `pub(crate)`: only `cluster::absence` consumes it, via
+    /// [`Membership::departing_flags`].
+    departing: watch::Receiver<HashMap<NodeId, LiveFlags>>,
     local: Peer,
     commands: mpsc::UnboundedSender<Command>,
 }
@@ -255,10 +263,10 @@ impl Membership {
         self.cache_modes.clone()
     }
 
-    /// The live peers, each with whether it has gossiped a graceful
-    /// departure; the absence tracker's only input, so a peer's last flag
-    /// and its disappearance arrive together.
-    pub(crate) fn departing_flags(&self) -> watch::Receiver<HashMap<NodeId, bool>> {
+    /// The live peers, each with its [`LiveFlags`]; the absence tracker's
+    /// only input, so a peer's last flags and its disappearance arrive
+    /// together.
+    pub(crate) fn departing_flags(&self) -> watch::Receiver<HashMap<NodeId, LiveFlags>> {
         self.departing.clone()
     }
 
@@ -468,6 +476,66 @@ fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
         .collect()
 }
 
+/// One other member's state, as this node currently sees it, for the CRDT
+/// writer-retirement quiet and dead-incarnation predicates below. Built
+/// from [`Peer`]/[`crate::cluster::absence::AbsenceTracker`] state by the
+/// caller; the predicates take it as plain data so they're testable
+/// without a live cluster.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemberView {
+    /// `Some(since)` when the member is currently live in this node's view,
+    /// continuously present since `since`
+    /// ([`crate::cluster::absence::AbsenceTracker::present_since`]); `None`
+    /// when currently tracked absent. Mutually exclusive with
+    /// `absent_since`.
+    pub(crate) present_since: Option<Instant>,
+    /// `Some(since)` when the member is currently tracked absent (dropped
+    /// from the live set without a graceful departure) since `since`
+    /// ([`crate::cluster::absence::AbsenceTracker::absent_since`]); `None`
+    /// when live or never observed.
+    pub(crate) absent_since: Option<Instant>,
+    /// The member's current incarnation, when it is live; `None` when
+    /// absent.
+    pub(crate) live_incarnation: Option<u64>,
+}
+
+/// Whether `member` has settled for the CRDT writer-retirement "cache is
+/// quiet" rule: continuously present for at
+/// least `bound`, or continuously absent for at least `bound`. A member
+/// that is neither — recently returned, or recently gone but not yet aged
+/// past `bound` — defers retirement for every writer in the cache, since
+/// its own view of who's-seen-what can't yet be trusted as settled.
+pub(crate) fn member_is_quiet(member: &MemberView, now: Instant, bound: Duration) -> bool {
+    if let Some(since) = member.present_since {
+        return now.saturating_duration_since(since) >= bound;
+    }
+    if let Some(since) = member.absent_since {
+        return now.saturating_duration_since(since) >= bound;
+    }
+    false
+}
+
+/// Whether writer incarnation `w_incarnation` is dead on `member`'s node:
+/// `member` has been absent longer than
+/// `bound`, or `member` is live with a *different* current incarnation than
+/// `w_incarnation` (any difference counts, not just a greater one, so a
+/// clock stepping backward across a restart can't pin an old incarnation
+/// live forever). A member never observed at all — neither live nor
+/// tracked absent — is not yet known dead.
+pub(crate) fn incarnation_is_dead(
+    member: &MemberView,
+    w_incarnation: u64,
+    now: Instant,
+    bound: Duration,
+) -> bool {
+    match member.live_incarnation {
+        Some(current) => current != w_incarnation,
+        None => member
+            .absent_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= bound),
+    }
+}
+
 /// Owns the chitchat handle for one membership session: forwards discovered
 /// addresses into gossip, republishes live-set changes as `Vec<Peer>`, and
 /// performs shutdown on request. Spawned once, so `ChitchatHandle::shutdown`
@@ -477,7 +545,7 @@ fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
 struct Publishers {
     peers: watch::Sender<Vec<Peer>>,
     cache_modes: watch::Sender<CacheModes>,
-    departing: watch::Sender<HashMap<NodeId, bool>>,
+    departing: watch::Sender<HashMap<NodeId, LiveFlags>>,
 }
 
 async fn run(
@@ -510,7 +578,7 @@ async fn run(
             live = live_nodes.select_next_some() => {
                 let mut peers: Vec<Peer> = Vec::new();
                 let mut cache_modes: CacheModes = HashMap::new();
-                let mut departing: HashMap<NodeId, bool> = HashMap::new();
+                let mut departing: HashMap<NodeId, LiveFlags> = HashMap::new();
                 for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
                     let Some(peer) = parse_peer(id, state) else { continue };
                     if let Some(notice) = protocol_notice(peer.protocol)
@@ -519,7 +587,12 @@ async fn run(
                         tracing::warn!(peer = %peer.node, peer_protocol = peer.protocol, "{notice}");
                     }
                     cache_modes.insert(peer.node, parse_cache_modes(state));
-                    departing.insert(peer.node, is_departing(state));
+                    departing.insert(
+                        peer.node,
+                        LiveFlags {
+                            departing: is_departing(state),
+                        },
+                    );
                     peers.push(peer);
                 }
                 tracing::debug!(count = peers.len(), "membership view updated");
@@ -1074,5 +1147,146 @@ mod tests {
         assert!(peers1.borrow().is_empty());
 
         membership1.shutdown().await;
+    }
+
+    /// `secs` seconds before `now`, for building [`MemberView`] fixtures.
+    fn ago(now: Instant, secs: u64) -> Instant {
+        now.checked_sub(Duration::from_secs(secs))
+            .expect("test duration fits before `now`")
+    }
+
+    #[test]
+    fn member_is_quiet_when_continuously_present_past_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let member = MemberView {
+            present_since: Some(ago(now, 61)),
+            absent_since: None,
+            live_incarnation: Some(1),
+        };
+        assert!(member_is_quiet(&member, now, bound));
+    }
+
+    #[test]
+    fn member_is_quiet_defers_when_present_less_than_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let member = MemberView {
+            present_since: Some(ago(now, 1)),
+            absent_since: None,
+            live_incarnation: Some(1),
+        };
+        assert!(!member_is_quiet(&member, now, bound));
+    }
+
+    #[test]
+    fn member_is_quiet_when_continuously_absent_past_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let member = MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 61)),
+            live_incarnation: None,
+        };
+        assert!(member_is_quiet(&member, now, bound));
+    }
+
+    #[test]
+    fn member_is_quiet_defers_when_absent_less_than_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let member = MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 1)),
+            live_incarnation: None,
+        };
+        assert!(
+            !member_is_quiet(&member, now, bound),
+            "a member absent for less than the bound defers retirement"
+        );
+    }
+
+    #[test]
+    fn member_is_quiet_is_false_for_a_never_observed_member() {
+        let now = Instant::now();
+        let member = MemberView {
+            present_since: None,
+            absent_since: None,
+            live_incarnation: None,
+        };
+        assert!(!member_is_quiet(&member, now, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn incarnation_is_dead_when_live_with_a_different_incarnation() {
+        let now = Instant::now();
+        let member = MemberView {
+            present_since: Some(now),
+            absent_since: None,
+            live_incarnation: Some(2),
+        };
+        assert!(
+            incarnation_is_dead(&member, 1, now, Duration::from_secs(60)),
+            "any incarnation mismatch is dead, not only a newer one"
+        );
+    }
+
+    #[test]
+    fn incarnation_is_dead_is_false_when_live_with_the_same_incarnation() {
+        let now = Instant::now();
+        let member = MemberView {
+            present_since: Some(now),
+            absent_since: None,
+            live_incarnation: Some(1),
+        };
+        assert!(!incarnation_is_dead(
+            &member,
+            1,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn incarnation_is_dead_when_absent_longer_than_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let member = MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 61)),
+            live_incarnation: None,
+        };
+        assert!(incarnation_is_dead(&member, 1, now, bound));
+    }
+
+    #[test]
+    fn incarnation_is_dead_defers_when_absent_less_than_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let member = MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 1)),
+            live_incarnation: None,
+        };
+        assert!(
+            !incarnation_is_dead(&member, 1, now, bound),
+            "a member absent for less than the bound is not yet known dead"
+        );
+    }
+
+    #[test]
+    fn incarnation_is_dead_is_false_for_a_never_observed_member() {
+        let now = Instant::now();
+        let member = MemberView {
+            present_since: None,
+            absent_since: None,
+            live_incarnation: None,
+        };
+        assert!(!incarnation_is_dead(
+            &member,
+            1,
+            now,
+            Duration::from_secs(60)
+        ));
     }
 }

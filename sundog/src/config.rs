@@ -59,6 +59,19 @@ pub struct ClusterConfig {
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
     /// member that never comes back.
     pub tombstone_max_ttl: Duration,
+    /// How long an absent, non-local writer incarnation must stay absent
+    /// (or superseded by a live incarnation of the same node) before its
+    /// `PnCounter`/`OrSet` slot becomes eligible for the CRDT compaction
+    /// sweep's stage-one retirement. Defaults to
+    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) — the same bound this
+    /// crate already documents as "a member gone longer than this may
+    /// resurrect data" if it returns, and the trust boundary CRDT
+    /// compaction's writer-retirement rule relies on for the same reason.
+    pub crdt_retire_after: Duration,
+    /// Per-tick cap on how many resident CRDT records the compaction sweep
+    /// (re)encodes and re-applies, so a single tick's work stays bounded
+    /// regardless of how many records are eligible.
+    pub crdt_compact_batch: usize,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
     /// Hard cap on a single wire frame, in bytes. Must not exceed
@@ -187,6 +200,8 @@ impl Default for ClusterConfig {
             ae_interval: Duration::from_secs(30),
             tombstone_ttl: Duration::from_mins(10),
             tombstone_max_ttl: Duration::from_hours(24),
+            crdt_retire_after: Duration::from_hours(24),
+            crdt_compact_batch: 4_096,
             outbox_capacity: 8_192,
             max_frame: MAX_FRAME,
             gossip_bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -287,6 +302,32 @@ mod tests {
     #[test]
     fn default_rebalance_concurrency_is_four() {
         assert_eq!(ClusterConfig::default().rebalance_concurrency, 4);
+    }
+
+    #[test]
+    fn default_crdt_retire_after_matches_tombstone_max_ttl() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.crdt_retire_after, config.tombstone_max_ttl);
+    }
+
+    #[test]
+    fn default_crdt_compact_batch_is_four_thousand_ninety_six() {
+        assert_eq!(ClusterConfig::default().crdt_compact_batch, 4_096);
+    }
+
+    #[test]
+    fn with_overrides_crdt_retire_after_and_batch_independently() {
+        let config = ClusterConfig::default().with(|c| {
+            c.crdt_retire_after = Duration::from_secs(1);
+            c.crdt_compact_batch = 10;
+        });
+        assert_eq!(config.crdt_retire_after, Duration::from_secs(1));
+        assert_eq!(config.crdt_compact_batch, 10);
+        assert_eq!(
+            config.tombstone_max_ttl,
+            ClusterConfig::default().tombstone_max_ttl,
+            "overriding the new knobs leaves unrelated fields at their defaults"
+        );
     }
 
     #[test]

@@ -7,14 +7,14 @@
 
 # sundog
 
-sundog is an embedded, replicated cache for Rust services. Every instance on the
+sundog is an embedded, replicated cache for Rust services. Every process on the
 network finds the others, forms a cluster over gossip, and keeps named caches
 coherent between them. No cache server, no coordinator, no config beyond a
 cluster name. Caches run in one of four modes: invalidation, full replication,
 distributed, or local-only.
 
 It's named for the [parhelion](https://en.wikipedia.org/wiki/Sun_dog), the
-optical effect where ice crystals render extra copies of the sun next to the
+optical effect where ice crystals produce extra copies of the sun next to the
 real one. A replicated cache, drawn by the atmosphere.
 
 Consistency is best-effort on purpose. Gossip membership and last-write-wins
@@ -34,7 +34,7 @@ or in `Cargo.toml`:
 sundog = "0.6"
 ```
 
-sundog is async, on [tokio](https://tokio.rs); the examples below assume a tokio
+sundog is async, on [tokio](https://tokio.rs). The examples below assume a tokio
 runtime. [Feature flags](#feature-flags) are additive: `cargo add sundog
 --features tls,prometheus`.
 
@@ -78,19 +78,25 @@ cluster.shutdown().await; // graceful leave
 ```
 
 That's the whole API surface for the common case.
-`Cluster::builder(name).build()` with nothing else chained works on a LAN; the
+`Cluster::builder(name).build()` with nothing else chained works on a LAN. The
 doctest in `sundog/src/lib.rs` runs it as the project's acceptance test. For
 bulk fills, `users.insert_many(entries).await?` gives every entry its own HLC
 stamp and event under one lock acquisition instead of one per entry. The rest of
-the surface: `contains_key`; `keys`, a local snapshot, and `for_each_key`, the
-same scan as a visitor that never materializes it all at once;
-`get_or_insert_with`, an infallible `get_or_load`; `remove_many`; and `clear`.
-`clear` tombstones and fans out every key this node holds. In `Replicated` mode
-that empties the whole cluster once the tombstones land. `get_sync`,
-`contains_key_sync`, `insert_sync`, and `remove_sync` are the same operations
-without an async runtime. `users.close().await` stops its background tasks and
-frees the name for a fresh `open()`; a clone kept past `close()` keeps working
-as a local, detached cache.
+the surface:
+
+- `contains_key`.
+- `keys`, a local snapshot.
+- `for_each_key`, the same scan as a visitor that never holds it all in
+  memory at once.
+- `get_or_insert_with`, an infallible `get_or_load`.
+- `remove_many`.
+- `clear`, which tombstones and fans out every key this node holds. In
+  `Replicated` mode, that empties the whole cluster once the tombstones land.
+
+`get_sync`, `contains_key_sync`, `insert_sync`, and `remove_sync` are the same
+operations without an async runtime. `users.close().await` stops its
+background tasks and frees the name for a fresh `open()`. A clone kept past
+`close()` keeps working as a local, detached cache.
 
 ## Should you use this?
 
@@ -104,10 +110,17 @@ no merge, the loser vanishes.
 A merge resolver changes that for values that combine. A `ConflictResolver`
 can implement `merge`, folding the stored and incoming records into a third
 value, and every node converges on the same result whatever order the writes
-arrive in. `sundog::crdt` ships `PnCounter` and `OrSet` with their resolvers;
+arrive in. `sundog::crdt` ships `PnCounter` and `OrSet` with their resolvers.
 `Cache::merge` writes through one without a read, and
 `CacheBuilder::merge_coalesce_window` batches a writer's merges to one
-applied record per key per window.
+applied record per key per window. A background sweep keeps their metadata
+from growing forever under writer churn: a writer absent (or superseded by
+a restart) longer than `ClusterConfig::crdt_retire_after` (default:
+`tombstone_max_ttl`, 24h) gets retired into bounded per-writer state, and
+folded away once that retirement itself has aged past a second
+`crdt_retire_after` with every peer quiet. That is the same trust boundary
+`tombstone_max_ttl` already accepts for a member gone that long, applied
+here to a writer's own contribution rather than a whole entry.
 
 Deletes and expiries differ. A TTL-expired entry never returns. Every record
 carries its own absolute `expires_at_ms`, and once a key is past it no peer
@@ -115,19 +128,19 @@ accepts a stale copy back, partition or not. `.ttl(..)` sets a cache's default
 lifespan. `insert_with_ttl` and `insert_many_with_ttl` override it per entry or
 batch, and the override replicates like the default. Reads never touch expiry.
 
-A manually removed key becomes a tombstone. It skips the `tombstone_ttl` GC
-schedule while any recently known member is absent. A partitioned node can't
+A manually removed key becomes a tombstone that skips the `tombstone_ttl` GC
+schedule while any member gossip still remembers is absent. A partitioned node can't
 return with pre-delete data and resurrect the key elsewhere. That deferral caps
-at `tombstone_max_ttl`, 24 hours by default. Past it the tombstone is collected
+at `tombstone_max_ttl`, 24 hours unless raised. Past it the tombstone is collected
 regardless of who's missing. A member gone longer can resurrect the key on
 return, bounded only by its stale copy's own `expires_at_ms`, and 24+ hours
-already outlives most cache TTLs. Set a TTL and deletes stay deleted; without
+already outlives most cache TTLs. Set a TTL and deletes stay deleted. Without
 one, raise `tombstone_max_ttl` or treat sundog as the wrong layer.
 
 Good fits: read-through caching in front of a slower store, session or profile
 data that's fine being eventually consistent, or any per-instance cache whose
 instances agree without standing up Redis. It targets small clusters of 2-30
-nodes on a LAN, with no consistent-hashing or partitioning; every replicated
+nodes on a LAN, with no consistent-hashing or partitioning. Every replicated
 node holds every entry.
 
 The store is an in-crate engine with 1,024 lock-striped tables, one per
@@ -137,14 +150,14 @@ time is proportional to the bucket, not the cache. 447 ns for a local read, 1.0
 µs for a replicated write, on one machine.
 
 A burst of writes, `insert_many` or back-to-back `insert` calls, fans out as
-coalesced `Replicate` batches; replication throughput scales with the burst, not
+coalesced `Replicate` batches. Replication throughput scales with the burst, not
 per-message overhead. Frames encode and decode without copying key/value bytes.
-Writes to different keys apply concurrently; same-key writes still serialize.
+Writes to different keys apply concurrently. Same-key writes still serialize.
 Anti-entropy and state-transfer requests reuse pooled connections instead of
 dialing fresh every round.
 
 Each bucket also keeps 64 part digests, the next 6 hash bits below the bucket's
-own 10. A round exchanges the 1,024 bucket digests first; a mismatched bucket
+own 10. A round exchanges the 1,024 bucket digests first. A mismatched bucket
 answers with a full `(key, version)` listing, or, past `ae_sketch_min_bucket`
 entries, an IBLT sketch decoding up to ~100 differing elements, or, past the
 larger `ae_part_min_bucket`, its 64 part digests instead of either, without ever
@@ -174,25 +187,25 @@ cache is open.
 hashing over the peers that advertise the same cache under the same mode and
 owner count. The view recomputes from gossip membership, so ownership
 converges a few gossip intervals after a join or leave, not instantly. A node
-that gains a bucket pulls it from the previous owners; one that loses a bucket
+that gains a bucket pulls it from the previous owners. One that loses a bucket
 keeps serving it for `distributed_disown_grace_rounds` anti-entropy intervals,
 then hands it to each new owner in one anti-entropy round and drops it only
 once every owner has answered. Until a gained bucket's pull lands, a `fetch`
 that misses it locally asks the other owners first. A write for a
 bucket this node doesn't own is forwarded to that bucket's owners and never
-applied locally, so no external routing is required — though a local `get`
+applied locally, so nothing external needs to route it, though a local `get`
 right after a forwarded write still misses, since only the owners hold it.
-Every forwarded batch carries the writer's view hash; an owner whose own
+Every forwarded batch carries the writer's view hash. An owner whose own
 view differs passes the batch on once more to the owners it knows, so a
 write routed under a view that has since changed still lands on every
 current owner.
-`get` stays local-only everywhere, returning `None` off a non-owner; `fetch`
+`get` stays local-only everywhere, returning `None` off a non-owner. `fetch`
 is the network-aware read, trying live owners in rendezvous order and
 returning `Ok(None)` for a genuine miss or `CacheError::FetchUnavailable` once
 every owner has timed out inside `fetch_timeout`. `owners_of` reports a key's
-current owners in that same order. `owners` must be at least 2
+current owners in that same order. `owners` must be 2 or more
 (`CacheError::TooFewOwners` otherwise), a finite `max_capacity` needs a
-`spill` tier exactly as `Replicated` requires, `tti` is rejected outright, and
+`spill` tier the same way `Replicated` does, `tti` is rejected outright, and
 two peers disagreeing on `owners` for the same cache name hit
 `CacheError::ModeMismatch` like any other mode conflict.
 
@@ -210,7 +223,7 @@ match prices.fetch(&sku).await? {
 }
 ```
 
-Every node gossips the mode of each cache it has open; opening a name under a
+Every node gossips the mode of each cache it has open. Opening a name under a
 mode that conflicts with a live peer fails with `CacheError::ModeMismatch`. TTL
 and capacity are local knobs, free to differ.
 
@@ -223,10 +236,10 @@ never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
 The current release speaks protocol 3 and serves protocol 2, the release
-before it; a container test runs the previous release's node against the
-current one in both roles. Distribution mode's message kinds — `Fetch`,
+before it. A container test runs the previous release's node against the
+current one in both roles. Distribution mode's message kinds (`Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
-`StBucketChunk`, `ForwardBatch`, and `StaleView` — are gated on protocol 3: a distributed cache forms only among protocol-3
+`StBucketChunk`, `ForwardBatch`, and `StaleView`) are gated on protocol 3: a distributed cache forms only among protocol-3
 peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
 own a bucket and never receives one of these messages at all.
 
@@ -240,20 +253,21 @@ own a bucket and never receives one of these messages at all.
 
 Discovery keeps running after startup: if the whole cluster reboots at once and
 nobody remembers anybody, continuous mDNS browsing lets it find itself again. A
-node with no peers isn't broken; a single-node "cluster" is a normal, healthy
+node with no peers isn't broken. A single-node "cluster" is a normal, healthy
 state.
 
-**The Docker gotcha:** mDNS doesn't cross the default Docker bridge network, and
-usually not AP-isolated Wi-Fi either, since multicast doesn't route there. If
-you're demoing this with `docker compose`, use `Static` seeds; save `Mdns` for
+**The Docker gotcha:** mDNS doesn't cross the default Docker bridge network,
+and on most Wi-Fi networks AP isolation blocks it too, since multicast
+doesn't route there. If
+you're demoing this with `docker compose`, use `Static` seeds. Save `Mdns` for
 host networking or bare-metal LANs.
 
 **Behind NAT or a container port mapping**, the interface address a node finds
-on its own — via its outbound-interface probe, or the `if-addrs` fallback
-behind it — is not always the address peers must dial: a cloud instance's
+on its own (via its outbound-interface probe, or the `if-addrs` fallback
+behind it) is not always the address peers must dial: a cloud instance's
 public IP while the process binds its private one, or a container's
 externally published port. Set `ClusterConfig::advertise_ip` to the address
-peers should use; it covers both the gossip and data-plane addresses, and no
+peers should use. It covers both the gossip and data-plane addresses, and no
 probe runs. Under Kubernetes host networking, or any setup where the bind
 address is already correct, leave it unset.
 
@@ -267,47 +281,55 @@ address is already correct, leave it unset.
 | `fuzzing` | off | exposes the reference model the apply-path fuzz targets drive against a real shard (`sundog::store::model`); changes no behavior |
 | `spill` | off | a local SSD/NVMe spill tier; `CacheBuilder::spill(SpillConfig::new(dir, capacity_bytes))` lets eviction demote cold entries to disk instead of discarding them |
 
-With `spill` configured, eviction writes cold entries to a FIFO ring of region
+With `spill` in use, eviction writes cold entries to a FIFO ring of region
 files on local disk instead of discarding them, so a cache's effective size
-extends past its RAM budget; a later read promotes a spilled entry back into
-RAM. Four knobs: `capacity_bytes`, the disk budget the tier stays within;
-`region_bytes`, the size of each region file in the ring (64 MiB default);
-`read_concurrency`, how many spilled-value reads run at once (16 default); and
-`flush_queue_bytes`, the cap on how many queued-but-unwritten bytes a lagging
-flusher may hold in RAM before eviction falls back to an ordinary delete
-instead (one region's worth by default), which keeps a slow disk a
-plain-eviction problem rather than an unbounded-RSS one. A `Replicated` cache
-keeps a refused victim resident, at its full weight, for a later eviction pass
-to retry instead, since every peer still holds the entry and a local delete
-would only have anti-entropy repair it back in; a `Local` or `Invalidation`
-cache evicts it as described above.
+extends past its RAM budget. A later read promotes a spilled entry back into
+RAM.
+
+- `capacity_bytes`, the disk budget bounding the tier.
+- `region_bytes`, the size of each region file in the ring (64 MiB default).
+- `read_concurrency`, how many spilled-value reads run at once (16 default).
+- `flush_queue_bytes`, the cap on how many queued-but-unwritten bytes a
+  lagging flusher may hold in RAM before eviction falls back to an ordinary
+  delete instead (one region's worth unless raised), which keeps a slow disk a
+  plain-eviction problem rather than an unbounded-RSS one.
+
+A `Replicated` cache keeps a refused victim resident, at its full weight, for
+a later eviction pass to retry instead, since every peer still holds the
+entry and a local delete would only have anti-entropy repair it back in. A
+`Local` or `Invalidation` cache evicts it as described above.
 
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,
 `sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,
 `sundog_live_peers`, `sundog_open_caches`, `sundog_ae_sketch_total{cache,
 outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
-tags anti-entropy's IBLT-sketch reconciliation on large buckets; `outcome` is
-`decoded` or `fallback`. The second tags the part-digest path's per-part
-reconciliation; `outcome` is `listing`, `sketch`, or `fallback`. Without
+tags anti-entropy's IBLT-sketch reconciliation on large buckets, where
+`outcome` is `decoded` or `fallback`. The second tags the part-digest path's
+per-part reconciliation, where `outcome` is `listing`, `sketch`, or
+`fallback`. Without
 `prometheus` they fall into the `metrics` crate's no-op default recorder.
 Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
-A `Mode::Distributed` cache adds six more: `sundog_owned_buckets{cache}`, this
-node's current bucket count; `sundog_rebalance_buckets_total{cache,
-direction}`, buckets rebalance pulled in or released out; `sundog_fetch_total{
-cache, outcome}`, each `Cache::fetch` call's outcome (`local`, `remote`,
-`miss`, or `error`); `sundog_forwarded_writes_total{cache}`, writes this node
-forwarded to a bucket's owners instead of applying, or passed on because they
-arrived under another node's view; `sundog_stale_view_total{
-cache}`, anti-entropy rounds a peer declined over a mismatched ownership view;
-and `sundog_unowned_inbound_dropped_total{cache}`, inbound records dropped for
-a bucket this node neither owns nor is mid disown-grace on.
+A `Mode::Distributed` cache adds six more:
+
+- `sundog_owned_buckets{cache}`, this node's current bucket count.
+- `sundog_rebalance_buckets_total{cache, direction}`, buckets rebalance
+  pulled in or released out.
+- `sundog_fetch_total{cache, outcome}`, each `Cache::fetch` call's outcome
+  (`local`, `remote`, `miss`, or `error`).
+- `sundog_forwarded_writes_total{cache}`, writes this node forwarded to a
+  bucket's owners instead of applying, or passed on because they arrived
+  under another node's view.
+- `sundog_stale_view_total{cache}`, anti-entropy rounds a peer declined over
+  a mismatched ownership view.
+- `sundog_unowned_inbound_dropped_total{cache}`, inbound records dropped for
+  a bucket this node neither owns nor is mid disown-grace on.
 
 `Cluster::is_ready()` and `Cluster::health()` report whether every open
-`Mode::Replicated` cache has finished its state transfer; a `Local` or
+`Mode::Replicated` cache has finished its state transfer. A `Local` or
 `Invalidation` cache is warm from the moment it opens, so it never holds
 readiness back. With the `prometheus` feature, the same listener that serves
 `GET /metrics` also serves `GET /readyz` (200 once ready, 503 otherwise) and
@@ -325,14 +347,17 @@ Five layers, cheapest and highest-signal first:
    the property this loss-tolerant design rests on.
 2. **Deterministic simulation** runs via `turmoil` in `sundog/tests/sim.rs`,
    behind the `sim` feature. It drives the real net layer and store against a
-   scripted membership feed with no sockets involved. Scenarios: partition under
-   load, heal, check convergence within a bounded number of rounds; message
-   loss, reordering, duplication; a donor dying mid-state-transfer; a forced
-   low `ae_sketch_min_bucket` driving the IBLT sketch path itself, and a forced
-   low `ae_part_min_bucket` driving the part-digest path, both under the same
-   loss and reordering; and a `Mode::Distributed` cluster churning membership
-   under loss and reordering, checking that every bucket's data converges
-   across its current owners with no non-owner ever holding one.
+   scripted membership feed with no sockets involved. Scenarios:
+   - Partition under load, heal, and check convergence inside a bounded
+     number of rounds.
+   - Message loss, reordering, and duplication.
+   - A donor dying mid-state-transfer.
+   - A forced low `ae_sketch_min_bucket` driving the IBLT sketch path
+     itself, and a forced low `ae_part_min_bucket` driving the part-digest
+     path, both under the same loss and reordering.
+   - A `Mode::Distributed` cluster churning membership under loss and
+     reordering, checking that every bucket's data converges across its
+     current owners with no non-owner ever holding one.
 3. **Container integration** runs via
    [`rightsize`](https://crates.io/crates/rightsize) in
    `sundog/tests/containers.rs`, no Docker CLI, no `bollard`. Multi-node
@@ -345,7 +370,7 @@ Five layers, cheapest and highest-signal first:
    fill's wire cost pinned via `netstats` against the fan-out queue
    duplicating it, high-churn add/remove/TTL workloads draining to zero, and
    64 KiB values verified byte-for-byte, and, for `Mode::Distributed`, a
-   five-node fill landing every key on exactly two owners, one owner crashing
+   five-node fill landing every key on two owners, one owner crashing
    with every key still fetchable and then re-owned, and a fourth node
    joining a filled cluster and taking its share. Each node is
    `sundog-testnode`, a tiny
@@ -359,7 +384,7 @@ Five layers, cheapest and highest-signal first:
    SUNDOG_CONTAINER_TESTS=1 cargo test --release -p sundog --test containers -- --test-threads=1
    ```
 
-   `RIGHTSIZE_BACKEND=docker` is required: sundog's gossip is UDP, and only
+   Set `RIGHTSIZE_BACKEND=docker`: sundog's gossip is UDP, and only
    rightsize's Docker backend carries it, not its lighter TCP-only microVM
    emulation. CI pulls a real base image over KVM and Docker. Locally, point
    `SUNDOG_TEST_BASE_IMAGE` at a pre-seeded image if registry pulls aren't
@@ -395,7 +420,7 @@ Five layers, cheapest and highest-signal first:
    in-crate under libFuzzer instead of proptest. `apply_permutation` runs the
    same permutation-convergence property: a duplicated, twice-shuffled record
    set must converge two shards to identical digests and entry sets.
-5. **Chaos demo** runs `sundog-demo` in headless mode; see below.
+5. **Chaos demo** runs `sundog-demo` in headless mode, described in the Chaos demo section.
 
 Three benchmark suites sit outside these five layers, each gated on
 `SUNDOG_BENCH=1` so a plain `cargo test` never pays their wall-clock cost:
@@ -460,10 +485,10 @@ while you kill and restart nodes and watch buckets move:
 cargo run --release -p sundog-distributed-demo -- --nodes 5 --keys 2000000
 ```
 
-It preloads `--keys` keys (`k{i}` = `v{i}`, two million by default) in
+It preloads `--keys` keys (`k{i}` = `v{i}`, two million unless overridden) in
 batches spread round-robin across the live nodes via `Cache::insert_many`
 before the write load starts, printing preload throughput and this
-process's RSS once it lands. Flags: `--owners <N>` (live owners per bucket,
+process's RSS when the preload finishes. Flags: `--owners <N>` (live owners per bucket,
 default 2), `--cluster <NAME>`, `--write-interval-ms <N>`,
 `--gossip-base-port <PORT>`; `--help` lists everything. The TUI shows a
 progress bar during preload, then per node: entry count, an estimated
@@ -476,9 +501,9 @@ Watch entries per node settle around `owners / N` of the key count; kill a
 node and watch the survivors' owned-bucket counts and entry counts climb as
 they pull its buckets; restart it and watch it take its share back.
 
-`--headless <SECS>` preloads, runs the load for `SECS` seconds — killing one
+`--headless <SECS>` preloads, runs the load for `SECS` seconds (killing one
 node at the midpoint and restarting it three-quarters through, to exercise a
-real rebalance — then pauses it, polls the sum of live nodes' entry counts
+real rebalance), then pauses it, polls the sum of live nodes' entry counts
 against `owners * surviving keys` under a bound wide enough for
 `distributed_disown_grace_rounds` to run out, verifies a random sample of
 surviving keys against their expected value, and prints one report line

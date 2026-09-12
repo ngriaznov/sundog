@@ -80,6 +80,16 @@ pub fn build_testnode() -> &'static Path {
 /// this checkout must interoperate with across a rolling upgrade.
 pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.0";
 
+/// Env var a container test passes via [`Node::spawn_with_env`] to override
+/// `ClusterConfig::crdt_retire_after` (`u64` seconds) down from its 24h
+/// default to something a test can actually wait out, the same override
+/// shape as `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` and friends (this file's
+/// module doc names the pattern; `sundog-testnode`'s own crate doc lists
+/// every `SUNDOG_TESTNODE_*` knob it currently reads). `sundog-testnode`
+/// wires this straight into `ClusterConfig::crdt_retire_after`, the same
+/// way `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET` etc. already are.
+pub const CRDT_RETIRE_AFTER_SECS_ENV: &str = "SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS";
+
 /// Builds the previous release's `sundog-testnode` from its git tag, once per
 /// test process, into `target/prev-release/` and returns the musl binary
 /// path. The tag is fetched if the clone lacks it, as a shallow CI checkout
@@ -550,6 +560,120 @@ impl Node {
                 .and_then(|value| value.parse::<i64>().ok())
                 .map(Some)
                 .ok_or(reply),
+        }
+    }
+
+    /// `osadd k e`, merging an [`sundog::crdt::OrSet::add`] delta tagged
+    /// with this node's own current writer identity into key `k` of the
+    /// `"os"` cache.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not `ok`.
+    pub async fn os_add(&self, key: &str, elem: &str) -> Result<(), String> {
+        match self.command(&format!("osadd {key} {elem}")).await?.as_str() {
+            "ok" => Ok(()),
+            other => Err(other.to_string()),
+        }
+    }
+
+    /// `osremove k e`, merging an [`sundog::crdt::OrSet::remove`] delta
+    /// against this node's own currently observed copy of key `k` into it.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not `ok`.
+    pub async fn os_remove(&self, key: &str, elem: &str) -> Result<(), String> {
+        match self
+            .command(&format!("osremove {key} {elem}"))
+            .await?
+            .as_str()
+        {
+            "ok" => Ok(()),
+            other => Err(other.to_string()),
+        }
+    }
+
+    /// `osmembers k`: `None` for a key never written, `Some(members)` —
+    /// alphabetically sorted, per `sundog-testnode`'s own rendering — for a
+    /// key that has been written, `Some(vec![])` included if every element
+    /// has since been removed (a written, currently empty set is not the
+    /// same as an unwritten key).
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails.
+    pub async fn os_members(&self, key: &str) -> Result<Option<Vec<String>>, String> {
+        let reply = self.command(&format!("osmembers {key}")).await?;
+        if reply == "none" {
+            return Ok(None);
+        }
+        if reply.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(reply.split_whitespace().map(str::to_string).collect()))
+    }
+
+    /// Cuts this node off the network entirely — `ip link set <iface> down`
+    /// inside the container, via [`ContainerGuard::exec`], which reaches the
+    /// container through the backend directly rather than over the network
+    /// this severs, so it (and [`Node::heal`]) keep working on an already
+    /// partitioned node — without stopping its process. Unlike
+    /// [`Node::stop`]/[`Node::crash`], the process keeps running and never
+    /// gets a chance to gossip anything, gracefully or otherwise, so every
+    /// peer sees exactly a genuine network partition: the node drops out of
+    /// the live set with no departure signal at all, distinct from a
+    /// confirmed-gone member the same way CRDT compaction's own
+    /// partitioned-vs-retired distinction
+    /// (`crate::cluster::crdt_compact_tick`'s dead/quiet predicates)
+    /// requires.
+    ///
+    /// The interface name is detected at call time (`eth0` first, falling
+    /// back to the first non-loopback interface `ip -o link show` reports),
+    /// so this only requires the container image's busybox to provide the
+    /// `ip` applet — true of `alpine:3.22`, this file's default base image —
+    /// not a full `iproute2`/`iptables` install.
+    /// # Errors
+    ///
+    /// Returns `Err` if the exec call itself fails, or the in-container
+    /// command exits non-zero (e.g. no `ip` applet in a non-default base
+    /// image).
+    pub async fn partition(&self) -> Result<(), String> {
+        self.set_interface_state("down").await
+    }
+
+    /// Reverses [`Node::partition`], restoring this node's network
+    /// connectivity without having ever stopped its process.
+    /// # Errors
+    ///
+    /// Returns `Err` if the exec call itself fails, or the in-container
+    /// command exits non-zero.
+    pub async fn heal(&self) -> Result<(), String> {
+        self.set_interface_state("up").await
+    }
+
+    /// The `ip link set <iface> {up,down}` `sh -c` script both
+    /// [`Node::partition`] and [`Node::heal`] run.
+    async fn set_interface_state(&self, state: &str) -> Result<(), String> {
+        let script = format!(
+            "set -e; \
+             iface=eth0; \
+             if ! ip link show \"$iface\" >/dev/null 2>&1; then \
+                 iface=$(ip -o link show | awk -F': ' '$2 != \"lo\" {{print $2; exit}}'); \
+             fi; \
+             ip link set \"$iface\" {state}"
+        );
+        let result = self
+            .guard
+            .exec(&["sh", "-c", script.as_str()])
+            .await
+            .map_err(|error| {
+                format!("exec failed setting this node's interface {state}: {error}")
+            })?;
+        if result.exit_code == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "setting this node's interface {state} exited {}: stdout={:?} stderr={:?}",
+                result.exit_code, result.stdout, result.stderr
+            ))
         }
     }
 

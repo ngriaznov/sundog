@@ -93,6 +93,7 @@ use crate::hlc::Hlc;
 use crate::node::NodeId;
 use crate::wire::WireRecord;
 
+use super::crdt;
 #[cfg(feature = "spill")]
 use super::spill::{SpillJob, SpillLoc, SpillSink, SpillTier, spilled_is_current};
 use super::{
@@ -1623,8 +1624,23 @@ pub(crate) struct Engine<K, V> {
     /// no effect at all on a resolver that doesn't merge — see
     /// `apply_many`'s docs.
     prefold_enabled: AtomicBool,
+    /// Where [`Engine::compact`]'s next call resumes: the index of the next
+    /// stripe it has not yet visited, so consecutive ticks rotate through
+    /// every stripe in turn instead of always starting over at stripe `0`.
+    /// Read and stored as a plain stripe index (always `< BUCKET_COUNT`),
+    /// which [`stripe_index_from_hash`]'s mask leaves unchanged — the same
+    /// helper `evict_cursor` uses, reused here for a value that is already
+    /// a valid index rather than a hash needing one. Starts at `0`; unlike
+    /// `evict_cursor` this is a rotation pointer, not a PRNG state, so a
+    /// zero seed is fine.
+    compact_cursor: AtomicU64,
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
+    /// Test-only: how many stripe read locks [`Engine::compact`] has taken
+    /// across its whole run, one per stripe visited — never more than one
+    /// held at a time, since each is dropped before the next is taken.
+    #[cfg(test)]
+    compact_lock_acquisitions: AtomicU64,
 }
 
 impl<K, V> Engine<K, V>
@@ -1662,8 +1678,11 @@ where
             #[cfg(feature = "spill")]
             pending_spill_weight: AtomicU64::new(0),
             prefold_enabled: AtomicBool::new(true),
+            compact_cursor: AtomicU64::new(0),
             #[cfg(test)]
             eviction_lock_acquisitions: AtomicU64::new(0),
+            #[cfg(test)]
+            compact_lock_acquisitions: AtomicU64::new(0),
         }
     }
 
@@ -2228,6 +2247,200 @@ where
             }
             self.note_spill_departures(removed_spilled);
         }
+    }
+
+    /// One rate-limited pass of the CRDT writer-retirement sweep: visits
+    /// stripes starting from [`Engine::compact_cursor`]'s current position,
+    /// each under its own read lock in turn (never more than one held at
+    /// once — compaction only reads, so a write lock is never needed here),
+    /// calling `resolver.compact(key_bytes, encoded, now_ms, retire, quiet,
+    /// bound_ms)` on every resident live entry and collecting `(key,
+    /// key_bytes, ver, new_encoded)` for every one that returns `Some`.
+    ///
+    /// Never mutates a stripe itself: this only *reads* candidates, each
+    /// carrying the version they were read at, for
+    /// [`super::ShardOps::compact_pass`] to apply via
+    /// [`Engine::compact_replace_if_current`] — a version-gated direct
+    /// replace, not the ordinary merge-based apply path every other write
+    /// goes through (see that method's own doc for why). A
+    /// [`Payload::Spilled`] entry is skipped —
+    /// its bytes aren't resident to hand to a resolver without a disk read
+    /// this sweep does not pay for; it is reconsidered once a later read or
+    /// write promotes it back to `Resident`.
+    ///
+    /// `max_entries` bounds how many resident entries this call examines
+    /// (calls `resolver.compact` on), not how many it finds eligible: once
+    /// a stripe currently being visited is finished, examining stops if the
+    /// running total has reached `max_entries`. A stripe already in
+    /// progress is always finished before stopping — the same
+    /// whole-stripe-at-a-time granularity [`Engine::sweep`] and
+    /// [`Engine::gc_tombstones`] already commit to — so a single
+    /// oversized stripe can exceed the nominal budget for one tick rather
+    /// than being torn mid-stripe across two. `compact_cursor` always
+    /// advances to the next stripe this call has not yet visited (wrapping
+    /// past the last stripe back to `0`), so consecutive calls rotate
+    /// through every stripe in turn and a call never revisits a stripe it
+    /// already finished this pass; `max_entries == 0` visits nothing and
+    /// leaves the cursor untouched.
+    pub(crate) fn compact(
+        &self,
+        resolver: &dyn ConflictResolver,
+        now_ms: u64,
+        retire: &dyn Fn(crdt::WriterId) -> bool,
+        quiet: bool,
+        bound_ms: u64,
+        max_entries: usize,
+    ) -> Vec<(K, Bytes, Hlc, Bytes)> {
+        if max_entries == 0 {
+            return Vec::new();
+        }
+        let start = stripe_index_from_hash(self.compact_cursor.load(Ordering::Relaxed));
+        let mut out = Vec::new();
+        let mut examined = 0usize;
+        let mut visited = 0usize;
+        let mut next_start = start;
+        while visited < BUCKET_COUNT {
+            let idx = (start + visited) % BUCKET_COUNT;
+            visited += 1;
+            next_start = (idx + 1) % BUCKET_COUNT;
+            let stripe = self.stripes[idx].read();
+            self.note_compact_lock_acquisition();
+            for live in &stripe.live {
+                let encoded = match &live.payload {
+                    Payload::Resident { encoded, .. } => encoded,
+                    // Never compacted off-lock: its bytes aren't resident,
+                    // and reading them back in would cost a disk read this
+                    // sweep does not pay for. Reconsidered once a later
+                    // read or write promotes it back to `Resident`.
+                    #[cfg(feature = "spill")]
+                    Payload::Spilled(_) => continue,
+                };
+                examined += 1;
+                if let Some(new_encoded) = resolver.compact(
+                    live.key_bytes.as_ref(),
+                    encoded.as_ref(),
+                    now_ms,
+                    retire,
+                    quiet,
+                    bound_ms,
+                ) {
+                    out.push((
+                        live.key.clone(),
+                        live.key_bytes.clone(),
+                        live.ver,
+                        new_encoded,
+                    ));
+                }
+            }
+            drop(stripe);
+            if examined >= max_entries {
+                break;
+            }
+        }
+        self.compact_cursor
+            .store(next_start as u64, Ordering::Relaxed);
+        out
+    }
+
+    /// Replaces a live, resident entry's payload and version with
+    /// `value`/`encoded`/`new_ver` iff it is still exactly at
+    /// `expected_ver` — the version-gated, no-merge write
+    /// [`super::ShardOps::compact_pass`] uses to apply every
+    /// [`Self::compact`] candidate, in place of the ordinary versioned
+    /// apply path every other write goes through.
+    ///
+    /// [`Self::compact`]'s output is always a valid evolution of *exactly*
+    /// the resident bytes it read — nothing else in this call needs
+    /// deciding once the version above confirms nothing else has touched
+    /// this entry since. Bypassing the ordinary merge-based apply is not
+    /// merely an optimization here: a resolver's own [`ConflictResolver::merge`]
+    /// only ever *unions* two sides' state, so merging the compacted
+    /// candidate back against the still-resident pre-compact copy that
+    /// produced it — exactly what the ordinary apply path would do — never
+    /// removes anything either side still carries. Stage one and two
+    /// survive that union safely by design (a fresh `folded_at`/`retired`
+    /// receipt on the compacted side lets the merge recognize the
+    /// pre-compact side's now-superseded entry and drop it), but stage
+    /// three's own receipt has no *further* receipt to vouch for *its*
+    /// removal, so a merge-based apply would silently restore the very
+    /// receipt this pass just pruned, every single pass, forever. Applying
+    /// the candidate directly (this method), never as another side of a
+    /// merge, is what lets pruning actually take hold.
+    ///
+    /// Still mints a fresh, strictly greater version rather than leaving
+    /// `ver` untouched: `resolve_and_rebind`'s own "equal versions are
+    /// always a no-op" rule trusts a version to name at most one exact
+    /// byte content ever, and a compaction pass changes the content
+    /// (shrinking it) without changing anything about *when* or *who*
+    /// wrote it — leaving the old version in place would let a later,
+    /// genuinely different write from a peer that happens to carry that
+    /// same version (two replicas independently merging the same two
+    /// writers' contributions mint identical versions for identical
+    /// merged bytes, by design — see [`merge_version`]'s doc) be silently
+    /// rejected as an already-absorbed redelivery, when its bytes are the
+    /// pre-compaction shape this side has since moved past. Correcting the
+    /// digest for the version change is the only bookkeeping a version
+    /// bump needs here: no `Incoming` apply, no fan-out, no `Event` — this
+    /// never replicates, since every reachable replica's own
+    /// [`ConflictResolver::compact`] independently reaches the same,
+    /// purely locally-derived conclusion (dead writers and settled
+    /// membership are facts every node can observe on its own) on its own
+    /// schedule; a replica that has not yet caught up simply has not
+    /// reached this conclusion yet, not disagrees with it.
+    ///
+    /// Returns `false` — a no-op — once the entry has moved on: a
+    /// different version (something else wrote it since [`Self::compact`]
+    /// read it), no longer live at all, or currently spilled. The caller
+    /// (`compact_pass`) treats that exactly like a bucket it no longer
+    /// owns: skipped this pass, safely recomputed from fresh state on the
+    /// next one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compact_replace_if_current(
+        &self,
+        key: &K,
+        key_bytes: &[u8],
+        hash: u64,
+        expected_ver: Hlc,
+        new_ver: Hlc,
+        value: V,
+        encoded: Bytes,
+    ) -> bool {
+        let bucket = stripe_index_from_hash(hash);
+        let part = part_index_from_hash(hash);
+        let (old_weight, new_weight) = {
+            let mut stripe = self.stripes[bucket].write();
+            let Some(live) = stripe
+                .live
+                .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes)
+            else {
+                return false;
+            };
+            if live.ver != expected_ver || !matches!(live.payload, Payload::Resident { .. }) {
+                return false;
+            }
+            let new_weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
+            let old_weight = live.weight;
+            live.payload = Payload::Resident { value, encoded };
+            live.weight = new_weight;
+            live.ver = new_ver;
+            (old_weight, new_weight)
+        };
+        self.digest[digest_slot(bucket, part)].fetch_xor(
+            entry_fingerprint(key_bytes, expected_ver) ^ entry_fingerprint(key_bytes, new_ver),
+            Ordering::Relaxed,
+        );
+        self.total_weight
+            .fetch_add(u64::from(new_weight), Ordering::Relaxed);
+        self.total_weight
+            .fetch_sub(u64::from(old_weight), Ordering::Relaxed);
+        true
+    }
+
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn note_compact_lock_acquisition(&self) {
+        #[cfg(test)]
+        self.compact_lock_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// The number of live entries across every stripe.
@@ -3322,6 +3535,25 @@ where
 
     pub(crate) fn debug_eviction_lock_acquisitions(&self) -> u64 {
         self.eviction_lock_acquisitions.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: how many stripe read locks [`Engine::compact`] has taken
+    /// in total, across every call on this engine.
+    pub(crate) fn debug_compact_lock_acquisitions(&self) -> u64 {
+        self.compact_lock_acquisitions.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: [`Engine::compact`]'s current cursor position, the index
+    /// of the next stripe a future call resumes from.
+    pub(crate) fn debug_compact_cursor(&self) -> u64 {
+        self.compact_cursor.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: pins [`Engine::compact`]'s cursor to `stripe`, so a test
+    /// can start a pass from a known stripe instead of wherever the
+    /// previous pass left it.
+    pub(crate) fn debug_set_compact_cursor(&self, stripe: u64) {
+        self.compact_cursor.store(stripe, Ordering::Relaxed);
     }
 
     /// Test-only: inserts a live entry already pointing at `loc`, with the
@@ -6928,8 +7160,8 @@ mod tests {
                 let key = 1u32;
                 let kb = key_bytes(key);
                 let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
-                let node_a = NodeId::from(11);
-                let node_b = NodeId::from(22);
+                let node_a = crate::store::crdt::WriterId::new(NodeId::from(11), 1);
+                let node_b = crate::store::crdt::WriterId::new(NodeId::from(22), 1);
 
                 let _ = put_with_resolver(
                     &engine,
@@ -7011,7 +7243,7 @@ mod tests {
                 key: u32,
                 kb: &Bytes,
                 bucket: usize,
-            ) -> (Hlc, i64) {
+            ) -> (Hlc, i128) {
                 let ver = engine
                     .collect_buckets(&[u16::try_from(bucket).expect("bucket fits u16")], 0)
                     .into_iter()
@@ -7067,9 +7299,10 @@ mod tests {
                 let key = 1u32;
                 let kb = key_bytes(key);
                 let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
-                let node_p = NodeId::from(1);
-                let node_b = NodeId::from(22);
-                let node_c = NodeId::from(33);
+                let node_p_id = NodeId::from(1);
+                let node_p = crate::store::crdt::WriterId::new(node_p_id, 1);
+                let node_b = crate::store::crdt::WriterId::new(NodeId::from(22), 1);
+                let node_c = crate::store::crdt::WriterId::new(NodeId::from(33), 1);
                 // A nonzero `logical` simulates `P` already carrying prior
                 // merge history (a realistic starting point for a spilled
                 // counter): with an all-fresh, all-zero-`logical` `P`, the
@@ -7081,7 +7314,7 @@ mod tests {
                 let p_ver = Hlc {
                     wall_ms: 1,
                     logical: 5,
-                    node: node_p,
+                    node: node_p_id,
                 };
                 let e0 = (hlc(5, 2), PnCounter::local_delta(node_b, 4));
                 let e1 = (hlc(6, 3), PnCounter::local_delta(node_c, 9));
@@ -7183,6 +7416,169 @@ mod tests {
 
                 let _ = std::fs::remove_dir_all(&dir);
             }
+        }
+    }
+
+    /// Coverage for [`Engine::compact`]: how its cursor rotates across
+    /// calls, that it never locks more of the engine than its budget needs,
+    /// and that a spilled entry is never handed to the resolver.
+    /// [`crate::store::crdt::PnCounter`]/[`crate::store::crdt::PnCounterResolver`]
+    /// (real types, not a stub) exercise the resolver-hook plumbing end to
+    /// end, since a fake resolver would only prove this method calls
+    /// *something*, not that it hands the real hook real arguments.
+    mod compact_sweep {
+        use super::*;
+        use crate::store::crdt::{PnCounter, PnCounterResolver, WriterId};
+
+        /// The smallest key whose hash lands in stripe `target`. Exists for
+        /// every `target < BUCKET_COUNT`: `stripe_index_from_hash` hashes
+        /// over the full `u32` key space, uniformly enough that some small
+        /// key lands in every stripe.
+        fn key_for_stripe(target: usize) -> u32 {
+            (0u32..1 << 20)
+                .find(|&k| stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == target)
+                .expect("some u32 key well within range hashes into every stripe")
+        }
+
+        fn writer(id: u64) -> WriterId {
+            WriterId::new(NodeId::from(id), 1)
+        }
+
+        fn seed_counter(
+            engine: &Engine<u32, PnCounter>,
+            resolver: PnCounterResolver,
+            key: u32,
+            writer_id: WriterId,
+        ) {
+            let kb = key_bytes(key);
+            let _ = put_with_resolver(
+                engine,
+                key,
+                kb,
+                PnCounter::local_delta(writer_id, 1),
+                hlc(1, 1),
+                None,
+                0,
+                &resolver,
+            );
+        }
+
+        /// Four resident counters, each alone in its own stripe, each
+        /// carrying one retirement-eligible writer. One entry per
+        /// [`Engine::compact`] call, cursor pinned to `0` beforehand: each
+        /// call must return exactly the one entry sitting between the
+        /// cursor and the next seeded stripe, in ascending stripe order,
+        /// and leave the cursor just past the stripe it visited — proving
+        /// rotation carries forward across calls instead of restarting at
+        /// stripe `0` (which would instead return the same first entry
+        /// every time) or skipping ahead arbitrarily.
+        #[test]
+        fn compact_rotates_the_cursor_across_stripes_between_calls() {
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+            let resolver = PnCounterResolver;
+            let targets = [3usize, 200, 500, 900];
+            let keys: Vec<u32> = targets.iter().map(|&t| key_for_stripe(t)).collect();
+            for (i, &key) in keys.iter().enumerate() {
+                seed_counter(&engine, resolver, key, writer(u64::try_from(i).unwrap()));
+            }
+
+            engine.debug_set_compact_cursor(0);
+            let retire_everyone = |_: WriterId| true;
+            let mut seen = Vec::new();
+            for &target in &targets {
+                let out = engine.compact(&resolver, 1_000, &retire_everyone, false, 0, 1);
+                assert_eq!(
+                    out.len(),
+                    1,
+                    "exactly one seeded entry sits between the cursor and the next target"
+                );
+                seen.push(out[0].0);
+                assert_eq!(
+                    engine.debug_compact_cursor(),
+                    u64::try_from((target + 1) % BUCKET_COUNT).unwrap(),
+                    "the cursor advances to just past the stripe it last visited"
+                );
+            }
+            assert_eq!(
+                seen, keys,
+                "four calls visit the four seeded stripes in rotation, none repeated, none \
+                 skipped"
+            );
+        }
+
+        /// A single entry seeded in stripe `5`, cursor pinned to stripe
+        /// `0`: one [`Engine::compact`] call with `max_entries: 1` must
+        /// stop the instant its budget is met, locking stripes `0..=5`
+        /// (six stripes) and no more — never the whole 1024-stripe engine,
+        /// and never fewer than it actually needed to find the one entry.
+        /// Each stripe's lock is taken and dropped before the next is
+        /// touched (`Engine::compact`'s own structure never calls
+        /// `self.stripes[idx].read()` a second time before the previous
+        /// guard is dropped), so this count is exactly the number of
+        /// distinct stripes visited, one lock each.
+        #[test]
+        fn compact_locks_only_as_many_stripes_as_its_budget_needs() {
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+            let resolver = PnCounterResolver;
+            let key = key_for_stripe(5);
+            seed_counter(&engine, resolver, key, writer(1));
+
+            engine.debug_set_compact_cursor(0);
+            let retire_everyone = |_: WriterId| true;
+            let before = engine.debug_compact_lock_acquisitions();
+            let out = engine.compact(&resolver, 1_000, &retire_everyone, false, 0, 1);
+            let after = engine.debug_compact_lock_acquisitions();
+
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                after - before,
+                6,
+                "stripes 0..=5 are visited (the entry sits in stripe 5) — not the whole engine"
+            );
+        }
+
+        /// A resident entry and a spilled one, both carrying a
+        /// retirement-eligible writer: only the resident entry is ever
+        /// handed to [`ConflictResolver::compact`]. A spilled payload has
+        /// no bytes in RAM for a resolver to read without a disk read this
+        /// sweep does not pay for; it must be silently skipped, not
+        /// errored or panicked on, and must never suppress the resident
+        /// candidate sharing the pass.
+        #[cfg(feature = "spill")]
+        #[test]
+        fn compact_never_hands_a_spilled_payload_to_the_resolver() {
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+            let resolver = PnCounterResolver;
+
+            let spilled_key = 1u32;
+            let spilled_kb = key_bytes(spilled_key);
+            engine.debug_insert_spilled(
+                spilled_key,
+                &spilled_kb,
+                hlc(1, 1),
+                None,
+                SpillLoc {
+                    region: 0,
+                    offset: 0,
+                    len: 4,
+                    generation: 0,
+                },
+                0,
+            );
+
+            let resident_key = 2u32;
+            seed_counter(&engine, resolver, resident_key, writer(1));
+
+            engine.debug_set_compact_cursor(0);
+            let retire_everyone = |_: WriterId| true;
+            let out = engine.compact(&resolver, 1_000, &retire_everyone, false, 0, usize::MAX);
+
+            assert_eq!(
+                out.len(),
+                1,
+                "the spilled entry is skipped; only the resident one is a candidate"
+            );
+            assert_eq!(out[0].0, resident_key);
         }
     }
 

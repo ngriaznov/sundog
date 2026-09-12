@@ -28,9 +28,9 @@
 //! per warm-cluster node) and each writer's contribution to each entity at
 //! a single increment, so `N` alone governs their cost, and scenario 9
 //! reuses the same knob for its own batch size, no network or writer count
-//! involved. Their defaults are lower than the plan's own (documented at
-//! each default's definition) to keep every variant inside a 3-minute
-//! budget on a 4-core box. A smoke run:
+//! involved. Their defaults are set low (documented at each default's
+//! definition) to keep every variant inside a 3-minute budget on a 4-core
+//! box. A smoke run:
 //!
 //! ```text
 //! SUNDOG_BENCH=1 SUNDOG_BENCH_WRITERS=2 SUNDOG_BENCH_ITERS=50 \
@@ -99,6 +99,21 @@
 //! "`sketch_fallback`", plus their sum as "`sketch_rounds`": how many times
 //! this scenario's bucket answered a mismatch through the sketch mechanism
 //! at all, successfully or not, before it reconverged.
+//!
+//! Scenario 14 (`crdt_compaction_writer_churn`) exercises the two-stage
+//! writer retirement rule itself: one
+//! writer role is torn down and rebuilt several times under the same
+//! persisted `NodeId`, so each rebuild is a fresh `WriterId` incarnation
+//! that supersedes, and thereby retires, the previous one. It reports one
+//! counter's encoded `PnCounter::encode().len()` right after the last
+//! replacement against its size once the compaction sweep has had time to
+//! fold the dead incarnations away, so the metadata bound under churn is
+//! visible directly on the printed `BENCH` line, plus the retired-writer/
+//! compaction counters under `--features prometheus`. Unlike every
+//! scenario above it, its wall-clock cost is dominated by the compaction
+//! sweep's own 30-second-floor cadence rather than by `SUNDOG_BENCH_CHURN_COUNTERS`/
+//! `SUNDOG_BENCH_CHURN_REPLACEMENTS`, so it reports a single run rather
+//! than a median over [`repetitions`].
 
 mod common;
 
@@ -110,7 +125,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sundog::crdt::{PnCounter, PnCounterResolver};
+use sundog::crdt::{PnCounter, PnCounterResolver, WriterId};
 use sundog::{Cluster, ClusterConfig, ConflictResolver, Mode, NodeId, RecordView, Winner};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -148,9 +163,8 @@ fn repetitions() -> u32 {
 }
 
 /// The entity count `N` scenarios 7 and 8 scale, `SUNDOG_BENCH_KEYS`
-/// overriding `default`. Each scenario passes its own default; both are
-/// lower than the plan's own defaults (`20_000` and `100_000` respectively),
-/// documented where each is defined.
+/// overriding `default`. Each scenario passes its own default, `20_000`
+/// and `100_000` respectively, documented where each is defined.
 fn scale_keys(default: u32) -> u32 {
     env_u32("SUNDOG_BENCH_KEYS", default)
 }
@@ -227,6 +241,18 @@ async fn local_cluster(name: &str) -> Cluster {
         .build()
         .await
         .expect("single-node loopback cluster builds")
+}
+
+/// A synthetic, fixed-incarnation writer identity for a benchmark's own
+/// simulated writer index `id`. Every scenario before the churn scenario at
+/// the end of this file assigns each concurrent writer a distinct `NodeId`
+/// that is never a real cluster member and never restarts, so pairing it
+/// with a fixed incarnation of `1` is exact, not an approximation: none of
+/// those scenarios runs anywhere near the compaction sweep's own
+/// 30-second-floor cadence (`sundog/src/cluster.rs`), so retirement never
+/// engages and the incarnation value itself carries no meaning there.
+fn synthetic_writer(id: u64) -> WriterId {
+    WriterId::new(NodeId::from(id), 1)
 }
 
 /// Builds three loopback `Mode::Replicated` caches of the same name across
@@ -579,6 +605,97 @@ fn entries_received_field(median: u64) -> String {
 
 #[cfg(not(feature = "prometheus"))]
 fn entries_received_field(_median: u64) -> String {
+    String::new()
+}
+
+/// The current value of `sundog_crdt_retired_writers_total{cache=cache_name}`,
+/// the per-writer retirement counter incremented once per `WriterId` the
+/// compaction sweep folds out of `cache_name`'s live state, or 0 if the
+/// recorder never installed or nothing has retired yet.
+#[cfg(feature = "prometheus")]
+fn crdt_retired_writers_total(cache_name: &str) -> u64 {
+    let value = metrics_handle().and_then(|h| {
+        scraped_metric(
+            &h.render(),
+            "sundog_crdt_retired_writers_total",
+            &[("cache", cache_name)],
+        )
+    });
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "sundog_crdt_retired_writers_total is a nonnegative counter"
+    )]
+    let count = value.unwrap_or(0.0).round() as u64;
+    count
+}
+
+/// [`ae_repaired_snapshot`]'s counterpart for [`crdt_retired_writers_total`],
+/// for a before/after delta around the churn scenario's compaction wait.
+#[cfg(feature = "prometheus")]
+fn crdt_retired_writers_snapshot(cache_name: &str) -> u64 {
+    crdt_retired_writers_total(cache_name)
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn crdt_retired_writers_snapshot(_cache_name: &str) -> u64 {
+    0
+}
+
+/// [`ae_repaired_field`]'s counterpart for the churn scenario's
+/// [`crdt_retired_writers_snapshot`] delta.
+#[cfg(feature = "prometheus")]
+fn crdt_retired_writers_field(median: u64) -> String {
+    format!(" crdt_retired_writers_total={median}")
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn crdt_retired_writers_field(_median: u64) -> String {
+    String::new()
+}
+
+/// The current value of `sundog_crdt_compactions_total{cache=cache_name}`,
+/// the per-tick record-compaction counter, or 0 if the recorder never
+/// installed or nothing has compacted yet.
+#[cfg(feature = "prometheus")]
+fn crdt_compactions_total(cache_name: &str) -> u64 {
+    let value = metrics_handle().and_then(|h| {
+        scraped_metric(
+            &h.render(),
+            "sundog_crdt_compactions_total",
+            &[("cache", cache_name)],
+        )
+    });
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "sundog_crdt_compactions_total is a nonnegative counter"
+    )]
+    let count = value.unwrap_or(0.0).round() as u64;
+    count
+}
+
+/// [`ae_repaired_snapshot`]'s counterpart for [`crdt_compactions_total`], for
+/// a before/after delta around the churn scenario's compaction wait.
+#[cfg(feature = "prometheus")]
+fn crdt_compactions_snapshot(cache_name: &str) -> u64 {
+    crdt_compactions_total(cache_name)
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn crdt_compactions_snapshot(_cache_name: &str) -> u64 {
+    0
+}
+
+/// [`ae_repaired_field`]'s counterpart for the churn scenario's
+/// [`crdt_compactions_snapshot`] delta.
+#[cfg(feature = "prometheus")]
+fn crdt_compactions_field(median: u64) -> String {
+    format!(" crdt_compactions_total={median}")
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn crdt_compactions_field(_median: u64) -> String {
     String::new()
 }
 
@@ -958,7 +1075,7 @@ async fn run_merged_rep(
     let handles: Vec<_> = (0..writers)
         .map(|w| {
             let cache_a = cache_a.clone();
-            let node = NodeId::from(u64::from(w));
+            let writer = synthetic_writer(u64::from(w));
             tokio::spawn(async move {
                 let mut latencies = Vec::with_capacity(iters as usize);
                 for i in 1..=iters {
@@ -967,7 +1084,7 @@ async fn run_merged_rep(
                         let _ = cache_a.get(&key).await;
                     }
                     cache_a
-                        .insert(key, PnCounter::local_delta(node, u64::from(i)))
+                        .insert(key, PnCounter::local_delta(writer, u64::from(i)))
                         .await
                         .expect("insert succeeds");
                     latencies.push(t0.elapsed());
@@ -984,7 +1101,7 @@ async fn run_merged_rep(
     let elapsed = started.elapsed();
     all_latencies.sort_unstable();
 
-    let expected = i64::from(writers) * i64::from(iters);
+    let expected = i128::from(writers) * i128::from(iters);
     let final_value = cache_a.get(&key).await.map_or(0, |c| c.value());
     let lost_updates = u64::try_from((expected - final_value).max(0)).unwrap_or(0);
 
@@ -1153,7 +1270,7 @@ async fn apply_ns_merge() {
     let ops = micro_ops();
     let reps = repetitions();
     let cache_name = "crdt-apply-merge";
-    let node = NodeId::from(0u64);
+    let writer = synthetic_writer(0);
 
     let mut rep_metrics = Vec::with_capacity(reps as usize);
     for _ in 0..reps {
@@ -1163,8 +1280,8 @@ async fn apply_ns_merge() {
                 cache_name,
                 Arc::new(PnCounterResolver),
                 ops,
-                PnCounter::local_delta(node, 0),
-                |i| PnCounter::local_delta(node, u64::from(i)),
+                PnCounter::local_delta(writer, 0),
+                |i| PnCounter::local_delta(writer, u64::from(i)),
             )
             .await,
         );
@@ -1265,10 +1382,10 @@ async fn run_resident_rep(
         }
     }
 
-    let node0 = NodeId::from(0u64);
+    let sole_writer = synthetic_writer(0);
     for cumulative in 1..=(u64::from(writers) * u64::from(iters)) {
         mrg_a
-            .insert(0u32, PnCounter::local_delta(node0, cumulative))
+            .insert(0u32, PnCounter::local_delta(sole_writer, cumulative))
             .await
             .expect("merged insert succeeds");
     }
@@ -1417,7 +1534,7 @@ async fn decomposed_all_converged(caches: &[&sundog::Cache<String, u64>], keys: 
 async fn merged_all_converged(
     caches: &[&sundog::Cache<u32, PnCounter>],
     keys: u32,
-    expected: i64,
+    expected: i128,
 ) -> bool {
     for i in 0..keys {
         for cache in caches {
@@ -1440,11 +1557,11 @@ async fn merged_all_converged(
 // the cold-join replication cost this scenario measures.
 // ---------------------------------------------------------------------
 
-/// `SUNDOG_BENCH_KEYS` default for `cold_join_initial_replication`. The
-/// plan's own default is `20_000`; at that size, the population writes are
+/// `SUNDOG_BENCH_KEYS` default for `cold_join_initial_replication`. At
+/// `20_000` keys, the population writes are
 /// cheap (one `insert_many` per writer), but the exact-total correctness
-/// pass this scenario runs before and after the join — `SCALE_WRITERS`
-/// real `.get()` round trips per counter, on top of `keys` themselves —
+/// pass this scenario runs before and after the join (`SCALE_WRITERS`
+/// real `.get()` round trips per counter, on top of `keys` themselves)
 /// does not pipeline and would risk the 3-minute budget once
 /// `repetitions()` reps and both variants are added up on a 4-core box.
 /// `2_000` keeps that pass fast while still exercising a cold join against a
@@ -1580,16 +1697,20 @@ async fn run_cold_join_merged_rep(keys: u32) -> ColdJoinRepMetrics {
 
     for (writer, cache) in [&cache_a, &cache_b, &cache_c].into_iter().enumerate() {
         let writer = u32::try_from(writer).expect("3-element writer index fits in u32");
-        let node = NodeId::from(u64::from(writer));
-        let entries =
-            (0..keys).map(|i| (i, PnCounter::local_delta(node, SCALE_INCREMENTS_PER_WRITER)));
+        let writer_id = synthetic_writer(u64::from(writer));
+        let entries = (0..keys).map(|i| {
+            (
+                i,
+                PnCounter::local_delta(writer_id, SCALE_INCREMENTS_PER_WRITER),
+            )
+        });
         cache
             .insert_many(entries)
             .await
             .expect("merged population insert_many succeeds");
     }
 
-    let expected = i64::try_from(scale_expected_total()).unwrap_or(i64::MAX);
+    let expected = i128::from(scale_expected_total());
     common::eventually(Duration::from_secs(30), || async {
         merged_all_converged(&[&cache_a, &cache_b, &cache_c], keys, expected).await
     })
@@ -1689,7 +1810,7 @@ async fn cold_join_initial_replication_merged() {
 // ---------------------------------------------------------------------
 
 /// `SUNDOG_BENCH_KEYS` default for `large_entity_convergence`, lowered from
-/// the plan's own `100_000` for the same reason [`COLD_JOIN_KEYS_DEFAULT`] is:
+/// `100_000` for the same reason [`COLD_JOIN_KEYS_DEFAULT`] is:
 /// this scenario's writers issue one real `.insert` per counter rather than
 /// a bulk `insert_many`, and its convergence check reads every counter back
 /// from all three nodes, so `100_000` would risk the 3-minute budget once
@@ -1838,11 +1959,14 @@ async fn run_large_entity_merged_rep(keys: u32) -> ScaleConvergeRepMetrics {
         .enumerate()
         .map(|(writer, cache)| {
             let writer = u32::try_from(writer).expect("3-element writer index fits in u32");
-            let node = NodeId::from(u64::from(writer));
+            let writer_id = synthetic_writer(u64::from(writer));
             tokio::spawn(async move {
                 for i in 0..keys {
                     cache
-                        .insert(i, PnCounter::local_delta(node, SCALE_INCREMENTS_PER_WRITER))
+                        .insert(
+                            i,
+                            PnCounter::local_delta(writer_id, SCALE_INCREMENTS_PER_WRITER),
+                        )
                         .await
                         .expect("merged insert succeeds");
                 }
@@ -1865,7 +1989,7 @@ async fn run_large_entity_merged_rep(keys: u32) -> ScaleConvergeRepMetrics {
         lost_updates += scale_expected_total().saturating_sub(actual);
     }
 
-    let expected = i64::try_from(scale_expected_total()).unwrap_or(i64::MAX);
+    let expected = i128::from(scale_expected_total());
     let convergence_started = Instant::now();
     common::eventually(Duration::from_secs(60), || async {
         merged_all_converged(&[&cache_a, &cache_b, &cache_c], keys, expected).await
@@ -1989,8 +2113,8 @@ where
 // from its `one_key` fold benefit.
 // ---------------------------------------------------------------------
 
-/// `SUNDOG_BENCH_KEYS` default for `apply_many_prefold`'s batch size,
-/// matching the plan's own 1,000-record batch.
+/// `SUNDOG_BENCH_KEYS` default for `apply_many_prefold`'s batch size:
+/// 1,000 records.
 const PREFOLD_BATCH_DEFAULT: u32 = 1_000;
 
 fn prefold_batch_size() -> u32 {
@@ -2154,7 +2278,7 @@ async fn apply_many_prefold() {
 
     let batch_size = prefold_batch_size();
     let reps = repetitions();
-    let node = NodeId::from(0u64);
+    let writer = synthetic_writer(0);
 
     for (shape_name, one_key) in [("one_key", true), ("many_keys", false)] {
         let mut lww_metrics = Vec::with_capacity(reps as usize);
@@ -2188,7 +2312,7 @@ async fn apply_many_prefold() {
                     batch_size,
                     one_key,
                     rep_idx % 2 == 1,
-                    move |i| PnCounter::local_delta(node, u64::from(i) + 1),
+                    move |i| PnCounter::local_delta(writer, u64::from(i) + 1),
                 )
                 .await,
             );
@@ -2283,11 +2407,11 @@ async fn run_hot_counter_receive_rep(
     let handles: Vec<_> = (0..writers)
         .map(|w| {
             let cache_a = cache_a.clone();
-            let node = NodeId::from(u64::from(w));
+            let writer = synthetic_writer(u64::from(w));
             tokio::spawn(async move {
                 for i in 1..=iters {
                     cache_a
-                        .insert(key, PnCounter::local_delta(node, u64::from(i)))
+                        .insert(key, PnCounter::local_delta(writer, u64::from(i)))
                         .await
                         .expect("insert succeeds");
                 }
@@ -2298,7 +2422,7 @@ async fn run_hot_counter_receive_rep(
         handle.await.expect("writer worker did not panic");
     }
 
-    let expected = i64::from(writers) * i64::from(iters);
+    let expected = i128::from(writers) * i128::from(iters);
     let snapshot = cache_a.get(&key).await.map_or(0, |c| c.value());
     let lost_updates = u64::try_from((expected - snapshot).max(0)).unwrap_or(0);
 
@@ -2467,13 +2591,13 @@ async fn run_coalesced_rep(
     let handles: Vec<_> = (0..writers)
         .map(|w| {
             let cache_a = cache_a.clone();
-            let node = NodeId::from(u64::from(w));
+            let writer = synthetic_writer(u64::from(w));
             tokio::spawn(async move {
                 let mut latencies = Vec::with_capacity(iters as usize);
                 for i in 1..=iters {
                     let t0 = Instant::now();
                     cache_a
-                        .merge(key, PnCounter::local_delta(node, u64::from(i)))
+                        .merge(key, PnCounter::local_delta(writer, u64::from(i)))
                         .await
                         .expect("merge succeeds");
                     latencies.push(t0.elapsed());
@@ -2490,7 +2614,7 @@ async fn run_coalesced_rep(
     let elapsed = started.elapsed();
     all_latencies.sort_unstable();
 
-    let expected = i64::from(writers) * i64::from(iters);
+    let expected = i128::from(writers) * i128::from(iters);
     let snapshot = cache_a.get(&key).await.map_or(0, |c| c.value());
     let lost_updates = u64::try_from((expected - snapshot).max(0)).unwrap_or(0);
 
@@ -2612,11 +2736,14 @@ async fn run_large_entity_coalesced_rep(keys: u32) -> ScaleConvergeRepMetrics {
         .enumerate()
         .map(|(writer, cache)| {
             let writer = u32::try_from(writer).expect("3-element writer index fits in u32");
-            let node = NodeId::from(u64::from(writer));
+            let writer_id = synthetic_writer(u64::from(writer));
             tokio::spawn(async move {
                 for i in 0..keys {
                     cache
-                        .merge(i, PnCounter::local_delta(node, SCALE_INCREMENTS_PER_WRITER))
+                        .merge(
+                            i,
+                            PnCounter::local_delta(writer_id, SCALE_INCREMENTS_PER_WRITER),
+                        )
                         .await
                         .expect("merged merge succeeds");
                 }
@@ -2639,7 +2766,7 @@ async fn run_large_entity_coalesced_rep(keys: u32) -> ScaleConvergeRepMetrics {
         lost_updates += scale_expected_total().saturating_sub(actual);
     }
 
-    let expected = i64::try_from(scale_expected_total()).unwrap_or(i64::MAX);
+    let expected = i128::from(scale_expected_total());
     let convergence_started = Instant::now();
     common::eventually(Duration::from_secs(60), || async {
         merged_all_converged(&[&cache_a, &cache_b, &cache_c], keys, expected).await
@@ -3002,12 +3129,12 @@ async fn run_sketch_path_pn_counter_rep(keys: u32, min_bucket: usize) -> SketchP
     .await;
 
     let dense_keys = keys_in_one_bucket(keys as usize);
-    let node = NodeId::from(0u64);
+    let writer = synthetic_writer(0);
     cache_a
         .insert_many(
             dense_keys
                 .iter()
-                .map(|&k| (k, PnCounter::local_delta(node, 1))),
+                .map(|&k| (k, PnCounter::local_delta(writer, 1))),
         )
         .await
         .expect("dense bulk insert succeeds");
@@ -3055,4 +3182,297 @@ async fn sketch_path_convergence_pn_counter() {
     }
 
     print_sketch_path_bench("pn_counter", keys, SKETCH_PATH_MIN_BUCKET, &rep_metrics);
+}
+
+// ---------------------------------------------------------------------
+// Scenario 14: crdt_compaction_writer_churn — the two-stage writer
+// retirement rule: `CHURN_COUNTERS`
+// `PnCounter` keys, one logical writer role that is torn down and rebuilt
+// `CHURN_REPLACEMENTS` times under the SAME persisted `NodeId`
+// (`ClusterBuilder::node_id`), joining a stable observer node each time.
+// Reusing the node id means every rebuild mints a fresh incarnation
+// (`Cache::writer_id`, pairing that node id with `Cluster::local_incarnation`)
+// and the *previous* incarnation is dead the instant the new one is visible
+// live (`membership::incarnation_is_dead`), with no absence wait needed for
+// stage one. `ClusterConfig::crdt_retire_after` is set to
+// [`CHURN_RETIRE_AFTER`], a few seconds, so stage two's `2x` bound
+// is comfortably aged within a couple of the
+// compaction sweep's own 30-second-floor ticks
+// (`(crdt_retire_after / 4).max(30s)`, `crdt_compact_task`,
+// `sundog/src/cluster.rs`). That fixed floor, not `CHURN_COUNTERS` or
+// `CHURN_REPLACEMENTS`, is what dominates this scenario's wall-clock cost,
+// so unlike every scenario above it this one reports a single run rather
+// than a median over [`repetitions`]: waiting out that floor several times
+// over just to average an otherwise-deterministic outcome buys nothing.
+//
+// Reports one counter's encoded record size (`PnCounter::encode().len()`),
+// still carrying every historical incarnation's own live slot right after
+// the last replacement since no sweep has run yet at that point, against
+// its size once the sweep has had time to retire the dead
+// incarnations (stage one) and fold them into the bounded scalar
+// accumulator (stage two), so the metadata bound is visible directly in the
+// two numbers on the printed `BENCH` line, plus the retired-writer/
+// compaction counters under `--features prometheus`. Asserts the aggregate
+// total is unaffected by however many replacements or compaction passes
+// ran, and that the record never ends up
+// larger after compaction than it was before.
+// ---------------------------------------------------------------------
+
+/// `N` counters churned in [`crdt_compaction_writer_churn`].
+/// `SUNDOG_BENCH_CHURN_COUNTERS` overrides.
+const CHURN_COUNTERS_DEFAULT: u32 = 3;
+
+fn churn_counters() -> u32 {
+    env_u32("SUNDOG_BENCH_CHURN_COUNTERS", CHURN_COUNTERS_DEFAULT)
+}
+
+/// `K`, the number of times the churn scenario's single writer role is torn
+/// down and rebuilt under the same persisted `NodeId`.
+/// `SUNDOG_BENCH_CHURN_REPLACEMENTS` overrides.
+const CHURN_REPLACEMENTS_DEFAULT: u32 = 3;
+
+fn churn_replacements() -> u32 {
+    env_u32(
+        "SUNDOG_BENCH_CHURN_REPLACEMENTS",
+        CHURN_REPLACEMENTS_DEFAULT,
+    )
+}
+
+/// Each writer incarnation's one-shot contribution to every counter: fixed
+/// so the fully-converged total is always
+/// `churn_replacements() * CHURN_INCREMENT_PER_WRITER`, independent of
+/// `churn_counters()`.
+const CHURN_INCREMENT_PER_WRITER: u64 = 10;
+
+/// `ClusterConfig::crdt_retire_after` for this scenario: short enough that
+/// stage two's `2x` bound elapses within a couple of the compaction sweep's
+/// own 30-second-floor ticks, long enough that one replacement round's
+/// build-and-join (well under a second on loopback) never itself outlives
+/// it and gets treated as a genuine absence.
+const CHURN_RETIRE_AFTER: Duration = Duration::from_secs(2);
+
+/// How long to wait, after the last replacement lands, for the compaction
+/// sweep to run several times over: `crdt_compact_task`'s ticker fires
+/// immediately on the observer's cache opening (before any replacement has
+/// happened) and every `(CHURN_RETIRE_AFTER / 4).max(30s)` — 30s here —
+/// after that, so five ticks comfortably covers stage one (the first tick
+/// after every dead incarnation is visible) and stage two (a later tick,
+/// once `2 * CHURN_RETIRE_AFTER` has aged past a dead incarnation's own
+/// retirement, folding it into the bounded scalar) with slack to spare.
+fn churn_compaction_wait() -> Duration {
+    Duration::from_secs(150)
+}
+
+/// [`merged_all_converged`]'s single-cache counterpart for the churn
+/// scenario's one observer cache.
+async fn churn_converged(
+    cache: &sundog::Cache<u32, PnCounter>,
+    counters: u32,
+    expected: i128,
+) -> bool {
+    for i in 0..counters {
+        if cache.get(&i).await.map(|c| c.value()) != Some(expected) {
+            return false;
+        }
+    }
+    true
+}
+
+struct ChurnRepMetrics {
+    bytes_before_compaction: u64,
+    bytes_after_compaction: u64,
+    retired_writers_total: u64,
+    compactions_total: u64,
+}
+
+fn print_churn_bench(name: &str, counters: u32, replacements: u32, metrics: &ChurnRepMetrics) {
+    println!(
+        "BENCH {name} counters={counters} replacements={replacements} reps=1 \
+         record_bytes_before_compaction={} record_bytes_after_compaction={}{}{}",
+        metrics.bytes_before_compaction,
+        metrics.bytes_after_compaction,
+        crdt_retired_writers_field(metrics.retired_writers_total),
+        crdt_compactions_field(metrics.compactions_total),
+    );
+}
+
+/// One churn round: builds a fresh writer incarnation under
+/// `writer_node_id`, joined to `observer_addr`, writes
+/// [`CHURN_INCREMENT_PER_WRITER`] to every one of `counters` counters, and
+/// waits for the observer to see the cumulative total through this round.
+/// Returns the built cluster so the caller decides whether to tear it down
+/// (every round but the last) or keep it running as the still-live
+/// "current" writer (the last round) — see [`run_crdt_compaction_churn`].
+async fn run_churn_writer_round(
+    cluster_label: &str,
+    cache_name: &str,
+    observer_addr: SocketAddr,
+    observer_cache: &sundog::Cache<u32, PnCounter>,
+    writer_node_id: NodeId,
+    round: u32,
+    counters: u32,
+) -> Cluster {
+    let writer_addr = reserve_gossip_addr().await;
+    let writer_cluster = Cluster::builder(cluster_label)
+        .node_id(writer_node_id)
+        .seeds([observer_addr])
+        .config(node_config(writer_addr).with(|c| {
+            c.crdt_retire_after = CHURN_RETIRE_AFTER;
+        }))
+        .build()
+        .await
+        .unwrap_or_else(|error| panic!("writer round {round} builds: {error}"));
+    let writer_cache = writer_cluster
+        .cache::<u32, PnCounter>(cache_name)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await
+        .unwrap_or_else(|error| panic!("writer round {round} opens the churn cache: {error}"));
+    let writer = writer_cache.writer_id();
+
+    for i in 0..counters {
+        writer_cache
+            .insert(
+                i,
+                PnCounter::local_delta(writer, CHURN_INCREMENT_PER_WRITER),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("writer round {round} counter {i} inserts: {error}"));
+    }
+
+    let expected_so_far = i128::from(round + 1) * i128::from(CHURN_INCREMENT_PER_WRITER);
+    common::eventually(Duration::from_secs(15), || async {
+        churn_converged(observer_cache, counters, expected_so_far).await
+    })
+    .await;
+
+    writer_cluster
+}
+
+async fn run_crdt_compaction_churn() -> ChurnRepMetrics {
+    #[cfg(feature = "prometheus")]
+    let _ = metrics_handle();
+
+    let counters = churn_counters();
+    let replacements = churn_replacements();
+    let cluster_label = "bench-crdt-churn";
+    let cache_name = "crdt-churn";
+
+    let observer_addr = reserve_gossip_addr().await;
+    let observer = Cluster::builder(cluster_label)
+        .seeds(std::iter::empty())
+        .config(node_config(observer_addr).with(|c| {
+            c.crdt_retire_after = CHURN_RETIRE_AFTER;
+        }))
+        .build()
+        .await
+        .expect("observer node builds");
+    let observer_cache = observer
+        .cache::<u32, PnCounter>(cache_name)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await
+        .expect("observer opens the churn cache");
+
+    let retired_before = crdt_retired_writers_snapshot(cache_name);
+    let compactions_before = crdt_compactions_snapshot(cache_name);
+
+    // The one writer role, replaced `replacements` times under the same
+    // persisted node id: every rebuild is a brand-new process as far as
+    // `PnCounter`/`WriterId` are concerned, restarting its own contribution
+    // from zero under its fresh incarnation.
+    let writer_node_id = NodeId::random();
+    let mut bytes_before_compaction = 0u64;
+    // Holds the final round's cluster past the loop: every earlier
+    // incarnation is torn down as soon as its round converges, so its slot
+    // goes dead (superseded by the next round's fresh incarnation), but the
+    // last one stays up as the still-live "current" writer through the
+    // compaction wait below, matching real churn — only past writers
+    // retire, never the one still running.
+    let mut current_writer_cluster: Option<Cluster> = None;
+    for round in 0..replacements {
+        let writer_cluster = run_churn_writer_round(
+            cluster_label,
+            cache_name,
+            observer_addr,
+            &observer_cache,
+            writer_node_id,
+            round,
+            counters,
+        )
+        .await;
+
+        if round + 1 == replacements {
+            bytes_before_compaction = observer_cache
+                .get(&0)
+                .await
+                .expect("counter 0 has landed on the observer")
+                .encode()
+                .expect("PnCounter::encode never fails on a resident value")
+                .len() as u64;
+            current_writer_cluster = Some(writer_cluster);
+        } else {
+            writer_cluster.shutdown().await;
+        }
+    }
+
+    let expected = i128::from(replacements) * i128::from(CHURN_INCREMENT_PER_WRITER);
+    tokio::time::sleep(churn_compaction_wait()).await;
+
+    common::eventually(Duration::from_secs(30), || async {
+        churn_converged(&observer_cache, counters, expected).await
+    })
+    .await;
+
+    let bytes_after_compaction = observer_cache
+        .get(&0)
+        .await
+        .expect("counter 0 is still resident after compaction")
+        .encode()
+        .expect("PnCounter::encode never fails on a resident value")
+        .len() as u64;
+    assert!(
+        bytes_after_compaction <= bytes_before_compaction,
+        "compaction should never leave a record larger than it started: \
+         before={bytes_before_compaction} after={bytes_after_compaction}"
+    );
+
+    let retired_writers_total =
+        crdt_retired_writers_snapshot(cache_name).saturating_sub(retired_before);
+    let compactions_total =
+        crdt_compactions_snapshot(cache_name).saturating_sub(compactions_before);
+
+    if let Some(current_writer_cluster) = current_writer_cluster {
+        current_writer_cluster.shutdown().await;
+    }
+    observer.shutdown().await;
+
+    ChurnRepMetrics {
+        bytes_before_compaction,
+        bytes_after_compaction,
+        retired_writers_total,
+        compactions_total,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn crdt_compaction_writer_churn() {
+    if !bench_enabled() {
+        eprintln!("skipping: SUNDOG_BENCH=1 not set");
+        return;
+    }
+
+    let counters = churn_counters();
+    let replacements = churn_replacements();
+
+    let metrics = Box::pin(run_crdt_compaction_churn()).await;
+
+    print_churn_bench(
+        "crdt_compaction_writer_churn",
+        counters,
+        replacements,
+        &metrics,
+    );
 }

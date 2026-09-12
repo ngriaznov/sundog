@@ -21,7 +21,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -41,7 +41,7 @@ use crate::discovery::statics::Static;
 use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
 use crate::hlc::Hlc;
-use crate::membership::{CacheModes, Membership, Peer};
+use crate::membership::{self, CacheModes, Membership, Peer};
 use crate::net::{
     AeServeOutcome, FetchServe, InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler,
     batch_forward, batch_replicate,
@@ -49,7 +49,8 @@ use crate::net::{
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
 use crate::store::{
-    FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of, chunk_records_for_snapshot,
+    FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of, chunk_records_for_snapshot, crdt,
+    now_ms,
 };
 use crate::wire::{self, Msg, WireRecord};
 
@@ -240,6 +241,14 @@ impl Cluster {
     #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.inner.node
+    }
+
+    /// This node's current membership incarnation: the value CRDT writer
+    /// identity (`WriterId { node, incarnation }`) reuses so a restarted
+    /// process writes from a fresh, never-before-seen slot instead of
+    /// resuming one a compaction sweep may already have retired.
+    pub(crate) fn local_incarnation(&self) -> u64 {
+        self.inner.membership.local_peer().incarnation
     }
 
     /// Opens or joins a named cache. Call `.open().await` on the result to
@@ -1497,6 +1506,21 @@ fn group_by_owner_set(
     groups
 }
 
+/// Encodes each of `msgs` into an [`OutFrame`], dropping (and logging) any
+/// that fails to encode — the one fan-out encoding policy every send site
+/// in this module shares.
+fn encode_frames(msgs: Vec<Msg>) -> Vec<OutFrame> {
+    msgs.into_iter()
+        .filter_map(|msg| match OutFrame::new(msg) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode outbound message; dropped");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Groups `records` by the exact target-peer set each should replicate to —
 /// its bucket's live owners under `view`, self excluded — then sends each
 /// group as `ForwardBatch` frames stamped with `view`'s hash through the
@@ -1517,16 +1541,7 @@ async fn fan_out_by_owner_set(
         if owners.is_empty() {
             continue;
         }
-        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), 0, recs)
-            .into_iter()
-            .filter_map(|msg| match OutFrame::new(msg) {
-                Ok(frame) => Some(frame),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to encode outbound message; dropped");
-                    None
-                }
-            })
-            .collect();
+        let frames = encode_frames(batch_forward(cache_name, view.view_hash(), 0, recs));
         for peer in owners {
             mesh.send_frames_awaiting(peer, frames.clone(), deadline)
                 .await;
@@ -1534,6 +1549,10 @@ async fn fan_out_by_owner_set(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one branch per Mode, each with its own send path"
+)]
 async fn fan_out_batch<K, V>(
     shard: &Shard<K, V>,
     cluster: &Cluster,
@@ -1608,43 +1627,41 @@ async fn fan_out_batch<K, V>(
     }
 
     let peers = cluster.live_peer_ids();
-    let (class, msgs): (MsgClass, Vec<Msg>) = match mode {
+    match mode {
         // Distributed is handled, and returned, above.
-        Mode::Local | Mode::Distributed { .. } => return,
-        Mode::Invalidation => (
-            MsgClass::Invalidate,
-            records
-                .into_iter()
-                .map(|rec| Msg::Invalidate {
-                    cache: cache_name.clone(),
-                    key: rec.key,
-                    ver: rec.ver,
-                })
-                .collect(),
-        ),
+        Mode::Local | Mode::Distributed { .. } => (),
+        Mode::Invalidation => {
+            // No value ever rides an invalidation, so there is nothing a
+            // low-protocol peer could misdecode: every peer gets the same
+            // frames, exactly as before.
+            let frames = encode_frames(
+                records
+                    .into_iter()
+                    .map(|rec| Msg::Invalidate {
+                        cache: cache_name.clone(),
+                        key: rec.key,
+                        ver: rec.ver,
+                    })
+                    .collect(),
+            );
+            for &peer in &peers {
+                cluster
+                    .mesh()
+                    .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
+            }
+        }
         // Pre-batched by the same budget/count rules `net::conn`'s writer
         // uses for coalescing, so a drained burst can't flood the outbox
         // into drop-newest. The writer-side coalescer still catches trickle
         // writes arriving one drained event at a time.
-        Mode::Replicated => (MsgClass::Replicate, batch_replicate(cache_name, records)),
-    };
-    // Encodes each message once, so every live peer gets a cheap `Bytes` clone
-    // of the same frame.
-    let frames: Vec<OutFrame> = msgs
-        .into_iter()
-        .filter_map(|msg| match OutFrame::new(msg) {
-            Ok(frame) => Some(frame),
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode outbound message; dropped");
-                None
+        Mode::Replicated => {
+            let frames = encode_frames(batch_replicate(cache_name, records));
+            for &peer in &peers {
+                cluster
+                    .mesh()
+                    .send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
             }
-        })
-        .collect();
-    // Resolves each peer's handle once and reuses it for the whole batch.
-    for &peer in &peers {
-        cluster
-            .mesh()
-            .send_frames(peer, class, frames.iter().cloned());
+        }
     }
 }
 
@@ -1680,6 +1697,246 @@ pub(crate) async fn tombstone_gc_task(
                 let view = shard.ownership_view();
                 let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl, view.as_deref());
                 shard.gc_tombstones(defer).await;
+            }
+        }
+    }
+}
+
+/// Whether writer `w` is eligible for CRDT retirement this tick: `w`'s
+/// node is dead — see
+/// [`membership::incarnation_is_dead`] — and `w` isn't `local`, this node's
+/// own current writer identity. The second guard is defense in depth: a
+/// live node's own current incarnation is already unreachable through
+/// `incarnation_is_dead` (it can be neither absent nor live under a
+/// different incarnation than itself), but keeping the check explicit
+/// means the invariant holds even if that stops being incidentally true.
+fn crdt_writer_is_retirement_eligible(
+    local: crdt::WriterId,
+    w: crdt::WriterId,
+    member: &membership::MemberView,
+    now: Instant,
+    bound: Duration,
+) -> bool {
+    w != local && membership::incarnation_is_dead(member, w.incarnation(), now, bound)
+}
+
+/// Whether an entire cache is quiet this tick: every member relevant to
+/// it has settled — see
+/// [`membership::member_is_quiet`] — meaning continuously present, or
+/// continuously absent, for at least `bound`. Vacuously `true` for a cache
+/// with no other known members (including the single-node case).
+///
+/// Only stage two of [`crdt::PnCounter::compact`]/[`crdt::OrSet::compact`]
+/// (folding an aged retired writer into the bounded scalar/dropping its
+/// `seen` watermark) reads this; stage one — moving a dead writer's live
+/// slot into its own per-writer retired entry — runs unconditionally on
+/// `retire` alone.
+fn crdt_cache_is_quiet(members: &[membership::MemberView], now: Instant, bound: Duration) -> bool {
+    members
+        .iter()
+        .all(|member| membership::member_is_quiet(member, now, bound))
+}
+
+/// Every [`membership::MemberView`] the CRDT compaction sweep for `name`
+/// treats as relevant this tick: every live peer that currently has `name`
+/// open, plus every member `absence` currently tracks absent at all —
+/// live-holder scoped, absentee-global: absence is tracked per-member
+/// globally, not per-(member, cache), so one absent member holds every
+/// merging cache's quiet check pending, not just the ones it had open.
+fn crdt_cache_members(
+    peers: &[Peer],
+    modes: &CacheModes,
+    name: &SmolStr,
+    absence: &absence::AbsenceTracker,
+) -> Vec<membership::MemberView> {
+    let live = peers
+        .iter()
+        .filter(|peer| {
+            modes
+                .get(&peer.node)
+                .is_some_and(|caches| caches.contains_key(name))
+        })
+        .map(|peer| membership::MemberView {
+            present_since: absence.present_since(peer.node),
+            absent_since: None,
+            live_incarnation: Some(peer.incarnation),
+        });
+    // `Duration::ZERO` makes every currently-tracked absentee match,
+    // non-destructively (`AbsenceTracker::absent_longer_than`'s own doc):
+    // this is a membership *listing*, not a retirement decision, so it must
+    // never prune.
+    let absent = absence
+        .absent_longer_than(Duration::ZERO)
+        .into_iter()
+        .map(|node| membership::MemberView {
+            present_since: None,
+            absent_since: absence.absent_since(node),
+            live_incarnation: None,
+        });
+    live.chain(absent).collect()
+}
+
+/// One pass of the CRDT writer-retirement sweep for one merging cache. Runs
+/// whenever the cache's resolver merges at all
+/// ([`ConflictResolver::merges`](crate::store::ConflictResolver::merges)
+/// via [`ShardOps::merges`]) — never gated on any peer's protocol, since
+/// no released node predates this crate's CRDT layouts and a cache with a
+/// merging resolver only ever runs on nodes that carry that resolver.
+/// Otherwise builds this tick's retirement predicate and the cache's quiet
+/// flag from the current membership/absence snapshot and hands both to
+/// [`ShardOps::compact_pass`]. Every writer the pass actually retired stops
+/// being tracked absent ([`absence::AbsenceTracker::mark_retired`]) and is
+/// counted in `sundog_crdt_retired_writers_total{cache}`;
+/// `sundog_crdt_compactions_total{cache}` counts records rewritten this
+/// pass.
+///
+/// Returns exactly what [`ShardOps::compact_pass`] returned (or `(vec![],
+/// 0)` for a non-merging cache), so a test can observe a single pass's
+/// outcome directly instead of scraping global metrics state. Split out
+/// from [`crdt_compact_task`]'s ticker loop for the same reason: a test can
+/// drive exactly one pass at a time without waiting on a real timer.
+async fn crdt_compact_tick(
+    shard: &dyn ShardOps,
+    name: &SmolStr,
+    cluster: &Cluster,
+    absence: &absence::AbsenceTracker,
+) -> (Vec<crdt::WriterId>, usize) {
+    if !shard.merges() {
+        return (Vec::new(), 0);
+    }
+    let peers = cluster.peers();
+    let modes = cluster.inner.membership.cache_modes().borrow().clone();
+
+    let retire_after = cluster.config().crdt_retire_after;
+    let batch = cluster.config().crdt_compact_batch;
+    let now = Instant::now();
+    let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
+    // Seeded with this node's own current incarnation, not just its peers':
+    // `Cluster::peers()` excludes self by construction, so without this a
+    // node could never tell its *own* past incarnations (same `NodeId`, an
+    // earlier `local_incarnation()` from before a restart) apart from a
+    // writer it has genuinely never observed — the "never observed" branch
+    // below always answers "not dead" once, and a node is never absent from
+    // its own point of view to ever fall back to the absence check either.
+    // A node's own current incarnation is always known with certainty, no
+    // membership round-trip required, so every one of its own past
+    // incarnations is unconditionally eligible the moment it holds a newer
+    // one live — the same "any difference counts" rule
+    // [`membership::incarnation_is_dead`] already applies to every peer.
+    // Left unfixed, a node's own dead incarnations never fold locally, and
+    // since the node keeps taking part in ordinary anti-entropy, its
+    // perpetually unfolded copy keeps re-merging its old writer slots back
+    // into every peer's already-compacted copy of the same record.
+    let mut live_incarnation: HashMap<NodeId, u64> = peers
+        .iter()
+        .map(|peer| (peer.node, peer.incarnation))
+        .collect();
+    live_incarnation.insert(cluster.node_id(), cluster.local_incarnation());
+
+    let members = crdt_cache_members(&peers, &modes, name, absence);
+    let quiet = crdt_cache_is_quiet(&members, now, retire_after);
+
+    let retire = |w: crdt::WriterId| {
+        let member = match live_incarnation.get(&w.node()) {
+            Some(&incarnation) => membership::MemberView {
+                present_since: None,
+                absent_since: None,
+                live_incarnation: Some(incarnation),
+            },
+            None => membership::MemberView {
+                present_since: None,
+                absent_since: absence.absent_since(w.node()),
+                live_incarnation: None,
+            },
+        };
+        crdt_writer_is_retirement_eligible(local, w, &member, now, retire_after)
+    };
+
+    let bound_ms = u64::try_from(retire_after.as_millis()).unwrap_or(u64::MAX);
+    let (retired, compacted) = shard
+        .compact_pass(now_ms(), &retire, quiet, bound_ms, batch)
+        .await;
+    for writer in &retired {
+        absence.mark_retired(writer.node());
+        metrics::counter!("sundog_crdt_retired_writers_total", "cache" => name.to_string())
+            .increment(1);
+    }
+    if compacted > 0 {
+        metrics::counter!("sundog_crdt_compactions_total", "cache" => name.to_string())
+            .increment(u64::try_from(compacted).unwrap_or(u64::MAX));
+    }
+    (retired, compacted)
+}
+
+/// Milliseconds from `now_ms` until the next wall-clock instant that is an
+/// exact multiple of `period_ms` — the same boundary regardless of which
+/// node computes it or when its own task happened to start, given
+/// reasonably synced clocks. [`crdt_compact_task`] uses this for every tick
+/// after its first: two replicas' compaction sweeps landing at (very
+/// nearly) the same real moment is what lets a receipt [`crdt::PnCounter`]/
+/// [`crdt::OrSet`] left behind actually disappear for good. Left as a
+/// process-relative fixed-period ticker instead (`tokio::time::interval`'s
+/// own behavior, and this function's own predecessor), two nodes whose
+/// tasks started even a few seconds apart tick at a permanently fixed
+/// offset from each other, and neither's own prune ever survives more than
+/// one anti-entropy round: node A prunes and is clean until node B's own
+/// (differently-phased) tick eventually sends its own not-yet-pruned copy
+/// back, re-merging the receipt into A (`PnCounter::merge`/`OrSet::merge`
+/// only ever union a receipt in, never drop one, so nothing short of *both*
+/// sides holding no receipt at the same moment ends this); B then prunes
+/// its own copy on its own schedule, but by then A's still-carried receipt
+/// (re-merged in during the gap before B's tick) flows back and re-infects
+/// B right after — forever, on every cycle, however long the run. Aligning
+/// every tick after the first to a shared boundary collapses that
+/// permanent gap to (at most) ordinary clock skew, so a receipt aged past
+/// the pruning bound is dropped by every reachable replica at essentially
+/// the same instant and has no not-yet-pruned copy left anywhere to
+/// resurrect it on the next round.
+///
+/// Returns `period_ms` itself (never `0`, even when `now_ms` already sits
+/// exactly on a boundary) so a caller never computes a zero-length sleep
+/// that would immediately recompute the very same boundary and spin.
+fn next_aligned_wait_ms(now_ms: u64, period_ms: u64) -> u64 {
+    if period_ms == 0 {
+        return 0;
+    }
+    let remainder = now_ms % period_ms;
+    if remainder == 0 {
+        period_ms
+    } else {
+        period_ms - remainder
+    }
+}
+
+/// Periodically runs [`crdt_compact_tick`] for one merging cache, at a
+/// quarter of `ClusterConfig::crdt_retire_after` (floored at 30s, the same
+/// cadence idea [`tombstone_gc_task`] uses): retirement eligibility, not
+/// raw traffic, is what changes over time here, so there's no need to poll
+/// faster than absence tracking itself changes.
+///
+/// The first tick fires immediately (a freshly opened cache should not
+/// wait a full period for its first sweep); every tick after that is
+/// aligned to a shared wall-clock boundary via
+/// [`next_aligned_wait_ms`] — see that function's own doc for why this
+/// alignment, not just the period, is load-bearing for `folded_at`
+/// receipts actually pruning under ongoing replication.
+pub(crate) async fn crdt_compact_task(
+    shard: Arc<dyn ShardOps>,
+    name: SmolStr,
+    cluster: Cluster,
+    absence: absence::AbsenceTracker,
+    cancel: CancellationToken,
+) {
+    let period = (cluster.config().crdt_retire_after / 4).max(Duration::from_secs(30));
+    let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+    let mut wait = Duration::ZERO;
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(wait) => {
+                crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+                wait = Duration::from_millis(next_aligned_wait_ms(now_ms(), period_ms));
             }
         }
     }
@@ -1726,8 +1983,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::cache::Cache;
     use crate::error::CacheError;
-    use crate::store::crdt::{PnCounter, PnCounterResolver};
+    use crate::store::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver};
     use crate::store::{ConflictResolver, Event, Origin, RecordView, Winner};
 
     /// Loopback-only config: skips the outbound-interface probe and keeps
@@ -1777,6 +2035,28 @@ mod tests {
         })
         .await
         .expect("the peer disappears from the live set within the bound");
+    }
+
+    #[tokio::test]
+    async fn local_incarnation_matches_the_membership_local_peer() {
+        let cluster = Cluster::builder("cluster-it-local-incarnation")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        assert_eq!(
+            cluster.local_incarnation(),
+            cluster.inner.membership.local_peer().incarnation
+        );
+        assert_ne!(
+            cluster.local_incarnation(),
+            0,
+            "a real membership incarnation is a current-time-derived value, never zero"
+        );
+
+        cluster.shutdown().await;
     }
 
     #[tokio::test]
@@ -2131,9 +2411,9 @@ mod tests {
             .await
             .expect("c opens");
 
-        let node_a = cluster_a.node_id();
-        let node_b = cluster_b.node_id();
-        let node_c = cluster_c.node_id();
+        let wid_a = crdt::WriterId::new(cluster_a.node_id(), cluster_a.local_incarnation());
+        let wid_b = crdt::WriterId::new(cluster_b.node_id(), cluster_b.local_incarnation());
+        let wid_c = crdt::WriterId::new(cluster_c.node_id(), cluster_c.local_incarnation());
 
         // Every node blindly increments the same key with no read
         // beforehand and no coordination between them, concurrently: each
@@ -2145,7 +2425,7 @@ mod tests {
             async move {
                 for cumulative in 1..=INCREMENTS_PER_NODE {
                     cache_a
-                        .insert(1, PnCounter::local_delta(node_a, cumulative))
+                        .insert(1, PnCounter::local_delta(wid_a, cumulative))
                         .await
                         .expect("a's blind increment applies");
                 }
@@ -2156,7 +2436,7 @@ mod tests {
             async move {
                 for cumulative in 1..=INCREMENTS_PER_NODE {
                     cache_b
-                        .insert(1, PnCounter::local_delta(node_b, cumulative))
+                        .insert(1, PnCounter::local_delta(wid_b, cumulative))
                         .await
                         .expect("b's blind increment applies");
                 }
@@ -2167,7 +2447,7 @@ mod tests {
             async move {
                 for cumulative in 1..=INCREMENTS_PER_NODE {
                     cache_c
-                        .insert(1, PnCounter::local_delta(node_c, cumulative))
+                        .insert(1, PnCounter::local_delta(wid_c, cumulative))
                         .await
                         .expect("c's blind increment applies");
                 }
@@ -2180,7 +2460,7 @@ mod tests {
         tb.await.expect("b's writer task doesn't panic");
         tc.await.expect("c's writer task doesn't panic");
 
-        let expected_total = i64::try_from(INCREMENTS_PER_NODE * 3).expect("small total fits i64");
+        let expected_total = i128::from(INCREMENTS_PER_NODE * 3);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let vals = [
@@ -2202,6 +2482,50 @@ mod tests {
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
         cluster_c.shutdown().await;
+    }
+
+    /// The Cache-level counterpart of `OrSet`'s own extensive merge/compact
+    /// unit tests: opens a real `Cache<String, OrSet<String>>` and drives
+    /// it through `insert`/`merge`/`get`, exercising the generic
+    /// `postcard::to_stdvec::<V>`/`from_bytes::<V>` path `Shard`/`Cache`
+    /// actually store and read values through — not `OrSet::encode`/
+    /// `decode` called directly, as every lower-level `or_set` test does.
+    /// `OrSet<T>` carries no `#[derive(Serialize, Deserialize)]`; its own
+    /// hand-rolled impls are what this path depends on.
+    #[tokio::test]
+    async fn or_set_cache_round_trips_through_the_generic_serde_path() {
+        let cluster = Cluster::builder("cluster-it-crdt-orset")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<String, OrSet<String>>("os")
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(OrSetResolver::<String>::new()))
+            .open()
+            .await
+            .expect("opens");
+
+        let writer = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
+        cache
+            .insert("k".to_string(), OrSet::add(writer, 0, "x".to_string()))
+            .await
+            .expect("insert");
+        let after_add = cache.get(&"k".to_string()).await.expect("present");
+        assert!(after_add.contains(&"x".to_string()));
+
+        let removed = OrSet::remove(&after_add, &"x".to_string());
+        cache.merge("k".to_string(), removed).await.expect("merge");
+        let after_remove = cache.get(&"k".to_string()).await.expect("still present");
+        assert!(
+            !after_remove.contains(&"x".to_string()),
+            "the removed element must not survive a round trip through the real \
+             storage/network encoding, not just OrSet::merge called directly"
+        );
+
+        cluster.shutdown().await;
     }
 
     /// Contrast with the merged test above: a plain get-then-insert
@@ -4887,5 +5211,685 @@ mod tests {
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------
+    // crdt_compact_task: pure decision logic.
+    // -----------------------------------------------------------------
+
+    /// `secs` seconds before `now`, for building [`membership::MemberView`]
+    /// fixtures without a real clock.
+    fn ago(now: Instant, secs: u64) -> Instant {
+        now.checked_sub(Duration::from_secs(secs))
+            .expect("test duration fits before `now`")
+    }
+
+    fn writer(node: u64, incarnation: u64) -> crdt::WriterId {
+        crdt::WriterId::new(NodeId::from(node), incarnation)
+    }
+
+    #[test]
+    fn crdt_writer_is_retirement_eligible_is_false_for_the_local_writer_even_if_absent() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let local = writer(1, 1);
+        // If `local` weren't excluded, this member view (absent well past
+        // the bound) would otherwise make it eligible.
+        let member = membership::MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 3600)),
+            live_incarnation: None,
+        };
+        assert!(!crdt_writer_is_retirement_eligible(
+            local, local, &member, now, bound
+        ));
+    }
+
+    #[test]
+    fn crdt_writer_is_retirement_eligible_is_true_for_a_writer_absent_past_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let local = writer(1, 1);
+        let w = writer(2, 1);
+        let member = membership::MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 3600)),
+            live_incarnation: None,
+        };
+        assert!(crdt_writer_is_retirement_eligible(
+            local, w, &member, now, bound
+        ));
+    }
+
+    #[test]
+    fn crdt_writer_is_retirement_eligible_defers_for_a_writer_absent_less_than_the_bound() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(3600);
+        let local = writer(1, 1);
+        let w = writer(2, 1);
+        let member = membership::MemberView {
+            present_since: None,
+            absent_since: Some(ago(now, 5)),
+            live_incarnation: None,
+        };
+        assert!(!crdt_writer_is_retirement_eligible(
+            local, w, &member, now, bound
+        ));
+    }
+
+    #[test]
+    fn crdt_writer_is_retirement_eligible_is_true_for_a_live_writer_under_a_different_incarnation()
+    {
+        let now = Instant::now();
+        let bound = Duration::from_secs(3600);
+        let local = writer(1, 1);
+        // node 2 is live, but under incarnation 9 now: incarnation 1's
+        // process is gone regardless of how recently node 2 restarted.
+        let old_w = writer(2, 1);
+        let member = membership::MemberView {
+            present_since: Some(now),
+            absent_since: None,
+            live_incarnation: Some(9),
+        };
+        assert!(crdt_writer_is_retirement_eligible(
+            local, old_w, &member, now, bound
+        ));
+    }
+
+    #[test]
+    fn crdt_writer_is_retirement_eligible_is_false_for_a_never_observed_writer() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let local = writer(1, 1);
+        let w = writer(2, 1);
+        let member = membership::MemberView {
+            present_since: None,
+            absent_since: None,
+            live_incarnation: None,
+        };
+        assert!(!crdt_writer_is_retirement_eligible(
+            local, w, &member, now, bound
+        ));
+    }
+
+    #[test]
+    fn next_aligned_wait_ms_reaches_the_next_multiple_of_the_period() {
+        assert_eq!(next_aligned_wait_ms(1_000, 30_000), 29_000);
+        assert_eq!(next_aligned_wait_ms(29_999, 30_000), 1);
+    }
+
+    #[test]
+    fn next_aligned_wait_ms_returns_a_full_period_exactly_on_a_boundary() {
+        assert_eq!(
+            next_aligned_wait_ms(60_000, 30_000),
+            30_000,
+            "sitting exactly on a boundary must still wait a full period, never spin at 0"
+        );
+        assert_eq!(next_aligned_wait_ms(0, 30_000), 30_000);
+    }
+
+    #[test]
+    fn next_aligned_wait_ms_is_the_same_boundary_regardless_of_starting_offset() {
+        // Two "nodes" reading the clock at different moments land on the
+        // exact same next boundary once each one's own wait has elapsed —
+        // the entire point of aligning by wall clock instead of by a
+        // per-node fixed period from an arbitrary start time.
+        let period_ms = 30_000;
+        let observer_now = 12_345;
+        let writer_now = 12_345 + 7_000;
+        let boundary_from_observer = observer_now + next_aligned_wait_ms(observer_now, period_ms);
+        let boundary_from_writer = writer_now + next_aligned_wait_ms(writer_now, period_ms);
+        assert_eq!(boundary_from_observer, boundary_from_writer);
+    }
+
+    #[test]
+    fn next_aligned_wait_ms_is_zero_for_a_zero_period() {
+        assert_eq!(next_aligned_wait_ms(12_345, 0), 0);
+    }
+
+    #[test]
+    fn crdt_cache_is_quiet_is_vacuously_true_with_no_members() {
+        let now = Instant::now();
+        assert!(crdt_cache_is_quiet(&[], now, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn crdt_cache_is_quiet_is_true_when_every_member_has_settled() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let members = [
+            membership::MemberView {
+                present_since: Some(ago(now, 120)),
+                absent_since: None,
+                live_incarnation: Some(1),
+            },
+            membership::MemberView {
+                present_since: None,
+                absent_since: Some(ago(now, 120)),
+                live_incarnation: None,
+            },
+        ];
+        assert!(crdt_cache_is_quiet(&members, now, bound));
+    }
+
+    #[test]
+    fn crdt_cache_is_quiet_is_false_when_one_member_has_not_settled() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let members = [
+            membership::MemberView {
+                present_since: Some(ago(now, 120)),
+                absent_since: None,
+                live_incarnation: Some(1),
+            },
+            // Recently returned/gone absent: not yet past the bound.
+            membership::MemberView {
+                present_since: None,
+                absent_since: Some(ago(now, 5)),
+                live_incarnation: None,
+            },
+        ];
+        assert!(!crdt_cache_is_quiet(&members, now, bound));
+    }
+
+    #[test]
+    fn crdt_cache_members_scopes_live_to_cache_holders_and_absentees_globally() {
+        let cache = SmolStr::new("counters");
+        let other_cache = SmolStr::new("other");
+        let holder = NodeId::from(2);
+        let bystander = NodeId::from(3);
+        let peers = vec![
+            Peer {
+                node: holder,
+                name: NodeName::new("host", holder),
+                gossip_addr: "127.0.0.1:0".parse().expect("valid addr"),
+                data_addr: "127.0.0.1:0".parse().expect("valid addr"),
+                incarnation: 7,
+                protocol: wire::PROTOCOL_VERSION,
+            },
+            Peer {
+                node: bystander,
+                name: NodeName::new("host", bystander),
+                gossip_addr: "127.0.0.1:0".parse().expect("valid addr"),
+                data_addr: "127.0.0.1:0".parse().expect("valid addr"),
+                incarnation: 3,
+                protocol: wire::PROTOCOL_VERSION,
+            },
+        ];
+        let mut modes: CacheModes = HashMap::new();
+        modes
+            .entry(holder)
+            .or_default()
+            .insert(cache.clone(), Mode::Replicated);
+        modes
+            .entry(bystander)
+            .or_default()
+            .insert(other_cache, Mode::Replicated);
+
+        let absentee = NodeId::from(4);
+        let absence = absence::AbsenceTracker::default();
+        // `absentee` starts live, then drops out once `holder`/`bystander`
+        // are the live set: the same tracker that reports presence for the
+        // live peers also reports the absentee, exactly as it would from a
+        // real membership feed.
+        absence.observe(&HashMap::from([(
+            absentee,
+            membership::LiveFlags { departing: false },
+        )]));
+        absence.observe(&HashMap::from([
+            (holder, membership::LiveFlags { departing: false }),
+            (bystander, membership::LiveFlags { departing: false }),
+        ]));
+
+        let members = crdt_cache_members(&peers, &modes, &cache, &absence);
+        assert_eq!(
+            members.len(),
+            2,
+            "the live holder of `cache` and the global absentee, but not the \
+             bystander holding a different cache"
+        );
+        assert!(
+            members
+                .iter()
+                .any(|m| m.live_incarnation == Some(7) && m.present_since.is_some()),
+            "the live holder's own incarnation is carried through"
+        );
+        assert!(
+            members
+                .iter()
+                .any(|m| m.absent_since.is_some() && m.live_incarnation.is_none()),
+            "the absentee is carried through even though it holds no cache at all"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // crdt_compact_task: end-to-end passes against a real cluster/shard,
+    // driving `crdt_compact_tick` directly (rather than the real ticker,
+    // which floors at 30s) with a fake `AbsenceTracker` for deterministic
+    // absence state.
+    // -----------------------------------------------------------------
+
+    fn crdt_loopback_config(retire_after: Duration) -> ClusterConfig {
+        ClusterConfig {
+            crdt_retire_after: retire_after,
+            crdt_compact_batch: 100,
+            ..loopback_config()
+        }
+    }
+
+    async fn open_counters_cache(cluster: &Cluster, name: &str) -> Cache<u32, PnCounter> {
+        cluster
+            .cache::<u32, PnCounter>(name)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("open succeeds")
+    }
+
+    /// The quiet-deferral variant: stage one (moving a dead writer's slot
+    /// into its own per-writer retired entry) runs as soon as the writer is
+    /// dead, but stage two (folding a long-aged retired entry into the
+    /// bounded scalar) defers for as long as any other member of the cache
+    /// hasn't settled, even once that entry is old enough on its own.
+    #[tokio::test]
+    async fn crdt_compact_tick_defers_stage_two_folding_while_the_cache_is_not_quiet() {
+        let retire_after = Duration::from_millis(30);
+        let cluster = Cluster::builder("cluster-it-crdt-quiet-deferral")
+            .seeds(std::iter::empty())
+            .config(crdt_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let name = SmolStr::new("counters");
+        let cache = open_counters_cache(&cluster, name.as_str()).await;
+        let shard = registered_shard(&cluster, &name);
+
+        let dead_writer = writer(999, 1);
+        cache
+            .insert(1, PnCounter::local_delta(dead_writer, 5))
+            .await
+            .expect("seed write");
+
+        let absence = absence::AbsenceTracker::default();
+        absence.observe(&HashMap::from([(
+            dead_writer.node(),
+            membership::LiveFlags { departing: false },
+        )]));
+        absence.observe(&HashMap::new());
+
+        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
+
+        // Stage one: with no other known members the cache is vacuously
+        // quiet, so the dead writer's live slot moves into its own retired
+        // entry the moment it's found dead.
+        let (retired, compacted) =
+            crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+        assert_eq!(retired, vec![dead_writer]);
+        assert_eq!(compacted, 1);
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(5),
+            "stage one never changes the counter's value"
+        );
+
+        // Age the dead writer's retired entry well past the stage-two
+        // bound (`2 * retire_after`) *before* introducing any other
+        // member, so the only thing standing between it and stage two is
+        // the cache's quiet flag, not its own age.
+        tokio::time::sleep(retire_after * 2 + Duration::from_millis(30)).await;
+
+        // A second, freshly-unsettled member, introduced right before the
+        // next pass: its own absence age is close to zero, well under
+        // `retire_after`, so it alone holds the cache's quiet flag false —
+        // absence is tracked globally, not per-cache, so this holds every
+        // merging cache's quiet check pending, regardless of which cache
+        // `flaky` ever had open.
+        let flaky = NodeId::from(998);
+        absence.observe(&HashMap::from([(
+            flaky,
+            membership::LiveFlags { departing: false },
+        )]));
+        absence.observe(&HashMap::new());
+
+        // The dead writer's retired entry is now old enough for stage two,
+        // but `flaky` hasn't settled yet, so the cache stays not-quiet and
+        // stage two must defer.
+        let (retired, compacted) =
+            crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+        assert!(
+            retired.is_empty(),
+            "no writer newly enters stage one this pass"
+        );
+        assert_eq!(
+            compacted, 0,
+            "stage two defers while the cache is not quiet"
+        );
+
+        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
+
+        // `flaky` has now itself been continuously absent past the bound,
+        // settling it: the cache is quiet and stage two folds the
+        // long-aged retired entry into the bounded scalar accumulator.
+        let (retired, compacted) =
+            crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+        assert!(retired.is_empty());
+        assert_eq!(
+            compacted, 1,
+            "stage two runs once the cache settles: this pass's own change is exactly \
+             what was deferred above"
+        );
+        // `ShardOps::compact_pass` applies stage two's folded bytes via
+        // `Engine::compact_replace_if_current` — a version-gated direct
+        // replace, never a merge against the still-resident pre-fold
+        // bytes — so the folded value this pass produced is exactly what
+        // is now resident, with nothing to reconcile.
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(5),
+            "stage two's own fold never changes the counter's value"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    /// A node's own past incarnation (same [`NodeId`] as this very node,
+    /// under an incarnation earlier than [`Cluster::local_incarnation`] —
+    /// the shape a persisted-node-id restart or replacement leaves behind)
+    /// retires and folds away with no peers and no absence tracking
+    /// involved at all: `Cluster::peers()` excludes self by construction,
+    /// so a node can never learn its own dead past selves are dead through
+    /// the peer-liveness or absence-tracking paths a genuine peer's writer
+    /// identity uses. Left unseeded, `retire` for such a writer falls into
+    /// the "never observed" branch every single pass and never retires it
+    /// locally — meaning it never compacts on this node's own copy even
+    /// though this very node is certain of its own current incarnation with
+    /// no round-trip required, and every other replica this node talks to
+    /// via ordinary anti-entropy keeps having its own, already-compacted
+    /// copy of the record re-polluted with this one's permanently-live old
+    /// writer slot.
+    ///
+    /// Drives `crdt_compact_tick` directly, several times over, rather than
+    /// asserting on any one call's own return value: this exact writer
+    /// shape needs no absence wait at all, so the cluster's own
+    /// automatically-spawned `crdt_compact_task` (started the moment the
+    /// cache opens, ticking immediately) races this test's manual calls for
+    /// the very same pass — whichever wins a given stage is immaterial,
+    /// since both read this fix's same corrected `live_incarnation` map, so
+    /// only the converged, observable outcome across every task combined is
+    /// asserted.
+    #[tokio::test]
+    async fn crdt_compact_tick_retires_this_nodes_own_past_incarnation_with_no_peers_at_all() {
+        let retire_after = Duration::from_millis(20);
+        let cluster = Cluster::builder("cluster-it-crdt-self-past-incarnation")
+            .seeds(std::iter::empty())
+            .config(crdt_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let name = SmolStr::new("counters");
+        let cache = open_counters_cache(&cluster, name.as_str()).await;
+        let shard = registered_shard(&cluster, &name);
+
+        // A stale `WriterId` under this very node's own id, one incarnation
+        // behind the current one: exactly what a fresh incarnation minted
+        // after a restart under the same persisted `NodeId` leaves behind
+        // in a still-resident record.
+        let stale_self = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation() - 1);
+        cache
+            .insert(1, PnCounter::local_delta(stale_self, 7))
+            .await
+            .expect("seed write from this node's own past incarnation");
+        let raw_len = cache
+            .get(&1)
+            .await
+            .expect("the seed write is resident")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
+
+        // No absence tracker entries at all: with no peers and nothing
+        // tracked absent, the cache is vacuously quiet, and this node needs
+        // no absence information whatsoever to know its own past self is
+        // dead.
+        let absence = absence::AbsenceTracker::default();
+
+        // Polls rather than counting a fixed number of passes: stage two
+        // needs a pass strictly after a retirement its own age has cleared
+        // `2 * bound_ms`, and stage three (pruning the `folded_at` receipt
+        // stage two just left) needs a *further* pass strictly after that
+        // one, once the receipt's own age has cleared `3 * bound_ms` —
+        // reaching the fully-folded, minimal form takes several
+        // sufficiently-spaced passes, not merely enough total elapsed time.
+        let folded_len = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+                let len = cache
+                    .get(&1)
+                    .await
+                    .expect("the record is still resident while folding")
+                    .encode()
+                    .expect("PnCounter::encode never fails on a resident value")
+                    .len();
+                if len < raw_len {
+                    return len;
+                }
+                tokio::time::sleep(retire_after).await;
+            }
+        })
+        .await
+        .expect(
+            "this node's own past incarnation folds away, bounding the record's metadata \
+             instead of leaving it live (and growing every peer's already-compacted copy \
+             back out on the next anti-entropy round) forever",
+        );
+        assert!(folded_len < raw_len, "raw={raw_len} folded={folded_len}");
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(7),
+            "retiring and folding this node's own past incarnation never changes the value"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    /// `sundog_crdt_retired_writers_total`/`sundog_crdt_compactions_total`
+    /// increment exactly once each for the pass that retires a writer, via
+    /// the real `crdt_compact_task` entry point (not just `crdt_compact_tick`
+    /// directly, so the ticker/task wiring itself is exercised too).
+    #[tokio::test]
+    async fn crdt_compact_task_retires_a_dead_writer_and_leaves_a_live_one_alone() {
+        let retire_after = Duration::from_millis(20);
+        let cluster = Cluster::builder("cluster-it-crdt-metrics")
+            .seeds(std::iter::empty())
+            .config(crdt_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let name = SmolStr::new("counters");
+        let cache = open_counters_cache(&cluster, name.as_str()).await;
+        let shard = registered_shard(&cluster, &name);
+
+        let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
+        let dead_writer = writer(999, 1);
+        cache
+            .insert(1, PnCounter::local_delta(dead_writer, 5))
+            .await
+            .expect("seed write from the dead writer");
+        cache
+            .insert(1, PnCounter::local_delta(local, 2))
+            .await
+            .expect("seed write from this node's own current writer identity");
+
+        let absence = absence::AbsenceTracker::default();
+        absence.observe(&HashMap::from([(
+            dead_writer.node(),
+            membership::LiveFlags { departing: false },
+        )]));
+        absence.observe(&HashMap::new());
+        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(crdt_compact_task(
+            Arc::clone(&shard),
+            name.clone(),
+            cluster.clone(),
+            absence.clone(),
+            cancel.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if absence.absent_since(dead_writer.node()).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the dead writer is retired, clearing its tracked absence");
+
+        assert_eq!(
+            cache.get(&1).await.map(|c| c.value()),
+            Some(7),
+            "retiring the dead writer never changes the counter's exact value"
+        );
+
+        cancel.cancel();
+        task.await.expect("crdt_compact_task doesn't panic");
+        cluster.shutdown().await;
+    }
+
+    /// A writer's `NodeId` reused across three replacements (the exact
+    /// churn shape `crdt_bench`'s own benchmark drives at a real cluster's
+    /// full scale): each replacement's own incarnation retires and folds
+    /// away on the observer, and — the regression this test pins — its
+    /// `folded_at` receipt actually disappears for good, not merely once
+    /// per stray tick. Left on the pre-alignment, purely
+    /// process-relative ticker, this never happens under ongoing
+    /// replication between exactly two nodes: the observer's own prune
+    /// only ever survives until the writer's own, differently-phased tick
+    /// sends its still-unpruned copy back over anti-entropy (`merge` only
+    /// ever unions a receipt in, never drops one), and the writer's own
+    /// prune is undone the same way in the other direction — forever, on
+    /// every cycle, however long the run (proven directly against this
+    /// exact two-node shape while fixing this test). Aligning every tick
+    /// after the first to a shared wall-clock boundary
+    /// (`next_aligned_wait_ms`) is what lets the two nodes' sweeps land
+    /// close enough together that neither's un-pruned copy is left in
+    /// flight to resurrect the other's.
+    #[tokio::test]
+    async fn crdt_compact_task_prunes_a_folded_receipt_for_good_under_ongoing_two_node_replication()
+    {
+        let retire_after = Duration::from_secs(2);
+        let observer = Cluster::builder("cluster-it-crdt-churn-receipt-prune")
+            .seeds(std::iter::empty())
+            .config(crdt_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("observer builds");
+        let observer_addr = observer.inner.membership.local_peer().gossip_addr;
+        let name = SmolStr::new("counters");
+        let observer_cache = open_counters_cache(&observer, name.as_str()).await;
+
+        let writer_node_id = NodeId::random();
+        let mut last_writer_cluster: Option<Cluster> = None;
+        for round in 0..3u64 {
+            let writer = Cluster::builder("cluster-it-crdt-churn-receipt-prune")
+                .node_id(writer_node_id)
+                .seeds([observer_addr])
+                .config(crdt_loopback_config(retire_after))
+                .build()
+                .await
+                .unwrap_or_else(|e| panic!("writer round {round} builds: {e}"));
+            wait_for_peer_count(&observer, 1).await;
+            let writer_cache = open_counters_cache(&writer, name.as_str()).await;
+            let wid = writer_cache.writer_id();
+            writer_cache
+                .insert(0, PnCounter::local_delta(wid, 10))
+                .await
+                .expect("writer inserts");
+            let expected = i128::from(round + 1) * 10;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if observer_cache.get(&0).await.map(|c| c.value()) == Some(expected) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("observer converges this round");
+            if round + 1 == 3 {
+                last_writer_cluster = Some(writer);
+            } else {
+                writer.shutdown().await;
+            }
+        }
+
+        let raw_len = observer_cache
+            .get(&0)
+            .await
+            .expect("counter 0 has landed on the observer")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
+
+        // Every earlier incarnation's fold-and-prune, end to end, well
+        // within the aligned-ticker's own cadence (two 30-second-floored
+        // ticks after the alignment boundary, comfortably inside this
+        // budget) — a bound this test hits on every run once the fix
+        // holds, never just occasionally.
+        let pruned_len = tokio::time::timeout(Duration::from_secs(100), async {
+            loop {
+                let len = observer_cache
+                    .get(&0)
+                    .await
+                    .expect("counter 0 is still resident")
+                    .encode()
+                    .expect("PnCounter::encode never fails on a resident value")
+                    .len();
+                if len < raw_len {
+                    return len;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect(
+            "every earlier incarnation's folded_at receipt prunes for good under ongoing \
+             two-node replication, shrinking the record below its raw, pre-compaction size",
+        );
+        assert!(pruned_len < raw_len, "raw={raw_len} pruned={pruned_len}");
+
+        // Never bounces back over one further tick cycle on each side: a
+        // receipt actually gone stays gone, it doesn't just dip below
+        // `raw_len` for a moment before the next anti-entropy round
+        // resurrects it.
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        let settled_len = observer_cache
+            .get(&0)
+            .await
+            .expect("counter 0 is still resident")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
+        assert!(
+            settled_len <= pruned_len,
+            "the pruned form must hold, not regrow: pruned={pruned_len} settled={settled_len}"
+        );
+        assert_eq!(
+            observer_cache.get(&0).await.map(|c| c.value()),
+            Some(30),
+            "pruning three earlier incarnations' receipts never changes the counter's total"
+        );
+
+        if let Some(w) = last_writer_cluster {
+            w.shutdown().await;
+        }
+        observer.shutdown().await;
     }
 }

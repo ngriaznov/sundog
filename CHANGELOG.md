@@ -11,90 +11,161 @@ All notable changes to this project are documented in this file. Format follows
   them through `ConflictResolver::merge`, reachable as `sundog::crdt::{PnCounter,
   PnCounterResolver, OrSet, OrSetResolver}`. `PnCounter` is a per-node
   increment/decrement counter that merges by taking the componentwise
-  maximum of each node's cumulative counts; `OrSet` is an observed-remove
-  set whose `remove` tombstones only the add-tags it has actually observed,
+  maximum of each node's cumulative counts. `OrSet` is an observed-remove
+  set whose `remove` tombstones only the add-tags it has seen,
   so a concurrent add of the same element survives a concurrent remove.
   Both encode canonically over `BTreeMap`/`BTreeSet` state, so two logically
   equal values always produce identical bytes, and both merge commutatively,
   associatively, and idempotently under any delivery order. `PnCounterResolver`
-  and `OrSetResolver` merge two decodable values — a spilled stored side's
+  and `OrSetResolver` merge two decodable values (a spilled stored side's
   real bytes included, read back off disk before the fold rather than
-  treated as value-less — and fall back to plain `Hlc` order only against a
+  treated as value-less) and fall back to plain `Hlc` order only against a
   tombstone, a spilled side whose bytes genuinely can't be read (no tier
   attached, or the read fails), or a decode failure.
 - `ConflictResolver::merge` and `Merged { value, expires_at_ms }`: an
-  additive pair on top of the existing `winner`-only contract — both
+  additive pair on top of the existing `winner`-only contract, both
   defaulted (`merge` to `None`, `merges` to `false`), so no existing
   `ConflictResolver` implementation or match on `Winner` changes. A
   resolver's `merge` can fold the stored and incoming records into a third
-  value instead of `winner` picking one of the two; `None` falls back to
-  `winner`. The engine derives the merged record's version from the merged
+  value instead of `winner` picking one of the two. `None` falls back to
+  `winner`. The engine computes the merged record's version from the merged
   bytes themselves: a merge that reduces to one side outright adopts that
   side's own `(version, bytes)` pair verbatim (or is a no-op, if that side is
-  already what's stored), and a merge that produces genuinely new content
-  mints a version strictly ahead of both inputs under a `node` id derived
-  from a hash of the merged bytes (`NodeId::merge_derived`) — never a real
+  already what's stored), and a merge that produces new content
+  mints a version strictly ahead of both inputs under a `node` id computed
+  from a hash of the merged bytes (`NodeId::merge_derived`), never a real
   node's id, so a minted version never collides with a real single-writer
   stamp, and two nodes minting for the same merged bytes always land on the
   same version regardless of fold order. `merge` is consulted only when both
-  the stored and incoming records carry a value; against a tombstone it is
+  the stored and incoming records carry a value. Against a tombstone it is
   never consulted, and `winner` decides instead. A spilled stored side is
   not value-less on that account: the engine reads its bytes back off disk
   (via a prefetch pass keyed by spill location, ahead of the stripe lock on
   the common path) so a value-aware resolver merges against a spilled
-  record's real content exactly as it would a resident one; only a side
+  record's real content the same way it would a resident one. Only a side
   whose bytes genuinely can't be produced still falls back to `winner`. A
   redelivered record whose merge result reproduces the stored bytes and
-  version exactly is a no-op: nothing is re-applied, no event is published,
+  version is a no-op: nothing is re-applied, no event is published,
   and nothing is re-replicated.
 - `ConflictResolver::merges` and `ShardOps::merges` (the latter forwarding a
   shard's own resolver's answer): whether a resolver's `merge` can ever
-  return `Some`, `false` by default and `true` on `PnCounterResolver` and
+  return `Some`, `false` unless overridden and `true` on `PnCounterResolver` and
   `OrSetResolver`. `cluster::anti_entropy` reads it once per round and, when
   `true`, exchanges a version-mismatched key in both directions instead of
   only pushing the greater side to the lesser one, so two replicas each
   holding half of a merge converge in that one round rather than needing a
   second round to carry a minted result back to whichever side mints first.
   The partition-heal sim, rebuilt to drive `run_round_against` (sundog's
-  real anti-entropy round, re-exported under `feature = "sim"` for exactly
-  this) instead of a reimplementation, repairs a fully-conflicting partition
+  real anti-entropy round, re-exported under `feature = "sim"` for this
+  purpose) instead of a reimplementation, repairs a fully-conflicting partition
   split in 3 anti-entropy rounds against a per-writer-key `LwwResolver`
   control's 4, at both 2,000 and 20,000 keys, with round counts pinned
   non-decreasing in key count from 2,000 through 40,000. A partial conflict
   mix can still cost more total bytes than the control despite an equal
-  round count — see `ROADMAP.md`'s "Merge resolvers" section.
+  round count. See `ROADMAP.md`'s "Merge resolvers" section.
 - **`Engine::apply_many` pre-folds a batch that repeats a key.** When the
   resolver's `ConflictResolver::merges` is `true`, a batch is grouped by key
   into maximal runs of consecutive puts and each run long enough to fold
-  collapses to one survivor via the resolver, entirely outside the stripe
-  lock, before applying through the ordinary per-entry path — several
+  collapses to one survivor via the resolver, outside the stripe
+  lock, before applying through the ordinary per-entry path. Several
   entries for the same key now cost one real `apply_locked` call instead of
   one per entry. The survivor is seeded with the key's own real stored
   record when one exists, ahead of the run's own entries, so the batch's
   stored `(version, bytes)` comes out identical, `Hlc` included, to applying
   every entry one at a time. A peer's replicated fan-out batch and
-  `Cache::insert_many` are where a real run appears; a singleton `insert`
+  `Cache::insert_many` are where a real run appears. A singleton `insert`
   never contains one, and a non-merging resolver never triggers the fold.
 - **`Cache::merge` and `CacheBuilder::merge_coalesce_window`.** `Cache::merge(key,
-  value)` folds `value` into the configured resolver without a read. Left at
+  value)` folds `value` into the resolver without a read. Left at
   the default zero window, every call applies (and replicates) at once,
   equivalent to `insert` under a merging resolver. With
   `merge_coalesce_window(Duration)` set to a nonzero window, consecutive
-  `merge` calls to one key fold in memory and apply exactly once, when the
+  `merge` calls to one key fold in memory and apply once, when the
   window that opened at the first of those calls elapses, so replication and
   every `Event` this key gets during the window see one record, not one per
   call. `Cache::get` never consults a pending fold: a value folded in but
   not yet flushed is invisible to a read for as long as it stays pending, up
   to one whole window. `Cache::close`, and dropping a cache's last handle,
   both flush whatever is still pending regardless of the window. The flush
-  sweep itself is sharded the same way `engine::Engine`'s own stripes are —
+  sweep itself is sharded the same way `engine::Engine`'s own stripes are:
   one independently locked `pending_merges` stripe per bucket, each with its
-  own deadline-ordered index — rather than one shard-wide mutex a sweep had
+  own deadline-ordered index, rather than one shard-wide mutex a sweep had
   to scan in full on every tick, so a flush locks and pops only the entries
-  actually due, in one stripe at a time, no matter how many keys are
+  due, in one stripe at a time, no matter how many keys are
   coalescing at once.
   `CacheBuilder::merge_coalesce_window` rejects a nonzero window on a cache
   whose resolver does not merge (`CacheError::MergeWindowRequiresMergingResolver`).
+- **CRDT writer retirement.** `crdt::WriterId` pairs a node with the
+  membership incarnation it wrote under, replacing the bare `NodeId`
+  keys `PnCounter`'s `p`/`n` and `OrSet`'s tags used in 0.6.1's first
+  `crdt` module: a restarted node's fresh incarnation gets its own slot
+  rather than resuming or corrupting its pre-restart one.
+  `PnCounter::compact`/`OrSetResolver::compact` (backing the new
+  `ConflictResolver::compact`, defaulted to a no-op) retire a dead writer
+  in two stages: moving its live state into a per-writer retired entry,
+  then, once the cache is quiet and the retirement has aged past
+  `2 * ClusterConfig::crdt_retire_after`, folding it away (into a bounded
+  scalar for `PnCounter`, dropped outright for `OrSet`, whose `adds` a
+  retired writer's own never-removed elements stay in indefinitely) and
+  leaving a per-writer receipt in `folded_at`: the folded writer's own
+  `since_ms`, recorded under its own key, so `merge` can tell a side that
+  has folded writer `w` from a side that has merely folded some other
+  writer whose retirement time happens to be later. A receipt is
+  pruned once it is older than `3 * crdt_retire_after`, past the point
+  every reachable replica is guaranteed to have independently folded that
+  writer too, so per-record metadata stops growing with historical writer
+  churn instead of accumulating forever. `merge` carries no clock or bound
+  of its own: it trusts a side's silence about a folded writer (no live
+  slot, no retired entry) only once that side's own `folded_at` names that
+  writer with a `since_ms` at least as late as the writer's retirement on
+  the other side, so two independently-folded records
+  reconcile to the exact total without double-counting the same writer.
+  `PnCounter`'s `{p, n, retired, folded_p, folded_n, folded_at}` and
+  `OrSet`'s `{adds, seen, retired, folded_at}` are each one plain
+  `#[derive(Serialize, Deserialize)]` layout, encoded and decoded by a
+  thin postcard wrapper. These are this crate's own record layouts, and
+  no released node predates them, so there is nothing for a
+  wire-compatible encoding to protect and no protocol gate on when the
+  sweep may run: the CRDT compaction sweep runs for a cache whenever its
+  resolver merges at all (`ConflictResolver::merges`), gated only by the
+  per-writer dead/quiet predicates below. A future change to either
+  layout bumps `wire::PROTOCOL_VERSION` and is versioned then, the same as
+  any other wire change. `ClusterConfig::crdt_retire_after` (default:
+  `tombstone_max_ttl`, 24h) and `crdt_compact_batch` (default 4,096) size
+  the retirement window and the sweep's per-tick record budget.
+  `sundog_crdt_retired_writers_total{cache}` and
+  `sundog_crdt_compactions_total{cache}` count writers retired and records
+  rewritten. The sweep runs at `(crdt_retire_after / 4).max(30s)` cadence.
+  Release 0.6.1 interoperates with 0.6.0 on every cache except the two new
+  ones (`PnCounter`/`OrSet` themselves are new in 0.6.1, so a 0.6.0 peer
+  never opens one).
+
+### Changed
+
+- `PnCounter` and `OrSet` key every writer's slot by `crdt::WriterId {
+  node, incarnation }` instead of a bare `NodeId`, and `PnCounter::local_delta`/
+  `PnCounter::local_decrement`/`OrSet::add` take a `WriterId` where they
+  previously took a `NodeId`. Neither type nor these signatures had
+  shipped in a release before this one, so this is not a breaking change.
+  It exists so a restarted node's fresh membership incarnation gets a slot
+  of its own rather than resuming, or corrupting, the one its pre-restart
+  process wrote to.
+- **The retirement contract, stated plainly.** A writer is retirement-
+  eligible on a node once it is confirmed dead there (absent longer than
+  `ClusterConfig::crdt_retire_after`, or superseded by a live incarnation
+  of the same node) and the cache is quiet: every other member sharing it
+  has been either continuously present or continuously absent for that
+  same `crdt_retire_after`. Stage one moves the writer's contribution into
+  per-writer retired state at that point, exact regardless of how stale
+  any replica's view of any other replica is. Stage two only runs once
+  that retirement has itself aged past a second `crdt_retire_after`
+  (`2 * crdt_retire_after` total) with the cache still quiet, and it is
+  exact only up to that same bound: a writer whose slot survives on one
+  replica past `2 * crdt_retire_after` while another replica has already
+  folded it away produces a bounded, documented divergence in that
+  writer's counted contribution. That is the same trust boundary
+  `tombstone_max_ttl` already accepts for a member gone that long, not a
+  new one.
 
 ## [0.6.0] – 2026-09-07
 
@@ -102,10 +173,10 @@ All notable changes to this project are documented in this file. Format follows
 
 - **Distribution mode**: `Mode::Distributed { owners }` and
   `Mode::distributed()` / `Mode::DEFAULT_OWNERS`. Each cache key lives on
-  exactly `owners` live nodes, chosen by rendezvous hashing over the cache's
+  `owners` live nodes, chosen by rendezvous hashing over the cache's
   live, protocol-3 peers advertising it under the same mode and owner count.
   `Cache::fetch` reads a key from an owner (local if this node owns its
-  bucket, otherwise the network), returning `Ok(None)` for a genuine miss;
+  bucket, otherwise the network), returning `Ok(None)` for a genuine miss.
   `Cache::owners_of` reports a key's current owners in rendezvous order. A
   write for a bucket this node doesn't own is forwarded to that bucket's
   owners and never applied locally.
@@ -129,8 +200,8 @@ All notable changes to this project are documented in this file. Format follows
   `StBuckets`, `StBucketChunk`, `ForwardBatch`, and `StaleView`, all gated on
   the peer's protocol from its hello: a peer speaking less than
   `wire::PROTOCOL_DISTRIBUTED` never receives one. A distributed fan-out
-  travels as `ForwardBatch`, stamped with the writer's ownership view hash;
-  a receiver whose own view differs re-forwards the batch once more to the
+  travels as `ForwardBatch`, stamped with the writer's ownership view hash.
+  A receiver whose own view differs re-forwards the batch once more to the
   records' owners under its view, so a write routed under a stale view (a
   delete issued before the writer saw a replacement owner join, say) still
   reaches every current owner instead of waiting on an anti-entropy round
@@ -141,7 +212,7 @@ All notable changes to this project are documented in this file. Format follows
 - A cache close or cluster shutdown seals every fan-out queue first, finishes
   the fan-out batch in flight, drains the backlog, and flushes queued frames
   to their peers before cancelling the writers, so a write accepted before
-  shutdown still reaches its owners; a forwarded write arriving after that
+  shutdown still reaches its owners. A forwarded write arriving after that
   fails with the new `CacheError::Closed` instead of being accepted and never
   sent, while a write the node applies itself still lands as a detached local
   write. A `Mode::Distributed` fan-out waits for outbox space,
@@ -153,17 +224,17 @@ All notable changes to this project are documented in this file. Format follows
   no node ever holds a bucket outside its own owned-or-releasing set, and a
   releasing bucket still answering anti-entropy while refusing a fresh
   apply. New
-  container scenarios: a five-node fill landing every key on exactly two
+  container scenarios: a five-node fill landing every key on two
   owners, one owner crashing with every key still fetchable and then
   re-owned, and a fourth node joining a filled cluster and taking its share,
   plus the chaos lane's `chaos_distributed_crashes_churn_and_drops_still_converge`.
-- `demos/sundog-demo` moved under `demos/`, alongside the new distributed
-  demo below, out of the repository root.
+- `demos/sundog-demo` moved out of the repository root into `demos/`, next
+  to the new distributed demo below.
 - **`sundog-distributed-demo`**: a `ratatui` demo for `Mode::Distributed`, a
   sibling of `sundog-demo`. Preloads a large key set (two million `k{i}` =
-  `v{i}` pairs by default) across N in-process nodes in batches spread
+  `v{i}` pairs unless overridden) across N in-process nodes in batches spread
   round-robin via `Cache::insert_many`, then runs a steady write load plus
-  random `fetch` sampling against it; the TUI shows a preload progress bar,
+  random `fetch` sampling against it. The TUI shows a preload progress bar,
   each node's entry count and estimated owned-bucket share, and
   cluster-wide fetch hit/miss/error counts and latency, with the same
   interactive kill/restart/pause controls as the chaos demo. Its
@@ -175,11 +246,11 @@ All notable changes to this project are documented in this file. Format follows
 ### Changed
 
 - **Breaking**: `Mode` is `#[non_exhaustive]` and gains the struct variant
-  `Distributed`; a downstream `match` without a wildcard arm needs one added,
+  `Distributed`. A downstream `match` without a wildcard arm needs one added,
   and a numeric cast of a `Mode` (`as isize`) no longer compiles.
-- `wire::Msg` gains the six variants above; already `#[non_exhaustive]` since
+- `wire::Msg` gains the six variants above, already `#[non_exhaustive]` since
   0.3.0, so no downstream `match` needs a change for them.
-- `wire::PROTOCOL_VERSION` is 3; the current release interoperates with
+- `wire::PROTOCOL_VERSION` is 3. The current release interoperates with
   protocol 2.
 
 ## [0.5.0] – 2026-09-06
@@ -189,11 +260,11 @@ All notable changes to this project are documented in this file. Format follows
 - `spill` feature: a local SSD/NVMe spill tier. `CacheBuilder::spill(SpillConfig::new(dir,
   capacity_bytes))` lets eviction demote cold entries onto a FIFO ring of
   region files on disk instead of discarding them, extending a cache's
-  effective size past its RAM budget; a later read promotes a spilled entry
+  effective size past its RAM budget. A later read promotes a spilled entry
   back into RAM. `SpillConfig::region_bytes` and `SpillConfig::read_concurrency`
   tune the region file size (64 MiB default) and how many spilled-value reads
-  run at once (16 default). Off by default; no effect on a non-`spill` build.
-  With `spill` configured, `Mode::Replicated` accepts a finite `max_capacity`.
+  run at once (16 default). Inactive unless a cache opts in, with no effect on
+  a non-`spill` build. With `spill` set up, `Mode::Replicated` accepts a finite `max_capacity`.
   Eviction demotes rather than deletes, so anti-entropy does not need to
   silently re-pull evicted entries back. `tti` stays rejected for `Replicated`
   regardless, since it is local-only by design.
@@ -206,14 +277,14 @@ All notable changes to this project are documented in this file. Format follows
   `replicated_cluster_serves_spilled_entries_and_settles_without_repair_loops`
   drives a three-node `Mode::Replicated` cluster through a tiny RAM budget on
   one node and checks every key still reads correctly, resident or spilled,
-  and that anti-entropy settles with no repair loop; `spilling_node_survives_
+  and that anti-entropy settles with no repair loop. `spilling_node_survives_
   a_restart_and_rewarms_from_peers` restarts the spilling node and confirms
   its tier starts empty (discarded, not resumed) before rewarming from its
   peers and resuming disk-backed reads.
 
 ### Changed
 
-- **Breaking**: `store::Stored` is gone; its fields moved into the engine's
+- **Breaking**: `store::Stored` is gone. Its fields moved into the engine's
   own entry representation.
 - **Breaking**: `CacheError` is `#[non_exhaustive]`, so a downstream `match`
   without a wildcard arm needs one added.
@@ -229,7 +300,7 @@ All notable changes to this project are documented in this file. Format follows
 - `ClusterBuilder::node_id` and `NodeId: FromStr`: a persisted identity, so a
   restarted process rejoins as the same member. `Cluster::shutdown` gossips a
   graceful departure first, and a member that leaves this way no longer holds
-  tombstone garbage collection back for `tombstone_max_ttl`; only a crash
+  tombstone garbage collection back for `tombstone_max_ttl`. Only a crash
   does.
 - `Cluster::is_ready` and `Cluster::health`: ready once every open
   `Mode::Replicated` cache has finished warming. With the `prometheus`
@@ -241,14 +312,14 @@ All notable changes to this project are documented in this file. Format follows
 - `Cache::for_each_key` and `Shard::for_each_key`: a visitor over this node's
   live keys that never holds every key in one `Vec`.
 - `Cache::close`: stops the cache's background tasks, drops it from the
-  registry, and clears its gossiped mode, so the name opens again at once. A
+  registry, and erases its gossiped mode, so the name opens again at once. A
   clone kept past `close` keeps working as a local, detached cache.
 
 ### Fixed
 
 - A `Mode::Local` cache no longer queues every written key for a fan-out task
-  it never runs; that queue grew without bound with the write count.
-- `SUNDOG_SEEDS` selects static discovery on its own; before, a build without
+  it never runs. That queue grew without bound with the write count.
+- `SUNDOG_SEEDS` selects static discovery on its own. Before, a build without
   `.seeds()` ignored it and browsed mDNS.
 - A pooled request connection idle for more than 30 s is dropped instead of
   reused, and one the peer has already closed is retried on a fresh dial
@@ -266,11 +337,11 @@ All notable changes to this project are documented in this file. Format follows
 ### Fixed
 
 - A node declines to donate a state-transfer snapshot of a cache until its
-  own transfer of that cache has completed, answering `Msg::StUnavailable`;
-  a joiner tries every live peer in turn and, once its snapshot lands, runs
+  own transfer of that cache has completed, answering `Msg::StUnavailable`.
+  A joiner tries every live peer in turn and, once its snapshot lands, runs
   one anti-entropy round against every live peer, not only its donor. A
   node with no peer in sight at `open()` waits a fifth of
-  `state_transfer_budget`, 4 s by default, for gossip to show one before it
+  `state_transfer_budget`, 4 s unless overridden, for gossip to show one before it
   opens as the origin. A node that came up before gossip found any peer
   could donate an empty or half-warm copy to the next joiner, and a chain of
   such joins with the last complete holder crashing lost live entries
@@ -282,8 +353,8 @@ All notable changes to this project are documented in this file. Format follows
   buckets now also keeps 64 part digests, the next 6 hash bits below the
   bucket's own 10. A mismatched bucket past
   `ClusterConfig::ae_part_min_bucket` entries, default 4,096, answers with its
-  64 part digests instead of a full listing or an IBLT sketch, without ever
-  materializing the listing; a mismatched part then follows the existing
+  64 part digests instead of a full listing or an IBLT sketch, without
+  building the listing. A mismatched part then follows the existing
   listing-or-sketch rule at part scale. This narrows a mismatch 64x before any
   listing or sketch is sent, so repairing one changed key in a 100M-entry
   cache costs a few hundred bytes of digests plus a small listing, instead of
@@ -300,21 +371,21 @@ All notable changes to this project are documented in this file. Format follows
   with them ignored. A node serves a peer only with what that peer's
   protocol understands: no part-digest replies and no `Msg::StUnavailable`
   to a protocol-1 peer. One release step interoperates, so a cluster upgrades
-  one node at a time; a container test runs the 0.3.1 node against this one
+  one node at a time. A container test runs the 0.3.1 node against this one
   in both directions.
 - **Breaking**, in the `sim`-feature test seams and the wire types only:
   `net::AeMismatch` gains the `PartDigests` variant and is
-  `#[non_exhaustive]` from here on, as is the new `net::AePartReply`;
+  `#[non_exhaustive]` from here on, as is the new `net::AePartReply`.
   `net::RequestHandler` and `store::ShardOps` gain the required methods
-  `bucket_lens`, `part_digests`, and `entries_for_parts`;
+  `bucket_lens`, `part_digests`, and `entries_for_parts`.
   `wire::Msg::Hello` gains the `protocol` field and `membership::Peer` the
   `protocol` field. `cargo semver-checks --release-type minor` against
-  0.3.1 reports exactly these; every other check passes.
+  0.3.1 reports these findings. Every other check passes.
 - **Chaos lane** for the container suite: `chaos_crashes_churn_and_drops_still_converge`
   drives a four-node cluster through a seeded random mix of crashes, churn,
   dropped keys, refills, and put bursts for a bounded time, then checks every
   node converges to the same content. Gated on `SUNDOG_CONTAINER_TESTS=1` and
-  `SUNDOG_CHAOS_SECS`; `SUNDOG_CHAOS_SEED` replays a specific run. Runs for 45s
+  `SUNDOG_CHAOS_SECS`. `SUNDOG_CHAOS_SEED` replays a specific run. Runs for 45s
   in every CI pass and for ten minutes nightly with a fresh seed
   (`nightly-chaos.yml`).
 - `sundog-testnode` control commands `digest` (an order-independent xxh3
@@ -332,13 +403,13 @@ All notable changes to this project are documented in this file. Format follows
   its repair no longer ship the same records twice when the peer's round
   lands mid-stream.
 - The README quick start opens a second, session-typed cache for its
-  per-entry TTL example; a cache is typed once at open.
+  per-entry TTL example. A cache is typed once at open.
 
 ## [0.3.0] – 2026-09-03
 
 ### Added
 
-- **Bespoke store engine**: live entries and tombstones share 1,024 lock-striped
+- **A store engine built for sundog**: live entries and tombstones share 1,024 lock-striped
   tables, one per anti-entropy bucket, each a `parking_lot::RwLock` over a
   `hashbrown` table keyed by the postcard-encoded key. A read takes one read
   lock and one lookup with no allocation. A versioned apply runs under one write
@@ -351,8 +422,8 @@ All notable changes to this project are documented in this file. Format follows
   `ClusterConfig::ae_sketch_min_bucket` entries, default 384, answers with an
   invertible Bloom lookup table, `ClusterConfig::ae_sketch_cells`, default 240
   cells and about 9 KB on the wire, instead of a full `(key, version)` listing.
-  Wire cost is fixed regardless of bucket size; it decodes symmetric differences
-  up to 100 elements in at least 99% of cases and falls back to the full listing
+  Wire cost is fixed regardless of bucket size. It decodes symmetric differences
+  up to 100 elements successfully in 99 of 100 cases and falls back to the full listing
   otherwise. New wire messages `Msg::AeSketch`, `Msg::AeEntries`, and
   `Msg::AePullHashes` carry the exchange and its fallbacks. New metric
   `sundog_ae_sketch_total{cache, outcome}` counts `decoded` vs `fallback`
@@ -360,8 +431,8 @@ All notable changes to this project are documented in this file. Format follows
 - **Stateful fuzzing of the apply path**: two `cargo-fuzz` targets,
   `apply_model` and `apply_permutation` (`sundog/fuzz`), drive coverage-guided,
   sequence-generated local writes, remote applies and batches, invalidations,
-  tombstone GC, and clock advances through a real `Shard` alongside a reference
-  model of the same semantics, checking the permutation-convergence invariant
+  tombstone GC, and clock advances through a real `Shard`, mirrored against a
+  reference model of the same semantics, checking the permutation-convergence invariant
   under libFuzzer's own mutation instead of proptest's sampling. The model,
   `sundog::store::model`, `#[doc(hidden)]` behind the `fuzzing` feature or
   `cfg(test)`, is shared with the in-crate property test
@@ -371,8 +442,8 @@ All notable changes to this project are documented in this file. Format follows
 
 - `moka` is no longer a dependency. Size-bounded eviction (`max_capacity`,
   `weigher`) is sampled LRU: a write that pushes total weight past the cap
-  evicts the least recently read of eight entries sampled from a rotating offset
-  in one stripe, repeating until the cap holds. TTI stays a local per-entry idle
+  evicts whichever of eight entries sampled from a rotating offset in one
+  stripe was read longest ago, repeating until the cap holds. TTI stays a local per-entry idle
   deadline. Neither is available in `Replicated` mode.
 - The hand-off from a local write to the fan-out routine is a lossless queue of
   pending keys drained whole, replacing a bounded broadcast channel that lagged
@@ -382,11 +453,11 @@ All notable changes to this project are documented in this file. Format follows
   of frames per peer whatever the machine's speed.
 - Anti-entropy pull replies (`AePull`, `AePullHashes`) travel as
   `ReplicateBatch` frames under the same byte and count budget as the live
-  fan-out, replacing one `Replicate` frame per record; a 100k-record repair is a
+  fan-out, replacing one `Replicate` frame per record. A 100k-record repair is a
   few dozen frames.
-- Anti-entropy skips a peer while replicate traffic with it is still in motion,
-  frames queued or recently sent toward it, or a batch recently received from
-  it, judged over one `ae_interval`, for at most three rounds running. This
+- Anti-entropy skips a peer while replicate traffic with it is still in motion:
+  frames queued or sent toward it in the last `ae_interval`, or a batch
+  received from it in that same window, for at most three rounds running. This
   closes the double-delivery race between a bulk fill's own fan-out and its
   repair, without letting a steady write trickle starve the repair.
 - `Cluster::build` returns `JoinError::InvalidConfig` for an `ae_sketch_cells`
@@ -399,15 +470,15 @@ All notable changes to this project are documented in this file. Format follows
   `Msg` without a wildcard arm needs one added, a one-time cost that lets future
   wire message kinds, like this release's own
   `AeSketch`/`AeEntries`/`AePullHashes`, ship without another breaking release
-  apiece. `cargo semver-checks --release-type minor` reports exactly this one
-  intentional break; every other check passes.
+  apiece. `cargo semver-checks --release-type minor` reports this one
+  intentional break. Every other check passes.
 
 ### Fixed
 
 - `insert_many` and `insert_many_with_ttl` apply the entries before an
   oversized value and then return `ValueTooLarge`, as their docs state.
   Every entry was rejected before.
-- `DnsSrv` discovery uses the configured fallback port for an SRV record
+- `DnsSrv` discovery uses its fallback port for an SRV record
   whose port is zero instead of dialing port zero.
 
 ## [0.2.0] – 2026-09-02
@@ -417,21 +488,25 @@ All notable changes to this project are documented in this file. Format follows
 - **Cache-config fingerprint gossip**: every node advertises the mode of each
   open cache in its membership state. `open()` on a name a live peer already
   runs under a different `Mode` fails with `CacheError::ModeMismatch { cache,
-  local, remote }`; `Mode::Local` counts too, since a private cache and a
+  local, remote }`. `Mode::Local` counts too, since a private cache and a
   replicated one can't share a name. A conflict that slips past the open-time
   check, two nodes opening at the same instant, is reported loudly when the
   peer's advertisement arrives. TTL and capacity stay local knobs.
-- **API surface**: `Cache::contains_key`, expiry-aware and not counted as a
-  read; `Cache::keys`, a point-in-time local snapshot; `Cache::remove_many`, the
-  tombstone counterpart of `insert_many`, one lock acquisition per stripe and
-  one `Removed` event per key, batched fan-out; `Cache::clear`, which tombstones
-  every key this node holds and fans them out at O(entries), and in `Replicated`
-  mode empties the cluster once tombstones land; and
-  `Cache::get_or_insert_with`, an infallible-loader `get_or_load` with the same
-  stampede collapse. The `Shard` API gains the same methods.
+- **API surface**:
+  - `Cache::contains_key`, expiry-aware and not counted as a read.
+  - `Cache::keys`, a point-in-time local snapshot.
+  - `Cache::remove_many`, the tombstone counterpart of `insert_many`, one lock
+    acquisition per stripe and one `Removed` event per key, batched fan-out.
+  - `Cache::clear`, which tombstones every key this node holds and fans them
+    out at O(entries), and in `Replicated` mode empties the cluster once
+    tombstones land.
+  - `Cache::get_or_insert_with`, an infallible-loader `get_or_load` with the
+    same stampede collapse.
+
+  The `Shard` API gains the same methods.
 - **Per-cache metrics**: `sundog_cache_hits_total{cache}` and
   `sundog_cache_misses_total{cache}`. A miss is one loader execution or one
-  empty `get`; collapsed waiters count as hits; `contains_key` counts as
+  empty `get`. Collapsed waiters count as hits. `contains_key` counts as
   neither. `sundog_cache_entries{cache}` is a gauge refreshed every five seconds
   per open cache. Counter handles are created once per shard, so the read path
   pays an atomic increment, not label resolution. Two matching Grafana panels
@@ -457,7 +532,7 @@ below: reads never touch expiry. 0.2.0 removes it and keeps everything else from
   give one write, or one batch, its own lifespan, overriding the cache's
   `.ttl(..)` default in either direction and working on a cache with no default.
   The per-entry deadline is stamped as the record's absolute `expires_at_ms` and
-  replicates exactly as a default-TTL stamp, so the entry expires at the same
+  replicates the same way a default-TTL stamp does, so the entry expires at the same
   instant on every node with the same can't-resurrect guarantee. Reads stay out
   of it: `get_or_load` fills take the cache default. The `Shard` API gains the
   same two methods.
@@ -476,20 +551,25 @@ The first release: the full core library.
 
 ### Added
 
-- **Discovery** (`sundog::discovery`): `Mdns`, zeroconf default via `mdns-sd`;
-  `Static`, fixed or env-var seed list re-resolved on an interval; and `DnsSrv`,
-  SRV-record polling for Kubernetes headless services with an A/AAAA fallback.
+- **Discovery** (`sundog::discovery`):
+  - `Mdns`, zeroconf default via `mdns-sd`.
+  - `Static`, fixed or env-var seed list re-resolved on an interval.
+  - `DnsSrv`, SRV-record polling for Kubernetes headless services with an
+    A/AAAA fallback.
+
   All three stream candidates continuously, so a full-cluster cold restart still
   re-converges.
 - **Membership** (`sundog::membership`): gossip membership on `chitchat`,
-  advertising each node's data-plane address and incarnation; a `watch` stream
+  advertising each node's data-plane address and incarnation. A `watch` stream
   of the live peer set drives everything downstream.
-- **Data plane** (`sundog::net`): a lazy TCP mesh, one connection per live peer,
-  `LengthDelimitedCodec`-framed with a 4 MiB frame cap; per-class bounded
-  outboxes with a documented drop policy, `Invalidate` drops oldest, `Replicate`
-  drops newest and marks the peer dirty for anti-entropy priority;
-  `StRequest`/`AeDigest`/`AePull` request-response paths off the broadcast
-  channel entirely.
+- **Data plane** (`sundog::net`):
+  - A lazy TCP mesh, one connection per live peer, `LengthDelimitedCodec`-framed
+    with a 4 MiB frame cap.
+  - Per-class bounded outboxes with a documented drop policy: `Invalidate` drops
+    oldest, `Replicate` drops newest and marks the peer dirty for anti-entropy
+    priority.
+  - `StRequest`/`AeDigest`/`AePull` request-response paths off the broadcast
+    channel.
 - **Store** (`sundog::store`): typed shards on a hybrid logical clock
   (`Hlc`/`HlcClock`) whose stamps encode deterministically and order
   lexicographically, versioned apply as the single path every write, local,
@@ -501,21 +581,23 @@ The first release: the full core library.
 - **`tls` feature**, off by default: mutual TLS on the data-plane mesh
   (`rustls`). `ClusterConfig::tls`/`ClusterBuilder::tls` wraps every dialed and
   accepted connection, including the short-lived state-transfer and anti-entropy
-  ones; client certificates are verified too, mutual auth.
+  ones. Client certificates are verified too, mutual auth.
 - **Cluster/cache public API** (`sundog::cluster`, `sundog::cache`):
-  `Cluster::builder(name).build()` as the zero-config zeroconf happy path;
-  `Cluster::cache::<K, V>(name)` builder with `.mode()`, `.max_capacity()`,
-  `.ttl()`, `.tti()`, `.resolver()`, `.weigher()`; `Cache<K, V>` with `get`,
-  `get_or_load`, stampede-collapsing read-through, `insert`, `remove`,
-  `entry_count`, live local count and housekeeping flushed, `invalidate_local`,
-  and an `events()` broadcast stream of `Created`/`Updated`/`Removed`, each
-  tagged with its `Origin`.
-- **Three cache modes**: `Local`, no cluster traffic; `Invalidation`, the
-  default, independent local copies with writes broadcasting an invalidate; and
-  `Replicated`, full copy per node, writes broadcast the value.
+  - `Cluster::builder(name).build()` as the zero-config zeroconf happy path.
+  - `Cluster::cache::<K, V>(name)` builder with `.mode()`, `.max_capacity()`,
+    `.ttl()`, `.tti()`, `.resolver()`, `.weigher()`.
+  - `Cache<K, V>` with `get`, `get_or_load`, stampede-collapsing read-through,
+    `insert`, `remove`, `entry_count`, live local count and housekeeping
+    flushed, `invalidate_local`, and an `events()` broadcast stream of
+    `Created`/`Updated`/`Removed`, each tagged with its `Origin`.
+- **Three cache modes**:
+  - `Local`, no cluster traffic.
+  - `Invalidation`, the default, independent local copies with writes
+    broadcasting an invalidate.
+  - `Replicated`, full copy per node, writes broadcast the value.
 - **State transfer**: a newly opened `Replicated` cache pulls a full snapshot
   from the lowest-node-id live donor before `open()` returns, then runs one
-  immediate anti-entropy round against that donor as a safety sweep; donor death
+  immediate anti-entropy round against that donor as a safety sweep. Donor death
   mid-stream is recovered by re-picking and re-requesting, made free by
   idempotent apply. Time `open()` spends on this is bounded by
   `ClusterConfig::state_transfer_budget`, default 20s, a startup-latency knob,
@@ -528,13 +610,13 @@ The first release: the full core library.
   keeping the documented `tombstone_ttl >= 3 * ae_interval` safety margin
   (`ClusterConfig::tombstone_ttl_is_safe`).
 - **`tracing` instrumentation** at membership changes, state transfer,
-  anti-entropy rounds, and drops; `metrics` counters and gauges
+  anti-entropy rounds, and drops. `metrics` counters and gauges
   (`sundog_backlog_dropped_total{peer}`, `sundog_live_peers`,
   `sundog_open_caches`) emitted unconditionally, independent of the `prometheus`
   feature.
 - **`prometheus` feature**, off by default: `metrics-exporter-prometheus` wired
   two ways, `ClusterBuilder::prometheus_listen(addr)` serves `GET /metrics`
-  directly, and `telemetry::prometheus_handle()` installs a recorder for
+  itself, and `telemetry::prometheus_handle()` installs a recorder for
   embedding into a caller-owned HTTP server.
 - **`sim` feature**, off by default: swaps the data plane's transport seam
   (`net::tcp`) to `turmoil::net`, enabling `tests/sim.rs`'s deterministic
@@ -542,24 +624,27 @@ The first release: the full core library.
   crash mid-state-transfer, with no real UDP/TCP involved.
 - **`sundog-demo`**: a `ratatui` chaos-testing TUI, N in-process nodes over
   static loopback seeds, a background write load, interactive kill/restart per
-  node, live replication/anti-entropy visibility; plus a `--headless <SECS>`
+  node, live replication/anti-entropy visibility, plus a `--headless <SECS>`
   mode for CI smoke checks and manual soak runs.
-- **Test suite**: property tests (`proptest`) on HLC, wire encoding, and the
-  store, including the permutation-convergence property, the correctness
-  argument for the whole loss-tolerant design; the `turmoil` simulation suite; a
-  container-backed multi-node integration suite, see next bullet; two-node
-  loopback integration tests living as ordinary unit tests next to the code they
-  exercise (`sundog::cluster`'s
-  replication/invalidation/state-transfer/anti-entropy/ local-mode tests,
-  `sundog::store`'s read-through stampede-collapse and TTL-expiry tests);
-  Prometheus-exporter and TLS integration tests; unit tests in every module.
+- **Test suite**:
+  - Property tests (`proptest`) on HLC, wire encoding, and the store, including
+    the permutation-convergence property, the correctness argument for the
+    whole loss-tolerant design.
+  - The `turmoil` simulation suite.
+  - A container-backed multi-node integration suite, see next bullet.
+  - Two-node loopback integration tests living as ordinary unit tests next to
+    the code they exercise (`sundog::cluster`'s
+    replication/invalidation/state-transfer/anti-entropy/local-mode tests,
+    `sundog::store`'s read-through stampede-collapse and TTL-expiry tests).
+  - Prometheus-exporter and TLS integration tests.
+  - Unit tests in every module.
 - **`sundog-testnode`** (new workspace member): a tiny static-musl binary that
   opens `Mode::Replicated` `sundog` caches and exposes them over a line-based
   control protocol, `put`/`get`/`del`/`count`/`peers`/`quit`, plus bulk-fill,
-  high-frequency churn, and large-value content-check commands, so external test
-  harnesses can drive a real cluster member as a separate process.
+  high-frequency churn, and large-value content-check commands, so a test
+  process outside the crate can control a real cluster member as a separate process.
 - **Container-backed integration suite** (`sundog/tests/containers.rs`,
-  `sundog/tests/container_smoke.rs`, harness in `sundog/tests/container_util`):
+  `sundog/tests/container_smoke.rs`, driver code in `sundog/tests/container_util`):
   multi-node scenarios run as separate `sundog-testnode` processes on a real
   virtual network, exclusively through the
   [`rightsize`](https://crates.io/crates/rightsize) crate, no Docker CLI, no
@@ -572,13 +657,13 @@ The first release: the full core library.
   frame-cap boundary. Gated on `SUNDOG_CONTAINER_TESTS=1`, checked first in
   every test, not `#[ignore]`, so a plain `cargo test --workspace` still
   compiles and passes the file without a container backend or the musl target
-  installed; needs `RIGHTSIZE_BACKEND=docker` because sundog's gossip is UDP and
+  installed. It needs `RIGHTSIZE_BACKEND=docker` because sundog's gossip is UDP and
   rightsize's microsandbox network emulation relays TCP only.
-- CI: the main `ci` job runs, in order, `cargo fmt --check`, `cargo clippy
+- CI: the main `ci` job runs `cargo fmt --check`, then `cargo clippy
   --workspace --all-targets -D warnings -W clippy::pedantic`, plus a
   `sim`-feature pass and a `tls,prometheus`-features pass, `cargo test
   --workspace`, then the `turmoil` simulation suite and the `tls,prometheus`
-  feature tests as further steps in that same job. The container suite runs as
+  feature tests as later steps in that same job. The container suite runs as
   its own separate job, musl target and `musl-tools` installed,
   `RIGHTSIZE_BACKEND=docker` and `SUNDOG_CONTAINER_TESTS=1` set, default base
   image pulls fine on a hosted runner. A nightly `nightly-sim` workflow runs the
@@ -588,25 +673,25 @@ The first release: the full core library.
   open caches, per-peer backlog drops, anti-entropy repair rate, and
   state-transfer throughput.
 - **`Cache::insert_many`/`Shard::insert_many`**: bulk local writes applied under
-  one acquisition of the store's apply lock rather than one per entry; each
+  one acquisition of the store's apply lock rather than one per entry. Each
   entry still gets its own `Hlc` stamp and its own `Event`. Fan-out
   notifications for a bulk fill travel as per-stripe key batches on the internal
   channel (`store::FanOutNotice::Many`) rather than one notice per entry, so an
   arbitrarily large fill can never lag the fan-out channel and degrade its
-  replication to anti-entropy repair. A 100k-entry fill fully converges on live
+  replication to anti-entropy repair. A 100k-entry fill converges on live
   peers a fraction of a second after the call returns, in a few hundred wire
   frames.
 - **Batched replication on the wire**: the fan-out layer pre-batches each
   drained burst of local writes into `Msg::ReplicateBatch` frames, budget- and
   count-capped, so a bulk burst occupies outbox slots per *batch* rather than
-  per record; `net::conn`'s per-peer writer opportunistically coalesces whatever
+  per record. `net::conn`'s per-peer writer opportunistically coalesces whatever
   is queued, single `Replicate`s and pre-built batches alike, into fuller frames
   with no added latency, only what's already queued by the time the writer
   drains. Anti-entropy repair pushes travel through the same budgeted batching
   instead of one `Replicate` message per repaired record.
   `ShardOps::apply_remote_batch` applies a whole batch, a coalesced wire frame,
-  a state-transfer chunk, or an anti-entropy pull, under one lock acquisition;
-  the permutation-convergence property test mixes single and batch applies as
+  a state-transfer chunk, or an anti-entropy pull, under one lock acquisition.
+  The permutation-convergence property test mixes single and batch applies as
   part of its coverage. `TCP_NODELAY` is set on every mesh connection: every
   wire message is already a deliberately-sized application-level batch, so
   nothing is gained by leaving Nagle's algorithm to hold small frames back.
@@ -622,9 +707,9 @@ The first release: the full core library.
   `Msg::StChunk`, the wire messages that carry actual key/value bytes, use a
   fixed-width layout (`zerocopy`'s safe views, no `unsafe`) instead of postcard.
   Encoding writes straight from already-owned key/value `Bytes` with no
-  intermediate buffer; decoding slices `Bytes` views directly out of the
+  intermediate buffer. Decoding slices `Bytes` views out of the
   received frame with no payload copy. A stored record keeps its encoded wire
-  bytes (`store::Stored::encoded`) alongside its typed value, so answering a
+  bytes (`store::Stored::encoded`) next to its typed value, so answering a
   replication or anti-entropy request clones an existing `Bytes` handle rather
   than re-serializing. Control messages (`Hello`, `StRequest`, `AeDigest`,
   `AeBucket`, `AePull`, `ReqDone`) still encode as postcard.
@@ -633,35 +718,35 @@ The first release: the full core library.
   from a small per-peer pool instead of dialing fresh, and under `tls`,
   completing a fresh mutual-cert handshake, on every call, falling back to a
   fresh dial when the pool is empty or a pooled connection turns out dead. The
-  accept side serves multiple requests per connection instead of exactly one,
+  accept side serves multiple requests per connection instead of one,
   torn down after an idle timeout or a request-count cap. This pool is separate
   from the persistent per-peer broadcast connection, so a slow snapshot transfer
   can't back up live replication traffic. A connection is only ever returned to
-  the pool after a clean end-of-reply; one left in an unknown framing state
+  the pool once a reply completes without error. One left in an unknown framing state
   after an error, timeout, or cancellation is dropped instead of reused.
 - **Striped apply lock**: each shard's tombstone map and write-serialization
   lock is split into 64 independent key-hash stripes instead of one lock per
-  shard. Writes to keys in different stripes apply fully concurrently; writes to
-  the same key stay serialized against each other exactly as a single shard-wide
+  shard. Writes to keys in different stripes apply concurrently. Writes to
+  the same key stay serialized against each other the same way a single shard-wide
   lock would. Remote batch applies and local bulk inserts group their entries by
   stripe and apply each stripe's sub-batch under one acquisition of that
   stripe's lock.
-- **Lean fan-out**: local writes notify the peer fan-out path over an internal
+- **Lean fan-out**: local writes post to the peer fan-out path over an internal
   keys-only channel (`store::FanOutNotice`, single keys for ordinary writes,
-  per-stripe key batches for bulk fills; remote applies never notify), separate
-  from the public `Cache::events()` broadcast channel. The app-facing `Event`,
+  per-stripe key batches for bulk fills, and no message at all for remote
+  applies), separate from the public `Cache::events()` broadcast channel. The app-facing `Event`,
   which owns a clone of the value, is only built when `events()` has a
   subscriber, so a cache with nothing subscribed to `events()` pays no per-write
   value clone for replication or invalidation fan-out.
 - **Partition-aware tombstone retention**: `ClusterConfig::tombstone_max_ttl`,
-  24 hours by default, bounds a new deferral in the tombstone GC sweep: a
-  tombstone past `tombstone_ttl` is kept, not collected, while any recently
-  known cluster member is currently absent, up to the hard cap. This closes the
+  24 hours unless overridden, bounds a new deferral in the tombstone GC sweep: a
+  tombstone past `tombstone_ttl` is kept, not collected, while any member
+  seen inside that window is currently absent, up to the hard cap. This closes the
   resurrection window where a member absent longer than `tombstone_ttl` could
-  bring a manually deleted key back to life on the nodes that stayed up; a
+  bring a manually deleted key back to life on the nodes that stayed up. A
   member gone longer than `tombstone_max_ttl` is the one case that can still
   resurrect a key. Deferred tombstones stay counted in the anti-entropy digest
-  until they're actually collected, so digests and the tombstone set never drift
+  until they're collected, so digests and the tombstone set never drift
   out of sync.
 
 ### Known gaps (tracked, not bugs)

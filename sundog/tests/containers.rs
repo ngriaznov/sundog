@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use container_util::{
-    METRICS_PORT, Node, build_previous_testnode, container_tests_enabled, eventually,
+    CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode,
+    container_tests_enabled, eventually,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -32,6 +33,13 @@ const GOSSIP_PORT: u16 = 7946;
 
 const PEER_WAIT: Duration = Duration::from_secs(30);
 const CONVERGE_WAIT: Duration = Duration::from_secs(20);
+/// Bound for a CRDT compaction-metric wait: the sweep's own cadence
+/// (`cluster.rs::crdt_compact_task`) is `(crdt_retire_after / 4).max(30s)`,
+/// so even a short `crdt_retire_after` still needs multiple 30s-floor
+/// ticks to retire and then fold a writer;
+/// generous headroom against container boot and gossip jitter on top of
+/// that.
+const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(180);
 
 fn seed(alias: &str) -> String {
     format!("{alias}:{GOSSIP_PORT}")
@@ -552,6 +560,184 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     n2.stop().await.expect("n2 stops");
     n3.stop().await.expect("n3 stops");
     n4.stop().await.expect("n4 stops");
+    net.close().await.expect("network closes");
+}
+
+/// Bounds CRDT metadata growth under sustained writer churn: a third node
+/// is repeatedly joined under the same alias, writes to both the `"pn"`
+/// `PnCounter` and `"os"` `OrSet<String>` caches, and is stopped again — a
+/// fresh process mints a fresh membership incarnation and therefore a
+/// fresh [`sundog::crdt::WriterId`], so this exercises genuine writer
+/// churn, not repeated writes from one identity — over a window exceeding
+/// a shortened `crdt_retire_after`. Asserts `pn`'s totals stay exact
+/// despite the churn, `os`'s membership keeps every churned writer's
+/// never-removed element (retirement blocks only a *future* add under a
+/// retired writer's incarnation), and that a fresh cold join's
+/// bytes-per-entry after the churn window and its compaction sweeps is no
+/// larger (within noise) than before any churn — proving the two-stage
+/// fold actually bounds resident record size instead of it growing with
+/// every replaced writer's incarnation.
+///
+/// Uses [`CRDT_RETIRE_AFTER_SECS_ENV`] (see that constant's doc) to shorten
+/// `ClusterConfig::crdt_retire_after` well below its 24h default, so the
+/// compaction-metric wait below settles within the test's own timeout.
+#[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
+#[tokio::test]
+async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
+    const RETIRE_AFTER_SECS: u64 = 5;
+    const CHURN_ROUNDS: u32 = 5;
+    const PN_KEYS: u32 = 10;
+    const OS_KEY: &str = "churn-set";
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let retire_secs = RETIRE_AFTER_SECS.to_string();
+    let env = [(CRDT_RETIRE_AFTER_SECS_ENV, retire_secs.as_str())];
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn_with_env(&net, "churn-scale-cluster", "n1", &[], &env).await;
+    let n2 = Node::spawn_with_env(&net, "churn-scale-cluster", "n2", &[&seed("n1")], &env).await;
+    wait_for_peers(&[&n1, &n2], 1).await;
+
+    n1.pn_fill(PN_KEYS).await.expect("n1 pnfill");
+    n2.pn_fill(PN_KEYS).await.expect("n2 pnfill");
+    let mut expected_total: i64 = 2;
+    let last_key = format!("pn{}", PN_KEYS - 1);
+    for node in [&n1, &n2] {
+        eventually(CONVERGE_WAIT, || async {
+            node.pn_get("pn0").await == Ok(Some(expected_total))
+                && node.pn_get(&last_key).await == Ok(Some(expected_total))
+        })
+        .await;
+    }
+
+    // "Before": a fresh cold join's bytes-per-entry with only n1/n2's two
+    // writers resident on every counter, no churn or compaction yet.
+    let (_, b1_before) = n1.netstats().await.expect("n1 netstats before churn");
+    let (_, b2_before) = n2.netstats().await.expect("n2 netstats before churn");
+    let probe1 = Node::spawn_with_env(
+        &net,
+        "churn-scale-cluster",
+        "probe1",
+        &[&seed("n1"), &seed("n2")],
+        &env,
+    )
+    .await;
+    eventually(CONVERGE_WAIT, || async {
+        probe1.pn_count().await == Ok(PN_KEYS as usize)
+    })
+    .await;
+    let (_, b1_after_probe1) = n1.netstats().await.expect("n1 netstats after probe1");
+    let (_, b2_after_probe1) = n2.netstats().await.expect("n2 netstats after probe1");
+    let bytes_before = (b1_after_probe1 - b1_before) + (b2_after_probe1 - b2_before);
+    let per_entry_before = bytes_before / u64::from(PN_KEYS);
+    probe1.stop().await.expect("probe1 stops");
+
+    // Churn: a third writer joins, contributes to every pn key and adds a
+    // never-removed os element, then is stopped, `CHURN_ROUNDS` times,
+    // each under a fresh incarnation and therefore a fresh `WriterId`,
+    // spanning well past `crdt_retire_after`.
+    for round in 0..CHURN_ROUNDS {
+        let churner = Node::spawn_with_env(
+            &net,
+            "churn-scale-cluster",
+            "churner",
+            &[&seed("n1"), &seed("n2")],
+            &env,
+        )
+        .await;
+        wait_for_peers(&[&n1, &n2, &churner], 2).await;
+
+        churner.pn_fill(PN_KEYS).await.expect("churner pnfill");
+        churner
+            .os_add(OS_KEY, &format!("e{round}"))
+            .await
+            .expect("churner osadd");
+        expected_total += 1;
+
+        eventually(CONVERGE_WAIT, || async {
+            n1.pn_get("pn0").await == Ok(Some(expected_total))
+                && n2.pn_get("pn0").await == Ok(Some(expected_total))
+        })
+        .await;
+        let expected_so_far: Vec<String> = (0..=round).map(|r| format!("e{r}")).collect();
+        eventually(CONVERGE_WAIT, || async {
+            n1.os_members(OS_KEY).await == Ok(Some(expected_so_far.clone()))
+        })
+        .await;
+
+        churner.stop().await.expect("churner stops");
+        wait_for_peers(&[&n1, &n2], 1).await;
+    }
+
+    // Give the sweep (`cluster.rs::crdt_compact_task`, cadence
+    // `(crdt_retire_after / 4).max(30s)`) time to
+    // retire every churned writer — stage one — then a further wait for
+    // stage two's `2 * crdt_retire_after` fold once the cache goes quiet.
+    eventually(CRDT_COMPACT_WAIT, || async {
+        scrape_metric(&n1, "sundog_crdt_retired_writers_total", ("cache", "pn")).await
+            >= u64::from(CHURN_ROUNDS)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2 * RETIRE_AFTER_SECS + 65)).await;
+
+    // Exact totals survive every retirement.
+    for node in [&n1, &n2] {
+        eventually(CONVERGE_WAIT, || async {
+            node.pn_get("pn0").await == Ok(Some(expected_total))
+                && node.pn_get(&last_key).await == Ok(Some(expected_total))
+        })
+        .await;
+    }
+    let expected_members: Vec<String> = (0..CHURN_ROUNDS).map(|r| format!("e{r}")).collect();
+    assert_eq!(
+        n1.os_members(OS_KEY).await,
+        Ok(Some(expected_members)),
+        "every churned writer's never-removed element must survive retirement"
+    );
+
+    // "After": a fresh cold join's bytes-per-entry once every churned
+    // writer has been folded away, despite `CHURN_ROUNDS` more distinct
+    // writer identities having touched every counter than in the "before"
+    // measurement.
+    let (_, b1_before2) = n1.netstats().await.expect("n1 netstats before probe2");
+    let (_, b2_before2) = n2.netstats().await.expect("n2 netstats before probe2");
+    let probe2 = Node::spawn_with_env(
+        &net,
+        "churn-scale-cluster",
+        "probe2",
+        &[&seed("n1"), &seed("n2")],
+        &env,
+    )
+    .await;
+    eventually(CONVERGE_WAIT, || async {
+        probe2.pn_count().await == Ok(PN_KEYS as usize)
+    })
+    .await;
+    let (_, b1_after2) = n1.netstats().await.expect("n1 netstats after probe2");
+    let (_, b2_after2) = n2.netstats().await.expect("n2 netstats after probe2");
+    let bytes_after = (b1_after2 - b1_before2) + (b2_after2 - b2_before2);
+    let per_entry_after = bytes_after / u64::from(PN_KEYS);
+
+    println!(
+        "record size per pn entry: {per_entry_before} bytes/entry before {CHURN_ROUNDS} \
+         writers churned through, {per_entry_after} bytes/entry after they were all retired \
+         and compacted"
+    );
+    assert_eq!(probe2.pn_get("pn0").await, Ok(Some(expected_total)));
+    assert!(
+        per_entry_after <= per_entry_before + 300,
+        "resident record size grew from {per_entry_before} to {per_entry_after} bytes/entry \
+         across {CHURN_ROUNDS} replaced writers — compaction should keep it bounded, not \
+         growing with churn"
+    );
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    probe2.stop().await.expect("probe2 stops");
     net.close().await.expect("network closes");
 }
 

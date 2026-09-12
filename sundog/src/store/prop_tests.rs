@@ -606,7 +606,7 @@ proptest! {
     }
 }
 
-use crdt::{PnCounter, PnCounterResolver};
+use crdt::{PnCounter, PnCounterResolver, WriterId};
 
 /// Builds one [`WireRecord`] per origin, each carrying a
 /// [`PnCounter::local_delta`] write for the same fixed key, staggered and
@@ -629,7 +629,7 @@ fn build_pn_counter_records(deltas: &[u64]) -> Vec<WireRecord> {
             let ver = clocks[origin].now(physical_ms);
             let gossip_idx = (origin + 1) % clocks.len();
             clocks[gossip_idx].observe(physical_ms, ver);
-            let counter = PnCounter::local_delta(node, delta);
+            let counter = PnCounter::local_delta(WriterId::new(node, 0), delta);
             WireRecord {
                 key: key_bytes.clone(),
                 value: Some(Bytes::from(
@@ -658,7 +658,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let rt = current_thread_runtime();
 
         rt.block_on(async {
@@ -727,7 +727,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let rt = current_thread_runtime();
 
         rt.block_on(async {
@@ -801,7 +801,7 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
     let a = WireRecord {
         key: key_bytes.clone(),
         value: Some(Bytes::from(
-            PnCounter::local_delta(NodeId::from(1), 3)
+            PnCounter::local_delta(WriterId::new(NodeId::from(1), 0), 3)
                 .encode()
                 .expect("encodes"),
         )),
@@ -815,7 +815,7 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
     let b = WireRecord {
         key: key_bytes.clone(),
         value: Some(Bytes::from(
-            PnCounter::local_delta(NodeId::from(2), 4)
+            PnCounter::local_delta(WriterId::new(NodeId::from(2), 0), 4)
                 .encode()
                 .expect("encodes"),
         )),
@@ -940,7 +940,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), usize::from(NUM_NODES)),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let key_bytes = records[0].key.clone();
         let rt = current_thread_runtime();
 
@@ -1061,7 +1061,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), usize::from(NUM_NODES)),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let key_bytes = records[0].key.clone();
         let rt = current_thread_runtime();
 

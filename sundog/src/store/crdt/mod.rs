@@ -9,6 +9,8 @@
 
 pub mod or_set;
 mod pn_counter;
+mod writer;
 
 pub use or_set::{OrSet, OrSetResolver};
 pub use pn_counter::{PnCounter, PnCounterResolver};
+pub use writer::WriterId;
