@@ -1,5 +1,5 @@
 //! Reference CRDT value types and the [`super::ConflictResolver`]s that merge
-//! them through [`super::Winner::Merged`].
+//! them through [`super::ConflictResolver::merge`].
 //!
 //! Every type here is built on `BTreeMap`/`BTreeSet` rather than a
 //! hash-based collection, so its postcard encoding is canonical: two

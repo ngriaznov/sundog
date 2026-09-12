@@ -17,7 +17,7 @@ pub struct NodeId(u64);
 impl NodeId {
     /// Partitions the `u64` id space in two: a real node's id always has
     /// this bit clear, and the engine's merge-version combinator always sets
-    /// it when minting a version for a resolver's [`crate::store::Winner::Merged`]
+    /// it when minting a version for a resolver's [`crate::store::ConflictResolver::merge`]
     /// reply. The two halves never overlap, so a minted version can never
     /// collide with a real single-writer stamp: [`Self::random`] clears the
     /// bit unconditionally, and the explicit-id path

@@ -1,5 +1,5 @@
 //! An observed-remove set: [`OrSet`] and the [`OrSetResolver`] that merges
-//! it through [`crate::store::Winner::Merged`].
+//! it through [`crate::store::ConflictResolver::merge`].
 //!
 //! Built on `BTreeMap`/`BTreeSet` rather than a hash-based collection, so
 //! its postcard encoding is canonical: two logically equal sets always
@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::node::NodeId;
-use crate::store::{ConflictResolver, RecordView, Winner};
+use crate::store::{ConflictResolver, Merged, RecordView, Winner};
 
 /// A tag uniquely identifying one [`OrSet::add`]: the writer's node id
 /// paired with a sequence number local to that writer. No two adds, from
@@ -33,10 +33,10 @@ type Tag = (NodeId, u64);
 /// meant to be written back through an ordinary `Put` (a normal
 /// `Cache::insert`), the same way a [`super::PnCounter`] delta is. It never
 /// goes through `Cache::remove`, which discards the entire logical set as a
-/// real tombstone — a value [`crate::store::Winner::Merged`] can never be computed
-/// against, since the engine rejects any merge where either side carries no
-/// value. A real per-key delete stays a real delete, decided by plain
-/// last-writer-wins, never by this resolver.
+/// real tombstone — a value [`crate::store::ConflictResolver::merge`] is
+/// never consulted against, since the engine never calls `merge` when either
+/// side carries no value. A real per-key delete stays a real delete, decided
+/// by plain last-writer-wins, never by this resolver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrSet<T>
 where
@@ -190,39 +190,29 @@ where
     T: Ord + Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-        let (Some(av), Some(bv)) = (a.value, b.value) else {
-            return if a.ver >= b.ver { Winner::A } else { Winner::B };
-        };
-        match (OrSet::<T>::decode(av), OrSet::<T>::decode(bv)) {
-            (Ok(sa), Ok(sb)) => match sa.merge(&sb).encode() {
-                Ok(bytes) => Winner::Merged {
-                    value: Bytes::from(bytes),
-                    // A merged set's tags only ever accumulate (adds and
-                    // tombstones alike), so the set as a whole never
-                    // expires on its own: a TTL policy for it, if any,
-                    // belongs to whichever explicit write set one.
-                    expires_at_ms: None,
-                },
-                Err(_) => {
-                    if a.ver >= b.ver {
-                        Winner::A
-                    } else {
-                        Winner::B
-                    }
-                }
-            },
-            _ => {
-                if a.ver >= b.ver {
-                    Winner::A
-                } else {
-                    Winner::B
-                }
-            }
-        }
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
     }
 
     fn merges(&self) -> bool {
         true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let (Some(av), Some(bv)) = (a.value, b.value) else {
+            return None;
+        };
+        let (Ok(sa), Ok(sb)) = (OrSet::<T>::decode(av), OrSet::<T>::decode(bv)) else {
+            return None;
+        };
+        let bytes = sa.merge(&sb).encode().ok()?;
+        Some(Merged {
+            value: Bytes::from(bytes),
+            // A merged set's tags only ever accumulate (adds and
+            // tombstones alike), so the set as a whole never expires on
+            // its own: a TTL policy for it, if any, belongs to whichever
+            // explicit write set one.
+            expires_at_ms: None,
+        })
     }
 }
 
@@ -423,17 +413,17 @@ mod tests {
         };
 
         let resolver = OrSetResolver::<String>::new();
-        let Winner::Merged {
+        let Some(Merged {
             value: merged_ab, ..
-        } = resolver.winner(b"k", av, bv)
+        }) = resolver.merge(b"k", av, bv)
         else {
-            panic!("expected Winner::Merged when both sides decode");
+            panic!("expected Some(Merged) when both sides decode");
         };
-        let Winner::Merged {
+        let Some(Merged {
             value: merged_ba, ..
-        } = resolver.winner(b"k", bv, av)
+        }) = resolver.merge(b"k", bv, av)
         else {
-            panic!("expected Winner::Merged when both sides decode");
+            panic!("expected Some(Merged) when both sides decode");
         };
         assert_eq!(
             merged_ab, merged_ba,
@@ -465,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_falls_back_to_lww_on_decode_failure() {
+    fn resolver_merge_declines_on_decode_failure_and_winner_falls_back_to_lww() {
         let s = OrSet::add(NodeId::from(1), 0, "x".to_string());
         let encoded = s.encode().expect("encodes");
         let malformed = [0xffu8; 6];
@@ -482,6 +472,8 @@ mod tests {
         };
 
         let resolver = OrSetResolver::<String>::new();
+        assert!(resolver.merge(b"k", good, bad).is_none());
+        assert!(resolver.merge(b"k", bad, good).is_none());
         assert_eq!(resolver.winner(b"k", good, bad), Winner::B);
         assert_eq!(resolver.winner(b"k", bad, good), Winner::A);
     }
@@ -495,7 +487,7 @@ mod tests {
     fn merges_is_true() {
         assert!(
             OrSetResolver::<String>::new().merges(),
-            "OrSetResolver returns Winner::Merged, so it must advertise merges()"
+            "OrSetResolver's merge can return Some, so it must advertise merges()"
         );
     }
 }

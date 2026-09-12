@@ -37,7 +37,7 @@ mod engine;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
 /// Reference CRDT value types — a PN-Counter today — and the
-/// [`ConflictResolver`]s that merge them through [`Winner::Merged`].
+/// [`ConflictResolver`]s that merge them through [`ConflictResolver::merge`].
 pub mod crdt;
 
 /// The optional local SSD/NVMe spill tier. Off by default; see
@@ -338,9 +338,10 @@ pub enum Origin {
     Local,
     /// Caused by an inbound wire message from the given peer.
     ///
-    /// For a record a [`Winner::Merged`] resolver produced, `NodeId` here is
-    /// the merge-derived id the engine minted for it, not the id of any node
-    /// that actually authored a write: it names no member of the cluster.
+    /// For a record a [`ConflictResolver::merge`] resolver produced, `NodeId`
+    /// here is the merge-derived id the engine minted for it, not the id of
+    /// any node that actually authored a write: it names no member of the
+    /// cluster.
     ///
     /// `ShardOps::apply_remote_batch`'s pre-fold narrows this further for a
     /// batch carrying several records for one key from distinct origins (a
@@ -542,9 +543,8 @@ pub trait ShardOps: Send + Sync {
         (dirty, live)
     }
 
-    /// Whether this shard's [`ConflictResolver`] can return
-    /// [`Winner::Merged`], forwarded straight from
-    /// [`ConflictResolver::merges`]. `cluster::anti_entropy` reads this once
+    /// Whether this shard's [`ConflictResolver`] merges, forwarded straight
+    /// from [`ConflictResolver::merges`]. `cluster::anti_entropy` reads this once
     /// per round and, when `true`, has `diff_bucket`/`diff_decoded` queue a
     /// key present on both sides under different versions for both push and
     /// pull instead of only pushing the greater side to the lesser one, so
@@ -572,31 +572,30 @@ pub struct RecordView<'a> {
 }
 
 /// The outcome of a [`ConflictResolver::winner`] call: which argument record
-/// wins, by position rather than role, or a synthesized merge of both.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// wins, by position rather than role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Winner {
     /// The first record (`a`) wins; `b` is discarded.
     A,
     /// The second record (`b`) wins; `a` is discarded.
     B,
-    /// Neither `a` nor `b`: the resolver folded both into a new value.
-    /// Legal **only** when both `a.value` and `b.value` were `Some` — a real
-    /// tombstone or a spilled (`value: None`) side on either input makes
-    /// `Merged` a contract violation; the engine enforces this rather than
-    /// trusting the resolver. `expires_at_ms` is the merged record's own
-    /// TTL, decided explicitly by the resolver — the engine never infers
-    /// one from `a`/`b`.
-    Merged {
-        /// The merged record's postcard-encoded value bytes.
-        value: Bytes,
-        /// The merged record's own TTL; never derived from `a`/`b`.
-        expires_at_ms: Option<u64>,
-    },
 }
 
-/// Picks a winner between two differently-versioned records for the same
-/// key, or folds both into a new value via [`Winner::Merged`].
+/// The outcome of a [`ConflictResolver::merge`] call: the folded value and
+/// its own TTL, decided explicitly by the resolver — the engine never infers
+/// one from `a`/`b`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+    /// The merged record's postcard-encoded value bytes.
+    pub value: Bytes,
+    /// The merged record's own TTL; never derived from `a`/`b`.
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Picks a winner between two differently-versioned records for the same key. A
+/// resolver picks; it never merges, since a synthesized value would make
+/// `Shard::apply`'s outcome depend on which two versions happened to collide
+/// locally.
 ///
 /// # Correctness contract
 ///
@@ -605,25 +604,26 @@ pub enum Winner {
 /// antisymmetric (`winner(key, a, b) == A` iff `winner(key, b, a) == B`, never
 /// favoring argument position), and total and transitive (the "beats" relation
 /// over any set of distinct-version records for one key is a strict total
-/// order, with no cycle) whenever it decides between `A` and `B`.
-/// `Shard::apply` calls `winner` only when `a.ver != b.ver`.
+/// order, with no cycle). `Shard::apply` calls `winner` only when `a.ver !=
+/// b.ver`.
 ///
-/// A resolver that ever returns [`Winner::Merged`] additionally commits its
-/// merge to the join-semilattice laws: **commutative**
-/// (`merge(a, b) == merge(b, a)` byte-for-byte — the engine calls `winner`
-/// with the stored record first and the incoming record second, an accident
-/// of arrival order, never semantics), **associative** across repeated
-/// pairwise folds (the engine only ever folds one collision at a time, so an
-/// N-way concurrent write converges only if arbitrary fold order and
-/// grouping give the same result), and **idempotent** (`merge(a, a) == a`,
-/// since a redelivered, already-absorbed input must be a no-op).
+/// A resolver whose [`ConflictResolver::merges`] returns `true` additionally
+/// commits its [`ConflictResolver::merge`] to the join-semilattice laws:
+/// **commutative** (`merge(a, b) == merge(b, a)` byte-for-byte — the engine
+/// calls `merge` with the stored record first and the incoming record
+/// second, an accident of arrival order, never semantics), **associative**
+/// across repeated pairwise folds (the engine only ever folds one collision
+/// at a time, so an N-way concurrent write converges only if arbitrary fold
+/// order and grouping give the same result), and **idempotent** (`merge(a,
+/// a) == a`, since a redelivered, already-absorbed input must be a no-op).
 ///
-/// [`Winner::Merged`] is legal **only** when both `a.value` and `b.value` are
-/// `Some`. A resolver must never override [`ConflictResolver::needs_value_bytes`]
-/// to return `false` if it can ever return `Merged`: doing so hands `winner`
-/// a `RecordView { value: None, .. }` on both sides, with nothing to merge.
+/// [`ConflictResolver::merge`] is consulted only when both `a.value` and
+/// `b.value` are `Some`. A resolver must never override
+/// [`ConflictResolver::needs_value_bytes`] to return `false` if `merges`
+/// returns `true`: doing so hands `merge` a `RecordView { value: None, .. }`
+/// on both sides, with nothing to merge.
 ///
-/// The version assigned to a `Merged` outcome is not this trait's concern —
+/// The version assigned to a `merge` outcome is not this trait's concern —
 /// the engine decides it from `a.ver`, `b.ver`, and how the merged bytes
 /// compare to each side's own bytes, never from the resolver. A merge that
 /// reduces to one side's exact bytes adopts that side's own version only
@@ -638,34 +638,35 @@ pub enum Winner {
 ///
 /// The resolver is local, per-`Shard` configuration, never wire-negotiated —
 /// every node in a cluster must run an identical resolver for a given cache,
-/// `Merged`-capable resolvers included. A mid-rollout cluster with some
-/// nodes still on [`LwwResolver`] silently drops the merge property on those
-/// nodes rather than erroring: nothing in this crate detects a
-/// mixed-resolver cluster, exactly as nothing detects one node violating
-/// antisymmetry or transitivity while others don't.
+/// merging resolvers included. A mid-rollout cluster with some nodes still
+/// on [`LwwResolver`] silently drops the merge property on those nodes
+/// rather than erroring: nothing in this crate detects a mixed-resolver
+/// cluster, exactly as nothing detects one node violating antisymmetry or
+/// transitivity while others don't.
 pub trait ConflictResolver: Send + Sync + 'static {
     /// Decides which of `a`, `b`, two different versions of the record stored
-    /// at `key`'s wire-encoded bytes, wins, or returns a merge of both. See
-    /// the trait docs for the correctness contract.
+    /// at `key`'s wire-encoded bytes, wins. See the trait docs for the
+    /// correctness contract.
     fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner;
 
     /// Whether `winner` reads `RecordView::value`. Defaults to `true`. Override
     /// to `false` for a resolver that, like [`LwwResolver`], only compares
     /// `ver`/`expires_at_ms`, so the versioned apply skips encoding both
     /// records' values on every apply. Never override to `false` for a
-    /// resolver that can return [`Winner::Merged`]: see the trait docs.
+    /// resolver whose [`ConflictResolver::merges`] returns `true`: see the
+    /// trait docs.
     fn needs_value_bytes(&self) -> bool {
         true
     }
 
-    /// Whether this resolver can ever return [`Winner::Merged`]. Defaults to
-    /// `false`, matching [`LwwResolver`] and any other pick-a-side-only
-    /// resolver. A resolver that overrides `winner` to return `Merged` must
-    /// override this to `true` — nothing enforces the override, but
-    /// `ShardOps::merges` (via `Shard::with_resolver`) forwards it straight
-    /// into anti-entropy's direction rule, so a resolver claiming `false`
-    /// while returning `Merged` only loses the optimization below, never
-    /// correctness.
+    /// Whether this resolver's [`ConflictResolver::merge`] can ever return
+    /// `Some`. Defaults to `false`, matching [`LwwResolver`] and any other
+    /// pick-a-side-only resolver. A resolver that overrides `merge` to
+    /// return `Some` must override this to `true` — nothing enforces the
+    /// override, but `ShardOps::merges` (via `Shard::with_resolver`)
+    /// forwards it straight into anti-entropy's direction rule, so a
+    /// resolver claiming `false` while `merge` returns `Some` only loses the
+    /// optimization below, never correctness.
     ///
     /// Anti-entropy's `diff_bucket`/`diff_decoded` push only the greater of
     /// two differently-versioned records to the lesser side by default,
@@ -678,10 +679,20 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// (or adopt) the identical result in the same round: see
     /// `merge_version`'s doc for why the mint arm is symmetric in its two
     /// input stamps. `true` is always correct to return, even for a
-    /// resolver that never actually returns `Merged`; it only ever costs an
-    /// extra exchange, never a correctness issue.
+    /// resolver whose `merge` never actually returns `Some`; it only ever
+    /// costs an extra exchange, never a correctness issue.
     fn merges(&self) -> bool {
         false
+    }
+
+    /// Folds `a` and `b` into a third record. `None` falls back to
+    /// [`ConflictResolver::winner`]. Only consulted when
+    /// [`ConflictResolver::merges`] is `true` and both sides carry a value.
+    /// See the trait docs for the correctness contract a resolver that
+    /// returns `Some` commits to.
+    fn merge(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let _ = (key, a, b);
+        None
     }
 }
 
@@ -2084,25 +2095,31 @@ where
         } = &mut *stripe;
         match entries.entry(key) {
             Entry::Occupied(slot) => {
-                let winner = {
+                let (a, b) = {
                     let existing = slot.get();
-                    let a = RecordView {
-                        value: Some(existing.encoded.as_ref()),
-                        ver: existing.ver,
-                        expires_at_ms: existing.expires_at_ms,
-                    };
-                    let b = RecordView {
-                        value: Some(encoded.as_ref()),
-                        ver,
-                        expires_at_ms: self.expiry_for(None),
-                    };
-                    self.resolver.winner(key_bytes.as_ref(), a, b)
+                    (
+                        RecordView {
+                            value: Some(existing.encoded.as_ref()),
+                            ver: existing.ver,
+                            expires_at_ms: existing.expires_at_ms,
+                        },
+                        RecordView {
+                            value: Some(encoded.as_ref()),
+                            ver,
+                            expires_at_ms: self.expiry_for(None),
+                        },
+                    )
                 };
-                match winner {
-                    Winner::Merged {
+                let merged = self
+                    .resolver
+                    .merges()
+                    .then(|| self.resolver.merge(key_bytes.as_ref(), a, b))
+                    .flatten();
+                match merged {
+                    Some(Merged {
                         value: merged_bytes,
                         expires_at_ms,
-                    } => {
+                    }) => {
                         let merged_value: V =
                             postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
                         let entry = slot.into_mut();
@@ -2111,20 +2128,22 @@ where
                         entry.expires_at_ms = expires_at_ms;
                         entry.ver = ver;
                     }
-                    Winner::B => {
-                        let entry = slot.into_mut();
-                        entry.value = value;
-                        entry.encoded = encoded;
-                        entry.expires_at_ms = self.expiry_for(None);
-                        entry.ver = ver;
-                    }
-                    Winner::A => {
-                        // The incoming call lost outright: nothing about the
-                        // pending entry changes, version included, mirroring
-                        // `resolve_and_rebind`'s `IncomingLoses => None` in
-                        // the engine — a losing write never advances the
-                        // version of the record it lost against.
-                    }
+                    None => match self.resolver.winner(key_bytes.as_ref(), a, b) {
+                        Winner::B => {
+                            let entry = slot.into_mut();
+                            entry.value = value;
+                            entry.encoded = encoded;
+                            entry.expires_at_ms = self.expiry_for(None);
+                            entry.ver = ver;
+                        }
+                        Winner::A => {
+                            // The incoming call lost outright: nothing about the
+                            // pending entry changes, version included, mirroring
+                            // `resolve_and_rebind`'s `IncomingLoses => None` in
+                            // the engine — a losing write never advances the
+                            // version of the record it lost against.
+                        }
+                    },
                 }
             }
             Entry::Vacant(slot) => {
@@ -4475,46 +4494,40 @@ mod tests {
     }
 
     #[test]
-    fn winner_merged_carries_the_resolvers_value_and_ttl() {
-        let merged = Winner::Merged {
+    fn merged_carries_the_resolvers_value_and_ttl() {
+        let merged = Merged {
             value: Bytes::from_static(b"merged-bytes"),
             expires_at_ms: Some(42),
         };
-        match merged {
-            Winner::Merged {
-                value,
-                expires_at_ms,
-            } => {
-                assert_eq!(value, Bytes::from_static(b"merged-bytes"));
-                assert_eq!(expires_at_ms, Some(42));
-            }
-            _ => panic!("expected Winner::Merged"),
-        }
+        let Merged {
+            value,
+            expires_at_ms,
+        } = merged;
+        assert_eq!(value, Bytes::from_static(b"merged-bytes"));
+        assert_eq!(expires_at_ms, Some(42));
     }
 
     #[test]
-    fn winner_merged_equality_compares_value_and_ttl() {
-        let a = Winner::Merged {
+    fn merged_equality_compares_value_and_ttl() {
+        let a = Merged {
             value: Bytes::from_static(b"x"),
             expires_at_ms: None,
         };
-        let b = Winner::Merged {
+        let b = Merged {
             value: Bytes::from_static(b"x"),
             expires_at_ms: None,
         };
-        let different_value = Winner::Merged {
+        let different_value = Merged {
             value: Bytes::from_static(b"y"),
             expires_at_ms: None,
         };
-        let different_ttl = Winner::Merged {
+        let different_ttl = Merged {
             value: Bytes::from_static(b"x"),
             expires_at_ms: Some(1),
         };
         assert_eq!(a, b);
         assert_ne!(a, different_value);
         assert_ne!(a, different_ttl);
-        assert_ne!(a, Winner::A);
-        assert_ne!(a, Winner::B);
     }
 
     #[test]
@@ -4649,12 +4662,13 @@ mod tests {
         );
     }
 
-    /// A resolver that always claims to have merged both sides into fixed
-    /// bytes, regardless of whether either side actually carries a value or
-    /// whether those bytes decode as the shard's value type. `resolve_conflict`
-    /// itself is private to `engine.rs`, so this is how its engine-enforced
-    /// tombstone/spill guard and decode-failure rejection get exercised from
-    /// out here, through the public `Shard`/`ShardOps` surface only.
+    /// A resolver whose `merge` always claims to have folded both sides into
+    /// fixed bytes, regardless of whether those bytes decode as the shard's
+    /// value type, and whose `winner` falls back to plain `Hlc` order, like
+    /// `LwwResolver`. `resolve_conflict` itself is private to `engine.rs`, so
+    /// this is how its engine-enforced value-presence guard and
+    /// decode-failure rejection get exercised from out here, through the
+    /// public `Shard`/`ShardOps` surface only.
     #[derive(Debug, Clone)]
     struct AlwaysMerge {
         value: Bytes,
@@ -4662,20 +4676,24 @@ mod tests {
     }
 
     impl ConflictResolver for AlwaysMerge {
-        fn winner(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Winner {
-            Winner::Merged {
-                value: self.value.clone(),
-                expires_at_ms: self.expires_at_ms,
-            }
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            if a.ver >= b.ver { Winner::A } else { Winner::B }
         }
 
         fn merges(&self) -> bool {
             true
         }
+
+        fn merge(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Option<Merged> {
+            Some(Merged {
+                value: self.value.clone(),
+                expires_at_ms: self.expires_at_ms,
+            })
+        }
     }
 
     #[tokio::test]
-    async fn merge_against_a_tombstone_degrades_to_keeping_the_stored_record() {
+    async fn merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_order() {
         let s = shard::<u32, u32>(1).with_resolver(Arc::new(AlwaysMerge {
             value: Bytes::from(postcard::to_stdvec(&99u32).expect("encode")),
             expires_at_ms: None,
@@ -4687,8 +4705,9 @@ mod tests {
         // A bare tombstone for a key that has never existed: `stored_ver` is
         // `None` going in, so this never consults `AlwaysMerge` at all — it
         // would otherwise see its own tombstone as a value-less "incoming"
-        // and have the engine's guard reject it, same as the colliding write
-        // below, which is exactly what this test means to isolate instead.
+        // and have the engine's guard skip `merge`, same as the colliding
+        // write below, which is exactly what this test means to isolate
+        // instead.
         ShardOps::apply_remote(
             &s,
             WireRecord {
@@ -4708,8 +4727,12 @@ mod tests {
             .recv()
             .await
             .expect("Removed for the setup tombstone");
-        let (_, weight_before) = s.engine.debug_totals();
 
+        // Genuinely newer than the tombstone by `Hlc`: the tombstone's
+        // value-less side means `merge` is never consulted no matter what
+        // `merges()` claims, so this lands via the ordinary Hlc-order
+        // `winner` fallback, with its own real value, never `AlwaysMerge`'s
+        // synthesized 99.
         let incoming = WireRecord {
             key: key_bytes(&1u32),
             value: Some(Bytes::from(postcard::to_stdvec(&42u32).expect("encode"))),
@@ -4720,28 +4743,33 @@ mod tests {
 
         assert_eq!(
             s.get(&1).await,
-            None,
-            "a Merged reply against a tombstone is rejected: a deleted key never resurrects"
+            Some(42),
+            "the incoming write's own value lands via the ordinary winner fallback, never the \
+             resolver's synthesized merge bytes, since a tombstone's value-less side means \
+             merge is never consulted"
         );
-        assert!(
-            events.try_recv().is_err(),
-            "the rejected merge publishes no event"
-        );
-        let (_, weight_after) = s.engine.debug_totals();
-        assert_eq!(
-            weight_before, weight_after,
-            "a rejected merge leaves the engine's bookkeeping untouched"
-        );
+        match events
+            .recv()
+            .await
+            .expect("an event for the colliding write")
+        {
+            Event::Created { key, value, origin } => {
+                assert_eq!(key, 1);
+                assert_eq!(value, 42);
+                assert_eq!(origin, Origin::Remote(NodeId::from(2)));
+            }
+            other => panic!("expected Event::Created for a write over a tombstone, got {other:?}"),
+        }
     }
 
     /// A spilled stored side is no longer value-less once `apply_locked`
     /// reads its bytes back off disk (see `engine::read_spilled_for_conflict`):
-    /// `AlwaysMerge` always returns `Winner::Merged`, and now that both
+    /// `AlwaysMerge`'s `merge` always returns `Some`, and now that both
     /// sides have real values, `resolve_conflict`'s guard has nothing to
-    /// reject, so the merge applies exactly as it would against a resident
-    /// stored side. `merge_against_a_tombstone_degrades_to_keeping_the_stored_record`,
+    /// stop it, so the merge applies exactly as it would against a resident
+    /// stored side. `merge_against_a_tombstone_is_never_consulted_and_falls_back_to_hlc_order`,
     /// just above, is the guard's remaining case: a tombstone is genuinely
-    /// value-less, spilled or not, and still degrades every time.
+    /// value-less, spilled or not, and `merge` is never consulted for it.
     #[cfg(feature = "spill")]
     #[tokio::test]
     async fn merge_against_a_spilled_side_folds_once_its_bytes_are_read_back() {
@@ -4911,39 +4939,37 @@ mod tests {
 
     impl ConflictResolver for SumResolver {
         fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-            let (Some(av), Some(bv)) = (a.value, b.value) else {
-                return if a.ver >= b.ver { Winner::A } else { Winner::B };
-            };
-            match (
-                postcard::from_bytes::<u32>(av),
-                postcard::from_bytes::<u32>(bv),
-            ) {
-                (Ok(x), Ok(y)) => Winner::Merged {
-                    value: Bytes::from(postcard::to_stdvec(&(x + y)).expect("u32 always encodes")),
-                    expires_at_ms: None,
-                },
-                _ => {
-                    if a.ver >= b.ver {
-                        Winner::A
-                    } else {
-                        Winner::B
-                    }
-                }
-            }
+            if a.ver >= b.ver { Winner::A } else { Winner::B }
         }
 
         fn merges(&self) -> bool {
             true
         }
+
+        fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+            let (Some(av), Some(bv)) = (a.value, b.value) else {
+                return None;
+            };
+            let (Ok(x), Ok(y)) = (
+                postcard::from_bytes::<u32>(av),
+                postcard::from_bytes::<u32>(bv),
+            ) else {
+                return None;
+            };
+            Some(Merged {
+                value: Bytes::from(postcard::to_stdvec(&(x + y)).expect("u32 always encodes")),
+                expires_at_ms: None,
+            })
+        }
     }
 
-    /// A resolver that keeps whichever side decodes to the greater `u32`
-    /// and never actually returns [`Winner::Merged`] — legal per
+    /// A resolver that keeps whichever side decodes to the greater `u32` and
+    /// never overrides [`ConflictResolver::merge`] — legal per
     /// [`ConflictResolver::merges`]'s own doc ("`true` is always correct to
-    /// return, even for a resolver that never actually returns `Merged`")
-    /// and exactly the shape needed to drive [`Shard::merge`]'s pending
-    /// fold through a real `Winner::A`/`Winner::B` decision between two
-    /// real `Put` values, rather than only through the tombstone/decode-
+    /// return, even for a resolver whose `merge` never actually returns
+    /// `Some`") and exactly the shape needed to drive [`Shard::merge`]'s
+    /// pending fold through a real `Winner::A`/`Winner::B` decision between
+    /// two real `Put` values, rather than only through the tombstone/decode-
     /// failure fallback every other test resolver's `A`/`B` arm takes.
     #[derive(Debug, Clone, Copy, Default)]
     struct MaxWinsResolver;

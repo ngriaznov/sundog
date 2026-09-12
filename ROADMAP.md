@@ -51,9 +51,12 @@ or repairs.
 
 ### Merge resolvers
 
-`ConflictResolver::winner` no longer only picks one of two records: the
-`Winner::Merged { value, expires_at_ms }` variant lets it fold the stored and
-incoming records into a third value. The engine derives that value's version
+`ConflictResolver` no longer only picks one of two records via `winner`:
+`ConflictResolver::merge`, a defaulted method returning `Option<Merged>`
+(`Merged { value, expires_at_ms }`), lets a resolver fold the stored and
+incoming records into a third value instead, consulted only when
+`ConflictResolver::merges` is `true` and both sides carry a value; `None`
+falls back to `winner`. The engine derives that value's version
 from the merged bytes themselves, not only from the two inputs' versions:
 when the merge reduces to one side outright it adopts that side's own
 `(version, bytes)` pair (or does nothing, if that side is already what's
@@ -66,8 +69,10 @@ version. A merge-derived id can never equal a real node's id (a private high
 bit distinguishes the two), so a minted version never falls into the
 equal-version fast path against a genuine single-writer stamp, and
 redelivering an already-absorbed merge is a no-op rather than an unbounded
-re-broadcast. `Winner` is `#[non_exhaustive]`, so this shipped as a
-minor-version addition rather than waiting on a major. The `sundog::crdt`
+re-broadcast. `Winner` itself is untouched — still exactly `A`/`B`, exactly
+as in every prior release — and `merges`/`merge` are both defaulted, so no
+existing `ConflictResolver` implementation changes; this shipped as a patch
+rather than waiting on a minor. The `sundog::crdt`
 module ships `PnCounter`/`PnCounterResolver` and `OrSet`/`OrSetResolver` as
 reference types proving the mechanism: both merge commutatively,
 associatively, and idempotently under any delivery order, and a three-node
@@ -98,10 +103,10 @@ keys, and a monotonicity pin
 (`partition_heal_rounds_are_monotone_in_key_count`) holds both variants'
 round counts non-decreasing from 2,000 through 40,000 keys. This supersedes
 an earlier, since-replaced version of the sim that measured a round-count
-inversion at 20,000 keys under a race-prone anti-entropy tick; see
-`docs/merge-resolvers.md`'s partition-heal results and closing section for
-the byte-cost question that measurement did surface and that this rebuild
-does not resolve.
+inversion at 20,000 keys under a race-prone anti-entropy tick; the
+"Redundant pulls at a partial conflict fraction" item below is the
+byte-cost question that measurement did surface and that this rebuild does
+not resolve.
 
 Two write-path levers sit on top of the same contract, both public API,
 neither changing the version rule or the wire format. `Engine::apply_many`

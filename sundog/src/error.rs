@@ -48,14 +48,12 @@ pub enum JoinError {
     /// A zeroconf announce/browse operation failed.
     #[error("discovery error")]
     Discovery(#[source] io::Error),
-    /// A [`crate::config::ClusterConfig`] field failed validation.
+    /// A [`crate::config::ClusterConfig`] field failed validation, or
+    /// [`crate::ClusterBuilder::node_id`] was given a merge-derived node id
+    /// (one only the engine's merge-version combinator ever mints), which no
+    /// real node may use.
     #[error("invalid cluster config: {0}")]
     InvalidConfig(String),
-    /// [`crate::ClusterBuilder::node_id`] was given a merge-derived node id
-    /// (one only the engine's merge-version combinator ever mints), which
-    /// no real node may use.
-    #[error("node id {0} is reserved for merge versions and cannot be used as a real node id")]
-    ReservedNodeId(NodeId),
 }
 
 /// Errors from operating on a named [`crate::cache::Cache`].

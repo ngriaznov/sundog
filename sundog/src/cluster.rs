@@ -498,7 +498,7 @@ impl ClusterBuilder {
     ///
     /// `id` is validated at [`build`](Self::build): a merge-derived id (one
     /// only the engine's merge-version combinator ever mints, never a real
-    /// node) is rejected with [`JoinError::ReservedNodeId`] rather than
+    /// node) is rejected with [`JoinError::InvalidConfig`] rather than
     /// silently remapped.
     pub fn node_id(mut self, id: NodeId) -> Self {
         self.node_id = Some(id);
@@ -548,7 +548,9 @@ impl ClusterBuilder {
 
         validate_config(&config)?;
         if let Some(id) = node_id.filter(|id| id.is_merge_derived()) {
-            return Err(JoinError::ReservedNodeId(id));
+            return Err(JoinError::InvalidConfig(format!(
+                "node id {id} is reserved for merge versions and cannot be used as a real node id"
+            )));
         }
 
         let local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>> =
@@ -4734,10 +4736,15 @@ mod tests {
             .build()
             .await
             .expect_err("a merge-derived id must never become a real node id");
-        assert!(matches!(
-            err,
-            JoinError::ReservedNodeId(id) if id == derived
-        ));
+        match err {
+            JoinError::InvalidConfig(msg) => {
+                assert!(
+                    msg.contains(&derived.to_string()),
+                    "the rejection names the offending id: {msg:?}"
+                );
+            }
+            other => panic!("expected JoinError::InvalidConfig, got {other:?}"),
+        }
     }
 
     #[tokio::test]

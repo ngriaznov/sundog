@@ -34,7 +34,7 @@ use sundog::node::{NodeId, NodeName};
 use sundog::store::{Mode, Shard, ShardOps, SimFanOut};
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
-    ConflictResolver, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
+    ConflictResolver, Merged, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
     ownership_diff,
 };
 use tokio::sync::watch;
@@ -3176,16 +3176,18 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
 // default `LwwResolver` — measuring anti-entropy rounds, virtual time,
 // frames, bytes, records, engine applies, resolver folds, and redundant
 // pulls spent reconciling after the heal, against the exact expected
-// total. See `docs/merge-resolvers.md`'s partition-heal section for the
-// full design and `SUNDOG_SIM_FULL`'s grid.
+// total. `SUNDOG_SIM_FULL` controls the grid's size: the fast default
+// (2,000 keys, conflict fraction 0.0/1.0, one seed) or the full sweep
+// (2,000 and 20,000 keys, the whole 0.0/0.1/0.5/1.0 conflict-fraction
+// range, three seeds).
 // ---------------------------------------------------------------------
 
 /// Which side of the fair comparison a partition-heal run exercises: the
 /// same content, keyed either per-writer under [`LwwResolver`] (so no key is
 /// ever really contended) or on one shared key under [`PnCounterResolver`]
-/// (so every overlapping counter is a real, folded merge). See the module
-/// docs at `docs/merge-resolvers.md`'s partition-heal section for the full
-/// design this grid measures.
+/// (so every overlapping counter is a real, folded merge). This is the
+/// fair A/B comparison [`partition_heal_comparison`] measures across every
+/// configured key count, conflict fraction, and seed.
 ///
 /// [`LwwResolver`]: sundog::LwwResolver
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3236,10 +3238,11 @@ const HEAL_PARTITION_MS: u64 = 500;
 /// monotonicity, exact convergence) therefore measures the resolver and
 /// anti-entropy logic in isolation from that scheduling race, not the
 /// bidirectional exchange's round count at production's actual tick
-/// cadence; it cannot by itself confirm the round-count regression
-/// `docs/merge-resolvers.md`'s "Where merge loses" describes is fixed at
-/// 200ms, only that nothing here regresses further under generous
-/// scheduling margin. A
+/// cadence: a merging resolver's bidirectional exchange trades a round
+/// for an extra push/pull pair per divergent key, a real regression at
+/// production's actual 200ms cadence; this generous margin can only show
+/// that nothing here regresses further, never confirm that regression is
+/// fixed. A
 /// production-cadence variant, run at (or near) 200ms and tolerant of the
 /// resulting scheduling noise, would be needed to confirm that separately.
 const HEAL_AE_INTERVAL_MS: u64 = 1000;
@@ -3293,8 +3296,8 @@ impl HealConfig {
 /// additions over the harness's earlier `PartitionHealMetrics`: `records` is
 /// every record either direction actually applied (or attempted to apply),
 /// `applies` is the subset that changed the touched key's stored
-/// `(version, bytes)`, `folds` is how many times the resolver itself
-/// returned `Winner::Merged`, and `redundant_pulls` is the pull-direction
+/// `(version, bytes)`, `folds` is how many times the resolver's `merge`
+/// itself returned `Some`, and `redundant_pulls` is the pull-direction
 /// subset of `records - applies` -- the "Findings" section's own
 /// redundant-pull cost of the bidirectional exchange, isolated from the
 /// push direction.
@@ -3317,7 +3320,7 @@ struct HealMetrics {
     lost_updates: i64,
 }
 
-/// Wraps a [`ConflictResolver`] to count every [`Winner::Merged`] outcome it
+/// Wraps a [`ConflictResolver`] to count every `Some` its [`ConflictResolver::merge`]
 /// returns: the "resolver folds" metric, a test-visible counter on the
 /// resolver itself rather than anything the production `ConflictResolver`
 /// contract exposes.
@@ -3341,11 +3344,7 @@ impl<R> CountingResolver<R> {
 
 impl<R: ConflictResolver> ConflictResolver for CountingResolver<R> {
     fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-        let winner = self.inner.winner(key, a, b);
-        if matches!(winner, Winner::Merged { .. }) {
-            self.folds.fetch_add(1, Ordering::Relaxed);
-        }
-        winner
+        self.inner.winner(key, a, b)
     }
 
     fn needs_value_bytes(&self) -> bool {
@@ -3354,6 +3353,14 @@ impl<R: ConflictResolver> ConflictResolver for CountingResolver<R> {
 
     fn merges(&self) -> bool {
         self.inner.merges()
+    }
+
+    fn merge(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let merged = self.inner.merge(key, a, b);
+        if merged.is_some() {
+            self.folds.fetch_add(1, Ordering::Relaxed);
+        }
+        merged
     }
 }
 
@@ -3763,9 +3770,7 @@ static HEAL_WIRE_METRICS_LOCK: StdMutex<()> = StdMutex::new(());
 /// `cfg.conflict_fraction` and `cfg.variant` select, a heal, then anti-entropy
 /// -- run through the production `sundog::run_round_against` entry point,
 /// never a reimplementation of it -- until every node's fingerprint agrees
-/// and every counter reads the exact expected total. See
-/// `docs/merge-resolvers.md`'s partition-heal section for the full design and
-/// the "Findings that shape the implementation" this driver embodies.
+/// and every counter reads the exact expected total.
 #[allow(
     clippy::too_many_lines,
     reason = "one scenario driver's full setup, write/heal schedule, and convergence check read \
@@ -4068,8 +4073,9 @@ fn partition_heal_variant_reaches_exact_totals() {
 /// runs decomposed then merged with the same seed, prints one `SIM` line
 /// per run and one `SIM partition_heal_pair` line per pair, and asserts only
 /// that both sides converged correctly and within
-/// [`HEAL_MAX_AE_ROUNDS`] -- never a specific ratio between them, which is a
-/// report to read (see `docs/merge-resolvers.md`), not a property to pin.
+/// [`HEAL_MAX_AE_ROUNDS`] -- never a specific ratio between them, which the
+/// printed `SIM`/`SIM partition_heal_pair` lines are there to read, not a
+/// property to pin.
 /// `SUNDOG_SIM_FULL=1` swaps the fast default grid (2,000 keys, conflict
 /// fraction 0.0/1.0, one seed) for the full one (2,000 and 20,000 keys, the
 /// whole 0.0/0.1/0.5/1.0 conflict-fraction range, three seeds).

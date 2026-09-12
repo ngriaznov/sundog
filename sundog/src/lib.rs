@@ -90,7 +90,7 @@ pub use node::{NodeId, NodeName};
 pub use store::crdt;
 #[cfg(feature = "spill")]
 pub use store::spill::SpillConfig;
-pub use store::{ConflictResolver, Event, LwwResolver, Mode, Origin, RecordView, Winner};
+pub use store::{ConflictResolver, Event, LwwResolver, Merged, Mode, Origin, RecordView, Winner};
 #[cfg(feature = "prometheus")]
 pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
 

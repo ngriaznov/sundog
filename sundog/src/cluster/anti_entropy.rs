@@ -3,8 +3,8 @@
 //! 1,024 bucket digests; for each mismatch the peer answers with the bucket's
 //! entry listing, or an IBLT sketch for a large bucket. The initiator diffs,
 //! pushes what it has newer, and pulls what the peer has newer, so both sides
-//! converge in one round. When the shard's resolver can return
-//! `Winner::Merged` (`ShardOps::merges` is `true`), a version-mismatched key
+//! converge in one round. When the shard's resolver merges
+//! (`ShardOps::merges` is `true`), a version-mismatched key
 //! is pushed *and* pulled instead of only in the greater side's direction, so
 //! two replicas each holding half of a merge exchange records in this same
 //! round rather than needing a second round to carry the minted result back.
@@ -190,8 +190,8 @@ pub async fn run_round_against(
     cache: &SmolStr,
     peer: NodeId,
 ) -> RoundOutcome {
-    // Read once per round: a resolver that can return `Winner::Merged` has
-    // both sides exchange a mismatched key instead of only the greater
+    // Read once per round: a merging resolver has both sides exchange a
+    // mismatched key instead of only the greater
     // version pushing to the lesser side, so two replicas each holding half
     // of a merge converge in this one round rather than needing a second
     // round to carry the minted result back. See `ShardOps::merges`.

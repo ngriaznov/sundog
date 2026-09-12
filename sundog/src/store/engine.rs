@@ -96,8 +96,8 @@ use crate::wire::WireRecord;
 #[cfg(feature = "spill")]
 use super::spill::{SpillJob, SpillLoc, SpillSink, SpillTier, spilled_is_current};
 use super::{
-    BUCKET_COUNT, BucketEntries, ConflictResolver, Incoming, PART_COUNT, PartEntries, RecordView,
-    Tombstone, Weigher, Winner, entry_fingerprint,
+    BUCKET_COUNT, BucketEntries, ConflictResolver, Incoming, Merged, PART_COUNT, PartEntries,
+    RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
 };
 
 /// Stack-buffer size for a key's postcard encoding on the read path, large
@@ -366,19 +366,21 @@ enum Resolution {
 /// fast path (an already-applied record seen again) without calling the
 /// resolver at all.
 ///
-/// A [`Winner::Merged`] reply is trusted only when both sides actually carry
-/// a value: this is an engine-enforced guard, not just a resolver-authoring
-/// convention, so a resolver that (by bug, or because either side is a real
-/// tombstone, or a spilled side with no tier attached or whose disk read
-/// failed) tries to merge against a value-less side degrades to
-/// [`Resolution::IncomingLoses`] rather than ever reaching
-/// [`apply_put`]/[`apply_tombstone`] — a deleted key never resurrects, and a
-/// spilled entry whose bytes cannot actually be produced is never
-/// overwritten with a fabricated value, no matter what the resolver
-/// returns. A spilled side whose bytes *can* be read back — [`apply_locked`]
-/// does this before ever calling here, via [`read_spilled_for_conflict`] —
-/// is not value-less: the resolver merges against its real content exactly
-/// as it would against a resident record.
+/// [`ConflictResolver::merge`] is consulted only when [`ConflictResolver::merges`]
+/// is `true` and both sides actually carry a value: this is an
+/// engine-enforced guard, not just a resolver-authoring convention, so a
+/// resolver that (by bug, or because either side is a real tombstone, or a
+/// spilled side with no tier attached or whose disk read failed) would
+/// otherwise merge against a value-less side never gets the chance — `merge`
+/// is simply not called, and [`ConflictResolver::winner`] decides instead,
+/// exactly as it would for a non-merging resolver. A deleted key can still
+/// lose to a genuinely newer write this way, but never to a fabricated
+/// value: a spilled entry whose bytes cannot actually be produced is never
+/// overwritten with a fabricated value either, no matter what `merge`
+/// would have returned. A spilled side whose bytes *can* be read back —
+/// [`apply_locked`] does this before ever calling here, via
+/// [`read_spilled_for_conflict`] — is not value-less: the resolver merges
+/// against its real content exactly as it would against a resident record.
 fn resolve_conflict<V>(
     resolver: &dyn ConflictResolver,
     key_bytes: &[u8],
@@ -410,26 +412,26 @@ fn resolve_conflict<V>(
         ver,
         expires_at_ms: incoming_expires_at_ms,
     };
+    if resolver.merges()
+        && stored_view.value.is_some()
+        && incoming_view.value.is_some()
+        && let Some(Merged {
+            value,
+            expires_at_ms,
+        }) = resolver.merge(key_bytes, stored_view, incoming_view)
+    {
+        return Resolution::Merged {
+            value,
+            expires_at_ms,
+        };
+    }
     match resolver.winner(key_bytes, stored_view, incoming_view) {
         Winner::A => Resolution::IncomingLoses,
         Winner::B => Resolution::IncomingWins,
-        Winner::Merged {
-            value,
-            expires_at_ms,
-        } => {
-            if stored_view.value.is_none() || incoming_view.value.is_none() {
-                Resolution::IncomingLoses
-            } else {
-                Resolution::Merged {
-                    value,
-                    expires_at_ms,
-                }
-            }
-        }
     }
 }
 
-/// What a resolver's [`Winner::Merged`] reply becomes once [`merge_version`]
+/// What a resolver's [`ConflictResolver::merge`] reply becomes once [`merge_version`]
 /// has weighed the two inputs' versions against how the merged bytes compare
 /// to each side's own bytes.
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -441,7 +443,7 @@ enum MergedVersion {
     Store(Hlc),
 }
 
-/// Decides the version and disposition of a [`Winner::Merged`] reply: `sv`
+/// Decides the version and disposition of a [`ConflictResolver::merge`] reply: `sv`
 /// and `stored` are the stripe's own version and bytes for the key, `ver`
 /// and `incoming` the colliding write's, and `merged` the resolver's folded
 /// bytes. Called only once [`resolve_conflict`]'s guard has confirmed both
@@ -752,7 +754,7 @@ fn fold_run<V: DeserializeOwned>(
 /// splits each key's indices into maximal runs of consecutive
 /// `Incoming::Put` entries. A run never crosses an `Incoming::Tombstone`: a
 /// tombstone always starts a singleton run of its own, on both sides of it
-/// — [`Winner::Merged`] is never legal against a tombstone's value-less
+/// — `merge` is never consulted against a tombstone's value-less
 /// side (see [`resolve_conflict`]) and pre-folding takes the same stance
 /// rather than relying on that guard alone. Shared by [`prefold_batch`] and
 /// [`Engine::apply_many`]'s seed lookup so both agree on exactly which runs
@@ -1218,7 +1220,7 @@ fn prefetch_spilled_conflict_bytes<'a, K, V>(
 /// `resolver` picks it over whatever `stripe` currently holds, updating
 /// `digest_bucket`, `total_weight`, and `live_count` to match. On a real
 /// collision, `resolver` may instead fold both sides into a new value
-/// ([`Winner::Merged`]); when it does, `ver` and `incoming` are rebound to
+/// ([`ConflictResolver::merge`]); when it does, `ver` and `incoming` are rebound to
 /// the merged version ([`merge_version`]) and the merged bytes before
 /// anything downstream — the fingerprint, and the final store — ever runs,
 /// so a merge is written and fingerprinted exactly like any other `Put`.
@@ -3511,7 +3513,8 @@ mod tests {
     }
 
     /// [`put`]'s counterpart for a test that needs a resolver other than
-    /// [`LwwResolver`], in particular one that can return [`Winner::Merged`].
+    /// [`LwwResolver`], in particular one whose [`ConflictResolver::merge`]
+    /// can return `Some`.
     #[allow(clippy::too_many_arguments)]
     fn put_with_resolver<K, V>(
         engine: &Engine<K, V>,
@@ -3577,39 +3580,39 @@ mod tests {
     /// taking the lexicographically greater decoded `String` — an
     /// intentionally trivial join-semilattice (`max` is commutative,
     /// associative, and idempotent) that lets a test assert the engine wires
-    /// a real [`Winner::Merged`] reply through end to end, including the
-    /// redelivery no-op case. Falls back to plain `Hlc` order whenever
+    /// a real [`ConflictResolver::merge`] reply through end to end, including
+    /// the redelivery no-op case. Falls back to plain `Hlc` order whenever
     /// either side is a tombstone or spilled.
     struct MaxStringResolver;
 
     impl ConflictResolver for MaxStringResolver {
         fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-            match (a.value, b.value) {
-                (Some(av), Some(bv)) => {
-                    let da: String = postcard::from_bytes(av).expect("test value decodes");
-                    let db: String = postcard::from_bytes(bv).expect("test value decodes");
-                    let merged = da.max(db);
-                    Winner::Merged {
-                        value: Bytes::from(
-                            postcard::to_stdvec(&merged).expect("merged value encodes"),
-                        ),
-                        expires_at_ms: None,
-                    }
-                }
-                _ => {
-                    if a.ver >= b.ver {
-                        Winner::A
-                    } else {
-                        Winner::B
-                    }
-                }
-            }
+            if a.ver >= b.ver { Winner::A } else { Winner::B }
+        }
+
+        fn merges(&self) -> bool {
+            true
+        }
+
+        fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+            let (Some(av), Some(bv)) = (a.value, b.value) else {
+                return None;
+            };
+            let da: String = postcard::from_bytes(av).expect("test value decodes");
+            let db: String = postcard::from_bytes(bv).expect("test value decodes");
+            let merged = da.max(db);
+            Some(Merged {
+                value: Bytes::from(postcard::to_stdvec(&merged).expect("merged value encodes")),
+                expires_at_ms: None,
+            })
         }
     }
 
-    /// Test-only resolver: always claims a merge, regardless of whether
-    /// either side actually carries a value — the buggy-resolver shape
-    /// [`resolve_conflict`]'s engine-enforced guard exists to contain.
+    /// Test-only resolver whose `merge` always claims a merge, regardless of
+    /// whether those bytes decode as the shard's value type, and whose
+    /// `winner` falls back to plain `Hlc` order, like `LwwResolver` — the
+    /// buggy-resolver shape [`resolve_conflict`]'s engine-enforced
+    /// value-presence guard exists to contain.
     struct AlwaysMergeResolver {
         /// The bytes to hand back as the "merged" value; deliberately
         /// invalid postcard for the decode-failure test.
@@ -3617,11 +3620,19 @@ mod tests {
     }
 
     impl ConflictResolver for AlwaysMergeResolver {
-        fn winner(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Winner {
-            Winner::Merged {
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            if a.ver >= b.ver { Winner::A } else { Winner::B }
+        }
+
+        fn merges(&self) -> bool {
+            true
+        }
+
+        fn merge(&self, _key: &[u8], _a: RecordView<'_>, _b: RecordView<'_>) -> Option<Merged> {
+            Some(Merged {
                 value: Bytes::from_static(self.value),
                 expires_at_ms: None,
-            }
+            })
         }
     }
 
@@ -3795,33 +3806,26 @@ mod tests {
 
     impl ConflictResolver for UnionSetResolver {
         fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-            match (a.value, b.value) {
-                (Some(av), Some(bv)) => {
-                    let da: std::collections::BTreeSet<String> =
-                        postcard::from_bytes(av).expect("test value decodes");
-                    let db: std::collections::BTreeSet<String> =
-                        postcard::from_bytes(bv).expect("test value decodes");
-                    let merged: std::collections::BTreeSet<String> =
-                        da.union(&db).cloned().collect();
-                    Winner::Merged {
-                        value: Bytes::from(
-                            postcard::to_stdvec(&merged).expect("merged value encodes"),
-                        ),
-                        expires_at_ms: None,
-                    }
-                }
-                _ => {
-                    if a.ver >= b.ver {
-                        Winner::A
-                    } else {
-                        Winner::B
-                    }
-                }
-            }
+            if a.ver >= b.ver { Winner::A } else { Winner::B }
         }
 
         fn merges(&self) -> bool {
             true
+        }
+
+        fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+            let (Some(av), Some(bv)) = (a.value, b.value) else {
+                return None;
+            };
+            let da: std::collections::BTreeSet<String> =
+                postcard::from_bytes(av).expect("test value decodes");
+            let db: std::collections::BTreeSet<String> =
+                postcard::from_bytes(bv).expect("test value decodes");
+            let merged: std::collections::BTreeSet<String> = da.union(&db).cloned().collect();
+            Some(Merged {
+                value: Bytes::from(postcard::to_stdvec(&merged).expect("merged value encodes")),
+                expires_at_ms: None,
+            })
         }
     }
 
@@ -3912,15 +3916,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_conflict_degrades_a_merge_against_a_tombstone_to_incoming_loses() {
+    fn resolve_conflict_never_consults_merge_against_a_tombstone() {
         let engine = engine_u32_string(u64::MAX, None);
-        // A resolver that (incorrectly) always claims a merge, even against
-        // a tombstone, must never resurrect the deleted key: the engine's
-        // guard, not resolver good behavior, is what prevents it here.
-        let resolver = AlwaysMergeResolver { value: b"whatever" };
+        // Valid postcard for the `String` "hi": what would land if the
+        // guard failed to hold and `merge` were wrongly consulted against
+        // the tombstone below, instead of the ordinary Hlc-order `winner`
+        // pick.
+        let resolver = AlwaysMergeResolver {
+            value: &[2, b'h', b'i'],
+        };
         tombstone(&engine, 1, key_bytes(1), hlc(1, 1), 0);
         assert_eq!(engine.get(&1, 0), None);
 
+        // Genuinely newer than the tombstone by `Hlc`: an ordinary
+        // winner-only resolver would let this win outright, and this one
+        // must too, since the tombstone's value-less side means `merge` is
+        // never consulted no matter what `merges()` claims.
         let outcome = put_with_resolver(
             &engine,
             1,
@@ -3931,14 +3942,13 @@ mod tests {
             0,
             &resolver,
         );
-        assert!(
-            matches!(outcome, ApplyOutcome::Rejected),
-            "a bogus Merged reply against a tombstone must be rejected, never resurrect the key"
-        );
+        assert!(matches!(outcome, ApplyOutcome::Put { .. }));
         assert_eq!(
             engine.get(&1, 0),
-            None,
-            "deleted entries never resurrect, even via a buggy resolver's Merged reply"
+            Some("new".to_string()),
+            "the incoming write's own value lands via the ordinary winner fallback, never the \
+             resolver's synthesized merge bytes, since a tombstone's value-less side means \
+             merge is never consulted"
         );
     }
 
@@ -6891,9 +6901,9 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
-            /// `resolve_conflict`'s tombstone/spill guard only ever degrades a
-            /// misbehaving resolver's own `Winner::Merged` reply; a
-            /// well-behaved value-aware resolver's *own* fallback (returning
+            /// `resolve_conflict`'s tombstone/spill guard only ever skips
+            /// calling a misbehaving resolver's own `merge`; a well-behaved
+            /// value-aware resolver's *own* fallback (`winner` returning
             /// `A`/`B` by `Hlc` order whenever it is handed a value-less
             /// side) must never fire here just because the stored side
             /// happens to be spilled rather than actually value-less. This

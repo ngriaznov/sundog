@@ -109,7 +109,7 @@ use bytes::Bytes;
 #[cfg(feature = "spill")]
 use sundog::SpillConfig;
 use sundog::crdt::{PnCounter, PnCounterResolver};
-use sundog::{Cache, Cluster, ClusterConfig, ConflictResolver, Mode, RecordView, Winner};
+use sundog::{Cache, Cluster, ClusterConfig, ConflictResolver, Merged, Mode, RecordView, Winner};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use xxhash_rust::xxh3::xxh3_64;
@@ -312,7 +312,7 @@ fn decode_counter(bytes: &[u8]) -> Option<u64> {
 
 /// The merged counter's postcard-encoded decimal-string bytes when both `a`
 /// and `b` parse as `u64` counters via [`decode_counter`], `None` otherwise:
-/// the pure decision [`SumCounterResolver::winner`] wraps around a real
+/// the pure decision [`SumCounterResolver::merge`] wraps around a real
 /// `RecordView` pair.
 fn merge_counter_bytes(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     let (a, b) = (decode_counter(a)?, decode_counter(b)?);
@@ -321,10 +321,10 @@ fn merge_counter_bytes(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
 
 /// Merges two decimal-string counters by addition on a genuine version
 /// conflict, rather than picking whichever write is most recent, so a real
-/// `Winner::Merged` outcome — and the sentinel-stamped `Hlc` sundog stamps it
-/// with — reaches the wire. Falls back to plain `Hlc` order whenever either
-/// side fails to parse as a `u64` (a tombstone, a spilled view, or a
-/// non-numeric value), matching `sundog::crdt`'s own resolvers'
+/// `ConflictResolver::merge` outcome — and the sentinel-stamped `Hlc` sundog
+/// stamps it with — reaches the wire. Falls back to plain `Hlc` order
+/// whenever either side fails to parse as a `u64` (a tombstone, a spilled
+/// view, or a non-numeric value), matching `sundog::crdt`'s own resolvers'
 /// decode-failure fallback.
 ///
 /// Summing on every merge is not idempotent (`merge(a, a) != a`), so this is
@@ -335,26 +335,22 @@ struct SumCounterResolver;
 
 impl ConflictResolver for SumCounterResolver {
     fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-        let (Some(av), Some(bv)) = (a.value, b.value) else {
-            return if a.ver >= b.ver { Winner::A } else { Winner::B };
-        };
-        match merge_counter_bytes(av, bv) {
-            Some(merged) => Winner::Merged {
-                value: Bytes::from(merged),
-                expires_at_ms: None,
-            },
-            None => {
-                if a.ver >= b.ver {
-                    Winner::A
-                } else {
-                    Winner::B
-                }
-            }
-        }
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
     }
 
     fn merges(&self) -> bool {
         true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let (Some(av), Some(bv)) = (a.value, b.value) else {
+            return None;
+        };
+        let merged = merge_counter_bytes(av, bv)?;
+        Some(Merged {
+            value: Bytes::from(merged),
+            expires_at_ms: None,
+        })
     }
 }
 
@@ -919,18 +915,18 @@ mod tests {
             ver: hlc_at(2),
             expires_at_ms: None,
         };
-        match SumCounterResolver.winner(b"key", a, b) {
-            Winner::Merged {
+        match SumCounterResolver.merge(b"key", a, b) {
+            Some(Merged {
                 value,
                 expires_at_ms,
-            } => {
+            }) => {
                 assert_eq!(
                     postcard::from_bytes::<String>(&value).expect("merged bytes decode"),
                     "8"
                 );
                 assert_eq!(expires_at_ms, None);
             }
-            other => panic!("expected Winner::Merged, got {other:?}"),
+            other => panic!("expected Some(Merged), got {other:?}"),
         }
     }
 
@@ -938,7 +934,7 @@ mod tests {
     fn merges_is_true() {
         assert!(
             SumCounterResolver.merges(),
-            "SumCounterResolver returns Winner::Merged, so it must advertise merges()"
+            "SumCounterResolver's merge can return Some, so it must advertise merges()"
         );
     }
 

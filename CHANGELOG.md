@@ -8,7 +8,7 @@ All notable changes to this project are documented in this file. Format follows
 ### Added
 
 - **`crdt` module**: reference CRDT value types and the resolvers that merge
-  them through `Winner::Merged`, reachable as `sundog::crdt::{PnCounter,
+  them through `ConflictResolver::merge`, reachable as `sundog::crdt::{PnCounter,
   PnCounterResolver, OrSet, OrSetResolver}`. `PnCounter` is a per-node
   increment/decrement counter that merges by taking the componentwise
   maximum of each node's cumulative counts; `OrSet` is an observed-remove
@@ -22,30 +22,34 @@ All notable changes to this project are documented in this file. Format follows
   treated as value-less — and fall back to plain `Hlc` order only against a
   tombstone, a spilled side whose bytes genuinely can't be read (no tier
   attached, or the read fails), or a decode failure.
-- `Winner::Merged { value, expires_at_ms }`: a resolver can fold the stored
-  and incoming records into a third value instead of picking one of the two.
-  The engine derives the merged record's version from the merged bytes
-  themselves: a merge that reduces to one side outright adopts that side's
-  own `(version, bytes)` pair verbatim (or is a no-op, if that side is
+- `ConflictResolver::merge` and `Merged { value, expires_at_ms }`: an
+  additive pair on top of the existing `winner`-only contract — both
+  defaulted (`merge` to `None`, `merges` to `false`), so no existing
+  `ConflictResolver` implementation or match on `Winner` changes. A
+  resolver's `merge` can fold the stored and incoming records into a third
+  value instead of `winner` picking one of the two; `None` falls back to
+  `winner`. The engine derives the merged record's version from the merged
+  bytes themselves: a merge that reduces to one side outright adopts that
+  side's own `(version, bytes)` pair verbatim (or is a no-op, if that side is
   already what's stored), and a merge that produces genuinely new content
   mints a version strictly ahead of both inputs under a `node` id derived
   from a hash of the merged bytes (`NodeId::merge_derived`) — never a real
   node's id, so a minted version never collides with a real single-writer
   stamp, and two nodes minting for the same merged bytes always land on the
-  same version regardless of fold order. A `Merged` outcome is only honored
-  when both the stored and incoming records carry a value; against a
-  tombstone it degrades to keeping the existing record. A spilled stored
-  side is not value-less on that account: the engine reads its bytes back
-  off disk (via a prefetch pass keyed by spill location, ahead of the
-  stripe lock on the common path) so a value-aware resolver merges against
-  a spilled record's real content exactly as it would a resident one; only
-  a side whose bytes genuinely can't be produced still degrades to the
-  tombstone's treatment. A redelivered record whose merge result reproduces
-  the stored bytes and version exactly is a no-op: nothing is re-applied,
-  no event is published, and nothing is re-replicated.
+  same version regardless of fold order. `merge` is consulted only when both
+  the stored and incoming records carry a value; against a tombstone it is
+  never consulted, and `winner` decides instead. A spilled stored side is
+  not value-less on that account: the engine reads its bytes back off disk
+  (via a prefetch pass keyed by spill location, ahead of the stripe lock on
+  the common path) so a value-aware resolver merges against a spilled
+  record's real content exactly as it would a resident one; only a side
+  whose bytes genuinely can't be produced still falls back to `winner`. A
+  redelivered record whose merge result reproduces the stored bytes and
+  version exactly is a no-op: nothing is re-applied, no event is published,
+  and nothing is re-replicated.
 - `ConflictResolver::merges` and `ShardOps::merges` (the latter forwarding a
-  shard's own resolver's answer): whether a resolver can ever return
-  `Winner::Merged`, `false` by default and `true` on `PnCounterResolver` and
+  shard's own resolver's answer): whether a resolver's `merge` can ever
+  return `Some`, `false` by default and `true` on `PnCounterResolver` and
   `OrSetResolver`. `cluster::anti_entropy` reads it once per round and, when
   `true`, exchanges a version-mismatched key in both directions instead of
   only pushing the greater side to the lesser one, so two replicas each
@@ -91,11 +95,6 @@ All notable changes to this project are documented in this file. Format follows
   coalescing at once.
   `CacheBuilder::merge_coalesce_window` rejects a nonzero window on a cache
   whose resolver does not merge (`CacheError::MergeWindowRequiresMergingResolver`).
-
-### Changed
-
-- **Breaking**: `Winner` is `#[non_exhaustive]` and gains the `Merged`
-  variant; a downstream `match` without a wildcard arm needs one added.
 
 ## [0.6.0] – 2026-09-07
 

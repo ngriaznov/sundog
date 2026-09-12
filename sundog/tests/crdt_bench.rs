@@ -59,8 +59,8 @@
 //! field is the median of at least [`repetitions`] independent runs, so a
 //! single noisy run never skews a reported number.
 //!
-//! Scenarios 9-12 isolate `docs/merge-resolvers.md`'s two write-path levers:
-//! Lever A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine.rs`)
+//! Scenarios 9-12 isolate a merging resolver's two write-path levers: Lever
+//! A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine.rs`)
 //! in scenarios 9 and 10, Lever B (`Cache::merge`'s coalescing window) in
 //! scenarios 11 and 12. Both levers' on/off (or window) comparisons are
 //! measured through the real toggle now: `CacheBuilder::prefold_enabled`
@@ -86,8 +86,8 @@
 //! how many times the engine actually applied, per `Cache::merge`'s and the
 //! resolver contract's own docs.
 //!
-//! Scenario 13 (`sketch_path_convergence`) checks `docs/merge-resolvers.md`'s
-//! scale-hardening item on the IBLT sketch path: `ClusterConfig::ae_sketch_min_bucket`
+//! Scenario 13 (`sketch_path_convergence`) checks a merging resolver's
+//! scale-hardening on the IBLT sketch path: `ClusterConfig::ae_sketch_min_bucket`
 //! lowered, and `keys` filler entries forced into one anti-entropy bucket,
 //! so a deliberately seeded mismatch there (`Cache::invalidate_local` on one
 //! node, past state transfer entirely) answers with a sketch
@@ -1932,9 +1932,9 @@ async fn large_entity_convergence_merged() {
 // Shared by scenarios 9-12: counts every `Event` a cache's public
 // `Cache::events()` broadcast stream carries. One event publishes per
 // non-no-op apply — a redelivered merge that reproduces exactly what's
-// already stored publishes nothing, per `merge_version`'s own no-op arm
-// (`docs/merge-resolvers.md`) — so this is the one public-API signal for how
-// many times the engine actually applied, the "engine applies" field on
+// already stored publishes nothing, per `merge_version`'s own no-op arm — so
+// this is the one public-API signal for how many times the engine actually
+// applied, the "engine applies" field on
 // every `BENCH` line below. Runs until the cache's sender side drops (the
 // cache closes) or the caller aborts the returned handle; a lagged receiver
 // (the counting task falling behind the publish rate) adds the lagged count
@@ -2685,8 +2685,8 @@ async fn large_entity_convergence_coalesced() {
 }
 
 // ---------------------------------------------------------------------
-// Scenario 13: sketch_path_convergence — `docs/merge-resolvers.md`'s
-// scale-hardening item on the IBLT sketch path (`sundog/src/cluster/sketch.rs`,
+// Scenario 13: sketch_path_convergence — a merging resolver's
+// scale-hardening on the IBLT sketch path (`sundog/src/cluster/sketch.rs`,
 // `sundog/src/cluster/anti_entropy.rs`). `ClusterConfig::ae_sketch_min_bucket`
 // is lowered to [`SKETCH_PATH_MIN_BUCKET`], and every one of `keys` filler
 // entries is forced into the *same* anti-entropy bucket

@@ -102,14 +102,12 @@ same key at nearly the same time, one write silently loses: no conflict error,
 no merge, the loser vanishes.
 
 A merge resolver changes that for values that combine. A `ConflictResolver`
-can return `Winner::Merged`, folding the stored and incoming records into a
-third value, and every node converges on the same result whatever order the
-writes arrive in. `sundog::crdt` ships `PnCounter` and `OrSet` with their
-resolvers; `Cache::merge` writes through one without a read, and
+can implement `merge`, folding the stored and incoming records into a third
+value, and every node converges on the same result whatever order the writes
+arrive in. `sundog::crdt` ships `PnCounter` and `OrSet` with their resolvers;
+`Cache::merge` writes through one without a read, and
 `CacheBuilder::merge_coalesce_window` batches a writer's merges to one
-applied record per key per window. `docs/merge-resolvers.md` has the design,
-the convergence argument, and the benchmarks against last-write-wins from a
-hot counter to a million counters.
+applied record per key per window.
 
 Deletes and expiries differ. A TTL-expired entry never returns. Every record
 carries its own absolute `expires_at_ms`, and once a key is past it no peer

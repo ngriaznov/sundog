@@ -18,7 +18,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::node::NodeId;
-use crate::store::{ConflictResolver, RecordView, Winner};
+use crate::store::{ConflictResolver, Merged, RecordView, Winner};
 
 /// A PN-Counter: per-node cumulative increments and decrements that merge by
 /// pointwise maximum, converging to the exact total regardless of apply
@@ -122,39 +122,29 @@ pub struct PnCounterResolver;
 
 impl ConflictResolver for PnCounterResolver {
     fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
-        let (Some(av), Some(bv)) = (a.value, b.value) else {
-            return if a.ver >= b.ver { Winner::A } else { Winner::B };
-        };
-        match (PnCounter::decode(av), PnCounter::decode(bv)) {
-            (Ok(pa), Ok(pb)) => match pa.merge(&pb).encode() {
-                Ok(bytes) => Winner::Merged {
-                    value: Bytes::from(bytes),
-                    // A merged counter's slots only ever accumulate, so the
-                    // counter as a whole never expires on its own: a TTL
-                    // policy for it, if any, belongs to whichever explicit
-                    // write set one.
-                    expires_at_ms: None,
-                },
-                Err(_) => {
-                    if a.ver >= b.ver {
-                        Winner::A
-                    } else {
-                        Winner::B
-                    }
-                }
-            },
-            _ => {
-                if a.ver >= b.ver {
-                    Winner::A
-                } else {
-                    Winner::B
-                }
-            }
-        }
+        if a.ver >= b.ver { Winner::A } else { Winner::B }
     }
 
     fn merges(&self) -> bool {
         true
+    }
+
+    fn merge(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let (Some(av), Some(bv)) = (a.value, b.value) else {
+            return None;
+        };
+        let (Ok(pa), Ok(pb)) = (PnCounter::decode(av), PnCounter::decode(bv)) else {
+            return None;
+        };
+        let bytes = pa.merge(&pb).encode().ok()?;
+        Some(Merged {
+            value: Bytes::from(bytes),
+            // A merged counter's slots only ever accumulate, so the
+            // counter as a whole never expires on its own: a TTL
+            // policy for it, if any, belongs to whichever explicit
+            // write set one.
+            expires_at_ms: None,
+        })
     }
 }
 
@@ -285,17 +275,17 @@ mod tests {
         };
 
         let resolver = PnCounterResolver;
-        let Winner::Merged {
+        let Some(Merged {
             value: merged_ab, ..
-        } = resolver.winner(b"k", av, bv)
+        }) = resolver.merge(b"k", av, bv)
         else {
-            panic!("expected Winner::Merged when both sides decode");
+            panic!("expected Some(Merged) when both sides decode");
         };
-        let Winner::Merged {
+        let Some(Merged {
             value: merged_ba, ..
-        } = resolver.winner(b"k", bv, av)
+        }) = resolver.merge(b"k", bv, av)
         else {
-            panic!("expected Winner::Merged when both sides decode");
+            panic!("expected Some(Merged) when both sides decode");
         };
         assert_eq!(
             merged_ab, merged_ba,
@@ -328,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_falls_back_to_lww_on_decode_failure() {
+    fn resolver_merge_declines_on_decode_failure_and_winner_falls_back_to_lww() {
         let c = PnCounter::local_delta(NodeId::from(1), 3);
         let encoded = c.encode().expect("encodes");
         let malformed = [0xffu8; 6];
@@ -345,9 +335,11 @@ mod tests {
         };
 
         let resolver = PnCounterResolver;
-        // `bad` fails to decode as a `PnCounter`, so the resolver degrades
-        // to plain `Hlc` order rather than merging or panicking; `bad`'s
-        // strictly newer version wins.
+        // `bad` fails to decode as a `PnCounter`, so `merge` declines rather
+        // than merging or panicking, and `winner` degrades to plain `Hlc`
+        // order; `bad`'s strictly newer version wins.
+        assert!(resolver.merge(b"k", good, bad).is_none());
+        assert!(resolver.merge(b"k", bad, good).is_none());
         assert_eq!(resolver.winner(b"k", good, bad), Winner::B);
         assert_eq!(resolver.winner(b"k", bad, good), Winner::A);
     }
@@ -361,12 +353,12 @@ mod tests {
     fn merges_is_true() {
         assert!(
             PnCounterResolver.merges(),
-            "PnCounterResolver returns Winner::Merged, so it must advertise merges()"
+            "PnCounterResolver's merge can return Some, so it must advertise merges()"
         );
     }
 
-    /// `docs/merge-resolvers.md`'s "Writer-slot growth" measurement: one `p`
-    /// slot per distinct writer, one node id and one `u64` total apiece, so
+    /// Writer-slot growth: one `p` slot per distinct writer, one node id
+    /// and one `u64` total apiece, so
     /// encoded size grows with how many nodes have ever incremented the
     /// counter, never with how many times any one of them has. Prints each
     /// size (`cargo test -p sundog --lib pn_counter:: -- --nocapture`)
