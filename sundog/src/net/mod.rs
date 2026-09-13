@@ -202,7 +202,7 @@ pub(crate) fn batch_replicate(cache_name: &SmolStr, records: Vec<WireRecord>) ->
 /// [`batch_replicate`] for a `Mode::Distributed` fan-out: every chunk is a
 /// [`Msg::ForwardBatch`] stamped with the sender's `view_hash` and `hops`,
 /// a lone record included, so the receiver always sees the view the batch
-/// was routed under.
+/// routes under.
 pub(crate) fn batch_forward(
     cache_name: &SmolStr,
     view_hash: u64,
@@ -282,7 +282,7 @@ fn request_timeout() -> Duration {
 /// effect on this thread for [`request_timeout`] to read, restoring the
 /// real [`REQUEST_TIMEOUT`] once `fut` resolves. `duration` is set before
 /// `fut` is ever polled and cleared only after, so it's in effect for
-/// `fut`'s whole lifetime, not just the moment this function is called.
+/// `fut`'s whole lifetime, not only the moment this function is called.
 /// Doesn't change production behavior, which never reads the override.
 #[cfg(all(test, not(feature = "sim")))]
 async fn with_request_timeout<T>(
@@ -302,6 +302,19 @@ fn request_timeout_error(what: &str, timeout: Duration) -> CodecError {
         io::ErrorKind::TimedOut,
         format!("{what} did not complete within {timeout:?}"),
     ))
+}
+
+/// Bounds `fut` by [`request_timeout`], mapping a timeout to
+/// [`request_timeout_error`] naming `what`: the one expression every
+/// `ae_*`/`fetch` request method reduces to.
+async fn timed<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, CodecError>>,
+) -> Result<T, CodecError> {
+    let timeout = request_timeout();
+    tokio::time::timeout(timeout, fut)
+        .await
+        .unwrap_or_else(|_| Err(request_timeout_error(what, timeout)))
 }
 
 /// Backpressure class for a fan-out message, selecting the per-class drop
@@ -558,11 +571,11 @@ pub trait RequestHandler: Send + Sync + 'static {
         crate::config::ClusterConfig::default().ae_sketch_cells
     }
 
-    /// The requester's `view_hash` for `cache`, if this node has one —
-    /// i.e. `cache` is a distribution-mode cache this node has opened.
-    /// Default `None`: every existing implementor keeps compiling and
-    /// simply never answers a distribution-mode epoch check, which is
-    /// correct, since none of them ever open a distribution-mode cache.
+    /// The requester's `view_hash` for `cache`, when this node has one:
+    /// `cache` is a distribution-mode cache this node has opened. Default
+    /// `None`: every existing implementor keeps compiling and never answers
+    /// a distribution-mode epoch check, correct since none of them open a
+    /// distribution-mode cache.
     fn ownership_view_hash(&self, cache: SmolStr) -> Option<u64> {
         let _ = cache;
         None
@@ -596,9 +609,6 @@ pub trait RequestHandler: Send + Sync + 'static {
         Box::pin(async { AeServeOutcome::Unavailable })
     }
 
-    /// Whether this node can donate `cache`'s named `buckets` right now, at
-    /// `view_hash`: the [`crate::wire::Msg::StBuckets`] availability check.
-    /// Default `false`.
     /// Whether this node owns any of `buckets` without having pulled it
     /// from a co-owner yet, so its copy is not a source to transfer from:
     /// the responder declines with [`Msg::StUnavailable`] and the requester
@@ -608,6 +618,9 @@ pub trait RequestHandler: Send + Sync + 'static {
         Box::pin(async { false })
     }
 
+    /// Whether this node can donate `cache`'s named `buckets` right now, at
+    /// `view_hash`: the [`crate::wire::Msg::StBuckets`] availability check.
+    /// Default `false`.
     fn st_buckets_available(&self, cache: SmolStr, view_hash: u64) -> BoxFuture<'_, bool> {
         let _ = (cache, view_hash);
         Box::pin(async { false })
@@ -615,8 +628,8 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Streams the reply chunks once
     /// [`RequestHandler::st_buckets_available`] said yes. Default: an
-    /// immediately-empty stream, never actually polled unless the caller
-    /// ignores the availability check.
+    /// immediately-empty stream, never polled unless the caller ignores the
+    /// availability check.
     fn st_bucket_chunks(
         &self,
         cache: SmolStr,
@@ -1007,7 +1020,7 @@ impl Mesh {
     /// Waits, up to `deadline`, until every peer's replicate outbox has been
     /// handed to its writer, then a moment more for the writer's last
     /// frames to leave: what [`Mesh::shutdown`] runs before cancelling the
-    /// writers, so a frame accepted just before shutdown still goes out.
+    /// writers, so a frame accepted right before shutdown still goes out.
     async fn flush_outboxes(&self, deadline: tokio::time::Instant) {
         loop {
             let pending = {
@@ -1132,28 +1145,12 @@ impl Mesh {
 
     /// Checks a pooled, already-`Hello`'d connection out of `peer`'s pool
     /// and sends `first` on it, or dials a fresh one, coalescing `Hello`
-    /// and `first` into one flush. Returns the connection with its pool
-    /// and, when a reused connection's first reply frame was already
-    /// there to read, that pre-read reply: `Mesh::request_state` and the
-    /// `conn::collect_*` helpers consume it in place of their own first
-    /// read.
-    ///
-    /// A reused connection whose write succeeds but whose receive side is
-    /// already at `EOF` is the server's idle timeout having closed it
-    /// first: this is caught here and retried, on the next pooled
-    /// connection or a fresh dial, rather than failing the whole request.
-    async fn acquire_conn(
-        &self,
-        peer: NodeId,
-        first: Msg,
-    ) -> Result<
-        (
-            conn::PeerFramed,
-            Arc<conn::ReqPool>,
-            Option<Result<Msg, CodecError>>,
-        ),
-        CodecError,
-    > {
+    /// and `first` into one flush; the returned [`conn::Reply`] carries any
+    /// reply already peeked off a reused connection. A reused connection
+    /// whose write succeeds but whose receive side is already at `EOF` is
+    /// the server's idle timeout having closed it first: retried here on
+    /// the next pooled connection or a fresh dial.
+    async fn acquire_conn(&self, peer: NodeId, first: Msg) -> Result<conn::Reply, CodecError> {
         let (addr, pool) = self.peer_req_pool(peer)?;
         while let Some(mut framed) = pool.checkout() {
             // A fresh dial has a real yield point; a reused connection has
@@ -1178,6 +1175,30 @@ impl Mesh {
         Ok((framed, pool, None))
     }
 
+    /// [`acquire_conn`], then reads the responder's own first reply if it
+    /// didn't already peek one off a reused connection. Bounds both steps
+    /// by [`request_timeout`], mapping a timeout to
+    /// `request_timeout_error(what, ..)`.
+    async fn acquire_conn_and_first(
+        &self,
+        peer: NodeId,
+        first: Msg,
+        what: &str,
+    ) -> Result<conn::Reply, CodecError> {
+        let timeout = request_timeout();
+        let (mut framed, pool, pre_read) =
+            tokio::time::timeout(timeout, self.acquire_conn(peer, first))
+                .await
+                .unwrap_or_else(|_| Err(request_timeout_error(what, timeout)))?;
+        let first = match pre_read {
+            Some(result) => Some(result),
+            None => tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
+                .await
+                .map_err(|_| request_timeout_error(what, timeout))?,
+        };
+        Ok((framed, pool, first))
+    }
+
     /// Requests a full snapshot of `cache` from `donor`, for state transfer
     /// on join, and returns a stream of its `StChunk`s. Reads lazily off a
     /// fresh connection as the caller polls.
@@ -1194,19 +1215,9 @@ impl Mesh {
         // Only the checkout-or-dial step and the donor's first reply are
         // bounded here; `try_donor`'s own per-donor budget governs the full
         // snapshot stream instead.
-        let timeout = request_timeout();
-        let (mut framed, pool, pre_read) =
-            tokio::time::timeout(timeout, self.acquire_conn(donor, Msg::StRequest { cache }))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(request_timeout_error("state transfer request", timeout))
-                })?;
-        let first = match pre_read {
-            Some(result) => Some(result),
-            None => tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
-                .await
-                .map_err(|_| request_timeout_error("state transfer request", timeout))?,
-        };
+        let (framed, pool, first) = self
+            .acquire_conn_and_first(donor, Msg::StRequest { cache }, "state transfer request")
+            .await?;
         if let Some(Ok(Msg::StUnavailable { .. })) = first {
             pool.checkin(framed);
             return Ok(None);
@@ -1214,8 +1225,7 @@ impl Mesh {
         Ok(Some(conn::state_stream(framed, pool, first)))
     }
 
-    /// Runs one anti-entropy digest exchange against `peer`: sends
-    /// `local_buckets` and returns the reply for every mismatched bucket.
+    /// Runs one anti-entropy digest exchange against `peer`, returning `local_buckets`'s mismatches.
     ///
     /// # Errors
     ///
@@ -1226,31 +1236,17 @@ impl Mesh {
         cache: SmolStr,
         local_buckets: Vec<(u16, u64)>,
     ) -> Result<Vec<AeMismatch>, CodecError> {
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) = self
-                .acquire_conn(
-                    peer,
-                    Msg::AeDigest {
-                        cache,
-                        buckets: local_buckets,
-                    },
-                )
-                .await?;
-            conn::collect_ae_mismatches(framed, &pool, first).await
+        timed("anti-entropy digest exchange", async {
+            let msg = Msg::AeDigest {
+                cache,
+                buckets: local_buckets,
+            };
+            conn::collect_ae_mismatches(self.acquire_conn(peer, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| {
-            Err(request_timeout_error(
-                "anti-entropy digest exchange",
-                timeout,
-            ))
-        })
     }
 
-    /// The `AeSketch` fallback: full `(key, version)` listings for
-    /// `buckets` whose `AeSketch` reply failed to decode, answered like
-    /// [`Mesh::ae_round`].
+    /// The `AeSketch` fallback: full listings for `buckets`, answered like [`Mesh::ae_round`].
     ///
     /// # Errors
     ///
@@ -1261,26 +1257,14 @@ impl Mesh {
         cache: SmolStr,
         buckets: Vec<u16>,
     ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) = self
-                .acquire_conn(peer, Msg::AeEntries { cache, buckets })
-                .await?;
-            conn::collect_ae_buckets(framed, &pool, first).await
+        timed("anti-entropy sketch-fallback listing", async {
+            let msg = Msg::AeEntries { cache, buckets };
+            conn::collect_ae_buckets(self.acquire_conn(peer, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| {
-            Err(request_timeout_error(
-                "anti-entropy sketch-fallback listing",
-                timeout,
-            ))
-        })
     }
 
-    /// Requests the mismatched `(bucket, part)` pairs found by comparing a
-    /// peer's [`AeMismatch::PartDigests`] reply against this node's own part
-    /// digests: the third step of the part path, answered one
-    /// [`AePartReply`] per part.
+    /// Requests the mismatched `(bucket, part)` pairs named by `peer`'s [`AeMismatch::PartDigests`] reply.
     ///
     /// # Errors
     ///
@@ -1291,15 +1275,11 @@ impl Mesh {
         cache: SmolStr,
         parts: Vec<(u16, u8)>,
     ) -> Result<Vec<AePartReply>, CodecError> {
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) = self
-                .acquire_conn(peer, Msg::AeParts { cache, parts })
-                .await?;
-            conn::collect_ae_part_replies(framed, &pool, first).await
+        timed("anti-entropy part exchange", async {
+            let msg = Msg::AeParts { cache, parts };
+            conn::collect_ae_part_replies(self.acquire_conn(peer, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy part exchange", timeout)))
     }
 
     /// Pulls full records for `keys` from `peer`, the `AePull` step.
@@ -1313,18 +1293,14 @@ impl Mesh {
         cache: SmolStr,
         keys: Vec<Bytes>,
     ) -> Result<Vec<WireRecord>, CodecError> {
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) =
-                self.acquire_conn(peer, Msg::AePull { cache, keys }).await?;
-            conn::collect_pulled_records(framed, &pool, first).await
+        timed("anti-entropy pull", async {
+            let msg = Msg::AePull { cache, keys };
+            conn::collect_pulled_records(self.acquire_conn(peer, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull", timeout)))
     }
 
-    /// Pulls records from `peer` for `bucket`'s entries whose key hash is
-    /// in `hashes`, the sketch-decoded counterpart to [`Mesh::ae_pull`].
+    /// Pulls records from `peer` for `bucket`'s entries whose key hash is in `hashes`.
     ///
     /// # Errors
     ///
@@ -1336,26 +1312,18 @@ impl Mesh {
         bucket: u16,
         hashes: Vec<u64>,
     ) -> Result<Vec<WireRecord>, CodecError> {
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) = self
-                .acquire_conn(
-                    peer,
-                    Msg::AePullHashes {
-                        cache,
-                        bucket,
-                        hashes,
-                    },
-                )
-                .await?;
-            conn::collect_pulled_records(framed, &pool, first).await
+        timed("anti-entropy pull-by-hash", async {
+            let msg = Msg::AePullHashes {
+                cache,
+                bucket,
+                hashes,
+            };
+            conn::collect_pulled_records(self.acquire_conn(peer, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("anti-entropy pull-by-hash", timeout)))
     }
 
-    /// Distribution-mode read: requests `key`'s record from `owner`,
-    /// carrying this node's `view_hash` for the epoch check.
+    /// Distribution-mode read: requests `key`'s record from `owner`, at this node's `view_hash`.
     ///
     /// # Errors
     ///
@@ -1373,27 +1341,18 @@ impl Mesh {
             wire::PROTOCOL_DISTRIBUTED,
             "a distribution-mode fetch",
         )?;
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) = self
-                .acquire_conn(
-                    owner,
-                    Msg::Fetch {
-                        cache,
-                        key,
-                        view_hash,
-                    },
-                )
-                .await?;
-            conn::collect_fetch_reply(framed, &pool, first).await
+        timed("distribution-mode fetch", async {
+            let msg = Msg::Fetch {
+                cache,
+                key,
+                view_hash,
+            };
+            conn::collect_fetch_reply(self.acquire_conn(owner, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| Err(request_timeout_error("distribution-mode fetch", timeout)))
     }
 
-    /// Distribution-mode anti-entropy round, step 1: like [`Mesh::ae_round`],
-    /// but sends only `local_buckets` — never every bucket of the cache —
-    /// with `view_hash` for the epoch check.
+    /// Distribution-mode anti-entropy round, step 1: like [`Mesh::ae_round`] but scoped to `local_buckets` at `view_hash`.
     ///
     /// # Errors
     ///
@@ -1411,27 +1370,15 @@ impl Mesh {
             wire::PROTOCOL_DISTRIBUTED,
             "a scoped anti-entropy digest exchange",
         )?;
-        let timeout = request_timeout();
-        tokio::time::timeout(timeout, async {
-            let (framed, pool, first) = self
-                .acquire_conn(
-                    peer,
-                    Msg::AeDigestScoped {
-                        cache,
-                        view_hash,
-                        buckets: local_buckets,
-                    },
-                )
-                .await?;
-            conn::collect_ae_round_scoped(framed, &pool, first).await
+        timed("scoped anti-entropy digest exchange", async {
+            let msg = Msg::AeDigestScoped {
+                cache,
+                view_hash,
+                buckets: local_buckets,
+            };
+            conn::collect_ae_round_scoped(self.acquire_conn(peer, msg).await?).await
         })
         .await
-        .unwrap_or_else(|_| {
-            Err(request_timeout_error(
-                "scoped anti-entropy digest exchange",
-                timeout,
-            ))
-        })
     }
 
     /// Rebalance: requests everything `donor` holds for `buckets`, the
@@ -1454,29 +1401,17 @@ impl Mesh {
         view_hash: u64,
     ) -> Result<BucketPull, CodecError> {
         self.require_peer_protocol(donor, wire::PROTOCOL_DISTRIBUTED, "a rebalance bucket pull")?;
-        // Only the checkout-or-dial step and the donor's first reply are
-        // bounded here; the caller's own transfer budget governs the full
-        // chunk stream instead, exactly as `request_state` does.
-        let timeout = request_timeout();
-        let (mut framed, pool, pre_read) = tokio::time::timeout(
-            timeout,
-            self.acquire_conn(
-                donor,
-                Msg::StBuckets {
-                    cache,
-                    buckets,
-                    view_hash,
-                },
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| Err(request_timeout_error("rebalance bucket request", timeout)))?;
-        let first = match pre_read {
-            Some(result) => Some(result),
-            None => tokio::time::timeout(timeout, conn::recv_msg(&mut framed))
-                .await
-                .map_err(|_| request_timeout_error("rebalance bucket request", timeout))?,
+        // The caller's own transfer budget governs the full chunk stream,
+        // exactly as `request_state` does; only the checkout-or-dial step
+        // and the donor's first reply are bounded here.
+        let msg = Msg::StBuckets {
+            cache,
+            buckets,
+            view_hash,
         };
+        let (framed, pool, first) = self
+            .acquire_conn_and_first(donor, msg, "rebalance bucket request")
+            .await?;
         if let Some(Ok(Msg::StaleView { .. })) = first {
             pool.checkin(framed);
             return Ok(BucketPull::Stale);
@@ -2103,10 +2038,10 @@ mod tests {
     /// server's `REQ_CONN_IDLE_TIMEOUT` without waiting out the real 60s
     /// bound. `Mesh::update_peers` also opens its own persistent writer
     /// connection to the same address, which sends `Hello` and then
-    /// nothing else; that connection's task simply blocks forever on its
+    /// nothing else; that connection's task blocks forever on its
     /// second read and is otherwise harmless, since every connection is
-    /// served independently. `served` fires once per request actually
-    /// answered, after its connection is already closed.
+    /// served independently. `served` fires once per request answered,
+    /// after its connection is already closed.
     fn spawn_serve_one_digest_per_connection(
         listener: TcpListener,
         served: Arc<tokio::sync::Notify>,
@@ -2172,7 +2107,7 @@ mod tests {
 
     /// A raw request connection to `addr` that has already sent `hello`, for
     /// speaking as a peer of any protocol version, including the ones this
-    /// build's own `Mesh` no longer sends.
+    /// build's own `Mesh` doesn't send.
     async fn raw_request_conn(
         addr: SocketAddr,
         hello: Bytes,
@@ -3332,7 +3267,7 @@ mod tests {
         assert!(!cancel.is_cancelled(), "not cancelled while still a peer");
 
         // Dropping peer 2 from the incoming set removes its handle and
-        // must cancel the writer task that was spawned for it.
+        // must cancel the writer task spawned for it.
         mesh.update_peers(Vec::new());
         assert!(
             cancel.is_cancelled(),

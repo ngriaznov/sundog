@@ -15,7 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
-use super::{InboundMsg, MeshInner, MeshStream, OutFrame, RequestHandler, TlsCtx};
+use super::{
+    AeMismatch, AePartReply, AeRoundOutcome, FetchOutcome, InboundMsg, MeshInner, MeshStream,
+    OutFrame, RequestHandler, TlsCtx,
+};
 use crate::error::CodecError;
 use crate::node::NodeId;
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
@@ -91,7 +94,7 @@ async fn send_batch(framed: &mut PeerFramed, msgs: &[Msg]) -> Result<(), CodecEr
 }
 
 /// [`send_batch`], but for already-encoded frames: the per-peer writer's
-/// broadcast-class drain feeds these straight onto the wire. The frame was
+/// broadcast-class drain feeds these straight onto the wire. The frame is
 /// built once, upstream, and shared as a `Bytes` clone per peer.
 async fn send_frames(
     framed: &mut PeerFramed,
@@ -337,7 +340,7 @@ pub(super) enum ReusedProbe {
     /// A receive-side `EOF` or a broken read: the server already closed
     /// this connection as idle, or it is otherwise unusable.
     Stale,
-    /// A reply frame was already there. Handed back so the caller doesn't
+    /// A reply frame is already there. Handed back so the caller doesn't
     /// lose it, since reading it here already took it off the wire.
     Ready(Msg),
 }
@@ -452,7 +455,7 @@ pub(super) async fn run_peer_writer(
                     }
                 }
                 received = replicate_rx.recv() => {
-                    let Some(first) = received else { return }; // sender dropped: peer was removed
+                    let Some(first) = received else { return }; // sender dropped: peer removed
                     let mut drained = vec![first];
                     while let Ok(item) = replicate_rx.try_recv() {
                         drained.push(item);
@@ -911,7 +914,7 @@ async fn serve_fetch(
 }
 
 /// Serves an `AeDigestScoped`: an epoch check ahead of an ordinary digest
-/// exchange. `handler.ae_digest_scoped` folds both together — its `Digests`
+/// exchange. `handler.ae_digest_scoped` folds both together: its `Digests`
 /// case is this responder's own owned-bucket digests, view hashes already
 /// confirmed to match, fed into the same [`ae_mismatch_replies`] tiering
 /// [`serve_ae_digest`] uses. A `Stale` or `Unavailable` answer short-circuits
@@ -963,7 +966,7 @@ async fn serve_ae_digest_scoped(
 /// [`RequestHandler::st_buckets_available`] agrees, the bucket-scoped
 /// counterpart of [`serve_state_transfer`]; declines with `StaleView`
 /// otherwise (an unrecognized cache, one not open in distribution mode, or
-/// a view hash that no longer matches the requester's). Returns `true` when
+/// a view hash that has diverged from the requester's). Returns `true` when
 /// this connection is done.
 async fn serve_st_buckets(
     framed: &mut PeerFramed,
@@ -1153,240 +1156,146 @@ async fn serve_ae_pull_hashes(
     send_batch_or_cancelled(framed, &replies, cancel).await
 }
 
-/// Reads `AeBucket` replies until [`Msg::ReqDone`]. On success, checks
-/// `framed` back into `pool`; on error, the connection is dropped instead.
-/// `first`, when set, is consumed before any further read: `acquire_conn`
-/// hands one over when it already peeked a reply off a reused connection.
+/// A checked-out or dialed connection: `framed`, its `pool`, and any
+/// reply `acquire_conn` already peeked off a reused connection.
+pub(super) type Reply = (PeerFramed, Arc<ReqPool>, Option<Result<Msg, CodecError>>);
+
+/// Reads `reply` until [`Msg::ReqDone`], folding each message into `seed`
+/// via `accumulate`. Checks in on success; drops the connection on error.
+async fn collect_replies<T>(
+    reply: Reply,
+    what: &str,
+    mut seed: T,
+    mut accumulate: impl FnMut(Msg, &mut T),
+) -> Result<T, CodecError> {
+    let (mut framed, pool, mut first) = reply;
+    loop {
+        let received = match first.take() {
+            Some(msg) => Some(msg),
+            None => recv_msg(&mut framed).await,
+        };
+        match received {
+            Some(Ok(Msg::ReqDone)) => {
+                pool.checkin(framed);
+                return Ok(seed);
+            }
+            Some(Ok(msg)) => accumulate(msg, &mut seed),
+            Some(Err(err)) => return Err(err),
+            None => return Err(unexpected_close(what)),
+        }
+    }
+}
+
+/// Reads `AeBucket` replies into a `(bucket, entries)` list.
 pub(super) async fn collect_ae_buckets(
-    mut framed: PeerFramed,
-    pool: &ReqPool,
-    first: Option<Result<Msg, CodecError>>,
-) -> Result<Vec<(u16, Vec<(Bytes, crate::hlc::Hlc)>)>, CodecError> {
-    let mut result = Vec::new();
-    let mut pending = first;
-    loop {
-        let received = match pending.take() {
-            Some(msg) => Some(msg),
-            None => recv_msg(&mut framed).await,
-        };
-        match received {
-            Some(Ok(Msg::ReqDone)) => {
-                pool.checkin(framed);
-                return Ok(result);
-            }
-            Some(Ok(Msg::AeBucket {
-                bucket, entries, ..
-            })) => result.push((bucket, entries)),
-            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
-            Some(Err(err)) => return Err(err),
-            None => return Err(unexpected_close("anti-entropy digest reply")),
+    reply: Reply,
+) -> Result<crate::store::BucketEntries, CodecError> {
+    collect_replies(reply, "digest reply", Vec::new(), |msg, out| {
+        if let Msg::AeBucket {
+            bucket, entries, ..
+        } = msg
+        {
+            out.push((bucket, entries));
         }
+    })
+    .await
+}
+
+/// Reads digest replies into one [`AeMismatch`] list, per [`push_mismatch`].
+pub(super) async fn collect_ae_mismatches(reply: Reply) -> Result<Vec<AeMismatch>, CodecError> {
+    collect_replies(reply, "digest reply", Vec::new(), push_mismatch).await
+}
+
+fn push_mismatch(msg: Msg, out: &mut Vec<AeMismatch>) {
+    match msg {
+        Msg::AeBucket {
+            bucket, entries, ..
+        } => out.push(AeMismatch::Bucket(bucket, entries)),
+        Msg::AeSketch { bucket, cells, .. } => out.push(AeMismatch::Sketch(bucket, cells)),
+        Msg::AePartDigests {
+            bucket, digests, ..
+        } => out.push(AeMismatch::PartDigests(bucket, digests)),
+        _ => {}
     }
 }
 
-/// Reads `AeBucket`/`AeSketch` replies until [`Msg::ReqDone`] marks the
-/// reply complete: [`Mesh::ae_round`]'s collector, one [`super::AeMismatch`]
-/// per bucket regardless of shape. Same pool-checkin rules as
-/// [`collect_ae_buckets`].
-///
-/// [`Mesh::ae_round`]: super::Mesh::ae_round
-pub(super) async fn collect_ae_mismatches(
-    mut framed: PeerFramed,
-    pool: &ReqPool,
-    first: Option<Result<Msg, CodecError>>,
-) -> Result<Vec<super::AeMismatch>, CodecError> {
-    let mut result = Vec::new();
-    let mut pending = first;
-    loop {
-        let received = match pending.take() {
-            Some(msg) => Some(msg),
-            None => recv_msg(&mut framed).await,
-        };
-        match received {
-            Some(Ok(Msg::ReqDone)) => {
-                pool.checkin(framed);
-                return Ok(result);
-            }
-            Some(Ok(Msg::AeBucket {
-                bucket, entries, ..
-            })) => result.push(super::AeMismatch::Bucket(bucket, entries)),
-            Some(Ok(Msg::AeSketch { bucket, cells, .. })) => {
-                result.push(super::AeMismatch::Sketch(bucket, cells));
-            }
-            Some(Ok(Msg::AePartDigests {
-                bucket, digests, ..
-            })) => {
-                result.push(super::AeMismatch::PartDigests(bucket, digests));
-            }
-            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
-            Some(Err(err)) => return Err(err),
-            None => return Err(unexpected_close("anti-entropy digest reply")),
-        }
-    }
+/// Reads part replies into one [`AePartReply`] list.
+pub(super) async fn collect_ae_part_replies(reply: Reply) -> Result<Vec<AePartReply>, CodecError> {
+    collect_replies(reply, "part reply", Vec::new(), |msg, out| match msg {
+        Msg::AePart {
+            bucket,
+            part,
+            entries,
+            ..
+        } => out.push(AePartReply::Listing {
+            bucket,
+            part,
+            entries,
+        }),
+        Msg::AePartSketch {
+            bucket,
+            part,
+            cells,
+            ..
+        } => out.push(AePartReply::Sketch {
+            bucket,
+            part,
+            cells,
+        }),
+        _ => {}
+    })
+    .await
 }
 
-/// Reads `AePart`/`AePartSketch` replies until [`Msg::ReqDone`]:
-/// [`super::Mesh::ae_parts`]'s collector, one [`super::AePartReply`] per
-/// part. Same pool-checkin rules as [`collect_ae_buckets`].
-pub(super) async fn collect_ae_part_replies(
-    mut framed: PeerFramed,
-    pool: &ReqPool,
-    first: Option<Result<Msg, CodecError>>,
-) -> Result<Vec<super::AePartReply>, CodecError> {
-    let mut result = Vec::new();
-    let mut pending = first;
-    loop {
-        let received = match pending.take() {
-            Some(msg) => Some(msg),
-            None => recv_msg(&mut framed).await,
-        };
-        match received {
-            Some(Ok(Msg::ReqDone)) => {
-                pool.checkin(framed);
-                return Ok(result);
-            }
-            Some(Ok(Msg::AePart {
-                bucket,
-                part,
-                entries,
-                ..
-            })) => result.push(super::AePartReply::Listing {
-                bucket,
-                part,
-                entries,
-            }),
-            Some(Ok(Msg::AePartSketch {
-                bucket,
-                part,
-                cells,
-                ..
-            })) => result.push(super::AePartReply::Sketch {
-                bucket,
-                part,
-                cells,
-            }),
-            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
-            Some(Err(err)) => return Err(err),
-            None => return Err(unexpected_close("anti-entropy part reply")),
-        }
-    }
-}
-
-/// Reads `Replicate`/`ReplicateBatch` replies until [`Msg::ReqDone`], per
-/// [`collect_ae_buckets`].
+/// Reads `Replicate`/`ReplicateBatch` replies into one record list.
 pub(super) async fn collect_pulled_records(
-    mut framed: PeerFramed,
-    pool: &ReqPool,
-    first: Option<Result<Msg, CodecError>>,
+    reply: Reply,
 ) -> Result<Vec<crate::wire::WireRecord>, CodecError> {
-    let mut result = Vec::new();
-    let mut pending = first;
-    loop {
-        let received = match pending.take() {
-            Some(msg) => Some(msg),
-            None => recv_msg(&mut framed).await,
-        };
-        match received {
-            Some(Ok(Msg::ReqDone)) => {
-                pool.checkin(framed);
-                return Ok(result);
-            }
-            Some(Ok(Msg::Replicate { rec, .. })) => result.push(rec),
-            Some(Ok(Msg::ReplicateBatch { recs, .. })) => result.extend(recs),
-            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
-            Some(Err(err)) => return Err(err),
-            None => return Err(unexpected_close("anti-entropy pull reply")),
-        }
-    }
+    collect_replies(reply, "pull reply", Vec::new(), |msg, out| match msg {
+        Msg::Replicate { rec, .. } => out.push(rec),
+        Msg::ReplicateBatch { recs, .. } => out.extend(recs),
+        _ => {}
+    })
+    .await
 }
 
-/// Reads a `FetchReply`/`StaleView` reply until [`Msg::ReqDone`]:
-/// [`Mesh::fetch`]'s collector. Same pool-checkin rules as
-/// [`collect_ae_buckets`].
-///
-/// [`Mesh::fetch`]: super::Mesh::fetch
-pub(super) async fn collect_fetch_reply(
-    mut framed: PeerFramed,
-    pool: &ReqPool,
-    first: Option<Result<Msg, CodecError>>,
-) -> Result<super::FetchOutcome, CodecError> {
-    let mut outcome: Option<super::FetchOutcome> = None;
-    let mut pending = first;
-    loop {
-        let received = match pending.take() {
-            Some(msg) => Some(msg),
-            None => recv_msg(&mut framed).await,
-        };
-        match received {
-            Some(Ok(Msg::ReqDone)) => {
-                pool.checkin(framed);
-                return outcome.ok_or_else(|| unexpected_close("fetch reply"));
-            }
-            Some(Ok(Msg::FetchReply { rec })) => outcome = Some(super::FetchOutcome::Found(rec)),
-            Some(Ok(Msg::FetchDeclined { .. })) => outcome = Some(super::FetchOutcome::Declined),
-            Some(Ok(Msg::StaleView {
+/// Reads a `FetchReply`/`FetchDeclined`/`StaleView` reply; a later one replaces an earlier one, since only a misbehaving peer sends more than one.
+pub(super) async fn collect_fetch_reply(reply: Reply) -> Result<FetchOutcome, CodecError> {
+    let outcome = collect_replies(reply, "fetch reply", None, |msg, out| {
+        *out = match msg {
+            Msg::FetchReply { rec } => Some(FetchOutcome::Found(rec)),
+            Msg::FetchDeclined { .. } => Some(FetchOutcome::Declined),
+            Msg::StaleView {
                 responder_view_hash,
                 ..
-            })) => {
-                outcome = Some(super::FetchOutcome::Stale {
-                    responder_view_hash,
-                });
-            }
-            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
-            Some(Err(err)) => return Err(err),
-            None => return Err(unexpected_close("fetch reply")),
-        }
-    }
+            } => Some(FetchOutcome::Stale {
+                responder_view_hash,
+            }),
+            _ => return,
+        };
+    })
+    .await?;
+    outcome.ok_or_else(|| unexpected_close("fetch reply"))
 }
 
-/// Reads `AeBucket`/`AeSketch`/`AePartDigests` replies, or a single
-/// `StaleView`, until [`Msg::ReqDone`]: [`Mesh::ae_round_scoped`]'s
-/// collector, the epoch-checked counterpart of [`collect_ae_mismatches`].
-///
-/// [`Mesh::ae_round_scoped`]: super::Mesh::ae_round_scoped
-pub(super) async fn collect_ae_round_scoped(
-    mut framed: PeerFramed,
-    pool: &ReqPool,
-    first: Option<Result<Msg, CodecError>>,
-) -> Result<super::AeRoundOutcome, CodecError> {
-    let mut result = Vec::new();
-    let mut stale: Option<u64> = None;
-    let mut pending = first;
-    loop {
-        let received = match pending.take() {
-            Some(msg) => Some(msg),
-            None => recv_msg(&mut framed).await,
-        };
-        match received {
-            Some(Ok(Msg::ReqDone)) => {
-                pool.checkin(framed);
-                return Ok(match stale {
-                    Some(responder_view_hash) => super::AeRoundOutcome::Stale {
-                        responder_view_hash,
-                    },
-                    None => super::AeRoundOutcome::Mismatches(result),
-                });
-            }
-            Some(Ok(Msg::StaleView {
-                responder_view_hash,
-                ..
-            })) => stale = Some(responder_view_hash),
-            Some(Ok(Msg::AeBucket {
-                bucket, entries, ..
-            })) => result.push(super::AeMismatch::Bucket(bucket, entries)),
-            Some(Ok(Msg::AeSketch { bucket, cells, .. })) => {
-                result.push(super::AeMismatch::Sketch(bucket, cells));
-            }
-            Some(Ok(Msg::AePartDigests {
-                bucket, digests, ..
-            })) => {
-                result.push(super::AeMismatch::PartDigests(bucket, digests));
-            }
-            Some(Ok(_)) => {} // unexpected message on this connection; keep reading
-            Some(Err(err)) => return Err(err),
-            None => return Err(unexpected_close("scoped anti-entropy digest reply")),
-        }
-    }
+/// Reads digest replies like [`collect_ae_mismatches`], but epoch-checked: the last `StaleView` seen wins over every mismatch.
+pub(super) async fn collect_ae_round_scoped(reply: Reply) -> Result<AeRoundOutcome, CodecError> {
+    type Seed = (Vec<AeMismatch>, Option<u64>);
+    let accumulate = |msg, (out, stale): &mut Seed| match msg {
+        Msg::StaleView {
+            responder_view_hash,
+            ..
+        } => *stale = Some(responder_view_hash),
+        other => push_mismatch(other, out),
+    };
+    let (mismatches, stale) =
+        collect_replies(reply, "scoped digest reply", Seed::default(), accumulate).await?;
+    Ok(match stale {
+        Some(responder_view_hash) => AeRoundOutcome::Stale {
+            responder_view_hash,
+        },
+        None => AeRoundOutcome::Mismatches(mismatches),
+    })
 }
 
 fn unexpected_close(what: &str) -> CodecError {
@@ -1550,7 +1459,7 @@ mod tests {
         .await;
         assert!(
             super::pooled_is_fresh(checked_in, tokio::time::Instant::now().into()),
-            "just under REQ_POOL_MAX_IDLE must stay fresh"
+            "narrowly under REQ_POOL_MAX_IDLE must stay fresh"
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
@@ -1583,13 +1492,13 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[cfg(not(feature = "sim"))]
-    use super::{InboundMsg, PeerFramed, ReqPool};
+    use super::{InboundMsg, PeerFramed, Reply, ReqPool};
     use super::{OutFrame, coalesce_replicate};
     #[cfg(not(feature = "sim"))]
     use crate::error::CodecError;
     use crate::hlc::Hlc;
     #[cfg(not(feature = "sim"))]
-    use crate::net::AeMismatch;
+    use crate::net::{AeMismatch, AePartReply};
     use crate::node::NodeId;
     use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
@@ -1686,7 +1595,7 @@ mod tests {
     }
 
     /// A `Msg::ReplicateBatch` following same-cache entries in the pending
-    /// run merges into it too, not just a lone `Msg::Replicate`.
+    /// run merges into it too, not only a lone `Msg::Replicate`.
     #[test]
     fn coalesce_replicate_merges_a_replicate_batch_into_a_pending_run() {
         let drained = vec![
@@ -2049,6 +1958,13 @@ mod tests {
         ));
     }
 
+    /// A [`Reply`] over `framed`, backed by a fresh, empty pool: the
+    /// collector tests below never expect a checked-in connection to matter.
+    #[cfg(not(feature = "sim"))]
+    fn reply(framed: PeerFramed) -> Reply {
+        (framed, Arc::new(ReqPool::new()), None)
+    }
+
     /// Asserts `err` is the `UnexpectedEof` a collector returns when its
     /// connection closes before the terminating `Msg::ReqDone`.
     #[cfg(not(feature = "sim"))]
@@ -2063,8 +1979,7 @@ mod tests {
     #[tokio::test]
     async fn collect_ae_buckets_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
-        let pool = ReqPool::new();
-        let err = super::collect_ae_buckets(framed, &pool, None)
+        let err = super::collect_ae_buckets(reply(framed))
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -2074,8 +1989,7 @@ mod tests {
     #[tokio::test]
     async fn collect_ae_mismatches_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
-        let pool = ReqPool::new();
-        let err = super::collect_ae_mismatches(framed, &pool, None)
+        let err = super::collect_ae_mismatches(reply(framed))
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -2085,8 +1999,7 @@ mod tests {
     #[tokio::test]
     async fn collect_pulled_records_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
-        let pool = ReqPool::new();
-        let err = super::collect_pulled_records(framed, &pool, None)
+        let err = super::collect_pulled_records(reply(framed))
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -2117,8 +2030,7 @@ mod tests {
             Msg::ReqDone,
         ])
         .await;
-        let pool = ReqPool::new();
-        let got = super::collect_ae_buckets(framed, &pool, None)
+        let got = super::collect_ae_buckets(reply(framed))
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![(3, entries)]);
@@ -2141,8 +2053,7 @@ mod tests {
             Msg::ReqDone,
         ])
         .await;
-        let pool = ReqPool::new();
-        let got = super::collect_ae_mismatches(framed, &pool, None)
+        let got = super::collect_ae_mismatches(reply(framed))
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![AeMismatch::Sketch(2, Vec::new())]);
@@ -2174,8 +2085,7 @@ mod tests {
             Msg::ReqDone,
         ])
         .await;
-        let pool = ReqPool::new();
-        let got = super::collect_pulled_records(framed, &pool, None)
+        let got = super::collect_pulled_records(reply(framed))
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![rec]);
@@ -2194,8 +2104,7 @@ mod tests {
             Msg::ReqDone,
         ])
         .await;
-        let pool = ReqPool::new();
-        let got = super::collect_ae_mismatches(framed, &pool, None)
+        let got = super::collect_ae_mismatches(reply(framed))
             .await
             .expect("collects the AePartDigests reply");
         assert_eq!(got, vec![AeMismatch::PartDigests(5, digests)]);
@@ -2205,8 +2114,7 @@ mod tests {
     #[tokio::test]
     async fn collect_ae_part_replies_errors_on_a_connection_closed_before_req_done() {
         let framed = dial_fake_donor(Vec::new()).await;
-        let pool = ReqPool::new();
-        let err = super::collect_ae_part_replies(framed, &pool, None)
+        let err = super::collect_ae_part_replies(reply(framed))
             .await
             .expect_err("a connection closed before ReqDone must error");
         assert_unexpected_eof(&err);
@@ -2244,19 +2152,18 @@ mod tests {
             Msg::ReqDone,
         ])
         .await;
-        let pool = ReqPool::new();
-        let got = super::collect_ae_part_replies(framed, &pool, None)
+        let got = super::collect_ae_part_replies(reply(framed))
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(
             got,
             vec![
-                super::super::AePartReply::Listing {
+                AePartReply::Listing {
                     bucket: 3,
                     part: 7,
                     entries,
                 },
-                super::super::AePartReply::Sketch {
+                AePartReply::Sketch {
                     bucket: 3,
                     part: 8,
                     cells: Vec::new(),
