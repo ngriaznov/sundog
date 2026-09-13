@@ -157,7 +157,12 @@ All notable changes to this project are documented in this file. Format follows
   node) and the cache is quiet: every other member sharing it has been
   either continuously present or continuously gone for that same
   `crdt_retire_after`. A graceful leaver still never holds tombstone
-  collection back; only writer retirement treats it like a crash. Stage one moves the writer's contribution into
+  collection back; only writer retirement treats it like a crash. A gone
+  member stays known to the sweep until it returns, past the
+  `tombstone_max_ttl` hard cap that ages its absence out of tombstone
+  deferral, so the records a later tick reaches see the same death: the
+  sweep works one stripe per tick, and a writer retired in one record
+  must retire in every other. Stage one moves the writer's contribution into
   per-writer retired state at that point, exact regardless of how stale
   any replica's view of any other replica is. Stage two only runs once
   that retirement has itself aged past a second `crdt_retire_after`

@@ -1785,9 +1785,10 @@ fn crdt_cache_members(
 /// merging resolver only ever runs on nodes that carry that resolver.
 /// Otherwise builds this tick's retirement predicate and the cache's quiet
 /// flag from the current membership/absence snapshot and hands both to
-/// [`ShardOps::compact_pass`]. Every writer the pass actually retired stops
-/// being tracked absent ([`absence::AbsenceTracker::mark_retired`]) and is
-/// counted in `sundog_crdt_retired_writers_total{cache}`;
+/// [`ShardOps::compact_pass`]. Every writer the pass actually retired is
+/// counted in `sundog_crdt_retired_writers_total{cache}`; the member stays
+/// tracked gone until it returns, so the records a later tick reaches see
+/// the same death;
 /// `sundog_crdt_compactions_total{cache}` counts records rewritten this
 /// pass.
 ///
@@ -1857,8 +1858,7 @@ async fn crdt_compact_tick(
     let (retired, compacted) = shard
         .compact_pass(now_ms(), &retire, quiet, bound_ms, batch)
         .await;
-    for writer in &retired {
-        absence.mark_retired(writer.node());
+    for _ in &retired {
         metrics::counter!("sundog_crdt_retired_writers_total", "cache" => name.to_string())
             .increment(1);
     }
@@ -5742,16 +5742,34 @@ mod tests {
             cancel.clone(),
         ));
 
+        let seeded_len = cache
+            .get(&1)
+            .await
+            .expect("counter 1 is resident")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if absence.gone_since(dead_writer.node()).is_none() {
+                let len = cache
+                    .get(&1)
+                    .await
+                    .expect("counter 1 is resident")
+                    .encode()
+                    .expect("PnCounter::encode never fails on a resident value")
+                    .len();
+                if len != seeded_len {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("the dead writer is retired, clearing its tracked absence");
+        .expect("the dead writer's slot moves into its retired entry, rewriting the record");
+        assert!(
+            absence.gone_since(dead_writer.node()).is_some(),
+            "the member stays tracked gone after retirement, for the records later ticks reach"
+        );
 
         assert_eq!(
             cache.get(&1).await.map(|c| c.value()),
