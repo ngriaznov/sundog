@@ -869,8 +869,10 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
 /// listing. n2 cold-joins and warms first, so both replicas start
 /// byte-identical; dropping one key locally on n2 then leaves exactly one
 /// bucket, and within it one part, mismatched. The repair's shape is read
-/// off n2's own `sundog_ae_parts_total` outcomes, one `listing` and no
-/// `sketch` or `fallback`, with no bucket-level sketch either: n1's wire
+/// off both nodes' `sundog_ae_parts_total` outcomes summed, since either
+/// node's round may find the gap first and the initiator counts it: one
+/// `listing` and no `sketch` or `fallback`, with no bucket-level sketch
+/// either: n1's wire
 /// bytes over the same window also carry its own rounds' 3 KB digests,
 /// so they are printed for reference, not asserted on. The baseline is
 /// read after [`wait_for_quiescent_netstats`]: n2's local count reaches
@@ -908,9 +910,7 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     wait_for_quiescent_netstats(&n1, Duration::from_secs(90)).await;
 
     let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the drop");
-    let parts_before = ae_parts_outcomes(&n2).await;
-    let bucket_sketches_before =
-        scrape_metric(&n2, "sundog_ae_sketch_total", ("cache", "it")).await;
+    let outcomes_before = ae_outcomes_on_both(&n1, &n2).await;
 
     n2.drop_key(TARGET_KEY)
         .await
@@ -932,19 +932,18 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     let frames_for_repair = frames_after - frames_before;
     let bytes_for_repair = bytes_after - bytes_before;
     println!("part-digest repair: n1 sent {frames_for_repair} frames / {bytes_for_repair} bytes");
-    let parts_after = ae_parts_outcomes(&n2).await;
-    let bucket_sketches_after = scrape_metric(&n2, "sundog_ae_sketch_total", ("cache", "it")).await;
+    let outcomes_after = ae_outcomes_on_both(&n1, &n2).await;
     assert_eq!(
-        (
-            parts_after.listing - parts_before.listing,
-            parts_after.sketch - parts_before.sketch,
-            parts_after.fallback - parts_before.fallback,
-            bucket_sketches_after - bucket_sketches_before,
-        ),
-        (1, 0, 0, 0),
-        "the repair should list exactly the one part the dropped key falls into (part outcomes \
-         listing/sketch/fallback, then bucket sketches): the mismatched bucket answers with part \
-         digests, not a bucket sketch or a full listing"
+        outcomes_after.zip_with(outcomes_before, |after, before| after - before),
+        AeOutcomes {
+            listing: 1,
+            sketch: 0,
+            fallback: 0,
+            bucket_sketches: 0
+        },
+        "the repair lists exactly the one part the dropped key falls into, whichever node's \
+         round finds the gap: the mismatched bucket answers with part digests, not a bucket \
+         sketch or a full listing"
     );
     assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
 
@@ -1516,21 +1515,45 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
 /// exact-integer count, so rounding it to `u64` here sidesteps
 /// `clippy::float_cmp` entirely: every comparison below compares `u64`s,
 /// never `f64`s, mirroring `tests/spill_bench.rs`'s `metric_count`.
-/// One node's `sundog_ae_parts_total` counters by outcome, the part-path
-/// shape of the anti-entropy rounds it initiated.
-#[derive(Debug, Clone, Copy)]
-struct AePartsOutcomes {
+/// The anti-entropy outcome counters two nodes report between them: part
+/// outcomes by kind plus bucket-level sketches, each summed over both nodes
+/// since the node whose round finds a gap is the one that counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AeOutcomes {
     listing: u64,
     sketch: u64,
     fallback: u64,
+    bucket_sketches: u64,
 }
 
-async fn ae_parts_outcomes(node: &Node) -> AePartsOutcomes {
-    AePartsOutcomes {
-        listing: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "listing")).await,
-        sketch: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "sketch")).await,
-        fallback: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "fallback")).await,
+impl AeOutcomes {
+    fn zip_with(self, other: Self, f: impl Fn(u64, u64) -> u64) -> Self {
+        Self {
+            listing: f(self.listing, other.listing),
+            sketch: f(self.sketch, other.sketch),
+            fallback: f(self.fallback, other.fallback),
+            bucket_sketches: f(self.bucket_sketches, other.bucket_sketches),
+        }
     }
+}
+
+async fn ae_outcomes_on_both(a: &Node, b: &Node) -> AeOutcomes {
+    let mut total = AeOutcomes {
+        listing: 0,
+        sketch: 0,
+        fallback: 0,
+        bucket_sketches: 0,
+    };
+    for node in [a, b] {
+        let one = AeOutcomes {
+            listing: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "listing")).await,
+            sketch: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "sketch")).await,
+            fallback: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "fallback")).await,
+            bucket_sketches: scrape_metric(node, "sundog_ae_sketch_total", ("cache", "it")).await,
+        };
+        total = total.zip_with(one, |x, y| x + y);
+    }
+    total
 }
 
 async fn scrape_metric(node: &Node, metric: &str, label: (&str, &str)) -> u64 {

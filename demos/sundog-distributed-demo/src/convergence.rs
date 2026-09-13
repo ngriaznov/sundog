@@ -58,11 +58,14 @@ impl fmt::Display for Convergence {
     }
 }
 
-/// `owners * surviving_keys`, the entry count every live node's local
-/// counts should sum to once rebalancing settles.
+/// The entry count every live node's local counts should sum to once
+/// rebalancing settles: `min(owners, live) * surviving_keys`, since a
+/// cluster with fewer live nodes than owners holds one copy per node.
 #[must_use]
-pub(crate) fn expected_entries(owners: u64, surviving_keys: usize) -> u64 {
-    owners.saturating_mul(u64::try_from(surviving_keys).unwrap_or(u64::MAX))
+pub(crate) fn expected_entries(owners: u64, live: usize, surviving_keys: usize) -> u64 {
+    owners
+        .min(u64::try_from(live).unwrap_or(u64::MAX))
+        .saturating_mul(u64::try_from(surviving_keys).unwrap_or(u64::MAX))
 }
 
 /// Compares a summed entry count against the expected total. Pure: the
@@ -118,7 +121,7 @@ pub(crate) async fn poll(
     let started = tokio::time::Instant::now();
     loop {
         let (total, live) = total_live_entries(nodes);
-        let expected = expected_entries(owners, surviving_keys());
+        let expected = expected_entries(owners, live, surviving_keys());
         let report = check(total, expected, live);
         if !report.is_diverged() || started.elapsed() >= deadline {
             return report;
@@ -133,9 +136,14 @@ mod tests {
     use crate::node::build_slots;
 
     #[test]
-    fn expected_entries_multiplies_owners_by_surviving_keys() {
-        assert_eq!(expected_entries(2, 1000), 2000);
-        assert_eq!(expected_entries(3, 0), 0);
+    fn expected_entries_multiplies_surviving_keys_by_the_copies_the_cluster_can_hold() {
+        assert_eq!(expected_entries(2, 3, 1000), 2000);
+        assert_eq!(
+            expected_entries(2, 1, 1000),
+            1000,
+            "one node holds one copy"
+        );
+        assert_eq!(expected_entries(3, 5, 0), 0);
     }
 
     #[test]

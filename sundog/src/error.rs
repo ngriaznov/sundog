@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use smol_str::SmolStr;
 
@@ -136,6 +137,20 @@ pub enum CacheError {
         cache: SmolStr,
         owners: std::num::NonZeroU8,
     },
+    /// The cache was opened as [`crate::store::Mode::Distributed`] under a
+    /// `ClusterConfig::tombstone_ttl` shorter than the bucket release
+    /// window, `ae_interval * (2 * distributed_disown_grace_rounds + 2)`.
+    /// A node that lost a bucket hands its copy off up to that long after
+    /// the last removal reached it; with the owners' tombstone already
+    /// collected, the hand-off would bring a removed key back.
+    #[error(
+        "cache {cache:?} distributed mode needs tombstone_ttl ({tombstone_ttl:?}) to cover the bucket release window of {window:?} (ae_interval x (2 x distributed_disown_grace_rounds + 2))"
+    )]
+    TombstoneTtlInsideReleaseWindow {
+        cache: SmolStr,
+        tombstone_ttl: Duration,
+        window: Duration,
+    },
     /// A `Cache::fetch` on a [`crate::store::Mode::Distributed`] cache found
     /// no reachable owner of the key's bucket within
     /// [`crate::config::ClusterConfig::fetch_timeout`], across every
@@ -182,6 +197,19 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("prices"));
         assert!(text.contains('1'));
+    }
+
+    #[test]
+    fn tombstone_ttl_inside_release_window_message_names_cache_and_both_durations() {
+        let err = CacheError::TombstoneTtlInsideReleaseWindow {
+            cache: SmolStr::new("prices"),
+            tombstone_ttl: Duration::from_secs(15),
+            window: Duration::from_secs(24),
+        };
+        let text = err.to_string();
+        assert!(text.contains("prices"), "{text}");
+        assert!(text.contains("15s"), "{text}");
+        assert!(text.contains("24s"), "{text}");
     }
 
     #[test]

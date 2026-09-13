@@ -398,6 +398,38 @@ pub(crate) fn hand_off_owners(
     owners
 }
 
+/// How long a released bucket may stay resident before it is dropped
+/// without a hand-off: the tombstone retention less one interval for the
+/// round. A copy held longer can no longer be trusted not to resurrect a
+/// key the owners removed and whose tombstone they have since collected;
+/// losing what the owners never pulled costs a cache entry, resurrecting a
+/// delete breaks the contract that deleted entries never come back.
+pub(crate) fn hand_off_cutoff(tombstone_ttl: Duration, ae_interval: Duration) -> Duration {
+    tombstone_ttl.saturating_sub(ae_interval).max(ae_interval)
+}
+
+/// Drops `buckets` held past [`hand_off_cutoff`] at once, counted under
+/// `sundog_rebalance_buckets_total{direction="out"}` like any release.
+async fn release_without_hand_off(
+    shard: &dyn ShardOps,
+    residency: &ResidencySet,
+    cache: &SmolStr,
+    buckets: &[u16],
+) {
+    if buckets.is_empty() {
+        return;
+    }
+    let removed = shard.release_buckets(buckets).await;
+    residency.unmark(buckets);
+    metrics::counter!(
+        "sundog_rebalance_buckets_total",
+        "cache" => cache.to_string(),
+        "direction" => "out"
+    )
+    .increment(u64::try_from(buckets.len()).unwrap_or(u64::MAX));
+    tracing::warn!(cache = %cache, buckets = buckets.len(), removed, "released buckets held past the tombstone retention without a hand-off");
+}
+
 /// The buckets in `due` a release may drop now: those whose every other
 /// current owner is in `reconciled` (its anti-entropy round completed
 /// since the bucket came due) or, once `overdue`, in `unreachable` (its
@@ -452,6 +484,7 @@ pub(crate) async fn rebalance_task(
 ) {
     let budget = cluster.config().state_transfer_budget;
     let ae_interval = cluster.config().ae_interval;
+    let cutoff = hand_off_cutoff(cluster.config().tombstone_ttl, ae_interval);
     let mut view_rx = ownership.subscribe();
     // `prev_view` is the view published right before the current one;
     // `pulled_view` is the latest view without a superseded pull. See
@@ -515,7 +548,13 @@ pub(crate) async fn rebalance_task(
                 }
             }
             _ = ticker.tick() => {
-                let due = residency.expired(disown_grace);
+                let past_cutoff = residency.expired(cutoff);
+                release_without_hand_off(shard.as_ref(), &residency, &cache, &past_cutoff).await;
+                let due: Vec<u16> = residency
+                    .expired(disown_grace)
+                    .into_iter()
+                    .filter(|bucket| !past_cutoff.contains(bucket))
+                    .collect();
                 if !due.is_empty() {
                     let view = ownership.current();
                     let self_node = cluster.node_id();
@@ -707,6 +746,19 @@ mod tests {
         assert!(
             !hand_off_owners(&view, self_node, &due, &live_minus_one).contains(&dead),
             "a dead owner is skipped"
+        );
+    }
+
+    #[test]
+    fn hand_off_cutoff_is_one_interval_inside_the_tombstone_retention() {
+        assert_eq!(
+            hand_off_cutoff(Duration::from_secs(60), Duration::from_secs(3)),
+            Duration::from_secs(57)
+        );
+        assert_eq!(
+            hand_off_cutoff(Duration::from_secs(2), Duration::from_secs(3)),
+            Duration::from_secs(3),
+            "never shorter than one interval"
         );
     }
 

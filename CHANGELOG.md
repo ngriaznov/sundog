@@ -214,6 +214,30 @@ All notable changes to this project are documented in this file. Format follows
   trust boundary `tombstone_max_ttl` already accepts for a member gone
   that long, not a new one.
 
+### Fixed
+
+- A removed key could come back in a `Mode::Distributed` cache after a
+  bucket moved under load. A node that lost a bucket keeps a copy that no
+  removal reaches until its hand-off round, up to twice the disown grace
+  later, and that round pushes whatever the owners lack; once the owners'
+  tombstone was collected, the stale copy resurrected the key on both.
+  Opening a `Mode::Distributed` cache now rejects a `tombstone_ttl` shorter
+  than `ClusterConfig::bucket_release_window`,
+  `ae_interval * (2 * distributed_disown_grace_rounds + 2)`, with
+  `CacheError::TombstoneTtlInsideReleaseWindow`, and a released bucket
+  still resident when the retention runs out is dropped without a
+  hand-off, since its copy can no longer be trusted not to resurrect a
+  removal. The library defaults already satisfy the rule; the distributed
+  demo's 15-second retention did not and is 60 seconds, and the test node's
+  10-second retention is 20 seconds.
+- The distributed demo expected `owners` copies of every key even with
+  fewer live nodes than owners, so a one-node run never converged; the
+  expectation is `min(owners, live)` copies. Its status line says when the
+  load is still running, since the sum settles only once the load pauses,
+  and a diverged headless report lists per node the keys held in buckets
+  it does not own, how many nodes hold each key, and removed keys some
+  node still holds.
+
 ## [0.6.0] – 2026-09-07
 
 ### Added
