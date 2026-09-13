@@ -661,36 +661,66 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
         wait_for_peers(&[&n1, &n2], 1).await;
     }
 
-    // Give the sweep (`cluster.rs::crdt_compact_task`, cadence
-    // `(crdt_retire_after / 4).max(30s)`) time to
-    // retire every churned writer — stage one — then a further wait for
-    // stage two's `2 * crdt_retire_after` fold once the cache goes quiet.
-    eventually(CRDT_COMPACT_WAIT, || async {
-        scrape_metric(&n1, "sundog_crdt_retired_writers_total", ("cache", "pn")).await
-            >= u64::from(CHURN_ROUNDS)
-    })
-    .await;
+    // Both compaction stages, observed rather than slept for and logged
+    // on every poll so a miss on CI shows how far the sweep got: stage
+    // one retires every churned writer (cadence `(crdt_retire_after /
+    // 4).max(30s)`, see `cluster.rs::crdt_compact_task`); stage two folds
+    // them once the cache has been quiet for `2 * crdt_retire_after` and
+    // prunes its fold receipts three bounds later, each on the next tick.
+    let bound = per_entry_before + FOLD_SLACK_BYTES;
+    let started = std::time::Instant::now();
+    let mut retired_done = false;
+    loop {
+        let retired = (
+            scrape_metric(&n1, "sundog_crdt_retired_writers_total", ("cache", "pn")).await,
+            scrape_metric(&n2, "sundog_crdt_retired_writers_total", ("cache", "pn")).await,
+        );
+        let compactions = (
+            scrape_metric(&n1, "sundog_crdt_compactions_total", ("cache", "pn")).await,
+            scrape_metric(&n2, "sundog_crdt_compactions_total", ("cache", "pn")).await,
+        );
+        let bytes = (
+            n1.pn_bytes(PN_KEYS)
+                .await
+                .expect("n1 pnbytes during compaction"),
+            n2.pn_bytes(PN_KEYS)
+                .await
+                .expect("n2 pnbytes during compaction"),
+        );
+        let per_entry = bytes.0.max(bytes.1) / u64::from(PN_KEYS);
+        println!(
+            "compaction at {:?}: retired n1={} n2={}, compactions n1={} n2={}, pn bytes n1={} \
+             n2={} ({per_entry}/entry, bound {bound})",
+            started.elapsed(),
+            retired.0,
+            retired.1,
+            compactions.0,
+            compactions.1,
+            bytes.0,
+            bytes.1
+        );
+        if !retired_done && retired.0.min(retired.1) >= u64::from(CHURN_ROUNDS) {
+            retired_done = true;
+            println!("every churned writer retired on both replicas");
+        }
+        if retired_done && per_entry <= bound {
+            break;
+        }
+        assert!(
+            started.elapsed() < CRDT_COMPACT_WAIT,
+            "compaction did not settle within {CRDT_COMPACT_WAIT:?}: retired n1={} n2={} \
+             (need {CHURN_ROUNDS} each), pn bytes {per_entry}/entry against a bound of \
+             {bound}",
+            retired.0,
+            retired.1
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 
     // "After": the same size once every churned writer has been folded
     // away, despite `CHURN_ROUNDS` more distinct writer identities having
-    // touched every counter than in the "before" measurement. Read on both
-    // replicas, since each one compacts on its own sweep, and polled rather
-    // than slept for: stage two's fold waits out `2 * crdt_retire_after` of
-    // quiet and its receipts prune three bounds later, each landing on the
-    // next 30s-floored tick.
-    let bound = per_entry_before + FOLD_SLACK_BYTES;
-    eventually(CRDT_COMPACT_WAIT, || async {
-        let n1_bytes = n1
-            .pn_bytes(PN_KEYS)
-            .await
-            .expect("n1 pnbytes after compaction");
-        let n2_bytes = n2
-            .pn_bytes(PN_KEYS)
-            .await
-            .expect("n2 pnbytes after compaction");
-        n1_bytes.max(n2_bytes) / u64::from(PN_KEYS) <= bound
-    })
-    .await;
+    // touched every counter than in the "before" measurement, read on both
+    // replicas since each one compacts on its own sweep.
     let bytes_after_n1 = n1
         .pn_bytes(PN_KEYS)
         .await
