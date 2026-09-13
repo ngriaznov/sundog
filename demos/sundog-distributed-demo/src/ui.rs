@@ -149,6 +149,7 @@ fn draw_feed(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let convergence = app.convergence();
+    let paused = app.demo.paused.load(Ordering::Relaxed);
     let (conv_text, conv_color) = match convergence {
         Convergence::NoLiveNodes => ("no live nodes".to_owned(), Color::Red),
         Convergence::Converged { total, live } => (
@@ -160,11 +161,14 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             expected,
             live,
         } => (
-            format!("settling ({live} nodes, {total}/{expected} entries)"),
+            if paused {
+                format!("settling ({live} nodes, {total}/{expected} entries)")
+            } else {
+                format!("settling ({live} nodes, {total}/{expected} entries, load running)")
+            },
             Color::Yellow,
         ),
     };
-    let paused = app.demo.paused.load(Ordering::Relaxed);
 
     let hits = app.demo.state.fetch_hits.load(Ordering::Relaxed);
     let misses = app.demo.state.fetch_misses.load(Ordering::Relaxed);

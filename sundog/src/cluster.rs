@@ -660,10 +660,33 @@ fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
     !discovery_set && seeds_env.is_some_and(|raw| !raw.trim().is_empty())
 }
 
+/// The longest a `Mode::Distributed` node can hold a bucket it no longer
+/// owns before its hand-off round pushes that copy to the owners: twice the
+/// disown grace, plus one interval for the round and one of slack.
+fn release_window(config: &ClusterConfig) -> Duration {
+    config.ae_interval.saturating_mul(
+        config
+            .distributed_disown_grace_rounds
+            .saturating_mul(2)
+            .saturating_add(2),
+    )
+}
+
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:
-/// `max_frame` against the wire codec's hard cap, and the sketch frame size
-/// it implies.
+/// `max_frame` against the wire codec's hard cap, the sketch frame size it
+/// implies, and a tombstone retention that outlives the bucket release
+/// window, so a released bucket's hand-off never pushes a stale copy of a
+/// key over an owner whose tombstone for it is already collected.
 fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
+    let window = release_window(config);
+    if config.tombstone_ttl < window {
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::tombstone_ttl ({:?}) is shorter than the bucket release window of \
+             {window:?} (ae_interval x (2 x distributed_disown_grace_rounds + 2)); a removed key \
+             could come back from a released bucket's hand-off",
+            config.tombstone_ttl
+        )));
+    }
     if config.max_frame > wire::MAX_FRAME {
         return Err(JoinError::InvalidConfig(format!(
             "ClusterConfig::max_frame ({}) exceeds the wire codec's hard cap of {} bytes",
@@ -2209,6 +2232,32 @@ mod tests {
             .await
             .expect_err("max_frame above the wire cap must be rejected at build() time");
         assert!(matches!(err, JoinError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_tombstone_ttl_shorter_than_the_release_window() {
+        let mut config = loopback_config();
+        config.ae_interval = Duration::from_secs(3);
+        config.distributed_disown_grace_rounds = 3;
+        config.tombstone_ttl = Duration::from_secs(15);
+
+        let err = Cluster::builder("cluster-it-tombstone-release-window-guard")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect_err("a tombstone ttl inside the release window must be rejected at build()");
+        assert!(matches!(err, JoinError::InvalidConfig(_)), "{err:?}");
+        assert_eq!(release_window(&config), Duration::from_secs(24));
+
+        config.tombstone_ttl = Duration::from_secs(24);
+        let cluster = Cluster::builder("cluster-it-tombstone-release-window-ok")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("a tombstone ttl equal to the release window is accepted");
+        cluster.shutdown().await;
     }
 
     #[tokio::test]

@@ -50,7 +50,13 @@ pub struct ClusterConfig {
     pub ae_interval: Duration,
     /// How long a tombstone is retained before garbage collection. Must be
     /// at least `3 * ae_interval` so a lagging peer gets a few anti-entropy
-    /// rounds to observe the deletion first.
+    /// rounds to observe the deletion first, and at least
+    /// `ae_interval * (2 * distributed_disown_grace_rounds + 2)`, the bucket
+    /// release window: a `Mode::Distributed` node that lost a bucket keeps a
+    /// copy that no removal reaches until its hand-off round, up to twice
+    /// the grace later, and that round pushes whatever the owners lack. With
+    /// the tombstone still there the stale copy loses; without it a removed
+    /// key comes back. `Cluster::build` rejects a shorter retention.
     ///
     /// While a member is absent, a `Replicated`-mode cache defers collection
     /// past this point, up to [`tombstone_max_ttl`](Self::tombstone_max_ttl),
@@ -174,7 +180,9 @@ pub struct ClusterConfig {
     /// How many anti-entropy intervals a `Mode::Distributed` node keeps a
     /// disowned bucket's data resident before physically releasing it, so a
     /// new owner's rebalance pull has time to land against it as donor
-    /// first. Default: 3.
+    /// first. Default: 3. Bounded above by
+    /// [`tombstone_ttl`](Self::tombstone_ttl), which must cover
+    /// `ae_interval * (2 * rounds + 2)`.
     pub distributed_disown_grace_rounds: u32,
     /// Per-owner-attempt timeout for a `Mode::Distributed` cache's read
     /// against a remote owner. Deliberately shorter than a general request
