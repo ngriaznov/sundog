@@ -65,7 +65,7 @@ pub struct ClusterConfig {
     /// superseded by a live incarnation of the same node), before its
     /// `PnCounter`/`OrSet` slot becomes eligible for the CRDT compaction
     /// sweep's stage-one retirement. Defaults to
-    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) — the same bound this
+    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl), the same bound this
     /// crate already documents as "a member gone longer than this may
     /// resurrect data" if it returns, and the trust boundary CRDT
     /// compaction's writer-retirement rule relies on for the same reason.
@@ -133,8 +133,8 @@ pub struct ClusterConfig {
     pub state_transfer_budget: Duration,
     /// Bucket size past which an anti-entropy responder answers a mismatch
     /// with its 64 part digests instead of a listing or sketch, narrowing
-    /// the mismatch to whichever parts actually differ before either side
-    /// sends anything at bucket scale. Each mismatched part is then answered
+    /// the mismatch to whichever parts differ before either side sends
+    /// anything at bucket scale. Each mismatched part is then answered
     /// by the same rule [`ae_sketch_min_bucket`](Self::ae_sketch_min_bucket)
     /// applies at bucket scale: a sketch past that many entries, a listing
     /// otherwise. Effectively a three-tier responder rule: part digests,

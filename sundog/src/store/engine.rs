@@ -2,73 +2,27 @@
 //! each a [`parking_lot::RwLock`] over the bucket's live entries and
 //! tombstones.
 //!
-//! A read takes a stripe's read lock, finds the key by its postcard bytes in a
-//! [`hashbrown::HashTable`], and clones the value. Keys up to `KEY_STACK_BUF`
-//! bytes encode on the stack. A versioned write (`apply_locked`) runs
-//! synchronously under the stripe's write lock. Anti-entropy enumerates a
-//! bucket by locking one stripe.
+//! A read takes a stripe's read lock, finds the key by its postcard bytes in
+//! a [`hashbrown::HashTable`], and clones the value. Keys up to
+//! `KEY_STACK_BUF` bytes encode on the stack. A versioned write
+//! (`apply_locked`) runs synchronously under the stripe's write lock.
+//! Anti-entropy enumerates a bucket by locking one stripe.
 //!
 //! Expiry is checked on every read and reclaimed by [`Engine::sweep`], which
 //! visits only stripes with an entry due. Capacity eviction is sampled LRU:
-//! [`Engine::enforce_capacity`] locks one stripe at a time, weighs up to
-//! `EVICTION_BATCH_SAMPLE` entries from a rotating offset, and evicts up to
-//! `EVICTION_BATCH` of the coldest under that one lock hold, until total
-//! weight fits. [`Engine::live_entry_count`] is a counter every insert and
-//! remove path maintains.
+//! [`Engine::enforce_capacity`] locks one stripe at a time and evicts the
+//! coldest of a sampled batch under that one lock hold, until total weight
+//! fits under `max_capacity`. [`Engine::live_entry_count`] is a counter
+//! every insert and remove path maintains.
 //!
 //! [`super::Shard::get_or_load`] collapses concurrent misses through a
-//! per-stripe map of in-flight loads. A waiter subscribes to the load's
-//! completion channel under the stripe lock, so a completion cannot slip
-//! between its lookup and its wait. `InflightGuard` frees a cancelled load so a
+//! per-stripe map of in-flight loads: a waiter subscribes to the load's
+//! completion channel under the stripe lock, so no completion can slip
+//! between a lookup and a wait. `InflightGuard` frees a cancelled load so a
 //! waiter takes over.
 //!
-//! # The optional spill tier
-//!
-//! A live entry's `payload` is `Payload::Resident`, the value in RAM, or,
-//! only under `feature = "spill"`, `Payload::Spilled`, a pointer into a
-//! [`super::spill::SpillTier`]'s region log with the value on disk.
-//! Weight, `ver`, and `expires_at_ms` are common `Live` fields regardless
-//! of `payload`'s variant, so eviction, expiry, and the digest never need
-//! to know which one a key is in: a spilled entry's weight is always `0`,
-//! and `entry_fingerprint` never reads the value. `Engine::evict_one_sampled`
-//! and `Engine::evict_batch_sampled` hand a `Payload::Resident` victim to a
-//! configured tier's `try_spill` instead of deleting it. Once the tier
-//! accepts the job, the victim's weight is zeroed in place and freed from
-//! `total_weight` immediately, the same instant a physical removal would
-//! free it, while the entry itself stays in `live`, `live_count`, and the
-//! digest, `Resident` at weight `0`, until the tier's flusher, `Engine`'s
-//! [`super::spill::SpillSink`] impl, installs it and flips its payload to
-//! `Spilled`, or a failed write hands that weight back through
-//! [`super::spill::SpillSink::abandon`]. A `Resident` entry at weight `0`
-//! is a hand-off already in flight and is never sampled as a victim again;
-//! nor is a `Payload::Spilled` one. If the record can never fit any region,
-//! the tier is closed, or its flush-queue byte bound is reached, decided
-//! under the stripe lock, before hand-off, via `SpillTier::would_accept`,
-//! `Engine::evict_victim_locked` consults `SpillTier::keep_resident_when_refused`
-//! (set by `Shard::attach_spill` from the cache's `Mode`): a
-//! `Mode::Local`/`Mode::Invalidation` cache falls through to the ordinary
-//! delete-and-XOR path, weight and all, exactly as without a tier, while a
-//! `Mode::Replicated` or `Mode::Distributed` cache leaves the victim
-//! resident, at its untouched weight, `VictimOutcome::Deferred`, for a
-//! later `enforce_capacity` pass to retry — deleting it there would only
-//! have anti-entropy, or a rebalance donor pull, repair it back in from
-//! every peer that still holds it. A queue with no room right now
-//! can also surface later than `would_accept`: that can only be discovered
-//! by actually trying to send, so `Engine::evict_victim_locked` commits to
-//! the hand-off first, and the actual channel send, `SpillTier::enqueue`,
-//! runs only once the stripe lock is released, in
-//! `Engine::finish_spill_handoff`. A full queue found there is handled
-//! exactly like a downstream failed write: `SpillSink::abandon` restores
-//! the weight, the entry stays resident, never a physical removal.
-//!
-//! `total_weight` freeing a hand-off's weight immediately does not mean
-//! that RAM is actually free: the victim's value stays fully resident
-//! until the flusher's `install` runs. `Engine::pending_spill_weight`
-//! tracks exactly that gap, gaining a victim's weight at hand-off and
-//! losing it again at `install` or `abandon`, and `Engine::enforce_capacity`
-//! weighs `total_weight` plus this against `max_capacity`, so a lagging
-//! flusher's backlog still counts against the cap instead of vanishing
-//! from the budget while sitting fully resident in RAM.
+//! Under `feature = "spill"`, a live entry can move to disk instead of
+//! being evicted; see [`super::spill::SpillTier`] for that mechanism.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -152,7 +106,7 @@ pub(crate) fn hash_key_bytes(key_bytes: &[u8]) -> u64 {
 }
 
 /// One [`Engine::compact`] call's result: the records whose resolver
-/// produced a compacted form, each with the version it was read at, and
+/// produced a compacted form, each with the version it is read at, and
 /// how many stripes the call walked before its entry budget ran out. A
 /// caller that wants the whole keyspace examined keeps calling until the
 /// visited stripes add up to [`BUCKET_COUNT`](crate::store::BUCKET_COUNT).
@@ -185,7 +139,7 @@ fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
 }
 
 /// One live entry: its version and expiry, its payload, its weight for
-/// capacity accounting, and the last time it was read. The payload lives
+/// capacity accounting, and the last time it is read. The payload lives
 /// in RAM, or, under `feature = "spill"`, on disk. `ver`/`expires_at_ms`
 /// sit on `Live` itself rather than inside `payload`, since every reader
 /// that never touches the value, eviction, expiry, the digest,
@@ -234,11 +188,10 @@ fn is_resident<K, V>(live: &Live<K, V>) -> bool {
 }
 
 /// Whether `live` is eligible to be sampled as an eviction victim:
-/// [`is_resident`] and its weight has not already been zeroed by an
-/// earlier hand-off to a spill tier. A `Resident` entry at weight `0` is a
-/// spill already in flight, still awaiting the flusher's `install`, and
-/// must never be picked a second time while it is pending. Pure; unit
-/// tested directly.
+/// [`is_resident`] and its weight is not already zeroed by a hand-off to a
+/// spill tier still in flight. A `Resident` entry at weight `0` is such a
+/// hand-off, awaiting the flusher's `install`, and is never picked a
+/// second time while pending. Pure; unit tested directly.
 fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
     is_resident(live) && live.weight > 0
 }
@@ -325,8 +278,8 @@ impl<K, V> Stripe<K, V> {
 
 /// What [`remove_live`] reports about the entry it took out of `live`:
 /// its weight, already `0` for a [`Payload::Spilled`] entry, its
-/// version, and whether it was spilled. Every caller that discards a
-/// live entry needs `was_spilled` to keep `sundog_spill_entries{cache}`
+/// version, and whether it held a spilled payload. Every caller that
+/// discards a live entry needs `was_spilled` to keep `sundog_spill_entries{cache}`
 /// from drifting, via [`Engine::note_spill_departure`] or
 /// [`Engine::note_spill_departures`].
 struct RemovedLive {
@@ -372,26 +325,17 @@ enum Resolution {
     },
 }
 
-/// Consults `resolver` on `incoming` at `ver` against whatever is already
-/// stored at `sv`. Returns [`Resolution::IncomingLoses`] on the equal-version
-/// fast path (an already-applied record seen again) without calling the
-/// resolver at all.
+/// Consults `resolver` on `incoming` at `ver` against whatever is stored at
+/// `sv`. Returns [`Resolution::IncomingLoses`] on the equal-version fast
+/// path (an already-applied record seen again) without calling `resolver`.
 ///
-/// [`ConflictResolver::merge`] is consulted only when [`ConflictResolver::merges`]
-/// is `true` and both sides actually carry a value: this is an
-/// engine-enforced guard, not just a resolver-authoring convention, so a
-/// resolver that (by bug, or because either side is a real tombstone, or a
-/// spilled side with no tier attached or whose disk read failed) would
-/// otherwise merge against a value-less side never gets the chance — `merge`
-/// is simply not called, and [`ConflictResolver::winner`] decides instead,
-/// exactly as it would for a non-merging resolver. A deleted key can still
-/// lose to a genuinely newer write this way, but never to a fabricated
-/// value: a spilled entry whose bytes cannot actually be produced is never
-/// overwritten with a fabricated value either, no matter what `merge`
-/// would have returned. A spilled side whose bytes *can* be read back —
-/// [`apply_locked`] does this before ever calling here, via
-/// [`read_spilled_for_conflict`] — is not value-less: the resolver merges
-/// against its real content exactly as it would against a resident record.
+/// [`ConflictResolver::merge`] runs only when [`ConflictResolver::merges`]
+/// is `true` and both sides carry a real value; a tombstone or an
+/// unreadable spilled side never reaches it, and [`ConflictResolver::winner`]
+/// decides instead. No side is ever merged against a fabricated value:
+/// [`apply_locked`] reads a spilled side's real bytes through
+/// [`read_spilled_for_conflict`] first, so a readable spilled side merges
+/// like a resident one.
 fn resolve_conflict<V>(
     resolver: &dyn ConflictResolver,
     key_bytes: &[u8],
@@ -454,143 +398,19 @@ enum MergedVersion {
     Store(Hlc),
 }
 
-/// Decides the version and disposition of a [`ConflictResolver::merge`] reply: `sv`
-/// and `stored` are the stripe's own version and bytes for the key, `ver`
-/// and `incoming` the colliding write's, and `merged` the resolver's folded
-/// bytes. Called only once [`resolve_conflict`]'s guard has confirmed both
-/// `stored` and `incoming` are real values, never a tombstone or a spilled
-/// view, so a comparison against either is always meaningful.
-///
-/// Two simpler rules both fall short. Reusing `sv.max(ver)` verbatim risks
-/// reproducing a real future single-writer stamp bit for bit, which would
-/// wrongly short-circuit that later write through the `sv == ver` fast path
-/// in [`resolve_conflict`] and skip the resolver entirely. Stamping every
-/// merge with a fixed reserved node id and componentwise-max
-/// `wall_ms`/`logical`, independent of the merged bytes, avoids that
-/// collision but not a subtler one: two nodes folding the same two inputs
-/// into different merged content (a buggy resolver, or two different but
-/// equally-valid resolvers on a mixed-version cluster) mint the exact same
-/// version for different bytes, and [`super::entry_fingerprint`] (a function
-/// of the version alone) never notices they diverged. Every claim this
-/// function relies on is checked by the property tests below rather than
-/// assumed from the construction, precisely to catch a version-rule bug of
-/// this shape before it ships.
-///
-/// The rule below closes both gaps by choosing among four outcomes:
-///
-/// - **Same content everywhere** (`merged == stored == incoming`): nothing
-///   about the value changed, so this is purely a version reconciliation.
-///   Adopt whichever of `sv`/`ver` is greater under [`Hlc`]'s `Ord`; if `sv`
-///   already is, there is nothing left to do.
-/// - **The merge reduces to `incoming`** (`merged == incoming`) and `ver`
-///   truly is newer (`ver > sv`): store `incoming`'s own `(ver, merged)`
-///   pair verbatim, exactly as an outright win would.
-/// - **The merge reduces to `stored`** (`merged == stored`) and `sv` truly
-///   is newer (`sv > ver`): nothing to do, the incoming write is already
-///   fully absorbed.
-/// - **Otherwise**: the merged bytes are genuinely new content relative to
-///   at least one side, or the two inputs' real-clock order disagrees with
-///   which side the content-level merge favors. Mint a version: `wall_ms` is
-///   the max of both inputs' and `logical` is that max plus one, except when
-///   `logical` is already `u32::MAX`, where the `+ 1` carries into `wall_ms`
-///   instead and `logical` resets to zero. `node` is [`NodeId::merge_derived`]
-///   of the merged bytes' `xxh3_64`.
-///
-/// The mint arm is the only one that produces a version neither input's real
-/// clock could have stamped, and it is what makes the other three arms safe:
-/// `node` being a function of the merged content means two nodes minting for
-/// the same bytes mint the same id, and being merge-derived means the result
-/// can never collide with, and so never be short-circuited by, a real
-/// node's future stamp. It strictly dominates both `sv` and `ver` under
-/// `Hlc`'s `Ord` unconditionally: `wall_ms` is at least either input's, and
-/// on a `wall_ms` tie `logical` exceeds either input's, since it is a real
-/// input's max *plus one* rather than the max itself — the `+ 1` is what
-/// keeps a merge that folds in more content than the last one strictly
-/// ahead of it even when `wall_ms` does not move, closing the gap a bare
-/// componentwise max leaves open. The carry into `wall_ms` on a `logical`
-/// overflow keeps this true even in that corner case: `wall_ms` is then
-/// strictly greater than either input's, so dominance no longer needs
-/// `logical` to have room left to grow.
-///
-/// # Why repeated pairwise folding converges
-///
-/// Take two replicas X and Y holding `(vx, Cx)` and `(vy, Cy)` for the same
-/// key, `vx > vy`, any content. Anti-entropy pushes X's record to Y, which
-/// folds `C = Cx ⊔ Cy` (the resolver's join):
-///
-/// - `C == Cx`: the merge reduces to the incoming side and `vx > vy`, so Y
-///   adopts `(vx, Cx)` verbatim. Converged.
-/// - `C == Cy != Cx`: the merge reduces to Y's own stored side, but `vy`
-///   is *not* greater than `vx` — the real-clock order disagrees with which
-///   side the content favors — so this falls to the mint arm: Y stores a
-///   freshly minted `v' > vx` for `Cy`. The next round carries `(v', Cy)` to
-///   X, whose own merge reduces to its incoming side with `v' > vx`, and X
-///   adopts it. Converged.
-/// - `C` differs from both `Cx` and `Cy`: the mint arm fires on Y, minting
-///   `v' > vx` for `C`. X receives `(v', C)`; its own merge of `C` against
-///   its stored `Cx` reduces to the incoming side (the resolver's join is
-///   idempotent, so folding `C`'s superset back in reproduces `C`) with
-///   `v' > vx`, and X adopts it. Converged.
-///
-/// Every mint strictly grows the version and either grows content on some
-/// replica or is immediately followed by verbatim adoption on the peer, and
-/// content itself is a join over a finite set of writes, so repeating this
-/// exchange terminates at one shared `(version, bytes)` pair. A redelivery of
-/// an input already folded into what's stored lands on the no-op arm (or the
-/// first arm with `sv` already the greater version) rather than re-minting,
-/// so it never re-triggers this growth.
-///
-/// # One-round convergence under a bidirectional exchange
-///
-/// The two-round shape above comes entirely from anti-entropy's ordinary
-/// direction rule pushing only the greater of two versions to the lesser
-/// side: whichever replica merges first mints ahead of the other, and the
-/// mint has to make a second round trip before the other replica ever sees
-/// it. `cluster::anti_entropy`'s `diff_bucket`/`diff_decoded` have a second
-/// mode, gated on [`crate::store::ShardOps::merges`], that instead queues a
-/// key present on both sides under different versions for both push *and*
-/// pull, so X and Y above each fold the other's *pre-round* record into
-/// their own stored one in the very same round X and Y each call this
-/// function once, with `(sv, ver)` equal to `(vx, vy)` on one side and
-/// `(vy, vx)` on the other, over the identical unordered pair of records.
-///
-/// This still converges in one round on every arm above, and the mint arm
-/// does so by producing byte-for-byte, `Hlc`-for-`Hlc` identical output on
-/// both sides, not merely two outputs that happen to agree once compared:
-///
-/// - The content merge itself is symmetric — `winner`'s commutativity
-///   contract requires `merge(a, b) == merge(b, a)` byte-for-byte — so both
-///   sides mint from the identical `merged` bytes, which alone fixes
-///   `node` (`NodeId::merge_derived` of the same `xxh3_64`) equal on both
-///   sides.
-/// - `wall_ms`/`logical` are each a `max` over the *same* two inputs
-///   (`{sv, ver} == {vx, vy}` on both sides, only the `sv`/`ver` labels
-///   swap), and `max` does not care which argument carries which label, so
-///   `base_wall`/`base_logical`, and therefore the minted `(wall_ms,
-///   logical)`, come out identical too.
-///
-/// So a mint is symmetric in its two input stamps in exactly the sense that
-/// matters here: it is a function of the *unordered pair* of `(version,
-/// bytes)` inputs, not of which one arrived as `sv` and which as `ver`. The
-/// two adopt-verbatim arms converge in one round by that same
-/// swapped-argument symmetry, when they fire at all: if the merge reduces
-/// to one side's exact content and that same side's real clock is the
-/// greater of the two, that side's own exchange call lands on the no-op
-/// arm (content matches `stored`, `sv` the greater) while the other side's
-/// call lands on the adopt-verbatim arm (content matches `incoming`, `ver`
-/// the greater) over the same swapped `(sv, ver)` labels, so both land on
-/// the no-op side's exact `(version, bytes)` in this one round, no mint
-/// needed. The remaining case — the merge reduces to neither side's
-/// content, or it reduces to one side's but that side's real clock is the
-/// *lesser* of the two — is exactly what routes *both* calls to the mint
-/// arm instead (the content-vs-clock disagreement the two-replica
-/// argument's second bullet describes), which the paragraph above already
-/// covers: both sides mint the identical result. Every case therefore
-/// converges in this one round, never needing a second. A resolver that
-/// returns `Merged` without ever actually needing the two-round path can
-/// safely report [`crate::store::ConflictResolver::merges`] as `true`
-/// unconditionally: the bidirectional exchange is never wrong, only
-/// sometimes redundant.
+/// Decides the version and disposition of a [`ConflictResolver::merge`]
+/// reply, from `sv`/`stored` (this stripe's own version and bytes) and
+/// `ver`/`incoming` (the colliding write's) against the resolver's folded
+/// `merged` bytes. Four outcomes: identical content everywhere adopts the
+/// greater of `sv`/`ver` under [`Hlc`]'s `Ord`, or no-ops if `sv` already
+/// is; a merge reducing to `incoming` with `ver > sv` stores its `(ver,
+/// merged)` pair verbatim; one reducing to `stored` with `sv > ver` is a
+/// no-op; otherwise mints a version, [`NodeId::merge_derived`] from the
+/// merged bytes, that strictly dominates both inputs under `Hlc`'s `Ord`.
+/// `permutation_convergence` and
+/// `pn_counter_bidirectional_gossip_converges_in_one_round` in
+/// `store::prop_tests` prove this converges, including the one-round case
+/// under `cluster::anti_entropy`'s bidirectional exchange.
 fn merge_version(
     sv: Hlc,
     ver: Hlc,
@@ -632,7 +452,7 @@ fn merge_version(
 /// and value [`merge_version`] decides. Returns `None` for a rejected write
 /// (outright loss, the engine-enforced tombstone/spill guard, a redelivered
 /// already-absorbed merge, or bytes that fail to decode as `V`) and
-/// `Some((ver, incoming))` otherwise — unchanged for an outright win, rebound
+/// `Some((ver, incoming))` otherwise: unchanged for an outright win, rebound
 /// for a merge.
 fn resolve_and_rebind<V: DeserializeOwned>(
     resolver: &dyn ConflictResolver,
@@ -658,10 +478,10 @@ fn resolve_and_rebind<V: DeserializeOwned>(
             value,
             expires_at_ms,
         } => {
-            // `resolve_conflict`'s guard already confirmed both sides carry
-            // a real value whenever it returns `Merged`, so these are
-            // always `Some`/`Put` in practice; falling back to rejecting
-            // rather than trusting that invariant blindly costs nothing.
+            // `resolve_conflict`'s guard confirms both sides carry a real
+            // value whenever it returns `Merged`, so these are always
+            // `Some`/`Put`; falling back to rejecting rather than trusting
+            // that invariant blindly costs nothing.
             let stored = stored_encoded?;
             let Incoming::Put {
                 encoded: incoming_encoded,
@@ -700,32 +520,15 @@ fn resolve_and_rebind<V: DeserializeOwned>(
 type BatchEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>);
 
 /// [`prefold_batch`]'s per-run fold: `seed_ver`/`seed_incoming` and every
-/// subsequent `(ver, incoming)` in `rest`, in original order, folded into
-/// one survivor by repeatedly calling [`resolve_and_rebind`] — the exact
-/// function [`apply_locked`] itself calls against real stored state,
-/// applied here with the running accumulator standing in for "stored" and
-/// the next batch entry for "incoming". Every entry here is a real
-/// `Incoming::Put`: [`prefold_batch`] never lets an `Incoming::Tombstone`
-/// join a run, so the accumulator's own variant never changes across the
-/// fold and `stored_encoded` is always `Some`. This runs entirely outside
-/// any stripe lock, over the fold's own inputs, never touching the stripe
-/// itself — [`prefold_batch`] is the one that decides what `seed_ver`/
-/// `seed_incoming` start from, seeding with the key's real stored record
-/// when [`prefold_batch`] was handed one, and [`Engine::apply_many`]
-/// applies the returned survivor through the ordinary per-record path
-/// afterward, which is what actually reconciles it with real stored state
-/// (unchanged since the seed was read, in the common case, or once more if
-/// a concurrent writer moved it in between).
-///
-/// `resolve_and_rebind`'s own commutativity/associativity/idempotence
-/// contract (required of any resolver whose [`ConflictResolver::merges`] is
-/// `true`) is what makes `merge_version`'s *content* result fold-order
-/// independent: `(P ⊔ e0) ⊔ e1 == P ⊔ (e0 ⊔ e1)` in bytes, always. The
-/// *version* `merge_version` mints is a `max(..) + 1` chain, which is not
-/// associative the same way once more than one mint fires in the chain —
-/// see [`prefold_batch`]'s doc for why folding `P` in first, rather than
-/// last, is what keeps this fold's minted version identical to sequential
-/// application's too, not just its bytes.
+/// subsequent `(ver, incoming)` in `rest`, in order, folded into one
+/// survivor by repeatedly calling [`resolve_and_rebind`], the same function
+/// [`apply_locked`] calls against real stored state, with the running
+/// accumulator standing in for "stored". Every entry is a real
+/// `Incoming::Put`: [`prefold_batch`] never lets a run cross an
+/// `Incoming::Tombstone`. Runs entirely outside any stripe lock; see
+/// [`prefold_batch`]'s doc for why seeding with the key's real stored
+/// record, when there is one, keeps the minted version identical to
+/// sequential application's, not only the bytes.
 fn fold_run<V: DeserializeOwned>(
     resolver: &dyn ConflictResolver,
     key_bytes: &[u8],
@@ -764,9 +567,9 @@ fn fold_run<V: DeserializeOwned>(
 /// however its entries are interleaved with other keys' in the batch, and
 /// splits each key's indices into maximal runs of consecutive
 /// `Incoming::Put` entries. A run never crosses an `Incoming::Tombstone`: a
-/// tombstone always starts a singleton run of its own, on both sides of it
-/// — `merge` is never consulted against a tombstone's value-less
-/// side (see [`resolve_conflict`]) and pre-folding takes the same stance
+/// tombstone always starts a singleton run of its own, on both sides of it,
+/// since `merge` is never consulted against a tombstone's value-less side
+/// (see [`resolve_conflict`]), and pre-folding takes the same stance
 /// rather than relying on that guard alone. Shared by [`prefold_batch`] and
 /// [`Engine::apply_many`]'s seed lookup so both agree on exactly which runs
 /// are long enough to fold.
@@ -802,7 +605,7 @@ fn group_prefold_runs<K, V>(entries: &[BatchEntry<K, V>]) -> Vec<Vec<usize>> {
 /// key, or a currently-spilled entry whose bytes weren't already prefetched
 /// into `prefetched_spilled` (no value bytes to fold), `Some` with the
 /// stored `Hlc`, encoded bytes, and TTL otherwise. Read under a brief stripe
-/// read lock, before any decode or fold work runs — see
+/// read lock, before any decode or fold work runs; see
 /// [`Engine::apply_many`]'s call site.
 /// [`peek_stored_seed`]'s and [`peek_prefold_seeds`]'s result for one key:
 /// the real stored `(version, encoded bytes, TTL)` to seed
@@ -825,13 +628,12 @@ fn peek_stored_seed<K, V>(
         .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
     let encoded = match &live.payload {
         Payload::Resident { encoded, .. } => encoded.clone(),
-        // `prefetched_spilled` was read entirely off-lock, before this
-        // stripe's read lock was even taken — see
-        // `prefetch_spilled_conflict_bytes`. A miss (never fetched because
-        // the resolver doesn't need value bytes, the read failed, or this
-        // entry moved to a different location since the prefetch pass)
-        // degrades to no seed, exactly as an always-value-less spilled entry
-        // did before prefetching existed.
+        // `prefetched_spilled` is read entirely off-lock, before this
+        // stripe's read lock is taken, in `prefetch_spilled_conflict_bytes`.
+        // A miss (never fetched because the resolver doesn't need value
+        // bytes, the read failed, or this entry moved to a different
+        // location since the prefetch pass) degrades to no seed, exactly as
+        // an always-value-less spilled entry does without prefetching.
         #[cfg(feature = "spill")]
         Payload::Spilled(loc) => prefetched_spilled.get(loc).cloned()?,
     };
@@ -839,13 +641,13 @@ fn peek_stored_seed<K, V>(
 }
 
 /// [`Engine::apply_many`]'s seed lookup: for every `runs` entry long enough
-/// to actually fold (`len() >= 2`), [`peek_stored_seed`]s that key once,
-/// keyed by its wire bytes. Takes the stripe read lock for exactly this
-/// pass — [`Engine::apply_many`] drops the guard immediately after this
-/// returns, before any decode or fold work, which all runs lock-free
-/// afterward in [`prefold_batch`]. `prefetched_spilled`, when the `spill`
-/// feature is on, is [`prefetch_spilled_conflict_bytes`]'s result, computed
-/// before this same read lock was taken.
+/// to fold (`len() >= 2`), [`peek_stored_seed`]s that key once, keyed by
+/// its wire bytes. Takes the stripe read lock for exactly this pass;
+/// [`Engine::apply_many`] drops the guard immediately after this returns,
+/// before any decode or fold work, which all runs lock-free afterward in
+/// [`prefold_batch`]. `prefetched_spilled`, when the `spill` feature is
+/// on, is [`prefetch_spilled_conflict_bytes`]'s result, computed before
+/// this same read lock is taken.
 fn peek_prefold_seeds<K, V>(
     stripe: &Stripe<K, V>,
     entries: &[BatchEntry<K, V>],
@@ -871,48 +673,19 @@ fn peek_prefold_seeds<K, V>(
     seeds
 }
 
-/// [`Engine::apply_many`]'s pre-fold, run only when the caller has already
-/// confirmed the resolver's [`ConflictResolver::merges`] is `true` and
-/// pre-folding is enabled: folds every maximal run [`group_prefold_runs`]
-/// found down to one survivor with [`fold_run`], entirely outside any
-/// stripe lock.
+/// [`Engine::apply_many`]'s pre-fold: run only when the resolver's
+/// [`ConflictResolver::merges`] is `true` and pre-folding is on, folds
+/// every maximal run [`group_prefold_runs`] found into one survivor with
+/// [`fold_run`], outside any stripe lock. A run whose key has a real stored
+/// record ([`peek_prefold_seeds`]) folds that record in first, matching
+/// sequential application's order: `merge_version`'s content-join is
+/// fold-order independent but its mint arm's running max is not, so seeding
+/// first keeps the minted version identical too, not only the bytes. A run
+/// with no stored record folds from its own first entry.
 ///
-/// A run whose key has a real stored record — `stored_seeds` carries one,
-/// looked up by [`peek_prefold_seeds`] before this runs — folds that record
-/// in *first*, ahead of every entry the run itself carries, in original
-/// order: `P ⊔ e0 ⊔ e1 ⊔ ... ⊔ eN`, the exact left-to-right order
-/// sequential per-record application folds them in against real stored
-/// state one call at a time. This is what makes the survivor's minted
-/// `Hlc`, not only its bytes, land identical to sequential application's:
-/// `merge_version`'s content-join is fold-order independent by the
-/// resolver's own contract, but its mint arm's `wall_ms.max(..)`/
-/// `logical.max(..) + 1` is a running max, not a fixed function of the
-/// unordered input set, so folding `P` in last instead of first can mint a
-/// different (still correct — still strictly dominant over every input,
-/// still landing on byte-identical content) version than folding it in
-/// first does. Seeding here keeps the two paths minting the identical
-/// version, not just converging to the same content.
-///
-/// A run with no real stored record (a batch touching an entirely fresh
-/// key) folds starting from its own first entry instead, exactly as before
-/// seeding existed — there is no `P` to fold in.
-///
-/// Returns one slot per original index, in original order, so
-/// [`Engine::apply_many`]'s returned outcome vector always has exactly
-/// `entries.len()` entries: `Some` for every index that should still run
-/// through [`apply_locked`] as usual — every entry outside a multi-entry
-/// run, plus the *last* index of one, now holding that run's folded
-/// survivor in place of its own original `(ver, incoming)` — and `None` for
-/// every other index a multi-entry run absorbed, which contributed nothing
-/// beyond what the survivor already carries and so never reaches
-/// `apply_locked` at all; [`Engine::apply_many`] reports [`ApplyOutcome::Rejected`]
-/// for those directly. [`apply_locked`]'s own call against real stored
-/// state, once the survivor reaches it, still reconciles the rare case
-/// where a concurrent writer moved the stored record in between the read
-/// lock this seeded from and the write lock the survivor applies under —
-/// `resolve_and_rebind`'s contract makes that reconciliation a correct,
-/// idempotent no-op or verbatim adoption when nothing moved, and a normal
-/// merge when something did.
+/// Returns one slot per original index: `Some` where [`apply_locked`] still
+/// runs, `None` where a run absorbed the entry ([`Engine::apply_many`]
+/// reports those as [`ApplyOutcome::Rejected`]).
 fn prefold_batch<K, V: DeserializeOwned>(
     entries: Vec<BatchEntry<K, V>>,
     runs: Vec<Vec<usize>>,
@@ -941,7 +714,7 @@ fn prefold_batch<K, V: DeserializeOwned>(
             .collect();
 
         // Decoding the peeked stored bytes never happens under the read
-        // lock `peek_prefold_seeds` took — that lock is long gone by here.
+        // lock `peek_prefold_seeds` took: that lock is gone by here.
         let stored_decoded = stored_seeds
             .get(key_bytes.as_ref())
             .and_then(Option::as_ref)
@@ -1012,7 +785,7 @@ enum VictimRefusal {
     /// Leave the victim fully resident, at its current weight, for a later
     /// eviction pass to retry: the `Mode::Replicated`/`Mode::Distributed`
     /// policy, since a local delete here is exactly what anti-entropy, or a
-    /// rebalance donor pull, would just repair back in from every peer that
+    /// rebalance donor pull, would repair back in from every peer that
     /// still holds the entry.
     LeaveResident,
     /// Fall back to the ordinary physical delete, the only behavior every
@@ -1056,8 +829,8 @@ fn eviction_batch_size(over_by: u64, sampled_weights: &[u32]) -> usize {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EvictOutcome {
     /// Weight freed this pass, physically removed or handed to a spill
-    /// tier; `0` when the stripe this pass sampled held no victim, for
-    /// example because it was empty.
+    /// tier; `0` when the stripe this pass sampled held no victim, an
+    /// empty stripe among them.
     removed_weight: u64,
 }
 
@@ -1077,10 +850,10 @@ enum VictimOutcome {
     /// weight `0`, the entry's fate already decided under the stripe lock
     /// via [`SpillTier::would_accept`], but the channel send itself,
     /// [`SpillTier::enqueue`], deliberately deferred until the lock is
-    /// released — see [`Engine::try_spill_victim`]. `weight` is what the
+    /// released; see [`Engine::try_spill_victim`]. `weight` is what the
     /// entry carried right before hand-off, already zeroed on the entry
     /// itself, so it is the caller's to fold into `total_weight` exactly
-    /// like `Removed`'s — only `live_count` differs between the two. The
+    /// like `Removed`'s; only `live_count` differs between the two. The
     /// caller finishes the hand-off with [`Engine::finish_spill_handoff`]
     /// once the lock is dropped: on a full queue that restores the weight
     /// through [`SpillSink::abandon`] exactly as a downstream write or
@@ -1092,11 +865,11 @@ enum VictimOutcome {
     /// A configured spill tier refused this victim's hand-off
     /// ([`SpillTier::would_accept`] declining: too large, closed, or the
     /// flush queue is full), and [`spill_refusal_outcome`] says to leave it
-    /// resident rather than delete it — the `Mode::Replicated`/
+    /// resident rather than delete it, the `Mode::Replicated`/
     /// `Mode::Distributed` policy `Shard::attach_spill` sets on the tier.
-    /// `stripe.live` is untouched: the
-    /// entry keeps its full weight and stays a spill candidate for a later
-    /// eviction pass to sample and retry, once the tier has room again.
+    /// `stripe.live` is untouched: the entry keeps its full weight and
+    /// stays a spill candidate for a later eviction pass to sample and
+    /// retry, once the tier has room again.
     /// Reported to the caller exactly like [`VictimOutcome::Vanished`], no
     /// weight or count to fold in, since nothing here changed. Only ever
     /// constructed under `feature = "spill"`.
@@ -1118,23 +891,22 @@ enum SpillAttempt {
     /// [`SpillTier::keep_resident_when_refused`] policy at the moment of
     /// refusal, carried back here so the caller need not re-look it up.
     Refused { keep_resident: bool },
-    /// No tier configured, or the victim raced away — removed, or no
-    /// longer [`Payload::Resident`] — between sampling and this call. The
-    /// ordinary remove-and-XOR path runs exactly as it did before this
-    /// policy existed.
+    /// No tier configured, or the victim raced away, removed or not
+    /// resident anymore, between sampling and this call. The ordinary
+    /// remove-and-XOR path runs exactly as without this policy.
     NotApplicable,
 }
 
 /// The outcome of [`apply_locked`]: the caller's `key` back plus what changed,
 /// to build an [`super::Event`] and decide on fan-out.
 pub(crate) enum ApplyOutcome<K, V> {
-    /// `incoming` lost to what was already stored; nothing changed.
+    /// `incoming` loses to what is already stored; nothing changes.
     Rejected,
-    /// A value was written. `created` is `false` for a value that replaced an
+    /// Writes a value. `created` is `false` when the value replaces an
     /// existing live entry.
     Put { key: K, value: V, created: bool },
-    /// A tombstone was written, replacing whatever, live entry or nothing, was
-    /// there before. Unlike `Put`'s `created`, this carries no
+    /// Writes a tombstone, replacing whatever, live entry or nothing,
+    /// preceded it. Unlike `Put`'s `created`, this carries no
     /// prior-liveness flag.
     Tombstoned { key: K },
 }
@@ -1153,24 +925,15 @@ impl<K, V> ApplyOutcome<K, V> {
 /// Reads a currently-[`Payload::Spilled`] stored record's value bytes off
 /// disk, so [`resolve_conflict`]'s collision decision can fold a
 /// value-aware resolver against them instead of degrading to its
-/// value-less guard against a spilled side.
+/// value-less guard. Called off-lock by [`prefetch_spilled_conflict_bytes`]
+/// for the overwhelming majority of calls, and under the stripe write lock
+/// by [`apply_locked`] itself on the rare fallback where prefetch missed
+/// this pointer, since losing a real value to a stale prefetch would
+/// violate [`resolve_conflict`]'s never-drop-a-real-value guarantee.
 ///
-/// Called by [`prefetch_spilled_conflict_bytes`], itself called before
-/// `stripes[bucket]`'s write lock is ever taken for the batch that follows —
-/// never under any stripe lock — for the overwhelming majority of calls, and
-/// by [`apply_locked`] itself, still under that write lock, only on the rare
-/// fallback where the prefetch pass missed this exact pointer (nothing found
-/// it spilled yet, or a concurrent flush moved it afterward): losing a real
-/// stored value to a stale prefetch would violate [`resolve_conflict`]'s own
-/// never-drop-a-real-value guarantee, so correctness wins over the fallback
-/// case alone still doing this under the lock.
-///
-/// `None` on anything [`SpillTier::read_at`] itself treats as an ordinary,
-/// expected outcome rather than a hard error — a torn write, a failed
-/// checksum, a region rotated past `loc.generation` since the pointer was
-/// read, or a genuine I/O error. Either degrades exactly like a value-less
-/// stored side already does in [`resolve_conflict`]'s guard: never panics,
-/// never propagates.
+/// `None` on anything [`SpillTier::read_at`] treats as an ordinary outcome
+/// (a torn write, a failed checksum, a rotated-past generation, a genuine
+/// I/O error): degrades like a value-less stored side, never panics.
 #[cfg(feature = "spill")]
 fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
     tier.read_at(loc)
@@ -1180,21 +943,15 @@ fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
 }
 
 /// Reads back, off any stripe lock, the value bytes of every currently-
-/// [`Payload::Spilled`] stored record among `keys` that a merge might need
-/// to fold against — feeding both [`peek_stored_seed`]'s pre-fold seeding and
-/// [`apply_locked`]'s own stored-side lookup, so [`SpillTier::read_at`] is
-/// never called while `stripe_lock` (held for the write batch that follows)
-/// is held. A brief stripe *read* lock — dropped before any disk read runs —
-/// finds which keys are currently spilled; every actual read then happens
-/// entirely off-lock, keyed by [`SpillLoc`] rather than by key bytes so a
-/// later lookup naturally misses (degrading exactly like "no tier attached"
-/// already does) if the entry moved to a different location in the interim,
-/// rather than ever serving stale content.
-///
-/// Skips the read-lock pass entirely, with no lock taken at all, when
-/// `resolver` never inspects stored-side bytes
-/// ([`ConflictResolver::needs_value_bytes`] is `false`) or no tier is
-/// attached — the common case pays only that one check.
+/// [`Payload::Spilled`] stored record among `keys` a merge might need,
+/// feeding both [`peek_stored_seed`]'s pre-fold seeding and
+/// [`apply_locked`]'s stored-side lookup; see [`read_spilled_for_conflict`]
+/// for why a fallback under the write lock still exists. A brief stripe
+/// read lock finds which keys are spilled, then every read happens off-lock,
+/// keyed by [`SpillLoc`] so a moved entry misses rather than serving stale
+/// content. Skips the read lock entirely when `resolver` never inspects
+/// stored bytes ([`ConflictResolver::needs_value_bytes`] is `false`) or no
+/// tier is attached.
 #[cfg(feature = "spill")]
 fn prefetch_spilled_conflict_bytes<'a, K, V>(
     stripe_lock: &RwLock<Stripe<K, V>>,
@@ -1226,44 +983,19 @@ fn prefetch_spilled_conflict_bytes<'a, K, V>(
         .collect()
 }
 
-/// The versioned-apply core: applies `incoming` at `ver` for `key`
-/// (`key_bytes`/`hash` its postcard-encoded bytes and their xxh3 hash) iff
-/// `resolver` picks it over whatever `stripe` currently holds, updating
-/// `digest_bucket`, `total_weight`, and `live_count` to match. On a real
-/// collision, `resolver` may instead fold both sides into a new value
-/// ([`ConflictResolver::merge`]); when it does, `ver` and `incoming` are rebound to
-/// the merged version ([`merge_version`]) and the merged bytes before
-/// anything downstream — the fingerprint, and the final store — ever runs,
-/// so a merge is written and fingerprinted exactly like any other `Put`.
-/// Fully synchronous: the caller holds `stripe`'s write lock for this call's
-/// entire duration, and this never itself performs any disk I/O — see
-/// `prefetched_spilled` below. The returned `bool` is whether this call
-/// displaced a [`Payload::Spilled`] entry from `live`. It is `false` for a
-/// `Rejected` outcome, which changes nothing. The caller uses it to keep
-/// `sundog_spill_entries{cache}` correct; see
-/// [`Engine::note_spill_departure`].
-///
-/// `prefetched_spilled`, present only in a `spill`-featured build, is
-/// [`prefetch_spilled_conflict_bytes`]'s result: bytes already read back off
-/// disk, keyed by [`SpillLoc`], before `stripe`'s write lock (held for the
-/// whole batch this call is part of, not only this one key) was ever taken.
-/// When the stored side turns out to be [`Payload::Spilled`] and `resolver`
-/// actually reads value bytes ([`ConflictResolver::needs_value_bytes`]), this
-/// looks up that side's location in the map first, so the overwhelming
-/// majority of calls — every one where nothing moved the entry between the
-/// prefetch pass and this write lock — never call [`SpillTier::read_at`]
-/// under this lock at all. `spill` is the fallback for the rare miss: the
-/// entry spilled, evicted, or was reclaimed into a new location by a
-/// concurrent flush after the prefetch pass read the old one, or a caller
-/// (a single-key write, or a test) skipped prefetching altogether. Losing
-/// that side's real content to a stale-pointer miss would violate the same
-/// contract [`resolve_conflict`]'s guard exists to protect — a merge must
-/// never silently drop a real value — so this reads it here, one more time,
-/// still correct even though, only in this narrow case, it is no longer
-/// off-lock. `None` — no tier attached, `resolver` never needs value bytes,
-/// or the fallback read itself comes back empty — keeps the old degraded
-/// behavior exactly: the resolver sees the same value-less view a tombstone
-/// gets.
+/// The versioned-apply core: applies `incoming` at `ver` for `key` iff
+/// `resolver` picks it over whatever `stripe` holds, updating
+/// `digest_bucket`, `total_weight`, and `live_count` to match. A collision
+/// may fold both sides via [`ConflictResolver::merge`], rebinding
+/// `ver`/`incoming` to the merged version ([`merge_version`]) and bytes
+/// before anything downstream runs, so a merge stores and fingerprints like
+/// any other `Put`. Synchronous under the caller's write lock on `stripe`;
+/// no disk I/O of its own. `prefetched_spilled` (`spill` builds) is
+/// [`prefetch_spilled_conflict_bytes`]'s off-lock read of the stored side's
+/// bytes; a lookup miss falls back to [`read_spilled_for_conflict`] under
+/// this lock rather than treating the side as value-less. Returns whether
+/// this displaced a [`Payload::Spilled`] entry (`false` for `Rejected`);
+/// see [`Engine::note_spill_departure`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -1298,18 +1030,8 @@ where
             .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
             .map(|l| {
                 // A currently-spilled entry has no value bytes resident in
-                // RAM. Its bytes, if `resolver` actually reads them and a
-                // tier is attached, were almost always already read back off
-                // disk before this stripe's write lock was ever taken — see
-                // `prefetch_spilled_conflict_bytes`. Only on the rare miss (a
-                // concurrent flush moved the entry after the prefetch pass,
-                // or the caller never prefetched) does this fall back to
-                // reading it here, still under the lock — see
-                // `apply_locked`'s own doc for why a miss must not simply be
-                // treated as value-less. A resolver that never inspects
-                // `stored_view.value`, a key spilled with no tier attached,
-                // or a read that comes back empty either way still gets the
-                // same value-less view a tombstone already gets.
+                // RAM; see this function's doc for `prefetched_spilled` and
+                // the off-lock/under-lock read split.
                 let encoded = match &l.payload {
                     Payload::Resident { encoded, .. } => Some(encoded.clone()),
                     #[cfg(feature = "spill")]
@@ -1414,9 +1136,9 @@ where
 /// The `Incoming::Put` half of [`apply_locked`]'s write: installs the new
 /// value, corrects total weight for whatever it displaced (`had_live`), bumps
 /// `live_count` iff nothing physically live occupied the key before, and
-/// reports `created` unless a readable entry (`was_visible`) was replaced.
-/// The returned `bool` is whether the displaced entry, if any, was
-/// [`Payload::Spilled`]. An overwrite of a spilled key always installs
+/// reports `created` unless a readable entry (`was_visible`) is replaced.
+/// The returned `bool` is whether the displaced entry, if any, held a
+/// spilled payload. An overwrite of a spilled key always installs
 /// fresh as resident, so this is the only place such an entry departs
 /// without a matching promotion.
 #[allow(clippy::too_many_arguments)]
@@ -1488,7 +1210,7 @@ where
 /// The `Incoming::Tombstone` half of [`apply_locked`]'s write: removes the
 /// displaced live entry from total weight and `live_count`, then records the
 /// tombstone with its two GC deadlines. The returned `bool` is whether the
-/// displaced entry, if any, was [`Payload::Spilled`].
+/// displaced entry, if any, held a spilled payload.
 #[allow(clippy::too_many_arguments)]
 fn apply_tombstone<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -1631,14 +1353,14 @@ pub(crate) struct Engine<K, V> {
     /// `true`. `true` by default; [`Engine::set_prefold_enabled`] is the
     /// only way to turn it off, to compare pre-fold's effect on throughput
     /// against the unfolded per-record path it otherwise always takes. Has
-    /// no effect at all on a resolver that doesn't merge — see
+    /// no effect at all on a resolver that doesn't merge; see
     /// `apply_many`'s docs.
     prefold_enabled: AtomicBool,
     /// Where [`Engine::compact`]'s next call resumes: the index of the next
     /// stripe it has not yet visited, so consecutive ticks rotate through
     /// every stripe in turn instead of always starting over at stripe `0`.
     /// Read and stored as a plain stripe index (always `< BUCKET_COUNT`),
-    /// which [`stripe_index_from_hash`]'s mask leaves unchanged — the same
+    /// which [`stripe_index_from_hash`]'s mask leaves unchanged: the same
     /// helper `evict_cursor` uses, reused here for a value that is already
     /// a valid index rather than a hash needing one. Starts at `0`; unlike
     /// `evict_cursor` this is a rotation pointer, not a PRNG state, so a
@@ -1647,8 +1369,8 @@ pub(crate) struct Engine<K, V> {
     #[cfg(test)]
     eviction_lock_acquisitions: AtomicU64,
     /// Test-only: how many stripe read locks [`Engine::compact`] has taken
-    /// across its whole run, one per stripe visited — never more than one
-    /// held at a time, since each is dropped before the next is taken.
+    /// across its whole run, one per stripe visited, never more than one
+    /// held at a time since each is dropped before the next is taken.
     #[cfg(test)]
     compact_lock_acquisitions: AtomicU64,
 }
@@ -1781,10 +1503,10 @@ where
 
     /// `pending_spill_weight`'s current value, for
     /// [`Engine::enforce_capacity`]'s over-cap check: RAM a spill hand-off
-    /// has already zeroed out of `total_weight` but that a lagging
-    /// flusher has not yet actually freed. Always `0` in a non-`spill`
-    /// build, which never creates a hand-off to begin with, so this
-    /// leaves `enforce_capacity`'s behavior there exactly as it was.
+    /// has already zeroed out of `total_weight` but that a lagging flusher
+    /// has not yet freed. Always `0` in a non-`spill` build, which never
+    /// creates a hand-off, so `enforce_capacity`'s behavior there is
+    /// unaffected.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -2146,7 +1868,7 @@ where
     /// half off-lock, via `spawn_blocking` behind the tier's read
     /// semaphore, and folds any successful read back in as a `WireRecord`,
     /// dropping the rest. Nothing here promotes; a served-from-disk record
-    /// leaves `payload` as it was.
+    /// leaves `payload` unchanged.
     #[cfg(feature = "spill")]
     pub(crate) fn records_for_or_spilled(
         &self,
@@ -2260,40 +1982,19 @@ where
     }
 
     /// One rate-limited pass of the CRDT writer-retirement sweep: visits
-    /// stripes starting from [`Engine::compact_cursor`]'s current position,
-    /// each under its own read lock in turn (never more than one held at
-    /// once — compaction only reads, so a write lock is never needed here),
+    /// stripes from [`Engine::compact_cursor`] under read locks only,
     /// calling `resolver.compact(key_bytes, encoded, now_ms, retire, quiet,
-    /// bounds)` on every resident live entry and collecting `(key,
-    /// key_bytes, ver, new_encoded)` for every one that returns `Some`.
+    /// bounds)` on every resident live entry and collecting the `Some`
+    /// results. Never mutates a stripe; [`super::ShardOps::compact_pass`]
+    /// applies each candidate via [`Engine::compact_replace_if_current`]. A
+    /// [`Payload::Spilled`] entry is skipped until promoted back to
+    /// `Resident`.
     ///
-    /// Never mutates a stripe itself: this only *reads* candidates, each
-    /// carrying the version they were read at, for
-    /// [`super::ShardOps::compact_pass`] to apply via
-    /// [`Engine::compact_replace_if_current`] — a version-gated direct
-    /// replace, not the ordinary merge-based apply path every other write
-    /// goes through (see that method's own doc for why). A
-    /// [`Payload::Spilled`] entry is skipped —
-    /// its bytes aren't resident to hand to a resolver without a disk read
-    /// this sweep does not pay for; it is reconsidered once a later read or
-    /// write promotes it back to `Resident`.
-    ///
-    /// `max_entries` bounds how many resident entries this call examines
-    /// (calls `resolver.compact` on), not how many it finds eligible: once
-    /// a stripe currently being visited is finished, examining stops if the
-    /// running total has reached `max_entries`. A stripe already in
-    /// progress is always finished before stopping — the same
-    /// whole-stripe-at-a-time granularity [`Engine::sweep`] and
-    /// [`Engine::gc_tombstones`] already commit to — so a single
-    /// oversized stripe can exceed the nominal budget for one tick rather
-    /// than being torn mid-stripe across two. `compact_cursor` always
-    /// advances to the next stripe this call has not yet visited (wrapping
-    /// past the last stripe back to `0`), so consecutive calls rotate
-    /// through every stripe in turn and a call never revisits a stripe it
-    /// already finished this pass; `max_entries == 0` visits nothing and
-    /// leaves the cursor untouched. Returns the candidates with how many
-    /// stripes were walked, so a caller can tell a complete rotation from
-    /// a budget-limited partial one.
+    /// `max_entries` bounds entries examined, not entries eligible; a
+    /// stripe already in progress always finishes. The cursor advances past
+    /// every visited stripe, wrapping at `BUCKET_COUNT`; `max_entries == 0`
+    /// visits nothing. Returns the candidates and how many stripes were
+    /// walked.
     pub(crate) fn compact(
         &self,
         resolver: &dyn ConflictResolver,
@@ -2362,62 +2063,19 @@ where
 
     /// Replaces a live, resident entry's payload and version with
     /// `value`/`encoded`/`new_ver` iff it is still exactly at
-    /// `expected_ver` — the version-gated, no-merge write
-    /// [`super::ShardOps::compact_pass`] uses to apply every
-    /// [`Self::compact`] candidate, in place of the ordinary versioned
-    /// apply path every other write goes through.
-    ///
-    /// [`Self::compact`]'s output is always a valid evolution of *exactly*
-    /// the resident bytes it read — nothing else in this call needs
-    /// deciding once the version above confirms nothing else has touched
-    /// this entry since. Bypassing the ordinary merge-based apply is not
-    /// merely an optimization here: a resolver's own [`ConflictResolver::merge`]
-    /// only ever *unions* two sides' state, so merging the compacted
-    /// candidate back against the still-resident pre-compact copy that
-    /// produced it — exactly what the ordinary apply path would do — never
-    /// removes anything either side still carries. Stage one and two
-    /// survive that union safely by design (a fresh `folded_at`/`retired`
-    /// receipt on the compacted side lets the merge recognize the
-    /// pre-compact side's now-superseded entry and drop it), but stage
-    /// three's own receipt has no *further* receipt to vouch for *its*
-    /// removal, so a merge-based apply would silently restore the very
-    /// receipt this pass just pruned, every single pass, forever. Applying
-    /// the candidate directly (this method), never as another side of a
-    /// merge, is what lets pruning actually take hold.
-    ///
-    /// Still mints a fresh, strictly greater version rather than leaving
-    /// `ver` untouched: `resolve_and_rebind`'s own "equal versions are
-    /// always a no-op" rule trusts a version to name at most one exact
-    /// byte content ever, and a compaction pass changes the content
-    /// (shrinking it) without changing anything about *when* or *who*
-    /// wrote it — leaving the old version in place would let a later,
-    /// genuinely different write from a peer that happens to carry that
-    /// same version (two replicas independently merging the same two
-    /// writers' contributions mint identical versions for identical
-    /// merged bytes, by design — see [`merge_version`]'s doc) be silently
-    /// rejected as an already-absorbed redelivery, when its bytes are the
-    /// pre-compaction shape this side has since moved past. Correcting the
-    /// digest for the version change is the only bookkeeping a version
-    /// bump needs here: no `Incoming` apply, no fan-out, no `Event`. The
-    /// new version is minted from the compacted bytes themselves
-    /// ([`super::compacted_version`]), so two replicas that independently
-    /// compact identical bytes mint identical versions and anti-entropy
-    /// has nothing to exchange for that key; replicas that compact to
-    /// different bytes (one has judged a writer dead that the other has
-    /// not yet) mint different versions and anti-entropy does exchange
-    /// the key, exactly as it would for any other divergent write. That is
-    /// fine: [`ConflictResolver::merge`] plus [`ConflictResolver::settle`]
-    /// converge the two sides the same way they converge any other merge.
-    /// A replica that has not yet reached [`ConflictResolver::compact`]'s
-    /// conclusion locally simply has not gotten there yet, not disagreed
-    /// with it.
-    ///
-    /// Returns `false` — a no-op — once the entry has moved on: a
-    /// different version (something else wrote it since [`Self::compact`]
-    /// read it), no longer live at all, or currently spilled. The caller
-    /// (`compact_pass`) treats that exactly like a bucket it no longer
-    /// owns: skipped this pass, safely recomputed from fresh state on the
-    /// next one.
+    /// `expected_ver`: the version-gated, no-merge write
+    /// [`super::ShardOps::compact_pass`] uses for every [`Self::compact`]
+    /// candidate, in place of the ordinary merge-based apply path. A
+    /// merge-based apply would silently restore the receipt a compaction
+    /// pass pruned, since [`ConflictResolver::merge`] only ever unions
+    /// state, so this replaces directly instead. Mints a fresh version from
+    /// the compacted bytes ([`super::compacted_version`]) rather than
+    /// reusing `expected_ver`, since two different contents must never
+    /// share one version; see
+    /// `pn_counter_compaction_under_gossip_keeps_the_exact_total` in
+    /// `store::prop_tests` for why this still converges. Returns `false`, a
+    /// no-op, once the entry has moved on: a different version, not live,
+    /// or currently spilled.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compact_replace_if_current(
         &self,
@@ -2508,32 +2166,18 @@ where
 
     /// Whether a configured spill tier commits to taking `victim_bytes`,
     /// found at `hash` in `bucket` with `stripe` already write-locked, in
-    /// place of physically removing it. [`SpillAttempt::NotApplicable`] with
-    /// no tier configured, a victim that has since stopped being
-    /// [`Payload::Resident`], or vanished outright; the ordinary remove-and-
-    /// XOR path runs in every one of those cases, exactly as before.
-    /// [`SpillAttempt::Refused`] when [`SpillTier::would_accept`] declines
-    /// outright, too large to ever fit a region, the tier closed, or its
-    /// flush queue full; [`Engine::evict_victim_locked`] decides the
-    /// victim's fate from there via [`spill_refusal_outcome`]. On
-    /// [`SpillAttempt::Committed`], the first field is the victim's weight
-    /// *before* this call, already zeroed on the entry in place and thus
-    /// already excluded from what a fresh read of `live.weight` would
-    /// report, and the second is the caller's job to hand to
-    /// [`Engine::finish_spill_handoff`] once the stripe lock is released.
-    ///
-    /// Deliberately does not call [`SpillTier::enqueue`] itself: that is
-    /// the one part of a hand-off that touches the flusher's channel, worth
-    /// keeping off this lock, and it is safe to defer because
-    /// `SpillTier::would_accept`'s checks — too large, closed, queue full —
-    /// are the only ways this decision could otherwise need to unwind, and
-    /// all are already settled here, under the lock, before the weight is
-    /// zeroed. A full queue discovered later, the only way `enqueue` can
-    /// still fail, is handled exactly like a downstream write or install
-    /// failure already is: [`SpillSink::abandon`] restores the weight,
-    /// never a physical removal — seeing `would_accept` succeed here is not
-    /// a guarantee the record ever reaches disk, only that it is now this
-    /// victim's only path off `live`.
+    /// place of physically removing it. [`SpillAttempt::NotApplicable`] when
+    /// no tier is configured or the victim is not [`Payload::Resident`]
+    /// anymore; [`SpillAttempt::Refused`] when
+    /// [`SpillTier::would_accept`] declines (too large, closed, flush queue
+    /// full), leaving [`Engine::evict_victim_locked`] to decide the
+    /// victim's fate via [`spill_refusal_outcome`]. On
+    /// [`SpillAttempt::Committed`], the weight returned is already zeroed
+    /// on the entry in place, and the job is the caller's to hand to
+    /// [`Engine::finish_spill_handoff`] once the stripe lock is released;
+    /// [`SpillTier::enqueue`] itself runs later, off this lock, and a full
+    /// queue found there is handled like any downstream write failure via
+    /// [`SpillSink::abandon`].
     #[cfg(feature = "spill")]
     fn try_spill_victim(
         &self,
@@ -2574,15 +2218,13 @@ where
     }
 
     /// Finishes a hand-off [`Engine::evict_victim_locked`] committed to via
-    /// [`Engine::try_spill_victim`], after the stripe lock that decided it
-    /// has already been released: the one part of the hand-off that touches
-    /// the flusher's channel, [`SpillTier::enqueue`]. A full queue gets
-    /// `job` back, key bytes included, with nothing cloned to recover them;
-    /// [`SpillSink::abandon`] then restores the victim's weight exactly as
-    /// it would for a write or install failure discovered later, downstream
-    /// in the flusher itself. No tier configured is unreachable here, since
-    /// `try_spill_victim` never commits to a hand-off without one, but is
-    /// still handled rather than assumed.
+    /// [`Engine::try_spill_victim`], after the stripe lock is released:
+    /// runs the one part of the hand-off that touches the flusher's
+    /// channel, [`SpillTier::enqueue`]. A full queue gets `job` back with
+    /// its key bytes, and [`SpillSink::abandon`] restores the victim's
+    /// weight exactly as it would for a write or install failure
+    /// discovered later downstream. No tier configured is unreachable
+    /// here, but still handled rather than assumed.
     #[cfg(feature = "spill")]
     fn finish_spill_handoff(&self, job: SpillJob) {
         let Some(tier) = self.spill() else { return };
@@ -2598,31 +2240,17 @@ where
 
     /// Removes or spills `victim_bytes`, found at `hash` in `bucket` with
     /// `stripe` already write-locked. Hands a [`Payload::Resident`] victim
-    /// to a configured spill tier when [`try_spill_victim`] commits to it:
-    /// weight zeroed in place right there, so this reports it as
-    /// [`VictimOutcome::PendingSpill`] with that freed weight and the job
-    /// still to enqueue, while `stripe.live`, the digest, and `live_count`
-    /// stay untouched until the flusher, `Engine`'s [`SpillSink`] impl,
-    /// installs it. The entry stays resident, at weight `0`, until then.
-    /// When the tier refuses instead, [`spill_refusal_outcome`] decides
-    /// between [`VictimOutcome::Deferred`], leaving the victim resident at
-    /// its untouched weight, and falling through to the ordinary
-    /// remove-and-XOR path, [`VictimOutcome::Removed`], which also runs
-    /// whenever [`try_spill_victim`] finds nothing to hand off in the first
-    /// place. A [`Payload::Spilled`] victim, or a `Resident` one already at
-    /// weight `0`, a hand-off already pending, is never handed here: the
-    /// sampling passes above filter both out via [`is_spill_candidate`]. A
-    /// race where the entry vanished between sampling and this call reports
-    /// [`VictimOutcome::Vanished`].
-    ///
-    /// Total weight and `live_count` are the caller's job: this only
-    /// mutates `stripe.live` and the digest, so a batch caller can fold
-    /// several victims' weight into one pair of atomic updates after the
-    /// loop. The caller is likewise responsible for calling
-    /// [`Engine::finish_spill_handoff`] on a [`VictimOutcome::PendingSpill`]
-    /// job, once it has dropped `stripe`.
-    ///
-    /// [`try_spill_victim`]: Engine::try_spill_victim
+    /// to a configured spill tier when [`Engine::try_spill_victim`] commits
+    /// to it: weight zeroed in place, reported as
+    /// [`VictimOutcome::PendingSpill`], while `stripe.live`, the digest,
+    /// and `live_count` stay untouched until the flusher installs it. On a
+    /// refusal, [`spill_refusal_outcome`] picks between
+    /// [`VictimOutcome::Deferred`] (victim stays resident, untouched
+    /// weight) and the ordinary remove-and-XOR path,
+    /// [`VictimOutcome::Removed`]; a vanished entry reports
+    /// [`VictimOutcome::Vanished`]. Total weight and `live_count` stay the
+    /// caller's job; a [`VictimOutcome::PendingSpill`] job still needs
+    /// [`Engine::finish_spill_handoff`] once `stripe` is dropped.
     fn evict_victim_locked(
         &self,
         stripe: &mut Stripe<K, V>,
@@ -2706,8 +2334,8 @@ where
     }
 
     /// Evicts one entry from the first non-empty stripe at or after `bucket`,
-    /// wrapping around once. Returns `None` only when every stripe was found
-    /// to hold nothing to evict.
+    /// wrapping around once. Returns `None` only when every stripe holds
+    /// nothing to evict.
     fn evict_one_scanning(&self, bucket: usize) -> Option<EvictOutcome> {
         (0..BUCKET_COUNT)
             .map(|step| (bucket + step) % BUCKET_COUNT)
@@ -2809,7 +2437,7 @@ where
     /// The over-cap check weighs `total_weight` plus `pending_spill_weight`:
     /// a spill hand-off zeroes and frees its victim's weight from
     /// `total_weight` the instant it commits, but the victim stays fully
-    /// resident until the flusher's install actually resolves it, so
+    /// resident until the flusher's install resolves it, so
     /// `pending_spill_weight` is what keeps that still-resident RAM
     /// counting against the cap in the meantime. When a pass evicts
     /// nothing and some hand-off is still pending, [`defer_to_flusher`]
@@ -2851,7 +2479,7 @@ where
     /// [`super::Shard::with_prefold_enabled`] is the `#[doc(hidden)]` seam
     /// that reaches this from `crate::cache::CacheBuilder::prefold_enabled`,
     /// in turn reachable from an integration-test binary outside this
-    /// crate, which is why this can no longer be `#[cfg(test)]`-gated.
+    /// crate, so this stays outside any `#[cfg(test)]` gate.
     pub(crate) fn set_prefold_enabled(&self, enabled: bool) {
         self.prefold_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -2864,42 +2492,23 @@ where
         self.prefold_enabled.load(Ordering::Relaxed)
     }
 
-    /// Applies a batch of versioned writes that all hash into `bucket`, under
-    /// one write-lock acquisition for the whole group. Runs
+    /// Applies a batch of versioned writes that all hash into `bucket`,
+    /// under one write-lock acquisition for the whole group. Runs
     /// [`Self::enforce_capacity`] once afterward, outside the write lock,
     /// iff the batch put anything.
     ///
-    /// When `resolver`'s [`ConflictResolver::merges`] is `true` and
-    /// pre-folding is enabled (`prefold_enabled`, on by default, off only
-    /// when a caller has reached [`Engine::set_prefold_enabled`] through
-    /// [`super::Shard::with_prefold_enabled`]), `entries` is first grouped
-    /// into runs and, for every run long
-    /// enough to fold, has its key's real stored record peeked under a
-    /// brief stripe *read* lock (dropped again before any decode or fold
-    /// work runs), then folded through [`prefold_batch`] entirely outside
-    /// any lock: several entries for the same key collapse to at most one
-    /// real [`apply_locked`] call rather than one per entry, with every
-    /// other index in that group reported [`ApplyOutcome::Rejected`] rather
-    /// than skipped from the returned `Vec` — this always has exactly one
-    /// outcome per entry given, pre-fold or not. The stripe ends up holding
-    /// byte-for-byte, `Hlc`-for-`Hlc` what applying every entry one at a
-    /// time against real stored state would have left it holding; see
-    /// [`prefold_batch`]'s and [`fold_run`]'s docs for why folding the real
-    /// stored record in first, rather than never or last, is what makes
-    /// that hold for the minted version too, not only the bytes. A
-    /// resolver that never merges, or a batch with no repeated key, pays
-    /// only the grouping and (on a repeated key) the read-lock peek, and
-    /// otherwise applies exactly as before pre-folding existed.
+    /// When `resolver` merges and pre-folding is enabled
+    /// (`prefold_enabled`, toggled only via [`Engine::set_prefold_enabled`]),
+    /// `entries` are grouped into runs and folded through [`prefold_batch`]
+    /// before any [`apply_locked`] call, collapsing repeated keys to one
+    /// call each with every other index reported [`ApplyOutcome::Rejected`];
+    /// see [`prefold_batch`]'s doc for why the result matches sequential
+    /// application exactly, version and all.
     ///
-    /// Before any of that, [`prefetch_spilled_conflict_bytes`] reads back
-    /// every entry's currently-spilled stored side, if any, entirely off any
-    /// stripe lock: both the pre-fold seed peek above and [`apply_locked`]'s
-    /// own stored-side lookup consult that prefetched map first, so a
-    /// `spill`-featured build calls [`crate::store::spill::SpillTier::read_at`]
-    /// under `bucket`'s write lock (held below for the whole batch) only on
-    /// the rare miss where a concurrent flush moved an entry after this
-    /// prefetch pass read its old location — see [`apply_locked`]'s own doc
-    /// for why that fallback exists rather than degrading to value-less.
+    /// [`prefetch_spilled_conflict_bytes`] reads back any currently-spilled
+    /// stored sides off-lock first, before the write lock this call holds
+    /// for the whole batch; see [`apply_locked`]'s doc for the under-lock
+    /// fallback on a miss.
     pub(crate) fn apply_many(
         &self,
         bucket: usize,
@@ -3041,9 +2650,9 @@ where
     /// tombstone of its own, so a released bucket carries nothing for
     /// anti-entropy or replication to fan back out; a peer later applying a
     /// fresh write for a key in a released bucket lands it under the
-    /// ordinary ownership-gated apply path, never a resurrection of what
-    /// was here. A bucket at or past [`BUCKET_COUNT`], which only a
-    /// misbehaving caller names, is skipped. Returns the total number of
+    /// ordinary ownership-gated apply path, never a resurrection of the
+    /// bucket's prior contents. A bucket at or past [`BUCKET_COUNT`], which
+    /// only a misbehaving caller names, is skipped. Returns the total number of
     /// entries removed, live and tombstoned together, across every bucket
     /// given.
     pub(crate) fn release_buckets(&self, buckets: &[u16]) -> u64 {
@@ -3789,10 +3398,10 @@ mod tests {
         let hash = hash_key_bytes(key_bytes.as_ref());
         let encoded = Bytes::from(postcard::to_stdvec(&value).expect("test value encodes"));
         let bucket = stripe_index_from_hash(hash);
-        // Mirrors `Engine::apply_many`'s own prefetch — see `put` above —
-        // so a merge against an already-spilled stored side, exercised
+        // Mirrors `Engine::apply_many`'s own prefetch (see `put` above), so
+        // a merge against an already-spilled stored side, exercised
         // directly through this helper, reads its bytes back off-lock
-        // exactly as the real write path now does.
+        // exactly as the real write path does.
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
             &engine.stripes[bucket],
@@ -3833,7 +3442,7 @@ mod tests {
     }
 
     /// Test-only resolver: whenever both sides carry a value, merges by
-    /// taking the lexicographically greater decoded `String` — an
+    /// taking the lexicographically greater decoded `String`, an
     /// intentionally trivial join-semilattice (`max` is commutative,
     /// associative, and idempotent) that lets a test assert the engine wires
     /// a real [`ConflictResolver::merge`] reply through end to end, including
@@ -3866,7 +3475,7 @@ mod tests {
 
     /// Test-only resolver whose `merge` always claims a merge, regardless of
     /// whether those bytes decode as the shard's value type, and whose
-    /// `winner` falls back to plain `Hlc` order, like `LwwResolver` — the
+    /// `winner` falls back to plain `Hlc` order, like `LwwResolver`: the
     /// buggy-resolver shape [`resolve_conflict`]'s engine-enforced
     /// value-presence guard exists to contain.
     struct AlwaysMergeResolver {
@@ -4024,7 +3633,7 @@ mod tests {
         // Redeliver `vb`'s own value: its content is already fully absorbed
         // into the stored union (the merge reduces to stored), and the mint
         // above strictly outranks `vb` under `Hlc`'s real order even though
-        // their `wall_ms` ties — the mint's `logical` is one higher — so
+        // their `wall_ms` ties (the mint's `logical` is one higher), so
         // this lands on the no-op arm rather than re-publishing.
         let redelivered = put_with_resolver(
             &engine,
@@ -4050,7 +3659,7 @@ mod tests {
     /// Test-only resolver: merges by set union of postcard-decoded
     /// `BTreeSet<String>` values, a trivial join-semilattice standing in for
     /// a real CRDT like [`super::super::crdt::PnCounter`] or
-    /// [`super::super::crdt::OrSet`] — content that grows whenever either
+    /// [`super::super::crdt::OrSet`]: content that grows whenever either
     /// side contributes an element the other lacks, unlike
     /// [`MaxStringResolver`]'s `max`, which can reproduce one side's bytes
     /// exactly and so cannot exercise the case below. `merges()` is `true`:
@@ -4137,10 +3746,10 @@ mod tests {
         );
 
         // `vc`'s own content, "c", is absent from both prior inputs, and its
-        // `wall_ms` ties the stored version's exactly — the case a bare
+        // `wall_ms` ties the stored version's exactly: the case a bare
         // componentwise max cannot tell apart from a no-op. The `+ 1` on
-        // `logical` at mint time is what keeps this merge strictly ahead of
-        // the one before it despite the tie.
+        // `logical` at mint time keeps this merge strictly ahead of the
+        // prior one despite the tie.
         let vc = hlc(5, 3);
         let second = put_with_resolver(
             &engine,
@@ -6973,7 +6582,7 @@ mod tests {
                 );
 
                 // First eviction: the colder key (`now_ms: 0`) hands off
-                // cleanly, the queue was empty.
+                // cleanly, with the queue empty.
                 engine.evict_one_sampled(bucket);
                 assert_eq!(
                     engine.get(&keys[0], 0),
@@ -7027,7 +6636,8 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
-            /// The `Mode::Replicated` mirror of the test just above:
+            /// The `Mode::Replicated` mirror of
+            /// `enforce_capacity_via_real_hand_off_bounds_ram_and_falls_back_to_queue_full`:
             /// identical setup, `tier.set_keep_resident_when_refused(true)`
             /// the only difference, so the second victim's refused hand-off
             /// leaves it fully resident instead of falling back to a
@@ -7095,14 +6705,14 @@ mod tests {
                     1,
                 );
 
-                // First eviction: the colder key hands off cleanly, the
-                // queue was empty.
+                // First eviction: the colder key hands off cleanly, with
+                // the queue empty.
                 engine.evict_one_sampled(bucket);
                 assert_eq!(engine.debug_pending_spill_weight(), 200);
 
                 // Second eviction: the queue already holds one record's
                 // worth and the flusher is paused, so `would_accept`
-                // refuses again — but this tier's `keep_resident_when_
+                // refuses again, but this tier's `keep_resident_when_
                 // refused` is set, so the victim is left fully resident
                 // instead of deleted.
                 engine.evict_one_sampled(bucket);
@@ -7161,8 +6771,8 @@ mod tests {
             /// calling a misbehaving resolver's own `merge`; a well-behaved
             /// value-aware resolver's *own* fallback (`winner` returning
             /// `A`/`B` by `Hlc` order whenever it is handed a value-less
-            /// side) must never fire here just because the stored side
-            /// happens to be spilled rather than actually value-less. This
+            /// side) must never fire here merely because the stored side
+            /// is spilled rather than genuinely value-less. This
             /// pins that `apply_locked` reads a spilled stored record's real
             /// bytes back off disk before consulting the resolver, so a
             /// merge against it folds exactly as it would against a resident
@@ -7252,14 +6862,14 @@ mod tests {
             /// multi-entry batch landing on an already-spilled stored record
             /// folds `P` in *first*, ahead of the batch's own entries, the
             /// same left-to-right order sequential per-record application
-            /// uses — so the version the batched fold mints matches
-            /// sequential application's exactly, not only its content. Before
-            /// `peek_stored_seed` read spilled bytes back, it always treated
-            /// a spilled `P` as absent, seeding the fold with the batch's own
-            /// first entry instead and minting a version off that narrower
-            /// input set — still correct content (`apply_locked`'s own final
-            /// call still re-folds the real `P` in), but not the identical
-            /// `Hlc` sequential application mints.
+            /// uses, so the version the batched fold mints matches
+            /// sequential application's exactly, not only its content.
+            /// Seeding from a spilled `P` this way is what this test pins:
+            /// treating a spilled `P` as absent, seeding the fold with the
+            /// batch's own first entry instead, would still mint correct
+            /// content (`apply_locked`'s own final call still re-folds the
+            /// real `P` in) but not the identical `Hlc` sequential
+            /// application mints.
             /// This test's own `(version, value)` reader, shared by its
             /// sequential-reference and batched-under-test engines.
             fn stored_ver_and_value(
@@ -7283,7 +6893,7 @@ mod tests {
             }
 
             /// A fresh engine, seeded with one `(seed, seed_ver)` record at
-            /// `key`, then evicted and confirmed spilled — this test's own
+            /// `key`, then evicted and confirmed spilled: this test's own
             /// `P`, shared by its batched-under-test engine. Returns the temp
             /// dir (removed by the caller once done) alongside the engine.
             fn spilled_pn_counter_engine(
@@ -7345,7 +6955,7 @@ mod tests {
 
                 // The reference: `P`, then each batch entry, one real
                 // `apply_many` call at a time against a plain resident
-                // engine — never spilled, since spilling is this test's own
+                // engine, never spilled, since spilling is this test's own
                 // artifact, not part of the CRDT history being compared.
                 let sequential = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
                 for (value, ver) in [
@@ -7369,7 +6979,7 @@ mod tests {
 
                 // The batch under test: `P` applied and spilled exactly like
                 // the sibling test above, then `e0` and `e1` folded through
-                // one real `apply_many` call — prefold-eligible, since both
+                // one real `apply_many` call, prefold-eligible since both
                 // share a key and `PnCounterResolver::merges()` is `true`.
                 let (dir, batched) = spilled_pn_counter_engine(
                     "prefold-seed-spilled",
@@ -7492,10 +7102,10 @@ mod tests {
         /// [`Engine::compact`] call, cursor pinned to `0` beforehand: each
         /// call must return exactly the one entry sitting between the
         /// cursor and the next seeded stripe, in ascending stripe order,
-        /// and leave the cursor just past the stripe it visited — proving
-        /// rotation carries forward across calls instead of restarting at
-        /// stripe `0` (which would instead return the same first entry
-        /// every time) or skipping ahead arbitrarily.
+        /// and leave the cursor immediately past the stripe it visited,
+        /// proving rotation carries forward across calls instead of
+        /// restarting at stripe `0` (which would instead return the same
+        /// first entry every time) or skipping ahead arbitrarily.
         #[test]
         fn compact_rotates_the_cursor_across_stripes_between_calls() {
             let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
@@ -7542,8 +7152,8 @@ mod tests {
         /// A single entry seeded in stripe `5`, cursor pinned to stripe
         /// `0`: one [`Engine::compact`] call with `max_entries: 1` must
         /// stop the instant its budget is met, locking stripes `0..=5`
-        /// (six stripes) and no more — never the whole 1024-stripe engine,
-        /// and never fewer than it actually needed to find the one entry.
+        /// (six stripes) and no more, never the whole 1024-stripe engine,
+        /// and never fewer than it needed to find the one entry.
         /// Each stripe's lock is taken and dropped before the next is
         /// touched (`Engine::compact`'s own structure never calls
         /// `self.stripes[idx].read()` a second time before the previous
@@ -7635,17 +7245,18 @@ mod tests {
 
     /// Property coverage for [`merge_version`] alone: every claim its doc
     /// comment's convergence argument rests on is checked here rather than
-    /// assumed from the construction — that the mint arm strictly dominates
-    /// both inputs, that different merged bytes mint different nodes, that
-    /// each of the other three arms returns exactly what the rule says, and
-    /// that a mint is always recognizable as one (never a real node's id).
+    /// assumed from the construction, namely that the mint arm strictly
+    /// dominates both inputs, that different merged bytes mint different
+    /// nodes, that each of the other three arms returns exactly what the
+    /// rule says, and that a mint is always recognizable as one (never a
+    /// real node's id).
     mod merge_version {
         use proptest::prelude::*;
 
         use super::*;
 
         /// A real single-writer stamp: `wall_ms`/`logical` unconstrained,
-        /// `node` drawn from the lower half of the `u64` range only —
+        /// `node` drawn from the lower half of the `u64` range only,
         /// everything [`NodeId::random`] can ever produce. A generated pair
         /// here can never itself be merge-derived, so any `Store` arm that
         /// reproduces one of `sv`/`ver` verbatim carries a real node id, and
@@ -7669,8 +7280,8 @@ mod tests {
             #![proptest_config(ProptestConfig::with_cases(512))]
 
             /// (a) + (d): whenever the merged bytes match neither side's own
-            /// bytes, the mint arm fires unconditionally — none of the other
-            /// three arms' equality preconditions can hold — and its result
+            /// bytes, the mint arm fires unconditionally (none of the other
+            /// three arms' equality preconditions can hold), and its result
             /// both strictly dominates `sv` and `ver` under `Hlc`'s `Ord`
             /// and is recognizable as a mint, never a real node's stamp.
             #[test]
@@ -7695,7 +7306,7 @@ mod tests {
 
             /// (b): two mints for merged bytes that differ from each other
             /// (and from both sides, so both trigger the mint arm) mint
-            /// different node components — the property that keeps two
+            /// different node components: the property that keeps two
             /// nodes minting for genuinely different content from ever
             /// colliding on the same version.
             #[test]
@@ -7724,7 +7335,7 @@ mod tests {
             }
 
             /// (c), first arm: identical content on both sides is pure
-            /// version reconciliation — adopt whichever of `sv`/`ver` is
+            /// version reconciliation: adopt whichever of `sv`/`ver` is
             /// greater, or do nothing if `sv` already is.
             #[test]
             fn identical_content_arm_adopts_the_greater_version_or_no_ops(
@@ -7759,7 +7370,7 @@ mod tests {
             }
 
             /// (c), third arm: the merge reducing to stored's own bytes,
-            /// with stored genuinely newer, is a no-op — incoming is fully
+            /// with stored genuinely newer, is a no-op: incoming is fully
             /// absorbed already.
             #[test]
             fn reduces_to_stored_arm_is_a_no_op(
@@ -7812,8 +7423,8 @@ mod tests {
 
     /// Coverage for [`Engine::apply_many`]'s pre-fold: that a non-merging
     /// resolver never triggers it, that a run never crosses a tombstone,
-    /// and — the property [`prefold_batch`]'s and [`fold_run`]'s docs
-    /// argue for from the resolver's join-semilattice contract — that
+    /// and, the property [`prefold_batch`]'s and [`fold_run`]'s docs argue
+    /// for from the resolver's join-semilattice contract, that
     /// pre-fold changes only how many `apply_locked` calls a batch costs,
     /// never the `(version, bytes)` it leaves stored or the set of keys it
     /// reports a real outcome for.
@@ -7882,8 +7493,8 @@ mod tests {
 
         /// One batch entry spec: a small key, so several entries collide on
         /// one key within a batch; a real per-writer [`Hlc`] over a narrow
-        /// `wall_ms` range and a handful of `node`s, so ties and near-ties —
-        /// the cases `merge_version` treats specially — are common; and a
+        /// `wall_ms` range and a handful of `node`s, so ties and near-ties,
+        /// the cases `merge_version` treats specially, are common; and a
         /// one-element `Put`.
         fn arb_entry_spec() -> impl Strategy<Value = (u32, u64, u64, &'static str)> {
             (0u32..4, 0u64..12, 1u64..4, arb_elem())
@@ -7895,21 +7506,21 @@ mod tests {
             /// Replaying the identical batch through two fresh engines, one
             /// pre-folding (the default) and one with it forced off, stores
             /// byte-for-byte, `Hlc`-for-`Hlc` the same `(version, bytes)`
-            /// per key — `UnionSetResolver`'s join (set union) is
+            /// per key: `UnionSetResolver`'s join (set union) is
             /// commutative, associative, and idempotent, which is exactly
             /// what makes fold order irrelevant to the final *content*, the
             /// same argument `merge_version`'s doc makes for two
             /// anti-entropy replicas folding in either order, and
             /// `prefold_batch`'s seeding with the key's real stored record
             /// is what extends that fold-order independence to the minted
-            /// *version* too — and reports a real, non-
-            /// [`ApplyOutcome::Rejected`] outcome for exactly the same set
-            /// of keys either way.
+            /// *version* too, and reports a real,
+            /// non-[`ApplyOutcome::Rejected`] outcome for exactly the same
+            /// set of keys either way.
             ///
             /// A `setup` batch is applied to both engines first, through
             /// the exact same on/off split, so every key the later `main`
             /// batch touches already has a real stored record with a
-            /// non-trivial version behind it — the case
+            /// non-trivial version behind it, the case
             /// [`prefold_batch`]'s seeding exists for: without it, folding
             /// `main`'s own entries together before ever consulting that
             /// stored record mints a different version than sequential

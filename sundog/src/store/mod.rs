@@ -36,7 +36,7 @@ use crate::wire::{self, MAX_FRAME, WireRecord};
 mod engine;
 use engine::{ApplyOutcome, Engine, JoinOutcome};
 
-/// Reference CRDT value types — a PN-Counter today — and the
+/// Reference CRDT value types (a PN-Counter today) and the
 /// [`ConflictResolver`]s that merge them through [`ConflictResolver::merge`].
 pub mod crdt;
 
@@ -71,7 +71,7 @@ pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
 /// Upper bound on records per [`WireRecord`] batch yielded by
 /// [`ShardOps::snapshot_chunks`], caps chunk size only for small-value caches:
-/// a chunk breaks earlier once its encoded size approaches [`MAX_FRAME`].
+/// a chunk breaks sooner once its encoded size approaches [`MAX_FRAME`].
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
 /// Headroom reserved below [`MAX_FRAME`] for the `Msg::StChunk` envelope around
@@ -238,11 +238,11 @@ impl<K> FanOutQueue<K> {
 }
 
 /// One entry in a shard's fan-out queue. `Applied` is every write this
-/// shard actually holds: every mode's own local write, and an owner's
-/// write under `Mode::Distributed`. `cluster::fan_out_batch` re-fetches its
-/// current record via `Shard::records_for_typed`, unchanged from every
-/// other mode. `Forward` is a `Mode::Distributed` non-owner write: the
-/// record was never applied, so there is nothing to re-fetch, and the
+/// shard holds: every mode's own local write, and an owner's write under
+/// `Mode::Distributed`. `cluster::fan_out_batch` re-fetches its current
+/// record via `Shard::records_for_typed`, unchanged from every other mode.
+/// `Forward` is a `Mode::Distributed` non-owner write: the record is never
+/// applied, so there is nothing to re-fetch, and the
 /// fully built [`WireRecord`] travels with the queue entry itself. One
 /// queue, one drain, for every mode: this generalizes [`FanOutQueue`]'s
 /// item type rather than adding a second queue and a second task.
@@ -340,7 +340,7 @@ pub enum Origin {
     ///
     /// For a record a [`ConflictResolver::merge`] resolver produced, `NodeId`
     /// here is the merge-derived id the engine minted for it, not the id of
-    /// any node that actually authored a write: it names no member of the
+    /// any node that authored a write: it names no member of the
     /// cluster.
     ///
     /// `ShardOps::apply_remote_batch`'s pre-fold narrows this further for a
@@ -348,7 +348,7 @@ pub enum Origin {
     /// peer's fan-out or anti-entropy-pull reply bundling more than one
     /// node's writes to the same key): pre-fold collapses that whole run
     /// into one real apply and one published event, and the event's
-    /// `NodeId` here names only the run's last record's origin — the other
+    /// `NodeId` here names only the run's last record's origin; the other
     /// contributors' `NodeId`s are folded into the stored content but never
     /// surface on the event stream. This is an accepted cost of folding a
     /// batch's own same-key records together before the stripe lock (see
@@ -360,11 +360,11 @@ pub enum Origin {
 /// A change notification published on [`Shard::events`] / `Cache::events`.
 #[derive(Debug, Clone)]
 pub enum Event<K, V> {
-    /// A key was inserted where none existed before.
+    /// A key is inserted where none existed before.
     Created { key: K, value: V, origin: Origin },
-    /// An existing key's value changed.
+    /// An existing key's value changes.
     Updated { key: K, value: V, origin: Origin },
-    /// A key was removed; a tombstone was applied.
+    /// A key is removed; a tombstone is applied.
     Removed { key: K, origin: Origin },
 }
 
@@ -445,14 +445,14 @@ impl CompactionBounds {
 
 /// What one [`ShardOps::compact_pass`] call did: the writers its scan found
 /// eligible (see the note on the metric in the implementation), the
-/// records it actually rewrote, and how many stripes it walked, so the
+/// records it rewrote, and how many stripes it walked, so the
 /// caller can keep calling until the visited stripes add up to
 /// [`BUCKET_COUNT`] and the whole keyspace has been examined this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactPassOutcome {
     /// Writers the scan found eligible for retirement this call.
     pub retired: Vec<crdt::WriterId>,
-    /// Records actually rewritten in their compacted form this call.
+    /// Records rewritten in their compacted form this call.
     pub compacted: usize,
     /// Stripes the scan walked before its entry budget ran out.
     pub stripes_visited: usize,
@@ -545,34 +545,23 @@ pub trait ShardOps: Send + Sync {
 
     /// Runs one rate-limited pass of the CRDT writer-retirement sweep over
     /// this shard's merging caches: reads up to `max_entries` live,
-    /// resident candidates and asks the shard's resolver to fold writers
-    /// out of each one via [`ConflictResolver::compact`], then applies
-    /// every changed record with a version-gated direct replace, never
-    /// the ordinary merge-based apply path (see
-    /// `engine::Engine::compact_replace_if_current`'s own doc for why).
-    /// The replacement mints its new version from the compacted bytes
-    /// themselves, so two replicas that compact identical bytes agree on
-    /// the version with nothing left to exchange; it never fans out or
-    /// publishes an `Event` on its own, though a peer whose own copy
-    /// still differs can still discover the version change through an
-    /// ordinary anti-entropy round. `now_ms`, `retire`, `quiet`, and
-    /// `bounds` are exactly [`ConflictResolver::compact`]'s own
-    /// parameters, threaded straight through per candidate: this
-    /// method's job is the shard-level plumbing (candidate selection,
-    /// the apply path, and aggregating results across the whole pass),
-    /// never the retirement decision itself, which stays the resolver's
-    /// call.
+    /// resident candidates, asks the resolver to fold writers out of each
+    /// via [`ConflictResolver::compact`], then applies every changed
+    /// record with a version-gated direct replace, never the ordinary
+    /// merge-based apply path (see
+    /// `engine::Engine::compact_replace_if_current`'s doc for why).
+    /// `now_ms`, `retire`, `quiet`, and `bounds` are exactly
+    /// [`ConflictResolver::compact`]'s own parameters, threaded straight
+    /// through; this method's job is the shard-level plumbing, never the
+    /// retirement decision, which stays the resolver's call.
     ///
-    /// Returns every writer the scan found eligible for retirement, per
-    /// [`ConflictResolver::compact`]'s doc, deduplicated across the whole
-    /// batch, for the caller to record in its own absence-tracking
-    /// state, and how many records were compacted. The writer count can
-    /// exceed the record count: a bucket this shard no longer owns is
-    /// skipped without applying, yet the writer(s) it would have retired
-    /// are still reported. Defaulted to a no-op for a shard whose
-    /// resolver never compacts, the common case for [`LwwResolver`] and
-    /// any other non-merging resolver. Called periodically by
-    /// `crdt_compact_task`, independent of read/write traffic.
+    /// Returns every writer the scan found eligible for retirement,
+    /// deduplicated across the batch, and how many records were
+    /// compacted; the writer count can exceed the record count, since a
+    /// bucket this shard doesn't own anymore is skipped without applying
+    /// but its writer(s) are still reported. A no-op for a shard whose
+    /// resolver never compacts (the common case for [`LwwResolver`]).
+    /// Called periodically by `crdt_compact_task`.
     fn compact_pass(
         &self,
         now_ms: u64,
@@ -592,7 +581,7 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// Closes this shard's spill tier, if the `spill` feature is compiled in
-    /// and one was ever attached via `CacheBuilder::spill`: stops accepting
+    /// and one is attached via `CacheBuilder::spill`: stops accepting
     /// new spills and drops the flusher thread's channel sender. A no-op
     /// otherwise. Called by `crate::cache::Cache::close` and by
     /// `crate::cluster::Cluster::shutdown` for every cache still registered
@@ -692,7 +681,7 @@ pub enum Winner {
 }
 
 /// The outcome of a [`ConflictResolver::merge`] call: the folded value and
-/// its own TTL, decided explicitly by the resolver — the engine never infers
+/// its own TTL, decided explicitly by the resolver; the engine never infers
 /// one from `a`/`b`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merged {
@@ -702,57 +691,25 @@ pub struct Merged {
     pub expires_at_ms: Option<u64>,
 }
 
-/// Picks a winner between two differently-versioned records for the same key. A
-/// resolver picks; it never merges, since a synthesized value would make
-/// `Shard::apply`'s outcome depend on which two versions happened to collide
-/// locally.
+/// Picks a winner between two differently-versioned records for the same
+/// key; a resolver never merges on its own, since a synthesized value
+/// would make `Shard::apply`'s outcome depend on which two versions
+/// happened to collide locally.
 ///
 /// # Correctness contract
 ///
-/// `Shard::apply`'s convergence guarantee transfers to a custom resolver only
-/// if `winner` is deterministic (a pure function of `key`, `a`, `b`),
-/// antisymmetric (`winner(key, a, b) == A` iff `winner(key, b, a) == B`, never
-/// favoring argument position), and total and transitive (the "beats" relation
-/// over any set of distinct-version records for one key is a strict total
-/// order, with no cycle). `Shard::apply` calls `winner` only when `a.ver !=
-/// b.ver`.
-///
-/// A resolver whose [`ConflictResolver::merges`] returns `true` additionally
-/// commits its [`ConflictResolver::merge`] to the join-semilattice laws:
-/// **commutative** (`merge(a, b) == merge(b, a)` byte-for-byte — the engine
-/// calls `merge` with the stored record first and the incoming record
-/// second, an accident of arrival order, never semantics), **associative**
-/// across repeated pairwise folds (the engine only ever folds one collision
-/// at a time, so an N-way concurrent write converges only if arbitrary fold
-/// order and grouping give the same result), and **idempotent** (`merge(a,
-/// a) == a`, since a redelivered, already-absorbed input must be a no-op).
-///
-/// [`ConflictResolver::merge`] is consulted only when both `a.value` and
-/// `b.value` are `Some`. A resolver must never override
-/// [`ConflictResolver::needs_value_bytes`] to return `false` if `merges`
-/// returns `true`: doing so hands `merge` a `RecordView { value: None, .. }`
-/// on both sides, with nothing to merge.
-///
-/// The version assigned to a `merge` outcome is not this trait's concern —
-/// the engine decides it from `a.ver`, `b.ver`, and how the merged bytes
-/// compare to each side's own bytes, never from the resolver. A merge that
-/// reduces to one side's exact bytes adopts that side's own version only
-/// when that side's own `Hlc` is also the greater of the two; otherwise —
-/// the merge produces bytes neither side had, or the real-clock order
-/// disagrees with which side the content-level merge favors — it is
-/// stamped with a fresh version no real node's clock could ever produce, so
-/// anti-entropy always recognizes it as something to fetch.
-///
-/// The default [`LwwResolver`] returns only `A`/`B` and satisfies
-/// antisymmetry and transitivity by comparing [`Hlc`] alone.
-///
-/// The resolver is local, per-`Shard` configuration, never wire-negotiated —
-/// every node in a cluster must run an identical resolver for a given cache,
-/// merging resolvers included. A mid-rollout cluster with some nodes still
-/// on [`LwwResolver`] silently drops the merge property on those nodes
-/// rather than erroring: nothing in this crate detects a mixed-resolver
-/// cluster, exactly as nothing detects one node violating antisymmetry or
-/// transitivity while others don't.
+/// Convergence requires `winner` to be deterministic, antisymmetric
+/// (`winner(key, a, b) == A` iff `winner(key, b, a) == B`), and a strict
+/// total order over one key's distinct-version records. A resolver whose
+/// [`ConflictResolver::merges`] is `true` additionally commits
+/// [`ConflictResolver::merge`] to the join-semilattice laws (commutative,
+/// associative across repeated pairwise folds, idempotent); it runs only
+/// when both sides carry a value, so
+/// [`ConflictResolver::needs_value_bytes`] must stay `true` whenever
+/// `merges` does. The engine, never the resolver, mints the merge
+/// outcome's version. Configuration is local per `Shard`, never
+/// wire-negotiated: every node must run an identical resolver for a given
+/// cache.
 pub trait ConflictResolver: Send + Sync + 'static {
     /// Decides which of `a`, `b`, two different versions of the record stored
     /// at `key`'s wire-encoded bytes, wins. See the trait docs for the
@@ -772,7 +729,7 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// Whether this resolver's [`ConflictResolver::merge`] can ever return
     /// `Some`. Defaults to `false`, matching [`LwwResolver`] and any other
     /// pick-a-side-only resolver. A resolver that overrides `merge` to
-    /// return `Some` must override this to `true` — nothing enforces the
+    /// return `Some` must override this to `true`; nothing enforces the
     /// override, but `ShardOps::merges` (via `Shard::with_resolver`)
     /// forwards it straight into anti-entropy's direction rule, so a
     /// resolver claiming `false` while `merge` returns `Some` only loses the
@@ -784,13 +741,13 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// side merges and mints a version above both inputs, and only the next
     /// round carries the fuller content back (see `merge_version`'s doc for
     /// why the mint always dominates both inputs). When `merges` is `true`,
-    /// anti-entropy instead exchanges both records on a version mismatch —
-    /// each side folds the other's record into its own — so both sides mint
-    /// (or adopt) the identical result in the same round: see
+    /// anti-entropy instead exchanges both records on a version mismatch,
+    /// each side folding the other's record into its own, so both sides
+    /// mint (or adopt) the identical result in the same round: see
     /// `merge_version`'s doc for why the mint arm is symmetric in its two
     /// input stamps. `true` is always correct to return, even for a
-    /// resolver whose `merge` never actually returns `Some`; it only ever
-    /// costs an extra exchange, never a correctness issue.
+    /// resolver whose `merge` never returns `Some`; it only ever costs an
+    /// extra exchange, never a correctness issue.
     fn merges(&self) -> bool {
         false
     }
@@ -807,51 +764,26 @@ pub trait ConflictResolver: Send + Sync + 'static {
 
     /// Folds writer identities out of `value`'s live state into a bounded,
     /// already-retired representation, returning freshly encoded bytes
-    /// when anything changed. `None` when nothing was retirement-eligible,
-    /// or this resolver doesn't compact at all — the default. Only ever
-    /// called while [`ConflictResolver::merges`] is `true`.
+    /// when anything changed; `None` when nothing is retirement-eligible or
+    /// this resolver doesn't compact (the default). Only called while
+    /// [`ConflictResolver::merges`] is `true`; `now_ms` is the sweep's
+    /// timestamp, threaded through for a pure decision.
     ///
-    /// `key` is the record's own key bytes; `value` its current
-    /// postcard-encoded bytes. `now_ms` is the compaction sweep's
-    /// timestamp, threaded through rather than read from a clock so a
-    /// decision stays a pure function of its inputs.
-    ///
-    /// `retire` answers, for a writer identity `w` this record still
-    /// carries a live slot for, whether `w` is dead per the retirement
-    /// rule: absent from the cluster longer than
-    /// [`crate::config::ClusterConfig::crdt_retire_after`], or a live node
-    /// on a different incarnation than `w`'s own (any other incarnation,
-    /// not only a greater one, so a clock stepping backward across a
-    /// restart can never pin an old incarnation forever). A resolver's
-    /// first, exact compaction stage moves every writer `retire` accepts
-    /// out of the record's live state into a per-writer retired entry
-    /// stamped with `now_ms` — exact under any staleness between replicas,
-    /// since a slot and its retired entry are always maxed together at
-    /// merge time, never summed.
-    ///
-    /// `quiet` is whether every other member sharing this record's cache
-    /// is either continuously present for longer than `crdt_retire_after`,
-    /// or absent for longer than it — computed once per sweep tick and
-    /// passed in rather than recomputed per record. `bounds` carries a
-    /// resolver's second-stage age threshold, `2 * bounds.retire_after_ms`
-    /// for the resolvers this crate ships: a retired writer entry older
-    /// than this, on a quiet cache, may be folded into a bounded
-    /// accumulator and dropped, trading per-writer exactness for a record
-    /// size that stays bounded under churn — the same trust boundary
-    /// [`crate::config::ClusterConfig::tombstone_max_ttl`] already
-    /// documents ("a member gone longer than this may resurrect data"),
-    /// never invoked for anything less stale than that. A resolver with no
-    /// such second stage is free to ignore `quiet`/`bounds` entirely.
-    ///
-    /// A resolver whose second stage collapses per-writer state into a
-    /// bounded accumulator carries no replica identity through this call —
-    /// [`crate::crdt::PnCounter`]'s own fold instead leaves a per-writer
-    /// receipt in the record itself: the writer's own `since_ms` at the
-    /// moment it was folded, recorded under that writer's own key, never a
-    /// single cross-writer watermark, so a later [`ConflictResolver::merge`]
-    /// between two independently-folded records can tell which side's
-    /// silence about a writer means "already folded" without needing to
-    /// know which replica did the folding.
+    /// `retire(w)` says whether writer `w` is dead: absent from the
+    /// cluster longer than [`crate::config::ClusterConfig::crdt_retire_after`],
+    /// or on a different incarnation than `w`'s own. A resolver's first
+    /// stage moves every writer `retire` accepts into a per-writer retired
+    /// entry stamped with `now_ms`, exact under any inter-replica
+    /// staleness since a slot and its retired entry are always maxed
+    /// together at merge time. `quiet` and `bounds` gate an optional
+    /// second stage that folds a retired entry older than `2 *
+    /// bounds.retire_after_ms` on a quiet cache into a bounded
+    /// accumulator, trading per-writer exactness for a bounded record
+    /// size under the same trust boundary
+    /// [`crate::config::ClusterConfig::tombstone_max_ttl`] documents; see
+    /// [`crate::crdt::PnCounter`]'s docs for how its own second stage stays
+    /// exact under this trade. A resolver with no second stage ignores
+    /// `quiet`/`bounds`.
     fn compact(
         &self,
         key: &[u8],
@@ -872,18 +804,17 @@ pub trait ConflictResolver: Send + Sync + 'static {
     /// [`ConflictResolver::merge`], with the `receipt_ttl_ms` of the same
     /// [`CompactionBounds`] as [`ConflictResolver::compact`]: for the
     /// resolvers this crate ships it prunes fold receipts older than that,
-    /// so a receipt one
-    /// replica's sweep already dropped cannot ride back in from a peer
-    /// whose sweep has not reached it yet. Without this step two replicas
-    /// re-import each other's receipts through anti-entropy indefinitely,
-    /// since a merge only ever unions them.
+    /// so a receipt one replica's sweep already dropped cannot ride back in
+    /// from a peer whose sweep has not reached it yet. Without this step
+    /// two replicas re-import each other's receipts through anti-entropy
+    /// indefinitely, since a merge only ever unions them.
     fn settle(&self, key: &[u8], value: &[u8], now_ms: u64, receipt_ttl_ms: u64) -> Option<Bytes> {
         let _ = (key, value, now_ms, receipt_ttl_ms);
         None
     }
 }
 
-/// The resolver a merging shard actually runs: `inner` for every decision,
+/// The resolver a merging shard runs: `inner` for every decision,
 /// plus [`ConflictResolver::settle`] applied to each merge result with the
 /// shard's clock and its [`CompactionBounds`], so aged fold receipts are
 /// dropped on the apply path and not only on the compaction sweep.
@@ -988,9 +919,9 @@ enum Incoming<V> {
 /// however many `merge` calls land inside the current coalescing window,
 /// until [`Shard::flush_due_pending_merges`] (or a close/drop flush that
 /// ignores the deadline) hands it to the ordinary write path as a single
-/// [`Shard::apply`] — the same versioned apply every other write goes
+/// [`Shard::apply`], the same versioned apply every other write goes
 /// through, so the fold gets its own fresh version and folds again, this
-/// time against whatever is actually stored.
+/// time against whatever is stored.
 struct PendingMerge<V> {
     /// `K`'s encoded bytes, kept so a flush never re-encodes the key.
     key_bytes: Bytes,
@@ -1002,9 +933,9 @@ struct PendingMerge<V> {
     expires_at_ms: Option<u64>,
     /// The version stamped by whichever `merge` call last folded into this
     /// entry, used only as the "incoming" side of the next fold's
-    /// [`RecordView`] — discarded at flush time in favor of a fresh stamp,
+    /// [`RecordView`], discarded at flush time in favor of a fresh stamp,
     /// since the flush itself, not any one call that built up to it, is the
-    /// write that actually lands.
+    /// write that lands.
     ver: Hlc,
 }
 
@@ -1017,8 +948,8 @@ struct PendingMerge<V> {
 struct PendingMergeStripe<K, V> {
     entries: HashMap<K, PendingMerge<V>>,
     /// `(deadline_ms, seq) -> key`, ordered by deadline so
-    /// [`drain_due_deadlines`] pops exactly the entries actually due
-    /// instead of scanning every entry in this stripe on every sweep.
+    /// [`drain_due_deadlines`] pops exactly the entries due instead of
+    /// scanning every entry in this stripe on every sweep.
     /// `seq` (this stripe's own [`Self::next_seq`] at insertion) breaks a
     /// tie between two entries that share a `deadline_ms` deterministically,
     /// without requiring `K: Ord`.
@@ -1084,12 +1015,11 @@ fn merge_window_elapsed(now_ms: u64, deadline_ms: u64) -> bool {
 /// Pops every `(deadline_ms, seq) -> key` entry from `by_deadline` whose
 /// deadline has passed by `now_ms`, in ascending deadline order, stopping at
 /// the first entry not yet due. `BTreeMap` keeps `by_deadline` ordered by
-/// its `(deadline_ms, seq)` key, so this touches only the entries actually
-/// due rather than scanning every entry in the stripe — the fix for
-/// [`Shard::flush_due_pending_merges`]'s sweep serializing on a full scan at
-/// high key counts. Pure over the ordering structure alone (no `V`, no live
-/// `Shard`), split out for its own unit test the same way
-/// [`merge_window_elapsed`] is.
+/// its `(deadline_ms, seq)` key, so this touches only the entries due,
+/// never scanning the whole stripe, keeping
+/// [`Shard::flush_due_pending_merges`]'s sweep cheap at high key counts.
+/// Pure over the ordering structure alone (no `V`, no live `Shard`), split
+/// out for its own unit test the same way [`merge_window_elapsed`] is.
 fn drain_due_deadlines<K>(by_deadline: &mut BTreeMap<(u64, u64), K>, now_ms: u64) -> Vec<K> {
     let mut due = Vec::new();
     while let Some(&(deadline_ms, _)) = by_deadline.keys().next() {
@@ -1217,8 +1147,8 @@ where
     /// into [`BUCKET_COUNT`] independently locked stripes by the same
     /// `xxh3(key_bytes)`-derived index [`engine::stripe_index_from_hash`]
     /// gives the engine's own stripes, so many keys coalescing at once
-    /// spread their pending state — and the background sweep's own lock
-    /// contention — across many mutexes instead of one. Only ever non-empty
+    /// spread their pending state, and the background sweep's own lock
+    /// contention, across many mutexes instead of one. Only ever non-empty
     /// while `merge_window` is non-zero.
     pending_merges: Box<[StdMutex<PendingMergeStripe<K, V>>]>,
     /// Notified whenever [`Shard::merge`] opens a fresh coalescing window
@@ -1424,7 +1354,7 @@ where
     /// key within: they fold in memory instead of each applying on its own,
     /// and the fold applies once, when the window elapses. Zero, the
     /// default, applies every `merge` call at once. A raw setter that
-    /// trusts the caller to have already checked the resolver merges —
+    /// trusts the caller to have already checked the resolver merges;
     /// [`crate::cache::CacheBuilder::merge_coalesce_window`] is the
     /// validated entry point.
     #[must_use]
@@ -1442,7 +1372,7 @@ where
     /// Flips [`Engine::apply_many`]'s pre-fold on or off for this shard's
     /// engine, `true` (pre-folding on) by default. `#[doc(hidden)]`:
     /// reachable from `crate::cache::CacheBuilder::prefold_enabled`, in turn
-    /// reachable from an integration-test binary outside this crate — a
+    /// reachable from an integration-test binary outside this crate; a
     /// benchmark measuring pre-fold's own effect is the only caller that
     /// ever needs it off, to compare against the unfolded per-record path
     /// [`Engine::apply_many`] otherwise always takes. Never call this
@@ -1455,7 +1385,7 @@ where
     }
 
     /// This shard's engine's current [`Shard::with_prefold_enabled`] flag,
-    /// for a test to confirm the toggle actually reached the engine.
+    /// for a test to confirm the toggle reached the engine.
     #[cfg(test)]
     pub(crate) fn prefold_enabled(&self) -> bool {
         self.engine.prefold_enabled()
@@ -1832,7 +1762,7 @@ where
     /// Whether `bucket` is currently resident for outbound anti-entropy or
     /// snapshot serving: owned, or mid disown-grace. `is_resident = owns ||
     /// residency.is_releasing`, used only by the outbound-serving guard and
-    /// the donor-serving exception — never by the inbound-apply guard,
+    /// the donor-serving exception, never by the inbound-apply guard,
     /// which stays strict current-view ownership.
     fn is_resident_bucket(
         residency: &(Arc<OwnershipView>, Arc<ResidencySet>),
@@ -1844,7 +1774,7 @@ where
 
     /// Non-owner write path: builds the [`WireRecord`] a
     /// `Mode::Distributed` write for a bucket this node does not own fans
-    /// out, without ever touching `engine` — see the store module's
+    /// out, without ever touching `engine`; see the store module's
     /// write-path docs for the no-window proof this relies on. Emits
     /// [`Event::Created`]/[`Event::Removed`] directly from the
     /// caller-supplied value: a non-owner holds no prior copy to tell a
@@ -2323,7 +2253,7 @@ where
 
     /// Applies a versioned write locally if this shard owns `key_bytes`'
     /// bucket, or builds and forwards it to the bucket's current owners
-    /// otherwise — the tail every local-write entry point shares:
+    /// otherwise: the tail every local-write entry point shares,
     /// [`Shard::insert_expiring`] and a coalesced [`Shard::merge`] fold's
     /// flush alike.
     fn apply_or_forward(
@@ -2347,33 +2277,18 @@ where
     }
 
     /// Folds `value` into `key` through the configured [`ConflictResolver`]
-    /// without a read: unlike a get-modify-`insert` cycle, this never
-    /// touches whatever this shard already holds for `key` until the fold
-    /// actually applies. With [`Shard::with_merge_coalesce_window`] left at
-    /// its default zero, every call applies at once, through the same path
-    /// as [`Shard::insert`] — folding one call against whatever is stored
-    /// is exactly what the shard's ordinary versioned-apply conflict
-    /// resolution already does when the configured resolver's
-    /// [`ConflictResolver::merges`] is `true`.
+    /// without a read, applying through the same versioned-apply path as
+    /// [`Shard::insert`]. With [`Shard::with_merge_coalesce_window`] left
+    /// at its default zero, every call applies at once. With a non-zero
+    /// window, consecutive calls to the same key fold into an in-memory
+    /// pending value instead, applying once when the window that opened at
+    /// the first call elapses (`crate::cache::merge_coalesce_task`,
+    /// `Cache::close`, and this shard's `Drop` all guarantee a flush);
+    /// replication and every [`Event`] then see exactly one record, the
+    /// fold, not each call.
     ///
-    /// With a non-zero window, consecutive calls to the same key land in an
-    /// in-memory pending fold instead: each call folds its value into
-    /// whatever is already pending for that key through the same resolver,
-    /// and the result applies through the same versioned-apply path exactly
-    /// once, when the window that opened at the first of those calls
-    /// elapses — `crate::cache::merge_coalesce_task` drives that for an
-    /// open [`crate::cache::Cache`], and this shard's own pending-map flush
-    /// (`crate::cache::Cache::close`, and this shard's own `Drop`)
-    /// guarantees it regardless. Replication and every [`Event`] this key
-    /// gets during the window see exactly one record: the fold, not each
-    /// call that built it.
-    ///
-    /// # `get` during a window
-    ///
-    /// [`Shard::get`]/[`Shard::get_sync`] never consult the pending fold: a
-    /// value folded in but not yet flushed is invisible to a read for as
-    /// long as it stays pending — up to one whole window from the call
-    /// that opened it.
+    /// [`Shard::get`]/[`Shard::get_sync`] never consult a pending fold: it
+    /// stays invisible to reads for up to one whole window.
     ///
     /// # Errors
     ///
@@ -2460,7 +2375,7 @@ where
                             // The incoming call lost outright: nothing about the
                             // pending entry changes, version included, mirroring
                             // `resolve_and_rebind`'s `IncomingLoses => None` in
-                            // the engine — a losing write never advances the
+                            // the engine: a losing write never advances the
                             // version of the record it lost against.
                         }
                     },
@@ -2814,8 +2729,8 @@ where
         }
     }
 
-    /// Whether this shard's attached spill tier has been closed by
-    /// [`Shard::close_spill`], or there never was one. `false` only while a
+    /// Whether this shard's attached spill tier is closed by
+    /// [`Shard::close_spill`], or none is attached. `false` only while a
     /// tier is attached and still open. Test-facing: lets a test observe
     /// that [`Cache::close`] stopped the tier a surviving clone still
     /// shares, without needing to drive an eviction and infer it
@@ -2841,8 +2756,8 @@ where
     }
 
     /// Applies one flushed [`PendingMerge`] through
-    /// [`Shard::apply_or_forward`], exactly as if its folded value had just
-    /// been [`Shard::insert`]ed: a fresh version stamped now, so
+    /// [`Shard::apply_or_forward`], exactly as if its folded value were
+    /// freshly [`Shard::insert`]ed: a fresh version stamped now, so
     /// replication and events see the fold as one write happening at flush
     /// time, not backdated to whichever `merge` call opened the window.
     fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
@@ -2854,7 +2769,7 @@ where
         };
         // Best-effort: a forward failure here means the cache is closing,
         // and nothing calling this (the background sweep, `close`, or
-        // `Drop`) has anywhere to hand an error to — the same fate an
+        // `Drop`) has anywhere to hand an error to, the same fate an
         // ordinary local write racing a close already gets, documented on
         // `Shard::insert`.
         let _ = self.apply_or_forward(key, pending.key_bytes, ver, incoming);
@@ -2864,7 +2779,7 @@ where
     /// elapsed by `now_ms`. Visits [`Shard::pending_merges`]'s
     /// [`BUCKET_COUNT`] stripes one at a time, locking each only long
     /// enough for [`drain_due_deadlines`] to pop that stripe's due entries
-    /// out of its deadline-ordered index — never one lock (or one linear
+    /// out of its deadline-ordered index, never one lock (or one linear
     /// scan) for the whole shard's pending state, so many keys coalescing
     /// at once don't serialize this sweep on each other. The background
     /// sweep (`crate::cache::merge_coalesce_task`) is the only production
@@ -2909,8 +2824,8 @@ where
     /// across every stripe, or `None` when nothing is pending anywhere.
     /// `crate::cache::merge_coalesce_task` sleeps until this to flush right
     /// at the window's edge instead of polling. Each stripe's own earliest
-    /// deadline is its `by_deadline` index's first key — no scan of that
-    /// stripe's entries needed — so this costs one brief lock per stripe,
+    /// deadline is its `by_deadline` index's first key, no scan of that
+    /// stripe's entries needed, so this costs one brief lock per stripe,
     /// not one lock over the whole shard's pending state.
     pub(crate) fn next_pending_merge_deadline_ms(&self) -> Option<u64> {
         self.pending_merges
@@ -3046,7 +2961,7 @@ where
         Box::pin(async move {
             // The inbound-apply guard: a `Mode::Distributed` shard never
             // applies a record for a bucket its own *current* view does not
-            // own — strict current-view ownership, before decoding, the
+            // own: strict current-view ownership, before decoding, is the
             // single choke point every inbound record path (live
             // replication, an anti-entropy pull reply, a rebalance transfer
             // chunk) funnels through. A record for a bucket this node is
@@ -3370,8 +3285,8 @@ where
         Box::pin(async move {})
     }
 
-    /// All the work here is synchronous — `Engine::compact` never awaits,
-    /// nor does re-applying its candidates — so, like
+    /// All the work here is synchronous: `Engine::compact` never awaits,
+    /// nor does re-applying its candidates, so, like
     /// [`ShardOps::gc_tombstones`]/[`ShardOps::run_pending_tasks`] above,
     /// it all runs before the trivial future is built rather than inside
     /// an `async move` block: `retire`'s borrow only needs to outlive this
@@ -3390,8 +3305,8 @@ where
             // `ConflictResolver::compact`'s own contract: "only ever
             // called while `merges()` is `true`". Enforced here rather
             // than left to `Engine::compact`'s caller to remember, so a
-            // non-merging shard — `LwwResolver` and every other
-            // pick-a-side resolver, the common case — never pays for a
+            // non-merging shard (`LwwResolver` and every other
+            // pick-a-side resolver, the common case) never pays for a
             // full-engine scan whose every call would return `None`
             // anyway, and the contract holds regardless of what a future
             // caller of this method does or doesn't check first.
@@ -3404,32 +3319,31 @@ where
             });
         }
         // `Engine::compact` takes `retire` as `&dyn Fn`, not `FnMut`, so
-        // recording which writers it actually accepted (as opposed to
-        // every writer it was merely asked about) goes through interior
-        // mutability rather than a captured `&mut`. A resolver's own
-        // `compact` only ever calls `retire` on a writer identity the
-        // record still holds a *live* slot for (never one already folded
-        // away by an earlier pass), and a `true` answer always turns that
-        // record into a candidate (`newly` becomes non-empty), so every
-        // writer captured here belongs to some candidate this scan found
-        // — deduplicated by the `HashSet`, since the same eligible writer
-        // can surface across more than one candidate record in a single
-        // pass.
+        // recording which writers it accepted (as opposed to every writer
+        // merely passed to it) goes through interior mutability
+        // rather than a captured `&mut`. A resolver's own `compact` only
+        // ever calls `retire` on a writer identity the record still holds
+        // a *live* slot for (never one already folded away by a prior
+        // pass), and a `true` answer always turns that record into a
+        // candidate (`newly` becomes non-empty), so every writer captured
+        // here belongs to some candidate this scan found, deduplicated by
+        // the `HashSet`, since the same eligible writer can surface across
+        // more than one candidate record in a single pass.
         //
         // This is scoped to the whole scan, not to the handful of
-        // candidates that go on to actually apply below: a candidate for
-        // a bucket this shard's *current* view no longer owns is skipped,
+        // candidates that go on to apply below: a candidate for a bucket
+        // this shard's *current* view does not own anymore is skipped,
         // never applied, yet the writer(s) it would have retired are
-        // still reported here. This is deliberate, not an oversight — the
+        // still reported here. This is deliberate, not an oversight: the
         // alternative (only ever reporting a writer once every one of its
-        // live records anywhere in the cluster has actually compacted) is
+        // live records anywhere in the cluster is compacted) is
         // unobtainable at this layer, since nothing this generic-over-`V`
         // method sees distinguishes "a writer's slot" from arbitrary
         // bytes. Reporting it anyway is safe in the direction that
         // matters: the caller (`crdt_compact_tick`) only counts it in
         // `sundog_crdt_retired_writers_total`, never deletes data on the
         // strength of it, and the member stays tracked gone until it
-        // returns, so a skipped record is retried on the next pass — the
+        // returns, so a skipped record is retried on the next pass: the
         // skipped bucket's own stale copy is either physically dropped by
         // `ShardOps::release_buckets` once its disown-grace period ends
         // (the common case: ownership rarely moves back), or, if this
@@ -3462,8 +3376,8 @@ where
         for (key, key_bytes, stale_ver, new_encoded) in candidates {
             // Mirrors `guard_inbound`'s strict current-view rule: a
             // `Mode::Distributed` shard mid disown-grace never re-applies
-            // a compacted record for a bucket its *current* view no
-            // longer owns. Skipped, never forwarded — unlike an ordinary
+            // a compacted record for a bucket its *current* view does not
+            // own anymore. Skipped, never forwarded: unlike an ordinary
             // write, a compaction candidate has no caller waiting on it,
             // and the bucket's new owner will compact its own copy on its
             // own schedule once it, too, decides the same writers are
@@ -3483,10 +3397,10 @@ where
             // own doc for why a merge-based apply here would silently
             // undo stage three's own pruning on every single pass. `false`
             // means something else touched this entry since the scan
-            // above read it (or it is no longer live, or no longer
-            // resident) — skipped, exactly like an unowned bucket above,
-            // and recomputed fresh on the next pass rather than counted
-            // here.
+            // above read it (or it is not live anymore, or not
+            // resident anymore): skipped, exactly like an unowned bucket
+            // above, and recomputed fresh on the next pass rather than
+            // counted here.
             let hash = engine::hash_key_bytes(key_bytes.as_ref());
             let new_ver = compacted_version(stale_ver, new_encoded.as_ref());
             self.observe_remote(new_ver);

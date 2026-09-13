@@ -1,73 +1,30 @@
 //! An observed-remove set: [`OrSet`] and the [`OrSetResolver`] that merges
 //! it through [`crate::store::ConflictResolver::merge`].
 //!
-//! Built on `BTreeMap`/`BTreeSet` rather than a hash-based collection, so
-//! its postcard encoding is canonical: two logically equal sets always
-//! encode to identical bytes. That property is what lets the merge be
-//! checked for idempotence and associativity at the byte level.
+//! Built on `BTreeMap`/`BTreeSet`, so its postcard encoding is canonical:
+//! two logically equal sets always encode to identical bytes, letting the
+//! merge be checked for idempotence and associativity at the byte level.
 //!
-//! ## Writer identity and two-stage retirement
-//!
-//! Every tag is keyed by a [`WriterId`] (a node paired with the membership
-//! incarnation it wrote under) rather
-//! than a bare node id, so a restarted node's fresh incarnation can never
-//! resume, or collide with, a running total or tag sequence its previous
-//! incarnation used.
-//!
-//! `seen` (a per-writer version-vector watermark) is how [`OrSet::remove`]
-//! records a removal: a watermark, not a per-tag tombstone, so removing a
-//! large batch of tags costs one map entry per writer rather than one set
-//! entry per removed tag. `retired` tracks writers this replica has stopped
-//! paying `seen` bookkeeping for, keyed by the wall-clock millisecond it
-//! happened:
-//!
-//! - **Stage one** (`compact` with `retire(w)` true): `w`'s existing `seen`
-//!   watermark is left exactly as it is, and `w` gains a `retired` entry.
-//!   `adds` is never touched by any stage — retiring a writer only ever
-//!   stops this replica tracking removes made *through* it; every element
-//!   `w` ever added and was never removed remains a live set member
-//!   indefinitely, exactly like any other writer's.
-//! - **Stage two** (`compact` once the cache is quiet and `w` has been
-//!   retired for more than twice `crdt_retire_after`): `w`'s `seen` and
-//!   `retired` entries are both dropped, and a receipt for it is left in
-//!   `folded_at`: `w`'s own `since_ms`, recorded under `w`'s own key — a
-//!   per-writer *credential*, not a value, so [`OrSet::merge`] can tell
-//!   "this side has actually folded writer `w`" from "this side has folded
-//!   some *other* writer whose retirement time happens to be later". A
-//!   receipt is dropped once it is older than
-//!   [`CompactionBounds::receipt_ttl_ms`], safely past the point every
-//!   reachable replica is guaranteed to have independently folded the same
-//!   writer too. `OrSet::prune_receipts` drops an aged-out receipt, run
-//!   both by the compaction sweep and, via [`OrSetResolver::settle`], on
-//!   every merge apply, so a receipt one replica's sweep has already
-//!   dropped cannot ride back in from a peer whose sweep has not reached
-//!   it yet, keeping the record's metadata from growing with historical
-//!   churn. A replica isolated past `receipt_ttl_ms`, still holding a live
-//!   `seen` watermark for a writer every other replica has already folded
-//!   away and pruned the receipt for, resurrects that writer's
-//!   already-removed elements the moment it reconnects and merges (the
-//!   [`super::PnCounter`] analogue double-counts the writer's contribution
-//!   instead): the same trust boundary `tombstone_max_ttl` already accepts
-//!   for a member gone that long, not a new one.
+//! Every tag is keyed by a [`WriterId`] (node plus membership incarnation),
+//! so a restarted node's fresh incarnation never collides with its prior
+//! one's tag sequence. [`OrSet::remove`] records removal as a per-writer
+//! `seen` watermark, not a per-tag tombstone. Compaction retires a writer
+//! in two stages: stage one marks it `retired`; stage two, once quiet and
+//! retired long enough, drops `seen`/`retired` and leaves a `folded_at`
+//! receipt so [`OrSet::merge`] can tell an already-folded writer from mere
+//! silence about one. A tag from a retired or folded writer is rejected
+//! outright; retirement is sticky here, unlike [`super::PnCounter`].
+//! `OrSet::prune_receipts` drops a receipt past `receipt_ttl_ms`, under the
+//! same trust boundary `tombstone_max_ttl` accepts for a long-gone member.
 //!
 //! A tag `(w, s)` absent from a side's own `adds` is dead to that side if
-//! `w` is in that side's `retired` map or has a `folded_at` receipt (any new
-//! tag from a retired incarnation is rejected — retirement is sticky for
-//! `OrSet`, unlike [`super::PnCounter`]) or if `s` does not exceed that
-//! side's `seen` watermark for `w`. [`OrSet::merge`] treats a side's silence
-//! about `w` (no `seen`, no `retired`) as "already folded away" only once
-//! that side's own `folded_at` names `w` specifically with a `since_ms` at
-//! least as late as the merged `retired` entry's — an exact, per-writer fact
-//! each side recorded for that writer specifically, never inferred from an
-//! unrelated writer's retirement time — so the merged record drops `w`'s
-//! bookkeeping rather than resurrecting it from whichever side hasn't folded
-//! yet, and never drops it based on a side's mere silence about a writer it
-//! has simply never heard of.
+//! `w` is retired or folded there, or `s` does not exceed that side's
+//! `seen` watermark for `w`; a writer with no `seen` entry is never
+//! treated as an implicit watermark of `0`, since sequences legitimately
+//! start there too.
 //!
 //! [`OrSet::encode`]/[`OrSet::decode`] are thin postcard wrappers around
-//! this type's one wire layout — every field, always. This layout is this
-//! crate's own; no released node predates it, so there is nothing to stay
-//! compatible with. A future change to it is versioned then.
+//! this type's one wire layout; a future change to it is versioned.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -87,23 +44,9 @@ type Tag = (WriterId, u64);
 
 /// An observed-remove set: adds and removes from any number of writers
 /// merge to the set reflecting every add whose tag no remover has
-/// observed. A concurrent add of an element survives a concurrent remove
-/// of that same element, because the remove can only mark dead the tags it
-/// has actually seen — a fresh tag from a concurrent add was never among
-/// them.
-///
-/// Removing an element is an ordinary mutation of the stored value, not a
-/// whole-key delete: [`OrSet::remove`] produces a delta meant to be written
-/// back through an ordinary `Put` (a normal `Cache::insert`), the same way
-/// a [`super::PnCounter`] delta is. It never goes through `Cache::remove`,
-/// which discards the entire logical set as a real tombstone — a value
-/// [`crate::store::ConflictResolver::merge`] is never consulted against,
-/// since the engine never calls `merge` when either side carries no value.
-/// A real per-key delete stays a real delete, decided by plain
-/// last-writer-wins, never by this resolver.
-///
-/// See the module doc for how `seen`/`retired` implement two-stage writer
-/// retirement.
+/// observed, since a remove only marks dead the tags it has seen. Use
+/// [`OrSet::remove`] through `Cache::insert`, never `Cache::remove`'s
+/// whole-key tombstone; see the module doc for two-stage retirement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrSet<T>
 where
@@ -113,26 +56,23 @@ where
     /// Per-writer version-vector watermark: every tag `(w, s)` with
     /// `s <= seen[w]` that this replica does not itself hold in `adds` is
     /// dead. Populated by [`OrSet::remove`], and left untouched by stage one
-    /// of [`OrSet::compact`] — only stage two, once a retired writer has
+    /// of [`OrSet::compact`]; only stage two, once a retired writer has
     /// aged out, drops its entry.
     seen: BTreeMap<WriterId, u64>,
     /// Writers this replica has retired, keyed by the wall-clock
     /// millisecond retirement happened (stage one). A writer in this map
     /// can never contribute a *new* live tag to this replica or any replica
-    /// this one merges into — see the module doc's deadness rule. Stage two
+    /// this one merges into; see the module doc's deadness rule. Stage two
     /// drops an entry (leaving a `folded_at` receipt behind) once it has
     /// aged past twice `crdt_retire_after` and the cache is quiet.
     retired: BTreeMap<WriterId, u64>,
     /// A per-writer receipt: `w`'s own `since_ms` the moment this replica
-    /// drops `w`'s `seen`/`retired` entries in stage two. Unlike a single
-    /// cross-writer watermark, this can only ever vouch for a writer it was
-    /// actually recorded for — [`Self::merge`] trusts a side's silence
-    /// about `w` (no `seen`, no `retired`) to mean "already folded away"
-    /// only once that side's own `folded_at` names `w` specifically with a
-    /// `since_ms` at least as late as the merged `retired` entry's. A
-    /// receipt is dropped once it is old enough that every reachable
-    /// replica is guaranteed to have independently folded the same writer
-    /// too — see [`Self::compact`].
+    /// drops `w`'s `seen`/`retired` entries in stage two. [`Self::merge`]
+    /// trusts a side's silence about `w` as "already folded" only once its
+    /// own `folded_at` names `w` with a `since_ms` at least as late as the
+    /// merged `retired` entry's. Dropped once old enough that every
+    /// reachable replica has independently folded the same writer too; see
+    /// [`Self::compact`].
     folded_at: BTreeMap<WriterId, u64>,
 }
 
@@ -140,10 +80,10 @@ impl<T> OrSet<T>
 where
     T: Ord + Clone + Serialize + DeserializeOwned,
 {
-    /// The set's live members: every added element whose tag is not dead —
+    /// The set's live members: every added element whose tag is not dead,
     /// i.e. not covered by any writer's `seen` watermark. Since `compact`
-    /// never touches `adds` (see the module doc), this is simply "every tag
-    /// this replica's own `adds` still holds," independent of retirement.
+    /// never touches `adds` (see the module doc), this is every tag this
+    /// replica's own `adds` still holds, independent of retirement.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.adds.values()
     }
@@ -155,18 +95,12 @@ where
     }
 
     /// A blind add: `writer` tags `element` with its own next sequence
-    /// number (`seq`), unique across every add this writer's incarnation
-    /// has ever made. The caller tracks its own running sequence counter
-    /// (an `AtomicU64` is typical, reset to zero on every fresh
-    /// incarnation) and calls this on every local add; no read of the shard
-    /// is needed.
-    ///
-    /// A `writer` this replica has already retired can still call `add` —
-    /// the returned delta is a perfectly ordinary tag — but it will never
-    /// become a live member anywhere it merges into a replica that has
-    /// retired `writer`: see the module doc's deadness rule. In practice a
-    /// caller only calls `add` under its own current incarnation, which is
-    /// never retired on itself.
+    /// number (`seq`), unique across every add its incarnation has ever
+    /// made. The caller tracks its own running sequence counter (an
+    /// `AtomicU64` is typical, reset on every fresh incarnation); no read
+    /// of the shard is needed. A retired `writer` can still call this, but
+    /// the tag never becomes live wherever it merges into a replica that
+    /// has retired `writer`; see the module doc's deadness rule.
     #[must_use]
     pub fn add(writer: WriterId, seq: u64, element: T) -> Self {
         Self {
@@ -177,31 +111,11 @@ where
         }
     }
 
-    /// An observed-remove: raises the `seen` watermark, per writer, high
-    /// enough to cover every one of that writer's tags in `observed` — a
-    /// snapshot of the set this replica has actually read — that backs
-    /// `element`. Because only tags this replica has seen are ever marked
-    /// dead, a concurrent add of the same element on another replica, whose
-    /// fresh tag this replica could not have observed, survives the merge:
-    /// the defining add-wins property of an observed-remove set.
-    ///
-    /// A writer's `seen` watermark is a single per-writer high-water mark,
-    /// not a per-tag tombstone, so it cannot say "sequence 3 is dead but
-    /// sequence 2 (also from this writer) is not": raising it to cover a
-    /// removed tag implicitly asserts that every lower, un-reasserted
-    /// sequence from that writer is dead too. To keep that assertion
-    /// correct, this delta re-asserts — as ordinary live adds — every one
-    /// of `observed`'s *other* tags from a writer touched by this remove
-    /// (i.e. every one of that writer's tags that do not back `element`),
-    /// so nothing this replica has not actually observed dying is ever
-    /// implied to be dead by the watermark this delta carries. A writer
-    /// with no tag backing `element` is left completely untouched: its
-    /// watermark does not move, and none of its tags are copied into this
-    /// delta.
-    ///
-    /// Like [`Self::add`], the result is a delta meant to be written back
-    /// as an ordinary `Put`, merged into the stored set by
-    /// [`OrSetResolver`] — never a whole-key `Cache::remove`.
+    /// An observed-remove: raises each touched writer's `seen` watermark to
+    /// cover every tag in `observed` backing `element`, so only an
+    /// observed tag is marked dead, and re-asserts that writer's other
+    /// tags as live adds, since a watermark cannot spare a lower sequence.
+    /// Write back via `Cache::insert`, never `Cache::remove`.
     #[must_use]
     pub fn remove(observed: &Self, element: &T) -> Self {
         let touched: BTreeSet<WriterId> = observed
@@ -232,62 +146,22 @@ where
         }
     }
 
-    /// Folds `other` into a new set.
+    /// Folds `other` into a new set. `seen` merges by pointwise maximum;
+    /// `retired` takes, for each writer either side retired, the
+    /// *earliest* `since_ms` recorded; `folded_at` is the union, taking the
+    /// *later* `since_ms` for a writer both sides have a receipt for. A
+    /// writer named by the merged `retired` map is dropped from
+    /// `seen`/`retired` entirely, rather than resurrected, once the
+    /// *other* side's own `folded_at` names it with a `since_ms` at least
+    /// as late; see the module doc for why a receipt, not mere silence, is
+    /// what licenses that.
     ///
-    /// `seen` merges by pointwise maximum (a standard per-writer max
-    /// register). `retired` merges by taking, for each writer retired by
-    /// either side, the *earliest* `since_ms` either side recorded — so
-    /// every replica ages a retired writer from the first moment anyone
-    /// observed its retirement, keeping stage two's timing agreement within
-    /// one sweep period across every replica regardless of merge order.
-    /// `folded_at` is the union of both sides', taking the later `since_ms`
-    /// for a writer both sides have a receipt for (a receipt only ever grows
-    /// more permissive).
-    ///
-    /// A writer `w` named by either side's `retired` map is then checked
-    /// against the *other* side's receipt: a side that carries neither a
-    /// `seen` nor a `retired` entry for `w`, whose own `folded_at` names `w`
-    /// specifically with a `since_ms` at least as late as `w`'s (merged)
-    /// `since_ms`, counts as having already folded `w` away in its own
-    /// stage two — the per-writer receipt is what lets that silence be
-    /// trusted as "already folded" rather than "never heard of `w` yet"; a
-    /// coincidentally high-water receipt for some *other* writer can never
-    /// stand in for it, unlike a single cross-writer watermark would. A
-    /// writer folded by either side this way is dropped from the merged
-    /// `seen`/`retired` entirely, not resurrected from whichever side hasn't
-    /// folded it yet.
-    ///
-    /// A tag is dead to a side if that side does not hold it in its own
-    /// `adds` and either that side has retired the tag's writer or holds a
-    /// `folded_at` receipt for it, or that side *has a `seen` watermark for
-    /// the writer* and the tag's sequence does not exceed it. A side with no
-    /// `seen` entry for a writer at all has never observed a remove touching
-    /// that writer, so it must never be treated as if it held an implicit
-    /// watermark of `0` — sequence numbers legitimately start at `0` (every
-    /// example in this crate uses them that way), so defaulting a missing
-    /// watermark to `0` would wrongly mark every writer's very first tag
-    /// dead to any side that simply has never heard of that writer yet.
-    /// Deadness is evaluated only against the *other* operand from the tag's
-    /// perspective — checking `is_dead_by(other, ...)` for a tag this side
-    /// holds, and `is_dead_by(self, ...)` for a tag only the other side
-    /// holds — so the keep-predicate is symmetric in `self`/`other` and
-    /// reapplying it to its own output changes nothing. This check is
-    /// always against each side's own, pre-merge `retired`/`seen`/
-    /// `folded_at`, never the merged result above.
-    ///
-    /// A tag held by *both* sides is always kept unconditionally: since
-    /// `compact` never strips a live tag from `adds` (only `remove` ever
-    /// does, via `seen`), a tag surviving in both operands' own `adds` is
-    /// definitionally still live on both, independent of what either side's
-    /// `seen`/`retired`/`folded_at` say about it.
-    ///
-    /// This is exact whenever every replica's receipts are an honest record
-    /// of what it has actually folded — true for anything `compact` itself
-    /// produces: when a peer whose own copy still holds a writer as
-    /// `retired`/`seen` (or even still live) syncs against a replica that
-    /// has already folded that same writer away, the folded side's receipt
-    /// for it is exactly what lets the still-retired (or still-live) side's
-    /// entries be reconciled without resurrecting them.
+    /// A tag survives if either side's own `adds` still holds it, or it is
+    /// live by the module doc's deadness rule evaluated against the
+    /// *other* operand's pre-merge state. `merge_is_commutative`,
+    /// `merge_is_idempotent_at_the_byte_level`, and
+    /// `merge_never_resurrects_a_removed_element_solely_because_an_unrelated_writer_folded_later`
+    /// prove this stays exact and lattice-lawful.
     #[must_use]
     pub fn merge(&self, other: &Self) -> Self {
         let mut retired: BTreeMap<WriterId, u64> = self.retired.clone();
@@ -318,20 +192,13 @@ where
         }
 
         // A side that has already folded `w` away: no `seen`, no `retired`,
-        // and a per-writer receipt naming `w` specifically — with no
-        // `since_ms` comparison, since a `WriterId` names one specific
-        // membership incarnation and an incarnation dies at most once
-        // ever: a receipt for `w` and *any* `retired`/`seen` evidence of
+        // and a per-writer receipt naming `w` specifically, with no
+        // `since_ms` comparison needed. A `WriterId` names one specific
+        // membership incarnation, and an incarnation dies at most once
+        // ever, so a receipt for `w` and any `retired`/`seen` evidence of
         // `w` can only ever refer to that same, singular death, never a
-        // different, later one the receipt might otherwise need to be
-        // "caught up" to. Comparing timestamps here previously let a peer
-        // that independently discovers (and retires) the very same,
-        // already-dead writer *after* another replica has already folded
-        // it defeat that replica's own receipt purely because its own
-        // discovery-time timestamp happened to land later — silently
-        // resurrecting the removed element on every such merge, not just
-        // once outside the trust window this module's docs otherwise
-        // bound.
+        // different, later one the receipt would need to be "caught up"
+        // to.
         let dropped_by = |side: &Self, w: WriterId| -> bool {
             !side.seen.contains_key(&w)
                 && !side.retired.contains_key(&w)
@@ -406,43 +273,18 @@ where
     }
 
     /// Runs both retirement stages for the writers `retire` accepts,
-    /// returning the compacted set when anything changed, or `None`
+    /// returning the compacted set when anything changed, `None`
     /// otherwise.
     ///
-    /// **Stage one**: every writer with a tag in `adds` or an entry in
-    /// `seen` for which `retire` returns `true` and that is not already
-    /// retired gains a `retired` entry stamped `now_ms`; its `seen`
-    /// watermark, if any, is left exactly as it was. `retire` is expected
-    /// to already fold in every eligibility condition — the writer is dead,
-    /// *and* the cache is quiet — this method does not re-derive either on its own for
-    /// stage one, since both are per-writer-or-cache-wide facts only the
-    /// caller (which has the membership view) can evaluate.
-    ///
-    /// **Stage two**: only runs when `quiet` is `true` (the caller's
-    /// current, freshly-evaluated read of the same cache-wide quiet
-    /// predicate, independent of whatever was true at the moment any
-    /// writer was originally retired). Any writer retired more than
-    /// `2 * retire_after_ms` ago has its `seen` and `retired` entries
-    /// dropped, and a receipt for it left in `folded_at` under its own key.
-    /// A `folded_at` receipt already present *before this call* (never one
-    /// this same call just inserted — see the note below) is then dropped
-    /// once it is older than `3 * retire_after_ms` — see the module doc for
-    /// why that bound is safe.
-    ///
-    /// The receipt-pruning step runs against `self`'s own, pre-existing
-    /// `folded_at` before the drop above inserts anything new, so a writer
-    /// only ever advances one step per call: dropped-with-receipt this
-    /// call, or receipt-pruned on some later one, never both in the same
-    /// call. This matters because [`Self::merge`] relies on a freshly-folded
-    /// writer's receipt still being present to reconcile against a peer
-    /// replica that syncs in still holding that writer live or retired (see
-    /// [`Self::merge`]'s doc) — a call that folded a writer *and* pruned its
-    /// own brand-new receipt in one step would leave nothing behind for
-    /// that reconciliation for at least one round-trip, risking a
-    /// resurrection the very next time that peer's stale copy arrives.
-    ///
-    /// Never touches `adds`: a retired writer's existing, never-removed
-    /// elements remain first-class set members forever.
+    /// Stage one stamps a `retired` entry at `now_ms` for a writer
+    /// `retire` accepts, leaving `seen` untouched. Stage two, only when
+    /// `quiet`, drops `seen`/`retired` for a writer retired more than
+    /// `2 * retire_after_ms` ago and leaves a `folded_at` receipt; a
+    /// pre-existing receipt older than `3 * retire_after_ms` is pruned
+    /// first, against `self`'s state before that drop, so a writer
+    /// advances at most one stage per call, keeping [`Self::merge`]'s
+    /// reconciliation always finding a fresh receipt. Never touches
+    /// `adds`.
     #[must_use]
     pub(crate) fn compact(
         &self,
@@ -472,7 +314,7 @@ where
             let mut aged_any = false;
 
             // Prune pre-existing receipts *before* folding anything new
-            // this call — see the doc comment above for why the ordering
+            // this call; see the doc comment above for why the ordering
             // matters.
             if let Some(pruned) = out.prune_receipts(now_ms, bounds.receipt_ttl_ms) {
                 out = pruned;
@@ -523,17 +365,10 @@ where
 }
 
 /// A [`ConflictResolver`] that merges two [`OrSet<T>`] values via
-/// [`OrSet::merge`] instead of picking a winner, so concurrent adds and
-/// removes from any number of writers converge to the add-wins
-/// observed-remove result.
-///
-/// Falls back to plain [`crate::Hlc`]-order `A`/`B` whenever either side is
-/// a tombstone or spill-degraded view (no value to merge) or fails to
-/// decode as an [`OrSet<T>`] — a corrupt or foreign-format record degrades
-/// to last-writer-wins rather than stalling replication.
-///
-/// Carries no state of its own — `T` only selects which element type this
-/// resolver decodes as — so it is `Send`/`Sync`/`Copy` regardless of `T`.
+/// [`OrSet::merge`] instead of picking a winner, falling back to plain
+/// [`crate::Hlc`]-order `A`/`B` when either side is value-less or fails to
+/// decode as an [`OrSet<T>`]. Carries no state of its own, so it is
+/// `Send`/`Sync`/`Copy` regardless of `T`.
 pub struct OrSetResolver<T> {
     element_type: PhantomData<fn() -> T>,
 }
@@ -708,7 +543,7 @@ mod tests {
         (writer_id(), 0u64..4)
     }
 
-    /// The element a given tag adds, in the generated test data — a
+    /// The element a given tag adds, in the generated test data: a
     /// deterministic function of the tag alone, so any two independently
     /// generated sets that happen to share a tag necessarily agree on its
     /// element, matching the real invariant (a tag is minted once, for one
@@ -789,7 +624,7 @@ mod tests {
         assert_eq!(merged.iter().collect::<Vec<_>>(), Vec::<&String>::new());
     }
 
-    /// `add` then `remove` then `merge` actually removes the element.
+    /// `add` then `remove` then `merge` removes the element.
     /// Guards `is_dead_by`'s argument order: swapped, a remove's watermark
     /// is never reachable and the element stays live.
     #[test]
@@ -1020,7 +855,7 @@ mod tests {
     }
 
     /// A `folded_at` receipt is pruned only once it is old enough *and* the
-    /// cache is quiet — but only counting from before the call that created
+    /// cache is quiet, counting only from before the call that created
     /// it: a single `compact` call that folds a writer never also prunes
     /// that same brand-new receipt (see [`OrSet::compact`]'s doc for why),
     /// so this needs a further, separate call once the receipt itself has
@@ -1070,7 +905,7 @@ mod tests {
     }
 
     /// After stage two ages a writer's `seen`/`retired` entries out, the
-    /// live-membership content is otherwise unaffected — aging out is pure
+    /// live-membership content is otherwise unaffected: aging out is pure
     /// bookkeeping cleanup, not a membership change.
     #[test]
     fn compact_stage_two_never_changes_live_membership() {
@@ -1097,7 +932,7 @@ mod tests {
     /// replica B already held live at retirement time. Since `compact`
     /// never touches `adds`, A's own copy is unaffected either way, and
     /// merging A's retired state into B does not remove B's already-live
-    /// tag from the merged result (it was in both sides' `adds`).
+    /// tag from the merged result (it is in both sides' `adds`).
     #[test]
     fn retiring_a_writer_on_one_replica_does_not_disturb_a_tag_the_other_already_holds_live() {
         let w = wid(1, 0);
@@ -1147,7 +982,7 @@ mod tests {
         let new_tag_seen_elsewhere = base.merge(&OrSet::add(w, 1, "z".to_string()));
         assert!(new_tag_seen_elsewhere.contains(&"z".to_string()));
 
-        // Once X's retirement propagates via merge, the new tag is lost —
+        // Once X's retirement propagates via merge, the new tag is lost:
         // documented, bounded loss, not resurrection of a real remove.
         let merged = x.merge(&new_tag_seen_elsewhere);
         assert!(
@@ -1182,8 +1017,8 @@ mod tests {
         }
 
         /// Associativity across every one of the six orderings a
-        /// three-replica pairwise fold could apply `a`, `b`, `c` in — not
-        /// just the two groupings of a single ordering. Holds
+        /// three-replica pairwise fold could apply `a`, `b`, `c` in, not
+        /// only the two groupings of a single ordering. Holds
         /// unconditionally only while nothing has ever been retired on any
         /// side: [`OrSet::merge`]'s watermark-based fold-agreement rule is
         /// order-sensitive by design once retirement is involved, exactly
@@ -1212,7 +1047,7 @@ mod tests {
         }
 
         /// The add-wins observed-remove property itself: a remove can only
-        /// mark dead the tags it has actually observed, so a concurrent add
+        /// mark dead the tags it has observed, so a concurrent add
         /// of the same element under a fresh, unobserved tag survives the
         /// merge regardless of apply order.
         #[test]
@@ -1225,13 +1060,13 @@ mod tests {
             // Genuinely different writers: a single writer's own sequence
             // numbers are causally ordered (never issued out of order), so
             // "the same writer, a lower sequence" is not a real concurrent
-            // scenario at all — just a malformed input this property isn't
+            // scenario at all, only a malformed input this property is not
             // about.
             prop_assume!(writer_a != writer_b);
             let element = "x".to_string();
 
             let base = OrSet::add(writer_a, seq_a, element.clone());
-            // The remover observes only `base` — never the concurrent add.
+            // The remover observes only `base`, never the concurrent add.
             let removed = OrSet::remove(&base, &element);
             let concurrent_add = OrSet::add(writer_b, seq_b, element.clone());
 
@@ -1296,16 +1131,16 @@ mod tests {
     /// matches after every step. A writer's sequence counter is local to
     /// its current *incarnation*, matching the real system: this harness
     /// never restarts a writer mid-scenario, so each writer keeps one
-    /// incarnation (0) throughout — restart/incarnation-change behavior is
-    /// covered separately by the `WriterId`-specific regression tests
+    /// incarnation (0) throughout; restart/incarnation-change behavior is
+    /// covered separately by the dedicated `WriterId`-specific tests
     /// above. Once a writer is retired, a further `Add` from it is skipped
     /// identically on both sides (real and oracle) rather than generated
     /// at all, since the real system's sticky-retirement rejection of a
     /// *new* post-retirement add is already covered as its own dedicated
     /// property (`orset_compact_blocks_only_future_adds`); this harness
-    /// instead checks that everything retirement does *not* touch — every
+    /// instead checks that everything retirement does *not* touch, every
     /// pre-existing live element, and ordinary add/remove/merge/redeliver
-    /// behavior — stays exactly in step with a system that never retires
+    /// behavior, stays exactly in step with a system that never retires
     /// anyone at all.
     fn replay_and_compare(ops: &[Op]) {
         let mut real = OrSet::<String>::add(wid(999, 0), 0, "seed".to_string());
@@ -1411,7 +1246,7 @@ mod tests {
             .merge(&remove1)
             .merge(&remove1) // redelivered duplicate
             .merge(&add2);
-        // Replica B: add2, add1, remove1 — different order, no duplicate.
+        // Replica B: add2, add1, remove1, a different order, no duplicate.
         let replica_b = add2.merge(&add1).merge(&remove1);
 
         let merged_ab = replica_a.merge(&replica_b);
@@ -1432,9 +1267,9 @@ mod tests {
         let w2 = wid(2, 0);
         let base = OrSet::add(w1, 0, "x".to_string()).merge(&OrSet::add(w2, 0, "y".to_string()));
 
-        // Replica A retires w1 only; replica B retires w2 only — a stale
-        // view of each other's retirement decision, exactly the cross-stale shape
-        // `PnCounter`'s own merge tests exercise for the counter type.
+        // Replica A retires w1 only; replica B retires w2 only, a stale
+        // view of each other's retirement decision, exactly the cross-stale
+        // shape `PnCounter`'s own merge tests exercise for the counter type.
         let replica_a = base
             .compact(
                 1_000,
@@ -1546,21 +1381,21 @@ mod tests {
         );
     }
 
-    /// A properly-removed element must never resurrect just because some
+    /// A properly-removed element must never resurrect merely because some
     /// *other*, unrelated writer folds to stage two: replica C folding an
     /// unrelated writer `w3` must never "vouch" for writer `w`'s retirement
     /// on replica D too, when C has never seen `w` at all. Because
     /// `folded_at` names the specific writer it vouches for, `w`'s exact
     /// `seen` watermark survives a merge against a side that has only ever
     /// folded `w3`, closing the door to resurrecting `w`'s already-dead tag
-    /// from a stale, pre-removal copy — the removed element stays removed.
+    /// from a stale, pre-removal copy: the removed element stays removed.
     #[test]
     fn merge_never_resurrects_a_removed_element_solely_because_an_unrelated_writer_folded_later() {
         let w = wid(1, 0);
         let w3 = wid(3, 0);
 
         // Replica D: w adds "x", it is removed, then w is stage-one-retired
-        // only — never folded further.
+        // only, never folded further.
         let added = OrSet::add(w, 0, "x".to_string());
         let removed = OrSet::remove(&added, &"x".to_string());
         let d = added
@@ -1615,7 +1450,7 @@ mod tests {
     /// who has already folded that exact same writer must never defeat the
     /// peer's own receipt: an incarnation dies at most once ever, so a
     /// receipt for `w` and any `retired`/`seen` evidence of `w` on any
-    /// replica can only ever refer to that one, singular death — never a
+    /// replica can only ever refer to that one, singular death, never a
     /// different, later one. This is not a hypothetical: it is the normal
     /// shape of two independently-ticking replicas discovering the same
     /// supersession-based death at different real times (no absence wait
@@ -1648,7 +1483,7 @@ mod tests {
             )
             .expect("writer stage two fires once aged past 2x, still alone");
 
-        // Observer discovers the exact same dead writer much later —
+        // Observer discovers the exact same dead writer much later,
         // independently retiring it at its own, later discovery time.
         let observer_retired = base
             .compact(
@@ -1661,9 +1496,9 @@ mod tests {
 
         // Now they finally sync, in both directions: `x`'s own live
         // membership is unaffected by any of this either way (`compact`
-        // never touches `adds`), so the receipt's own job — keeping `w`'s
+        // never touches `adds`), so the receipt's own job, keeping `w`'s
         // `retired` entry from persisting forever once one side has
-        // already folded it — is what this actually checks.
+        // already folded it, is what this checks.
         for merged in [
             writer_folded.merge(&observer_retired),
             observer_retired.merge(&writer_folded),
@@ -1678,8 +1513,8 @@ mod tests {
         }
     }
 
-    /// Merging a compaction's own result against its pre-fold predecessor —
-    /// the same lineage — recovers the exact fully-folded shape: the
+    /// Merging a compaction's own result against its pre-fold predecessor,
+    /// the same lineage, recovers the exact fully-folded shape: the
     /// pre-fold side's `retired`/`seen` entries name exactly the writer the
     /// post-fold side's `folded_at` receipt already accounts for, so
     /// nothing is resurrected and an untouched writer's element is
@@ -1773,7 +1608,7 @@ mod tests {
     /// The documented bounded loss outside the trust window, `OrSet`'s own
     /// counterpart to `PnCounter`'s: once every replica that once tracked
     /// `w`'s retirement has folded it and then had its `folded_at` receipt
-    /// pruned, nothing is left to reject a fresh tag `w` writes afterward —
+    /// pruned, nothing is left to reject a fresh tag `w` writes afterward:
     /// the same trust boundary `tombstone_max_ttl` already documents for a
     /// member gone that long, not a new failure mode introduced by
     /// compaction. While `w`'s receipt is still present (stage two), its

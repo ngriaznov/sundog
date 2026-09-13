@@ -97,19 +97,15 @@ pub use store::{
 #[cfg(feature = "prometheus")]
 pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};
 
-/// `cluster::sketch` and `cluster::anti_entropy` are `pub(crate)`: nothing
+/// `cluster::sketch` and `cluster::anti_entropy` are `pub(crate)`; nothing
 /// outside `cluster.rs`'s own composition normally names an IBLT, its
-/// diffing, or a raw anti-entropy round directly. `tests/sim.rs` is the one
-/// exception, driving `net::Mesh` and `store::ShardOps` itself rather than a
-/// whole `Cluster`, so it needs `cluster::anti_entropy::run_round_against`
-/// itself — the partition-heal family's own scenario runs real anti-entropy
-/// rounds through this exact function rather than a reimplementation of
-/// its digest-exchange-through-repair sequence — plus [`diff_decoded`] and
-/// [`mismatched_parts`] for the handful of other scenarios that still
-/// reconcile a sketch or a part-digest reply by hand. `#[doc(hidden)]` and
-/// gated on `feature = "sim"` so none of this ever appears in the crate's
-/// normal public API, matching [`wire::Cell`]'s narrower precedent for the
-/// same module.
+/// diffing, or a raw anti-entropy round directly. `tests/sim.rs` drives
+/// `net::Mesh` and `store::ShardOps` directly rather than through a whole
+/// `Cluster`, so it needs `cluster::anti_entropy::run_round_against`,
+/// [`diff_decoded`], and [`mismatched_parts`] to run and reconcile real
+/// anti-entropy rounds by hand. `#[doc(hidden)]` and gated on `feature =
+/// "sim"` so none of this appears in the crate's normal public API,
+/// matching [`wire::Cell`]'s narrower precedent for the same module.
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use cluster::anti_entropy::{RoundOutcome, diff_decoded, mismatched_parts, run_round_against};
@@ -117,14 +113,13 @@ pub use cluster::anti_entropy::{RoundOutcome, diff_decoded, mismatched_parts, ru
 #[doc(hidden)]
 pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};
 
-/// `ownership` is `pub(crate)`: nothing outside the crate's own composition
+/// `ownership` is `pub(crate)`; nothing outside the crate's own composition
 /// normally builds or reads a `Mode::Distributed` cache's ownership view
-/// directly. `tests/sim.rs` is the one exception, driving `store::Shard`
-/// directly rather than through `Cluster`, so it needs these to seed and
-/// republish a shard's ownership view and residency set the same way
-/// `cluster::rebalance` reacts to a real membership change. `#[doc(hidden)]`
-/// and gated on `feature = "sim"` for the same reason as the re-exports
-/// above.
+/// directly. `tests/sim.rs` drives `store::Shard` directly rather than
+/// through `Cluster`, so it needs these to seed and republish a shard's
+/// ownership view and residency set the way `cluster::rebalance` reacts to
+/// a real membership change. `#[doc(hidden)]` and gated on `feature =
+/// "sim"` for the same reason as the re-exports above.
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use ownership::{

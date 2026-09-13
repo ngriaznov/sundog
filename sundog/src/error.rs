@@ -48,8 +48,8 @@ pub enum JoinError {
     /// A zeroconf announce/browse operation failed.
     #[error("discovery error")]
     Discovery(#[source] io::Error),
-    /// A [`crate::config::ClusterConfig`] field failed validation, or
-    /// [`crate::ClusterBuilder::node_id`] was given a merge-derived node id
+    /// A [`crate::config::ClusterConfig`] field fails validation, or
+    /// [`crate::ClusterBuilder::node_id`] is given a merge-derived node id
     /// (one only the engine's merge-version combinator ever mints), which no
     /// real node may use.
     #[error("invalid cluster config: {0}")]
@@ -60,7 +60,7 @@ pub enum JoinError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CacheError {
-    /// A value or key exceeded the configured max frame size and was
+    /// A value or key exceeds the configured max frame size and is
     /// rejected at the API boundary rather than fragmented.
     #[error("value for cache {cache:?} is {size} bytes, exceeding the {limit}-byte frame cap")]
     ValueTooLarge {
@@ -70,7 +70,7 @@ pub enum CacheError {
         /// The configured cap it exceeded.
         limit: usize,
     },
-    /// The named cache was opened locally with a [`crate::store::Mode`] that
+    /// The named cache is opened locally with a [`crate::store::Mode`] that
     /// conflicts with how another live node already has it configured. This
     /// check is best-effort: two nodes opening the same name at nearly the
     /// same moment can both pass it, so `cluster` re-checks on every
@@ -83,7 +83,7 @@ pub enum CacheError {
         /// The mode observed elsewhere.
         remote: crate::store::Mode,
     },
-    /// The cache was opened as [`crate::store::Mode::Replicated`] with a
+    /// The cache is opened as [`crate::store::Mode::Replicated`] with a
     /// finite `max_capacity` or `tti`. Every `Replicated` node holds every
     /// entry, so anti-entropy would silently re-pull an evicted entry back.
     /// Use [`crate::store::Mode::Invalidation`] for a bounded local cache.
@@ -109,14 +109,14 @@ pub enum CacheError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
-    /// The cache's [`crate::store::spill::SpillConfig`] failed validation at
-    /// `open()`: `region_bytes` was zero, or `capacity_bytes` was less than
+    /// The cache's [`crate::store::spill::SpillConfig`] fails validation at
+    /// `open()`: `region_bytes` is zero, or `capacity_bytes` is less than
     /// two regions.
     #[cfg(feature = "spill")]
     #[error("cache {cache:?} has an invalid spill config: {reason}")]
     InvalidSpillConfig {
         cache: SmolStr,
-        /// Why the config was rejected.
+        /// Why the config is rejected.
         reason: &'static str,
     },
     /// The cache's spill directory could not be created, or a region file
@@ -128,7 +128,7 @@ pub enum CacheError {
         #[source]
         source: io::Error,
     },
-    /// The cache was opened as [`crate::store::Mode::Distributed`] with
+    /// The cache is opened as [`crate::store::Mode::Distributed`] with
     /// `owners` under 2: a single owner is a lost bucket the instant it
     /// leaves.
     #[error("cache {cache:?} distributed mode needs at least 2 owners, got {owners}")]
@@ -143,19 +143,19 @@ pub enum CacheError {
     #[error("cache {cache:?} found no reachable owner for the requested key")]
     FetchUnavailable { cache: SmolStr },
     /// The cache is closing, or its cluster is shutting down, and the write
-    /// was for a `Mode::Distributed` bucket this node does not own: it has
-    /// no local copy to land in, so it was refused rather than accepted
+    /// is for a `Mode::Distributed` bucket this node does not own: it has
+    /// no local copy to land in, so it is refused rather than accepted
     /// and never sent. A caller that must land it retries on another node.
     /// A write this node applies itself still succeeds, as a detached
     /// local write.
     #[error("cache {cache:?} is closing; the forwarded write was refused")]
     Closed { cache: SmolStr },
-    /// [`crate::cache::CacheBuilder::merge_coalesce_window`] was set to a
+    /// [`crate::cache::CacheBuilder::merge_coalesce_window`] is set to a
     /// nonzero window on a cache whose [`crate::store::ConflictResolver`]
     /// does not merge ([`crate::store::ConflictResolver::merges`] is
     /// `false`): coalescing multiple [`crate::cache::Cache::merge`] calls
-    /// into one record only preserves every fold if the resolver can
-    /// actually fold two values, not just pick a side.
+    /// into one record only preserves every fold if the resolver can fold
+    /// two values, not only pick a side.
     #[error("cache {cache:?} set a merge coalesce window but its resolver does not merge")]
     MergeWindowRequiresMergingResolver { cache: SmolStr },
 }

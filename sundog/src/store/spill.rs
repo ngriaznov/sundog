@@ -1,84 +1,22 @@
 //! Local NVMe/SSD spill tier: a FIFO ring of fixed-size region files that
 //! extends a size-bounded cache's resident capacity onto disk.
 //!
-//! # Shape
-//!
 //! A `SpillTier` owns `region_count_for(capacity_bytes, region_bytes)`
-//! preallocated region files, `<dir>/<cache>/spill-XXXXXXXX.reg`. `open`
-//! recreates them from scratch every time; see `SpillTier::open`. One
-//! region is "active": new records append to it at its `write_cursor`. When
-//! a record doesn't fit, the next region in round-robin order is reclaimed
-//! and becomes the new active region. Its still-current keys are purged
-//! from the engine's `live` tables via `SpillSink::reclaim`, *before* it is
-//! reused. A `generation` counter per region, bumped on every reclaim, lets
-//! a read recognize a pointer into a region that has since rotated out
-//! from under it. See `SpillTier::read_at`.
+//! preallocated region files; `SpillTier::open` recreates them from
+//! scratch every call. One region is active, appending new records at its
+//! `write_cursor`; when a record doesn't fit, the next region rotates in,
+//! purging its still-current keys via `SpillSink::reclaim` first. A
+//! `generation` counter per region lets `SpillTier::read_at` recognize a
+//! pointer into a region that has since rotated out from under it.
 //!
-//! Writes go through one dedicated flusher thread, `std::thread` rather
-//! than a tokio task, since `SpillTier::try_spill` must work from sync and
-//! async callers alike, with no blocking I/O on the caller's stripe-locked
-//! hot path. It is fed by a bounded [`std::sync::mpsc::sync_channel`]:
-//! after a blocking `recv` returns one job, the flusher drains the channel
-//! greedily with `try_recv`, up to `FLUSH_BATCH_MAX_JOBS` jobs or
-//! `FLUSH_BATCH_MAX_BYTES` of summed record bytes, and encodes the whole
-//! batch into one buffer for one positional write. A batch that outgrows
-//! the active region's remaining space writes what it has, rotates, and
-//! continues the rest of the batch in the new region, so a batch costs one
-//! write per region it touches and a record never straddles two; see
-//! `flush_batch`, `write_segment`, and the pure split rule,
-//! `records_fitting_region`. Each written record then installs through
-//! `SpillSink` individually, since the sink's stripe lock is necessarily
-//! per-entry, but a batch's confirmed write count and byte total post to
-//! this module's own counters once for the whole batch, and a region's
-//! reverse-index rows post once per region the batch touches, not once per
-//! record. The flusher never re-inserts a key into the engine's tables. It
-//! calls back through `SpillSink` to flip an *existing* entry's payload in
-//! place, and only when the entry's current state still matches what was
-//! spilled, verified via `spilled_is_current`. A victim's weight is zeroed
-//! and freed from `total_weight` the moment eviction hands it off, before
-//! this thread ever touches it, so a queued-but-unwritten job that never
-//! reaches `install`, a region write whose batch failed, calls back
-//! through `SpillSink::abandon` instead, to put that weight back for every
-//! job the failed write covered. Reads are positional, `pread`/`pwrite`-
-//! style, one syscall each, with no `open()` on the hot path, using a
-//! `read_exact_at`/`write_all_at` unix implementation and a
-//! `seek_read`/`seek_write` windows one below.
+//! One dedicated flusher thread, fed by a bounded channel, batches writes
+//! into one positional write per region touched and installs each record
+//! through `SpillSink` individually; a write that never reaches
+//! `install` calls `SpillSink::abandon` to restore the victim's weight.
 //!
-//! # No wire effect
-//!
-//! Spilling is a purely local, per-node representation choice for a value
-//! already accepted and versioned. It never changes what goes on the wire.
-//! A promoted or served-from-disk value round-trips identically to a
-//! resident one, so it needs no `wire::PROTOCOL_VERSION` bump and no
-//! `store::model`/`sundog-fuzz` changes: those cover "everything downstream
-//! of a successful wire decode," and spilling has no wire decode of its own.
-//!
-//! # `sim` interaction
-//!
-//! The `sim` feature swaps only `net::tcp`'s transport seam for turmoil's; it
-//! gives no determinism or virtual-time guarantee over this module's real
-//! filesystem I/O or the flusher's real OS thread. A `SpillConfig`'d cache
-//! driven inside a turmoil `Sim` does real wall-clock disk I/O interleaved
-//! with virtual-time network traffic, an orthogonal, non-composable
-//! combination. `spill` and `sim` are never enabled together in this crate's
-//! CI, and this module's own I/O tests are gated accordingly; see the
-//! `tests` module below.
-//!
-//! # A note on this module's `pub(crate)` surface
-//!
-//! `store::engine`'s `Payload::Spilled` integration consumes every item
-//! here: eviction decides a victim's fallback with `would_accept`, still
-//! under the stripe write lock, then hands it to `enqueue` once the lock is
-//! released; a queue with no room right now reaches `SpillSink::abandon`
-//! exactly like a job whose write never reached `install`. `Engine`'s
-//! `SpillSink` impl installs and reclaims through `spilled_is_current`.
-//! `open`/`attach` are called from `Shard::with_spill`, and
-//! `read_at`/`bytes_used`/`SpilledBytes` back `Shard::get`/
-//! `Shard::get_or_load`'s promotion path and the anti-entropy/snapshot read
-//! path, both behind `spawn_blocking`. `try_spill` itself, `would_accept`
-//! plus `enqueue` in one call, is what this module's own tests drive
-//! directly and the only form a caller outside eviction's lock-sensitive
-//! path needs.
+//! Spilling never changes what goes on the wire: a purely local
+//! representation choice for an already-accepted, versioned value, needing
+//! no `wire::PROTOCOL_VERSION` bump.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -110,14 +48,13 @@ const DEFAULT_READ_CONCURRENCY: usize = 16;
 /// knob. Config-independent by design: every [`SpillConfig`] gets the same
 /// bound regardless of `capacity_bytes`. A bulk insert can evict thousands
 /// of entries under one `enforce_capacity` lock hold, all queued in a
-/// burst; at the old bound of 256 most of a large burst overflowed the
-/// queue and was dropped with `reason = "queue_full"` instead of spilled.
-/// 8192 absorbs that: a [`SpillJob`] holds two refcounted [`Bytes`] handles
-/// plus a few words, so the queue's own memory footprint stays small even
-/// at this depth, and the bytes those handles point at are already
-/// resident in RAM regardless of whether the job sits in this queue or the
-/// entry sits in `live` — queuing it costs nothing beyond what is already
-/// paid for.
+/// burst; a smaller bound would drop most of a large burst with `reason =
+/// "queue_full"` instead of spilling it. 8192 absorbs that: a [`SpillJob`]
+/// holds two refcounted [`Bytes`] handles plus a few words, so the queue's
+/// own memory footprint stays small even at this depth, and the bytes
+/// those handles point at are already resident in RAM regardless of
+/// whether the job sits in this queue or the entry sits in `live`, so
+/// queuing it costs nothing beyond what is already paid for.
 pub(crate) const FLUSH_QUEUE_CAPACITY: usize = 8192;
 /// Bound on how many jobs one flusher batch coalesces into as few
 /// positional writes as its rotations require. After a blocking `recv`
@@ -234,7 +171,7 @@ impl SpillConfig {
         self.flush_queue_bytes.unwrap_or(self.region_bytes)
     }
 
-    /// Checks this config before it is used to [`SpillTier::open`] a tier.
+    /// Checks this config before [`SpillTier::open`] uses it to open a tier.
     ///
     /// Rejects a zero `region_bytes`, a `region_bytes` too large to address
     /// with the tier's 32-bit on-disk offsets, a `capacity_bytes` less than
@@ -341,17 +278,16 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
     /// `live_count`. Returns how many were removed.
     fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize;
 
-    /// A queued job for `key_bytes` was never installed: its region write
-    /// failed, or the tier stopped accepting jobs while this one was still
+    /// A queued job for `key_bytes` is never installed: its region write
+    /// fails, or the tier stops accepting jobs while this one is still
     /// queued unwritten. Either way the victim's weight, zeroed at
     /// hand-off, needs restoring. Under the stripe write lock, finds a
     /// `Resident` entry at exactly `ver` with weight `0`, recomputes its
     /// weight through the weigher, stores it, and adds it back to
     /// `total_weight`. A key whose stored state changed in the meantime, a
-    /// fresh write, a tombstone, or (impossible in practice, but never
-    /// assumed) an install that already ran, is left untouched: that
-    /// change already accounted for the weight this job would have
-    /// restored.
+    /// fresh write, a tombstone, or (never expected, but never assumed) an
+    /// install that already ran, is left untouched: that change already
+    /// accounted for the weight this job would have restored.
     fn abandon(&self, stripe_idx: usize, key_bytes: &Bytes, hash: u64, ver: Hlc, weight: u32);
 }
 
@@ -424,9 +360,9 @@ pub(crate) fn record_fits_queue(
 /// `"deferred"` when `keep_resident_when_refused` is set, since the caller
 /// leaves the victim resident and retries it on a later eviction pass
 /// rather than deleting it, so an operator sees backpressure instead of a
-/// delete reason that no longer describes what happened; `specific`
-/// (`"too_large"`, `"closed"`, or `"queue_full"`) unchanged otherwise,
-/// exactly as before this policy existed. Pure; unit tested directly.
+/// delete reason that fails to describe what happened; `specific`
+/// (`"too_large"`, `"closed"`, or `"queue_full"`) unchanged otherwise. Pure;
+/// unit tested directly.
 pub(crate) fn refusal_drop_reason(
     keep_resident_when_refused: bool,
     specific: &'static str,
@@ -517,7 +453,7 @@ struct Inner {
     flush_queue_bytes: u64,
     /// Summed record length, header included, of every job currently
     /// sitting in the flusher's channel: added in
-    /// [`SpillTier::enqueue`] once a job is actually sent, subtracted in
+    /// [`SpillTier::enqueue`] once a job is sent, subtracted in
     /// [`flusher_loop`] the instant the flusher takes it back off the
     /// channel, whether or not it has been written yet. Bounds the
     /// flusher's RAM backlog independently of
@@ -531,7 +467,7 @@ struct Inner {
     /// or [`SpillTier::enqueue`] declining) leaves its victim resident
     /// instead of the caller falling back to a delete: `Shard::attach_spill`
     /// sets this for a `Mode::Replicated` shard, where a local delete would
-    /// just have anti-entropy repair the entry back in from every peer that
+    /// have anti-entropy repair the entry back in from every peer that
     /// still holds it.
     keep_resident_when_refused: AtomicBool,
     /// Test-only: [`flusher_loop`] blocks here instead of pulling its next
@@ -546,13 +482,13 @@ impl Inner {
     /// one of: `"too_large"`, the record can never fit any region, checked
     /// by [`record_too_large`] before it is ever queued; `"closed"`, a
     /// [`SpillTier::try_spill`] call after [`SpillTier::close`];
-    /// `"queue_full"`, the flusher's bounded channel has no room, or was
-    /// never attached; `"obsolete"`, the flusher wrote the record, but
+    /// `"queue_full"`, the flusher's bounded channel has no room, or none
+    /// is attached; `"obsolete"`, the flusher wrote the record, but
     /// [`SpillSink::install`] rejected it because the key's state had
     /// already moved on; or `"deferred"`, one of the first three refusals
     /// but recorded under this reason instead because
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
-    /// policy — see [`refusal_drop_reason`].
+    /// policy; see [`refusal_drop_reason`].
     fn record_dropped(&self, reason: &'static str) {
         metrics::counter!(
             "sundog_spill_dropped_total",
@@ -563,8 +499,8 @@ impl Inner {
     }
 
     /// Increments `sundog_spill_writes_total{cache}` by `count`, once per
-    /// flush batch for however many of its jobs actually installed, rather
-    /// than once per record.
+    /// flush batch for however many of its jobs installed, rather than
+    /// once per record.
     fn record_writes(&self, count: u64) {
         metrics::counter!("sundog_spill_writes_total", "cache" => self.cache_name.clone())
             .increment(count);
@@ -616,6 +552,12 @@ impl SpillTier {
     ///
     /// Does not start the flusher thread. Call [`SpillTier::attach`] once
     /// the engine implementing [`SpillSink`] exists.
+    ///
+    /// Under `feature = "sim"`, this still does real filesystem I/O and
+    /// runs the flusher on a real OS thread: `sim` swaps only `net::tcp`'s
+    /// transport for turmoil's, giving no determinism or virtual-time
+    /// guarantee here, so `spill` and `sim` are never enabled together in
+    /// this crate's CI.
     ///
     /// # Errors
     ///
@@ -739,15 +681,15 @@ impl SpillTier {
     /// rather than the caller falling back to a delete. `Shard::attach_spill`
     /// calls this once, right after [`SpillTier::open`], from the shard's
     /// `Mode`: `Mode::Replicated` passes `true`, since every peer still
-    /// holds the entry and a local delete would just have anti-entropy
+    /// holds the entry and a local delete would have anti-entropy
     /// repair it back in; `Mode::Local`/`Mode::Invalidation` never call
     /// this, leaving the default of `false`, the delete fallback those
-    /// modes have always used and still need, to keep RAM bounded with no
-    /// repair loop to guard against. Also steers which reason
+    /// modes need to keep RAM bounded with no repair loop to guard
+    /// against. Also steers which reason
     /// [`SpillTier::would_accept`]/[`SpillTier::enqueue`] record a refusal
     /// under: `"deferred"` in place of `"too_large"`/`"closed"`/
     /// `"queue_full"` once this is `true`, so an operator sees backpressure
-    /// rather than a delete reason that no longer describes what happened.
+    /// rather than a delete reason that fails to describe what happened.
     pub(crate) fn set_keep_resident_when_refused(&self, keep: bool) {
         self.inner
             .keep_resident_when_refused
@@ -774,8 +716,8 @@ impl SpillTier {
 
     /// Non-blocking, best-effort: `false` means the record can never fit any
     /// region, `reason = "too_large"`, or [`SpillTier::close`] has run,
-    /// `reason = "closed"`, or the flusher's queue has no room, or was
-    /// never attached, `reason = "queue_full"` either way. The caller
+    /// `reason = "closed"`, or the flusher's queue has no room, or none is
+    /// attached, `reason = "queue_full"` either way. The caller
     /// must fall back to an unconditional delete. Never touches disk on
     /// this call, so it is safe to call while holding a stripe write
     /// lock.
@@ -803,7 +745,7 @@ impl SpillTier {
     /// [`SpillTier::enqueue`], this is cheap enough to call while holding a
     /// stripe write lock. `false` increments `sundog_spill_dropped_total`
     /// with `reason = "too_large"`, `reason = "closed"`, or `reason =
-    /// "queue_full"` for the byte bound, whichever applied — or `reason =
+    /// "queue_full"` for the byte bound, whichever applies, or `reason =
     /// "deferred"` in place of any of those three once
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
     /// policy, since the caller then leaves the victim resident instead of
@@ -839,7 +781,7 @@ impl SpillTier {
     /// `Err` on failure, since a full or missing channel is the only way
     /// this can fail; a caller with no further use for the job on failure
     /// can discard it, exactly like `try_spill`'s plain `bool`. `reason =
-    /// "queue_full"` covers both a full queue and one that was never
+    /// "queue_full"` covers both a full queue and one with none
     /// attached, or `reason = "deferred"` in either case once
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
     /// policy. Never touches disk, but does take the channel's own lock,
@@ -916,9 +858,9 @@ impl SpillTier {
         }
         let mut buf = vec![0u8; loc.len as usize];
         pread_exact(&region.file, &mut buf, u64::from(loc.offset))?;
-        // The region may have rotated while this read was in flight; a
-        // generation bump after the fact means these bytes may already
-        // belong to an unrelated later record.
+        // The region may rotate while this read is in flight; a generation
+        // bump after the fact means these bytes may already belong to an
+        // unrelated later record.
         if region.generation.load(Ordering::Acquire) != loc.generation {
             return Ok(None);
         }
@@ -930,7 +872,7 @@ impl SpillTier {
         self.inner.bytes_used.load(Ordering::Acquire)
     }
 
-    /// The cache name this tier was [`SpillTier::open`]ed under. The
+    /// The cache name this tier is [`SpillTier::open`]ed under. The
     /// `cache` label every metric this module or its `SpillSink` caller,
     /// `engine::Engine`, publishes carries.
     pub(crate) fn cache_name(&self) -> &str {
@@ -995,7 +937,7 @@ fn build_header(job: &SpillJob, key_len: u32, value_len: u32) -> SpillRecordHead
 /// [`SpilledBytes`], or `None` for anything that doesn't check out: a short
 /// buffer, a bad magic, a length mismatch, or a checksum mismatch. Every
 /// one of these is treated identically. A corrupted or torn record reads
-/// like a record that was never there.
+/// like one that is never there.
 fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
     let (header, rest) = SpillRecordHeader::read_from_prefix(buf).ok()?;
     if header.magic != SPILL_MAGIC {
@@ -1067,9 +1009,9 @@ fn wait_while_flusher_paused(_inner: &Inner) {}
 /// A job's on-disk record length, header plus key plus value, together with
 /// the header's own `key_len`/`value_len` fields, computed once per job and
 /// reused for both the batch-drain byte bound and the record it builds.
-/// `None` only if `job`'s key or value is too long to ever have passed
+/// `None` only if `job`'s key or value is too long to ever pass
 /// `SpillTier::would_accept`'s own `record_too_large` check before this job
-/// was ever queued; unreachable in practice, never assumed.
+/// is queued; unreachable, never assumed.
 fn job_record_lens(job: &SpillJob) -> Option<(u32, u32, u32)> {
     let key_len = u32::try_from(job.key_bytes.len()).ok()?;
     let value_len = u32::try_from(job.encoded.len()).ok()?;
@@ -1103,7 +1045,7 @@ struct PreparedJob {
 /// region's reverse-index rows post once per region the batch touches
 /// rather than once per record. A region whose write fails calls
 /// `sink.abandon` for every job that segment held; jobs in a segment
-/// written earlier in the same batch are unaffected.
+/// already written in the same batch are unaffected.
 fn flush_batch(inner: &Inner, sink: &dyn SpillSink, jobs: Vec<SpillJob>) {
     let mut pending: Vec<PreparedJob> = Vec::with_capacity(jobs.len());
     for job in jobs {
@@ -1166,8 +1108,7 @@ fn flush_batch(inner: &Inner, sink: &dyn SpillSink, jobs: Vec<SpillJob>) {
 /// the enclosing batch's single counter increment and byte total. A failed
 /// write calls `sink.abandon` for every job in `segment` and returns
 /// `(0, 0)`; the region's write cursor is left untouched either way the
-/// write itself resolves, since it only ever advances past bytes actually
-/// on disk.
+/// write itself resolves, since it only ever advances past bytes on disk.
 fn write_segment(
     inner: &Inner,
     sink: &dyn SpillSink,
@@ -1353,7 +1294,7 @@ mod tests {
         // 60 bytes are free; a 4-byte record lands exactly on the boundary
         // and is taken, a following 1-byte record is not.
         assert_eq!(records_fitting_region(60, 64, &[4, 1]), 1);
-        // The same 4-byte record one byte later no longer fits at all.
+        // The same 4-byte record one byte later does not fit at all.
         assert_eq!(records_fitting_region(61, 64, &[4]), 0);
     }
 
@@ -1550,7 +1491,7 @@ mod tests {
         const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
         /// One `reclaim` call: the region and generation being reused, and
-        /// the `(stripe_idx, key_bytes)` pairs it was asked to purge.
+        /// the `(stripe_idx, key_bytes)` pairs to purge.
         type ReclaimCall = (u32, u32, Vec<(usize, Bytes)>);
 
         #[derive(Default)]
@@ -1924,7 +1865,7 @@ mod tests {
             let write_counts = WriteCounts::default();
             // Same single-process-global-slot race every other metrics-
             // reading test in this module tolerates: if another test already
-            // won the slot, this one just skips the counter assertion below.
+            // won the slot, this one skips the counter assertion below.
             let recorder_installed = metrics::set_global_recorder(WriteRecorder {
                 counts: write_counts.clone(),
             })
@@ -2065,7 +2006,7 @@ mod tests {
             // `flush_batch` call writes them as a single segment; the
             // region's file handle is reopened read-only, so the segment's
             // one positional write fails deterministically for every job it
-            // holds, not just the first.
+            // holds, the first included.
             let dir = temp_dir("write-fails");
             let record_len = HEADER_LEN as u64 + 6 + 4; // fixed-width key/value
             let region_bytes = record_len * 4;

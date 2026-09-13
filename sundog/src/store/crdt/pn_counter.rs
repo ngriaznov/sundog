@@ -2,65 +2,26 @@
 //! to the exact total, with no read before write and no lost updates under
 //! concurrent apply.
 //!
-//! Each writer owns exactly one slot in `p` (its cumulative increments) and
-//! one in `n` (its cumulative decrements) — the standard PN-Counter
-//! decomposition into two G-Counters, each merging by pointwise maximum. A
-//! writer's successive writes must each carry its own cumulative total
-//! ([`PnCounter::local_delta`]), never a one-shot increment: two independent
-//! "+1" deltas from the same writer merge to `1` under `max`, silently
-//! dropping the second. A writer tracks its own running total (an
-//! `AtomicU64` is typical) and calls `local_delta` with the new cumulative
-//! value on every local write.
+//! Each writer owns one slot in `p` (cumulative increments) and one in `n`
+//! (cumulative decrements), the standard PN-Counter decomposition into two
+//! G-Counters merging by pointwise maximum. A writer's successive writes
+//! carry its own cumulative total ([`PnCounter::local_delta`]), never a
+//! one-shot increment, since two independent "+1" deltas from the same
+//! writer merge to `1` under `max`. A slot is keyed by [`WriterId`], not
+//! [`NodeId`] alone, so a restarted node's fresh incarnation never resumes
+//! or clobbers its pre-restart total; see [`WriterId`]'s doc.
 //!
-//! A slot is keyed by [`WriterId`], not by [`NodeId`] alone: a node that
-//! restarts writes from a fresh incarnation, so its pre-restart total keeps
-//! its own slot forever rather than being resumed (or clobbered) by the new
-//! process — [`WriterId`]'s own doc comment has the full rationale.
-//!
-//! # Retirement
-//!
-//! A writer gone long enough is retired out of `p`/`n` in two stages
-//! ([`PnCounter::compact`]):
-//!
-//! - **Stage one** moves the writer's slot into a per-writer `retired` entry
-//!   (its `p`/`n` values plus the time of retirement). This is exact under
-//!   any staleness: merging two replicas that each independently retired a
-//!   different writer, while still holding a live, more-current slot for the
-//!   *other* replica's writer, recovers both writers' true totals exactly
-//!   (see [`PnCounter::merge`]'s doc).
-//! - **Stage two**, once the cache is quiet and the retirement is older than
-//!   twice `CompactionBounds::retire_after_ms` (twice
-//!   [`ClusterConfig::crdt_retire_after`](crate::ClusterConfig::crdt_retire_after)
-//!   for the resolver this crate ships), folds the per-writer entry into a
-//!   bounded scalar (`folded_p`/`folded_n`) and leaves a receipt for it in
-//!   `folded_at`: `w`'s own `since_ms`, recorded under `w`'s own key — a
-//!   per-writer *credential*, not a value, so [`PnCounter::merge`] can tell
-//!   "this side has actually folded writer `w`" from "this side has folded
-//!   some *other* writer whose retirement time happens to be later" — the
-//!   two are not the same fact, and a single cross-writer watermark
-//!   conflating them would silently drop a still-tracked writer's
-//!   contribution even though nothing about it is stale. `folded_at` itself
-//!   is bounded: once a receipt is older than
-//!   [`CompactionBounds::receipt_ttl_ms`], safely past the point every
-//!   reachable replica is guaranteed to have independently folded the same
-//!   writer too, `PnCounter::prune_receipts` drops it, run both by the
-//!   compaction sweep and, via [`PnCounterResolver::settle`], on every
-//!   merge apply, so a receipt one replica's sweep has already dropped
-//!   cannot ride back in from a peer whose sweep has not reached it yet.
-//!   This is exact whenever every replica's receipts are honest about
-//!   what they have actually folded. A replica isolated past
-//!   `receipt_ttl_ms`, still holding a live `p`/`n` slot for a writer
-//!   every other replica has already folded away and pruned the receipt
-//!   for, double-counts that writer's contribution the moment it
-//!   reconnects and merges (the [`super::OrSet`] analogue resurrects that
-//!   writer's already-removed elements instead): the same trust boundary
-//!   `tombstone_max_ttl` already accepts for a member gone that long, not
-//!   a new one.
+//! Compaction retires a long-gone writer in two stages
+//! ([`PnCounter::compact`]): stage one moves its slot into a `retired`
+//! entry; stage two, once quiet and retired long enough, folds it into a
+//! bounded `folded_p`/`folded_n` accumulator and leaves a `folded_at`
+//! receipt so [`PnCounter::merge`] can tell an already-folded writer from
+//! mere silence about one. `PnCounter::prune_receipts` drops a receipt
+//! past `receipt_ttl_ms`, under the same trust boundary `tombstone_max_ttl`
+//! accepts for a long-gone member.
 //!
 //! [`PnCounter::encode`]/[`PnCounter::decode`] are thin postcard wrappers
-//! around this type's one wire layout — every field, always. This layout is
-//! this crate's own; no released node predates it, so there is nothing to
-//! stay compatible with. A future change to it is versioned then.
+//! around this type's one wire layout; a future change to it is versioned.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -70,8 +31,8 @@ use serde::{Deserialize, Serialize};
 use super::WriterId;
 use crate::store::{CompactionBounds, ConflictResolver, Merged, RecordView, Winner};
 
-/// A writer's contribution at (and after) the moment it was retired: its
-/// `p`/`n` slots as they stood then, and when retirement happened. Stays
+/// A writer's contribution at (and after) the moment it is retired: its
+/// `p`/`n` slots as they stand then, and when retirement happens. Stays
 /// disjoint from `PnCounter::p`/`PnCounter::n` for the same writer at all
 /// times (the invariant [`PnCounter::merge`] and [`PnCounter::compact`] both
 /// maintain).
@@ -79,7 +40,7 @@ use crate::store::{CompactionBounds, ConflictResolver, Merged, RecordView, Winne
 struct Retired {
     p: u64,
     n: u64,
-    /// Epoch milliseconds this writer's slot was moved into `retired`.
+    /// Epoch milliseconds this writer's slot moves into `retired`.
     /// Merges by minimum, so every replica ages a writer from the earliest
     /// retirement anyone recorded.
     since_ms: u64,
@@ -87,7 +48,7 @@ struct Retired {
 
 /// A PN-Counter: per-writer cumulative increments and decrements that merge
 /// by pointwise maximum, converging to the exact total regardless of apply
-/// order, duplication, or how many writers have ever written to it — plus
+/// order, duplication, or how many writers have ever written to it, plus
 /// the bounded, two-stage retirement state described in the module docs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PnCounter {
@@ -96,23 +57,18 @@ pub struct PnCounter {
     retired: BTreeMap<WriterId, Retired>,
     /// This replica's own bounded stage-two fold: a single running total,
     /// not one slot per replica. [`Self::merge`] never sums two sides'
-    /// `folded_p` together — a writer's contribution must be counted
-    /// exactly once — it instead takes whichever side's bound already
+    /// `folded_p` together, since a writer's contribution must be counted
+    /// exactly once; it instead takes whichever side's bound already
     /// accounts for at least as much, deciding that via [`Self::folded_at`].
     folded_p: u64,
     folded_n: u64,
     /// A per-writer receipt: `w`'s own `since_ms` the moment this replica
-    /// folds `w` into `folded_p`/`folded_n`. Unlike a single cross-writer
-    /// watermark, this can only ever vouch for a writer it was actually
-    /// recorded for — [`Self::merge`] trusts a side's silence about `w` (no
-    /// live slot, no retired entry) to mean "already folded away" only once
-    /// that side's own `folded_at` names `w` specifically with a `since_ms`
-    /// at least as late as the merged `retired` entry's; before that,
-    /// silence just means "never heard of `w` yet", and the writer's
-    /// per-writer `retired` entry is kept instead of assumed folded. A
-    /// receipt is dropped once it is old enough that every reachable
-    /// replica is guaranteed to have independently folded the same writer
-    /// too — see [`Self::compact`].
+    /// folds `w` into `folded_p`/`folded_n`. [`Self::merge`] trusts a
+    /// side's silence about `w` as "already folded" only once its own
+    /// `folded_at` names `w` with a `since_ms` at least as late as the
+    /// merged `retired` entry's. Dropped once old enough that every
+    /// reachable replica has independently folded the same writer too;
+    /// see [`Self::compact`].
     folded_at: BTreeMap<WriterId, u64>,
 }
 
@@ -164,58 +120,27 @@ impl PnCounter {
         }
     }
 
-    /// Folds `other` into a new counter in two stages. Takes no clock and no
-    /// bound: every timing decision this needs was already made by whichever
-    /// `compact` call produced `self`/`other`'s own state, and is carried in
+    /// Folds `other` into a new counter in two stages. Takes no clock or
+    /// bound: every timing decision is already made by whichever
+    /// `compact` call produced `self`/`other`'s state, carried in
     /// `folded_at`.
     ///
-    /// **Stage one** rebuilds the per-writer `retired` map as the union of
-    /// both sides' retired writers: for each, `p`/`n` become the maximum
-    /// over *both* sides' retired entry (if any) *and* both sides' still-live
-    /// `p`/`n` slot (if any) for that writer, and `since_ms` becomes the
-    /// minimum of the sides that have it retired. Folding in a still-live
-    /// slot is what makes this exact under the classic cross-stale-retirement
-    /// case: replica A retires writer `w1` at a stale value while still
-    /// holding replica B's writer `w2` live and current, and vice versa —
-    /// merging recovers both writers' true totals exactly, never the
-    /// undercounted result a plain scalar bound would produce.
+    /// Stage one rebuilds `retired` as the union of both sides', taking
+    /// each writer's max `p`/`n` (over both sides' retired and still-live
+    /// slots) and minimum `since_ms`, which keeps the cross-stale-retirement
+    /// case exact. Stage two drops a writer from `retired` once either
+    /// side's `folded_at` receipt for it is at least as recent as the
+    /// merged entry, crediting its bound into that side's
+    /// `folded_p`/`folded_n` first; the merged bound is the greater of the
+    /// two, never their sum. `p`/`n` are the pointwise maximum of both
+    /// sides, excluding every writer now `retired`.
     ///
-    /// **Stage two** decides, for each writer `w` now in that unioned
-    /// `retired` map, whether either side has already folded `w` away: side
-    /// `x` counts as having folded `w` when `x` carries no live slot and no
-    /// retired entry for it, *and* `x.folded_at` names `w` specifically with
-    /// a `since_ms` at least as late as `w`'s (merged) `since_ms` — the
-    /// per-writer receipt is what lets `x`'s silence be trusted as "already
-    /// folded", rather than "never heard of `w` yet"; a coincidentally
-    /// high-water receipt for some *other* writer can never stand in for it,
-    /// unlike a single cross-writer watermark would. A writer folded by
-    /// either side is dropped from the merged `retired` map. Each side's new
-    /// bound is its own `folded_p` plus the `retired` totals of every writer
-    /// folded by the *other* side but not by it — a value already present in
-    /// the other side's scalar, credited here only so the comparison below
-    /// is fair — and the merged `folded_p` is the greater of the two, never
-    /// their sum: two replicas that independently fold *different* dead
-    /// writers converge because each side's own bound already accounts for
-    /// the other's fold once their retired maps cross paths through this
-    /// same rule on a later merge, not because both scalars are added
-    /// together. `folded_n` mirrors `folded_p`; `folded_at` is the union of
-    /// both sides', taking the later `since_ms` for a writer both sides have
-    /// a receipt for (a receipt only ever grows more permissive). `p`/`n`
-    /// themselves are the pointwise maximum of both sides, excluding every
-    /// writer now in the merged `retired` map (the invariant that keeps a
-    /// writer's live slot and its retired entry mutually exclusive).
-    ///
-    /// This is exact whenever every replica's receipts are an honest record
-    /// of what it has actually folded — true for anything `compact` itself
-    /// produces: when a peer whose own copy still holds a writer as
-    /// `retired` (or even still live) syncs against a replica that has
-    /// already folded that same writer away, the folded side's receipt for
-    /// it is exactly what lets the still-retired (or still-live) side's
-    /// entry be reconciled without double-counting it.
-    /// Commutative and idempotent unconditionally (proved by this module's
-    /// proptests); associative only while nothing has ever been retired on
-    /// any side, since stage two's fold is order-sensitive by design once
-    /// retirement is involved.
+    /// `merge_is_commutative_for_any_shape` and
+    /// `merge_is_idempotent_for_any_shape` hold unconditionally;
+    /// `merge_is_associative_three_way_all_orderings_with_no_retired_state`
+    /// only once nothing is retired.
+    /// `merge_never_double_counts_when_a_peer_discovers_the_same_death_after_a_fold`
+    /// pins the receipt exactness this relies on.
     #[must_use]
     pub fn merge(&self, other: &Self) -> Self {
         let mut retired: BTreeMap<WriterId, Retired> = BTreeMap::new();
@@ -246,20 +171,13 @@ impl PnCounter {
         }
 
         // Whether `side` already folded `w` away: no live slot, no retired
-        // entry, and a per-writer receipt naming `w` specifically — with no
-        // `since_ms` comparison, since a `WriterId` names one specific
-        // membership incarnation and an incarnation dies at most once
-        // ever: a receipt for `w` and *any* `retired`/live evidence of `w`
-        // can only ever refer to that same, singular death, never a
-        // different, later one the receipt might otherwise need to be
-        // "caught up" to. Comparing timestamps here previously let a peer
-        // that independently discovers (and retires) the very same,
-        // already-dead writer *after* another replica has already folded
-        // it defeat that replica's own receipt purely because its own
-        // discovery-time timestamp happened to land later — silently
-        // double-counting the writer's contribution on every such merge,
-        // not just once outside the trust window this module's docs
-        // otherwise bound.
+        // entry, and a per-writer receipt naming `w` specifically, with no
+        // `since_ms` comparison needed. A `WriterId` names one specific
+        // membership incarnation, and an incarnation dies at most once
+        // ever, so a receipt for `w` and any `retired`/live evidence of
+        // `w` can only ever refer to that same, singular death, never a
+        // different, later one the receipt would need to be "caught up"
+        // to.
         let already_folded = |side: &Self, w: WriterId| -> bool {
             !side.retired.contains_key(&w)
                 && !side.p.contains_key(&w)
@@ -319,37 +237,18 @@ impl PnCounter {
         }
     }
 
-    /// Retires writers `retire` accepts out of `p`/`n`, in two stages, and
-    /// returns the changed value — `None` if nothing changed.
+    /// Retires writers `retire` accepts out of `p`/`n`, in two stages,
+    /// returning the changed value, `None` if nothing changed.
     ///
-    /// **Stage one**: every writer currently holding a live `p` or `n` slot
-    /// for which `retire` returns `true` has that slot moved into a fresh
-    /// `retired` entry stamped with `now_ms`.
-    ///
-    /// **Stage two**, only while `quiet` is `true` (every other member of
-    /// this cache is either continuously present, or gone, for at least
-    /// `bounds.retire_after_ms`, the caller's job to evaluate, not this
-    /// method's): every `retired` entry older than
-    /// `2 * bounds.retire_after_ms` is folded into `folded_p`/`folded_n`
-    /// and dropped from the per-writer map, leaving a receipt for it in
-    /// `folded_at` under its own key. A `folded_at` receipt already
-    /// present *before this call* (never one this same call just
-    /// inserted, see the note below) is then dropped once it is older
-    /// than `bounds.receipt_ttl_ms`, bounding the record's metadata under
-    /// sustained churn.
-    ///
-    /// The receipt-pruning step runs against `self`'s own, pre-existing
-    /// `folded_at` before the fold above inserts anything new, so a writer
-    /// only ever advances one step per call: fold-with-receipt this call, or
-    /// receipt-pruned on some later one, never both in the same call. This
-    /// matters because [`Self::merge`] relies on a freshly-folded writer's
-    /// receipt still being present to reconcile against a peer replica that
-    /// syncs in still holding that writer's old, unfolded `retired` entry
-    /// (see [`Self::merge`]'s doc) — a call that folded a writer *and*
-    /// pruned its own brand-new receipt in one step would leave nothing
-    /// behind for that reconciliation for at least one round-trip, risking
-    /// double-counting the writer's contribution the very next time that
-    /// peer's stale copy arrives.
+    /// Stage one moves any writer's live `p`/`n` slot that `retire`
+    /// accepts into a `retired` entry stamped `now_ms`. Stage two, only
+    /// while `quiet`, folds a `retired` entry older than
+    /// `2 * bounds.retire_after_ms` into `folded_p`/`folded_n` and leaves
+    /// a `folded_at` receipt; a pre-existing receipt older than
+    /// `bounds.receipt_ttl_ms` is pruned first, against `self`'s state
+    /// before that fold, so a writer advances at most one stage per call,
+    /// keeping [`Self::merge`]'s reconciliation always finding a fresh
+    /// receipt.
     #[must_use]
     pub(crate) fn compact(
         &self,
@@ -386,7 +285,7 @@ impl PnCounter {
             let mut aged_any = false;
 
             // Prune pre-existing receipts *before* folding anything new
-            // this call — see the doc comment above for why the ordering
+            // this call; see the doc comment above for why the ordering
             // matters.
             if let Some(pruned) = out.prune_receipts(now_ms, bounds.receipt_ttl_ms) {
                 out = pruned;
@@ -471,7 +370,7 @@ impl PnCounter {
 
 /// Slot-wise maximum of two keyed totals: the join operation [`PnCounter`]'s
 /// `p`/`n` sides use, keyed by [`WriterId`]. Safe whenever each key's own
-/// value only ever grows at its source — true for a writer's own
+/// value only ever grows at its source: true for a writer's own
 /// cumulative delta, the only thing this crate ever merges this way.
 fn pointwise_max<K: Ord + Copy>(a: &BTreeMap<K, u64>, b: &BTreeMap<K, u64>) -> BTreeMap<K, u64> {
     let mut merged = a.clone();
@@ -484,7 +383,7 @@ fn pointwise_max<K: Ord + Copy>(a: &BTreeMap<K, u64>, b: &BTreeMap<K, u64>) -> B
     merged
 }
 
-/// [`pointwise_max`], then drops every writer now present in `excluding` —
+/// [`pointwise_max`], then drops every writer now present in `excluding`,
 /// the invariant that keeps a writer's live slot and its retired entry
 /// mutually exclusive.
 fn pointwise_max_excluding(
@@ -498,20 +397,10 @@ fn pointwise_max_excluding(
 }
 
 /// A [`ConflictResolver`] that merges two [`PnCounter`] values via
-/// [`PnCounter::merge`] instead of picking a winner, so concurrent increments
-/// and decrements from any number of writers converge to the exact total
-/// with no lost updates.
-///
-/// Falls back to plain [`crate::Hlc`]-order `A`/`B` whenever either side is a
-/// tombstone or spill-degraded view (no value to merge) or fails to decode
-/// as a [`PnCounter`] — a corrupt or foreign-format record degrades to
-/// last-writer-wins rather than stalling replication.
-///
-/// A unit struct, kept constructible as a bare value (`PnCounterResolver`)
-/// like every other resolver in this crate, so existing `Arc::new(PnCounterResolver)`
-/// call sites are unaffected by compaction support landing here: `compact`'s
-/// `bounds` is one of its parameters, not resolver state, so there is
-/// nothing to construct differently.
+/// [`PnCounter::merge`] instead of picking a winner, falling back to plain
+/// [`crate::Hlc`]-order `A`/`B` when either side is value-less or fails to
+/// decode as a [`PnCounter`]. A unit struct, constructible as a bare value
+/// like every other resolver in this crate.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PnCounterResolver;
 
@@ -593,7 +482,7 @@ mod tests {
     /// who has already folded that exact same writer must never defeat the
     /// peer's own receipt: an incarnation dies at most once ever, so a
     /// receipt for `w` and any `retired`/live evidence of `w` on any
-    /// replica can only ever refer to that one, singular death — never a
+    /// replica can only ever refer to that one, singular death, never a
     /// different, later one. This is not a hypothetical: it is the normal
     /// shape of two independently-ticking replicas discovering the same
     /// supersession-based death at different real times (no absence wait
@@ -625,8 +514,8 @@ mod tests {
             )
             .expect("writer stage two fires once aged past 2x, still alone");
 
-        // Observer discovers the exact same dead writer much later — e.g.
-        // gossip propagation delay, or its own tick simply landing later —
+        // Observer discovers the exact same dead writer much later, e.g.
+        // gossip propagation delay, or its own tick landing later,
         // independently retiring it at its own, later discovery time.
         let observer_retired = base
             .compact(
@@ -811,7 +700,7 @@ mod tests {
 
     /// The classic stage-one exactness case a scalar-only bound would
     /// undercount: A retires `w1` at a stale value while B still holds
-    /// `w1` live and current, and vice versa for `w2` — neither side has
+    /// `w1` live and current, and vice versa for `w2`; neither side has
     /// folded either writer past a per-writer `retired` entry, so this
     /// exercises stage one alone.
     #[test]
@@ -850,9 +739,9 @@ mod tests {
     /// replicas at three different times, converges to the exact total
     /// however the merges are ordered: since every replica's fold names
     /// the very same writer and total, taking the max of their bounds
-    /// (never a sum) is exact — this is the fix for the bug a per-replica-
-    /// keyed accumulator had, where N replicas each folding the same dead
-    /// writer counted its contribution N times.
+    /// (never a sum) is exact. Taking the max of independent per-replica
+    /// bounds, never a sum, keeps N independent folds of the same writer
+    /// counted once.
     #[test]
     fn merge_recovers_the_exact_total_when_n_replicas_independently_fold_the_same_writer_at_different_times()
      {
@@ -894,18 +783,18 @@ mod tests {
         );
     }
 
-    /// Merging a compaction's own result against its pre-fold predecessor —
-    /// the same lineage, not an independently-folded copy — recovers the
+    /// Merging a compaction's own result against its pre-fold predecessor,
+    /// the same lineage, not an independently-folded copy, recovers the
     /// exact pre-fold value: the pre-fold side's per-writer `retired` entry
     /// names exactly the writer the post-fold side's `folded_at` receipt
     /// already accounts for, so the two are reconciled without
     /// double-counting. `ShardOps::compact_pass` itself never merges a
     /// compaction result this way (`Engine::compact_replace_if_current`
     /// replaces the resident bytes directly instead, precisely because a
-    /// merge here can restore what compaction just pruned); this pins the
+    /// merge here can restore what compaction pruned); this pins the
     /// underlying exactness property `merge` itself still needs to hold for
-    /// two *distinct* replicas — one still holding a writer live or
-    /// retired, the other having already folded it away — to reconcile
+    /// two *distinct* replicas, one still holding a writer live or
+    /// retired, the other having already folded it away, to reconcile
     /// correctly.
     #[test]
     fn a_compaction_result_merged_against_its_own_pre_fold_predecessor_is_exact() {
@@ -996,11 +885,10 @@ mod tests {
     /// `tombstone_max_ttl` already documents ("a member gone longer than
     /// this may resurrect data"), not a new failure mode introduced by
     /// compaction: the merge cannot know its own stale fold and the live
-    /// slot name the same writer, so it counts both — the loss is bounded
-    /// by exactly the stale snapshot, never unbounded, and it only arises
-    /// once a writer has actually reached stage three, unlike the
-    /// unconditional loss a coincidental cross-writer watermark used to
-    /// cause at any staleness at all.
+    /// slot name the same writer, so it counts both, bounded by exactly
+    /// the stale snapshot, never unbounded, and only once a writer has
+    /// reached stage three, unlike the unconditional loss a coincidental
+    /// cross-writer watermark would cause at any staleness at all.
     #[test]
     fn documents_the_bounded_loss_when_a_writers_slot_outlives_everyones_fold_of_it() {
         let w = wid(1, 0);
@@ -1028,7 +916,7 @@ mod tests {
     }
 
     /// Two entirely different writers, retired independently, whose
-    /// retirement times just happen to differ: a side that folds the
+    /// retirement times happen to differ: a side that folds the
     /// *later*-retiring writer (`w3`) to stage two must never thereby
     /// "vouch" for a completely unrelated, still-exact, earlier-retiring
     /// writer (`w1`) that side has never even seen. Because `folded_at`
@@ -1138,7 +1026,7 @@ mod tests {
         }
 
         /// Associativity holds unconditionally only while nothing has ever
-        /// been retired on any side — stage two's fold is order-sensitive
+        /// been retired on any side: stage two's fold is order-sensitive
         /// by design once retirement is involved (see
         /// `documents_the_bounded_loss_when_a_writers_slot_outlives_everyones_fold_of_it`
         /// above), so this is deliberately restricted to the plain
@@ -1266,7 +1154,7 @@ mod tests {
     }
 
     /// A `folded_at` receipt is pruned only once it is old enough *and* the
-    /// cache is quiet — but only counting from before the call that created
+    /// cache is quiet, counting only from before the call that created
     /// it: a single `compact` call that folds a writer never also prunes
     /// that same brand-new receipt (see [`PnCounter::compact`]'s doc for
     /// why), so this needs a further, separate call once the receipt itself
