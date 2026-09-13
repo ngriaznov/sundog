@@ -661,7 +661,7 @@ fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
 }
 
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:
-/// `max_frame` against the wire codec's hard cap, and the sketch frame size
+/// `max_frame` against the wire codec's hard cap and the sketch frame size
 /// it implies.
 fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
     if config.max_frame > wire::MAX_FRAME {

@@ -5,6 +5,7 @@
 //! nonzero status on divergence or a failed sample — the CI-friendly smoke
 //! test.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -117,6 +118,9 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
         "sample check: {sample_ok}/{sample_checked} surviving keys fetched with the expected value"
     );
     println!("convergence: {convergence_report}");
+    if convergence_report.is_diverged() {
+        explain_divergence(&demo);
+    }
 
     let diverged = convergence_report.is_diverged();
     let sample_failed = sample_ok != sample_checked || sample_checked == 0;
@@ -152,4 +156,42 @@ async fn verify_sample(demo: &setup::Demo, sample_size: usize) -> (usize, usize)
         }
     }
     (checked, matched)
+}
+
+/// Prints what a diverged sum is made of: per live node, keys held in
+/// buckets the node does not own; how many nodes hold each key; and how
+/// many removed keys some node still holds.
+fn explain_divergence(demo: &setup::Demo) {
+    let mut copies: HashMap<String, u8> = HashMap::new();
+    for (index, node) in demo.nodes.iter().enumerate() {
+        if !node.is_alive() {
+            continue;
+        }
+        let Some(cache) = node.cache() else { continue };
+        let node_id = sundog::NodeId::from(node.status.node_id.load(Ordering::Relaxed));
+        let keys = cache.keys();
+        let foreign = keys
+            .iter()
+            .inspect(|key| *copies.entry((*key).clone()).or_insert(0) += 1)
+            .filter(|key| !cache.owners_of(key).contains(&node_id))
+            .count();
+        println!(
+            "divergence: node{index} holds {} keys, {foreign} in buckets it does not own",
+            keys.len()
+        );
+    }
+    let mut by_copies = [0usize; 4];
+    for &n in copies.values() {
+        by_copies[usize::from(n).min(3)] += 1;
+    }
+    println!(
+        "divergence: keys held once={} twice={} three or more={}",
+        by_copies[1], by_copies[2], by_copies[3]
+    );
+    let removed_but_held = copies
+        .keys()
+        .filter_map(|key| key.strip_prefix('k')?.parse::<usize>().ok())
+        .filter(|&index| demo.state.is_removed(index))
+        .count();
+    println!("divergence: removed keys some node still holds: {removed_but_held}");
 }

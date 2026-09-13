@@ -19,8 +19,11 @@ use crate::preload;
 /// Faster than the library default so convergence and rebalancing visibly
 /// settle quickly.
 pub(crate) const AE_INTERVAL: Duration = Duration::from_secs(3);
-/// `>= 3 * AE_INTERVAL`, satisfying the tombstone-GC safety rule.
-pub(crate) const TOMBSTONE_TTL: Duration = Duration::from_secs(15);
+/// Covers the bucket release window, `AE_INTERVAL * (2 * grace rounds + 2)`
+/// or 24s at three rounds, with margin: a node that lost a bucket during the
+/// preload hands its stale copy off up to twice the grace later, and the
+/// owners' tombstone must still be there for a removed key to stay removed.
+pub(crate) const TOMBSTONE_TTL: Duration = Duration::from_secs(60);
 
 /// Everything one run of the demo needs: node slots, the merged event feed,
 /// the load's pause switch, and preload progress, shared by the TUI and

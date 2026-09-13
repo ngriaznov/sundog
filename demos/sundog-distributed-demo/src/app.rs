@@ -47,6 +47,7 @@ impl App {
         let (total, live) = convergence::total_live_entries(&self.demo.nodes);
         let expected = convergence::expected_entries(
             u64::from(self.demo.owners.get()),
+            live,
             self.demo.state.surviving_keys(),
         );
         convergence::check(total, expected, live)
