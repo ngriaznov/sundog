@@ -146,7 +146,7 @@ pub struct Decoded {
     pub(crate) only_right: Vec<Elem>,
 }
 
-/// [`Iblt::peel`]'s failure case: the symmetric difference was too large
+/// [`Iblt::peel`]'s failure case: the symmetric difference is too large
 /// for peeling to resolve every cell back to zero. Never a wrong result,
 /// only no result; the caller's `AeEntries` fallback is exact regardless.
 ///
@@ -277,7 +277,7 @@ impl Iblt {
     ///
     /// # Errors
     ///
-    /// Returns [`Undecodable`] if the symmetric difference was too large
+    /// Returns [`Undecodable`] if the symmetric difference is too large
     /// for every cell to peel back to zero; the caller falls back to a full
     /// listing.
     pub fn peel(mut self) -> Result<Decoded, Undecodable> {
@@ -290,7 +290,7 @@ impl Iblt {
         while let Some(idx) = queue.pop_front() {
             let cell = self.cells[idx];
             if !cell.is_pure_and_valid() {
-                continue; // touched again since it was enqueued
+                continue; // touched again since being enqueued
             }
             let elem = cell.claimed_elem();
             let sign = cell.count;
@@ -483,8 +483,8 @@ mod tests {
     /// present on both replicas at different versions, so it contributes
     /// *two* elements to the symmetric difference rather than one (see
     /// `cluster::anti_entropy`'s bidirectional-exchange doc). This pins
-    /// `RATED_CAPACITY`'s claim for exactly that shape — every element a
-    /// two-sided version mismatch, none one-sided — at a key count whose
+    /// `RATED_CAPACITY`'s claim for exactly that shape (every element a
+    /// two-sided version mismatch, none one-sided) at a key count whose
     /// element count sits well under the rated 100, so a real decode is
     /// expected rather than merely tolerated.
     #[test]

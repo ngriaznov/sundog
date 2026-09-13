@@ -41,7 +41,7 @@ const PROTOCOL_KEY: &str = "protocol";
 /// Set by [`Membership::shutdown`] before it tells chitchat to leave, and
 /// never cleared afterward since the process exits shortly after. A peer
 /// that observes this key before this node drops out of the live set knows
-/// the departure was graceful, not a crash; see [`crate::cluster::absence`].
+/// the departure is graceful, not a crash; see [`crate::cluster::absence`].
 const DEPARTING_KEY: &str = "departing";
 /// Prefix for the per-cache mode keys `Membership::set_cache_mode` sets:
 /// the full key is `cache:<name>`.
@@ -80,7 +80,7 @@ pub(crate) type CacheModes = HashMap<NodeId, HashMap<SmolStr, Mode>>;
 /// A live peer's flags [`cluster::absence`](crate::cluster::absence) needs
 /// captured at the instant it drops out of the live set: whether it
 /// gossiped a graceful departure ([`DEPARTING_KEY`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LiveFlags {
     pub(crate) departing: bool,
 }
@@ -216,8 +216,8 @@ impl Membership {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
         // A departing node's `DEPARTING_KEY` write needs at least one full
-        // gossip round to reach every peer before this node actually leaves;
-        // three rounds is generous headroom against a dropped packet or two.
+        // gossip round to reach every peer before this node leaves; three
+        // rounds is generous headroom against a dropped packet or two.
         let departure_notice = config.gossip_interval.saturating_mul(3);
 
         let publishers = Publishers {
@@ -338,9 +338,9 @@ pub(crate) fn advertise_ip_for(config: &ClusterConfig, bind_ip: IpAddr) -> IpAdd
 /// [`crate::config::ClusterConfig::advertise_ip`] leaves it unset. A
 /// concrete bind IP is used as-is; the zeroconf default probes the
 /// OS-chosen outbound interface via a UDP "connect" toward a public address
-/// (which never sends a packet on a datagram socket), and, on any probe
-/// failure — an unplugged cable, a network with no route to the internet —
-/// falls back to the first non-loopback, non-link-local address `if-addrs`
+/// (which never sends a packet on a datagram socket). On any probe failure
+/// (an unplugged cable, a network with no route to the internet), it falls
+/// back to the first non-loopback, non-link-local address `if-addrs`
 /// reports for the same family, then to loopback: this never fails.
 fn resolve_advertise_ip(bind_ip: IpAddr) -> IpAddr {
     if !bind_ip.is_unspecified() {
@@ -357,7 +357,7 @@ fn resolve_advertise_ip(bind_ip: IpAddr) -> IpAddr {
 
 /// The outbound-interface probe: a UDP "connect" toward a public address,
 /// which never sends a packet on a datagram socket but makes the kernel pick
-/// a source address as if it were about to.
+/// a source address as though about to send one.
 fn probe_outbound_ip(bind_ip: IpAddr) -> io::Result<IpAddr> {
     let probe_target: SocketAddr = if bind_ip.is_ipv6() {
         (
@@ -497,7 +497,7 @@ pub(crate) struct MemberView {
     /// The member's current incarnation, when it is live; `None` when
     /// gone.
     pub(crate) live_incarnation: Option<u64>,
-    /// When the member was first observed live
+    /// When the member is first observed live
     /// ([`crate::cluster::absence::AbsenceTracker::known_since`]); `None`
     /// if never.
     pub(crate) known_since: Option<Instant>,
@@ -524,12 +524,12 @@ pub(crate) fn member_is_quiet(member: &MemberView, now: Instant, bound: Duration
 }
 
 /// Whether writer incarnation `w_incarnation` is dead on `member`'s node:
-/// `member` has been absent longer than
-/// `bound`, or `member` is live with a *different* current incarnation than
-/// `w_incarnation` (any difference counts, not just a greater one, so a
-/// clock stepping backward across a restart can't pin an old incarnation
-/// live forever). A member never observed at all — neither live nor
-/// tracked absent — is not yet known dead.
+/// `member` has been absent longer than `bound`, or `member` is live with
+/// a *different* current incarnation than `w_incarnation` (any difference
+/// counts, not only a greater one, so a clock stepping backward across a
+/// restart can't pin an old incarnation live forever). A member never
+/// observed at all, neither live nor tracked absent, is not yet known
+/// dead.
 pub(crate) fn incarnation_is_dead(
     member: &MemberView,
     w_incarnation: u64,
@@ -625,11 +625,11 @@ async fn run(
                             .delete(&cache_key(&name));
                     }
                     Some(Command::Shutdown(reply)) => {
-                        // Gossips the departure before actually leaving, and
-                        // waits for it to reach peers: `AbsenceTracker`
-                        // reads it off the last state a peer had before
-                        // dropping out of the live set, never counting a
-                        // graceful leave as absence.
+                        // Gossips the departure before leaving, and waits
+                        // for it to reach peers: `AbsenceTracker` reads it
+                        // off the last state a peer had before dropping
+                        // out of the live set, never counting a graceful
+                        // leave as absence.
                         chitchat
                             .lock()
                             .await

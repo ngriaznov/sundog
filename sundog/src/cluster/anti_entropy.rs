@@ -44,10 +44,12 @@ pub(crate) async fn scheduler_task(
 ) {
     let mut skipped: HashMap<NodeId, u32> = HashMap::new();
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(jittered(ae_interval)) => {}
+        if cancel
+            .run_until_cancelled(tokio::time::sleep(jittered(ae_interval)))
+            .await
+            .is_none()
+        {
+            return;
         }
         let Some((peer, was_dirty)) = pick_peer(&cluster, &shard) else {
             continue;
@@ -101,7 +103,7 @@ fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
 /// an empty give-back. `None` when both are empty.
 ///
 /// `live` takes ownership, not a slice, to match `dirty`'s shape: both come
-/// from a caller that just built them fresh (`take_dirty_peers`,
+/// from a caller that builds them fresh this round (`take_dirty_peers`,
 /// `live_peer_ids`), and only `dirty` needs the transfer, on the branch that
 /// consumes it into `give_back`.
 #[allow(clippy::needless_pass_by_value)]
@@ -120,7 +122,7 @@ fn choose_peer(
 /// The peer for this round, and whether it came from the dirty set; a
 /// skipped round can hand the mark back. `shard`'s
 /// [`ShardOps::ae_peer_filter`] narrows both candidate sets to its current
-/// cohort first — identity for every mode but `Mode::Distributed`, whose
+/// cohort first: identity for every mode but `Mode::Distributed`, whose
 /// override drops a peer sharing no bucket this shard currently owns or is
 /// mid disown-grace on, since such a peer has nothing to reconcile.
 fn pick_peer(cluster: &Cluster, shard: &Arc<dyn ShardOps>) -> Option<(NodeId, bool)> {
@@ -142,7 +144,7 @@ fn pick_peer(cluster: &Cluster, shard: &Arc<dyn ShardOps>) -> Option<(NodeId, bo
 /// [`RoundOutcome::Reconciled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundOutcome {
-    /// The digest exchange completed and every mismatch was repaired as far
+    /// The digest exchange completed and every mismatch is repaired as far
     /// as the peer answered.
     Reconciled,
     /// The peer's ownership view differs from this node's: no repair ran.
@@ -152,33 +154,21 @@ pub enum RoundOutcome {
 }
 
 /// One anti-entropy round against `peer`: exchanges digests, then diffs the
-/// mismatched buckets. Keys this node has newer, or `peer` lacks, push via
-/// the normal `Replicate` path; keys `peer` has newer, or this node lacks,
-/// pull and apply directly. When `shard`'s resolver reports
-/// [`ShardOps::merges`] as `true`, a key present on both sides under
-/// different versions is pushed *and* pulled rather than only in the
-/// greater side's direction, so two replicas each holding half of a merge
-/// converge in this one round instead of needing a second round to carry
-/// the minted result back.
+/// mismatched buckets. A key this node has newer, or `peer` lacks, pushes
+/// via the normal `Replicate` path; a key `peer` has newer, or this node
+/// lacks, pulls and applies directly. When `shard`'s resolver reports
+/// [`ShardOps::merges`], a key present on both sides under different
+/// versions pushes *and* pulls, so two replicas each holding half of a
+/// merge converge in this one round rather than needing a second.
 ///
-/// For a `Mode::Distributed` shard (one reporting an
-/// [`ShardOps::ownership_view_hash`]), the digest exchange goes through
-/// `Mesh::ae_round_scoped` instead of [`Mesh::ae_round`], carrying this
-/// shard's view hash for the epoch check; a `Stale` reply ends the round
-/// immediately, `sundog_stale_view_total` counted, with no push or pull
-/// attempted — the next scheduled round retries with a freshly re-borrowed
-/// view. Every tier past the initial digest exchange — part digests,
-/// sketches, listings — runs exactly the same regardless of how the round
-/// was scoped.
+/// A `Mode::Distributed` shard exchanges digests through
+/// `Mesh::ae_round_scoped` instead of [`Mesh::ae_round`], carrying its
+/// [`ShardOps::ownership_view_hash`] for the epoch check; a `Stale` reply
+/// ends the round at once, counted in `sundog_stale_view_total`.
 ///
-/// Takes `mesh` directly rather than a whole `&Cluster`: every caller inside
-/// this crate already has one (`cluster.mesh()`), and this is also the seam
-/// `tests/sim.rs` calls under `feature = "sim"` (re-exported from `lib.rs`)
-/// to drive one round through the real digest-exchange-through-repair
-/// sequence against its own hand-built `Mesh`/`ShardOps` pair, instead of
-/// reimplementing it — see that module's own doc for why building a whole
-/// `Cluster` there would pull in gossip and discovery this suite never
-/// needs.
+/// Takes `mesh` directly, not a whole `&Cluster`: `tests/sim.rs` drives
+/// this same seam under `feature = "sim"` against a hand-built
+/// `Mesh`/`ShardOps` pair, skipping a real `Cluster`'s gossip and discovery.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
 #[allow(
     clippy::too_many_lines,
@@ -191,10 +181,8 @@ pub async fn run_round_against(
     peer: NodeId,
 ) -> RoundOutcome {
     // Read once per round: a merging resolver has both sides exchange a
-    // mismatched key instead of only the greater
-    // version pushing to the lesser side, so two replicas each holding half
-    // of a merge converge in this one round rather than needing a second
-    // round to carry the minted result back. See `ShardOps::merges`.
+    // mismatched key instead of only the greater version pushing to the
+    // lesser side. See `ShardOps::merges`.
     let merging = shard.merges();
     let mismatched = match shard.ownership_view_hash() {
         Some(view_hash) => {
@@ -250,34 +238,15 @@ pub async fn run_round_against(
             .into_iter()
             .partition(|m| matches!(m, AeMismatch::PartDigests(..)));
 
-    let mut push_keys: Vec<Bytes> = Vec::new();
-    let mut pull_keys: Vec<Bytes> = Vec::new();
-    // Sketch-decoded pulls know only a key hash and are answered per bucket, so
-    // they queue separately from `pull_keys`.
-    let mut pull_hashes: Vec<(u16, Vec<u64>)> = Vec::new();
-    let mut undecodable_buckets: Vec<u16> = Vec::new();
-
-    classify_bucket_mismatches(
-        shard,
-        cache,
-        bucket_mismatches,
-        &mut push_keys,
-        &mut pull_keys,
-        &mut pull_hashes,
-        &mut undecodable_buckets,
-        merging,
-    )
-    .await;
+    let mut plan = RepairPlan::default();
+    classify_bucket_mismatches(shard, cache, bucket_mismatches, &mut plan, merging).await;
     classify_part_digest_mismatches(
         mesh,
         shard,
         cache,
         peer,
         part_digest_mismatches,
-        &mut push_keys,
-        &mut pull_keys,
-        &mut pull_hashes,
-        &mut undecodable_buckets,
+        &mut plan,
         merging,
     )
     .await;
@@ -288,9 +257,13 @@ pub async fn run_round_against(
     // reach here may come from either the bucket path or the part path, so
     // their entries are fetched fresh rather than reusing either path's
     // already-scoped local lookup.
-    if !undecodable_buckets.is_empty() {
+    if !plan.undecodable_buckets.is_empty() {
         match mesh
-            .ae_entries(peer, cache.clone(), undecodable_buckets)
+            .ae_entries(
+                peer,
+                cache.clone(),
+                std::mem::take(&mut plan.undecodable_buckets),
+            )
             .await
         {
             Ok(fallback_buckets) => {
@@ -302,8 +275,8 @@ pub async fn run_round_against(
                     diff_bucket(
                         local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
                         &peer_entries,
-                        &mut push_keys,
-                        &mut pull_keys,
+                        &mut plan.push_keys,
+                        &mut plan.pull_keys,
                         merging,
                     );
                 }
@@ -314,8 +287,17 @@ pub async fn run_round_against(
         }
     }
 
-    retain_owned_pulls(shard, &mut pull_keys, &mut pull_hashes);
-    apply_repairs(mesh, shard, cache, peer, push_keys, pull_keys, pull_hashes).await;
+    retain_owned_pulls(shard, &mut plan.pull_keys, &mut plan.pull_hashes);
+    apply_repairs(
+        mesh,
+        shard,
+        cache,
+        peer,
+        plan.push_keys,
+        plan.pull_keys,
+        plan.pull_hashes,
+    )
+    .await;
     RoundOutcome::Reconciled
 }
 
@@ -335,23 +317,56 @@ fn retain_owned_pulls(
     }
 }
 
+/// One round's push/pull/hash-pull/fallback classification, threaded as
+/// `&mut RepairPlan` instead of four separate out-parameters.
+#[derive(Default)]
+struct RepairPlan {
+    push_keys: Vec<Bytes>,
+    pull_keys: Vec<Bytes>,
+    pull_hashes: Vec<(u16, Vec<u64>)>,
+    undecodable_buckets: Vec<u16>,
+}
+
+impl RepairPlan {
+    /// Queues `hashes` to pull from `bucket` by hash; a no-op if empty.
+    fn pull_by_hash(&mut self, bucket: u16, hashes: Vec<u64>) {
+        if !hashes.is_empty() {
+            self.pull_hashes.push((bucket, hashes));
+        }
+    }
+
+    /// Queues `bucket` for the whole-bucket `Msg::AeEntries` fallback.
+    fn mark_undecodable(&mut self, bucket: u16) {
+        self.undecodable_buckets.push(bucket);
+    }
+}
+
+/// Whether a version mismatch pushes, pulls, or both, as `(push, pull)`:
+/// either side missing sends toward the side that holds it; both present
+/// sends the greater version's side, and `merging` additionally sends the
+/// other direction too.
+fn classify_versions(local: Option<Hlc>, peer: Option<Hlc>, merging: bool) -> (bool, bool) {
+    match (local, peer) {
+        (Some(local), Some(peer)) if local != peer => {
+            (local > peer || merging, local < peer || merging)
+        }
+        (Some(_), Some(_)) | (None, None) => (false, false),
+        (Some(_), None) => (true, false),
+        (None, Some(_)) => (false, true),
+    }
+}
+
 /// Classifies buckets answered with a listing or sketch
 /// (`AeMismatch::Bucket`/`Sketch`): one local shard pass for all of them at
-/// once, not one per bucket, since a mostly-divergent peer mismatches many
-/// and per-bucket scans would be quadratic; each is then classified into
-/// `push_keys`/`pull_keys` directly, or, for a sketch, via
-/// [`handle_sketch_mismatch`]. `merging` is [`ShardOps::merges`]'s answer for
-/// this round, forwarded into [`diff_bucket`]/[`handle_sketch_mismatch`]. A
-/// no-op when `mismatches` is empty.
-#[allow(clippy::too_many_arguments)]
+/// once, since a mostly-divergent peer mismatches many and per-bucket scans
+/// would be quadratic; each is classified into `plan` directly, or, for a
+/// sketch, via [`handle_sketch_mismatch`]. A no-op when `mismatches` is
+/// empty.
 async fn classify_bucket_mismatches(
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     mismatches: Vec<AeMismatch>,
-    push_keys: &mut Vec<Bytes>,
-    pull_keys: &mut Vec<Bytes>,
-    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
-    undecodable_buckets: &mut Vec<u16>,
+    plan: &mut RepairPlan,
     merging: bool,
 ) {
     if mismatches.is_empty() {
@@ -368,24 +383,15 @@ async fn classify_bucket_mismatches(
                 diff_bucket(
                     local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
                     &peer_entries,
-                    push_keys,
-                    pull_keys,
+                    &mut plan.push_keys,
+                    &mut plan.pull_keys,
                     merging,
                 );
             }
             AeMismatch::Sketch(bucket, cells) => {
                 let entries: &[(Bytes, Hlc)] =
                     local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
-                handle_sketch_mismatch(
-                    cache,
-                    bucket,
-                    cells,
-                    entries,
-                    push_keys,
-                    pull_hashes,
-                    undecodable_buckets,
-                    merging,
-                );
+                handle_sketch_mismatch(cache, bucket, cells, entries, plan, merging);
             }
             AeMismatch::PartDigests(..) => {
                 unreachable!("invariant: run_round_against partitions this variant out")
@@ -395,26 +401,20 @@ async fn classify_bucket_mismatches(
 }
 
 /// Classifies buckets answered with part digests (`AeMismatch::PartDigests`):
-/// compares each against this node's own part digests for the same bucket,
-/// one shard call for all of them, then one [`Mesh::ae_parts`] request for
-/// every part that actually differs, classifying each reply the same way
-/// [`classify_bucket_mismatches`] does at bucket scale. `merging` is
-/// [`ShardOps::merges`]'s answer for this round, forwarded into
-/// [`diff_bucket`]/[`handle_part_sketch_mismatch`]. A no-op when
+/// compares each against this node's own part digests, one shard call for
+/// all of them, then one [`Mesh::ae_parts`] request for every part that
+/// differs, classifying each reply the same way
+/// [`classify_bucket_mismatches`] does at bucket scale. A no-op when
 /// `mismatches` is empty.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
-#[allow(clippy::too_many_arguments)]
 async fn classify_part_digest_mismatches(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
     mismatches: Vec<AeMismatch>,
-    push_keys: &mut Vec<Bytes>,
-    pull_keys: &mut Vec<Bytes>,
-    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
-    undecodable_buckets: &mut Vec<u16>,
+    plan: &mut RepairPlan,
     merging: bool,
 ) {
     if mismatches.is_empty() {
@@ -450,7 +450,7 @@ async fn classify_part_digest_mismatches(
             let local_part_entries = shard.entries_for_parts(wanted_parts).await;
             let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
                 local_part_entries.into_iter().collect();
-            let mut gathered: HashMap<u16, BucketParts> = HashMap::new();
+            let mut gathered: HashMap<u16, RepairPlan> = HashMap::new();
             for reply in replies {
                 let slot = gathered.entry(reply.bucket()).or_default();
                 match reply {
@@ -489,28 +489,11 @@ async fn classify_part_digest_mismatches(
                         let entries: &[(Bytes, Hlc)] = local_by_part
                             .get(&(bucket, part))
                             .map_or(&[], Vec::as_slice);
-                        let mut undecodable = Vec::new();
-                        handle_part_sketch_mismatch(
-                            cache,
-                            bucket,
-                            cells,
-                            entries,
-                            &mut slot.push_keys,
-                            &mut slot.pull_hashes,
-                            &mut undecodable,
-                            merging,
-                        );
-                        slot.undecodable |= !undecodable.is_empty();
+                        handle_part_sketch_mismatch(cache, bucket, cells, entries, slot, merging);
                     }
                 }
             }
-            settle_bucket_parts(
-                gathered,
-                push_keys,
-                pull_keys,
-                pull_hashes,
-                undecodable_buckets,
-            );
+            settle_bucket_parts(gathered, plan);
         }
         Err(error) => {
             tracing::debug!(%error, "anti-entropy part exchange failed");
@@ -581,22 +564,15 @@ async fn apply_repairs(
     tracing::debug!(repaired, "anti-entropy round complete");
 }
 
-/// Classifies one `AeMismatch::Sketch(bucket, cells)` reply: builds a local
-/// comparison sketch, subtracts the received one, and peels it. On success,
-/// [`diff_decoded`] classifies the result into `push_keys`/`pull_hashes`,
-/// with `merging` forwarded the same way [`diff_bucket`] takes it; on
-/// failure queues `bucket` into `undecodable_buckets` for the
-/// `Msg::AeEntries` fallback. Emits `sundog_ae_sketch_total{outcome}` either
-/// way.
-#[allow(clippy::too_many_arguments)]
+/// Classifies one `AeMismatch::Sketch(bucket, cells)` reply through
+/// [`peel_sketch_into`] at bucket scope; on failure marks `bucket`
+/// undecodable in `plan` for the `Msg::AeEntries` fallback.
 fn handle_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,
     cells: Vec<Cell>,
     local_entries: &[(Bytes, Hlc)],
-    push_keys: &mut Vec<Bytes>,
-    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
-    undecodable_buckets: &mut Vec<u16>,
+    plan: &mut RepairPlan,
     merging: bool,
 ) {
     if !peel_sketch_into(
@@ -605,11 +581,10 @@ fn handle_sketch_mismatch(
         bucket,
         cells,
         local_entries,
-        push_keys,
-        pull_hashes,
+        plan,
         merging,
     ) {
-        undecodable_buckets.push(bucket);
+        plan.mark_undecodable(bucket);
     }
 }
 
@@ -641,22 +616,16 @@ impl SketchScope {
 /// The one peel path for bucket and part sketches: builds the local
 /// comparison sketch over `local_entries`, subtracts the received `cells`,
 /// and peels. On success [`diff_decoded`] classifies the result into
-/// `push_keys` and `pull_hashes`, scoped to `bucket`, and this returns
-/// `true`; on failure it returns `false` and the caller queues the fallback.
-/// `merging` is [`ShardOps::merges`]'s answer for this round, passed
-/// straight through to [`diff_decoded`]: when `true`, a key hash the peeled
-/// sketch shows present on both sides under different versions queues for
-/// both push and pull instead of only the greater version's side. Emits
-/// `scope`'s metric either way.
-#[allow(clippy::too_many_arguments)]
+/// `plan`, scoped to `bucket`, and this returns `true`; on failure it
+/// returns `false` for the caller to mark undecodable. Emits `scope`'s
+/// metric either way.
 fn peel_sketch_into(
     scope: SketchScope,
     cache: &SmolStr,
     bucket: u16,
     cells: Vec<Cell>,
     local_entries: &[(Bytes, Hlc)],
-    push_keys: &mut Vec<Bytes>,
-    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
+    plan: &mut RepairPlan,
     merging: bool,
 ) -> bool {
     // Sized from the received sketch's cell count, not this node's own
@@ -681,10 +650,14 @@ fn peel_sketch_into(
         return false;
     };
     let mut hashes = Vec::new();
-    diff_decoded(local_entries, &decoded, push_keys, &mut hashes, merging);
-    if !hashes.is_empty() {
-        pull_hashes.push((bucket, hashes));
-    }
+    diff_decoded(
+        local_entries,
+        &decoded,
+        &mut plan.push_keys,
+        &mut hashes,
+        merging,
+    );
+    plan.pull_by_hash(bucket, hashes);
     true
 }
 
@@ -708,19 +681,15 @@ pub fn mismatched_parts(local: &[u64], remote: &[u64]) -> Vec<u8> {
 }
 
 /// Classifies one part's `AePartReply::Sketch` reply through
-/// [`peel_sketch_into`] at part scope, `merging` forwarded the same way. On
-/// failure, `bucket` queues into `undecodable_buckets` for the whole-bucket
-/// `Msg::AeEntries` fallback: a part sketch never gets its own part-scoped
-/// fallback.
-#[allow(clippy::too_many_arguments)]
+/// [`peel_sketch_into`] at part scope. On failure, marks `bucket`
+/// undecodable in `plan` (a per-bucket-part [`RepairPlan`] here, not the
+/// round's own): a part sketch never gets its own part-scoped fallback.
 fn handle_part_sketch_mismatch(
     cache: &SmolStr,
     bucket: u16,
     cells: Vec<Cell>,
     local_entries: &[(Bytes, Hlc)],
-    push_keys: &mut Vec<Bytes>,
-    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
-    undecodable_buckets: &mut Vec<u16>,
+    plan: &mut RepairPlan,
     merging: bool,
 ) {
     if !peel_sketch_into(
@@ -729,62 +698,35 @@ fn handle_part_sketch_mismatch(
         bucket,
         cells,
         local_entries,
-        push_keys,
-        pull_hashes,
+        plan,
         merging,
     ) {
-        undecodable_buckets.push(bucket);
+        plan.mark_undecodable(bucket);
     }
 }
 
-/// One bucket's classification gathered across its part replies, kept aside
-/// until every reply is in: a bucket with any undecodable part falls back
-/// to its full listing, and the work its other parts classified is dropped
-/// rather than repaired twice.
-#[derive(Default)]
-struct BucketParts {
-    push_keys: Vec<Bytes>,
-    pull_keys: Vec<Bytes>,
-    pull_hashes: Vec<(u16, Vec<u64>)>,
-    undecodable: bool,
-}
-
-/// Folds every bucket's gathered part classification into the round's
-/// sets: a bucket with an undecodable part goes to `undecodable_buckets`
-/// once and contributes nothing else; every other bucket's keys and hashes
-/// are kept.
-fn settle_bucket_parts(
-    gathered: HashMap<u16, BucketParts>,
-    push_keys: &mut Vec<Bytes>,
-    pull_keys: &mut Vec<Bytes>,
-    pull_hashes: &mut Vec<(u16, Vec<u64>)>,
-    undecodable_buckets: &mut Vec<u16>,
-) {
-    let mut buckets: Vec<(u16, BucketParts)> = gathered.into_iter().collect();
+/// Folds every bucket's gathered part classification (each a [`RepairPlan`]
+/// at bucket-part scope) into the round's own `plan`: a bucket with any
+/// undecodable part marks `plan` undecodable for it once and contributes
+/// nothing else; every other bucket's keys and hashes are kept.
+fn settle_bucket_parts(gathered: HashMap<u16, RepairPlan>, plan: &mut RepairPlan) {
+    let mut buckets: Vec<(u16, RepairPlan)> = gathered.into_iter().collect();
     buckets.sort_unstable_by_key(|(bucket, _)| *bucket);
     for (bucket, parts) in buckets {
-        if parts.undecodable {
-            undecodable_buckets.push(bucket);
+        if !parts.undecodable_buckets.is_empty() {
+            plan.mark_undecodable(bucket);
             continue;
         }
-        push_keys.extend(parts.push_keys);
-        pull_keys.extend(parts.pull_keys);
-        pull_hashes.extend(parts.pull_hashes);
+        plan.push_keys.extend(parts.push_keys);
+        plan.pull_keys.extend(parts.pull_keys);
+        plan.pull_hashes.extend(parts.pull_hashes);
     }
 }
 
-/// Classifies one bucket's local listing against `peer_entries`: a key newer
-/// locally pushes, a key newer on the peer pulls, and a key only one side
-/// holds follows suit on that side. `merging` is [`ShardOps::merges`]'s
-/// answer for this round: `false` keeps that greater-version-only behavior
-/// unchanged (anti-entropy's ordinary direction rule, costing a merging
-/// resolver a second round to carry a minted result back — see
-/// `engine::merge_version`'s doc); `true` additionally queues a key present
-/// on *both* sides under different versions for the *other* direction too,
-/// so both replicas fold each other's record into their own merge in this
-/// same round rather than only the lesser side pulling ahead. A key only one
-/// side holds is never a version mismatch between two records, so `merging`
-/// leaves that case alone either way.
+/// Classifies one bucket's local listing against `peer_entries` via
+/// [`classify_versions`], bytes-keyed: each local key looks up its peer
+/// entry by the key itself, and a key only the peer holds pulls. See
+/// [`diff_decoded`] for the hash-keyed sketch analogue of this same rule.
 fn diff_bucket(
     local_entries: &[(Bytes, Hlc)],
     peer_entries: &[(Bytes, Hlc)],
@@ -797,17 +739,13 @@ fn diff_bucket(
 
     for (key, local_ver) in local_entries {
         local_keys.insert(key);
-        match peer_by_key.get(key) {
-            Some(&peer_ver) if *local_ver != peer_ver => {
-                if *local_ver > peer_ver || merging {
-                    push_keys.push(key.clone());
-                }
-                if *local_ver < peer_ver || merging {
-                    pull_keys.push(key.clone());
-                }
-            }
-            Some(_) => {}
-            None => push_keys.push(key.clone()),
+        let (push, pull) =
+            classify_versions(Some(*local_ver), peer_by_key.get(key).copied(), merging);
+        if push {
+            push_keys.push(key.clone());
+        }
+        if pull {
+            pull_keys.push(key.clone());
         }
     }
     for (key, _) in peer_entries {
@@ -818,23 +756,12 @@ fn diff_bucket(
 }
 
 /// The initiator's push/pull classification once an `AeSketch` reply
-/// decodes: mirrors `diff_bucket`'s rules over [`Iblt::peel`]'s peeled
-/// element lists instead of two full listings. A key newer in
-/// `decoded.only_left` (this node) than in `only_right` (the peer's) pushes;
-/// newer on the peer's side pulls; present in only one side follows suit. A
-/// sketch carries no key bytes, only a `key_hash`, so every pull queues a
-/// hash into `pull_hashes`; only a push resolves its hash back to
-/// `local_entries` and queues actual key bytes.
-///
-/// `merging` is [`ShardOps::merges`]'s answer for this round, exactly as
-/// `diff_bucket` takes it: `false` keeps the greater-version-only behavior
-/// above; `true` additionally queues the other direction too for a
-/// `key_hash` [`Iblt::peel`] shows on *both* sides under different
-/// versions — present in `only_left` and `only_right` at once, since an
-/// identical `(key_hash, ver)` element on both sides would have cancelled
-/// out of the sketch subtraction and never reached `decoded` at all. A
-/// `key_hash` only one side's sketch peeled is never such a mismatch — it
-/// stays a plain pull either way, `merging` or not.
+/// decodes: the same version-mismatch rule as `diff_bucket`, over
+/// [`Iblt::peel`]'s peeled element lists, hash-keyed instead of
+/// `diff_bucket`'s bytes-keyed lookup. A sketch carries no key bytes, only a
+/// `key_hash`, so every pull queues the hash into `pull_hashes`; only a push
+/// resolves its hash back to `local_entries` first, to queue the actual key
+/// bytes.
 ///
 /// Reachable outside `cluster::anti_entropy` only because `tests/sim.rs`
 /// re-exports it as `crate::diff_decoded` under `feature = "sim"`, to
@@ -863,24 +790,16 @@ pub fn diff_decoded(
         .collect();
 
     for elem in &decoded.only_left {
-        let key_hash = elem.key_hash;
-        let local_ver = elem.ver;
-        match remote_only.get(&key_hash) {
-            Some(&remote_ver) if remote_ver != local_ver => {
-                if remote_ver > local_ver || merging {
-                    pull_hashes.push(key_hash);
-                }
-                if (local_ver > remote_ver || merging)
-                    && let Some(&key) = local_by_hash.get(&key_hash)
-                {
-                    push_keys.push(key.clone());
-                }
-            }
-            _ => {
-                if let Some(&key) = local_by_hash.get(&key_hash) {
-                    push_keys.push(key.clone());
-                }
-            }
+        let (push, pull) = classify_versions(
+            Some(elem.ver),
+            remote_only.get(&elem.key_hash).copied(),
+            merging,
+        );
+        if push && let Some(&key) = local_by_hash.get(&elem.key_hash) {
+            push_keys.push(key.clone());
+        }
+        if pull {
+            pull_hashes.push(elem.key_hash);
         }
     }
     for elem in &decoded.only_right {
@@ -1083,26 +1002,17 @@ mod tests {
         }
     }
 
-    fn mismatch_of(cells: Vec<Cell>, local_entries: &[(Bytes, Hlc)]) -> SketchOutcome {
-        let mut out = SketchOutcome::default();
+    fn mismatch_of(cells: Vec<Cell>, local_entries: &[(Bytes, Hlc)]) -> RepairPlan {
+        let mut plan = RepairPlan::default();
         handle_sketch_mismatch(
             &SmolStr::new("users"),
             7,
             cells,
             local_entries,
-            &mut out.push_keys,
-            &mut out.pull_hashes,
-            &mut out.undecodable_buckets,
+            &mut plan,
             false,
         );
-        out
-    }
-
-    #[derive(Default)]
-    struct SketchOutcome {
-        push_keys: Vec<Bytes>,
-        pull_hashes: Vec<(u16, Vec<u64>)>,
-        undecodable_buckets: Vec<u16>,
+        plan
     }
 
     #[test]
@@ -1140,10 +1050,8 @@ mod tests {
     /// round: every one of its mismatched keys is a two-sided version
     /// mismatch, the shape `sketch.rs`'s own
     /// `two_sided_version_mismatches_decode_at_the_default_shape` pins as
-    /// decodable at this element count, so the peel here succeeds (no
-    /// fallback) and `merging` queues both directions for every key —
-    /// exactly the bidirectional exchange this module's doc argues
-    /// converges a divergent merged key in one round rather than two.
+    /// decodable at this element count, so the peel here succeeds with no
+    /// fallback, and `merging` queues both directions for every key.
     #[test]
     fn a_merging_bucket_above_the_threshold_converges_through_the_sketch_path() {
         const KEYS: u64 = 40;
@@ -1155,28 +1063,26 @@ mod tests {
             remote.insert(xxh3_64(format!("k{i}").as_bytes()), hlc(2 * i));
         }
 
-        let mut out = SketchOutcome::default();
+        let mut plan = RepairPlan::default();
         handle_sketch_mismatch(
             &SmolStr::new("users"),
             7,
             remote.into_cells(),
             &local_entries,
-            &mut out.push_keys,
-            &mut out.pull_hashes,
-            &mut out.undecodable_buckets,
+            &mut plan,
             true,
         );
 
         assert!(
-            out.undecodable_buckets.is_empty(),
+            plan.undecodable_buckets.is_empty(),
             "a two-sided diff this size peels at the default sketch shape, no fallback"
         );
         assert_eq!(
-            out.push_keys.len(),
+            plan.push_keys.len(),
             usize::try_from(KEYS).expect("KEYS is a small literal, always fits"),
             "merging pushes every mismatched key, not only the greater-version side"
         );
-        let (bucket, hashes) = out
+        let (bucket, hashes) = plan
             .pull_hashes
             .first()
             .expect("one bucket entry carries every pulled hash");
@@ -1212,19 +1118,17 @@ mod tests {
         );
     }
 
-    fn part_mismatch_of(cells: Vec<Cell>, local_entries: &[(Bytes, Hlc)]) -> SketchOutcome {
-        let mut out = SketchOutcome::default();
+    fn part_mismatch_of(cells: Vec<Cell>, local_entries: &[(Bytes, Hlc)]) -> RepairPlan {
+        let mut plan = RepairPlan::default();
         handle_part_sketch_mismatch(
             &SmolStr::new("users"),
             7,
             cells,
             local_entries,
-            &mut out.push_keys,
-            &mut out.pull_hashes,
-            &mut out.undecodable_buckets,
+            &mut plan,
             false,
         );
-        out
+        plan
     }
 
     #[test]
@@ -1250,39 +1154,32 @@ mod tests {
 
     #[test]
     fn settle_bucket_parts_drops_a_bucket_with_an_undecodable_part_and_queues_it_once() {
-        let mut gathered: HashMap<u16, BucketParts> = HashMap::new();
+        let mut gathered: HashMap<u16, RepairPlan> = HashMap::new();
         gathered.insert(
             3,
-            BucketParts {
+            RepairPlan {
                 push_keys: vec![Bytes::from_static(b"p3")],
                 pull_keys: vec![Bytes::from_static(b"q3")],
                 pull_hashes: vec![(3, vec![33])],
-                undecodable: true,
+                undecodable_buckets: vec![3],
             },
         );
         gathered.insert(
             5,
-            BucketParts {
+            RepairPlan {
                 push_keys: vec![Bytes::from_static(b"p5")],
                 pull_keys: Vec::new(),
                 pull_hashes: vec![(5, vec![55])],
-                undecodable: false,
+                undecodable_buckets: Vec::new(),
             },
         );
-        let (mut push, mut pull, mut hashes, mut undecodable) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        settle_bucket_parts(
-            gathered,
-            &mut push,
-            &mut pull,
-            &mut hashes,
-            &mut undecodable,
-        );
-        assert_eq!(push, vec![Bytes::from_static(b"p5")]);
-        assert!(pull.is_empty());
-        assert_eq!(hashes, vec![(5, vec![55])]);
+        let mut plan = RepairPlan::default();
+        settle_bucket_parts(gathered, &mut plan);
+        assert_eq!(plan.push_keys, vec![Bytes::from_static(b"p5")]);
+        assert!(plan.pull_keys.is_empty());
+        assert_eq!(plan.pull_hashes, vec![(5, vec![55])]);
         assert_eq!(
-            undecodable,
+            plan.undecodable_buckets,
             vec![3],
             "the bucket falls back once, its part work dropped"
         );

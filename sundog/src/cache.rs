@@ -137,7 +137,7 @@ where
     /// cache's shard, `true` (pre-folding on) by default. `#[doc(hidden)]`:
     /// the real engine-level toggle, reachable from an integration-test
     /// binary outside this crate through
-    /// [`crate::store::Shard::with_prefold_enabled`] — a benchmark
+    /// [`crate::store::Shard::with_prefold_enabled`]; a benchmark
     /// measuring pre-fold's own effect is the only caller that ever needs
     /// it off, to compare against the unfolded per-record path
     /// `apply_many` otherwise always takes. Never call this outside a
@@ -171,44 +171,29 @@ where
     /// cluster's shard registry, and, unless `mode` is [`Mode::Local`],
     /// starts fanning local writes out to the mesh per `mode`.
     ///
-    /// For [`Mode::Replicated`], `open()` also runs state transfer before
-    /// returning: pulls a full snapshot from the lowest-node-id live peer,
-    /// then runs one anti-entropy round against that donor, bounded by
-    /// `ClusterConfig::state_transfer_budget`. A cache too large to finish
-    /// inside the budget opens with a partial copy anti-entropy tops up.
-    ///
-    /// For [`Mode::Distributed`], `open()` computes and attaches its
-    /// bucket-ownership view before the shard is ever shared, then pulls
-    /// every bucket that view assigns to this node from a current owner —
-    /// the same open()-time transfer shape as [`Mode::Replicated`], scoped
-    /// to this node's own buckets rather than the whole cache. A transfer
-    /// that lands, or finds nothing to pull, opens the cache warm; one that
-    /// times out repeatedly opens warm anyway once anti-entropy and
-    /// rebalance have somewhere to carry on from.
+    /// For [`Mode::Replicated`], also runs state transfer before
+    /// returning: a full snapshot from the lowest-node-id live peer, then
+    /// one anti-entropy round against that donor, bounded by
+    /// `ClusterConfig::state_transfer_budget`; a cache too large to finish
+    /// opens with a partial copy anti-entropy tops up. For
+    /// [`Mode::Distributed`], the same open()-time transfer instead pulls
+    /// only this node's own buckets, per its freshly computed ownership
+    /// view; a transfer that lands, finds nothing to pull, or times out
+    /// repeatedly all still open the cache warm.
     ///
     /// # Errors
     ///
     /// Returns [`CacheError::AlreadyOpen`] if a cache named `name` is
-    /// already open in this process.
-    ///
-    /// Returns [`CacheError::TooFewOwners`] if `mode` is
-    /// [`Mode::Distributed`] with an `owners` count under 2.
-    ///
-    /// Returns [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
-    /// [`Mode::Replicated`] or [`Mode::Distributed`] and `tti` was set, or
-    /// `max_capacity` was set with no `spill` tier configured via
-    /// `CacheBuilder::spill`. A local eviction would be silently re-pulled
-    /// by the next anti-entropy round. `tti` is rejected unconditionally,
-    /// spill or not. It is local-only by design, and spilling does nothing
-    /// to reconcile it.
-    ///
-    /// Returns `CacheError::InvalidSpillConfig`, with the `spill` feature
-    /// compiled in, if `spill` was configured with a `region_bytes` of
-    /// zero, or a `capacity_bytes` under two regions.
-    ///
-    /// Returns [`CacheError::ModeMismatch`] if a live peer already
-    /// advertises `name` under a different [`Mode`]. Best-effort: a
-    /// background sweep in `cluster` logs whatever mismatch this misses.
+    /// already open in this process; [`CacheError::TooFewOwners`] if
+    /// `mode` is [`Mode::Distributed`] with an `owners` count under 2;
+    /// [`CacheError::ReplicatedWithLocalEviction`] if `mode` is
+    /// [`Mode::Replicated`] or [`Mode::Distributed`] with `tti` set, or
+    /// `max_capacity` set with no `spill` tier configured (`tti` is
+    /// rejected unconditionally, spill or not, since it is local-only by
+    /// design); `CacheError::InvalidSpillConfig`, with the `spill` feature
+    /// compiled in, for an invalid `spill` config; and
+    /// [`CacheError::ModeMismatch`], best-effort, if a live peer already
+    /// advertises `name` under a different [`Mode`].
     ///
     /// # Panics
     ///
@@ -373,7 +358,7 @@ fn validate_mode(
 /// resolver's [`ConflictResolver::merges`] answer is a valid configuration:
 /// a nonzero window needs a merging resolver, since coalescing multiple
 /// [`Cache::merge`] calls into one record only preserves every fold when
-/// the resolver can actually fold two values rather than just pick a side.
+/// the resolver can fold two values rather than only pick a side.
 fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
     window.is_zero() || resolver_merges
 }
@@ -546,7 +531,7 @@ async fn spawn_cache_tasks<K, V>(
     );
     // Only a merging cache ever compacts (`ConflictResolver::compact` is a
     // no-op for every other resolver), so a plain LWW cache never pays for
-    // a ticker that would never do anything — the same gating
+    // a ticker that would never do anything, the same gating
     // `cluster::anti_entropy` already applies to its own merge-aware
     // exchange path via `ShardOps::merges`.
     if (Arc::clone(shard) as Arc<dyn ShardOps>).merges() {
@@ -579,7 +564,7 @@ async fn spawn_cache_tasks<K, V>(
 /// window opens via [`Shard::merge_wake_notified`] or `cancel` fires), then
 /// flushes everything due and loops. [`Cache::close`]'s own explicit flush
 /// and this shard's own `Drop` both guarantee every fold lands regardless,
-/// so this task's timing is never load-bearing for correctness — only for
+/// so this task's timing is never load-bearing for correctness, only for
 /// the staleness bound [`Cache::merge`]'s docs commit to.
 async fn merge_coalesce_task<K, V>(shard: Arc<Shard<K, V>>, cancel: CancellationToken)
 where
@@ -664,16 +649,17 @@ async fn distributed_warm_and_rebalance(
     );
 
     let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
-    let outcome = crate::cluster::rebalance::pull_buckets(
+    let outcome = crate::cluster::rebalance::PullRequest {
         cluster,
-        &shard_ops,
-        &ownership,
-        &residency,
-        name,
-        initially_owned,
+        shard: &shard_ops,
+        ownership: &ownership,
+        residency: &residency,
+        cache: name,
+        buckets: initially_owned,
         budget,
         concurrency,
-    )
+    }
+    .run()
     .await;
     if outcome.needs_warm_up() {
         cluster.spawn_tracked_in(
@@ -779,10 +765,11 @@ where
     }
 
     /// This node's current [`WriterId`]: its own [`Cluster::node_id`] paired
-    /// with the cluster's current membership incarnation. Every caller of a merging cache's
-    /// [`Cache::merge`] — including the CRDT types' own `local_delta`/`add`
-    /// constructors — should build its writer identity from this rather
-    /// than a bare [`NodeId`], so a restart writes from a fresh slot the
+    /// with the cluster's current membership incarnation. Every caller of
+    /// a merging cache's [`Cache::merge`], including the CRDT types' own
+    /// `local_delta`/`add` constructors, should build its writer identity
+    /// from this rather than a bare [`NodeId`], so a restart writes from
+    /// a fresh slot the
     /// compaction sweep has never seen, instead of resuming (or colliding
     /// with) whatever this node wrote under its previous incarnation.
     /// Stable for the process's lifetime; every clone of this `Cache`
@@ -807,32 +794,24 @@ where
     /// Reads `key`: local if this node owns its bucket (no network,
     /// counted `sundog_fetch_total{outcome="local"}`), otherwise one request
     /// to a live owner, tried in rendezvous-score order until one answers.
-    /// Never promotes the fetched value into the local store —
-    /// [`Cache::get`] for the same key immediately afterward is still a
-    /// miss on this node. A bucket this node owns but has not yet pulled
-    /// from a co-owner is cold: a local miss there asks the other owners
-    /// before answering `Ok(None)`, a remote owner declines instead of
-    /// answering a miss for a cold bucket of its own, so the next owner is
-    /// tried, and a cold owner whose every other owner is unreachable
+    /// Never promotes the fetched value into the local store; [`Cache::get`]
+    /// for the same key immediately afterward is still a miss on this node.
+    /// A bucket this node owns but has not yet pulled from a co-owner is
+    /// cold: a local miss there asks the other owners before answering
+    /// `Ok(None)`, and a cold owner whose every other owner is unreachable
     /// returns [`CacheError::FetchUnavailable`] rather than a miss it
-    /// cannot vouch for. On a cache that isn't
-    /// [`Mode::Distributed`] this is [`Cache::get`] wrapped in `Ok`, counted
-    /// `outcome="local"` unconditionally, so callers don't need to branch
-    /// on mode.
+    /// cannot vouch for. On a cache that isn't [`Mode::Distributed`] this
+    /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
+    /// unconditionally, so callers don't need to branch on mode.
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::Codec`] if `key` fails to encode.
-    ///
-    /// Returns [`CacheError::FetchUnavailable`] if every owner is
-    /// unreachable or times out
-    /// (`crate::config::ClusterConfig::fetch_timeout` per attempt) —
-    /// distinct from a genuine miss, which returns `Ok(None)`. An owner
-    /// whose ownership view differs from this node's, the state both are
-    /// in for a moment after a membership change, is retried with a short
-    /// jittered backoff for one `fetch_timeout` before the next owner is
-    /// tried, and at once against a fresh view when this node's own view
-    /// moves first.
+    /// Returns [`CacheError::Codec`] if `key` fails to encode, and
+    /// [`CacheError::FetchUnavailable`] if every owner is unreachable or
+    /// times out (`crate::config::ClusterConfig::fetch_timeout` per
+    /// attempt), distinct from a genuine miss, which returns `Ok(None)`.
+    /// An owner whose ownership view differs from this node's is retried
+    /// with a short jittered backoff before the next owner is tried.
     pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
         let Some(view) = self.shard.ownership_view() else {
             let value = self.shard.get(key).await;
@@ -1072,7 +1051,7 @@ where
     ///
     /// [`Cache::get`] never consults a pending fold: a value folded in but
     /// not yet flushed is invisible to a read for as long as it stays
-    /// pending — up to one whole window from the call that opened it.
+    /// pending, up to one whole window from the call that opened it.
     ///
     /// # Errors
     ///
@@ -1149,7 +1128,7 @@ where
     }
 
     /// Closes this cache: stops its background tasks and waits for them,
-    /// closes its spill tier if one was configured, drops it from the
+    /// closes its spill tier if one is configured, drops it from the
     /// cluster's shard registry, and clears its gossiped mode, so peers
     /// stop seeing it advertised and this node stops serving or applying
     /// replication traffic for it. The name is free to `open()` again

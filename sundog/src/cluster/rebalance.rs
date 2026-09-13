@@ -2,8 +2,8 @@
 //! current owners the moment this node's [`OwnershipView`] says it gained
 //! it, and releases a bucket's local data once this node has kept it
 //! resident past the disown grace after losing it. The open()-time initial
-//! pull and this module's ongoing loop share one mechanism,
-//! [`pull_buckets`], scoped to whichever bucket set is at hand.
+//! pull and this module's ongoing loop share one mechanism, [`PullRequest`],
+//! scoped to whichever bucket set is at hand.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,17 +21,14 @@ use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
 use crate::store::ShardOps;
 
-/// Groups `buckets` by the exact donor set each should be pulled from — the
-/// bucket's live owners under `view`, self excluded, in the view's own
-/// rendezvous order — so two buckets sharing an owner-set-minus-self land in
-/// one `StBuckets` round trip. The bucket-scoped analogue of
-/// `cluster::group_by_owner_set`, grouping bucket numbers instead of
-/// records, and preserving rendezvous order (not sorting it) since that
-/// order is exactly this group's donor try-order.
 /// One pull group: the donors to try, in rendezvous order, and the buckets
 /// they all co-own.
 type DonorGroup = (Vec<NodeId>, Vec<u16>);
 
+/// Groups `buckets` by exact donor set (`view`'s live owners minus self, in
+/// rendezvous order), so buckets sharing a donor set land in one
+/// `StBuckets` round trip; the bucket-scoped analogue of
+/// `cluster::group_by_owner_set`.
 fn group_buckets_by_donor_set(
     view: &OwnershipView,
     self_node: NodeId,
@@ -89,18 +86,18 @@ const ALL_COLD_PASSES: u32 = 3;
 const GROUP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Tries `donors` in order for one bucket group, applying the first that
-/// donates. A donor's `StaleView` decline is expected while this side's and
-/// that donor's `refresh_task`s are still converging on the same eligible
-/// set right after a membership change — see
-/// [`crate::store::ShardOps::ae_peer_filter`]'s doc for the same race — so a
-/// pass where every donor declines or fails retries the whole list after
-/// [`GROUP_RETRY_BACKOFF`] rather than giving up, unless this node's own
-/// view has moved on from `view_hash` since the pull was planned: then no
-/// donor will ever agree, and the pull answers `None` so the caller plans
-/// afresh against the current view; the caller's own `budget`
-/// timeout is the only bound on how long this keeps trying. Returns the
-/// count of records actually landed once a donor succeeds.
-#[allow(clippy::too_many_arguments)]
+/// donates. A `StaleView` decline is expected while both sides'
+/// `refresh_task`s converge after a membership change (see
+/// [`crate::store::ShardOps::ae_peer_filter`]), so an all-declined pass
+/// retries after [`GROUP_RETRY_BACKOFF`] rather than giving up, unless this
+/// node's own view has moved past `view_hash`: then no donor ever agrees,
+/// and the pull answers `None` for the caller to replan against the
+/// current view. Returns the count of records landed once a donor
+/// succeeds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is independent context one donor-group retry loop needs; grouping any subset into a struct would only rename the same eight pieces of state"
+)]
 async fn pull_one_group(
     shard: &Arc<dyn ShardOps>,
     mesh: &Mesh,
@@ -153,143 +150,140 @@ async fn pull_one_group(
     }
 }
 
-/// Pulls `buckets` from any current owner (per `ownership.current()`),
-/// grouped by donor set exactly as `cluster::fan_out_by_owner_set` groups
-/// writes: two buckets sharing an owner-set-minus-self go in one
-/// `StBuckets` round trip, tried in rendezvous order per group. Bounded to
-/// at most `concurrency` simultaneous donor streams via a
-/// [`tokio::sync::Semaphore`], so a mass-membership event can't open dozens
-/// of simultaneous transfer streams. Applies replies through
-/// [`ShardOps::apply_remote_batch`], so the inbound-apply guard is the
-/// final safety net regardless of what a donor sends.
-///
-/// An empty `buckets` short-circuits to [`Outcome::Completed`] — nothing to
-/// pull. A zero `budget` short-circuits to [`Outcome::Skipped`], matching
-/// [`state_transfer::run`]'s same rule. A bucket set whose every group has
-/// no donor at all (every owner is this node alone, the degenerate
-/// small-cluster case) answers [`Outcome::NoPeers`]. Cold marks are the
-/// caller's: `attach_ownership` and [`rebalance_task`] mark a bucket cold
-/// when it is gained from a co-owner, and a landed pull clears it here; a
-/// warm-up retry never marks, since this node may be the origin of what it
-/// holds. Otherwise the whole
-/// operation races `budget`: every group either lands or declines within it
-/// and this returns [`Outcome::Completed`], or the budget runs out first
-/// and this returns [`Outcome::TimedOut`], leaving the rest to a retry or
-/// to anti-entropy's self-healing backstop. A view that moves on from
-/// `ownership.current()` mid-pull answers [`Outcome::Superseded`] once
-/// every group has landed or given up: the caller plans afresh against
-/// the current view.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn pull_buckets(
-    cluster: &Cluster,
-    shard: &Arc<dyn ShardOps>,
-    ownership: &OwnershipTracker,
-    residency: &Arc<ResidencySet>,
-    cache: &SmolStr,
-    buckets: Vec<u16>,
-    budget: Duration,
-    concurrency: usize,
-) -> Outcome {
-    if buckets.is_empty() {
-        return Outcome::Completed;
-    }
-    if budget.is_zero() {
-        tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained buckets to anti-entropy");
-        return Outcome::Skipped;
-    }
+/// One bucket pull's eight fields, gathered so every caller builds and runs
+/// one value instead of repeating an eight-argument call.
+pub(crate) struct PullRequest<'a> {
+    pub(crate) cluster: &'a Cluster,
+    pub(crate) shard: &'a Arc<dyn ShardOps>,
+    pub(crate) ownership: &'a OwnershipTracker,
+    pub(crate) residency: &'a Arc<ResidencySet>,
+    pub(crate) cache: &'a SmolStr,
+    pub(crate) buckets: Vec<u16>,
+    pub(crate) budget: Duration,
+    pub(crate) concurrency: usize,
+}
 
-    let view = ownership.current();
-    let view_hash = view.view_hash();
-    let (groups, no_donor): (Vec<DonorGroup>, Vec<DonorGroup>) =
-        group_buckets_by_donor_set(&view, cluster.node_id(), buckets)
-            .into_iter()
-            .partition(|(donors, _)| !donors.is_empty());
-    // A bucket this node owns alone has nobody to pull from: what is here
-    // is all there is, so it is not cold either.
-    let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
-    if !alone.is_empty() {
-        residency.clear_cold(&alone);
-    }
-    if groups.is_empty() {
-        tracing::debug!(cache = %cache, "no live co-owner for any gained bucket; nothing to pull");
-        return Outcome::NoPeers;
-    }
+impl PullRequest<'_> {
+    /// Pulls `buckets` from any current owner, grouped by donor set so two
+    /// buckets sharing an owner-set-minus-self go in one `StBuckets` round
+    /// trip, bounded to `concurrency` simultaneous donor streams. Answers
+    /// [`Outcome::Completed`]/[`Outcome::Skipped`]/[`Outcome::NoPeers`] for
+    /// an empty bucket set, a zero budget, or no live co-owner anywhere;
+    /// otherwise races `budget`, answering [`Outcome::TimedOut`] or
+    /// [`Outcome::Superseded`] if it runs out or the view moves on first.
+    pub(crate) async fn run(self) -> Outcome {
+        let Self {
+            cluster,
+            shard,
+            ownership,
+            residency,
+            cache,
+            buckets,
+            budget,
+            concurrency,
+        } = self;
+        if buckets.is_empty() {
+            return Outcome::Completed;
+        }
+        if budget.is_zero() {
+            tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained buckets to anti-entropy");
+            return Outcome::Skipped;
+        }
 
-    let per_donor = state_transfer::per_donor_budget(budget);
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mesh = cluster.mesh().clone();
+        let view = ownership.current();
+        let view_hash = view.view_hash();
+        let (groups, no_donor): (Vec<DonorGroup>, Vec<DonorGroup>) =
+            group_buckets_by_donor_set(&view, cluster.node_id(), buckets)
+                .into_iter()
+                .partition(|(donors, _)| !donors.is_empty());
+        // A bucket this node owns alone has nobody to pull from: what is here
+        // is all there is, so it is not cold either.
+        let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
+        if !alone.is_empty() {
+            residency.clear_cold(&alone);
+        }
+        if groups.is_empty() {
+            tracing::debug!(cache = %cache, "no live co-owner for any gained bucket; nothing to pull");
+            return Outcome::NoPeers;
+        }
 
-    let run_all = async {
-        let mut set = tokio::task::JoinSet::new();
-        for (donors, group_buckets) in groups {
-            let semaphore = Arc::clone(&semaphore);
-            let shard = Arc::clone(shard);
-            let mesh = mesh.clone();
-            let cache = cache.clone();
-            let ownership = ownership.clone();
-            let residency = Arc::clone(residency);
-            set.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
+        let per_donor = state_transfer::per_donor_budget(budget);
+        let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+        let mesh = cluster.mesh().clone();
+
+        let run_all = async {
+            let mut set = tokio::task::JoinSet::new();
+            for (donors, group_buckets) in groups {
+                let semaphore = Arc::clone(&semaphore);
+                let shard = Arc::clone(shard);
+                let mesh = mesh.clone();
+                let cache = cache.clone();
+                let ownership = ownership.clone();
+                let residency = Arc::clone(residency);
+                set.spawn(async move {
+                    let _permit = semaphore
+                        .acquire_owned()
+                        .await
+                        .expect("invariant: semaphore is never closed");
+                    pull_one_group(
+                        &shard,
+                        &mesh,
+                        &cache,
+                        &ownership,
+                        &residency,
+                        donors,
+                        group_buckets,
+                        view_hash,
+                        per_donor,
+                    )
                     .await
-                    .expect("invariant: semaphore is never closed");
-                pull_one_group(
-                    &shard,
-                    &mesh,
-                    &cache,
-                    &ownership,
-                    &residency,
-                    donors,
-                    group_buckets,
-                    view_hash,
-                    per_donor,
-                )
-                .await
-            });
-        }
-        let mut landed = 0u64;
-        let mut superseded = false;
-        while let Some(result) = set.join_next().await {
-            match result.ok().flatten() {
-                Some(count) => landed += count,
-                None => superseded = true,
+                });
             }
-        }
-        (landed, superseded)
-    };
+            let mut landed = 0u64;
+            let mut superseded = false;
+            while let Some(result) = set.join_next().await {
+                match result.ok().flatten() {
+                    Some(count) => landed += count,
+                    None => superseded = true,
+                }
+            }
+            (landed, superseded)
+        };
 
-    match tokio::time::timeout(budget, run_all).await {
-        Ok((landed, superseded)) => {
-            // `landed` counts buckets whose pull landed, not records.
-            if landed > 0 {
-                metrics::counter!(
-                    "sundog_rebalance_buckets_total",
-                    "cache" => cache.to_string(),
-                    "direction" => "in"
-                )
-                .increment(landed);
+        match tokio::time::timeout(budget, run_all).await {
+            Ok((landed, superseded)) => {
+                // `landed` counts buckets whose pull landed, not records.
+                if landed > 0 {
+                    metrics::counter!(
+                        "sundog_rebalance_buckets_total",
+                        "cache" => cache.to_string(),
+                        "direction" => "in"
+                    )
+                    .increment(landed);
+                }
+                if superseded {
+                    Outcome::Superseded
+                } else {
+                    Outcome::Completed
+                }
             }
-            if superseded {
-                Outcome::Superseded
-            } else {
-                Outcome::Completed
-            }
+            Err(_) => Outcome::TimedOut,
         }
-        Err(_) => Outcome::TimedOut,
     }
 }
 
-/// Retries [`pull_buckets`] for whatever this node's [`OwnershipTracker`]
-/// currently owns, after an initial `open()`-time pull that
-/// [`state_transfer::Outcome::needs_warm_up`] left cold: with no co-owner
-/// in the current view it waits for the view to change, since only a new
-/// view can bring one, then pulls again every `retry_interval` until a
-/// pass lands or repeated timeouts give up and mark the cache warm with
-/// whatever landed, leaving the rest to anti-entropy. The bucket-scoped
-/// analogue of [`state_transfer::warm_up_task`], sharing its
-/// [`state_transfer::next_warm_up_step`] decision and
-/// [`state_transfer::MAX_WARM_UP_ATTEMPTS`] cap.
-#[allow(clippy::too_many_arguments)]
+/// Retries [`PullRequest::run`] for whatever this node's [`OwnershipTracker`]
+/// owns, after an initial `open()`-time pull that
+/// [`state_transfer::Outcome::needs_warm_up`] left cold: waits for a
+/// co-owner when there is none, then retries every `retry_interval` until a
+/// pass lands or repeated timeouts mark the cache warm with whatever
+/// landed. Shares [`state_transfer::next_warm_up_step`]'s decision and
+/// [`state_transfer::MAX_WARM_UP_ATTEMPTS`] cap with the whole-cache
+/// analogue, [`state_transfer::warm_up_task`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a long-running per-cache background task carries this cache's full context for its whole lifetime; a struct would only rename these same eight fields"
+)]
 pub(crate) async fn warm_up_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
@@ -305,10 +299,20 @@ pub(crate) async fn warm_up_task(
     let mut view_rx = ownership.subscribe();
     loop {
         let buckets: Vec<u16> = view_rx.borrow_and_update().owned_buckets().collect();
+        let pull = PullRequest {
+            cluster: &cluster,
+            shard: &shard,
+            ownership: &ownership,
+            residency: &residency,
+            cache: &cache,
+            buckets,
+            budget,
+            concurrency,
+        };
         let outcome = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            outcome = pull_buckets(&cluster, &shard, &ownership, &residency, &cache, buckets, budget, concurrency) => outcome,
+            outcome = pull.run() => outcome,
         };
         attempt += 1;
         match state_transfer::next_warm_up_step(outcome, attempt) {
@@ -351,13 +355,10 @@ pub(crate) async fn warm_up_task(
 }
 
 /// What one published view change asks of [`rebalance_task`]: `lost` and
-/// `regained` are the differences from the view published just before
-/// (`prev`), so a bucket held from any earlier view starts or stops its
-/// disown grace; `to_pull` is the difference from the last view whose pull
-/// was not superseded (`pulled`), so a bucket gained under a view that
-/// moved on mid-pull is pulled again under the current one rather than
-/// skipped. With no superseded pull in between, `prev` and `pulled` are
-/// the same view and `to_pull` equals `regained`.
+/// `regained` are the difference from the previous view (`prev`); `to_pull`
+/// is the difference from the latest view whose pull is not superseded
+/// (`pulled`), so a bucket gained under a view that gets superseded
+/// mid-pull is pulled again under the current one instead of skipped.
 pub(crate) struct ViewChangePlan {
     pub(crate) lost: Vec<u16>,
     pub(crate) regained: Vec<u16>,
@@ -398,14 +399,11 @@ pub(crate) fn hand_off_owners(
 }
 
 /// The buckets in `due` a release may drop now: those whose every other
-/// current owner either is in `reconciled` (an anti-entropy round against
-/// it completed since the bucket came due, so it holds what this node
-/// held) or, for a bucket in `overdue` (held past the hard cap), is in
-/// `unreachable` (its round failed outright, or it is not a live peer), so
-/// an owner that never answers cannot pin memory forever. An owner whose
-/// view still differs from this node's is neither: its round ends `Stale`,
-/// the bucket stays resident, and the next tick tries again once the views
-/// converge, however long that takes.
+/// current owner is in `reconciled` (its anti-entropy round completed
+/// since the bucket came due) or, once `overdue`, in `unreachable` (its
+/// round failed, or it has dropped out of the live set). An owner whose view still
+/// differs from this node's is neither, so the bucket stays resident until
+/// the views converge.
 pub(crate) fn buckets_to_release(
     view: &OwnershipView,
     self_node: NodeId,
@@ -428,20 +426,20 @@ pub(crate) fn buckets_to_release(
 
 /// Reacts to every change in `ownership`'s view for as long as `cancel`
 /// stays live: marks newly lost buckets releasing, unmarks newly regained
-/// ones (a flap never accumulates toward release), and pulls newly gained
-/// ones from their current owners. On a tick piggybacked on `ae_interval`
-/// (no separate ticker), hands off whichever buckets' disown grace has
-/// elapsed: one anti-entropy round against each of their live current
-/// owners ([`hand_off_owners`]), pushing what an owner lacks, then
-/// [`ShardOps::release_buckets`] for the buckets every owner answered
-/// ([`buckets_to_release`]), counting each released bucket in
-/// `sundog_rebalance_buckets_total{direction="out"}`. A bucket whose owner
-/// did not answer stays resident until the next tick: for as long as the
-/// owner's view differs from this node's, or up to twice the grace when
-/// the owner is unreachable. The hand-off closes the one gap a pull alone
-/// leaves: two nodes joining at once can both own a bucket neither has
-/// yet, each pulling it from the other.
-#[allow(clippy::too_many_arguments)]
+/// ones, and pulls newly gained ones from their current owners. On a tick
+/// piggybacked on `ae_interval`, hands off whichever buckets' disown grace
+/// has elapsed to their live current owners ([`hand_off_owners`]), then
+/// calls [`ShardOps::release_buckets`] for the buckets every owner answered
+/// ([`buckets_to_release`]); an owner that never answers keeps the bucket
+/// resident until it is reachable again or its view converges.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a long-running per-cache background task carries this cache's full context for its whole lifetime; a struct would only rename these same eight fields"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one event loop's whole view-change and disown-grace handling reads best kept together"
+)]
 pub(crate) async fn rebalance_task(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
@@ -455,8 +453,8 @@ pub(crate) async fn rebalance_task(
     let budget = cluster.config().state_transfer_budget;
     let ae_interval = cluster.config().ae_interval;
     let mut view_rx = ownership.subscribe();
-    // `prev_view` is the view published just before the current one;
-    // `pulled_view` the last one whose pull was not superseded. See
+    // `prev_view` is the view published right before the current one;
+    // `pulled_view` is the latest view without a superseded pull. See
     // `plan_view_change` for why the two differ.
     let mut prev_view = view_rx.borrow_and_update().clone();
     let mut pulled_view = Arc::clone(&prev_view);
@@ -496,11 +494,22 @@ pub(crate) async fn rebalance_task(
                     // Gained from a co-owner: cold until the pull lands.
                     residency.mark_cold(&plan.to_pull);
                     tracing::debug!(cache = %cache, count = plan.to_pull.len(), "buckets gained; pulling from current owners");
-                    pull_buckets(&cluster, &shard, &ownership, &residency, &cache, plan.to_pull, budget, concurrency).await
+                    PullRequest {
+                        cluster: &cluster,
+                        shard: &shard,
+                        ownership: &ownership,
+                        residency: &residency,
+                        cache: &cache,
+                        buckets: plan.to_pull,
+                        budget,
+                        concurrency,
+                    }
+                    .run()
+                    .await
                 };
-                // A pull the view moved past is planned again from the
-                // same starting point on the next change, which has
-                // already been published, so nothing gained is skipped.
+                // A pull the view moves past is planned again from the same
+                // starting point on the next change, which is already
+                // published, so nothing gained is skipped.
                 if outcome != Outcome::Superseded {
                     pulled_view = new_view;
                 }
@@ -512,7 +521,7 @@ pub(crate) async fn rebalance_task(
                     let self_node = cluster.node_id();
                     let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
                     let mut reconciled: HashSet<NodeId> = HashSet::new();
-                    // An owner gossip no longer lists is unreachable by
+                    // An owner missing from gossip is unreachable by
                     // definition; the view drops it on its next refresh.
                     let mut unreachable: HashSet<NodeId> = due
                         .iter()
@@ -556,7 +565,7 @@ pub(crate) async fn rebalance_task(
     }
 }
 
-// The pure grouping tests need no cluster; the `pull_buckets` tests build a
+// The pure grouping tests need no cluster; the `PullRequest` tests build a
 // real `Cluster` with a real `Mesh`, which panics under `sim` outside a
 // driven `turmoil::Sim`.
 #[cfg(all(test, not(feature = "sim")))]
@@ -615,7 +624,7 @@ mod tests {
         let self_node = NodeId::from(1);
         let k = 2;
         // v0: three nodes. v1: node 3 died, so self gained its share. v2:
-        // node 4 joined, taking some of those just-gained buckets away.
+        // node 4 joined, taking some of those newly gained buckets away.
         let v0 = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
         let v1 = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
         let v2 = view(self_node, [1u64, 2, 4].map(NodeId::from).to_vec(), k);
@@ -632,7 +641,7 @@ mod tests {
             assert!(o0.contains(&b) && !o1.contains(&b));
         }
 
-        // v1's pull was superseded by v2: lost is measured from v1, so a
+        // v1's pull gets superseded by v2: lost is measured from v1, so a
         // bucket gained under v1 and gone in v2 starts its grace, while
         // the pull covers everything v2 owns that v0 did not.
         let plan = plan_view_change(&v1, &v0, &v2);
@@ -736,7 +745,7 @@ mod tests {
         );
 
         // Overdue: a stale owner still holds the bucket, an unreachable
-        // one no longer does.
+        // one does not.
         let overdue: Vec<u16> = due.clone();
         let still_held = buckets_to_release(&view, self_node, &due, &overdue, &none, &none);
         assert_eq!(
@@ -756,9 +765,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pull_buckets_completes_trivially_with_no_buckets_to_pull() {
-        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-empty")
+    fn empty_shard() -> Arc<dyn ShardOps> {
+        Arc::new(crate::store::Shard::<u32, u32>::new(
+            SmolStr::new("prices"),
+            crate::store::Mode::Distributed {
+                owners: NonZeroU8::new(2).expect("nonzero"),
+            },
+            crate::node::NodeId::random(),
+            1024,
+            None,
+            None,
+        )) as Arc<dyn ShardOps>
+    }
+
+    async fn solo_cluster(name: &str) -> crate::cluster::Cluster {
+        crate::cluster::Cluster::builder(name)
             .seeds(std::iter::empty())
             .config(crate::config::ClusterConfig {
                 gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
@@ -767,7 +788,12 @@ mod tests {
             })
             .build()
             .await
-            .expect("solo cluster builds");
+            .expect("solo cluster builds")
+    }
+
+    #[tokio::test]
+    async fn pull_buckets_completes_trivially_with_no_buckets_to_pull() {
+        let cluster = solo_cluster("rebalance-unit-test-empty").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
         let (tracker, _tx) = OwnershipTracker::seed(
@@ -777,18 +803,18 @@ mod tests {
             &name,
             k,
         );
-        let shard = empty_shard();
 
-        let outcome = pull_buckets(
-            &cluster,
-            &shard,
-            &tracker,
-            &Arc::new(ResidencySet::new()),
-            &name,
-            Vec::new(),
-            Duration::from_secs(1),
-            4,
-        )
+        let outcome = PullRequest {
+            cluster: &cluster,
+            shard: &empty_shard(),
+            ownership: &tracker,
+            residency: &Arc::new(ResidencySet::new()),
+            cache: &name,
+            buckets: Vec::new(),
+            budget: Duration::from_secs(1),
+            concurrency: 4,
+        }
+        .run()
         .await;
         assert_eq!(outcome, Outcome::Completed);
 
@@ -797,16 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_buckets_reports_no_peers_when_every_bucket_has_no_other_owner() {
-        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-solo")
-            .seeds(std::iter::empty())
-            .config(crate::config::ClusterConfig {
-                gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-                data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-                ..crate::config::ClusterConfig::default()
-            })
-            .build()
-            .await
-            .expect("solo cluster builds");
+        let cluster = solo_cluster("rebalance-unit-test-solo").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
         let (tracker, _tx) = OwnershipTracker::seed(
@@ -816,18 +833,18 @@ mod tests {
             &name,
             k,
         );
-        let shard = empty_shard();
 
-        let outcome = pull_buckets(
-            &cluster,
-            &shard,
-            &tracker,
-            &Arc::new(ResidencySet::new()),
-            &name,
-            vec![0, 1, 2],
-            Duration::from_secs(1),
-            4,
-        )
+        let outcome = PullRequest {
+            cluster: &cluster,
+            shard: &empty_shard(),
+            ownership: &tracker,
+            residency: &Arc::new(ResidencySet::new()),
+            cache: &name,
+            buckets: vec![0, 1, 2],
+            budget: Duration::from_secs(1),
+            concurrency: 4,
+        }
+        .run()
         .await;
         assert_eq!(outcome, Outcome::NoPeers);
 
@@ -895,16 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_buckets_skips_with_a_zero_budget() {
-        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-zero-budget")
-            .seeds(std::iter::empty())
-            .config(crate::config::ClusterConfig {
-                gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-                data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-                ..crate::config::ClusterConfig::default()
-            })
-            .build()
-            .await
-            .expect("solo cluster builds");
+        let cluster = solo_cluster("rebalance-unit-test-zero-budget").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
         let (tracker, _tx) = OwnershipTracker::seed(
@@ -914,34 +922,21 @@ mod tests {
             &name,
             k,
         );
-        let shard = empty_shard();
 
-        let outcome = pull_buckets(
-            &cluster,
-            &shard,
-            &tracker,
-            &Arc::new(ResidencySet::new()),
-            &name,
-            vec![0],
-            Duration::ZERO,
-            4,
-        )
+        let outcome = PullRequest {
+            cluster: &cluster,
+            shard: &empty_shard(),
+            ownership: &tracker,
+            residency: &Arc::new(ResidencySet::new()),
+            cache: &name,
+            buckets: vec![0],
+            budget: Duration::ZERO,
+            concurrency: 4,
+        }
+        .run()
         .await;
         assert_eq!(outcome, Outcome::Skipped);
 
         cluster.shutdown().await;
-    }
-
-    fn empty_shard() -> Arc<dyn ShardOps> {
-        Arc::new(crate::store::Shard::<u32, u32>::new(
-            SmolStr::new("prices"),
-            crate::store::Mode::Distributed {
-                owners: NonZeroU8::new(2).expect("nonzero"),
-            },
-            crate::node::NodeId::random(),
-            1024,
-            None,
-            None,
-        )) as Arc<dyn ShardOps>
     }
 }
