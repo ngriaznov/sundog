@@ -928,21 +928,21 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
 /// one part the dropped key falls into then answers with its own small
 /// listing. n2 cold-joins and warms first, so both replicas start
 /// byte-identical; dropping one key locally on n2 then leaves exactly one
-/// bucket, and within it one part, mismatched. The wire-cost measurement
-/// waits for [`wait_for_quiescent_netstats`] first: n2's local count reaches
+/// bucket, and within it one part, mismatched. The repair's shape is read
+/// off n2's own `sundog_ae_parts_total` outcomes, one `listing` and no
+/// `sketch` or `fallback`, with no bucket-level sketch either: n1's wire
+/// bytes over the same window also carry its own rounds' 3 KB digests,
+/// so they are printed for reference, not asserted on. The baseline is
+/// read after [`wait_for_quiescent_netstats`]: n2's local count reaches
 /// ENTRIES slightly before its state-transfer stream and the first
-/// post-join anti-entropy round finish draining, and that unrelated tail
-/// would otherwise land inside the measured window.
+/// post-join anti-entropy round finish draining, and that round's own
+/// outcomes must not count as the repair's.
 #[tokio::test]
 async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     const ENTRIES: u32 = 1_000_000;
     const TARGET_KEY: &str = "k123456";
     const TARGET_VALUE: &str = "v123456";
     const PART_MIN_BUCKET: &str = "512";
-    /// A full bucket listing at this scale runs about 22 KB; the part path
-    /// is ~512 B of part digests, plus a small listing for the one
-    /// differing part, plus the repaired record itself.
-    const REPAIR_BYTES_BUDGET: u64 = 16 * 1024;
 
     if !container_tests_enabled() {
         eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
@@ -971,6 +971,9 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     wait_for_quiescent_netstats(&n1, Duration::from_secs(90)).await;
 
     let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the drop");
+    let parts_before = ae_parts_outcomes(&n2).await;
+    let bucket_sketches_before =
+        scrape_metric(&n2, "sundog_ae_sketch_total", ("cache", "it")).await;
 
     n2.drop_key(TARGET_KEY)
         .await
@@ -992,11 +995,19 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     let frames_for_repair = frames_after - frames_before;
     let bytes_for_repair = bytes_after - bytes_before;
     println!("part-digest repair: n1 sent {frames_for_repair} frames / {bytes_for_repair} bytes");
-    assert!(
-        bytes_for_repair < REPAIR_BYTES_BUDGET,
-        "n1 sent {bytes_for_repair} bytes to repair one dropped key out of a {REPAIR_BYTES_BUDGET}-byte \
-         budget; a full bucket listing at this scale runs about 22 KB, so the part-digest path \
-         should cost a small fraction of that"
+    let parts_after = ae_parts_outcomes(&n2).await;
+    let bucket_sketches_after = scrape_metric(&n2, "sundog_ae_sketch_total", ("cache", "it")).await;
+    assert_eq!(
+        (
+            parts_after.listing - parts_before.listing,
+            parts_after.sketch - parts_before.sketch,
+            parts_after.fallback - parts_before.fallback,
+            bucket_sketches_after - bucket_sketches_before,
+        ),
+        (1, 0, 0, 0),
+        "the repair should list exactly the one part the dropped key falls into (part outcomes \
+         listing/sketch/fallback, then bucket sketches): the mismatched bucket answers with part \
+         digests, not a bucket sketch or a full listing"
     );
     assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
 
@@ -1583,6 +1594,23 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
 /// exact-integer count in practice, so rounding it to `u64` here sidesteps
 /// `clippy::float_cmp` entirely: every comparison below compares `u64`s,
 /// never `f64`s, mirroring `tests/spill_bench.rs`'s `metric_count`.
+/// One node's `sundog_ae_parts_total` counters by outcome, the part-path
+/// shape of the anti-entropy rounds it initiated.
+#[derive(Debug, Clone, Copy)]
+struct AePartsOutcomes {
+    listing: u64,
+    sketch: u64,
+    fallback: u64,
+}
+
+async fn ae_parts_outcomes(node: &Node) -> AePartsOutcomes {
+    AePartsOutcomes {
+        listing: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "listing")).await,
+        sketch: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "sketch")).await,
+        fallback: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "fallback")).await,
+    }
+}
+
 async fn scrape_metric(node: &Node, metric: &str, label: (&str, &str)) -> u64 {
     let value = node
         .metrics()
