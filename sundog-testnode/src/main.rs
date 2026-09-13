@@ -3,120 +3,20 @@
 //! can drive a real cluster member from outside its container. Built as a
 //! static musl binary with no libc dependency.
 //!
-//! Usage: `sundog-testnode <cluster-name>`, with `SUNDOG_SEEDS` a
-//! comma-separated list of `host:port` gossip seeds,
-//! `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET`/`SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET`
-//! optional `usize` overrides for `ClusterConfig::ae_part_min_bucket`/
-//! `ae_sketch_min_bucket`, and `SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS` an
-//! optional `u64` override for `ClusterConfig::crdt_retire_after` (absent
-//! means each knob's built-in default). Opens one `Mode::Replicated` cache
-//! named `"it"` and prints `testnode-ready` once the control listener is up.
+//! Usage: `sundog-testnode <cluster-name>`; every other setting comes from
+//! `SUNDOG_*` environment variables (seeds, anti-entropy bucket overrides,
+//! cache mode and capacity, spill tier, conflict resolver): see each
+//! variable's read site in [`run`] for its meaning and default.
 //!
-//! `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`, an optional `u64`, bounds `"it"`
-//! with a byte-counting weigher (`byte_weight`) instead of the default
-//! unbounded entry count. Combined with `SUNDOG_TESTNODE_SPILL_DIR` (a
-//! filesystem path) and `SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES` (a `u64` byte
-//! budget), both required together, `"it"` opens with a `SpillConfig` tier
-//! under that directory and capacity; `SUNDOG_TESTNODE_SPILL_REGION_BYTES`,
-//! an optional `u64`, overrides its default region size, and
-//! `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`, also optional, overrides the
-//! flush-queue byte bound (default: one region's worth) independently of
-//! `region_bytes`. These four spill variables only exist when this binary is
-//! built with sundog's `spill` feature; setting
-//! `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` alone, with no spill dir, opens
-//! `Mode::Replicated` with a finite `max_capacity` and no spill tier, which
-//! `open()` rejects — a test never does this. With none of these set, `"it"`
-//! opens exactly as it always has: unbounded, no weigher, no spill.
+//! Line protocol: one command per line on `CONTROL_PORT`, one
+//! line-terminated reply each; each command's argument shape and reply
+//! string is documented on the match arm or handler that implements it, in
+//! [`TestNode::dispatch`] and the `*_command` functions it calls.
 //!
 //! Built with the `prometheus` feature, every run also serves `GET /metrics`
-//! (and `/readyz`, `/healthz`) on `METRICS_PORT` via
-//! `sundog::ClusterBuilder::prometheus_listen`, exposing every
-//! `sundog_spill_*`/`sundog_ae_repaired_total` counter and gauge the store
-//! emits for `"it"`.
-//!
-//! Control protocol, one command per line, one line-terminated reply each:
-//! `put k v` -> `ok`; `get k` -> `val <v>` | `none`; `del k` -> `ok`;
-//! `count` -> `<n>`; `fill n` -> `ok`, bulk-inserting `k0..kn` = `v0..vn`;
-//! `drop k` -> `ok`, dropping `k`'s local copy with no tombstone, standing
-//! in for a lost `Replicate`; `netstats` -> `<frames> <bytes>`, this
-//! process's total wire frames and bytes sent; `peers` -> `<n>`; `quit` ->
-//! exits 0.
-//!
-//! A second `Mode::Replicated` cache named `"churn"` carries a short TTL
-//! (`CHURN_TTL`): `churn n` -> `ok` runs `n` operations (3:1 insert:remove)
-//! over `CHURN_KEYSPACE` keys; `ccount` -> `<n>` reads its live-entry count.
-//!
-//! Large-value commands work on `"it"` with deterministic content
-//! ([`big_value`]), verified without crossing the control connection:
-//! `bigfill n bytes` -> `ok`; `bigcheck i bytes` -> `ok` | `bad` | `none`;
-//! `bigput bytes` -> `ok` | `err ...`, the point for over-cap sizes;
-//! `bigverify bytes` -> `ok` | `bad` | `none`.
-//!
-//! `digest` -> `<hex u64>`: an order-independent digest of `"it"`'s live
-//! content, computed as [`digest_it`] describes. `crash` -> `ok`, then the
-//! process exits with status 3 without leaving the cluster gracefully, the
-//! closest a control command can get to a process actually being killed.
-//!
-//! `SUNDOG_TESTNODE_MODE` selects `"it"`'s clustering mode: `"replicated"`
-//! (the default, byte-for-byte the behavior above) or `"distributed"`,
-//! which opens `"it"` as `Mode::Distributed` instead. `SUNDOG_TESTNODE_OWNERS`,
-//! an optional `u8` at least 2, sets the owners-per-bucket count in
-//! distributed mode; absent, distributed mode uses `Mode::distributed()`'s
-//! default of two. Either variable set to anything else fails startup with
-//! a clear message. `"churn"` always stays `Mode::Replicated` regardless of
-//! this setting.
-//!
-//! Three more control routes, meaningful on any mode but only ever
-//! interesting on a distributed `"it"`: `fetch k` -> `val <v>` | `none` |
-//! `err <e>` ([`Cache::fetch`]); `owners k` -> `k`'s owning node ids, as
-//! space-separated decimal `u64`s in rendezvous score order
-//! ([`Cache::owners_of`]; on a non-distributed cache this is just this
-//! node's own id); `id` -> this node's own [`sundog::NodeId`] as a decimal
-//! `u64`.
-//!
-//! `SUNDOG_TESTNODE_RESOLVER` selects `"it"`'s `ConflictResolver`: absent or
-//! `"lww"` keeps the default; `"sum_counter"` installs [`SumCounterResolver`],
-//! which merges two decimal-string counters by addition on a genuine version
-//! conflict instead of picking the most recent write. It exists to drive the
-//! mixed-version container test's sentinel-stamped-merge scenario: a merge on
-//! this node's `"it"` stamps its version with sundog's reserved merge-version
-//! node id, and the container test installs this resolver on the current
-//! release's node to confirm the previous release's node stores and serves
-//! what it receives.
-//!
-//! A third `Mode::Replicated` cache named `"pn"` carries real
-//! [`sundog::crdt::PnCounter`] values under [`sundog::crdt::PnCounterResolver`]
-//! unconditionally, rather than gating it behind `SUNDOG_TESTNODE_RESOLVER`
-//! the way `"it"` does: [`SumCounterResolver`]'s decimal-string wire shape
-//! cannot stand in for it, since summing on every merge is not idempotent and
-//! a real anti-entropy repair can redeliver the same merge more than once,
-//! where `PnCounter::merge`'s pointwise-max join can absorb a redelivery for
-//! free. `pnfill n` -> `ok`, bulk-incrementing `pn0..pn(n-1)` by one from this
-//! node's [`Cache::writer_id`] — a blind
-//! [`sundog::crdt::PnCounter::local_delta`] write, no read needed; `pncount`
-//! -> `<n>`, `"pn"`'s live-entry count; `pnget k` -> `val <n>` | `none`, key
-//! `k`'s current [`sundog::crdt::PnCounter::value`]; `pnbytes n` -> `<b>`,
-//! the summed [`sundog::crdt::PnCounter::encode`] length of `pn0..pn(n-1)`
-//! as resident here, the record size a cold join or a state transfer
-//! carries per counter; `pndump k` -> key `k`'s resident counter in its
-//! `Debug` form, or `none`, for reading compaction state off a node. It
-//! drives the
-//! million-counter cold-join container scenario: three nodes each increment
-//! every one of a million counters once, concurrently, and a cold-joining
-//! fourth node's state transfer must carry every counter's exact merged
-//! total, not any one writer's last write.
-//!
-//! A fourth `Mode::Replicated` cache named `"os"` carries real
-//! [`sundog::crdt::OrSet`]`<String>` values under
-//! [`sundog::crdt::OrSetResolver`], one independent set per key. `osadd k e`
-//! -> `ok`, adding element `e` to key `k`'s set via a blind
-//! [`sundog::crdt::OrSet::add`] tagged with this node's own `writer_id` and
-//! its own next per-process sequence number — no read needed. `osremove k e`
-//! -> `ok`, reading key `k`'s currently observed set (a no-op if the key has
-//! never been written on this node, since there is then nothing to observe)
-//! and merging in an [`sundog::crdt::OrSet::remove`] delta against it.
-//! `osmembers k` -> every live element of key `k`'s set, alphabetically
-//! sorted and space-separated, or `none` if the key has never been written.
+//! (and `/readyz`, `/healthz`) on `METRICS_PORT`. Built with the `spill`
+//! feature, `"it"` can open a `SpillConfig` disk tier; see
+//! `spill_config_from_env`.
 
 use std::env;
 use std::io::Write as _;
@@ -183,7 +83,7 @@ async fn digest_it(cache: &Cache<String, String>) -> u64 {
     for key in cache.keys() {
         let Some(value) = cache.get(&key).await else {
             // Expired or removed between `keys()` and `get`: no contribution,
-            // matching a digest taken after it was already gone.
+            // matching a digest taken once it's already gone.
             continue;
         };
         let mut buf = Vec::with_capacity(key.len() + 1 + value.len());
@@ -344,16 +244,15 @@ fn merge_counter_bytes(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
 
 /// Merges two decimal-string counters by addition on a genuine version
 /// conflict, rather than picking whichever write is most recent, so a real
-/// `ConflictResolver::merge` outcome — and the sentinel-stamped `Hlc` sundog
-/// stamps it with — reaches the wire. Falls back to plain `Hlc` order
+/// `ConflictResolver::merge` outcome, and the sentinel-stamped `Hlc` sundog
+/// stamps it with, reaches the wire, falling back to plain `Hlc` order
 /// whenever either side fails to parse as a `u64` (a tombstone, a spilled
-/// view, or a non-numeric value), matching `sundog::crdt`'s own resolvers'
-/// decode-failure fallback.
-///
-/// Summing on every merge is not idempotent (`merge(a, a) != a`), so this is
-/// not a general-purpose CRDT resolver the way `sundog::crdt`'s are: it
-/// exists only to drive one interop scenario in the container test suite,
-/// which triggers exactly one merge on one key and never redelivers it.
+/// view, or a non-numeric value) to match `sundog::crdt`'s own resolvers'
+/// decode-failure fallback: summing on every merge is not idempotent
+/// (`merge(a, a) != a`), so this is not a general-purpose CRDT resolver the
+/// way `sundog::crdt`'s are, existing only to drive one interop scenario in
+/// the container test suite, which triggers exactly one merge on one key
+/// and never redelivers it.
 struct SumCounterResolver;
 
 impl ConflictResolver for SumCounterResolver {
@@ -465,6 +364,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // writer incarnation, not per key. Starts at zero every process start,
     // matching a fresh incarnation's fresh tag space.
     let os_seq = Arc::new(AtomicU64::new(0));
+    let node = TestNode {
+        cache,
+        churn,
+        pn,
+        os,
+        os_seq,
+        cluster,
+    };
 
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
     println!("testnode-ready");
@@ -472,15 +379,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (socket, _) = listener.accept().await?;
-        tokio::spawn(serve(
-            socket,
-            cache.clone(),
-            churn.clone(),
-            pn.clone(),
-            os.clone(),
-            Arc::clone(&os_seq),
-            cluster.clone(),
-        ));
+        tokio::spawn(serve(socket, node.clone()));
     }
 }
 
@@ -506,150 +405,170 @@ enum Reply {
     Crash,
 }
 
-async fn dispatch(
-    cache: &Cache<String, String>,
-    churn: &Cache<String, String>,
-    pn: &Cache<String, PnCounter>,
-    os: &Cache<String, OrSet<String>>,
-    os_seq: &AtomicU64,
-    cluster: &Cluster,
-    line: &str,
-) -> Reply {
-    let mut parts = line.trim().splitn(3, ' ');
-    let command = parts.next().unwrap_or_default();
-    match command {
-        "put" => {
-            let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
-                return Reply::Line("err put needs a key and a value".to_string());
-            };
-            Reply::Line(
-                match cache.insert(key.to_string(), value.to_string()).await {
-                    Ok(()) => "ok".to_string(),
-                    Err(error) => format!("err {error}"),
-                },
-            )
-        }
-        "get" => {
-            let Some(key) = parts.next() else {
-                return Reply::Line("err get needs a key".to_string());
-            };
-            Reply::Line(match cache.get(&key.to_string()).await {
-                Some(value) => format!("val {value}"),
-                None => "none".to_string(),
-            })
-        }
-        "del" => {
-            let Some(key) = parts.next() else {
-                return Reply::Line("err del needs a key".to_string());
-            };
-            Reply::Line(match cache.remove(&key.to_string()).await {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("err {error}"),
-            })
-        }
-        "count" => Reply::Line(cache.entry_count().await.to_string()),
-        "fill" => {
-            let Some(count) = parts.next().and_then(|raw| raw.parse::<u32>().ok()) else {
-                return Reply::Line("err fill needs a u32 count".to_string());
-            };
-            let entries = (0..count).map(|i| (format!("k{i}"), format!("v{i}")));
-            Reply::Line(match cache.insert_many(entries).await {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("err {error}"),
-            })
-        }
-        "churn" => {
-            let Some(ops) = parts.next().and_then(|raw| raw.parse::<u32>().ok()) else {
-                return Reply::Line("err churn needs a u32 op count".to_string());
-            };
-            for i in 0..ops {
-                let key = format!("c{}", i % CHURN_KEYSPACE);
-                let result = if i % 4 == 3 {
-                    churn.remove(&key).await
-                } else {
-                    churn.insert(key, format!("v{i}")).await
-                };
-                if let Err(error) = result {
-                    return Reply::Line(format!("err {error}"));
-                }
-            }
-            Reply::Line("ok".to_string())
-        }
-        "ccount" => Reply::Line(churn.entry_count().await.to_string()),
-        "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
-            big_command(cache, command, &mut parts).await
-        }
-        "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
-            pn_command(pn, pn.writer_id(), command, parts.next()).await
-        }
-        "osadd" | "osremove" | "osmembers" => {
-            os_command(
-                os,
-                os.writer_id(),
-                os_seq,
-                command,
-                parts.next(),
-                parts.next(),
-            )
-            .await
-        }
-        "drop" => {
-            let Some(key) = parts.next() else {
-                return Reply::Line("err drop needs a key".to_string());
-            };
-            cache.invalidate_local(&key.to_string()).await;
-            Reply::Line("ok".to_string())
-        }
-        "fetch" | "owners" => ownership_command(cache, command, parts.next()).await,
-        "id" => Reply::Line(cluster.node_id().as_u64().to_string()),
-        "netstats" => Reply::Line(format!(
-            "{} {}",
-            sundog::net::frames_sent_total(),
-            sundog::net::bytes_sent_total()
-        )),
-        "peers" => Reply::Line(cluster.peers().len().to_string()),
-        "digest" => Reply::Line(format!("{:016x}", digest_it(cache).await)),
-        "quit" => Reply::Quit,
-        "crash" => Reply::Crash,
-        other => Reply::Line(format!("err unknown command {other:?}")),
+/// Parses one control-line argument via `FromStr`; `None` if absent or unparsable.
+fn parse_arg<T: std::str::FromStr>(raw: Option<&str>) -> Option<T> {
+    raw?.parse().ok()
+}
+
+/// Renders `Ok(())` as `ok`, `Err(error)` as `err <error>`.
+fn ok_reply(result: Result<(), impl std::fmt::Display>) -> String {
+    match result {
+        Ok(()) => "ok".to_string(),
+        Err(error) => format!("err {error}"),
     }
 }
 
-/// The `big*` command family: every variant parses a trailing `usize` size,
-/// `bigfill`/`bigcheck` an index or count before it.
+/// One control connection's handles to every open cache and the cluster.
+#[derive(Clone)]
+struct TestNode {
+    cache: Cache<String, String>,
+    churn: Cache<String, String>,
+    pn: Cache<String, PnCounter>,
+    os: Cache<String, OrSet<String>>,
+    os_seq: Arc<AtomicU64>,
+    cluster: Cluster,
+}
+
+impl TestNode {
+    /// Parses and runs one control line, returning its reply.
+    async fn dispatch(&self, line: &str) -> Reply {
+        let mut parts = line.trim().splitn(3, ' ');
+        let command = parts.next().unwrap_or_default();
+        match command {
+            // put k v -> ok | err <e>.
+            "put" => {
+                let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
+                    return Reply::Line("err put needs a key and a value".to_string());
+                };
+                Reply::Line(ok_reply(
+                    self.cache.insert(key.to_string(), value.to_string()).await,
+                ))
+            }
+            // get k -> val <v> | none.
+            "get" => {
+                let Some(key) = parts.next() else {
+                    return Reply::Line("err get needs a key".to_string());
+                };
+                Reply::Line(match self.cache.get(&key.to_string()).await {
+                    Some(value) => format!("val {value}"),
+                    None => "none".to_string(),
+                })
+            }
+            // del k -> ok | err <e>.
+            "del" => {
+                let Some(key) = parts.next() else {
+                    return Reply::Line("err del needs a key".to_string());
+                };
+                Reply::Line(ok_reply(self.cache.remove(&key.to_string()).await))
+            }
+            // count -> <n>, "it"'s live-entry count.
+            "count" => Reply::Line(self.cache.entry_count().await.to_string()),
+            // fill n -> ok | err <e>, bulk-inserting k0..kn = v0..vn.
+            "fill" => {
+                let Some(count) = parse_arg::<u32>(parts.next()) else {
+                    return Reply::Line("err fill needs a u32 count".to_string());
+                };
+                let entries = (0..count).map(|i| (format!("k{i}"), format!("v{i}")));
+                Reply::Line(ok_reply(self.cache.insert_many(entries).await))
+            }
+            // churn n -> ok | err <e>, running n ops (3:1 insert:remove) over CHURN_KEYSPACE keys.
+            "churn" => {
+                let Some(ops) = parse_arg::<u32>(parts.next()) else {
+                    return Reply::Line("err churn needs a u32 op count".to_string());
+                };
+                for i in 0..ops {
+                    let key = format!("c{}", i % CHURN_KEYSPACE);
+                    let result = if i % 4 == 3 {
+                        self.churn.remove(&key).await
+                    } else {
+                        self.churn.insert(key, format!("v{i}")).await
+                    };
+                    if let Err(error) = result {
+                        return Reply::Line(format!("err {error}"));
+                    }
+                }
+                Reply::Line("ok".to_string())
+            }
+            // ccount -> <n>, "churn"'s live-entry count.
+            "ccount" => Reply::Line(self.churn.entry_count().await.to_string()),
+            "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
+                big_command(&self.cache, command, &mut parts).await
+            }
+            "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
+                pn_command(&self.pn, self.pn.writer_id(), command, parts.next()).await
+            }
+            "osadd" | "osremove" | "osmembers" => {
+                os_command(
+                    &self.os,
+                    self.os.writer_id(),
+                    &self.os_seq,
+                    command,
+                    parts.next(),
+                    parts.next(),
+                )
+                .await
+            }
+            // drop k -> ok, dropping k's local copy with no tombstone.
+            "drop" => {
+                let Some(key) = parts.next() else {
+                    return Reply::Line("err drop needs a key".to_string());
+                };
+                self.cache.invalidate_local(&key.to_string()).await;
+                Reply::Line("ok".to_string())
+            }
+            "fetch" | "owners" => ownership_command(&self.cache, command, parts.next()).await,
+            // id -> this node's own NodeId as a decimal u64.
+            "id" => Reply::Line(self.cluster.node_id().as_u64().to_string()),
+            // netstats -> <frames> <bytes>, this process's total wire frames/bytes sent.
+            "netstats" => Reply::Line(format!(
+                "{} {}",
+                sundog::net::frames_sent_total(),
+                sundog::net::bytes_sent_total()
+            )),
+            // peers -> <n>.
+            "peers" => Reply::Line(self.cluster.peers().len().to_string()),
+            // digest -> <hex u64>, an order-independent digest of "it"'s live content.
+            "digest" => Reply::Line(format!("{:016x}", digest_it(&self.cache).await)),
+            // quit -> exits 0, no reply written.
+            "quit" => Reply::Quit,
+            // crash -> ok, then exits status 3 without leaving the cluster gracefully.
+            "crash" => Reply::Crash,
+            other => Reply::Line(format!("err unknown command {other:?}")),
+        }
+    }
+}
+
+/// The `big*` command family; each variant's contract is on its match arm.
 async fn big_command(
     cache: &Cache<String, String>,
     command: &str,
     parts: &mut std::str::SplitN<'_, char>,
 ) -> Reply {
     let index = if matches!(command, "bigfill" | "bigcheck") {
-        match parts.next().and_then(|raw| raw.parse::<u32>().ok()) {
+        match parse_arg::<u32>(parts.next()) {
             Some(index) => index,
             None => return Reply::Line(format!("err {command} needs a u32 before the size")),
         }
     } else {
         BIG_ONE_INDEX
     };
-    let Some(bytes) = parts.next().and_then(|raw| raw.parse::<usize>().ok()) else {
+    let Some(bytes) = parse_arg::<usize>(parts.next()) else {
         return Reply::Line(format!("err {command} needs a usize size"));
     };
 
     Reply::Line(match command {
+        // bigfill n bytes -> ok | err <e>, bulk-inserting big0..bign.
         "bigfill" => {
             let entries = (0..index).map(|i| (format!("big{i}"), big_value(i, bytes)));
-            match cache.insert_many(entries).await {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("err {error}"),
-            }
+            ok_reply(cache.insert_many(entries).await)
         }
-        "bigput" => match cache
-            .insert(BIG_ONE_KEY.to_string(), big_value(BIG_ONE_INDEX, bytes))
-            .await
-        {
-            Ok(()) => "ok".to_string(),
-            Err(error) => format!("err {error}"),
-        },
-        // `bigcheck`/`bigverify`'s fixed key: regenerate and byte-compare.
+        // bigput bytes -> ok | err <e>, the point for over-cap sizes.
+        "bigput" => ok_reply(
+            cache
+                .insert(BIG_ONE_KEY.to_string(), big_value(BIG_ONE_INDEX, bytes))
+                .await,
+        ),
+        // bigcheck i bytes / bigverify bytes -> ok | bad | none, via verdict.
         _ => {
             let key = if command == "bigcheck" {
                 format!("big{index}")
@@ -665,8 +584,8 @@ async fn big_command(
 }
 
 /// The `pnfill n` entries: `pn0..pn(n-1)`, each a blind
-/// [`PnCounter::local_delta`] of `1` from `writer`. Pure so the fill's shape
-/// — key names, one writer, one increment each — is testable without
+/// [`PnCounter::local_delta`] of `1` from `writer`. Pure so the fill's
+/// shape, key names, one writer, one increment each, is testable without
 /// writing through a real cache.
 fn pn_fill_entries(writer: WriterId, count: u32) -> Vec<(String, PnCounter)> {
     (0..count)
@@ -708,13 +627,7 @@ fn pn_encoded_bytes<'a>(
         .map_err(|error| error.to_string())
 }
 
-/// The `pn*` command family on `"pn"`: `pnfill n` bulk-increments
-/// `pn0..pn(n-1)` by one from `writer` via [`pn_fill_entries`] (no read
-/// needed); `pncount` reads `"pn"`'s live-entry count; `pnget k` reads key
-/// `k`'s current value via [`pn_get_reply`]; `pnbytes n` sums
-/// `pn0..pn(n-1)`'s resident encoded sizes via [`pn_encoded_bytes`], an
-/// absent key contributing nothing; `pndump k` renders key `k`'s resident
-/// counter via [`pn_dump_reply`].
+/// The `pn*` command family on `"pn"`; each variant's contract is on its match arm.
 async fn pn_command(
     pn: &Cache<String, PnCounter>,
     writer: WriterId,
@@ -722,18 +635,20 @@ async fn pn_command(
     arg: Option<&str>,
 ) -> Reply {
     match command {
+        // pnfill n -> ok | err <e>, bulk-incrementing pn0..pn(n-1) by one.
         "pnfill" => {
-            let Some(count) = arg.and_then(|raw| raw.parse::<u32>().ok()) else {
+            let Some(count) = parse_arg::<u32>(arg) else {
                 return Reply::Line("err pnfill needs a u32 count".to_string());
             };
-            Reply::Line(match pn.insert_many(pn_fill_entries(writer, count)).await {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("err {error}"),
-            })
+            Reply::Line(ok_reply(
+                pn.insert_many(pn_fill_entries(writer, count)).await,
+            ))
         }
+        // pncount -> <n>, "pn"'s live-entry count.
         "pncount" => Reply::Line(pn.entry_count().await.to_string()),
+        // pnbytes n -> <b>, summed encoded length of pn0..pn(n-1).
         "pnbytes" => {
-            let Some(count) = arg.and_then(|raw| raw.parse::<u32>().ok()) else {
+            let Some(count) = parse_arg::<u32>(arg) else {
                 return Reply::Line("err pnbytes needs a u32 count".to_string());
             };
             let mut counters = Vec::with_capacity(count as usize);
@@ -747,13 +662,14 @@ async fn pn_command(
                 Err(error) => format!("err {error}"),
             })
         }
+        // pndump k -> key k's resident counter in Debug form, or none.
         "pndump" => {
             let Some(key) = arg else {
                 return Reply::Line("err pndump needs a key".to_string());
             };
             Reply::Line(pn_dump_reply(pn.get(&key.to_string()).await.as_ref()))
         }
-        // "pnget"
+        // pnget k -> val <n> | none, key k's current value.
         _ => {
             let Some(key) = arg else {
                 return Reply::Line("err pnget needs a key".to_string());
@@ -763,10 +679,8 @@ async fn pn_command(
     }
 }
 
-/// Parses `osadd`/`osremove`'s two required arguments — a key and an
-/// element — out of the line's already-split tokens: `Err` names which
-/// command needs both, `Ok` the pair unwrapped. Pure so the validation is
-/// testable without a real cache.
+/// Parses `osadd`/`osremove`'s required key and element; `Err` names which
+/// command needs both. Pure so the validation is testable without a real cache.
 fn parse_key_and_element<'a>(
     command: &str,
     key: Option<&'a str>,
@@ -785,8 +699,8 @@ fn osadd_delta(writer: WriterId, seq: u64, elem: &str) -> OrSet<String> {
     OrSet::add(writer, seq, elem.to_string())
 }
 
-/// The `osremove k e` delta against `observed` — key `k`'s currently read
-/// set — a blind [`OrSet::remove`]. Pure so the delta's shape is testable
+/// The `osremove k e` delta against `observed`, key `k`'s currently read
+/// set: a blind [`OrSet::remove`]. Pure so the delta's shape is testable
 /// without writing through a real cache.
 fn osremove_delta(observed: &OrSet<String>, elem: &str) -> OrSet<String> {
     OrSet::remove(observed, &elem.to_string())
@@ -813,15 +727,8 @@ fn os_members_reply(set: Option<&OrSet<String>>) -> String {
     }
 }
 
-/// The `os*` command family on `"os"`: `osadd k e` -> `ok`, merging
-/// [`osadd_delta`] tagged with `writer`'s own next sequence number
-/// (`next_seq`, shared across every key and connection, reset to zero at
-/// process start since a fresh process gets a fresh incarnation and so a
-/// fresh tag space) into key `k`; `osremove k e` -> `ok`, reading key `k`'s
-/// currently observed set — a no-op, since there is then nothing to observe
-/// or remove, if the key has never been written — and merging in
-/// [`osremove_delta`] against it; `osmembers k` -> [`os_members_reply`] of
-/// key `k`'s current set.
+/// The `os*` command family on `"os"`, `next_seq` being `writer`'s own next
+/// per-process sequence number; each variant's contract is on its match arm.
 async fn os_command(
     os: &Cache<String, OrSet<String>>,
     writer: WriterId,
@@ -831,6 +738,7 @@ async fn os_command(
     elem: Option<&str>,
 ) -> Reply {
     match command {
+        // osadd k e -> ok | err <e>, merging a blind OrSet::add into key k.
         "osadd" => {
             let (key, elem) = match parse_key_and_element(command, key, elem) {
                 Ok(pair) => pair,
@@ -838,11 +746,9 @@ async fn os_command(
             };
             let seq = next_seq.fetch_add(1, Ordering::Relaxed);
             let delta = osadd_delta(writer, seq, elem);
-            Reply::Line(match os.merge(key.to_string(), delta).await {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("err {error}"),
-            })
+            Reply::Line(ok_reply(os.merge(key.to_string(), delta).await))
         }
+        // osremove k e -> ok | err <e>, merging OrSet::remove against the observed set.
         "osremove" => {
             let (key, elem) = match parse_key_and_element(command, key, elem) {
                 Ok(pair) => pair,
@@ -852,12 +758,9 @@ async fn os_command(
                 return Reply::Line("ok".to_string());
             };
             let delta = osremove_delta(&observed, elem);
-            Reply::Line(match os.merge(key.to_string(), delta).await {
-                Ok(()) => "ok".to_string(),
-                Err(error) => format!("err {error}"),
-            })
+            Reply::Line(ok_reply(os.merge(key.to_string(), delta).await))
         }
-        // "osmembers"
+        // osmembers k -> sorted space-separated live elements, or none.
         _ => {
             let Some(key) = key else {
                 return Reply::Line("err osmembers needs a key".to_string());
@@ -867,9 +770,7 @@ async fn os_command(
     }
 }
 
-/// `fetch`/`owners`, the two routes that read `"it"`'s ownership state
-/// rather than its content: `fetch` answers via [`Cache::fetch`], `owners`
-/// via [`Cache::owners_of`] rendered as space-separated decimal ids.
+/// `fetch`/`owners`, the two routes reading `"it"`'s ownership state.
 async fn ownership_command(
     cache: &Cache<String, String>,
     command: &str,
@@ -880,11 +781,13 @@ async fn ownership_command(
     };
     let key = key.to_string();
     Reply::Line(match command {
+        // fetch k -> val <v> | none | err <e>.
         "fetch" => match cache.fetch(&key).await {
             Ok(Some(value)) => format!("val {value}"),
             Ok(None) => "none".to_string(),
             Err(error) => format!("err {error}"),
         },
+        // owners k -> k's owning node ids, space-separated decimal u64s.
         _ => cache
             .owners_of(&key)
             .into_iter()
@@ -894,22 +797,14 @@ async fn ownership_command(
     })
 }
 
-async fn serve(
-    socket: TcpStream,
-    cache: Cache<String, String>,
-    churn: Cache<String, String>,
-    pn: Cache<String, PnCounter>,
-    os: Cache<String, OrSet<String>>,
-    os_seq: Arc<AtomicU64>,
-    cluster: Cluster,
-) {
+async fn serve(socket: TcpStream, node: TestNode) {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
     loop {
         let Ok(Some(line)) = lines.next_line().await else {
             return;
         };
-        match dispatch(&cache, &churn, &pn, &os, &os_seq, &cluster, &line).await {
+        match node.dispatch(&line).await {
             Reply::Line(reply) => {
                 if writer
                     .write_all(format!("{reply}\n").as_bytes())
@@ -954,6 +849,29 @@ mod tests {
             None,
             "usize rejects a negative value"
         );
+    }
+
+    #[test]
+    fn parse_arg_reads_a_valid_number() {
+        assert_eq!(parse_arg::<u32>(Some("42")), Some(42));
+        assert_eq!(parse_arg::<usize>(Some("0")), Some(0));
+    }
+
+    #[test]
+    fn parse_arg_is_none_for_absent_or_unparsable_input() {
+        assert_eq!(parse_arg::<u32>(None), None);
+        assert_eq!(parse_arg::<u32>(Some("")), None);
+        assert_eq!(parse_arg::<u32>(Some("not-a-number")), None);
+    }
+
+    #[test]
+    fn ok_reply_renders_ok_for_success() {
+        assert_eq!(ok_reply(Ok::<(), String>(())), "ok");
+    }
+
+    #[test]
+    fn ok_reply_renders_the_error_for_failure() {
+        assert_eq!(ok_reply(Err("boom")), "err boom");
     }
 
     #[test]
@@ -1312,6 +1230,91 @@ mod tests {
         assert_eq!(os_members_reply(None), "none");
     }
 
+    /// A single-node [`TestNode`] on loopback, all four caches open as [`run`] opens them.
+    async fn test_node(name: &str) -> TestNode {
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let config = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = loopback;
+            c.data_bind_addr = loopback;
+        });
+        let cluster = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("a single-node cluster builds with no seeds");
+        let cache = cluster
+            .cache::<String, String>(CACHE_NAME)
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("\"it\" opens");
+        let churn = cluster
+            .cache::<String, String>(CHURN_CACHE_NAME)
+            .mode(Mode::Replicated)
+            .ttl(CHURN_TTL)
+            .open()
+            .await
+            .expect("\"churn\" opens");
+        let pn = cluster
+            .cache::<String, PnCounter>(PN_CACHE_NAME)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("\"pn\" opens");
+        let os = cluster
+            .cache::<String, OrSet<String>>(OS_CACHE_NAME)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(OrSetResolver::<String>::new()))
+            .open()
+            .await
+            .expect("\"os\" opens");
+        TestNode {
+            cache,
+            churn,
+            pn,
+            os,
+            os_seq: Arc::new(AtomicU64::new(0)),
+            cluster,
+        }
+    }
+
+    /// Unwraps a [`Reply::Line`]; panics on `Quit`/`Crash`.
+    fn reply_line(reply: Reply) -> String {
+        match reply {
+            Reply::Line(line) => line,
+            Reply::Quit | Reply::Crash => panic!("expected Reply::Line"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_through_test_node_put_get_and_count_round_trip() {
+        let node = test_node("testnode-dispatch-put-get").await;
+        assert_eq!(reply_line(node.dispatch("put k v").await), "ok");
+        assert_eq!(reply_line(node.dispatch("get k").await), "val v");
+        assert_eq!(reply_line(node.dispatch("count").await), "1");
+        assert_eq!(reply_line(node.dispatch("get missing").await), "none");
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_through_test_node_reports_an_unknown_command() {
+        let node = test_node("testnode-dispatch-unknown-command").await;
+        assert_eq!(
+            reply_line(node.dispatch("bogus").await),
+            "err unknown command \"bogus\""
+        );
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_through_test_node_quit_yields_no_reply_line() {
+        let node = test_node("testnode-dispatch-quit").await;
+        assert!(matches!(node.dispatch("quit").await, Reply::Quit));
+        node.cluster.clone().shutdown().await;
+    }
+
     #[cfg(feature = "spill")]
     mod spill_env {
         use super::*;
@@ -1351,7 +1354,7 @@ mod tests {
             assert_ne!(
                 cfg.region_bytes_value(),
                 default_region,
-                "the override actually changes the region size from the default"
+                "the override changes the region size from the default"
             );
         }
 
@@ -1372,7 +1375,7 @@ mod tests {
             assert_ne!(
                 cfg.flush_queue_bytes_value(),
                 default_flush_queue,
-                "the override actually changes the flush-queue bound from the default"
+                "the override changes the flush-queue bound from the default"
             );
         }
 

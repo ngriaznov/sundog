@@ -35,7 +35,7 @@ impl Mdns {
     pub fn new(cluster_name: impl Into<SmolStr>, instance_name: impl Into<String>) -> Self {
         let daemon = ServiceDaemon::new()
             .inspect_err(
-                |err| tracing::warn!(%err, "mDNS daemon failed to start; Mdns discovery disabled"),
+                |error| tracing::warn!(%error, "mDNS daemon failed to start; Mdns discovery disabled"),
             )
             .ok();
         Self {
@@ -54,8 +54,8 @@ impl Discovery for Mdns {
         let cluster_name = self.cluster_name.clone();
         let events = match daemon.browse(SERVICE_TYPE) {
             Ok(events) => events,
-            Err(err) => {
-                tracing::warn!(%err, "mDNS browse failed to start");
+            Err(error) => {
+                tracing::warn!(%error, "mDNS browse failed to start");
                 return stream::empty().boxed();
             }
         };
@@ -118,8 +118,8 @@ fn resolved_addr(event: &ServiceEvent, cluster_name: &str) -> Option<SocketAddr>
 }
 
 /// Picks the best candidate IP out of a resolved service's advertised
-/// addresses: the first IPv4 address, or, absent one, whatever address was
-/// advertised first. Pure and independent of `mdns_sd`'s own types, so it's
+/// addresses: the first IPv4 address, or, absent one, whichever address
+/// appears first. Pure and independent of `mdns_sd`'s own types, so it's
 /// unit-testable with hand-built addresses.
 fn select_ip(addresses: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
     let mut first = None;
