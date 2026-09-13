@@ -223,8 +223,11 @@ All notable changes to this project are documented in this file. Format follows
   tombstone was collected, the stale copy resurrected the key on both.
   `Cluster::build` now rejects a `tombstone_ttl` shorter than the release
   window, `ae_interval * (2 * distributed_disown_grace_rounds + 2)`, with
-  `JoinError::InvalidConfig`. The library defaults already satisfy it; the
-  distributed demo's 15-second retention did not and is 60 seconds.
+  `JoinError::InvalidConfig`, and a released bucket still resident when
+  the retention runs out is dropped without a hand-off, since its copy can
+  no longer be trusted not to resurrect a removal. The library defaults
+  already satisfy the rule; the distributed demo's 15-second retention did
+  not and is 60 seconds.
 - The distributed demo expected `owners` copies of every key even with
   fewer live nodes than owners, so a one-node run never converged; the
   expectation is `min(owners, live)` copies. Its status line says when the
