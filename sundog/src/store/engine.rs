@@ -3,7 +3,8 @@
 //! tombstones.
 //!
 //! A read takes a stripe's read lock, finds the key by its postcard bytes in
-//! a [`hashbrown::HashTable`], and clones the value. Keys up to
+//! a [`hashbrown::HashTable`], and decodes the stored record's value half.
+//! Keys up to
 //! `KEY_STACK_BUF` bytes encode on the stack. A versioned write
 //! (`apply_locked`) runs synchronously under the stripe's write lock.
 //! Anti-entropy enumerates a bucket by locking one stripe.
@@ -143,68 +144,177 @@ fn digest_slot(bucket: usize, part: usize) -> usize {
 }
 
 fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
-    xxh3_64(live.key_bytes.as_ref())
+    xxh3_64(record_key(&live.record))
 }
 
-/// One live entry: its version and expiry, its payload, its weight for
-/// capacity accounting, and the last time it is read. The payload lives
-/// in RAM, or, under `feature = "spill"`, on disk. `ver`/`expires_at_ms`
-/// sit on `Live` itself rather than inside `payload`, since every reader
-/// that never touches the value, eviction, expiry, the digest,
-/// anti-entropy's listings, needs only these two fields, whichever
-/// `payload` variant is current. The read timestamp is written only when
-/// TTI or a finite capacity is configured.
+/// Sentinel `expires_at_ms` for "no expiry". Never a real timestamp:
+/// `u64::MAX` milliseconds since the epoch is ~584 million years out.
+const NO_EXPIRY: u64 = u64::MAX;
+
+/// The write-side counterpart to [`from_stored_expiry`]. `store::duration_ms`'s
+/// own `unwrap_or(u64::MAX)` overflow fallback, and a peer-supplied wire
+/// `expires_at_ms` of exactly `u64::MAX`, can both legitimately produce
+/// `Some(u64::MAX)`: functionally indistinguishable from "never" for any
+/// real clock, but distinct from `None` in `Option<u64>`'s own
+/// representation. Clamps at the storage boundary only, so `duration_ms`
+/// and wire ingest need no change: `None` becomes [`NO_EXPIRY`], `Some(v)`
+/// becomes `v.min(NO_EXPIRY - 1)`.
+fn to_stored_expiry(expires_at_ms: Option<u64>) -> u64 {
+    expires_at_ms.map_or(NO_EXPIRY, |v| v.min(NO_EXPIRY - 1))
+}
+
+/// The inverse of [`to_stored_expiry`]: `None` for the [`NO_EXPIRY`]
+/// sentinel, `Some(stored)` for any other value.
+fn from_stored_expiry(stored: u64) -> Option<u64> {
+    (stored != NO_EXPIRY).then_some(stored)
+}
+
+/// Builds a resident record: `LEN ++ KEY ++ VALUE`. `key_bytes` is
+/// `postcard::to_stdvec(&key)`; `value_bytes` is `postcard::to_stdvec(&value)`.
+/// `LEN` is `postcard::to_stdvec(&(key_bytes.len() as u32))`, 1 byte for any
+/// key encoding under 128 bytes. `build_resident_record`,
+/// `build_key_only_record`, and [`split_record`] are the only three
+/// functions in this file allowed to construct or parse a record.
+fn build_resident_record(key_bytes: &[u8], value_bytes: &[u8]) -> Bytes {
+    let key_len = u32::try_from(key_bytes.len()).expect("a key's postcard encoding fits in u32");
+    let len_prefix = postcard::to_stdvec(&key_len).expect("a u32 always encodes");
+    let mut buf = Vec::with_capacity(len_prefix.len() + key_bytes.len() + value_bytes.len());
+    buf.extend_from_slice(&len_prefix);
+    buf.extend_from_slice(key_bytes);
+    buf.extend_from_slice(value_bytes);
+    Bytes::from(buf)
+}
+
+/// Builds a spilled record: `LEN ++ KEY` only, an empty value half. Always a
+/// fresh allocation copying `key_bytes` out, never a slice of an existing
+/// resident record: a slice shares the old allocation's refcount, keeping
+/// the value bytes it is supposed to shed resident in RAM for as long as
+/// the slice lives. Called by `SpillSink::install` in a `spill` build;
+/// otherwise only test code reaches it.
+#[cfg_attr(not(any(test, feature = "spill")), allow(dead_code))]
+fn build_key_only_record(key_bytes: &[u8]) -> Bytes {
+    build_resident_record(key_bytes, &[])
+}
+
+/// Splits a record (`LEN ++ KEY ++ VALUE`) into its `(KEY, VALUE)` halves,
+/// zero-copy. `record` is always this engine's own output of
+/// [`build_resident_record`]/[`build_key_only_record`], so the postcard
+/// parse of `LEN` cannot fail in practice: the same reasoning
+/// [`decode_key`]/[`decode_value`] lean on for postcard round-trips
+/// elsewhere in this file.
+fn split_record(record: &[u8]) -> (&[u8], &[u8]) {
+    let (key_len, rest): (u32, &[u8]) = postcard::take_from_bytes(record)
+        .expect("record's LEN prefix is this engine's own postcard output");
+    let key_len = key_len as usize;
+    (&rest[..key_len], &rest[key_len..])
+}
+
+/// `record`'s key half, `split_record(record).0`.
+fn record_key(record: &[u8]) -> &[u8] {
+    split_record(record).0
+}
+
+/// `record`'s key half as an independently owned, zero-copy `Bytes`.
+fn record_key_bytes(record: &Bytes) -> Bytes {
+    record.slice_ref(record_key(record))
+}
+
+/// `record`'s value half as an independently owned, zero-copy `Bytes`.
+/// Empty for a spilled record.
+fn record_value_bytes(record: &Bytes) -> Bytes {
+    let (_, value) = split_record(record);
+    record.slice_ref(value)
+}
+
+/// Decodes `key_bytes`, always this engine's own prior
+/// `postcard::to_stdvec(&key)` output, back into `K`. Panics on a decode
+/// failure: a live key reading as absent is a worse lie than a loud panic.
+fn decode_key<K: DeserializeOwned>(key_bytes: &[u8]) -> K {
+    postcard::from_bytes(key_bytes).expect("key_bytes is this engine's own postcard output")
+}
+
+/// Decodes `value_bytes`, always this engine's own prior
+/// `postcard::to_stdvec(&value)` output or verbatim wire bytes decoding to a
+/// structurally equal value, back into `V`. Panics on a decode failure,
+/// mirroring [`decode_key`].
+fn decode_value<V: DeserializeOwned>(value_bytes: &[u8]) -> V {
+    postcard::from_bytes(value_bytes).expect("value_bytes is this engine's own postcard output")
+}
+
+/// One live entry. Carries neither a decoded key nor a decoded value: only
+/// `record`'s raw postcard bytes are stored. Every reader that needs a typed
+/// `K` or `V` decodes it on demand from `record` ([`record_key`],
+/// [`record_value_bytes`], [`decode_key`], [`decode_value`]). `K`/`V` are
+/// phantom-only: no field is `K`- or `V`-typed.
 struct Live<K, V> {
-    key_bytes: Bytes,
-    key: K,
+    /// `key || value`, framed as one field: a leading postcard-encoded
+    /// `u32` giving the key half's byte length, then the key's own
+    /// postcard bytes, then the value's own postcard bytes; see
+    /// [`build_resident_record`]'s doc for the exact framing. One heap
+    /// allocation for a resident entry. For a spilled entry
+    /// (`feature = "spill"` only) it holds the key half alone, built
+    /// fresh by [`build_key_only_record`], never a `.slice()` of the old
+    /// resident record: see [`EntryState::Spilled`]'s doc.
+    record: Bytes,
+    /// This write's version. Kept as a plain `Hlc`, not split into
+    /// interned fields: `Hlc`'s total order is the whole cluster's
+    /// conflict-resolution contract.
     ver: Hlc,
-    expires_at_ms: Option<u64>,
-    payload: Payload<V>,
+    /// Absolute expiry in epoch milliseconds. [`NO_EXPIRY`] (`u64::MAX`)
+    /// means "never expires"; any other value is a real timestamp. Every
+    /// writer goes through [`to_stored_expiry`], every reader through
+    /// [`from_stored_expiry`], so the sentinel is never assigned by
+    /// accident.
+    expires_at_ms: u64,
+    /// Capacity-accounting weight. `1` by default, an arbitrary caller
+    /// value when a `Weigher` is configured, `0` while a spill hand-off
+    /// for this entry is in flight.
     weight: u32,
+    /// Epoch milliseconds this entry was last read, written only when
+    /// [`Engine::tracks_last_access`] is true (TTI or a finite capacity
+    /// configured).
     last_access_ms: AtomicU64,
+    /// Whether `record` holds a value ([`EntryState::Resident`]) or points
+    /// at disk with no value in RAM ([`EntryState::Spilled`]). Absent in a
+    /// non-`spill` build: every entry is implicitly resident.
+    #[cfg(feature = "spill")]
+    state: EntryState,
+    /// Zero-sized. Carries `Live`'s variance over `K`/`V` so every existing
+    /// `fn foo<K, V>(&Live<K, V>)` signature in this file compiles even
+    /// though no field is `K`- or `V`-typed.
+    _marker: PhantomData<fn(&K, &V)>,
 }
 
-/// A live entry's value: in RAM, or, only under `feature = "spill"`, a
-/// pointer into a [`super::spill::SpillTier`]'s region log. `weight` on
-/// [`Live`] is always `0` while `Spilled`. A non-`spill` build never
-/// compiles the `Spilled` arm, so `Payload<V>` collapses to a plain
-/// one-variant wrapper around `Resident`'s two fields, with no layout or
-/// cost overhead over storing those two fields directly.
-enum Payload<V> {
-    Resident {
-        /// The current value.
-        value: V,
-        /// `value`'s postcard-encoded bytes. On the local-origin path,
-        /// `insert`/`insert_many`/`get_or_load`'s fill, these are the
-        /// first encode's bytes; on the replica-apply path,
-        /// `apply_remote_batch`, they are the verbatim wire bytes. Always
-        /// equal to `postcard::to_stdvec(&value)`, or to wire bytes
-        /// decoding to a structurally equal `value`.
-        encoded: Bytes,
-    },
-    /// The value lives on disk at this location; nothing here is in RAM.
-    #[cfg(feature = "spill")]
+/// [`Live::record`]'s residency.
+#[cfg(feature = "spill")]
+enum EntryState {
+    /// `record` is `[key_len][key][value]`; the value is in RAM.
+    Resident,
+    /// `record` is `[key_len][key]` only, built by [`build_key_only_record`]
+    /// as a fresh copy of the old record's key half. Never a `.slice()` of
+    /// a still-resident record: a slice shares the old allocation's
+    /// refcount, so the value bytes it is supposed to shed stay physically
+    /// resident in RAM for as long as that slice lives, silently breaking
+    /// the promise this variant makes ("nothing here is in RAM").
     Spilled(SpillLoc),
 }
 
-impl<V> Payload<V> {
-    /// The encoded bytes, iff still resident; `None` once spilled.
-    #[cfg_attr(not(feature = "spill"), allow(clippy::unnecessary_wraps))]
-    fn resident(&self) -> Option<&Bytes> {
-        match self {
-            Payload::Resident { encoded, .. } => Some(encoded),
-            #[cfg(feature = "spill")]
-            Payload::Spilled(_) => None,
-        }
-    }
-}
-
-/// Whether `live`'s payload is currently in RAM: eviction and spill
-/// candidacy hinge on this, since a [`Payload::Spilled`] entry is never
-/// sampled as a victim. It holds nothing to spill, and physically
-/// deleting it is region reclaim's job alone, not sampled LRU's.
+/// Whether `live`'s record currently holds a value in RAM: eviction and
+/// spill candidacy hinge on this, since a spilled entry is never sampled
+/// as a victim. It holds nothing to spill, and physically deleting it is
+/// region reclaim's job alone, not sampled LRU's. Always `true` in a
+/// non-`spill` build, which never compiles an entry that is anything but
+/// resident.
 fn is_resident<K, V>(live: &Live<K, V>) -> bool {
-    matches!(live.payload, Payload::Resident { .. })
+    #[cfg(feature = "spill")]
+    {
+        matches!(live.state, EntryState::Resident)
+    }
+    #[cfg(not(feature = "spill"))]
+    {
+        let _ = live;
+        true
+    }
 }
 
 /// Whether `live` is eligible to be sampled as an eviction victim:
@@ -216,14 +326,14 @@ fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
     is_resident(live) && live.weight > 0
 }
 
-/// Whether `live`'s payload is currently spilled: the mirror of
+/// Whether `live`'s record is currently spilled: the mirror of
 /// [`is_resident`], used only to decide whether removing this entry from
 /// `live` must also decrement `sundog_spill_entries{cache}`. Always `false`
 /// in a non-`spill` build, which never compiles the `Spilled` arm.
 fn is_spilled<K, V>(live: &Live<K, V>) -> bool {
     #[cfg(feature = "spill")]
     {
-        matches!(live.payload, Payload::Spilled(_))
+        matches!(live.state, EntryState::Spilled(_))
     }
     #[cfg(not(feature = "spill"))]
     {
@@ -297,7 +407,7 @@ impl<K, V> Stripe<K, V> {
 }
 
 /// What [`remove_live`] reports about the entry it took out of `live`:
-/// its weight, already `0` for a [`Payload::Spilled`] entry, its
+/// its weight, already `0` for a [`EntryState::Spilled`] entry, its
 /// version, and whether it held a spilled payload. Every caller that
 /// discards a live entry needs `was_spilled` to keep `sundog_spill_entries{cache}`
 /// from drifting, via [`Engine::note_spill_departure`] or
@@ -314,7 +424,7 @@ fn remove_live<K, V>(
     hash: u64,
     key_bytes: &[u8],
 ) -> Option<RemovedLive> {
-    match table.entry(hash, |l| l.key_bytes.as_ref() == key_bytes, hasher_for) {
+    match table.entry(hash, |l| record_key(&l.record) == key_bytes, hasher_for) {
         Entry::Occupied(occ) => {
             let (removed, _vacant) = occ.remove();
             Some(RemovedLive {
@@ -645,19 +755,21 @@ fn peek_stored_seed<K, V>(
     }
     let live = stripe
         .live
-        .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
-    let encoded = match &live.payload {
-        Payload::Resident { encoded, .. } => encoded.clone(),
-        // `prefetched_spilled` is read entirely off-lock, before this
-        // stripe's read lock is taken, in `prefetch_spilled_conflict_bytes`.
-        // A miss (never fetched because the resolver doesn't need value
-        // bytes, the read failed, or this entry moved to a different
-        // location since the prefetch pass) degrades to no seed, exactly as
-        // an always-value-less spilled entry does without prefetching.
-        #[cfg(feature = "spill")]
-        Payload::Spilled(loc) => prefetched_spilled.get(loc).cloned()?,
+        .find(hash, |l| record_key(&l.record) == key_bytes)?;
+    // `prefetched_spilled` is read entirely off-lock, before this stripe's
+    // read lock is taken, in `prefetch_spilled_conflict_bytes`. A miss
+    // (never fetched because the resolver doesn't need value bytes, the
+    // read failed, or this entry moved to a different location since the
+    // prefetch pass) degrades to no seed, exactly as an always-value-less
+    // spilled entry does without prefetching.
+    #[cfg(feature = "spill")]
+    let encoded = match &live.state {
+        EntryState::Resident => record_value_bytes(&live.record),
+        EntryState::Spilled(loc) => prefetched_spilled.get(loc).cloned()?,
     };
-    Some((live.ver, encoded, live.expires_at_ms))
+    #[cfg(not(feature = "spill"))]
+    let encoded = record_value_bytes(&live.record);
+    Some((live.ver, encoded, from_stored_expiry(live.expires_at_ms)))
 }
 
 /// [`Engine::apply_many`]'s seed lookup: for every `runs` entry long enough
@@ -767,7 +879,7 @@ fn prefold_batch<K, V: DeserializeOwned>(
 /// idle for `tti_ms` or longer. Lazy expiry and idle eviction both hinge on
 /// this; a sweep only reclaims what it already reports absent.
 fn absent_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool {
-    if let Some(exp) = live.expires_at_ms
+    if let Some(exp) = from_stored_expiry(live.expires_at_ms)
         && now_ms >= exp
     {
         return true;
@@ -912,7 +1024,7 @@ impl<K, V> ApplyOutcome<K, V> {
     }
 }
 
-/// Reads a currently-[`Payload::Spilled`] stored record's value bytes off
+/// Reads a currently-[`EntryState::Spilled`] stored record's value bytes off
 /// disk, so [`resolve_conflict`]'s collision decision can fold a
 /// value-aware resolver against them instead of degrading to its
 /// value-less guard. Called off-lock by [`prefetch_spilled_conflict_bytes`]
@@ -933,7 +1045,7 @@ fn read_spilled_for_conflict(tier: &SpillTier, loc: SpillLoc) -> Option<Bytes> {
 }
 
 /// Reads back, off any stripe lock, the value bytes of every currently-
-/// [`Payload::Spilled`] stored record among `keys` a merge might need,
+/// [`EntryState::Spilled`] stored record among `keys` a merge might need,
 /// feeding both [`peek_stored_seed`]'s pre-fold seeding and
 /// [`apply_locked`]'s stored-side lookup; see [`read_spilled_for_conflict`]
 /// for why a fallback under the write lock still exists. A brief stripe
@@ -961,8 +1073,8 @@ fn prefetch_spilled_conflict_bytes<'a, K, V>(
             }
             if let Some(live) = stripe
                 .live
-                .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
-                && let Payload::Spilled(loc) = &live.payload
+                .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
+                && let EntryState::Spilled(loc) = &live.state
             {
                 locs.insert(*loc);
             }
@@ -1038,7 +1150,7 @@ pub(crate) struct CompactReplace<'a, K, V> {
 /// [`prefetch_spilled_conflict_bytes`]'s off-lock read of the stored side's
 /// bytes; a lookup miss falls back to [`read_spilled_for_conflict`] under
 /// this lock rather than treating the side as value-less. Returns whether
-/// this displaced a [`Payload::Spilled`] entry (`false` for `Rejected`);
+/// this displaced a [`EntryState::Spilled`] entry (`false` for `Rejected`);
 /// see [`Engine::note_spill_departure`].
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
@@ -1063,15 +1175,15 @@ where
     let stored_live = if prior_tombstone.is_none() {
         stripe
             .live
-            .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+            .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             .map(|l| {
                 // A currently-spilled entry has no value bytes resident in
                 // RAM; see this function's doc for `prefetched_spilled` and
                 // the off-lock/under-lock read split.
-                let encoded = match &l.payload {
-                    Payload::Resident { encoded, .. } => Some(encoded.clone()),
-                    #[cfg(feature = "spill")]
-                    Payload::Spilled(loc) => {
+                #[cfg(feature = "spill")]
+                let encoded = match &l.state {
+                    EntryState::Resident => Some(record_value_bytes(&l.record)),
+                    EntryState::Spilled(loc) => {
                         ctx.prefetched_spilled.get(loc).cloned().or_else(|| {
                             ctx.spill
                                 .filter(|_| ctx.resolver.needs_value_bytes())
@@ -1079,10 +1191,12 @@ where
                         })
                     }
                 };
+                #[cfg(not(feature = "spill"))]
+                let encoded = Some(record_value_bytes(&l.record));
                 (
                     l.ver,
                     encoded,
-                    l.expires_at_ms,
+                    from_stored_expiry(l.expires_at_ms),
                     !absent_at(l, ctx.tti_ms, ctx.now_ms),
                 )
             })
@@ -1206,16 +1320,14 @@ where
     stripe.live.insert_unique(
         hash,
         Live {
-            key_bytes,
-            key: key.clone(),
+            record: build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
             ver,
-            expires_at_ms,
-            payload: Payload::Resident {
-                value: value.clone(),
-                encoded,
-            },
+            expires_at_ms: to_stored_expiry(expires_at_ms),
             weight,
             last_access_ms: AtomicU64::new(ctx.now_ms),
+            #[cfg(feature = "spill")]
+            state: EntryState::Resident,
+            _marker: PhantomData,
         },
         hasher_for,
     );
@@ -1353,7 +1465,7 @@ pub(crate) struct Engine<K, V> {
     /// `Shard::misses` are: label resolution costs more than the paths
     /// that touch this gauge can afford per call. Those paths are install,
     /// promote, reclaim, and every write or removal that displaces a
-    /// [`Payload::Spilled`] entry from `live`.
+    /// [`EntryState::Spilled`] entry from `live`.
     #[cfg(feature = "spill")]
     spill_entries_gauge: OnceLock<metrics::Gauge>,
     /// Test-only mirror of `spill_entries_gauge`'s value, updated in
@@ -1367,7 +1479,7 @@ pub(crate) struct Engine<K, V> {
     /// [`Engine::evict_one_sampled`]/[`Engine::evict_batch_sampled`]
     /// committing to [`VictimOutcome::PendingSpill`], but not yet
     /// resolved: the entry stays fully resident in RAM until
-    /// [`SpillSink::install`] flips it to [`Payload::Spilled`], which
+    /// [`SpillSink::install`] flips it to [`EntryState::Spilled`], which
     /// subtracts its share back out, or [`SpillSink::abandon`] restores it
     /// to `total_weight` instead. `Engine::enforce_capacity`'s over-cap
     /// check adds this to `total_weight`, so RAM a lagging flusher hasn't
@@ -1476,7 +1588,7 @@ where
     /// test-only mirror counter, iff a spill tier's gauge is attached.
     /// Always a no-op in a non-`spill` build. The counterpart to
     /// [`Engine::note_spill_arrival`]; every write or removal path that
-    /// takes a [`Payload::Spilled`] entry out of `live` calls this, or
+    /// takes a [`EntryState::Spilled`] entry out of `live` calls this, or
     /// [`Engine::note_spill_departure`], its one-entry shorthand, so the
     /// gauge never drifts from how many entries are spilled.
     #[cfg_attr(
@@ -1513,7 +1625,7 @@ where
 
     /// Increments `sundog_spill_entries{cache}`, plus the test-only mirror
     /// counter. The counterpart to [`Engine::note_spill_departures`], called
-    /// wherever a `live` entry newly becomes [`Payload::Spilled`]: from
+    /// wherever a `live` entry newly becomes [`EntryState::Spilled`]: from
     /// `SpillSink::install`, and from the test-only
     /// [`Engine::debug_insert_spilled`].
     #[cfg(feature = "spill")]
@@ -1582,7 +1694,7 @@ where
     }
 
     /// Reads `key`: a stripe read lock, a hashbrown lookup by the key's
-    /// postcard-encoded bytes, and a value clone. No mutation beyond the
+    /// postcard-encoded bytes, and a value decode. No mutation beyond the
     /// recency touch, when configured.
     pub(crate) fn get(&self, key: &K, now_ms: u64) -> Option<V> {
         let key_buf = encode_key_for_read(key).ok()?;
@@ -1593,7 +1705,7 @@ where
     /// [`Engine::get`] for a key already encoded and hashed, so a caller that
     /// holds both, as the `get_or_load` loop does, skips re-encoding.
     ///
-    /// `None` for a currently-[`Payload::Spilled`] entry too. A spill-aware
+    /// `None` for a currently-[`EntryState::Spilled`] entry too. A spill-aware
     /// caller, `get`/`get_or_load`, checks [`Engine::spilled_loc`] next; a
     /// spill-blind one, `get_sync`, treats this like a miss, per its
     /// documented contract.
@@ -1601,18 +1713,15 @@ where
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
         let live = stripe
             .live
-            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
+            .find(hash, |l| record_key(&l.record) == key_bytes)?;
         if self.is_absent(live, now_ms) {
             return None;
         }
-        match &live.payload {
-            Payload::Resident { value, .. } => {
-                self.touch(live, now_ms);
-                Some(value.clone())
-            }
-            #[cfg(feature = "spill")]
-            Payload::Spilled(_) => None,
+        if !is_resident(live) {
+            return None;
         }
+        self.touch(live, now_ms);
+        Some(decode_value(record_value_bytes(&live.record).as_ref()))
     }
 
     /// Whether `key` has a live, unexpired, non-idle entry.
@@ -1625,7 +1734,7 @@ where
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
         let Some(live) = stripe
             .live
-            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)
+            .find(hash, |l| record_key(&l.record) == key_bytes)
         else {
             return false;
         };
@@ -1647,7 +1756,7 @@ where
                     .live
                     .iter()
                     .filter(|live| !self.is_absent(live, now_ms))
-                    .map(|live| live.key.clone()),
+                    .map(|live| decode_key(record_key(&live.record))),
             );
         }
         out
@@ -1663,7 +1772,7 @@ where
                     .live
                     .iter()
                     .filter(|live| !self.is_absent(live, now_ms))
-                    .map(|live| live.key.clone())
+                    .map(|live| decode_key(record_key(&live.record)))
                     .collect()
             };
             for key in stripe_keys {
@@ -1689,15 +1798,15 @@ where
         }
         let live = stripe
             .live
-            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
+            .find(hash, |l| record_key(&l.record) == key_bytes)?;
         if self.is_absent(live, now_ms) {
             return None;
         }
-        live.payload.resident().map(|encoded| WireRecord {
+        is_resident(live).then(|| WireRecord {
             key: Bytes::copy_from_slice(key_bytes),
-            value: Some(encoded.clone()),
+            value: Some(record_value_bytes(&live.record)),
             ver: live.ver,
-            expires_at_ms: live.expires_at_ms,
+            expires_at_ms: from_stored_expiry(live.expires_at_ms),
         })
     }
 
@@ -1717,7 +1826,7 @@ where
                         .iter()
                         .filter(|live| !self.is_absent(live, now_ms))
                         .map(|live| KeyVersion {
-                            key: live.key_bytes.clone(),
+                            key: record_key_bytes(&live.record),
                             version: live.ver,
                         }),
                 );
@@ -1760,11 +1869,11 @@ where
                 .live
                 .iter()
                 .filter(|live| !self.is_absent(live, now_ms))
-                .map(|live| (&live.key_bytes, live.ver));
+                .map(|live| (record_key_bytes(&live.record), live.ver));
             let tombstone_entries = stripe
                 .tombstones
                 .iter()
-                .map(|(key_bytes, t)| (key_bytes, t.ver));
+                .map(|(key_bytes, t)| (key_bytes.clone(), t.ver));
             for (key_bytes, ver) in live_entries.chain(tombstone_entries) {
                 let slot = slot_of_part[part_index_from_hash(hash_key_bytes(key_bytes.as_ref()))];
                 if slot != usize::MAX {
@@ -1832,10 +1941,6 @@ where
     /// never included here: see [`Engine::snapshot_spilled`], its sibling,
     /// for the pointers a spill-aware caller reads off-lock and folds in.
     ///
-    /// Non-`spill` builds never compile a `Payload::Spilled` arm, so the
-    /// `filter_map` below degenerates to an infallible `map`; the allow
-    /// below is scoped to that configuration.
-    #[cfg_attr(not(feature = "spill"), allow(clippy::unnecessary_filter_map))]
     pub(crate) fn snapshot_records(&self, now_ms: u64) -> Vec<WireRecord> {
         let mut out = Vec::new();
         for stripe_lock in &self.stripes {
@@ -1845,13 +1950,12 @@ where
                     .live
                     .iter()
                     .filter(|live| !self.is_absent(live, now_ms))
-                    .filter_map(|live| {
-                        live.payload.resident().map(|encoded| WireRecord {
-                            key: live.key_bytes.clone(),
-                            value: Some(encoded.clone()),
-                            ver: live.ver,
-                            expires_at_ms: live.expires_at_ms,
-                        })
+                    .filter(|&live| is_resident(live))
+                    .map(|live| WireRecord {
+                        key: record_key_bytes(&live.record),
+                        value: Some(record_value_bytes(&live.record)),
+                        ver: live.ver,
+                        expires_at_ms: from_stored_expiry(live.expires_at_ms),
                     }),
             );
             out.extend(stripe.tombstones.iter().map(|(key_bytes, t)| WireRecord {
@@ -1880,11 +1984,14 @@ where
                     .live
                     .iter()
                     .filter(|live| !self.is_absent(live, now_ms))
-                    .filter_map(|live| match &live.payload {
-                        Payload::Spilled(loc) => {
-                            Some((live.key_bytes.clone(), live.ver, live.expires_at_ms, *loc))
-                        }
-                        Payload::Resident { .. } => None,
+                    .filter_map(|live| match &live.state {
+                        EntryState::Spilled(loc) => Some((
+                            record_key_bytes(&live.record),
+                            live.ver,
+                            from_stored_expiry(live.expires_at_ms),
+                            *loc,
+                        )),
+                        EntryState::Resident => None,
                     }),
             );
         }
@@ -1897,7 +2004,7 @@ where
     /// half off-lock, via `spawn_blocking` behind the tier's read
     /// semaphore, and folds any successful read back in as a `WireRecord`,
     /// dropping the rest. Nothing here promotes; a served-from-disk record
-    /// leaves `payload` unchanged.
+    /// leaves `record` unchanged.
     #[cfg(feature = "spill")]
     pub(crate) fn records_for_or_spilled(
         &self,
@@ -1920,22 +2027,27 @@ where
             }
             let Some(live) = stripe
                 .live
-                .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+                .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             else {
                 continue;
             };
             if self.is_absent(live, now_ms) {
                 continue;
             }
-            match &live.payload {
-                Payload::Resident { encoded, .. } => records.push(WireRecord {
+            match &live.state {
+                EntryState::Resident => records.push(WireRecord {
                     key: key_bytes.clone(),
-                    value: Some(encoded.clone()),
+                    value: Some(record_value_bytes(&live.record)),
                     ver: live.ver,
-                    expires_at_ms: live.expires_at_ms,
+                    expires_at_ms: from_stored_expiry(live.expires_at_ms),
                 }),
-                Payload::Spilled(loc) => {
-                    spilled.push((key_bytes.clone(), live.ver, live.expires_at_ms, *loc));
+                EntryState::Spilled(loc) => {
+                    spilled.push((
+                        key_bytes.clone(),
+                        live.ver,
+                        from_stored_expiry(live.expires_at_ms),
+                        *loc,
+                    ));
                 }
             }
         }
@@ -1979,9 +2091,9 @@ where
             let mut new_next = u64::MAX;
             stripe.live.retain(|live| {
                 if self.is_absent(live, now_ms) {
-                    let part = part_index_from_hash(hash_key_bytes(live.key_bytes.as_ref()));
+                    let part = part_index_from_hash(hash_key_bytes(record_key(&live.record)));
                     self.digest[digest_slot(idx, part)].fetch_xor(
-                        entry_fingerprint(&live.key_bytes, live.ver),
+                        entry_fingerprint(record_key(&live.record), live.ver),
                         Ordering::Relaxed,
                     );
                     removed_weight += u64::from(live.weight);
@@ -1991,7 +2103,7 @@ where
                     }
                     false
                 } else {
-                    if let Some(exp) = live.expires_at_ms {
+                    if let Some(exp) = from_stored_expiry(live.expires_at_ms) {
                         new_next = new_next.min(exp);
                     }
                     true
@@ -2016,7 +2128,7 @@ where
     /// bounds)` on every resident live entry and collecting the `Some`
     /// results. Never mutates a stripe; [`super::ShardOps::compact_pass`]
     /// applies each candidate via [`Engine::compact_replace_if_current`]. A
-    /// [`Payload::Spilled`] entry is skipped until promoted back to
+    /// [`EntryState::Spilled`] entry is skipped until promoted back to
     /// `Resident`.
     ///
     /// `max_entries` bounds entries examined, not entries eligible; a
@@ -2051,18 +2163,17 @@ where
             let stripe = self.stripes[idx].read();
             self.note_compact_lock_acquisition();
             for live in &stripe.live {
-                let encoded = match &live.payload {
-                    Payload::Resident { encoded, .. } => encoded,
-                    // Never compacted off-lock: its bytes aren't resident,
-                    // and reading them back in would cost a disk read this
-                    // sweep does not pay for. Reconsidered once a later
-                    // read or write promotes it back to `Resident`.
-                    #[cfg(feature = "spill")]
-                    Payload::Spilled(_) => continue,
-                };
+                // Never compacted off-lock: its bytes aren't resident, and
+                // reading them back in would cost a disk read this sweep
+                // does not pay for. Reconsidered once a later read or write
+                // promotes it back to resident.
+                if !is_resident(live) {
+                    continue;
+                }
+                let encoded = record_value_bytes(&live.record);
                 examined += 1;
                 if let Some(new_encoded) = resolver.compact(
-                    live.key_bytes.as_ref(),
+                    record_key(&live.record),
                     encoded.as_ref(),
                     now_ms,
                     retire,
@@ -2070,8 +2181,8 @@ where
                     bounds,
                 ) {
                     out.push(CompactCandidate {
-                        key: live.key.clone(),
-                        key_bytes: live.key_bytes.clone(),
+                        key: decode_key(record_key(&live.record)),
+                        key_bytes: record_key_bytes(&live.record),
                         stale_ver: live.ver,
                         new_encoded,
                     });
@@ -2121,16 +2232,16 @@ where
             let mut stripe = self.stripes[bucket].write();
             let Some(live) = stripe
                 .live
-                .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes)
+                .find_mut(hash, |l| record_key(&l.record) == key_bytes)
             else {
                 return false;
             };
-            if live.ver != expected_ver || !matches!(live.payload, Payload::Resident { .. }) {
+            if live.ver != expected_ver || !is_resident(live) {
                 return false;
             }
             let new_weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
             let old_weight = live.weight;
-            live.payload = Payload::Resident { value, encoded };
+            live.record = build_resident_record(record_key(&live.record), encoded.as_ref());
             live.weight = new_weight;
             live.ver = new_ver;
             (old_weight, new_weight)
@@ -2195,7 +2306,7 @@ where
     /// Whether a configured spill tier commits to taking `victim_bytes`,
     /// found at `hash` in `bucket` with `stripe` already write-locked, in
     /// place of physically removing it. [`SpillAttempt::NotApplicable`] when
-    /// no tier is configured or the victim is not [`Payload::Resident`]
+    /// no tier is configured or the victim is not [`EntryState::Resident`]
     /// anymore; [`SpillAttempt::Refused`] when
     /// [`SpillTier::would_accept`] declines (too large, closed, flush queue
     /// full), leaving [`Engine::evict_victim_locked`] to decide the
@@ -2219,13 +2330,14 @@ where
         };
         let Some(live) = stripe
             .live
-            .find_mut(hash, |l| l.key_bytes.as_ref() == victim_bytes.as_ref())
+            .find_mut(hash, |l| record_key(&l.record) == victim_bytes.as_ref())
         else {
             return SpillAttempt::NotApplicable;
         };
-        let Payload::Resident { encoded, .. } = &live.payload else {
+        if !matches!(live.state, EntryState::Resident) {
             return SpillAttempt::NotApplicable;
-        };
+        }
+        let encoded = record_value_bytes(&live.record);
         if !tier.would_accept(victim_bytes.len(), encoded.len()) {
             return SpillAttempt::Refused {
                 keep_resident: tier.keep_resident_when_refused(),
@@ -2235,10 +2347,10 @@ where
         let job = SpillJob {
             stripe_idx: bucket,
             hash,
-            key_bytes: victim_bytes.clone(),
+            key_bytes: record_key_bytes(&live.record),
             ver: live.ver,
-            expires_at_ms: live.expires_at_ms,
-            encoded: encoded.clone(),
+            expires_at_ms: from_stored_expiry(live.expires_at_ms),
+            encoded,
             weight,
         };
         live.weight = 0;
@@ -2267,7 +2379,7 @@ where
     }
 
     /// Removes or spills `victim_bytes`, found at `hash` in `bucket` with
-    /// `stripe` already write-locked. Hands a [`Payload::Resident`] victim
+    /// `stripe` already write-locked. Hands a [`EntryState::Resident`] victim
     /// to a configured spill tier when [`Engine::try_spill_victim`] commits
     /// to it: weight zeroed in place, reported as
     /// [`VictimOutcome::PendingSpill`], while `stripe.live`, the digest,
@@ -2300,7 +2412,7 @@ where
         }
         let Entry::Occupied(occ) = stripe.live.entry(
             hash,
-            |l| l.key_bytes.as_ref() == victim_bytes.as_ref(),
+            |l| record_key(&l.record) == victim_bytes.as_ref(),
             hasher_for,
         ) else {
             return VictimOutcome::Vanished;
@@ -2308,7 +2420,7 @@ where
         let (removed, _vacant) = occ.remove();
         let part = part_index_from_hash(hash);
         self.digest[digest_slot(bucket, part)].fetch_xor(
-            entry_fingerprint(&removed.key_bytes, removed.ver),
+            entry_fingerprint(record_key(&removed.record), removed.ver),
             Ordering::Relaxed,
         );
         VictimOutcome::Removed(removed.weight)
@@ -2339,7 +2451,7 @@ where
         let Some(victim_bytes) = self
             .sample_candidates(&stripe, EVICTION_SAMPLE)
             .min_by_key(|live| live.last_access_ms.load(Ordering::Relaxed))
-            .map(|live| live.key_bytes.clone())
+            .map(|live| record_key_bytes(&live.record))
         else {
             return EvictOutcome::default();
         };
@@ -2395,7 +2507,7 @@ where
             .sample_candidates(&stripe, EVICTION_BATCH_SAMPLE)
             .map(|live| {
                 (
-                    live.key_bytes.clone(),
+                    record_key_bytes(&live.record),
                     live.last_access_ms.load(Ordering::Relaxed),
                     live.weight,
                 )
@@ -2657,7 +2769,7 @@ where
             Some(t) => Some(t.ver),
             None => stripe
                 .live
-                .find(hash, |l| l.key_bytes.as_ref() == key_bytes)
+                .find(hash, |l| record_key(&l.record) == key_bytes)
                 .map(|l| l.ver),
         };
         if stored_ver.is_some_and(|sv| ver <= sv) {
@@ -2762,18 +2874,13 @@ where
         let mut stripe = self.stripes[bucket].write();
         if let Some(live) = stripe
             .live
-            .find(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+            .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             && !self.is_absent(live, now_ms)
+            && is_resident(live)
         {
-            match &live.payload {
-                Payload::Resident { value, .. } => {
-                    let value = value.clone();
-                    self.touch(live, now_ms);
-                    return JoinOutcome::Hit(value);
-                }
-                #[cfg(feature = "spill")]
-                Payload::Spilled(_) => {}
-            }
+            let value = decode_value(record_value_bytes(&live.record).as_ref());
+            self.touch(live, now_ms);
+            return JoinOutcome::Hit(value);
         }
         if let Some(existing) = stripe.inflight.get(key_bytes.as_ref()) {
             return JoinOutcome::Join(Arc::clone(existing), existing.done.subscribe());
@@ -2860,13 +2967,14 @@ where
             stripe.live.insert_unique(
                 hash,
                 Live {
-                    key_bytes: key_bytes.clone(),
-                    key: key.clone(),
+                    record: build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
                     ver,
-                    expires_at_ms,
-                    payload: Payload::Resident { value, encoded },
+                    expires_at_ms: to_stored_expiry(expires_at_ms),
                     weight,
                     last_access_ms: AtomicU64::new(now_ms),
+                    #[cfg(feature = "spill")]
+                    state: EntryState::Resident,
+                    _marker: PhantomData,
                 },
                 hasher_for,
             );
@@ -2897,7 +3005,7 @@ where
         inflight.finish();
     }
 
-    /// Snapshots a currently-[`Payload::Spilled`] entry's pointer under the
+    /// Snapshots a currently-[`EntryState::Spilled`] entry's pointer under the
     /// stripe read lock: `None` for a resident entry, an absent key, or one
     /// a read at `now_ms` would see as expired. Touches `last_access_ms`.
     /// The entry's `ver` travels alongside the pointer so a later
@@ -2916,32 +3024,35 @@ where
         let stripe = self.stripes[stripe_index_from_hash(hash)].read();
         let live = stripe
             .live
-            .find(hash, |l| l.key_bytes.as_ref() == key_bytes)?;
+            .find(hash, |l| record_key(&l.record) == key_bytes)?;
         if self.is_absent(live, now_ms) {
             return None;
         }
-        match &live.payload {
-            Payload::Spilled(loc) => {
+        match &live.state {
+            EntryState::Spilled(loc) => {
                 let loc = *loc;
                 let ver = live.ver;
                 self.touch(live, now_ms);
                 Some((ver, loc))
             }
-            Payload::Resident { .. } => None,
+            EntryState::Resident => None,
         }
     }
 
-    /// Flips a currently-[`Payload::Spilled`] entry back to
-    /// [`Payload::Resident`] in place, iff [`spilled_is_current`] still
+    /// Flips a currently-[`EntryState::Spilled`] entry back to
+    /// [`EntryState::Resident`] in place, iff [`spilled_is_current`] still
     /// holds for `read_ver` against what is currently stored. A tombstone
     /// or a version change since the disk read started means the
     /// promotion is a silent no-op. The caller's read already succeeded
-    /// independently of this; only the RAM reinstall is skipped. Adds the
-    /// freshly weighed entry's weight back to `total_weight`. **Never
-    /// touches the digest or `live_count`**: same key, same `ver`, same
-    /// fingerprint, so nothing about the entry's replicated identity
-    /// changes. Also decrements `sundog_spill_entries{cache}`, the mirror
-    /// of `SpillSink::install`'s increment, since a resident entry is not
+    /// independently of this; only the RAM reinstall is skipped. Decodes
+    /// `key` from `key_bytes` for the one weigher call this makes: see the
+    /// design note on why `promote_locked` decodes its own key rather than
+    /// taking one from the caller. Adds the freshly weighed entry's weight
+    /// back to `total_weight`. **Never touches the digest or
+    /// `live_count`**: same key, same `ver`, same fingerprint, so nothing
+    /// about the entry's replicated identity changes. Also decrements
+    /// `sundog_spill_entries{cache}`, the mirror of
+    /// `SpillSink::install`'s increment, since a resident entry is not
     /// counted among currently-spilled entries. Returns whether it
     /// promoted.
     #[cfg(feature = "spill")]
@@ -2950,28 +3061,30 @@ where
         key_bytes: &[u8],
         hash: u64,
         read_ver: Hlc,
-        value: V,
-        encoded: Bytes,
+        value: &V,
+        encoded: &Bytes,
     ) -> bool {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
         let stored_tombstone_ver = stripe.tombstones.get(key_bytes).map(|t| t.ver);
         let Some(live) = stripe
             .live
-            .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes)
+            .find_mut(hash, |l| record_key(&l.record) == key_bytes)
         else {
             return false;
         };
         if !spilled_is_current(stored_tombstone_ver, Some(live.ver), read_ver) {
             return false;
         }
-        if !matches!(live.payload, Payload::Spilled(_)) {
+        if !matches!(live.state, EntryState::Spilled(_)) {
             // Already resident: a racing promotion, or a fresh write that
             // happens to share this version, got there first.
             return false;
         }
-        let weight = self.weigher.as_ref().map_or(1, |w| w(&live.key, &value));
-        live.payload = Payload::Resident { value, encoded };
+        let key: K = decode_key(key_bytes);
+        let weight = self.weigher.as_ref().map_or(1, |w| w(&key, value));
+        live.record = build_resident_record(key_bytes, encoded.as_ref());
+        live.state = EntryState::Resident;
         live.weight = weight;
         drop(stripe);
         self.total_weight
@@ -3010,14 +3123,19 @@ where
             let stored_tombstone_ver = stripe.tombstones.get(key_bytes.as_ref()).map(|t| t.ver);
             match stripe
                 .live
-                .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+                .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             {
                 Some(live)
                     if spilled_is_current(stored_tombstone_ver, Some(live.ver), ver)
                         && live.weight == 0
-                        && matches!(live.payload, Payload::Resident { .. }) =>
+                        && matches!(live.state, EntryState::Resident) =>
                 {
-                    live.payload = Payload::Spilled(loc);
+                    // A fresh copy of the key half, never a slice of the
+                    // still-resident record: a slice would share the old
+                    // allocation's refcount, keeping the value bytes this
+                    // flip is supposed to shed physically resident in RAM.
+                    live.record = build_key_only_record(record_key(&live.record));
+                    live.state = EntryState::Spilled(loc);
                     true
                 }
                 _ => false,
@@ -3039,12 +3157,12 @@ where
             let mut stripe = self.stripes[stripe_idx].write();
             match stripe
                 .live
-                .find_mut(hash, |l| l.key_bytes.as_ref() == key_bytes.as_ref())
+                .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             {
                 Some(live)
                     if live.ver == ver
                         && live.weight == 0
-                        && matches!(live.payload, Payload::Resident { .. }) =>
+                        && matches!(live.state, EntryState::Resident) =>
                 {
                     live.weight = weight;
                     true
@@ -3069,14 +3187,14 @@ where
                 let mut stripe = self.stripes[bucket].write();
                 let Entry::Occupied(occ) = stripe.live.entry(
                     hash,
-                    |l| l.key_bytes.as_ref() == key_bytes.as_ref(),
+                    |l| record_key(&l.record) == key_bytes.as_ref(),
                     hasher_for,
                 ) else {
                     continue;
                 };
                 let still_points_here = matches!(
-                    &occ.get().payload,
-                    Payload::Spilled(loc) if loc.region == region && loc.generation == generation
+                    &occ.get().state,
+                    EntryState::Spilled(loc) if loc.region == region && loc.generation == generation
                 );
                 if !still_points_here {
                     continue;
@@ -3084,7 +3202,7 @@ where
                 let (removed_entry, _vacant) = occ.remove();
                 let part = part_index_from_hash(hash);
                 self.digest[digest_slot(bucket, part)].fetch_xor(
-                    entry_fingerprint(&removed_entry.key_bytes, removed_entry.ver),
+                    entry_fingerprint(record_key(&removed_entry.record), removed_entry.ver),
                     Ordering::Relaxed,
                 );
                 true
@@ -3136,8 +3254,9 @@ where
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let stripe = stripe_lock.read();
             for live in &stripe.live {
-                let part = part_index_from_hash(hash_key_bytes(live.key_bytes.as_ref()));
-                out[digest_slot(idx, part)] ^= entry_fingerprint(&live.key_bytes, live.ver);
+                let part = part_index_from_hash(hash_key_bytes(record_key(&live.record)));
+                out[digest_slot(idx, part)] ^=
+                    entry_fingerprint(record_key(&live.record), live.ver);
             }
             for (key_bytes, t) in &stripe.tombstones {
                 let part = part_index_from_hash(hash_key_bytes(key_bytes));
@@ -3157,15 +3276,16 @@ where
         for stripe_lock in &self.stripes {
             let stripe = stripe_lock.read();
             for live in &stripe.live {
-                let encoded = match &live.payload {
-                    Payload::Resident { encoded, .. } => encoded.clone(),
-                    #[cfg(feature = "spill")]
-                    Payload::Spilled(_) => panic!(
-                        "debug_snapshot: no resident bytes for a spilled entry; this helper is \
-                         for tests that never configure a spill tier"
-                    ),
-                };
-                live_out.push((live.key_bytes.clone(), encoded, live.ver));
+                assert!(
+                    is_resident(live),
+                    "debug_snapshot: no resident bytes for a spilled entry; this helper is \
+                     for tests that never configure a spill tier"
+                );
+                live_out.push((
+                    record_key_bytes(&live.record),
+                    record_value_bytes(&live.record),
+                    live.ver,
+                ));
             }
             for (key_bytes, t) in &stripe.tombstones {
                 tomb_out.push((key_bytes.clone(), t.ver));
@@ -3240,11 +3360,11 @@ where
     /// spill install would have left behind, bypassing the normal
     /// Resident-only write path. Lets mutation tests exercise a spilled key
     /// with no real disk I/O and no dependency on a real [`SpillTier`]'s
-    /// flusher thread.
+    /// flusher thread. Takes no decoded key: `Live` carries none, so the
+    /// caller only ever needs `key_bytes`.
     #[cfg(feature = "spill")]
     pub(crate) fn debug_insert_spilled(
         &self,
-        key: K,
         key_bytes: &Bytes,
         ver: Hlc,
         expires_at_ms: Option<u64>,
@@ -3259,13 +3379,13 @@ where
             stripe.live.insert_unique(
                 hash,
                 Live {
-                    key_bytes: key_bytes.clone(),
-                    key,
+                    record: build_key_only_record(key_bytes.as_ref()),
                     ver,
-                    expires_at_ms,
-                    payload: Payload::Spilled(loc),
+                    expires_at_ms: to_stored_expiry(expires_at_ms),
                     weight: 0,
                     last_access_ms: AtomicU64::new(now_ms),
+                    state: EntryState::Spilled(loc),
+                    _marker: PhantomData,
                 },
                 hasher_for,
             );
@@ -5219,34 +5339,32 @@ mod tests {
     #[test]
     fn is_resident_true_for_resident_false_for_spilled() {
         let resident = Live::<u32, String> {
-            key_bytes: key_bytes(1),
-            key: 1,
+            record: build_resident_record(key_bytes(1).as_ref(), b"v"),
             ver: hlc(1, 1),
-            expires_at_ms: None,
-            payload: Payload::Resident {
-                value: "v".to_string(),
-                encoded: Bytes::from_static(b"v"),
-            },
+            expires_at_ms: to_stored_expiry(None),
             weight: 1,
             last_access_ms: AtomicU64::new(0),
+            #[cfg(feature = "spill")]
+            state: EntryState::Resident,
+            _marker: PhantomData,
         };
         assert!(is_resident(&resident));
 
         #[cfg(feature = "spill")]
         {
             let spilled = Live::<u32, String> {
-                key_bytes: key_bytes(1),
-                key: 1,
+                record: build_key_only_record(key_bytes(1).as_ref()),
                 ver: hlc(1, 1),
-                expires_at_ms: None,
-                payload: Payload::Spilled(SpillLoc {
+                expires_at_ms: to_stored_expiry(None),
+                weight: 0,
+                last_access_ms: AtomicU64::new(0),
+                state: EntryState::Spilled(SpillLoc {
                     region: 0,
                     offset: 0,
                     len: 1,
                     generation: 0,
                 }),
-                weight: 0,
-                last_access_ms: AtomicU64::new(0),
+                _marker: PhantomData,
             };
             assert!(!is_resident(&spilled));
         }
@@ -5255,30 +5373,26 @@ mod tests {
     #[test]
     fn is_spill_candidate_true_only_for_a_resident_entry_with_nonzero_weight() {
         let resident_hot = Live::<u32, String> {
-            key_bytes: key_bytes(1),
-            key: 1,
+            record: build_resident_record(key_bytes(1).as_ref(), b"v"),
             ver: hlc(1, 1),
-            expires_at_ms: None,
-            payload: Payload::Resident {
-                value: "v".to_string(),
-                encoded: Bytes::from_static(b"v"),
-            },
+            expires_at_ms: to_stored_expiry(None),
             weight: 3,
             last_access_ms: AtomicU64::new(0),
+            #[cfg(feature = "spill")]
+            state: EntryState::Resident,
+            _marker: PhantomData,
         };
         assert!(is_spill_candidate(&resident_hot));
 
         let resident_pending = Live::<u32, String> {
-            key_bytes: key_bytes(1),
-            key: 1,
+            record: build_resident_record(key_bytes(1).as_ref(), b"v"),
             ver: hlc(1, 1),
-            expires_at_ms: None,
-            payload: Payload::Resident {
-                value: "v".to_string(),
-                encoded: Bytes::from_static(b"v"),
-            },
+            expires_at_ms: to_stored_expiry(None),
             weight: 0,
             last_access_ms: AtomicU64::new(0),
+            #[cfg(feature = "spill")]
+            state: EntryState::Resident,
+            _marker: PhantomData,
         };
         assert!(
             !is_spill_candidate(&resident_pending),
@@ -5288,21 +5402,100 @@ mod tests {
         #[cfg(feature = "spill")]
         {
             let spilled = Live::<u32, String> {
-                key_bytes: key_bytes(1),
-                key: 1,
+                record: build_key_only_record(key_bytes(1).as_ref()),
                 ver: hlc(1, 1),
-                expires_at_ms: None,
-                payload: Payload::Spilled(SpillLoc {
+                expires_at_ms: to_stored_expiry(None),
+                weight: 0,
+                last_access_ms: AtomicU64::new(0),
+                state: EntryState::Spilled(SpillLoc {
                     region: 0,
                     offset: 0,
                     len: 1,
                     generation: 0,
                 }),
-                weight: 0,
-                last_access_ms: AtomicU64::new(0),
+                _marker: PhantomData,
             };
             assert!(!is_spill_candidate(&spilled));
         }
+    }
+
+    #[test]
+    fn build_resident_record_round_trips_key_and_value() {
+        for (key_bytes, value_bytes) in [
+            (&b""[..], &b""[..]),
+            (&b"k"[..], &b"v"[..]),
+            (&b"a-longer-key"[..], &b"a-longer-value-too"[..]),
+        ] {
+            let record = build_resident_record(key_bytes, value_bytes);
+            assert_eq!(record_key(&record), key_bytes);
+            let record_bytes = Bytes::from(record.to_vec());
+            assert_eq!(record_key_bytes(&record_bytes).as_ref(), key_bytes);
+            assert_eq!(record_value_bytes(&record_bytes).as_ref(), value_bytes);
+        }
+    }
+
+    #[test]
+    fn split_record_recovers_the_value_half_at_every_key_length_boundary() {
+        // Key lengths 0, 1, 127, 128, 129 bytes: 127 and below encode LEN in
+        // one postcard varint byte, 128 and above spill into a second,
+        // crossing the varint continuation-bit boundary.
+        for key_len in [0usize, 1, 127, 128, 129] {
+            let key_bytes = vec![b'k'; key_len];
+            let value_bytes = b"value".to_vec();
+            let record = build_resident_record(&key_bytes, &value_bytes);
+            let (key_half, value_half) = split_record(&record);
+            assert_eq!(key_half, key_bytes.as_slice(), "key_len = {key_len}");
+            assert_eq!(value_half, value_bytes.as_slice(), "key_len = {key_len}");
+        }
+    }
+
+    #[test]
+    fn build_key_only_record_produces_an_empty_value_half() {
+        let record = build_key_only_record(b"a-key");
+        let (key_half, value_half) = split_record(&record);
+        assert_eq!(key_half, b"a-key");
+        assert!(value_half.is_empty());
+    }
+
+    #[test]
+    fn to_stored_expiry_round_trips_every_option() {
+        for expires_at_ms in [None, Some(0), Some(1), Some(u64::MAX - 2)] {
+            assert_eq!(
+                from_stored_expiry(to_stored_expiry(expires_at_ms)),
+                expires_at_ms
+            );
+        }
+    }
+
+    #[test]
+    fn to_stored_expiry_clamps_a_legitimate_u64_max_below_the_sentinel() {
+        let stored = to_stored_expiry(Some(u64::MAX));
+        assert_ne!(
+            stored, NO_EXPIRY,
+            "a real Some(u64::MAX) timestamp must not collide with the no-expiry sentinel"
+        );
+        assert_eq!(stored, NO_EXPIRY - 1);
+        assert_eq!(from_stored_expiry(stored), Some(NO_EXPIRY - 1));
+    }
+
+    #[test]
+    fn decode_key_and_decode_value_round_trip_postcard_bytes() {
+        let key_bytes = postcard::to_stdvec(&42u32).expect("u32 encodes");
+        let value_bytes = postcard::to_stdvec(&"a value".to_string()).expect("string encodes");
+        assert_eq!(decode_key::<u32>(&key_bytes), 42u32);
+        assert_eq!(decode_value::<String>(&value_bytes), "a value".to_string());
+    }
+
+    #[test]
+    #[cfg(not(feature = "spill"))]
+    fn live_size_is_80_bytes_without_spill() {
+        assert_eq!(std::mem::size_of::<Live<String, String>>(), 80);
+    }
+
+    #[test]
+    #[cfg(feature = "spill")]
+    fn live_size_is_96_bytes_with_spill() {
+        assert_eq!(std::mem::size_of::<Live<String, String>>(), 96);
     }
 
     #[test]
@@ -5329,7 +5522,7 @@ mod tests {
             let mut stripe = engine.stripe_lock(bucket).write();
             let live = stripe
                 .live
-                .find_mut(hash, |l| l.key_bytes.as_ref() == kb.as_ref())
+                .find_mut(hash, |l| record_key(&l.record) == kb.as_ref())
                 .expect("entry is present");
             live.weight = 0;
         }
@@ -5371,7 +5564,7 @@ mod tests {
             let key = 1u32;
             let kb = key_bytes(key);
             let bucket = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
             assert_eq!(engine.debug_spill_entries_count(), 1);
 
             let removed =
@@ -5395,7 +5588,7 @@ mod tests {
             let key1 = 1u32;
             let kb1 = key_bytes(key1);
             let l = loc(0, 0, 4, 0);
-            engine.debug_insert_spilled(key1, &kb1, hlc(1, 1), Some(500), l, 0);
+            engine.debug_insert_spilled(&kb1, hlc(1, 1), Some(500), l, 0);
             let key2 = 2u32;
             let kb2 = key_bytes(key2);
             let _ = put(
@@ -5432,7 +5625,7 @@ mod tests {
             let kb_spilled = key_bytes(spilled_key);
             let l = loc(0, 0, 4, 0);
             let spilled_ver = hlc(1, 1);
-            engine.debug_insert_spilled(spilled_key, &kb_spilled, spilled_ver, Some(500), l, 0);
+            engine.debug_insert_spilled(&kb_spilled, spilled_ver, Some(500), l, 0);
 
             let resident_key = 2u32;
             let kb_resident = key_bytes(resident_key);
@@ -5483,7 +5676,7 @@ mod tests {
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
 
             assert_eq!(
                 engine.get(&key, 0),
@@ -5507,7 +5700,7 @@ mod tests {
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
 
             match engine.miss_or_join(&kb, hash, 0) {
                 JoinOutcome::Hit(_) => panic!("a spilled entry has no resident value to hit on"),
@@ -5523,7 +5716,7 @@ mod tests {
             let hash = hash_key_bytes(kb.as_ref());
             let ver = hlc(1, 1);
             let l = loc(2, 8, 4, 1);
-            engine.debug_insert_spilled(key, &kb, ver, None, l, 0);
+            engine.debug_insert_spilled(&kb, ver, None, l, 0);
 
             assert_eq!(engine.spilled_loc(kb.as_ref(), hash, 100), Some((ver, l)));
 
@@ -5532,7 +5725,7 @@ mod tests {
             let live = stripe
                 .live
                 .iter()
-                .find(|live| live.key_bytes.as_ref() == kb.as_ref())
+                .find(|live| record_key(&live.record) == kb.as_ref())
                 .expect("the entry is present");
             assert_eq!(
                 live.last_access_ms.load(Ordering::Relaxed),
@@ -5573,7 +5766,7 @@ mod tests {
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
             let ver = hlc(5, 1);
-            engine.debug_insert_spilled(key, &kb, ver, None, loc(0, 0, 10, 0), 0);
+            engine.debug_insert_spilled(&kb, ver, None, loc(0, 0, 10, 0), 0);
 
             let digest_before = engine.digests();
             let (live_count_before, weight_before) = engine.debug_totals();
@@ -5583,8 +5776,8 @@ mod tests {
                 kb.as_ref(),
                 hash,
                 ver,
-                "restored".to_string(),
-                Bytes::from_static(b"restored-bytes"),
+                &"restored".to_string(),
+                &Bytes::from(postcard::to_stdvec(&"restored".to_string()).expect("string encodes")),
             );
             assert!(
                 promoted,
@@ -5629,14 +5822,48 @@ mod tests {
                 kb.as_ref(),
                 hash,
                 ver,
-                "stale-read".to_string(),
-                Bytes::from_static(b"stale"),
+                &"stale-read".to_string(),
+                &Bytes::from_static(b"stale"),
             );
             assert!(
                 !promoted,
                 "nothing to promote: the entry is already resident"
             );
             assert_eq!(engine.get(&key, 0), Some("already-here".to_string()));
+        }
+
+        #[test]
+        fn promote_locked_invokes_the_weigher_with_the_original_key_and_value() {
+            let calls: Arc<std::sync::Mutex<Vec<(u32, String)>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&calls);
+            let weigher: Weigher<u32, String> = Box::new(move |k, v| {
+                recorded.lock().expect("lock").push((*k, v.clone()));
+                1
+            });
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let ver = hlc(5, 1);
+            engine.debug_insert_spilled(&kb, ver, None, loc(0, 0, 10, 0), 0);
+
+            let promoted = engine.promote_locked(
+                kb.as_ref(),
+                hash,
+                ver,
+                &"restored".to_string(),
+                &Bytes::from(postcard::to_stdvec(&"restored".to_string()).expect("string encodes")),
+            );
+            assert!(promoted);
+
+            let calls = calls.lock().expect("lock");
+            assert_eq!(
+                calls.as_slice(),
+                &[(key, "restored".to_string())],
+                "the weigher sees the original key, decoded from key_bytes, and the original \
+                 value passed in, not a stale or spilled-pointer substitute"
+            );
         }
 
         #[test]
@@ -5709,7 +5936,7 @@ mod tests {
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
             let bucket = stripe_index_from_hash(hash);
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(3, 0, 10, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(3, 0, 10, 0), 0);
 
             let removed = SpillSink::reclaim(&engine, 3, 0, &[(bucket, kb.clone())]);
             assert_eq!(
@@ -5729,13 +5956,13 @@ mod tests {
             let hash = hash_key_bytes(kb.as_ref());
             let bucket = stripe_index_from_hash(hash);
             let ver = hlc(1, 1);
-            engine.debug_insert_spilled(key, &kb, ver, None, loc(3, 0, 10, 0), 0);
+            engine.debug_insert_spilled(&kb, ver, None, loc(3, 0, 10, 0), 0);
             assert!(engine.promote_locked(
                 kb.as_ref(),
                 hash,
                 ver,
-                "restored".to_string(),
-                Bytes::from_static(b"bytes"),
+                &"restored".to_string(),
+                &Bytes::from(postcard::to_stdvec(&"restored".to_string()).expect("string encodes")),
             ));
 
             let digest_before = engine.digests();
@@ -5755,7 +5982,7 @@ mod tests {
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
             let bucket = stripe_index_from_hash(hash);
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(3, 0, 10, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(3, 0, 10, 0), 0);
             let _ = put(
                 &engine,
                 key,
@@ -5792,7 +6019,7 @@ mod tests {
                 let mut stripe = engine.stripe_lock(bucket).write();
                 let live = stripe
                     .live
-                    .find_mut(hash, |l| l.key_bytes.as_ref() == kb.as_ref())
+                    .find_mut(hash, |l| record_key(&l.record) == kb.as_ref())
                     .expect("entry is present");
                 live.weight = 0;
             }
@@ -5844,7 +6071,7 @@ mod tests {
             let live = stripe
                 .live
                 .iter()
-                .find(|l| l.key_bytes.as_ref() == kb.as_ref())
+                .find(|l| record_key(&l.record) == kb.as_ref())
                 .expect("entry is present");
             assert_eq!(
                 live.weight, 7,
@@ -5936,6 +6163,48 @@ mod tests {
             assert_eq!(
                 weight_after, 0,
                 "install never adds to total_weight; the entry stays at weight 0, Spilled"
+            );
+        }
+
+        #[test]
+        fn install_copies_the_key_into_a_fresh_allocation_instead_of_slicing() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let ver = hlc(1, 1);
+            let _ = put(&engine, key, kb.clone(), "value".to_string(), ver, None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 1);
+
+            let record_ptr_before = {
+                let stripe = engine.stripe_lock(bucket).read();
+                let live = stripe
+                    .live
+                    .iter()
+                    .find(|l| record_key(&l.record) == kb.as_ref())
+                    .expect("entry is present");
+                live.record.as_ref().as_ptr()
+            };
+
+            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0), 1);
+            assert!(installed);
+
+            let record_ptr_after = {
+                let stripe = engine.stripe_lock(bucket).read();
+                let live = stripe
+                    .live
+                    .iter()
+                    .find(|l| record_key(&l.record) == kb.as_ref())
+                    .expect("entry is present");
+                live.record.as_ref().as_ptr()
+            };
+
+            assert_ne!(
+                record_ptr_before, record_ptr_after,
+                "install builds a fresh key-only allocation rather than slicing the old \
+                 resident record: a slice would share its refcount and keep the value bytes \
+                 physically resident in RAM"
             );
         }
 
@@ -6044,7 +6313,7 @@ mod tests {
             let engine = engine_u32_string(u64::MAX, None);
             let key = 1u32;
             let kb = key_bytes(key);
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
             let (live_count_before, weight_before) = engine.debug_totals();
             assert_eq!(weight_before, 0);
             assert_eq!(
@@ -6089,7 +6358,7 @@ mod tests {
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
             let bucket = stripe_index_from_hash(hash);
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
             assert_eq!(engine.debug_spill_entries_count(), 1);
 
             {
@@ -6132,7 +6401,7 @@ mod tests {
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
             let ver = hlc(1, 1);
-            engine.debug_insert_spilled(key, &kb, ver, None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, ver, None, loc(0, 0, 4, 0), 0);
             assert_eq!(engine.debug_spill_entries_count(), 1);
 
             let removed_ver = engine.invalidate(kb.as_ref(), hash, hlc(2, 1));
@@ -6153,7 +6422,7 @@ mod tests {
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
             assert_eq!(engine.debug_spill_entries_count(), 1);
 
             engine.invalidate_local(kb.as_ref(), hash);
@@ -6172,7 +6441,7 @@ mod tests {
             let engine = engine_u32_string(u64::MAX, None);
             let key = 1u32;
             let kb = key_bytes(key);
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), Some(50), loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), Some(50), loc(0, 0, 4, 0), 0);
             assert_eq!(engine.debug_spill_entries_count(), 1);
 
             engine.sweep(100);
@@ -6199,7 +6468,7 @@ mod tests {
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
             assert_eq!(engine.debug_spill_entries_count(), 1);
 
             let inflight = Arc::new(Inflight::<String>::new());
@@ -6235,7 +6504,7 @@ mod tests {
             let engine = engine_u32_string(u64::MAX, None);
             let key = 1u32;
             let kb = key_bytes(key);
-            engine.debug_insert_spilled(key, &kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(0, 0, 4, 0), 0);
             let digest_before = engine.digests();
 
             engine.gc_tombstones(true, u64::MAX);
@@ -6293,7 +6562,8 @@ mod tests {
                 let bucket = stripe_index_from_hash(hash);
                 let stripe = engine.stripe_lock(bucket).read();
                 stripe.live.iter().any(|l| {
-                    l.key_bytes.as_ref() == kb.as_ref() && matches!(l.payload, Payload::Spilled(_))
+                    record_key(&l.record) == kb.as_ref()
+                        && matches!(l.state, EntryState::Spilled(_))
                 })
             }
 
@@ -6353,7 +6623,7 @@ mod tests {
                         stripe
                             .live
                             .iter()
-                            .find(|l| l.key_bytes.as_ref() == kb.as_ref())
+                            .find(|l| record_key(&l.record) == kb.as_ref())
                             .map(|l| l.weight)
                     },
                     Some(0),
@@ -6469,7 +6739,7 @@ mod tests {
                 let live = stripe
                     .live
                     .iter()
-                    .find(|l| l.key_bytes.as_ref() == kb.as_ref())
+                    .find(|l| record_key(&l.record) == kb.as_ref())
                     .expect("entry is present");
                 assert_eq!(
                     live.weight, 30,
@@ -6701,7 +6971,7 @@ mod tests {
                     let live = stripe
                         .live
                         .iter()
-                        .find(|l| l.key_bytes.as_ref() == key_bytes(keys[1]).as_ref())
+                        .find(|l| record_key(&l.record) == key_bytes(keys[1]).as_ref())
                         .expect("the deferred entry is still present");
                     assert_eq!(live.weight, 200, "its own weight field is untouched too");
                 }
@@ -7168,7 +7438,6 @@ mod tests {
             let spilled_key = 1u32;
             let spilled_kb = key_bytes(spilled_key);
             engine.debug_insert_spilled(
-                spilled_key,
                 &spilled_kb,
                 hlc(1, 1),
                 None,

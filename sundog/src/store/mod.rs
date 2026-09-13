@@ -523,10 +523,11 @@ pub struct CompactPassOutcome {
 }
 
 /// The type-erased surface the network layer drives a shard through, wire bytes
-/// in and out. This is the boundary where postcard (de)serialization happens;
-/// local reads never deserialize. Implemented by `Shard<K, V>` for any `K`, `V`
-/// meeting its bounds, and held as `Arc<dyn ShardOps>` in the cluster's cache
-/// registry.
+/// in and out. This is the boundary where postcard (de)serialization happens
+/// for the wire; a local read decodes its own stored record under the
+/// stripe's read lock, the same lock hold a clone used to take. Implemented by
+/// `Shard<K, V>` for any `K`, `V` meeting its bounds, and held as
+/// `Arc<dyn ShardOps>` in the cluster's cache registry.
 ///
 /// Async methods return `BoxFuture` rather than `async fn` so `dyn ShardOps`
 /// stays usable from a `HashMap<SmolStr, Arc<dyn ShardOps>>`.
@@ -2125,7 +2126,7 @@ where
         spill_read.reads_hit.increment(1);
         if self
             .engine
-            .promote_locked(key_bytes, hash, ver, value.clone(), bytes.encoded)
+            .promote_locked(key_bytes, hash, ver, &value, &bytes.encoded)
         {
             spill_read.promotions.increment(1);
         }
@@ -5568,7 +5569,6 @@ mod tests {
             // directly) must skip it regardless of what its bytes would
             // decode to.
             s.engine.debug_insert_spilled(
-                1,
                 &key_bytes(&1u32),
                 hlc(1, 1),
                 None,

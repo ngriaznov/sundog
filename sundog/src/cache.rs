@@ -1,5 +1,6 @@
 //! The typed cache handle and its builder. `Cache<K, V>` wraps
-//! `Arc<Shard<K, V>>`; local reads never deserialize.
+//! `Arc<Shard<K, V>>`; a local read decodes its own stored record under the
+//! stripe's read lock, the same lock hold a clone used to take.
 //!
 //! [`CacheBuilder::open`] checks the requested [`Mode`] against what live
 //! peers advertise for the same name before registering the shard, and
