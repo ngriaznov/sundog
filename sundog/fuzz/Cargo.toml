@@ -34,6 +34,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "crdt_decode_never_panics"
+path = "fuzz_targets/crdt_decode_never_panics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "apply_model"
 path = "fuzz_targets/apply_model.rs"
 test = false

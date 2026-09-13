@@ -151,6 +151,16 @@ pub(crate) fn hash_key_bytes(key_bytes: &[u8]) -> u64 {
     xxh3_64(key_bytes)
 }
 
+/// One [`Engine::compact`] call's result: the records whose resolver
+/// produced a compacted form, each with the version it was read at, and
+/// how many stripes the call walked before its entry budget ran out. A
+/// caller that wants the whole keyspace examined keeps calling until the
+/// visited stripes add up to [`BUCKET_COUNT`](crate::store::BUCKET_COUNT).
+pub(crate) struct CompactScan<K> {
+    pub(crate) candidates: Vec<(K, Bytes, Hlc, Bytes)>,
+    pub(crate) stripes_visited: usize,
+}
+
 /// The stripe, an anti-entropy bucket, a precomputed key hash belongs to.
 pub(crate) fn stripe_index_from_hash(hash: u64) -> usize {
     usize::try_from(hash & (BUCKET_COUNT as u64 - 1))
@@ -2254,7 +2264,7 @@ where
     /// each under its own read lock in turn (never more than one held at
     /// once — compaction only reads, so a write lock is never needed here),
     /// calling `resolver.compact(key_bytes, encoded, now_ms, retire, quiet,
-    /// bound_ms)` on every resident live entry and collecting `(key,
+    /// bounds)` on every resident live entry and collecting `(key,
     /// key_bytes, ver, new_encoded)` for every one that returns `Some`.
     ///
     /// Never mutates a stripe itself: this only *reads* candidates, each
@@ -2281,18 +2291,23 @@ where
     /// past the last stripe back to `0`), so consecutive calls rotate
     /// through every stripe in turn and a call never revisits a stripe it
     /// already finished this pass; `max_entries == 0` visits nothing and
-    /// leaves the cursor untouched.
+    /// leaves the cursor untouched. Returns the candidates with how many
+    /// stripes were walked, so a caller can tell a complete rotation from
+    /// a budget-limited partial one.
     pub(crate) fn compact(
         &self,
         resolver: &dyn ConflictResolver,
         now_ms: u64,
         retire: &dyn Fn(crdt::WriterId) -> bool,
         quiet: bool,
-        bound_ms: u64,
+        bounds: super::CompactionBounds,
         max_entries: usize,
-    ) -> Vec<(K, Bytes, Hlc, Bytes)> {
+    ) -> CompactScan<K> {
         if max_entries == 0 {
-            return Vec::new();
+            return CompactScan {
+                candidates: Vec::new(),
+                stripes_visited: 0,
+            };
         }
         let start = stripe_index_from_hash(self.compact_cursor.load(Ordering::Relaxed));
         let mut out = Vec::new();
@@ -2322,7 +2337,7 @@ where
                     now_ms,
                     retire,
                     quiet,
-                    bound_ms,
+                    bounds,
                 ) {
                     out.push((
                         live.key.clone(),
@@ -2339,7 +2354,10 @@ where
         }
         self.compact_cursor
             .store(next_start as u64, Ordering::Relaxed);
-        out
+        CompactScan {
+            candidates: out,
+            stripes_visited: visited,
+        }
     }
 
     /// Replaces a live, resident entry's payload and version with
@@ -2380,13 +2398,19 @@ where
     /// rejected as an already-absorbed redelivery, when its bytes are the
     /// pre-compaction shape this side has since moved past. Correcting the
     /// digest for the version change is the only bookkeeping a version
-    /// bump needs here: no `Incoming` apply, no fan-out, no `Event` — this
-    /// never replicates, since every reachable replica's own
-    /// [`ConflictResolver::compact`] independently reaches the same,
-    /// purely locally-derived conclusion (dead writers and settled
-    /// membership are facts every node can observe on its own) on its own
-    /// schedule; a replica that has not yet caught up simply has not
-    /// reached this conclusion yet, not disagrees with it.
+    /// bump needs here: no `Incoming` apply, no fan-out, no `Event`. The
+    /// new version is minted from the compacted bytes themselves
+    /// ([`super::compacted_version`]), so two replicas that independently
+    /// compact identical bytes mint identical versions and anti-entropy
+    /// has nothing to exchange for that key; replicas that compact to
+    /// different bytes (one has judged a writer dead that the other has
+    /// not yet) mint different versions and anti-entropy does exchange
+    /// the key, exactly as it would for any other divergent write. That is
+    /// fine: [`ConflictResolver::merge`] plus [`ConflictResolver::settle`]
+    /// converge the two sides the same way they converge any other merge.
+    /// A replica that has not yet reached [`ConflictResolver::compact`]'s
+    /// conclusion locally simply has not gotten there yet, not disagreed
+    /// with it.
     ///
     /// Returns `false` — a no-op — once the entry has moved on: a
     /// different version (something else wrote it since [`Self::compact`]
@@ -7486,7 +7510,16 @@ mod tests {
             let retire_everyone = |_: WriterId| true;
             let mut seen = Vec::new();
             for &target in &targets {
-                let out = engine.compact(&resolver, 1_000, &retire_everyone, false, 0, 1);
+                let out = engine
+                    .compact(
+                        &resolver,
+                        1_000,
+                        &retire_everyone,
+                        false,
+                        crate::store::CompactionBounds::three_bounds(0),
+                        1,
+                    )
+                    .candidates;
                 assert_eq!(
                     out.len(),
                     1,
@@ -7526,7 +7559,16 @@ mod tests {
             engine.debug_set_compact_cursor(0);
             let retire_everyone = |_: WriterId| true;
             let before = engine.debug_compact_lock_acquisitions();
-            let out = engine.compact(&resolver, 1_000, &retire_everyone, false, 0, 1);
+            let out = engine
+                .compact(
+                    &resolver,
+                    1_000,
+                    &retire_everyone,
+                    false,
+                    crate::store::CompactionBounds::three_bounds(0),
+                    1,
+                )
+                .candidates;
             let after = engine.debug_compact_lock_acquisitions();
 
             assert_eq!(out.len(), 1);
@@ -7571,7 +7613,16 @@ mod tests {
 
             engine.debug_set_compact_cursor(0);
             let retire_everyone = |_: WriterId| true;
-            let out = engine.compact(&resolver, 1_000, &retire_everyone, false, 0, usize::MAX);
+            let out = engine
+                .compact(
+                    &resolver,
+                    1_000,
+                    &retire_everyone,
+                    false,
+                    crate::store::CompactionBounds::three_bounds(0),
+                    usize::MAX,
+                )
+                .candidates;
 
             assert_eq!(
                 out.len(),

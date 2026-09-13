@@ -118,9 +118,18 @@ from growing forever under writer churn: a writer gone (crashed or shut
 down, or superseded by a restart) longer than `ClusterConfig::crdt_retire_after` (default:
 `tombstone_max_ttl`, 24h) gets retired into bounded per-writer state, and
 folded away once that retirement itself has aged past a second
-`crdt_retire_after` with every peer quiet. That is the same trust boundary
-`tombstone_max_ttl` already accepts for a member gone that long, applied
-here to a writer's own contribution rather than a whole entry.
+`crdt_retire_after` with every peer quiet, leaving a per-writer receipt
+behind so a merge can tell a writer some other replica already folded from
+one it just hasn't retired yet. `ConflictResolver::settle` prunes that
+receipt on every merge apply once it outlives its own lifetime, so a
+receipt one replica has already dropped can't ride back in from a peer
+that hasn't caught up. A replica isolated for longer than that receipt
+lifetime, still holding a live slot for a writer every other replica has
+already folded away, double-counts that writer's contribution once it
+reconnects (an `OrSet` writer's already-removed elements resurrect the
+same way). That is the same trust boundary `tombstone_max_ttl` already
+accepts for a member gone that long, applied here to one writer's
+contribution rather than a whole entry.
 
 Deletes and expiries differ. A TTL-expired entry never returns. Every record
 carries its own absolute `expires_at_ms`, and once a key is past it no peer
@@ -307,7 +316,14 @@ outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
 tags anti-entropy's IBLT-sketch reconciliation on large buckets, where
 `outcome` is `decoded` or `fallback`. The second tags the part-digest path's
 per-part reconciliation, where `outcome` is `listing`, `sketch`, or
-`fallback`. Without
+`fallback`. A cache whose resolver merges (`sundog::crdt`'s `PnCounter` and
+`OrSet`) also emits `sundog_crdt_retired_writers_total{cache}`, writers the
+CRDT compaction sweep found eligible for retirement, and
+`sundog_crdt_compactions_total{cache}`, records it actually rewrote in
+their compacted form. The first can exceed the second: a writer counts as
+retired the moment the sweep's scan judges it eligible, even for a record
+the pass skips without rewriting (an unowned bucket, or one that changed
+underneath the scan). Without
 `prometheus` they fall into the `metrics` crate's no-op default recorder.
 Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at

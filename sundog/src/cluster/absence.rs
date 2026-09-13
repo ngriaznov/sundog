@@ -34,6 +34,14 @@ struct AbsenceState {
     /// tick, so its death has to stay known until the member itself comes
     /// back under a fresh incarnation, however long that takes.
     gone_since: HashMap<NodeId, Instant>,
+    /// When each member was first observed live, never moved by later
+    /// transitions: a member that keeps flapping faster than the
+    /// retirement bound never settles as present or gone, and this is
+    /// what lets the CRDT sweep's quiet check count it as settled anyway
+    /// once it has been known for two bounds (see
+    /// `membership::member_is_quiet`). Dropped with `gone_since` by
+    /// [`AbsenceTracker::prune_gone_older_than`].
+    known_since: HashMap<NodeId, Instant>,
     /// How long each live member has been continuously present, keyed only
     /// while the member is live. Reset (removed) only when the member is
     /// marked absent below — never touched by an `observe()` call that
@@ -76,9 +84,32 @@ impl AbsenceTracker {
             state.absent_since.remove(&node);
             state.gone_since.remove(&node);
             state.present_since.entry(node).or_insert_with(Instant::now);
+            state.known_since.entry(node).or_insert_with(Instant::now);
             state.last_flags.insert(node, flags);
         }
         state.live = live_ids;
+    }
+
+    /// Forgets every member gone for longer than `horizon`, along with when
+    /// it was first known: the CRDT sweep calls this with three times
+    /// `crdt_retire_after`, the age past which a fold receipt no longer
+    /// reconciles a straggling copy of the member's writer either, so
+    /// retiring it any later could only double count. Bounds this
+    /// tracker under sustained churn, where every restarted process
+    /// leaves behind a node id that never returns.
+    pub(crate) fn prune_gone_older_than(&self, horizon: Duration) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let forgotten: Vec<NodeId> = state
+            .gone_since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) > horizon)
+            .map(|(&node, _)| node)
+            .collect();
+        for node in forgotten {
+            state.gone_since.remove(&node);
+            state.known_since.remove(&node);
+        }
     }
 
     /// Whether any recently-known member is absent and not yet aged past
@@ -133,11 +164,19 @@ impl AbsenceTracker {
 
     /// When this member last left the live set, by a crash or a graceful
     /// departure; `None` if it is live or has never been observed. Holds
-    /// until the member returns, never ageing out, so every record the
-    /// compaction sweep reaches on a later tick still sees the member gone.
+    /// until the member returns or [`AbsenceTracker::prune_gone_older_than`]
+    /// forgets it, so every record the compaction sweep reaches on a later
+    /// tick still sees the member gone.
     pub(crate) fn gone_since(&self, node: NodeId) -> Option<Instant> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.gone_since.get(&node).copied()
+    }
+
+    /// When this member was first observed live; `None` if never, or once
+    /// [`AbsenceTracker::prune_gone_older_than`] forgot it.
+    pub(crate) fn known_since(&self, node: NodeId) -> Option<Instant> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.known_since.get(&node).copied()
     }
 }
 
@@ -324,6 +363,51 @@ mod tests {
         tracker.observe(&live(&[(1, false)]));
         assert!(tracker.gone_since(NodeId::from(1)).is_none());
         assert!(tracker.gone_longer_than(Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn known_since_is_first_observation_and_survives_flapping() {
+        let tracker = AbsenceTracker::default();
+        assert!(tracker.known_since(NodeId::from(1)).is_none());
+        tracker.observe(&live(&[(1, false)]));
+        let first = tracker
+            .known_since(NodeId::from(1))
+            .expect("known once seen live");
+        std::thread::sleep(Duration::from_millis(5));
+        tracker.observe(&live(&[]));
+        tracker.observe(&live(&[(1, false)]));
+        assert_eq!(
+            tracker.known_since(NodeId::from(1)),
+            Some(first),
+            "leaving and returning never moves the first observation"
+        );
+        assert!(
+            tracker.present_since(NodeId::from(1)).expect("live again") > first,
+            "continuous presence restarted on return"
+        );
+    }
+
+    #[test]
+    fn prune_gone_older_than_forgets_only_members_gone_past_the_horizon() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false), (2, true)]));
+        tracker.observe(&live(&[(2, true)]));
+        std::thread::sleep(Duration::from_millis(20));
+        tracker.observe(&live(&[]));
+        tracker.prune_gone_older_than(Duration::from_millis(10));
+        assert!(
+            tracker.gone_since(NodeId::from(1)).is_none()
+                && tracker.known_since(NodeId::from(1)).is_none(),
+            "gone past the horizon: forgotten entirely"
+        );
+        assert!(
+            tracker.gone_since(NodeId::from(2)).is_some(),
+            "gone for less than the horizon: still tracked"
+        );
+        assert!(
+            tracker.any_absent(Duration::from_secs(3600)),
+            "pruning never touches tombstone absence"
+        );
     }
 
     #[test]

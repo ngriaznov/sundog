@@ -31,7 +31,7 @@ use sundog::hlc::Hlc;
 use sundog::membership::Peer;
 use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
-use sundog::store::{Mode, Shard, ShardOps, SimFanOut};
+use sundog::store::{CompactionBounds, Mode, Shard, ShardOps, SimFanOut};
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
     ConflictResolver, Merged, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
@@ -4332,9 +4332,15 @@ fn run_compact_tick<S: ShardOps>(
                 .get(&w.node())
                 .is_some_and(|&presence| crdt_writer_is_dead(w, presence, now_ms, bound_ms))
     };
-    block_on(ShardOps::compact_pass(
-        shard, now_ms, &retire, quiet, bound_ms, batch,
-    ))
+    let outcome = block_on(ShardOps::compact_pass(
+        shard,
+        now_ms,
+        &retire,
+        quiet,
+        CompactionBounds::three_bounds(bound_ms),
+        batch,
+    ));
+    (outcome.retired, outcome.compacted)
 }
 
 /// A minimal per-node loop for the CRDT-compaction scenarios: inbound

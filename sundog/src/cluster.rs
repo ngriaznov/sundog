@@ -49,8 +49,8 @@ use crate::net::{
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
 use crate::store::{
-    FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of, chunk_records_for_snapshot, crdt,
-    now_ms,
+    CompactionBounds, FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of,
+    chunk_records_for_snapshot, crdt, now_ms,
 };
 use crate::wire::{self, Msg, WireRecord};
 
@@ -1758,6 +1758,7 @@ fn crdt_cache_members(
                 .is_some_and(|caches| caches.contains_key(name))
         })
         .map(|peer| membership::MemberView {
+            known_since: absence.known_since(peer.node),
             present_since: absence.present_since(peer.node),
             absent_since: None,
             live_incarnation: Some(peer.incarnation),
@@ -1770,6 +1771,7 @@ fn crdt_cache_members(
         .gone_longer_than(Duration::ZERO)
         .into_iter()
         .map(|node| membership::MemberView {
+            known_since: absence.known_since(node),
             present_since: None,
             absent_since: absence.gone_since(node),
             live_incarnation: None,
@@ -1802,6 +1804,7 @@ async fn crdt_compact_tick(
     name: &SmolStr,
     cluster: &Cluster,
     absence: &absence::AbsenceTracker,
+    bounds: CompactionBounds,
 ) -> (Vec<crdt::WriterId>, usize) {
     if !shard.merges() {
         return (Vec::new(), 0);
@@ -1811,6 +1814,7 @@ async fn crdt_compact_tick(
 
     let retire_after = cluster.config().crdt_retire_after;
     let batch = cluster.config().crdt_compact_batch;
+    absence.prune_gone_older_than(retire_after.saturating_mul(3));
     let now = Instant::now();
     let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
     // Seeded with this node's own current incarnation, not just its peers':
@@ -1841,11 +1845,13 @@ async fn crdt_compact_tick(
     let retire = |w: crdt::WriterId| {
         let member = match live_incarnation.get(&w.node()) {
             Some(&incarnation) => membership::MemberView {
+                known_since: None,
                 present_since: None,
                 absent_since: None,
                 live_incarnation: Some(incarnation),
             },
             None => membership::MemberView {
+                known_since: None,
                 present_since: None,
                 absent_since: absence.gone_since(w.node()),
                 live_incarnation: None,
@@ -1854,10 +1860,28 @@ async fn crdt_compact_tick(
         crdt_writer_is_retirement_eligible(local, w, &member, now, retire_after)
     };
 
-    let bound_ms = u64::try_from(retire_after.as_millis()).unwrap_or(u64::MAX);
-    let (retired, compacted) = shard
-        .compact_pass(now_ms(), &retire, quiet, bound_ms, batch)
-        .await;
+    // The whole keyspace, `batch` records per call and a yield between
+    // calls so a large cache never pins the executor: one tick retires a
+    // dead writer everywhere, rather than `batch` records per period.
+    let mut retired: Vec<crdt::WriterId> = Vec::new();
+    let mut compacted = 0usize;
+    let mut stripes_visited = 0usize;
+    loop {
+        let outcome = shard
+            .compact_pass(now_ms(), &retire, quiet, bounds, batch)
+            .await;
+        for writer in outcome.retired {
+            if !retired.contains(&writer) {
+                retired.push(writer);
+            }
+        }
+        compacted += outcome.compacted;
+        stripes_visited += outcome.stripes_visited;
+        if sweep_is_complete(stripes_visited, outcome.stripes_visited) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
     for _ in &retired {
         metrics::counter!("sundog_crdt_retired_writers_total", "cache" => name.to_string())
             .increment(1);
@@ -1869,58 +1893,24 @@ async fn crdt_compact_tick(
     (retired, compacted)
 }
 
-/// Milliseconds from `now_ms` until the next wall-clock instant that is an
-/// exact multiple of `period_ms` — the same boundary regardless of which
-/// node computes it or when its own task happened to start, given
-/// reasonably synced clocks. [`crdt_compact_task`] uses this for every tick
-/// after its first: two replicas' compaction sweeps landing at (very
-/// nearly) the same real moment is what lets a receipt [`crdt::PnCounter`]/
-/// [`crdt::OrSet`] left behind actually disappear for good. Left as a
-/// process-relative fixed-period ticker instead (`tokio::time::interval`'s
-/// own behavior, and this function's own predecessor), two nodes whose
-/// tasks started even a few seconds apart tick at a permanently fixed
-/// offset from each other, and neither's own prune ever survives more than
-/// one anti-entropy round: node A prunes and is clean until node B's own
-/// (differently-phased) tick eventually sends its own not-yet-pruned copy
-/// back, re-merging the receipt into A (`PnCounter::merge`/`OrSet::merge`
-/// only ever union a receipt in, never drop one, so nothing short of *both*
-/// sides holding no receipt at the same moment ends this); B then prunes
-/// its own copy on its own schedule, but by then A's still-carried receipt
-/// (re-merged in during the gap before B's tick) flows back and re-infects
-/// B right after — forever, on every cycle, however long the run. Aligning
-/// every tick after the first to a shared boundary collapses that
-/// permanent gap to (at most) ordinary clock skew, so a receipt aged past
-/// the pruning bound is dropped by every reachable replica at essentially
-/// the same instant and has no not-yet-pruned copy left anywhere to
-/// resurrect it on the next round.
-///
-/// Returns `period_ms` itself (never `0`, even when `now_ms` already sits
-/// exactly on a boundary) so a caller never computes a zero-length sleep
-/// that would immediately recompute the very same boundary and spin.
-fn next_aligned_wait_ms(now_ms: u64, period_ms: u64) -> u64 {
-    if period_ms == 0 {
-        return 0;
-    }
-    let remainder = now_ms % period_ms;
-    if remainder == 0 {
-        period_ms
-    } else {
-        period_ms - remainder
-    }
+/// Whether one tick's sweep has examined the whole keyspace: the stripes
+/// its `compact_pass` calls walked add up to every stripe, or the last
+/// call walked none (an empty budget, or a shard that never compacts).
+fn sweep_is_complete(stripes_visited: usize, last_call_stripes: usize) -> bool {
+    last_call_stripes == 0 || stripes_visited >= crate::store::BUCKET_COUNT
 }
 
 /// Periodically runs [`crdt_compact_tick`] for one merging cache, at a
 /// quarter of `ClusterConfig::crdt_retire_after` (floored at 30s, the same
 /// cadence idea [`tombstone_gc_task`] uses): retirement eligibility, not
 /// raw traffic, is what changes over time here, so there's no need to poll
-/// faster than absence tracking itself changes.
-///
-/// The first tick fires immediately (a freshly opened cache should not
-/// wait a full period for its first sweep); every tick after that is
-/// aligned to a shared wall-clock boundary via
-/// [`next_aligned_wait_ms`] — see that function's own doc for why this
-/// alignment, not just the period, is load-bearing for `folded_at`
-/// receipts actually pruning under ongoing replication.
+/// faster than absence tracking itself changes. The first tick fires
+/// immediately, so a freshly opened cache does not wait a full period for
+/// its first sweep. Ticks need no alignment across replicas: a fold
+/// receipt one replica pruned is dropped again by every merge apply on
+/// its peers ([`crate::store::ConflictResolver::settle`]), and a compacted
+/// record's version is minted from the stale one, so replicas that
+/// compact the same bytes agree on the result whenever they get to it.
 pub(crate) async fn crdt_compact_task(
     shard: Arc<dyn ShardOps>,
     name: SmolStr,
@@ -1928,16 +1918,16 @@ pub(crate) async fn crdt_compact_task(
     absence: absence::AbsenceTracker,
     cancel: CancellationToken,
 ) {
-    let period = (cluster.config().crdt_retire_after / 4).max(Duration::from_secs(30));
-    let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+    let period = cluster.config().crdt_sweep_period();
+    let bounds = cluster.config().crdt_compaction_bounds();
     let mut wait = Duration::ZERO;
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(wait) => {
-                crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
-                wait = Duration::from_millis(next_aligned_wait_ms(now_ms(), period_ms));
+                crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence, bounds).await;
+                wait = period;
             }
         }
     }
@@ -5237,6 +5227,7 @@ mod tests {
         // If `local` weren't excluded, this member view (absent well past
         // the bound) would otherwise make it eligible.
         let member = membership::MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 3600)),
             live_incarnation: None,
@@ -5253,6 +5244,7 @@ mod tests {
         let local = writer(1, 1);
         let w = writer(2, 1);
         let member = membership::MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 3600)),
             live_incarnation: None,
@@ -5269,6 +5261,7 @@ mod tests {
         let local = writer(1, 1);
         let w = writer(2, 1);
         let member = membership::MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 5)),
             live_incarnation: None,
@@ -5288,6 +5281,7 @@ mod tests {
         // process is gone regardless of how recently node 2 restarted.
         let old_w = writer(2, 1);
         let member = membership::MemberView {
+            known_since: None,
             present_since: Some(now),
             absent_since: None,
             live_incarnation: Some(9),
@@ -5304,6 +5298,7 @@ mod tests {
         let local = writer(1, 1);
         let w = writer(2, 1);
         let member = membership::MemberView {
+            known_since: None,
             present_since: None,
             absent_since: None,
             live_incarnation: None,
@@ -5311,41 +5306,6 @@ mod tests {
         assert!(!crdt_writer_is_retirement_eligible(
             local, w, &member, now, bound
         ));
-    }
-
-    #[test]
-    fn next_aligned_wait_ms_reaches_the_next_multiple_of_the_period() {
-        assert_eq!(next_aligned_wait_ms(1_000, 30_000), 29_000);
-        assert_eq!(next_aligned_wait_ms(29_999, 30_000), 1);
-    }
-
-    #[test]
-    fn next_aligned_wait_ms_returns_a_full_period_exactly_on_a_boundary() {
-        assert_eq!(
-            next_aligned_wait_ms(60_000, 30_000),
-            30_000,
-            "sitting exactly on a boundary must still wait a full period, never spin at 0"
-        );
-        assert_eq!(next_aligned_wait_ms(0, 30_000), 30_000);
-    }
-
-    #[test]
-    fn next_aligned_wait_ms_is_the_same_boundary_regardless_of_starting_offset() {
-        // Two "nodes" reading the clock at different moments land on the
-        // exact same next boundary once each one's own wait has elapsed —
-        // the entire point of aligning by wall clock instead of by a
-        // per-node fixed period from an arbitrary start time.
-        let period_ms = 30_000;
-        let observer_now = 12_345;
-        let writer_now = 12_345 + 7_000;
-        let boundary_from_observer = observer_now + next_aligned_wait_ms(observer_now, period_ms);
-        let boundary_from_writer = writer_now + next_aligned_wait_ms(writer_now, period_ms);
-        assert_eq!(boundary_from_observer, boundary_from_writer);
-    }
-
-    #[test]
-    fn next_aligned_wait_ms_is_zero_for_a_zero_period() {
-        assert_eq!(next_aligned_wait_ms(12_345, 0), 0);
     }
 
     #[test]
@@ -5360,11 +5320,13 @@ mod tests {
         let bound = Duration::from_secs(60);
         let members = [
             membership::MemberView {
+                known_since: None,
                 present_since: Some(ago(now, 120)),
                 absent_since: None,
                 live_incarnation: Some(1),
             },
             membership::MemberView {
+                known_since: None,
                 present_since: None,
                 absent_since: Some(ago(now, 120)),
                 live_incarnation: None,
@@ -5379,12 +5341,14 @@ mod tests {
         let bound = Duration::from_secs(60);
         let members = [
             membership::MemberView {
+                known_since: None,
                 present_since: Some(ago(now, 120)),
                 absent_since: None,
                 live_incarnation: Some(1),
             },
             // Recently returned/gone absent: not yet past the bound.
             membership::MemberView {
+                known_since: None,
                 present_since: None,
                 absent_since: Some(ago(now, 5)),
                 live_incarnation: None,
@@ -5470,12 +5434,175 @@ mod tests {
     // absence state.
     // -----------------------------------------------------------------
 
+    /// A loopback config with `retire_after` for tests that drive
+    /// `crdt_compact_tick` by hand with their own tracker: the cache's
+    /// own background sweep keeps the 30-second production floor, so it
+    /// never races the hand-driven ticks within a test's lifetime, and
+    /// the hand-driven ticks pass [`three_bounds`] themselves.
     fn crdt_loopback_config(retire_after: Duration) -> ClusterConfig {
         ClusterConfig {
             crdt_retire_after: retire_after,
             crdt_compact_batch: 100,
             ..loopback_config()
         }
+    }
+
+    /// The config for tests that let the real `crdt_compact_task` do the
+    /// sweeping: a sweep every quarter of `retire_after` (at least 50ms),
+    /// so a fold receipt lives a few bounds rather than the minute the
+    /// production floor would give.
+    fn crdt_task_loopback_config(retire_after: Duration) -> ClusterConfig {
+        ClusterConfig {
+            crdt_sweep_interval: Some((retire_after / 4).max(Duration::from_millis(50))),
+            ..crdt_loopback_config(retire_after)
+        }
+    }
+
+    /// The bounds a hand-driven tick passes: ticks in these tests are as
+    /// frequent as the test sleeps, so the receipt lives its plain three
+    /// bounds.
+    fn three_bounds(retire_after: Duration) -> CompactionBounds {
+        CompactionBounds::three_bounds(u64::try_from(retire_after.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// One tick examines the whole keyspace however small the per-call
+    /// batch: eight records, a batch of one, and every record's dead writer
+    /// retired by a single `crdt_compact_tick`.
+    #[tokio::test]
+    async fn crdt_compact_tick_sweeps_the_whole_keyspace_however_small_the_batch() {
+        let retire_after = Duration::from_millis(20);
+        let cluster = Cluster::builder("cluster-it-crdt-whole-keyspace")
+            .seeds(std::iter::empty())
+            .config(ClusterConfig {
+                crdt_compact_batch: 1,
+                ..crdt_loopback_config(retire_after)
+            })
+            .build()
+            .await
+            .expect("build succeeds");
+        let name = SmolStr::new("counters");
+        let cache = open_counters_cache(&cluster, name.as_str()).await;
+        let shard = registered_shard(&cluster, &name);
+        let dead_writer = writer(999, 1);
+        for key in 0..8u32 {
+            cache
+                .insert(key, PnCounter::local_delta(dead_writer, u64::from(key) + 1))
+                .await
+                .expect("seed write");
+        }
+        let absence = absence::AbsenceTracker::default();
+        absence.observe(&HashMap::from([(
+            dead_writer.node(),
+            membership::LiveFlags { departing: false },
+        )]));
+        absence.observe(&HashMap::new());
+        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
+
+        let (retired, compacted) = crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            three_bounds(retire_after),
+        )
+        .await;
+        assert_eq!(retired, vec![dead_writer]);
+        assert_eq!(
+            compacted, 8,
+            "one tick rewrote all eight records, one per call"
+        );
+        for key in 0..8u32 {
+            assert_eq!(
+                cache.get(&key).await.map(|c| c.value()),
+                Some(i128::from(key) + 1),
+                "key {key} keeps its exact value"
+            );
+        }
+        cluster.shutdown().await;
+    }
+
+    #[test]
+    fn sweep_is_complete_once_every_stripe_was_walked_or_a_call_walked_none() {
+        assert!(!sweep_is_complete(crate::store::BUCKET_COUNT - 1, 3));
+        assert!(sweep_is_complete(crate::store::BUCKET_COUNT, 3));
+        assert!(sweep_is_complete(crate::store::BUCKET_COUNT + 7, 7));
+        assert!(
+            sweep_is_complete(0, 0),
+            "a call that walked nothing ends the tick"
+        );
+    }
+
+    /// A member flapping faster than the bound never settles as present or
+    /// gone; once known for two bounds it counts as settled, so it cannot
+    /// hold stage two back for every writer in the cache indefinitely.
+    #[test]
+    fn crdt_cache_is_quiet_counts_a_member_known_for_two_bounds_as_settled() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(10);
+        let flapper = membership::MemberView {
+            known_since: Some(now.checked_sub(Duration::from_secs(25)).expect("recent")),
+            present_since: Some(now.checked_sub(Duration::from_secs(1)).expect("recent")),
+            absent_since: None,
+            live_incarnation: Some(3),
+        };
+        assert!(crdt_cache_is_quiet(&[flapper], now, bound));
+        let newcomer = membership::MemberView {
+            known_since: Some(now.checked_sub(Duration::from_secs(15)).expect("recent")),
+            ..flapper
+        };
+        assert!(!crdt_cache_is_quiet(&[newcomer], now, bound));
+    }
+
+    /// A member gone for longer than three bounds is forgotten by the tick:
+    /// no fold receipt reconciles a straggling copy of its writer any more,
+    /// so keeping it could only make a later retirement double count, and
+    /// forgetting it bounds the tracker under sustained restarts.
+    #[tokio::test]
+    async fn crdt_compact_tick_forgets_a_member_gone_past_three_bounds() {
+        let retire_after = Duration::from_millis(20);
+        let cluster = Cluster::builder("cluster-it-crdt-forget-gone")
+            .seeds(std::iter::empty())
+            .config(crdt_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("build succeeds");
+        let name = SmolStr::new("counters");
+        let _cache = open_counters_cache(&cluster, name.as_str()).await;
+        let shard = registered_shard(&cluster, &name);
+        let absence = absence::AbsenceTracker::default();
+        let gone = NodeId::from(4242);
+        absence.observe(&HashMap::from([(
+            gone,
+            membership::LiveFlags { departing: false },
+        )]));
+        absence.observe(&HashMap::new());
+        tokio::time::sleep(retire_after * 2).await;
+        crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            three_bounds(retire_after),
+        )
+        .await;
+        assert!(
+            absence.gone_since(gone).is_some(),
+            "two bounds gone: still tracked"
+        );
+        tokio::time::sleep(retire_after * 2).await;
+        crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            three_bounds(retire_after),
+        )
+        .await;
+        assert!(
+            absence.gone_since(gone).is_none(),
+            "past three bounds: forgotten"
+        );
+        cluster.shutdown().await;
     }
 
     async fn open_counters_cache(cluster: &Cluster, name: &str) -> Cache<u32, PnCounter> {
@@ -5525,8 +5652,14 @@ mod tests {
         // Stage one: with no other known members the cache is vacuously
         // quiet, so the dead writer's live slot moves into its own retired
         // entry the moment it's found dead.
-        let (retired, compacted) =
-            crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+        let (retired, compacted) = crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            three_bounds(retire_after),
+        )
+        .await;
         assert_eq!(retired, vec![dead_writer]);
         assert_eq!(compacted, 1);
         assert_eq!(
@@ -5557,8 +5690,14 @@ mod tests {
         // The dead writer's retired entry is now old enough for stage two,
         // but `flaky` hasn't settled yet, so the cache stays not-quiet and
         // stage two must defer.
-        let (retired, compacted) =
-            crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+        let (retired, compacted) = crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            three_bounds(retire_after),
+        )
+        .await;
         assert!(
             retired.is_empty(),
             "no writer newly enters stage one this pass"
@@ -5573,8 +5712,14 @@ mod tests {
         // `flaky` has now itself been continuously absent past the bound,
         // settling it: the cache is quiet and stage two folds the
         // long-aged retired entry into the bounded scalar accumulator.
-        let (retired, compacted) =
-            crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+        let (retired, compacted) = crdt_compact_tick(
+            shard.as_ref(),
+            &name,
+            &cluster,
+            &absence,
+            three_bounds(retire_after),
+        )
+        .await;
         assert!(retired.is_empty());
         assert_eq!(
             compacted, 1,
@@ -5666,7 +5811,14 @@ mod tests {
         // sufficiently-spaced passes, not merely enough total elapsed time.
         let folded_len = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence).await;
+                crdt_compact_tick(
+                    shard.as_ref(),
+                    &name,
+                    &cluster,
+                    &absence,
+                    three_bounds(retire_after),
+                )
+                .await;
                 let len = cache
                     .get(&1)
                     .await
@@ -5705,7 +5857,7 @@ mod tests {
         let retire_after = Duration::from_millis(20);
         let cluster = Cluster::builder("cluster-it-crdt-metrics")
             .seeds(std::iter::empty())
-            .config(crdt_loopback_config(retire_after))
+            .config(crdt_task_loopback_config(retire_after))
             .build()
             .await
             .expect("build succeeds");
@@ -5787,26 +5939,23 @@ mod tests {
     /// full scale): each replacement's own incarnation retires and folds
     /// away on the observer, and — the regression this test pins — its
     /// `folded_at` receipt actually disappears for good, not merely once
-    /// per stray tick. Left on the pre-alignment, purely
-    /// process-relative ticker, this never happens under ongoing
-    /// replication between exactly two nodes: the observer's own prune
-    /// only ever survives until the writer's own, differently-phased tick
-    /// sends its still-unpruned copy back over anti-entropy (`merge` only
-    /// ever unions a receipt in, never drops one), and the writer's own
-    /// prune is undone the same way in the other direction — forever, on
-    /// every cycle, however long the run (proven directly against this
-    /// exact two-node shape while fixing this test). Aligning every tick
-    /// after the first to a shared wall-clock boundary
-    /// (`next_aligned_wait_ms`) is what lets the two nodes' sweeps land
-    /// close enough together that neither's un-pruned copy is left in
-    /// flight to resurrect the other's.
+    /// per stray tick. With pruning done only by each node's own sweep,
+    /// this never happens under ongoing replication between two nodes:
+    /// the observer's own prune only survives until the writer's own,
+    /// differently-phased tick sends its still-unpruned copy back over
+    /// anti-entropy (`merge` only ever unions a receipt in), and the
+    /// writer's own prune is undone the same way in the other direction,
+    /// on every cycle. The resolver's `settle` step, run on every merge
+    /// apply, is what ends it: a receipt past three bounds is dropped
+    /// again the moment a peer's copy carries it back in, whatever the
+    /// two sweeps' phase.
     #[tokio::test]
     async fn crdt_compact_task_prunes_a_folded_receipt_for_good_under_ongoing_two_node_replication()
     {
         let retire_after = Duration::from_secs(2);
         let observer = Cluster::builder("cluster-it-crdt-churn-receipt-prune")
             .seeds(std::iter::empty())
-            .config(crdt_loopback_config(retire_after))
+            .config(crdt_task_loopback_config(retire_after))
             .build()
             .await
             .expect("observer builds");
@@ -5820,7 +5969,7 @@ mod tests {
             let writer = Cluster::builder("cluster-it-crdt-churn-receipt-prune")
                 .node_id(writer_node_id)
                 .seeds([observer_addr])
-                .config(crdt_loopback_config(retire_after))
+                .config(crdt_task_loopback_config(retire_after))
                 .build()
                 .await
                 .unwrap_or_else(|e| panic!("writer round {round} builds: {e}"));
@@ -5857,11 +6006,9 @@ mod tests {
             .expect("PnCounter::encode never fails on a resident value")
             .len();
 
-        // Every earlier incarnation's fold-and-prune, end to end, well
-        // within the aligned-ticker's own cadence (two 30-second-floored
-        // ticks after the alignment boundary, comfortably inside this
-        // budget) — a bound this test hits on every run once the fix
-        // holds, never just occasionally.
+        // Every earlier incarnation's fold-and-prune, end to end, within
+        // a few 30-second-floored ticks, comfortably inside this budget:
+        // a bound this test hits on every run, never just occasionally.
         let pruned_len = tokio::time::timeout(Duration::from_secs(100), async {
             loop {
                 let len = observer_cache
@@ -5912,6 +6059,42 @@ mod tests {
         observer.shutdown().await;
     }
 
+    /// A cold joiner seeded at `observer` warms counter 0 from the
+    /// compacted record alone and holds it at `expected_len` bytes.
+    async fn assert_cold_joiner_warms_compacted_counter(
+        observer: &Cluster,
+        retire_after: Duration,
+        expected_len: usize,
+    ) {
+        let joiner = Cluster::builder("cluster-it-crdt-graceful-churn")
+            .seeds([observer.inner.membership.local_peer().gossip_addr])
+            .config(crdt_task_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("joiner builds");
+        wait_for_peer_count(&joiner, 1).await;
+        let joiner_cache = open_counters_cache(&joiner, "counters").await;
+        let warmed = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(counter) = joiner_cache.get(&0).await {
+                    return counter;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the joiner warms the compacted counter");
+        assert_eq!(
+            warmed
+                .encode()
+                .expect("PnCounter::encode never fails on a resident value")
+                .len(),
+            expected_len,
+            "the joiner's copy is the compacted, observer-only size"
+        );
+        joiner.shutdown().await;
+    }
+
     /// A writer that leaves through `Cluster::shutdown` is retired and
     /// folded like one that crashed: three distinct nodes each join, write
     /// one counter, and leave gracefully, and the observer's record ends up
@@ -5922,7 +6105,7 @@ mod tests {
         let retire_after = Duration::from_secs(2);
         let observer = Cluster::builder("cluster-it-crdt-graceful-churn")
             .seeds(std::iter::empty())
-            .config(crdt_loopback_config(retire_after))
+            .config(crdt_task_loopback_config(retire_after))
             .build()
             .await
             .expect("observer builds");
@@ -5943,7 +6126,7 @@ mod tests {
         for round in 1..=3i128 {
             let leaver = Cluster::builder("cluster-it-crdt-graceful-churn")
                 .seeds([observer_addr])
-                .config(crdt_loopback_config(retire_after))
+                .config(crdt_task_loopback_config(retire_after))
                 .build()
                 .await
                 .unwrap_or_else(|e| panic!("leaver {round} builds: {e}"));
@@ -5994,6 +6177,8 @@ mod tests {
         .await
         .expect("every gracefully departed writer retires, folds, and its receipt prunes");
         assert_eq!(settled_len, raw_len, "back to the observer-only size");
+
+        assert_cold_joiner_warms_compacted_counter(&observer, retire_after, raw_len).await;
         assert_eq!(
             observer_cache.get(&0).await.map(|c| c.value()),
             Some(31),

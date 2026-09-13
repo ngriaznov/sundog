@@ -33,13 +33,14 @@ const GOSSIP_PORT: u16 = 7946;
 
 const PEER_WAIT: Duration = Duration::from_secs(30);
 const CONVERGE_WAIT: Duration = Duration::from_secs(20);
-/// Bound for a CRDT compaction-metric wait: the sweep's own cadence
-/// (`cluster.rs::crdt_compact_task`) is `(crdt_retire_after / 4).max(30s)`,
-/// so even a short `crdt_retire_after` still needs multiple 30s-floor
-/// ticks to retire and then fold a writer;
-/// generous headroom against container boot and gossip jitter on top of
-/// that.
-const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(180);
+/// Bound for a CRDT compaction wait: the sweep's own cadence
+/// (`ClusterConfig::crdt_sweep_period`) is `(crdt_retire_after / 4).max(30s)`,
+/// so with the test node's 5s bound a writer retires on one 30s-floor tick,
+/// folds on a later one, and its receipt prunes once it is older than the
+/// receipt lifetime of two bounds plus two sweep periods (70s), on the
+/// tick after that: about 120s end to end, with headroom for container
+/// boot and gossip jitter on top.
+const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(240);
 
 fn seed(alias: &str) -> String {
     format!("{alias}:{GOSSIP_PORT}")

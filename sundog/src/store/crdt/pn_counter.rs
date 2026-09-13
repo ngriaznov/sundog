@@ -29,7 +29,7 @@
 //!   *other* replica's writer, recovers both writers' true totals exactly
 //!   (see [`PnCounter::merge`]'s doc).
 //! - **Stage two**, once the cache is quiet and the retirement is older than
-//!   twice `bound_ms` (twice
+//!   twice `CompactionBounds::retire_after_ms` (twice
 //!   [`ClusterConfig::crdt_retire_after`](crate::ClusterConfig::crdt_retire_after)
 //!   for the resolver this crate ships), folds the per-writer entry into a
 //!   bounded scalar (`folded_p`/`folded_n`) and leaves a receipt for it in
@@ -40,15 +40,22 @@
 //!   two are not the same fact, and a single cross-writer watermark
 //!   conflating them would silently drop a still-tracked writer's
 //!   contribution even though nothing about it is stale. `folded_at` itself
-//!   is bounded: once a receipt is older than three times `bound_ms`, safely
-//!   past the point every reachable replica is guaranteed to have
-//!   independently folded the same writer too, it is dropped, keeping the
-//!   record's metadata from growing with historical churn. This is exact
-//!   whenever every replica's receipts are honest about what they have
-//!   actually folded; a writer that keeps writing through a replica that
-//!   never retired it, after another replica already folded it away,
-//!   produces a documented, bounded divergence — the same trust boundary
-//!   `tombstone_max_ttl` already accepts for a member gone that long.
+//!   is bounded: once a receipt is older than
+//!   [`CompactionBounds::receipt_ttl_ms`], safely past the point every
+//!   reachable replica is guaranteed to have independently folded the same
+//!   writer too, `PnCounter::prune_receipts` drops it, run both by the
+//!   compaction sweep and, via [`PnCounterResolver::settle`], on every
+//!   merge apply, so a receipt one replica's sweep has already dropped
+//!   cannot ride back in from a peer whose sweep has not reached it yet.
+//!   This is exact whenever every replica's receipts are honest about
+//!   what they have actually folded. A replica isolated past
+//!   `receipt_ttl_ms`, still holding a live `p`/`n` slot for a writer
+//!   every other replica has already folded away and pruned the receipt
+//!   for, double-counts that writer's contribution the moment it
+//!   reconnects and merges (the [`super::OrSet`] analogue resurrects that
+//!   writer's already-removed elements instead): the same trust boundary
+//!   `tombstone_max_ttl` already accepts for a member gone that long, not
+//!   a new one.
 //!
 //! [`PnCounter::encode`]/[`PnCounter::decode`] are thin postcard wrappers
 //! around this type's one wire layout — every field, always. This layout is
@@ -61,7 +68,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::WriterId;
-use crate::store::{ConflictResolver, Merged, RecordView, Winner};
+use crate::store::{CompactionBounds, ConflictResolver, Merged, RecordView, Winner};
 
 /// A writer's contribution at (and after) the moment it was retired: its
 /// `p`/`n` slots as they stood then, and when retirement happened. Stays
@@ -321,14 +328,15 @@ impl PnCounter {
     ///
     /// **Stage two**, only while `quiet` is `true` (every other member of
     /// this cache is either continuously present, or gone, for at least
-    /// `bound_ms` — the caller's job to evaluate, not this method's): every
-    /// `retired` entry older than `2 * bound_ms` is folded into
-    /// `folded_p`/`folded_n` and dropped from the per-writer map, leaving a
-    /// receipt for it in `folded_at` under its own key. A `folded_at`
-    /// receipt already present *before this call* (never one this same call
-    /// just inserted — see the note below) is then dropped once it is older
-    /// than `3 * bound_ms`, bounding the record's metadata under sustained
-    /// churn.
+    /// `bounds.retire_after_ms`, the caller's job to evaluate, not this
+    /// method's): every `retired` entry older than
+    /// `2 * bounds.retire_after_ms` is folded into `folded_p`/`folded_n`
+    /// and dropped from the per-writer map, leaving a receipt for it in
+    /// `folded_at` under its own key. A `folded_at` receipt already
+    /// present *before this call* (never one this same call just
+    /// inserted, see the note below) is then dropped once it is older
+    /// than `bounds.receipt_ttl_ms`, bounding the record's metadata under
+    /// sustained churn.
     ///
     /// The receipt-pruning step runs against `self`'s own, pre-existing
     /// `folded_at` before the fold above inserts anything new, so a writer
@@ -348,7 +356,7 @@ impl PnCounter {
         now_ms: u64,
         retire: &dyn Fn(WriterId) -> bool,
         quiet: bool,
-        bound_ms: u64,
+        bounds: CompactionBounds,
     ) -> Option<Self> {
         let mut out = self.clone();
         let mut changed = false;
@@ -374,21 +382,16 @@ impl PnCounter {
         }
 
         if quiet {
-            let double_bound = bound_ms.saturating_mul(2);
-            let triple_bound = bound_ms.saturating_mul(3);
+            let double_bound = bounds.retire_after_ms.saturating_mul(2);
             let mut aged_any = false;
 
             // Prune pre-existing receipts *before* folding anything new
             // this call — see the doc comment above for why the ordering
             // matters.
-            out.folded_at.retain(|_, &mut since_ms| {
-                if now_ms.saturating_sub(since_ms) > triple_bound {
-                    aged_any = true;
-                    false
-                } else {
-                    true
-                }
-            });
+            if let Some(pruned) = out.prune_receipts(now_ms, bounds.receipt_ttl_ms) {
+                out = pruned;
+                aged_any = true;
+            }
 
             let (mut folded_p, mut folded_n) = (out.folded_p, out.folded_n);
             let folded_at = &mut out.folded_at;
@@ -411,6 +414,30 @@ impl PnCounter {
         changed.then_some(out)
     }
 
+    /// Drops every `folded_at` receipt older than `receipt_ttl_ms`
+    /// ([`CompactionBounds::receipt_ttl_ms`]), the point past which no
+    /// replica's stale copy of the writer is reconciled any more (see the
+    /// module doc); `None` if no receipt is that old. Called
+    /// by [`Self::compact`] on the sweep, and by the resolver on every
+    /// merge apply through [`ConflictResolver::settle`], so a receipt one
+    /// replica has already pruned cannot ride back in from a peer that has
+    /// not: the merge unions it, the settle drops it again, and the two
+    /// copies agree byte for byte.
+    #[must_use]
+    pub(crate) fn prune_receipts(&self, now_ms: u64, receipt_ttl_ms: u64) -> Option<Self> {
+        if !self
+            .folded_at
+            .values()
+            .any(|&since_ms| now_ms.saturating_sub(since_ms) > receipt_ttl_ms)
+        {
+            return None;
+        }
+        let mut out = self.clone();
+        out.folded_at
+            .retain(|_, &mut since_ms| now_ms.saturating_sub(since_ms) <= receipt_ttl_ms);
+        Some(out)
+    }
+
     /// Postcard-encodes this counter.
     ///
     /// # Errors
@@ -424,9 +451,21 @@ impl PnCounter {
     ///
     /// # Errors
     ///
-    /// Returns the codec's error for truncated or malformed bytes.
+    /// Returns the codec's error for truncated or malformed bytes, and for
+    /// a writer both live in `p`/`n` and present in `retired`: a shape no
+    /// constructor, merge, or compaction produces, whose first merge would
+    /// change its bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        let counter: Self = postcard::from_bytes(bytes)?;
+        let live_and_retired = counter
+            .p
+            .keys()
+            .chain(counter.n.keys())
+            .any(|w| counter.retired.contains_key(w));
+        if live_and_retired {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok(counter)
     }
 }
 
@@ -470,8 +509,8 @@ fn pointwise_max_excluding(
 ///
 /// A unit struct, kept constructible as a bare value (`PnCounterResolver`)
 /// like every other resolver in this crate, so existing `Arc::new(PnCounterResolver)`
-/// call sites are unaffected by compaction support landing here — `compact`'s
-/// `bound_ms` is one of its parameters, not resolver state, so there is
+/// call sites are unaffected by compaction support landing here: `compact`'s
+/// `bounds` is one of its parameters, not resolver state, so there is
 /// nothing to construct differently.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PnCounterResolver;
@@ -514,11 +553,18 @@ impl ConflictResolver for PnCounterResolver {
         now_ms: u64,
         retire: &dyn Fn(WriterId) -> bool,
         quiet: bool,
-        bound_ms: u64,
+        bounds: CompactionBounds,
     ) -> Option<Bytes> {
         let counter = PnCounter::decode(value).ok()?;
-        let compacted = counter.compact(now_ms, retire, quiet, bound_ms)?;
+        let compacted = counter.compact(now_ms, retire, quiet, bounds)?;
         let bytes = compacted.encode().ok()?;
+        Some(Bytes::from(bytes))
+    }
+
+    fn settle(&self, _key: &[u8], value: &[u8], now_ms: u64, receipt_ttl_ms: u64) -> Option<Bytes> {
+        let counter = PnCounter::decode(value).ok()?;
+        let pruned = counter.prune_receipts(now_ms, receipt_ttl_ms)?;
+        let bytes = pruned.encode().ok()?;
         Some(Bytes::from(bytes))
     }
 }
@@ -564,16 +610,31 @@ mod tests {
         // through stage two.
         let base = PnCounter::local_delta(w, 10);
         let writer_folded = base
-            .compact(0, &|writer| writer == w, false, bound_ms)
+            .compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("writer stage one fires at t=0")
-            .compact(2 * bound_ms + 1, &|_| false, true, bound_ms)
+            .compact(
+                2 * bound_ms + 1,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("writer stage two fires once aged past 2x, still alone");
 
         // Observer discovers the exact same dead writer much later — e.g.
         // gossip propagation delay, or its own tick simply landing later —
         // independently retiring it at its own, later discovery time.
         let observer_retired = base
-            .compact(2 * bound_ms + 1, &|writer| writer == w, false, bound_ms)
+            .compact(
+                2 * bound_ms + 1,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("observer stage one fires late, independently");
 
         // Now they finally sync, in both directions.
@@ -799,9 +860,19 @@ mod tests {
         let bound_ms = 1_000;
         let fold_at = |since_ms: u64| {
             PnCounter::local_delta(w, 77)
-                .compact(since_ms, &|writer| writer == w, false, bound_ms)
+                .compact(
+                    since_ms,
+                    &|writer| writer == w,
+                    false,
+                    CompactionBounds::three_bounds(bound_ms),
+                )
                 .expect("stage one fires")
-                .compact(since_ms + 2 * bound_ms + 1, &|_| false, true, bound_ms)
+                .compact(
+                    since_ms + 2 * bound_ms + 1,
+                    &|_| false,
+                    true,
+                    CompactionBounds::three_bounds(bound_ms),
+                )
                 .expect("stage two fires")
         };
         let a = fold_at(0);
@@ -844,10 +915,20 @@ mod tests {
 
         let base = PnCounter::local_delta(w, 42);
         let pre_fold = base
-            .compact(0, &|writer| writer == w, false, bound_ms)
+            .compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("stage one fires");
         let folded = pre_fold
-            .compact(2 * bound_ms + 1, &|_| false, true, bound_ms)
+            .compact(
+                2 * bound_ms + 1,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("stage two fires");
 
         let pre_fold_bytes = pre_fold.encode().expect("encodes");
@@ -883,10 +964,20 @@ mod tests {
 
         let base = PnCounter::local_delta(w, 42);
         let pre_fold = base
-            .compact(0, &|writer| writer == w, false, bound_ms)
+            .compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("stage one fires");
         let folded = pre_fold
-            .compact(2 * bound_ms + 1, &|_| false, true, bound_ms)
+            .compact(
+                2 * bound_ms + 1,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("stage two fires");
 
         let merged = folded.merge(&pre_fold);
@@ -953,7 +1044,12 @@ mod tests {
 
         // Replica D: w1 is stage-one-retired only, never folded further.
         let d = PnCounter::local_delta(w1, 100)
-            .compact(1_000, &|w| w == w1, false, bound_ms)
+            .compact(
+                1_000,
+                &|w| w == w1,
+                false,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("w1 newly eligible on D");
         assert_eq!(d.value(), 100);
 
@@ -962,9 +1058,19 @@ mod tests {
         // bookkeeping (and its `folded_at` receipt for w3 specifically).
         // C has never heard of w1 at all.
         let c = PnCounter::local_delta(w3, 1_000)
-            .compact(5_000, &|w| w == w3, false, bound_ms)
+            .compact(
+                5_000,
+                &|w| w == w3,
+                false,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("w3 newly eligible on C")
-            .compact(5_000 + 2 * bound_ms + 1, &|_| false, true, bound_ms)
+            .compact(
+                5_000 + 2 * bound_ms + 1,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(bound_ms),
+            )
             .expect("w3 folds to stage two on C, receipt intact");
         assert_eq!(c.value(), 1_000);
 
@@ -1006,9 +1112,9 @@ mod tests {
             // A huge bound keeps stage two from ever firing, in `compact`
             // or in the following `merge`, isolating stage one under two
             // independently, arbitrarily different retirement decisions.
-            let a = base.compact(1_000, &|w| a_retired.contains(&w), false, 1_000_000)
+            let a = base.compact(1_000, &|w| a_retired.contains(&w), false, CompactionBounds::three_bounds(1_000_000))
                 .unwrap_or_else(|| base.clone());
-            let b = base.compact(1_000, &|w| b_retired.contains(&w), false, 1_000_000)
+            let b = base.compact(1_000, &|w| b_retired.contains(&w), false, CompactionBounds::three_bounds(1_000_000))
                 .unwrap_or_else(|| base.clone());
 
             let merged = a.merge(&b);
@@ -1073,7 +1179,12 @@ mod tests {
         let before = c.value();
 
         let compacted = c
-            .compact(1_000, &|writer| writer == w, false, 10_000)
+            .compact(
+                1_000,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(10_000),
+            )
             .expect("w is eligible");
 
         assert_eq!(compacted.value(), before);
@@ -1092,27 +1203,57 @@ mod tests {
     #[test]
     fn compact_returns_none_when_no_writer_is_retirement_eligible() {
         let c = PnCounter::local_delta(wid(1, 0), 1);
-        assert!(c.compact(1_000, &|_| false, true, 10_000).is_none());
+        assert!(
+            c.compact(
+                1_000,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(10_000)
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn compact_stage_two_needs_both_quiet_and_twice_the_bound() {
         let w = wid(1, 0);
         let c = PnCounter::local_delta(w, 8)
-            .compact(0, &|writer| writer == w, false, 1_000)
+            .compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("stage one fires");
 
         assert!(
-            c.compact(1_500, &|_| false, true, 1_000).is_none(),
+            c.compact(
+                1_500,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(1_000)
+            )
+            .is_none(),
             "1_500ms hasn't reached twice the 1_000ms bound yet"
         );
         assert!(
-            c.compact(2_001, &|_| false, false, 1_000).is_none(),
+            c.compact(
+                2_001,
+                &|_| false,
+                false,
+                CompactionBounds::three_bounds(1_000)
+            )
+            .is_none(),
             "past the bound but not quiet"
         );
 
         let folded = c
-            .compact(2_001, &|_| false, true, 1_000)
+            .compact(
+                2_001,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("stage two fires: quiet and past 2x the bound");
         assert!(folded.retired.is_empty());
         assert_eq!(folded.folded_p, 8);
@@ -1134,23 +1275,52 @@ mod tests {
     fn a_folded_at_receipt_is_pruned_once_aged_past_three_times_the_bound_but_not_before() {
         let w = wid(1, 0);
         let folded = PnCounter::local_delta(w, 8)
-            .compact(0, &|writer| writer == w, false, 1_000)
+            .compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("stage one fires")
-            .compact(2_001, &|_| false, true, 1_000)
+            .compact(
+                2_001,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("stage two fires");
         assert!(folded.folded_at.contains_key(&w));
 
         assert!(
-            folded.compact(2_999, &|_| false, true, 1_000).is_none(),
+            folded
+                .compact(
+                    2_999,
+                    &|_| false,
+                    true,
+                    CompactionBounds::three_bounds(1_000)
+                )
+                .is_none(),
             "999ms since the receipt was written < 3x1_000ms bound: too soon to prune"
         );
         assert!(
-            folded.compact(3_001, &|_| false, false, 1_000).is_none(),
+            folded
+                .compact(
+                    3_001,
+                    &|_| false,
+                    false,
+                    CompactionBounds::three_bounds(1_000)
+                )
+                .is_none(),
             "aged past the bound, but the cache is not quiet"
         );
 
         let pruned = folded
-            .compact(3_001, &|_| false, true, 1_000)
+            .compact(
+                3_001,
+                &|_| false,
+                true,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("the receipt ages out: quiet and past 3x the bound");
         assert!(!pruned.folded_at.contains_key(&w));
         assert_eq!(
@@ -1161,15 +1331,83 @@ mod tests {
     }
 
     #[test]
+    fn decode_refuses_a_writer_both_live_and_retired() {
+        let w = wid(1, 1);
+        let mut counter = PnCounter::local_delta(w, 3);
+        counter.retired.insert(
+            w,
+            Retired {
+                p: 1,
+                n: 0,
+                since_ms: 5,
+            },
+        );
+        let bytes = counter.encode().expect("encode never validates");
+        assert!(PnCounter::decode(&bytes).is_err());
+        let well_formed = PnCounter::local_delta(w, 3)
+            .compact(10, &|_| true, false, CompactionBounds::three_bounds(1))
+            .expect("retires w");
+        let round_trip =
+            PnCounter::decode(&well_formed.encode().expect("encode")).expect("decodes");
+        assert_eq!(round_trip, well_formed);
+    }
+
+    #[test]
+    fn prune_receipts_drops_only_receipts_older_than_the_ttl() {
+        let w_old = wid(1, 1);
+        let w_young = wid(2, 1);
+        let mut counter = PnCounter::local_delta(wid(3, 1), 4);
+        counter.folded_at.insert(w_old, 1_000);
+        counter.folded_at.insert(w_young, 5_000);
+        counter.folded_p = 9;
+        let receipt_ttl_ms = 3_000;
+
+        let pruned = counter
+            .prune_receipts(5_000, receipt_ttl_ms)
+            .expect("the old receipt is past three bounds");
+        assert_eq!(
+            pruned.folded_at.keys().copied().collect::<Vec<_>>(),
+            vec![w_young]
+        );
+        assert_eq!(
+            pruned.folded_p, 9,
+            "pruning a receipt never touches the folded total"
+        );
+        assert_eq!(pruned.value(), counter.value());
+    }
+
+    #[test]
+    fn prune_receipts_is_none_when_no_receipt_is_old_enough() {
+        let mut counter = PnCounter::local_delta(wid(3, 1), 4);
+        counter.folded_at.insert(wid(1, 1), 4_000);
+        assert!(counter.prune_receipts(5_000, 3_000).is_none());
+        assert!(
+            PnCounter::local_delta(wid(3, 1), 1)
+                .prune_receipts(u64::MAX, 1)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn compact_is_idempotent() {
         let w = wid(1, 0);
         let c = PnCounter::local_delta(w, 8);
         let once = c
-            .compact(0, &|writer| writer == w, false, 1_000)
+            .compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("fires once");
         assert!(
-            once.compact(0, &|writer| writer == w, false, 1_000)
-                .is_none(),
+            once.compact(
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(1_000)
+            )
+            .is_none(),
             "re-applying with the same retire predicate changes nothing"
         );
     }
@@ -1268,7 +1506,14 @@ mod tests {
         let bytes = c.encode().expect("encodes");
         assert!(
             PnCounterResolver
-                .compact(b"k", &bytes, 0, &|_| false, true, 1_000)
+                .compact(
+                    b"k",
+                    &bytes,
+                    0,
+                    &|_| false,
+                    true,
+                    CompactionBounds::three_bounds(1_000)
+                )
                 .is_none()
         );
     }
@@ -1280,13 +1525,27 @@ mod tests {
         let bytes = c.encode().expect("encodes");
 
         let once = PnCounterResolver
-            .compact(b"k", &bytes, 0, &|writer| writer == w, false, 1_000)
+            .compact(
+                b"k",
+                &bytes,
+                0,
+                &|writer| writer == w,
+                false,
+                CompactionBounds::three_bounds(1_000),
+            )
             .expect("w is eligible");
         assert_eq!(PnCounter::decode(&once).expect("decodes").value(), 9);
 
         assert!(
             PnCounterResolver
-                .compact(b"k", &once, 0, &|writer| writer == w, false, 1_000)
+                .compact(
+                    b"k",
+                    &once,
+                    0,
+                    &|writer| writer == w,
+                    false,
+                    CompactionBounds::three_bounds(1_000)
+                )
                 .is_none(),
             "re-compacting an already-retired writer with the same predicate is a no-op"
         );

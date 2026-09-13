@@ -134,15 +134,20 @@ incarnation never resumes or corrupts its pre-restart slot.
 Stage one runs the instant a writer is confirmed dead (gone past
 `ClusterConfig::crdt_retire_after`, default: `tombstone_max_ttl`, 24h,
 whether it crashed or left gracefully, or live again under a different
-incarnation), moving its `p`/`n` slots or its
-`seen` watermark into per-writer retired state that merges correctly under
-any cross-replica staleness, since a writer's slot and its retired entry
-are never summed, only maxed, and a retirement's timestamp merges by the
-earliest any replica recorded. Stage two runs only once the cache is
-quiet (every member sharing it has been continuously present or
-continuously gone for a full `crdt_retire_after`) and the retirement
-itself has aged past a second `crdt_retire_after` (`2 * crdt_retire_after`
-total): it folds `PnCounter`'s retired entry into a bounded scalar, or
+incarnation) and the cache is quiet: `membership::member_is_quiet` counts
+a member as settled once it has been continuously present for
+`crdt_retire_after`, continuously gone for `crdt_retire_after`, or merely
+known for twice `crdt_retire_after` however often it has flapped between
+the two in that time, safe because any copy such a flapping member can
+still bring back is at most one bound old, and reconciles through the
+retired entry the fold replaces or the fold receipt it leaves behind.
+Stage one moves the writer's `p`/`n` slots or its `seen` watermark into
+per-writer retired state that merges correctly under any cross-replica
+staleness, since a writer's slot and its retired entry are never summed,
+only maxed, and a retirement's timestamp merges by the earliest any
+replica recorded. Stage two runs only once that retirement has itself
+aged past twice `CompactionBounds::retire_after_ms` with the cache still
+quiet: it folds `PnCounter`'s retired entry into a bounded scalar, or
 drops `OrSet`'s `seen`/`retired` entries outright, and either way leaves a
 per-writer receipt in `folded_at`: the folded writer's own `since_ms`,
 recorded under its own key. `OrSet`'s own never-removed elements stay
@@ -155,26 +160,67 @@ late as the writer's retirement on the other side. That is an exact,
 per-writer fact each side recorded for the writer itself, never inferred
 from an unrelated writer's later retirement, so two records independently
 folded by different replicas reconcile to the exact total without
-double-counting. A `folded_at` receipt is itself pruned once it is
-older than `3 * crdt_retire_after`, past the point every reachable replica
-is guaranteed to have independently folded that writer too, keeping the
-record's metadata from growing with historical churn. A record that still
-carries a writer's slot or retired entry past the `2 * crdt_retire_after`
-bound on some replica while another has already folded it away, with no
-receipt left anywhere to reconcile the two, sits inside the same trust
-boundary `tombstone_max_ttl` already accepts for a member gone that long:
-a documented, bounded divergence, not silent loss. A periodic per-shard
-sweep
-(`(crdt_retire_after / 4).max(30s)` cadence, `ClusterConfig::crdt_compact_batch`
-records per tick, default 4,096) drives both stages whenever the cache's
-resolver merges at all, gated only by the per-writer dead and cache-quiet
-predicates above. `PnCounter`'s and `OrSet`'s record layouts are this
-crate's own, so there is no released node to stay wire-compatible with and
-no protocol gate on when the sweep may run. A future change to either
-layout bumps `wire::PROTOCOL_VERSION` and is versioned then.
-`sundog_crdt_retired_writers_total{cache}` and
-`sundog_crdt_compactions_total{cache}` count writers retired and records
-rewritten.
+double-counting.
+
+A `folded_at` receipt is pruned once it is older than
+`CompactionBounds::receipt_ttl_ms` (the longer of three bounds and two
+bounds plus two sweep periods), past the point every reachable replica is
+guaranteed to have independently folded that writer too.
+`ConflictResolver::settle`, a new defaulted trait hook, drops an aged-out
+receipt on every merge apply too, right after `ConflictResolver::merge`
+(a shard's `SettlingResolver` wrapper is what actually calls it): without
+this step a receipt one replica's sweep has already dropped would ride
+back in from a peer's still-carrying copy on the very next merge, since a
+merge only ever unions two sides' state. A record that still carries a
+writer's slot or retired entry on one replica past
+`2 * CompactionBounds::retire_after_ms` while another replica has already
+folded the writer away, once the receipt that would otherwise reconcile
+the two has itself been pruned past `receipt_ttl_ms` on both sides,
+double-counts that writer's contribution when the two merge (an `OrSet`
+writer's already-removed elements resurrect the same way), the same
+trust boundary `tombstone_max_ttl` already accepts for a member gone
+that long, not a new one.
+
+Compaction changes a record's bytes with no wire write behind it, so it
+mints its own version: `compacted_version` is the stale version's
+successor under a content-hash-derived node tiebreaker, the same scheme
+a merge's own minted version uses. Two replicas compacting identical
+bytes at the same stale version mint identical versions, so anti-entropy
+finds nothing to exchange for that key; two that compact to different
+bytes (one has judged a writer dead the other has not yet) mint
+different versions and anti-entropy does exchange them, converging
+through the ordinary `merge`-plus-`settle` path exactly as it would any
+other divergent write. Compaction is not invisible to anti-entropy; it
+is merely redundant with it whenever replicas already agree.
+
+A per-shard sweep drives both stages whenever the cache's resolver
+merges at all, gated only by the per-writer dead and cache-quiet
+predicates above, at `ClusterConfig::crdt_sweep_period()` cadence: the
+new `crdt_sweep_interval: Option<Duration>` field if set, else a quarter
+of `crdt_retire_after` floored at 30s, the same period a shorter override
+also feeds into `CompactionBounds::receipt_ttl_ms`. Ticks need no
+alignment across replicas (an immediate first tick, then a plain
+interval): `settle` and the content-derived version above are what make
+eventual agreement enough on their own. One tick now walks the whole
+keyspace, calling `ShardOps::compact_pass` repeatedly at
+`ClusterConfig::crdt_compact_batch` records per call (default 4,096) and
+yielding between calls, so the batch size bounds the stall one call can
+cause, not the work a whole tick does. `AbsenceTracker::prune_gone_older_than`,
+called at the start of every tick, forgets a member gone past three
+bounds, the same age past which its absence no longer reconciles a
+writer's records either, bounding the absence tracker under sustained
+restarts, where every crashed-and-restarted process leaves behind a node
+id (random per process) that never comes back. `PnCounter`'s and
+`OrSet`'s record layouts are this crate's own, so there is no released
+node to stay wire-compatible with and no protocol gate on when the sweep
+may run. A future change to either layout bumps `wire::PROTOCOL_VERSION`
+and is versioned then.
+`sundog_crdt_retired_writers_total{cache}` counts writers the scan found
+eligible for retirement, which can run ahead of
+`sundog_crdt_compactions_total{cache}`'s count of records actually
+rewritten: a writer counts the moment the scan judges it eligible, even
+for a record the pass skips without rewriting (an unowned bucket, or one
+that changed underneath the scan).
 
 **What is still open:**
 

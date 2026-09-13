@@ -497,22 +497,30 @@ pub(crate) struct MemberView {
     /// The member's current incarnation, when it is live; `None` when
     /// gone.
     pub(crate) live_incarnation: Option<u64>,
+    /// When the member was first observed live
+    /// ([`crate::cluster::absence::AbsenceTracker::known_since`]); `None`
+    /// if never.
+    pub(crate) known_since: Option<Instant>,
 }
 
 /// Whether `member` has settled for the CRDT writer-retirement "cache is
-/// quiet" rule: continuously present for at
-/// least `bound`, or continuously gone for at least `bound`. A member
-/// that is neither — recently returned, or recently gone but not yet aged
-/// past `bound` — defers retirement for every writer in the cache, since
-/// its own view of who's-seen-what can't yet be trusted as settled.
+/// quiet" rule: continuously present for at least `bound`, continuously
+/// gone for at least `bound`, or known for at least twice `bound` however
+/// often it has come and gone in between. A member that is none of these,
+/// one recently seen for the first time that has already moved, defers
+/// stage two for every writer in the cache, since its own view of
+/// who's-seen-what can't yet be trusted as settled. The known-for-two-bounds
+/// clause keeps one member flapping faster than the bound from holding
+/// stage two back for good: any copy such a member can still bring back
+/// is at most a bound old, reconciled by the retired entry the fold
+/// replaces or by the fold receipt it leaves for three bounds.
 pub(crate) fn member_is_quiet(member: &MemberView, now: Instant, bound: Duration) -> bool {
-    if let Some(since) = member.present_since {
-        return now.saturating_duration_since(since) >= bound;
-    }
-    if let Some(since) = member.absent_since {
-        return now.saturating_duration_since(since) >= bound;
-    }
-    false
+    let settled = |since: Option<Instant>, for_at_least: Duration| {
+        since.is_some_and(|since| now.saturating_duration_since(since) >= for_at_least)
+    };
+    settled(member.present_since, bound)
+        || settled(member.absent_since, bound)
+        || settled(member.known_since, bound.saturating_mul(2))
 }
 
 /// Whether writer incarnation `w_incarnation` is dead on `member`'s node:
@@ -1160,6 +1168,7 @@ mod tests {
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let member = MemberView {
+            known_since: None,
             present_since: Some(ago(now, 61)),
             absent_since: None,
             live_incarnation: Some(1),
@@ -1172,6 +1181,7 @@ mod tests {
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let member = MemberView {
+            known_since: None,
             present_since: Some(ago(now, 1)),
             absent_since: None,
             live_incarnation: Some(1),
@@ -1184,6 +1194,7 @@ mod tests {
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let member = MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 61)),
             live_incarnation: None,
@@ -1196,6 +1207,7 @@ mod tests {
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let member = MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 1)),
             live_incarnation: None,
@@ -1210,6 +1222,7 @@ mod tests {
     fn member_is_quiet_is_false_for_a_never_observed_member() {
         let now = Instant::now();
         let member = MemberView {
+            known_since: None,
             present_since: None,
             absent_since: None,
             live_incarnation: None,
@@ -1218,9 +1231,36 @@ mod tests {
     }
 
     #[test]
+    fn member_is_quiet_once_known_for_two_bounds_however_much_it_flaps() {
+        let now = Instant::now();
+        let bound = Duration::from_secs(60);
+        let flapper = MemberView {
+            present_since: Some(now.checked_sub(Duration::from_secs(5)).expect("recent")),
+            absent_since: None,
+            live_incarnation: Some(7),
+            known_since: Some(now.checked_sub(Duration::from_secs(121)).expect("recent")),
+        };
+        assert!(
+            member_is_quiet(&flapper, now, bound),
+            "back for five seconds after flapping, but known for two bounds"
+        );
+        let newcomer = MemberView {
+            present_since: Some(now.checked_sub(Duration::from_secs(5)).expect("recent")),
+            absent_since: None,
+            live_incarnation: Some(7),
+            known_since: Some(now.checked_sub(Duration::from_secs(119)).expect("recent")),
+        };
+        assert!(
+            !member_is_quiet(&newcomer, now, bound),
+            "known for just under two bounds and only briefly present: not settled"
+        );
+    }
+
+    #[test]
     fn incarnation_is_dead_when_live_with_a_different_incarnation() {
         let now = Instant::now();
         let member = MemberView {
+            known_since: None,
             present_since: Some(now),
             absent_since: None,
             live_incarnation: Some(2),
@@ -1235,6 +1275,7 @@ mod tests {
     fn incarnation_is_dead_is_false_when_live_with_the_same_incarnation() {
         let now = Instant::now();
         let member = MemberView {
+            known_since: None,
             present_since: Some(now),
             absent_since: None,
             live_incarnation: Some(1),
@@ -1252,6 +1293,7 @@ mod tests {
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let member = MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 61)),
             live_incarnation: None,
@@ -1264,6 +1306,7 @@ mod tests {
         let now = Instant::now();
         let bound = Duration::from_secs(60);
         let member = MemberView {
+            known_since: None,
             present_since: None,
             absent_since: Some(ago(now, 1)),
             live_incarnation: None,
@@ -1278,6 +1321,7 @@ mod tests {
     fn incarnation_is_dead_is_false_for_a_never_observed_member() {
         let now = Instant::now();
         let member = MemberView {
+            known_since: None,
             present_since: None,
             absent_since: None,
             live_incarnation: None,

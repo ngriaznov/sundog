@@ -271,9 +271,7 @@ where
             ttl,
             tti,
         )
-        .with_tombstone_ttl(cluster.config().tombstone_ttl)
-        .with_tombstone_max_ttl(cluster.config().tombstone_max_ttl)
-        .with_max_frame(cluster.config().max_frame)
+        .with_cluster_config(cluster.config())
         .with_resolver(resolver)
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled);

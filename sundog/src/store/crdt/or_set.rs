@@ -34,13 +34,21 @@
 //!   per-writer *credential*, not a value, so [`OrSet::merge`] can tell
 //!   "this side has actually folded writer `w`" from "this side has folded
 //!   some *other* writer whose retirement time happens to be later". A
-//!   receipt is dropped once it is older than three times
-//!   `crdt_retire_after`, safely past the point every reachable replica is
-//!   guaranteed to have independently folded the same writer too (the same
-//!   trust boundary sundog's tombstone GC already documents —
-//!   `tombstone_max_ttl`: "a member gone longer than this may resurrect
-//!   data" — applied one bound further out), keeping the record's metadata
-//!   from growing with historical churn.
+//!   receipt is dropped once it is older than
+//!   [`CompactionBounds::receipt_ttl_ms`], safely past the point every
+//!   reachable replica is guaranteed to have independently folded the same
+//!   writer too. `OrSet::prune_receipts` drops an aged-out receipt, run
+//!   both by the compaction sweep and, via [`OrSetResolver::settle`], on
+//!   every merge apply, so a receipt one replica's sweep has already
+//!   dropped cannot ride back in from a peer whose sweep has not reached
+//!   it yet, keeping the record's metadata from growing with historical
+//!   churn. A replica isolated past `receipt_ttl_ms`, still holding a live
+//!   `seen` watermark for a writer every other replica has already folded
+//!   away and pruned the receipt for, resurrects that writer's
+//!   already-removed elements the moment it reconnects and merges (the
+//!   [`super::PnCounter`] analogue double-counts the writer's contribution
+//!   instead): the same trust boundary `tombstone_max_ttl` already accepts
+//!   for a member gone that long, not a new one.
 //!
 //! A tag `(w, s)` absent from a side's own `adds` is dead to that side if
 //! `w` is in that side's `retired` map or has a `folded_at` receipt (any new
@@ -70,7 +78,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::WriterId;
-use crate::store::{ConflictResolver, Merged, RecordView, Winner};
+use crate::store::{CompactionBounds, ConflictResolver, Merged, RecordView, Winner};
 
 /// A tag uniquely identifying one [`OrSet::add`]: the writer's identity
 /// paired with a sequence number local to that writer's own incarnation. No
@@ -375,6 +383,28 @@ where
         }
     }
 
+    /// Drops every `folded_at` receipt older than `receipt_ttl_ms`
+    /// ([`CompactionBounds::receipt_ttl_ms`]), the point past which no
+    /// replica's stale copy of the writer is reconciled any more; `None` if
+    /// no receipt is that old. Called by
+    /// [`Self::compact`] on the sweep, and by the resolver on every merge
+    /// apply through [`ConflictResolver::settle`], so a receipt one replica
+    /// has already pruned cannot ride back in from a peer that has not.
+    #[must_use]
+    pub(crate) fn prune_receipts(&self, now_ms: u64, receipt_ttl_ms: u64) -> Option<Self> {
+        if !self
+            .folded_at
+            .values()
+            .any(|&since_ms| now_ms.saturating_sub(since_ms) > receipt_ttl_ms)
+        {
+            return None;
+        }
+        let mut out = self.clone();
+        out.folded_at
+            .retain(|_, &mut since_ms| now_ms.saturating_sub(since_ms) <= receipt_ttl_ms);
+        Some(out)
+    }
+
     /// Runs both retirement stages for the writers `retire` accepts,
     /// returning the compacted set when anything changed, or `None`
     /// otherwise.
@@ -417,7 +447,7 @@ where
     pub(crate) fn compact(
         &self,
         now_ms: u64,
-        retire_after_ms: u64,
+        bounds: CompactionBounds,
         retire: &dyn Fn(WriterId) -> bool,
         quiet: bool,
     ) -> Option<Self> {
@@ -438,21 +468,16 @@ where
         }
 
         if quiet {
-            let double_bound = retire_after_ms.saturating_mul(2);
-            let triple_bound = retire_after_ms.saturating_mul(3);
+            let double_bound = bounds.retire_after_ms.saturating_mul(2);
             let mut aged_any = false;
 
             // Prune pre-existing receipts *before* folding anything new
             // this call — see the doc comment above for why the ordering
             // matters.
-            out.folded_at.retain(|_, &mut since_ms| {
-                if now_ms.saturating_sub(since_ms) > triple_bound {
-                    aged_any = true;
-                    false
-                } else {
-                    true
-                }
-            });
+            if let Some(pruned) = out.prune_receipts(now_ms, bounds.receipt_ttl_ms) {
+                out = pruned;
+                aged_any = true;
+            }
 
             // Stage two: drop a `retired` entry (and its `seen` watermark,
             // if any) once aged past the bound, leaving a receipt behind.
@@ -580,11 +605,18 @@ where
         now_ms: u64,
         retire: &dyn Fn(WriterId) -> bool,
         quiet: bool,
-        bound_ms: u64,
+        bounds: CompactionBounds,
     ) -> Option<Bytes> {
         let set = OrSet::<T>::decode(value).ok()?;
-        let compacted = set.compact(now_ms, bound_ms, retire, quiet)?;
+        let compacted = set.compact(now_ms, bounds, retire, quiet)?;
         let bytes = compacted.encode().ok()?;
+        Some(Bytes::from(bytes))
+    }
+
+    fn settle(&self, _key: &[u8], value: &[u8], now_ms: u64, receipt_ttl_ms: u64) -> Option<Bytes> {
+        let set = OrSet::<T>::decode(value).ok()?;
+        let pruned = set.prune_receipts(now_ms, receipt_ttl_ms)?;
+        let bytes = pruned.encode().ok()?;
         Some(Bytes::from(bytes))
     }
 }
@@ -833,7 +865,12 @@ mod tests {
         let w = wid(1, 0);
         let s = OrSet::add(w, 0, "x".to_string());
         let compacted = s
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("w is newly eligible, so compact must report a change");
         assert!(
             compacted.contains(&"x".to_string()),
@@ -855,7 +892,12 @@ mod tests {
         let w = wid(1, 0);
         let s = OrSet::add(w, 0, "x".to_string());
         let compacted = s
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("newly eligible");
 
         let late_add = OrSet::add(w, 1, "z".to_string());
@@ -873,15 +915,52 @@ mod tests {
     #[test]
     fn compact_returns_none_when_no_writer_is_eligible() {
         let s = OrSet::add(wid(1, 0), 0, "x".to_string());
-        assert_eq!(s.compact(1_000, 100, &|_| false, true), None);
+        assert_eq!(
+            s.compact(1_000, CompactionBounds::three_bounds(100), &|_| false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn prune_receipts_drops_only_receipts_older_than_the_ttl() {
+        let mut set = OrSet::add(wid(3, 1), 0, "x".to_string());
+        set.folded_at.insert(wid(1, 1), 1_000);
+        set.folded_at.insert(wid(2, 1), 5_000);
+        let pruned = set
+            .prune_receipts(5_000, 3_000)
+            .expect("the old receipt is past the ttl");
+        assert_eq!(
+            pruned.folded_at.keys().copied().collect::<Vec<_>>(),
+            vec![wid(2, 1)]
+        );
+        assert!(
+            pruned.contains(&"x".to_string()),
+            "pruning a receipt never touches membership"
+        );
+        assert!(set.prune_receipts(3_900, 3_000).is_none());
     }
 
     #[test]
     fn compact_is_idempotent() {
         let w = wid(1, 0);
         let s = OrSet::add(w, 0, "x".to_string());
-        let once = s.compact(1_000, 100, &|writer| writer == w, true).unwrap();
-        assert_eq!(once.compact(1_000, 100, &|writer| writer == w, true), None);
+        let once = s
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            once.compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true
+            ),
+            None
+        );
     }
 
     /// Stage two: a retired writer's `seen`/`retired` entries age out once
@@ -894,28 +973,38 @@ mod tests {
         let removed = OrSet::remove(&s, &"x".to_string());
         let merged = s.merge(&removed);
         let retired = merged
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("newly eligible");
         assert!(retired.seen.contains_key(&w));
         assert!(retired.retired.contains_key(&w));
 
         // Not yet past 2x the bound: no change.
         assert_eq!(
-            retired.compact(1_150, 100, &|_| false, true),
+            retired.compact(1_150, CompactionBounds::three_bounds(100), &|_| false, true),
             None,
             "150ms < 2x100ms bound: too soon to age out"
         );
 
         // Past the bound, but not quiet: no change.
         assert_eq!(
-            retired.compact(1_250, 100, &|_| false, false),
+            retired.compact(
+                1_250,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                false
+            ),
             None,
             "aged past the bound, but the cache is not quiet"
         );
 
         // Past 2x the bound and quiet: both entries drop, leaving a receipt.
         let aged_out = retired
-            .compact(1_250, 100, &|_| false, true)
+            .compact(1_250, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("aged past the bound and quiet");
         assert!(!aged_out.seen.contains_key(&w));
         assert!(!aged_out.retired.contains_key(&w));
@@ -943,25 +1032,35 @@ mod tests {
         let removed = OrSet::remove(&s, &"x".to_string());
         let folded = s
             .merge(&removed)
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("newly eligible")
-            .compact(1_250, 100, &|_| false, true)
+            .compact(1_250, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("stage two fires");
         assert!(folded.folded_at.contains_key(&w));
 
         assert_eq!(
-            folded.compact(1_299, 100, &|_| false, true),
+            folded.compact(1_299, CompactionBounds::three_bounds(100), &|_| false, true),
             None,
             "299ms since the receipt was written < 3x100ms bound: too soon to prune"
         );
         assert_eq!(
-            folded.compact(1_400, 100, &|_| false, false),
+            folded.compact(
+                1_400,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                false
+            ),
             None,
             "aged past the bound, but the cache is not quiet"
         );
 
         let pruned = folded
-            .compact(1_400, 100, &|_| false, true)
+            .compact(1_400, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("the receipt ages out: quiet and past 3x the bound");
         assert!(!pruned.folded_at.contains_key(&w));
         assert!(
@@ -978,10 +1077,15 @@ mod tests {
         let w = wid(1, 0);
         let s = OrSet::add(w, 0, "x".to_string()).merge(&OrSet::add(wid(2, 0), 0, "y".to_string()));
         let retired = s
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("newly eligible");
         let aged_out = retired
-            .compact(1_500, 100, &|_| false, true)
+            .compact(1_500, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("aged past the bound and quiet");
         assert_eq!(
             aged_out.iter().collect::<BTreeSet<_>>(),
@@ -999,7 +1103,12 @@ mod tests {
         let w = wid(1, 0);
         let shared = OrSet::add(w, 0, "x".to_string());
         let replica_a = shared
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("newly eligible");
         let replica_b = shared.clone();
 
@@ -1025,7 +1134,12 @@ mod tests {
         // Replica X never sees w's later activity and retires it.
         let x = base
             .clone()
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("newly eligible");
 
         // Meanwhile w, still alive under the same incarnation, keeps
@@ -1226,9 +1340,12 @@ mod tests {
                 }
                 Op::Retire { writer } => {
                     let w = wid(writer, 0);
-                    if let Some(compacted) =
-                        real.compact(now_ms, 100, &|candidate| candidate == w, true)
-                    {
+                    if let Some(compacted) = real.compact(
+                        now_ms,
+                        CompactionBounds::three_bounds(100),
+                        &|candidate| candidate == w,
+                        true,
+                    ) {
                         real = compacted;
                     }
                     retired.insert(writer);
@@ -1319,10 +1436,20 @@ mod tests {
         // view of each other's retirement decision, exactly the cross-stale shape
         // `PnCounter`'s own merge tests exercise for the counter type.
         let replica_a = base
-            .compact(1_000, 100, &|w| w == w1, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|w| w == w1,
+                true,
+            )
             .expect("w1 newly eligible on A");
         let replica_b = base
-            .compact(1_000, 100, &|w| w == w2, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|w| w == w2,
+                true,
+            )
             .expect("w2 newly eligible on B");
 
         let merged = replica_a.merge(&replica_b);
@@ -1348,8 +1475,22 @@ mod tests {
     fn retired_since_ms_merges_by_minimum() {
         let w = wid(1, 0);
         let base = OrSet::add(w, 0, "x".to_string());
-        let retired_early = base.compact(1_000, 100, &|c| c == w, true).unwrap();
-        let retired_late = base.compact(5_000, 100, &|c| c == w, true).unwrap();
+        let retired_early = base
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|c| c == w,
+                true,
+            )
+            .unwrap();
+        let retired_late = base
+            .compact(
+                5_000,
+                CompactionBounds::three_bounds(100),
+                &|c| c == w,
+                true,
+            )
+            .unwrap();
 
         let merged = retired_early.merge(&retired_late);
         assert_eq!(merged.retired.get(&w), Some(&1_000));
@@ -1369,10 +1510,20 @@ mod tests {
         let w = wid(1, 0);
         let base = OrSet::add(w, 0, "x".to_string());
         let fold_at = |since_ms: u64| {
-            base.compact(since_ms, 100, &|writer| writer == w, false)
-                .expect("stage one fires")
-                .compact(since_ms + 201, 100, &|_| false, true)
-                .expect("stage two fires")
+            base.compact(
+                since_ms,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                false,
+            )
+            .expect("stage one fires")
+            .compact(
+                since_ms + 201,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                true,
+            )
+            .expect("stage two fires")
         };
         let a = fold_at(0);
         let b = fold_at(500);
@@ -1414,7 +1565,12 @@ mod tests {
         let removed = OrSet::remove(&added, &"x".to_string());
         let d = added
             .merge(&removed)
-            .compact(1_000, 100, &|writer| writer == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                true,
+            )
             .expect("w newly eligible on D");
         assert!(!d.contains(&"x".to_string()));
 
@@ -1423,9 +1579,19 @@ mod tests {
         // w3 specifically), legitimately advancing C's own bookkeeping. C
         // has never heard of w or "x" at all.
         let c = OrSet::add(w3, 0, "y".to_string())
-            .compact(5_000, 100, &|writer| writer == w3, true)
+            .compact(
+                5_000,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w3,
+                true,
+            )
             .expect("w3 newly eligible on C")
-            .compact(5_000 + 201, 100, &|_| false, true)
+            .compact(
+                5_000 + 201,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                true,
+            )
             .expect("w3 folds to stage two on C, receipt intact");
         assert!(c.contains(&"y".to_string()));
 
@@ -1467,15 +1633,30 @@ mod tests {
         // only a `folded_at` receipt behind.
         let base = OrSet::add(w, 0, "x".to_string());
         let writer_folded = base
-            .compact(0, bound_ms, &|writer| writer == w, false)
+            .compact(
+                0,
+                CompactionBounds::three_bounds(bound_ms),
+                &|writer| writer == w,
+                false,
+            )
             .expect("writer stage one fires at t=0")
-            .compact(2 * bound_ms + 1, bound_ms, &|_| false, true)
+            .compact(
+                2 * bound_ms + 1,
+                CompactionBounds::three_bounds(bound_ms),
+                &|_| false,
+                true,
+            )
             .expect("writer stage two fires once aged past 2x, still alone");
 
         // Observer discovers the exact same dead writer much later —
         // independently retiring it at its own, later discovery time.
         let observer_retired = base
-            .compact(2 * bound_ms + 1, bound_ms, &|writer| writer == w, false)
+            .compact(
+                2 * bound_ms + 1,
+                CompactionBounds::three_bounds(bound_ms),
+                &|writer| writer == w,
+                false,
+            )
             .expect("observer stage one fires late, independently");
 
         // Now they finally sync, in both directions: `x`'s own live
@@ -1517,10 +1698,15 @@ mod tests {
         let removed = OrSet::remove(&base, &"x".to_string());
         let with_remove = base.merge(&removed);
         let pre_fold = with_remove
-            .compact(0, 100, &|writer| writer == w, false)
+            .compact(
+                0,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                false,
+            )
             .expect("stage one fires");
         let folded = pre_fold
-            .compact(201, 100, &|_| false, true)
+            .compact(201, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("stage two fires");
 
         let pre_fold_bytes = pre_fold.encode().expect("encodes");
@@ -1561,10 +1747,15 @@ mod tests {
         let w = wid(1, 0);
         let base = OrSet::add(w, 0, "x".to_string());
         let pre_fold = base
-            .compact(0, 100, &|writer| writer == w, false)
+            .compact(
+                0,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                false,
+            )
             .expect("stage one fires");
         let folded = pre_fold
-            .compact(201, 100, &|_| false, true)
+            .compact(201, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("stage two fires");
 
         let merged = folded.merge(&pre_fold);
@@ -1595,10 +1786,15 @@ mod tests {
         let removed = OrSet::remove(&base, &"x".to_string());
         let with_remove = base.merge(&removed);
         let pre_fold = with_remove
-            .compact(0, 100, &|writer| writer == w, false)
+            .compact(
+                0,
+                CompactionBounds::three_bounds(100),
+                &|writer| writer == w,
+                false,
+            )
             .expect("stage one fires");
         let at_stage_two = pre_fold
-            .compact(201, 100, &|_| false, true)
+            .compact(201, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("stage two fires");
         assert!(
             !at_stage_two.contains(&"x".to_string()),
@@ -1613,7 +1809,7 @@ mod tests {
         );
 
         let folded = at_stage_two
-            .compact(301, 100, &|_| false, true)
+            .compact(301, CompactionBounds::three_bounds(100), &|_| false, true)
             .expect("the receipt is pruned, past its own trust boundary");
         assert!(
             !folded.contains(&"x".to_string()),
@@ -1678,7 +1874,12 @@ mod tests {
         let removed = OrSet::remove(&s, &"x".to_string());
         let compacted = s
             .merge(&removed)
-            .compact(1_000, 100, &|c| c == w, true)
+            .compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|c| c == w,
+                true,
+            )
             .expect("newly eligible");
         let encoded = compacted.encode().expect("encodes");
 
