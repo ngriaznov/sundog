@@ -206,9 +206,11 @@ keyspace, calling `ShardOps::compact_pass` repeatedly at
 `ClusterConfig::crdt_compact_batch` records per call (default 4,096) and
 yielding between calls, so the batch size bounds the stall one call can
 cause, not the work a whole tick does. `AbsenceTracker::prune_gone_older_than`,
-called at the start of every tick, forgets a member gone past three
-bounds, the same age past which its absence no longer reconciles a
-writer's records either, bounding the absence tracker under sustained
+called at the start of every tick, forgets a member gone past the fold
+receipt lifetime, the same age past which its absence no longer reconciles
+a writer's records either and at least two sweep periods, so a member that
+left between ticks is seen gone before it is forgotten, bounding the
+absence tracker under sustained
 restarts, where every crashed-and-restarted process leaves behind a node
 id (random per process) that never comes back. `PnCounter`'s and
 `OrSet`'s record layouts are this crate's own, so there is no released

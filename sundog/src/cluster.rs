@@ -1814,7 +1814,7 @@ async fn crdt_compact_tick(
 
     let retire_after = cluster.config().crdt_retire_after;
     let batch = cluster.config().crdt_compact_batch;
-    absence.prune_gone_older_than(retire_after.saturating_mul(3));
+    absence.prune_gone_older_than(Duration::from_millis(bounds.receipt_ttl_ms));
     let now = Instant::now();
     let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
     // Seeded with this node's own current incarnation, not just its peers':
@@ -5553,12 +5553,12 @@ mod tests {
         assert!(!crdt_cache_is_quiet(&[newcomer], now, bound));
     }
 
-    /// A member gone for longer than three bounds is forgotten by the tick:
+    /// A member gone for longer than the receipt lifetime is forgotten by the tick:
     /// no fold receipt reconciles a straggling copy of its writer any more,
     /// so keeping it could only make a later retirement double count, and
     /// forgetting it bounds the tracker under sustained restarts.
     #[tokio::test]
-    async fn crdt_compact_tick_forgets_a_member_gone_past_three_bounds() {
+    async fn crdt_compact_tick_forgets_a_member_gone_past_the_receipt_lifetime() {
         let retire_after = Duration::from_millis(20);
         let cluster = Cluster::builder("cluster-it-crdt-forget-gone")
             .seeds(std::iter::empty())
@@ -5600,7 +5600,7 @@ mod tests {
         .await;
         assert!(
             absence.gone_since(gone).is_none(),
-            "past three bounds: forgotten"
+            "past the receipt lifetime: forgotten"
         );
         cluster.shutdown().await;
     }

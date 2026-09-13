@@ -193,9 +193,11 @@ All notable changes to this project are documented in this file. Format follows
   never holds tombstone collection back; only writer retirement treats it
   like a crash. A gone member stays known to the sweep until it returns
   or `AbsenceTracker::prune_gone_older_than` forgets it, run at the
-  start of every tick, past three bounds, the same age past which a fold
-  receipt no longer reconciles a straggling copy of that member's writer
-  either, so retiring it any later could only double count; this is what
+  start of every tick, past the fold receipt lifetime, the same age past
+  which no receipt reconciles a straggling copy of that member's writer
+  either, so retiring it any later could only double count; the lifetime
+  is at least two sweep periods, so a member that left between ticks is
+  seen gone by the next tick before it is forgotten; this is what
   bounds the tracker under sustained restarts, where every crashed process
   leaves behind a node id (random per process) that never comes back. The
   sweep works one stripe per tick, and a writer retired in one record must

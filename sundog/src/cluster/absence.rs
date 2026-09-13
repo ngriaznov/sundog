@@ -91,12 +91,14 @@ impl AbsenceTracker {
     }
 
     /// Forgets every member gone for longer than `horizon`, along with when
-    /// it was first known: the CRDT sweep calls this with three times
-    /// `crdt_retire_after`, the age past which a fold receipt no longer
-    /// reconciles a straggling copy of the member's writer either, so
-    /// retiring it any later could only double count. Bounds this
-    /// tracker under sustained churn, where every restarted process
-    /// leaves behind a node id that never returns.
+    /// it was first known: the CRDT sweep calls this with the fold receipt
+    /// lifetime (`CompactionBounds::receipt_ttl_ms`), the age past which no
+    /// receipt reconciles a straggling copy of the member's writer either,
+    /// so retiring it any later could only double count. That lifetime is
+    /// at least two sweep periods by construction, so a member that left
+    /// between ticks is always seen gone by the next tick before it is
+    /// forgotten. Bounds this tracker under sustained churn, where every
+    /// restarted process leaves behind a node id that never returns.
     pub(crate) fn prune_gone_older_than(&self, horizon: Duration) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();

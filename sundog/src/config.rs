@@ -361,6 +361,22 @@ mod tests {
     }
 
     #[test]
+    fn crdt_compaction_bounds_receipt_outlives_two_sweep_periods_at_any_bound() {
+        for secs in [1, 2, 5, 60, 119, 120, 3_600, 86_400] {
+            let config =
+                ClusterConfig::default().with(|c| c.crdt_retire_after = Duration::from_secs(secs));
+            let bounds = config.crdt_compaction_bounds();
+            let period_ms = u64::try_from(config.crdt_sweep_period().as_millis()).expect("fits");
+            assert!(
+                bounds.receipt_ttl_ms >= 2 * period_ms,
+                "bound {secs}s: receipt ttl {} ms must cover two sweep periods of {period_ms} ms, \
+                 so a member that left between ticks is seen gone before the tick forgets it",
+                bounds.receipt_ttl_ms
+            );
+        }
+    }
+
+    #[test]
     fn crdt_compaction_bounds_receipt_lives_the_longer_of_three_bounds_and_two_plus_two_periods() {
         let default = ClusterConfig::default().crdt_compaction_bounds();
         let day_ms = 24 * 60 * 60 * 1_000;
