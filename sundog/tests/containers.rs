@@ -778,25 +778,45 @@ async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
     net.close().await.expect("network closes");
 }
 
-/// Waits until `node`'s cumulative sent-frame/byte counters stop changing
-/// across a 1s sample, so a `netstats` snapshot taken right after this
-/// returns isolates whatever traffic comes next from any trailing activity
-/// (a state-transfer stream's last chunks, or the first post-join
-/// anti-entropy round) still draining at the moment a peer's local count
-/// first matches the expected total.
+/// Sent bytes per 1s sample at or under which a node counts as quiet for
+/// [`wait_for_quiescent_netstats`]. Two in-sync replicas never stop
+/// talking: every anti-entropy round costs a bucket digest of about 3 KB
+/// for a populated cache and a couple of bytes for an empty one, and with
+/// four caches each side runs a jittered round every 1 to 3 s per cache, so
+/// a second with no frame at all is a matter of jitter alignment rather
+/// than a state the node reaches. A state-transfer chunk alone runs about
+/// 26 KB and a draining stream carries dozens per second, so this ceiling
+/// admits the digest chatter and excludes the stream.
+const QUIET_BYTES_PER_SAMPLE: u64 = 32 * 1024;
+
+/// Waits until `node`'s cumulative sent-byte counter moves by at most
+/// [`QUIET_BYTES_PER_SAMPLE`] across each of two consecutive 1s samples, so
+/// a `netstats` snapshot taken right after this returns isolates whatever
+/// traffic comes next from any trailing activity (a state-transfer
+/// stream's last chunks, or the first post-join anti-entropy round) still
+/// draining at the moment a peer's local count first matches the expected
+/// total. Two samples in a row keep a one-second stall inside a stream on
+/// a busy runner from passing as the stream's end.
 /// # Panics
 ///
-/// Panics if the counters are still changing once `timeout` elapses.
+/// Panics if the counter is still moving faster than that once `timeout`
+/// elapses.
 async fn wait_for_quiescent_netstats(node: &Node, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut last = node.netstats().await.expect("netstats");
+    let (_, mut last_bytes) = node.netstats().await.expect("netstats");
+    let mut quiet_samples = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let current = node.netstats().await.expect("netstats");
-        if current == last {
-            return;
+        let (_, bytes) = node.netstats().await.expect("netstats");
+        if bytes - last_bytes <= QUIET_BYTES_PER_SAMPLE {
+            quiet_samples += 1;
+            if quiet_samples == 2 {
+                return;
+            }
+        } else {
+            quiet_samples = 0;
         }
-        last = current;
+        last_bytes = bytes;
         assert!(
             tokio::time::Instant::now() < deadline,
             "{}'s netstats never settled within {timeout:?}",
