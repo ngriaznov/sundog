@@ -20,18 +20,13 @@ use std::time::Duration;
 
 use container_util::{
     CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode,
-    container_tests_enabled, eventually,
+    container_tests_enabled, eventually, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
 use rand::{RngExt as _, SeedableRng as _};
 use rightsize::{Network, Wait};
 
-/// Every `sundog-testnode` binds gossip on this fixed port; seed strings
-/// below are `<alias>:<GOSSIP_PORT>`, resolved via DNS against the alias.
-const GOSSIP_PORT: u16 = 7946;
-
-const PEER_WAIT: Duration = Duration::from_secs(30);
 const CONVERGE_WAIT: Duration = Duration::from_secs(20);
 /// Bound for a CRDT compaction wait: the sweep's own cadence
 /// (`ClusterConfig::crdt_sweep_period`) is `(crdt_retire_after / 4).max(30s)`,
@@ -42,28 +37,23 @@ const CONVERGE_WAIT: Duration = Duration::from_secs(20);
 /// boot and gossip jitter on top.
 const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(240);
 
-fn seed(alias: &str) -> String {
-    format!("{alias}:{GOSSIP_PORT}")
-}
-
-async fn wait_for_peers(nodes: &[&Node], expected: usize) {
-    for node in nodes {
-        eventually(PEER_WAIT, || async { node.peers().await == Ok(expected) }).await;
-    }
+/// Returns from the calling test fn unless `SUNDOG_CONTAINER_TESTS=1` is
+/// set.
+macro_rules! require_containers {
+    () => {
+        if !container_tests_enabled() {
+            eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+            return;
+        }
+    };
 }
 
 #[tokio::test]
 async fn convergence_across_three_nodes_with_distinct_writers() {
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "cvg-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "cvg-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "cvg-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "cvg-cluster").await;
 
     let writers: [(&Node, &str); 3] = [(&n1, "n1"), (&n2, "n2"), (&n3, "n3")];
     for (node, label) in writers {
@@ -103,16 +93,10 @@ async fn convergence_across_three_nodes_with_distinct_writers() {
 
 #[tokio::test]
 async fn tombstone_reaches_every_node() {
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let a = Node::spawn(&net, "tomb-cluster", "n1", &[]).await;
-    let b = Node::spawn(&net, "tomb-cluster", "n2", &[&seed("n1")]).await;
-    let c = Node::spawn(&net, "tomb-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&a, &b, &c], 2).await;
+    let (a, b, c) = spawn_trio(&net, "tomb-cluster").await;
 
     a.put("k", "v").await.expect("a puts");
     eventually(CONVERGE_WAIT, || async {
@@ -137,16 +121,10 @@ async fn tombstone_reaches_every_node() {
 async fn warm_join_state_transfer_with_no_new_writes() {
     const ENTRIES: usize = 500;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "warm-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "warm-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "warm-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "warm-cluster").await;
 
     for i in 0..ENTRIES {
         n1.put(&format!("k{i}"), &format!("v{i}"))
@@ -184,16 +162,10 @@ async fn warm_join_state_transfer_with_no_new_writes() {
 
 #[tokio::test]
 async fn kill_one_node_and_replace_it_under_the_same_alias() {
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "kill-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "kill-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "kill-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "kill-cluster").await;
 
     n1.put("before", "v-before").await.expect("n1 puts");
     eventually(CONVERGE_WAIT, || async {
@@ -233,16 +205,10 @@ async fn kill_one_node_and_replace_it_under_the_same_alias() {
 /// prints, exercising the same repair path anti-entropy exists for.
 #[tokio::test]
 async fn anti_entropy_repairs_a_gap_after_a_member_returns() {
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "ae-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "ae-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "ae-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "ae-cluster").await;
 
     n1.put("steady", "v0").await.expect("n1 puts");
     eventually(CONVERGE_WAIT, || async {
@@ -284,10 +250,7 @@ async fn replication_and_cold_join_carry_realistic_value_sizes() {
     const NEAR_CAP_BYTES: usize = 3 * 1024 * 1024;
     const OVER_CAP_BYTES: usize = 5 * 1024 * 1024;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let n1 = Node::spawn(&net, "bigval-cluster", "n1", &[]).await;
@@ -364,16 +327,10 @@ async fn replication_and_cold_join_carry_realistic_value_sizes() {
 async fn high_churn_of_adds_removes_and_ttl_expiry_drains_cleanly() {
     const OPS: u32 = 100_000;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "churn-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "churn-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "churn-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "churn-cluster").await;
 
     let (r1, r2, r3) = tokio::join!(n1.churn(OPS), n2.churn(OPS), n3.churn(OPS));
     r1.expect("n1 churn completes");
@@ -423,10 +380,7 @@ async fn high_churn_of_adds_removes_and_ttl_expiry_drains_cleanly() {
 async fn cold_join_warms_a_million_entry_cluster() {
     const ENTRIES: u32 = 1_000_000;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let n1 = Node::spawn(&net, "million-cluster", "n1", &[]).await;
@@ -466,8 +420,8 @@ async fn cold_join_warms_a_million_entry_cluster() {
 /// under `sundog::crdt::PnCounterResolver` (`sundog-testnode`'s `"pn"`
 /// cache) each increment every one of a million counters once,
 /// concurrently, then a fourth node joins cold. Every node must converge
-/// to the exact total (`WRITERS`) on every counter — not merely to some
-/// value every replica happens to agree on — and the cold-joining node's
+/// to the exact total (`WRITERS`) on every counter, not merely to some
+/// value every replica happens to agree on, and the cold-joining node's
 /// state transfer must carry that merged total to every key, the same bar
 /// [`cold_join_warms_a_million_entry_cluster`] sets for plain LWW entries.
 #[tokio::test]
@@ -479,19 +433,13 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     // four-core box, so this scenario sizes its own.
     const CONVERGE_WAIT: Duration = Duration::from_secs(180);
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "pncounter-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "pncounter-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "pncounter-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "pncounter-cluster").await;
 
     // Every node increments every counter once, concurrently: `pn0..pn(COUNTERS
-    // - 1)` must converge to a total of `WRITERS`, not just whichever
+    // - 1)` must converge to a total of `WRITERS`, not whichever
     // increment's write happens to land last.
     let (r1, r2, r3) = tokio::join!(
         n1.pn_fill(COUNTERS),
@@ -566,10 +514,10 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
 
 /// Bounds CRDT metadata growth under sustained writer churn: a third node
 /// is repeatedly joined under the same alias, writes to both the `"pn"`
-/// `PnCounter` and `"os"` `OrSet<String>` caches, and is stopped again — a
+/// `PnCounter` and `"os"` `OrSet<String>` caches, and is stopped again, a
 /// fresh process mints a fresh membership incarnation and therefore a
 /// fresh [`sundog::crdt::WriterId`], so this exercises genuine writer
-/// churn, not repeated writes from one identity — over a window exceeding
+/// churn, not repeated writes from one identity, over a window exceeding
 /// a shortened `crdt_retire_after`. Asserts `pn`'s totals stay exact
 /// despite the churn, `os`'s membership keeps every churned writer's
 /// never-removed element (retirement blocks only a *future* add under a
@@ -595,10 +543,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
     /// fold receipt still waiting out its three-bound prune on a replica.
     const FOLD_SLACK_BYTES: u64 = 32;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let retire_secs = RETIRE_AFTER_SECS.to_string();
     let env = [(CRDT_RETIRE_AFTER_SECS_ENV, retire_secs.as_str())];
@@ -794,10 +739,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
 async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
     const ENTRIES: u32 = 100_000;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let n1 = Node::spawn(&net, "scale-cluster", "n1", &[]).await;
@@ -884,10 +826,7 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
     const TARGET_KEY: &str = "k123456";
     const TARGET_VALUE: &str = "v123456";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let n1 = Node::spawn(&net, "ae-sketch-cluster", "n1", &[]).await;
@@ -947,10 +886,7 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     const TARGET_VALUE: &str = "v123456";
     const PART_MIN_BUCKET: &str = "512";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let env = [("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET", PART_MIN_BUCKET)];
@@ -1044,16 +980,10 @@ fn fill_payload_bytes(count: u32) -> u64 {
 async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
     const ENTRIES: u32 = 100_000;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "fanout-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "fanout-cluster", "n2", &[&seed("n1")]).await;
-    let n3 = Node::spawn(&net, "fanout-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
-    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    let (n1, n2, n3) = spawn_trio(&net, "fanout-cluster").await;
 
     let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the fill");
 
@@ -1112,8 +1042,8 @@ fn chaos_seed(secs: u64) -> u64 {
 
 /// One randomly chosen chaos action, and everything an iteration needs to
 /// carry it out. Kept as a value (rather than performed inline in the
-/// picking match) so the picking logic — the part that must stay
-/// deterministic for a given seed — is a plain, independently testable
+/// picking match) so the picking logic, the part that must stay
+/// deterministic for a given seed, is a plain, independently testable
 /// function with no `.await` in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChaosAction {
@@ -1130,7 +1060,7 @@ enum ChaosAction {
 }
 
 /// Picks one [`ChaosAction`] from a fixed weighted distribution over
-/// `node_count` live nodes and `fill_keys` existing fill keys — crashes are
+/// `node_count` live nodes and `fill_keys` existing fill keys, crashes are
 /// deliberately rare (10%) since they are the most disruptive action and the
 /// scenario needs most of its run at steady churn, not mid-recovery; the
 /// remaining 90% splits across churn (30%), drop (20%), fill (15%), and a
@@ -1214,7 +1144,7 @@ async fn spawn_chaos_cluster(net: &Arc<Network>, cluster: &str, aliases: &[&str]
 /// Crashes `nodes[idx]`, respawns it under the same alias seeded from the
 /// other still-live aliases in the mode [`spawn_chaos_node`] decides from
 /// `owners`, and waits for every node to see the rest of the cluster again
-/// before returning — the point past which the next chaos iteration may pick
+/// before returning, the point past which the next chaos iteration may pick
 /// another node to crash.
 async fn crash_and_respawn_mode(
     nodes: &mut Vec<Node>,
@@ -1358,7 +1288,7 @@ async fn assert_converged(
 
 /// Random crashes, churn, dropped keys, refills, and put bursts against a
 /// four-node cluster for a bounded time, then checks every node converges to
-/// the same `"it"` content — count, digest, and a key sample all agreeing.
+/// the same `"it"` content, count, digest, and a key sample all agreeing.
 /// Exercises the class of bug 0.3.1 fixed (an anti-entropy round landing
 /// during a bulk fill) by never letting the cluster settle before the next
 /// disruption lands.
@@ -1367,7 +1297,7 @@ async fn assert_converged(
 /// length in seconds) being set; `SUNDOG_CHAOS_SEED` pins the scenario's
 /// random choices for a repeatable replay, otherwise a fresh seed is drawn
 /// and logged. The cluster's own timing is never seeded and never
-/// deterministic — that unpredictability is the point of a chaos lane.
+/// deterministic, that unpredictability is the point of a chaos lane.
 #[tokio::test]
 async fn chaos_crashes_churn_and_drops_still_converge() {
     const NODE_COUNT: usize = 4;
@@ -1381,10 +1311,7 @@ async fn chaos_crashes_churn_and_drops_still_converge() {
     const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4"];
     const CLUSTER: &str = "chaos-cluster";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
     let Ok(secs_raw) = std::env::var("SUNDOG_CHAOS_SECS") else {
         eprintln!("skipping: SUNDOG_CHAOS_SECS not set");
         return;
@@ -1451,10 +1378,7 @@ async fn chaos_crashes_churn_and_drops_still_converge() {
 async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
     const ENTRIES: u32 = 5_000;
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let previous = build_previous_testnode();
     let net = Arc::new(Network::new_network());
@@ -1513,7 +1437,7 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
 /// (`SUNDOG_TESTNODE_RESOLVER=sum_counter`), which sums two conflicting
 /// decimal-string counters on merge rather than picking whichever write is
 /// most recent. `old` writes first; `new` then writes a conflicting value of
-/// its own, merging it against what it just replicated from `old` instead of
+/// its own, merging it against what it recently replicated from `old` instead of
 /// overwriting it. The merged sum differs from both inputs, so `old` ending
 /// up there proves it applied the merge-derived-stamped bytes it received
 /// rather than coincidentally already holding the right value.
@@ -1524,10 +1448,7 @@ async fn the_previous_release_stores_and_serves_a_merge_derived_version_from_the
     const NEW_VALUE: &str = "5";
     const MERGED_VALUE: &str = "8";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let previous = build_previous_testnode();
     let net = Arc::new(Network::new_network());
@@ -1551,7 +1472,7 @@ async fn the_previous_release_stores_and_serves_a_merge_derived_version_from_the
     .await;
 
     // A second, conflicting write on the new node: its own resolver merges it
-    // against the value it just replicated from `old` instead of overwriting
+    // against the value it recently replicated from `old` instead of overwriting
     // it, storing the sum under a merge-derived version and fanning that
     // out to `old`.
     new.put(KEY, NEW_VALUE)
@@ -1591,7 +1512,7 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
 /// the scrape fails or the series has never been touched (a metric with no
 /// writes yet is absent from the exposition, not printed as zero). Every
 /// `sundog_spill_*`/`sundog_ae_repaired_total` series this file reads is an
-/// exact-integer count in practice, so rounding it to `u64` here sidesteps
+/// exact-integer count, so rounding it to `u64` here sidesteps
 /// `clippy::float_cmp` entirely: every comparison below compares `u64`s,
 /// never `f64`s, mirroring `tests/spill_bench.rs`'s `metric_count`.
 /// The anti-entropy outcome counters two nodes report between them: part
@@ -1743,10 +1664,7 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
     const SPILL_REGION_BYTES: u64 = 16 * 1024;
     const CLUSTER: &str = "spill-cluster";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     // A third holds roughly a third of the fill's entries; the capacity
     // budget below covers every entry's key/value bytes plus a generous
@@ -1791,8 +1709,8 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
     );
     // `it` is `Mode::Replicated`, so `SpillTier::keep_resident_when_refused`
     // is set: a refused hand-off leaves its victim resident and retried
-    // instead of falling back to a delete, so this can no longer happen at
-    // all, unlike before this policy existed.
+    // instead of falling back to a delete, so no entry is ever dropped
+    // this way.
     let dropped_queue_full =
         scrape_metric(&a, "sundog_spill_dropped_total", ("reason", "queue_full")).await;
     assert_eq!(
@@ -1870,10 +1788,7 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
     const SAMPLE_SIZE: usize = 300;
     const CLUSTER: &str = "spill-restart-cluster";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let total_weight = fill_weight_bytes(FILL_COUNT);
     let ram_budget_bytes = total_weight / 3;
@@ -1944,7 +1859,7 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
 
     // The control port is not necessarily up yet at this point (state
     // transfer, then `churn`'s own open, run before it binds), so `count`
-    // failing early is expected and `eventually` simply keeps retrying.
+    // failing early is expected and `eventually` keeps retrying.
     eventually(CONVERGE_WAIT, || async {
         a.count().await == Ok(FILL_COUNT as usize)
     })
@@ -2121,8 +2036,8 @@ async fn wait_for_entry_sum(nodes: &[Node], expected_sum: usize, wait: Duration,
     .await;
 }
 
-/// Sum of `count` across every node in `nodes`, `None` if any read fails —
-/// the shared building block every distributed scenario's convergence poll
+/// Sum of `count` across every node in `nodes`, `None` if any read fails.
+/// The shared building block every distributed scenario's convergence poll
 /// below sums to `owners * fill_keys`.
 async fn sum_counts(nodes: &[&Node]) -> Option<usize> {
     let mut sum = 0usize;
@@ -2157,10 +2072,7 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
     const CLUSTER: &str = "dist-fill-cluster";
     const CONVERGE_WAIT: Duration = Duration::from_secs(180);
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let mut nodes = Vec::with_capacity(NODE_COUNT);
@@ -2213,9 +2125,9 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
     net.close().await.expect("network closes");
 }
 
-/// Crashing one owner never makes a key unfetchable — the surviving owner
+/// Crashing one owner never makes a key unfetchable, the surviving owner
 /// keeps answering `fetch` through the dead peer's stale entry in the
-/// ownership view — and once gossip notices the death and rebalance runs,
+/// ownership view, and once gossip notices the death and rebalance runs,
 /// every key resettles on exactly `OWNERS` of the four survivors, with at
 /// least one of them having pulled buckets in.
 #[tokio::test]
@@ -2230,10 +2142,7 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
     const IMMEDIATE_CHECK_WINDOW: Duration = Duration::from_secs(10);
     const REOWNED_WAIT: Duration = Duration::from_secs(240);
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let mut nodes = Vec::with_capacity(NODE_COUNT);
@@ -2330,8 +2239,8 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
 /// `BUCKET_COUNT * OWNERS / 4`) and at least one original node's
 /// `direction="out"` counter moves to match. Once the disown grace period
 /// (`distributed_disown_grace_rounds` anti-entropy intervals) has passed, the
-/// donors have dropped what they no longer own and every key sits on exactly
-/// `OWNERS` of the four nodes, fetchable from all of them.
+/// donors have dropped every key outside their own ownership, and every key
+/// sits on exactly `OWNERS` of the four nodes, fetchable from all of them.
 #[tokio::test]
 async fn distributed_join_and_rebalance() {
     const OWNERS: u8 = 2;
@@ -2351,10 +2260,7 @@ async fn distributed_join_and_rebalance() {
     const DISOWN_GRACE_WAIT: Duration = Duration::from_secs(16);
     const SETTLE_WAIT: Duration = Duration::from_secs(180);
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
 
     let net = Arc::new(Network::new_network());
     let mut nodes = Vec::with_capacity(4);
@@ -2384,7 +2290,9 @@ async fn distributed_join_and_rebalance() {
     nodes.push(Node::spawn_distributed(&net, CLUSTER, JOINER, &all_seed_refs, Some(OWNERS)).await);
     let node_refs: Vec<&Node> = nodes.iter().collect();
     wait_for_peers(&node_refs, ALIASES.len()).await;
-    let joiner: &Node = node_refs.last().expect("just pushed the joiner");
+    let joiner: &Node = node_refs
+        .last()
+        .expect("nodes always has the joiner as its last element");
 
     let expected_joiner_buckets = expected_owned_buckets_sum(u64::from(OWNERS)) / 4;
     eventually(REBALANCE_WAIT, || async {
@@ -2444,8 +2352,8 @@ async fn distributed_join_and_rebalance() {
 /// (agreement on `count`/`digest`) assumes `Mode::Replicated`, where every
 /// node holds everything; a distributed cluster instead settles with each
 /// key on exactly `owners` nodes. `fill_keys` is `0..fill_keys`'s `k{i}`/
-/// `v{i}` keyspace (surviving `Drop` — a dropped bucket's other owner, or an
-/// anti-entropy repair, still has it — and `Fill`, which only ever rewrites
+/// `v{i}` keyspace (surviving `Drop`, a dropped bucket's other owner, or an
+/// anti-entropy repair, still has it, and `Fill`, which only ever rewrites
 /// a prefix of it to the same deterministic values); `burst_entries` is
 /// every distinct-key put [`perform_chaos_action`]'s `Burst` arm wrote,
 /// collected by the caller since those keys carry no predictable index.
@@ -2498,9 +2406,9 @@ async fn assert_converged_distributed(
 /// refill, put bursts) against a distributed `"it"`, converging on
 /// [`assert_converged_distributed`]'s ownership-aware check instead of
 /// content agreement across every node. Shares every helper the replicated
-/// chaos test uses — [`ChaosAction`], [`pick_chaos_action`],
+/// chaos test uses, [`ChaosAction`], [`pick_chaos_action`],
 /// [`perform_chaos_action`], [`spawn_chaos_cluster_mode`],
-/// [`crash_and_respawn_mode`] — parametrized on `owners` rather than
+/// [`crash_and_respawn_mode`], parametrized on `owners` rather than
 /// duplicated.
 ///
 /// Gated the same way: `SUNDOG_CONTAINER_TESTS=1` and `SUNDOG_CHAOS_SECS`;
@@ -2521,10 +2429,7 @@ async fn chaos_distributed_crashes_churn_and_drops_still_converge() {
     const ALIASES: [&str; NODE_COUNT] = ["n1", "n2", "n3", "n4"];
     const CLUSTER: &str = "chaos-distributed-cluster";
 
-    if !container_tests_enabled() {
-        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
-        return;
-    }
+    require_containers!();
     let Ok(secs_raw) = std::env::var("SUNDOG_CHAOS_SECS") else {
         eprintln!("skipping: SUNDOG_CHAOS_SECS not set");
         return;

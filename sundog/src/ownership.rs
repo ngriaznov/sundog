@@ -81,8 +81,8 @@ pub(crate) fn view_hash(eligible: &[NodeId]) -> u64 {
 
 /// The nodes eligible to own a bucket for `cache`: live peers speaking at
 /// least [`wire::PROTOCOL_DISTRIBUTED`] that currently advertise `cache` under
-/// `Mode::Distributed` with this same `k`, plus `self_node` unconditionally
-/// — a node is always eligible for its own view regardless of what it
+/// `Mode::Distributed` with this same `k`, plus `self_node` unconditionally,
+/// since a node is always eligible for its own view regardless of what it
 /// advertises about itself. A peer that's live but hasn't opened `cache`
 /// yet, or opened it with a different `owners` count, is excluded: routing
 /// a forwarded write or a rebalance pull to a node that can't decode it, or
@@ -137,7 +137,7 @@ pub fn ownership_diff(old: &OwnershipView, new: &OwnershipView) -> (Vec<u16>, Ve
 pub(crate) type OwnerSet = Vec<NodeId>;
 
 /// One cache's computed bucket ownership, current as of the eligible-node
-/// set it was built from. Immutable once built: a membership or cache-mode
+/// set that built it. Immutable once built: a membership or cache-mode
 /// change produces a whole new view via [`OwnershipView::compute`], never a
 /// mutation, so a reader holding an `Arc<OwnershipView>` sees a consistent
 /// snapshot for the whole of one operation.
@@ -239,7 +239,7 @@ pub struct OwnershipTracker {
 }
 
 impl OwnershipTracker {
-    /// Computes the first view synchronously — no task, no placeholder —
+    /// Computes the first view synchronously, no task and no placeholder,
     /// from a `(peers, modes)` snapshot the caller already has to hand.
     /// Returns the tracker plus the `watch::Sender` half a later refresh
     /// loop publishes new views through as membership and cache modes
@@ -274,11 +274,11 @@ impl OwnershipTracker {
     }
 }
 
-/// Buckets this node has just lost ownership of, per the latest
+/// Buckets this node recently lost ownership of, per the latest
 /// [`OwnershipView`], but keeps resident until a grace period elapses, so a
-/// new owner's bucket pull — or, as a self-healing backstop, an ordinary
-/// anti-entropy round pairing this node with the new owner — has time to
-/// land before the data disappears. Read by anti-entropy's cohort widening
+/// new owner's bucket pull, or an ordinary anti-entropy round pairing this
+/// node with the new owner as a self-healing backstop, has time to land
+/// before the data disappears. Read by anti-entropy's cohort widening
 /// and the donor-serving exception; never read by the inbound-apply guard,
 /// which stays strict current-view ownership.
 pub struct ResidencySet {

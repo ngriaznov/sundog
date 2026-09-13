@@ -81,7 +81,7 @@ async fn resolve_specs(specs: &[String]) -> Vec<SocketAddr> {
     for spec in specs {
         match tokio::net::lookup_host(spec.as_str()).await {
             Ok(addrs) => resolved.extend(addrs),
-            Err(err) => tracing::warn!(spec, %err, "static seed failed to resolve"),
+            Err(error) => tracing::warn!(spec, %error, "static seed failed to resolve"),
         }
     }
     resolved

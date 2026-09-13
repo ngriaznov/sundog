@@ -45,16 +45,26 @@ pub(crate) enum MeshStream {
     Tls(Box<tokio_rustls::TlsStream<TcpStream>>),
 }
 
+/// Forwards a `poll_*` call to whichever variant `self` holds; one macro
+/// arm covers `poll_read`, `poll_write`, `poll_flush`, and `poll_shutdown`
+/// alike, `Pin`ning the inner stream fresh each time since a boxed `Tls`
+/// needs `as_mut()` first.
+macro_rules! forward_poll {
+    ($self:ident, $method:ident $(, $arg:expr )*) => {
+        match $self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).$method($($arg),*),
+            Self::Tls(stream) => Pin::new(stream.as_mut()).$method($($arg),*),
+        }
+    };
+}
+
 impl AsyncRead for MeshStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
+        forward_poll!(self, poll_read, cx, buf)
     }
 }
 
@@ -64,24 +74,15 @@ impl AsyncWrite for MeshStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
+        forward_poll!(self, poll_write, cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
-        }
+        forward_poll!(self, poll_flush, cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
+        forward_poll!(self, poll_shutdown, cx)
     }
 }
 

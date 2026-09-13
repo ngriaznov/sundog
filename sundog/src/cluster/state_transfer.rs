@@ -52,10 +52,10 @@ pub(crate) enum Outcome {
     /// The budget ran out before any donor finished; the cache stays cold
     /// and keeps trying.
     TimedOut,
-    /// The ownership view a bucket-scoped pull was planned against moved
-    /// on before every group landed: the pull is stale and a fresh one
-    /// against the current view runs at once. Never answered by a
-    /// whole-cache transfer, which has no view to move.
+    /// The ownership view a bucket-scoped pull planned against moves on
+    /// before every group lands: the pull is stale and a fresh one against
+    /// the current view runs at once. Never answered by a whole-cache
+    /// transfer, which has no view to move.
     Superseded,
 }
 

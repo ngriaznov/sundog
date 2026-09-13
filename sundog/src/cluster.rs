@@ -12,16 +12,20 @@
 
 pub(crate) mod absence;
 pub(crate) mod anti_entropy;
+pub(crate) mod crdt_compact;
+pub(crate) mod fan_out;
 pub(crate) mod rebalance;
 pub(crate) mod sketch;
 pub(crate) mod state_transfer;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -40,23 +44,61 @@ use crate::discovery::mdns::Mdns;
 use crate::discovery::statics::Static;
 use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
+#[cfg(all(test, not(feature = "sim")))]
 use crate::hlc::Hlc;
-use crate::membership::{self, CacheModes, Membership, Peer};
+use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
-    AeServeOutcome, FetchServe, InboundMsg, Mesh, MsgClass, OutFrame, RequestHandler,
-    batch_forward, batch_replicate,
+    AeServeOutcome, FetchServe, InboundMsg, Mesh, OutFrame, RequestHandler, batch_forward,
 };
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
 use crate::store::{
-    CompactionBounds, FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of,
-    chunk_records_for_snapshot, crdt, now_ms,
+    BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, Shard, ShardOps,
+    bucket_of, chunk_records_for_snapshot,
 };
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
 /// Shared with the [`RequestHandler`] passed to [`Mesh::spawn`].
 type ShardRegistry = Arc<RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>>>;
+
+/// One-line accessors for [`ShardRegistry`]'s lock, on the lock type itself
+/// so they resolve through autoderef from an owned or borrowed registry.
+trait ShardRegistryExt {
+    fn read_shards(&self) -> RwLockReadGuard<'_, HashMap<SmolStr, Arc<dyn ShardOps>>>;
+    fn write_shards(&self) -> RwLockWriteGuard<'_, HashMap<SmolStr, Arc<dyn ShardOps>>>;
+}
+
+impl ShardRegistryExt for RwLock<HashMap<SmolStr, Arc<dyn ShardOps>>> {
+    fn read_shards(&self) -> RwLockReadGuard<'_, HashMap<SmolStr, Arc<dyn ShardOps>>> {
+        self.read()
+            .expect("invariant: shard registry lock is never poisoned")
+    }
+
+    fn write_shards(&self) -> RwLockWriteGuard<'_, HashMap<SmolStr, Arc<dyn ShardOps>>> {
+        self.write()
+            .expect("invariant: shard registry lock is never poisoned")
+    }
+}
+
+/// The same one-line accessors as [`ShardRegistryExt`], for the local
+/// cache-mode map's lock.
+trait LocalModesExt {
+    fn read_modes(&self) -> RwLockReadGuard<'_, HashMap<SmolStr, Mode>>;
+    fn write_modes(&self) -> RwLockWriteGuard<'_, HashMap<SmolStr, Mode>>;
+}
+
+impl LocalModesExt for RwLock<HashMap<SmolStr, Mode>> {
+    fn read_modes(&self) -> RwLockReadGuard<'_, HashMap<SmolStr, Mode>> {
+        self.read()
+            .expect("invariant: local cache-mode map lock is never poisoned")
+    }
+
+    fn write_modes(&self) -> RwLockWriteGuard<'_, HashMap<SmolStr, Mode>> {
+        self.write()
+            .expect("invariant: local cache-mode map lock is never poisoned")
+    }
+}
 
 /// A running cluster membership: the join point for opening named caches.
 ///
@@ -83,7 +125,7 @@ struct ClusterInner {
     membership: Membership,
     mesh: Mesh,
     shards: ShardRegistry,
-    /// The [`Mode`] each open cache was opened under; [`mode_conflict_task`]'s
+    /// The [`Mode`] each open cache opens under; [`mode_conflict_task`]'s
     /// local half, shared with the `prometheus` feature's `/readyz` route.
     local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>>,
     config: ClusterConfig,
@@ -106,20 +148,25 @@ pub(crate) struct InboundActivity {
 }
 
 impl InboundActivity {
-    fn note(&self, from: NodeId) {
+    fn seen(&self) -> RwLockReadGuard<'_, HashMap<NodeId, u64>> {
+        self.seen
+            .read()
+            .expect("invariant: inbound-activity lock is never poisoned")
+    }
+
+    fn seen_mut(&self) -> RwLockWriteGuard<'_, HashMap<NodeId, u64>> {
         self.seen
             .write()
             .expect("invariant: inbound-activity lock is never poisoned")
-            .insert(from, crate::net::mono_ms());
+    }
+
+    fn note(&self, from: NodeId) {
+        self.seen_mut().insert(from, crate::net::mono_ms());
     }
 
     /// Whether `peer` streamed replicate traffic within `window`.
     pub(crate) fn recent(&self, peer: NodeId, window: Duration) -> bool {
-        let seen = self
-            .seen
-            .read()
-            .expect("invariant: inbound-activity lock is never poisoned");
-        seen.get(&peer).is_some_and(|&at| {
+        self.seen().get(&peer).is_some_and(|&at| {
             let age = crate::net::mono_ms().saturating_sub(at);
             age <= u64::try_from(window.as_millis()).unwrap_or(u64::MAX)
         })
@@ -137,25 +184,28 @@ pub(crate) struct Warmth {
 }
 
 impl Warmth {
-    fn mark(&self, cache: &SmolStr) {
-        self.warm
-            .write()
-            .expect("invariant: warmth lock is never poisoned")
-            .insert(cache.clone());
-    }
-
-    fn is_warm(&self, cache: &SmolStr) -> bool {
+    fn warm(&self) -> RwLockReadGuard<'_, HashSet<SmolStr>> {
         self.warm
             .read()
             .expect("invariant: warmth lock is never poisoned")
-            .contains(cache)
     }
 
-    fn forget(&self, cache: &str) {
+    fn warm_mut(&self) -> RwLockWriteGuard<'_, HashSet<SmolStr>> {
         self.warm
             .write()
             .expect("invariant: warmth lock is never poisoned")
-            .remove(cache);
+    }
+
+    fn mark(&self, cache: &SmolStr) {
+        self.warm_mut().insert(cache.clone());
+    }
+
+    fn is_warm(&self, cache: &SmolStr) -> bool {
+        self.warm().contains(cache)
+    }
+
+    fn forget(&self, cache: &str) {
+        self.warm_mut().remove(cache);
     }
 }
 
@@ -166,7 +216,7 @@ impl Warmth {
 pub struct CacheHealth {
     /// The cache's name, as opened.
     pub name: SmolStr,
-    /// The [`Mode`] the cache was opened under.
+    /// The [`Mode`] the cache opens under.
     pub mode: Mode,
     /// Whether the cache has finished warming: for a [`Mode::Replicated`]
     /// cache, whether its state transfer has completed; for a
@@ -192,8 +242,7 @@ pub struct Health {
 /// `prometheus` listener share.
 fn cache_health(local_modes: &RwLock<HashMap<SmolStr, Mode>>, warmth: &Warmth) -> Vec<CacheHealth> {
     local_modes
-        .read()
-        .expect("invariant: local cache-mode map lock is never poisoned")
+        .read_modes()
         .iter()
         .map(|(name, &mode)| CacheHealth {
             name: name.clone(),
@@ -315,8 +364,7 @@ impl Cluster {
     pub(crate) fn advertise_cache_mode(&self, name: &SmolStr, mode: Mode) {
         self.inner
             .local_modes
-            .write()
-            .expect("invariant: local cache-mode map lock is never poisoned")
+            .write_modes()
             .insert(name.clone(), mode);
         self.inner.membership.set_cache_mode(name, mode);
     }
@@ -363,16 +411,8 @@ impl Cluster {
     /// and clears its gossiped mode so live peers stop seeing it advertised.
     /// Idempotent: closing an already-forgotten name changes nothing.
     pub(crate) fn forget_cache(&self, name: &str) {
-        self.inner
-            .shards
-            .write()
-            .expect("invariant: shard registry lock is never poisoned")
-            .remove(name);
-        self.inner
-            .local_modes
-            .write()
-            .expect("invariant: local cache-mode map lock is never poisoned")
-            .remove(name);
+        self.inner.shards.write_shards().remove(name);
+        self.inner.local_modes.write_modes().remove(name);
         self.inner.warmth.forget(name);
         self.inner.membership.clear_cache_mode(name);
     }
@@ -430,17 +470,11 @@ impl Cluster {
     }
 
     /// Leaves the cluster gracefully: background loops are cancelled and
-    /// joined, every still-registered cache has its spill tier closed, then
-    /// chitchat departs and the data plane closes its connections. No
-    /// further calls on any clone of this handle.
-    ///
-    /// See [`ShardOps::close_spill`]. Closing the spill tier of a cache
-    /// already closed via `crate::cache::Cache::close` is a no-op. Closing
-    /// the tier of a cache never explicitly closed keeps its flusher
-    /// thread from leaking past process exit.
-    ///
-    /// Cache handles opened before this call keep working for local
-    /// reads/writes.
+    /// joined, every still-registered cache has its spill tier closed (see
+    /// [`ShardOps::close_spill`], a no-op if already closed), then chitchat
+    /// departs and the data plane closes its connections. No further calls
+    /// on any clone of this handle; cache handles opened before this call
+    /// keep working for local reads/writes.
     ///
     /// # Panics
     ///
@@ -451,25 +485,13 @@ impl Cluster {
         // fan-out task drains on the way out, and a write from now on
         // fails with `CacheError::Closed` instead of being accepted and
         // never sent.
-        for shard in self
-            .inner
-            .shards
-            .read()
-            .expect("invariant: shard registry lock is never poisoned")
-            .values()
-        {
+        for shard in self.inner.shards.read_shards().values() {
             shard.seal_fan_out();
         }
         self.inner.cancel.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
-        for shard in self
-            .inner
-            .shards
-            .read()
-            .expect("invariant: shard registry lock is never poisoned")
-            .values()
-        {
+        for shard in self.inner.shards.read_shards().values() {
             shard.close_spill();
         }
         self.inner.membership.clone().shutdown().await;
@@ -500,15 +522,11 @@ impl ClusterBuilder {
     }
 
     /// Uses `id` as this node's identity instead of a fresh
-    /// [`NodeId::random`]. Persist it (it round-trips through `Display` and
-    /// `FromStr`) and pass the same value on restart: the node rejoins as
-    /// the same member, so its earlier incarnation is not tracked absent
-    /// for `tombstone_max_ttl` after every restart.
-    ///
-    /// `id` is validated at [`build`](Self::build): a merge-derived id (one
-    /// only the engine's merge-version combinator ever mints, never a real
-    /// node) is rejected with [`JoinError::InvalidConfig`] rather than
-    /// silently remapped.
+    /// [`NodeId::random`]. Persist it and pass the same value on restart:
+    /// the node rejoins as the same member, so its prior incarnation is
+    /// not tracked absent for `tombstone_max_ttl` after every restart.
+    /// Validated at [`build`](Self::build): a merge-derived id is rejected
+    /// with [`JoinError::InvalidConfig`] rather than silently remapped.
     pub fn node_id(mut self, id: NodeId) -> Self {
         self.node_id = Some(id);
         self
@@ -541,10 +559,9 @@ impl ClusterBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`JoinError`] if the gossip or data-plane sockets cannot bind,
-    /// the membership backend fails to start, or [`Self::node_id`] was given
-    /// a merge-derived id (one only the engine's merge-version combinator
-    /// ever mints, never a real node).
+    /// Returns [`JoinError`] if the sockets cannot bind, the membership
+    /// backend fails to start, or [`Self::node_id`] receives a
+    /// merge-derived id.
     pub async fn build(self) -> Result<Cluster, JoinError> {
         let Self {
             name,
@@ -557,8 +574,12 @@ impl ClusterBuilder {
 
         validate_config(&config)?;
         if let Some(id) = node_id.filter(|id| id.is_merge_derived()) {
+            // Mirrors `NodeId::MERGE_BIT`: a real id always has this bit
+            // clear, so any id at or past it is reserved for merge versions.
             return Err(JoinError::InvalidConfig(format!(
-                "node id {id} is reserved for merge versions and cannot be used as a real node id"
+                "node_id ({}) is merge-derived, over the {} limit",
+                id.as_u64(),
+                1u64 << 63
             )));
         }
 
@@ -654,7 +675,7 @@ impl crate::telemetry::ReadinessSource for ClusterReadiness {
 
 /// Whether an unset discovery mechanism falls back to
 /// [`Static::from_env`] instead of the zeroconf [`Mdns`] default: `true`
-/// exactly when no discovery source was configured and `SUNDOG_SEEDS` names
+/// exactly when no discovery source is configured and `SUNDOG_SEEDS` names
 /// at least one seed.
 fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
     !discovery_set && seeds_env.is_some_and(|raw| !raw.trim().is_empty())
@@ -676,9 +697,8 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
     let sketch_frame = wire::ae_sketch_frame_max_len(255, config.ae_sketch_cells);
     if sketch_frame > config.max_frame {
         return Err(JoinError::InvalidConfig(format!(
-            "ClusterConfig::ae_sketch_cells ({}) encodes to up to {sketch_frame} bytes, \
-             more than max_frame ({}) allows",
-            config.ae_sketch_cells, config.max_frame
+            "ClusterConfig::ae_sketch_cells implies an anti-entropy sketch frame of {sketch_frame} bytes, over the {}-byte max_frame limit",
+            config.max_frame
         )));
     }
     Ok(())
@@ -790,11 +810,7 @@ struct ClusterRequestHandler {
 
 impl ClusterRequestHandler {
     fn lookup(&self, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
-        self.shards
-            .read()
-            .expect("invariant: shard registry lock is never poisoned")
-            .get(cache)
-            .cloned()
+        self.shards.read_shards().get(cache).cloned()
     }
 }
 
@@ -810,7 +826,7 @@ impl RequestHandler for ClusterRequestHandler {
         }
     }
 
-    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.digests().await,
@@ -819,7 +835,7 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
-    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.bucket_entries(bucket).await,
@@ -850,7 +866,7 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
-    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.bucket_lens(buckets).await,
@@ -863,7 +879,7 @@ impl RequestHandler for ClusterRequestHandler {
         &self,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    ) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.part_digests(buckets).await,
@@ -875,7 +891,7 @@ impl RequestHandler for ClusterRequestHandler {
     fn entries_for_parts(
         &self,
         cache: SmolStr,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, crate::store::PartEntries> {
         Box::pin(async move {
             match self.lookup(&cache) {
@@ -900,7 +916,7 @@ impl RequestHandler for ClusterRequestHandler {
     // Distribution-mode serving: every method here answers `Unavailable`
     // (or its shape's equivalent) for a cache that isn't registered, or one
     // registered but not a `Mode::Distributed` cache (`ownership_view_hash`
-    // is `None` either way) — the same "unknown cache degrades gracefully"
+    // is `None` either way). Same "unknown cache degrades gracefully"
     // convention every other method on this trait already has.
     fn ownership_view_hash(&self, cache: SmolStr) -> Option<u64> {
         self.lookup(&cache)
@@ -939,7 +955,7 @@ impl RequestHandler for ClusterRequestHandler {
         &self,
         cache: SmolStr,
         view_hash: u64,
-        buckets: Vec<(u16, u64)>,
+        buckets: Vec<BucketDigest>,
     ) -> BoxFuture<'_, AeServeOutcome> {
         // The requester's own bucket list only matters once its epoch is
         // confirmed current; the mismatch classification against it happens
@@ -994,7 +1010,7 @@ impl RequestHandler for ClusterRequestHandler {
                         let entries = shard.entries_for_buckets(vec![bucket]).await;
                         let keys: Vec<Bytes> = entries
                             .into_iter()
-                            .flat_map(|(_, entries)| entries.into_iter().map(|(key, _)| key))
+                            .flat_map(|(_, entries)| entries.into_iter().map(|kv| kv.key))
                             .collect();
                         let recs = shard.records_for(keys).await;
                         chunk_records_for_snapshot(recs)
@@ -1006,11 +1022,7 @@ impl RequestHandler for ClusterRequestHandler {
 }
 
 fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
-    shards
-        .read()
-        .expect("invariant: shard registry lock is never poisoned")
-        .get(cache)
-        .cloned()
+    shards.read_shards().get(cache).cloned()
 }
 
 /// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls.
@@ -1023,19 +1035,16 @@ async fn membership_to_mesh_task(
     set_live_peers_gauge(initial.len());
     mesh.update_peers(initial);
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            changed = peers.changed() => {
-                if changed.is_err() {
-                    return; // membership shut down
-                }
-                let current = peers.borrow_and_update().clone();
-                tracing::info!(peer_count = current.len(), "membership view changed");
-                set_live_peers_gauge(current.len());
-                mesh.update_peers(current);
-            }
+        let Some(changed) = cancel.run_until_cancelled(peers.changed()).await else {
+            return;
+        };
+        if changed.is_err() {
+            return; // membership shut down
         }
+        let current = peers.borrow_and_update().clone();
+        tracing::info!(peer_count = current.len(), "membership view changed");
+        set_live_peers_gauge(current.len());
+        mesh.update_peers(current);
     }
 }
 
@@ -1047,17 +1056,14 @@ async fn mode_conflict_task(cluster: Cluster, cancel: CancellationToken) {
     let mut warned: HashSet<(NodeId, SmolStr)> = HashSet::new();
     report_mode_conflicts(&modes.borrow_and_update(), &cluster, &mut warned);
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            changed = modes.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                let current = modes.borrow_and_update().clone();
-                report_mode_conflicts(&current, &cluster, &mut warned);
-            }
+        let Some(changed) = cancel.run_until_cancelled(modes.changed()).await else {
+            return;
+        };
+        if changed.is_err() {
+            return;
         }
+        let current = modes.borrow_and_update().clone();
+        report_mode_conflicts(&current, &cluster, &mut warned);
     }
 }
 
@@ -1104,11 +1110,7 @@ fn report_mode_conflicts(
     cluster: &Cluster,
     warned: &mut HashSet<(NodeId, SmolStr)>,
 ) {
-    let local_modes = cluster
-        .inner
-        .local_modes
-        .read()
-        .expect("invariant: local cache-mode map lock is never poisoned");
+    let local_modes = cluster.inner.local_modes.read_modes();
     for ModeConflict {
         peer,
         cache,
@@ -1137,18 +1139,12 @@ async fn open_cache_gauge_task(shards: ShardRegistry, cancel: CancellationToken)
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            _ = ticker.tick() => {
-                let count = shards
-                    .read()
-                    .expect("invariant: shard registry lock is never poisoned")
-                    .len();
-                metrics::gauge!("sundog_open_caches")
-                    .set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
-            }
+        if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+            return;
         }
+        let count = shards.read_shards().len();
+        metrics::gauge!("sundog_open_caches")
+            .set(f64::from(u32::try_from(count).unwrap_or(u32::MAX)));
     }
 }
 
@@ -1216,16 +1212,11 @@ fn note_streaming_peers(activity: &InboundActivity, drained: &[InboundMsg]) {
 
 /// The single consumer of `Mesh`'s inbound-message channel: dispatches
 /// `Invalidate`/`Replicate`/`ReplicateBatch`/`ForwardBatch` to the named
-/// shard. A message for an unregistered cache is dropped with a trace
-/// event.
-///
-/// Drains a bounded batch per wake with `recv_many`, so a cache name is
-/// looked up at most once per batch and a run of same-cache
-/// `Replicate`/`ReplicateBatch`/`ForwardBatch` messages coalesces into one
-/// `apply_remote_batch` call, applied in drain order. A `ForwardBatch`
-/// routed under a view hash other than the shard's own is first
-/// re-forwarded to its records' owners under this node's view (see
-/// [`reforward_stale_view`]), then applied like any other.
+/// shard, dropping a message for an unregistered cache with a trace event.
+/// Drains a bounded batch per wake with `recv_many`, so a run of same-cache
+/// messages coalesces into one `apply_remote_batch` call; a `ForwardBatch`
+/// under a stale view hash is first re-forwarded to its records' current
+/// owners (see [`reforward_stale_view`]), then applied like any other.
 async fn inbound_loop(
     shards: ShardRegistry,
     activity: Arc<InboundActivity>,
@@ -1272,13 +1263,15 @@ async fn inbound_loop(
                     if let Some(shard) = shard {
                         reforward_stale_view(
                             &mesh,
-                            self_node,
-                            from,
-                            shard.as_ref(),
-                            &cache,
-                            view_hash,
-                            hops,
-                            &recs,
+                            ReforwardBatch {
+                                self_node,
+                                from,
+                                shard: shard.as_ref(),
+                                cache_name: &cache,
+                                sender_view_hash: view_hash,
+                                hops,
+                                records: &recs,
+                            },
                         )
                         .await;
                     }
@@ -1351,48 +1344,59 @@ fn reforward_groups(
     sender_view_hash: u64,
     hops: u8,
     records: &[WireRecord],
-) -> Option<Vec<(Vec<NodeId>, Vec<WireRecord>)>> {
+) -> Option<Vec<fan_out::OwnerGroup>> {
     if hops >= MAX_FORWARD_HOPS || sender_view_hash == view.view_hash() {
         return None;
     }
-    let groups: Vec<(Vec<NodeId>, Vec<WireRecord>)> =
-        group_by_owner_set(view, self_node, records.to_vec())
+    let groups: Vec<fan_out::OwnerGroup> =
+        fan_out::group_by_owner_set(view, self_node, records.to_vec())
             .into_iter()
-            .map(|(owners, recs)| {
-                (
-                    owners
-                        .into_iter()
-                        .filter(|&n| n != from)
-                        .collect::<Vec<_>>(),
-                    recs,
-                )
+            .map(|group| fan_out::OwnerGroup {
+                owners: group
+                    .owners
+                    .into_iter()
+                    .filter(|&n| n != from)
+                    .collect::<Vec<_>>(),
+                records: group.records,
             })
-            .filter(|(owners, _)| !owners.is_empty())
+            .filter(|group| !group.owners.is_empty())
             .collect();
     Some(groups)
 }
 
-/// Re-forwards a `ForwardBatch` the sender routed under a stale (or simply
-/// different) ownership view to the records' owners under this node's
+/// Re-forwards a `ForwardBatch` the sender routed under a stale or merely
+/// different ownership view to the records' owners under this node's
 /// view, so a write whose target set the writer got wrong still reaches
 /// every current owner: a tombstone from a writer that has not yet seen a
 /// replacement owner join lands on that owner too, instead of waiting for
 /// an anti-entropy round to pair the two, and a record for a bucket this
-/// node no longer owns at all travels on instead of being dropped by the
+/// node does not own at all travels on instead of being dropped by the
 /// inbound guard. Sent as a `hops + 1` batch stamped with this node's own
 /// view hash. A no-op for a shard without an ownership view (every mode
 /// but `Mode::Distributed`).
-#[allow(clippy::too_many_arguments)]
-async fn reforward_stale_view(
-    mesh: &Mesh,
+/// A `ForwardBatch` re-forwarded to its records' true owners under this
+/// node's ownership view, gathered here so [`reforward_stale_view`] takes
+/// one argument beyond the mesh it sends through.
+struct ReforwardBatch<'a> {
     self_node: NodeId,
     from: NodeId,
-    shard: &dyn ShardOps,
-    cache_name: &SmolStr,
+    shard: &'a dyn ShardOps,
+    cache_name: &'a SmolStr,
     sender_view_hash: u64,
     hops: u8,
-    records: &[WireRecord],
-) {
+    records: &'a [WireRecord],
+}
+
+async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
+    let ReforwardBatch {
+        self_node,
+        from,
+        shard,
+        cache_name,
+        sender_view_hash,
+        hops,
+        records,
+    } = batch;
     let Some(view) = shard.ownership_view() else {
         return;
     };
@@ -1403,7 +1407,7 @@ async fn reforward_stale_view(
     if groups.is_empty() {
         return;
     }
-    let forwarded: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+    let forwarded: usize = groups.iter().map(|g| g.records.len()).sum();
     metrics::counter!(
         "sundog_forwarded_writes_total",
         "cache" => cache_name.to_string()
@@ -1417,9 +1421,9 @@ async fn reforward_stale_view(
         records = forwarded,
         "forward batch routed under another view; re-forwarded to its owners under ours"
     );
-    let deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
-    for (owners, recs) in groups {
-        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, recs)
+    let deadline = tokio::time::Instant::now() + fan_out::FAN_OUT_SEND_DEADLINE;
+    for fan_out::OwnerGroup { owners, records } in groups {
+        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, records)
             .into_iter()
             .filter_map(|msg| match OutFrame::new(msg) {
                 Ok(frame) => Some(frame),
@@ -1436,247 +1440,14 @@ async fn reforward_stale_view(
     }
 }
 
-/// Drains one opened cache's queue of locally written keys and fans them out
-/// over the mesh per [`Mode`]; `Shard` holds no handle to `net::Mesh`. A
-/// `get_or_load` read-through fill fans out too, letting other
-/// `Replicated`-mode peers skip their own loader call.
-///
-/// Each iteration takes the whole backlog at once, so a burst of writes
-/// costs one round of per-peer sends, not one per write. See [`FanOutQueue`]
-/// for why nothing drops for arriving too fast.
-pub(crate) async fn fan_out_task<K, V>(
-    shard: Arc<Shard<K, V>>,
-    cluster: Cluster,
-    queue: Arc<FanOutQueue<FanOutItem<K>>>,
-    cache_name: SmolStr,
-    mode: Mode,
-    cancel: CancellationToken,
-) where
-    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-{
-    loop {
-        // A batch in flight is never raced against `cancel`: a write the
-        // caller was told succeeded goes out, or is forwarded, before this
-        // task ends. Cancellation is observed between batches, and one last
-        // drain covers what arrived after the final wake-up.
-        let items = tokio::select! {
-            biased;
-            () = cancel.cancelled() => break,
-            () = queue.wait_nonempty() => queue.drain(),
-        };
-        fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
-    }
-    let items = queue.drain();
-    if !items.is_empty() {
-        fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
-    }
-}
-
-/// How long one `Mode::Distributed` fan-out batch waits for outbox space
-/// across all its target peers before dropping what still does not fit.
-const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
-
-/// Groups `records` by the exact target-peer set each should replicate to —
-/// its bucket's live owners under `view`, self excluded — pure and
-/// mesh-free, so [`fan_out_by_owner_set`] and its own unit tests both build
-/// on it directly. Two records whose buckets share the same owner set land
-/// in the same group, so replicating them costs one round trip per group,
-/// not one per record.
-fn group_by_owner_set(
-    view: &OwnershipView,
-    self_node: NodeId,
-    records: Vec<WireRecord>,
-) -> Vec<(Vec<NodeId>, Vec<WireRecord>)> {
-    let mut groups: Vec<(Vec<NodeId>, Vec<WireRecord>)> = Vec::new();
-    for rec in records {
-        let bucket = bucket_of(rec.key.as_ref());
-        let mut owners: Vec<NodeId> = view
-            .owners_of(bucket)
-            .iter()
-            .copied()
-            .filter(|&n| n != self_node)
-            .collect();
-        owners.sort_unstable();
-        match groups.iter_mut().find(|(peers, _)| *peers == owners) {
-            Some((_, recs)) => recs.push(rec),
-            None => groups.push((owners, vec![rec])),
-        }
-    }
-    groups
-}
-
-/// Encodes each of `msgs` into an [`OutFrame`], dropping (and logging) any
-/// that fails to encode — the one fan-out encoding policy every send site
-/// in this module shares.
-fn encode_frames(msgs: Vec<Msg>) -> Vec<OutFrame> {
-    msgs.into_iter()
-        .filter_map(|msg| match OutFrame::new(msg) {
-            Ok(frame) => Some(frame),
-            Err(error) => {
-                tracing::warn!(%error, "failed to encode outbound message; dropped");
-                None
-            }
-        })
-        .collect()
-}
-
-/// Groups `records` by the exact target-peer set each should replicate to —
-/// its bucket's live owners under `view`, self excluded — then sends each
-/// group as `ForwardBatch` frames stamped with `view`'s hash through the
-/// mesh's existing per-peer outboxes ([`Mesh::send_frames_awaiting`],
-/// waiting for space rather than dropping on overflow, since a forwarded
-/// write's only copy is the frame). The single function both an owner's
-/// normal fan-out and a non-owner's forwarded writes route through: "group
-/// by owner set instead of broadcast" has one implementation, not two.
-async fn fan_out_by_owner_set(
-    mesh: &Mesh,
-    cache_name: &SmolStr,
-    view: &OwnershipView,
-    self_node: NodeId,
-    records: Vec<WireRecord>,
-) {
-    let deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
-    for (owners, recs) in group_by_owner_set(view, self_node, records) {
-        if owners.is_empty() {
-            continue;
-        }
-        let frames = encode_frames(batch_forward(cache_name, view.view_hash(), 0, recs));
-        for peer in owners {
-            mesh.send_frames_awaiting(peer, frames.clone(), deadline)
-                .await;
-        }
-    }
-}
-
-#[allow(
-    clippy::too_many_lines,
-    reason = "one branch per Mode, each with its own send path"
-)]
-async fn fan_out_batch<K, V>(
-    shard: &Shard<K, V>,
-    cluster: &Cluster,
-    cache_name: &SmolStr,
-    mode: Mode,
-    notified: Vec<FanOutItem<K>>,
-) where
-    K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-{
-    // The queue carries local writes (every mode) and, under
-    // `Mode::Distributed`, forwarded non-owner writes. This only dedups the
-    // drained burst's applied keys; a forwarded record is used as-is, never
-    // re-fetched — there is nothing to re-fetch.
-    let mut seen: HashSet<K> = HashSet::new();
-    let mut applied_keys: Vec<K> = Vec::new();
-    let mut forwarded: Vec<WireRecord> = Vec::new();
-    for item in notified {
-        match item {
-            FanOutItem::Applied(key) => {
-                if seen.insert(key.clone()) {
-                    applied_keys.push(key);
-                }
-            }
-            FanOutItem::Forward(rec) => forwarded.push(rec),
-        }
-    }
-    if applied_keys.is_empty() && forwarded.is_empty() {
-        return;
-    }
-
-    // Re-fetches applied keys through `Shard::records_for_typed` rather
-    // than carrying the `Hlc`/wire bytes on `Event` itself. A missing key
-    // on re-fetch means a later write or GC already covers it, so nothing
-    // stale needs fanning out. A forwarded record was never applied
-    // locally, so it travels exactly as built.
-    let mut records = shard.records_for_typed(&applied_keys).await;
-    let applied_keys_bytes: HashSet<Bytes> = records.iter().map(|rec| rec.key.clone()).collect();
-    records.extend(forwarded);
-    if records.is_empty() {
-        return;
-    }
-
-    if let Mode::Distributed { .. } = mode {
-        let Some(view) = shard.ownership_view() else {
-            return;
-        };
-        // A write forwarded while this node did not own its bucket, whose
-        // bucket this node owns by the time the queue drains, lands here
-        // too: sending it only to the other owners, or to nobody when this
-        // node is the sole owner, would lose the one copy that exists.
-        let mine: Vec<WireRecord> = records
-            .iter()
-            .filter(|rec| {
-                view.owns(bucket_of(rec.key.as_ref()))
-                    && !applied_keys_bytes.contains(rec.key.as_ref())
-            })
-            .cloned()
-            .collect();
-        if !mine.is_empty() {
-            shard.apply_remote_batch(mine).await;
-        }
-        fan_out_by_owner_set(
-            cluster.mesh(),
-            cache_name,
-            &view,
-            cluster.node_id(),
-            records,
-        )
-        .await;
-        return;
-    }
-
-    let peers = cluster.live_peer_ids();
-    match mode {
-        // Distributed is handled, and returned, above.
-        Mode::Local | Mode::Distributed { .. } => (),
-        Mode::Invalidation => {
-            // No value ever rides an invalidation, so there is nothing a
-            // low-protocol peer could misdecode: every peer gets the same
-            // frames, exactly as before.
-            let frames = encode_frames(
-                records
-                    .into_iter()
-                    .map(|rec| Msg::Invalidate {
-                        cache: cache_name.clone(),
-                        key: rec.key,
-                        ver: rec.ver,
-                    })
-                    .collect(),
-            );
-            for &peer in &peers {
-                cluster
-                    .mesh()
-                    .send_frames(peer, MsgClass::Invalidate, frames.iter().cloned());
-            }
-        }
-        // Pre-batched by the same budget/count rules `net::conn`'s writer
-        // uses for coalescing, so a drained burst can't flood the outbox
-        // into drop-newest. The writer-side coalescer still catches trickle
-        // writes arriving one drained event at a time.
-        Mode::Replicated => {
-            let frames = encode_frames(batch_replicate(cache_name, records));
-            for &peer in &peers {
-                cluster
-                    .mesh()
-                    .send_frames(peer, MsgClass::Replicate, frames.iter().cloned());
-            }
-        }
-    }
-}
-
 /// Periodically garbage-collects one shard's expired tombstones and flushes
-/// pending housekeeping via `ShardOps::run_pending_tasks`. Runs at a quarter
-/// of `tombstone_ttl` so a tombstone is never held much past its deadline.
-///
+/// pending housekeeping via `ShardOps::run_pending_tasks`, at a quarter of
+/// `tombstone_ttl` so a tombstone is never held much past its deadline.
 /// `mode` and `absence` decide each tick whether collection past
-/// `tombstone_ttl` defers via [`absence::should_defer_gc`]: while a
-/// recently known member is absent, a `Mode::Replicated` tombstone survives
-/// up to `tombstone_max_ttl`, so that member can't resurrect the entry on
-/// return. A `Mode::Distributed` cache narrows the same rule to an absent
-/// member that currently co-owns at least one bucket this node also owns,
-/// read off `shard`'s own current ownership view each tick.
-/// `Mode::Local`/`Mode::Invalidation` never defer.
+/// `tombstone_ttl` defers via [`absence::should_defer_gc`]: a
+/// `Mode::Replicated` tombstone survives up to `tombstone_max_ttl` while any
+/// recently known member is absent; `Mode::Distributed` narrows that to an
+/// absent co-owner of a bucket this node also owns.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
@@ -1689,247 +1460,13 @@ pub(crate) async fn tombstone_gc_task(
     let mut ticker = tokio::time::interval(period);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            _ = ticker.tick() => {
-                shard.run_pending_tasks().await;
-                let view = shard.ownership_view();
-                let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl, view.as_deref());
-                shard.gc_tombstones(defer).await;
-            }
+        if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+            return;
         }
-    }
-}
-
-/// Whether writer `w` is eligible for CRDT retirement this tick: `w`'s
-/// node is dead — see
-/// [`membership::incarnation_is_dead`] — and `w` isn't `local`, this node's
-/// own current writer identity. The second guard is defense in depth: a
-/// live node's own current incarnation is already unreachable through
-/// `incarnation_is_dead` (it can be neither absent nor live under a
-/// different incarnation than itself), but keeping the check explicit
-/// means the invariant holds even if that stops being incidentally true.
-fn crdt_writer_is_retirement_eligible(
-    local: crdt::WriterId,
-    w: crdt::WriterId,
-    member: &membership::MemberView,
-    now: Instant,
-    bound: Duration,
-) -> bool {
-    w != local && membership::incarnation_is_dead(member, w.incarnation(), now, bound)
-}
-
-/// Whether an entire cache is quiet this tick: every member relevant to
-/// it has settled — see
-/// [`membership::member_is_quiet`] — meaning continuously present, or
-/// continuously gone, for at least `bound`. Vacuously `true` for a cache
-/// with no other known members (including the single-node case).
-///
-/// Only stage two of [`crdt::PnCounter::compact`]/[`crdt::OrSet::compact`]
-/// (folding an aged retired writer into the bounded scalar/dropping its
-/// `seen` watermark) reads this; stage one — moving a dead writer's live
-/// slot into its own per-writer retired entry — runs unconditionally on
-/// `retire` alone.
-fn crdt_cache_is_quiet(members: &[membership::MemberView], now: Instant, bound: Duration) -> bool {
-    members
-        .iter()
-        .all(|member| membership::member_is_quiet(member, now, bound))
-}
-
-/// Every [`membership::MemberView`] the CRDT compaction sweep for `name`
-/// treats as relevant this tick: every live peer that currently has `name`
-/// open, plus every member `absence` currently tracks gone at all, whether
-/// it crashed or departed gracefully — live-holder scoped, gone-global:
-/// absence is tracked per-member globally, not per-(member, cache), so one
-/// gone member holds every merging cache's quiet check pending, not just
-/// the ones it had open.
-fn crdt_cache_members(
-    peers: &[Peer],
-    modes: &CacheModes,
-    name: &SmolStr,
-    absence: &absence::AbsenceTracker,
-) -> Vec<membership::MemberView> {
-    let live = peers
-        .iter()
-        .filter(|peer| {
-            modes
-                .get(&peer.node)
-                .is_some_and(|caches| caches.contains_key(name))
-        })
-        .map(|peer| membership::MemberView {
-            known_since: absence.known_since(peer.node),
-            present_since: absence.present_since(peer.node),
-            absent_since: None,
-            live_incarnation: Some(peer.incarnation),
-        });
-    // `Duration::ZERO` makes every currently-tracked gone member match,
-    // non-destructively (`AbsenceTracker::gone_longer_than`'s own doc):
-    // this is a membership *listing*, not a retirement decision, so it must
-    // never prune.
-    let gone = absence
-        .gone_longer_than(Duration::ZERO)
-        .into_iter()
-        .map(|node| membership::MemberView {
-            known_since: absence.known_since(node),
-            present_since: None,
-            absent_since: absence.gone_since(node),
-            live_incarnation: None,
-        });
-    live.chain(gone).collect()
-}
-
-/// One pass of the CRDT writer-retirement sweep for one merging cache. Runs
-/// whenever the cache's resolver merges at all
-/// ([`ConflictResolver::merges`](crate::store::ConflictResolver::merges)
-/// via [`ShardOps::merges`]) — never gated on any peer's protocol, since
-/// no released node predates this crate's CRDT layouts and a cache with a
-/// merging resolver only ever runs on nodes that carry that resolver.
-/// Otherwise builds this tick's retirement predicate and the cache's quiet
-/// flag from the current membership/absence snapshot and hands both to
-/// [`ShardOps::compact_pass`]. Every writer the pass actually retired is
-/// counted in `sundog_crdt_retired_writers_total{cache}`; the member stays
-/// tracked gone until it returns, so the records a later tick reaches see
-/// the same death;
-/// `sundog_crdt_compactions_total{cache}` counts records rewritten this
-/// pass.
-///
-/// Returns exactly what [`ShardOps::compact_pass`] returned (or `(vec![],
-/// 0)` for a non-merging cache), so a test can observe a single pass's
-/// outcome directly instead of scraping global metrics state. Split out
-/// from [`crdt_compact_task`]'s ticker loop for the same reason: a test can
-/// drive exactly one pass at a time without waiting on a real timer.
-async fn crdt_compact_tick(
-    shard: &dyn ShardOps,
-    name: &SmolStr,
-    cluster: &Cluster,
-    absence: &absence::AbsenceTracker,
-    bounds: CompactionBounds,
-) -> (Vec<crdt::WriterId>, usize) {
-    if !shard.merges() {
-        return (Vec::new(), 0);
-    }
-    let peers = cluster.peers();
-    let modes = cluster.inner.membership.cache_modes().borrow().clone();
-
-    let retire_after = cluster.config().crdt_retire_after;
-    let batch = cluster.config().crdt_compact_batch;
-    absence.prune_gone_older_than(Duration::from_millis(bounds.receipt_ttl_ms));
-    let now = Instant::now();
-    let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
-    // Seeded with this node's own current incarnation, not just its peers':
-    // `Cluster::peers()` excludes self by construction, so without this a
-    // node could never tell its *own* past incarnations (same `NodeId`, an
-    // earlier `local_incarnation()` from before a restart) apart from a
-    // writer it has genuinely never observed — the "never observed" branch
-    // below always answers "not dead" once, and a node is never absent from
-    // its own point of view to ever fall back to the absence check either.
-    // A node's own current incarnation is always known with certainty, no
-    // membership round-trip required, so every one of its own past
-    // incarnations is unconditionally eligible the moment it holds a newer
-    // one live — the same "any difference counts" rule
-    // [`membership::incarnation_is_dead`] already applies to every peer.
-    // Left unfixed, a node's own dead incarnations never fold locally, and
-    // since the node keeps taking part in ordinary anti-entropy, its
-    // perpetually unfolded copy keeps re-merging its old writer slots back
-    // into every peer's already-compacted copy of the same record.
-    let mut live_incarnation: HashMap<NodeId, u64> = peers
-        .iter()
-        .map(|peer| (peer.node, peer.incarnation))
-        .collect();
-    live_incarnation.insert(cluster.node_id(), cluster.local_incarnation());
-
-    let members = crdt_cache_members(&peers, &modes, name, absence);
-    let quiet = crdt_cache_is_quiet(&members, now, retire_after);
-
-    let retire = |w: crdt::WriterId| {
-        let member = match live_incarnation.get(&w.node()) {
-            Some(&incarnation) => membership::MemberView {
-                known_since: None,
-                present_since: None,
-                absent_since: None,
-                live_incarnation: Some(incarnation),
-            },
-            None => membership::MemberView {
-                known_since: None,
-                present_since: None,
-                absent_since: absence.gone_since(w.node()),
-                live_incarnation: None,
-            },
-        };
-        crdt_writer_is_retirement_eligible(local, w, &member, now, retire_after)
-    };
-
-    // The whole keyspace, `batch` records per call and a yield between
-    // calls so a large cache never pins the executor: one tick retires a
-    // dead writer everywhere, rather than `batch` records per period.
-    let mut retired: Vec<crdt::WriterId> = Vec::new();
-    let mut compacted = 0usize;
-    let mut stripes_visited = 0usize;
-    loop {
-        let outcome = shard
-            .compact_pass(now_ms(), &retire, quiet, bounds, batch)
-            .await;
-        for writer in outcome.retired {
-            if !retired.contains(&writer) {
-                retired.push(writer);
-            }
-        }
-        compacted += outcome.compacted;
-        stripes_visited += outcome.stripes_visited;
-        if sweep_is_complete(stripes_visited, outcome.stripes_visited) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    for _ in &retired {
-        metrics::counter!("sundog_crdt_retired_writers_total", "cache" => name.to_string())
-            .increment(1);
-    }
-    if compacted > 0 {
-        metrics::counter!("sundog_crdt_compactions_total", "cache" => name.to_string())
-            .increment(u64::try_from(compacted).unwrap_or(u64::MAX));
-    }
-    (retired, compacted)
-}
-
-/// Whether one tick's sweep has examined the whole keyspace: the stripes
-/// its `compact_pass` calls walked add up to every stripe, or the last
-/// call walked none (an empty budget, or a shard that never compacts).
-fn sweep_is_complete(stripes_visited: usize, last_call_stripes: usize) -> bool {
-    last_call_stripes == 0 || stripes_visited >= crate::store::BUCKET_COUNT
-}
-
-/// Periodically runs [`crdt_compact_tick`] for one merging cache, at a
-/// quarter of `ClusterConfig::crdt_retire_after` (floored at 30s, the same
-/// cadence idea [`tombstone_gc_task`] uses): retirement eligibility, not
-/// raw traffic, is what changes over time here, so there's no need to poll
-/// faster than absence tracking itself changes. The first tick fires
-/// immediately, so a freshly opened cache does not wait a full period for
-/// its first sweep. Ticks need no alignment across replicas: a fold
-/// receipt one replica pruned is dropped again by every merge apply on
-/// its peers ([`crate::store::ConflictResolver::settle`]), and a compacted
-/// record's version is minted from the stale one, so replicas that
-/// compact the same bytes agree on the result whenever they get to it.
-pub(crate) async fn crdt_compact_task(
-    shard: Arc<dyn ShardOps>,
-    name: SmolStr,
-    cluster: Cluster,
-    absence: absence::AbsenceTracker,
-    cancel: CancellationToken,
-) {
-    let period = cluster.config().crdt_sweep_period();
-    let bounds = cluster.config().crdt_compaction_bounds();
-    let mut wait = Duration::ZERO;
-    loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(wait) => {
-                crdt_compact_tick(shard.as_ref(), &name, &cluster, &absence, bounds).await;
-                wait = period;
-            }
-        }
+        shard.run_pending_tasks().await;
+        let view = shard.ownership_view();
+        let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl, view.as_deref());
+        shard.gc_tombstones(defer).await;
     }
 }
 
@@ -1951,13 +1488,10 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return,
-            _ = ticker.tick() => {
-                gauge.set(entry_count_f64(shard.entry_count().await));
-            }
+        if cancel.run_until_cancelled(ticker.tick()).await.is_none() {
+            return;
         }
+        gauge.set(entry_count_f64(shard.entry_count().await));
     }
 }
 
@@ -1973,69 +1507,29 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::test_support::{
+        loopback_config, registered_shard, wait_for_no_peers, wait_for_peer_count, wait_until,
+    };
     use super::*;
-    use crate::cache::Cache;
     use crate::error::CacheError;
+    use crate::store::crdt;
     use crate::store::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver};
     use crate::store::{ConflictResolver, Event, Origin, RecordView, Winner};
 
-    /// Loopback-only config: skips the outbound-interface probe and keeps
-    /// anti-entropy/tombstone timing tight for fast, deterministic tests.
-    fn loopback_config() -> ClusterConfig {
-        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        ClusterConfig {
-            gossip_bind_addr: loopback,
-            data_bind_addr: loopback,
-            ae_interval: Duration::from_millis(200),
-            tombstone_ttl: Duration::from_secs(2),
-            // A one-second first-peer grace, so a lone node opens fast.
-            state_transfer_budget: Duration::from_secs(5),
-            ..ClusterConfig::default()
-        }
-    }
-
-    async fn wait_for_peer_count(cluster: &Cluster, expected: usize) {
-        let mut peers = cluster.inner.membership.peers();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if peers.borrow().len() >= expected {
-                    return;
-                }
-                if peers.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-        .await
-        .expect("peers converge within the bound");
-    }
-
-    /// Waits until `cluster`'s live peer set is empty, for a departure or
-    /// crash scenario the failure detector needs a little time to notice.
-    async fn wait_for_no_peers(cluster: &Cluster) {
-        let mut peers = cluster.inner.membership.peers();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if peers.borrow().is_empty() {
-                    return;
-                }
-                if peers.changed().await.is_err() {
-                    return;
-                }
-            }
-        })
-        .await
-        .expect("the peer disappears from the live set within the bound");
-    }
-
-    #[tokio::test]
-    async fn local_incarnation_matches_the_membership_local_peer() {
-        let cluster = Cluster::builder("cluster-it-local-incarnation")
+    /// A single-node cluster over loopback, the common case for a test that
+    /// needs no peers at all.
+    async fn solo_cluster(name: &str) -> Cluster {
+        Cluster::builder(name)
             .seeds(std::iter::empty())
             .config(loopback_config())
             .build()
             .await
-            .expect("build succeeds");
+            .expect("build succeeds")
+    }
+
+    #[tokio::test]
+    async fn local_incarnation_matches_the_membership_local_peer() {
+        let cluster = solo_cluster("cluster-it-local-incarnation").await;
 
         assert_eq!(
             cluster.local_incarnation(),
@@ -2052,12 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_node_cluster_forms_with_no_seeds_and_local_cache_round_trips() {
-        let cluster = Cluster::builder("cluster-it-single")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds even with nobody else on the seed list");
+        let cluster = solo_cluster("cluster-it-single").await;
 
         let cache = cluster
             .cache::<u32, String>("solo")
@@ -2073,12 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_insert_sync_and_get_sync_round_trip_with_no_await() {
-        let cluster = Cluster::builder("cluster-it-insert-sync")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-insert-sync").await;
         let cache = cluster
             .cache::<u32, String>("solo")
             .mode(Mode::Local)
@@ -2094,12 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_contains_key_sync_and_remove_sync_agree_with_their_async_twins() {
-        let cluster = Cluster::builder("cluster-it-contains-remove-sync")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-contains-remove-sync").await;
         let cache = cluster
             .cache::<u32, String>("solo")
             .mode(Mode::Local)
@@ -2119,12 +1598,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_for_each_key_visits_the_same_set_as_keys() {
-        let cluster = Cluster::builder("cluster-it-for-each-key")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-for-each-key").await;
         let cache = cluster
             .cache::<u32, String>("solo")
             .mode(Mode::Local)
@@ -2149,12 +1623,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_rejects_replicated_mode_combined_with_a_finite_max_capacity() {
-        let cluster = Cluster::builder("cluster-it-replicated-capacity-guard")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-replicated-capacity-guard").await;
 
         match cluster
             .cache::<u32, String>("bounded")
@@ -2163,7 +1632,9 @@ mod tests {
             .open()
             .await
         {
-            Err(CacheError::ReplicatedWithLocalEviction { cache }) => assert_eq!(cache, "bounded"),
+            Err(CacheError::ReplicatedWithLocalEviction { cache }) => {
+                assert_eq!(cache, "bounded");
+            }
             other => panic!(
                 "expected ReplicatedWithLocalEviction, got {:?}",
                 other.map(|_| ())
@@ -2175,12 +1646,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_rejects_replicated_mode_combined_with_tti() {
-        let cluster = Cluster::builder("cluster-it-replicated-tti-guard")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-replicated-tti-guard").await;
 
         let err = cluster
             .cache::<u32, String>("idle-bounded")
@@ -2208,7 +1674,7 @@ mod tests {
             .build()
             .await
             .expect_err("max_frame above the wire cap must be rejected at build() time");
-        assert!(matches!(err, JoinError::InvalidConfig(_)));
+        assert!(matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("max_frame")));
     }
 
     #[tokio::test]
@@ -2222,17 +1688,15 @@ mod tests {
             .build()
             .await
             .expect_err("a sketch wider than max_frame must be rejected at build() time");
-        assert!(matches!(err, JoinError::InvalidConfig(_)), "{err:?}");
+        assert!(
+            matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("ae_sketch_cells")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
     async fn cache_and_cluster_debug_impls_surface_identifying_fields() {
-        let cluster = Cluster::builder("cluster-it-debug-fmt")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-debug-fmt").await;
         let cache = cluster
             .cache::<u32, String>("debug-fmt")
             .open()
@@ -2249,12 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_name_returns_the_opened_name() {
-        let cluster = Cluster::builder("cluster-it-cache-name")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-cache-name").await;
 
         let cache = cluster
             .cache::<u32, String>("named-cache")
@@ -2268,12 +1727,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_cache_with_weigher_and_ttl_stays_bounded_and_expires() {
-        let cluster = Cluster::builder("cluster-it-weigher-ttl")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-weigher-ttl").await;
 
         let cache = cluster
             .cache::<u32, Vec<u8>>("weighed")
@@ -2325,12 +1779,7 @@ mod tests {
     #[tokio::test]
     async fn cache_opened_with_a_custom_resolver_keeps_the_longer_value_over_a_newer_shorter_remote_write()
      {
-        let cluster = Cluster::builder("cluster-it-custom-resolver")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-custom-resolver").await;
 
         let cache = cluster
             .cache::<u32, Vec<u8>>("resolved")
@@ -2479,18 +1928,13 @@ mod tests {
     /// unit tests: opens a real `Cache<String, OrSet<String>>` and drives
     /// it through `insert`/`merge`/`get`, exercising the generic
     /// `postcard::to_stdvec::<V>`/`from_bytes::<V>` path `Shard`/`Cache`
-    /// actually store and read values through — not `OrSet::encode`/
+    /// actually store and read values through, not `OrSet::encode`/
     /// `decode` called directly, as every lower-level `or_set` test does.
     /// `OrSet<T>` carries no `#[derive(Serialize, Deserialize)]`; its own
     /// hand-rolled impls are what this path depends on.
     #[tokio::test]
     async fn or_set_cache_round_trips_through_the_generic_serde_path() {
-        let cluster = Cluster::builder("cluster-it-crdt-orset")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-crdt-orset").await;
         let cache = cluster
             .cache::<String, OrSet<String>>("os")
             .mode(Mode::Replicated)
@@ -2524,7 +1968,7 @@ mod tests {
     /// replace, loses updates under the default [`LwwResolver`] even
     /// though every node's write lands. The three reads below are staged
     /// to happen before any of the three writes rather than raced against
-    /// each other, so the loss this demonstrates is deterministic — never
+    /// each other, so the loss this demonstrates is deterministic, never
     /// a matter of which write happens to land first.
     #[tokio::test]
     async fn get_then_insert_read_modify_write_loses_updates_under_the_default_lww_resolver() {
@@ -2588,7 +2032,7 @@ mod tests {
         // Three concurrent "+1"s from a shared base of 0 sum to 3 if none
         // are lost. Every write here carries the same value (1), so
         // whichever one LWW keeps, the converged total is 1 regardless of
-        // arrival order — the other two increments are gone.
+        // arrival order: the other two increments are gone.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let vals = [
@@ -2613,12 +2057,7 @@ mod tests {
 
     #[tokio::test]
     async fn reopening_the_same_cache_name_fails_cleanly() {
-        let cluster = Cluster::builder("cluster-it-reopen")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-reopen").await;
 
         let _first = cluster
             .cache::<u32, String>("dup")
@@ -2635,12 +2074,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_a_cache_clears_its_local_mode_and_warmth_and_frees_the_name() {
-        let cluster = Cluster::builder("cluster-it-close-clears-state")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-close-clears-state").await;
 
         let name = SmolStr::new("closable");
         let cache = cluster
@@ -2691,12 +2125,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_handle_survives_shutdown_without_panicking() {
-        let cluster = Cluster::builder("cluster-it-shutdown")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-shutdown").await;
         let cache = cluster
             .cache::<u32, String>("post-shutdown")
             .open()
@@ -2713,9 +2142,19 @@ mod tests {
     }
 
     async fn two_node_cluster(cluster_name: &str) -> (Cluster, Cluster) {
+        two_node_cluster_with_config(cluster_name, loopback_config()).await
+    }
+
+    /// A fresh two-node loopback pair on `config`, joined and converged
+    /// before this returns: `b` seeds off `a`'s gossip address, then both
+    /// see one live peer.
+    async fn two_node_cluster_with_config(
+        cluster_name: &str,
+        config: ClusterConfig,
+    ) -> (Cluster, Cluster) {
         let cluster_a = Cluster::builder(cluster_name)
             .seeds(std::iter::empty())
-            .config(loopback_config())
+            .config(config.clone())
             .build()
             .await
             .expect("node a builds");
@@ -2723,7 +2162,7 @@ mod tests {
 
         let cluster_b = Cluster::builder(cluster_name)
             .seeds([gossip_a])
-            .config(loopback_config())
+            .config(config)
             .build()
             .await
             .expect("node b builds");
@@ -2754,20 +2193,17 @@ mod tests {
     /// Polls until `cluster` sees a live peer advertising `cache` under some
     /// [`Mode`]. Needed before a second `open()`, or it could race the first.
     async fn wait_for_cache_advertised(cluster: &Cluster, cache: &str) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if cluster
+        wait_until(
+            Duration::from_secs(15),
+            "peer's cache-mode advertisement converges within the bound",
+            async || {
+                cluster
                     .advertised_cache_modes()
                     .values()
                     .any(|caches| caches.contains_key(cache))
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("peer's cache-mode advertisement converges within the bound");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2918,20 +2354,17 @@ mod tests {
             "a never re-registers the closed cache on its own"
         );
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if !cluster_b
+        wait_until(
+            Duration::from_secs(10),
+            "b stops seeing a advertise the closed cache within a few gossip intervals",
+            async || {
+                !cluster_b
                     .advertised_cache_modes()
                     .values()
                     .any(|caches| caches.contains_key("orders"))
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("b stops seeing a advertise the closed cache within a few gossip intervals");
+            },
+        )
+        .await;
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
@@ -3114,18 +2547,16 @@ mod tests {
             .await
             .expect("a removes a batch");
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
+        wait_until(
+            Duration::from_secs(10),
+            "the removal reaches b and the fill reaches a within the bound",
+            async || {
                 let removed_on_b =
                     !cache_b.contains_key(&1).await && !cache_b.contains_key(&2).await;
-                if removed_on_b && cache_a.contains_key(&6).await {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the removal reaches b and the fill reaches a within the bound");
+                removed_on_b && cache_a.contains_key(&6).await
+            },
+        )
+        .await;
 
         tokio::time::sleep(Duration::from_millis(1500)).await;
         for cache in [&cache_a, &cache_b] {
@@ -3253,16 +2684,12 @@ mod tests {
             .await
             .expect("a writes a newer version");
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if cache_b.get(&1).await.is_none() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("b's stale copy is invalidated within the bound");
+        wait_until(
+            Duration::from_secs(10),
+            "b's stale copy is invalidated within the bound",
+            async || cache_b.get(&1).await.is_none(),
+        )
+        .await;
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
@@ -3271,12 +2698,7 @@ mod tests {
     #[tokio::test]
     async fn a_lone_node_waits_the_first_peer_grace_and_then_opens_warm() {
         let name = SmolStr::new("users");
-        let cluster = Cluster::builder("cluster-it-origin-grace")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-origin-grace").await;
         let started = tokio::time::Instant::now();
         let _cache = cluster
             .cache::<u32, String>("users")
@@ -3342,12 +2764,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_and_invalidation_caches_are_warm_the_moment_they_open() {
-        let cluster = Cluster::builder("cluster-it-warmth-modes")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-warmth-modes").await;
         let _local = cluster
             .cache::<u32, String>("local")
             .mode(Mode::Local)
@@ -3370,26 +2787,13 @@ mod tests {
     async fn a_joiner_reconciles_with_every_peer_after_its_snapshot() {
         // Anti-entropy far apart, so only the reconcile step that follows a
         // snapshot can close the gap within the test.
-        let slow_ae = || {
-            let mut config = loopback_config();
-            config.ae_interval = Duration::from_secs(60);
-            config
+        let slow_ae = ClusterConfig {
+            ae_interval: Duration::from_secs(60),
+            ..loopback_config()
         };
-        let cluster_a = Cluster::builder("cluster-it-reconcile-all")
-            .seeds(std::iter::empty())
-            .config(slow_ae())
-            .build()
-            .await
-            .expect("node a builds");
+        let (cluster_a, cluster_b) =
+            two_node_cluster_with_config("cluster-it-reconcile-all", slow_ae.clone()).await;
         let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
-        let cluster_b = Cluster::builder("cluster-it-reconcile-all")
-            .seeds([gossip_a])
-            .config(slow_ae())
-            .build()
-            .await
-            .expect("node b builds");
-        wait_for_peer_count(&cluster_a, 1).await;
-        wait_for_peer_count(&cluster_b, 1).await;
         let cache_a = cluster_a
             .cache::<u32, String>("users")
             .mode(Mode::Replicated)
@@ -3422,7 +2826,7 @@ mod tests {
         let gossip_b = cluster_b.inner.membership.local_peer().gossip_addr;
         let cluster_c = Cluster::builder("cluster-it-reconcile-all")
             .seeds([gossip_a, gossip_b])
-            .config(slow_ae())
+            .config(slow_ae)
             .build()
             .await
             .expect("node c builds");
@@ -3446,12 +2850,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_transfer_warms_a_late_joiner_from_the_existing_donor() {
-        let cluster_a = Cluster::builder("cluster-it-state-transfer")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("node a builds");
+        let cluster_a = solo_cluster("cluster-it-state-transfer").await;
         let cache_a = cluster_a
             .cache::<u32, String>("users")
             .mode(Mode::Replicated)
@@ -3509,32 +2908,24 @@ mod tests {
             .expect("b opens");
 
         cache_a.insert(1, "hello".into()).await.expect("a inserts");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if cache_b.get(&1).await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("live fan-out delivers the insert to b");
+        wait_until(
+            Duration::from_secs(10),
+            "live fan-out delivers the insert to b",
+            async || cache_b.get(&1).await.is_some(),
+        )
+        .await;
 
         // Simulate a dropped `Replicate` message: wipe B's copy without a
         // tombstone. Only anti-entropy can bring it back.
         cache_b.invalidate_local(&1).await;
         assert_eq!(cache_b.get(&1).await, None);
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if cache_b.get(&1).await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("anti-entropy repairs the dropped entry within a few rounds");
+        wait_until(
+            Duration::from_secs(10),
+            "anti-entropy repairs the dropped entry within a few rounds",
+            async || cache_b.get(&1).await.is_some(),
+        )
+        .await;
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
@@ -3594,8 +2985,6 @@ mod tests {
         u16::try_from(bucket).expect("masked to BUCKET_COUNT - 1, always fits in u16")
     }
 
-    // --- Distribution mode fan-out grouping (`cluster::group_by_owner_set`) ---
-
     /// A `WireRecord` for `key`, its own postcard-encoded bytes as `key`.
     fn wire_record_for_u32(key: u32) -> WireRecord {
         WireRecord {
@@ -3610,91 +2999,6 @@ mod tests {
             },
             expires_at_ms: None,
         }
-    }
-
-    /// `group_by_owner_set`'s grouping is a pure function of an
-    /// `OwnershipView` and a record list, with no `Mesh` or live cluster
-    /// involved: this is `fan_out_by_owner_set`'s own test, and the
-    /// pointed regression for "an owner's write fans out only to the
-    /// bucket's other owners, never to every live peer."
-    #[test]
-    fn insert_on_an_owner_fans_out_only_to_the_bucket_other_owners_not_every_live_peer() {
-        let self_node = NodeId::from(1);
-        let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
-        let k = std::num::NonZeroU8::new(2).expect("nonzero");
-        let view = OwnershipView::compute(self_node, eligible.clone(), k);
-
-        // Two keys in different buckets, so their owner sets can differ.
-        let key_a = 0u32;
-        let key_b = (1u32..100_000)
-            .find(|&k| bucket_of_u32(k) != bucket_of_u32(key_a))
-            .expect("a second, distinct bucket is found quickly");
-
-        let groups = group_by_owner_set(
-            &view,
-            self_node,
-            vec![wire_record_for_u32(key_a), wire_record_for_u32(key_b)],
-        );
-
-        let mut total = 0usize;
-        for (peers, recs) in &groups {
-            assert!(
-                !peers.contains(&self_node),
-                "self is never its own fan-out target"
-            );
-            assert!(
-                peers.len() < eligible.len(),
-                "a group's peer set is never every eligible/live node, only a bucket's other \
-                 owners: {peers:?}"
-            );
-            for rec in recs {
-                let key: u32 = postcard::from_bytes(&rec.key).expect("test key decodes");
-                let bucket = bucket_of_u32(key);
-                let mut expected: Vec<NodeId> = view
-                    .owners_of(bucket)
-                    .iter()
-                    .copied()
-                    .filter(|&n| n != self_node)
-                    .collect();
-                expected.sort_unstable();
-                assert_eq!(
-                    peers, &expected,
-                    "a record's group is exactly its bucket's live owners minus self"
-                );
-            }
-            total += recs.len();
-        }
-        assert_eq!(total, 2, "every record lands in exactly one group");
-    }
-
-    #[test]
-    fn group_by_owner_set_coalesces_records_sharing_the_same_owner_set() {
-        let self_node = NodeId::from(1);
-        // A single eligible peer besides self, so every bucket's owner set
-        // minus self is either empty (self is sole owner) or exactly that
-        // one peer — every non-empty group is the same peer set.
-        let eligible = vec![self_node, NodeId::from(2)];
-        let k = std::num::NonZeroU8::new(1).expect("nonzero");
-        let view = OwnershipView::compute(self_node, eligible, k);
-
-        let records: Vec<WireRecord> = (0u32..50).map(wire_record_for_u32).collect();
-        let groups = group_by_owner_set(&view, self_node, records.clone());
-
-        let non_empty_groups: Vec<_> = groups
-            .iter()
-            .filter(|(peers, _)| !peers.is_empty())
-            .collect();
-        assert!(
-            non_empty_groups.len() <= 1,
-            "with only one other eligible node, every non-empty group is the same one peer set: \
-             {non_empty_groups:?}"
-        );
-        let total: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
-        assert_eq!(
-            total,
-            records.len(),
-            "no record is lost or duplicated by grouping"
-        );
     }
 
     /// A batch routed under another view hash at hop zero re-forwards to
@@ -3717,20 +3021,20 @@ mod tests {
             !groups.is_empty(),
             "some bucket has an owner besides self and the sender"
         );
-        for (owners, recs) in &groups {
+        for group in &groups {
             assert_eq!(
-                owners.as_slice(),
+                group.owners.as_slice(),
                 [third],
                 "with three eligible nodes the only other target is the third node"
             );
-            for rec in recs {
+            for rec in &group.records {
                 assert!(
                     view.owners_of(bucket_of(rec.key.as_ref())).contains(&third),
                     "a record only re-forwards to a node that owns its bucket"
                 );
             }
         }
-        let re_forwarded: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+        let re_forwarded: usize = groups.iter().map(|g| g.records.len()).sum();
         let expected = records
             .iter()
             .filter(|rec| view.owners_of(bucket_of(rec.key.as_ref())).contains(&third))
@@ -3959,16 +3263,12 @@ mod tests {
         cache_b.invalidate_local(&target_key).await;
         assert_eq!(cache_b.get(&target_key).await, None);
 
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if cache_b.get(&target_key).await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("anti-entropy repairs the dropped entry via the part-digest path within the bound");
+        wait_until(
+            Duration::from_secs(15),
+            "anti-entropy repairs the dropped entry via the part-digest path within the bound",
+            async || cache_b.get(&target_key).await.is_some(),
+        )
+        .await;
 
         assert!(
             listing.load(Ordering::SeqCst) > 0,
@@ -4044,16 +3344,12 @@ mod tests {
         cache_b.invalidate_local(&target_key).await;
         assert_eq!(cache_b.get(&target_key).await, None);
 
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if cache_b.get(&target_key).await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("anti-entropy repairs the dropped entry via the sketch path within the bound");
+        wait_until(
+            Duration::from_secs(15),
+            "anti-entropy repairs the dropped entry via the sketch path within the bound",
+            async || cache_b.get(&target_key).await.is_some(),
+        )
+        .await;
 
         assert!(
             decoded.load(Ordering::SeqCst) > 0,
@@ -4139,20 +3435,14 @@ mod tests {
                 cache_b.invalidate_local(&key).await;
             }
 
-            tokio::time::timeout(Duration::from_secs(15), async {
-                loop {
-                    if cache_b.entry_count().await == total {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
+            wait_until(
+                Duration::from_secs(15),
+                &format!(
                     "attempt {attempt}: anti-entropy repairs every dropped entry within the bound"
-                )
-            });
+                ),
+                async || cache_b.entry_count().await == total,
+            )
+            .await;
 
             for &key in &colliding_keys {
                 assert_eq!(cache_b.get(&key).await, Some(key.to_string()));
@@ -4169,18 +3459,6 @@ mod tests {
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
-    }
-
-    /// `cluster_b`'s registered shard for `cache`, as [`anti_entropy::run_round_against`]
-    /// takes it: the same handle `Cache::open` installs in the registry.
-    fn registered_shard(cluster: &Cluster, cache: &SmolStr) -> Arc<dyn ShardOps> {
-        cluster
-            .shards()
-            .read()
-            .expect("invariant: shard registry lock is never poisoned")
-            .get(cache)
-            .cloned()
-            .expect("the cache was opened, so its shard is registered")
     }
 
     #[tokio::test]
@@ -4355,16 +3633,12 @@ mod tests {
             crate::cluster::anti_entropy::RoundOutcome::Reconciled
         );
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if cache_a.get(&extra_key).await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the push path delivers b's extra key to a within the bound");
+        wait_until(
+            Duration::from_secs(10),
+            "the push path delivers b's extra key to a within the bound",
+            async || cache_a.get(&extra_key).await.is_some(),
+        )
+        .await;
         assert_eq!(cache_a.get(&extra_key).await, Some(extra_value));
 
         cluster_a.shutdown().await;
@@ -4373,12 +3647,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_task_republishes_on_a_membership_change_and_skips_an_unchanged_hash() {
-        let cluster_a = Cluster::builder("cluster-it-refresh-task")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("a builds");
+        let cluster_a = solo_cluster("cluster-it-refresh-task").await;
         let name = SmolStr::new("prices");
         let k = std::num::NonZeroU8::new(2).expect("nonzero");
 
@@ -4447,24 +3716,14 @@ mod tests {
     #[tokio::test]
     async fn run_round_against_ends_on_stale_without_pushing_or_pulling() {
         // Two solo `Mode::Distributed` clusters, never gossip-joined to each
-        // other, so each independently computes its own view over just
-        // itself — genuinely different view hashes, since their `NodeId`s
+        // other, so each independently computes its own view over only
+        // itself: genuinely different view hashes, since their `NodeId`s
         // differ. `Mesh::update_peers` (a real, public mesh API) registers
         // `b` on `a`'s mesh directly, the deterministic way to drive a real
         // `AeDigestScoped` exchange to a real `StaleView` reply without
         // racing gossip's own convergence timing.
-        let cluster_a = Cluster::builder("cluster-it-ae-stale-a")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("node a builds");
-        let cluster_b = Cluster::builder("cluster-it-ae-stale-b")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("node b builds");
+        let cluster_a = solo_cluster("cluster-it-ae-stale-a").await;
+        let cluster_b = solo_cluster("cluster-it-ae-stale-b").await;
         let name = SmolStr::new("prices");
         let owners = std::num::NonZeroU8::new(2).expect("nonzero");
         let cache_a = cluster_a
@@ -4581,16 +3840,12 @@ mod tests {
             .insert_many((0..500u32).map(|k| (k, k.to_string())))
             .await
             .expect("a fills the cache before c ever joins");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if cache_b.entry_count().await == 500 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("b holds everything too, before c joins");
+        wait_until(
+            Duration::from_secs(10),
+            "b holds everything too, before c joins",
+            async || cache_b.entry_count().await == 500,
+        )
+        .await;
 
         let cluster_c = Cluster::builder("cluster-it-rebalance-join")
             .seeds([gossip_a])
@@ -4630,16 +3885,12 @@ mod tests {
         .expect("c's view converges to own at least one of the 500 keys' buckets");
         let displaced_cache = if a_displaced { &cache_a } else { &cache_b };
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if cache_c.get(&moved_key).await == Some(moved_key.to_string()) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("c's rebalance pull lands the moved key's value");
+        wait_until(
+            Duration::from_secs(10),
+            "c's rebalance pull lands the moved key's value",
+            async || cache_c.get(&moved_key).await == Some(moved_key.to_string()),
+        )
+        .await;
 
         // A brief, deliberate quiescence window: right after the pull lands
         // (necessarily well inside the several-hundred-millisecond disown
@@ -4652,16 +3903,12 @@ mod tests {
             "the displaced owner still resides the key mid disown-grace"
         );
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if displaced_cache.get(&moved_key).await.is_none() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the displaced owner releases the key once the disown grace elapses");
+        wait_until(
+            Duration::from_secs(10),
+            "the displaced owner releases the key once the disown grace elapses",
+            async || displaced_cache.get(&moved_key).await.is_none(),
+        )
+        .await;
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
@@ -4670,12 +3917,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_for_hashes_answers_exactly_the_records_whose_hash_matches() {
-        let cluster = Cluster::builder("cluster-it-records-for-hashes")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-records-for-hashes").await;
         let cache = cluster
             .cache::<u32, String>("users")
             .mode(Mode::Replicated)
@@ -4757,12 +3999,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines, reason = "one handler walk-through per RPC")]
     async fn cluster_request_handler_serves_a_distributed_cache_by_view_hash() {
-        let cluster = Cluster::builder("cluster-it-request-handler-distributed")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-request-handler-distributed").await;
         let cache = cluster
             .cache::<u32, String>("prices")
             .mode(Mode::Distributed {
@@ -4860,7 +4097,7 @@ mod tests {
         }
         assert!(
             got_key,
-            "st_bucket_chunks streams the requested owned bucket's contents"
+            "bucket_chunks streams the requested owned bucket's contents"
         );
 
         // A multi-bucket pull streams one bucket at a time, in request
@@ -4935,12 +4172,7 @@ mod tests {
 
     #[tokio::test]
     async fn report_mode_conflicts_logs_a_late_conflict_against_a_live_peer() {
-        let cluster = Cluster::builder("cluster-it-mode-conflict-log")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("build succeeds");
+        let cluster = solo_cluster("cluster-it-mode-conflict-log").await;
         let _cache = cluster
             .cache::<u32, String>("users")
             .mode(Mode::Replicated)
@@ -5053,9 +4285,10 @@ mod tests {
             .expect_err("a merge-derived id must never become a real node id");
         match err {
             JoinError::InvalidConfig(msg) => {
+                assert!(msg.contains("node_id"));
                 assert!(
-                    msg.contains(&derived.to_string()),
-                    "the rejection names the offending id: {msg:?}"
+                    msg.contains(&derived.as_u64().to_string()),
+                    "the rejection names the offending id"
                 );
             }
             other => panic!("expected JoinError::InvalidConfig, got {other:?}"),
@@ -5108,12 +4341,7 @@ mod tests {
     async fn graceful_shutdown_never_counts_absent_but_a_crash_does() {
         let hard_cap = Duration::from_secs(3600);
 
-        let cluster_a = Cluster::builder("cluster-it-absence-graceful-vs-crash")
-            .seeds(std::iter::empty())
-            .config(loopback_config())
-            .build()
-            .await
-            .expect("node a builds");
+        let cluster_a = solo_cluster("cluster-it-absence-graceful-vs-crash").await;
         let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
 
         // Graceful case: b leaves through `Cluster::shutdown`.
@@ -5202,988 +4430,5 @@ mod tests {
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;
-    }
-
-    // -----------------------------------------------------------------
-    // crdt_compact_task: pure decision logic.
-    // -----------------------------------------------------------------
-
-    /// `secs` seconds before `now`, for building [`membership::MemberView`]
-    /// fixtures without a real clock.
-    fn ago(now: Instant, secs: u64) -> Instant {
-        now.checked_sub(Duration::from_secs(secs))
-            .expect("test duration fits before `now`")
-    }
-
-    fn writer(node: u64, incarnation: u64) -> crdt::WriterId {
-        crdt::WriterId::new(NodeId::from(node), incarnation)
-    }
-
-    #[test]
-    fn crdt_writer_is_retirement_eligible_is_false_for_the_local_writer_even_if_absent() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(60);
-        let local = writer(1, 1);
-        // If `local` weren't excluded, this member view (absent well past
-        // the bound) would otherwise make it eligible.
-        let member = membership::MemberView {
-            known_since: None,
-            present_since: None,
-            absent_since: Some(ago(now, 3600)),
-            live_incarnation: None,
-        };
-        assert!(!crdt_writer_is_retirement_eligible(
-            local, local, &member, now, bound
-        ));
-    }
-
-    #[test]
-    fn crdt_writer_is_retirement_eligible_is_true_for_a_writer_absent_past_the_bound() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(60);
-        let local = writer(1, 1);
-        let w = writer(2, 1);
-        let member = membership::MemberView {
-            known_since: None,
-            present_since: None,
-            absent_since: Some(ago(now, 3600)),
-            live_incarnation: None,
-        };
-        assert!(crdt_writer_is_retirement_eligible(
-            local, w, &member, now, bound
-        ));
-    }
-
-    #[test]
-    fn crdt_writer_is_retirement_eligible_defers_for_a_writer_absent_less_than_the_bound() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(3600);
-        let local = writer(1, 1);
-        let w = writer(2, 1);
-        let member = membership::MemberView {
-            known_since: None,
-            present_since: None,
-            absent_since: Some(ago(now, 5)),
-            live_incarnation: None,
-        };
-        assert!(!crdt_writer_is_retirement_eligible(
-            local, w, &member, now, bound
-        ));
-    }
-
-    #[test]
-    fn crdt_writer_is_retirement_eligible_is_true_for_a_live_writer_under_a_different_incarnation()
-    {
-        let now = Instant::now();
-        let bound = Duration::from_secs(3600);
-        let local = writer(1, 1);
-        // node 2 is live, but under incarnation 9 now: incarnation 1's
-        // process is gone regardless of how recently node 2 restarted.
-        let old_w = writer(2, 1);
-        let member = membership::MemberView {
-            known_since: None,
-            present_since: Some(now),
-            absent_since: None,
-            live_incarnation: Some(9),
-        };
-        assert!(crdt_writer_is_retirement_eligible(
-            local, old_w, &member, now, bound
-        ));
-    }
-
-    #[test]
-    fn crdt_writer_is_retirement_eligible_is_false_for_a_never_observed_writer() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(60);
-        let local = writer(1, 1);
-        let w = writer(2, 1);
-        let member = membership::MemberView {
-            known_since: None,
-            present_since: None,
-            absent_since: None,
-            live_incarnation: None,
-        };
-        assert!(!crdt_writer_is_retirement_eligible(
-            local, w, &member, now, bound
-        ));
-    }
-
-    #[test]
-    fn crdt_cache_is_quiet_is_vacuously_true_with_no_members() {
-        let now = Instant::now();
-        assert!(crdt_cache_is_quiet(&[], now, Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn crdt_cache_is_quiet_is_true_when_every_member_has_settled() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(60);
-        let members = [
-            membership::MemberView {
-                known_since: None,
-                present_since: Some(ago(now, 120)),
-                absent_since: None,
-                live_incarnation: Some(1),
-            },
-            membership::MemberView {
-                known_since: None,
-                present_since: None,
-                absent_since: Some(ago(now, 120)),
-                live_incarnation: None,
-            },
-        ];
-        assert!(crdt_cache_is_quiet(&members, now, bound));
-    }
-
-    #[test]
-    fn crdt_cache_is_quiet_is_false_when_one_member_has_not_settled() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(60);
-        let members = [
-            membership::MemberView {
-                known_since: None,
-                present_since: Some(ago(now, 120)),
-                absent_since: None,
-                live_incarnation: Some(1),
-            },
-            // Recently returned/gone absent: not yet past the bound.
-            membership::MemberView {
-                known_since: None,
-                present_since: None,
-                absent_since: Some(ago(now, 5)),
-                live_incarnation: None,
-            },
-        ];
-        assert!(!crdt_cache_is_quiet(&members, now, bound));
-    }
-
-    #[test]
-    fn crdt_cache_members_scopes_live_to_cache_holders_and_absentees_globally() {
-        let cache = SmolStr::new("counters");
-        let other_cache = SmolStr::new("other");
-        let holder = NodeId::from(2);
-        let bystander = NodeId::from(3);
-        let peers = vec![
-            Peer {
-                node: holder,
-                name: NodeName::new("host", holder),
-                gossip_addr: "127.0.0.1:0".parse().expect("valid addr"),
-                data_addr: "127.0.0.1:0".parse().expect("valid addr"),
-                incarnation: 7,
-                protocol: wire::PROTOCOL_VERSION,
-            },
-            Peer {
-                node: bystander,
-                name: NodeName::new("host", bystander),
-                gossip_addr: "127.0.0.1:0".parse().expect("valid addr"),
-                data_addr: "127.0.0.1:0".parse().expect("valid addr"),
-                incarnation: 3,
-                protocol: wire::PROTOCOL_VERSION,
-            },
-        ];
-        let mut modes: CacheModes = HashMap::new();
-        modes
-            .entry(holder)
-            .or_default()
-            .insert(cache.clone(), Mode::Replicated);
-        modes
-            .entry(bystander)
-            .or_default()
-            .insert(other_cache, Mode::Replicated);
-
-        let absentee = NodeId::from(4);
-        let absence = absence::AbsenceTracker::default();
-        // `absentee` starts live, then drops out once `holder`/`bystander`
-        // are the live set: the same tracker that reports presence for the
-        // live peers also reports the absentee, exactly as it would from a
-        // real membership feed.
-        absence.observe(&HashMap::from([(
-            absentee,
-            membership::LiveFlags { departing: false },
-        )]));
-        absence.observe(&HashMap::from([
-            (holder, membership::LiveFlags { departing: false }),
-            (bystander, membership::LiveFlags { departing: false }),
-        ]));
-
-        let members = crdt_cache_members(&peers, &modes, &cache, &absence);
-        assert_eq!(
-            members.len(),
-            2,
-            "the live holder of `cache` and the global absentee, but not the \
-             bystander holding a different cache"
-        );
-        assert!(
-            members
-                .iter()
-                .any(|m| m.live_incarnation == Some(7) && m.present_since.is_some()),
-            "the live holder's own incarnation is carried through"
-        );
-        assert!(
-            members
-                .iter()
-                .any(|m| m.absent_since.is_some() && m.live_incarnation.is_none()),
-            "the absentee is carried through even though it holds no cache at all"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // crdt_compact_task: end-to-end passes against a real cluster/shard,
-    // driving `crdt_compact_tick` directly (rather than the real ticker,
-    // which floors at 30s) with a fake `AbsenceTracker` for deterministic
-    // absence state.
-    // -----------------------------------------------------------------
-
-    /// A loopback config with `retire_after` for tests that drive
-    /// `crdt_compact_tick` by hand with their own tracker: the cache's
-    /// own background sweep keeps the 30-second production floor, so it
-    /// never races the hand-driven ticks within a test's lifetime, and
-    /// the hand-driven ticks pass [`three_bounds`] themselves.
-    fn crdt_loopback_config(retire_after: Duration) -> ClusterConfig {
-        ClusterConfig {
-            crdt_retire_after: retire_after,
-            crdt_compact_batch: 100,
-            ..loopback_config()
-        }
-    }
-
-    /// The config for tests that let the real `crdt_compact_task` do the
-    /// sweeping: a sweep every quarter of `retire_after` (at least 50ms),
-    /// so a fold receipt lives a few bounds rather than the minute the
-    /// production floor would give.
-    fn crdt_task_loopback_config(retire_after: Duration) -> ClusterConfig {
-        ClusterConfig {
-            crdt_sweep_interval: Some((retire_after / 4).max(Duration::from_millis(50))),
-            ..crdt_loopback_config(retire_after)
-        }
-    }
-
-    /// The bounds a hand-driven tick passes: ticks in these tests are as
-    /// frequent as the test sleeps, so the receipt lives its plain three
-    /// bounds.
-    fn three_bounds(retire_after: Duration) -> CompactionBounds {
-        CompactionBounds::three_bounds(u64::try_from(retire_after.as_millis()).unwrap_or(u64::MAX))
-    }
-
-    /// One tick examines the whole keyspace however small the per-call
-    /// batch: eight records, a batch of one, and every record's dead writer
-    /// retired by a single `crdt_compact_tick`.
-    #[tokio::test]
-    async fn crdt_compact_tick_sweeps_the_whole_keyspace_however_small_the_batch() {
-        let retire_after = Duration::from_millis(20);
-        let cluster = Cluster::builder("cluster-it-crdt-whole-keyspace")
-            .seeds(std::iter::empty())
-            .config(ClusterConfig {
-                crdt_compact_batch: 1,
-                ..crdt_loopback_config(retire_after)
-            })
-            .build()
-            .await
-            .expect("build succeeds");
-        let name = SmolStr::new("counters");
-        let cache = open_counters_cache(&cluster, name.as_str()).await;
-        let shard = registered_shard(&cluster, &name);
-        let dead_writer = writer(999, 1);
-        for key in 0..8u32 {
-            cache
-                .insert(key, PnCounter::local_delta(dead_writer, u64::from(key) + 1))
-                .await
-                .expect("seed write");
-        }
-        let absence = absence::AbsenceTracker::default();
-        absence.observe(&HashMap::from([(
-            dead_writer.node(),
-            membership::LiveFlags { departing: false },
-        )]));
-        absence.observe(&HashMap::new());
-        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
-
-        let (retired, compacted) = crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
-        assert_eq!(retired, vec![dead_writer]);
-        assert_eq!(
-            compacted, 8,
-            "one tick rewrote all eight records, one per call"
-        );
-        for key in 0..8u32 {
-            assert_eq!(
-                cache.get(&key).await.map(|c| c.value()),
-                Some(i128::from(key) + 1),
-                "key {key} keeps its exact value"
-            );
-        }
-        cluster.shutdown().await;
-    }
-
-    #[test]
-    fn sweep_is_complete_once_every_stripe_was_walked_or_a_call_walked_none() {
-        assert!(!sweep_is_complete(crate::store::BUCKET_COUNT - 1, 3));
-        assert!(sweep_is_complete(crate::store::BUCKET_COUNT, 3));
-        assert!(sweep_is_complete(crate::store::BUCKET_COUNT + 7, 7));
-        assert!(
-            sweep_is_complete(0, 0),
-            "a call that walked nothing ends the tick"
-        );
-    }
-
-    /// A member flapping faster than the bound never settles as present or
-    /// gone; once known for two bounds it counts as settled, so it cannot
-    /// hold stage two back for every writer in the cache indefinitely.
-    #[test]
-    fn crdt_cache_is_quiet_counts_a_member_known_for_two_bounds_as_settled() {
-        let now = Instant::now();
-        let bound = Duration::from_secs(10);
-        let flapper = membership::MemberView {
-            known_since: Some(now.checked_sub(Duration::from_secs(25)).expect("recent")),
-            present_since: Some(now.checked_sub(Duration::from_secs(1)).expect("recent")),
-            absent_since: None,
-            live_incarnation: Some(3),
-        };
-        assert!(crdt_cache_is_quiet(&[flapper], now, bound));
-        let newcomer = membership::MemberView {
-            known_since: Some(now.checked_sub(Duration::from_secs(15)).expect("recent")),
-            ..flapper
-        };
-        assert!(!crdt_cache_is_quiet(&[newcomer], now, bound));
-    }
-
-    /// A member gone for longer than the receipt lifetime is forgotten by the tick:
-    /// no fold receipt reconciles a straggling copy of its writer any more,
-    /// so keeping it could only make a later retirement double count, and
-    /// forgetting it bounds the tracker under sustained restarts.
-    #[tokio::test]
-    async fn crdt_compact_tick_forgets_a_member_gone_past_the_receipt_lifetime() {
-        let retire_after = Duration::from_millis(20);
-        let cluster = Cluster::builder("cluster-it-crdt-forget-gone")
-            .seeds(std::iter::empty())
-            .config(crdt_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("build succeeds");
-        let name = SmolStr::new("counters");
-        let _cache = open_counters_cache(&cluster, name.as_str()).await;
-        let shard = registered_shard(&cluster, &name);
-        let absence = absence::AbsenceTracker::default();
-        let gone = NodeId::from(4242);
-        absence.observe(&HashMap::from([(
-            gone,
-            membership::LiveFlags { departing: false },
-        )]));
-        absence.observe(&HashMap::new());
-        tokio::time::sleep(retire_after * 2).await;
-        crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
-        assert!(
-            absence.gone_since(gone).is_some(),
-            "two bounds gone: still tracked"
-        );
-        tokio::time::sleep(retire_after * 2).await;
-        crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
-        assert!(
-            absence.gone_since(gone).is_none(),
-            "past the receipt lifetime: forgotten"
-        );
-        cluster.shutdown().await;
-    }
-
-    async fn open_counters_cache(cluster: &Cluster, name: &str) -> Cache<u32, PnCounter> {
-        cluster
-            .cache::<u32, PnCounter>(name)
-            .mode(Mode::Replicated)
-            .resolver(Arc::new(PnCounterResolver))
-            .open()
-            .await
-            .expect("open succeeds")
-    }
-
-    /// The quiet-deferral variant: stage one (moving a dead writer's slot
-    /// into its own per-writer retired entry) runs as soon as the writer is
-    /// dead, but stage two (folding a long-aged retired entry into the
-    /// bounded scalar) defers for as long as any other member of the cache
-    /// hasn't settled, even once that entry is old enough on its own.
-    #[tokio::test]
-    async fn crdt_compact_tick_defers_stage_two_folding_while_the_cache_is_not_quiet() {
-        let retire_after = Duration::from_millis(30);
-        let cluster = Cluster::builder("cluster-it-crdt-quiet-deferral")
-            .seeds(std::iter::empty())
-            .config(crdt_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("build succeeds");
-
-        let name = SmolStr::new("counters");
-        let cache = open_counters_cache(&cluster, name.as_str()).await;
-        let shard = registered_shard(&cluster, &name);
-
-        let dead_writer = writer(999, 1);
-        cache
-            .insert(1, PnCounter::local_delta(dead_writer, 5))
-            .await
-            .expect("seed write");
-
-        let absence = absence::AbsenceTracker::default();
-        absence.observe(&HashMap::from([(
-            dead_writer.node(),
-            membership::LiveFlags { departing: false },
-        )]));
-        absence.observe(&HashMap::new());
-
-        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
-
-        // Stage one: with no other known members the cache is vacuously
-        // quiet, so the dead writer's live slot moves into its own retired
-        // entry the moment it's found dead.
-        let (retired, compacted) = crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
-        assert_eq!(retired, vec![dead_writer]);
-        assert_eq!(compacted, 1);
-        assert_eq!(
-            cache.get(&1).await.map(|c| c.value()),
-            Some(5),
-            "stage one never changes the counter's value"
-        );
-
-        // Age the dead writer's retired entry well past the stage-two
-        // bound (`2 * retire_after`) *before* introducing any other
-        // member, so the only thing standing between it and stage two is
-        // the cache's quiet flag, not its own age.
-        tokio::time::sleep(retire_after * 2 + Duration::from_millis(30)).await;
-
-        // A second, freshly-unsettled member, introduced right before the
-        // next pass: its own absence age is close to zero, well under
-        // `retire_after`, so it alone holds the cache's quiet flag false —
-        // absence is tracked globally, not per-cache, so this holds every
-        // merging cache's quiet check pending, regardless of which cache
-        // `flaky` ever had open.
-        let flaky = NodeId::from(998);
-        absence.observe(&HashMap::from([(
-            flaky,
-            membership::LiveFlags { departing: false },
-        )]));
-        absence.observe(&HashMap::new());
-
-        // The dead writer's retired entry is now old enough for stage two,
-        // but `flaky` hasn't settled yet, so the cache stays not-quiet and
-        // stage two must defer.
-        let (retired, compacted) = crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
-        assert!(
-            retired.is_empty(),
-            "no writer newly enters stage one this pass"
-        );
-        assert_eq!(
-            compacted, 0,
-            "stage two defers while the cache is not quiet"
-        );
-
-        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
-
-        // `flaky` has now itself been continuously absent past the bound,
-        // settling it: the cache is quiet and stage two folds the
-        // long-aged retired entry into the bounded scalar accumulator.
-        let (retired, compacted) = crdt_compact_tick(
-            shard.as_ref(),
-            &name,
-            &cluster,
-            &absence,
-            three_bounds(retire_after),
-        )
-        .await;
-        assert!(retired.is_empty());
-        assert_eq!(
-            compacted, 1,
-            "stage two runs once the cache settles: this pass's own change is exactly \
-             what was deferred above"
-        );
-        // `ShardOps::compact_pass` applies stage two's folded bytes via
-        // `Engine::compact_replace_if_current` — a version-gated direct
-        // replace, never a merge against the still-resident pre-fold
-        // bytes — so the folded value this pass produced is exactly what
-        // is now resident, with nothing to reconcile.
-        assert_eq!(
-            cache.get(&1).await.map(|c| c.value()),
-            Some(5),
-            "stage two's own fold never changes the counter's value"
-        );
-
-        cluster.shutdown().await;
-    }
-
-    /// A node's own past incarnation (same [`NodeId`] as this very node,
-    /// under an incarnation earlier than [`Cluster::local_incarnation`] —
-    /// the shape a persisted-node-id restart or replacement leaves behind)
-    /// retires and folds away with no peers and no absence tracking
-    /// involved at all: `Cluster::peers()` excludes self by construction,
-    /// so a node can never learn its own dead past selves are dead through
-    /// the peer-liveness or absence-tracking paths a genuine peer's writer
-    /// identity uses. Left unseeded, `retire` for such a writer falls into
-    /// the "never observed" branch every single pass and never retires it
-    /// locally — meaning it never compacts on this node's own copy even
-    /// though this very node is certain of its own current incarnation with
-    /// no round-trip required, and every other replica this node talks to
-    /// via ordinary anti-entropy keeps having its own, already-compacted
-    /// copy of the record re-polluted with this one's permanently-live old
-    /// writer slot.
-    ///
-    /// Drives `crdt_compact_tick` directly, several times over, rather than
-    /// asserting on any one call's own return value: this exact writer
-    /// shape needs no absence wait at all, so the cluster's own
-    /// automatically-spawned `crdt_compact_task` (started the moment the
-    /// cache opens, ticking immediately) races this test's manual calls for
-    /// the very same pass — whichever wins a given stage is immaterial,
-    /// since both read this fix's same corrected `live_incarnation` map, so
-    /// only the converged, observable outcome across every task combined is
-    /// asserted.
-    #[tokio::test]
-    async fn crdt_compact_tick_retires_this_nodes_own_past_incarnation_with_no_peers_at_all() {
-        let retire_after = Duration::from_millis(20);
-        let cluster = Cluster::builder("cluster-it-crdt-self-past-incarnation")
-            .seeds(std::iter::empty())
-            .config(crdt_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("build succeeds");
-
-        let name = SmolStr::new("counters");
-        let cache = open_counters_cache(&cluster, name.as_str()).await;
-        let shard = registered_shard(&cluster, &name);
-
-        // A stale `WriterId` under this very node's own id, one incarnation
-        // behind the current one: exactly what a fresh incarnation minted
-        // after a restart under the same persisted `NodeId` leaves behind
-        // in a still-resident record.
-        let stale_self = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation() - 1);
-        cache
-            .insert(1, PnCounter::local_delta(stale_self, 7))
-            .await
-            .expect("seed write from this node's own past incarnation");
-        let raw_len = cache
-            .get(&1)
-            .await
-            .expect("the seed write is resident")
-            .encode()
-            .expect("PnCounter::encode never fails on a resident value")
-            .len();
-
-        // No absence tracker entries at all: with no peers and nothing
-        // tracked absent, the cache is vacuously quiet, and this node needs
-        // no absence information whatsoever to know its own past self is
-        // dead.
-        let absence = absence::AbsenceTracker::default();
-
-        // Polls rather than counting a fixed number of passes: stage two
-        // needs a pass strictly after a retirement its own age has cleared
-        // `2 * bound_ms`, and stage three (pruning the `folded_at` receipt
-        // stage two just left) needs a *further* pass strictly after that
-        // one, once the receipt's own age has cleared `3 * bound_ms` —
-        // reaching the fully-folded, minimal form takes several
-        // sufficiently-spaced passes, not merely enough total elapsed time.
-        let folded_len = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                crdt_compact_tick(
-                    shard.as_ref(),
-                    &name,
-                    &cluster,
-                    &absence,
-                    three_bounds(retire_after),
-                )
-                .await;
-                let len = cache
-                    .get(&1)
-                    .await
-                    .expect("the record is still resident while folding")
-                    .encode()
-                    .expect("PnCounter::encode never fails on a resident value")
-                    .len();
-                if len < raw_len {
-                    return len;
-                }
-                tokio::time::sleep(retire_after).await;
-            }
-        })
-        .await
-        .expect(
-            "this node's own past incarnation folds away, bounding the record's metadata \
-             instead of leaving it live (and growing every peer's already-compacted copy \
-             back out on the next anti-entropy round) forever",
-        );
-        assert!(folded_len < raw_len, "raw={raw_len} folded={folded_len}");
-        assert_eq!(
-            cache.get(&1).await.map(|c| c.value()),
-            Some(7),
-            "retiring and folding this node's own past incarnation never changes the value"
-        );
-
-        cluster.shutdown().await;
-    }
-
-    /// `sundog_crdt_retired_writers_total`/`sundog_crdt_compactions_total`
-    /// increment exactly once each for the pass that retires a writer, via
-    /// the real `crdt_compact_task` entry point (not just `crdt_compact_tick`
-    /// directly, so the ticker/task wiring itself is exercised too).
-    #[tokio::test]
-    async fn crdt_compact_task_retires_a_dead_writer_and_leaves_a_live_one_alone() {
-        let retire_after = Duration::from_millis(20);
-        let cluster = Cluster::builder("cluster-it-crdt-metrics")
-            .seeds(std::iter::empty())
-            .config(crdt_task_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("build succeeds");
-
-        let name = SmolStr::new("counters");
-        let cache = open_counters_cache(&cluster, name.as_str()).await;
-        let shard = registered_shard(&cluster, &name);
-
-        let local = crdt::WriterId::new(cluster.node_id(), cluster.local_incarnation());
-        let dead_writer = writer(999, 1);
-        cache
-            .insert(1, PnCounter::local_delta(dead_writer, 5))
-            .await
-            .expect("seed write from the dead writer");
-        cache
-            .insert(1, PnCounter::local_delta(local, 2))
-            .await
-            .expect("seed write from this node's own current writer identity");
-
-        let absence = absence::AbsenceTracker::default();
-        absence.observe(&HashMap::from([(
-            dead_writer.node(),
-            membership::LiveFlags { departing: false },
-        )]));
-        absence.observe(&HashMap::new());
-        tokio::time::sleep(retire_after + Duration::from_millis(20)).await;
-
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(crdt_compact_task(
-            Arc::clone(&shard),
-            name.clone(),
-            cluster.clone(),
-            absence.clone(),
-            cancel.clone(),
-        ));
-
-        let seeded_len = cache
-            .get(&1)
-            .await
-            .expect("counter 1 is resident")
-            .encode()
-            .expect("PnCounter::encode never fails on a resident value")
-            .len();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let len = cache
-                    .get(&1)
-                    .await
-                    .expect("counter 1 is resident")
-                    .encode()
-                    .expect("PnCounter::encode never fails on a resident value")
-                    .len();
-                if len != seeded_len {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the dead writer's slot moves into its retired entry, rewriting the record");
-        assert!(
-            absence.gone_since(dead_writer.node()).is_some(),
-            "the member stays tracked gone after retirement, for the records later ticks reach"
-        );
-
-        assert_eq!(
-            cache.get(&1).await.map(|c| c.value()),
-            Some(7),
-            "retiring the dead writer never changes the counter's exact value"
-        );
-
-        cancel.cancel();
-        task.await.expect("crdt_compact_task doesn't panic");
-        cluster.shutdown().await;
-    }
-
-    /// A writer's `NodeId` reused across three replacements (the exact
-    /// churn shape `crdt_bench`'s own benchmark drives at a real cluster's
-    /// full scale): each replacement's own incarnation retires and folds
-    /// away on the observer, and — the regression this test pins — its
-    /// `folded_at` receipt actually disappears for good, not merely once
-    /// per stray tick. With pruning done only by each node's own sweep,
-    /// this never happens under ongoing replication between two nodes:
-    /// the observer's own prune only survives until the writer's own,
-    /// differently-phased tick sends its still-unpruned copy back over
-    /// anti-entropy (`merge` only ever unions a receipt in), and the
-    /// writer's own prune is undone the same way in the other direction,
-    /// on every cycle. The resolver's `settle` step, run on every merge
-    /// apply, is what ends it: a receipt past three bounds is dropped
-    /// again the moment a peer's copy carries it back in, whatever the
-    /// two sweeps' phase.
-    #[tokio::test]
-    async fn crdt_compact_task_prunes_a_folded_receipt_for_good_under_ongoing_two_node_replication()
-    {
-        let retire_after = Duration::from_secs(2);
-        let observer = Cluster::builder("cluster-it-crdt-churn-receipt-prune")
-            .seeds(std::iter::empty())
-            .config(crdt_task_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("observer builds");
-        let observer_addr = observer.inner.membership.local_peer().gossip_addr;
-        let name = SmolStr::new("counters");
-        let observer_cache = open_counters_cache(&observer, name.as_str()).await;
-
-        let writer_node_id = NodeId::random();
-        let mut last_writer_cluster: Option<Cluster> = None;
-        for round in 0..3u64 {
-            let writer = Cluster::builder("cluster-it-crdt-churn-receipt-prune")
-                .node_id(writer_node_id)
-                .seeds([observer_addr])
-                .config(crdt_task_loopback_config(retire_after))
-                .build()
-                .await
-                .unwrap_or_else(|e| panic!("writer round {round} builds: {e}"));
-            wait_for_peer_count(&observer, 1).await;
-            let writer_cache = open_counters_cache(&writer, name.as_str()).await;
-            let wid = writer_cache.writer_id();
-            writer_cache
-                .insert(0, PnCounter::local_delta(wid, 10))
-                .await
-                .expect("writer inserts");
-            let expected = i128::from(round + 1) * 10;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if observer_cache.get(&0).await.map(|c| c.value()) == Some(expected) {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("observer converges this round");
-            if round + 1 == 3 {
-                last_writer_cluster = Some(writer);
-            } else {
-                writer.shutdown().await;
-            }
-        }
-
-        let raw_len = observer_cache
-            .get(&0)
-            .await
-            .expect("counter 0 has landed on the observer")
-            .encode()
-            .expect("PnCounter::encode never fails on a resident value")
-            .len();
-
-        // Every earlier incarnation's fold-and-prune, end to end, within
-        // a few 30-second-floored ticks, comfortably inside this budget:
-        // a bound this test hits on every run, never just occasionally.
-        let pruned_len = tokio::time::timeout(Duration::from_secs(100), async {
-            loop {
-                let len = observer_cache
-                    .get(&0)
-                    .await
-                    .expect("counter 0 is still resident")
-                    .encode()
-                    .expect("PnCounter::encode never fails on a resident value")
-                    .len();
-                if len < raw_len {
-                    return len;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        })
-        .await
-        .expect(
-            "every earlier incarnation's folded_at receipt prunes for good under ongoing \
-             two-node replication, shrinking the record below its raw, pre-compaction size",
-        );
-        assert!(pruned_len < raw_len, "raw={raw_len} pruned={pruned_len}");
-
-        // Never bounces back over one further tick cycle on each side: a
-        // receipt actually gone stays gone, it doesn't just dip below
-        // `raw_len` for a moment before the next anti-entropy round
-        // resurrects it.
-        tokio::time::sleep(Duration::from_secs(35)).await;
-        let settled_len = observer_cache
-            .get(&0)
-            .await
-            .expect("counter 0 is still resident")
-            .encode()
-            .expect("PnCounter::encode never fails on a resident value")
-            .len();
-        assert!(
-            settled_len <= pruned_len,
-            "the pruned form must hold, not regrow: pruned={pruned_len} settled={settled_len}"
-        );
-        assert_eq!(
-            observer_cache.get(&0).await.map(|c| c.value()),
-            Some(30),
-            "pruning three earlier incarnations' receipts never changes the counter's total"
-        );
-
-        if let Some(w) = last_writer_cluster {
-            w.shutdown().await;
-        }
-        observer.shutdown().await;
-    }
-
-    /// A cold joiner seeded at `observer` warms counter 0 from the
-    /// compacted record alone and holds it at `expected_len` bytes.
-    async fn assert_cold_joiner_warms_compacted_counter(
-        observer: &Cluster,
-        retire_after: Duration,
-        expected_len: usize,
-    ) {
-        let joiner = Cluster::builder("cluster-it-crdt-graceful-churn")
-            .seeds([observer.inner.membership.local_peer().gossip_addr])
-            .config(crdt_task_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("joiner builds");
-        wait_for_peer_count(&joiner, 1).await;
-        let joiner_cache = open_counters_cache(&joiner, "counters").await;
-        let warmed = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if let Some(counter) = joiner_cache.get(&0).await {
-                    return counter;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the joiner warms the compacted counter");
-        assert_eq!(
-            warmed
-                .encode()
-                .expect("PnCounter::encode never fails on a resident value")
-                .len(),
-            expected_len,
-            "the joiner's copy is the compacted, observer-only size"
-        );
-        joiner.shutdown().await;
-    }
-
-    /// A writer that leaves through `Cluster::shutdown` is retired and
-    /// folded like one that crashed: three distinct nodes each join, write
-    /// one counter, and leave gracefully, and the observer's record ends up
-    /// back at the size it had with only the observer's own slot, holding
-    /// the exact total, within two 30s-floored ticks of the last leave.
-    #[tokio::test]
-    async fn crdt_compact_task_retires_and_folds_gracefully_departed_writers() {
-        let retire_after = Duration::from_secs(2);
-        let observer = Cluster::builder("cluster-it-crdt-graceful-churn")
-            .seeds(std::iter::empty())
-            .config(crdt_task_loopback_config(retire_after))
-            .build()
-            .await
-            .expect("observer builds");
-        let observer_addr = observer.inner.membership.local_peer().gossip_addr;
-        let observer_cache = open_counters_cache(&observer, "counters").await;
-        observer_cache
-            .insert(0, PnCounter::local_delta(observer_cache.writer_id(), 1))
-            .await
-            .expect("observer writes");
-        let raw_len = observer_cache
-            .get(&0)
-            .await
-            .expect("counter 0 is resident")
-            .encode()
-            .expect("PnCounter::encode never fails on a resident value")
-            .len();
-
-        for round in 1..=3i128 {
-            let leaver = Cluster::builder("cluster-it-crdt-graceful-churn")
-                .seeds([observer_addr])
-                .config(crdt_task_loopback_config(retire_after))
-                .build()
-                .await
-                .unwrap_or_else(|e| panic!("leaver {round} builds: {e}"));
-            wait_for_peer_count(&observer, 1).await;
-            let leaver_cache = open_counters_cache(&leaver, "counters").await;
-            leaver_cache
-                .merge(0, PnCounter::local_delta(leaver_cache.writer_id(), 10))
-                .await
-                .expect("leaver writes");
-            let expected = 1 + round * 10;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while observer_cache.get(&0).await.map(|c| c.value()) != Some(expected) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("observer converges this round");
-            leaver.shutdown().await;
-            wait_for_no_peers(&observer).await;
-        }
-        let churned_len = observer_cache
-            .get(&0)
-            .await
-            .expect("counter 0 is resident")
-            .encode()
-            .expect("PnCounter::encode never fails on a resident value")
-            .len();
-        assert!(
-            churned_len > raw_len,
-            "three more slots: raw={raw_len} churned={churned_len}"
-        );
-
-        let settled_len = tokio::time::timeout(Duration::from_secs(100), async {
-            loop {
-                let len = observer_cache
-                    .get(&0)
-                    .await
-                    .expect("counter 0 is resident")
-                    .encode()
-                    .expect("PnCounter::encode never fails on a resident value")
-                    .len();
-                if len <= raw_len {
-                    return len;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        })
-        .await
-        .expect("every gracefully departed writer retires, folds, and its receipt prunes");
-        assert_eq!(settled_len, raw_len, "back to the observer-only size");
-
-        assert_cold_joiner_warms_compacted_counter(&observer, retire_after, raw_len).await;
-        assert_eq!(
-            observer_cache.get(&0).await.map(|c| c.value()),
-            Some(31),
-            "folding three departed writers never changes the total"
-        );
-        observer.shutdown().await;
     }
 }

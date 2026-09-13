@@ -3,7 +3,7 @@
 //! chosen live node gets a write (insert or remove) and one gets a `fetch`,
 //! with latency and outcome recorded. The write side only ever touches keys
 //! it hasn't already removed, so the removed set is monotonic and the
-//! surviving-key count it reports is exact — no resurrection to track.
+//! surviving-key count it reports is exact: no resurrection to track.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -203,7 +203,7 @@ async fn run_write_tick(nodes: &[Arc<NodeSlot>], state: &LoadState) {
     let index = random_range(0..state.keys);
     if state.is_removed(index) {
         // Already gone; skip rather than resurrect it, keeping the removed
-        // set — and the surviving-key count derived from it — exact.
+        // set, and the surviving-key count derived from it, exact.
         return;
     }
     match decide_op(random_range(0.0..1.0), REMOVE_PROBABILITY) {

@@ -26,8 +26,8 @@ pub struct Hlc {
 
 /// A node's local hybrid logical clock, generating and merging [`Hlc`] stamps.
 ///
-/// Not `Sync`: callers serialize access with a mutex or actor, matching how a
-/// single per-node clock is used in practice.
+/// Not `Sync`: callers serialize access with a mutex or actor, matching how
+/// a single per-node clock is used.
 #[derive(Debug)]
 pub struct HlcClock {
     node: NodeId,

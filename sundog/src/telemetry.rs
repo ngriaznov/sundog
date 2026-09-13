@@ -16,8 +16,8 @@
 //! Install the recorder before opening a cache. A cache resolves its
 //! per-cache handles (`sundog_cache_hits_total{cache}`,
 //! `sundog_spill_entries{cache}`, and the like) once, when it opens, against
-//! whichever recorder is global at that moment; a cache opened earlier keeps
-//! reporting to the no-op recorder.
+//! whichever recorder is global at that moment; a cache opened before the
+//! real recorder installs keeps reporting to the no-op recorder.
 
 use std::io;
 use std::net::SocketAddr;

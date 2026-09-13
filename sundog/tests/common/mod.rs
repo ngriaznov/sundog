@@ -59,7 +59,7 @@ pub async fn reserve_gossip_addr() -> SocketAddr {
         .expect("a freshly bound udp socket reports a local address")
 }
 
-/// A running node plus the loopback gossip address it was built with,
+/// A running node plus the loopback gossip address it builds from,
 /// tracked here since the public API has no accessor for it.
 pub struct Node {
     pub cluster: Cluster,

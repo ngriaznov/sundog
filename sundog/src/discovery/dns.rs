@@ -34,8 +34,8 @@ impl DnsSrv {
     pub fn new(service_name: impl Into<String>, fallback_port: u16) -> Self {
         let resolver = TokioResolver::builder_tokio()
             .and_then(ResolverBuilder::build)
-            .inspect_err(|err| {
-                tracing::warn!(%err, "DNS resolver failed to initialize; DnsSrv discovery disabled");
+            .inspect_err(|error| {
+                tracing::warn!(%error, "DNS resolver failed to initialize; DnsSrv discovery disabled");
             })
             .ok();
         Self {
@@ -99,22 +99,22 @@ async fn resolve_once<L: SrvLookup>(
                 let port = if port == 0 { fallback_port } else { port };
                 match lookup.ips(&target).await {
                     Ok(ips) => addrs.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port))),
-                    Err(err) => {
-                        tracing::warn!(target = %target, %err, "SRV target failed to resolve");
+                    Err(error) => {
+                        tracing::warn!(target = %target, %error, "SRV target failed to resolve");
                     }
                 }
             }
             addrs
         }
-        Err(err) => {
-            tracing::debug!(%err, service_name, "SRV lookup failed, falling back to A/AAAA");
+        Err(error) => {
+            tracing::debug!(%error, service_name, "SRV lookup failed, falling back to A/AAAA");
             match lookup.ips(service_name).await {
                 Ok(ips) => ips
                     .into_iter()
                     .map(|ip| SocketAddr::new(ip, fallback_port))
                     .collect(),
-                Err(err) => {
-                    tracing::warn!(%err, service_name, "DNS discovery lookup failed");
+                Err(error) => {
+                    tracing::warn!(%error, service_name, "DNS discovery lookup failed");
                     Vec::new()
                 }
             }

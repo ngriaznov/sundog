@@ -31,7 +31,10 @@ use sundog::hlc::Hlc;
 use sundog::membership::Peer;
 use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
-use sundog::store::{CompactionBounds, Mode, Shard, ShardOps, SimFanOut};
+use sundog::store::{
+    BucketDigest, BucketLen, BucketPart, BucketPartDigests, CompactionBounds, KeyVersion, Mode,
+    Quiescence, Shard, ShardOps, SimFanOut,
+};
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
     ConflictResolver, Merged, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
@@ -76,8 +79,19 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     futures::executor::block_on(fut)
 }
 
+/// [`KeyVersion`]s to this file's own `(key, version)` tuple shape, at the
+/// boundary where a [`ShardOps`]/[`AeMismatch`] result meets this file's
+/// tuple-based classification helpers, reimplementing
+/// `cluster::anti_entropy`'s own such boundary.
+fn kv_to_tuples(entries: Vec<KeyVersion>) -> Vec<(Bytes, Hlc)> {
+    entries.into_iter().map(|kv| (kv.key, kv.version)).collect()
+}
+
 fn digests_of(shard: &TestShard) -> Vec<(u16, u64)> {
     block_on(ShardOps::digests(shard))
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect()
 }
 
 fn value_of(shard: &TestShard, key: u32) -> Option<String> {
@@ -171,12 +185,12 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
         ShardOps::snapshot_chunks(self.shard.as_ref())
     }
 
-    fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::digests(shard.as_ref()).await })
     }
 
-    fn bucket_entries(&self, _cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, _cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::bucket_entries(shard.as_ref(), bucket).await })
     }
@@ -195,7 +209,7 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
         Box::pin(async move { ShardOps::records_for(shard.as_ref(), keys).await })
     }
 
-    fn bucket_lens(&self, _cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, _cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::bucket_lens(shard.as_ref(), buckets).await })
     }
@@ -204,7 +218,7 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
         &self,
         _cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    ) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::part_digests(shard.as_ref(), buckets).await })
     }
@@ -212,7 +226,7 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
     fn entries_for_parts(
         &self,
         _cache: SmolStr,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, sundog::store::PartEntries> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::entries_for_parts(shard.as_ref(), parts).await })
@@ -314,10 +328,18 @@ async fn classify_ae_mismatches<S: ShardOps>(
                 if let Some(counter) = bucket_listings {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-                diff_bucket(shard, bucket, &peer_entries, push_keys, pull_keys, merging).await;
+                diff_bucket(
+                    shard,
+                    bucket,
+                    &kv_to_tuples(peer_entries),
+                    push_keys,
+                    pull_keys,
+                    merging,
+                )
+                .await;
             }
             AeMismatch::Sketch(bucket, cells) => {
-                let local_entries = ShardOps::bucket_entries(shard, bucket).await;
+                let local_entries = kv_to_tuples(ShardOps::bucket_entries(shard, bucket).await);
                 decode_sketch_into(
                     bucket,
                     cells,
@@ -328,13 +350,13 @@ async fn classify_ae_mismatches<S: ShardOps>(
                     merging,
                 );
             }
-            AeMismatch::PartDigests(bucket, remote_parts) => {
+            AeMismatch::PartDigests(bucket, digests) => {
                 let local_parts = ShardOps::part_digests(shard, vec![bucket])
                     .await
                     .into_iter()
-                    .find(|(b, _)| *b == bucket)
-                    .map_or_else(Vec::new, |(_, d)| d);
-                for part in sundog::mismatched_parts(&local_parts, &remote_parts) {
+                    .find(|p| p.bucket == bucket)
+                    .map_or_else(Vec::new, |p| p.digests);
+                for part in sundog::mismatched_parts(&local_parts, &digests) {
                     wanted_parts.push((bucket, part));
                 }
             }
@@ -362,6 +384,10 @@ async fn resolve_wanted_parts<S: ShardOps>(
     undecodable_buckets: &mut Vec<u16>,
     merging: bool,
 ) -> bool {
+    let wanted_bucket_parts: Vec<BucketPart> = wanted_parts
+        .iter()
+        .map(|&(bucket, part)| BucketPart { bucket, part })
+        .collect();
     match tokio::time::timeout(
         NET_TIMEOUT,
         mesh.ae_parts(peer, cache_name(), wanted_parts.clone()),
@@ -369,9 +395,11 @@ async fn resolve_wanted_parts<S: ShardOps>(
     .await
     {
         Ok(Ok(replies)) => {
-            let local_part_entries = ShardOps::entries_for_parts(shard, wanted_parts).await;
-            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
-                local_part_entries.into_iter().collect();
+            let local_part_entries = ShardOps::entries_for_parts(shard, wanted_bucket_parts).await;
+            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> = local_part_entries
+                .into_iter()
+                .map(|(bp, entries)| ((bp.bucket, bp.part), kv_to_tuples(entries)))
+                .collect();
             for reply in replies {
                 match reply {
                     AePartReply::Listing {
@@ -383,7 +411,13 @@ async fn resolve_wanted_parts<S: ShardOps>(
                             .get(&(bucket, part))
                             .cloned()
                             .unwrap_or_default();
-                        diff_part(&local_entries, &peer_entries, push_keys, pull_keys, merging);
+                        diff_part(
+                            &local_entries,
+                            &kv_to_tuples(peer_entries),
+                            push_keys,
+                            pull_keys,
+                            merging,
+                        );
                     }
                     AePartReply::Sketch {
                         bucket,
@@ -448,7 +482,11 @@ async fn ae_round_with_sketch<S: ShardOps>(
     // mismatched key in the same round instead of only the greater version
     // pushing to the lesser side.
     let merging = ShardOps::merges(shard);
-    let local_buckets = ShardOps::digests(shard).await;
+    let local_buckets: Vec<(u16, u64)> = ShardOps::digests(shard)
+        .await
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect();
     let Ok(Ok(mismatched)) = tokio::time::timeout(
         NET_TIMEOUT,
         mesh.ae_round(peer, cache_name(), local_buckets),
@@ -506,7 +544,7 @@ async fn ae_round_with_sketch<S: ShardOps>(
                     diff_bucket(
                         shard,
                         bucket,
-                        &peer_entries,
+                        &kv_to_tuples(peer_entries),
                         &mut push_keys,
                         &mut pull_keys,
                         merging,
@@ -578,7 +616,11 @@ async fn diff_bucket<S: ShardOps>(
     let peer_by_key: HashMap<Bytes, Hlc> = peer_entries.iter().cloned().collect();
     let mut local_keys = HashSet::with_capacity(peer_by_key.len());
 
-    for (key, local_ver) in ShardOps::bucket_entries(shard, bucket).await {
+    for KeyVersion {
+        key,
+        version: local_ver,
+    } in ShardOps::bucket_entries(shard, bucket).await
+    {
         local_keys.insert(key.clone());
         match peer_by_key.get(&key) {
             Some(&peer_ver) if local_ver != peer_ver => {
@@ -1967,11 +2009,11 @@ fn part_reconciliation_repairs_one_key_under_loss() {
 // `watch::Sender<Arc<OwnershipView>>`, rather than through a live
 // `refresh_task`/gossip loop this harness has no chitchat layer to run.
 // `republish_view` mirrors `cluster::rebalance::rebalance_task`'s own
-// reaction to a view change — mark newly lost buckets releasing, unmark
-// newly regained ones — so residency behaves exactly as it does in
+// reaction to a view change, mark newly lost buckets releasing, unmark
+// newly regained ones, so residency behaves exactly as it does in
 // production. Bucket transfer to a newly owning node goes through the same
 // self-healing anti-entropy backstop `cluster::rebalance`'s own doc calls
-// out — `ae_round_with_sketch` above — rather than an eager
+// out, `ae_round_with_sketch` above, rather than an eager
 // `Mesh::request_buckets` pull (`pub(crate)`, out of reach here): once a
 // gained bucket starts appearing in the new owner's own `ShardOps::digests`,
 // the previous owner's own round shows a mismatch and the ordinary push
@@ -1993,7 +2035,7 @@ struct DistNode {
 
 /// Builds one `Mode::Distributed` node: a fresh shard with an ownership
 /// tracker and residency set attached via `Shard::with_ownership_for_sim`,
-/// seeded to the solo view `OwnershipTracker::seed` always starts from —
+/// seeded to the solo view `OwnershipTracker::seed` always starts from;
 /// see the `distributed_shard` fixture in `store/mod.rs`'s own tests for
 /// the identical construction. The caller republishes the scenario's real
 /// starting view immediately after, via `republish_view`/`republish_all`.
@@ -2082,7 +2124,7 @@ fn republish_view(
 /// [`republish_view`] for every node in `nodes` whose id is in `live`, all
 /// against the view computed over exactly `live`: the hand-scripted
 /// membership feed's counterpart to a real gossip round converging on a
-/// new peer set. A node not in `live` is left untouched — it may be
+/// new peer set. A node not in `live` is left untouched, it may be
 /// crashed, in which case nothing reads its tracker until it bounces back
 /// and this is called again with it included.
 fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
@@ -2093,23 +2135,11 @@ fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
     }
 }
 
-/// One `Mode::Distributed` write's fan-out: drains the shard's fan-out
-/// queue and sends each item to its bucket's current owners (`self_node`
-/// excluded), the per-write counterpart of
+/// Sends one `Mode::Distributed` record to its bucket's current owners
+/// (`self_node` excluded), the per-write counterpart of
 /// `cluster::group_by_owner_set`/`fan_out_by_owner_set`'s owner-set
-/// grouping, without that function's batching since this harness drains at
-/// most a handful of items per tick. An `Applied` item re-fetches its
-/// current record via `ShardOps::records_for`, exactly as `Replicated`
-/// mode's own [`fan_out`] helper above does; a `Forward` item already
-/// carries its record, since a non-owner write is never applied to
-/// `engine` in the first place.
-///
-/// A `Forward` item's send is duplicated a few times: the forwarding node
-/// keeps no local copy once it has forwarded, so a lost send has no
-/// anti-entropy backstop the way a lost `Applied` send does (the owner
-/// that issued it still holds a copy anti-entropy can push again next
-/// round), matching this file's existing `dup_factor` pattern for
-/// `Replicated` mode's own lossy scenarios above.
+/// grouping; [`fan_out_owned`] calls this once per `Applied` item, and
+/// retries a `Forward` item across ticks the same way.
 fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &WireRecord) {
     let bucket = bucket_of_bytes(rec.key.as_ref());
     for &owner in view.owners_of(bucket) {
@@ -2133,7 +2163,7 @@ fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &Wi
 /// own copy to push again next round); a `Forward` item already carries
 /// its record, since a non-owner write is never applied to `engine` in the
 /// first place, and is returned to the caller to retry across several
-/// ticks via [`dist_node_loop`]'s own retry pool — a forwarding node keeps
+/// ticks via [`dist_node_loop`]'s own retry pool, a forwarding node keeps
 /// no local copy once it has forwarded, so a lost send has no
 /// anti-entropy backstop the way a lost `Applied` send does.
 async fn fan_out_owned(
@@ -2172,7 +2202,7 @@ enum DistOp {
 /// `Mode::Replicated`, but fanning writes out to a key's current owners
 /// (via [`fan_out_owned`]) instead of broadcasting to every peer, gating
 /// anti-entropy's peer choice through `ShardOps::ae_peer_filter`, and
-/// releasing buckets whose disown grace has elapsed on its own tick —
+/// releasing buckets whose disown grace has elapsed on its own tick,
 /// mirroring `cluster::rebalance::rebalance_task`'s release half. The
 /// gained half is left to anti-entropy's self-healing backstop; see this
 /// section's own doc.
@@ -2189,7 +2219,7 @@ struct DistNodeParams {
     /// re-clones `DistNodeParams` on every restart (a bounce included), and
     /// an owned `Vec` would replay every already-issued op from scratch on
     /// each one, re-inserting an already-removed key with a fresh,
-    /// LWW-winning `Hlc` — a real bug this harness hit once already. A
+    /// LWW-winning `Hlc`, a real bug this harness hit once already. A
     /// shared queue keeps the harness's own restart honest: a bounced node
     /// resumes issuing its remaining ops, the way a real node resumes
     /// serving already-accepted API calls rather than an external caller
@@ -2361,11 +2391,11 @@ fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
 }
 
 /// [`dist_data_settled`]'s counterpart for a key removed rather than
-/// surviving: every current owner of the key's bucket has actually
-/// forgotten it. A removed key's own writer applies its tombstone
+/// surviving: every current owner of the key's bucket has forgotten it.
+/// A removed key's own writer applies its tombstone
 /// instantly, but the co-owner only learns of it via the ordinary
 /// `Applied`-item fan-out (or, if that one send is lost, the next
-/// anti-entropy round) — [`dist_data_settled`] never looks at a removed
+/// anti-entropy round), [`dist_data_settled`] never looks at a removed
 /// key at all, so this is the churn scenario's own explicit wait for that
 /// second hop to land before treating the pre-churn baseline as settled.
 fn dist_removals_settled(nodes: &[DistNode], removed: &HashSet<u32>) -> bool {
@@ -2433,8 +2463,8 @@ fn distributed_rebalance_under_churn() {
     republish_all(&nodes, &node_ids, k);
 
     // Message loss turns on only once the initial write/remove plans have
-    // settled (below), so that churn — the thing this scenario actually
-    // tests — runs under real loss and reordering without also fighting
+    // settled (below), so that churn, the thing this scenario tests, runs
+    // under real loss and reordering without also fighting
     // the transport's own worst case for a one-shot forward: turmoil's
     // `fail_rate` breaks a link outright until *some* further traffic on
     // it happens to trigger a repair check, which a forward that only ever
@@ -2521,7 +2551,7 @@ fn distributed_rebalance_under_churn() {
     // keeps `Builder`'s own default (1.0): any further traffic on a
     // link heals it on the very next attempt, so churn's own repeated
     // anti-entropy rounds are always enough to recover, without needing a
-    // one-shot forward to itself get as lucky as the win it was denied.
+    // one-shot forward to succeed on an attempt the fail rate might deny.
     sim.set_fail_rate(0.03);
 
     // Phase 2: churn. One node down at a time, never below three live, each
@@ -2551,8 +2581,8 @@ fn distributed_rebalance_under_churn() {
     // Phase 3: let every disown grace fully elapse. `ResidencySet`'s grace
     // clock is stamped from real `Instant::now()`, not turmoil's virtual
     // clock (matching tombstone retention's own real-time deadline
-    // elsewhere in this file), so real time — not simulated steps — must
-    // actually pass before a rebalance tick has anything to release; the
+    // elsewhere in this file), so real time, not simulated steps, must
+    // pass before a rebalance tick has anything to release; the
     // ticks themselves then need simulated time. Both are repeated until
     // no node has a bucket left mid grace, bounded, since a bounced
     // node's loop may need more than one window to reach its tick.
@@ -2581,9 +2611,9 @@ fn distributed_rebalance_under_churn() {
     assert_holds_only_owned_or_releasing("after churn settles", &nodes, 80, false);
 }
 
-/// Splits the cluster into two halves, writes on both sides — including a
+/// Splits the cluster into two halves, writes on both sides, including a
 /// conflicting write to the same key, side two's strictly later so its
-/// `Hlc` wins — then heals. `owners=2` over a two-node eligible set
+/// `Hlc` wins, then heals. `owners=2` over a two-node eligible set
 /// degenerates to both sides owning everything while split (see
 /// `owners_of_bucket`'s doc), so each side's writes apply locally without
 /// forwarding. After healing, every node's independently computed view has
@@ -2715,8 +2745,8 @@ fn distributed_partition_then_heal_reconciles_ownership() {
 
 /// With `owners=2`, kills one of a chosen bucket's two owners. The
 /// surviving owner keeps answering for every one of the bucket's keys
-/// throughout the outage — checked repeatedly while the cluster
-/// rebalances, not only once at the end — and once the vacated slot's new
+/// throughout the outage, checked repeatedly while the cluster
+/// rebalances, not only once at the end, and once the vacated slot's new
 /// third owner has pulled the bucket via the anti-entropy self-healing
 /// backstop, its content for those keys matches the survivor's exactly.
 #[test]
@@ -2810,7 +2840,7 @@ fn distributed_owner_loss_k_two_loses_nothing() {
     );
     assert!(
         !new_owners.contains(&leaving),
-        "the killed node is no longer eligible"
+        "the killed node is not an eligible owner"
     );
     let new_third = *new_owners
         .iter()
@@ -2846,7 +2876,7 @@ fn distributed_owner_loss_k_two_loses_nothing() {
 /// For a seeded, randomized sequence of membership toggles (crash/bounce,
 /// never below two live nodes) and writes/removes on random live nodes,
 /// checks after every step that every node's local content is contained in
-/// its own current owned-or-releasing bucket set — equivalently, that a
+/// its own current owned-or-releasing bucket set, equivalently, that a
 /// node holding neither ownership nor a residency grace on a bucket holds
 /// nothing in it.
 #[test]
@@ -2944,9 +2974,9 @@ fn distributed_non_owner_never_applies_as_a_property() {
     assert_holds_only_owned_or_releasing("final", &nodes, KEY_SPACE, true);
 }
 
-/// Displaces one of a bucket's two owners with a phantom fourth node —
-/// advertised into the eligible set but never run as a real host, since
-/// only the rendezvous computation, not its reachability, matters here —
+/// Displaces one of a bucket's two owners with a phantom fourth node,
+/// advertised into the eligible set but never run as a real host since
+/// only the rendezvous computation, not its reachability, matters here,
 /// so the departed owner enters disown-grace while its former co-owner
 /// keeps the bucket. A one-shot prober dials the departed owner directly,
 /// well within the grace window, proving it still answers a digest
@@ -2954,7 +2984,7 @@ fn distributed_non_owner_never_applies_as_a_property() {
 /// (`Mesh::ae_entries`) with real data, then sends it a fresh `Replicate`
 /// for a new key in the same bucket, proving the inbound-apply guard drops
 /// it. The bucket's pre-existing data survives untouched through the grace
-/// window, then is actually released once the grace period elapses.
+/// window, then is released once the grace period elapses.
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -2978,9 +3008,9 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     assert_eq!(initial_owners.len(), 2);
     // `owners_of` is ordered by descending rendezvous score: index 0 is the
     // strictly higher-scoring owner. Adding one more eligible node can only
-    // ever displace the *weaker* of the two from the top-2 — the stronger
+    // ever displace the *weaker* of the two from the top-2, the stronger
     // owner would have to be outscored by the newcomer to fall out, which
-    // would put the newcomer in its place instead, not remove it outright —
+    // would put the newcomer in its place instead, not remove it outright,
     // so `leaving` must be the weaker owner for the phantom search below to
     // have a solution.
     let staying = initial_owners[0];
@@ -3079,7 +3109,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     ))
     .into_iter()
     .next()
-    .expect("just inserted");
+    .expect("fresh_key is inserted above");
 
     let leaving_host = nodes.iter().find(|n| n.node == leaving).unwrap().host;
     let leaving_port = nodes.iter().find(|n| n.node == leaving).unwrap().port;
@@ -3153,9 +3183,9 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         );
     }
 
-    // Once the grace period fully elapses, the bucket is actually released.
+    // Once the grace period fully elapses, the bucket is released.
     // `ResidencySet`'s grace clock is stamped from real `Instant::now()`,
-    // not turmoil's virtual clock, so real time must actually pass — see
+    // not turmoil's virtual clock, so real time must pass; see
     // `distributed_rebalance_under_churn`'s identical comment.
     std::thread::sleep(disown_grace * 3);
     run_steps(&mut sim, steps_for(disown_grace * 3));
@@ -3171,9 +3201,9 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
 // Partition-heal family: three nodes, a two-way partition (node `a` split
 // from `b`/`c`, which stay mutually connected) during which side a and
 // side b each increment a share of `keys` counters, then a heal. Run in
-// two variants over the same shape — one merged `PnCounter` key per counter
+// two variants over the same shape, one merged `PnCounter` key per counter
 // under `PnCounterResolver`, and per-writer keys decomposed under the
-// default `LwwResolver` — measuring anti-entropy rounds, virtual time,
+// default `LwwResolver`, measuring anti-entropy rounds, virtual time,
 // frames, bytes, records, engine applies, resolver folds, and redundant
 // pulls spent reconciling after the heal, against the exact expected
 // total. `SUNDOG_SIM_FULL` controls the grid's size: the fast default
@@ -3217,7 +3247,7 @@ const HEAL_PARTITION_MS: u64 = 500;
 /// `REPAIR_BATCH` chunks spans several `sim.step()`s within one
 /// `run_round_against` call, and node b's and node c's own independent
 /// tick (never partitioned from node a, so *also* a candidate to relay
-/// node a's content, and just as capable of fully repairing a pair on its
+/// node a's content, and equally capable of fully repairing a pair on its
 /// own as node a's own round against that same pair is) can fall on any
 /// step in between. A short tick period lets that race resolve differently
 /// depending on how many chunks a given key count happens to need -- the
@@ -3239,22 +3269,22 @@ const HEAL_PARTITION_MS: u64 = 500;
 /// anti-entropy logic in isolation from that scheduling race, not the
 /// bidirectional exchange's round count at production's actual tick
 /// cadence: a merging resolver's bidirectional exchange trades a round
-/// for an extra push/pull pair per divergent key, a real regression at
-/// production's actual 200ms cadence; this generous margin can only show
-/// that nothing here regresses further, never confirm that regression is
-/// fixed. A
+/// for an extra push/pull pair per divergent key, a real slowdown at
+/// production's actual 200ms cadence. This generous margin only shows
+/// that nothing here gets slower still; it does not bound how much slower
+/// the bidirectional exchange itself is at that cadence. A
 /// production-cadence variant, run at (or near) 200ms and tolerant of the
-/// resulting scheduling noise, would be needed to confirm that separately.
+/// resulting scheduling noise, would be needed to measure that directly.
 const HEAL_AE_INTERVAL_MS: u64 = 1000;
 /// Every anti-entropy round in this family runs against at most two peers
 /// on a 1s tick; a generous multiple of the handful of rounds convergence
-/// actually needs at every scale this grid drives, so a run spending more
-/// than this many rounds signals a regression rather than ordinary
+/// needs at every scale this grid drives, so a run spending more than
+/// this many rounds signals a genuine slowdown rather than ordinary
 /// scheduling noise.
 const HEAL_MAX_AE_ROUNDS: u64 = 60;
-/// `40_000` sits past the `20_000` scale the original round-count
-/// regression was measured at, so this pin has headroom beyond the exact
-/// point that finding was made at, not just up to it.
+/// `40_000` sits past the `20_000` scale where the Findings section's own
+/// non-monotonic round counts appear, giving this pin headroom beyond
+/// that exact scale, not merely up to it.
 const HEAL_MONOTONIC_KEYS: [u32; 5] = [2_000, 8_000, 16_000, 20_000, 40_000];
 
 /// `SUNDOG_SIM_FULL=1` switches [`partition_heal_comparison`] from the fast
@@ -3292,10 +3322,8 @@ impl HealConfig {
 }
 
 /// One [`run_partition_heal`] call's reported metrics, from the heal onward.
-/// `records`/`applies`/`folds`/`redundant_pulls` are this redesign's own
-/// additions over the harness's earlier `PartitionHealMetrics`: `records` is
-/// every record either direction actually applied (or attempted to apply),
-/// `applies` is the subset that changed the touched key's stored
+/// `records` is every record either direction applied (or attempted to
+/// apply), `applies` is the subset that changed the touched key's stored
 /// `(version, bytes)`, `folds` is how many times the resolver's `merge`
 /// itself returned `Some`, and `redundant_pulls` is the pull-direction
 /// subset of `records - applies` -- the "Findings" section's own
@@ -3437,15 +3465,15 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
         self.inner.invalidate(key, ver)
     }
 
-    fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {
         self.inner.digests()
     }
 
-    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<BucketDigest>> {
         self.inner.ae_digests_for(peer)
     }
 
-    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         self.inner.bucket_entries(bucket)
     }
 
@@ -3456,17 +3484,17 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
         self.inner.entries_for_buckets(buckets)
     }
 
-    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         self.inner.bucket_lens(buckets)
     }
 
-    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         self.inner.part_digests(buckets)
     }
 
     fn entries_for_parts(
         &self,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, sundog::store::PartEntries> {
         self.inner.entries_for_parts(parts)
     }
@@ -3553,7 +3581,7 @@ fn overlap_count(keys: u32, conflict_fraction: f64) -> u32 {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "scaled is already clamped into (0.0, f64::from(keys)) by the checks above, so \
-                  this truncating, sign-losing cast can never actually truncate or flip sign"
+                  this truncating, sign-losing cast can never truncate or flip sign"
     )]
     let overlap = scaled as u32;
     overlap
@@ -3603,6 +3631,9 @@ fn write_side(
 /// per-side keys per counter for decomposed.
 fn heal_digests_of(shard: &Shard<String, PnCounter>) -> Vec<(u16, u64)> {
     block_on(ShardOps::digests(shard))
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect()
 }
 
 fn counter_total(shard: &Shard<String, PnCounter>, keys: u32, variant: Variant) -> i128 {
@@ -3662,7 +3693,7 @@ fn heal_node_id(run_id: &str, role: &str) -> NodeId {
 /// rounds settle before the measurement window opens and stay a routine,
 /// always-no-op background rate the same as with any other steady pair
 /// (see `run_partition_heal`'s own pre-heal settle step) -- counting them
-/// alongside the rounds that actually repair the a/b-c split would mix an
+/// alongside the rounds that repair the a/b-c split would mix an
 /// irrelevant, scale-independent tick rate into a metric meant to measure
 /// the repair itself.
 #[derive(Clone)]
@@ -3758,10 +3789,10 @@ fn spawn_heal_host(
     });
 }
 
-/// [`run_partition_heal`]'s wire-metrics measurement window, guarded the
-/// same way [`HEAL_WIRE_METRICS_LOCK`]'s predecessor was: `frames_sent_total`/
-/// `bytes_sent_total` are process-wide, shared with every other test in this
-/// binary, so only one partition-heal run's window is open at a time.
+/// [`run_partition_heal`]'s wire-metrics measurement window, guarded by
+/// this mutex since `frames_sent_total`/`bytes_sent_total` are
+/// process-wide, shared with every other test in this binary, so only one
+/// partition-heal run's window is open at a time.
 static HEAL_WIRE_METRICS_LOCK: StdMutex<()> = StdMutex::new(());
 
 /// Runs one partition-heal scenario end to end and returns its metrics from
@@ -4211,12 +4242,12 @@ fn partition_heal_is_deterministic_for_a_fixed_config() {
     );
 }
 
-/// Pins the "Findings" section's own regression signature: the harness
-/// artifact that reimplemented anti-entropy produced non-monotonic round
-/// counts as key count grew (3 rounds at 8,000 keys, 19 at 16,000, 5 at
-/// 20,000). Driving rounds through the production `run_round_against` entry
-/// point instead should make rounds monotone non-decreasing in key count, at
-/// fixed full conflict, for both variants.
+/// Pins the "Findings" section's own non-monotonic round-count signature:
+/// the harness artifact that reimplemented anti-entropy produced
+/// non-monotonic round counts as key count grew (3 rounds at 8,000 keys,
+/// 19 at 16,000, 5 at 20,000). Driving rounds through the production
+/// `run_round_against` entry point instead makes rounds monotone
+/// non-decreasing in key count, at fixed full conflict, for both variants.
 #[test]
 fn partition_heal_rounds_are_monotone_in_key_count() {
     let seed = sim_seed(0xC0DE_7400);
@@ -4297,11 +4328,13 @@ fn crdt_cache_is_quiet(
     local: NodeId,
     now_ms: u64,
     bound_ms: u64,
-) -> bool {
-    members
-        .iter()
-        .filter(|&(&node, _)| node != local)
-        .all(|(_, &presence)| crdt_member_is_settled(presence, now_ms, bound_ms))
+) -> Quiescence {
+    Quiescence::from_settled(
+        members
+            .iter()
+            .filter(|&(&node, _)| node != local)
+            .all(|(_, &presence)| crdt_member_is_settled(presence, now_ms, bound_ms)),
+    )
 }
 
 /// This simulation's virtual time so far, in milliseconds.
@@ -4708,7 +4741,7 @@ fn crdt_compaction_pncounter_churn_and_restart_retires_and_folds_exactly() {
     );
     assert!(
         compacted_again > 0,
-        "stage two must actually change the resident record"
+        "stage two must change the resident record"
     );
     let size_after_stage_two = block_on(shard_a.get(&key)).unwrap().encode().unwrap().len();
     assert!(

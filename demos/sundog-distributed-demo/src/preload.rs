@@ -51,7 +51,10 @@ pub(crate) fn node_for_batch(batch_index: usize, node_count: usize) -> usize {
 
 /// Keys inserted per second, `0.0` for a zero or negative-length elapsed.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a rate display only needs f64's exact-integer range for any realistic key count"
+)]
 pub(crate) fn keys_per_sec(count: usize, elapsed: Duration) -> f64 {
     let secs = elapsed.as_secs_f64();
     if secs <= 0.0 {

@@ -75,7 +75,7 @@ fn unique_wire_record(index: usize, record: &RemoteRecord, now_ms: u64) -> WireR
 fn digests(shard: &Shard<u8, u8>) -> Vec<u64> {
     futures::executor::block_on(ShardOps::digests(shard))
         .into_iter()
-        .map(|(_, digest)| digest)
+        .map(|bd| bd.digest)
         .collect()
 }
 
@@ -84,6 +84,7 @@ fn entry_set(shard: &Shard<u8, u8>) -> HashSet<(Bytes, Hlc)> {
     futures::executor::block_on(ShardOps::entries_for_buckets(shard, all_buckets))
         .into_iter()
         .flat_map(|(_, entries)| entries)
+        .map(|kv| (kv.key, kv.version))
         .collect()
 }
 

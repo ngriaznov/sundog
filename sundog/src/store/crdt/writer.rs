@@ -3,15 +3,11 @@
 //! A counter slot ([`super::PnCounter`]) or an OR-set tag ([`super::OrSet`])
 //! is keyed by a [`WriterId`], not by [`NodeId`] alone: pairing the node
 //! with its current membership incarnation means a restarted node writes
-//! from a fresh slot starting at zero rather than resuming (or colliding
-//! with) whatever it wrote before the restart, and a retired incarnation
-//! can never receive a later write from its own process, since the process
-//! that owned it is gone the moment its incarnation changes.
-//!
-//! The incarnation is the one membership already has
-//! (`now_incarnation_ms()` in `crate::membership`, gossiped in `Msg::Hello`
-//! since protocol 1), so this is a new key shape over existing data, not a
-//! new field on the wire.
+//! from a fresh slot starting at zero, and a retired incarnation can never
+//! receive a later write from its own process. The incarnation is the one
+//! membership already tracks (`now_incarnation_ms()` in
+//! `crate::membership`), so this is a new key shape over existing data,
+//! not a new wire field.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,17 +15,10 @@ use crate::node::NodeId;
 
 /// The identity of one writer to a [`super::PnCounter`] slot or
 /// [`super::OrSet`] tag: a node paired with the membership incarnation it
-/// wrote under.
-///
-/// Two `WriterId`s with the same [`NodeId`] but different incarnations are
-/// different writers for every purpose the CRDT types care about: a slot or
-/// tag keyed by one is never touched by a write keyed by the other, so a
-/// node that restarts (and so is assigned a new incarnation) never resumes
-/// or corrupts the running total or tag sequence it used before
-/// the restart. This also shapes retirement eligibility: a live node
-/// writing under any incarnation other than its current one means every
-/// other incarnation of it is already dead, independent of absence
-/// tracking.
+/// wrote under. Two `WriterId`s with the same [`NodeId`] but different
+/// incarnations are different writers for every purpose the CRDT types
+/// care about, so a restarted node never resumes or corrupts what it
+/// wrote before restarting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WriterId {
     node: NodeId,
@@ -49,7 +38,7 @@ impl WriterId {
         self.node
     }
 
-    /// The membership incarnation this writer identity was minted under.
+    /// The membership incarnation this writer identity is minted under.
     #[must_use]
     pub fn incarnation(&self) -> u64 {
         self.incarnation
@@ -90,7 +79,7 @@ mod tests {
     fn is_copy() {
         let w = WriterId::new(NodeId::from(3), 5);
         let copy = w;
-        // Using both after the copy proves `Copy`, not just `Clone`: a move
+        // Using both after the copy proves `Copy`, not only `Clone`: a move
         // would make this a compile error.
         assert_eq!(w, copy);
     }

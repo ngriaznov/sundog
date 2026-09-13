@@ -272,37 +272,17 @@ async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
         .await;
 }
 
-/// Drives one real writer through CRDT retirement so the scrape loop below
-/// pins `sundog_crdt_retired_writers_total`/`sundog_crdt_compactions_total`
-/// on an actual `cluster::crdt_compact_task` pass, not just its pure
-/// decision logic (already unit-tested in `cluster.rs`/`membership/mod.rs`).
-///
-/// A writer becomes retirement-eligible here purely through a genuine
-/// incarnation mismatch (`membership::incarnation_is_dead`'s "live under a
-/// different incarnation" branch, true the instant it's observed — no
-/// waiting on any bound): a graceful [`Cluster::shutdown`] never enters
-/// absence tracking at all (`AbsenceTracker::observe`'s own
-/// `counts_as_absent` exclusion for a departing peer), so the absence-aged
-/// path can never fire from a black-box integration test that has no way
-/// to simulate a real crash. Rejoining under the same explicit
-/// [`sundog::ClusterBuilder::node_id`] — the restart scenario
-/// [`sundog::NodeId::random`]'s own docs name — is the one reliable, real
-/// trigger reachable from outside the crate: `first_life` contributes
-/// under its writer id and gracefully leaves; `second_life` then rejoins
-/// under the identical node id with a fresh incarnation, which is
-/// immediately a mismatch against `first_life`'s recorded writer.
-///
-/// Only one key with one dead writer ever exists on the `counters` cache
-/// used here, and stage-one retirement (moving a dead writer's slot out of
-/// the live `p`/`n` maps) never calls `retire` on it again once moved, so
-/// `sundog_crdt_retired_writers_total{cache="counters"}` settles at exactly
-/// `1` for the rest of the process — pinned exactly below, the same way
-/// `sundog_spill_writes_total` etc. are. `sundog_crdt_compactions_total`
-/// only gets a lower bound there instead: once this writer's retired slot
-/// ages past twice `crdt_retire_after`, quite plausibly before the scrape
-/// below, stage two folds it into the bounded scalar as a second, equally
-/// real record rewrite — so this cache's compactions total may legitimately
-/// read `1` or `2` depending on exactly when the scrape below lands.
+/// Drives one real writer through CRDT retirement, rejoining
+/// `second_life` under `first_life`'s identical explicit
+/// [`sundog::ClusterBuilder::node_id`] with a fresh incarnation so
+/// `membership::incarnation_is_dead` marks `first_life`'s writer dead, the
+/// one trigger for a real `cluster::crdt_compact_task` pass reachable from
+/// a black-box integration test (a graceful [`Cluster::shutdown`] never
+/// enters absence tracking at all). `sundog_crdt_retired_writers_total{cache="counters"}`
+/// settles at exactly `1` once stage-one retirement runs, while
+/// `sundog_crdt_compactions_total` reads `1` or `2` depending on whether
+/// stage two's later record rewrite has landed by the time the caller
+/// scrapes.
 async fn seed_crdt_compaction_metrics(
     cluster: &Cluster,
     gossip_a: SocketAddr,
@@ -377,7 +357,7 @@ async fn seed_crdt_compaction_metrics(
     })
     .await;
 
-    // `crdt_compact_task` ticks at most every 30s (its own cadence floor —
+    // `crdt_compact_task` ticks at most every 30s (its own cadence floor,
     // see `node_config`'s comment above). Give the next real tick after the
     // incarnation mismatch above becomes visible ample room to land.
     common::eventually(Duration::from_secs(120), || async {
@@ -402,9 +382,9 @@ async fn seed_crdt_compaction_metrics(
 }
 
 /// Opens `prices` as `Mode::Distributed { owners: 2 }` across `cluster`,
-/// `peer`, and two more nodes joined just for this scenario, driving every
+/// `peer`, and two more nodes joined for this scenario, driving every
 /// `sundog_fetch_total` outcome, a forwarded write, and both
-/// `sundog_rebalance_buckets_total` directions on `cluster` itself — the
+/// `sundog_rebalance_buckets_total` directions on `cluster` itself, the
 /// only node whose metrics this test scrapes. Folded into the main test
 /// rather than its own `#[tokio::test]`, for the same process-global
 /// recorder reason `spill_writes_and_promotes_pin_metrics` is.
@@ -425,7 +405,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
         .await
         .expect("third node builds");
     common::wait_for_peer_count(&third, 1, Duration::from_secs(15)).await;
-    // Both real peers, not just third's own view of the mesh: cluster's
+    // Both real peers, not only third's own view of the mesh: cluster's
     // own membership must include third before it ever opens prices.
     common::wait_for_peer_count(cluster, 2, Duration::from_secs(15)).await;
 
@@ -496,7 +476,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
     .expect("outcome=local eventually reads the owned key's value");
 
     // outcome="remote": cluster reads an unowned key's value back over the
-    // wire from a real owner — proof the open()-time pull, or a live fetch
+    // wire from a real owner, proof the open()-time pull, or a live fetch
     // to peer/third, delivers it.
     let unowned_key = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -579,7 +559,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
         }
     })
     .await
-    .expect("fourth's arrival displaces cluster from at least one previously-owned bucket");
+    .expect("fourth's arrival displaces cluster from at least one bucket it held before");
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if cluster_prices.get(&displaced_key).await.is_none() {
@@ -651,7 +631,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // count `seed_distributed_metrics` below needs to account for.
     seed_crdt_compaction_metrics(&cluster, gossip_a, metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
-    // no longer needs them, and `peer` isn't touched by anything after it.
+    // is done with them, and `peer` isn't touched by anything after it.
     seed_distributed_metrics(&cluster, &peer, gossip_a).await;
 
     // `sundog_open_caches` comes from a periodic background routine and the
@@ -878,7 +858,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
 /// serves `/metrics` from its own HTTP stack. Whichever test in this binary
 /// installs the process-global recorder first wins it: if the recorder
 /// above already claimed the slot, `prometheus_handle` still runs (and this
-/// test still exercises it), it just cannot hand back a usable handle, so
+/// test still exercises it), it cannot hand back a usable handle, so
 /// the render-based assertion below only applies when this test wins the
 /// race.
 #[tokio::test]
