@@ -9,6 +9,7 @@ mod cli;
 mod convergence;
 mod headless;
 mod load;
+mod metrics;
 mod node;
 mod preload;
 mod rss;
@@ -27,6 +28,7 @@ use tokio::sync::mpsc;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = cli::parse(std::env::args().skip(1))?;
+    preload::set_value_bytes(args.value_bytes);
 
     if let Some(duration) = args.headless {
         let code = headless::run(&args, duration).await?;

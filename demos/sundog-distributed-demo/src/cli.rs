@@ -1,8 +1,10 @@
 //! Command-line arguments for the distributed demo: node count, key-space
-//! size, owner count, and either the interactive TUI or a fixed-duration
-//! `--headless` smoke run.
+//! size, owner count, value size, the per-node RAM cap and spill tier, the
+//! in-process metrics reporter, and either the interactive TUI or a
+//! fixed-duration `--headless` smoke run.
 
 use std::num::NonZeroU8;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -17,6 +19,45 @@ pub(crate) struct Args {
     pub(crate) owners: NonZeroU8,
     pub(crate) write_interval: Duration,
     pub(crate) gossip_base_port: Option<u16>,
+    /// Pads every preload and load value out to this many bytes; `0`
+    /// leaves the short `v{i}` values.
+    pub(crate) value_bytes: usize,
+    pub(crate) tuning: CacheTuning,
+    /// `Some(interval)` prints an in-process metrics line every `interval`
+    /// and a full `sundog_*` dump at each milestone of a headless run.
+    pub(crate) metrics: Option<Duration>,
+}
+
+/// Per-node cache sizing: the RAM entry cap and the spill tier that catches
+/// what the cap evicts.
+#[derive(Debug, Clone)]
+pub(crate) struct CacheTuning {
+    /// `CacheBuilder::max_capacity`, in entries per node; `None` leaves the
+    /// cache unbounded.
+    pub(crate) max_entries: Option<u64>,
+    /// Root of the spill tier; each node gets its own subdirectory.
+    pub(crate) spill_dir: Option<PathBuf>,
+    /// `SpillConfig::capacity_bytes` per node.
+    pub(crate) spill_capacity_bytes: u64,
+    /// `SpillConfig::region_bytes`; `None` keeps the library default.
+    pub(crate) spill_region_bytes: Option<u64>,
+    /// `SpillConfig::flush_queue_bytes`; `None` keeps the library default
+    /// of one region.
+    pub(crate) spill_flush_queue_bytes: Option<u64>,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+impl Default for CacheTuning {
+    fn default() -> Self {
+        Self {
+            max_entries: None,
+            spill_dir: None,
+            spill_capacity_bytes: 4096 * MIB,
+            spill_region_bytes: None,
+            spill_flush_queue_bytes: None,
+        }
+    }
 }
 
 impl Default for Args {
@@ -29,9 +70,14 @@ impl Default for Args {
             owners: NonZeroU8::new(2).expect("2 is nonzero"),
             write_interval: Duration::from_millis(50),
             gossip_base_port: None,
+            value_bytes: 0,
+            tuning: CacheTuning::default(),
+            metrics: None,
         }
     }
 }
+
+const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Parses `std::env::args()`, minus `argv[0]`, into [`Args`].
 ///
@@ -99,6 +145,7 @@ pub(crate) fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Ar
                         .context("--gossip-base-port must be a 16-bit port number")?,
                 );
             }
+            flag if parse_sizing_flag(flag, &mut args, &mut parsed)? => {}
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -106,7 +153,100 @@ pub(crate) fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Ar
             other => bail!("unrecognized argument: {other} (try --help)"),
         }
     }
+    if parsed.tuning.spill_dir.is_some() && !cfg!(feature = "spill") {
+        bail!("--spill-dir needs the demo built with --features spill");
+    }
+    if parsed.tuning.spill_dir.is_none() && parsed.tuning.max_entries.is_some() {
+        bail!(
+            "--max-entries needs --spill-dir: a distributed cache refuses a RAM cap with no spill tier to catch the evictions"
+        );
+    }
+    if parsed.metrics.is_some() && !cfg!(feature = "prometheus") {
+        bail!("--metrics needs the demo built with --features prometheus");
+    }
     Ok(parsed)
+}
+
+/// Handles the value-size, RAM-cap, spill and metrics flags; `Ok(false)`
+/// for any other flag.
+///
+/// # Errors
+///
+/// Returns an error for a missing or bad value.
+fn parse_sizing_flag(
+    flag: &str,
+    args: &mut impl Iterator<Item = String>,
+    parsed: &mut Args,
+) -> anyhow::Result<bool> {
+    match flag {
+        "--value-bytes" => {
+            parsed.value_bytes = args
+                .next()
+                .context("--value-bytes needs a value")?
+                .parse()
+                .context("--value-bytes must be a non-negative integer")?;
+        }
+        "--max-entries" => {
+            let n: u64 = args
+                .next()
+                .context("--max-entries needs a value")?
+                .parse()
+                .context("--max-entries must be a positive integer")?;
+            if n == 0 {
+                bail!("--max-entries must be at least 1");
+            }
+            parsed.tuning.max_entries = Some(n);
+        }
+        "--spill-dir" => {
+            parsed.tuning.spill_dir = Some(PathBuf::from(
+                args.next().context("--spill-dir needs a value")?,
+            ));
+        }
+        "--spill-capacity-mb" => {
+            let mb: u64 = args
+                .next()
+                .context("--spill-capacity-mb needs a value")?
+                .parse()
+                .context("--spill-capacity-mb must be a positive integer")?;
+            if mb == 0 {
+                bail!("--spill-capacity-mb must be at least 1");
+            }
+            parsed.tuning.spill_capacity_bytes = mb.saturating_mul(MIB);
+        }
+        "--spill-region-mb" => {
+            parsed.tuning.spill_region_bytes = Some(parse_mib(args, "--spill-region-mb")?);
+        }
+        "--spill-flush-queue-mb" => {
+            parsed.tuning.spill_flush_queue_bytes =
+                Some(parse_mib(args, "--spill-flush-queue-mb")?);
+        }
+        "--metrics" => {
+            parsed.metrics.get_or_insert(DEFAULT_METRICS_INTERVAL);
+        }
+        "--metrics-interval-secs" => {
+            let secs: u64 = args
+                .next()
+                .context("--metrics-interval-secs needs a value")?
+                .parse()
+                .context("--metrics-interval-secs must be an integer")?;
+            parsed.metrics = Some(Duration::from_secs(secs.max(1)));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The next argument as a positive MiB count, in bytes.
+fn parse_mib(args: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<u64> {
+    let mb: u64 = args
+        .next()
+        .with_context(|| format!("{flag} needs a value"))?
+        .parse()
+        .with_context(|| format!("{flag} must be a positive integer"))?;
+    if mb == 0 {
+        bail!("{flag} must be at least 1");
+    }
+    Ok(mb.saturating_mul(MIB))
 }
 
 fn print_help() {
@@ -122,6 +262,14 @@ fn print_help() {
          \x20   --cluster <NAME>            cluster name (default sundog-demo-distributed)\n\
          \x20   --write-interval-ms <N>     delay between load ticks (default 50)\n\
          \x20   --gossip-base-port <PORT>   first loopback gossip port (default random)\n\
+         \x20   --value-bytes <N>           pad every value out to N bytes (default 0: short v{{i}} values)\n\
+         \x20   --max-entries <N>           RAM entry cap per node; needs --spill-dir (default unbounded)\n\
+         \x20   --spill-dir <PATH>          spill tier root, one subdirectory per node (needs --features spill)\n\
+         \x20   --spill-capacity-mb <N>     spill disk budget per node in MiB (default 4096)\n\
+         \x20   --spill-region-mb <N>       spill region file size in MiB (default 64)\n\
+         \x20   --spill-flush-queue-mb <N>  queued-but-unwritten spill bytes before eviction drops instead (default one region)\n\
+         \x20   --metrics                   print in-process sundog_* metrics during a headless run (needs --features prometheus)\n\
+         \x20   --metrics-interval-secs <N> seconds between metrics lines (default 15, implies --metrics)\n\
          \x20   -h, --help                  print this help\n\n\
          KEYS (TUI): up/down or j/k move, 1-9/enter select, K kill, R restart, P pause/resume load, q quit"
     );
@@ -129,6 +277,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -182,5 +332,52 @@ mod tests {
     #[test]
     fn rejects_unknown_flag() {
         assert!(parse(["--bogus"].into_iter().map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn parses_value_bytes_and_metrics_interval() {
+        let args = parse(
+            ["--value-bytes", "256", "--metrics-interval-secs", "5"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        if cfg!(feature = "prometheus") {
+            let args = args.expect("valid args parse");
+            assert_eq!(args.value_bytes, 256);
+            assert_eq!(args.metrics, Some(Duration::from_secs(5)));
+        } else {
+            assert!(args.is_err(), "--metrics needs the prometheus feature");
+        }
+    }
+
+    #[test]
+    fn spill_flags_need_the_feature_and_each_other() {
+        assert!(
+            parse(["--max-entries", "10"].into_iter().map(str::to_owned)).is_err(),
+            "a RAM cap with no spill tier is refused"
+        );
+        let args = parse(
+            [
+                "--spill-dir",
+                "/tmp/spill",
+                "--max-entries",
+                "10",
+                "--spill-capacity-mb",
+                "512",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        if cfg!(feature = "spill") {
+            let args = args.expect("valid args parse");
+            assert_eq!(args.tuning.max_entries, Some(10));
+            assert_eq!(
+                args.tuning.spill_dir.as_deref(),
+                Some(Path::new("/tmp/spill"))
+            );
+            assert_eq!(args.tuning.spill_capacity_bytes, 512 * MIB);
+        } else {
+            assert!(args.is_err(), "--spill-dir needs the spill feature");
+        }
     }
 }

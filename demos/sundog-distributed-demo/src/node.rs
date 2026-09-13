@@ -14,7 +14,20 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
+use crate::cli::CacheTuning;
 use crate::sample::{self, BUCKET_COUNT, PROBE_COUNT};
+
+/// Everything a node needs to open or reopen: the cluster it joins and how
+/// its cache is sized. One per run, shared by every node.
+#[derive(Debug, Clone)]
+pub(crate) struct Topology {
+    pub(crate) cluster_name: String,
+    pub(crate) seeds: Vec<SocketAddr>,
+    pub(crate) ae_interval: Duration,
+    pub(crate) tombstone_ttl: Duration,
+    pub(crate) owners: NonZeroU8,
+    pub(crate) tuning: CacheTuning,
+}
 
 pub(crate) const CACHE_NAME: &str = "demo";
 
@@ -121,22 +134,10 @@ impl NodeSlot {
     /// Returns an error if the cluster fails to form or the cache to open.
     pub(crate) async fn start(
         self: &Arc<Self>,
-        cluster_name: &str,
-        seeds: &[SocketAddr],
-        ae_interval: Duration,
-        tombstone_ttl: Duration,
-        owners: NonZeroU8,
+        topology: &Topology,
         feed_tx: &UnboundedSender<String>,
     ) -> anyhow::Result<()> {
-        let handle = open(
-            cluster_name,
-            self.gossip_addr,
-            seeds,
-            ae_interval,
-            tombstone_ttl,
-            owners,
-        )
-        .await?;
+        let handle = open(self.gossip_addr, self.index, topology).await?;
         self.status
             .node_id
             .store(handle.cluster.node_id().as_u64(), Ordering::Relaxed);
@@ -170,11 +171,7 @@ impl NodeSlot {
     /// returns `false` without touching anything: no cluster reopens.
     pub(crate) async fn restart(
         self: &Arc<Self>,
-        cluster_name: &str,
-        seeds: &[SocketAddr],
-        ae_interval: Duration,
-        tombstone_ttl: Duration,
-        owners: NonZeroU8,
+        topology: &Topology,
         feed_tx: &UnboundedSender<String>,
     ) -> bool {
         if self.status.busy.swap(true, Ordering::AcqRel) {
@@ -182,16 +179,7 @@ impl NodeSlot {
         }
         self.teardown().await;
         let _ = feed_tx.send(format!("node{}: restarting…", self.index));
-        let succeeded = match open(
-            cluster_name,
-            self.gossip_addr,
-            seeds,
-            ae_interval,
-            tombstone_ttl,
-            owners,
-        )
-        .await
-        {
+        let succeeded = match open(self.gossip_addr, self.index, topology).await {
             Ok(handle) => {
                 self.status
                     .node_id
@@ -245,23 +233,54 @@ fn config(
     })
 }
 
+/// Opens a cluster on `gossip_addr` and the demo cache on it, sized per
+/// `topology.tuning`: the RAM entry cap, and a spill tier under
+/// `spill_dir/node{index}` so in-process nodes never share region files.
 async fn open(
-    cluster_name: &str,
     gossip_addr: SocketAddr,
-    seeds: &[SocketAddr],
-    ae_interval: Duration,
-    tombstone_ttl: Duration,
-    owners: NonZeroU8,
+    index: usize,
+    topology: &Topology,
 ) -> anyhow::Result<Handle> {
-    let cluster = Cluster::builder(cluster_name)
-        .seeds(seeds.iter().copied())
-        .config(config(gossip_addr, ae_interval, tombstone_ttl))
+    let cluster = Cluster::builder(topology.cluster_name.as_str())
+        .seeds(topology.seeds.iter().copied())
+        .config(config(
+            gossip_addr,
+            topology.ae_interval,
+            topology.tombstone_ttl,
+        ))
         .build()
         .await
         .context("failed to form cluster")?;
-    let cache = cluster
+    let tuning = &topology.tuning;
+    let builder = cluster
         .cache::<String, String>(CACHE_NAME)
-        .mode(Mode::Distributed { owners })
+        .mode(Mode::Distributed {
+            owners: topology.owners,
+        });
+    let builder = match tuning.max_entries {
+        Some(max) => builder.max_capacity(max),
+        None => builder,
+    };
+    #[cfg(feature = "spill")]
+    let builder = match &tuning.spill_dir {
+        Some(root) => {
+            let mut cfg = sundog::SpillConfig::new(
+                root.join(format!("node{index}")),
+                tuning.spill_capacity_bytes,
+            );
+            if let Some(bytes) = tuning.spill_region_bytes {
+                cfg = cfg.region_bytes(bytes);
+            }
+            if let Some(bytes) = tuning.spill_flush_queue_bytes {
+                cfg = cfg.flush_queue_bytes(bytes);
+            }
+            builder.spill(cfg)
+        }
+        None => builder,
+    };
+    #[cfg(not(feature = "spill"))]
+    let _ = index;
+    let cache = builder
         .open()
         .await
         .context("failed to open the demo cache")?;
@@ -412,16 +431,15 @@ mod tests {
         // Simulate a restart already in flight: the guard must bail out
         // before touching the network and report the outcome as `false`.
         slots[0].status.busy.store(true, Ordering::Release);
-        let restarted = slots[0]
-            .restart(
-                "test-cluster",
-                &seeds,
-                Duration::from_millis(50),
-                Duration::from_secs(30),
-                NonZeroU8::new(1).expect("1 is nonzero"),
-                &feed_tx,
-            )
-            .await;
+        let topology = Topology {
+            cluster_name: "test-cluster".to_owned(),
+            seeds,
+            ae_interval: Duration::from_millis(50),
+            tombstone_ttl: Duration::from_secs(30),
+            owners: NonZeroU8::new(1).expect("1 is nonzero"),
+            tuning: CacheTuning::default(),
+        };
+        let restarted = slots[0].restart(&topology, &feed_tx).await;
         assert!(!restarted);
         drop(feed_tx);
         assert!(feed_rx.recv().await.is_none());

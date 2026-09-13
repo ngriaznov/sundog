@@ -6,14 +6,17 @@
 //! test.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::random_range;
 
 use crate::cli::Args;
 use crate::convergence;
-use crate::node::DISOWN_GRACE_ROUNDS;
+use crate::metrics::{self, Metrics};
+use crate::node::{DISOWN_GRACE_ROUNDS, NodeSlot};
 use crate::preload::key_for;
 use crate::rss;
 use crate::setup;
@@ -31,6 +34,13 @@ const SAMPLE_ATTEMPT_CAP: usize = SAMPLE_SIZE * 20;
 ///
 /// Returns an error if the cluster fails to bootstrap.
 pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> {
+    // The recorder must exist before the first node opens, or every metric
+    // registered until then stays on the no-op recorder.
+    let metrics = match args.metrics {
+        Some(interval) => Some((Arc::new(Metrics::install()?), interval)),
+        None => None,
+    };
+    let started = Instant::now();
     let mut demo = setup::bootstrap(args).await?;
     // The event feed is unbounded; drain it since only the TUI reads it.
     let (drained_tx, drained_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -39,14 +49,16 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     tokio::spawn(async move { while feed.recv().await.is_some() {} });
     let demo = demo;
 
-    println!(
-        "sundog-distributed-demo headless: {} nodes, {} keys, {} owners, cluster {:?}, running for {}s",
-        args.nodes,
-        args.keys,
-        args.owners.get(),
-        args.cluster_name,
-        duration.as_secs()
-    );
+    print_banner(args, duration);
+    let reporter = metrics.as_ref().map(|(metrics, interval)| {
+        tokio::spawn(report_periodically(
+            Arc::clone(metrics),
+            *interval,
+            Arc::clone(&demo.nodes),
+            args.tuning.spill_dir.clone(),
+            started,
+        ))
+    });
 
     let report = demo.wait_for_preload().await;
     let rss_kb = rss::read_rss_kb();
@@ -57,6 +69,9 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
         report.keys_per_sec(),
         rss::format_rss(rss_kb)
     );
+    if let Some((metrics, _)) = &metrics {
+        println!("metrics after preload:\n{}", metrics.dump());
+    }
 
     // Kill one node at the midpoint and restart it three-quarters through,
     // so the run exercises a real rebalance under live load.
@@ -72,14 +87,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
 
     tokio::time::sleep(three_quarter.saturating_sub(half)).await;
     let restarted = demo.nodes[killed_index]
-        .restart(
-            &demo.cluster_name,
-            &demo.seeds,
-            setup::AE_INTERVAL,
-            setup::TOMBSTONE_TTL,
-            args.owners,
-            &demo.feed_tx,
-        )
+        .restart(&demo.topology, &demo.feed_tx)
         .await;
     if restarted {
         println!(
@@ -101,13 +109,42 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     let deadline = convergence::poll_deadline(setup::AE_INTERVAL, DISOWN_GRACE_ROUNDS);
     let convergence_report = convergence::poll(
         &demo.nodes,
-        u64::from(demo.owners.get()),
+        u64::from(demo.topology.owners.get()),
         || demo.state.surviving_keys(),
         deadline,
     )
     .await;
 
-    let (sample_checked, sample_ok) = verify_sample(&demo, SAMPLE_SIZE).await;
+    let sample_failed = report_fetches_and_sample(&demo, &convergence_report).await;
+    let exit_code = i32::from(convergence_report.is_diverged() || sample_failed || !restarted);
+
+    if let Some(reporter) = reporter {
+        reporter.abort();
+    }
+    if let Some((metrics, _)) = &metrics {
+        println!(
+            "{}",
+            status_line(
+                metrics,
+                &demo.nodes,
+                args.tuning.spill_dir.as_deref(),
+                started
+            )
+        );
+        println!("metrics at end:\n{}", metrics.dump());
+    }
+    demo.shutdown().await;
+    Ok(exit_code)
+}
+
+/// Prints the fetch counters, the sample check and the convergence report,
+/// with the per-node explanation on divergence. Returns whether the sample
+/// check failed.
+async fn report_fetches_and_sample(
+    demo: &setup::Demo,
+    convergence_report: &convergence::Convergence,
+) -> bool {
+    let (sample_checked, sample_ok) = verify_sample(demo, SAMPLE_SIZE).await;
     let (p50_us, p99_us) = demo.state.latency_percentiles();
     let hits = demo.state.fetch_hits.load(Ordering::Relaxed);
     let misses = demo.state.fetch_misses.load(Ordering::Relaxed);
@@ -119,15 +156,109 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     );
     println!("convergence: {convergence_report}");
     if convergence_report.is_diverged() {
-        explain_divergence(&demo);
+        explain_divergence(demo);
     }
+    sample_ok != sample_checked || sample_checked == 0
+}
 
-    let diverged = convergence_report.is_diverged();
-    let sample_failed = sample_ok != sample_checked || sample_checked == 0;
-    let exit_code = i32::from(diverged || sample_failed || !restarted);
+/// Prints the run's shape: cluster, key space, value size, RAM cap and
+/// spill tier.
+fn print_banner(args: &Args, duration: Duration) {
+    println!(
+        "sundog-distributed-demo headless: {} nodes, {} keys, {} owners, cluster {:?}, running for {}s",
+        args.nodes,
+        args.keys,
+        args.owners.get(),
+        args.cluster_name,
+        duration.as_secs()
+    );
+    println!(
+        "sizing: {} value bytes, RAM cap {} entries per node, spill {}",
+        args.value_bytes,
+        args.tuning
+            .max_entries
+            .map_or_else(|| "unbounded".to_owned(), |n| n.to_string()),
+        args.tuning.spill_dir.as_ref().map_or_else(
+            || "off".to_owned(),
+            |dir| format!(
+                "under {} with {} per node, regions of {}, flush queue {}",
+                dir.display(),
+                metrics::format_bytes(args.tuning.spill_capacity_bytes),
+                args.tuning
+                    .spill_region_bytes
+                    .map_or_else(|| "64.0 MiB (default)".to_owned(), metrics::format_bytes),
+                args.tuning
+                    .spill_flush_queue_bytes
+                    .map_or_else(|| "one region (default)".to_owned(), metrics::format_bytes),
+            )
+        )
+    );
+}
 
-    demo.shutdown().await;
-    Ok(exit_code)
+/// Prints [`status_line`] every `interval` until aborted.
+async fn report_periodically(
+    metrics: Arc<Metrics>,
+    interval: Duration,
+    nodes: Arc<Vec<Arc<NodeSlot>>>,
+    spill_dir: Option<PathBuf>,
+    started: Instant,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        println!(
+            "{}",
+            status_line(&metrics, &nodes, spill_dir.as_deref(), started)
+        );
+    }
+}
+
+/// One line of run state: elapsed time, RSS, each node's own entry and
+/// bucket counts, the size of each node's spill directory on disk, and the
+/// watched metric totals.
+fn status_line(
+    metrics: &Metrics,
+    nodes: &[Arc<NodeSlot>],
+    spill_dir: Option<&Path>,
+    started: Instant,
+) -> String {
+    let per_node: Vec<String> = nodes
+        .iter()
+        .map(|node| {
+            let disk = spill_dir.map_or_else(String::new, |root| {
+                format!(
+                    " disk={}",
+                    metrics::format_bytes(metrics::dir_bytes(
+                        &root.join(format!("node{}", node.index))
+                    ))
+                )
+            });
+            let state = if node.status.alive.load(Ordering::Relaxed) {
+                if node.status.warm.load(Ordering::Relaxed) {
+                    "warm"
+                } else {
+                    "cold"
+                }
+            } else {
+                "down"
+            };
+            format!(
+                "node{} {state} entries={} buckets={}{disk}",
+                node.index,
+                node.status.entry_count.load(Ordering::Relaxed),
+                node.status.owned_buckets.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+    format!(
+        "t={}s rss={} | {} | {}",
+        started.elapsed().as_secs(),
+        rss::format_rss(rss::read_rss_kb()),
+        per_node.join("; "),
+        metrics::summary_line(&metrics.totals())
+    )
 }
 
 /// Fetches `sample_size` random surviving keys from a random live node and

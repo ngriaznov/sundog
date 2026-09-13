@@ -12,6 +12,13 @@ publish = false
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
+# Both off by default so the workspace's feature-less lanes build the demo
+# exactly as the library's own defaults do; `--features spill,prometheus`
+# turns on `--spill-dir` and `--metrics`.
+[features]
+spill = ["sundog/spill"]
+prometheus = ["sundog/prometheus"]
+
 [dependencies]
 anyhow = "1.0.104"
 crossterm = "0.29.0"
