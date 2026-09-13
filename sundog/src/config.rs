@@ -1,6 +1,7 @@
 //! Cluster-wide tunables: the values and their defaults, consumed by the
 //! `Cluster` builder.
 
+use crate::store::CompactionBounds;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -59,6 +60,29 @@ pub struct ClusterConfig {
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
     /// member that never comes back.
     pub tombstone_max_ttl: Duration,
+    /// How long a gone, non-local writer incarnation must stay gone,
+    /// whether it crashed or left through `Cluster::shutdown` (or be
+    /// superseded by a live incarnation of the same node), before its
+    /// `PnCounter`/`OrSet` slot becomes eligible for the CRDT compaction
+    /// sweep's stage-one retirement. Defaults to
+    /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) — the same bound this
+    /// crate already documents as "a member gone longer than this may
+    /// resurrect data" if it returns, and the trust boundary CRDT
+    /// compaction's writer-retirement rule relies on for the same reason.
+    pub crdt_retire_after: Duration,
+    /// How many resident CRDT records one `compact_pass` call examines
+    /// before yielding to the executor. A tick keeps calling until the
+    /// whole keyspace has been examined, so this bounds the stall per call,
+    /// not the work per tick.
+    pub crdt_compact_batch: usize,
+    /// How often the CRDT compaction sweep runs. `None`, the default, is a
+    /// quarter of [`crdt_retire_after`](Self::crdt_retire_after) floored at
+    /// 30 seconds ([`crdt_sweep_period`](Self::crdt_sweep_period)); a test
+    /// cluster with a bound of seconds sets this to something shorter,
+    /// which also shortens the fold receipt lifetime
+    /// ([`crdt_compaction_bounds`](Self::crdt_compaction_bounds)) the
+    /// sweep period feeds.
+    pub crdt_sweep_interval: Option<Duration>,
     /// Bounded capacity of each per-peer outbox (`mpsc`) on the data plane.
     pub outbox_capacity: usize,
     /// Hard cap on a single wire frame, in bytes. Must not exceed
@@ -171,6 +195,27 @@ impl ClusterConfig {
         self.tombstone_ttl >= self.ae_interval.saturating_mul(3)
     }
 
+    /// How often the CRDT compaction sweep runs:
+    /// [`crdt_sweep_interval`](Self::crdt_sweep_interval) if set, else a
+    /// quarter of [`crdt_retire_after`](Self::crdt_retire_after) floored at
+    /// 30 seconds, since retirement eligibility rather than traffic is what
+    /// changes over time, and a full pass examines every resident record.
+    #[must_use]
+    pub fn crdt_sweep_period(&self) -> Duration {
+        self.crdt_sweep_interval
+            .unwrap_or_else(|| (self.crdt_retire_after / 4).max(Duration::from_secs(30)))
+    }
+
+    /// The [`CompactionBounds`] the sweep and the merge apply path share
+    /// under this configuration: `crdt_retire_after` with a fold receipt
+    /// living the longer of three bounds and two bounds plus two sweep
+    /// periods, so it outlives every reachable replica's own fold of the
+    /// same writer.
+    #[must_use]
+    pub fn crdt_compaction_bounds(&self) -> CompactionBounds {
+        CompactionBounds::new(self.crdt_retire_after, self.crdt_sweep_period())
+    }
+
     /// Applies `f` to a mutable borrow of `self` and returns it: how code
     /// outside this crate overrides a subset of fields on
     /// [`ClusterConfig::default`] without breaking when a field is added.
@@ -187,6 +232,9 @@ impl Default for ClusterConfig {
             ae_interval: Duration::from_secs(30),
             tombstone_ttl: Duration::from_mins(10),
             tombstone_max_ttl: Duration::from_hours(24),
+            crdt_retire_after: Duration::from_hours(24),
+            crdt_compact_batch: 4_096,
+            crdt_sweep_interval: None,
             outbox_capacity: 8_192,
             max_frame: MAX_FRAME,
             gossip_bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -287,6 +335,82 @@ mod tests {
     #[test]
     fn default_rebalance_concurrency_is_four() {
         assert_eq!(ClusterConfig::default().rebalance_concurrency, 4);
+    }
+
+    #[test]
+    fn default_crdt_retire_after_matches_tombstone_max_ttl() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.crdt_retire_after, config.tombstone_max_ttl);
+    }
+
+    #[test]
+    fn default_crdt_compact_batch_is_four_thousand_ninety_six() {
+        assert_eq!(ClusterConfig::default().crdt_compact_batch, 4_096);
+    }
+
+    #[test]
+    fn crdt_sweep_period_is_a_quarter_of_the_bound_floored_at_thirty_seconds() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.crdt_sweep_period(), Duration::from_hours(6));
+        let short = config
+            .clone()
+            .with(|c| c.crdt_retire_after = Duration::from_secs(60));
+        assert_eq!(short.crdt_sweep_period(), Duration::from_secs(30));
+        let overridden = short.with(|c| c.crdt_sweep_interval = Some(Duration::from_millis(250)));
+        assert_eq!(overridden.crdt_sweep_period(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn crdt_compaction_bounds_receipt_outlives_two_sweep_periods_at_any_bound() {
+        for secs in [1, 2, 5, 60, 119, 120, 3_600, 86_400] {
+            let config =
+                ClusterConfig::default().with(|c| c.crdt_retire_after = Duration::from_secs(secs));
+            let bounds = config.crdt_compaction_bounds();
+            let period_ms = u64::try_from(config.crdt_sweep_period().as_millis()).expect("fits");
+            assert!(
+                bounds.receipt_ttl_ms >= 2 * period_ms,
+                "bound {secs}s: receipt ttl {} ms must cover two sweep periods of {period_ms} ms, \
+                 so a member that left between ticks is seen gone before the tick forgets it",
+                bounds.receipt_ttl_ms
+            );
+        }
+    }
+
+    #[test]
+    fn crdt_compaction_bounds_receipt_lives_the_longer_of_three_bounds_and_two_plus_two_periods() {
+        let default = ClusterConfig::default().crdt_compaction_bounds();
+        let day_ms = 24 * 60 * 60 * 1_000;
+        assert_eq!(default.retire_after_ms, day_ms);
+        assert_eq!(
+            default.receipt_ttl_ms,
+            3 * day_ms,
+            "three bounds win over 48h + 12h"
+        );
+
+        let short = ClusterConfig::default()
+            .with(|c| c.crdt_retire_after = Duration::from_secs(2))
+            .crdt_compaction_bounds();
+        assert_eq!(short.retire_after_ms, 2_000);
+        assert_eq!(
+            short.receipt_ttl_ms,
+            2 * 2_000 + 2 * 30_000,
+            "two bounds plus two 30s sweep periods win over a 6s triple bound"
+        );
+    }
+
+    #[test]
+    fn with_overrides_crdt_retire_after_and_batch_independently() {
+        let config = ClusterConfig::default().with(|c| {
+            c.crdt_retire_after = Duration::from_secs(1);
+            c.crdt_compact_batch = 10;
+        });
+        assert_eq!(config.crdt_retire_after, Duration::from_secs(1));
+        assert_eq!(config.crdt_compact_batch, 10);
+        assert_eq!(
+            config.tombstone_max_ttl,
+            ClusterConfig::default().tombstone_max_ttl,
+            "overriding the new knobs leaves unrelated fields at their defaults"
+        );
     }
 
     #[test]

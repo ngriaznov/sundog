@@ -617,7 +617,11 @@ async fn handle_accepted(
 /// message to `inbound_tx`, serves a request inline, or, for a message only
 /// ever sent as a reply on a connection this node initiated, does nothing.
 /// Returns `true` when this connection is done.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one match arm per RPC kind; splitting it up would obscure the dispatch table"
+)]
 async fn dispatch_one(
     msg: Msg,
     from: NodeId,

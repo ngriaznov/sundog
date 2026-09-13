@@ -7,9 +7,10 @@
 //! comma-separated list of `host:port` gossip seeds,
 //! `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET`/`SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET`
 //! optional `usize` overrides for `ClusterConfig::ae_part_min_bucket`/
-//! `ae_sketch_min_bucket` (absent means the built-in default). Opens one
-//! `Mode::Replicated` cache named `"it"` and prints `testnode-ready` once
-//! the control listener is up.
+//! `ae_sketch_min_bucket`, and `SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS` an
+//! optional `u64` override for `ClusterConfig::crdt_retire_after` (absent
+//! means each knob's built-in default). Opens one `Mode::Replicated` cache
+//! named `"it"` and prints `testnode-ready` once the control listener is up.
 //!
 //! `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`, an optional `u64`, bounds `"it"`
 //! with a byte-counting weigher (`byte_weight`) instead of the default
@@ -91,24 +92,43 @@
 //! a real anti-entropy repair can redeliver the same merge more than once,
 //! where `PnCounter::merge`'s pointwise-max join can absorb a redelivery for
 //! free. `pnfill n` -> `ok`, bulk-incrementing `pn0..pn(n-1)` by one from this
-//! node — a blind [`sundog::crdt::PnCounter::local_delta`] write, no read
-//! needed; `pncount` -> `<n>`, `"pn"`'s live-entry count; `pnget k` ->
-//! `val <n>` | `none`, key `k`'s current [`sundog::crdt::PnCounter::value`].
-//! It drives the million-counter cold-join container scenario: three nodes
-//! each increment every one of a million counters once, concurrently, and a
-//! cold-joining fourth node's state transfer must carry every counter's exact
-//! merged total, not any one writer's last write.
+//! node's [`Cache::writer_id`] — a blind
+//! [`sundog::crdt::PnCounter::local_delta`] write, no read needed; `pncount`
+//! -> `<n>`, `"pn"`'s live-entry count; `pnget k` -> `val <n>` | `none`, key
+//! `k`'s current [`sundog::crdt::PnCounter::value`]; `pnbytes n` -> `<b>`,
+//! the summed [`sundog::crdt::PnCounter::encode`] length of `pn0..pn(n-1)`
+//! as resident here, the record size a cold join or a state transfer
+//! carries per counter; `pndump k` -> key `k`'s resident counter in its
+//! `Debug` form, or `none`, for reading compaction state off a node. It
+//! drives the
+//! million-counter cold-join container scenario: three nodes each increment
+//! every one of a million counters once, concurrently, and a cold-joining
+//! fourth node's state transfer must carry every counter's exact merged
+//! total, not any one writer's last write.
+//!
+//! A fourth `Mode::Replicated` cache named `"os"` carries real
+//! [`sundog::crdt::OrSet`]`<String>` values under
+//! [`sundog::crdt::OrSetResolver`], one independent set per key. `osadd k e`
+//! -> `ok`, adding element `e` to key `k`'s set via a blind
+//! [`sundog::crdt::OrSet::add`] tagged with this node's own `writer_id` and
+//! its own next per-process sequence number — no read needed. `osremove k e`
+//! -> `ok`, reading key `k`'s currently observed set (a no-op if the key has
+//! never been written on this node, since there is then nothing to observe)
+//! and merging in an [`sundog::crdt::OrSet::remove`] delta against it.
+//! `osmembers k` -> every live element of key `k`'s set, alphabetically
+//! sorted and space-separated, or `none` if the key has never been written.
 
 use std::env;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 #[cfg(feature = "spill")]
 use sundog::SpillConfig;
-use sundog::crdt::{PnCounter, PnCounterResolver};
+use sundog::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver, WriterId};
 use sundog::{Cache, Cluster, ClusterConfig, ConflictResolver, Merged, Mode, RecordView, Winner};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -125,6 +145,9 @@ const CHURN_CACHE_NAME: &str = "churn";
 /// The dedicated `PnCounter` cache `pnfill`/`pncount`/`pnget` operate on,
 /// always merging under [`PnCounterResolver`].
 const PN_CACHE_NAME: &str = "pn";
+/// The dedicated `OrSet<String>` cache `osadd`/`osremove`/`osmembers`
+/// operate on, always merging under [`OrSetResolver`].
+const OS_CACHE_NAME: &str = "os";
 /// Short enough that early `churn` writes expire while the run continues.
 const CHURN_TTL: Duration = Duration::from_secs(2);
 /// `churn` wraps keys modulo this, so churners on different nodes collide.
@@ -361,6 +384,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let seeds = resolve_seeds(&env::var("SUNDOG_SEEDS").unwrap_or_default()).await;
     let ae_part_min_bucket = usize_env("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET");
     let ae_sketch_min_bucket = usize_env("SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET");
+    let crdt_retire_after_secs = u64_env("SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS");
     let owners = match env::var("SUNDOG_TESTNODE_OWNERS").ok() {
         None => None,
         Some(raw) => Some(
@@ -381,6 +405,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(min_bucket) = ae_sketch_min_bucket {
             c.ae_sketch_min_bucket = min_bucket;
+        }
+        if let Some(secs) = crdt_retire_after_secs {
+            c.crdt_retire_after = Duration::from_secs(secs);
         }
     });
 
@@ -427,6 +454,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .resolver(Arc::new(PnCounterResolver))
         .open()
         .await?;
+    let os = cluster
+        .cache::<String, OrSet<String>>(OS_CACHE_NAME)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(OrSetResolver::<String>::new()))
+        .open()
+        .await?;
+    // This process's next `OrSet::add` sequence number: shared across every
+    // control connection and every key, since it only has to be unique per
+    // writer incarnation, not per key. Starts at zero every process start,
+    // matching a fresh incarnation's fresh tag space.
+    let os_seq = Arc::new(AtomicU64::new(0));
 
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
     println!("testnode-ready");
@@ -439,6 +477,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cache.clone(),
             churn.clone(),
             pn.clone(),
+            os.clone(),
+            Arc::clone(&os_seq),
             cluster.clone(),
         ));
     }
@@ -470,6 +510,8 @@ async fn dispatch(
     cache: &Cache<String, String>,
     churn: &Cache<String, String>,
     pn: &Cache<String, PnCounter>,
+    os: &Cache<String, OrSet<String>>,
+    os_seq: &AtomicU64,
     cluster: &Cluster,
     line: &str,
 ) -> Reply {
@@ -537,8 +579,19 @@ async fn dispatch(
         "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
             big_command(cache, command, &mut parts).await
         }
-        "pnfill" | "pncount" | "pnget" => {
-            pn_command(pn, cluster.node_id(), command, parts.next()).await
+        "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
+            pn_command(pn, pn.writer_id(), command, parts.next()).await
+        }
+        "osadd" | "osremove" | "osmembers" => {
+            os_command(
+                os,
+                os.writer_id(),
+                os_seq,
+                command,
+                parts.next(),
+                parts.next(),
+            )
+            .await
         }
         "drop" => {
             let Some(key) = parts.next() else {
@@ -611,13 +664,60 @@ async fn big_command(
     })
 }
 
+/// The `pnfill n` entries: `pn0..pn(n-1)`, each a blind
+/// [`PnCounter::local_delta`] of `1` from `writer`. Pure so the fill's shape
+/// — key names, one writer, one increment each — is testable without
+/// writing through a real cache.
+fn pn_fill_entries(writer: WriterId, count: u32) -> Vec<(String, PnCounter)> {
+    (0..count)
+        .map(|i| (format!("pn{i}"), PnCounter::local_delta(writer, 1)))
+        .collect()
+}
+
+/// Renders `"pn"`'s [`Cache::get`] result as the `pndump` reply body: the
+/// counter's `Debug` form for a present key, `none` for an absent one.
+/// Pure so the reply formatting is testable without a real cluster.
+fn pn_dump_reply(counter: Option<&PnCounter>) -> String {
+    counter.map_or_else(|| "none".to_string(), |counter| format!("{counter:?}"))
+}
+
+/// Renders `"pn"`'s [`Cache::get`] result as the `pnget` reply body:
+/// `val <n>` for a present counter's [`PnCounter::value`], `none` for an
+/// absent key. Pure so the reply formatting is testable without a real
+/// cluster.
+fn pn_get_reply(counter: Option<&PnCounter>) -> String {
+    match counter {
+        Some(counter) => format!("val {}", counter.value()),
+        None => "none".to_string(),
+    }
+}
+
+/// The summed encoded length of `counters`, the resident record size a
+/// cold join or a state transfer carries for them. Pure so the sum is
+/// testable without a real cache.
+/// # Errors
+///
+/// Returns `Err` if any counter fails to encode.
+fn pn_encoded_bytes<'a>(
+    counters: impl IntoIterator<Item = &'a PnCounter>,
+) -> Result<usize, String> {
+    counters
+        .into_iter()
+        .map(|counter| counter.encode().map(|bytes| bytes.len()))
+        .try_fold(0, |total, len| len.map(|len| total + len))
+        .map_err(|error| error.to_string())
+}
+
 /// The `pn*` command family on `"pn"`: `pnfill n` bulk-increments
-/// `pn0..pn(n-1)` by one from `node_id` via a blind [`PnCounter::local_delta`]
-/// write (no read needed); `pncount` reads `"pn"`'s live-entry count;
-/// `pnget k` reads key `k`'s current [`PnCounter::value`].
+/// `pn0..pn(n-1)` by one from `writer` via [`pn_fill_entries`] (no read
+/// needed); `pncount` reads `"pn"`'s live-entry count; `pnget k` reads key
+/// `k`'s current value via [`pn_get_reply`]; `pnbytes n` sums
+/// `pn0..pn(n-1)`'s resident encoded sizes via [`pn_encoded_bytes`], an
+/// absent key contributing nothing; `pndump k` renders key `k`'s resident
+/// counter via [`pn_dump_reply`].
 async fn pn_command(
     pn: &Cache<String, PnCounter>,
-    node_id: sundog::NodeId,
+    writer: WriterId,
     command: &str,
     arg: Option<&str>,
 ) -> Reply {
@@ -626,23 +726,143 @@ async fn pn_command(
             let Some(count) = arg.and_then(|raw| raw.parse::<u32>().ok()) else {
                 return Reply::Line("err pnfill needs a u32 count".to_string());
             };
-            let entries =
-                (0..count).map(|i| (format!("pn{i}"), PnCounter::local_delta(node_id, 1)));
-            Reply::Line(match pn.insert_many(entries).await {
+            Reply::Line(match pn.insert_many(pn_fill_entries(writer, count)).await {
                 Ok(()) => "ok".to_string(),
                 Err(error) => format!("err {error}"),
             })
         }
         "pncount" => Reply::Line(pn.entry_count().await.to_string()),
+        "pnbytes" => {
+            let Some(count) = arg.and_then(|raw| raw.parse::<u32>().ok()) else {
+                return Reply::Line("err pnbytes needs a u32 count".to_string());
+            };
+            let mut counters = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                if let Some(counter) = pn.get(&format!("pn{i}")).await {
+                    counters.push(counter);
+                }
+            }
+            Reply::Line(match pn_encoded_bytes(&counters) {
+                Ok(bytes) => bytes.to_string(),
+                Err(error) => format!("err {error}"),
+            })
+        }
+        "pndump" => {
+            let Some(key) = arg else {
+                return Reply::Line("err pndump needs a key".to_string());
+            };
+            Reply::Line(pn_dump_reply(pn.get(&key.to_string()).await.as_ref()))
+        }
         // "pnget"
         _ => {
             let Some(key) = arg else {
                 return Reply::Line("err pnget needs a key".to_string());
             };
-            Reply::Line(match pn.get(&key.to_string()).await {
-                Some(counter) => format!("val {}", counter.value()),
-                None => "none".to_string(),
+            Reply::Line(pn_get_reply(pn.get(&key.to_string()).await.as_ref()))
+        }
+    }
+}
+
+/// Parses `osadd`/`osremove`'s two required arguments — a key and an
+/// element — out of the line's already-split tokens: `Err` names which
+/// command needs both, `Ok` the pair unwrapped. Pure so the validation is
+/// testable without a real cache.
+fn parse_key_and_element<'a>(
+    command: &str,
+    key: Option<&'a str>,
+    elem: Option<&'a str>,
+) -> Result<(&'a str, &'a str), String> {
+    match (key, elem) {
+        (Some(key), Some(elem)) => Ok((key, elem)),
+        _ => Err(format!("err {command} needs a key and an element")),
+    }
+}
+
+/// The `osadd k e` delta: `e` tagged with `writer`'s next sequence number
+/// (`seq`), a blind [`OrSet::add`]. Pure so the delta's shape is testable
+/// without writing through a real cache.
+fn osadd_delta(writer: WriterId, seq: u64, elem: &str) -> OrSet<String> {
+    OrSet::add(writer, seq, elem.to_string())
+}
+
+/// The `osremove k e` delta against `observed` — key `k`'s currently read
+/// set — a blind [`OrSet::remove`]. Pure so the delta's shape is testable
+/// without writing through a real cache.
+fn osremove_delta(observed: &OrSet<String>, elem: &str) -> OrSet<String> {
+    OrSet::remove(observed, &elem.to_string())
+}
+
+/// Renders `"os"`'s [`Cache::get`] result as the `osmembers` reply body:
+/// every live element of a present set, alphabetically sorted and
+/// space-separated so two replicas holding the same membership always
+/// render identically regardless of each element's underlying tag order,
+/// `none` for a key that has never been written. Pure so the reply
+/// formatting is testable without a real cluster.
+fn os_members_reply(set: Option<&OrSet<String>>) -> String {
+    match set {
+        Some(set) => {
+            let mut members: Vec<&String> = set.iter().collect();
+            members.sort();
+            members
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        None => "none".to_string(),
+    }
+}
+
+/// The `os*` command family on `"os"`: `osadd k e` -> `ok`, merging
+/// [`osadd_delta`] tagged with `writer`'s own next sequence number
+/// (`next_seq`, shared across every key and connection, reset to zero at
+/// process start since a fresh process gets a fresh incarnation and so a
+/// fresh tag space) into key `k`; `osremove k e` -> `ok`, reading key `k`'s
+/// currently observed set — a no-op, since there is then nothing to observe
+/// or remove, if the key has never been written — and merging in
+/// [`osremove_delta`] against it; `osmembers k` -> [`os_members_reply`] of
+/// key `k`'s current set.
+async fn os_command(
+    os: &Cache<String, OrSet<String>>,
+    writer: WriterId,
+    next_seq: &AtomicU64,
+    command: &str,
+    key: Option<&str>,
+    elem: Option<&str>,
+) -> Reply {
+    match command {
+        "osadd" => {
+            let (key, elem) = match parse_key_and_element(command, key, elem) {
+                Ok(pair) => pair,
+                Err(error) => return Reply::Line(error),
+            };
+            let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+            let delta = osadd_delta(writer, seq, elem);
+            Reply::Line(match os.merge(key.to_string(), delta).await {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("err {error}"),
             })
+        }
+        "osremove" => {
+            let (key, elem) = match parse_key_and_element(command, key, elem) {
+                Ok(pair) => pair,
+                Err(error) => return Reply::Line(error),
+            };
+            let Some(observed) = os.get(&key.to_string()).await else {
+                return Reply::Line("ok".to_string());
+            };
+            let delta = osremove_delta(&observed, elem);
+            Reply::Line(match os.merge(key.to_string(), delta).await {
+                Ok(()) => "ok".to_string(),
+                Err(error) => format!("err {error}"),
+            })
+        }
+        // "osmembers"
+        _ => {
+            let Some(key) = key else {
+                return Reply::Line("err osmembers needs a key".to_string());
+            };
+            Reply::Line(os_members_reply(os.get(&key.to_string()).await.as_ref()))
         }
     }
 }
@@ -679,6 +899,8 @@ async fn serve(
     cache: Cache<String, String>,
     churn: Cache<String, String>,
     pn: Cache<String, PnCounter>,
+    os: Cache<String, OrSet<String>>,
+    os_seq: Arc<AtomicU64>,
     cluster: Cluster,
 ) {
     let (reader, mut writer) = socket.into_split();
@@ -687,7 +909,7 @@ async fn serve(
         let Ok(Some(line)) = lines.next_line().await else {
             return;
         };
-        match dispatch(&cache, &churn, &pn, &cluster, &line).await {
+        match dispatch(&cache, &churn, &pn, &os, &os_seq, &cluster, &line).await {
             Reply::Line(reply) => {
                 if writer
                     .write_all(format!("{reply}\n").as_bytes())
@@ -970,6 +1192,124 @@ mod tests {
             expires_at_ms: None,
         };
         assert_eq!(SumCounterResolver.winner(b"key", a, b), Winner::B);
+    }
+
+    fn writer(node: u64, incarnation: u64) -> WriterId {
+        WriterId::new(NodeId::from(node), incarnation)
+    }
+
+    #[test]
+    fn pn_fill_entries_builds_one_local_delta_per_index() {
+        let writer = writer(1, 100);
+        let entries = pn_fill_entries(writer, 3);
+        assert_eq!(entries.len(), 3);
+        for (i, (key, counter)) in entries.iter().enumerate() {
+            assert_eq!(*key, format!("pn{i}"));
+            assert_eq!(counter.value(), 1);
+        }
+    }
+
+    #[test]
+    fn pn_fill_entries_is_empty_for_a_zero_count() {
+        assert!(pn_fill_entries(writer(1, 100), 0).is_empty());
+    }
+
+    #[test]
+    fn pn_get_reply_reports_the_counters_value() {
+        let counter = PnCounter::local_delta(writer(1, 100), 5);
+        assert_eq!(pn_get_reply(Some(&counter)), "val 5");
+    }
+
+    #[test]
+    fn pn_get_reply_is_none_for_an_absent_key() {
+        assert_eq!(pn_get_reply(None), "none");
+    }
+
+    #[test]
+    fn pn_dump_reply_renders_the_counters_debug_form() {
+        let counter = PnCounter::local_delta(writer(1, 100), 5);
+        assert_eq!(pn_dump_reply(Some(&counter)), format!("{counter:?}"));
+        assert_eq!(pn_dump_reply(None), "none");
+    }
+
+    #[test]
+    fn pn_encoded_bytes_sums_each_counters_encoded_length() {
+        let a = PnCounter::local_delta(writer(1, 100), 5);
+        let b = a.merge(&PnCounter::local_delta(writer(2, 100), 7));
+        let expected = a.encode().unwrap().len() + b.encode().unwrap().len();
+        assert_eq!(pn_encoded_bytes([&a, &b]), Ok(expected));
+        assert!(
+            b.encode().unwrap().len() > a.encode().unwrap().len(),
+            "a second writer's slot makes the record larger, so the sum is size-sensitive"
+        );
+    }
+
+    #[test]
+    fn pn_encoded_bytes_is_zero_for_no_counters() {
+        assert_eq!(pn_encoded_bytes(std::iter::empty()), Ok(0));
+    }
+
+    #[test]
+    fn parse_key_and_element_accepts_both_arguments() {
+        assert_eq!(
+            parse_key_and_element("osadd", Some("k"), Some("e")),
+            Ok(("k", "e"))
+        );
+    }
+
+    #[test]
+    fn parse_key_and_element_rejects_a_missing_key_or_element() {
+        let missing_both =
+            parse_key_and_element("osadd", None, None).expect_err("neither argument is present");
+        assert!(missing_both.contains("osadd"));
+        assert!(missing_both.contains("key"));
+        assert!(missing_both.contains("element"));
+        assert!(parse_key_and_element("osremove", Some("k"), None).is_err());
+        assert!(parse_key_and_element("osremove", None, Some("e")).is_err());
+    }
+
+    #[test]
+    fn osadd_delta_tags_the_element_with_the_writer_and_seq() {
+        let set = osadd_delta(writer(1, 100), 7, "hello");
+        assert!(set.contains(&"hello".to_string()));
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![&"hello".to_string()]);
+    }
+
+    #[test]
+    fn osremove_delta_removes_only_the_named_element() {
+        let a = osadd_delta(writer(1, 100), 0, "keep");
+        let b = osadd_delta(writer(1, 100), 1, "drop");
+        let observed = a.merge(&b);
+        assert!(observed.contains(&"keep".to_string()));
+        assert!(observed.contains(&"drop".to_string()));
+
+        let delta = osremove_delta(&observed, "drop");
+        let after = observed.merge(&delta);
+        assert!(after.contains(&"keep".to_string()));
+        assert!(
+            !after.contains(&"drop".to_string()),
+            "osremove_delta must remove exactly the named element"
+        );
+    }
+
+    #[test]
+    fn os_members_reply_sorts_and_space_joins_live_members() {
+        let a = osadd_delta(writer(1, 100), 0, "banana");
+        let b = osadd_delta(writer(2, 100), 0, "apple");
+        let set = a.merge(&b);
+        assert_eq!(os_members_reply(Some(&set)), "apple banana");
+    }
+
+    #[test]
+    fn os_members_reply_is_empty_string_for_a_present_but_fully_removed_set() {
+        let a = osadd_delta(writer(1, 100), 0, "only");
+        let removed = a.merge(&osremove_delta(&a, "only"));
+        assert_eq!(os_members_reply(Some(&removed)), "");
+    }
+
+    #[test]
+    fn os_members_reply_is_none_for_an_absent_key() {
+        assert_eq!(os_members_reply(None), "none");
     }
 
     #[cfg(feature = "spill")]

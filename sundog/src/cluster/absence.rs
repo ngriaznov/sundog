@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::membership::LiveFlags;
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
 use crate::store::Mode;
@@ -18,12 +19,36 @@ use crate::store::Mode;
 #[derive(Default)]
 struct AbsenceState {
     live: HashSet<NodeId>,
-    /// The last-seen graceful-departure flag for every currently live peer,
-    /// consulted the moment a peer drops out of `live` so a crash (flag never
-    /// set) and a graceful leave (flag set just before disappearing) are
-    /// told apart.
-    last_departing: HashMap<NodeId, bool>,
+    /// The last-seen flags for every currently live peer, consulted the
+    /// moment a peer drops out of `live`: `departing` tells a crash (never
+    /// set) from a graceful leave (set just before disappearing) apart.
+    last_flags: HashMap<NodeId, LiveFlags>,
     absent_since: HashMap<NodeId, Instant>,
+    /// When each member last left the live set, by a crash or a graceful
+    /// departure alike, kept apart from `absent_since` for the CRDT
+    /// compaction sweep: a graceful leaver holds no tombstone hostage, so
+    /// tombstone collection never defers for it, but its writer
+    /// incarnation is gone for good and the sweep retires it exactly like
+    /// a crashed one. Never aged out, only cleared when the member
+    /// returns: the sweep reaches a gone writer's records one stripe per
+    /// tick, so its death has to stay known until the member itself comes
+    /// back under a fresh incarnation, however long that takes.
+    gone_since: HashMap<NodeId, Instant>,
+    /// When each member was first observed live, never moved by later
+    /// transitions: a member that keeps flapping faster than the
+    /// retirement bound never settles as present or gone, and this is
+    /// what lets the CRDT sweep's quiet check count it as settled anyway
+    /// once it has been known for two bounds (see
+    /// `membership::member_is_quiet`). Dropped with `gone_since` by
+    /// [`AbsenceTracker::prune_gone_older_than`].
+    known_since: HashMap<NodeId, Instant>,
+    /// How long each live member has been continuously present, keyed only
+    /// while the member is live. Reset (removed) only when the member is
+    /// marked absent below — never touched by an `observe()` call that
+    /// leaves the member live throughout, so gossip jitter that never trips
+    /// the failure detector (never drops the member from `live`) never
+    /// resets it.
+    present_since: HashMap<NodeId, Instant>,
 }
 
 /// Cheap-to-clone, cluster-wide view of which recently-known members are
@@ -37,26 +62,56 @@ pub(crate) struct AbsenceTracker {
 }
 
 impl AbsenceTracker {
-    /// Applies one membership snapshot, the live peers and whether each has
-    /// gossiped a graceful departure: a peer newly dropped from `live`
-    /// starts being tracked absent unless its last flag was set; a peer back
-    /// in `live` clears it.
-    fn observe(&self, live: &HashMap<NodeId, bool>) {
+    /// Applies one membership snapshot, the live peers and each one's
+    /// [`LiveFlags`]: a peer newly dropped from `live` is tracked gone,
+    /// and tracked absent as well unless its last flag showed a graceful
+    /// departure; a peer back in `live` clears both and starts a fresh
+    /// continuous-presence timer.
+    pub(crate) fn observe(&self, live: &HashMap<NodeId, LiveFlags>) {
         let live_ids: HashSet<NodeId> = live.keys().copied().collect();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let departed: Vec<NodeId> = state.live.difference(&live_ids).copied().collect();
         for node in departed {
-            let departed_gracefully = state.last_departing.get(&node).copied().unwrap_or(false);
+            let flags = state.last_flags.remove(&node);
+            let departed_gracefully = flags.is_some_and(|f| f.departing);
             if counts_as_absent(departed_gracefully) {
                 state.absent_since.entry(node).or_insert_with(Instant::now);
             }
-            state.last_departing.remove(&node);
+            state.gone_since.entry(node).or_insert_with(Instant::now);
+            state.present_since.remove(&node);
         }
-        for (&node, &departing) in live {
+        for (&node, &flags) in live {
             state.absent_since.remove(&node);
-            state.last_departing.insert(node, departing);
+            state.gone_since.remove(&node);
+            state.present_since.entry(node).or_insert_with(Instant::now);
+            state.known_since.entry(node).or_insert_with(Instant::now);
+            state.last_flags.insert(node, flags);
         }
         state.live = live_ids;
+    }
+
+    /// Forgets every member gone for longer than `horizon`, along with when
+    /// it was first known: the CRDT sweep calls this with the fold receipt
+    /// lifetime (`CompactionBounds::receipt_ttl_ms`), the age past which no
+    /// receipt reconciles a straggling copy of the member's writer either,
+    /// so retiring it any later could only double count. That lifetime is
+    /// at least two sweep periods by construction, so a member that left
+    /// between ticks is always seen gone by the next tick before it is
+    /// forgotten. Bounds this tracker under sustained churn, where every
+    /// restarted process leaves behind a node id that never returns.
+    pub(crate) fn prune_gone_older_than(&self, horizon: Duration) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        let forgotten: Vec<NodeId> = state
+            .gone_since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) > horizon)
+            .map(|(&node, _)| node)
+            .collect();
+        for node in forgotten {
+            state.gone_since.remove(&node);
+            state.known_since.remove(&node);
+        }
     }
 
     /// Whether any recently-known member is absent and not yet aged past
@@ -80,6 +135,50 @@ impl AbsenceTracker {
             .absent_since
             .retain(|_, since| now.saturating_duration_since(*since) < hard_cap);
         state.absent_since.keys().copied().collect()
+    }
+
+    /// Every member gone for at least `retire_after`, whether it crashed
+    /// or gossiped a graceful departure: the members whose writer
+    /// incarnations the CRDT compaction sweep may retire. Read off the
+    /// never-pruned `gone_since` map, so unlike [`AbsenceTracker::any_absent`]/
+    /// [`AbsenceTracker::absent_nodes`] it is unaffected by the tombstone
+    /// hard cap ageing an absence out.
+    pub(crate) fn gone_longer_than(&self, retire_after: Duration) -> Vec<NodeId> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        state
+            .gone_since
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= retire_after)
+            .map(|(&node, _)| node)
+            .collect()
+    }
+
+    /// This member's continuous-presence start time, if it is currently
+    /// live and tracked; `None` if it has never been observed live or is
+    /// currently gone. Reset only when the member leaves the live set, so
+    /// gossip jitter that never trips the failure detector never moves this
+    /// forward.
+    pub(crate) fn present_since(&self, node: NodeId) -> Option<Instant> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.present_since.get(&node).copied()
+    }
+
+    /// When this member last left the live set, by a crash or a graceful
+    /// departure; `None` if it is live or has never been observed. Holds
+    /// until the member returns or [`AbsenceTracker::prune_gone_older_than`]
+    /// forgets it, so every record the compaction sweep reaches on a later
+    /// tick still sees the member gone.
+    pub(crate) fn gone_since(&self, node: NodeId) -> Option<Instant> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.gone_since.get(&node).copied()
+    }
+
+    /// When this member was first observed live; `None` if never, or once
+    /// [`AbsenceTracker::prune_gone_older_than`] forgot it.
+    pub(crate) fn known_since(&self, node: NodeId) -> Option<Instant> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.known_since.get(&node).copied()
     }
 }
 
@@ -126,7 +225,7 @@ fn counts_as_absent(departed_gracefully: bool) -> bool {
 /// Republishes [`crate::membership::Membership::departing_flags`] changes
 /// into `tracker`, keeping [`AbsenceTracker`] current.
 pub(crate) async fn tracking_task(
-    mut live: watch::Receiver<HashMap<NodeId, bool>>,
+    mut live: watch::Receiver<HashMap<NodeId, LiveFlags>>,
     tracker: AbsenceTracker,
     cancel: CancellationToken,
 ) {
@@ -151,10 +250,10 @@ mod tests {
     use super::*;
 
     /// A live set of `(node, departing)` pairs.
-    fn live(peers: &[(u64, bool)]) -> HashMap<NodeId, bool> {
+    fn live(peers: &[(u64, bool)]) -> HashMap<NodeId, LiveFlags> {
         peers
             .iter()
-            .map(|&(node, departing)| (NodeId::from(node), departing))
+            .map(|&(node, departing)| (NodeId::from(node), LiveFlags { departing }))
             .collect()
     }
 
@@ -218,6 +317,117 @@ mod tests {
             !tracker.any_absent(tiny_cap),
             "absence older than the hard cap ages out"
         );
+    }
+
+    #[test]
+    fn a_graceful_departure_is_gone_but_never_absent() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, true)]));
+        tracker.observe(&live(&[]));
+        assert!(
+            !tracker.any_absent(Duration::from_secs(3600)),
+            "tombstone deferral never waits on a graceful leaver"
+        );
+        assert!(
+            tracker.gone_since(NodeId::from(1)).is_some(),
+            "its writer incarnation is gone for good"
+        );
+        assert_eq!(
+            tracker.gone_longer_than(Duration::ZERO),
+            vec![NodeId::from(1)],
+            "listed among the members the compaction sweep may retire"
+        );
+        assert!(
+            tracker.present_since(NodeId::from(1)).is_none(),
+            "no longer continuously present"
+        );
+    }
+
+    #[test]
+    fn a_crash_is_gone_and_absent() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
+        assert!(tracker.any_absent(Duration::from_secs(3600)));
+        assert!(tracker.gone_since(NodeId::from(1)).is_some());
+        assert_eq!(
+            tracker.gone_longer_than(Duration::ZERO),
+            vec![NodeId::from(1)]
+        );
+    }
+
+    #[test]
+    fn a_returning_peer_clears_its_tracked_departure() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, true)]));
+        tracker.observe(&live(&[]));
+        assert!(tracker.gone_since(NodeId::from(1)).is_some());
+        tracker.observe(&live(&[(1, false)]));
+        assert!(tracker.gone_since(NodeId::from(1)).is_none());
+        assert!(tracker.gone_longer_than(Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn known_since_is_first_observation_and_survives_flapping() {
+        let tracker = AbsenceTracker::default();
+        assert!(tracker.known_since(NodeId::from(1)).is_none());
+        tracker.observe(&live(&[(1, false)]));
+        let first = tracker
+            .known_since(NodeId::from(1))
+            .expect("known once seen live");
+        std::thread::sleep(Duration::from_millis(5));
+        tracker.observe(&live(&[]));
+        tracker.observe(&live(&[(1, false)]));
+        assert_eq!(
+            tracker.known_since(NodeId::from(1)),
+            Some(first),
+            "leaving and returning never moves the first observation"
+        );
+        assert!(
+            tracker.present_since(NodeId::from(1)).expect("live again") > first,
+            "continuous presence restarted on return"
+        );
+    }
+
+    #[test]
+    fn prune_gone_older_than_forgets_only_members_gone_past_the_horizon() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false), (2, true)]));
+        tracker.observe(&live(&[(2, true)]));
+        std::thread::sleep(Duration::from_millis(20));
+        tracker.observe(&live(&[]));
+        tracker.prune_gone_older_than(Duration::from_millis(10));
+        assert!(
+            tracker.gone_since(NodeId::from(1)).is_none()
+                && tracker.known_since(NodeId::from(1)).is_none(),
+            "gone past the horizon: forgotten entirely"
+        );
+        assert!(
+            tracker.gone_since(NodeId::from(2)).is_some(),
+            "gone for less than the horizon: still tracked"
+        );
+        assert!(
+            tracker.any_absent(Duration::from_secs(3600)),
+            "pruning never touches tombstone absence"
+        );
+    }
+
+    #[test]
+    fn a_gone_member_outlives_the_tombstone_hard_cap() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
+        let tiny_cap = Duration::from_millis(1);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !tracker.any_absent(tiny_cap),
+            "the absence aged out of tombstone deferral"
+        );
+        assert!(
+            tracker.gone_since(NodeId::from(1)).is_some(),
+            "but the member stays gone for writer retirement until it returns"
+        );
+        assert_eq!(tracker.gone_longer_than(tiny_cap), vec![NodeId::from(1)]);
     }
 
     #[test]
@@ -320,5 +530,103 @@ mod tests {
             Duration::from_secs(3600),
             Some(&view),
         ));
+    }
+
+    #[test]
+    fn present_since_is_not_reset_by_jitter_that_never_reaches_the_detector() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        let first = tracker
+            .present_since(NodeId::from(1))
+            .expect("live member is tracked present");
+
+        // Further observations that still show the member live are the
+        // failure-detector-invisible jitter case: the member never actually
+        // drops out of the live set, so its continuous-presence start time
+        // must not move forward.
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[(1, false)]));
+        assert_eq!(
+            tracker.present_since(NodeId::from(1)),
+            Some(first),
+            "repeated observations of a still-live member never reset present_since"
+        );
+    }
+
+    #[test]
+    fn present_since_is_reset_once_the_tracker_marks_the_member_absent() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        assert!(tracker.present_since(NodeId::from(1)).is_some());
+
+        tracker.observe(&live(&[]));
+        assert_eq!(
+            tracker.present_since(NodeId::from(1)),
+            None,
+            "an absent member has no continuous-presence start time"
+        );
+
+        tracker.observe(&live(&[(1, false)]));
+        assert!(
+            tracker.present_since(NodeId::from(1)).is_some(),
+            "a returning member starts a fresh presence timer"
+        );
+    }
+
+    #[test]
+    fn present_since_is_none_for_a_never_observed_member() {
+        let tracker = AbsenceTracker::default();
+        assert_eq!(tracker.present_since(NodeId::from(1)), None);
+    }
+
+    #[test]
+    fn absent_since_is_none_while_live_and_some_once_absent() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        assert_eq!(tracker.gone_since(NodeId::from(1)), None);
+
+        tracker.observe(&live(&[]));
+        assert!(tracker.gone_since(NodeId::from(1)).is_some());
+    }
+
+    #[test]
+    fn absent_longer_than_finds_a_member_aged_past_the_bound_without_pruning() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
+
+        let retire_after = Duration::from_millis(1);
+        // A tombstone-GC-style hard cap the member is nowhere near yet, so a
+        // concurrent destructive `any_absent` call at this cap must not
+        // prune the entry `absent_longer_than` is about to read.
+        let tombstone_hard_cap = Duration::from_secs(3600);
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(
+            tracker.gone_longer_than(retire_after),
+            vec![NodeId::from(1)]
+        );
+        assert!(
+            tracker.any_absent(tombstone_hard_cap),
+            "a concurrent tombstone-GC read at its own, much larger, hard cap"
+        );
+        assert_eq!(
+            tracker.gone_longer_than(retire_after),
+            vec![NodeId::from(1)],
+            "absent_longer_than never prunes, so a second read still sees the member"
+        );
+    }
+
+    #[test]
+    fn absent_longer_than_excludes_a_member_not_yet_aged_past_the_bound() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
+
+        assert_eq!(
+            tracker.gone_longer_than(Duration::from_secs(3600)),
+            Vec::new(),
+            "a member absent for less than the bound is not yet retirement-eligible"
+        );
     }
 }

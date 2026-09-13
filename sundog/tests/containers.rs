@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use container_util::{
-    METRICS_PORT, Node, build_previous_testnode, container_tests_enabled, eventually,
+    CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode,
+    container_tests_enabled, eventually,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -32,6 +33,14 @@ const GOSSIP_PORT: u16 = 7946;
 
 const PEER_WAIT: Duration = Duration::from_secs(30);
 const CONVERGE_WAIT: Duration = Duration::from_secs(20);
+/// Bound for a CRDT compaction wait: the sweep's own cadence
+/// (`ClusterConfig::crdt_sweep_period`) is `(crdt_retire_after / 4).max(30s)`,
+/// so with the test node's 5s bound a writer retires on one 30s-floor tick,
+/// folds on a later one, and its receipt prunes once it is older than the
+/// receipt lifetime of two bounds plus two sweep periods (70s), on the
+/// tick after that: about 120s end to end, with headroom for container
+/// boot and gossip jitter on top.
+const CRDT_COMPACT_WAIT: Duration = Duration::from_secs(240);
 
 fn seed(alias: &str) -> String {
     format!("{alias}:{GOSSIP_PORT}")
@@ -555,6 +564,230 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     net.close().await.expect("network closes");
 }
 
+/// Bounds CRDT metadata growth under sustained writer churn: a third node
+/// is repeatedly joined under the same alias, writes to both the `"pn"`
+/// `PnCounter` and `"os"` `OrSet<String>` caches, and is stopped again — a
+/// fresh process mints a fresh membership incarnation and therefore a
+/// fresh [`sundog::crdt::WriterId`], so this exercises genuine writer
+/// churn, not repeated writes from one identity — over a window exceeding
+/// a shortened `crdt_retire_after`. Asserts `pn`'s totals stay exact
+/// despite the churn, `os`'s membership keeps every churned writer's
+/// never-removed element (retirement blocks only a *future* add under a
+/// retired writer's incarnation), and that every counter's resident
+/// encoded size after the churn window and its compaction sweeps is no
+/// larger than before any churn beyond the fold's own aggregate slot,
+/// proving the two-stage fold bounds resident record size instead of it
+/// growing with every replaced writer's incarnation. A fresh cold join at
+/// the end carries the compacted records with their exact totals.
+///
+/// Uses [`CRDT_RETIRE_AFTER_SECS_ENV`] (see that constant's doc) to shorten
+/// `ClusterConfig::crdt_retire_after` well below its 24h default, so the
+/// compaction-metric wait below settles within the test's own timeout.
+#[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
+#[tokio::test]
+async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
+    const RETIRE_AFTER_SECS: u64 = 5;
+    const CHURN_ROUNDS: u32 = 5;
+    const PN_KEYS: u32 = 10;
+    const OS_KEY: &str = "churn-set";
+    /// A fully compacted counter encodes to the same size as one that
+    /// never saw the churned writers, so this only leaves room for one
+    /// fold receipt still waiting out its three-bound prune on a replica.
+    const FOLD_SLACK_BYTES: u64 = 32;
+
+    if !container_tests_enabled() {
+        eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
+        return;
+    }
+
+    let retire_secs = RETIRE_AFTER_SECS.to_string();
+    let env = [(CRDT_RETIRE_AFTER_SECS_ENV, retire_secs.as_str())];
+
+    let net = Arc::new(Network::new_network());
+    let n1 = Node::spawn_with_env(&net, "churn-scale-cluster", "n1", &[], &env).await;
+    let n2 = Node::spawn_with_env(&net, "churn-scale-cluster", "n2", &[&seed("n1")], &env).await;
+    wait_for_peers(&[&n1, &n2], 1).await;
+
+    n1.pn_fill(PN_KEYS).await.expect("n1 pnfill");
+    n2.pn_fill(PN_KEYS).await.expect("n2 pnfill");
+    let mut expected_total: i64 = 2;
+    let last_key = format!("pn{}", PN_KEYS - 1);
+    for node in [&n1, &n2] {
+        eventually(CONVERGE_WAIT, || async {
+            node.pn_get("pn0").await == Ok(Some(expected_total))
+                && node.pn_get(&last_key).await == Ok(Some(expected_total))
+        })
+        .await;
+    }
+
+    // "Before": every counter's resident encoded size with only n1's and
+    // n2's two writers on it, no churn or compaction yet.
+    let bytes_before = n1.pn_bytes(PN_KEYS).await.expect("n1 pnbytes before churn");
+    let per_entry_before = bytes_before / u64::from(PN_KEYS);
+
+    // Churn: a third writer joins, contributes to every pn key and adds a
+    // never-removed os element, then is stopped, `CHURN_ROUNDS` times,
+    // each under a fresh incarnation and therefore a fresh `WriterId`,
+    // spanning well past `crdt_retire_after`.
+    for round in 0..CHURN_ROUNDS {
+        let churner = Node::spawn_with_env(
+            &net,
+            "churn-scale-cluster",
+            "churner",
+            &[&seed("n1"), &seed("n2")],
+            &env,
+        )
+        .await;
+        wait_for_peers(&[&n1, &n2, &churner], 2).await;
+
+        churner.pn_fill(PN_KEYS).await.expect("churner pnfill");
+        churner
+            .os_add(OS_KEY, &format!("e{round}"))
+            .await
+            .expect("churner osadd");
+        expected_total += 1;
+
+        eventually(CONVERGE_WAIT, || async {
+            n1.pn_get("pn0").await == Ok(Some(expected_total))
+                && n2.pn_get("pn0").await == Ok(Some(expected_total))
+        })
+        .await;
+        let expected_so_far: Vec<String> = (0..=round).map(|r| format!("e{r}")).collect();
+        eventually(CONVERGE_WAIT, || async {
+            n1.os_members(OS_KEY).await == Ok(Some(expected_so_far.clone()))
+        })
+        .await;
+
+        churner.stop().await.expect("churner stops");
+        wait_for_peers(&[&n1, &n2], 1).await;
+    }
+
+    // Both compaction stages, observed rather than slept for and logged
+    // on every poll so a miss on CI shows how far the sweep got: stage
+    // one retires every churned writer (cadence `(crdt_retire_after /
+    // 4).max(30s)`, see `cluster.rs::crdt_compact_task`); stage two folds
+    // them once the cache has been quiet for `2 * crdt_retire_after` and
+    // prunes its fold receipts three bounds later, each on the next tick.
+    let bound = per_entry_before + FOLD_SLACK_BYTES;
+    let started = std::time::Instant::now();
+    let mut retired_done = false;
+    let mut last_bytes = (0, 0);
+    loop {
+        let retired = (
+            scrape_metric(&n1, "sundog_crdt_retired_writers_total", ("cache", "pn")).await,
+            scrape_metric(&n2, "sundog_crdt_retired_writers_total", ("cache", "pn")).await,
+        );
+        let compactions = (
+            scrape_metric(&n1, "sundog_crdt_compactions_total", ("cache", "pn")).await,
+            scrape_metric(&n2, "sundog_crdt_compactions_total", ("cache", "pn")).await,
+        );
+        let bytes = (
+            n1.pn_bytes(PN_KEYS)
+                .await
+                .expect("n1 pnbytes during compaction"),
+            n2.pn_bytes(PN_KEYS)
+                .await
+                .expect("n2 pnbytes during compaction"),
+        );
+        let per_entry = bytes.0.max(bytes.1) / u64::from(PN_KEYS);
+        println!(
+            "compaction at {:?}: retired n1={} n2={}, compactions n1={} n2={}, pn bytes n1={} \
+             n2={} ({per_entry}/entry, bound {bound})",
+            started.elapsed(),
+            retired.0,
+            retired.1,
+            compactions.0,
+            compactions.1,
+            bytes.0,
+            bytes.1
+        );
+        if bytes != last_bytes {
+            println!("  n1 pn0: {}", n1.pn_dump("pn0").await.expect("n1 pndump"));
+            println!("  n2 pn0: {}", n2.pn_dump("pn0").await.expect("n2 pndump"));
+            last_bytes = bytes;
+        }
+        // A writer retired on one replica reaches the other already
+        // retired through anti-entropy, so only the sum across both sweeps
+        // is guaranteed to reach the churned count.
+        if !retired_done && retired.0 + retired.1 >= u64::from(CHURN_ROUNDS) {
+            retired_done = true;
+            println!("every churned writer retired on some replica");
+        }
+        if retired_done && per_entry <= bound {
+            break;
+        }
+        assert!(
+            started.elapsed() < CRDT_COMPACT_WAIT,
+            "compaction did not settle within {CRDT_COMPACT_WAIT:?}: retired n1={} n2={} \
+             (need {CHURN_ROUNDS} in total), pn bytes {per_entry}/entry against a bound of \
+             {bound}",
+            retired.0,
+            retired.1
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // "After": the same size once every churned writer has been folded
+    // away, despite `CHURN_ROUNDS` more distinct writer identities having
+    // touched every counter than in the "before" measurement, read on both
+    // replicas since each one compacts on its own sweep.
+    let bytes_after_n1 = n1
+        .pn_bytes(PN_KEYS)
+        .await
+        .expect("n1 pnbytes after compaction");
+    let bytes_after_n2 = n2
+        .pn_bytes(PN_KEYS)
+        .await
+        .expect("n2 pnbytes after compaction");
+    let per_entry_after = bytes_after_n1.max(bytes_after_n2) / u64::from(PN_KEYS);
+    println!(
+        "record size per pn entry: {per_entry_before} bytes/entry before {CHURN_ROUNDS} \
+         writers churned through, {per_entry_after} bytes/entry after they were all retired \
+         and compacted"
+    );
+    assert!(
+        per_entry_after <= bound,
+        "resident record size grew from {per_entry_before} to {per_entry_after} bytes/entry \
+         across {CHURN_ROUNDS} replaced writers; compaction should keep it bounded, not \
+         growing with churn"
+    );
+
+    // Exact totals survive every retirement.
+    for node in [&n1, &n2] {
+        eventually(CONVERGE_WAIT, || async {
+            node.pn_get("pn0").await == Ok(Some(expected_total))
+                && node.pn_get(&last_key).await == Ok(Some(expected_total))
+        })
+        .await;
+    }
+    let expected_members: Vec<String> = (0..CHURN_ROUNDS).map(|r| format!("e{r}")).collect();
+    assert_eq!(
+        n1.os_members(OS_KEY).await,
+        Ok(Some(expected_members)),
+        "every churned writer's never-removed element must survive retirement"
+    );
+
+    // A fresh cold join carries the compacted records with exact totals.
+    let probe2 = Node::spawn_with_env(
+        &net,
+        "churn-scale-cluster",
+        "probe2",
+        &[&seed("n1"), &seed("n2")],
+        &env,
+    )
+    .await;
+    eventually(CONVERGE_WAIT, || async {
+        probe2.pn_count().await == Ok(PN_KEYS as usize)
+    })
+    .await;
+    assert_eq!(probe2.pn_get("pn0").await, Ok(Some(expected_total)));
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    probe2.stop().await.expect("probe2 stops");
+    net.close().await.expect("network closes");
+}
+
 /// A cold node joining a populated cluster warms via state transfer in
 /// seconds, at 100k-entry scale; the printed duration is the number to watch.
 #[tokio::test]
@@ -592,25 +825,45 @@ async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
     net.close().await.expect("network closes");
 }
 
-/// Waits until `node`'s cumulative sent-frame/byte counters stop changing
-/// across a 1s sample, so a `netstats` snapshot taken right after this
-/// returns isolates whatever traffic comes next from any trailing activity
-/// (a state-transfer stream's last chunks, or the first post-join
-/// anti-entropy round) still draining at the moment a peer's local count
-/// first matches the expected total.
+/// Sent bytes per 1s sample at or under which a node counts as quiet for
+/// [`wait_for_quiescent_netstats`]. Two in-sync replicas never stop
+/// talking: every anti-entropy round costs a bucket digest of about 3 KB
+/// for a populated cache and a couple of bytes for an empty one, and with
+/// four caches each side runs a jittered round every 1 to 3 s per cache, so
+/// a second with no frame at all is a matter of jitter alignment rather
+/// than a state the node reaches. A state-transfer chunk alone runs about
+/// 26 KB and a draining stream carries dozens per second, so this ceiling
+/// admits the digest chatter and excludes the stream.
+const QUIET_BYTES_PER_SAMPLE: u64 = 32 * 1024;
+
+/// Waits until `node`'s cumulative sent-byte counter moves by at most
+/// [`QUIET_BYTES_PER_SAMPLE`] across each of two consecutive 1s samples, so
+/// a `netstats` snapshot taken right after this returns isolates whatever
+/// traffic comes next from any trailing activity (a state-transfer
+/// stream's last chunks, or the first post-join anti-entropy round) still
+/// draining at the moment a peer's local count first matches the expected
+/// total. Two samples in a row keep a one-second stall inside a stream on
+/// a busy runner from passing as the stream's end.
 /// # Panics
 ///
-/// Panics if the counters are still changing once `timeout` elapses.
+/// Panics if the counter is still moving faster than that once `timeout`
+/// elapses.
 async fn wait_for_quiescent_netstats(node: &Node, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut last = node.netstats().await.expect("netstats");
+    let (_, mut last_bytes) = node.netstats().await.expect("netstats");
+    let mut quiet_samples = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let current = node.netstats().await.expect("netstats");
-        if current == last {
-            return;
+        let (_, bytes) = node.netstats().await.expect("netstats");
+        if bytes - last_bytes <= QUIET_BYTES_PER_SAMPLE {
+            quiet_samples += 1;
+            if quiet_samples == 2 {
+                return;
+            }
+        } else {
+            quiet_samples = 0;
         }
-        last = current;
+        last_bytes = bytes;
         assert!(
             tokio::time::Instant::now() < deadline,
             "{}'s netstats never settled within {timeout:?}",
@@ -676,21 +929,21 @@ async fn anti_entropy_repairs_a_dropped_key_at_sketch_scale() {
 /// one part the dropped key falls into then answers with its own small
 /// listing. n2 cold-joins and warms first, so both replicas start
 /// byte-identical; dropping one key locally on n2 then leaves exactly one
-/// bucket, and within it one part, mismatched. The wire-cost measurement
-/// waits for [`wait_for_quiescent_netstats`] first: n2's local count reaches
+/// bucket, and within it one part, mismatched. The repair's shape is read
+/// off n2's own `sundog_ae_parts_total` outcomes, one `listing` and no
+/// `sketch` or `fallback`, with no bucket-level sketch either: n1's wire
+/// bytes over the same window also carry its own rounds' 3 KB digests,
+/// so they are printed for reference, not asserted on. The baseline is
+/// read after [`wait_for_quiescent_netstats`]: n2's local count reaches
 /// ENTRIES slightly before its state-transfer stream and the first
-/// post-join anti-entropy round finish draining, and that unrelated tail
-/// would otherwise land inside the measured window.
+/// post-join anti-entropy round finish draining, and that round's own
+/// outcomes must not count as the repair's.
 #[tokio::test]
 async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     const ENTRIES: u32 = 1_000_000;
     const TARGET_KEY: &str = "k123456";
     const TARGET_VALUE: &str = "v123456";
     const PART_MIN_BUCKET: &str = "512";
-    /// A full bucket listing at this scale runs about 22 KB; the part path
-    /// is ~512 B of part digests, plus a small listing for the one
-    /// differing part, plus the repaired record itself.
-    const REPAIR_BYTES_BUDGET: u64 = 16 * 1024;
 
     if !container_tests_enabled() {
         eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
@@ -719,6 +972,9 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     wait_for_quiescent_netstats(&n1, Duration::from_secs(90)).await;
 
     let (frames_before, bytes_before) = n1.netstats().await.expect("netstats before the drop");
+    let parts_before = ae_parts_outcomes(&n2).await;
+    let bucket_sketches_before =
+        scrape_metric(&n2, "sundog_ae_sketch_total", ("cache", "it")).await;
 
     n2.drop_key(TARGET_KEY)
         .await
@@ -740,11 +996,19 @@ async fn anti_entropy_repairs_a_dropped_key_through_part_digests() {
     let frames_for_repair = frames_after - frames_before;
     let bytes_for_repair = bytes_after - bytes_before;
     println!("part-digest repair: n1 sent {frames_for_repair} frames / {bytes_for_repair} bytes");
-    assert!(
-        bytes_for_repair < REPAIR_BYTES_BUDGET,
-        "n1 sent {bytes_for_repair} bytes to repair one dropped key out of a {REPAIR_BYTES_BUDGET}-byte \
-         budget; a full bucket listing at this scale runs about 22 KB, so the part-digest path \
-         should cost a small fraction of that"
+    let parts_after = ae_parts_outcomes(&n2).await;
+    let bucket_sketches_after = scrape_metric(&n2, "sundog_ae_sketch_total", ("cache", "it")).await;
+    assert_eq!(
+        (
+            parts_after.listing - parts_before.listing,
+            parts_after.sketch - parts_before.sketch,
+            parts_after.fallback - parts_before.fallback,
+            bucket_sketches_after - bucket_sketches_before,
+        ),
+        (1, 0, 0, 0),
+        "the repair should list exactly the one part the dropped key falls into (part outcomes \
+         listing/sketch/fallback, then bucket sketches): the mismatched bucket answers with part \
+         digests, not a bucket sketch or a full listing"
     );
     assert_eq!(n2.get(TARGET_KEY).await, Ok(Some(TARGET_VALUE.to_string())));
 
@@ -1331,6 +1595,23 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
 /// exact-integer count in practice, so rounding it to `u64` here sidesteps
 /// `clippy::float_cmp` entirely: every comparison below compares `u64`s,
 /// never `f64`s, mirroring `tests/spill_bench.rs`'s `metric_count`.
+/// One node's `sundog_ae_parts_total` counters by outcome, the part-path
+/// shape of the anti-entropy rounds it initiated.
+#[derive(Debug, Clone, Copy)]
+struct AePartsOutcomes {
+    listing: u64,
+    sketch: u64,
+    fallback: u64,
+}
+
+async fn ae_parts_outcomes(node: &Node) -> AePartsOutcomes {
+    AePartsOutcomes {
+        listing: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "listing")).await,
+        sketch: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "sketch")).await,
+        fallback: scrape_metric(node, "sundog_ae_parts_total", ("outcome", "fallback")).await,
+    }
+}
+
 async fn scrape_metric(node: &Node, metric: &str, label: (&str, &str)) -> u64 {
     let value = node
         .metrics()

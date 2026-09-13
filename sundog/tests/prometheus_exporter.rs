@@ -14,9 +14,11 @@ mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU8;
+use std::sync::Arc;
 use std::time::Duration;
 
-use sundog::{CacheError, Cluster, Mode};
+use sundog::crdt::{PnCounter, PnCounterResolver};
+use sundog::{CacheError, Cluster, Mode, NodeId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -112,6 +114,12 @@ fn node_config(gossip_bind_addr: SocketAddr) -> sundog::ClusterConfig {
         c.gossip_bind_addr = gossip_bind_addr;
         c.ae_sketch_min_bucket = SKETCH_MIN_BUCKET;
         c.ae_part_min_bucket = PART_MIN_BUCKET;
+        // `crdt_compact_task` ticks at `(crdt_retire_after / 4).max(30s)`;
+        // shrinking `crdt_retire_after` well under 120s pins that cadence to
+        // its 30s floor instead of the default's six hours. No cache opened
+        // in this file besides `seed_crdt_compaction_metrics`'s `counters`
+        // ever merges, so this is otherwise inert.
+        c.crdt_retire_after = Duration::from_secs(1);
     })
 }
 
@@ -262,6 +270,135 @@ async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
     peer_parts
         .invalidate_local(dense_keys.first().expect("DENSE_BUCKET_COUNT is nonzero"))
         .await;
+}
+
+/// Drives one real writer through CRDT retirement so the scrape loop below
+/// pins `sundog_crdt_retired_writers_total`/`sundog_crdt_compactions_total`
+/// on an actual `cluster::crdt_compact_task` pass, not just its pure
+/// decision logic (already unit-tested in `cluster.rs`/`membership/mod.rs`).
+///
+/// A writer becomes retirement-eligible here purely through a genuine
+/// incarnation mismatch (`membership::incarnation_is_dead`'s "live under a
+/// different incarnation" branch, true the instant it's observed — no
+/// waiting on any bound): a graceful [`Cluster::shutdown`] never enters
+/// absence tracking at all (`AbsenceTracker::observe`'s own
+/// `counts_as_absent` exclusion for a departing peer), so the absence-aged
+/// path can never fire from a black-box integration test that has no way
+/// to simulate a real crash. Rejoining under the same explicit
+/// [`sundog::ClusterBuilder::node_id`] — the restart scenario
+/// [`sundog::NodeId::random`]'s own docs name — is the one reliable, real
+/// trigger reachable from outside the crate: `first_life` contributes
+/// under its writer id and gracefully leaves; `second_life` then rejoins
+/// under the identical node id with a fresh incarnation, which is
+/// immediately a mismatch against `first_life`'s recorded writer.
+///
+/// Only one key with one dead writer ever exists on the `counters` cache
+/// used here, and stage-one retirement (moving a dead writer's slot out of
+/// the live `p`/`n` maps) never calls `retire` on it again once moved, so
+/// `sundog_crdt_retired_writers_total{cache="counters"}` settles at exactly
+/// `1` for the rest of the process — pinned exactly below, the same way
+/// `sundog_spill_writes_total` etc. are. `sundog_crdt_compactions_total`
+/// only gets a lower bound there instead: once this writer's retired slot
+/// ages past twice `crdt_retire_after`, quite plausibly before the scrape
+/// below, stage two folds it into the bounded scalar as a second, equally
+/// real record rewrite — so this cache's compactions total may legitimately
+/// read `1` or `2` depending on exactly when the scrape below lands.
+async fn seed_crdt_compaction_metrics(
+    cluster: &Cluster,
+    gossip_a: SocketAddr,
+    metrics_addr: SocketAddr,
+) {
+    let name = "counters";
+    let restart_id = NodeId::random();
+
+    let cluster_counters = cluster
+        .cache::<u32, PnCounter>(name)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await
+        .expect("cluster opens counters");
+
+    let first_life = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(node_config(common::reserve_gossip_addr().await))
+        .node_id(restart_id)
+        .build()
+        .await
+        .expect("first-life node builds");
+    common::wait_for_peer_count(&first_life, 1, Duration::from_secs(15)).await;
+    let first_life_counters = first_life
+        .cache::<u32, PnCounter>(name)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await
+        .expect("first-life opens counters");
+    let dead_writer = first_life_counters.writer_id();
+    first_life_counters
+        .merge(1, PnCounter::local_delta(dead_writer, 7))
+        .await
+        .expect("first-life contributes under its own writer id");
+
+    common::eventually(Duration::from_secs(15), || async {
+        cluster_counters
+            .get(&1)
+            .await
+            .is_some_and(|c| c.value() == 7)
+    })
+    .await;
+
+    // A graceful departure never enters absence tracking (see this fn's own
+    // doc), so the writer stays alive in `cluster`'s view until this same
+    // node identity returns under a fresh incarnation below.
+    first_life.shutdown().await;
+
+    let second_life = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(node_config(common::reserve_gossip_addr().await))
+        .node_id(restart_id)
+        .build()
+        .await
+        .expect("second-life node builds");
+    let second_life_counters = second_life
+        .cache::<u32, PnCounter>(name)
+        .mode(Mode::Replicated)
+        .resolver(Arc::new(PnCounterResolver))
+        .open()
+        .await
+        .expect("second-life opens counters");
+    let fresh_incarnation = second_life_counters.writer_id().incarnation();
+
+    common::eventually(Duration::from_secs(15), || async {
+        cluster
+            .peers()
+            .iter()
+            .any(|p| p.node == restart_id && p.incarnation == fresh_incarnation)
+    })
+    .await;
+
+    // `crdt_compact_task` ticks at most every 30s (its own cadence floor —
+    // see `node_config`'s comment above). Give the next real tick after the
+    // incarnation mismatch above becomes visible ample room to land.
+    common::eventually(Duration::from_secs(120), || async {
+        scrape_metrics(metrics_addr).await.is_some_and(|body| {
+            scraped_metric_value(
+                &body,
+                "sundog_crdt_retired_writers_total",
+                &[("cache", name)],
+            )
+            .is_some_and(|count| count >= 1.0)
+        })
+    })
+    .await;
+
+    assert_eq!(
+        cluster_counters.get(&1).await.map(|c| c.value()),
+        Some(7),
+        "stage-one retirement moves a dead writer's slot without changing the merged value"
+    );
+
+    second_life.shutdown().await;
 }
 
 /// Opens `prices` as `Mode::Distributed { owners: 2 }` across `cluster`,
@@ -509,6 +646,10 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     count_hits_and_misses(&cluster).await;
     #[cfg(feature = "spill")]
     let spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
+    // Independent of `peer`/`third`/`fourth`: creates and fully retires its
+    // own two scenario-local nodes before returning, so it leaves no peer
+    // count `seed_distributed_metrics` below needs to account for.
+    seed_crdt_compaction_metrics(&cluster, gossip_a, metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // no longer needs them, and `peer` isn't touched by anything after it.
     seed_distributed_metrics(&cluster, &peer, gossip_a).await;
@@ -609,6 +750,31 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              >= 1; got body:\n{body}"
         );
     }
+
+    // `seed_crdt_compaction_metrics` retires exactly one dead writer, ever
+    // (stage-one retirement never calls `retire` on it again once moved),
+    // so this pins exactly. `sundog_crdt_compactions_total` only gets a
+    // lower bound: that same writer's retired slot may or may not have
+    // already aged into a second, real stage-two fold by the time this
+    // scrape lands (see `seed_crdt_compaction_metrics`'s own doc).
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_crdt_retired_writers_total",
+            &[("cache", "counters")]
+        ),
+        Some(1.0),
+        "expected exactly one retired writer on the 'counters' cache; got body:\n{body}"
+    );
+    assert!(
+        scraped_metric_value(
+            &body,
+            "sundog_crdt_compactions_total",
+            &[("cache", "counters")]
+        )
+        .is_some_and(|count| count >= 1.0),
+        "expected at least one crdt compaction on the 'counters' cache; got body:\n{body}"
+    );
 
     #[cfg(feature = "spill")]
     {

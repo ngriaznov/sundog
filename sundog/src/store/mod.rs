@@ -396,6 +396,68 @@ type PreparedPut<K, V> = (u64, K, Bytes, Hlc, V, Option<u64>, Bytes);
 /// `Shard::remove_many`, not yet decided owner-vs-forward.
 type PreparedTombstone<K> = (u64, K, Bytes, Hlc);
 
+/// The two ages the CRDT compaction sweep and the merge apply path work
+/// with, in milliseconds: `retire_after_ms` (`ClusterConfig::crdt_retire_after`)
+/// is how long a writer must be gone before stage one retires it and, twice
+/// over, how old a retirement must be before stage two folds it;
+/// `receipt_ttl_ms` is how long a fold receipt lives after the writer's
+/// retirement instant before both the sweep and every merge apply drop it.
+/// The receipt must outlive every reachable replica's own fold of the same
+/// writer plus one anti-entropy exchange, and a replica folds on its first
+/// sweep after the retirement is two bounds old, so the receipt lives the
+/// longer of three bounds and two bounds plus two sweep periods
+/// ([`ClusterConfig::crdt_compaction_bounds`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionBounds {
+    /// `ClusterConfig::crdt_retire_after`, in milliseconds.
+    pub retire_after_ms: u64,
+    /// How long a fold receipt lives past the writer's retirement instant.
+    pub receipt_ttl_ms: u64,
+}
+
+impl CompactionBounds {
+    /// Bounds for `retire_after` with the sweep running every `sweep_period`.
+    #[must_use]
+    pub fn new(retire_after: Duration, sweep_period: Duration) -> Self {
+        let retire_after_ms = duration_ms(retire_after);
+        let period_ms = duration_ms(sweep_period);
+        let three_bounds = retire_after_ms.saturating_mul(3);
+        let two_bounds_two_periods = retire_after_ms
+            .saturating_mul(2)
+            .saturating_add(period_ms.saturating_mul(2));
+        Self {
+            retire_after_ms,
+            receipt_ttl_ms: three_bounds.max(two_bounds_two_periods),
+        }
+    }
+
+    /// Bounds with the receipt living exactly three bounds: what a sweep
+    /// running at least four times per bound amounts to, and the shape
+    /// every unit test of the CRDT types assumes.
+    #[must_use]
+    pub fn three_bounds(retire_after_ms: u64) -> Self {
+        Self {
+            retire_after_ms,
+            receipt_ttl_ms: retire_after_ms.saturating_mul(3),
+        }
+    }
+}
+
+/// What one [`ShardOps::compact_pass`] call did: the writers its scan found
+/// eligible (see the note on the metric in the implementation), the
+/// records it actually rewrote, and how many stripes it walked, so the
+/// caller can keep calling until the visited stripes add up to
+/// [`BUCKET_COUNT`] and the whole keyspace has been examined this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactPassOutcome {
+    /// Writers the scan found eligible for retirement this call.
+    pub retired: Vec<crdt::WriterId>,
+    /// Records actually rewritten in their compacted form this call.
+    pub compacted: usize,
+    /// Stripes the scan walked before its entry budget ran out.
+    pub stripes_visited: usize,
+}
+
 /// The type-erased surface the network layer drives a shard through, wire bytes
 /// in and out. This is the boundary where postcard (de)serialization happens;
 /// local reads never deserialize. Implemented by `Shard<K, V>` for any `K`, `V`
@@ -480,6 +542,54 @@ pub trait ShardOps: Send + Sync {
     /// of its own. Called periodically by `tombstone_gc_task`, independent
     /// of read/write traffic.
     fn run_pending_tasks(&self) -> BoxFuture<'_, ()>;
+
+    /// Runs one rate-limited pass of the CRDT writer-retirement sweep over
+    /// this shard's merging caches: reads up to `max_entries` live,
+    /// resident candidates and asks the shard's resolver to fold writers
+    /// out of each one via [`ConflictResolver::compact`], then applies
+    /// every changed record with a version-gated direct replace, never
+    /// the ordinary merge-based apply path (see
+    /// `engine::Engine::compact_replace_if_current`'s own doc for why).
+    /// The replacement mints its new version from the compacted bytes
+    /// themselves, so two replicas that compact identical bytes agree on
+    /// the version with nothing left to exchange; it never fans out or
+    /// publishes an `Event` on its own, though a peer whose own copy
+    /// still differs can still discover the version change through an
+    /// ordinary anti-entropy round. `now_ms`, `retire`, `quiet`, and
+    /// `bounds` are exactly [`ConflictResolver::compact`]'s own
+    /// parameters, threaded straight through per candidate: this
+    /// method's job is the shard-level plumbing (candidate selection,
+    /// the apply path, and aggregating results across the whole pass),
+    /// never the retirement decision itself, which stays the resolver's
+    /// call.
+    ///
+    /// Returns every writer the scan found eligible for retirement, per
+    /// [`ConflictResolver::compact`]'s doc, deduplicated across the whole
+    /// batch, for the caller to record in its own absence-tracking
+    /// state, and how many records were compacted. The writer count can
+    /// exceed the record count: a bucket this shard no longer owns is
+    /// skipped without applying, yet the writer(s) it would have retired
+    /// are still reported. Defaulted to a no-op for a shard whose
+    /// resolver never compacts, the common case for [`LwwResolver`] and
+    /// any other non-merging resolver. Called periodically by
+    /// `crdt_compact_task`, independent of read/write traffic.
+    fn compact_pass(
+        &self,
+        now_ms: u64,
+        retire: &dyn Fn(crdt::WriterId) -> bool,
+        quiet: bool,
+        bounds: CompactionBounds,
+        max_entries: usize,
+    ) -> BoxFuture<'_, CompactPassOutcome> {
+        let _ = (now_ms, retire, quiet, bounds, max_entries);
+        Box::pin(async {
+            CompactPassOutcome {
+                retired: Vec::new(),
+                compacted: 0,
+                stripes_visited: BUCKET_COUNT,
+            }
+        })
+    }
 
     /// Closes this shard's spill tier, if the `spill` feature is compiled in
     /// and one was ever attached via `CacheBuilder::spill`: stops accepting
@@ -694,6 +804,141 @@ pub trait ConflictResolver: Send + Sync + 'static {
         let _ = (key, a, b);
         None
     }
+
+    /// Folds writer identities out of `value`'s live state into a bounded,
+    /// already-retired representation, returning freshly encoded bytes
+    /// when anything changed. `None` when nothing was retirement-eligible,
+    /// or this resolver doesn't compact at all — the default. Only ever
+    /// called while [`ConflictResolver::merges`] is `true`.
+    ///
+    /// `key` is the record's own key bytes; `value` its current
+    /// postcard-encoded bytes. `now_ms` is the compaction sweep's
+    /// timestamp, threaded through rather than read from a clock so a
+    /// decision stays a pure function of its inputs.
+    ///
+    /// `retire` answers, for a writer identity `w` this record still
+    /// carries a live slot for, whether `w` is dead per the retirement
+    /// rule: absent from the cluster longer than
+    /// [`crate::config::ClusterConfig::crdt_retire_after`], or a live node
+    /// on a different incarnation than `w`'s own (any other incarnation,
+    /// not only a greater one, so a clock stepping backward across a
+    /// restart can never pin an old incarnation forever). A resolver's
+    /// first, exact compaction stage moves every writer `retire` accepts
+    /// out of the record's live state into a per-writer retired entry
+    /// stamped with `now_ms` — exact under any staleness between replicas,
+    /// since a slot and its retired entry are always maxed together at
+    /// merge time, never summed.
+    ///
+    /// `quiet` is whether every other member sharing this record's cache
+    /// is either continuously present for longer than `crdt_retire_after`,
+    /// or absent for longer than it — computed once per sweep tick and
+    /// passed in rather than recomputed per record. `bounds` carries a
+    /// resolver's second-stage age threshold, `2 * bounds.retire_after_ms`
+    /// for the resolvers this crate ships: a retired writer entry older
+    /// than this, on a quiet cache, may be folded into a bounded
+    /// accumulator and dropped, trading per-writer exactness for a record
+    /// size that stays bounded under churn — the same trust boundary
+    /// [`crate::config::ClusterConfig::tombstone_max_ttl`] already
+    /// documents ("a member gone longer than this may resurrect data"),
+    /// never invoked for anything less stale than that. A resolver with no
+    /// such second stage is free to ignore `quiet`/`bounds` entirely.
+    ///
+    /// A resolver whose second stage collapses per-writer state into a
+    /// bounded accumulator carries no replica identity through this call —
+    /// [`crate::crdt::PnCounter`]'s own fold instead leaves a per-writer
+    /// receipt in the record itself: the writer's own `since_ms` at the
+    /// moment it was folded, recorded under that writer's own key, never a
+    /// single cross-writer watermark, so a later [`ConflictResolver::merge`]
+    /// between two independently-folded records can tell which side's
+    /// silence about a writer means "already folded" without needing to
+    /// know which replica did the folding.
+    fn compact(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        now_ms: u64,
+        retire: &dyn Fn(crdt::WriterId) -> bool,
+        quiet: bool,
+        bounds: CompactionBounds,
+    ) -> Option<Bytes> {
+        let _ = (key, value, now_ms, retire, quiet, bounds);
+        None
+    }
+
+    /// Drops the metadata in `value`, `key`'s freshly merged record, whose
+    /// reconciliation window has closed as of `now_ms`, returning the
+    /// settled bytes, or `None` when nothing in it is that old. Defaults
+    /// to `None`. Called on every merge apply, right after
+    /// [`ConflictResolver::merge`], with the `receipt_ttl_ms` of the same
+    /// [`CompactionBounds`] as [`ConflictResolver::compact`]: for the
+    /// resolvers this crate ships it prunes fold receipts older than that,
+    /// so a receipt one
+    /// replica's sweep already dropped cannot ride back in from a peer
+    /// whose sweep has not reached it yet. Without this step two replicas
+    /// re-import each other's receipts through anti-entropy indefinitely,
+    /// since a merge only ever unions them.
+    fn settle(&self, key: &[u8], value: &[u8], now_ms: u64, receipt_ttl_ms: u64) -> Option<Bytes> {
+        let _ = (key, value, now_ms, receipt_ttl_ms);
+        None
+    }
+}
+
+/// The resolver a merging shard actually runs: `inner` for every decision,
+/// plus [`ConflictResolver::settle`] applied to each merge result with the
+/// shard's clock and its [`CompactionBounds`], so aged fold receipts are
+/// dropped on the apply path and not only on the compaction sweep.
+struct SettlingResolver {
+    inner: Arc<dyn ConflictResolver>,
+    bounds: CompactionBounds,
+    clock_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl ConflictResolver for SettlingResolver {
+    fn winner(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+        self.inner.winner(key, a, b)
+    }
+
+    fn needs_value_bytes(&self) -> bool {
+        self.inner.needs_value_bytes()
+    }
+
+    fn merges(&self) -> bool {
+        self.inner.merges()
+    }
+
+    fn merge(&self, key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Option<Merged> {
+        let merged = self.inner.merge(key, a, b)?;
+        let now_ms = (self.clock_fn)();
+        match self.inner.settle(
+            key,
+            merged.value.as_ref(),
+            now_ms,
+            self.bounds.receipt_ttl_ms,
+        ) {
+            Some(value) => Some(Merged {
+                value,
+                expires_at_ms: merged.expires_at_ms,
+            }),
+            None => Some(merged),
+        }
+    }
+
+    fn compact(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        now_ms: u64,
+        retire: &dyn Fn(crdt::WriterId) -> bool,
+        quiet: bool,
+        bounds: CompactionBounds,
+    ) -> Option<Bytes> {
+        self.inner
+            .compact(key, value, now_ms, retire, quiet, bounds)
+    }
+
+    fn settle(&self, key: &[u8], value: &[u8], now_ms: u64, receipt_ttl_ms: u64) -> Option<Bytes> {
+        self.inner.settle(key, value, now_ms, receipt_ttl_ms)
+    }
 }
 
 /// The default resolver: last-write-wins by [`Hlc`], ignoring value bytes and
@@ -877,6 +1122,31 @@ fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
     xxh3_64(&buf)
 }
 
+/// The version a compacted record takes: the stale version's own successor
+/// in `wall_ms`/`logical`, with the node tiebreaker derived from the
+/// compacted bytes the same way `merge_version` derives it from merged
+/// bytes. Two replicas compacting byte-identical records at the same
+/// version therefore mint byte-identical versions and their digests keep
+/// agreeing, while two that reached different bytes from the same version
+/// (one retired a writer the other has not yet judged dead) mint different
+/// versions, so anti-entropy still sees the difference and merges it. A
+/// version minted from the local clock instead differs per replica for
+/// identical bytes, and anti-entropy then re-exchanges every compacted
+/// record in both directions after every pass. The shard observes the
+/// minted version into its own clock right after, so a local write in the
+/// same millisecond still stamps strictly later.
+fn compacted_version(stale: Hlc, compacted: &[u8]) -> Hlc {
+    let (wall_ms, logical) = match stale.logical.checked_add(1) {
+        Some(logical) => (stale.wall_ms, logical),
+        None => (stale.wall_ms.saturating_add(1), 0),
+    };
+    Hlc {
+        wall_ms,
+        logical,
+        node: NodeId::merge_derived(xxh3_64(compacted)),
+    }
+}
+
 /// Postcard-encodes `key`, its wire form and digest-hash input alike.
 ///
 /// Debug builds assert the encoding round-trips to itself. A key type whose
@@ -927,7 +1197,16 @@ where
     ttl: Option<Duration>,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
+    /// The resolver every decision runs through: `raw_resolver` wrapped in
+    /// a [`SettlingResolver`] carrying `crdt_retire_after_ms` and this
+    /// shard's clock, rebuilt whenever any of the three changes.
     resolver: Arc<dyn ConflictResolver>,
+    /// The resolver as handed to [`Shard::with_resolver`].
+    raw_resolver: Arc<dyn ConflictResolver>,
+    /// The bounds [`ConflictResolver::settle`] prunes fold receipts against
+    /// on every merge apply; the compaction sweep passes the same bounds
+    /// per pass.
+    crdt_bounds: CompactionBounds,
     max_frame: usize,
     /// [`Shard::with_merge_coalesce_window`]'s configured window. Zero (the
     /// default) means every [`Shard::merge`] call applies at once;
@@ -1046,6 +1325,8 @@ where
             tombstone_ttl_ms: duration_ms(ClusterConfig::default().tombstone_ttl),
             tombstone_max_ttl_ms: duration_ms(ClusterConfig::default().tombstone_max_ttl),
             resolver: Arc::new(LwwResolver),
+            raw_resolver: Arc::new(LwwResolver),
+            crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),
             max_frame: MAX_FRAME,
             merge_window: Duration::ZERO,
             pending_merges: (0..BUCKET_COUNT)
@@ -1088,8 +1369,46 @@ where
     /// [`LwwResolver`].
     #[must_use]
     pub fn with_resolver(mut self, resolver: Arc<dyn ConflictResolver>) -> Self {
-        self.resolver = resolver;
+        self.raw_resolver = resolver;
+        self.rebuild_resolver();
         self
+    }
+
+    /// Overrides the bounds the resolver's [`ConflictResolver::settle`]
+    /// step prunes fold receipts against on every merge apply; the
+    /// compaction sweep passes the same bounds per pass. Defaults to
+    /// [`ClusterConfig::default`]'s.
+    #[must_use]
+    pub fn with_crdt_bounds(mut self, bounds: CompactionBounds) -> Self {
+        self.crdt_bounds = bounds;
+        self.rebuild_resolver();
+        self
+    }
+
+    /// Applies everything a live cluster's configuration decides for a
+    /// shard: both tombstone bounds, the CRDT compaction bounds, and the
+    /// frame cap.
+    #[must_use]
+    pub fn with_cluster_config(self, config: &ClusterConfig) -> Self {
+        self.with_tombstone_ttl(config.tombstone_ttl)
+            .with_tombstone_max_ttl(config.tombstone_max_ttl)
+            .with_crdt_bounds(config.crdt_compaction_bounds())
+            .with_max_frame(config.max_frame)
+    }
+
+    /// Rewraps `raw_resolver` with the current bound and clock. A
+    /// non-merging resolver is used bare: it never merges, so it never
+    /// settles either, and the wrapper would only add a hop.
+    fn rebuild_resolver(&mut self) {
+        self.resolver = if self.raw_resolver.merges() {
+            Arc::new(SettlingResolver {
+                inner: Arc::clone(&self.raw_resolver),
+                bounds: self.crdt_bounds,
+                clock_fn: Arc::clone(&self.clock_fn),
+            })
+        } else {
+            Arc::clone(&self.raw_resolver)
+        };
     }
 
     /// Overrides the hard cap [`Shard::insert`] enforces before writing a
@@ -1304,6 +1623,7 @@ where
     #[must_use]
     pub fn with_clock(mut self, now_ms: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         self.clock_fn = now_ms;
+        self.rebuild_resolver();
         self
     }
 
@@ -3050,6 +3370,152 @@ where
         Box::pin(async move {})
     }
 
+    /// All the work here is synchronous — `Engine::compact` never awaits,
+    /// nor does re-applying its candidates — so, like
+    /// [`ShardOps::gc_tombstones`]/[`ShardOps::run_pending_tasks`] above,
+    /// it all runs before the trivial future is built rather than inside
+    /// an `async move` block: `retire`'s borrow only needs to outlive this
+    /// call, not whatever lifetime the returned `BoxFuture<'_, _>` (tied
+    /// to `&self`, per this trait method's elided signature) would force
+    /// on anything captured into it.
+    fn compact_pass(
+        &self,
+        now_ms: u64,
+        retire: &dyn Fn(crdt::WriterId) -> bool,
+        quiet: bool,
+        bounds: CompactionBounds,
+        max_entries: usize,
+    ) -> BoxFuture<'_, CompactPassOutcome> {
+        if !self.resolver.merges() {
+            // `ConflictResolver::compact`'s own contract: "only ever
+            // called while `merges()` is `true`". Enforced here rather
+            // than left to `Engine::compact`'s caller to remember, so a
+            // non-merging shard — `LwwResolver` and every other
+            // pick-a-side resolver, the common case — never pays for a
+            // full-engine scan whose every call would return `None`
+            // anyway, and the contract holds regardless of what a future
+            // caller of this method does or doesn't check first.
+            return Box::pin(async {
+                CompactPassOutcome {
+                    retired: Vec::new(),
+                    compacted: 0,
+                    stripes_visited: BUCKET_COUNT,
+                }
+            });
+        }
+        // `Engine::compact` takes `retire` as `&dyn Fn`, not `FnMut`, so
+        // recording which writers it actually accepted (as opposed to
+        // every writer it was merely asked about) goes through interior
+        // mutability rather than a captured `&mut`. A resolver's own
+        // `compact` only ever calls `retire` on a writer identity the
+        // record still holds a *live* slot for (never one already folded
+        // away by an earlier pass), and a `true` answer always turns that
+        // record into a candidate (`newly` becomes non-empty), so every
+        // writer captured here belongs to some candidate this scan found
+        // — deduplicated by the `HashSet`, since the same eligible writer
+        // can surface across more than one candidate record in a single
+        // pass.
+        //
+        // This is scoped to the whole scan, not to the handful of
+        // candidates that go on to actually apply below: a candidate for
+        // a bucket this shard's *current* view no longer owns is skipped,
+        // never applied, yet the writer(s) it would have retired are
+        // still reported here. This is deliberate, not an oversight — the
+        // alternative (only ever reporting a writer once every one of its
+        // live records anywhere in the cluster has actually compacted) is
+        // unobtainable at this layer, since nothing this generic-over-`V`
+        // method sees distinguishes "a writer's slot" from arbitrary
+        // bytes. Reporting it anyway is safe in the direction that
+        // matters: the caller (`crdt_compact_tick`) only counts it in
+        // `sundog_crdt_retired_writers_total`, never deletes data on the
+        // strength of it, and the member stays tracked gone until it
+        // returns, so a skipped record is retried on the next pass — the
+        // skipped bucket's own stale copy is either physically dropped by
+        // `ShardOps::release_buckets` once its disown-grace period ends
+        // (the common case: ownership rarely moves back), or, if this
+        // shard reacquires the bucket first, recompacted on this shard's
+        // own next pass. The metric therefore counts writers found
+        // eligible in the scan, which can exceed the records rewritten.
+        let newly_retired: StdMutex<HashSet<crdt::WriterId>> = StdMutex::new(HashSet::new());
+        let tracking_retire = |writer: crdt::WriterId| {
+            let accepted = retire(writer);
+            if accepted {
+                newly_retired
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(writer);
+            }
+            accepted
+        };
+        let engine::CompactScan {
+            candidates,
+            stripes_visited,
+        } = self.engine.compact(
+            self.resolver.as_ref(),
+            now_ms,
+            &tracking_retire,
+            quiet,
+            bounds,
+            max_entries,
+        );
+        let mut compacted = 0usize;
+        for (key, key_bytes, stale_ver, new_encoded) in candidates {
+            // Mirrors `guard_inbound`'s strict current-view rule: a
+            // `Mode::Distributed` shard mid disown-grace never re-applies
+            // a compacted record for a bucket its *current* view no
+            // longer owns. Skipped, never forwarded — unlike an ordinary
+            // write, a compaction candidate has no caller waiting on it,
+            // and the bucket's new owner will compact its own copy on its
+            // own schedule once it, too, decides the same writers are
+            // dead.
+            if !self.owns_key(key_bytes.as_ref()) {
+                continue;
+            }
+            let Ok(value) = postcard::from_bytes::<V>(&new_encoded) else {
+                tracing::warn!(
+                    cache = %self.name,
+                    "compact_pass: a resolver's own compacted bytes failed to decode as V"
+                );
+                continue;
+            };
+            // A version-gated direct replace, never the ordinary
+            // merge-based apply path: see `Engine::compact_replace_if_current`'s
+            // own doc for why a merge-based apply here would silently
+            // undo stage three's own pruning on every single pass. `false`
+            // means something else touched this entry since the scan
+            // above read it (or it is no longer live, or no longer
+            // resident) — skipped, exactly like an unowned bucket above,
+            // and recomputed fresh on the next pass rather than counted
+            // here.
+            let hash = engine::hash_key_bytes(key_bytes.as_ref());
+            let new_ver = compacted_version(stale_ver, new_encoded.as_ref());
+            self.observe_remote(new_ver);
+            if self.engine.compact_replace_if_current(
+                &key,
+                key_bytes.as_ref(),
+                hash,
+                stale_ver,
+                new_ver,
+                value,
+                new_encoded,
+            ) {
+                compacted += 1;
+            }
+        }
+        let retired: Vec<crdt::WriterId> = newly_retired
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .collect();
+        Box::pin(async move {
+            CompactPassOutcome {
+                retired,
+                compacted,
+                stripes_visited,
+            }
+        })
+    }
+
     fn close_spill(&self) {
         Shard::close_spill(self);
     }
@@ -3192,6 +3658,36 @@ mod tests {
 
     fn key_bytes<K: Serialize>(key: &K) -> Bytes {
         Bytes::from(postcard::to_stdvec(key).expect("test key encodes"))
+    }
+
+    #[test]
+    fn compacted_version_is_the_stale_versions_successor_keyed_by_content() {
+        let stale = hlc(5_000, 1);
+        let minted = compacted_version(stale, b"folded");
+        assert!(minted > stale);
+        assert_eq!((minted.wall_ms, minted.logical), (5_000, stale.logical + 1));
+        assert!(minted.node.is_merge_derived());
+        assert_eq!(
+            compacted_version(stale, b"folded"),
+            minted,
+            "the same stale version and bytes mint the same version on any replica"
+        );
+        assert_ne!(
+            compacted_version(stale, b"folded differently"),
+            minted,
+            "different bytes from the same stale version mint different versions"
+        );
+    }
+
+    #[test]
+    fn compacted_version_carries_wall_ms_into_logical_zero_on_overflow() {
+        let stale = Hlc {
+            wall_ms: 9_000,
+            logical: u32::MAX,
+            node: NodeId::from(1),
+        };
+        let minted = compacted_version(stale, b"x");
+        assert_eq!((minted.wall_ms, minted.logical), (9_001, 0));
     }
 
     /// Unwraps every item as [`FanOutItem::Applied`], panicking on a
@@ -4374,10 +4870,10 @@ mod tests {
         .with_spill(&cfg)
         .expect("the tier's directory and region files open");
 
-        let node_a = NodeId::from(11);
-        let node_b = NodeId::from(22);
+        let writer_a = crdt::WriterId::new(NodeId::from(11), 1);
+        let writer_b = crdt::WriterId::new(NodeId::from(22), 1);
 
-        s.merge(1, PnCounter::local_delta(node_a, 3))
+        s.merge(1, PnCounter::local_delta(writer_a, 3))
             .await
             .expect("first increment");
 
@@ -4393,7 +4889,7 @@ mod tests {
             "the single over-weight entry spills once eviction runs"
         );
 
-        s.merge(1, PnCounter::local_delta(node_b, 4))
+        s.merge(1, PnCounter::local_delta(writer_b, 4))
             .await
             .expect("second increment, colliding with the spilled record");
 
@@ -4550,6 +5046,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conflict_resolver_compact_defaults_to_none_and_is_overridable() {
+        let retire_everyone = |_: crdt::WriterId| true;
+        assert_eq!(
+            LwwResolver.compact(
+                b"k",
+                b"v",
+                0,
+                &retire_everyone,
+                true,
+                CompactionBounds::three_bounds(0)
+            ),
+            None,
+            "the default resolver never compacts, regardless of key/value/\
+             now/retire/quiet/bound"
+        );
+        assert_eq!(
+            LongestValueWins.compact(
+                b"k",
+                b"v",
+                12_345,
+                &retire_everyone,
+                false,
+                CompactionBounds::three_bounds(999)
+            ),
+            None,
+            "a custom winner-only resolver inherits the None default without \
+             overriding compact"
+        );
+
+        let retire_none = |_: crdt::WriterId| false;
+        let out = AlwaysCompacts
+            .compact(
+                b"key",
+                b"val",
+                42,
+                &retire_none,
+                true,
+                CompactionBounds::three_bounds(100),
+            )
+            .expect("a resolver that overrides compact can return Some");
+        assert_eq!(
+            out.as_ref(),
+            b"key:val|42|false|true|100",
+            "every parameter compact was called with reaches the resolver's \
+             own implementation"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_ops_compact_pass_defaults_to_a_no_op() {
+        let s = shard::<u32, String>(1);
+        s.insert(1, "v".to_string()).await.expect("insert");
+        let writer = crdt::WriterId::new(NodeId::from(9), 1);
+        let retire = move |w: crdt::WriterId| w == writer;
+
+        let CompactPassOutcome {
+            retired, compacted, ..
+        } = ShardOps::compact_pass(&s, 0, &retire, true, CompactionBounds::three_bounds(0), 100)
+            .await;
+
+        assert!(
+            retired.is_empty(),
+            "a shard with no resolver set (LwwResolver) never retires a writer"
+        );
+        assert_eq!(compacted, 0, "the default compact_pass compacts nothing");
+        assert_eq!(
+            s.get(&1).await,
+            Some("v".to_string()),
+            "compact_pass's no-op default never touches the resident value"
+        );
+    }
+
     #[tokio::test]
     async fn shard_merges_reflects_the_resolvers_merges_flag() {
         let default_resolver = shard::<u32, Vec<u8>>(1);
@@ -4689,6 +5258,646 @@ mod tests {
                 value: self.value.clone(),
                 expires_at_ms: self.expires_at_ms,
             })
+        }
+    }
+
+    /// A resolver whose `compact` always claims to have folded something,
+    /// echoing every parameter it was called with into the returned bytes
+    /// so a test can assert each one actually reached the implementation,
+    /// not merely that `Some`/`None` came back.
+    #[derive(Debug, Clone, Copy)]
+    struct AlwaysCompacts;
+
+    impl ConflictResolver for AlwaysCompacts {
+        fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+            if a.ver >= b.ver { Winner::A } else { Winner::B }
+        }
+
+        fn merges(&self) -> bool {
+            true
+        }
+
+        fn compact(
+            &self,
+            key: &[u8],
+            value: &[u8],
+            now_ms: u64,
+            retire: &dyn Fn(crdt::WriterId) -> bool,
+            quiet: bool,
+            bounds: CompactionBounds,
+        ) -> Option<Bytes> {
+            let retired_probe = retire(crdt::WriterId::new(NodeId::from(1), 1));
+            Some(Bytes::from(format!(
+                "{}|{now_ms}|{retired_probe}|{quiet}|{}",
+                String::from_utf8_lossy(key).into_owned() + ":" + &String::from_utf8_lossy(value),
+                bounds.retire_after_ms
+            )))
+        }
+    }
+
+    /// [`ShardOps::compact_pass`]'s real, non-default implementation on
+    /// [`Shard`]: shard-level plumbing tests covering a fake retire
+    /// predicate injected directly, the compacted record's shape, its
+    /// unchanged `Hlc` and lack of any `Event`, the `Mode::Distributed`
+    /// skip-not-forward rule for an unowned bucket, the spilled-entry
+    /// skip, rate-limited cursor rotation across several calls with
+    /// returned counts matching actual work, the non-merging early-out,
+    /// and two shards compacting independently converging once
+    /// cross-applied.
+    mod compact_pass_tests {
+        use std::sync::atomic::AtomicUsize;
+
+        use super::*;
+        use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+        fn writer(id: u64) -> crdt::WriterId {
+            crdt::WriterId::new(NodeId::from(id), 1)
+        }
+
+        #[tokio::test]
+        async fn folds_a_dead_writer_in_place_with_no_event_or_version_change() {
+            let s = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+            let dead = writer(11);
+            let alive = writer(22);
+            s.merge(1, PnCounter::local_delta(dead, 3))
+                .await
+                .expect("first writer's contribution");
+            s.merge(1, PnCounter::local_delta(alive, 4))
+                .await
+                .expect("second writer's contribution");
+            assert_eq!(s.get(&1).await.map(|c| c.value()), Some(7));
+            let before = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+            assert_eq!(before.len(), 1);
+
+            let mut events = s.events();
+            let retire = move |w: crdt::WriterId| w == dead;
+            // A `bound_ms` far larger than any `now_ms` gap this test ever
+            // spans: stage two only folds a retired entry once it has aged
+            // past `2 * bound_ms`, and this test means to isolate stage
+            // one's own idempotency, not stage two's separate threshold.
+            let CompactPassOutcome {
+                retired, compacted, ..
+            } = ShardOps::compact_pass(
+                &s,
+                1_000,
+                &retire,
+                true,
+                CompactionBounds::three_bounds(1_000_000_000),
+                100,
+            )
+            .await;
+
+            assert_eq!(
+                retired,
+                vec![dead],
+                "exactly the one dead writer is reported"
+            );
+            assert_eq!(compacted, 1, "exactly the one touched record is counted");
+            assert_eq!(
+                s.get(&1).await.map(|c| c.value()),
+                Some(7),
+                "folding a writer's slot into its retired total never changes the value"
+            );
+            assert!(
+                matches!(
+                    events.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ),
+                "compaction applies through `Engine::compact_replace_if_current`, a direct \
+                 in-place replace, never `Shard::apply` — no `Event` fires for it, unlike \
+                 every ordinary write"
+            );
+            let after = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+            assert_eq!(after.len(), 1);
+            assert!(
+                after[0].ver > before[0].ver,
+                "the version-gated direct replace still mints a fresh, strictly greater \
+                 version — never leaving the old one in place — so a version alone still \
+                 uniquely names this content, exactly as `resolve_and_rebind`'s own \
+                 equal-version no-op rule requires"
+            );
+            assert_ne!(
+                after[0].value, before[0].value,
+                "the resident bytes themselves change shape once a writer is retired"
+            );
+
+            // Idempotent: the same writer is no longer live in the record, so
+            // a second pass with the identical retire predicate finds
+            // nothing left to do.
+            let CompactPassOutcome {
+                retired: retired_again,
+                compacted: compacted_again,
+                ..
+            } = ShardOps::compact_pass(
+                &s,
+                2_000,
+                &retire,
+                true,
+                CompactionBounds::three_bounds(1_000_000_000),
+                100,
+            )
+            .await;
+            assert!(retired_again.is_empty());
+            assert_eq!(compacted_again, 0);
+        }
+
+        #[tokio::test]
+        async fn never_calls_a_non_merging_resolvers_compact() {
+            struct SpyNeverMerges {
+                calls: Arc<AtomicUsize>,
+            }
+            impl ConflictResolver for SpyNeverMerges {
+                fn winner(&self, _key: &[u8], a: RecordView<'_>, b: RecordView<'_>) -> Winner {
+                    if a.ver >= b.ver { Winner::A } else { Winner::B }
+                }
+                // `merges()` is left at its `false` default: this resolver
+                // never claims to merge.
+                fn compact(
+                    &self,
+                    _key: &[u8],
+                    _value: &[u8],
+                    _now_ms: u64,
+                    _retire: &dyn Fn(crdt::WriterId) -> bool,
+                    _quiet: bool,
+                    _bounds: CompactionBounds,
+                ) -> Option<Bytes> {
+                    self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(Bytes::from_static(b"should never be reached"))
+                }
+            }
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let s = shard::<u32, String>(1).with_resolver(Arc::new(SpyNeverMerges {
+                calls: Arc::clone(&calls),
+            }));
+            s.insert(1, "v".to_string()).await.expect("insert");
+
+            let retire_everyone = |_: crdt::WriterId| true;
+            let CompactPassOutcome {
+                retired, compacted, ..
+            } = ShardOps::compact_pass(
+                &s,
+                0,
+                &retire_everyone,
+                true,
+                CompactionBounds::three_bounds(0),
+                100,
+            )
+            .await;
+
+            assert!(retired.is_empty());
+            assert_eq!(compacted, 0);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "ConflictResolver::compact's own contract (\"only ever called while merges() \
+                 is true\") is enforced here, not merely assumed: an override that would \
+                 otherwise happily compact is never even invoked for a non-merging resolver"
+            );
+        }
+
+        #[tokio::test]
+        async fn skips_a_bucket_the_current_view_no_longer_owns() {
+            let self_node = NodeId::from(1);
+            let residency = Arc::new(ResidencySet::new());
+            let (s, initial_view, tx) = distributed_shard::<u32, PnCounter>(
+                self_node,
+                vec![self_node],
+                1,
+                Arc::clone(&residency),
+            );
+            let s = s.with_resolver(Arc::new(PnCounterResolver));
+
+            let new_view = OwnershipView::compute(
+                self_node,
+                vec![self_node, NodeId::from(2)],
+                NonZeroU8::new(1).expect("nonzero"),
+            );
+            let key = (0..1_000_000u32)
+                .find(|&k| !new_view.owns(bucket_of(&key_bytes(&k))))
+                .expect("some bucket flips ownership once a second node joins");
+            let bucket = bucket_of(&key_bytes(&key));
+            assert!(initial_view.owns(bucket));
+
+            let dead = writer(11);
+            s.merge(key, PnCounter::local_delta(dead, 3))
+                .await
+                .expect("owner's merge lands");
+            let before = ShardOps::records_for(&s, vec![key_bytes(&key)]).await;
+            assert_eq!(before.len(), 1);
+            // Drains the setup write's own `FanOutItem::Applied` entry so
+            // the check below only ever sees what `compact_pass` itself
+            // did to the queue, never the ordinary write that seeded it.
+            let _ = s.fan_out.drain();
+
+            // Membership widens and this bucket moves to the other node — the
+            // shard's own physical copy is still sitting right there, mid
+            // disown-grace, exactly as `a_releasing_bucket_still_answers_
+            // digests_and_entries` sets up for the ordinary write path.
+            // `mark_releasing` keeps the bucket servable by `records_for`'s
+            // own outbound-serving guard below, so the *before*/*after*
+            // comparison actually reads the resident record rather than
+            // the guard's "not resident at all" empty answer either time.
+            tx.send(Arc::new(new_view)).expect("receiver still alive");
+            residency.mark_releasing(&[bucket]);
+            assert!(
+                !ShardOps::ownership_view(&s).expect("attached").owns(bucket),
+                "sanity: this node no longer owns the bucket under the new view"
+            );
+
+            let retire = move |w: crdt::WriterId| w == dead;
+            let CompactPassOutcome {
+                retired: _retired,
+                compacted,
+                ..
+            } = ShardOps::compact_pass(
+                &s,
+                1_000,
+                &retire,
+                true,
+                CompactionBounds::three_bounds(1),
+                100,
+            )
+            .await;
+
+            assert_eq!(
+                compacted, 0,
+                "a compaction candidate for a bucket this shard's current view no longer \
+                 owns is never applied"
+            );
+            assert!(
+                s.fan_out.drain().is_empty(),
+                "unlike an ordinary write, a skipped compaction candidate is never forwarded \
+                 to the bucket's new owners either"
+            );
+            let after = ShardOps::records_for(&s, vec![key_bytes(&key)]).await;
+            assert_eq!(
+                before, after,
+                "the unowned bucket's resident record is left completely untouched"
+            );
+        }
+
+        #[tokio::test]
+        async fn processes_the_whole_shard_over_several_rate_limited_calls() {
+            const KEYS: u32 = 12;
+            let s = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+            let dead = writer(9);
+            let alive = writer(99);
+            for k in 0..KEYS {
+                s.merge(k, PnCounter::local_delta(dead, 1))
+                    .await
+                    .expect("merge");
+                s.merge(k, PnCounter::local_delta(alive, 1))
+                    .await
+                    .expect("merge");
+            }
+
+            let retire = move |w: crdt::WriterId| w == dead;
+            let mut total_compacted = 0usize;
+            let mut all_retired: HashSet<crdt::WriterId> = HashSet::new();
+            for _ in 0..BUCKET_COUNT {
+                let CompactPassOutcome {
+                    retired, compacted, ..
+                } = ShardOps::compact_pass(
+                    &s,
+                    1_000,
+                    &retire,
+                    true,
+                    CompactionBounds::three_bounds(1),
+                    3,
+                )
+                .await;
+                total_compacted += compacted;
+                all_retired.extend(retired);
+                if total_compacted >= KEYS as usize {
+                    break;
+                }
+            }
+
+            assert_eq!(
+                total_compacted, KEYS as usize,
+                "a small per-tick budget still processes every candidate, given enough \
+                 rate-limited calls — the returned counts sum to exactly the work actually \
+                 done, never more and never less"
+            );
+            assert_eq!(
+                all_retired,
+                HashSet::from([dead]),
+                "the same writer, dead in every one of the twelve records, is reported \
+                 exactly once across the whole run, not once per record"
+            );
+            for k in 0..KEYS {
+                assert_eq!(
+                    s.get(&k).await.map(|c| c.value()),
+                    Some(2),
+                    "key {k}'s value is unaffected by compaction"
+                );
+            }
+        }
+
+        #[cfg(feature = "spill")]
+        #[tokio::test]
+        async fn never_hands_a_spilled_entry_to_the_resolver() {
+            use crate::store::spill::SpillLoc;
+
+            let s = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+            let dead = writer(9);
+
+            // An ordinary resident entry.
+            s.merge(2, PnCounter::local_delta(dead, 4))
+                .await
+                .expect("merge");
+
+            // A fabricated spilled entry for the very same dead writer,
+            // bypassing any real spill tier — `Engine::compact` (and
+            // therefore `Shard::compact_pass`, which never reads a stripe
+            // directly) must skip it regardless of what its bytes would
+            // decode to.
+            s.engine.debug_insert_spilled(
+                1,
+                &key_bytes(&1u32),
+                hlc(1, 1),
+                None,
+                SpillLoc {
+                    region: 0,
+                    offset: 0,
+                    len: 4,
+                    generation: 0,
+                },
+                0,
+            );
+
+            let retire = move |w: crdt::WriterId| w == dead;
+            let CompactPassOutcome {
+                retired, compacted, ..
+            } = ShardOps::compact_pass(
+                &s,
+                1_000,
+                &retire,
+                true,
+                CompactionBounds::three_bounds(1),
+                100,
+            )
+            .await;
+
+            assert_eq!(
+                compacted, 1,
+                "the spilled entry is skipped; only the resident one is compacted"
+            );
+            assert_eq!(retired, vec![dead]);
+            assert_eq!(
+                s.get(&2).await.map(|c| c.value()),
+                Some(4),
+                "the resident counter's own value is unchanged by compaction"
+            );
+        }
+
+        /// Two replicas, holding the same pre-compaction state,
+        /// independently decide to retire a *different* writer each,
+        /// through this task's own real `Shard::compact_pass` plumbing, not
+        /// `PnCounter::compact` called directly. Cross-applying each
+        /// shard's resulting record through the other's ordinary
+        /// replicated-apply path converges both to the exact combined
+        /// total, and to bit-identical resident state, not merely an equal
+        /// `.value()`.
+        #[tokio::test]
+        /// Two replicas compacting byte-identical records at the same
+        /// version mint the same version, so their digests keep agreeing
+        /// and anti-entropy has nothing to exchange after a pass.
+        async fn two_replicas_compacting_identical_records_mint_identical_versions() {
+            let a = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+            let b = shard::<u32, PnCounter>(2).with_resolver(Arc::new(PnCounterResolver));
+            let dead = writer(9);
+            let alive = writer(99);
+            for k in 0..5u32 {
+                a.merge(k, PnCounter::local_delta(dead, 3))
+                    .await
+                    .expect("merge");
+                a.merge(k, PnCounter::local_delta(alive, 4))
+                    .await
+                    .expect("merge");
+            }
+            let keys: Vec<Bytes> = (0..5u32).map(|k| key_bytes(&k)).collect();
+            for rec in ShardOps::records_for(&a, keys).await {
+                ShardOps::apply_remote(&b, rec).await;
+            }
+            assert_eq!(
+                ShardOps::digests(&a).await,
+                ShardOps::digests(&b).await,
+                "b warmed from a's records, versions included"
+            );
+
+            let retire = move |w: crdt::WriterId| w == dead;
+            let bounds = CompactionBounds::three_bounds(1);
+            let outcome_a = ShardOps::compact_pass(&a, 1_000, &retire, true, bounds, 100).await;
+            let outcome_b = ShardOps::compact_pass(&b, 1_000, &retire, true, bounds, 100).await;
+            assert_eq!((outcome_a.compacted, outcome_b.compacted), (5, 5));
+            assert_eq!(
+                ShardOps::digests(&a).await,
+                ShardOps::digests(&b).await,
+                "the same compaction on the same records mints the same versions on both"
+            );
+        }
+
+        #[tokio::test]
+        /// A merge apply drops a fold receipt older than the receipt ttl even
+        /// when a peer's copy carries it back in, so two replicas whose sweeps
+        /// prune at different moments still converge on the receipt-free
+        /// bytes instead of re-importing each other's receipts forever.
+        async fn merge_apply_settles_an_aged_receipt_a_peer_carries_back_in() {
+            let bounds = CompactionBounds::three_bounds(1_000);
+            let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let clock = {
+                let now = Arc::clone(&now);
+                Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed))
+                    as Arc<dyn Fn() -> u64 + Send + Sync>
+            };
+            let s = shard::<u32, PnCounter>(1)
+                .with_resolver(Arc::new(PnCounterResolver))
+                .with_crdt_bounds(bounds)
+                .with_clock(clock);
+            let dead = writer(9);
+            let alive = writer(99);
+            s.merge(1, PnCounter::local_delta(dead, 3))
+                .await
+                .expect("merge");
+            s.merge(1, PnCounter::local_delta(alive, 4))
+                .await
+                .expect("merge");
+
+            let retire = move |w: crdt::WriterId| w == dead;
+            // Stage one at 1_000, stage two past two bounds: a receipt at 1_000.
+            ShardOps::compact_pass(&s, 1_000, &retire, true, bounds, 100).await;
+            let folded = ShardOps::compact_pass(&s, 3_001, &retire, true, bounds, 100).await;
+            assert_eq!(folded.compacted, 1, "folded with a receipt");
+            let with_receipt = ShardOps::records_for(&s, vec![key_bytes(&1u32)])
+                .await
+                .into_iter()
+                .next()
+                .expect("resident");
+            // Stage three past three bounds: the receipt is gone locally.
+            let pruned = ShardOps::compact_pass(&s, 4_001, &retire, true, bounds, 100).await;
+            assert_eq!(pruned.compacted, 1, "receipt pruned");
+            let pruned_bytes = s.get(&1).await.expect("resident").encode().expect("encode");
+
+            // A peer's copy still carrying the receipt merges in at a time
+            // past the ttl: the merge unions the receipt, settle drops it.
+            now.store(4_001, std::sync::atomic::Ordering::Relaxed);
+            ShardOps::apply_remote(&s, with_receipt).await;
+            let after = s.get(&1).await.expect("resident");
+            assert_eq!(after.value(), 7, "the exact total is untouched");
+            assert_eq!(
+                after.encode().expect("encode"),
+                pruned_bytes,
+                "the receipt the peer carried back in is settled away on apply"
+            );
+        }
+
+        #[tokio::test]
+        /// A record that another write touched between the scan and the
+        /// version-gated apply is skipped that pass and rewritten on the
+        /// next: the writer stays eligible, so nothing is left behind.
+        async fn a_record_touched_between_scan_and_apply_is_retried_on_the_next_pass() {
+            let s = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+            let dead = writer(9);
+            let alive = writer(99);
+            s.merge(1, PnCounter::local_delta(dead, 5))
+                .await
+                .expect("merge");
+            s.merge(1, PnCounter::local_delta(alive, 1))
+                .await
+                .expect("merge");
+            let retire = move |w: crdt::WriterId| w == dead;
+            let bounds = CompactionBounds::three_bounds(1);
+
+            let scan = s
+                .engine
+                .compact(s.resolver.as_ref(), 1_000, &retire, true, bounds, 100);
+            let (key, key_bytes, stale_ver, new_encoded) = scan
+                .candidates
+                .into_iter()
+                .next()
+                .expect("the dead writer's record is a candidate");
+            // A concurrent write lands before the apply.
+            s.merge(1, PnCounter::local_delta(alive, 2))
+                .await
+                .expect("merge");
+            let value = PnCounter::decode(&new_encoded).expect("decodes");
+            let applied = s.engine.compact_replace_if_current(
+                &key,
+                key_bytes.as_ref(),
+                engine::hash_key_bytes(key_bytes.as_ref()),
+                stale_ver,
+                compacted_version(stale_ver, new_encoded.as_ref()),
+                value,
+                new_encoded,
+            );
+            assert!(!applied, "the stale candidate is refused");
+            assert_eq!(s.get(&1).await.map(|c| c.value()), Some(7));
+
+            let next = ShardOps::compact_pass(&s, 1_001, &retire, true, bounds, 100).await;
+            assert_eq!(next.retired, vec![dead], "still eligible on the next pass");
+            assert_eq!(
+                next.compacted, 1,
+                "rewritten with the concurrent write folded in"
+            );
+            assert_eq!(s.get(&1).await.map(|c| c.value()), Some(7));
+        }
+
+        #[tokio::test]
+        async fn two_shards_compacting_independently_converge() {
+            let a = shard::<u32, PnCounter>(1).with_resolver(Arc::new(PnCounterResolver));
+            let b = shard::<u32, PnCounter>(2).with_resolver(Arc::new(PnCounterResolver));
+            let w1 = writer(101);
+            let w2 = writer(202);
+
+            for shard in [&a, &b] {
+                shard
+                    .merge(1, PnCounter::local_delta(w1, 10))
+                    .await
+                    .expect("w1's contribution");
+                shard
+                    .merge(1, PnCounter::local_delta(w2, 50))
+                    .await
+                    .expect("w2's contribution");
+            }
+            assert_eq!(a.get(&1).await.map(|c| c.value()), Some(60));
+            assert_eq!(b.get(&1).await.map(|c| c.value()), Some(60));
+
+            // Independent decisions: `a` alone judges `w1` dead, `b` alone
+            // judges `w2` dead, with the same tick timestamp on both sides
+            // so the two sides' `retired` entries land at the identical
+            // `since_ms`.
+            let retire_w1 = move |w: crdt::WriterId| w == w1;
+            let retire_w2 = move |w: crdt::WriterId| w == w2;
+            let CompactPassOutcome {
+                retired: retired_a,
+                compacted: compacted_a,
+                ..
+            } = ShardOps::compact_pass(
+                &a,
+                5_000,
+                &retire_w1,
+                true,
+                CompactionBounds::three_bounds(1),
+                100,
+            )
+            .await;
+            let CompactPassOutcome {
+                retired: retired_b,
+                compacted: compacted_b,
+                ..
+            } = ShardOps::compact_pass(
+                &b,
+                5_000,
+                &retire_w2,
+                true,
+                CompactionBounds::three_bounds(1),
+                100,
+            )
+            .await;
+            assert_eq!(retired_a, vec![w1]);
+            assert_eq!(compacted_a, 1);
+            assert_eq!(retired_b, vec![w2]);
+            assert_eq!(compacted_b, 1);
+
+            // Each side still reads its own exact total after compacting
+            // only its own writer.
+            assert_eq!(a.get(&1).await.map(|c| c.value()), Some(60));
+            assert_eq!(b.get(&1).await.map(|c| c.value()), Some(60));
+
+            let rec_a = ShardOps::records_for(&a, vec![key_bytes(&1u32)])
+                .await
+                .into_iter()
+                .next()
+                .expect("a holds the key");
+            let rec_b = ShardOps::records_for(&b, vec![key_bytes(&1u32)])
+                .await
+                .into_iter()
+                .next()
+                .expect("b holds the key");
+
+            ShardOps::apply_remote(&a, rec_b).await;
+            ShardOps::apply_remote(&b, rec_a).await;
+
+            assert_eq!(
+                a.get(&1).await.map(|c| c.value()),
+                Some(60),
+                "cross-applying the other side's independently-compacted record recovers \
+                 the exact combined total on a"
+            );
+            assert_eq!(
+                b.get(&1).await.map(|c| c.value()),
+                Some(60),
+                "cross-applying the other side's independently-compacted record recovers \
+                 the exact combined total on b"
+            );
+            assert_eq!(
+                a.get(&1).await,
+                b.get(&1).await,
+                "both replicas converge to bit-identical state, not merely an equal value: \
+                 each now carries both writers' slots folded into its own retired map"
+            );
         }
     }
 

@@ -29,6 +29,7 @@ use crate::error::CacheError;
 use crate::net::FetchOutcome;
 use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
+use crate::store::crdt::WriterId;
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{
@@ -270,9 +271,7 @@ where
             ttl,
             tti,
         )
-        .with_tombstone_ttl(cluster.config().tombstone_ttl)
-        .with_tombstone_max_ttl(cluster.config().tombstone_max_ttl)
-        .with_max_frame(cluster.config().max_frame)
+        .with_cluster_config(cluster.config())
         .with_resolver(resolver)
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled);
@@ -545,6 +544,23 @@ async fn spawn_cache_tasks<K, V>(
             cancel.clone(),
         ),
     );
+    // Only a merging cache ever compacts (`ConflictResolver::compact` is a
+    // no-op for every other resolver), so a plain LWW cache never pays for
+    // a ticker that would never do anything — the same gating
+    // `cluster::anti_entropy` already applies to its own merge-aware
+    // exchange path via `ShardOps::merges`.
+    if (Arc::clone(shard) as Arc<dyn ShardOps>).merges() {
+        cluster.spawn_tracked_in(
+            tasks,
+            crate::cluster::crdt_compact_task(
+                Arc::clone(shard) as Arc<dyn ShardOps>,
+                name.clone(),
+                cluster.clone(),
+                cluster.absence_tracker(),
+                cancel.clone(),
+            ),
+        );
+    }
     cluster.spawn_tracked_in(
         tasks,
         crate::cluster::cache_entries_gauge_task(Arc::clone(shard), name.clone(), cancel.clone()),
@@ -760,6 +776,21 @@ where
     #[must_use]
     pub fn name(&self) -> &str {
         self.shard.name()
+    }
+
+    /// This node's current [`WriterId`]: its own [`Cluster::node_id`] paired
+    /// with the cluster's current membership incarnation. Every caller of a merging cache's
+    /// [`Cache::merge`] — including the CRDT types' own `local_delta`/`add`
+    /// constructors — should build its writer identity from this rather
+    /// than a bare [`NodeId`], so a restart writes from a fresh slot the
+    /// compaction sweep has never seen, instead of resuming (or colliding
+    /// with) whatever this node wrote under its previous incarnation.
+    /// Stable for the process's lifetime; every clone of this `Cache`
+    /// returns the same value, since they share one underlying cluster
+    /// membership.
+    #[must_use]
+    pub fn writer_id(&self) -> WriterId {
+        WriterId::new(self.cluster.node_id(), self.cluster.local_incarnation())
     }
 
     /// Reads `key`, without triggering read-through.
@@ -1829,14 +1860,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_with_a_zero_window_applies_immediately() {
-        let cluster = Cluster::builder("cache-it-merge-zero-window")
+    async fn writer_id_pairs_the_node_with_the_cluster_incarnation() {
+        let cluster = Cluster::builder("cache-it-writer-id")
             .seeds(std::iter::empty())
             .config(loopback_config())
             .build()
             .await
             .expect("build succeeds");
-        let node = cluster.node_id();
+        let cache = cluster
+            .cache::<u32, PnCounter>("counters")
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("open succeeds");
+
+        let writer = cache.writer_id();
+        assert_eq!(
+            writer,
+            WriterId::new(cluster.node_id(), cluster.local_incarnation()),
+            "Cache::writer_id pairs this node's id with the cluster's own \
+             membership incarnation, the same pairing WriterId::new takes"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn writer_id_is_stable_across_clones_and_repeated_calls() {
+        let cluster = Cluster::builder("cache-it-writer-id-stable")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, PnCounter>("counters")
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("open succeeds");
+        let clone = cache.clone();
+
+        assert_eq!(
+            cache.writer_id(),
+            cache.writer_id(),
+            "two calls on the same handle agree"
+        );
+        assert_eq!(
+            cache.writer_id(),
+            clone.writer_id(),
+            "a clone shares the same underlying cluster membership, so it \
+             reports the identical writer identity, never a fresh one"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    /// The end-to-end reason `Cache::writer_id` exists: a value merged under
+    /// it round-trips through the exact merging path CRDT compaction relies
+    /// on, exercised at the `Cache` layer rather than only unit-tested on
+    /// `WriterId` itself.
+    #[tokio::test]
+    async fn a_value_merged_under_writer_id_reads_back_correctly() {
+        let cluster = Cluster::builder("cache-it-writer-id-merge")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
         let cache = cluster
             .cache::<u32, PnCounter>("counters")
             .resolver(Arc::new(PnCounterResolver))
@@ -1845,7 +1938,33 @@ mod tests {
             .expect("open succeeds");
 
         cache
-            .merge(1, PnCounter::local_delta(node, 1))
+            .merge(1, PnCounter::local_delta(cache.writer_id(), 5))
+            .await
+            .expect("merge");
+        assert_eq!(cache.get(&1).await.map(|c| c.value()), Some(5));
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_with_a_zero_window_applies_immediately() {
+        let cluster = Cluster::builder("cache-it-merge-zero-window")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, PnCounter>("counters")
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("open succeeds");
+        let writer = cache.writer_id();
+
+        cache
+            .merge(1, PnCounter::local_delta(writer, 1))
             .await
             .expect("merge");
         assert_eq!(
@@ -1866,7 +1985,6 @@ mod tests {
             .build()
             .await
             .expect("build succeeds");
-        let node = cluster.node_id();
         let window = Duration::from_millis(150);
         let cache = cluster
             .cache::<u32, PnCounter>("counters")
@@ -1875,18 +1993,19 @@ mod tests {
             .open()
             .await
             .expect("open succeeds");
+        let writer = cache.writer_id();
         let mut events = cache.events();
 
         cache
-            .merge(1, PnCounter::local_delta(node, 1))
+            .merge(1, PnCounter::local_delta(writer, 1))
             .await
             .expect("merge 1");
         cache
-            .merge(1, PnCounter::local_delta(node, 2))
+            .merge(1, PnCounter::local_delta(writer, 2))
             .await
             .expect("merge 2");
         cache
-            .merge(1, PnCounter::local_delta(node, 3))
+            .merge(1, PnCounter::local_delta(writer, 3))
             .await
             .expect("merge 3");
 
@@ -1932,7 +2051,6 @@ mod tests {
             .build()
             .await
             .expect("build succeeds");
-        let node = cluster.node_id();
         let cache = cluster
             .cache::<u32, PnCounter>("counters")
             .resolver(Arc::new(PnCounterResolver))
@@ -1941,9 +2059,10 @@ mod tests {
             .await
             .expect("open succeeds");
         let survivor = cache.clone();
+        let writer = cache.writer_id();
 
         cache
-            .merge(1, PnCounter::local_delta(node, 7))
+            .merge(1, PnCounter::local_delta(writer, 7))
             .await
             .expect("merge");
         assert_eq!(
@@ -2951,11 +3070,11 @@ mod tests {
                 .await
                 .expect("opens with spill");
 
-            let node_a = NodeId::from(11);
-            let node_b = NodeId::from(22);
+            let writer_a = WriterId::new(NodeId::from(11), 1);
+            let writer_b = WriterId::new(NodeId::from(22), 1);
 
             cache
-                .merge(1, PnCounter::local_delta(node_a, 3))
+                .merge(1, PnCounter::local_delta(writer_a, 3))
                 .await
                 .expect("first increment");
 
@@ -2965,7 +3084,7 @@ mod tests {
             );
 
             cache
-                .merge(1, PnCounter::local_delta(node_b, 4))
+                .merge(1, PnCounter::local_delta(writer_b, 4))
                 .await
                 .expect("second increment, colliding with the spilled record");
 

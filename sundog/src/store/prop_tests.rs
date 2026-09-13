@@ -6,6 +6,7 @@
 //! [`shard_matches_the_reference_model_under_arbitrary_op_sequences`], which
 //! runs the [`model::run`] driver over proptest-generated op sequences.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
@@ -606,7 +607,7 @@ proptest! {
     }
 }
 
-use crdt::{PnCounter, PnCounterResolver};
+use crdt::{PnCounter, PnCounterResolver, WriterId};
 
 /// Builds one [`WireRecord`] per origin, each carrying a
 /// [`PnCounter::local_delta`] write for the same fixed key, staggered and
@@ -629,7 +630,7 @@ fn build_pn_counter_records(deltas: &[u64]) -> Vec<WireRecord> {
             let ver = clocks[origin].now(physical_ms);
             let gossip_idx = (origin + 1) % clocks.len();
             clocks[gossip_idx].observe(physical_ms, ver);
-            let counter = PnCounter::local_delta(node, delta);
+            let counter = PnCounter::local_delta(WriterId::new(node, 0), delta);
             WireRecord {
                 key: key_bytes.clone(),
                 value: Some(Bytes::from(
@@ -658,7 +659,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let rt = current_thread_runtime();
 
         rt.block_on(async {
@@ -727,7 +728,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), NUM_REPLICAS),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let rt = current_thread_runtime();
 
         rt.block_on(async {
@@ -801,7 +802,7 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
     let a = WireRecord {
         key: key_bytes.clone(),
         value: Some(Bytes::from(
-            PnCounter::local_delta(NodeId::from(1), 3)
+            PnCounter::local_delta(WriterId::new(NodeId::from(1), 0), 3)
                 .encode()
                 .expect("encodes"),
         )),
@@ -815,7 +816,7 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
     let b = WireRecord {
         key: key_bytes.clone(),
         value: Some(Bytes::from(
-            PnCounter::local_delta(NodeId::from(2), 4)
+            PnCounter::local_delta(WriterId::new(NodeId::from(2), 0), 4)
                 .encode()
                 .expect("encodes"),
         )),
@@ -940,7 +941,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), usize::from(NUM_NODES)),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let key_bytes = records[0].key.clone();
         let rt = current_thread_runtime();
 
@@ -1061,7 +1062,7 @@ proptest! {
         seeds in proptest::collection::vec(any::<u64>(), usize::from(NUM_NODES)),
     ) {
         let records = build_pn_counter_records(&deltas);
-        let expected_total = i64::try_from(deltas.iter().sum::<u64>()).expect("fits");
+        let expected_total = i128::from(deltas.iter().sum::<u64>());
         let key_bytes = records[0].key.clone();
         let rt = current_thread_runtime();
 
@@ -1123,5 +1124,187 @@ proptest! {
                 }
             }
         });
+    }
+}
+
+/// Drives every ordered pair of `replicas` through one [`PnCounter::merge`],
+/// applying the same settle step a shard applies after every merge apply
+/// ([`PnCounter::prune_receipts`], with the same `receipt_ttl_ms` a live
+/// shard's [`CompactionBounds`] carries). One call over every ordered pair
+/// floods every replica's own content into every other replica, so repeating
+/// it after every model step below keeps no replica unmerged for longer than
+/// one step's worth of model time -- the receipt-lifetime bound
+/// [`PnCounter::compact`]'s exactness relies on.
+fn gossip_all_pairs(replicas: &mut [PnCounter], now_ms: u64, receipt_ttl_ms: u64) {
+    for i in 0..replicas.len() {
+        for j in 0..replicas.len() {
+            if i == j {
+                continue;
+            }
+            let merged = replicas[i].merge(&replicas[j]);
+            replicas[i] = merged
+                .prune_receipts(now_ms, receipt_ttl_ms)
+                .unwrap_or(merged);
+        }
+    }
+}
+
+/// One step of
+/// [`pn_counter_compaction_under_gossip_keeps_the_exact_total`]'s randomized
+/// workload: either a writer's next cumulative-total write, or a compaction
+/// sweep of one replica.
+#[derive(Debug, Clone, Copy)]
+enum CompactionStep {
+    Write { writer: usize, amount: u64 },
+    Compact { replica: usize },
+}
+
+fn compaction_step_strategy(
+    num_replicas: usize,
+    num_writers: usize,
+) -> impl Strategy<Value = CompactionStep> {
+    prop_oneof![
+        (0..num_writers, 0u64..500)
+            .prop_map(|(writer, amount)| CompactionStep::Write { writer, amount }),
+        (0..num_replicas).prop_map(|replica| CompactionStep::Compact { replica }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Compaction under gossip keeps the exact total: `num_replicas` (2..4)
+    /// replicas each hold a [`PnCounter`] for one key, fed a random sequence
+    /// of per-writer cumulative-total writes (each writer through its own
+    /// fixed home replica) interleaved with random [`PnCounter::compact`]
+    /// sweeps of individual replicas, with every replica gossiping --
+    /// merging, then settling via [`PnCounter::prune_receipts`], exactly as
+    /// a shard does on every merge apply -- against every other replica
+    /// after every step, so no replica ever goes more than one step's worth
+    /// of model time unmerged, the bound `compact`'s two-stage retirement
+    /// relies on. A fixed subset of writers stops writing at a chosen step
+    /// and only then becomes eligible for `compact`'s `retire` predicate,
+    /// matching the real precondition that a writer `retire` accepts is
+    /// actually dead. After a final full gossip round, every replica's
+    /// [`PnCounter::value`] must equal the exact sum of every writer's final
+    /// cumulative total, and merge must still be commutative on the final
+    /// states.
+    #[test]
+    fn pn_counter_compaction_under_gossip_keeps_the_exact_total(
+        (num_replicas, num_writers, writer_home, dead_flags, retire_at, timed_steps) in
+            (2usize..=4, 2usize..=4).prop_flat_map(|(num_replicas, num_writers)| {
+                (
+                    Just(num_replicas),
+                    Just(num_writers),
+                    proptest::collection::vec(0..num_replicas, num_writers),
+                    proptest::collection::vec(any::<bool>(), num_writers),
+                    0usize..30,
+                    proptest::collection::vec(
+                        (compaction_step_strategy(num_replicas, num_writers), 1u64..15),
+                        6..24,
+                    ),
+                )
+            })
+    ) {
+        const BOUND_MS: u64 = 20;
+        let bounds = CompactionBounds::three_bounds(BOUND_MS);
+
+        let writer_ids: Vec<WriterId> = (0..num_writers)
+            .map(|i| {
+                WriterId::new(
+                    NodeId::from(u64::try_from(i).expect("small writer count") + 1),
+                    0,
+                )
+            })
+            .collect();
+        let dead_writer_ids: BTreeSet<WriterId> = dead_flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &dead)| dead.then_some(writer_ids[i]))
+            .collect();
+
+        let mut cumulative = vec![0u64; num_writers];
+        let mut replicas: Vec<PnCounter> = vec![PnCounter::default(); num_replicas];
+        let mut now_ms: u64 = 1_000_000;
+        let mut retired = false;
+        let retire_at = retire_at.min(timed_steps.len());
+
+        for (idx, &(step, elapsed_ms)) in timed_steps.iter().enumerate() {
+            now_ms += elapsed_ms;
+            if idx == retire_at {
+                retired = true;
+            }
+
+            let retire_fn = |w: WriterId| retired && dead_writer_ids.contains(&w);
+
+            match step {
+                CompactionStep::Write { writer, amount } => {
+                    let writer_id = writer_ids[writer];
+                    if !(retired && dead_writer_ids.contains(&writer_id)) {
+                        cumulative[writer] = cumulative[writer].saturating_add(amount);
+                        let delta = PnCounter::local_delta(writer_id, cumulative[writer]);
+                        let home = writer_home[writer];
+                        let merged = replicas[home].merge(&delta);
+                        replicas[home] = merged
+                            .prune_receipts(now_ms, bounds.receipt_ttl_ms)
+                            .unwrap_or(merged);
+                    }
+                }
+                CompactionStep::Compact { replica } => {
+                    if let Some(compacted) =
+                        replicas[replica].compact(now_ms, &retire_fn, true, bounds)
+                    {
+                        replicas[replica] = compacted;
+                    }
+                }
+            }
+
+            // A background sweep of every replica, exactly like a live
+            // cluster's periodic compaction pass, run every step (not just
+            // on the step's own randomly chosen `Compact`): this keeps the
+            // gap between a writer crossing the retire/fold age threshold
+            // and the next fold attempt small relative to `BOUND_MS`, the
+            // same "sweep runs at least four times per bound" precondition
+            // [`CompactionBounds::three_bounds`]'s doc names as what makes
+            // its receipt lifetime exact. A sweep run only as often as the
+            // random `Compact` steps land could let a fold's own receipt
+            // age out (relative to the writer's original retirement
+            // instant, not the fold instant) before this same step's gossip
+            // ever carries it anywhere -- a real divergence, not a flaw in
+            // the model.
+            for replica in &mut replicas {
+                if let Some(compacted) = replica.compact(now_ms, &retire_fn, true, bounds) {
+                    *replica = compacted;
+                }
+            }
+
+            gossip_all_pairs(&mut replicas, now_ms, bounds.receipt_ttl_ms);
+        }
+
+        // A final full gossip round, beyond the per-step gossip already run
+        // above, so every replica has demonstrably merged against every
+        // other replica's very latest state before the invariant is checked.
+        now_ms += 1;
+        gossip_all_pairs(&mut replicas, now_ms, bounds.receipt_ttl_ms);
+
+        let expected_total: i128 = cumulative.iter().map(|&c| i128::from(c)).sum();
+        for (i, replica) in replicas.iter().enumerate() {
+            assert_eq!(
+                replica.value(),
+                expected_total,
+                "replica {i} did not converge to the exact sum of every writer's final \
+                 cumulative total after gossip and compaction"
+            );
+        }
+
+        for i in 0..replicas.len() {
+            for j in (i + 1)..replicas.len() {
+                assert_eq!(
+                    replicas[i].merge(&replicas[j]),
+                    replicas[j].merge(&replicas[i]),
+                    "merge must be commutative on the final replica states {i} and {j}"
+                );
+            }
+        }
     }
 }
