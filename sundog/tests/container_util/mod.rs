@@ -548,6 +548,19 @@ impl Node {
             .map_err(|error| format!("bad pncount reply: {error}"))
     }
 
+    /// `pnbytes n`, the summed resident encoded size of `pn0..pn(n-1)` on
+    /// this node: the record bytes a cold join or a state transfer carries
+    /// for those counters.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is not numeric.
+    pub async fn pn_bytes(&self, count: u32) -> Result<u64, String> {
+        self.command(&format!("pnbytes {count}"))
+            .await?
+            .parse()
+            .map_err(|error| format!("bad pnbytes reply: {error}"))
+    }
+
     /// `pnget k`, returning `Some(value)` on `val <v>` and `None` on `none`.
     /// # Errors
     ///

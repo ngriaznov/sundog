@@ -95,7 +95,10 @@
 //! node's [`Cache::writer_id`] — a blind
 //! [`sundog::crdt::PnCounter::local_delta`] write, no read needed; `pncount`
 //! -> `<n>`, `"pn"`'s live-entry count; `pnget k` -> `val <n>` | `none`, key
-//! `k`'s current [`sundog::crdt::PnCounter::value`]. It drives the
+//! `k`'s current [`sundog::crdt::PnCounter::value`]; `pnbytes n` -> `<b>`,
+//! the summed [`sundog::crdt::PnCounter::encode`] length of `pn0..pn(n-1)`
+//! as resident here, the record size a cold join or a state transfer
+//! carries per counter. It drives the
 //! million-counter cold-join container scenario: three nodes each increment
 //! every one of a million counters once, concurrently, and a cold-joining
 //! fourth node's state transfer must carry every counter's exact merged
@@ -574,7 +577,7 @@ async fn dispatch(
         "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
             big_command(cache, command, &mut parts).await
         }
-        "pnfill" | "pncount" | "pnget" => {
+        "pnfill" | "pncount" | "pnget" | "pnbytes" => {
             pn_command(pn, pn.writer_id(), command, parts.next()).await
         }
         "osadd" | "osremove" | "osmembers" => {
@@ -680,10 +683,28 @@ fn pn_get_reply(counter: Option<&PnCounter>) -> String {
     }
 }
 
+/// The summed encoded length of `counters`, the resident record size a
+/// cold join or a state transfer carries for them. Pure so the sum is
+/// testable without a real cache.
+/// # Errors
+///
+/// Returns `Err` if any counter fails to encode.
+fn pn_encoded_bytes<'a>(
+    counters: impl IntoIterator<Item = &'a PnCounter>,
+) -> Result<usize, String> {
+    counters
+        .into_iter()
+        .map(|counter| counter.encode().map(|bytes| bytes.len()))
+        .try_fold(0, |total, len| len.map(|len| total + len))
+        .map_err(|error| error.to_string())
+}
+
 /// The `pn*` command family on `"pn"`: `pnfill n` bulk-increments
 /// `pn0..pn(n-1)` by one from `writer` via [`pn_fill_entries`] (no read
 /// needed); `pncount` reads `"pn"`'s live-entry count; `pnget k` reads key
-/// `k`'s current value via [`pn_get_reply`].
+/// `k`'s current value via [`pn_get_reply`]; `pnbytes n` sums
+/// `pn0..pn(n-1)`'s resident encoded sizes via [`pn_encoded_bytes`], an
+/// absent key contributing nothing.
 async fn pn_command(
     pn: &Cache<String, PnCounter>,
     writer: WriterId,
@@ -701,6 +722,21 @@ async fn pn_command(
             })
         }
         "pncount" => Reply::Line(pn.entry_count().await.to_string()),
+        "pnbytes" => {
+            let Some(count) = arg.and_then(|raw| raw.parse::<u32>().ok()) else {
+                return Reply::Line("err pnbytes needs a u32 count".to_string());
+            };
+            let mut counters = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                if let Some(counter) = pn.get(&format!("pn{i}")).await {
+                    counters.push(counter);
+                }
+            }
+            Reply::Line(match pn_encoded_bytes(&counters) {
+                Ok(bytes) => bytes.to_string(),
+                Err(error) => format!("err {error}"),
+            })
+        }
         // "pnget"
         _ => {
             let Some(key) = arg else {
@@ -1171,6 +1207,23 @@ mod tests {
     #[test]
     fn pn_get_reply_is_none_for_an_absent_key() {
         assert_eq!(pn_get_reply(None), "none");
+    }
+
+    #[test]
+    fn pn_encoded_bytes_sums_each_counters_encoded_length() {
+        let a = PnCounter::local_delta(writer(1, 100), 5);
+        let b = a.merge(&PnCounter::local_delta(writer(2, 100), 7));
+        let expected = a.encode().unwrap().len() + b.encode().unwrap().len();
+        assert_eq!(pn_encoded_bytes([&a, &b]), Ok(expected));
+        assert!(
+            b.encode().unwrap().len() > a.encode().unwrap().len(),
+            "a second writer's slot makes the record larger, so the sum is size-sensitive"
+        );
+    }
+
+    #[test]
+    fn pn_encoded_bytes_is_zero_for_no_counters() {
+        assert_eq!(pn_encoded_bytes(std::iter::empty()), Ok(0));
     }
 
     #[test]

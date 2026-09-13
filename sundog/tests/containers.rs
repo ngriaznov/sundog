@@ -572,11 +572,12 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
 /// a shortened `crdt_retire_after`. Asserts `pn`'s totals stay exact
 /// despite the churn, `os`'s membership keeps every churned writer's
 /// never-removed element (retirement blocks only a *future* add under a
-/// retired writer's incarnation), and that a fresh cold join's
-/// bytes-per-entry after the churn window and its compaction sweeps is no
-/// larger (within noise) than before any churn — proving the two-stage
-/// fold actually bounds resident record size instead of it growing with
-/// every replaced writer's incarnation.
+/// retired writer's incarnation), and that every counter's resident
+/// encoded size after the churn window and its compaction sweeps is no
+/// larger than before any churn beyond the fold's own aggregate slot,
+/// proving the two-stage fold bounds resident record size instead of it
+/// growing with every replaced writer's incarnation. A fresh cold join at
+/// the end carries the compacted records with their exact totals.
 ///
 /// Uses [`CRDT_RETIRE_AFTER_SECS_ENV`] (see that constant's doc) to shorten
 /// `ClusterConfig::crdt_retire_after` well below its 24h default, so the
@@ -588,6 +589,10 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
     const CHURN_ROUNDS: u32 = 5;
     const PN_KEYS: u32 = 10;
     const OS_KEY: &str = "churn-set";
+    /// What a compacted counter carries beyond its live writers' own
+    /// slots: the fold's aggregate positive and negative totals, two
+    /// varint `u64`s plus their framing.
+    const FOLD_SLACK_BYTES: u64 = 32;
 
     if !container_tests_enabled() {
         eprintln!("skipping: SUNDOG_CONTAINER_TESTS=1 not set");
@@ -614,27 +619,10 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
         .await;
     }
 
-    // "Before": a fresh cold join's bytes-per-entry with only n1/n2's two
-    // writers resident on every counter, no churn or compaction yet.
-    let (_, b1_before) = n1.netstats().await.expect("n1 netstats before churn");
-    let (_, b2_before) = n2.netstats().await.expect("n2 netstats before churn");
-    let probe1 = Node::spawn_with_env(
-        &net,
-        "churn-scale-cluster",
-        "probe1",
-        &[&seed("n1"), &seed("n2")],
-        &env,
-    )
-    .await;
-    eventually(CONVERGE_WAIT, || async {
-        probe1.pn_count().await == Ok(PN_KEYS as usize)
-    })
-    .await;
-    let (_, b1_after_probe1) = n1.netstats().await.expect("n1 netstats after probe1");
-    let (_, b2_after_probe1) = n2.netstats().await.expect("n2 netstats after probe1");
-    let bytes_before = (b1_after_probe1 - b1_before) + (b2_after_probe1 - b2_before);
+    // "Before": every counter's resident encoded size with only n1's and
+    // n2's two writers on it, no churn or compaction yet.
+    let bytes_before = n1.pn_bytes(PN_KEYS).await.expect("n1 pnbytes before churn");
     let per_entry_before = bytes_before / u64::from(PN_KEYS);
-    probe1.stop().await.expect("probe1 stops");
 
     // Churn: a third writer joins, contributes to every pn key and adds a
     // never-removed os element, then is stopped, `CHURN_ROUNDS` times,
@@ -682,7 +670,47 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
             >= u64::from(CHURN_ROUNDS)
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(2 * RETIRE_AFTER_SECS + 65)).await;
+
+    // "After": the same size once every churned writer has been folded
+    // away, despite `CHURN_ROUNDS` more distinct writer identities having
+    // touched every counter than in the "before" measurement. Read on both
+    // replicas, since each one compacts on its own sweep, and polled rather
+    // than slept for: stage two's fold waits out `2 * crdt_retire_after` of
+    // quiet and its receipts prune three bounds later, each landing on the
+    // next 30s-floored tick.
+    let bound = per_entry_before + FOLD_SLACK_BYTES;
+    eventually(CRDT_COMPACT_WAIT, || async {
+        let n1_bytes = n1
+            .pn_bytes(PN_KEYS)
+            .await
+            .expect("n1 pnbytes after compaction");
+        let n2_bytes = n2
+            .pn_bytes(PN_KEYS)
+            .await
+            .expect("n2 pnbytes after compaction");
+        n1_bytes.max(n2_bytes) / u64::from(PN_KEYS) <= bound
+    })
+    .await;
+    let bytes_after_n1 = n1
+        .pn_bytes(PN_KEYS)
+        .await
+        .expect("n1 pnbytes after compaction");
+    let bytes_after_n2 = n2
+        .pn_bytes(PN_KEYS)
+        .await
+        .expect("n2 pnbytes after compaction");
+    let per_entry_after = bytes_after_n1.max(bytes_after_n2) / u64::from(PN_KEYS);
+    println!(
+        "record size per pn entry: {per_entry_before} bytes/entry before {CHURN_ROUNDS} \
+         writers churned through, {per_entry_after} bytes/entry after they were all retired \
+         and compacted"
+    );
+    assert!(
+        per_entry_after <= bound,
+        "resident record size grew from {per_entry_before} to {per_entry_after} bytes/entry \
+         across {CHURN_ROUNDS} replaced writers; compaction should keep it bounded, not \
+         growing with churn"
+    );
 
     // Exact totals survive every retirement.
     for node in [&n1, &n2] {
@@ -699,12 +727,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
         "every churned writer's never-removed element must survive retirement"
     );
 
-    // "After": a fresh cold join's bytes-per-entry once every churned
-    // writer has been folded away, despite `CHURN_ROUNDS` more distinct
-    // writer identities having touched every counter than in the "before"
-    // measurement.
-    let (_, b1_before2) = n1.netstats().await.expect("n1 netstats before probe2");
-    let (_, b2_before2) = n2.netstats().await.expect("n2 netstats before probe2");
+    // A fresh cold join carries the compacted records with exact totals.
     let probe2 = Node::spawn_with_env(
         &net,
         "churn-scale-cluster",
@@ -717,23 +740,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
         probe2.pn_count().await == Ok(PN_KEYS as usize)
     })
     .await;
-    let (_, b1_after2) = n1.netstats().await.expect("n1 netstats after probe2");
-    let (_, b2_after2) = n2.netstats().await.expect("n2 netstats after probe2");
-    let bytes_after = (b1_after2 - b1_before2) + (b2_after2 - b2_before2);
-    let per_entry_after = bytes_after / u64::from(PN_KEYS);
-
-    println!(
-        "record size per pn entry: {per_entry_before} bytes/entry before {CHURN_ROUNDS} \
-         writers churned through, {per_entry_after} bytes/entry after they were all retired \
-         and compacted"
-    );
     assert_eq!(probe2.pn_get("pn0").await, Ok(Some(expected_total)));
-    assert!(
-        per_entry_after <= per_entry_before + 300,
-        "resident record size grew from {per_entry_before} to {per_entry_after} bytes/entry \
-         across {CHURN_ROUNDS} replaced writers — compaction should keep it bounded, not \
-         growing with churn"
-    );
 
     n1.stop().await.expect("n1 stops");
     n2.stop().await.expect("n2 stops");
