@@ -131,15 +131,16 @@ by that pair instead of the bare node id, and a restarted node's fresh
 incarnation never resumes or corrupts its pre-restart slot.
 `ConflictResolver::compact` (defaulted to a no-op, backed by
 `PnCounter::compact`/`OrSet::compact`) retires a writer in two stages.
-Stage one runs the instant a writer is confirmed dead (absent past
-`ClusterConfig::crdt_retire_after`, default: `tombstone_max_ttl`, 24h, or
-live again under a different incarnation), moving its `p`/`n` slots or its
+Stage one runs the instant a writer is confirmed dead (gone past
+`ClusterConfig::crdt_retire_after`, default: `tombstone_max_ttl`, 24h,
+whether it crashed or left gracefully, or live again under a different
+incarnation), moving its `p`/`n` slots or its
 `seen` watermark into per-writer retired state that merges correctly under
 any cross-replica staleness, since a writer's slot and its retired entry
 are never summed, only maxed, and a retirement's timestamp merges by the
 earliest any replica recorded. Stage two runs only once the cache is
 quiet (every member sharing it has been continuously present or
-continuously absent for a full `crdt_retire_after`) and the retirement
+continuously gone for a full `crdt_retire_after`) and the retirement
 itself has aged past a second `crdt_retire_after` (`2 * crdt_retire_after`
 total): it folds `PnCounter`'s retired entry into a bounded scalar, or
 drops `OrSet`'s `seen`/`retired` entries outright, and either way leaves a

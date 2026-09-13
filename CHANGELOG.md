@@ -151,11 +151,13 @@ All notable changes to this project are documented in this file. Format follows
   of its own rather than resuming, or corrupting, the one its pre-restart
   process wrote to.
 - **The retirement contract, stated plainly.** A writer is retirement-
-  eligible on a node once it is confirmed dead there (absent longer than
-  `ClusterConfig::crdt_retire_after`, or superseded by a live incarnation
-  of the same node) and the cache is quiet: every other member sharing it
-  has been either continuously present or continuously absent for that
-  same `crdt_retire_after`. Stage one moves the writer's contribution into
+  eligible on a node once it is confirmed dead there (gone longer than
+  `ClusterConfig::crdt_retire_after`, whether it crashed or left through
+  `Cluster::shutdown`, or superseded by a live incarnation of the same
+  node) and the cache is quiet: every other member sharing it has been
+  either continuously present or continuously gone for that same
+  `crdt_retire_after`. A graceful leaver still never holds tombstone
+  collection back; only writer retirement treats it like a crash. Stage one moves the writer's contribution into
   per-writer retired state at that point, exact regardless of how stale
   any replica's view of any other replica is. Stage two only runs once
   that retirement has itself aged past a second `crdt_retire_after`

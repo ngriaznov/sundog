@@ -59,8 +59,9 @@ pub struct ClusterConfig {
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
     /// member that never comes back.
     pub tombstone_max_ttl: Duration,
-    /// How long an absent, non-local writer incarnation must stay absent
-    /// (or superseded by a live incarnation of the same node) before its
+    /// How long a gone, non-local writer incarnation must stay gone,
+    /// whether it crashed or left through `Cluster::shutdown` (or be
+    /// superseded by a live incarnation of the same node), before its
     /// `PnCounter`/`OrSet` slot becomes eligible for the CRDT compaction
     /// sweep's stage-one retirement. Defaults to
     /// [`tombstone_max_ttl`](Self::tombstone_max_ttl) — the same bound this

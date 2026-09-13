@@ -114,8 +114,8 @@ arrive in. `sundog::crdt` ships `PnCounter` and `OrSet` with their resolvers.
 `Cache::merge` writes through one without a read, and
 `CacheBuilder::merge_coalesce_window` batches a writer's merges to one
 applied record per key per window. A background sweep keeps their metadata
-from growing forever under writer churn: a writer absent (or superseded by
-a restart) longer than `ClusterConfig::crdt_retire_after` (default:
+from growing forever under writer churn: a writer gone (crashed or shut
+down, or superseded by a restart) longer than `ClusterConfig::crdt_retire_after` (default:
 `tombstone_max_ttl`, 24h) gets retired into bounded per-writer state, and
 folded away once that retirement itself has aged past a second
 `crdt_retire_after` with every peer quiet. That is the same trust boundary

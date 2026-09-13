@@ -19,7 +19,7 @@
 //!
 //! # Retirement
 //!
-//! A writer absent long enough is retired out of `p`/`n` in two stages
+//! A writer gone long enough is retired out of `p`/`n` in two stages
 //! ([`PnCounter::compact`]):
 //!
 //! - **Stage one** moves the writer's slot into a per-writer `retired` entry
@@ -320,7 +320,7 @@ impl PnCounter {
     /// `retired` entry stamped with `now_ms`.
     ///
     /// **Stage two**, only while `quiet` is `true` (every other member of
-    /// this cache is either continuously present, or absent, for at least
+    /// this cache is either continuously present, or gone, for at least
     /// `bound_ms` — the caller's job to evaluate, not this method's): every
     /// `retired` entry older than `2 * bound_ms` is folded into
     /// `folded_p`/`folded_n` and dropped from the per-writer map, leaving a

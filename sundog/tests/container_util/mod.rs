@@ -561,6 +561,15 @@ impl Node {
             .map_err(|error| format!("bad pnbytes reply: {error}"))
     }
 
+    /// `pndump k`, key `k`'s resident counter in its `Debug` form, or
+    /// `none`.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails.
+    pub async fn pn_dump(&self, key: &str) -> Result<String, String> {
+        self.command(&format!("pndump {key}")).await
+    }
+
     /// `pnget k`, returning `Some(value)` on `val <v>` and `None` on `none`.
     /// # Errors
     ///

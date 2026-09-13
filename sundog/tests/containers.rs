@@ -589,9 +589,9 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
     const CHURN_ROUNDS: u32 = 5;
     const PN_KEYS: u32 = 10;
     const OS_KEY: &str = "churn-set";
-    /// What a compacted counter carries beyond its live writers' own
-    /// slots: the fold's aggregate positive and negative totals, two
-    /// varint `u64`s plus their framing.
+    /// A fully compacted counter encodes to the same size as one that
+    /// never saw the churned writers, so this only leaves room for one
+    /// fold receipt still waiting out its three-bound prune on a replica.
     const FOLD_SLACK_BYTES: u64 = 32;
 
     if !container_tests_enabled() {
@@ -670,6 +670,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
     let bound = per_entry_before + FOLD_SLACK_BYTES;
     let started = std::time::Instant::now();
     let mut retired_done = false;
+    let mut last_bytes = (0, 0);
     loop {
         let retired = (
             scrape_metric(&n1, "sundog_crdt_retired_writers_total", ("cache", "pn")).await,
@@ -699,9 +700,17 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
             bytes.0,
             bytes.1
         );
-        if !retired_done && retired.0.min(retired.1) >= u64::from(CHURN_ROUNDS) {
+        if bytes != last_bytes {
+            println!("  n1 pn0: {}", n1.pn_dump("pn0").await.expect("n1 pndump"));
+            println!("  n2 pn0: {}", n2.pn_dump("pn0").await.expect("n2 pndump"));
+            last_bytes = bytes;
+        }
+        // A writer retired on one replica reaches the other already
+        // retired through anti-entropy, so only the sum across both sweeps
+        // is guaranteed to reach the churned count.
+        if !retired_done && retired.0 + retired.1 >= u64::from(CHURN_ROUNDS) {
             retired_done = true;
-            println!("every churned writer retired on both replicas");
+            println!("every churned writer retired on some replica");
         }
         if retired_done && per_entry <= bound {
             break;
@@ -709,7 +718,7 @@ async fn churn_at_scale_bounds_crdt_record_size_across_writer_replacement() {
         assert!(
             started.elapsed() < CRDT_COMPACT_WAIT,
             "compaction did not settle within {CRDT_COMPACT_WAIT:?}: retired n1={} n2={} \
-             (need {CHURN_ROUNDS} each), pn bytes {per_entry}/entry against a bound of \
+             (need {CHURN_ROUNDS} in total), pn bytes {per_entry}/entry against a bound of \
              {bound}",
             retired.0,
             retired.1

@@ -489,19 +489,19 @@ pub(crate) struct MemberView {
     /// when currently tracked absent. Mutually exclusive with
     /// `absent_since`.
     pub(crate) present_since: Option<Instant>,
-    /// `Some(since)` when the member is currently tracked absent (dropped
-    /// from the live set without a graceful departure) since `since`
-    /// ([`crate::cluster::absence::AbsenceTracker::absent_since`]); `None`
-    /// when live or never observed.
+    /// `Some(since)` when the member is currently tracked gone (dropped
+    /// from the live set, by a crash or a graceful departure) since
+    /// `since` ([`crate::cluster::absence::AbsenceTracker::gone_since`]);
+    /// `None` when live or never observed.
     pub(crate) absent_since: Option<Instant>,
     /// The member's current incarnation, when it is live; `None` when
-    /// absent.
+    /// gone.
     pub(crate) live_incarnation: Option<u64>,
 }
 
 /// Whether `member` has settled for the CRDT writer-retirement "cache is
 /// quiet" rule: continuously present for at
-/// least `bound`, or continuously absent for at least `bound`. A member
+/// least `bound`, or continuously gone for at least `bound`. A member
 /// that is neither — recently returned, or recently gone but not yet aged
 /// past `bound` — defers retirement for every writer in the cache, since
 /// its own view of who's-seen-what can't yet be trusted as settled.

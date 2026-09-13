@@ -1723,7 +1723,7 @@ fn crdt_writer_is_retirement_eligible(
 /// Whether an entire cache is quiet this tick: every member relevant to
 /// it has settled — see
 /// [`membership::member_is_quiet`] — meaning continuously present, or
-/// continuously absent, for at least `bound`. Vacuously `true` for a cache
+/// continuously gone, for at least `bound`. Vacuously `true` for a cache
 /// with no other known members (including the single-node case).
 ///
 /// Only stage two of [`crdt::PnCounter::compact`]/[`crdt::OrSet::compact`]
@@ -1739,10 +1739,11 @@ fn crdt_cache_is_quiet(members: &[membership::MemberView], now: Instant, bound: 
 
 /// Every [`membership::MemberView`] the CRDT compaction sweep for `name`
 /// treats as relevant this tick: every live peer that currently has `name`
-/// open, plus every member `absence` currently tracks absent at all —
-/// live-holder scoped, absentee-global: absence is tracked per-member
-/// globally, not per-(member, cache), so one absent member holds every
-/// merging cache's quiet check pending, not just the ones it had open.
+/// open, plus every member `absence` currently tracks gone at all, whether
+/// it crashed or departed gracefully — live-holder scoped, gone-global:
+/// absence is tracked per-member globally, not per-(member, cache), so one
+/// gone member holds every merging cache's quiet check pending, not just
+/// the ones it had open.
 fn crdt_cache_members(
     peers: &[Peer],
     modes: &CacheModes,
@@ -1761,19 +1762,19 @@ fn crdt_cache_members(
             absent_since: None,
             live_incarnation: Some(peer.incarnation),
         });
-    // `Duration::ZERO` makes every currently-tracked absentee match,
-    // non-destructively (`AbsenceTracker::absent_longer_than`'s own doc):
+    // `Duration::ZERO` makes every currently-tracked gone member match,
+    // non-destructively (`AbsenceTracker::gone_longer_than`'s own doc):
     // this is a membership *listing*, not a retirement decision, so it must
     // never prune.
-    let absent = absence
-        .absent_longer_than(Duration::ZERO)
+    let gone = absence
+        .gone_longer_than(Duration::ZERO)
         .into_iter()
         .map(|node| membership::MemberView {
             present_since: None,
-            absent_since: absence.absent_since(node),
+            absent_since: absence.gone_since(node),
             live_incarnation: None,
         });
-    live.chain(absent).collect()
+    live.chain(gone).collect()
 }
 
 /// One pass of the CRDT writer-retirement sweep for one merging cache. Runs
@@ -1845,7 +1846,7 @@ async fn crdt_compact_tick(
             },
             None => membership::MemberView {
                 present_since: None,
-                absent_since: absence.absent_since(w.node()),
+                absent_since: absence.gone_since(w.node()),
                 live_incarnation: None,
             },
         };
@@ -5743,7 +5744,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if absence.absent_since(dead_writer.node()).is_none() {
+                if absence.gone_since(dead_writer.node()).is_none() {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5890,6 +5891,96 @@ mod tests {
         if let Some(w) = last_writer_cluster {
             w.shutdown().await;
         }
+        observer.shutdown().await;
+    }
+
+    /// A writer that leaves through `Cluster::shutdown` is retired and
+    /// folded like one that crashed: three distinct nodes each join, write
+    /// one counter, and leave gracefully, and the observer's record ends up
+    /// back at the size it had with only the observer's own slot, holding
+    /// the exact total, within two 30s-floored ticks of the last leave.
+    #[tokio::test]
+    async fn crdt_compact_task_retires_and_folds_gracefully_departed_writers() {
+        let retire_after = Duration::from_secs(2);
+        let observer = Cluster::builder("cluster-it-crdt-graceful-churn")
+            .seeds(std::iter::empty())
+            .config(crdt_loopback_config(retire_after))
+            .build()
+            .await
+            .expect("observer builds");
+        let observer_addr = observer.inner.membership.local_peer().gossip_addr;
+        let observer_cache = open_counters_cache(&observer, "counters").await;
+        observer_cache
+            .insert(0, PnCounter::local_delta(observer_cache.writer_id(), 1))
+            .await
+            .expect("observer writes");
+        let raw_len = observer_cache
+            .get(&0)
+            .await
+            .expect("counter 0 is resident")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
+
+        for round in 1..=3i128 {
+            let leaver = Cluster::builder("cluster-it-crdt-graceful-churn")
+                .seeds([observer_addr])
+                .config(crdt_loopback_config(retire_after))
+                .build()
+                .await
+                .unwrap_or_else(|e| panic!("leaver {round} builds: {e}"));
+            wait_for_peer_count(&observer, 1).await;
+            let leaver_cache = open_counters_cache(&leaver, "counters").await;
+            leaver_cache
+                .merge(0, PnCounter::local_delta(leaver_cache.writer_id(), 10))
+                .await
+                .expect("leaver writes");
+            let expected = 1 + round * 10;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while observer_cache.get(&0).await.map(|c| c.value()) != Some(expected) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("observer converges this round");
+            leaver.shutdown().await;
+            wait_for_no_peers(&observer).await;
+        }
+        let churned_len = observer_cache
+            .get(&0)
+            .await
+            .expect("counter 0 is resident")
+            .encode()
+            .expect("PnCounter::encode never fails on a resident value")
+            .len();
+        assert!(
+            churned_len > raw_len,
+            "three more slots: raw={raw_len} churned={churned_len}"
+        );
+
+        let settled_len = tokio::time::timeout(Duration::from_secs(100), async {
+            loop {
+                let len = observer_cache
+                    .get(&0)
+                    .await
+                    .expect("counter 0 is resident")
+                    .encode()
+                    .expect("PnCounter::encode never fails on a resident value")
+                    .len();
+                if len <= raw_len {
+                    return len;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("every gracefully departed writer retires, folds, and its receipt prunes");
+        assert_eq!(settled_len, raw_len, "back to the observer-only size");
+        assert_eq!(
+            observer_cache.get(&0).await.map(|c| c.value()),
+            Some(31),
+            "folding three departed writers never changes the total"
+        );
         observer.shutdown().await;
     }
 }

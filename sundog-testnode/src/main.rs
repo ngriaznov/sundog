@@ -98,7 +98,9 @@
 //! `k`'s current [`sundog::crdt::PnCounter::value`]; `pnbytes n` -> `<b>`,
 //! the summed [`sundog::crdt::PnCounter::encode`] length of `pn0..pn(n-1)`
 //! as resident here, the record size a cold join or a state transfer
-//! carries per counter. It drives the
+//! carries per counter; `pndump k` -> key `k`'s resident counter in its
+//! `Debug` form, or `none`, for reading compaction state off a node. It
+//! drives the
 //! million-counter cold-join container scenario: three nodes each increment
 //! every one of a million counters once, concurrently, and a cold-joining
 //! fourth node's state transfer must carry every counter's exact merged
@@ -577,7 +579,7 @@ async fn dispatch(
         "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
             big_command(cache, command, &mut parts).await
         }
-        "pnfill" | "pncount" | "pnget" | "pnbytes" => {
+        "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
             pn_command(pn, pn.writer_id(), command, parts.next()).await
         }
         "osadd" | "osremove" | "osmembers" => {
@@ -672,6 +674,13 @@ fn pn_fill_entries(writer: WriterId, count: u32) -> Vec<(String, PnCounter)> {
         .collect()
 }
 
+/// Renders `"pn"`'s [`Cache::get`] result as the `pndump` reply body: the
+/// counter's `Debug` form for a present key, `none` for an absent one.
+/// Pure so the reply formatting is testable without a real cluster.
+fn pn_dump_reply(counter: Option<&PnCounter>) -> String {
+    counter.map_or_else(|| "none".to_string(), |counter| format!("{counter:?}"))
+}
+
 /// Renders `"pn"`'s [`Cache::get`] result as the `pnget` reply body:
 /// `val <n>` for a present counter's [`PnCounter::value`], `none` for an
 /// absent key. Pure so the reply formatting is testable without a real
@@ -704,7 +713,8 @@ fn pn_encoded_bytes<'a>(
 /// needed); `pncount` reads `"pn"`'s live-entry count; `pnget k` reads key
 /// `k`'s current value via [`pn_get_reply`]; `pnbytes n` sums
 /// `pn0..pn(n-1)`'s resident encoded sizes via [`pn_encoded_bytes`], an
-/// absent key contributing nothing.
+/// absent key contributing nothing; `pndump k` renders key `k`'s resident
+/// counter via [`pn_dump_reply`].
 async fn pn_command(
     pn: &Cache<String, PnCounter>,
     writer: WriterId,
@@ -736,6 +746,12 @@ async fn pn_command(
                 Ok(bytes) => bytes.to_string(),
                 Err(error) => format!("err {error}"),
             })
+        }
+        "pndump" => {
+            let Some(key) = arg else {
+                return Reply::Line("err pndump needs a key".to_string());
+            };
+            Reply::Line(pn_dump_reply(pn.get(&key.to_string()).await.as_ref()))
         }
         // "pnget"
         _ => {
@@ -1207,6 +1223,13 @@ mod tests {
     #[test]
     fn pn_get_reply_is_none_for_an_absent_key() {
         assert_eq!(pn_get_reply(None), "none");
+    }
+
+    #[test]
+    fn pn_dump_reply_renders_the_counters_debug_form() {
+        let counter = PnCounter::local_delta(writer(1, 100), 5);
+        assert_eq!(pn_dump_reply(Some(&counter)), format!("{counter:?}"));
+        assert_eq!(pn_dump_reply(None), "none");
     }
 
     #[test]
