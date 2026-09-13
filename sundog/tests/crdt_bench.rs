@@ -44,76 +44,42 @@
 //! interval, 2s tombstone TTL); every writer targets a single cache handle
 //! (`cache_a`), matching `replication_bench.rs`'s own concurrent-writer
 //! shape. Scenarios 5/5a/5b build a single-node `Mode::Local` cluster with
-//! no peers, isolating per-apply CPU cost from all network/AE noise.
-//! Scenario 7 (`cold_join_initial_replication`) builds the same warm 3-node
-//! `fast_config()` trio, lets it converge, then joins a fourth node against
-//! it and times the join; scenario 8 (`large_entity_convergence`) builds
-//! the same trio and writes `N` entities concurrently from all three nodes
-//! with anti-entropy live throughout, timing convergence from the last
-//! write. Both print one `BENCH` line per variant — `decomposed` (`3N`
-//! per-writer keys under `LwwResolver`) and `merged` (`N` keys under
-//! `PnCounterResolver`) — sharing topology, `fast_config()`, the 3-writer
-//! count, and total logical increments between the two. No key ever
-//! expires or is removed in any scenario — TTL is irrelevant here, stated
-//! to rule out a confound rather than leave it implicit. Every numeric
-//! field is the median of at least [`repetitions`] independent runs, so a
-//! single noisy run never skews a reported number.
+//! no peers, isolating per-apply CPU cost from all network/AE noise. No
+//! key ever expires or is removed in any scenario, since TTL is
+//! irrelevant here. Every numeric field is the median of at least
+//! [`repetitions`] independent runs, so a single noisy run never skews a
+//! reported number.
 //!
-//! Scenarios 9-12 isolate a merging resolver's two write-path levers: Lever
+//! Scenarios 9-12 isolate a merging resolver's two write-path levers
+//! through the real `CacheBuilder::prefold_enabled` and
+//! `merge_coalesce_window` toggles rather than approximating either: Lever
 //! A (`Engine::apply_many`'s batch pre-fold, `sundog/src/store/engine.rs`)
 //! in scenarios 9 and 10, Lever B (`Cache::merge`'s coalescing window) in
-//! scenarios 11 and 12. Both levers' on/off (or window) comparisons are
-//! measured through the real toggle now: `CacheBuilder::prefold_enabled`
-//! (`#[doc(hidden)]`, `sundog/src/cache.rs`) threads down to
-//! `Shard::with_prefold_enabled` and `Engine::set_prefold_enabled`, so this
-//! binary, an ordinary downstream crate, can open a cache with pre-fold
-//! genuinely off rather than approximating it. Scenario 9
-//! (`apply_many_prefold`) runs the identical `insert_many` batch against
-//! two caches that differ only in that flag — "on" the default, "off"
-//! `.prefold_enabled(false)` — so both sides pay the same single stripe-lock
-//! acquisition and the same batch shape; only whether `apply_many` folds a
-//! same-key run before applying it differs. Scenario 10
-//! (`replicated_hot_counter_receive`) applies the same toggle to the two
-//! *receiving* nodes: a receiving node's batch shape comes from the
-//! sender's own fan-out, not from anything this crate builds directly, but
-//! `CacheBuilder::prefold_enabled` reaches that node's engine exactly the
-//! same way regardless of who assembled the batch, so both an "on" and a
-//! real "off" run are reported. Scenarios 11 and 12 use `Cache::merge` and
-//! `CacheBuilder::merge_coalesce_window` directly, both genuinely public, so
-//! neither needed a new seam.
-//! Scenarios 9-12 all report "engine applies" as `Cache::events()`'s own
-//! count: one event per non-no-op apply, the only public-API signal for
-//! how many times the engine actually applied, per `Cache::merge`'s and the
-//! resolver contract's own docs.
+//! scenarios 11 and 12. All four report "engine applies" as
+//! `Cache::events()`'s own count: one event per non-no-op apply, the only
+//! public-API signal for how many times the engine applied, per
+//! `Cache::merge`'s and the resolver contract's own docs.
 //!
-//! Scenario 13 (`sketch_path_convergence`) checks a merging resolver's
-//! scale-hardening on the IBLT sketch path: `ClusterConfig::ae_sketch_min_bucket`
-//! lowered, and `keys` filler entries forced into one anti-entropy bucket,
-//! so a deliberately seeded mismatch there (`Cache::invalidate_local` on one
-//! node, past state transfer entirely) answers with a sketch
-//! (`cluster::sketch::Iblt`) rather than a listing. `lww` (non-merging) and
-//! `pn_counter` (merging) both run it, sharing the `keys` knob. It reports
-//! `sundog_ae_sketch_total`'s existing `decoded`/`fallback` outcome
-//! counters — no new metric, since that counter already covers a peel
-//! success and a peel fallback exactly — as "`sketch_peeled`" and
-//! "`sketch_fallback`", plus their sum as "`sketch_rounds`": how many times
-//! this scenario's bucket answered a mismatch through the sketch mechanism
-//! at all, successfully or not, before it reconverged.
+//! Scenarios 7-14 each carry their full rationale on their own `run_*` or
+//! `print_*` function; this is only an index:
 //!
-//! Scenario 14 (`crdt_compaction_writer_churn`) exercises the two-stage
-//! writer retirement rule itself: one
-//! writer role is torn down and rebuilt several times under the same
-//! persisted `NodeId`, so each rebuild is a fresh `WriterId` incarnation
-//! that supersedes, and thereby retires, the previous one. It reports one
-//! counter's encoded `PnCounter::encode().len()` right after the last
-//! replacement against its size once the compaction sweep has had time to
-//! fold the dead incarnations away, so the metadata bound under churn is
-//! visible directly on the printed `BENCH` line, plus the retired-writer/
-//! compaction counters under `--features prometheus`. Unlike every
-//! scenario above it, its wall-clock cost is dominated by the compaction
-//! sweep's own 30-second-floor cadence rather than by `SUNDOG_BENCH_CHURN_COUNTERS`/
-//! `SUNDOG_BENCH_CHURN_REPLACEMENTS`, so it reports a single run rather
-//! than a median over [`repetitions`].
+//! - Scenario 7, `cold_join_initial_replication`: times a fourth node's
+//!   join against an already-converged warm 3-node trio.
+//! - Scenario 8, `large_entity_convergence`: times convergence of `N`
+//!   concurrently written entities under live anti-entropy.
+//! - Scenario 9, `apply_many_prefold`: Lever A on the local apply path,
+//!   isolated from the network on a single-node cluster.
+//! - Scenario 10, `replicated_hot_counter_receive`: Lever A on the
+//!   replication receive path instead of the local apply path.
+//! - Scenario 11, `merged_counter_coalesced`: Lever B across three
+//!   coalescing window sizes.
+//! - Scenario 12, `large_entity_convergence_coalesced`: scenario 8's
+//!   `merged` variant with Lever B's coalescing window replacing `insert`.
+//! - Scenario 13, `sketch_path_convergence`: forces a deliberate bucket
+//!   mismatch onto the IBLT sketch path (`sundog_ae_sketch_total`).
+//! - Scenario 14, `crdt_compaction_writer_churn`: churns one writer
+//!   role's `NodeId` incarnation and times the compaction sweep's
+//!   retirement of the dead incarnations.
 
 mod common;
 
@@ -136,6 +102,16 @@ use sundog::PrometheusHandle;
 
 fn bench_enabled() -> bool {
     std::env::var("SUNDOG_BENCH").as_deref() == Ok("1")
+}
+
+/// Returns from the calling scenario fn unless `SUNDOG_BENCH=1` is set.
+macro_rules! require_bench {
+    () => {
+        if !bench_enabled() {
+            eprintln!("skipping: SUNDOG_BENCH=1 not set");
+            return;
+        }
+    };
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -288,7 +264,7 @@ where
 /// mirror of `Engine::set_prefold_enabled`) set from `prefold_enabled`,
 /// node a/b/c in order. Scenario 10 uses this to build its two *receiving*
 /// nodes with the flag genuinely off, rather than scenario 9's
-/// identical-batch, differently-toggled-cache comparison — there is no
+/// identical-batch, differently-toggled-cache comparison, there is no
 /// local batch to build differently on the receive path, only the real
 /// flag each receiving node opens with.
 async fn open_replicated_trio_with_prefold<V>(
@@ -404,7 +380,7 @@ fn median_field_u64<T>(items: &[T], f: impl Fn(&T) -> u64) -> u64 {
 // `sundog_ae_repaired_total` scrape, cfg-gated on `prometheus`: this
 // binary's one claim on the process-global Prometheus recorder slot,
 // installed lazily on first use, before the first benchmark in a run opens
-// its first cache — a cache binds its per-cache metric handles when it
+// its first cache, a cache binds its per-cache metric handles when it
 // opens, so the recorder has to exist first or those handles stay on the
 // no-op recorder and every scrape reads back zero.
 // ---------------------------------------------------------------------
@@ -442,56 +418,136 @@ fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f
     })
 }
 
-/// The current value of `sundog_ae_repaired_total{cache=cache_name}`, or 0
-/// if the recorder never installed or the counter never incremented.
-#[cfg(feature = "prometheus")]
-fn ae_repaired_total(cache_name: &str) -> u64 {
-    let value = metrics_handle().and_then(|h| {
-        scraped_metric(
-            &h.render(),
-            "sundog_ae_repaired_total",
-            &[("cache", cache_name)],
-        )
-    });
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "sundog_ae_repaired_total is a nonnegative counter"
-    )]
-    let count = value.unwrap_or(0.0).round() as u64;
-    count
+/// Defines a Prometheus counter family's `_total` scrape fn plus its
+/// `_snapshot` and `_field` `#[cfg(feature = "prometheus")]`/
+/// `#[cfg(not(...))]` pairs. The `_snapshot` fn re-reads `_total` for a
+/// before/after delta around one repetition's writes (or join, or
+/// compaction wait), the pattern every scenario uses for
+/// `frames_sent_total`/`bytes_sent_total` too, since every repetition of a
+/// scenario shares one process-global counter for a given `cache_name`.
+/// The `_field` fn renders a `_snapshot` delta's median (across a
+/// scenario's repetitions) as a `BENCH`-line field, empty under a build
+/// without `prometheus`. A second arm covers `sketch_outcome`, whose metric
+/// carries a second label and whose field renders two counts as three
+/// named sub-fields instead of one.
+macro_rules! metric_family {
+    (
+        metric: $metric:literal,
+        label: $label:literal,
+        total_fn: $total_fn:ident,
+        total_doc: $total_doc:literal,
+        snapshot_fn: $snapshot_fn:ident,
+        snapshot_doc: $snapshot_doc:literal,
+        field_fn: $field_fn:ident,
+        field_name: $field_name:literal,
+        field_doc: $field_doc:literal $(,)?
+    ) => {
+        #[doc = $total_doc]
+        #[cfg(feature = "prometheus")]
+        fn $total_fn(cache_name: &str) -> u64 {
+            let value = metrics_handle()
+                .and_then(|h| scraped_metric(&h.render(), $metric, &[($label, cache_name)]));
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "a Prometheus counter is nonnegative"
+            )]
+            let count = value.unwrap_or(0.0).round() as u64;
+            count
+        }
+
+        #[doc = $snapshot_doc]
+        #[cfg(feature = "prometheus")]
+        fn $snapshot_fn(cache_name: &str) -> u64 {
+            $total_fn(cache_name)
+        }
+
+        #[cfg(not(feature = "prometheus"))]
+        fn $snapshot_fn(_cache_name: &str) -> u64 {
+            0
+        }
+
+        #[doc = $field_doc]
+        #[cfg(feature = "prometheus")]
+        fn $field_fn(median: u64) -> String {
+            format!(concat!(" ", $field_name, "={}"), median)
+        }
+
+        #[cfg(not(feature = "prometheus"))]
+        fn $field_fn(_median: u64) -> String {
+            String::new()
+        }
+    };
+
+    (
+        metric: $metric:literal,
+        labels: ($label1:literal, $label2:literal),
+        total_fn: $total_fn:ident,
+        total_doc: $total_doc:literal,
+        snapshot_fn: $snapshot_fn:ident,
+        snapshot_doc: $snapshot_doc:literal,
+        field_fn: $field_fn:ident,
+        field_doc: $field_doc:literal $(,)?
+    ) => {
+        #[doc = $total_doc]
+        #[cfg(feature = "prometheus")]
+        fn $total_fn(cache_name: &str, outcome: &str) -> u64 {
+            let value = metrics_handle().and_then(|h| {
+                scraped_metric(
+                    &h.render(),
+                    $metric,
+                    &[($label1, cache_name), ($label2, outcome)],
+                )
+            });
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "a Prometheus counter is nonnegative"
+            )]
+            let count = value.unwrap_or(0.0).round() as u64;
+            count
+        }
+
+        #[doc = $snapshot_doc]
+        #[cfg(feature = "prometheus")]
+        fn $snapshot_fn(cache_name: &str, outcome: &str) -> u64 {
+            $total_fn(cache_name, outcome)
+        }
+
+        #[cfg(not(feature = "prometheus"))]
+        fn $snapshot_fn(_cache_name: &str, _outcome: &str) -> u64 {
+            0
+        }
+
+        #[doc = $field_doc]
+        #[cfg(feature = "prometheus")]
+        fn $field_fn(decoded: u64, fallback: u64) -> String {
+            format!(
+                " sketch_rounds={} sketch_peeled={decoded} sketch_fallback={fallback}",
+                decoded + fallback
+            )
+        }
+
+        #[cfg(not(feature = "prometheus"))]
+        fn $field_fn(_decoded: u64, _fallback: u64) -> String {
+            String::new()
+        }
+    };
 }
 
-/// A per-repetition snapshot of `sundog_ae_repaired_total{cache=cache_name}`,
-/// for a before/after delta around one repetition's writes and convergence
-/// wait — the same pattern every scenario already uses for
-/// `frames_sent_total`/`bytes_sent_total`. Every repetition of a scenario
-/// shares one process-global counter for a given `cache_name`, so without
-/// this delta a scrape taken after all repetitions have run would report
-/// their sum, not one repetition's own repair count. `0` under a build
-/// without `prometheus`, where there is no counter to scrape.
-#[cfg(feature = "prometheus")]
-fn ae_repaired_snapshot(cache_name: &str) -> u64 {
-    ae_repaired_total(cache_name)
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn ae_repaired_snapshot(_cache_name: &str) -> u64 {
-    0
-}
-
-/// Renders `median` — the median, across a scenario's repetitions, of each
-/// one's own before/after [`ae_repaired_snapshot`] delta — as a `BENCH`-line
-/// field. Empty under a build without `prometheus`, matching every other
-/// `prometheus`-gated field on the line.
-#[cfg(feature = "prometheus")]
-fn ae_repaired_field(median: u64) -> String {
-    format!(" ae_repaired_total={median}")
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn ae_repaired_field(_median: u64) -> String {
-    String::new()
+metric_family! {
+    metric: "sundog_ae_repaired_total",
+    label: "cache",
+    total_fn: ae_repaired_total,
+    total_doc: "The current value of `sundog_ae_repaired_total{cache=cache_name}`, or 0 \
+                if the recorder never installed or the counter never incremented.",
+    snapshot_fn: ae_repaired_snapshot,
+    snapshot_doc: "A per-repetition snapshot of [`ae_repaired_total`], for a before/after \
+                   delta around one repetition's writes and convergence wait.",
+    field_fn: ae_repaired_field,
+    field_name: "ae_repaired_total",
+    field_doc: "Renders `median`, the median across a scenario's repetitions of each one's \
+                own before/after [`ae_repaired_snapshot`] delta, as a `BENCH`-line field.",
 }
 
 /// [`ae_repaired_field`]'s counterpart for a `BENCH` line reporting more
@@ -506,197 +562,75 @@ fn ae_repaired_field_named(_label: &str, _median: u64) -> String {
     String::new()
 }
 
-/// The current value of `sundog_ae_sketch_total{cache=cache_name,outcome=outcome}`
-/// — scenario 13's own peel-success (`outcome="decoded"`) and fallback
-/// (`outcome="fallback"`) counts, the existing metric
-/// `cluster::anti_entropy::handle_sketch_mismatch` already emits, reused
-/// here rather than adding a new one — or 0 if the recorder never installed
-/// or the counter never incremented.
-#[cfg(feature = "prometheus")]
-fn sketch_outcome_total(cache_name: &str, outcome: &str) -> u64 {
-    let value = metrics_handle().and_then(|h| {
-        scraped_metric(
-            &h.render(),
-            "sundog_ae_sketch_total",
-            &[("cache", cache_name), ("outcome", outcome)],
-        )
-    });
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "sundog_ae_sketch_total is a nonnegative counter"
-    )]
-    let count = value.unwrap_or(0.0).round() as u64;
-    count
+metric_family! {
+    metric: "sundog_ae_sketch_total",
+    labels: ("cache", "outcome"),
+    total_fn: sketch_outcome_total,
+    total_doc: "The current value of `sundog_ae_sketch_total{cache=cache_name,outcome=outcome}`, \
+                scenario 13's own peel-success (`outcome=\"decoded\"`) and fallback \
+                (`outcome=\"fallback\"`) counts, the metric \
+                `cluster::anti_entropy::handle_sketch_mismatch` already emits, reused here \
+                rather than adding a new one. Returns 0 if the recorder never installed or \
+                the counter never incremented.",
+    snapshot_fn: sketch_outcome_snapshot,
+    snapshot_doc: "[`ae_repaired_snapshot`]'s counterpart for [`sketch_outcome_total`], for a \
+                   before/after delta around one repetition's writes and convergence wait.",
+    field_fn: sketch_outcome_field,
+    field_doc: "Renders scenario 13's `sketch_rounds`/`sketch_peeled`/`sketch_fallback` \
+                fields. `sketch_rounds` is `decoded + fallback`, the number of times this \
+                scenario's buckets answer a mismatch through the sketch mechanism, \
+                successfully or not.",
 }
 
-/// [`ae_repaired_snapshot`]'s counterpart for [`sketch_outcome_total`], for
-/// a before/after delta around one repetition's writes and convergence
-/// wait.
-#[cfg(feature = "prometheus")]
-fn sketch_outcome_snapshot(cache_name: &str, outcome: &str) -> u64 {
-    sketch_outcome_total(cache_name, outcome)
+metric_family! {
+    metric: "sundog_state_transfer_records_total",
+    label: "cache",
+    total_fn: entries_received_total,
+    total_doc: "The current value of `sundog_state_transfer_records_total{cache=cache_name}`, \
+                the count of entries a state transfer applies to `cache_name` on this \
+                process, incremented once per donor a `Mode::Replicated` cache opens \
+                against, or 0 if the recorder never installed or no transfer has completed \
+                yet.",
+    snapshot_fn: entries_received_snapshot,
+    snapshot_doc: "[`ae_repaired_snapshot`]'s counterpart for [`entries_received_total`], for \
+                   a before/after delta around scenario 7's join.",
+    field_fn: entries_received_field,
+    field_name: "entries_received",
+    field_doc: "[`ae_repaired_field`]'s counterpart for a `BENCH` line reporting scenario 7's \
+                join-time [`entries_received_snapshot`] delta.",
 }
 
-#[cfg(not(feature = "prometheus"))]
-fn sketch_outcome_snapshot(_cache_name: &str, _outcome: &str) -> u64 {
-    0
+metric_family! {
+    metric: "sundog_crdt_retired_writers_total",
+    label: "cache",
+    total_fn: crdt_retired_writers_total,
+    total_doc: "The current value of `sundog_crdt_retired_writers_total{cache=cache_name}`, \
+                the per-writer retirement counter incremented once per `WriterId` the \
+                compaction sweep folds out of `cache_name`'s live state, or 0 if the \
+                recorder never installed or nothing has retired yet.",
+    snapshot_fn: crdt_retired_writers_snapshot,
+    snapshot_doc: "[`ae_repaired_snapshot`]'s counterpart for [`crdt_retired_writers_total`], \
+                   for a before/after delta around the churn scenario's compaction wait.",
+    field_fn: crdt_retired_writers_field,
+    field_name: "crdt_retired_writers_total",
+    field_doc: "[`ae_repaired_field`]'s counterpart for the churn scenario's \
+                [`crdt_retired_writers_snapshot`] delta.",
 }
 
-/// Renders scenario 13's own `sketch_rounds`/`sketch_peeled`/`sketch_fallback`
-/// fields: `sketch_rounds` is `decoded + fallback`, how many times this
-/// scenario's buckets answered a mismatch through the sketch mechanism at
-/// all, successfully or not. Empty under a build without `prometheus`,
-/// matching every other `prometheus`-gated field on a `BENCH` line.
-#[cfg(feature = "prometheus")]
-fn sketch_outcome_field(decoded: u64, fallback: u64) -> String {
-    format!(
-        " sketch_rounds={} sketch_peeled={decoded} sketch_fallback={fallback}",
-        decoded + fallback
-    )
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn sketch_outcome_field(_decoded: u64, _fallback: u64) -> String {
-    String::new()
-}
-
-/// The current value of `sundog_state_transfer_records_total{cache=cache_name}`
-/// — the count of entries a state transfer has applied to `cache_name` on
-/// this process, incremented once per donor a `Mode::Replicated` cache
-/// opens against — or 0 if the recorder never installed or no transfer has
-/// completed yet.
-#[cfg(feature = "prometheus")]
-fn entries_received_total(cache_name: &str) -> u64 {
-    let value = metrics_handle().and_then(|h| {
-        scraped_metric(
-            &h.render(),
-            "sundog_state_transfer_records_total",
-            &[("cache", cache_name)],
-        )
-    });
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "sundog_state_transfer_records_total is a nonnegative counter"
-    )]
-    let count = value.unwrap_or(0.0).round() as u64;
-    count
-}
-
-/// [`ae_repaired_snapshot`]'s counterpart for [`entries_received_total`], for
-/// a before/after delta around scenario 7's join.
-#[cfg(feature = "prometheus")]
-fn entries_received_snapshot(cache_name: &str) -> u64 {
-    entries_received_total(cache_name)
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn entries_received_snapshot(_cache_name: &str) -> u64 {
-    0
-}
-
-/// [`ae_repaired_field`]'s counterpart for a `BENCH` line reporting
-/// scenario 7's join-time [`entries_received_snapshot`] delta.
-#[cfg(feature = "prometheus")]
-fn entries_received_field(median: u64) -> String {
-    format!(" entries_received={median}")
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn entries_received_field(_median: u64) -> String {
-    String::new()
-}
-
-/// The current value of `sundog_crdt_retired_writers_total{cache=cache_name}`,
-/// the per-writer retirement counter incremented once per `WriterId` the
-/// compaction sweep folds out of `cache_name`'s live state, or 0 if the
-/// recorder never installed or nothing has retired yet.
-#[cfg(feature = "prometheus")]
-fn crdt_retired_writers_total(cache_name: &str) -> u64 {
-    let value = metrics_handle().and_then(|h| {
-        scraped_metric(
-            &h.render(),
-            "sundog_crdt_retired_writers_total",
-            &[("cache", cache_name)],
-        )
-    });
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "sundog_crdt_retired_writers_total is a nonnegative counter"
-    )]
-    let count = value.unwrap_or(0.0).round() as u64;
-    count
-}
-
-/// [`ae_repaired_snapshot`]'s counterpart for [`crdt_retired_writers_total`],
-/// for a before/after delta around the churn scenario's compaction wait.
-#[cfg(feature = "prometheus")]
-fn crdt_retired_writers_snapshot(cache_name: &str) -> u64 {
-    crdt_retired_writers_total(cache_name)
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn crdt_retired_writers_snapshot(_cache_name: &str) -> u64 {
-    0
-}
-
-/// [`ae_repaired_field`]'s counterpart for the churn scenario's
-/// [`crdt_retired_writers_snapshot`] delta.
-#[cfg(feature = "prometheus")]
-fn crdt_retired_writers_field(median: u64) -> String {
-    format!(" crdt_retired_writers_total={median}")
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn crdt_retired_writers_field(_median: u64) -> String {
-    String::new()
-}
-
-/// The current value of `sundog_crdt_compactions_total{cache=cache_name}`,
-/// the per-tick record-compaction counter, or 0 if the recorder never
-/// installed or nothing has compacted yet.
-#[cfg(feature = "prometheus")]
-fn crdt_compactions_total(cache_name: &str) -> u64 {
-    let value = metrics_handle().and_then(|h| {
-        scraped_metric(
-            &h.render(),
-            "sundog_crdt_compactions_total",
-            &[("cache", cache_name)],
-        )
-    });
-    #[allow(
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "sundog_crdt_compactions_total is a nonnegative counter"
-    )]
-    let count = value.unwrap_or(0.0).round() as u64;
-    count
-}
-
-/// [`ae_repaired_snapshot`]'s counterpart for [`crdt_compactions_total`], for
-/// a before/after delta around the churn scenario's compaction wait.
-#[cfg(feature = "prometheus")]
-fn crdt_compactions_snapshot(cache_name: &str) -> u64 {
-    crdt_compactions_total(cache_name)
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn crdt_compactions_snapshot(_cache_name: &str) -> u64 {
-    0
-}
-
-/// [`ae_repaired_field`]'s counterpart for the churn scenario's
-/// [`crdt_compactions_snapshot`] delta.
-#[cfg(feature = "prometheus")]
-fn crdt_compactions_field(median: u64) -> String {
-    format!(" crdt_compactions_total={median}")
-}
-
-#[cfg(not(feature = "prometheus"))]
-fn crdt_compactions_field(_median: u64) -> String {
-    String::new()
+metric_family! {
+    metric: "sundog_crdt_compactions_total",
+    label: "cache",
+    total_fn: crdt_compactions_total,
+    total_doc: "The current value of `sundog_crdt_compactions_total{cache=cache_name}`, the \
+                per-tick record-compaction counter, or 0 if the recorder never installed or \
+                nothing has compacted yet.",
+    snapshot_fn: crdt_compactions_snapshot,
+    snapshot_doc: "[`ae_repaired_snapshot`]'s counterpart for [`crdt_compactions_total`], for \
+                   a before/after delta around the churn scenario's compaction wait.",
+    field_fn: crdt_compactions_field,
+    field_name: "crdt_compactions_total",
+    field_doc: "[`ae_repaired_field`]'s counterpart for the churn scenario's \
+                [`crdt_compactions_snapshot`] delta.",
 }
 
 // ---------------------------------------------------------------------
@@ -704,12 +638,12 @@ fn crdt_compactions_field(_median: u64) -> String {
 // with `needs_value_bytes()` forced to `true`. This does not isolate real
 // byte-decode cost from merge-logic cost: `apply_locked`'s stored-side
 // lookup clones a resident entry's already-encoded `Bytes` unconditionally,
-// before any resolver runs, regardless of `needs_value_bytes()` — a cheap
+// before any resolver runs, regardless of `needs_value_bytes()`, a cheap
 // refcount bump, not a decode. `needs_value_bytes()` only gates whether
 // those already-cloned bytes are exposed to the resolver's `RecordView`
 // (an `Option::filter`), so forcing it to `true` here adds at most that
 // filter's own cost, not real materialization work. Scenario 5 vs 5b is
-// expected to show a near-zero delta given the current engine — that
+// expected to show a near-zero delta given the current engine, that
 // result would confirm this exact reasoning, not indicate a broken
 // isolation.
 // ---------------------------------------------------------------------
@@ -788,7 +722,7 @@ fn print_micro_bench(name: &str, ops: u32, reps: &[MicroRepMetrics]) {
 }
 
 // ---------------------------------------------------------------------
-// Scenario 1: naive_lww_counter — the lost-update problem, control, not a
+// Scenario 1: naive_lww_counter, the lost-update problem, control, not a
 // target to beat. `WRITERS` concurrent tasks race `get -> +1 -> insert`
 // against one shared key under the default `LwwResolver`.
 // ---------------------------------------------------------------------
@@ -892,10 +826,7 @@ async fn run_naive_rep(writers: u32, iters: u32, cache_name: &str) -> WriteRepMe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn naive_lww_counter() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -911,7 +842,7 @@ async fn naive_lww_counter() {
 }
 
 // ---------------------------------------------------------------------
-// Scenario 2: decomposed_counter — today's best-practice workaround using
+// Scenario 2: decomposed_counter, today's best-practice workaround using
 // only existing public API: `WRITERS` disjoint keys, each writer touching
 // only its own, still `LwwResolver`. The real performance bar scenario 3 is
 // measured against.
@@ -1012,10 +943,7 @@ async fn run_decomposed_rep(writers: u32, iters: u32, cache_name: &str) -> Write
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn decomposed_counter() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -1037,7 +965,7 @@ async fn decomposed_counter() {
 }
 
 // ---------------------------------------------------------------------
-// Scenarios 3/4: merged_counter_blind / merged_counter_rmw — `WRITERS`
+// Scenarios 3/4: merged_counter_blind / merged_counter_rmw, `WRITERS`
 // writers each keep a private cumulative total and call
 // `PnCounter::local_delta` against one shared key, `PnCounterResolver`
 // installed. `read_before_write` isolates whether 3's speedup comes from
@@ -1136,10 +1064,7 @@ async fn run_merged_rep(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn merged_counter_blind() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -1156,10 +1081,7 @@ async fn merged_counter_blind() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn merged_counter_rmw() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -1175,7 +1097,7 @@ async fn merged_counter_rmw() {
 }
 
 // ---------------------------------------------------------------------
-// Scenario 5/5b: apply_ns_lww / apply_ns_merge / apply_ns_lww_forced_bytes —
+// Scenario 5/5b: apply_ns_lww / apply_ns_merge / apply_ns_lww_forced_bytes,
 // per-apply CPU cost, isolated from network/AE: a tight loop against a
 // single-node `Mode::Local` cache, timing directly against one
 // pre-populated, always-colliding key (every insert after the seed lands
@@ -1233,10 +1155,7 @@ where
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_ns_lww() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let ops = micro_ops();
     let reps = repetitions();
@@ -1262,10 +1181,7 @@ async fn apply_ns_lww() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_ns_merge() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let ops = micro_ops();
     let reps = repetitions();
@@ -1292,10 +1208,7 @@ async fn apply_ns_merge() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_ns_lww_forced_bytes() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let ops = micro_ops();
     let reps = repetitions();
@@ -1320,11 +1233,11 @@ async fn apply_ns_lww_forced_bytes() {
 }
 
 // ---------------------------------------------------------------------
-// Scenario 6: resident_keys_at_rest — a fresh 3-node cluster, populated with
+// Scenario 6: resident_keys_at_rest, a fresh 3-node cluster, populated with
 // the same decomposed (`WRITERS` keys) and merged (one `PnCounter` key,
 // written sequentially from a single node) shapes scenarios 2 and 3
 // exercise, then left to converge with no further writes. Not a
-// measurement of scenarios 2/3's own post-benchmark state — a standalone
+// measurement of scenarios 2/3's own post-benchmark state, a standalone
 // re-creation of the same two shapes, built once here rather than threaded
 // through from those scenarios' clusters. The clearest, most durable win:
 // O(1) resident keys for merge vs. O(`WRITERS`) for decomposition.
@@ -1419,10 +1332,7 @@ async fn run_resident_rep(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn resident_keys_at_rest() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -1462,8 +1372,8 @@ async fn resident_keys_at_rest() {
 
 // ---------------------------------------------------------------------
 // Scenarios 7-8 shared shape: `N` counters (`keys`, `SUNDOG_BENCH_KEYS`),
-// `SCALE_WRITERS` writers — one per warm-cluster node, not the
-// `SUNDOG_BENCH_WRITERS`-controlled count scenarios 1-4 use — each
+// `SCALE_WRITERS` writers, one per warm-cluster node, not the
+// `SUNDOG_BENCH_WRITERS`-controlled count scenarios 1-4 use, each
 // contributing exactly [`SCALE_INCREMENTS_PER_WRITER`] to every counter, so
 // `keys` alone scales cost and every counter's converged value is
 // [`scale_expected_total`] regardless of `keys`. The decomposed variant
@@ -1512,8 +1422,8 @@ async fn decomposed_counter_sum(cache: &sundog::Cache<String, u64>, i: u32) -> u
 /// `true` once every one of `keys` counters sums to [`scale_expected_total`]
 /// on every cache in `caches`, decomposed-variant reader. `entry_count`
 /// alone is not a converged signal here: a key can exist the moment any one
-/// writer's record lands, before the other writers' records — or, for the
-/// merged variant's [`merged_all_converged`], before a remote merge — have
+/// writer's record lands, before the other writers' records, or, for the
+/// merged variant's [`merged_all_converged`], before a remote merge, have
 /// applied, so an `entry_count`-only gate can pass while a counter still
 /// reads a partial sum. Short-circuits on the first unconverged counter, so
 /// an early, mostly-unconverged poll stays cheap.
@@ -1546,17 +1456,6 @@ async fn merged_all_converged(
     true
 }
 
-// ---------------------------------------------------------------------
-// Scenario 7: cold_join_initial_replication — a warm 3-node trio converges
-// on `SCALE_WRITERS * keys` logical increments, then a fourth node joins
-// and pulls the resulting state. `Cache::open` on a `Mode::Replicated`
-// cache blocks until the full state-transfer snapshot from the live donor
-// with the lowest node id has landed and one anti-entropy round against
-// that donor has run, so timing from just before the fourth node is built
-// to just after its cache reports every counter's exact total is exactly
-// the cold-join replication cost this scenario measures.
-// ---------------------------------------------------------------------
-
 /// `SUNDOG_BENCH_KEYS` default for `cold_join_initial_replication`. At
 /// `20_000` keys, the population writes are
 /// cheap (one `insert_many` per writer), but the exact-total correctness
@@ -1575,6 +1474,18 @@ struct ColdJoinRepMetrics {
     entries_received: u64,
 }
 
+/// Scenario 7, `cold_join_initial_replication`: a warm 3-node trio
+/// converges on `SCALE_WRITERS * keys` logical increments, then a fourth
+/// node joins and pulls the resulting state. `Cache::open` on a
+/// `Mode::Replicated` cache blocks until the full state-transfer snapshot
+/// from the live donor with the lowest node id has landed and one
+/// anti-entropy round against that donor has run, so timing from
+/// immediately before the fourth node is built to immediately after its cache reports every
+/// counter's exact total is exactly the cold-join replication cost this
+/// scenario measures. Prints one `BENCH` line per `variant`: `decomposed`
+/// (`3N` per-writer keys under `LwwResolver`) and `merged` (`N` keys under
+/// `PnCounterResolver`), sharing topology, `fast_config()`, the 3-writer
+/// count, and total logical increments between the two.
 fn print_cold_join_bench(variant: &str, keys: u32, reps: &[ColdJoinRepMetrics]) {
     println!(
         "BENCH cold_join_initial_replication_{variant} keys={keys} reps={} join_secs={:.3} \
@@ -1766,10 +1677,7 @@ async fn run_cold_join_merged_rep(keys: u32) -> ColdJoinRepMetrics {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cold_join_initial_replication_decomposed() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(COLD_JOIN_KEYS_DEFAULT);
     let reps = repetitions();
@@ -1784,10 +1692,7 @@ async fn cold_join_initial_replication_decomposed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cold_join_initial_replication_merged() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(COLD_JOIN_KEYS_DEFAULT);
     let reps = repetitions();
@@ -1800,23 +1705,14 @@ async fn cold_join_initial_replication_merged() {
     print_cold_join_bench("merged", keys, &rep_metrics);
 }
 
-// ---------------------------------------------------------------------
-// Scenario 8: large_entity_convergence — `SCALE_WRITERS` writers, one per
-// warm-cluster node, each concurrently write every one of `keys` counters
-// (one `.insert` per counter, not a bulk `insert_many`, since the point is
-// genuinely concurrent cross-node writes racing anti-entropy rather than a
-// single burst) while `fast_config()`'s anti-entropy loop keeps running.
-// Convergence is timed from the last writer's last write.
-// ---------------------------------------------------------------------
-
 /// `SUNDOG_BENCH_KEYS` default for `large_entity_convergence`, lowered from
 /// `100_000` for the same reason [`COLD_JOIN_KEYS_DEFAULT`] is:
 /// this scenario's writers issue one real `.insert` per counter rather than
 /// a bulk `insert_many`, and its convergence check reads every counter back
 /// from all three nodes, so `100_000` would risk the 3-minute budget once
 /// `repetitions()` reps and both variants are added up on a 4-core box.
-/// `4_000` keeps the same shape observable — many entities, concurrent
-/// writers, anti-entropy live — well inside budget; `SUNDOG_BENCH_KEYS`
+/// `4_000` keeps the same shape observable, many entities, concurrent
+/// writers, anti-entropy live, well inside budget; `SUNDOG_BENCH_KEYS`
 /// overrides for a real capacity run.
 const LARGE_ENTITY_KEYS_DEFAULT: u32 = 4_000;
 
@@ -1829,6 +1725,14 @@ struct ScaleConvergeRepMetrics {
     lost_updates: u64,
 }
 
+/// Scenario 8, `large_entity_convergence`: `SCALE_WRITERS` writers, one per
+/// warm-cluster node, each concurrently write every one of `keys` counters
+/// (one `.insert` per counter, not a bulk `insert_many`, since the point is
+/// genuinely concurrent cross-node writes racing anti-entropy rather than a
+/// single burst) while `fast_config()`'s anti-entropy loop keeps running.
+/// Convergence is timed from the last writer's last write. Also prints
+/// scenario 12's `coalesced` variant, which reuses this same `variant`
+/// line shape.
 fn print_scale_convergence_bench(variant: &str, keys: u32, reps: &[ScaleConvergeRepMetrics]) {
     println!(
         "BENCH large_entity_convergence_{variant} keys={keys} reps={} converge_secs={:.3} \
@@ -2018,10 +1922,7 @@ async fn run_large_entity_merged_rep(keys: u32) -> ScaleConvergeRepMetrics {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_entity_convergence_decomposed() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(LARGE_ENTITY_KEYS_DEFAULT);
     let reps = repetitions();
@@ -2036,10 +1937,7 @@ async fn large_entity_convergence_decomposed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_entity_convergence_merged() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(LARGE_ENTITY_KEYS_DEFAULT);
     let reps = repetitions();
@@ -2055,9 +1953,9 @@ async fn large_entity_convergence_merged() {
 // ---------------------------------------------------------------------
 // Shared by scenarios 9-12: counts every `Event` a cache's public
 // `Cache::events()` broadcast stream carries. One event publishes per
-// non-no-op apply — a redelivered merge that reproduces exactly what's
-// already stored publishes nothing, per `merge_version`'s own no-op arm — so
-// this is the one public-API signal for how many times the engine actually
+// non-no-op apply, a redelivered merge that reproduces exactly what's
+// already stored publishes nothing, per `merge_version`'s own no-op arm, so
+// this is the one public-API signal for how many times the engine
 // applied, the "engine applies" field on
 // every `BENCH` line below. Runs until the cache's sender side drops (the
 // cache closes) or the caller aborts the returned handle; a lagged receiver
@@ -2091,28 +1989,6 @@ where
     (handle, count)
 }
 
-// ---------------------------------------------------------------------
-// Scenario 9: apply_many_prefold — Lever A, batch pre-folding ahead of the
-// stripe lock (`Engine::apply_many`, `sundog/src/store/engine.rs`). No
-// network: a fresh single-node `Mode::Local` cluster per rep, matching
-// scenario 5's own isolation of apply cost from all network/AE noise. Two
-// batch shapes, both of `batch_size` (`SUNDOG_BENCH_KEYS`, default 1,000)
-// records: `one_key`, every record colliding on a single key (pre-fold's
-// best case, a run of `batch_size` puts folded to one survivor), and
-// `many_keys`, one record per distinct key (pre-fold's worst case: nothing
-// to fold, so its only cost is the batch's own by-key grouping pass). Each
-// shape runs under both `LwwResolver` (`merges() == false`, pre-fold never
-// engages regardless of the flag) and `PnCounterResolver` (`merges() ==
-// true`) — "on" and "off" now open two caches that differ only in
-// `CacheBuilder::prefold_enabled`, both driven by the identical
-// `insert_many` call over the identical batch: the only thing that differs
-// between the two timed passes is whether `Engine::apply_many` folds a
-// same-key run before applying it. The `many_keys` shape's on/off pair is
-// expected to land close together for both resolvers — there is nothing to
-// fold either way, so it isolates pre-fold's idle grouping-pass overhead
-// from its `one_key` fold benefit.
-// ---------------------------------------------------------------------
-
 /// `SUNDOG_BENCH_KEYS` default for `apply_many_prefold`'s batch size:
 /// 1,000 records.
 const PREFOLD_BATCH_DEFAULT: u32 = 1_000;
@@ -2128,6 +2004,25 @@ struct PrefoldRepMetrics {
     batch_ns_off: f64,
 }
 
+/// Scenario 9, `apply_many_prefold`: Lever A, batch pre-folding ahead of
+/// the stripe lock (`Engine::apply_many`, `sundog/src/store/engine.rs`).
+/// No network: a fresh single-node `Mode::Local` cluster per rep, matching
+/// scenario 5's own isolation of apply cost from all network/AE noise. Two
+/// batch shapes, both of `batch_size` (`SUNDOG_BENCH_KEYS`, default 1,000)
+/// records: `one_key`, every record colliding on a single key (pre-fold's
+/// best case, a run of `batch_size` puts folded to one survivor), and
+/// `many_keys`, one record per distinct key (pre-fold's worst case:
+/// nothing to fold, so its only cost is the batch's own by-key grouping
+/// pass). Each shape runs under both `LwwResolver` (`merges() == false`,
+/// pre-fold never engages regardless of the flag) and `PnCounterResolver`
+/// (`merges() == true`): "on" and "off" open two caches that differ only
+/// in `CacheBuilder::prefold_enabled`, both driven by the identical
+/// `insert_many` call over the identical batch, so the only thing that
+/// differs between the two timed passes is whether `Engine::apply_many`
+/// folds a same-key run before applying it. The `many_keys` shape's on/off
+/// pair lands close together for both resolvers: there is nothing to fold
+/// either way, so it isolates pre-fold's idle grouping-pass overhead from
+/// its `one_key` fold benefit.
 fn print_prefold_bench(name: &str, batch_size: u32, reps: &[PrefoldRepMetrics]) {
     println!(
         "BENCH {name} batch_size={batch_size} reps={} record_ns_on={:.1} \
@@ -2173,22 +2068,22 @@ where
 }
 
 /// One `apply_many_prefold` rep for one (shape, resolver) combo: opens two
-/// fresh single-node caches under the same name in turn — "on"
+/// fresh single-node caches under the same name in turn, "on"
 /// (`CacheBuilder::prefold_enabled`'s default `true`) and "off"
-/// (`.prefold_enabled(false)`) — closing the first before opening the
+/// (`.prefold_enabled(false)`), closing the first before opening the
 /// second so both can use the same `cache_name`, and times the identical
 /// `batch_size`-record `insert_many` call against each. `swap_order` runs
-/// "off" before "on" instead of the reverse — the caller alternates it
+/// "off" before "on" instead of the reverse, the caller alternates it
 /// across reps so whichever pass runs second on a freshly built cluster
 /// (and so benefits from the first pass's allocator/JIT warm-up) is not
 /// always the same one, canceling that bias out across reps rather than
 /// always favoring "off".
 ///
 /// Both passes take the identical single stripe-lock acquisition for the
-/// whole batch (`insert_many` always does, pre-fold or not — see
+/// whole batch (`insert_many` always does, pre-fold or not, see
 /// `Engine::apply_many`) and pay the identical per-call fan-out push, so the
-/// only thing that can differ between them is whether `apply_many` actually
-/// folds a same-key run before applying it — a real measurement of the
+/// only thing that can differ between them is whether `apply_many`
+/// folds a same-key run before applying it, a real measurement of the
 /// flag, not a proxy. `LwwResolver::merges()` is `false`, so it never
 /// triggers pre-fold at all regardless of the flag: its on/off gap is
 /// expected to land near zero, which `print_prefold_isolated_delta` checks
@@ -2271,10 +2166,7 @@ fn print_prefold_isolated_delta(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apply_many_prefold() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let batch_size = prefold_batch_size();
     let reps = repetitions();
@@ -2331,21 +2223,6 @@ async fn apply_many_prefold() {
     }
 }
 
-// ---------------------------------------------------------------------
-// Scenario 10: replicated_hot_counter_receive — Lever A on the replication
-// receive path: the same eight-writer single-`PnCounter`-key shape as
-// scenarios 3/4, but instrumented on the two nodes that only ever *receive*
-// the resulting writes rather than the one issuing them, so a concurrent
-// writer burst on `cache_a` arrives at `cache_b`/`cache_c` as fan-out and
-// anti-entropy batches carrying several records for the same key —
-// `apply_remote_batch`'s own batch shape, exactly what pre-fold folds. Runs
-// twice, "on" (both receivers' default `prefold_enabled(true)`) and "off"
-// (both receivers opened with `.prefold_enabled(false)`, `cache_a` itself
-// left on since it is never the one instrumented) — a real off variant,
-// since `CacheBuilder::prefold_enabled` reaches a receiving node's engine
-// the same way regardless of who assembled the batch it applies.
-// ---------------------------------------------------------------------
-
 struct HotCounterReceiveRepMetrics {
     applies_b: u64,
     applies_c: u64,
@@ -2355,6 +2232,19 @@ struct HotCounterReceiveRepMetrics {
     lost_updates: u64,
 }
 
+/// Scenario 10, `replicated_hot_counter_receive`: Lever A on the
+/// replication receive path: the same eight-writer single-`PnCounter`-key
+/// shape as scenarios 3/4, but instrumented on the two nodes that only
+/// ever *receive* the resulting writes rather than the one issuing them,
+/// so a concurrent writer burst on `cache_a` arrives at `cache_b`/`cache_c`
+/// as fan-out and anti-entropy batches carrying several records for the
+/// same key, `apply_remote_batch`'s own batch shape, exactly what
+/// pre-fold folds. Runs twice, "on" (both receivers' default
+/// `prefold_enabled(true)`) and "off" (both receivers opened with
+/// `.prefold_enabled(false)`, `cache_a` itself left on since it is never
+/// the one instrumented): a real off variant, since
+/// `CacheBuilder::prefold_enabled` reaches a receiving node's engine the
+/// same way regardless of who assembled the batch it applies.
 fn print_hot_counter_receive_bench(
     variant: &str,
     writers: u32,
@@ -2459,10 +2349,7 @@ async fn run_hot_counter_receive_rep(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn replicated_hot_counter_receive() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -2486,27 +2373,6 @@ async fn replicated_hot_counter_receive() {
     }
 }
 
-// ---------------------------------------------------------------------
-// Scenario 11: merged_counter_coalesced — Lever B, local delta coalescing
-// (`Cache::merge`, `CacheBuilder::merge_coalesce_window`). The same
-// eight-writer single-counter shape as scenarios 3/4, `Cache::merge`
-// replacing `insert`, across three coalescing windows: 0 (immediate apply,
-// `Cache::merge`'s own equivalent of `insert` under a merging resolver),
-// 1ms, and 10ms. "Engine applies" is `cache_a`'s own [`spawn_event_counter`]
-// total — the number of times the coalesced folds actually reached the
-// engine, expected to fall well below `writers * iters` (the number of
-// client-side `merge` calls) as the window widens. `lost_updates` is a
-// snapshot of `cache_a` taken immediately after the writers finish and
-// before the convergence wait, the same transient post-write,
-// pre-convergence gap scenario 8's own `lost_updates` measures — for a
-// nonzero window this also carries the write side's own coalescing delay
-// (a fold not yet flushed is invisible to `get`, `Cache::merge`'s own
-// documented staleness bound), not only replication lag. `converge_secs`
-// times from the last writer's last call to every one of the three nodes
-// reading the exact expected total, so it likewise includes that staleness
-// bound rather than only the network repair cost scenarios 3/4 isolate.
-// ---------------------------------------------------------------------
-
 /// The three `Cache::merge` coalescing windows this scenario compares, in
 /// milliseconds.
 const COALESCE_WINDOWS_MS: [u64; 3] = [0, 1, 10];
@@ -2522,6 +2388,25 @@ struct CoalescedRepMetrics {
     lost_updates: u64,
 }
 
+/// Scenario 11, `merged_counter_coalesced`: Lever B, local delta
+/// coalescing (`Cache::merge`, `CacheBuilder::merge_coalesce_window`). The
+/// same eight-writer single-counter shape as scenarios 3/4, `Cache::merge`
+/// replacing `insert`, across three coalescing windows: 0 (immediate
+/// apply, `Cache::merge`'s own equivalent of `insert` under a merging
+/// resolver), 1ms, and 10ms. "Engine applies" is `cache_a`'s own
+/// [`spawn_event_counter`] total, the number of times the coalesced folds
+/// reach the engine, expected to fall well below `writers *
+/// iters` (the number of client-side `merge` calls) as the window widens.
+/// `lost_updates` is a snapshot of `cache_a` taken immediately after the
+/// writers finish and before the convergence wait, the same transient
+/// post-write, pre-convergence gap scenario 8's own `lost_updates`
+/// measures; for a nonzero window this also carries the write side's own
+/// coalescing delay (a fold not yet flushed is invisible to `get`,
+/// `Cache::merge`'s own documented staleness bound), not only replication
+/// lag. `converge_secs` times from the last writer's last call to every
+/// one of the three nodes reading the exact expected total, so it
+/// likewise includes that staleness bound rather than only the network
+/// repair cost scenarios 3/4 isolate.
 fn print_coalesced_bench(
     name: &str,
     writers: u32,
@@ -2651,10 +2536,7 @@ async fn run_coalesced_rep(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn merged_counter_coalesced() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let writers = writers();
     let iters = iters();
@@ -2680,18 +2562,14 @@ async fn merged_counter_coalesced() {
     }
 }
 
-// ---------------------------------------------------------------------
-// Scenario 12: large_entity_convergence_coalesced — scenario 8's `merged`
-// variant with `Cache::merge` and a 1ms coalescing window replacing a
-// direct `insert` per write. Shares scenario 8's own `keys`
-// (`SUNDOG_BENCH_KEYS`) knob and default, so a full benchmark run covers
-// both entity counts the same way scenario 8's own doc run does — once at
-// the default, once at a larger scale.
-// ---------------------------------------------------------------------
-
 /// The coalescing window `large_entity_convergence_coalesced` runs at.
 const COALESCED_LARGE_ENTITY_WINDOW_MS: u64 = 1;
 
+/// Scenario 12, `large_entity_convergence_coalesced`: scenario 8's
+/// `merged` variant with `Cache::merge` and a
+/// [`COALESCED_LARGE_ENTITY_WINDOW_MS`] coalescing window replacing a
+/// direct `insert` per write. Shares scenario 8's own `keys`
+/// (`SUNDOG_BENCH_KEYS`) knob and default.
 async fn run_large_entity_coalesced_rep(keys: u32) -> ScaleConvergeRepMetrics {
     #[cfg(feature = "prometheus")]
     let _ = metrics_handle();
@@ -2795,10 +2673,7 @@ async fn run_large_entity_coalesced_rep(keys: u32) -> ScaleConvergeRepMetrics {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn large_entity_convergence_coalesced() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(LARGE_ENTITY_KEYS_DEFAULT);
     let reps = repetitions();
@@ -2811,44 +2686,6 @@ async fn large_entity_convergence_coalesced() {
     print_scale_convergence_bench("coalesced", keys, &rep_metrics);
 }
 
-// ---------------------------------------------------------------------
-// Scenario 13: sketch_path_convergence — a merging resolver's
-// scale-hardening on the IBLT sketch path (`sundog/src/cluster/sketch.rs`,
-// `sundog/src/cluster/anti_entropy.rs`). `ClusterConfig::ae_sketch_min_bucket`
-// is lowered to [`SKETCH_PATH_MIN_BUCKET`], and every one of `keys` filler
-// entries is forced into the *same* anti-entropy bucket
-// ([`keys_in_one_bucket`], the same deterministic technique
-// `tests/prometheus_exporter.rs`'s own `keys_in_one_bucket`/`bucket_of` pair
-// forces a dense bucket with — copied locally, integration test binaries
-// share nothing beyond `mod common`), so that one bucket clears the
-// lowered threshold regardless of `store::BUCKET_COUNT`'s usual averaging.
-// This sidesteps a write burst racing `cluster::fan_out_task`'s live
-// replication: at any key count this benchmark's budget can afford, that
-// live fan-out always finishes replicating before anti-entropy's own
-// `ae_interval` next fires, which is why scenarios 8/12 report zero
-// `ae_repaired_total` at their own defaults and why a bare write burst here
-// would too. Once every node holds the full dense bucket,
-// `Cache::invalidate_local` drops a quarter of it on `cache_b` only — an
-// escape hatch that removes a local copy without a tombstone or fan-out,
-// creating a real bucket digest mismatch with no write race involved —
-// mirroring `tests/prometheus_exporter.rs`'s own `seed_sketch_mismatch`.
-// The next anti-entropy round against a threshold this low answers with a
-// sketch. `lww` (default `LwwResolver`, non-merging) and `pn_counter`
-// (`PnCounterResolver`, merging) both run this, so `pn_counter`'s own
-// `sketch_peeled`/`sketch_fallback` counts are the bidirectional-exchange
-// sketch load `sketch.rs`'s `two_sided_version_mismatches_decode_at_the_default_shape`
-// and `anti_entropy`'s
-// `a_merging_bucket_above_the_threshold_converges_through_the_sketch_path`
-// pin at unit scale, now measured through a real, multi-round anti-entropy
-// loop instead. It reports `sundog_ae_sketch_total`'s existing `decoded`/
-// `fallback` outcome counters — no new metric, since that counter already
-// covers a peel success and a peel fallback exactly — as `sketch_peeled`
-// and `sketch_fallback`, plus their sum as `sketch_rounds`: how many times
-// this scenario's dense bucket answered a mismatch through the sketch
-// mechanism at all, successfully or not, over however many anti-entropy
-// rounds ran before it reconverged.
-// ---------------------------------------------------------------------
-
 /// `SUNDOG_BENCH_KEYS` default for `sketch_path_convergence`: the size of
 /// the single dense anti-entropy bucket this scenario builds. Comfortably
 /// under `cluster::sketch`'s rated 100-element symmetric difference once a
@@ -2859,7 +2696,7 @@ async fn large_entity_convergence_coalesced() {
 /// to see fallbacks appear.
 const SKETCH_PATH_KEYS_DEFAULT: u32 = 200;
 
-/// `ClusterConfig::ae_sketch_min_bucket` this scenario's clusters run at —
+/// `ClusterConfig::ae_sketch_min_bucket` this scenario's clusters run at,
 /// far under [`SKETCH_PATH_KEYS_DEFAULT`], so the one dense bucket this
 /// scenario builds always clears it and takes the sketch path rather than
 /// `ClusterConfig::default`'s 384-entry listing threshold, mirroring
@@ -2875,8 +2712,8 @@ const SKETCH_PATH_INVALIDATE_FRACTION: usize = 4;
 
 /// The anti-entropy bucket a `u32` key hashes into, mirroring
 /// `store::stripe_index_from_hash`'s formula; `tests/prometheus_exporter.rs`
-/// carries the identical helper for the same reason (copied locally —
-/// integration test binaries share nothing beyond `mod common`).
+/// carries the identical helper for the same reason (copied locally,
+/// since integration test binaries share nothing beyond `mod common`).
 fn sketch_path_bucket_of(key: u32) -> u16 {
     let bytes = postcard::to_stdvec(&key).expect("u32 key encodes");
     let bucket = xxh3_64(&bytes) & (sundog::store::BUCKET_COUNT as u64 - 1);
@@ -2943,6 +2780,42 @@ struct SketchPathRepMetrics {
     lost_updates: u64,
 }
 
+/// Scenario 13, `sketch_path_convergence`: a merging resolver's
+/// scale-hardening on the IBLT sketch path (`sundog/src/cluster/sketch.rs`,
+/// `sundog/src/cluster/anti_entropy.rs`). `ClusterConfig::ae_sketch_min_bucket`
+/// is lowered to [`SKETCH_PATH_MIN_BUCKET`], and every one of `keys`
+/// filler entries is forced into the *same* anti-entropy bucket
+/// ([`keys_in_one_bucket`], the same deterministic technique
+/// `tests/prometheus_exporter.rs`'s own `keys_in_one_bucket`/`bucket_of`
+/// pair uses to force a dense bucket, copied locally since integration
+/// test binaries share nothing beyond `mod common`), so that one bucket
+/// clears the lowered threshold regardless of `store::BUCKET_COUNT`'s
+/// usual averaging. This sidesteps a write burst racing
+/// `cluster::fan_out_task`'s live replication: at any key count this
+/// benchmark's budget can afford, that live fan-out always finishes
+/// replicating before anti-entropy's own `ae_interval` next fires, which
+/// is why scenarios 8/12 report zero `ae_repaired_total` at their own
+/// defaults and why a bare write burst here would too. Once every node
+/// holds the full dense bucket, `Cache::invalidate_local` drops a quarter
+/// of it on `cache_b` only, an escape hatch that removes a local copy
+/// without a tombstone or fan-out, creating a real bucket digest mismatch
+/// with no write race involved, mirroring
+/// `tests/prometheus_exporter.rs`'s own `seed_sketch_mismatch`. The next
+/// anti-entropy round against a threshold this low answers with a sketch.
+/// `lww` (default `LwwResolver`, non-merging) and `pn_counter`
+/// (`PnCounterResolver`, merging) both run this, so `pn_counter`'s own
+/// `sketch_peeled`/`sketch_fallback` counts are the bidirectional-exchange
+/// sketch load `sketch.rs`'s
+/// `two_sided_version_mismatches_decode_at_the_default_shape` and
+/// `anti_entropy`'s
+/// `a_merging_bucket_above_the_threshold_converges_through_the_sketch_path`
+/// pin at unit scale, now measured through a real, multi-round
+/// anti-entropy loop instead. Reports `sundog_ae_sketch_total`'s existing
+/// `decoded`/`fallback` outcome counters as `sketch_peeled` and
+/// `sketch_fallback`, plus their sum as `sketch_rounds`: how many times
+/// this scenario's dense bucket answers a mismatch through the sketch
+/// mechanism at all, successfully or not, over however many anti-entropy
+/// rounds run before it reconverges.
 fn print_sketch_path_bench(
     variant: &str,
     keys: u32,
@@ -2969,7 +2842,7 @@ fn print_sketch_path_bench(
 /// Waits for `cache_b`/`cache_c` to hold `dense_keys`' last entry (proof the
 /// whole dense bucket landed everywhere), invalidates
 /// [`SKETCH_PATH_INVALIDATE_FRACTION`] of it on `cache_b` alone, snapshots
-/// this scenario's metrics, then times `cache_b`'s reconvergence — the
+/// this scenario's metrics, then times `cache_b`'s reconvergence, the
 /// shape both variants below share once their own cache/resolver/dense
 /// bucket is built.
 async fn seed_and_time_sketch_mismatch(
@@ -2998,8 +2871,8 @@ async fn seed_and_time_sketch_mismatch(
 
     // A snapshot of how many of the invalidated keys are still missing on
     // `cache_b`, immediately after the invalidation above and before the
-    // convergence wait below — every one of them, since `invalidate_local`
-    // just dropped their local copies; mirrors every other scenario's own
+    // convergence wait below, every one of them, since `invalidate_local`
+    // dropped their local copies; mirrors every other scenario's own
     // `lost_updates`, the transient post-write, pre-convergence gap.
     let mut lost_updates = 0u64;
     for &key in invalidated {
@@ -3149,10 +3022,7 @@ async fn run_sketch_path_pn_counter_rep(keys: u32, min_bucket: usize) -> SketchP
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sketch_path_convergence_lww() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(SKETCH_PATH_KEYS_DEFAULT);
     let reps = repetitions();
@@ -3167,10 +3037,7 @@ async fn sketch_path_convergence_lww() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sketch_path_convergence_pn_counter() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let keys = scale_keys(SKETCH_PATH_KEYS_DEFAULT);
     let reps = repetitions();
@@ -3183,40 +3050,6 @@ async fn sketch_path_convergence_pn_counter() {
 
     print_sketch_path_bench("pn_counter", keys, SKETCH_PATH_MIN_BUCKET, &rep_metrics);
 }
-
-// ---------------------------------------------------------------------
-// Scenario 14: crdt_compaction_writer_churn — the two-stage writer
-// retirement rule: `CHURN_COUNTERS`
-// `PnCounter` keys, one logical writer role that is torn down and rebuilt
-// `CHURN_REPLACEMENTS` times under the SAME persisted `NodeId`
-// (`ClusterBuilder::node_id`), joining a stable observer node each time.
-// Reusing the node id means every rebuild mints a fresh incarnation
-// (`Cache::writer_id`, pairing that node id with `Cluster::local_incarnation`)
-// and the *previous* incarnation is dead the instant the new one is visible
-// live (`membership::incarnation_is_dead`), with no absence wait needed for
-// stage one. `ClusterConfig::crdt_retire_after` is set to
-// [`CHURN_RETIRE_AFTER`], a few seconds, so stage two's `2x` bound
-// is comfortably aged within a couple of the
-// compaction sweep's own 30-second-floor ticks
-// (`(crdt_retire_after / 4).max(30s)`, `crdt_compact_task`,
-// `sundog/src/cluster.rs`). That fixed floor, not `CHURN_COUNTERS` or
-// `CHURN_REPLACEMENTS`, is what dominates this scenario's wall-clock cost,
-// so unlike every scenario above it this one reports a single run rather
-// than a median over [`repetitions`]: waiting out that floor several times
-// over just to average an otherwise-deterministic outcome buys nothing.
-//
-// Reports one counter's encoded record size (`PnCounter::encode().len()`),
-// still carrying every historical incarnation's own live slot right after
-// the last replacement since no sweep has run yet at that point, against
-// its size once the sweep has had time to retire the dead
-// incarnations (stage one) and fold them into the bounded scalar
-// accumulator (stage two), so the metadata bound is visible directly in the
-// two numbers on the printed `BENCH` line, plus the retired-writer/
-// compaction counters under `--features prometheus`. Asserts the aggregate
-// total is unaffected by however many replacements or compaction passes
-// ran, and that the record never ends up
-// larger after compaction than it was before.
-// ---------------------------------------------------------------------
 
 /// `N` counters churned in [`crdt_compaction_writer_churn`].
 /// `SUNDOG_BENCH_CHURN_COUNTERS` overrides.
@@ -3254,7 +3087,7 @@ const CHURN_RETIRE_AFTER: Duration = Duration::from_secs(2);
 /// How long to wait, after the last replacement lands, for the compaction
 /// sweep to run several times over: `crdt_compact_task`'s ticker fires
 /// immediately on the observer's cache opening (before any replacement has
-/// happened) and every `(CHURN_RETIRE_AFTER / 4).max(30s)` — 30s here —
+/// happened) and every `(CHURN_RETIRE_AFTER / 4).max(30s)` (30s here)
 /// after that, so five ticks comfortably covers stage one (the first tick
 /// after every dead incarnation is visible) and stage two (a later tick,
 /// once `2 * CHURN_RETIRE_AFTER` has aged past a dead incarnation's own
@@ -3302,7 +3135,7 @@ fn print_churn_bench(name: &str, counters: u32, replacements: u32, metrics: &Chu
 /// waits for the observer to see the cumulative total through this round.
 /// Returns the built cluster so the caller decides whether to tear it down
 /// (every round but the last) or keep it running as the still-live
-/// "current" writer (the last round) — see [`run_crdt_compaction_churn`].
+/// "current" writer (the last round), see [`run_crdt_compaction_churn`].
 async fn run_churn_writer_round(
     cluster_label: &str,
     cache_name: &str,
@@ -3350,6 +3183,35 @@ async fn run_churn_writer_round(
     writer_cluster
 }
 
+/// Scenario 14, `crdt_compaction_writer_churn`: the two-stage writer
+/// retirement rule. [`CHURN_COUNTERS`] `PnCounter` keys, one logical
+/// writer role that is torn down and rebuilt [`CHURN_REPLACEMENTS`] times
+/// under the same persisted `NodeId` (`ClusterBuilder::node_id`), joining
+/// a stable observer node each time. Reusing the node id means every
+/// rebuild mints a fresh incarnation (`Cache::writer_id`, pairing that
+/// node id with `Cluster::local_incarnation`) and the *previous*
+/// incarnation is dead the instant the new one is visible live
+/// (`membership::incarnation_is_dead`), with no absence wait needed for
+/// stage one. `ClusterConfig::crdt_retire_after` is set to
+/// [`CHURN_RETIRE_AFTER`], a few seconds, so stage two's `2x` bound ages
+/// comfortably within a couple of the compaction sweep's own
+/// 30-second-floor ticks (`(crdt_retire_after / 4).max(30s)`,
+/// `crdt_compact_task`, `sundog/src/cluster.rs`). That fixed floor, not
+/// `CHURN_COUNTERS` or `CHURN_REPLACEMENTS`, dominates this scenario's
+/// wall-clock cost, so unlike every scenario above it this one reports a
+/// single run rather than a median over [`repetitions`].
+///
+/// Reports one counter's encoded record size (`PnCounter::encode().len()`),
+/// still carrying every historical incarnation's own live slot right
+/// after the last replacement since no sweep has run yet at that point,
+/// against its size once the sweep has had time to retire the dead
+/// incarnations (stage one) and fold them into the bounded scalar
+/// accumulator (stage two), so the metadata bound is visible directly in
+/// the two numbers on the printed `BENCH` line, plus the
+/// retired-writer/compaction counters under `--features prometheus`. The
+/// caller asserts the aggregate total is unaffected by however many
+/// replacements or compaction passes ran, and that the record never ends
+/// up larger after compaction than it was before.
 async fn run_crdt_compaction_churn() -> ChurnRepMetrics {
     #[cfg(feature = "prometheus")]
     let _ = metrics_handle();
@@ -3389,7 +3251,7 @@ async fn run_crdt_compaction_churn() -> ChurnRepMetrics {
     // incarnation is torn down as soon as its round converges, so its slot
     // goes dead (superseded by the next round's fresh incarnation), but the
     // last one stays up as the still-live "current" writer through the
-    // compaction wait below, matching real churn — only past writers
+    // compaction wait below, matching real churn, only past writers
     // retire, never the one still running.
     let mut current_writer_cluster: Option<Cluster> = None;
     for round in 0..replacements {
@@ -3459,10 +3321,7 @@ async fn run_crdt_compaction_churn() -> ChurnRepMetrics {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn crdt_compaction_writer_churn() {
-    if !bench_enabled() {
-        eprintln!("skipping: SUNDOG_BENCH=1 not set");
-        return;
-    }
+    require_bench!();
 
     let counters = churn_counters();
     let replacements = churn_replacements();

@@ -27,7 +27,7 @@ const CONTROL_PORT: u16 = 8080;
 pub const METRICS_PORT: u16 = 9090;
 const READY_LOG: &str = "testnode-ready";
 /// Bound on [`Node::crash`]'s wait for the backend to confirm the container
-/// process actually died.
+/// process died.
 const CRASH_WAIT: Duration = Duration::from_secs(30);
 
 /// Gate for `tests/containers.rs`: `false` unless `SUNDOG_CONTAINER_TESTS=1`,
@@ -82,7 +82,7 @@ pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.0";
 
 /// Env var a container test passes via [`Node::spawn_with_env`] to override
 /// `ClusterConfig::crdt_retire_after` (`u64` seconds) down from its 24h
-/// default to something a test can actually wait out, the same override
+/// default to something a test can reasonably wait out, the same override
 /// shape as `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` and friends (this file's
 /// module doc names the pattern; `sundog-testnode`'s own crate doc lists
 /// every `SUNDOG_TESTNODE_*` knob it currently reads). `sundog-testnode`
@@ -272,7 +272,7 @@ impl Node {
     }
 
     /// [`Node::spawn_with_env`], but returns as soon as `wait` reports ready
-    /// instead of waiting for the `testnode-ready` log line — for a caller
+    /// instead of waiting for the `testnode-ready` log line, for a caller
     /// that wants the guard back before the node has finished its cache
     /// warm-up, e.g. to observe `/metrics` the moment it starts serving,
     /// well before a `Mode::Replicated` cache's state transfer runs. A
@@ -598,24 +598,8 @@ impl Node {
         }
     }
 
-    /// `osremove k e`, merging an [`sundog::crdt::OrSet::remove`] delta
-    /// against this node's own currently observed copy of key `k` into it.
-    /// # Errors
-    ///
-    /// Returns `Err` if the connection fails or the reply is not `ok`.
-    pub async fn os_remove(&self, key: &str, elem: &str) -> Result<(), String> {
-        match self
-            .command(&format!("osremove {key} {elem}"))
-            .await?
-            .as_str()
-        {
-            "ok" => Ok(()),
-            other => Err(other.to_string()),
-        }
-    }
-
-    /// `osmembers k`: `None` for a key never written, `Some(members)` —
-    /// alphabetically sorted, per `sundog-testnode`'s own rendering — for a
+    /// `osmembers k`: `None` for a key never written, `Some(members)`,
+    /// alphabetically sorted per `sundog-testnode`'s own rendering, for a
     /// key that has been written, `Some(vec![])` included if every element
     /// has since been removed (a written, currently empty set is not the
     /// same as an unwritten key).
@@ -631,72 +615,6 @@ impl Node {
             return Ok(Some(Vec::new()));
         }
         Ok(Some(reply.split_whitespace().map(str::to_string).collect()))
-    }
-
-    /// Cuts this node off the network entirely — `ip link set <iface> down`
-    /// inside the container, via [`ContainerGuard::exec`], which reaches the
-    /// container through the backend directly rather than over the network
-    /// this severs, so it (and [`Node::heal`]) keep working on an already
-    /// partitioned node — without stopping its process. Unlike
-    /// [`Node::stop`]/[`Node::crash`], the process keeps running and never
-    /// gets a chance to gossip anything, gracefully or otherwise, so every
-    /// peer sees exactly a genuine network partition: the node drops out of
-    /// the live set with no departure signal at all, distinct from a
-    /// confirmed-gone member the same way CRDT compaction's own
-    /// partitioned-vs-retired distinction
-    /// (`crate::cluster::crdt_compact_tick`'s dead/quiet predicates)
-    /// requires.
-    ///
-    /// The interface name is detected at call time (`eth0` first, falling
-    /// back to the first non-loopback interface `ip -o link show` reports),
-    /// so this only requires the container image's busybox to provide the
-    /// `ip` applet — true of `alpine:3.22`, this file's default base image —
-    /// not a full `iproute2`/`iptables` install.
-    /// # Errors
-    ///
-    /// Returns `Err` if the exec call itself fails, or the in-container
-    /// command exits non-zero (e.g. no `ip` applet in a non-default base
-    /// image).
-    pub async fn partition(&self) -> Result<(), String> {
-        self.set_interface_state("down").await
-    }
-
-    /// Reverses [`Node::partition`], restoring this node's network
-    /// connectivity without having ever stopped its process.
-    /// # Errors
-    ///
-    /// Returns `Err` if the exec call itself fails, or the in-container
-    /// command exits non-zero.
-    pub async fn heal(&self) -> Result<(), String> {
-        self.set_interface_state("up").await
-    }
-
-    /// The `ip link set <iface> {up,down}` `sh -c` script both
-    /// [`Node::partition`] and [`Node::heal`] run.
-    async fn set_interface_state(&self, state: &str) -> Result<(), String> {
-        let script = format!(
-            "set -e; \
-             iface=eth0; \
-             if ! ip link show \"$iface\" >/dev/null 2>&1; then \
-                 iface=$(ip -o link show | awk -F': ' '$2 != \"lo\" {{print $2; exit}}'); \
-             fi; \
-             ip link set \"$iface\" {state}"
-        );
-        let result = self
-            .guard
-            .exec(&["sh", "-c", script.as_str()])
-            .await
-            .map_err(|error| {
-                format!("exec failed setting this node's interface {state}: {error}")
-            })?;
-        if result.exit_code == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "setting this node's interface {state} exited {}: stdout={:?} stderr={:?}",
-                result.exit_code, result.stdout, result.stderr
-            ))
-        }
     }
 
     /// `drop k`, dropping `k`'s local copy with no tombstone and no fan-out,
@@ -782,12 +700,12 @@ impl Node {
     }
 
     /// `crash`: sends the command, waits for the backend to confirm the
-    /// container process actually died, then removes the (already-dead)
+    /// container process died, then removes the (already-dead)
     /// container so `name()`'s alias is free for a fresh [`Node::spawn`].
     ///
     /// `ContainerGuard::is_running` only tracks whether this guard's own
-    /// `stop()` has run — it has no way to observe a death this process
-    /// didn't itself cause — so death is detected the way the backend
+    /// `stop()` has run, so it has no way to observe a death this process
+    /// didn't itself cause; death is detected the way the backend
     /// itself would notice: `docker exec` against an exited container
     /// fails, so polling `exec` until it errors is that confirmation.
     /// # Errors
@@ -862,4 +780,40 @@ where
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Every `sundog-testnode` binds gossip on this fixed port; a seed string
+/// is `<alias>:<GOSSIP_PORT>`, resolved via DNS against the alias.
+pub const GOSSIP_PORT: u16 = 7946;
+
+/// A seed string for `alias`, in the `<alias>:<GOSSIP_PORT>` shape every
+/// `sundog-testnode` resolves via DNS.
+pub fn seed(alias: &str) -> String {
+    format!("{alias}:{GOSSIP_PORT}")
+}
+
+/// Bound on [`wait_for_peers`]' wait for `Node::peers` to reach the
+/// expected count.
+const PEER_WAIT: Duration = Duration::from_secs(30);
+
+/// Waits for every one of `nodes` to report `expected` peers.
+pub async fn wait_for_peers(nodes: &[&Node], expected: usize) {
+    for node in nodes {
+        eventually(PEER_WAIT, || async { node.peers().await == Ok(expected) }).await;
+    }
+}
+
+/// Spawns a 3-node cluster under `cluster_name`: `n1` with no seeds, `n2`
+/// seeded on `n1`, `n3` seeded on `n1` and `n2`, then waits for every node
+/// to see both peers before returning.
+/// # Panics
+///
+/// Panics if any node fails to start or become ready, or if any node has
+/// not converged on 2 peers within [`PEER_WAIT`].
+pub async fn spawn_trio(net: &Arc<Network>, cluster_name: &str) -> (Node, Node, Node) {
+    let n1 = Node::spawn(net, cluster_name, "n1", &[]).await;
+    let n2 = Node::spawn(net, cluster_name, "n2", &[&seed("n1")]).await;
+    let n3 = Node::spawn(net, cluster_name, "n3", &[&seed("n1"), &seed("n2")]).await;
+    wait_for_peers(&[&n1, &n2, &n3], 2).await;
+    (n1, n2, n3)
 }
