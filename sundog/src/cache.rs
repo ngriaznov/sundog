@@ -349,6 +349,7 @@ fn validate_mode(
     {
         return Err(CacheError::ReplicatedWithLocalEviction {
             cache: name.clone(),
+            mode,
         });
     }
     Ok(())
@@ -487,7 +488,7 @@ async fn spawn_cache_tasks<K, V>(
     if !matches!(mode, Mode::Local) {
         cluster.spawn_tracked_in(
             tasks,
-            crate::cluster::fan_out_task(
+            crate::cluster::fan_out::fan_out_task(
                 Arc::clone(shard),
                 cluster.clone(),
                 shard.fan_out_queue(),
@@ -537,7 +538,7 @@ async fn spawn_cache_tasks<K, V>(
     if (Arc::clone(shard) as Arc<dyn ShardOps>).merges() {
         cluster.spawn_tracked_in(
             tasks,
-            crate::cluster::crdt_compact_task(
+            crate::cluster::crdt_compact::crdt_compact_task(
                 Arc::clone(shard) as Arc<dyn ShardOps>,
                 name.clone(),
                 cluster.clone(),
@@ -1167,6 +1168,7 @@ mod tests {
 
     use super::*;
     use crate::cluster::Cluster;
+    use crate::cluster::test_support::wait_until;
     use crate::config::ClusterConfig;
     use crate::store::crdt::{PnCounter, PnCounterResolver};
 
@@ -1183,16 +1185,12 @@ mod tests {
     }
 
     async fn wait_for_peer_count(cluster: &Cluster, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if cluster.peers().len() >= expected {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("peers converge within the bound");
+        wait_until(
+            Duration::from_secs(15),
+            "peers converge within the bound",
+            async || cluster.peers().len() >= expected,
+        )
+        .await;
     }
 
     /// Joins a fresh node onto `cluster_name`'s chitchat cluster (three
@@ -1328,18 +1326,12 @@ mod tests {
             .await
             .expect("insert");
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(Some(value)) = cache_a.fetch(&unowned_key).await
-                    && value == "remote"
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("fetch reaches a real owner and returns its value within the bound");
+        wait_until(
+            Duration::from_secs(10),
+            "fetch reaches a real owner and returns its value within the bound",
+            async || matches!(cache_a.fetch(&unowned_key).await, Ok(Some(value)) if value == "remote"),
+        )
+        .await;
 
         assert_eq!(
             cache_a.get(&unowned_key).await,
@@ -1577,18 +1569,12 @@ mod tests {
             .insert(unowned_key, "value".to_string())
             .await
             .expect("insert");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(Some(value)) = cache_a.fetch(&unowned_key).await
-                    && value == "value"
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the value reaches a real owner first, proving the key is genuinely resident");
+        wait_until(
+            Duration::from_secs(10),
+            "the value reaches a real owner first, proving the key is genuinely resident",
+            async || matches!(cache_a.fetch(&unowned_key).await, Ok(Some(value)) if value == "value"),
+        )
+        .await;
 
         // Both of the key's real owners go down; `a` never owned it and
         // gossip has not yet had time to recompute `a`'s view around their
@@ -1653,18 +1639,12 @@ mod tests {
         // owner either.
         let owners = cache_a.owners_of(&unowned_key);
         for cache in [&cache_a, &cache_b, &cache_c] {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if let Ok(Some(value)) = cache.fetch(&unowned_key).await
-                        && value == "through-a"
-                    {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("fetch converges to the forwarded value on every node");
+            wait_until(
+                Duration::from_secs(10),
+                "fetch converges to the forwarded value on every node",
+                async || matches!(cache.fetch(&unowned_key).await, Ok(Some(value)) if value == "through-a"),
+            )
+            .await;
         }
         assert_eq!(owners.len(), 2);
 

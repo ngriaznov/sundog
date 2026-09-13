@@ -52,8 +52,15 @@ pub enum JoinError {
     /// [`crate::ClusterBuilder::node_id`] is given a merge-derived node id
     /// (one only the engine's merge-version combinator ever mints), which no
     /// real node may use.
-    #[error("invalid cluster config: {0}")]
-    InvalidConfig(String),
+    #[error("invalid cluster config: {field} is {actual}, over the {limit} limit")]
+    InvalidConfig {
+        /// The name of the offending field or parameter.
+        field: &'static str,
+        /// The bound it violates.
+        limit: u64,
+        /// The value it was given.
+        actual: u64,
+    },
 }
 
 /// Errors from operating on a named [`crate::cache::Cache`].
@@ -88,9 +95,13 @@ pub enum CacheError {
     /// entry, so anti-entropy would silently re-pull an evicted entry back.
     /// Use [`crate::store::Mode::Invalidation`] for a bounded local cache.
     #[error(
-        "cache {cache:?} combines Mode::Replicated with a finite max_capacity or tti, which anti-entropy would silently defeat"
+        "cache {cache:?} combines {mode:?} with a finite max_capacity or tti, which anti-entropy would silently defeat"
     )]
-    ReplicatedWithLocalEviction { cache: SmolStr },
+    ReplicatedWithLocalEviction {
+        cache: SmolStr,
+        /// The mode that was rejected: `Replicated` or `Distributed`.
+        mode: crate::store::Mode,
+    },
     /// The named cache is already open in this process. The registry is
     /// type-erased, so a second `open()` is always rejected, even when the
     /// key/value types match.
