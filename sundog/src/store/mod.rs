@@ -386,16 +386,6 @@ pub type PartEntries = Vec<(Part, Vec<(Bytes, Hlc)>)>;
 /// tombstone it carries, plus which peer (or local call) it came from.
 type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
 
-/// One bulk `Mode::Distributed` write already prepared by
-/// `Shard::insert_many_expiring`, not yet decided owner-vs-forward: its
-/// precomputed hash, typed key, raw key bytes, version, value, expiry, and
-/// postcard-encoded value bytes.
-type PreparedPut<K, V> = (u64, K, Bytes, Hlc, V, Option<u64>, Bytes);
-
-/// One bulk `Mode::Distributed` tombstone already prepared by
-/// `Shard::remove_many`, not yet decided owner-vs-forward.
-type PreparedTombstone<K> = (u64, K, Bytes, Hlc);
-
 /// The two ages the CRDT compaction sweep and the merge apply path work
 /// with, in milliseconds: `retire_after_ms` (`ClusterConfig::crdt_retire_after`)
 /// is how long a writer must be gone before stage one retires it and, twice
@@ -913,6 +903,15 @@ enum Incoming<V> {
         encoded: Bytes,
     },
     Tombstone,
+}
+
+/// Builds an [`Incoming::Put`], for the bulk-insert closures that reassemble one from a prepared tuple.
+fn put_incoming<V>(value: V, expires_at_ms: Option<u64>, encoded: Bytes) -> Incoming<V> {
+    Incoming::Put {
+        value,
+        expires_at_ms,
+        encoded,
+    }
 }
 
 /// One key's in-flight [`Shard::merge`] fold: accumulated in memory, across
@@ -1772,6 +1771,63 @@ where
         view.owns(bucket) || res.is_releasing(bucket)
     }
 
+    /// Dedups and sorts a bulk request list, ascending.
+    fn dedup_sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+        items.sort_unstable();
+        items.dedup();
+        items
+    }
+
+    /// Runs `compute` for a resident `bucket`, else substitutes `absent` unrun.
+    fn gated<R>(
+        residency: Option<&(Arc<OwnershipView>, Arc<ResidencySet>)>,
+        bucket: u16,
+        compute: impl FnOnce() -> R,
+        absent: R,
+    ) -> (u16, R) {
+        let value = match residency {
+            Some(residency) if !Self::is_resident_bucket(residency, bucket) => absent,
+            _ => compute(),
+        };
+        (bucket, value)
+    }
+
+    /// Dedups and sorts `buckets`, then [`Self::gated`]-maps each one; the shared shape of `bucket_lens` and `part_digests`.
+    fn gated_map<R: Clone>(
+        &self,
+        buckets: Vec<u16>,
+        compute: impl Fn(u16) -> R,
+        absent: R,
+    ) -> Vec<(u16, R)> {
+        let residency = self.residency_check();
+        Self::dedup_sorted(buckets)
+            .into_iter()
+            .map(|b| Self::gated(residency.as_ref(), b, || compute(b), absent.clone()))
+            .collect()
+    }
+
+    /// The residency-gated backfill shared by `entries_for_buckets` and `entries_for_parts`.
+    fn resident_backfill<T: Ord + Copy>(
+        &self,
+        wanted: Vec<T>,
+        bucket_of: impl Fn(T) -> u16,
+        query: impl FnOnce(Vec<T>) -> Vec<(T, Vec<(Bytes, Hlc)>)>,
+    ) -> Vec<(T, Vec<(Bytes, Hlc)>)> {
+        let wanted = Self::dedup_sorted(wanted);
+        match self.residency_check() {
+            Some(residency) => {
+                let (resident, unresident): (Vec<T>, Vec<T>) = wanted
+                    .into_iter()
+                    .partition(|&t| Self::is_resident_bucket(&residency, bucket_of(t)));
+                let mut entries = query(resident);
+                entries.extend(unresident.into_iter().map(|t| (t, Vec::new())));
+                entries.sort_unstable_by_key(|&(t, _)| t);
+                entries
+            }
+            None => query(wanted),
+        }
+    }
+
     /// Non-owner write path: builds the [`WireRecord`] a
     /// `Mode::Distributed` write for a bucket this node does not own fans
     /// out, without ever touching `engine`; see the store module's
@@ -1830,66 +1886,42 @@ where
         }
     }
 
-    /// [`Shard::insert_many`]'s bulk counterpart to [`Shard::forward_write`]:
-    /// forwards every already-prepared, unowned put in `prepared`, chunked
-    /// into the fan-out queue the same [`REPLICATE_BATCH_COUNT`] increments
-    /// [`Shard::hand_off_bulk`] already flushes at, so a large mixed batch
-    /// never holds every forwarded record in memory until the end.
-    fn forward_prepared_puts(&self, prepared: Vec<PreparedPut<K, V>>) -> bool {
-        if prepared.is_empty() {
-            return true;
-        }
-        let total = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
-        let mut landed = Vec::new();
-        for (_, key, key_bytes, ver, value, expires_at_ms, encoded) in prepared {
-            let incoming = Incoming::Put {
-                value,
-                expires_at_ms,
-                encoded,
-            };
-            landed.push(self.forward_write(key, key_bytes, incoming, ver));
-            if landed.len() >= REPLICATE_BATCH_COUNT
-                && !self
-                    .fan_out
-                    .extend(landed.drain(..).map(FanOutItem::Forward))
-            {
-                return false;
+    /// Splits prepared entries into owned and forwarded halves by current bucket ownership.
+    fn partition_owned<T>(&self, prepared: Vec<T>, hash: impl Fn(&T) -> u64) -> (Vec<T>, Vec<T>) {
+        match &self.ownership {
+            Some(tracker) => {
+                let view = tracker.current();
+                prepared
+                    .into_iter()
+                    .partition(|entry| view.owns(bucket_of_hash(hash(entry))))
             }
+            None => (prepared, Vec::new()),
         }
-        if !self
-            .fan_out
-            .extend(landed.drain(..).map(FanOutItem::Forward))
-        {
-            return false;
-        }
-        metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
-            .increment(total);
-        true
     }
 
-    /// [`Shard::remove_many`]'s bulk counterpart to
-    /// [`Shard::forward_prepared_puts`]: forwards every already-prepared,
-    /// unowned tombstone in `prepared`, chunked the same way.
-    fn forward_prepared_tombstones(&self, prepared: Vec<PreparedTombstone<K>>) -> bool {
+    /// [`Shard::insert_many`]'s and [`Shard::remove_many`]'s shared fan-out step, chunked into [`REPLICATE_BATCH_COUNT`] batches.
+    fn forward_prepared<T>(
+        &self,
+        prepared: Vec<T>,
+        to_forward: impl Fn(T) -> (K, Bytes, Hlc, Incoming<V>),
+    ) -> bool {
         if prepared.is_empty() {
             return true;
         }
         let total = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
         let mut landed = Vec::new();
-        for (_, key, key_bytes, ver) in prepared {
-            landed.push(self.forward_write(key, key_bytes, Incoming::Tombstone, ver));
-            if landed.len() >= REPLICATE_BATCH_COUNT
-                && !self
-                    .fan_out
-                    .extend(landed.drain(..).map(FanOutItem::Forward))
-            {
+        let flush = |landed: &mut Vec<_>| {
+            self.fan_out
+                .extend(landed.drain(..).map(FanOutItem::Forward))
+        };
+        for entry in prepared {
+            let (key, key_bytes, ver, incoming) = to_forward(entry);
+            landed.push(self.forward_write(key, key_bytes, incoming, ver));
+            if landed.len() >= REPLICATE_BATCH_COUNT && !flush(&mut landed) {
                 return false;
             }
         }
-        if !self
-            .fan_out
-            .extend(landed.drain(..).map(FanOutItem::Forward))
-        {
+        if !flush(&mut landed) {
             return false;
         }
         metrics::counter!("sundog_forwarded_writes_total", "cache" => self.name.to_string())
@@ -2135,13 +2167,15 @@ where
                             ));
                             let expires_at_ms = self.expiry_for(None);
                             self.engine.complete_fresh_load(
-                                key,
-                                &key_bytes,
-                                hash,
-                                ver,
-                                value.clone(),
-                                encoded,
-                                expires_at_ms,
+                                engine::FreshLoad {
+                                    key,
+                                    key_bytes: &key_bytes,
+                                    hash,
+                                    ver,
+                                    value: value.clone(),
+                                    encoded,
+                                    expires_at_ms,
+                                },
                                 self.now_ms(),
                                 &inflight,
                             );
@@ -2478,22 +2512,32 @@ where
         // this node does not own before the owned group's ordinary
         // by-stripe apply below: a forwarded entry never reaches `engine`,
         // matching `Shard::insert`'s single-write guard.
-        let (owned_prepared, forwarded_prepared) = match &self.ownership {
-            Some(tracker) => {
-                let view = tracker.current();
-                prepared
-                    .into_iter()
-                    .partition(|entry| view.owns(bucket_of_hash(entry.0)))
-            }
-            None => (prepared, Vec::new()),
-        };
-        if !self.forward_prepared_puts(forwarded_prepared) {
+        let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
+        if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver, v, e, enc)| {
+            (key, key_bytes, ver, put_incoming(v, e, enc))
+        }) {
             return Err(self.closed());
         }
 
+        self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver, v, e, enc)| {
+            (hash, key, key_bytes, ver, put_incoming(v, e, enc))
+        });
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Shard::insert_many_expiring`]'s and [`Shard::remove_many`]'s shared apply step: groups by stripe, applies each under one lock.
+    fn apply_grouped<T>(
+        &self,
+        prepared: Vec<T>,
+        to_batch_entry: impl Fn(T) -> (u64, K, Bytes, Hlc, Incoming<V>),
+    ) {
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for entry in owned_prepared {
-            by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
+        for entry in prepared {
+            let batch_entry = to_batch_entry(entry);
+            by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push(batch_entry);
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<K> = Vec::new();
@@ -2501,27 +2545,9 @@ where
             if group.is_empty() {
                 continue;
             }
-            let entries: Vec<_> = group
-                .into_iter()
-                .map(
-                    |(hash, key, key_bytes, ver, value, expires_at_ms, encoded)| {
-                        (
-                            hash,
-                            key,
-                            key_bytes,
-                            ver,
-                            Incoming::Put {
-                                value,
-                                expires_at_ms,
-                                encoded,
-                            },
-                        )
-                    },
-                )
-                .collect();
             let outcomes = self.engine.apply_many(
                 bucket,
-                entries,
+                group,
                 self.resolver.as_ref(),
                 self.tombstone_ttl_ms,
                 self.tombstone_max_ttl_ms,
@@ -2534,10 +2560,6 @@ where
             self.hand_off_bulk(&mut applied_keys, false);
         }
         self.hand_off_bulk(&mut applied_keys, true);
-        match failure {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
@@ -2595,48 +2617,16 @@ where
 
         // Same owner-vs-forward split as `Shard::insert_many_expiring`: a
         // forwarded tombstone never reaches `engine`.
-        let (owned_prepared, forwarded_prepared) = match &self.ownership {
-            Some(tracker) => {
-                let view = tracker.current();
-                prepared
-                    .into_iter()
-                    .partition(|entry| view.owns(bucket_of_hash(entry.0)))
-            }
-            None => (prepared, Vec::new()),
-        };
-        if !self.forward_prepared_tombstones(forwarded_prepared) {
+        let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
+        if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver)| {
+            (key, key_bytes, ver, Incoming::Tombstone)
+        }) {
             return Err(self.closed());
         }
 
-        let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for entry in owned_prepared {
-            by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
-        }
-        let now = self.now_ms();
-        let mut applied_keys: Vec<K> = Vec::new();
-        for (bucket, group) in by_stripe.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            let entries: Vec<_> = group
-                .into_iter()
-                .map(|(hash, key, key_bytes, ver)| (hash, key, key_bytes, ver, Incoming::Tombstone))
-                .collect();
-            let outcomes = self.engine.apply_many(
-                bucket,
-                entries,
-                self.resolver.as_ref(),
-                self.tombstone_ttl_ms,
-                self.tombstone_max_ttl_ms,
-                now,
-            );
-            for outcome in outcomes {
-                applied_keys.extend(outcome.key().cloned());
-                self.handle_apply_outcome(outcome, Origin::Local, false);
-            }
-            self.hand_off_bulk(&mut applied_keys, false);
-        }
-        self.hand_off_bulk(&mut applied_keys, true);
+        self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
+            (hash, key, key_bytes, ver, Incoming::Tombstone)
+        });
         Ok(())
     }
 
@@ -3090,10 +3080,9 @@ where
         {
             return Box::pin(async { Vec::new() });
         }
-        let now = self.now_ms();
         let entries = self
             .engine
-            .collect_buckets(&[bucket], now)
+            .collect_buckets(&[bucket], self.now_ms())
             .pop()
             .map(|(_, entries)| entries)
             .unwrap_or_default();
@@ -3101,92 +3090,32 @@ where
     }
 
     fn entries_for_buckets(&self, buckets: Vec<u16>) -> BoxFuture<'_, BucketEntries> {
-        let now = self.now_ms();
         // Every requested bucket exactly once, ascending, so the initiator
         // learns to push even for buckets this peer holds nothing in.
-        let mut wanted: Vec<u16> = buckets
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        wanted.sort_unstable();
-        let entries = match self.residency_check() {
-            Some(residency) => {
-                let (resident, unresident): (Vec<u16>, Vec<u16>) = wanted
-                    .into_iter()
-                    .partition(|&b| Self::is_resident_bucket(&residency, b));
-                let mut entries = self.engine.collect_buckets(&resident, now);
-                entries.extend(unresident.into_iter().map(|b| (b, Vec::new())));
-                entries.sort_unstable_by_key(|&(b, _)| b);
-                entries
-            }
-            None => self.engine.collect_buckets(&wanted, now),
-        };
+        let entries = self.resident_backfill(
+            buckets,
+            |b| b,
+            |resident| self.engine.collect_buckets(&resident, self.now_ms()),
+        );
         Box::pin(async move { entries })
     }
 
     fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
-        let mut wanted: Vec<u16> = buckets
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        wanted.sort_unstable();
-        let residency = self.residency_check();
-        let out = wanted
-            .into_iter()
-            .map(|bucket| {
-                let len = match &residency {
-                    Some(residency) if !Self::is_resident_bucket(residency, bucket) => 0,
-                    _ => self.engine.bucket_len(bucket),
-                };
-                (bucket, len)
-            })
-            .collect();
+        let out = self.gated_map(buckets, |b| self.engine.bucket_len(b), 0);
         Box::pin(async move { out })
     }
 
     fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
-        let mut wanted: Vec<u16> = buckets
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        wanted.sort_unstable();
-        let residency = self.residency_check();
-        let out = wanted
-            .into_iter()
-            .map(|bucket| {
-                let digests = match &residency {
-                    Some(residency) if !Self::is_resident_bucket(residency, bucket) => Vec::new(),
-                    _ => self.engine.part_digests(bucket),
-                };
-                (bucket, digests)
-            })
-            .collect();
+        let out = self.gated_map(buckets, |b| self.engine.part_digests(b), Vec::new());
         Box::pin(async move { out })
     }
 
     fn entries_for_parts(&self, parts: Vec<Part>) -> BoxFuture<'_, PartEntries> {
-        let now = self.now_ms();
-        let mut wanted: Vec<Part> = parts
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        wanted.sort_unstable();
-        let entries = match self.residency_check() {
-            Some(residency) => {
-                let (resident, unresident): (Vec<Part>, Vec<Part>) = wanted
-                    .into_iter()
-                    .partition(|&(b, _)| Self::is_resident_bucket(&residency, b));
-                let mut entries = self.engine.collect_parts(&resident, now);
-                entries.extend(unresident.into_iter().map(|p| (p, Vec::new())));
-                entries.sort_unstable_by_key(|&(p, _)| p);
-                entries
-            }
-            None => self.engine.collect_parts(&wanted, now),
-        };
+        let entries = self.resident_backfill(
+            parts,
+            |(bucket, _)| bucket,
+            |resident| self.engine.collect_parts(&resident, self.now_ms()),
+        );
         Box::pin(async move { entries })
     }
 
@@ -3373,7 +3302,13 @@ where
             max_entries,
         );
         let mut compacted = 0usize;
-        for (key, key_bytes, stale_ver, new_encoded) in candidates {
+        for engine::CompactCandidate {
+            key,
+            key_bytes,
+            stale_ver,
+            new_encoded,
+        } in candidates
+        {
             // Mirrors `guard_inbound`'s strict current-view rule: a
             // `Mode::Distributed` shard mid disown-grace never re-applies
             // a compacted record for a bucket its *current* view does not
@@ -3404,15 +3339,18 @@ where
             let hash = engine::hash_key_bytes(key_bytes.as_ref());
             let new_ver = compacted_version(stale_ver, new_encoded.as_ref());
             self.observe_remote(new_ver);
-            if self.engine.compact_replace_if_current(
-                &key,
-                key_bytes.as_ref(),
-                hash,
-                stale_ver,
-                new_ver,
-                value,
-                new_encoded,
-            ) {
+            if self
+                .engine
+                .compact_replace_if_current(engine::CompactReplace {
+                    key: &key,
+                    key_bytes: key_bytes.as_ref(),
+                    hash,
+                    expected_ver: stale_ver,
+                    new_ver,
+                    value,
+                    encoded: new_encoded,
+                })
+            {
                 compacted += 1;
             }
         }
@@ -5687,7 +5625,12 @@ mod tests {
             let scan = s
                 .engine
                 .compact(s.resolver.as_ref(), 1_000, &retire, true, bounds, 100);
-            let (key, key_bytes, stale_ver, new_encoded) = scan
+            let engine::CompactCandidate {
+                key,
+                key_bytes,
+                stale_ver,
+                new_encoded,
+            } = scan
                 .candidates
                 .into_iter()
                 .next()
@@ -5697,15 +5640,15 @@ mod tests {
                 .await
                 .expect("merge");
             let value = PnCounter::decode(&new_encoded).expect("decodes");
-            let applied = s.engine.compact_replace_if_current(
-                &key,
-                key_bytes.as_ref(),
-                engine::hash_key_bytes(key_bytes.as_ref()),
-                stale_ver,
-                compacted_version(stale_ver, new_encoded.as_ref()),
+            let applied = s.engine.compact_replace_if_current(engine::CompactReplace {
+                key: &key,
+                key_bytes: key_bytes.as_ref(),
+                hash: engine::hash_key_bytes(key_bytes.as_ref()),
+                expected_ver: stale_ver,
+                new_ver: compacted_version(stale_ver, new_encoded.as_ref()),
                 value,
-                new_encoded,
-            );
+                encoded: new_encoded,
+            });
             assert!(!applied, "the stale candidate is refused");
             assert_eq!(s.get(&1).await.map(|c| c.value()), Some(7));
 
@@ -7946,6 +7889,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod prop_tests;

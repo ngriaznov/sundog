@@ -105,13 +105,21 @@ pub(crate) fn hash_key_bytes(key_bytes: &[u8]) -> u64 {
     xxh3_64(key_bytes)
 }
 
+/// One record [`Engine::compact`]'s scan found a compacted form for.
+pub(crate) struct CompactCandidate<K> {
+    pub(crate) key: K,
+    pub(crate) key_bytes: Bytes,
+    pub(crate) stale_ver: Hlc,
+    pub(crate) new_encoded: Bytes,
+}
+
 /// One [`Engine::compact`] call's result: the records whose resolver
 /// produced a compacted form, each with the version it is read at, and
 /// how many stripes the call walked before its entry budget ran out. A
 /// caller that wants the whole keyspace examined keeps calling until the
 /// visited stripes add up to [`BUCKET_COUNT`](crate::store::BUCKET_COUNT).
 pub(crate) struct CompactScan<K> {
-    pub(crate) candidates: Vec<(K, Bytes, Hlc, Bytes)>,
+    pub(crate) candidates: Vec<CompactCandidate<K>>,
     pub(crate) stripes_visited: usize,
 }
 
@@ -177,6 +185,18 @@ enum Payload<V> {
     /// The value lives on disk at this location; nothing here is in RAM.
     #[cfg(feature = "spill")]
     Spilled(SpillLoc),
+}
+
+impl<V> Payload<V> {
+    /// The encoded bytes, iff still resident; `None` once spilled.
+    #[cfg_attr(not(feature = "spill"), allow(clippy::unnecessary_wraps))]
+    fn resident(&self) -> Option<&Bytes> {
+        match self {
+            Payload::Resident { encoded, .. } => Some(encoded),
+            #[cfg(feature = "spill")]
+            Payload::Spilled(_) => None,
+        }
+    }
 }
 
 /// Whether `live`'s payload is currently in RAM: eviction and spill
@@ -774,36 +794,6 @@ fn defer_to_flusher(pending_spill_weight: u64) -> bool {
     pending_spill_weight > 0
 }
 
-/// What a resident victim's spill refusal ([`SpillTier::would_accept`]
-/// declining) means for the victim itself: [`Engine::evict_victim_locked`]'s
-/// decision, driven by [`SpillTier::keep_resident_when_refused`] as set by
-/// `Shard::attach_spill` from the cache's `Mode`. Pure; unit tested
-/// directly.
-#[cfg(feature = "spill")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VictimRefusal {
-    /// Leave the victim fully resident, at its current weight, for a later
-    /// eviction pass to retry: the `Mode::Replicated`/`Mode::Distributed`
-    /// policy, since a local delete here is exactly what anti-entropy, or a
-    /// rebalance donor pull, would repair back in from every peer that
-    /// still holds the entry.
-    LeaveResident,
-    /// Fall back to the ordinary physical delete, the only behavior every
-    /// mode had before this policy existed, and still correct for
-    /// `Mode::Local`/`Mode::Invalidation`: no peer will ever repair the
-    /// entry back in, so deleting it is what keeps RAM bounded.
-    Delete,
-}
-
-#[cfg(feature = "spill")]
-fn spill_refusal_outcome(keep_resident_when_refused: bool) -> VictimRefusal {
-    if keep_resident_when_refused {
-        VictimRefusal::LeaveResident
-    } else {
-        VictimRefusal::Delete
-    }
-}
-
 /// How many of `sampled_weights` (coldest first) one lock hold evicts: the
 /// fewest that clear `over_by`, at most [`EVICTION_BATCH`], and never more
 /// than the colder half of the sample, so recency still decides under a
@@ -864,7 +854,7 @@ enum VictimOutcome {
     PendingSpill(u32, SpillJob),
     /// A configured spill tier refused this victim's hand-off
     /// ([`SpillTier::would_accept`] declining: too large, closed, or the
-    /// flush queue is full), and [`spill_refusal_outcome`] says to leave it
+    /// flush queue is full), and `keep_resident` says to leave it
     /// resident rather than delete it, the `Mode::Replicated`/
     /// `Mode::Distributed` policy `Shard::attach_spill` sets on the tier.
     /// `stripe.live` is untouched: the entry keeps its full weight and
@@ -983,6 +973,60 @@ fn prefetch_spilled_conflict_bytes<'a, K, V>(
         .collect()
 }
 
+/// One entry's identity for the versioned-apply path, in place of three positional parameters.
+pub(crate) struct EntryKey<K> {
+    hash: u64,
+    key: K,
+    key_bytes: Bytes,
+}
+
+/// An [`Incoming::Put`]'s three fields, bundled for [`apply_put`].
+pub(crate) struct PutWrite<V> {
+    value: V,
+    expires_at_ms: Option<u64>,
+    encoded: Bytes,
+}
+
+/// Borrowed engine-wide state one versioned-apply call needs, in place of a dozen positional parameters.
+pub(crate) struct ApplyCtx<'a, K, V> {
+    /// Already resolved for this entry's part; a batch apply builds a fresh one per entry.
+    digest_bucket: &'a AtomicU64,
+    total_weight: &'a AtomicU64,
+    live_count: &'a AtomicU64,
+    weigher: Option<&'a Weigher<K, V>>,
+    tti_ms: Option<u64>,
+    resolver: &'a dyn ConflictResolver,
+    #[cfg(feature = "spill")]
+    prefetched_spilled: &'a HashMap<SpillLoc, Bytes>,
+    #[cfg(feature = "spill")]
+    spill: Option<&'a SpillTier>,
+    tombstone_ttl_ms: u64,
+    tombstone_max_ttl_ms: u64,
+    now_ms: u64,
+}
+
+/// A successful [`super::Shard::get_or_load`] fill's write, for [`Engine::complete_fresh_load`].
+pub(crate) struct FreshLoad<'a, K, V> {
+    pub(crate) key: &'a K,
+    pub(crate) key_bytes: &'a Bytes,
+    pub(crate) hash: u64,
+    pub(crate) ver: Hlc,
+    pub(crate) value: V,
+    pub(crate) encoded: Bytes,
+    pub(crate) expires_at_ms: Option<u64>,
+}
+
+/// One [`Engine::compact_replace_if_current`] call's write.
+pub(crate) struct CompactReplace<'a, K, V> {
+    pub(crate) key: &'a K,
+    pub(crate) key_bytes: &'a [u8],
+    pub(crate) hash: u64,
+    pub(crate) expected_ver: Hlc,
+    pub(crate) new_ver: Hlc,
+    pub(crate) value: V,
+    pub(crate) encoded: Bytes,
+}
+
 /// The versioned-apply core: applies `incoming` at `ver` for `key` iff
 /// `resolver` picks it over whatever `stripe` holds, updating
 /// `digest_bucket`, `total_weight`, and `live_count` to match. A collision
@@ -996,30 +1040,22 @@ fn prefetch_spilled_conflict_bytes<'a, K, V>(
 /// this lock rather than treating the side as value-less. Returns whether
 /// this displaced a [`Payload::Spilled`] entry (`false` for `Rejected`);
 /// see [`Engine::note_spill_departure`].
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_locked<K, V>(
     stripe: &mut Stripe<K, V>,
-    digest_bucket: &AtomicU64,
-    total_weight: &AtomicU64,
-    live_count: &AtomicU64,
-    weigher: Option<&Weigher<K, V>>,
-    tti_ms: Option<u64>,
-    hash: u64,
-    key: K,
-    key_bytes: Bytes,
+    ctx: &ApplyCtx<'_, K, V>,
+    entry: EntryKey<K>,
     mut ver: Hlc,
     mut incoming: Incoming<V>,
-    resolver: &dyn ConflictResolver,
-    #[cfg(feature = "spill")] prefetched_spilled: &HashMap<SpillLoc, Bytes>,
-    #[cfg(feature = "spill")] spill: Option<&SpillTier>,
-    tombstone_ttl_ms: u64,
-    tombstone_max_ttl_ms: u64,
-    now_ms: u64,
 ) -> (ApplyOutcome<K, V>, bool)
 where
     K: Hash + Eq + Clone,
     V: Clone + DeserializeOwned,
 {
+    let EntryKey {
+        hash,
+        key,
+        key_bytes,
+    } = entry;
     let prior_tombstone = stripe.tombstones.get(key_bytes.as_ref()).copied();
     // `visible` is what a read at `now_ms` would see: an expired or idle
     // entry still takes part in conflict resolution and still gets displaced,
@@ -1035,17 +1071,19 @@ where
                 let encoded = match &l.payload {
                     Payload::Resident { encoded, .. } => Some(encoded.clone()),
                     #[cfg(feature = "spill")]
-                    Payload::Spilled(loc) => prefetched_spilled.get(loc).cloned().or_else(|| {
-                        spill
-                            .filter(|_| resolver.needs_value_bytes())
-                            .and_then(|tier| read_spilled_for_conflict(tier, *loc))
-                    }),
+                    Payload::Spilled(loc) => {
+                        ctx.prefetched_spilled.get(loc).cloned().or_else(|| {
+                            ctx.spill
+                                .filter(|_| ctx.resolver.needs_value_bytes())
+                                .and_then(|tier| read_spilled_for_conflict(tier, *loc))
+                        })
+                    }
                 };
                 (
                     l.ver,
                     encoded,
                     l.expires_at_ms,
-                    !absent_at(l, tti_ms, now_ms),
+                    !absent_at(l, ctx.tti_ms, ctx.now_ms),
                 )
             })
     } else {
@@ -1061,7 +1099,7 @@ where
             .and_then(|(_, enc, _, _)| enc.as_deref());
         let stored_expires_at_ms = stored_live.as_ref().and_then(|(_, _, e, _)| *e);
         match resolve_and_rebind(
-            resolver,
+            ctx.resolver,
             key_bytes.as_ref(),
             sv,
             stored_encoded,
@@ -1086,16 +1124,22 @@ where
     // Subtracts whatever this write displaces before adding the new fingerprint
     // in.
     if let Some(t) = prior_tombstone {
-        digest_bucket.fetch_xor(
+        ctx.digest_bucket.fetch_xor(
             entry_fingerprint(key_bytes.as_ref(), t.ver),
             Ordering::Relaxed,
         );
         stripe.tombstones.remove(key_bytes.as_ref());
     } else if let Some(sv) = stored_ver {
-        digest_bucket.fetch_xor(entry_fingerprint(key_bytes.as_ref(), sv), Ordering::Relaxed);
+        ctx.digest_bucket
+            .fetch_xor(entry_fingerprint(key_bytes.as_ref(), sv), Ordering::Relaxed);
     }
-    digest_bucket.fetch_xor(new_fp, Ordering::Relaxed);
+    ctx.digest_bucket.fetch_xor(new_fp, Ordering::Relaxed);
 
+    let entry = EntryKey {
+        hash,
+        key,
+        key_bytes,
+    };
     match incoming {
         Incoming::Put {
             value,
@@ -1103,33 +1147,18 @@ where
             encoded,
         } => apply_put(
             stripe,
-            total_weight,
-            live_count,
-            weigher,
-            hash,
-            key,
-            key_bytes,
+            ctx,
+            entry,
             ver,
-            value,
-            expires_at_ms,
-            encoded,
+            PutWrite {
+                value,
+                expires_at_ms,
+                encoded,
+            },
             had_live,
             was_visible,
-            now_ms,
         ),
-        Incoming::Tombstone => apply_tombstone(
-            stripe,
-            total_weight,
-            live_count,
-            hash,
-            key,
-            key_bytes,
-            ver,
-            had_live,
-            tombstone_ttl_ms,
-            tombstone_max_ttl_ms,
-            now_ms,
-        ),
+        Incoming::Tombstone => apply_tombstone(stripe, ctx, entry, ver, had_live),
     }
 }
 
@@ -1141,28 +1170,30 @@ where
 /// spilled payload. An overwrite of a spilled key always installs
 /// fresh as resident, so this is the only place such an entry departs
 /// without a matching promotion.
-#[allow(clippy::too_many_arguments)]
 fn apply_put<K, V>(
     stripe: &mut Stripe<K, V>,
-    total_weight: &AtomicU64,
-    live_count: &AtomicU64,
-    weigher: Option<&Weigher<K, V>>,
-    hash: u64,
-    key: K,
-    key_bytes: Bytes,
+    ctx: &ApplyCtx<'_, K, V>,
+    entry: EntryKey<K>,
     ver: Hlc,
-    value: V,
-    expires_at_ms: Option<u64>,
-    encoded: Bytes,
+    put: PutWrite<V>,
     had_live: bool,
     was_visible: bool,
-    now_ms: u64,
 ) -> (ApplyOutcome<K, V>, bool)
 where
     K: Hash + Eq + Clone,
     V: Clone,
 {
-    let weight = weigher.map_or(1, |w| w(&key, &value));
+    let EntryKey {
+        hash,
+        key,
+        key_bytes,
+    } = entry;
+    let PutWrite {
+        value,
+        expires_at_ms,
+        encoded,
+    } = put;
+    let weight = ctx.weigher.map_or(1, |w| w(&key, &value));
     let removed = if had_live {
         remove_live(&mut stripe.live, hash, key_bytes.as_ref())
     } else {
@@ -1184,18 +1215,19 @@ where
                 encoded,
             },
             weight,
-            last_access_ms: AtomicU64::new(now_ms),
+            last_access_ms: AtomicU64::new(ctx.now_ms),
         },
         hasher_for,
     );
     if let Some(exp) = expires_at_ms {
         stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
     }
-    total_weight.fetch_add(u64::from(weight), Ordering::Relaxed);
+    ctx.total_weight
+        .fetch_add(u64::from(weight), Ordering::Relaxed);
     if let Some(ow) = old_weight {
-        total_weight.fetch_sub(u64::from(ow), Ordering::Relaxed);
+        ctx.total_weight.fetch_sub(u64::from(ow), Ordering::Relaxed);
     } else {
-        live_count.fetch_add(1, Ordering::Relaxed);
+        ctx.live_count.fetch_add(1, Ordering::Relaxed);
     }
     (
         ApplyOutcome::Put {
@@ -1211,35 +1243,34 @@ where
 /// displaced live entry from total weight and `live_count`, then records the
 /// tombstone with its two GC deadlines. The returned `bool` is whether the
 /// displaced entry, if any, held a spilled payload.
-#[allow(clippy::too_many_arguments)]
 fn apply_tombstone<K, V>(
     stripe: &mut Stripe<K, V>,
-    total_weight: &AtomicU64,
-    live_count: &AtomicU64,
-    hash: u64,
-    key: K,
-    key_bytes: Bytes,
+    ctx: &ApplyCtx<'_, K, V>,
+    entry: EntryKey<K>,
     ver: Hlc,
     had_live: bool,
-    tombstone_ttl_ms: u64,
-    tombstone_max_ttl_ms: u64,
-    now_ms: u64,
 ) -> (ApplyOutcome<K, V>, bool)
 where
     K: Hash + Eq,
 {
+    let EntryKey {
+        hash,
+        key,
+        key_bytes,
+    } = entry;
     let mut displaced_spilled = false;
     if had_live && let Some(removed) = remove_live(&mut stripe.live, hash, key_bytes.as_ref()) {
-        total_weight.fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
-        live_count.fetch_sub(1, Ordering::Relaxed);
+        ctx.total_weight
+            .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
+        ctx.live_count.fetch_sub(1, Ordering::Relaxed);
         displaced_spilled = removed.was_spilled;
     }
     stripe.tombstones.insert(
         key_bytes,
         Tombstone {
             ver,
-            ttl_deadline_ms: now_ms.saturating_add(tombstone_ttl_ms),
-            max_deadline_ms: now_ms.saturating_add(tombstone_max_ttl_ms),
+            ttl_deadline_ms: ctx.now_ms.saturating_add(ctx.tombstone_ttl_ms),
+            max_deadline_ms: ctx.now_ms.saturating_add(ctx.tombstone_max_ttl_ms),
         },
     );
     (ApplyOutcome::Tombstoned { key }, displaced_spilled)
@@ -1662,16 +1693,12 @@ where
         if self.is_absent(live, now_ms) {
             return None;
         }
-        match &live.payload {
-            Payload::Resident { encoded, .. } => Some(WireRecord {
-                key: Bytes::copy_from_slice(key_bytes),
-                value: Some(encoded.clone()),
-                ver: live.ver,
-                expires_at_ms: live.expires_at_ms,
-            }),
-            #[cfg(feature = "spill")]
-            Payload::Spilled(_) => None,
-        }
+        live.payload.resident().map(|encoded| WireRecord {
+            key: Bytes::copy_from_slice(key_bytes),
+            value: Some(encoded.clone()),
+            ver: live.ver,
+            expires_at_ms: live.expires_at_ms,
+        })
     }
 
     /// [`Engine::record_for`] for every requested bucket, one stripe lock each:
@@ -1814,15 +1841,13 @@ where
                     .live
                     .iter()
                     .filter(|live| !self.is_absent(live, now_ms))
-                    .filter_map(|live| match &live.payload {
-                        Payload::Resident { encoded, .. } => Some(WireRecord {
+                    .filter_map(|live| {
+                        live.payload.resident().map(|encoded| WireRecord {
                             key: live.key_bytes.clone(),
                             value: Some(encoded.clone()),
                             ver: live.ver,
                             expires_at_ms: live.expires_at_ms,
-                        }),
-                        #[cfg(feature = "spill")]
-                        Payload::Spilled(_) => None,
+                        })
                     }),
             );
             out.extend(stripe.tombstones.iter().map(|(key_bytes, t)| WireRecord {
@@ -2040,12 +2065,12 @@ where
                     quiet,
                     bounds,
                 ) {
-                    out.push((
-                        live.key.clone(),
-                        live.key_bytes.clone(),
-                        live.ver,
+                    out.push(CompactCandidate {
+                        key: live.key.clone(),
+                        key_bytes: live.key_bytes.clone(),
+                        stale_ver: live.ver,
                         new_encoded,
-                    ));
+                    });
                 }
             }
             drop(stripe);
@@ -2062,8 +2087,8 @@ where
     }
 
     /// Replaces a live, resident entry's payload and version with
-    /// `value`/`encoded`/`new_ver` iff it is still exactly at
-    /// `expected_ver`: the version-gated, no-merge write
+    /// `replace.value`/`replace.encoded`/`replace.new_ver` iff it is still
+    /// exactly at `replace.expected_ver`: the version-gated, no-merge write
     /// [`super::ShardOps::compact_pass`] uses for every [`Self::compact`]
     /// candidate, in place of the ordinary merge-based apply path. A
     /// merge-based apply would silently restore the receipt a compaction
@@ -2076,17 +2101,16 @@ where
     /// `store::prop_tests` for why this still converges. Returns `false`, a
     /// no-op, once the entry has moved on: a different version, not live,
     /// or currently spilled.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn compact_replace_if_current(
-        &self,
-        key: &K,
-        key_bytes: &[u8],
-        hash: u64,
-        expected_ver: Hlc,
-        new_ver: Hlc,
-        value: V,
-        encoded: Bytes,
-    ) -> bool {
+    pub(crate) fn compact_replace_if_current(&self, replace: CompactReplace<'_, K, V>) -> bool {
+        let CompactReplace {
+            key,
+            key_bytes,
+            hash,
+            expected_ver,
+            new_ver,
+            value,
+            encoded,
+        } = replace;
         let bucket = stripe_index_from_hash(hash);
         let part = part_index_from_hash(hash);
         let (old_weight, new_weight) = {
@@ -2171,7 +2195,7 @@ where
     /// anymore; [`SpillAttempt::Refused`] when
     /// [`SpillTier::would_accept`] declines (too large, closed, flush queue
     /// full), leaving [`Engine::evict_victim_locked`] to decide the
-    /// victim's fate via [`spill_refusal_outcome`]. On
+    /// victim's fate from `keep_resident`. On
     /// [`SpillAttempt::Committed`], the weight returned is already zeroed
     /// on the entry in place, and the job is the caller's to hand to
     /// [`Engine::finish_spill_handoff`] once the stripe lock is released;
@@ -2244,7 +2268,7 @@ where
     /// to it: weight zeroed in place, reported as
     /// [`VictimOutcome::PendingSpill`], while `stripe.live`, the digest,
     /// and `live_count` stay untouched until the flusher installs it. On a
-    /// refusal, [`spill_refusal_outcome`] picks between
+    /// refusal, `keep_resident` picks between
     /// [`VictimOutcome::Deferred`] (victim stays resident, untouched
     /// weight) and the ordinary remove-and-XOR path,
     /// [`VictimOutcome::Removed`]; a vanished entry reports
@@ -2264,7 +2288,7 @@ where
                 return VictimOutcome::PendingSpill(weight, job);
             }
             SpillAttempt::Refused { keep_resident } => {
-                if spill_refusal_outcome(keep_resident) == VictimRefusal::LeaveResident {
+                if keep_resident {
                     return VictimOutcome::Deferred;
                 }
             }
@@ -2286,20 +2310,30 @@ where
         VictimOutcome::Removed(removed.weight)
     }
 
+    /// The sampling window [`Engine::evict_one_sampled`] and [`Engine::evict_batch_sampled`] both draw from.
+    fn sample_candidates<'s>(
+        &self,
+        stripe: &'s Stripe<K, V>,
+        sample_size: usize,
+    ) -> impl Iterator<Item = &'s Live<K, V>> {
+        let offset = self.sample_offset(stripe.live.len());
+        stripe
+            .live
+            .iter()
+            .skip(offset)
+            .chain(stripe.live.iter().take(offset))
+            .take(sample_size)
+            .filter(|live| is_spill_candidate(live))
+    }
+
     /// Evicts the coldest of up to [`EVICTION_SAMPLE`] resident entries in
     /// `bucket`. Returns what happened: nothing to evict, a physical
     /// removal, or a hand-off to the spill tier.
     fn evict_one_sampled(&self, bucket: usize) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
-        let offset = self.sample_offset(stripe.live.len());
-        let Some(victim_bytes) = stripe
-            .live
-            .iter()
-            .skip(offset)
-            .chain(stripe.live.iter().take(offset))
-            .take(EVICTION_SAMPLE)
-            .filter(|live| is_spill_candidate(live))
+        let Some(victim_bytes) = self
+            .sample_candidates(&stripe, EVICTION_SAMPLE)
             .min_by_key(|live| live.last_access_ms.load(Ordering::Relaxed))
             .map(|live| live.key_bytes.clone())
         else {
@@ -2353,14 +2387,8 @@ where
     fn evict_batch_sampled(&self, bucket: usize, over_by: u64) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
-        let offset = self.sample_offset(stripe.live.len());
-        let mut sampled: Vec<(Bytes, u64, u32)> = stripe
-            .live
-            .iter()
-            .skip(offset)
-            .chain(stripe.live.iter().take(offset))
-            .take(EVICTION_BATCH_SAMPLE)
-            .filter(|live| is_spill_candidate(live))
+        let mut sampled: Vec<(Bytes, u64, u32)> = self
+            .sample_candidates(&stripe, EVICTION_BATCH_SAMPLE)
             .map(|live| {
                 (
                     live.key_bytes.clone(),
@@ -2557,27 +2585,31 @@ where
                     continue;
                 };
                 let part = part_index_from_hash(hash);
-                let digest_bucket = &self.digest[digest_slot(bucket, part)];
-                let (outcome, displaced_spilled) = apply_locked(
-                    &mut stripe,
-                    digest_bucket,
-                    &self.total_weight,
-                    &self.live_count,
-                    self.weigher.as_ref(),
-                    self.tti_ms,
-                    hash,
-                    key,
-                    key_bytes,
-                    ver,
-                    incoming,
+                let ctx = ApplyCtx {
+                    digest_bucket: &self.digest[digest_slot(bucket, part)],
+                    total_weight: &self.total_weight,
+                    live_count: &self.live_count,
+                    weigher: self.weigher.as_ref(),
+                    tti_ms: self.tti_ms,
                     resolver,
                     #[cfg(feature = "spill")]
-                    &prefetched_spilled,
+                    prefetched_spilled: &prefetched_spilled,
                     #[cfg(feature = "spill")]
-                    self.spill().map(Arc::as_ref),
+                    spill: self.spill().map(Arc::as_ref),
                     tombstone_ttl_ms,
                     tombstone_max_ttl_ms,
                     now_ms,
+                };
+                let (outcome, displaced_spilled) = apply_locked(
+                    &mut stripe,
+                    &ctx,
+                    EntryKey {
+                        hash,
+                        key,
+                        key_bytes,
+                    },
+                    ver,
+                    incoming,
                 );
                 self.note_spill_departure(displaced_spilled);
                 wrote |= matches!(outcome, ApplyOutcome::Put { .. });
@@ -2588,6 +2620,25 @@ where
             self.enforce_capacity(bucket);
         }
         outcomes
+    }
+
+    /// Folds a [`RemovedLive`]'s departure into digest, weight, count, and spill bookkeeping; `keep_count` skips the live-count decrement for a caller about to insert a replacement.
+    fn account_removed(
+        &self,
+        bucket: usize,
+        part: usize,
+        key_bytes: &[u8],
+        removed: &RemovedLive,
+        keep_count: bool,
+    ) {
+        self.digest[digest_slot(bucket, part)]
+            .fetch_xor(entry_fingerprint(key_bytes, removed.ver), Ordering::Relaxed);
+        self.total_weight
+            .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
+        if !keep_count {
+            self.live_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.note_spill_departure(removed.was_spilled);
     }
 
     /// Applies an inbound [`super::ShardOps::invalidate`]: drops the live entry
@@ -2614,14 +2665,10 @@ where
         }
         let removed = remove_live(&mut stripe.live, hash, key_bytes)?;
         drop(stripe);
+        let ver_out = removed.ver;
         let part = part_index_from_hash(hash);
-        self.digest[digest_slot(bucket, part)]
-            .fetch_xor(entry_fingerprint(key_bytes, removed.ver), Ordering::Relaxed);
-        self.total_weight
-            .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
-        self.live_count.fetch_sub(1, Ordering::Relaxed);
-        self.note_spill_departure(removed.was_spilled);
-        Some(removed.ver)
+        self.account_removed(bucket, part, key_bytes, &removed, false);
+        Some(ver_out)
     }
 
     /// Drops the local live entry at `key_bytes` unconditionally, no version
@@ -2633,12 +2680,7 @@ where
         if let Some(removed) = remove_live(&mut stripe.live, hash, key_bytes) {
             drop(stripe);
             let part = part_index_from_hash(hash);
-            self.digest[digest_slot(bucket, part)]
-                .fetch_xor(entry_fingerprint(key_bytes, removed.ver), Ordering::Relaxed);
-            self.total_weight
-                .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
-            self.live_count.fetch_sub(1, Ordering::Relaxed);
-            self.note_spill_departure(removed.was_spilled);
+            self.account_removed(bucket, part, key_bytes, &removed, false);
         }
     }
 
@@ -2766,50 +2808,47 @@ where
     }
 
     /// Applies a successful [`super::Shard::get_or_load`] fill: removes any
-    /// prior tombstone or live entry for `key`, unconditionally installs
-    /// the loader's value, corrects `live_count` for the net change, and
-    /// removes the `inflight` entry, all under one stripe write-lock
-    /// acquisition. Returns whether a live entry already existed.
-    #[allow(clippy::too_many_arguments)]
+    /// prior tombstone or live entry for `write.key`, unconditionally
+    /// installs the loader's value, corrects `live_count` for the net
+    /// change, and removes the `inflight` entry, all under one stripe
+    /// write-lock acquisition. Returns whether a live entry already
+    /// existed.
     pub(crate) fn complete_fresh_load(
         &self,
-        key: &K,
-        key_bytes: &Bytes,
-        hash: u64,
-        ver: Hlc,
-        value: V,
-        encoded: Bytes,
-        expires_at_ms: Option<u64>,
+        write: FreshLoad<'_, K, V>,
         now_ms: u64,
         inflight: &Inflight<V>,
     ) -> bool {
+        let FreshLoad {
+            key,
+            key_bytes,
+            hash,
+            ver,
+            value,
+            encoded,
+            expires_at_ms,
+        } = write;
         let bucket = stripe_index_from_hash(hash);
         let part = part_index_from_hash(hash);
-        let mut displaced_spilled = false;
         let had_live = {
             let mut stripe = self.stripes[bucket].write();
             stripe.inflight.remove(key_bytes.as_ref());
-            let digest_bucket = &self.digest[digest_slot(bucket, part)];
             let mut had_live = false;
             if let Some(t) = stripe.tombstones.remove(key_bytes.as_ref()) {
-                digest_bucket.fetch_xor(
+                self.digest[digest_slot(bucket, part)].fetch_xor(
                     entry_fingerprint(key_bytes.as_ref(), t.ver),
                     Ordering::Relaxed,
                 );
             } else if let Some(removed) = remove_live(&mut stripe.live, hash, key_bytes.as_ref()) {
                 had_live = true;
-                digest_bucket.fetch_xor(
-                    entry_fingerprint(key_bytes.as_ref(), removed.ver),
-                    Ordering::Relaxed,
-                );
-                self.total_weight
-                    .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
-                displaced_spilled = removed.was_spilled;
+                // A replacement is about to land below, so `live_count` nets
+                // to no change: `keep_count = true`.
+                self.account_removed(bucket, part, key_bytes.as_ref(), &removed, true);
             }
             if !had_live {
                 self.live_count.fetch_add(1, Ordering::Relaxed);
             }
-            digest_bucket.fetch_xor(
+            self.digest[digest_slot(bucket, part)].fetch_xor(
                 entry_fingerprint(key_bytes.as_ref(), ver),
                 Ordering::Relaxed,
             );
@@ -2834,7 +2873,6 @@ where
                 .fetch_add(u64::from(weight), Ordering::Relaxed);
             had_live
         };
-        self.note_spill_departure(displaced_spilled);
         inflight.finish();
         self.enforce_capacity(bucket);
         had_live
@@ -3272,7 +3310,40 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Always empty: every raw `apply_locked` test site below skips real spill prefetch.
+    #[cfg(feature = "spill")]
+    fn empty_prefetched() -> &'static HashMap<SpillLoc, Bytes> {
+        static EMPTY: std::sync::OnceLock<HashMap<SpillLoc, Bytes>> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(HashMap::new)
+    }
+
+    /// An [`ApplyCtx`] against `engine`'s own weigher/tti, no spill prefetch or tier, for a test driving [`apply_locked`] directly.
+    fn test_ctx<'a, K, V>(
+        engine: &'a Engine<K, V>,
+        bucket: usize,
+        hash: u64,
+        resolver: &'a dyn ConflictResolver,
+        tombstone_ttl_ms: u64,
+        tombstone_max_ttl_ms: u64,
+        now_ms: u64,
+    ) -> ApplyCtx<'a, K, V> {
+        ApplyCtx {
+            digest_bucket: &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
+            total_weight: &engine.total_weight,
+            live_count: &engine.live_count,
+            weigher: engine.weigher.as_ref(),
+            tti_ms: engine.tti_ms,
+            resolver,
+            #[cfg(feature = "spill")]
+            prefetched_spilled: empty_prefetched(),
+            #[cfg(feature = "spill")]
+            spill: None,
+            tombstone_ttl_ms,
+            tombstone_max_ttl_ms,
+            now_ms,
+        }
+    }
+
     fn put<K, V>(
         engine: &Engine<K, V>,
         key: K,
@@ -3286,54 +3357,16 @@ mod tests {
         K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
         V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     {
-        let hash = hash_key_bytes(key_bytes.as_ref());
-        let encoded = Bytes::from(postcard::to_stdvec(&value).expect("test value encodes"));
-        let bucket = stripe_index_from_hash(hash);
-        let resolver = LwwResolver;
-        // Mirrors `Engine::apply_many`'s own prefetch: reads any currently-
-        // spilled stored side back off disk before the write lock below is
-        // ever taken, so a test driving writes through this helper exercises
-        // `apply_locked`'s real lock discipline, not a shortcut around it.
-        #[cfg(feature = "spill")]
-        let prefetched_spilled = prefetch_spilled_conflict_bytes(
-            &engine.stripes[bucket],
-            std::iter::once((hash, &key_bytes)),
-            &resolver,
-            engine.spill().map(Arc::as_ref),
-        );
-        let (outcome, displaced_spilled) = {
-            let mut stripe = engine.stripes[bucket].write();
-            apply_locked(
-                &mut stripe,
-                &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                &engine.total_weight,
-                &engine.live_count,
-                engine.weigher.as_ref(),
-                engine.tti_ms,
-                hash,
-                key,
-                key_bytes,
-                ver,
-                Incoming::Put {
-                    value,
-                    expires_at_ms,
-                    encoded,
-                },
-                &resolver,
-                #[cfg(feature = "spill")]
-                &prefetched_spilled,
-                #[cfg(feature = "spill")]
-                engine.spill().map(Arc::as_ref),
-                60_000,
-                600_000,
-                now_ms,
-            )
-        };
-        // Mirrors `Engine::apply_many`'s own bookkeeping, so a test driving
-        // writes through this helper sees the same `sundog_spill_entries`
-        // behavior a real caller would.
-        engine.note_spill_departure(displaced_spilled);
-        outcome
+        put_with_resolver(
+            engine,
+            key,
+            key_bytes,
+            value,
+            ver,
+            expires_at_ms,
+            now_ms,
+            &LwwResolver,
+        )
     }
 
     /// [`put`]'s tombstone counterpart, for a test that needs a real
@@ -3354,26 +3387,31 @@ mod tests {
             engine.spill().map(Arc::as_ref),
         );
         let mut stripe = engine.stripes[bucket].write();
+        let ctx = ApplyCtx {
+            digest_bucket: &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
+            total_weight: &engine.total_weight,
+            live_count: &engine.live_count,
+            weigher: engine.weigher.as_ref(),
+            tti_ms: engine.tti_ms,
+            resolver: &resolver,
+            #[cfg(feature = "spill")]
+            prefetched_spilled: &prefetched_spilled,
+            #[cfg(feature = "spill")]
+            spill: engine.spill().map(Arc::as_ref),
+            tombstone_ttl_ms: 60_000,
+            tombstone_max_ttl_ms: 600_000,
+            now_ms,
+        };
         let _ = apply_locked(
             &mut stripe,
-            &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-            &engine.total_weight,
-            &engine.live_count,
-            engine.weigher.as_ref(),
-            engine.tti_ms,
-            hash,
-            key,
-            key_bytes,
+            &ctx,
+            EntryKey {
+                hash,
+                key,
+                key_bytes,
+            },
             ver,
             Incoming::Tombstone,
-            &resolver,
-            #[cfg(feature = "spill")]
-            &prefetched_spilled,
-            #[cfg(feature = "spill")]
-            engine.spill().map(Arc::as_ref),
-            60_000,
-            600_000,
-            now_ms,
         );
     }
 
@@ -3409,32 +3447,37 @@ mod tests {
             resolver,
             engine.spill().map(Arc::as_ref),
         );
+        let ctx = ApplyCtx {
+            digest_bucket: &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
+            total_weight: &engine.total_weight,
+            live_count: &engine.live_count,
+            weigher: engine.weigher.as_ref(),
+            tti_ms: engine.tti_ms,
+            resolver,
+            #[cfg(feature = "spill")]
+            prefetched_spilled: &prefetched_spilled,
+            #[cfg(feature = "spill")]
+            spill: engine.spill().map(Arc::as_ref),
+            tombstone_ttl_ms: 60_000,
+            tombstone_max_ttl_ms: 600_000,
+            now_ms,
+        };
         let (outcome, displaced_spilled) = {
             let mut stripe = engine.stripes[bucket].write();
             apply_locked(
                 &mut stripe,
-                &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                &engine.total_weight,
-                &engine.live_count,
-                engine.weigher.as_ref(),
-                engine.tti_ms,
-                hash,
-                key,
-                key_bytes,
+                &ctx,
+                EntryKey {
+                    hash,
+                    key,
+                    key_bytes,
+                },
                 ver,
                 Incoming::Put {
                     value,
                     expires_at_ms,
                     encoded,
                 },
-                resolver,
-                #[cfg(feature = "spill")]
-                &prefetched_spilled,
-                #[cfg(feature = "spill")]
-                engine.spill().map(Arc::as_ref),
-                60_000,
-                600_000,
-                now_ms,
             )
         };
         engine.note_spill_departure(displaced_spilled);
@@ -4018,32 +4061,7 @@ mod tests {
         let hash = hash_key_bytes(kb.as_ref());
         let bucket = stripe_index_from_hash(hash);
         let _ = put(&engine, key, kb.clone(), "a".into(), hlc(1, 1), None, 0);
-
-        {
-            let mut stripe = engine.stripe_lock(bucket).write();
-            let resolver = LwwResolver;
-            let _ = apply_locked(
-                &mut stripe,
-                &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                &engine.total_weight,
-                &engine.live_count,
-                engine.weigher.as_ref(),
-                engine.tti_ms,
-                hash,
-                key,
-                kb.clone(),
-                hlc(2, 1),
-                Incoming::Tombstone,
-                &resolver,
-                #[cfg(feature = "spill")]
-                &HashMap::new(),
-                #[cfg(feature = "spill")]
-                None,
-                60_000,
-                600_000,
-                0,
-            );
-        }
+        tombstone(&engine, key, kb.clone(), hlc(2, 1), 0);
         assert_eq!(engine.get(&key, 0), None);
 
         let bucket_u16 = u16::try_from(bucket).expect("invariant: bucket < BUCKET_COUNT");
@@ -4280,13 +4298,15 @@ mod tests {
                             let value = "loaded-once".to_string();
                             let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encode"));
                             let had_live = engine.complete_fresh_load(
-                                &key,
-                                &kb,
-                                hash,
-                                hlc(1, 1),
-                                value.clone(),
-                                encoded,
-                                None,
+                                FreshLoad {
+                                    key: &key,
+                                    key_bytes: &kb,
+                                    hash,
+                                    ver: hlc(1, 1),
+                                    value: value.clone(),
+                                    encoded,
+                                    expires_at_ms: None,
+                                },
                                 0,
                                 &inflight,
                             );
@@ -4391,13 +4411,15 @@ mod tests {
         // The owner completes before the waiter ever polls its receiver.
         let encoded = Bytes::from(postcard::to_stdvec("late").expect("encode"));
         engine.complete_fresh_load(
-            &key,
-            &kb,
-            hash,
-            hlc(1, 1),
-            "late".to_string(),
-            encoded,
-            None,
+            FreshLoad {
+                key: &key,
+                key_bytes: &kb,
+                hash,
+                ver: hlc(1, 1),
+                value: "late".to_string(),
+                encoded,
+                expires_at_ms: None,
+            },
             0,
             &inflight,
         );
@@ -4433,34 +4455,9 @@ mod tests {
         let key = 21u32;
         let kb = key_bytes(key);
         let hash = hash_key_bytes(kb.as_ref());
-        let bucket = stripe_index_from_hash(hash);
 
         let _ = put(&engine, key, kb.clone(), "old".into(), hlc(1, 1), None, 0);
-        {
-            let mut stripe = engine.stripe_lock(bucket).write();
-            let resolver = LwwResolver;
-            let _ = apply_locked(
-                &mut stripe,
-                &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                &engine.total_weight,
-                &engine.live_count,
-                engine.weigher.as_ref(),
-                engine.tti_ms,
-                hash,
-                key,
-                kb.clone(),
-                hlc(2, 1),
-                Incoming::Tombstone,
-                &resolver,
-                #[cfg(feature = "spill")]
-                &HashMap::new(),
-                #[cfg(feature = "spill")]
-                None,
-                60_000,
-                600_000,
-                0,
-            );
-        }
+        tombstone(&engine, key, kb.clone(), hlc(2, 1), 0);
         assert_eq!(
             engine.get(&key, 0),
             None,
@@ -4472,13 +4469,15 @@ mod tests {
         };
         let encoded = Bytes::from(postcard::to_stdvec("fresh").expect("encode"));
         let had_live = engine.complete_fresh_load(
-            &key,
-            &kb,
-            hash,
-            hlc(3, 1),
-            "fresh".to_string(),
-            encoded,
-            None,
+            FreshLoad {
+                key: &key,
+                key_bytes: &kb,
+                hash,
+                ver: hlc(3, 1),
+                value: "fresh".to_string(),
+                encoded,
+                expires_at_ms: None,
+            },
             0,
             &inflight,
         );
@@ -4517,13 +4516,15 @@ mod tests {
 
         let encoded = Bytes::from(postcard::to_stdvec("loaded").expect("encode"));
         let had_live = engine.complete_fresh_load(
-            &key,
-            &kb,
-            hash,
-            hlc(1, 1),
-            "loaded".to_string(),
-            encoded,
-            None,
+            FreshLoad {
+                key: &key,
+                key_bytes: &kb,
+                hash,
+                ver: hlc(1, 1),
+                value: "loaded".to_string(),
+                encoded,
+                expires_at_ms: None,
+            },
             0,
             &inflight,
         );
@@ -4564,34 +4565,13 @@ mod tests {
             let engine = Arc::clone(&engine);
             tasks.spawn(async move {
                 let kb = key_bytes(k);
-                let hash = hash_key_bytes(kb.as_ref());
-                let bucket = stripe_index_from_hash(hash);
-                let mut stripe = engine.stripe_lock(bucket).write();
-                let resolver = LwwResolver;
-                let encoded = Bytes::from(postcard::to_stdvec(&k.to_string()).expect("encode"));
-                let _ = apply_locked(
-                    &mut stripe,
-                    &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                    &engine.total_weight,
-                    &engine.live_count,
-                    None,
-                    None,
-                    hash,
+                let _ = put(
+                    &engine,
                     k,
                     kb,
+                    k.to_string(),
                     hlc(u64::from(k) + 1, 1),
-                    Incoming::Put {
-                        value: k.to_string(),
-                        expires_at_ms: None,
-                        encoded,
-                    },
-                    &resolver,
-                    #[cfg(feature = "spill")]
-                    &HashMap::new(),
-                    #[cfg(feature = "spill")]
                     None,
-                    60_000,
-                    600_000,
                     0,
                 );
             });
@@ -4887,6 +4867,28 @@ mod tests {
         assert_eq!(engine.evict_one_scanning(0), None);
     }
 
+    /// [`digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions`]'s
+    /// shared step: applies `incoming` directly through [`apply_locked`],
+    /// under a fresh stripe lock, with a 1s/10s tombstone deadline and an
+    /// [`LwwResolver`].
+    fn apply_direct<K, V>(
+        engine: &Engine<K, V>,
+        bucket: usize,
+        entry: EntryKey<K>,
+        ver: Hlc,
+        incoming: Incoming<V>,
+        now_ms: u64,
+    ) where
+        K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+    {
+        let hash = entry.hash;
+        let mut stripe = engine.stripe_lock(bucket).write();
+        let resolver = LwwResolver;
+        let apply_ctx = test_ctx(engine, bucket, hash, &resolver, 1_000, 10_000, now_ms);
+        let _ = apply_locked(&mut stripe, &apply_ctx, entry, ver, incoming);
+    }
+
     #[test]
     fn digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions() {
         use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
@@ -4907,59 +4909,36 @@ mod tests {
                     let ver = clock.now(now);
                     let value = u64::from(key) * 31;
                     let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encode"));
-                    let mut stripe = engine.stripe_lock(bucket).write();
-                    let resolver = LwwResolver;
-                    let _ = apply_locked(
-                        &mut stripe,
-                        &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                        &engine.total_weight,
-                        &engine.live_count,
-                        engine.weigher.as_ref(),
-                        engine.tti_ms,
-                        hash,
-                        key,
-                        kb,
+                    apply_direct(
+                        &engine,
+                        bucket,
+                        EntryKey {
+                            hash,
+                            key,
+                            key_bytes: kb,
+                        },
                         ver,
                         Incoming::Put {
                             value,
                             expires_at_ms: Some(now + 500),
                             encoded,
                         },
-                        &resolver,
-                        #[cfg(feature = "spill")]
-                        &HashMap::new(),
-                        #[cfg(feature = "spill")]
-                        None,
-                        1_000,
-                        10_000,
                         now,
                     );
-                    drop(stripe);
                     engine.enforce_capacity(bucket);
                 }
                 1 => {
                     let ver = clock.now(now);
-                    let mut stripe = engine.stripe_lock(bucket).write();
-                    let resolver = LwwResolver;
-                    let _ = apply_locked(
-                        &mut stripe,
-                        &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                        &engine.total_weight,
-                        &engine.live_count,
-                        engine.weigher.as_ref(),
-                        engine.tti_ms,
-                        hash,
-                        key,
-                        kb,
+                    apply_direct(
+                        &engine,
+                        bucket,
+                        EntryKey {
+                            hash,
+                            key,
+                            key_bytes: kb,
+                        },
                         ver,
                         Incoming::Tombstone,
-                        &resolver,
-                        #[cfg(feature = "spill")]
-                        &HashMap::new(),
-                        #[cfg(feature = "spill")]
-                        None,
-                        1_000,
-                        10_000,
                         now,
                     );
                 }
@@ -5121,32 +5100,7 @@ mod tests {
         let _ = put(&engine, key_a, kb_a.clone(), "a".into(), hlc(1, 1), None, 0);
         // key_b becomes a tombstone, still expected in its part's listing.
         let _ = put(&engine, key_b, kb_b.clone(), "b".into(), hlc(1, 1), None, 0);
-        {
-            let hash_b = hash_key_bytes(kb_b.as_ref());
-            let mut stripe = engine.stripe_lock(bucket).write();
-            let resolver = LwwResolver;
-            let _ = apply_locked(
-                &mut stripe,
-                &engine.digest[digest_slot(bucket, part_b)],
-                &engine.total_weight,
-                &engine.live_count,
-                engine.weigher.as_ref(),
-                engine.tti_ms,
-                hash_b,
-                key_b,
-                kb_b.clone(),
-                hlc(2, 1),
-                Incoming::Tombstone,
-                &resolver,
-                #[cfg(feature = "spill")]
-                &HashMap::new(),
-                #[cfg(feature = "spill")]
-                None,
-                60_000,
-                600_000,
-                0,
-            );
-        }
+        tombstone(&engine, key_b, kb_b.clone(), hlc(2, 1), 0);
 
         let bucket_u16 = u16::try_from(bucket).expect("fits");
         let req_a: (u16, u8) = (bucket_u16, u8::try_from(part_a).expect("fits"));
@@ -5670,31 +5624,7 @@ mod tests {
             let bucket = stripe_index_from_hash(hash);
             let ver = hlc(1, 1);
             let _ = put(&engine, key, kb.clone(), "old".to_string(), ver, None, 0);
-            {
-                let mut stripe = engine.stripe_lock(bucket).write();
-                let resolver = LwwResolver;
-                let _ = apply_locked(
-                    &mut stripe,
-                    &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                    &engine.total_weight,
-                    &engine.live_count,
-                    engine.weigher.as_ref(),
-                    engine.tti_ms,
-                    hash,
-                    key,
-                    kb.clone(),
-                    hlc(2, 1),
-                    Incoming::Tombstone,
-                    &resolver,
-                    #[cfg(feature = "spill")]
-                    &HashMap::new(),
-                    #[cfg(feature = "spill")]
-                    None,
-                    60_000,
-                    600_000,
-                    0,
-                );
-            }
+            tombstone(&engine, key, kb.clone(), hlc(2, 1), 0);
 
             let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0), 0);
             assert!(
@@ -5995,31 +5925,7 @@ mod tests {
             let old_ver = hlc(1, 1);
             let _ = put(&engine, key, kb.clone(), "x".repeat(9), old_ver, None, 0);
             simulate_pending_handoff(&engine, bucket, hash, &kb, 9);
-            let resolver = LwwResolver;
-            {
-                let mut stripe = engine.stripe_lock(bucket).write();
-                let _ = apply_locked(
-                    &mut stripe,
-                    &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                    &engine.total_weight,
-                    &engine.live_count,
-                    engine.weigher.as_ref(),
-                    engine.tti_ms,
-                    hash,
-                    key,
-                    kb.clone(),
-                    hlc(2, 1),
-                    Incoming::Tombstone,
-                    &resolver,
-                    #[cfg(feature = "spill")]
-                    &HashMap::new(),
-                    #[cfg(feature = "spill")]
-                    None,
-                    60_000,
-                    600_000,
-                    0,
-                );
-            }
+            tombstone(&engine, key, kb.clone(), hlc(2, 1), 0);
 
             SpillSink::abandon(&engine, bucket, &kb, hash, old_ver, 9);
 
@@ -6125,26 +6031,17 @@ mod tests {
             {
                 let mut stripe = engine.stripe_lock(bucket).write();
                 let resolver = LwwResolver;
+                let apply_ctx = test_ctx(&engine, bucket, hash, &resolver, 60_000, 600_000, 0);
                 let (outcome, displaced_spilled) = apply_locked(
                     &mut stripe,
-                    &engine.digest[digest_slot(bucket, part_index_from_hash(hash))],
-                    &engine.total_weight,
-                    &engine.live_count,
-                    engine.weigher.as_ref(),
-                    engine.tti_ms,
-                    hash,
-                    key,
-                    kb.clone(),
+                    &apply_ctx,
+                    EntryKey {
+                        hash,
+                        key,
+                        key_bytes: kb.clone(),
+                    },
                     hlc(2, 1),
                     Incoming::Tombstone,
-                    &resolver,
-                    #[cfg(feature = "spill")]
-                    &HashMap::new(),
-                    #[cfg(feature = "spill")]
-                    None,
-                    60_000,
-                    600_000,
-                    0,
                 );
                 assert!(matches!(outcome, ApplyOutcome::Tombstoned { .. }));
                 assert!(
@@ -6244,13 +6141,15 @@ mod tests {
             let inflight = Arc::new(Inflight::<String>::new());
             let encoded = Bytes::from(postcard::to_stdvec(&"loaded".to_string()).unwrap());
             let had_live = engine.complete_fresh_load(
-                &key,
-                &kb,
-                hash,
-                hlc(2, 1),
-                "loaded".to_string(),
-                encoded,
-                None,
+                FreshLoad {
+                    key: &key,
+                    key_bytes: &kb,
+                    hash,
+                    ver: hlc(2, 1),
+                    value: "loaded".to_string(),
+                    encoded,
+                    expires_at_ms: None,
+                },
                 0,
                 &inflight,
             );
@@ -7135,7 +7034,7 @@ mod tests {
                     1,
                     "exactly one seeded entry sits between the cursor and the next target"
                 );
-                seen.push(out[0].0);
+                seen.push(out[0].key);
                 assert_eq!(
                     engine.debug_compact_cursor(),
                     u64::try_from((target + 1) % BUCKET_COUNT).unwrap(),
@@ -7239,7 +7138,7 @@ mod tests {
                 1,
                 "the spilled entry is skipped; only the resident one is a candidate"
             );
-            assert_eq!(out[0].0, resident_key);
+            assert_eq!(out[0].key, resident_key);
         }
     }
 

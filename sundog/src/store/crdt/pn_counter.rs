@@ -463,20 +463,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::hlc::Hlc;
     use crate::node::NodeId;
-
-    fn hlc(wall_ms: u64, logical: u32) -> Hlc {
-        Hlc {
-            wall_ms,
-            logical,
-            node: NodeId::from(1),
-        }
-    }
-
-    fn wid(node: u64, incarnation: u64) -> WriterId {
-        WriterId::new(NodeId::from(node), incarnation)
-    }
+    use crate::store::test_support::{hlc, wid};
 
     /// A replica that discovers a dead writer's death *later* than a peer
     /// who has already folded that exact same writer must never defeat the
