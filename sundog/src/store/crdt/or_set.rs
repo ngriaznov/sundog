@@ -35,7 +35,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::WriterId;
-use crate::store::{CompactionBounds, ConflictResolver, Merged, RecordView, Winner};
+use crate::store::{CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner};
 
 /// A tag uniquely identifying one [`OrSet::add`]: the writer's identity
 /// paired with a sequence number local to that writer's own incarnation. No
@@ -291,7 +291,7 @@ where
         now_ms: u64,
         bounds: CompactionBounds,
         retire: &dyn Fn(WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
     ) -> Option<Self> {
         let mut out = self.clone();
         let mut changed = false;
@@ -309,7 +309,7 @@ where
             }
         }
 
-        if quiet {
+        if quiet.is_settled() {
             let double_bound = bounds.retire_after_ms.saturating_mul(2);
             let mut aged_any = false;
 
@@ -439,7 +439,7 @@ where
         value: &[u8],
         now_ms: u64,
         retire: &dyn Fn(WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
     ) -> Option<Bytes> {
         let set = OrSet::<T>::decode(value).ok()?;
@@ -691,7 +691,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("w is newly eligible, so compact must report a change");
         assert!(
@@ -718,7 +718,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible");
 
@@ -738,7 +738,12 @@ mod tests {
     fn compact_returns_none_when_no_writer_is_eligible() {
         let s = OrSet::add(wid(1, 0), 0, "x".to_string());
         assert_eq!(
-            s.compact(1_000, CompactionBounds::three_bounds(100), &|_| false, true),
+            s.compact(
+                1_000,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled
+            ),
             None
         );
     }
@@ -771,7 +776,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .unwrap();
         assert_eq!(
@@ -779,7 +784,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true
+                Quiescence::Settled
             ),
             None
         );
@@ -799,7 +804,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible");
         assert!(retired.seen.contains_key(&w));
@@ -807,7 +812,12 @@ mod tests {
 
         // Not yet past 2x the bound: no change.
         assert_eq!(
-            retired.compact(1_150, CompactionBounds::three_bounds(100), &|_| false, true),
+            retired.compact(
+                1_150,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled
+            ),
             None,
             "150ms < 2x100ms bound: too soon to age out"
         );
@@ -818,7 +828,7 @@ mod tests {
                 1_250,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
-                false
+                Quiescence::Churning
             ),
             None,
             "aged past the bound, but the cache is not quiet"
@@ -826,7 +836,12 @@ mod tests {
 
         // Past 2x the bound and quiet: both entries drop, leaving a receipt.
         let aged_out = retired
-            .compact(1_250, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                1_250,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("aged past the bound and quiet");
         assert!(!aged_out.seen.contains_key(&w));
         assert!(!aged_out.retired.contains_key(&w));
@@ -858,15 +873,25 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible")
-            .compact(1_250, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                1_250,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("stage two fires");
         assert!(folded.folded_at.contains_key(&w));
 
         assert_eq!(
-            folded.compact(1_299, CompactionBounds::three_bounds(100), &|_| false, true),
+            folded.compact(
+                1_299,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled
+            ),
             None,
             "299ms since the receipt was written < 3x100ms bound: too soon to prune"
         );
@@ -875,14 +900,19 @@ mod tests {
                 1_400,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
-                false
+                Quiescence::Churning
             ),
             None,
             "aged past the bound, but the cache is not quiet"
         );
 
         let pruned = folded
-            .compact(1_400, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                1_400,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("the receipt ages out: quiet and past 3x the bound");
         assert!(!pruned.folded_at.contains_key(&w));
         assert!(
@@ -903,11 +933,16 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible");
         let aged_out = retired
-            .compact(1_500, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                1_500,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("aged past the bound and quiet");
         assert_eq!(
             aged_out.iter().collect::<BTreeSet<_>>(),
@@ -929,7 +964,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible");
         let replica_b = shared.clone();
@@ -960,7 +995,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible");
 
@@ -1166,7 +1201,7 @@ mod tests {
                         now_ms,
                         CompactionBounds::three_bounds(100),
                         &|candidate| candidate == w,
-                        true,
+                        Quiescence::Settled,
                     ) {
                         real = compacted;
                     }
@@ -1262,7 +1297,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|w| w == w1,
-                true,
+                Quiescence::Settled,
             )
             .expect("w1 newly eligible on A");
         let replica_b = base
@@ -1270,7 +1305,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|w| w == w2,
-                true,
+                Quiescence::Settled,
             )
             .expect("w2 newly eligible on B");
 
@@ -1302,7 +1337,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|c| c == w,
-                true,
+                Quiescence::Settled,
             )
             .unwrap();
         let retired_late = base
@@ -1310,7 +1345,7 @@ mod tests {
                 5_000,
                 CompactionBounds::three_bounds(100),
                 &|c| c == w,
-                true,
+                Quiescence::Settled,
             )
             .unwrap();
 
@@ -1336,14 +1371,14 @@ mod tests {
                 since_ms,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
             )
             .expect("stage one fires")
             .compact(
                 since_ms + 201,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
-                true,
+                Quiescence::Settled,
             )
             .expect("stage two fires")
         };
@@ -1391,7 +1426,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("w newly eligible on D");
         assert!(!d.contains(&"x".to_string()));
@@ -1405,14 +1440,14 @@ mod tests {
                 5_000,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w3,
-                true,
+                Quiescence::Settled,
             )
             .expect("w3 newly eligible on C")
             .compact(
                 5_000 + 201,
                 CompactionBounds::three_bounds(100),
                 &|_| false,
-                true,
+                Quiescence::Settled,
             )
             .expect("w3 folds to stage two on C, receipt intact");
         assert!(c.contains(&"y".to_string()));
@@ -1459,14 +1494,14 @@ mod tests {
                 0,
                 CompactionBounds::three_bounds(bound_ms),
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
             )
             .expect("writer stage one fires at t=0")
             .compact(
                 2 * bound_ms + 1,
                 CompactionBounds::three_bounds(bound_ms),
                 &|_| false,
-                true,
+                Quiescence::Settled,
             )
             .expect("writer stage two fires once aged past 2x, still alone");
 
@@ -1477,7 +1512,7 @@ mod tests {
                 2 * bound_ms + 1,
                 CompactionBounds::three_bounds(bound_ms),
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
             )
             .expect("observer stage one fires late, independently");
 
@@ -1524,11 +1559,16 @@ mod tests {
                 0,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
             )
             .expect("stage one fires");
         let folded = pre_fold
-            .compact(201, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                201,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("stage two fires");
 
         let pre_fold_bytes = pre_fold.encode().expect("encodes");
@@ -1573,11 +1613,16 @@ mod tests {
                 0,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
             )
             .expect("stage one fires");
         let folded = pre_fold
-            .compact(201, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                201,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("stage two fires");
 
         let merged = folded.merge(&pre_fold);
@@ -1612,11 +1657,16 @@ mod tests {
                 0,
                 CompactionBounds::three_bounds(100),
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
             )
             .expect("stage one fires");
         let at_stage_two = pre_fold
-            .compact(201, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                201,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("stage two fires");
         assert!(
             !at_stage_two.contains(&"x".to_string()),
@@ -1631,7 +1681,12 @@ mod tests {
         );
 
         let folded = at_stage_two
-            .compact(301, CompactionBounds::three_bounds(100), &|_| false, true)
+            .compact(
+                301,
+                CompactionBounds::three_bounds(100),
+                &|_| false,
+                Quiescence::Settled,
+            )
             .expect("the receipt is pruned, past its own trust boundary");
         assert!(
             !folded.contains(&"x".to_string()),
@@ -1700,7 +1755,7 @@ mod tests {
                 1_000,
                 CompactionBounds::three_bounds(100),
                 &|c| c == w,
-                true,
+                Quiescence::Settled,
             )
             .expect("newly eligible");
         let encoded = compacted.encode().expect("encodes");

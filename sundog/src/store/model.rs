@@ -105,9 +105,8 @@ impl Model {
     }
 
     /// Whether this model's attached ownership view (if any) owns `key`'s
-    /// bucket. `true` unconditionally when no view is attached — the
-    /// default for every constructor but
-    /// [`new_shard_and_model_with_ownership`].
+    /// bucket. `true` unconditionally when no view is attached, the default
+    /// for every constructor but [`new_shard_and_model_with_ownership`].
     #[must_use]
     pub fn owns(&self, key: u8) -> bool {
         self.ownership
@@ -571,7 +570,7 @@ fn assert_digest_and_entries_match_model(shard: &Shard<u8, u8>, model: &Model) {
     }
     let actual_digest: Vec<u64> = futures::executor::block_on(ShardOps::digests(shard))
         .into_iter()
-        .map(|(_, digest)| digest)
+        .map(|bd| bd.digest)
         .collect();
     assert_eq!(
         actual_digest, expected_digest,
@@ -583,6 +582,7 @@ fn assert_digest_and_entries_match_model(shard: &Shard<u8, u8>, model: &Model) {
         futures::executor::block_on(ShardOps::entries_for_buckets(shard, all_buckets))
             .into_iter()
             .flat_map(|(_, entries)| entries)
+            .map(|kv| (kv.key, kv.version))
             .collect();
     assert_eq!(
         shard_entries, model_entries,

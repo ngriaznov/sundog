@@ -3,9 +3,9 @@
 //! keys` once rebalancing has settled. Unlike the replicated demo, where
 //! every node's count should match every other's, a distributed cache
 //! spreads entries across owners, so the check is on the *sum*, and it
-//! tolerates a bounded settling window — `distributed_disown_grace_rounds`
-//! anti-entropy intervals plus slack — during which a node that just lost a
-//! bucket still holds it while a new owner's rebalance pull lands.
+//! tolerates a bounded settling window (`distributed_disown_grace_rounds`
+//! anti-entropy intervals plus slack) during which a node that recently lost
+//! a bucket still holds it while a new owner's rebalance pull lands.
 
 use std::fmt;
 use std::sync::Arc;

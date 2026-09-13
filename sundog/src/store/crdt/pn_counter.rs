@@ -29,7 +29,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::WriterId;
-use crate::store::{CompactionBounds, ConflictResolver, Merged, RecordView, Winner};
+use crate::store::{CompactionBounds, ConflictResolver, Merged, Quiescence, RecordView, Winner};
 
 /// A writer's contribution at (and after) the moment it is retired: its
 /// `p`/`n` slots as they stand then, and when retirement happens. Stays
@@ -254,7 +254,7 @@ impl PnCounter {
         &self,
         now_ms: u64,
         retire: &dyn Fn(WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
     ) -> Option<Self> {
         let mut out = self.clone();
@@ -280,7 +280,7 @@ impl PnCounter {
             changed = true;
         }
 
-        if quiet {
+        if quiet.is_settled() {
             let double_bound = bounds.retire_after_ms.saturating_mul(2);
             let mut aged_any = false;
 
@@ -441,7 +441,7 @@ impl ConflictResolver for PnCounterResolver {
         value: &[u8],
         now_ms: u64,
         retire: &dyn Fn(WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
     ) -> Option<Bytes> {
         let counter = PnCounter::decode(value).ok()?;
@@ -490,14 +490,14 @@ mod tests {
             .compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("writer stage one fires at t=0")
             .compact(
                 2 * bound_ms + 1,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("writer stage two fires once aged past 2x, still alone");
@@ -509,7 +509,7 @@ mod tests {
             .compact(
                 2 * bound_ms + 1,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("observer stage one fires late, independently");
@@ -740,14 +740,14 @@ mod tests {
                 .compact(
                     since_ms,
                     &|writer| writer == w,
-                    false,
+                    Quiescence::Churning,
                     CompactionBounds::three_bounds(bound_ms),
                 )
                 .expect("stage one fires")
                 .compact(
                     since_ms + 2 * bound_ms + 1,
                     &|_| false,
-                    true,
+                    Quiescence::Settled,
                     CompactionBounds::three_bounds(bound_ms),
                 )
                 .expect("stage two fires")
@@ -795,7 +795,7 @@ mod tests {
             .compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("stage one fires");
@@ -803,7 +803,7 @@ mod tests {
             .compact(
                 2 * bound_ms + 1,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("stage two fires");
@@ -844,7 +844,7 @@ mod tests {
             .compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("stage one fires");
@@ -852,7 +852,7 @@ mod tests {
             .compact(
                 2 * bound_ms + 1,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("stage two fires");
@@ -923,7 +923,7 @@ mod tests {
             .compact(
                 1_000,
                 &|w| w == w1,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("w1 newly eligible on D");
@@ -937,14 +937,14 @@ mod tests {
             .compact(
                 5_000,
                 &|w| w == w3,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("w3 newly eligible on C")
             .compact(
                 5_000 + 2 * bound_ms + 1,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(bound_ms),
             )
             .expect("w3 folds to stage two on C, receipt intact");
@@ -988,9 +988,9 @@ mod tests {
             // A huge bound keeps stage two from ever firing, in `compact`
             // or in the following `merge`, isolating stage one under two
             // independently, arbitrarily different retirement decisions.
-            let a = base.compact(1_000, &|w| a_retired.contains(&w), false, CompactionBounds::three_bounds(1_000_000))
+            let a = base.compact(1_000, &|w| a_retired.contains(&w), Quiescence::Churning, CompactionBounds::three_bounds(1_000_000))
                 .unwrap_or_else(|| base.clone());
-            let b = base.compact(1_000, &|w| b_retired.contains(&w), false, CompactionBounds::three_bounds(1_000_000))
+            let b = base.compact(1_000, &|w| b_retired.contains(&w), Quiescence::Churning, CompactionBounds::three_bounds(1_000_000))
                 .unwrap_or_else(|| base.clone());
 
             let merged = a.merge(&b);
@@ -1058,7 +1058,7 @@ mod tests {
             .compact(
                 1_000,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(10_000),
             )
             .expect("w is eligible");
@@ -1083,7 +1083,7 @@ mod tests {
             c.compact(
                 1_000,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(10_000)
             )
             .is_none()
@@ -1097,7 +1097,7 @@ mod tests {
             .compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("stage one fires");
@@ -1106,7 +1106,7 @@ mod tests {
             c.compact(
                 1_500,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000)
             )
             .is_none(),
@@ -1116,7 +1116,7 @@ mod tests {
             c.compact(
                 2_001,
                 &|_| false,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(1_000)
             )
             .is_none(),
@@ -1127,7 +1127,7 @@ mod tests {
             .compact(
                 2_001,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("stage two fires: quiet and past 2x the bound");
@@ -1154,14 +1154,14 @@ mod tests {
             .compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("stage one fires")
             .compact(
                 2_001,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("stage two fires");
@@ -1172,7 +1172,7 @@ mod tests {
                 .compact(
                     2_999,
                     &|_| false,
-                    true,
+                    Quiescence::Settled,
                     CompactionBounds::three_bounds(1_000)
                 )
                 .is_none(),
@@ -1183,7 +1183,7 @@ mod tests {
                 .compact(
                     3_001,
                     &|_| false,
-                    false,
+                    Quiescence::Churning,
                     CompactionBounds::three_bounds(1_000)
                 )
                 .is_none(),
@@ -1194,7 +1194,7 @@ mod tests {
             .compact(
                 3_001,
                 &|_| false,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("the receipt ages out: quiet and past 3x the bound");
@@ -1221,7 +1221,12 @@ mod tests {
         let bytes = counter.encode().expect("encode never validates");
         assert!(PnCounter::decode(&bytes).is_err());
         let well_formed = PnCounter::local_delta(w, 3)
-            .compact(10, &|_| true, false, CompactionBounds::three_bounds(1))
+            .compact(
+                10,
+                &|_| true,
+                Quiescence::Churning,
+                CompactionBounds::three_bounds(1),
+            )
             .expect("retires w");
         let round_trip =
             PnCounter::decode(&well_formed.encode().expect("encode")).expect("decodes");
@@ -1272,7 +1277,7 @@ mod tests {
             .compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("fires once");
@@ -1280,7 +1285,7 @@ mod tests {
             once.compact(
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(1_000)
             )
             .is_none(),
@@ -1387,7 +1392,7 @@ mod tests {
                     &bytes,
                     0,
                     &|_| false,
-                    true,
+                    Quiescence::Settled,
                     CompactionBounds::three_bounds(1_000)
                 )
                 .is_none()
@@ -1406,7 +1411,7 @@ mod tests {
                 &bytes,
                 0,
                 &|writer| writer == w,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(1_000),
             )
             .expect("w is eligible");
@@ -1419,7 +1424,7 @@ mod tests {
                     &once,
                     0,
                     &|writer| writer == w,
-                    false,
+                    Quiescence::Churning,
                     CompactionBounds::three_bounds(1_000)
                 )
                 .is_none(),

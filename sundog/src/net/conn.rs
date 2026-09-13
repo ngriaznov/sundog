@@ -20,7 +20,9 @@ use super::{
     OutFrame, RequestHandler, TlsCtx,
 };
 use crate::error::CodecError;
+use crate::hlc::Hlc;
 use crate::node::NodeId;
+use crate::store::{BucketDigest, BucketPart, KeyVersion};
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
 pub(super) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
@@ -815,6 +817,7 @@ async fn ae_mismatch_replies(
             .bucket_lens(cache.clone(), mismatched.clone())
             .await
             .into_iter()
+            .map(|bl| (bl.bucket, bl.len))
             .collect();
         let (big, small): (Vec<u16>, Vec<u16>) = mismatched
             .into_iter()
@@ -826,10 +829,10 @@ async fn ae_mismatch_replies(
                     .part_digests(cache.clone(), big)
                     .await
                     .into_iter()
-                    .map(|(bucket, digests)| Msg::AePartDigests {
+                    .map(|bpd| Msg::AePartDigests {
                         cache: cache.clone(),
-                        bucket,
-                        digests,
+                        bucket: bpd.bucket,
+                        digests: bpd.digests,
                     }),
             );
         }
@@ -856,7 +859,7 @@ async fn ae_mismatch_replies(
                             ListingOrSketch::Listing(entries) => Msg::AeBucket {
                                 cache: cache.clone(),
                                 bucket,
-                                entries,
+                                entries: key_versions_to_wire(entries),
                             },
                         }
                     }),
@@ -877,8 +880,12 @@ async fn serve_ae_digest(
     cancel: &CancellationToken,
     peer_protocol: u16,
 ) -> bool {
-    let local: std::collections::HashMap<u16, u64> =
-        handler.digests(cache.clone()).await.into_iter().collect();
+    let local: std::collections::HashMap<u16, u64> = handler
+        .digests(cache.clone())
+        .await
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect();
     let mut replies =
         ae_mismatch_replies(&cache, &local, remote_buckets, handler, peer_protocol).await;
     replies.push(Msg::ReqDone);
@@ -928,8 +935,12 @@ async fn serve_ae_digest_scoped(
     cancel: &CancellationToken,
     peer_protocol: u16,
 ) -> bool {
+    let remote_bucket_digests: Vec<BucketDigest> = remote_buckets
+        .iter()
+        .map(|&(bucket, digest)| BucketDigest { bucket, digest })
+        .collect();
     match handler
-        .ae_digest_scoped(cache.clone(), view_hash, remote_buckets.clone())
+        .ae_digest_scoped(cache.clone(), view_hash, remote_bucket_digests)
         .await
     {
         super::AeServeOutcome::Unavailable => {
@@ -952,7 +963,8 @@ async fn serve_ae_digest_scoped(
             .await
         }
         super::AeServeOutcome::Digests(local) => {
-            let local: std::collections::HashMap<u16, u64> = local.into_iter().collect();
+            let local: std::collections::HashMap<u16, u64> =
+                local.into_iter().map(|bd| (bd.bucket, bd.digest)).collect();
             let mut replies =
                 ae_mismatch_replies(&cache, &local, remote_buckets, handler, peer_protocol).await;
             replies.push(Msg::ReqDone);
@@ -1044,11 +1056,15 @@ async fn serve_ae_parts(
     } else {
         let min_bucket = handler.ae_sketch_min_bucket();
         let sketch_cells = handler.ae_sketch_cells();
+        let parts: Vec<BucketPart> = parts
+            .into_iter()
+            .map(|(bucket, part)| BucketPart { bucket, part })
+            .collect();
         handler
             .entries_for_parts(cache.clone(), parts)
             .await
             .into_iter()
-            .map(|((bucket, part), entries)| {
+            .map(|(BucketPart { bucket, part }, entries)| {
                 match listing_or_sketch(entries, min_bucket, sketch_cells) {
                     ListingOrSketch::Sketch(cells) => Msg::AePartSketch {
                         cache: cache.clone(),
@@ -1060,7 +1076,7 @@ async fn serve_ae_parts(
                         cache: cache.clone(),
                         bucket,
                         part,
-                        entries,
+                        entries: key_versions_to_wire(entries),
                     },
                 }
             })
@@ -1074,7 +1090,7 @@ async fn serve_ae_parts(
 /// an IBLT sketch once the listing would outweigh one.
 #[derive(Debug, PartialEq, Eq)]
 enum ListingOrSketch {
-    Listing(Vec<(bytes::Bytes, crate::hlc::Hlc)>),
+    Listing(Vec<KeyVersion>),
     Sketch(Vec<crate::wire::Cell>),
 }
 
@@ -1083,19 +1099,34 @@ enum ListingOrSketch {
 /// over their `(key_hash, version)` pairs, anything up to it with the
 /// listing itself.
 fn listing_or_sketch(
-    entries: Vec<(bytes::Bytes, crate::hlc::Hlc)>,
+    entries: Vec<KeyVersion>,
     min_bucket: usize,
     sketch_cells: usize,
 ) -> ListingOrSketch {
     if entries.len() > min_bucket {
         let mut iblt = crate::cluster::sketch::Iblt::new(sketch_cells);
-        for (key, ver) in &entries {
-            iblt.insert(xxhash_rust::xxh3::xxh3_64(key), *ver);
+        for kv in &entries {
+            iblt.insert(xxhash_rust::xxh3::xxh3_64(&kv.key), kv.version);
         }
         ListingOrSketch::Sketch(iblt.into_cells())
     } else {
         ListingOrSketch::Listing(entries)
     }
+}
+
+/// [`KeyVersion`]s to the wire's own `(key, version)` tuple shape, for a
+/// [`Msg::AeBucket`]/[`Msg::AePart`] reply.
+fn key_versions_to_wire(entries: Vec<KeyVersion>) -> Vec<(Bytes, Hlc)> {
+    entries.into_iter().map(|kv| (kv.key, kv.version)).collect()
+}
+
+/// The wire's `(key, version)` tuple shape back to [`KeyVersion`]s, decoding
+/// a [`Msg::AeBucket`]/[`Msg::AePart`] reply.
+fn wire_to_key_versions(entries: Vec<(Bytes, Hlc)>) -> Vec<KeyVersion> {
+    entries
+        .into_iter()
+        .map(|(key, version)| KeyVersion { key, version })
+        .collect()
 }
 
 /// Serves an `AeEntries` request: the sketch fallback, full listings for the
@@ -1117,7 +1148,7 @@ async fn serve_ae_entries(
             .map(|(bucket, entries)| Msg::AeBucket {
                 cache: cache.clone(),
                 bucket,
-                entries,
+                entries: key_versions_to_wire(entries),
             })
             .collect()
     };
@@ -1195,7 +1226,7 @@ pub(super) async fn collect_ae_buckets(
             bucket, entries, ..
         } = msg
         {
-            out.push((bucket, entries));
+            out.push((bucket, wire_to_key_versions(entries)));
         }
     })
     .await
@@ -1210,7 +1241,7 @@ fn push_mismatch(msg: Msg, out: &mut Vec<AeMismatch>) {
     match msg {
         Msg::AeBucket {
             bucket, entries, ..
-        } => out.push(AeMismatch::Bucket(bucket, entries)),
+        } => out.push(AeMismatch::Bucket(bucket, wire_to_key_versions(entries))),
         Msg::AeSketch { bucket, cells, .. } => out.push(AeMismatch::Sketch(bucket, cells)),
         Msg::AePartDigests {
             bucket, digests, ..
@@ -1230,7 +1261,7 @@ pub(super) async fn collect_ae_part_replies(reply: Reply) -> Result<Vec<AePartRe
         } => out.push(AePartReply::Listing {
             bucket,
             part,
-            entries,
+            entries: wire_to_key_versions(entries),
         }),
         Msg::AePartSketch {
             bucket,
@@ -1419,15 +1450,13 @@ pub(super) fn bucket_stream(
 mod tests {
     #[test]
     fn listing_or_sketch_crosses_over_past_min_bucket() {
-        let entry = |n: u64| {
-            (
-                bytes::Bytes::from(n.to_be_bytes().to_vec()),
-                crate::hlc::Hlc {
-                    wall_ms: n,
-                    logical: 0,
-                    node: crate::node::NodeId::from(1),
-                },
-            )
+        let entry = |n: u64| crate::store::KeyVersion {
+            key: bytes::Bytes::from(n.to_be_bytes().to_vec()),
+            version: crate::hlc::Hlc {
+                wall_ms: n,
+                logical: 0,
+                node: crate::node::NodeId::from(1),
+            },
         };
         let small: Vec<_> = (0..3).map(entry).collect();
         assert_eq!(
@@ -1719,8 +1748,6 @@ mod tests {
         use smol_str::SmolStr;
         use tokio_util::sync::CancellationToken;
 
-        use crate::hlc::Hlc;
-
         struct NeverRespondingHandler;
         impl super::RequestHandler for NeverRespondingHandler {
             fn snapshot_chunks(
@@ -1729,14 +1756,14 @@ mod tests {
             ) -> BoxStream<'static, Vec<wire::WireRecord>> {
                 Box::pin(futures::stream::pending())
             }
-            fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+            fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<crate::store::BucketDigest>> {
                 Box::pin(async { Vec::new() })
             }
             fn bucket_entries(
                 &self,
                 _cache: SmolStr,
                 _bucket: u16,
-            ) -> BoxFuture<'_, Vec<(bytes::Bytes, Hlc)>> {
+            ) -> BoxFuture<'_, Vec<crate::store::KeyVersion>> {
                 Box::pin(async { Vec::new() })
             }
             fn entries_for_buckets(
@@ -1757,20 +1784,20 @@ mod tests {
                 &self,
                 _cache: SmolStr,
                 _buckets: Vec<u16>,
-            ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+            ) -> BoxFuture<'_, Vec<crate::store::BucketLen>> {
                 Box::pin(async { Vec::new() })
             }
             fn part_digests(
                 &self,
                 _cache: SmolStr,
                 _buckets: Vec<u16>,
-            ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+            ) -> BoxFuture<'_, Vec<crate::store::BucketPartDigests>> {
                 Box::pin(async { Vec::new() })
             }
             fn entries_for_parts(
                 &self,
                 _cache: SmolStr,
-                _parts: Vec<(u16, u8)>,
+                _parts: Vec<crate::store::BucketPart>,
             ) -> BoxFuture<'_, crate::store::PartEntries> {
                 Box::pin(async { Vec::new() })
             }
@@ -1835,14 +1862,17 @@ mod tests {
         ) -> futures::stream::BoxStream<'static, Vec<WireRecord>> {
             Box::pin(futures::stream::empty())
         }
-        fn digests(&self, _cache: SmolStr) -> futures::future::BoxFuture<'_, Vec<(u16, u64)>> {
+        fn digests(
+            &self,
+            _cache: SmolStr,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketDigest>> {
             Box::pin(async { Vec::new() })
         }
         fn bucket_entries(
             &self,
             _cache: SmolStr,
             _bucket: u16,
-        ) -> futures::future::BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::KeyVersion>> {
             Box::pin(async { Vec::new() })
         }
         fn entries_for_buckets(
@@ -1863,20 +1893,20 @@ mod tests {
             &self,
             _cache: SmolStr,
             _buckets: Vec<u16>,
-        ) -> futures::future::BoxFuture<'_, Vec<(u16, usize)>> {
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketLen>> {
             Box::pin(async { Vec::new() })
         }
         fn part_digests(
             &self,
             _cache: SmolStr,
             _buckets: Vec<u16>,
-        ) -> futures::future::BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketPartDigests>> {
             Box::pin(async { Vec::new() })
         }
         fn entries_for_parts(
             &self,
             _cache: SmolStr,
-            _parts: Vec<(u16, u8)>,
+            _parts: Vec<crate::store::BucketPart>,
         ) -> futures::future::BoxFuture<'_, crate::store::PartEntries> {
             Box::pin(async { Vec::new() })
         }
@@ -2033,7 +2063,7 @@ mod tests {
         let got = super::collect_ae_buckets(reply(framed))
             .await
             .expect("the stray Hello must be skipped, not break the reply");
-        assert_eq!(got, vec![(3, entries)]);
+        assert_eq!(got, vec![(3, super::wire_to_key_versions(entries))]);
     }
 
     #[cfg(not(feature = "sim"))]
@@ -2161,7 +2191,7 @@ mod tests {
                 AePartReply::Listing {
                     bucket: 3,
                     part: 7,
-                    entries,
+                    entries: super::wire_to_key_versions(entries),
                 },
                 AePartReply::Sketch {
                     bucket: 3,

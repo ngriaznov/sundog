@@ -51,8 +51,8 @@ use super::crdt;
 #[cfg(feature = "spill")]
 use super::spill::{SpillJob, SpillLoc, SpillSink, SpillTier, spilled_is_current};
 use super::{
-    BUCKET_COUNT, BucketEntries, ConflictResolver, Incoming, Merged, PART_COUNT, PartEntries,
-    RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
+    BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
+    PART_COUNT, PartEntries, Quiescence, RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
 };
 
 /// Stack-buffer size for a key's postcard encoding on the read path, large
@@ -1716,28 +1716,29 @@ where
                         .live
                         .iter()
                         .filter(|live| !self.is_absent(live, now_ms))
-                        .map(|live| (live.key_bytes.clone(), live.ver)),
+                        .map(|live| KeyVersion {
+                            key: live.key_bytes.clone(),
+                            version: live.ver,
+                        }),
                 );
-                entries.extend(
-                    stripe
-                        .tombstones
-                        .iter()
-                        .map(|(key_bytes, t)| (key_bytes.clone(), t.ver)),
-                );
+                entries.extend(stripe.tombstones.iter().map(|(key_bytes, t)| KeyVersion {
+                    key: key_bytes.clone(),
+                    version: t.ver,
+                }));
                 (bucket, entries)
             })
             .collect()
     }
 
-    /// [`Engine::collect_buckets`] at part granularity: `(key, version)` for
-    /// every live entry and un-GC'd tombstone in each requested `(bucket,
-    /// part)` pair, one stripe read lock per distinct bucket in `wanted`. An
-    /// out-of-range bucket ([`BUCKET_COUNT`] or past) or part ([`PART_COUNT`]
-    /// or past) is skipped rather than indexed.
-    pub(crate) fn collect_parts(&self, wanted: &[(u16, u8)], now_ms: u64) -> PartEntries {
+    /// [`Engine::collect_buckets`] at part granularity: a [`KeyVersion`] for
+    /// every live entry and un-GC'd tombstone in each requested
+    /// [`BucketPart`], one stripe read lock per distinct bucket in `wanted`.
+    /// An out-of-range bucket ([`BUCKET_COUNT`] or past) or part
+    /// ([`PART_COUNT`] or past) is skipped rather than indexed.
+    pub(crate) fn collect_parts(&self, wanted: &[BucketPart], now_ms: u64) -> PartEntries {
         let mut by_bucket: std::collections::BTreeMap<u16, Vec<u8>> =
             std::collections::BTreeMap::new();
-        for &(bucket, part) in wanted {
+        for &BucketPart { bucket, part } in wanted {
             if usize::from(bucket) >= BUCKET_COUNT || usize::from(part) >= PART_COUNT {
                 continue;
             }
@@ -1753,7 +1754,7 @@ where
             for (slot, &part) in parts.iter().enumerate() {
                 slot_of_part[usize::from(part)] = slot;
             }
-            let mut per_part: Vec<Vec<(Bytes, Hlc)>> = vec![Vec::new(); parts.len()];
+            let mut per_part: Vec<Vec<KeyVersion>> = vec![Vec::new(); parts.len()];
             let stripe = self.stripes[usize::from(bucket)].read();
             let live_entries = stripe
                 .live
@@ -1767,7 +1768,10 @@ where
             for (key_bytes, ver) in live_entries.chain(tombstone_entries) {
                 let slot = slot_of_part[part_index_from_hash(hash_key_bytes(key_bytes.as_ref()))];
                 if slot != usize::MAX {
-                    per_part[slot].push((key_bytes.clone(), ver));
+                    per_part[slot].push(KeyVersion {
+                        key: key_bytes.clone(),
+                        version: ver,
+                    });
                 }
             }
             drop(stripe);
@@ -1775,7 +1779,7 @@ where
                 parts
                     .into_iter()
                     .zip(per_part)
-                    .map(|(part, entries)| ((bucket, part), entries)),
+                    .map(|(part, entries)| (BucketPart { bucket, part }, entries)),
             );
         }
         out
@@ -2025,7 +2029,7 @@ where
         resolver: &dyn ConflictResolver,
         now_ms: u64,
         retire: &dyn Fn(crdt::WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: super::CompactionBounds,
         max_entries: usize,
     ) -> CompactScan<K> {
@@ -3099,7 +3103,11 @@ where
 /// comfortably covers any realistic entry count with no meaningful precision
 /// loss. Mirrors `spill::bytes_used_f64`.
 #[cfg(feature = "spill")]
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge only needs f64's exact-integer range, up to 2^53, which comfortably \
+              covers any realistic entry count"
+)]
 fn count_f64(n: usize) -> f64 {
     n as f64
 }
@@ -4071,7 +4079,7 @@ mod tests {
         assert!(
             records
                 .iter()
-                .any(|(k, ver)| k.as_ref() == kb.as_ref() && *ver == hlc(2, 1)),
+                .any(|kv| kv.key.as_ref() == kb.as_ref() && kv.version == hlc(2, 1)),
             "a removed key still appears in its bucket's entries, carrying the tombstone's \
              version: {records:?}"
         );
@@ -4655,7 +4663,13 @@ mod tests {
         let mixed = engine.collect_buckets(&[u16::MAX, bucket, 1024], 0);
         assert_eq!(mixed.len(), 1, "only the in-range bucket is answered");
         assert_eq!(mixed[0].0, bucket);
-        assert_eq!(mixed[0].1, vec![(kb, hlc(1, 1))]);
+        assert_eq!(
+            mixed[0].1,
+            vec![KeyVersion {
+                key: kb,
+                version: hlc(1, 1)
+            }]
+        );
     }
 
     #[test]
@@ -5103,8 +5117,14 @@ mod tests {
         tombstone(&engine, key_b, kb_b.clone(), hlc(2, 1), 0);
 
         let bucket_u16 = u16::try_from(bucket).expect("fits");
-        let req_a: (u16, u8) = (bucket_u16, u8::try_from(part_a).expect("fits"));
-        let req_b: (u16, u8) = (bucket_u16, u8::try_from(part_b).expect("fits"));
+        let req_a = BucketPart {
+            bucket: bucket_u16,
+            part: u8::try_from(part_a).expect("fits"),
+        };
+        let req_b = BucketPart {
+            bucket: bucket_u16,
+            part: u8::try_from(part_b).expect("fits"),
+        };
         let result = engine.collect_parts(&[req_a, req_b], 0);
         assert_eq!(result.len(), 2);
         let a_entries = &result
@@ -5112,7 +5132,13 @@ mod tests {
             .find(|(key, _)| *key == req_a)
             .expect("part_a present")
             .1;
-        assert_eq!(a_entries, &vec![(kb_a, hlc(1, 1))]);
+        assert_eq!(
+            a_entries,
+            &vec![KeyVersion {
+                key: kb_a,
+                version: hlc(1, 1)
+            }]
+        );
         let b_entries = &result
             .iter()
             .find(|(key, _)| *key == req_b)
@@ -5120,7 +5146,10 @@ mod tests {
             .1;
         assert_eq!(
             b_entries,
-            &vec![(kb_b, hlc(2, 1))],
+            &vec![KeyVersion {
+                key: kb_b,
+                version: hlc(2, 1)
+            }],
             "a tombstoned key still appears in its part's listing, at its tombstone version"
         );
     }
@@ -5135,21 +5164,56 @@ mod tests {
         let _ = put(&engine, 1, kb.clone(), "a".into(), hlc(1, 1), None, 0);
 
         assert!(
-            engine.collect_parts(&[(u16::MAX, part)], 0).is_empty(),
+            engine
+                .collect_parts(
+                    &[BucketPart {
+                        bucket: u16::MAX,
+                        part
+                    }],
+                    0
+                )
+                .is_empty(),
             "a bucket past BUCKET_COUNT yields nothing"
         );
         assert!(
-            engine.collect_parts(&[(bucket, u8::MAX)], 0).is_empty(),
+            engine
+                .collect_parts(
+                    &[BucketPart {
+                        bucket,
+                        part: u8::MAX
+                    }],
+                    0
+                )
+                .is_empty(),
             "a part past PART_COUNT yields nothing"
         );
-        let mixed = engine.collect_parts(&[(u16::MAX, part), (bucket, part), (bucket, u8::MAX)], 0);
+        let mixed = engine.collect_parts(
+            &[
+                BucketPart {
+                    bucket: u16::MAX,
+                    part,
+                },
+                BucketPart { bucket, part },
+                BucketPart {
+                    bucket,
+                    part: u8::MAX,
+                },
+            ],
+            0,
+        );
         assert_eq!(
             mixed.len(),
             1,
             "only the in-range (bucket, part) is answered"
         );
-        assert_eq!(mixed[0].0, (bucket, part));
-        assert_eq!(mixed[0].1, vec![(kb, hlc(1, 1))]);
+        assert_eq!(mixed[0].0, BucketPart { bucket, part });
+        assert_eq!(
+            mixed[0].1,
+            vec![KeyVersion {
+                key: kb,
+                version: hlc(1, 1)
+            }]
+        );
     }
 
     #[test]
@@ -6781,8 +6845,8 @@ mod tests {
                     .collect_buckets(&[u16::try_from(bucket).expect("bucket fits u16")], 0)
                     .into_iter()
                     .flat_map(|(_, entries)| entries)
-                    .find(|(k, _)| k.as_ref() == kb.as_ref())
-                    .map(|(_, ver)| ver)
+                    .find(|kv| kv.key.as_ref() == kb.as_ref())
+                    .map(|kv| kv.version)
                     .expect("the key is live");
                 let value = engine
                     .get(&key, 0)
@@ -7024,7 +7088,7 @@ mod tests {
                         &resolver,
                         1_000,
                         &retire_everyone,
-                        false,
+                        Quiescence::Churning,
                         crate::store::CompactionBounds::three_bounds(0),
                         1,
                     )
@@ -7073,7 +7137,7 @@ mod tests {
                     &resolver,
                     1_000,
                     &retire_everyone,
-                    false,
+                    Quiescence::Churning,
                     crate::store::CompactionBounds::three_bounds(0),
                     1,
                 )
@@ -7127,7 +7191,7 @@ mod tests {
                     &resolver,
                     1_000,
                     &retire_everyone,
-                    false,
+                    Quiescence::Churning,
                     crate::store::CompactionBounds::three_bounds(0),
                     usize::MAX,
                 )

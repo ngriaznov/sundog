@@ -1,8 +1,8 @@
 //! `--headless <SECS>`: preload, run the write load and fetch sampler for a
-//! fixed duration — killing and restarting one node partway through to
-//! exercise rebalance — pause it, poll a bounded convergence check, verify a
+//! fixed duration, killing and restarting one node partway through to
+//! exercise rebalance, pause it, poll a bounded convergence check, verify a
 //! random sample of surviving keys, and print a one-line report. Returns a
-//! nonzero status on divergence or a failed sample — the CI-friendly smoke
+//! nonzero status on divergence or a failed sample: the CI-friendly smoke
 //! test.
 
 use std::sync::atomic::Ordering;
@@ -94,7 +94,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
 
     tokio::time::sleep(duration.saturating_sub(three_quarter)).await;
     demo.paused.store(true, Ordering::Relaxed);
-    // Grace for whatever write/fetch tick was in flight to land.
+    // Grace for whatever write/fetch tick is in flight to land.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let deadline = convergence::poll_deadline(setup::AE_INTERVAL, DISOWN_GRACE_ROUNDS);

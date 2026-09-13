@@ -31,7 +31,10 @@ use sundog::hlc::Hlc;
 use sundog::membership::Peer;
 use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHandler};
 use sundog::node::{NodeId, NodeName};
-use sundog::store::{CompactionBounds, Mode, Shard, ShardOps, SimFanOut};
+use sundog::store::{
+    BucketDigest, BucketLen, BucketPart, BucketPartDigests, CompactionBounds, KeyVersion, Mode,
+    Quiescence, Shard, ShardOps, SimFanOut,
+};
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
     ConflictResolver, Merged, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
@@ -76,8 +79,19 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     futures::executor::block_on(fut)
 }
 
+/// [`KeyVersion`]s to this file's own `(key, version)` tuple shape, at the
+/// boundary where a [`ShardOps`]/[`AeMismatch`] result meets this file's
+/// tuple-based classification helpers, reimplementing
+/// `cluster::anti_entropy`'s own such boundary.
+fn kv_to_tuples(entries: Vec<KeyVersion>) -> Vec<(Bytes, Hlc)> {
+    entries.into_iter().map(|kv| (kv.key, kv.version)).collect()
+}
+
 fn digests_of(shard: &TestShard) -> Vec<(u16, u64)> {
     block_on(ShardOps::digests(shard))
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect()
 }
 
 fn value_of(shard: &TestShard, key: u32) -> Option<String> {
@@ -171,12 +185,12 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
         ShardOps::snapshot_chunks(self.shard.as_ref())
     }
 
-    fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::digests(shard.as_ref()).await })
     }
 
-    fn bucket_entries(&self, _cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, _cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::bucket_entries(shard.as_ref(), bucket).await })
     }
@@ -195,7 +209,7 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
         Box::pin(async move { ShardOps::records_for(shard.as_ref(), keys).await })
     }
 
-    fn bucket_lens(&self, _cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, _cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::bucket_lens(shard.as_ref(), buckets).await })
     }
@@ -204,7 +218,7 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
         &self,
         _cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    ) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::part_digests(shard.as_ref(), buckets).await })
     }
@@ -212,7 +226,7 @@ impl<S: ShardOps + 'static> RequestHandler for ShardHandler<S> {
     fn entries_for_parts(
         &self,
         _cache: SmolStr,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, sundog::store::PartEntries> {
         let shard = Arc::clone(&self.shard);
         Box::pin(async move { ShardOps::entries_for_parts(shard.as_ref(), parts).await })
@@ -314,10 +328,18 @@ async fn classify_ae_mismatches<S: ShardOps>(
                 if let Some(counter) = bucket_listings {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-                diff_bucket(shard, bucket, &peer_entries, push_keys, pull_keys, merging).await;
+                diff_bucket(
+                    shard,
+                    bucket,
+                    &kv_to_tuples(peer_entries),
+                    push_keys,
+                    pull_keys,
+                    merging,
+                )
+                .await;
             }
             AeMismatch::Sketch(bucket, cells) => {
-                let local_entries = ShardOps::bucket_entries(shard, bucket).await;
+                let local_entries = kv_to_tuples(ShardOps::bucket_entries(shard, bucket).await);
                 decode_sketch_into(
                     bucket,
                     cells,
@@ -328,13 +350,13 @@ async fn classify_ae_mismatches<S: ShardOps>(
                     merging,
                 );
             }
-            AeMismatch::PartDigests(bucket, remote_parts) => {
+            AeMismatch::PartDigests(bucket, digests) => {
                 let local_parts = ShardOps::part_digests(shard, vec![bucket])
                     .await
                     .into_iter()
-                    .find(|(b, _)| *b == bucket)
-                    .map_or_else(Vec::new, |(_, d)| d);
-                for part in sundog::mismatched_parts(&local_parts, &remote_parts) {
+                    .find(|p| p.bucket == bucket)
+                    .map_or_else(Vec::new, |p| p.digests);
+                for part in sundog::mismatched_parts(&local_parts, &digests) {
                     wanted_parts.push((bucket, part));
                 }
             }
@@ -362,6 +384,10 @@ async fn resolve_wanted_parts<S: ShardOps>(
     undecodable_buckets: &mut Vec<u16>,
     merging: bool,
 ) -> bool {
+    let wanted_bucket_parts: Vec<BucketPart> = wanted_parts
+        .iter()
+        .map(|&(bucket, part)| BucketPart { bucket, part })
+        .collect();
     match tokio::time::timeout(
         NET_TIMEOUT,
         mesh.ae_parts(peer, cache_name(), wanted_parts.clone()),
@@ -369,9 +395,11 @@ async fn resolve_wanted_parts<S: ShardOps>(
     .await
     {
         Ok(Ok(replies)) => {
-            let local_part_entries = ShardOps::entries_for_parts(shard, wanted_parts).await;
-            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
-                local_part_entries.into_iter().collect();
+            let local_part_entries = ShardOps::entries_for_parts(shard, wanted_bucket_parts).await;
+            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> = local_part_entries
+                .into_iter()
+                .map(|(bp, entries)| ((bp.bucket, bp.part), kv_to_tuples(entries)))
+                .collect();
             for reply in replies {
                 match reply {
                     AePartReply::Listing {
@@ -383,7 +411,13 @@ async fn resolve_wanted_parts<S: ShardOps>(
                             .get(&(bucket, part))
                             .cloned()
                             .unwrap_or_default();
-                        diff_part(&local_entries, &peer_entries, push_keys, pull_keys, merging);
+                        diff_part(
+                            &local_entries,
+                            &kv_to_tuples(peer_entries),
+                            push_keys,
+                            pull_keys,
+                            merging,
+                        );
                     }
                     AePartReply::Sketch {
                         bucket,
@@ -448,7 +482,11 @@ async fn ae_round_with_sketch<S: ShardOps>(
     // mismatched key in the same round instead of only the greater version
     // pushing to the lesser side.
     let merging = ShardOps::merges(shard);
-    let local_buckets = ShardOps::digests(shard).await;
+    let local_buckets: Vec<(u16, u64)> = ShardOps::digests(shard)
+        .await
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect();
     let Ok(Ok(mismatched)) = tokio::time::timeout(
         NET_TIMEOUT,
         mesh.ae_round(peer, cache_name(), local_buckets),
@@ -506,7 +544,7 @@ async fn ae_round_with_sketch<S: ShardOps>(
                     diff_bucket(
                         shard,
                         bucket,
-                        &peer_entries,
+                        &kv_to_tuples(peer_entries),
                         &mut push_keys,
                         &mut pull_keys,
                         merging,
@@ -578,7 +616,11 @@ async fn diff_bucket<S: ShardOps>(
     let peer_by_key: HashMap<Bytes, Hlc> = peer_entries.iter().cloned().collect();
     let mut local_keys = HashSet::with_capacity(peer_by_key.len());
 
-    for (key, local_ver) in ShardOps::bucket_entries(shard, bucket).await {
+    for KeyVersion {
+        key,
+        version: local_ver,
+    } in ShardOps::bucket_entries(shard, bucket).await
+    {
         local_keys.insert(key.clone());
         match peer_by_key.get(&key) {
             Some(&peer_ver) if local_ver != peer_ver => {
@@ -3423,15 +3465,15 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
         self.inner.invalidate(key, ver)
     }
 
-    fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {
         self.inner.digests()
     }
 
-    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<BucketDigest>> {
         self.inner.ae_digests_for(peer)
     }
 
-    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         self.inner.bucket_entries(bucket)
     }
 
@@ -3442,17 +3484,17 @@ impl<S: ShardOps + 'static> ShardOps for CountingShard<S> {
         self.inner.entries_for_buckets(buckets)
     }
 
-    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         self.inner.bucket_lens(buckets)
     }
 
-    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         self.inner.part_digests(buckets)
     }
 
     fn entries_for_parts(
         &self,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, sundog::store::PartEntries> {
         self.inner.entries_for_parts(parts)
     }
@@ -3589,6 +3631,9 @@ fn write_side(
 /// per-side keys per counter for decomposed.
 fn heal_digests_of(shard: &Shard<String, PnCounter>) -> Vec<(u16, u64)> {
     block_on(ShardOps::digests(shard))
+        .into_iter()
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect()
 }
 
 fn counter_total(shard: &Shard<String, PnCounter>, keys: u32, variant: Variant) -> i128 {
@@ -4283,11 +4328,13 @@ fn crdt_cache_is_quiet(
     local: NodeId,
     now_ms: u64,
     bound_ms: u64,
-) -> bool {
-    members
-        .iter()
-        .filter(|&(&node, _)| node != local)
-        .all(|(_, &presence)| crdt_member_is_settled(presence, now_ms, bound_ms))
+) -> Quiescence {
+    Quiescence::from_settled(
+        members
+            .iter()
+            .filter(|&(&node, _)| node != local)
+            .all(|(_, &presence)| crdt_member_is_settled(presence, now_ms, bound_ms)),
+    )
 }
 
 /// This simulation's virtual time so far, in milliseconds.

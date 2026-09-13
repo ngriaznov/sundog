@@ -71,9 +71,9 @@ pub const PROTOCOL_ST_UNAVAILABLE: u16 = 2;
 /// [`Msg::AeDigestScoped`], [`Msg::StBuckets`], [`Msg::StBucketChunk`],
 /// [`Msg::ForwardBatch`], and
 /// [`Msg::StaleView`]. A
-/// peer speaking less never receives one of these — moot in practice, since
-/// such a peer never becomes eligible to own a bucket in the first place,
-/// but gated at the wire layer regardless as the hard guarantee.
+/// peer speaking less never receives one of these: such a peer never becomes
+/// eligible to own a bucket in the first place, but the wire layer gates it
+/// regardless, as the hard guarantee.
 pub const PROTOCOL_DISTRIBUTED: u16 = 3;
 
 /// Whether a peer speaking `peer_protocol` understands a message kind
@@ -243,8 +243,8 @@ pub enum Msg {
     },
     /// Answers [`Msg::Fetch`]: the record if the responder currently owns
     /// the bucket and holds one, `None` for a definitive miss. Never sent
-    /// when the responder's own view hash differs from the request's —
-    /// [`Msg::StaleView`] instead.
+    /// when the responder's own view hash differs from the request's: it
+    /// sends [`Msg::StaleView`] instead.
     FetchReply { rec: Option<WireRecord> },
     /// Declines a [`Msg::Fetch`] without answering it: the responder has
     /// `cache` open but cannot vouch for a miss, because it owns the key's
@@ -258,7 +258,7 @@ pub enum Msg {
     /// `view_hash` for the epoch check. A brand-new variant, not a field
     /// added to [`Msg::AeDigest`]: mutating that struct variant's fields
     /// would change the wire encoding of every mode's anti-entropy traffic,
-    /// not just distribution mode's.
+    /// not only distribution mode's.
     AeDigestScoped {
         cache: SmolStr,
         view_hash: u64,

@@ -91,8 +91,8 @@ pub use store::crdt;
 #[cfg(feature = "spill")]
 pub use store::spill::SpillConfig;
 pub use store::{
-    CompactionBounds, ConflictResolver, Event, LwwResolver, Merged, Mode, Origin, RecordView,
-    Winner,
+    CompactionBounds, ConflictResolver, Event, LwwResolver, Merged, Mode, Origin, Quiescence,
+    RecordView, Winner,
 };
 #[cfg(feature = "prometheus")]
 pub use telemetry::{BuildError, PrometheusHandle, prometheus_handle};

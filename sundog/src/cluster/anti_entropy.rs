@@ -30,7 +30,7 @@ use super::sketch::{Cell, Decoded, Iblt};
 use crate::hlc::Hlc;
 use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
 use crate::node::NodeId;
-use crate::store::{ShardOps, bucket_of};
+use crate::store::{BucketPart, ShardOps, bucket_of};
 
 /// Runs anti-entropy for one shard while `cancel` stays live: every jittered
 /// `ae_interval`, picks one live peer, a dirty-marked one first, and runs
@@ -106,7 +106,12 @@ fn should_skip_round(streaming: bool, skipped_so_far: u32) -> bool {
 /// from a caller that builds them fresh this round (`take_dirty_peers`,
 /// `live_peer_ids`), and only `dirty` needs the transfer, on the branch that
 /// consumes it into `give_back`.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "live takes ownership, not a slice, to match dirty's shape: both come from a \
+              caller that builds them fresh this round, and only dirty needs the transfer, on \
+              the branch that consumes it into give_back"
+)]
 fn choose_peer(
     dirty: Vec<NodeId>,
     live: Vec<NodeId>,
@@ -190,7 +195,12 @@ pub async fn run_round_against(
             // would have every other bucket reported as a mismatch and
             // its entries pushed only to be dropped by the peer's inbound
             // guard.
-            let local_buckets = shard.ae_digests_for(peer).await;
+            let local_buckets: Vec<(u16, u64)> = shard
+                .ae_digests_for(peer)
+                .await
+                .into_iter()
+                .map(|bd| (bd.bucket, bd.digest))
+                .collect();
             match mesh
                 .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
                 .await
@@ -214,7 +224,16 @@ pub async fn run_round_against(
             }
         }
         None => match mesh
-            .ae_round(peer, cache.clone(), shard.digests().await)
+            .ae_round(
+                peer,
+                cache.clone(),
+                shard
+                    .digests()
+                    .await
+                    .into_iter()
+                    .map(|bd| (bd.bucket, bd.digest))
+                    .collect(),
+            )
             .await
         {
             Ok(mismatched) => mismatched,
@@ -269,12 +288,14 @@ pub async fn run_round_against(
             Ok(fallback_buckets) => {
                 let wanted: Vec<u16> = fallback_buckets.iter().map(|(bucket, _)| *bucket).collect();
                 let local_entries = shard.entries_for_buckets(wanted).await;
-                let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> =
-                    local_entries.into_iter().collect();
+                let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries
+                    .into_iter()
+                    .map(|(bucket, entries)| (bucket, key_versions_to_tuples(entries)))
+                    .collect();
                 for (bucket, peer_entries) in fallback_buckets {
                     diff_bucket(
                         local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
-                        &peer_entries,
+                        &key_versions_to_tuples(peer_entries),
                         &mut plan.push_keys,
                         &mut plan.pull_keys,
                         merging,
@@ -375,14 +396,17 @@ async fn classify_bucket_mismatches(
     let local_entries = shard
         .entries_for_buckets(mismatches.iter().map(AeMismatch::bucket).collect())
         .await;
-    let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries.into_iter().collect();
+    let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries
+        .into_iter()
+        .map(|(bucket, entries)| (bucket, key_versions_to_tuples(entries)))
+        .collect();
 
     for mismatch in mismatches {
         match mismatch {
             AeMismatch::Bucket(bucket, peer_entries) => {
                 diff_bucket(
                     local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
-                    &peer_entries,
+                    &key_versions_to_tuples(peer_entries),
                     &mut plan.push_keys,
                     &mut plan.pull_keys,
                     merging,
@@ -398,6 +422,13 @@ async fn classify_bucket_mismatches(
             }
         }
     }
+}
+
+/// [`crate::store::KeyVersion`]s back to this module's own `(key, version)`
+/// tuple shape, at the boundary where a [`ShardOps`]/[`AeMismatch`] result
+/// meets this file's tuple-based classification helpers.
+fn key_versions_to_tuples(entries: Vec<crate::store::KeyVersion>) -> Vec<(Bytes, Hlc)> {
+    entries.into_iter().map(|kv| (kv.key, kv.version)).collect()
 }
 
 /// Classifies buckets answered with part digests (`AeMismatch::PartDigests`):
@@ -422,34 +453,39 @@ async fn classify_part_digest_mismatches(
     }
     let buckets: Vec<u16> = mismatches.iter().map(AeMismatch::bucket).collect();
     let local_part_digests = shard.part_digests(buckets).await;
-    let local_digests_by_bucket: HashMap<u16, Vec<u64>> = local_part_digests.into_iter().collect();
+    let local_digests_by_bucket: HashMap<u16, Vec<u64>> = local_part_digests
+        .into_iter()
+        .map(|bpd| (bpd.bucket, bpd.digests))
+        .collect();
 
-    let mut wanted_parts: Vec<(u16, u8)> = Vec::new();
+    let mut wanted_parts: Vec<BucketPart> = Vec::new();
     for mismatch in &mismatches {
-        let AeMismatch::PartDigests(bucket, remote_parts) = mismatch else {
+        let AeMismatch::PartDigests(bucket, digests) = mismatch else {
             unreachable!("invariant: run_round_against partitions in only this variant")
         };
+        let bucket = *bucket;
         let local_parts = local_digests_by_bucket
-            .get(bucket)
+            .get(&bucket)
             .map_or(&[][..], Vec::as_slice);
         wanted_parts.extend(
-            mismatched_parts(local_parts, remote_parts)
+            mismatched_parts(local_parts, digests)
                 .into_iter()
-                .map(|part| (*bucket, part)),
+                .map(|part| BucketPart { bucket, part }),
         );
     }
     if wanted_parts.is_empty() {
         return;
     }
 
-    match mesh
-        .ae_parts(peer, cache.clone(), wanted_parts.clone())
-        .await
-    {
+    let wanted_parts_wire: Vec<(u16, u8)> =
+        wanted_parts.iter().map(|p| (p.bucket, p.part)).collect();
+    match mesh.ae_parts(peer, cache.clone(), wanted_parts_wire).await {
         Ok(replies) => {
             let local_part_entries = shard.entries_for_parts(wanted_parts).await;
-            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> =
-                local_part_entries.into_iter().collect();
+            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> = local_part_entries
+                .into_iter()
+                .map(|(bp, entries)| ((bp.bucket, bp.part), key_versions_to_tuples(entries)))
+                .collect();
             let mut gathered: HashMap<u16, RepairPlan> = HashMap::new();
             for reply in replies {
                 let slot = gathered.entry(reply.bucket()).or_default();
@@ -463,7 +499,7 @@ async fn classify_part_digest_mismatches(
                             local_by_part
                                 .get(&(bucket, part))
                                 .map_or(&[], Vec::as_slice),
-                            &entries,
+                            &key_versions_to_tuples(entries),
                             &mut slot.push_keys,
                             &mut slot.pull_keys,
                             merging,

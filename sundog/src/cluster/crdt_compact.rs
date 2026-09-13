@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::{Cluster, absence};
 use crate::membership::{self, CacheModes, Peer};
 use crate::node::NodeId;
-use crate::store::{CompactionBounds, ShardOps, crdt, now_ms};
+use crate::store::{CompactionBounds, Quiescence, ShardOps, crdt, now_ms};
 
 /// Whether writer `w` is eligible for CRDT retirement this tick: `w`'s
 /// node is dead (see [`membership::incarnation_is_dead`]) and `w` isn't
@@ -33,14 +33,20 @@ fn crdt_writer_is_retirement_eligible(
 
 /// Whether an entire cache is quiet this tick: every relevant member has
 /// settled (see [`membership::member_is_quiet`]), continuously present or
-/// continuously gone for at least `bound`. Vacuously `true` with no other
-/// known members. Only stage two of
+/// continuously gone for at least `bound`. Vacuously [`Quiescence::Settled`]
+/// with no other known members. Only stage two of
 /// [`crdt::PnCounter::compact`]/[`crdt::OrSet::compact`] reads this; stage
 /// one runs unconditionally on `retire` alone.
-fn crdt_cache_is_quiet(members: &[membership::MemberView], now: Instant, bound: Duration) -> bool {
-    members
-        .iter()
-        .all(|member| membership::member_is_quiet(member, now, bound))
+fn crdt_cache_is_quiet(
+    members: &[membership::MemberView],
+    now: Instant,
+    bound: Duration,
+) -> Quiescence {
+    Quiescence::from_settled(
+        members
+            .iter()
+            .all(|member| membership::member_is_quiet(member, now, bound)),
+    )
 }
 
 /// Every [`membership::MemberView`] the CRDT compaction sweep for `name`
@@ -346,7 +352,7 @@ mod tests {
     #[test]
     fn crdt_cache_is_quiet_is_vacuously_true_with_no_members() {
         let now = Instant::now();
-        assert!(crdt_cache_is_quiet(&[], now, Duration::from_secs(60)));
+        assert!(crdt_cache_is_quiet(&[], now, Duration::from_secs(60)).is_settled());
     }
 
     #[test]
@@ -367,7 +373,7 @@ mod tests {
                 live_incarnation: None,
             },
         ];
-        assert!(crdt_cache_is_quiet(&members, now, bound));
+        assert!(crdt_cache_is_quiet(&members, now, bound).is_settled());
     }
 
     #[test]
@@ -389,7 +395,7 @@ mod tests {
                 live_incarnation: None,
             },
         ];
-        assert!(!crdt_cache_is_quiet(&members, now, bound));
+        assert!(!crdt_cache_is_quiet(&members, now, bound).is_settled());
     }
 
     #[test]
@@ -580,12 +586,12 @@ mod tests {
             absent_since: None,
             live_incarnation: Some(3),
         };
-        assert!(crdt_cache_is_quiet(&[flapper], now, bound));
+        assert!(crdt_cache_is_quiet(&[flapper], now, bound).is_settled());
         let newcomer = membership::MemberView {
             known_since: Some(now.checked_sub(Duration::from_secs(15)).expect("recent")),
             ..flapper
         };
-        assert!(!crdt_cache_is_quiet(&[newcomer], now, bound));
+        assert!(!crdt_cache_is_quiet(&[newcomer], now, bound).is_settled());
     }
 
     /// A member gone for longer than the receipt lifetime is forgotten by the tick:

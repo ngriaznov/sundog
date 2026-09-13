@@ -38,7 +38,7 @@ pub(crate) const IBLT_PARTITIONS: usize = 3;
 /// overlap in every cell they touch stalls the peel. A failed decode costs
 /// one listing fallback, never a wrong answer.
 // Only read by the tests that pin it; a non-test build never evaluates it.
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const RATED_CAPACITY: usize = 100;
 
 /// Distinct per-partition salts folded into [`mix`]: arbitrary odd 64-bit

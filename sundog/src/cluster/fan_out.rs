@@ -62,6 +62,14 @@ pub(crate) async fn fan_out_task<K, V>(
 /// across all its target peers before dropping what still does not fit.
 pub(super) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
+/// One [`group_by_owner_set`] group: `records`, all sharing `owners` as
+/// their bucket's exact target-peer set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OwnerGroup {
+    pub(super) owners: Vec<NodeId>,
+    pub(super) records: Vec<WireRecord>,
+}
+
 /// Groups `records` by the exact target-peer set each replicates to: its
 /// bucket's live owners under `view`, self excluded. Pure and mesh-free, so
 /// [`fan_out_by_owner_set`] and its own unit tests both build on it
@@ -72,8 +80,8 @@ pub(super) fn group_by_owner_set(
     view: &OwnershipView,
     self_node: NodeId,
     records: Vec<WireRecord>,
-) -> Vec<(Vec<NodeId>, Vec<WireRecord>)> {
-    let mut groups: Vec<(Vec<NodeId>, Vec<WireRecord>)> = Vec::new();
+) -> Vec<OwnerGroup> {
+    let mut groups: Vec<OwnerGroup> = Vec::new();
     for rec in records {
         let bucket = bucket_of(rec.key.as_ref());
         let mut owners: Vec<NodeId> = view
@@ -83,9 +91,12 @@ pub(super) fn group_by_owner_set(
             .filter(|&n| n != self_node)
             .collect();
         owners.sort_unstable();
-        match groups.iter_mut().find(|(peers, _)| *peers == owners) {
-            Some((_, recs)) => recs.push(rec),
-            None => groups.push((owners, vec![rec])),
+        match groups.iter_mut().find(|group| group.owners == owners) {
+            Some(group) => group.records.push(rec),
+            None => groups.push(OwnerGroup {
+                owners,
+                records: vec![rec],
+            }),
         }
     }
     groups
@@ -122,11 +133,11 @@ async fn fan_out_by_owner_set(
     records: Vec<WireRecord>,
 ) {
     let deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
-    for (owners, recs) in group_by_owner_set(view, self_node, records) {
+    for OwnerGroup { owners, records } in group_by_owner_set(view, self_node, records) {
         if owners.is_empty() {
             continue;
         }
-        let frames = encode_frames(batch_forward(cache_name, view.view_hash(), 0, recs));
+        let frames = encode_frames(batch_forward(cache_name, view.view_hash(), 0, records));
         for peer in owners {
             mesh.send_frames_awaiting(peer, frames.clone(), deadline)
                 .await;
@@ -307,17 +318,17 @@ mod tests {
         );
 
         let mut total = 0usize;
-        for (peers, recs) in &groups {
+        for OwnerGroup { owners, records } in &groups {
             assert!(
-                !peers.contains(&self_node),
+                !owners.contains(&self_node),
                 "self is never its own fan-out target"
             );
             assert!(
-                peers.len() < eligible.len(),
+                owners.len() < eligible.len(),
                 "a group's peer set is never every eligible/live node, only a bucket's other \
-                 owners: {peers:?}"
+                 owners: {owners:?}"
             );
-            for rec in recs {
+            for rec in records {
                 let key: u32 = postcard::from_bytes(&rec.key).expect("test key decodes");
                 let bucket = bucket_of_u32(key);
                 let mut expected: Vec<NodeId> = view
@@ -328,11 +339,11 @@ mod tests {
                     .collect();
                 expected.sort_unstable();
                 assert_eq!(
-                    peers, &expected,
+                    owners, &expected,
                     "a record's group is exactly its bucket's live owners minus self"
                 );
             }
-            total += recs.len();
+            total += records.len();
         }
         assert_eq!(total, 2, "every record lands in exactly one group");
     }
@@ -350,16 +361,13 @@ mod tests {
         let records: Vec<WireRecord> = (0u32..50).map(wire_record_for_u32).collect();
         let groups = group_by_owner_set(&view, self_node, records.clone());
 
-        let non_empty_groups: Vec<_> = groups
-            .iter()
-            .filter(|(peers, _)| !peers.is_empty())
-            .collect();
+        let non_empty_groups: Vec<_> = groups.iter().filter(|g| !g.owners.is_empty()).collect();
         assert!(
             non_empty_groups.len() <= 1,
             "with only one other eligible node, every non-empty group is the same one peer set: \
              {non_empty_groups:?}"
         );
-        let total: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+        let total: usize = groups.iter().map(|g| g.records.len()).sum();
         assert_eq!(
             total,
             records.len(),

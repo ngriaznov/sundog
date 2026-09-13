@@ -44,6 +44,7 @@ use crate::discovery::mdns::Mdns;
 use crate::discovery::statics::Static;
 use crate::discovery::{Discovery, DiscoveryKind};
 use crate::error::JoinError;
+#[cfg(all(test, not(feature = "sim")))]
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
@@ -51,7 +52,10 @@ use crate::net::{
 };
 use crate::node::{NodeId, NodeName};
 use crate::ownership::OwnershipView;
-use crate::store::{Mode, Shard, ShardOps, bucket_of, chunk_records_for_snapshot};
+use crate::store::{
+    BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, Shard, ShardOps,
+    bucket_of, chunk_records_for_snapshot,
+};
 use crate::wire::{self, Msg, WireRecord};
 
 /// The cluster's type-erased cache registry: `cache name -> Arc<dyn ShardOps>`.
@@ -572,11 +576,11 @@ impl ClusterBuilder {
         if let Some(id) = node_id.filter(|id| id.is_merge_derived()) {
             // Mirrors `NodeId::MERGE_BIT`: a real id always has this bit
             // clear, so any id at or past it is reserved for merge versions.
-            return Err(JoinError::InvalidConfig {
-                field: "node_id",
-                limit: 1u64 << 63,
-                actual: id.as_u64(),
-            });
+            return Err(JoinError::InvalidConfig(format!(
+                "node_id ({}) is merge-derived, over the {} limit",
+                id.as_u64(),
+                1u64 << 63
+            )));
         }
 
         let local_modes: Arc<RwLock<HashMap<SmolStr, Mode>>> =
@@ -682,21 +686,20 @@ fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
 /// it implies.
 fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
     if config.max_frame > wire::MAX_FRAME {
-        return Err(JoinError::InvalidConfig {
-            field: "max_frame",
-            limit: u64::try_from(wire::MAX_FRAME).unwrap_or(u64::MAX),
-            actual: u64::try_from(config.max_frame).unwrap_or(u64::MAX),
-        });
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::max_frame ({}) exceeds the wire codec's hard cap of {} bytes",
+            config.max_frame,
+            wire::MAX_FRAME
+        )));
     }
     // Sized for a cache name of up to 255 bytes; the wire codec still
     // refuses a frame that a longer name pushes past `max_frame`.
     let sketch_frame = wire::ae_sketch_frame_max_len(255, config.ae_sketch_cells);
     if sketch_frame > config.max_frame {
-        return Err(JoinError::InvalidConfig {
-            field: "ae_sketch_cells",
-            limit: u64::try_from(config.max_frame).unwrap_or(u64::MAX),
-            actual: u64::try_from(sketch_frame).unwrap_or(u64::MAX),
-        });
+        return Err(JoinError::InvalidConfig(format!(
+            "ClusterConfig::ae_sketch_cells implies an anti-entropy sketch frame of {sketch_frame} bytes, over the {}-byte max_frame limit",
+            config.max_frame
+        )));
     }
     Ok(())
 }
@@ -823,7 +826,7 @@ impl RequestHandler for ClusterRequestHandler {
         }
     }
 
-    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.digests().await,
@@ -832,7 +835,7 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
-    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.bucket_entries(bucket).await,
@@ -863,7 +866,7 @@ impl RequestHandler for ClusterRequestHandler {
         })
     }
 
-    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.bucket_lens(buckets).await,
@@ -876,7 +879,7 @@ impl RequestHandler for ClusterRequestHandler {
         &self,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    ) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         Box::pin(async move {
             match self.lookup(&cache) {
                 Some(shard) => shard.part_digests(buckets).await,
@@ -888,7 +891,7 @@ impl RequestHandler for ClusterRequestHandler {
     fn entries_for_parts(
         &self,
         cache: SmolStr,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, crate::store::PartEntries> {
         Box::pin(async move {
             match self.lookup(&cache) {
@@ -952,7 +955,7 @@ impl RequestHandler for ClusterRequestHandler {
         &self,
         cache: SmolStr,
         view_hash: u64,
-        buckets: Vec<(u16, u64)>,
+        buckets: Vec<BucketDigest>,
     ) -> BoxFuture<'_, AeServeOutcome> {
         // The requester's own bucket list only matters once its epoch is
         // confirmed current; the mismatch classification against it happens
@@ -1007,7 +1010,7 @@ impl RequestHandler for ClusterRequestHandler {
                         let entries = shard.entries_for_buckets(vec![bucket]).await;
                         let keys: Vec<Bytes> = entries
                             .into_iter()
-                            .flat_map(|(_, entries)| entries.into_iter().map(|(key, _)| key))
+                            .flat_map(|(_, entries)| entries.into_iter().map(|kv| kv.key))
                             .collect();
                         let recs = shard.records_for(keys).await;
                         chunk_records_for_snapshot(recs)
@@ -1341,23 +1344,22 @@ fn reforward_groups(
     sender_view_hash: u64,
     hops: u8,
     records: &[WireRecord],
-) -> Option<Vec<(Vec<NodeId>, Vec<WireRecord>)>> {
+) -> Option<Vec<fan_out::OwnerGroup>> {
     if hops >= MAX_FORWARD_HOPS || sender_view_hash == view.view_hash() {
         return None;
     }
-    let groups: Vec<(Vec<NodeId>, Vec<WireRecord>)> =
+    let groups: Vec<fan_out::OwnerGroup> =
         fan_out::group_by_owner_set(view, self_node, records.to_vec())
             .into_iter()
-            .map(|(owners, recs)| {
-                (
-                    owners
-                        .into_iter()
-                        .filter(|&n| n != from)
-                        .collect::<Vec<_>>(),
-                    recs,
-                )
+            .map(|group| fan_out::OwnerGroup {
+                owners: group
+                    .owners
+                    .into_iter()
+                    .filter(|&n| n != from)
+                    .collect::<Vec<_>>(),
+                records: group.records,
             })
-            .filter(|(owners, _)| !owners.is_empty())
+            .filter(|group| !group.owners.is_empty())
             .collect();
     Some(groups)
 }
@@ -1405,7 +1407,7 @@ async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
     if groups.is_empty() {
         return;
     }
-    let forwarded: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+    let forwarded: usize = groups.iter().map(|g| g.records.len()).sum();
     metrics::counter!(
         "sundog_forwarded_writes_total",
         "cache" => cache_name.to_string()
@@ -1420,8 +1422,8 @@ async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
         "forward batch routed under another view; re-forwarded to its owners under ours"
     );
     let deadline = tokio::time::Instant::now() + fan_out::FAN_OUT_SEND_DEADLINE;
-    for (owners, recs) in groups {
-        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, recs)
+    for fan_out::OwnerGroup { owners, records } in groups {
+        let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, records)
             .into_iter()
             .filter_map(|msg| match OutFrame::new(msg) {
                 Ok(frame) => Some(frame),
@@ -1630,9 +1632,8 @@ mod tests {
             .open()
             .await
         {
-            Err(CacheError::ReplicatedWithLocalEviction { cache, mode }) => {
+            Err(CacheError::ReplicatedWithLocalEviction { cache }) => {
                 assert_eq!(cache, "bounded");
-                assert_eq!(mode, Mode::Replicated);
             }
             other => panic!(
                 "expected ReplicatedWithLocalEviction, got {:?}",
@@ -1673,13 +1674,7 @@ mod tests {
             .build()
             .await
             .expect_err("max_frame above the wire cap must be rejected at build() time");
-        assert!(matches!(
-            err,
-            JoinError::InvalidConfig {
-                field: "max_frame",
-                ..
-            }
-        ));
+        assert!(matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("max_frame")));
     }
 
     #[tokio::test]
@@ -1694,13 +1689,7 @@ mod tests {
             .await
             .expect_err("a sketch wider than max_frame must be rejected at build() time");
         assert!(
-            matches!(
-                err,
-                JoinError::InvalidConfig {
-                    field: "ae_sketch_cells",
-                    ..
-                }
-            ),
+            matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("ae_sketch_cells")),
             "{err:?}"
         );
     }
@@ -3032,20 +3021,20 @@ mod tests {
             !groups.is_empty(),
             "some bucket has an owner besides self and the sender"
         );
-        for (owners, recs) in &groups {
+        for group in &groups {
             assert_eq!(
-                owners.as_slice(),
+                group.owners.as_slice(),
                 [third],
                 "with three eligible nodes the only other target is the third node"
             );
-            for rec in recs {
+            for rec in &group.records {
                 assert!(
                     view.owners_of(bucket_of(rec.key.as_ref())).contains(&third),
                     "a record only re-forwards to a node that owns its bucket"
                 );
             }
         }
-        let re_forwarded: usize = groups.iter().map(|(_, recs)| recs.len()).sum();
+        let re_forwarded: usize = groups.iter().map(|g| g.records.len()).sum();
         let expected = records
             .iter()
             .filter(|rec| view.owners_of(bucket_of(rec.key.as_ref())).contains(&third))
@@ -4108,7 +4097,7 @@ mod tests {
         }
         assert!(
             got_key,
-            "st_bucket_chunks streams the requested owned bucket's contents"
+            "bucket_chunks streams the requested owned bucket's contents"
         );
 
         // A multi-bucket pull streams one bucket at a time, in request
@@ -4295,11 +4284,10 @@ mod tests {
             .await
             .expect_err("a merge-derived id must never become a real node id");
         match err {
-            JoinError::InvalidConfig { field, actual, .. } => {
-                assert_eq!(field, "node_id");
-                assert_eq!(
-                    actual,
-                    derived.as_u64(),
+            JoinError::InvalidConfig(msg) => {
+                assert!(msg.contains("node_id"));
+                assert!(
+                    msg.contains(&derived.as_u64().to_string()),
                     "the rejection names the offending id"
                 );
             }

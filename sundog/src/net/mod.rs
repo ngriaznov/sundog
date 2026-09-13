@@ -41,9 +41,11 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ClusterConfig;
 use crate::error::{CodecError, JoinError};
+#[cfg(all(test, not(feature = "sim")))]
 use crate::hlc::Hlc;
 use crate::membership::Peer;
 use crate::node::NodeId;
+use crate::store::{BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion};
 use crate::wire::{self, Cell, Msg, WireRecord};
 use outbox::DropOldestQueue;
 
@@ -346,7 +348,7 @@ pub struct InboundMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AeMismatch {
     /// `(bucket, entries)`: the bucket's full listing.
-    Bucket(u16, Vec<(Bytes, Hlc)>),
+    Bucket(u16, Vec<KeyVersion>),
     /// `(bucket, cells)`: an IBLT sketch over the bucket.
     Sketch(u16, Vec<Cell>),
     /// `(bucket, digests)`: the bucket's 64 part digests, sent instead of a
@@ -379,7 +381,7 @@ pub enum AePartReply {
     Listing {
         bucket: u16,
         part: u8,
-        entries: Vec<(Bytes, Hlc)>,
+        entries: Vec<KeyVersion>,
     },
     /// An IBLT sketch over the part.
     Sketch {
@@ -465,7 +467,7 @@ pub(crate) enum FetchServe {
 /// does), or a decline.
 pub(crate) enum AeServeOutcome {
     /// The responder's own owned-bucket digests, view hashes matching.
-    Digests(Vec<(u16, u64)>),
+    Digests(Vec<BucketDigest>),
     /// The responder's own view hash differs from the requester's.
     Stale { responder_view_hash: u64 },
     /// The named cache is not open here, or not a distribution-mode cache.
@@ -489,9 +491,9 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// transfer on join.
     fn snapshot_chunks(&self, cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>>;
     /// Returns `cache`'s current per-bucket digest array.
-    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>>;
+    fn digests(&self, cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>>;
     /// Returns the live key/version listing for one bucket of `cache`.
-    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
+    fn bucket_entries(&self, cache: SmolStr, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>>;
     /// [`RequestHandler::bucket_entries`] for many buckets in one shard pass.
     fn entries_for_buckets(
         &self,
@@ -505,24 +507,24 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// materializing their contents: the cheap check `serve_ae_digest` makes
     /// before deciding whether a mismatched bucket is answered with part
     /// digests instead of a listing or sketch.
-    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>>;
+    fn bucket_lens(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>>;
 
-    /// Returns `cache`'s part digests for each of `buckets`: `(bucket, 64
-    /// part-digests)` per bucket, the responder's step-2 reply for a bucket
-    /// past [`RequestHandler::ae_part_min_bucket`] entries.
+    /// Returns `cache`'s part digests for each of `buckets`, the responder's
+    /// step-2 reply for a bucket past
+    /// [`RequestHandler::ae_part_min_bucket`] entries.
     fn part_digests(
         &self,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>>;
+    ) -> BoxFuture<'_, Vec<BucketPartDigests>>;
 
-    /// [`RequestHandler::entries_for_buckets`] at part granularity: `(key,
-    /// version)` for every live entry and un-GC'd tombstone in each
-    /// requested `(bucket, part)` pair of `cache`.
+    /// [`RequestHandler::entries_for_buckets`] at part granularity: a
+    /// [`KeyVersion`] for every live entry and un-GC'd tombstone in each
+    /// requested [`BucketPart`] of `cache`.
     fn entries_for_parts(
         &self,
         cache: SmolStr,
-        parts: Vec<(u16, u8)>,
+        parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, crate::store::PartEntries>;
 
     /// Returns full records for the entries of `bucket` in `cache` whose
@@ -543,8 +545,8 @@ pub trait RequestHandler: Send + Sync + 'static {
             let entries = self.bucket_entries(cache.clone(), bucket).await;
             let keys: Vec<Bytes> = entries
                 .into_iter()
-                .filter(|(key, _)| wanted.contains(&xxh3_64(key)))
-                .map(|(key, _)| key)
+                .filter(|kv| wanted.contains(&xxh3_64(&kv.key)))
+                .map(|kv| kv.key)
                 .collect();
             self.records_for(cache, keys).await
         })
@@ -603,7 +605,7 @@ pub trait RequestHandler: Send + Sync + 'static {
         &self,
         cache: SmolStr,
         view_hash: u64,
-        buckets: Vec<(u16, u64)>,
+        buckets: Vec<BucketDigest>,
     ) -> BoxFuture<'_, AeServeOutcome> {
         let _ = (cache, view_hash, buckets);
         Box::pin(async { AeServeOutcome::Unavailable })
@@ -1256,7 +1258,7 @@ impl Mesh {
         peer: NodeId,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> Result<Vec<(u16, Vec<(Bytes, Hlc)>)>, CodecError> {
+    ) -> Result<crate::store::BucketEntries, CodecError> {
         timed("anti-entropy sketch-fallback listing", async {
             let msg = Msg::AeEntries { cache, buckets };
             conn::collect_ae_buckets(self.acquire_conn(peer, msg).await?).await
@@ -1467,6 +1469,15 @@ mod tests {
     use crate::node::NodeName;
     use crate::wire::{self, MAX_FRAME};
 
+    /// `(key, version)` tuples to [`KeyVersion`]s, for a fixture written the
+    /// terser tuple way.
+    fn kv(entries: Vec<(Bytes, Hlc)>) -> Vec<KeyVersion> {
+        entries
+            .into_iter()
+            .map(|(key, version)| KeyVersion { key, version })
+            .collect()
+    }
+
     /// [`FixtureHandler::fetch_fixture`]'s controllable outcome, one
     /// variant per [`FetchServe`] shape.
     enum FetchFixture {
@@ -1478,7 +1489,7 @@ mod tests {
     /// [`FixtureHandler::ae_scoped_fixture`]'s controllable outcome, one
     /// variant per [`AeServeOutcome`] shape.
     enum AeScopedFixture {
-        Digests(Vec<(u16, u64)>),
+        Digests(Vec<BucketDigest>),
         Stale(u64),
         Unavailable,
     }
@@ -1498,9 +1509,9 @@ mod tests {
         ownership_view_hash: Option<u64>,
         fetch_fixture: FetchFixture,
         ae_scoped_fixture: AeScopedFixture,
-        st_buckets_available: bool,
-        st_buckets_cold: bool,
-        st_bucket_chunks: Vec<Vec<WireRecord>>,
+        buckets_available: bool,
+        buckets_cold: bool,
+        bucket_chunks: Vec<Vec<WireRecord>>,
     }
 
     impl Default for FixtureHandler {
@@ -1518,9 +1529,9 @@ mod tests {
                 ownership_view_hash: None,
                 fetch_fixture: FetchFixture::Unavailable,
                 ae_scoped_fixture: AeScopedFixture::Unavailable,
-                st_buckets_available: false,
-                st_buckets_cold: false,
-                st_bucket_chunks: Vec::new(),
+                buckets_available: false,
+                buckets_cold: false,
+                bucket_chunks: Vec::new(),
             }
         }
     }
@@ -1534,16 +1545,23 @@ mod tests {
             Box::pin(futures::stream::iter(vec![self.records.clone()]))
         }
 
-        fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
-            Box::pin(async { self.digests.clone() })
+        fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>> {
+            let digests = self
+                .digests
+                .iter()
+                .map(|&(bucket, digest)| BucketDigest { bucket, digest })
+                .collect();
+            Box::pin(async { digests })
         }
 
-        fn bucket_entries(
-            &self,
-            _cache: SmolStr,
-            _bucket: u16,
-        ) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
-            Box::pin(async { self.bucket_entries.clone() })
+        fn bucket_entries(&self, _cache: SmolStr, _bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
+            let entries = self
+                .bucket_entries
+                .iter()
+                .cloned()
+                .map(|(key, version)| KeyVersion { key, version })
+                .collect();
+            Box::pin(async { entries })
         }
 
         fn entries_for_buckets(
@@ -1551,10 +1569,16 @@ mod tests {
             _cache: SmolStr,
             buckets: Vec<u16>,
         ) -> BoxFuture<'_, crate::store::BucketEntries> {
+            let bucket_entries: Vec<KeyVersion> = self
+                .bucket_entries
+                .iter()
+                .cloned()
+                .map(|(key, version)| KeyVersion { key, version })
+                .collect();
             Box::pin(async move {
                 buckets
                     .into_iter()
-                    .map(|bucket| (bucket, self.bucket_entries.clone()))
+                    .map(|bucket| (bucket, bucket_entries.clone()))
                     .collect()
             })
         }
@@ -1567,11 +1591,7 @@ mod tests {
             Box::pin(async { self.records.clone() })
         }
 
-        fn bucket_lens(
-            &self,
-            _cache: SmolStr,
-            buckets: Vec<u16>,
-        ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        fn bucket_lens(&self, _cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
             Box::pin(async move {
                 let fixture = &self.bucket_lens;
                 buckets
@@ -1581,7 +1601,7 @@ mod tests {
                             .iter()
                             .find(|(b, _)| *b == bucket)
                             .map_or(0, |(_, len)| *len);
-                        (bucket, len)
+                        BucketLen { bucket, len }
                     })
                     .collect()
             })
@@ -1591,7 +1611,7 @@ mod tests {
             &self,
             _cache: SmolStr,
             buckets: Vec<u16>,
-        ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        ) -> BoxFuture<'_, Vec<BucketPartDigests>> {
             Box::pin(async move {
                 let fixture = &self.part_digests;
                 buckets
@@ -1601,7 +1621,7 @@ mod tests {
                             .iter()
                             .find(|(b, _)| *b == bucket)
                             .map_or_else(Vec::new, |(_, d)| d.clone());
-                        (bucket, digests)
+                        BucketPartDigests { bucket, digests }
                     })
                     .collect()
             })
@@ -1610,7 +1630,7 @@ mod tests {
         fn entries_for_parts(
             &self,
             _cache: SmolStr,
-            parts: Vec<(u16, u8)>,
+            parts: Vec<BucketPart>,
         ) -> BoxFuture<'_, crate::store::PartEntries> {
             Box::pin(async move {
                 let fixture = &self.part_entries;
@@ -1656,7 +1676,7 @@ mod tests {
             &self,
             _cache: SmolStr,
             _view_hash: u64,
-            _buckets: Vec<(u16, u64)>,
+            _buckets: Vec<BucketDigest>,
         ) -> BoxFuture<'_, AeServeOutcome> {
             Box::pin(async move {
                 match &self.ae_scoped_fixture {
@@ -1670,11 +1690,11 @@ mod tests {
         }
 
         fn st_buckets_available(&self, _cache: SmolStr, _view_hash: u64) -> BoxFuture<'_, bool> {
-            Box::pin(async { self.st_buckets_available })
+            Box::pin(async { self.buckets_available })
         }
 
         fn st_buckets_cold(&self, _cache: SmolStr, _buckets: Vec<u16>) -> BoxFuture<'_, bool> {
-            Box::pin(async { self.st_buckets_cold })
+            Box::pin(async { self.buckets_cold })
         }
 
         fn st_bucket_chunks(
@@ -1682,7 +1702,7 @@ mod tests {
             _cache: SmolStr,
             _buckets: Vec<u16>,
         ) -> BoxStream<'static, Vec<WireRecord>> {
-            Box::pin(futures::stream::iter(self.st_bucket_chunks.clone()))
+            Box::pin(futures::stream::iter(self.bucket_chunks.clone()))
         }
     }
 
@@ -2003,7 +2023,7 @@ mod tests {
             .await
             .expect("ae round succeeds");
 
-        assert_eq!(result, vec![AeMismatch::Bucket(1, entries)]);
+        assert_eq!(result, vec![AeMismatch::Bucket(1, kv(entries))]);
     }
 
     #[tokio::test]
@@ -2277,7 +2297,10 @@ mod tests {
             })
             .collect();
         let handler = Arc::new(FixtureHandler {
-            part_entries: vec![((1, 2), small_entries.clone()), ((1, 3), big_entries)],
+            part_entries: vec![
+                (BucketPart { bucket: 1, part: 2 }, kv(small_entries.clone())),
+                (BucketPart { bucket: 1, part: 3 }, kv(big_entries)),
+            ],
             ..Default::default()
         });
         let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
@@ -2293,7 +2316,7 @@ mod tests {
         assert!(
             got.iter().any(|reply| matches!(
                 reply,
-                AePartReply::Listing { bucket: 1, part: 2, entries } if *entries == small_entries
+                AePartReply::Listing { bucket: 1, part: 2, entries } if *entries == kv(small_entries.clone())
             )),
             "the small part answers with a listing: {got:?}"
         );
@@ -2372,7 +2395,7 @@ mod tests {
         }
         assert_eq!(
             round().await,
-            vec![AeMismatch::Bucket(1, entries.clone())],
+            vec![AeMismatch::Bucket(1, kv(entries.clone()))],
             "the bound serves the next round, frames queued or not"
         );
         assert!(round().await.is_empty(), "a served round resets the bound");
@@ -2466,7 +2489,7 @@ mod tests {
             .await
             .expect("ae_entries succeeds");
 
-        assert_eq!(got, vec![(3, entries.clone()), (7, entries)]);
+        assert_eq!(got, vec![(3, kv(entries.clone())), (7, kv(entries))]);
     }
 
     #[tokio::test]
@@ -2831,7 +2854,16 @@ mod tests {
             },
         )];
         let handler = Arc::new(FixtureHandler {
-            ae_scoped_fixture: AeScopedFixture::Digests(vec![(0, 111), (1, 222)]),
+            ae_scoped_fixture: AeScopedFixture::Digests(vec![
+                BucketDigest {
+                    bucket: 0,
+                    digest: 111,
+                },
+                BucketDigest {
+                    bucket: 1,
+                    digest: 222,
+                },
+            ]),
             bucket_entries: entries.clone(),
             ..Default::default()
         });
@@ -2850,7 +2882,7 @@ mod tests {
             .expect("scoped ae round succeeds");
         assert_eq!(
             result,
-            AeRoundOutcome::Mismatches(vec![AeMismatch::Bucket(1, entries)])
+            AeRoundOutcome::Mismatches(vec![AeMismatch::Bucket(1, kv(entries))])
         );
     }
 
@@ -3002,8 +3034,8 @@ mod tests {
         let chunk_a = vec![sample_record(1)];
         let chunk_b = vec![sample_record(2), sample_record(3)];
         let handler = Arc::new(FixtureHandler {
-            st_buckets_available: true,
-            st_bucket_chunks: vec![chunk_a.clone(), chunk_b.clone()],
+            buckets_available: true,
+            bucket_chunks: vec![chunk_a.clone(), chunk_b.clone()],
             ..Default::default()
         });
         let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
@@ -3029,7 +3061,7 @@ mod tests {
     #[tokio::test]
     async fn request_buckets_declines_when_the_donor_is_unavailable() {
         let handler = Arc::new(FixtureHandler {
-            st_buckets_available: false,
+            buckets_available: false,
             ownership_view_hash: Some(123),
             ..Default::default()
         });
@@ -3057,8 +3089,8 @@ mod tests {
     #[tokio::test]
     async fn request_buckets_declines_cold_when_the_donor_has_not_pulled_the_buckets() {
         let handler = Arc::new(FixtureHandler {
-            st_buckets_available: true,
-            st_buckets_cold: true,
+            buckets_available: true,
+            buckets_cold: true,
             ownership_view_hash: Some(42),
             ..Default::default()
         });
@@ -3123,14 +3155,10 @@ mod tests {
         fn snapshot_chunks(&self, _cache: SmolStr) -> BoxStream<'static, Vec<WireRecord>> {
             Box::pin(futures::stream::empty())
         }
-        fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<(u16, u64)>> {
+        fn digests(&self, _cache: SmolStr) -> BoxFuture<'_, Vec<BucketDigest>> {
             Box::pin(async { Vec::new() })
         }
-        fn bucket_entries(
-            &self,
-            _cache: SmolStr,
-            _bucket: u16,
-        ) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+        fn bucket_entries(&self, _cache: SmolStr, _bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
             Box::pin(async { Vec::new() })
         }
         fn entries_for_buckets(
@@ -3151,20 +3179,20 @@ mod tests {
             &self,
             _cache: SmolStr,
             _buckets: Vec<u16>,
-        ) -> BoxFuture<'_, Vec<(u16, usize)>> {
+        ) -> BoxFuture<'_, Vec<BucketLen>> {
             Box::pin(async { Vec::new() })
         }
         fn part_digests(
             &self,
             _cache: SmolStr,
             _buckets: Vec<u16>,
-        ) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+        ) -> BoxFuture<'_, Vec<BucketPartDigests>> {
             Box::pin(async { Vec::new() })
         }
         fn entries_for_parts(
             &self,
             _cache: SmolStr,
-            _parts: Vec<(u16, u8)>,
+            _parts: Vec<BucketPart>,
         ) -> BoxFuture<'_, crate::store::PartEntries> {
             Box::pin(async { Vec::new() })
         }

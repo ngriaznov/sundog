@@ -7,7 +7,7 @@
 //! file's own binary is the sole claimant of the process-global Prometheus
 //! recorder slot: [`metrics_handle`] installs it once, lazily, the first
 //! time any benchmark in this binary needs it, before that benchmark opens
-//! its first cache — every later benchmark in the same run then shares the
+//! its first cache; every later benchmark in the same run then shares the
 //! same handle.
 //!
 //! ```text
@@ -164,7 +164,7 @@ async fn insert_chunks(cache: &Cache<u32, String>, entries: u32, chunk: u32) {
 /// after it. `None` if this process somehow lost the race for the slot
 /// (never expected for a single-purpose test binary, but tolerated the way
 /// `tests/prometheus_exporter.rs` tolerates it): every metric read below
-/// then just reads back as zero instead of panicking.
+/// then reads back as zero instead of panicking.
 static METRICS_HANDLE: OnceLock<Option<PrometheusHandle>> = OnceLock::new();
 
 fn metrics_handle() -> Option<&'static PrometheusHandle> {
@@ -195,8 +195,8 @@ fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f
     })
 }
 
-/// Every `sundog_spill_*` counter and gauge this file reads is an
-/// exact-integer count in practice, so reading it back through `f64` and
+/// Every `sundog_spill_*` counter and gauge this file reads holds an
+/// exact-integer count, so reading it back through `f64` and
 /// rounding to `u64` sidesteps `clippy::float_cmp` entirely: every
 /// comparison and settle-poll below compares `u64`s, never `f64`s.
 fn metric_count(name: &str, labels: &[(&str, &str)]) -> u64 {
@@ -454,7 +454,7 @@ async fn spill_read_latency() {
 
     // `get_sync` never disk-reads, so it tells resident from not-resident
     // with zero I/O; `contains_key_sync` then tells a currently-spilled key
-    // (still live, just not in RAM) from one queue_full/too_large dropped
+    // (still live, only not in RAM) from one queue_full/too_large dropped
     // outright during eviction, which `get_sync` alone cannot distinguish.
     let mut resident_keys = Vec::with_capacity(SAMPLE as usize);
     let mut spilled_keys = Vec::with_capacity((SAMPLE + SYNC_MISS_SAMPLE) as usize);
@@ -668,7 +668,7 @@ async fn spill_read_no_promotion_concurrency() {
 /// spills tens of megabytes, forcing repeated region reclaim. Reports how
 /// many reclaims happened, how many entries the live count lost to them,
 /// and the latency of a `get` on a key known to have been reclaimed, a
-/// miss with no disk touched at all since the key is no longer in `live`.
+/// miss with no disk touched at all since the key sits outside `live`.
 #[allow(
     clippy::too_many_lines,
     reason = "one self-contained scenario: fill, settle, one reclaimed-key read pass, one report"
@@ -760,8 +760,8 @@ async fn spill_reclaim() {
 
 /// The case for spilling instead of discarding: a 100k-entry working set
 /// against a 40%-of-total RAM budget, read 500k times with a skew biased
-/// toward low keys (see [`skewed_key`]) — the same keys eviction-without-
-/// spill drops earliest, since they were also the first written. With a
+/// toward low keys (see [`skewed_key`]): the same keys eviction-without-
+/// spill drops earliest, since they are also the first written. With a
 /// spill tier every one of those reads is still reachable from disk; with
 /// plain eviction they are gone for good.
 #[allow(

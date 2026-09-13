@@ -46,7 +46,11 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
     draw_status(frame, chunks[2], app);
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a progress ratio only needs f64's exact-integer range for any realistic preload \
+              count"
+)]
 fn draw_preload(frame: &mut Frame, area: Rect, done: u64, total: usize) {
     let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
     let ratio = if total == 0 {

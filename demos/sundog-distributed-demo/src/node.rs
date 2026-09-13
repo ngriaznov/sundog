@@ -19,7 +19,7 @@ use crate::sample::{self, BUCKET_COUNT, PROBE_COUNT};
 pub(crate) const CACHE_NAME: &str = "demo";
 
 /// A node keeps a disowned bucket around for two anti-entropy rounds before
-/// releasing it — shorter than the library default of three, so a kill/
+/// releasing it, shorter than the library default of three, so a kill/
 /// restart cycle visibly rebalances within one headless run.
 pub(crate) const DISOWN_GRACE_ROUNDS: u32 = 2;
 
@@ -167,7 +167,7 @@ impl NodeSlot {
     /// outcome too rather than only a narrated event).
     ///
     /// A concurrent kill/restart call that finds this node already busy
-    /// returns `false` without touching anything — no cluster was reopened.
+    /// returns `false` without touching anything: no cluster reopens.
     pub(crate) async fn restart(
         self: &Arc<Self>,
         cluster_name: &str,

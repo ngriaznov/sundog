@@ -137,8 +137,8 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     // repair that lands one round later. Two fixed windows are the
     // deliberate exception to this file's own bounded-poll rule. `fast_
     // config`'s 150ms ae_interval means two 500ms windows span several
-    // rounds each, giving the counter ample opportunity to move if it were
-    // going to.
+    // rounds each, giving the counter ample opportunity to move, should it
+    // move at all.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let before = metric_value(
         &handle.render(),

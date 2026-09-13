@@ -370,15 +370,58 @@ pub enum Event<K, V> {
 
 /// A second-level anti-entropy part: a bucket and one of its
 /// [`PART_COUNT`] parts.
-pub type Part = (u16, u8);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BucketPart {
+    /// The bucket this part belongs to.
+    pub bucket: u16,
+    /// The part within [`BucketPart::bucket`], `0..PART_COUNT`.
+    pub part: u8,
+}
+
+/// A bucket paired with its anti-entropy digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketDigest {
+    /// The bucket this digest covers.
+    pub bucket: u16,
+    /// The digest itself.
+    pub digest: u64,
+}
+
+/// A key paired with the version stamped on it, as an anti-entropy or
+/// state-transfer listing carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyVersion {
+    /// The record's wire-encoded key bytes.
+    pub key: Bytes,
+    /// The version stamped on the record.
+    pub version: Hlc,
+}
+
+/// A bucket paired with its live, un-GC'd entry count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketLen {
+    /// The bucket this count covers.
+    pub bucket: u16,
+    /// The bucket's entry count.
+    pub len: usize,
+}
+
+/// A bucket paired with its [`PART_COUNT`] part digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketPartDigests {
+    /// The bucket these digests cover.
+    pub bucket: u16,
+    /// One digest per part, in part order.
+    pub digests: Vec<u64>,
+}
 
 /// Entries per bucket, as an anti-entropy exchange reports them: every
 /// requested bucket present, empty lists included.
-pub type BucketEntries = Vec<(u16, Vec<(Bytes, Hlc)>)>;
+pub type BucketEntries = Vec<(u16, Vec<KeyVersion>)>;
 
 /// Entries per part, as a second-level anti-entropy exchange reports them:
 /// every requested `(bucket, part)` pair present, empty lists included.
-pub type PartEntries = Vec<(Part, Vec<(Bytes, Hlc)>)>;
+pub type PartEntries = Vec<(BucketPart, Vec<KeyVersion>)>;
 
 /// One inbound [`WireRecord`], decoded down to what
 /// [`ShardOps::apply_remote_batch`]'s per-stripe grouping needs: its
@@ -397,6 +440,37 @@ type RemoteEntry<K, V> = (u64, K, Bytes, Hlc, Incoming<V>, Origin);
 /// sweep after the retirement is two bounds old, so the receipt lives the
 /// longer of three bounds and two bounds plus two sweep periods
 /// ([`ClusterConfig::crdt_compaction_bounds`]).
+/// Whether a merging cache's membership has settled this compaction tick.
+/// `Settled` lets [`ConflictResolver::compact`]'s second stage fold aged
+/// retirements; `Churning` defers it. See `crdt_cache_is_quiet`'s doc for
+/// the settling rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quiescence {
+    /// Every relevant member has settled: continuously present or absent
+    /// long enough to trust as dead.
+    Settled,
+    /// At least one relevant member is still flapping in or out.
+    Churning,
+}
+
+impl Quiescence {
+    /// `Settled` for `true`, `Churning` for `false`.
+    #[must_use]
+    pub fn from_settled(settled: bool) -> Self {
+        if settled {
+            Self::Settled
+        } else {
+            Self::Churning
+        }
+    }
+
+    /// Whether this is [`Quiescence::Settled`].
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::Settled)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionBounds {
     /// `ClusterConfig::crdt_retire_after`, in milliseconds.
@@ -473,7 +547,7 @@ pub trait ShardOps: Send + Sync {
 
     /// This shard's current per-bucket XOR digests, `(bucket, digest)` for all
     /// [`BUCKET_COUNT`] buckets. The first step of an anti-entropy round.
-    fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>>;
+    fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>>;
 
     /// [`ShardOps::digests`] narrowed to what one anti-entropy round with
     /// `peer` has to reconcile. The full list for every mode but
@@ -482,14 +556,14 @@ pub trait ShardOps: Send + Sync {
     /// mid disown-grace): a bucket the peer does not own would be reported
     /// as a mismatch every round and its entries pushed only to be dropped
     /// by the peer's inbound guard.
-    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<BucketDigest>> {
         let _ = peer;
         self.digests()
     }
 
-    /// `(key, version)` for every live entry and un-GC'd tombstone in `bucket`,
-    /// for a peer that reported a digest mismatch there.
-    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>>;
+    /// A [`KeyVersion`] for every live entry and un-GC'd tombstone in
+    /// `bucket`, for a peer that reported a digest mismatch there.
+    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>>;
 
     /// [`ShardOps::bucket_entries`] for many buckets in one pass, so an
     /// anti-entropy round stays linear in shard size instead of quadratic.
@@ -501,18 +575,17 @@ pub trait ShardOps: Send + Sync {
     /// [`crate::config::ClusterConfig::ae_part_min_bucket`] before it pays to
     /// build a listing or sketch. A bucket at or past [`BUCKET_COUNT`]
     /// answers `0`.
-    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>>;
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>>;
 
-    /// This shard's part digests for each of `buckets`, `(bucket, 64
-    /// part-digests)` per bucket, the second-level reply for a bucket whose
-    /// digest mismatched and whose entry count passed
-    /// [`crate::config::ClusterConfig::ae_part_min_bucket`].
-    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>>;
+    /// This shard's part digests for each of `buckets`, the second-level
+    /// reply for a bucket whose digest mismatched and whose entry count
+    /// passed [`crate::config::ClusterConfig::ae_part_min_bucket`].
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>>;
 
-    /// [`ShardOps::entries_for_buckets`] at part granularity: `(key, version)`
-    /// for every live entry and un-GC'd tombstone in each requested
-    /// `(bucket, part)` pair.
-    fn entries_for_parts(&self, parts: Vec<Part>) -> BoxFuture<'_, PartEntries>;
+    /// [`ShardOps::entries_for_buckets`] at part granularity: a
+    /// [`KeyVersion`] for every live entry and un-GC'd tombstone in each
+    /// requested [`BucketPart`].
+    fn entries_for_parts(&self, parts: Vec<BucketPart>) -> BoxFuture<'_, PartEntries>;
 
     /// The full [`WireRecord`] for each of `keys` this shard holds, present
     /// entries and tombstones alike, answering an `AePull`.
@@ -556,7 +629,7 @@ pub trait ShardOps: Send + Sync {
         &self,
         now_ms: u64,
         retire: &dyn Fn(crdt::WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
         max_entries: usize,
     ) -> BoxFuture<'_, CompactPassOutcome> {
@@ -780,7 +853,7 @@ pub trait ConflictResolver: Send + Sync + 'static {
         value: &[u8],
         now_ms: u64,
         retire: &dyn Fn(crdt::WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
     ) -> Option<Bytes> {
         let _ = (key, value, now_ms, retire, quiet, bounds);
@@ -850,7 +923,7 @@ impl ConflictResolver for SettlingResolver {
         value: &[u8],
         now_ms: u64,
         retire: &dyn Fn(crdt::WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
     ) -> Option<Bytes> {
         self.inner
@@ -1811,8 +1884,8 @@ where
         &self,
         wanted: Vec<T>,
         bucket_of: impl Fn(T) -> u16,
-        query: impl FnOnce(Vec<T>) -> Vec<(T, Vec<(Bytes, Hlc)>)>,
-    ) -> Vec<(T, Vec<(Bytes, Hlc)>)> {
+        query: impl FnOnce(Vec<T>) -> Vec<(T, Vec<KeyVersion>)>,
+    ) -> Vec<(T, Vec<KeyVersion>)> {
         let wanted = Self::dedup_sorted(wanted);
         match self.residency_check() {
             Some(residency) => {
@@ -3040,7 +3113,7 @@ where
         })
     }
 
-    fn digests(&self) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {
         let digests = self.engine.digests();
         // The outbound-serving guard: a `Mode::Distributed` shard never
         // reports a bucket it neither owns nor is releasing.
@@ -3051,10 +3124,14 @@ where
                 .collect(),
             None => digests,
         };
+        let digests = digests
+            .into_iter()
+            .map(|(bucket, digest)| BucketDigest { bucket, digest })
+            .collect();
         Box::pin(async move { digests })
     }
 
-    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<(u16, u64)>> {
+    fn ae_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Vec<BucketDigest>> {
         let Some(residency) = self.residency_check() else {
             return self.digests();
         };
@@ -3062,7 +3139,7 @@ where
         let shared: HashSet<u16> = crate::ownership::shared_owned_buckets(view, peer)
             .into_iter()
             .collect();
-        let digests: Vec<(u16, u64)> = self
+        let digests: Vec<BucketDigest> = self
             .engine
             .digests()
             .into_iter()
@@ -3070,11 +3147,12 @@ where
                 shared.contains(&bucket)
                     || (releasing.is_releasing(bucket) && view.owners_of(bucket).contains(&peer))
             })
+            .map(|(bucket, digest)| BucketDigest { bucket, digest })
             .collect();
         Box::pin(async move { digests })
     }
 
-    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<(Bytes, Hlc)>> {
+    fn bucket_entries(&self, bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
         if let Some(residency) = self.residency_check()
             && !Self::is_resident_bucket(&residency, bucket)
         {
@@ -3100,20 +3178,28 @@ where
         Box::pin(async move { entries })
     }
 
-    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, usize)>> {
+    fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
         let out = self.gated_map(buckets, |b| self.engine.bucket_len(b), 0);
+        let out = out
+            .into_iter()
+            .map(|(bucket, len)| BucketLen { bucket, len })
+            .collect();
         Box::pin(async move { out })
     }
 
-    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<(u16, Vec<u64>)>> {
+    fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         let out = self.gated_map(buckets, |b| self.engine.part_digests(b), Vec::new());
+        let out = out
+            .into_iter()
+            .map(|(bucket, digests)| BucketPartDigests { bucket, digests })
+            .collect();
         Box::pin(async move { out })
     }
 
-    fn entries_for_parts(&self, parts: Vec<Part>) -> BoxFuture<'_, PartEntries> {
+    fn entries_for_parts(&self, parts: Vec<BucketPart>) -> BoxFuture<'_, PartEntries> {
         let entries = self.resident_backfill(
             parts,
-            |(bucket, _)| bucket,
+            |p: BucketPart| p.bucket,
             |resident| self.engine.collect_parts(&resident, self.now_ms()),
         );
         Box::pin(async move { entries })
@@ -3226,7 +3312,7 @@ where
         &self,
         now_ms: u64,
         retire: &dyn Fn(crdt::WriterId) -> bool,
-        quiet: bool,
+        quiet: Quiescence,
         bounds: CompactionBounds,
         max_entries: usize,
     ) -> BoxFuture<'_, CompactPassOutcome> {
@@ -3435,8 +3521,8 @@ mod tests {
     use super::*;
 
     /// A `Mode::Distributed` shard for `self_node`, its ownership view
-    /// computed directly from `eligible` via `OwnershipView::compute` — no
-    /// cluster, no `Peer`/`CacheModes` fixture — attached before the shard
+    /// computed directly from `eligible` via `OwnershipView::compute` (no
+    /// cluster, no `Peer`/`CacheModes` fixture), attached before the shard
     /// is ever shared, matching production's `attach_ownership`. Returns
     /// the shard's own view alongside for a test to compute expected
     /// owned/unowned keys against, and the tracker's `watch::Sender` so a
@@ -3543,7 +3629,7 @@ mod tests {
     }
 
     /// Unwraps every item as [`FanOutItem::Applied`], panicking on a
-    /// [`FanOutItem::Forward`] — every test that calls this drains an
+    /// [`FanOutItem::Forward`]: every test that calls this drains an
     /// owner's or a non-`Distributed` shard's queue, which never forwards.
     fn applied_keys<K: std::fmt::Debug>(items: Vec<FanOutItem<K>>) -> Vec<K> {
         items
@@ -4475,7 +4561,7 @@ mod tests {
         V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     {
         let expected_parts = s.engine.recompute_digests();
-        for (bucket, digest) in ShardOps::digests(s).await {
+        for BucketDigest { bucket, digest } in ShardOps::digests(s).await {
             let expected = (0..PART_COUNT).fold(0u64, |acc, part| {
                 acc ^ expected_parts[usize::from(bucket) * PART_COUNT + part]
             });
@@ -4533,16 +4619,18 @@ mod tests {
         s.remove(&99u32).await.expect("tombstone somewhere else");
 
         let lens = ShardOps::bucket_lens(&s, vec![bucket, u16::MAX]).await;
-        let (_, len) = lens
+        let len = lens
             .iter()
-            .find(|(b, _)| *b == bucket)
-            .expect("the populated bucket is answered");
-        assert!(*len >= 1, "bucket_lens counts at least the inserted entry");
-        let (_, oob_len) = lens
+            .find(|bl| bl.bucket == bucket)
+            .expect("the populated bucket is answered")
+            .len;
+        assert!(len >= 1, "bucket_lens counts at least the inserted entry");
+        let oob_len = lens
             .iter()
-            .find(|(b, _)| *b == u16::MAX)
-            .expect("an out-of-range bucket is still answered, at 0");
-        assert_eq!(*oob_len, 0);
+            .find(|bl| bl.bucket == u16::MAX)
+            .expect("an out-of-range bucket is still answered, at 0")
+            .len;
+        assert_eq!(oob_len, 0);
     }
 
     #[tokio::test]
@@ -4555,11 +4643,12 @@ mod tests {
         let bucket_digests = ShardOps::digests(&s).await;
         let part_digests = ShardOps::part_digests(&s, all_buckets).await;
         assert_eq!(part_digests.len(), BUCKET_COUNT);
-        for (bucket, digest) in bucket_digests {
-            let (_, parts) = part_digests
+        for BucketDigest { bucket, digest } in bucket_digests {
+            let parts = &part_digests
                 .iter()
-                .find(|(b, _)| *b == bucket)
-                .expect("every bucket answered");
+                .find(|bpd| bpd.bucket == bucket)
+                .expect("every bucket answered")
+                .digests;
             assert_eq!(parts.len(), PART_COUNT);
             let xored = parts.iter().fold(0u64, |acc, d| acc ^ d);
             assert_eq!(xored, digest, "bucket {bucket}'s parts XOR to its digest");
@@ -4572,7 +4661,7 @@ mod tests {
         s.insert(1, "a".into()).await.expect("insert");
         let out = ShardOps::part_digests(&s, vec![u16::MAX]).await;
         assert!(
-            out.iter().all(|(_, digests)| digests.is_empty()),
+            out.iter().all(|bpd| bpd.digests.is_empty()),
             "a bucket past BUCKET_COUNT answers an empty part-digest vec"
         );
     }
@@ -4587,12 +4676,12 @@ mod tests {
         let part = u8::try_from(engine::part_index_from_hash(hash)).expect("fits");
         s.insert(key, "seven".into()).await.expect("insert");
 
-        let result = ShardOps::entries_for_parts(&s, vec![(bucket, part)]).await;
+        let result = ShardOps::entries_for_parts(&s, vec![BucketPart { bucket, part }]).await;
         assert_eq!(result.len(), 1);
         let (got, entries) = &result[0];
-        assert_eq!(*got, (bucket, part));
+        assert_eq!(*got, BucketPart { bucket, part });
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0.as_ref(), kb.as_ref());
+        assert_eq!(entries[0].key.as_ref(), kb.as_ref());
     }
 
     #[tokio::test]
@@ -4606,9 +4695,15 @@ mod tests {
         )))
         .expect("fits");
 
-        let result =
-            ShardOps::entries_for_parts(&s, vec![(bucket, part), (bucket, part), (bucket, part)])
-                .await;
+        let result = ShardOps::entries_for_parts(
+            &s,
+            vec![
+                BucketPart { bucket, part },
+                BucketPart { bucket, part },
+                BucketPart { bucket, part },
+            ],
+        )
+        .await;
         assert_eq!(
             result.len(),
             1,
@@ -4907,7 +5002,7 @@ mod tests {
                 b"v",
                 0,
                 &retire_everyone,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(0)
             ),
             None,
@@ -4920,7 +5015,7 @@ mod tests {
                 b"v",
                 12_345,
                 &retire_everyone,
-                false,
+                Quiescence::Churning,
                 CompactionBounds::three_bounds(999)
             ),
             None,
@@ -4935,13 +5030,13 @@ mod tests {
                 b"val",
                 42,
                 &retire_none,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(100),
             )
             .expect("a resolver that overrides compact can return Some");
         assert_eq!(
             out.as_ref(),
-            b"key:val|42|false|true|100",
+            b"key:val|42|false|Settled|100",
             "every parameter compact was called with reaches the resolver's \
              own implementation"
         );
@@ -4956,8 +5051,15 @@ mod tests {
 
         let CompactPassOutcome {
             retired, compacted, ..
-        } = ShardOps::compact_pass(&s, 0, &retire, true, CompactionBounds::three_bounds(0), 100)
-            .await;
+        } = ShardOps::compact_pass(
+            &s,
+            0,
+            &retire,
+            Quiescence::Settled,
+            CompactionBounds::three_bounds(0),
+            100,
+        )
+        .await;
 
         assert!(
             retired.is_empty(),
@@ -5135,12 +5237,12 @@ mod tests {
             value: &[u8],
             now_ms: u64,
             retire: &dyn Fn(crdt::WriterId) -> bool,
-            quiet: bool,
+            quiet: Quiescence,
             bounds: CompactionBounds,
         ) -> Option<Bytes> {
             let retired_probe = retire(crdt::WriterId::new(NodeId::from(1), 1));
             Some(Bytes::from(format!(
-                "{}|{now_ms}|{retired_probe}|{quiet}|{}",
+                "{}|{now_ms}|{retired_probe}|{quiet:?}|{}",
                 String::from_utf8_lossy(key).into_owned() + ":" + &String::from_utf8_lossy(value),
                 bounds.retire_after_ms
             )))
@@ -5193,7 +5295,7 @@ mod tests {
                 &s,
                 1_000,
                 &retire,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000_000_000),
                 100,
             )
@@ -5233,8 +5335,8 @@ mod tests {
                 "the resident bytes themselves change shape once a writer is retired"
             );
 
-            // Idempotent: the same writer is no longer live in the record, so
-            // a second pass with the identical retire predicate finds
+            // Idempotent: the record now holds nothing live for that writer,
+            // so a second pass with the identical retire predicate finds
             // nothing left to do.
             let CompactPassOutcome {
                 retired: retired_again,
@@ -5244,7 +5346,7 @@ mod tests {
                 &s,
                 2_000,
                 &retire,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1_000_000_000),
                 100,
             )
@@ -5270,7 +5372,7 @@ mod tests {
                     _value: &[u8],
                     _now_ms: u64,
                     _retire: &dyn Fn(crdt::WriterId) -> bool,
-                    _quiet: bool,
+                    _quiet: Quiescence,
                     _bounds: CompactionBounds,
                 ) -> Option<Bytes> {
                     self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5291,7 +5393,7 @@ mod tests {
                 &s,
                 0,
                 &retire_everyone,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(0),
                 100,
             )
@@ -5342,7 +5444,7 @@ mod tests {
             // did to the queue, never the ordinary write that seeded it.
             let _ = s.fan_out.drain();
 
-            // Membership widens and this bucket moves to the other node — the
+            // Membership widens and this bucket moves to the other node; the
             // shard's own physical copy is still sitting right there, mid
             // disown-grace, exactly as `a_releasing_bucket_still_answers_
             // digests_and_entries` sets up for the ordinary write path.
@@ -5366,7 +5468,7 @@ mod tests {
                 &s,
                 1_000,
                 &retire,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1),
                 100,
             )
@@ -5414,7 +5516,7 @@ mod tests {
                     &s,
                     1_000,
                     &retire,
-                    true,
+                    Quiescence::Settled,
                     CompactionBounds::three_bounds(1),
                     3,
                 )
@@ -5461,7 +5563,7 @@ mod tests {
                 .expect("merge");
 
             // A fabricated spilled entry for the very same dead writer,
-            // bypassing any real spill tier — `Engine::compact` (and
+            // bypassing any real spill tier: `Engine::compact` (and
             // therefore `Shard::compact_pass`, which never reads a stripe
             // directly) must skip it regardless of what its bytes would
             // decode to.
@@ -5486,7 +5588,7 @@ mod tests {
                 &s,
                 1_000,
                 &retire,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1),
                 100,
             )
@@ -5541,8 +5643,10 @@ mod tests {
 
             let retire = move |w: crdt::WriterId| w == dead;
             let bounds = CompactionBounds::three_bounds(1);
-            let outcome_a = ShardOps::compact_pass(&a, 1_000, &retire, true, bounds, 100).await;
-            let outcome_b = ShardOps::compact_pass(&b, 1_000, &retire, true, bounds, 100).await;
+            let outcome_a =
+                ShardOps::compact_pass(&a, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
+            let outcome_b =
+                ShardOps::compact_pass(&b, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
             assert_eq!((outcome_a.compacted, outcome_b.compacted), (5, 5));
             assert_eq!(
                 ShardOps::digests(&a).await,
@@ -5579,8 +5683,9 @@ mod tests {
 
             let retire = move |w: crdt::WriterId| w == dead;
             // Stage one at 1_000, stage two past two bounds: a receipt at 1_000.
-            ShardOps::compact_pass(&s, 1_000, &retire, true, bounds, 100).await;
-            let folded = ShardOps::compact_pass(&s, 3_001, &retire, true, bounds, 100).await;
+            ShardOps::compact_pass(&s, 1_000, &retire, Quiescence::Settled, bounds, 100).await;
+            let folded =
+                ShardOps::compact_pass(&s, 3_001, &retire, Quiescence::Settled, bounds, 100).await;
             assert_eq!(folded.compacted, 1, "folded with a receipt");
             let with_receipt = ShardOps::records_for(&s, vec![key_bytes(&1u32)])
                 .await
@@ -5588,7 +5693,8 @@ mod tests {
                 .next()
                 .expect("resident");
             // Stage three past three bounds: the receipt is gone locally.
-            let pruned = ShardOps::compact_pass(&s, 4_001, &retire, true, bounds, 100).await;
+            let pruned =
+                ShardOps::compact_pass(&s, 4_001, &retire, Quiescence::Settled, bounds, 100).await;
             assert_eq!(pruned.compacted, 1, "receipt pruned");
             let pruned_bytes = s.get(&1).await.expect("resident").encode().expect("encode");
 
@@ -5622,9 +5728,14 @@ mod tests {
             let retire = move |w: crdt::WriterId| w == dead;
             let bounds = CompactionBounds::three_bounds(1);
 
-            let scan = s
-                .engine
-                .compact(s.resolver.as_ref(), 1_000, &retire, true, bounds, 100);
+            let scan = s.engine.compact(
+                s.resolver.as_ref(),
+                1_000,
+                &retire,
+                Quiescence::Settled,
+                bounds,
+                100,
+            );
             let engine::CompactCandidate {
                 key,
                 key_bytes,
@@ -5652,7 +5763,8 @@ mod tests {
             assert!(!applied, "the stale candidate is refused");
             assert_eq!(s.get(&1).await.map(|c| c.value()), Some(7));
 
-            let next = ShardOps::compact_pass(&s, 1_001, &retire, true, bounds, 100).await;
+            let next =
+                ShardOps::compact_pass(&s, 1_001, &retire, Quiescence::Settled, bounds, 100).await;
             assert_eq!(next.retired, vec![dead], "still eligible on the next pass");
             assert_eq!(
                 next.compacted, 1,
@@ -5695,7 +5807,7 @@ mod tests {
                 &a,
                 5_000,
                 &retire_w1,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1),
                 100,
             )
@@ -5708,7 +5820,7 @@ mod tests {
                 &b,
                 5_000,
                 &retire_w2,
-                true,
+                Quiescence::Settled,
                 CompactionBounds::three_bounds(1),
                 100,
             )
@@ -5769,7 +5881,7 @@ mod tests {
         let mut events = s.events();
 
         // A bare tombstone for a key that has never existed: `stored_ver` is
-        // `None` going in, so this never consults `AlwaysMerge` at all — it
+        // `None` going in, so this never consults `AlwaysMerge` at all: it
         // would otherwise see its own tombstone as a value-less "incoming"
         // and have the engine's guard skip `merge`, same as the colliding
         // write below, which is exactly what this test means to isolate
@@ -5828,7 +5940,7 @@ mod tests {
         }
     }
 
-    /// A spilled stored side is no longer value-less once `apply_locked`
+    /// A spilled stored side carries a real value once `apply_locked`
     /// reads its bytes back off disk (see `engine::read_spilled_for_conflict`):
     /// `AlwaysMerge`'s `merge` always returns `Some`, and now that both
     /// sides have real values, `resolve_conflict`'s guard has nothing to
@@ -5995,8 +6107,8 @@ mod tests {
         );
     }
 
-    /// A resolver whose merge sums both sides as `u32`, so repeated folding
-    /// — [`Shard::merge`]'s in-memory coalescing included — is observable
+    /// A resolver whose merge sums both sides as `u32`, so repeated folding,
+    /// [`Shard::merge`]'s in-memory coalescing included, is observable
     /// as an actual running total rather than just "some merge happened".
     /// Falls back to plain `Hlc` order when either side lacks a value,
     /// matching every other merging resolver's tombstone/spill guard.
@@ -6030,7 +6142,7 @@ mod tests {
     }
 
     /// A resolver that keeps whichever side decodes to the greater `u32` and
-    /// never overrides [`ConflictResolver::merge`] — legal per
+    /// never overrides [`ConflictResolver::merge`]: legal per
     /// [`ConflictResolver::merges`]'s own doc ("`true` is always correct to
     /// return, even for a resolver whose `merge` never actually returns
     /// `Some`") and exactly the shape needed to drive [`Shard::merge`]'s
@@ -6106,8 +6218,8 @@ mod tests {
     /// [`Engine::apply_many`]'s pre-fold (`engine::prefold_batch`) collapses
     /// several same-key records in one `apply_remote_batch` call into one
     /// real apply, so a fan-out batch carrying distinct origin nodes'
-    /// writes to the same key publishes exactly one event — not one per
-    /// contributing record, the pre-pre-fold behavior — and that event
+    /// writes to the same key publishes exactly one event, not one per
+    /// contributing record, the pre-pre-fold behavior, and that event
     /// names only the run's last record's origin, documented on
     /// [`Origin::Remote`] as an accepted cost of the fold.
     #[tokio::test]
@@ -6123,7 +6235,7 @@ mod tests {
         };
 
         // Three records for one key, from three distinct origin nodes, in
-        // one batch — the shape a peer's fan-out or anti-entropy-pull reply
+        // one batch: the shape a peer's fan-out or anti-entropy-pull reply
         // bundling several nodes' writes to the same key takes.
         let recs = vec![rec(2, 1, 2), rec(3, 2, 3), rec(4, 3, 4)];
         ShardOps::apply_remote_batch(&s, recs).await;
@@ -6383,8 +6495,8 @@ mod tests {
     #[tokio::test]
     async fn merge_falls_back_to_hlc_order_when_the_resolver_does_not_merge() {
         // `Shard::with_merge_coalesce_window` is a raw setter with no
-        // validation of its own — `crate::cache::CacheBuilder` is the
-        // validated entry point — so a non-merging resolver combined with a
+        // validation of its own: `crate::cache::CacheBuilder` is the
+        // validated entry point, so a non-merging resolver combined with a
         // window must still behave sanely: the pending fold degrades to
         // picking a side, never panicking.
         let s = shard::<u32, u32>(1).with_merge_coalesce_window(Duration::from_secs(60));
@@ -7077,7 +7189,7 @@ mod tests {
         let reported: HashSet<u16> = ShardOps::digests(&s)
             .await
             .into_iter()
-            .map(|(bucket, _)| bucket)
+            .map(|bd| bd.bucket)
             .collect();
         for &bucket in &reported {
             assert!(
@@ -7104,15 +7216,24 @@ mod tests {
 
         assert_eq!(
             ShardOps::bucket_lens(&s, vec![unowned_bucket]).await,
-            vec![(unowned_bucket, 0)],
+            vec![BucketLen {
+                bucket: unowned_bucket,
+                len: 0
+            }],
             "bucket_lens reports zero for an unowned bucket"
         );
         assert_eq!(
             ShardOps::part_digests(&s, vec![unowned_bucket]).await,
-            vec![(unowned_bucket, Vec::new())],
+            vec![BucketPartDigests {
+                bucket: unowned_bucket,
+                digests: Vec::new()
+            }],
             "part_digests reports nothing for an unowned bucket"
         );
-        let part = (unowned_bucket, 0u8);
+        let part = BucketPart {
+            bucket: unowned_bucket,
+            part: 0u8,
+        };
         assert_eq!(
             ShardOps::entries_for_parts(&s, vec![part]).await,
             vec![(part, Vec::new())],
@@ -7162,7 +7283,7 @@ mod tests {
             .await
             .expect("owner's insert lands");
 
-        // Membership widens and this bucket moves to the other node —
+        // Membership widens and this bucket moves to the other node,
         // exactly what `rebalance_task` reacts to by starting this bucket's
         // disown grace.
         tx.send(Arc::new(new_view)).expect("receiver still alive");
@@ -7175,7 +7296,7 @@ mod tests {
         let digests: HashSet<u16> = ShardOps::digests(&s)
             .await
             .into_iter()
-            .map(|(b, _)| b)
+            .map(|bd| bd.bucket)
             .collect();
         assert!(
             digests.contains(&bucket),
@@ -7188,7 +7309,7 @@ mod tests {
             entries[0]
                 .1
                 .iter()
-                .any(|(k, _)| k.as_ref() == key_bytes(&key).as_ref()),
+                .any(|kv| kv.key.as_ref() == key_bytes(&key).as_ref()),
             "the pre-existing entry in a releasing bucket is still served"
         );
     }
@@ -7233,7 +7354,7 @@ mod tests {
         }
 
         // A second forwarded insert for the same key: a non-owner holds no
-        // prior copy, so it still cannot distinguish create from update —
+        // prior copy, so it still cannot distinguish create from update:
         // this stays Created, never Updated, the documented difference from
         // every other write path.
         s.insert(key, "second".to_string())
@@ -7294,8 +7415,8 @@ mod tests {
         let digest_for_released = ShardOps::digests(&s)
             .await
             .into_iter()
-            .find(|&(b, _)| b == released_bucket)
-            .map(|(_, d)| d);
+            .find(|bd| bd.bucket == released_bucket)
+            .map(|bd| bd.digest);
         assert_eq!(
             digest_for_released,
             Some(0),
@@ -7373,7 +7494,7 @@ mod tests {
         let listed: HashSet<u16> = ShardOps::ae_digests_for(&s, peer)
             .await
             .into_iter()
-            .map(|(bucket, _)| bucket)
+            .map(|bd| bd.bucket)
             .collect();
         assert!(
             listed.contains(&shared_owned),

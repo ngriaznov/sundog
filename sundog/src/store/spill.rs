@@ -275,7 +275,7 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
     /// write lock, remove every listed key whose payload is still
     /// `Spilled(loc)` with `loc.region == region && loc.generation ==
     /// generation`, XOR its fingerprint out of the digest, and decrement
-    /// `live_count`. Returns how many were removed.
+    /// `live_count`. Returns the count removed.
     fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize;
 
     /// A queued job for `key_bytes` is never installed: its region write
@@ -520,11 +520,11 @@ impl Inner {
     }
 }
 
-// A gauge only needs f64's exact-integer range, up to 2^53, which
-// comfortably covers realistic spill capacities, petabytes, with no
-// meaningful precision loss. Unlike an entry count, a byte count routinely
-// exceeds `u32::MAX`.
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge only needs f64's exact-integer range, up to 2^53, which comfortably \
+              covers realistic spill capacities, petabytes"
+)]
 fn bytes_used_f64(bytes: u64) -> f64 {
     bytes as f64
 }

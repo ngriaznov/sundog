@@ -452,14 +452,14 @@ async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
     let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
     let mut expected = vec![0u64; BUCKET_COUNT];
     for (bucket, entries) in ShardOps::entries_for_buckets(shard, all_buckets).await {
-        for (key_bytes, ver) in entries {
-            expected[usize::from(bucket)] ^= entry_fingerprint(&key_bytes, ver);
+        for kv in entries {
+            expected[usize::from(bucket)] ^= entry_fingerprint(&kv.key, kv.version);
         }
     }
     let actual: Vec<u64> = ShardOps::digests(shard)
         .await
         .into_iter()
-        .map(|(_, d)| d)
+        .map(|bd| bd.digest)
         .collect();
     actual == expected
 }
@@ -468,23 +468,28 @@ async fn digest_matches_entries_for_buckets(shard: &Shard<u8, u16>) -> bool {
 /// [`ShardOps::entries_for_parts`], the part-grained counterpart of
 /// [`digest_matches_entries_for_buckets`].
 async fn digest_matches_entries_for_parts(shard: &Shard<u8, u16>) -> bool {
-    let all_parts: Vec<(u16, u8)> = (0..u16::try_from(BUCKET_COUNT).expect("fits"))
-        .flat_map(|b| (0..u8::try_from(PART_COUNT).expect("fits")).map(move |p| (b, p)))
+    let all_parts: Vec<BucketPart> = (0..u16::try_from(BUCKET_COUNT).expect("fits"))
+        .flat_map(|bucket| {
+            (0..u8::try_from(PART_COUNT).expect("fits"))
+                .map(move |part| BucketPart { bucket, part })
+        })
         .collect();
     let mut expected = vec![0u64; BUCKET_COUNT * PART_COUNT];
-    for ((bucket, part), entries) in ShardOps::entries_for_parts(shard, all_parts).await {
-        for (key_bytes, ver) in entries {
+    for (BucketPart { bucket, part }, entries) in
+        ShardOps::entries_for_parts(shard, all_parts).await
+    {
+        for kv in entries {
             expected[usize::from(bucket) * PART_COUNT + usize::from(part)] ^=
-                entry_fingerprint(&key_bytes, ver);
+                entry_fingerprint(&kv.key, kv.version);
         }
     }
     let all_buckets: Vec<u16> = (0..u16::try_from(BUCKET_COUNT).expect("fits")).collect();
     let actual = ShardOps::part_digests(shard, all_buckets).await;
-    actual.into_iter().all(|(bucket, digests)| {
-        digests
+    actual.into_iter().all(|bpd| {
+        bpd.digests
             .iter()
             .enumerate()
-            .all(|(part, &d)| d == expected[usize::from(bucket) * PART_COUNT + part])
+            .all(|(part, &d)| d == expected[usize::from(bpd.bucket) * PART_COUNT + part])
     })
 }
 
@@ -650,7 +655,7 @@ proptest! {
     /// concurrent per-origin increments to one shared key, replayed with
     /// arbitrary permutation, duplication (redelivery), and mixed
     /// single/batch/concurrent apply order across several shards, converges
-    /// everywhere to byte-identical state — and to the exact sum of every
+    /// everywhere to byte-identical state, and to the exact sum of every
     /// generated increment, the "no lost updates" oracle a digest match
     /// alone doesn't check.
     #[test]
@@ -782,7 +787,7 @@ proptest! {
 
 /// Targeted example test: a redelivery of an input already folded into a
 /// prior merge is a byte-for-byte, version-for-version no-op. This is the
-/// property that stops a redelivered record from re-broadcasting forever —
+/// property that stops a redelivered record from re-broadcasting forever:
 /// a merged version never equals either input's own version (so the
 /// `sv == ver` fast path never fires on redelivery), so the resolver runs
 /// again on every redelivery and must recognize the result as unchanged.
@@ -847,7 +852,7 @@ async fn pn_counter_redelivery_after_merge_is_a_no_op() {
     );
 
     // Redeliver `b`: already fully absorbed into the merge above, so this
-    // must change nothing — no event, and nothing queued for re-fan-out.
+    // must change nothing: no event, and nothing queued for re-fan-out.
     let _ = shard.fan_out.drain();
     let mut events = shard.events();
 
@@ -1052,9 +1057,9 @@ proptest! {
     /// own origin's, possibly redelivered and reordered, write), but driven
     /// through exactly one [`bidirectional_gossip_pass`] instead of a
     /// bounded loop of unidirectional rounds. Every pair of shards must hold
-    /// an identical `(version, bytes)` pair after that one pass — the
+    /// an identical `(version, bytes)` pair after that one pass, the
     /// one-round convergence property `engine::merge_version`'s doc proves
-    /// for a symmetric bidirectional exchange — and that shared value must
+    /// for a symmetric bidirectional exchange, and that shared value must
     /// be the exact sum of every generated increment, with no lost updates.
     #[test]
     fn pn_counter_bidirectional_gossip_converges_in_one_round(
@@ -1252,7 +1257,7 @@ proptest! {
                 }
                 CompactionStep::Compact { replica } => {
                     if let Some(compacted) =
-                        replicas[replica].compact(now_ms, &retire_fn, true, bounds)
+                        replicas[replica].compact(now_ms, &retire_fn, Quiescence::Settled, bounds)
                     {
                         replicas[replica] = compacted;
                     }
@@ -1273,7 +1278,7 @@ proptest! {
             // ever carries it anywhere -- a real divergence, not a flaw in
             // the model.
             for replica in &mut replicas {
-                if let Some(compacted) = replica.compact(now_ms, &retire_fn, true, bounds) {
+                if let Some(compacted) = replica.compact(now_ms, &retire_fn, Quiescence::Settled, bounds) {
                     *replica = compacted;
                 }
             }

@@ -349,7 +349,6 @@ fn validate_mode(
     {
         return Err(CacheError::ReplicatedWithLocalEviction {
             cache: name.clone(),
-            mode,
         });
     }
     Ok(())
@@ -1262,8 +1261,8 @@ mod tests {
         // owners = 2, roughly a third of keys land here. `a`'s ownership
         // view only recomputes once its background refresh task has
         // observed both the membership change above and the gossiped
-        // cache-mode advertisement `b`/`c` sent on their own `open()` —
-        // strictly a separate, slightly later event than peer liveness —
+        // cache-mode advertisement `b`/`c` sent on their own `open()`,
+        // strictly a separate, slightly later event than peer liveness,
         // so this polls rather than searching the instant peers converge.
         let unowned_key = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
