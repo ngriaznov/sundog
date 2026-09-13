@@ -399,7 +399,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
         // Faster than the default so container tests converge in seconds.
         c.ae_interval = Duration::from_secs(2);
-        c.tombstone_ttl = Duration::from_secs(10);
+        // Covers the 16 s bucket release window a distributed cache needs.
+        c.tombstone_ttl = Duration::from_secs(20);
         if let Some(min_bucket) = ae_part_min_bucket {
             c.ae_part_min_bucket = min_bucket;
         }

@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::cluster::Cluster;
+use crate::config::ClusterConfig;
 use crate::error::CacheError;
 use crate::net::FetchOutcome;
 use crate::node::NodeId;
@@ -235,7 +236,8 @@ where
         #[cfg(not(feature = "spill"))]
         let spill_configured = false;
 
-        validate_mode(&name, mode, tti, max_capacity, spill_configured)?;
+        let local_eviction = tti.is_some() || (max_capacity != u64::MAX && !spill_configured);
+        validate_mode(&name, mode, local_eviction, cluster.config())?;
 
         if !validate_merge_window(merge_coalesce_window, resolver.merges()) {
             return Err(CacheError::MergeWindowRequiresMergingResolver { cache: name });
@@ -339,29 +341,36 @@ where
     }
 }
 
-/// Rejects a `Mode::Distributed` cache opened with `owners` under 2, and
-/// rejects a `Replicated` or `Distributed` cache combined with local
-/// eviction: any `tti`, or a finite `max_capacity` with no spill tier
-/// configured. Anti-entropy would silently re-pull an evicted entry back
-/// for either mode, since every owner is expected to hold what it owns.
+/// Rejects a `Mode::Distributed` cache opened with `owners` under 2 or
+/// under a `tombstone_ttl` shorter than
+/// [`ClusterConfig::bucket_release_window`], and rejects a `Replicated` or
+/// `Distributed` cache combined with `local_eviction`: any `tti`, or a
+/// finite `max_capacity` with no spill tier configured. Anti-entropy would
+/// silently re-pull an evicted entry back for either mode, since every owner
+/// is expected to hold what it owns.
 fn validate_mode(
     name: &SmolStr,
     mode: Mode,
-    tti: Option<Duration>,
-    max_capacity: u64,
-    spill_configured: bool,
+    local_eviction: bool,
+    config: &ClusterConfig,
 ) -> Result<(), CacheError> {
-    if let Mode::Distributed { owners } = mode
-        && owners.get() < 2
-    {
-        return Err(CacheError::TooFewOwners {
-            cache: name.clone(),
-            owners,
-        });
+    if let Mode::Distributed { owners } = mode {
+        if owners.get() < 2 {
+            return Err(CacheError::TooFewOwners {
+                cache: name.clone(),
+                owners,
+            });
+        }
+        let window = config.bucket_release_window();
+        if config.tombstone_ttl < window {
+            return Err(CacheError::TombstoneTtlInsideReleaseWindow {
+                cache: name.clone(),
+                tombstone_ttl: config.tombstone_ttl,
+                window,
+            });
+        }
     }
-    if matches!(mode, Mode::Replicated | Mode::Distributed { .. })
-        && (tti.is_some() || (max_capacity != u64::MAX && !spill_configured))
-    {
+    if local_eviction && matches!(mode, Mode::Replicated | Mode::Distributed { .. }) {
         return Err(CacheError::ReplicatedWithLocalEviction {
             cache: name.clone(),
         });
@@ -1188,7 +1197,6 @@ mod tests {
 
     use super::*;
     use crate::cluster::Cluster;
-    use crate::config::ClusterConfig;
     use crate::store::crdt::{PnCounter, PnCounterResolver};
 
     fn loopback_config() -> ClusterConfig {
@@ -1385,6 +1393,7 @@ mod tests {
         let name = "distributed-cold-fetch";
         let mut config = loopback_config();
         config.ae_interval = Duration::from_secs(3600);
+        config.tombstone_ttl = config.bucket_release_window();
         let a = Cluster::builder(name)
             .seeds(std::iter::empty())
             .config(config.clone())
@@ -2093,6 +2102,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distributed_cache_rejects_a_tombstone_ttl_inside_the_release_window() {
+        let name = "distributed-release-window-guard";
+        let config = loopback_config().with(|c| {
+            c.ae_interval = Duration::from_secs(3);
+            c.distributed_disown_grace_rounds = 3;
+            c.tombstone_ttl = Duration::from_secs(15);
+        });
+        let cluster = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("the cluster builds; the rule binds distributed caches only");
+
+        let err = cluster
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect_err("a distributed cache under a short retention is rejected");
+        assert!(
+            matches!(
+                &err,
+                CacheError::TombstoneTtlInsideReleaseWindow { cache, tombstone_ttl, window }
+                    if cache == name
+                        && *tombstone_ttl == Duration::from_secs(15)
+                        && *window == Duration::from_secs(24)
+            ),
+            "{err:?}"
+        );
+
+        let replicated = cluster
+            .cache::<u32, String>(name)
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a replicated cache is not bound by the release window");
+        replicated.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn distributed_cache_opened_before_any_peer_is_known_pulls_its_buckets_once_one_appears()
     {
         // `a` is seeded with the port `b` binds later, so `b` opens its
@@ -2103,6 +2154,7 @@ mod tests {
         let name = "distributed-late-peer";
         let mut config = loopback_config();
         config.ae_interval = Duration::from_secs(3600);
+        config.tombstone_ttl = config.bucket_release_window();
         config.gossip_interval = Duration::from_millis(200);
         // The released port can be taken by a test running alongside before
         // `b` binds it; then the pair is torn down and set up on a new one.
@@ -2478,6 +2530,7 @@ mod tests {
         let name = "distributed-stale-forward";
         let mut config = loopback_config();
         config.ae_interval = Duration::from_secs(3600);
+        config.tombstone_ttl = config.bucket_release_window();
         let ((a, cache_a), (b, cache_b), (c, cache_c)) =
             three_node_distributed_with(name, config).await;
 

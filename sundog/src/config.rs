@@ -56,7 +56,8 @@ pub struct ClusterConfig {
     /// copy that no removal reaches until its hand-off round, up to twice
     /// the grace later, and that round pushes whatever the owners lack. With
     /// the tombstone still there the stale copy loses; without it a removed
-    /// key comes back. `Cluster::build` rejects a shorter retention.
+    /// key comes back. Opening a `Mode::Distributed` cache rejects a shorter
+    /// retention with `CacheError::TombstoneTtlInsideReleaseWindow`.
     ///
     /// While a member is absent, a `Replicated`-mode cache defers collection
     /// past this point, up to [`tombstone_max_ttl`](Self::tombstone_max_ttl),
@@ -182,6 +183,7 @@ pub struct ClusterConfig {
     /// new owner's rebalance pull has time to land against it as donor
     /// first. Default: 3. Bounded above by
     /// [`tombstone_ttl`](Self::tombstone_ttl), which must cover
+    /// [`bucket_release_window`](Self::bucket_release_window),
     /// `ae_interval * (2 * rounds + 2)`.
     pub distributed_disown_grace_rounds: u32,
     /// Per-owner-attempt timeout for a `Mode::Distributed` cache's read
@@ -201,6 +203,20 @@ impl ClusterConfig {
     #[must_use]
     pub fn tombstone_ttl_is_safe(&self) -> bool {
         self.tombstone_ttl >= self.ae_interval.saturating_mul(3)
+    }
+
+    /// The longest a `Mode::Distributed` node holds a bucket it no longer
+    /// owns before its hand-off round pushes that copy to the owners:
+    /// `ae_interval * (2 * distributed_disown_grace_rounds + 2)`, twice the
+    /// disown grace plus one interval for the round and one of slack.
+    /// [`tombstone_ttl`](Self::tombstone_ttl) must cover it.
+    #[must_use]
+    pub fn bucket_release_window(&self) -> Duration {
+        self.ae_interval.saturating_mul(
+            self.distributed_disown_grace_rounds
+                .saturating_mul(2)
+                .saturating_add(2),
+        )
     }
 
     /// How often the CRDT compaction sweep runs:
@@ -275,6 +291,19 @@ mod tests {
     #[test]
     fn defaults_satisfy_the_tombstone_ttl_rule() {
         assert!(ClusterConfig::default().tombstone_ttl_is_safe());
+    }
+
+    #[test]
+    fn bucket_release_window_spans_two_graces_plus_two_intervals() {
+        let config = ClusterConfig::default().with(|c| {
+            c.ae_interval = Duration::from_secs(3);
+            c.distributed_disown_grace_rounds = 3;
+        });
+        assert_eq!(config.bucket_release_window(), Duration::from_secs(24));
+        assert!(
+            ClusterConfig::default().tombstone_ttl
+                >= ClusterConfig::default().bucket_release_window()
+        );
     }
 
     #[test]
