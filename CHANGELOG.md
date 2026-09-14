@@ -57,6 +57,44 @@ All notable changes to this project are documented in this file. Format follows
   cache's seventh Prometheus metric, counting warm-ups that gave up on a
   bucket pull timing out repeatedly and opened warm with whatever landed,
   leaving the rest to anti-entropy.
+- **Spill flush-queue admission control**: a semaphore, sized from
+  `SpillConfig::flush_queue_bytes_value()`, tracks the flush queue's byte
+  budget in place of a plain counter. `Shard::insert_many`/`remove_many`
+  and `ShardOps::apply_remote_batch` (live replication, anti-entropy pull
+  repair, and every rebalance/state-transfer pull) reserve one batch's
+  worth of flush-queue room, once per call, before taking any stripe
+  lock, and wait up to `SpillConfig::spill_wait_timeout` (a new builder
+  method and accessor, `Duration::from_secs(2)` by default,
+  `Duration::ZERO` a documented opt-out) for room to free up instead of
+  refusing the eviction outright. That one reservation is sized only from
+  the call's own new bytes, so it can still run short against a real
+  backlog a lagging flusher left behind from earlier calls; when it does,
+  the call retries with a fresh reservation for exactly the shortfall,
+  against the same call's overall `spill_wait_timeout` budget. Every
+  entry this covers stays resident while the retry is still within
+  budget, never dropped for a shortfall the retry could still pay down;
+  once the budget runs out, the shortfall resolves through the same
+  ordinary, non-blocking refusal any unreserved write already uses, so
+  `SpillTier::set_keep_resident_when_refused`'s policy decides the
+  victim's fate exactly as it always has rather than leaving it resident
+  regardless of that policy. **This is a real behavior change for
+  every existing spill deployment**: `SpillConfig::new(...)` with no
+  override moves from always refusing an eviction instantly under
+  backpressure to waiting up to two seconds for room first; a cache
+  opened with no `SpillConfig` sees no change at all. The flush channel's
+  slot count scales with `flush_queue_bytes_value()` too (clamped to a
+  floor at the existing fixed 8192 slots and a ceiling that bounds a
+  pathological config), rather than staying fixed regardless of
+  configuration, since a fixed slot count fills, for small records, long
+  before the byte budget does. Three new metrics cover the wait itself:
+  `sundog_spill_wait_seconds_total{cache}` (a counter, whole seconds),
+  `sundog_spill_waiters{cache}` (a gauge), and
+  `sundog_spill_wait_timeouts_total{cache}` (a counter, incremented only
+  when the wait itself times out). `sundog_spill_dropped_total` gains a
+  `reason="disk_error"` value, incremented for every job in a segment
+  whose write fails; the victim stays resident on this path exactly as
+  every other refusal reason leaves it, so this counter is the only
+  visible sign of the failure.
 - **Scale workflow**: `.github/workflows/scale.yml` runs the distributed
   demo headless overnight (and on demand via `workflow_dispatch`, with
   `keys`, `duration_secs`, `max_entries`, and `runner` inputs) at 4M keys,

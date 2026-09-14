@@ -58,11 +58,30 @@ use crate::wire::WireRecord;
 
 use super::crdt;
 #[cfg(feature = "spill")]
-use super::spill::{SpillJob, SpillLoc, SpillSink, SpillTier, spilled_is_current};
+pub(crate) use super::spill::Reservation;
+#[cfg(feature = "spill")]
+use super::spill::{
+    Admission, SpillJob, SpillLoc, SpillSink, SpillTier, spill_record_len, spilled_is_current,
+};
 use super::{
     BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
     PART_COUNT, PartEntries, Quiescence, RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
 };
+
+/// [`spill::Reservation`](super::spill::Reservation), reduced to an
+/// always-`None` placeholder on a build with no `spill` feature: nothing on
+/// this build can ever construct one (every real reservation comes from
+/// `SpillTier::reserve`, itself only nameable under `feature = "spill"`),
+/// but the type still needs to be nameable here so
+/// `Engine::apply_many_with_reservation`, `Engine::enforce_capacity_with_reservation`,
+/// and the rest of the eviction chain keep one signature shared by both
+/// builds instead of a duplicated, feature-gated body each.
+#[cfg(not(feature = "spill"))]
+#[allow(
+    dead_code,
+    reason = "never constructed on this build; see the doc comment above"
+)]
+pub(crate) struct Reservation<'a>(PhantomData<&'a ()>);
 
 /// Stack-buffer size for a key's postcard encoding on the read path, large
 /// enough for every key type this crate ships and most user key types. A key
@@ -1086,6 +1105,26 @@ fn defer_to_flusher(pending_spill_weight: u64) -> bool {
     pending_spill_weight > 0
 }
 
+/// [`Engine::enforce_capacity_with_reservation`]'s stop rule once one batch
+/// reports a nonzero [`EvictOutcome::deficit`]: whether that deficit still
+/// needs paying down, or `current` (`total_weight + pending_spill_weight`,
+/// read fresh right after the batch that produced `deficit` returns) has
+/// already dropped back to `max_capacity` or under. A batch commits every
+/// victim it attempts under one lock hold before reporting anything, so a
+/// deficit from one victim refused there can coexist with other victims in
+/// the same hold succeeding, or with an unrelated flusher install
+/// completing concurrently on its own thread mid-batch: either way,
+/// `current` can already be satisfied by the time this is called even
+/// though `deficit` alone, taken at face value, still looks like more work
+/// is owed. Returns `0` once `current <= max_capacity` (the exact stop
+/// condition [`Engine::enforce_capacity_with_reservation`]'s own loop top
+/// checks), `deficit` unchanged otherwise, so a caller never spends an
+/// avoidable extra `SpillTier::reserve` wait paying down a deficit the cap
+/// already covers. Pure; unit tested directly.
+fn deficit_once_still_over_capacity(current: u64, max_capacity: u64, deficit: u64) -> u64 {
+    if current <= max_capacity { 0 } else { deficit }
+}
+
 /// How many of `sampled_weights` (coldest first) one lock hold evicts: the
 /// fewest that clear `over_by`, at most [`EVICTION_BATCH`], and never more
 /// than the colder half of the sample, so recency still decides under a
@@ -1114,6 +1153,15 @@ struct EvictOutcome {
     /// tier; `0` when the stripe this pass sampled held no victim, an
     /// empty stripe among them.
     removed_weight: u64,
+    /// Sum of every [`VictimOutcome::PendingReservation`] this pass
+    /// reported: bytes a `Reservation` in play, and `admit`'s own global
+    /// headroom, both refused right now. Always `0` when `reservation` was
+    /// `None` throughout the call that produced this outcome, `feature =
+    /// "spill"` or not: nothing constructs `PendingReservation` in that
+    /// case. A nonzero value is [`Engine::enforce_capacity_with_reservation`]'s
+    /// signal to stop its own loop rather than spin retrying the same
+    /// exhausted budget, and to hand the amount back to its caller.
+    deficit: u64,
 }
 
 impl EvictOutcome {
@@ -1157,6 +1205,18 @@ enum VictimOutcome {
     /// constructed under `feature = "spill"`.
     #[cfg(feature = "spill")]
     Deferred,
+    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`]:
+    /// a `Reservation` was in play and, right now, neither its own
+    /// remaining budget nor `admit`'s global headroom covers this victim.
+    /// `stripe.live` is untouched, exactly like [`VictimOutcome::Deferred`],
+    /// but no drop is recorded: `deficit` (this victim's own
+    /// `spill_record_len`) is the caller's to fold into
+    /// [`EvictOutcome::deficit`] and either cover with a fresh
+    /// reservation (`Shard::retry_reservation_deficit`) or leave for a
+    /// later pass with `reservation: None`, which does resolve it, one way
+    /// or the other. Only ever constructed under `feature = "spill"`.
+    #[cfg(feature = "spill")]
+    PendingReservation(u32),
     /// Vanished between sampling and this call, a race with another
     /// writer on the same stripe; nothing to do.
     Vanished,
@@ -1168,11 +1228,19 @@ enum SpillAttempt {
     /// The tier commits to taking the victim; see
     /// [`Engine::try_spill_victim`]'s docs for what the two fields mean.
     Committed(u32, SpillJob),
-    /// [`SpillTier::would_accept`] declined outright: too large, closed, or
-    /// the flush queue is full. `keep_resident` is the tier's own
+    /// [`SpillTier::would_accept`] returned [`Admission::RefusedFinal`]:
+    /// too large, closed, or the flush queue is full with no reservation
+    /// in play (or one that makes no difference here: `too_large`/`closed`
+    /// refuse regardless). `keep_resident` is the tier's own
     /// [`SpillTier::keep_resident_when_refused`] policy at the moment of
     /// refusal, carried back here so the caller need not re-look it up.
     Refused { keep_resident: bool },
+    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`]:
+    /// a `Reservation` was in play but, right now, insufficient, and
+    /// `admit`'s own headroom is too. `deficit` is this victim's own
+    /// `spill_record_len`: how many more reserved bytes would have
+    /// covered it.
+    Pending { deficit: u32 },
     /// No tier configured, or the victim raced away, removed or not
     /// resident anymore, between sampling and this call. The ordinary
     /// remove-and-XOR path runs exactly as without this policy.
@@ -2503,6 +2571,7 @@ where
         bucket: usize,
         hash: u64,
         victim_bytes: &Bytes,
+        reservation: Option<&mut Reservation<'_>>,
     ) -> SpillAttempt {
         let Some(tier) = self.spill() else {
             return SpillAttempt::NotApplicable;
@@ -2517,12 +2586,21 @@ where
             return SpillAttempt::NotApplicable;
         }
         let encoded = record_value_bytes(&live.record);
-        if !tier.would_accept(victim_bytes.len(), encoded.len()) {
-            return SpillAttempt::Refused {
-                keep_resident: tier.keep_resident_when_refused(),
-            };
+        match tier.would_accept(reservation, victim_bytes.len(), encoded.len()) {
+            Admission::RefusedFinal => {
+                return SpillAttempt::Refused {
+                    keep_resident: tier.keep_resident_when_refused(),
+                };
+            }
+            Admission::RefusedPending => {
+                return SpillAttempt::Pending {
+                    deficit: spill_record_len(victim_bytes.len(), encoded.len()),
+                };
+            }
+            Admission::Accepted => {}
         }
         let weight = live.weight;
+        let admitted_bytes = spill_record_len(victim_bytes.len(), encoded.len());
         let job = SpillJob {
             stripe_idx: bucket,
             hash,
@@ -2531,6 +2609,7 @@ where
             expires_at_ms: from_stored_expiry(live.expires_at_ms),
             encoded,
             weight,
+            admitted_bytes,
         };
         live.weight = 0;
         SpillAttempt::Committed(weight, job)
@@ -2551,7 +2630,12 @@ where
         let hash = job.hash;
         let ver = job.ver;
         let weight = job.weight;
+        let admitted_bytes = job.admitted_bytes;
         if let Err(job) = tier.enqueue(job) {
+            // A job that never reaches the flusher's channel must not
+            // permanently shrink `admit`'s total: release its admitted
+            // bytes back before `abandon` restores the victim's weight.
+            tier.release(admitted_bytes);
             let job = *job;
             self.abandon(stripe_idx, &job.key_bytes, hash, ver, weight);
         }
@@ -2570,15 +2654,31 @@ where
     /// [`VictimOutcome::Vanished`]. Total weight and `live_count` stay the
     /// caller's job; a [`VictimOutcome::PendingSpill`] job still needs
     /// [`Engine::finish_spill_handoff`] once `stripe` is dropped.
+    /// `reservation`, forwarded unchanged to [`Engine::try_spill_victim`],
+    /// is the pre-lock budget a caller carried in from
+    /// `Engine::apply_many_with_reservation`; unused (and unread) once the
+    /// `spill` feature is off, since nothing can be handed off in that
+    /// build.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            unused_variables,
+            clippy::needless_pass_by_value,
+            reason = "`reservation` is never read once `try_spill_victim` compiles out; kept \
+                      as a real parameter so every caller keeps one signature across both \
+                      builds"
+        )
+    )]
     fn evict_victim_locked(
         &self,
         stripe: &mut Stripe<K, V>,
         bucket: usize,
         victim_bytes: &Bytes,
+        reservation: Option<&mut Reservation<'_>>,
     ) -> VictimOutcome {
         let hash = hash_key_bytes(victim_bytes.as_ref());
         #[cfg(feature = "spill")]
-        match self.try_spill_victim(stripe, bucket, hash, victim_bytes) {
+        match self.try_spill_victim(stripe, bucket, hash, victim_bytes, reservation) {
             SpillAttempt::Committed(weight, job) => {
                 return VictimOutcome::PendingSpill(weight, job);
             }
@@ -2586,6 +2686,9 @@ where
                 if keep_resident {
                     return VictimOutcome::Deferred;
                 }
+            }
+            SpillAttempt::Pending { deficit } => {
+                return VictimOutcome::PendingReservation(deficit);
             }
             SpillAttempt::NotApplicable => {}
         }
@@ -2623,8 +2726,31 @@ where
 
     /// Evicts the coldest of up to [`EVICTION_SAMPLE`] resident entries in
     /// `bucket`. Returns what happened: nothing to evict, a physical
-    /// removal, or a hand-off to the spill tier.
+    /// removal, or a hand-off to the spill tier. A thin wrapper, `reservation:
+    /// None`, over [`Engine::evict_one_sampled_with_reservation`]; every
+    /// existing direct test call site keeps compiling unchanged. Production
+    /// code reaches eviction only through [`Engine::enforce_capacity`],
+    /// which calls the `_with_reservation` twin directly, so this wrapper
+    /// is test-only outside a `spill` build's own test suite.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "kept as the stable, reservation-less entry point every existing direct \
+                      test call site already uses"
+        )
+    )]
     fn evict_one_sampled(&self, bucket: usize) -> EvictOutcome {
+        self.evict_one_sampled_with_reservation(bucket, None)
+    }
+
+    /// [`Engine::evict_one_sampled`], threading `reservation` through to
+    /// [`Engine::evict_victim_locked`] for the one victim this samples.
+    fn evict_one_sampled_with_reservation(
+        &self,
+        bucket: usize,
+        reservation: Option<&mut Reservation<'_>>,
+    ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
         let Some(victim_bytes) = self
@@ -2634,7 +2760,7 @@ where
         else {
             return EvictOutcome::default();
         };
-        let outcome = self.evict_victim_locked(&mut stripe, bucket, &victim_bytes);
+        let outcome = self.evict_victim_locked(&mut stripe, bucket, &victim_bytes, reservation);
         drop(stripe);
         match outcome {
             VictimOutcome::Removed(weight) => {
@@ -2643,6 +2769,7 @@ where
                 self.live_count.fetch_sub(1, Ordering::Relaxed);
                 EvictOutcome {
                     removed_weight: u64::from(weight),
+                    deficit: 0,
                 }
             }
             #[cfg(feature = "spill")]
@@ -2654,23 +2781,56 @@ where
                 self.finish_spill_handoff(job);
                 EvictOutcome {
                     removed_weight: u64::from(weight),
+                    deficit: 0,
                 }
             }
             #[cfg(feature = "spill")]
             VictimOutcome::Deferred => EvictOutcome::default(),
+            #[cfg(feature = "spill")]
+            VictimOutcome::PendingReservation(deficit) => EvictOutcome {
+                removed_weight: 0,
+                deficit: u64::from(deficit),
+            },
             VictimOutcome::Vanished => EvictOutcome::default(),
         }
     }
 
     /// Evicts one entry from the first non-empty stripe at or after `bucket`,
     /// wrapping around once. Returns `None` only when every stripe holds
-    /// nothing to evict.
+    /// nothing to evict. A thin wrapper, `reservation: None`, over
+    /// [`Engine::evict_one_scanning_with_reservation`]; test-only outside a
+    /// `spill` build's own test suite, like [`Engine::evict_one_sampled`].
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "kept as the stable, reservation-less entry point every existing direct \
+                      test call site already uses"
+        )
+    )]
     fn evict_one_scanning(&self, bucket: usize) -> Option<EvictOutcome> {
+        self.evict_one_scanning_with_reservation(bucket, None)
+    }
+
+    /// [`Engine::evict_one_scanning`], reborrowing `reservation` into each
+    /// candidate stripe's own [`Engine::evict_one_sampled_with_reservation`]
+    /// call in turn, so the same budget carries across however many
+    /// stripes this scan visits before it finds one to evict from. Also
+    /// stops early, `Some`, the first time a candidate reports
+    /// [`EvictOutcome::deficit`]: an exhausted reservation is very likely
+    /// exhausted everywhere, so scanning up to [`BUCKET_COUNT`] further
+    /// stripes chasing the same refusal would only spin.
+    fn evict_one_scanning_with_reservation(
+        &self,
+        bucket: usize,
+        mut reservation: Option<&mut Reservation<'_>>,
+    ) -> Option<EvictOutcome> {
         (0..BUCKET_COUNT)
             .map(|step| (bucket + step) % BUCKET_COUNT)
             .find_map(|candidate| {
-                let outcome = self.evict_one_sampled(candidate);
-                (!outcome.made_no_progress()).then_some(outcome)
+                let outcome =
+                    self.evict_one_sampled_with_reservation(candidate, reservation.as_deref_mut());
+                (!outcome.made_no_progress() || outcome.deficit > 0).then_some(outcome)
             })
     }
 
@@ -2678,8 +2838,32 @@ where
     /// entries in `bucket` under one lock hold, as many as
     /// [`eviction_batch_size`] allows for `over_by`. Each victim is removed
     /// or, with a spill tier configured and room in its queue, handed off
-    /// instead; see [`Engine::evict_victim_locked`].
+    /// instead; see [`Engine::evict_victim_locked`]. A thin wrapper,
+    /// `reservation: None`, over
+    /// [`Engine::evict_batch_sampled_with_reservation`]; every existing
+    /// direct test call site keeps compiling unchanged.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "kept as the stable, reservation-less entry point every existing direct \
+                      test call site already uses"
+        )
+    )]
     fn evict_batch_sampled(&self, bucket: usize, over_by: u64) -> EvictOutcome {
+        self.evict_batch_sampled_with_reservation(bucket, over_by, None)
+    }
+
+    /// [`Engine::evict_batch_sampled`], reborrowing `reservation` into each
+    /// victim's own [`Engine::evict_victim_locked`] call in turn, so the
+    /// same pre-lock budget carries across every victim this one lock hold
+    /// evicts, spending down as `try_spill_victim` commits each one.
+    fn evict_batch_sampled_with_reservation(
+        &self,
+        bucket: usize,
+        over_by: u64,
+        mut reservation: Option<&mut Reservation<'_>>,
+    ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
         let mut sampled: Vec<(Bytes, u64, u32)> = self
@@ -2701,12 +2885,25 @@ where
 
         let mut removed_weight = 0u64;
         let mut removed_count = 0u64;
+        #[cfg_attr(
+            not(feature = "spill"),
+            allow(
+                unused_mut,
+                reason = "only VictimOutcome::PendingReservation, spill-only, ever mutates this"
+            )
+        )]
+        let mut deficit = 0u64;
         #[cfg(feature = "spill")]
         let mut pending_spills: Vec<SpillJob> = Vec::new();
         #[cfg(feature = "spill")]
         let mut pending_weight_added = 0u64;
         for (key_bytes, _, _) in sampled.into_iter().take(victims) {
-            match self.evict_victim_locked(&mut stripe, bucket, &key_bytes) {
+            match self.evict_victim_locked(
+                &mut stripe,
+                bucket,
+                &key_bytes,
+                reservation.as_deref_mut(),
+            ) {
                 VictimOutcome::Removed(weight) => {
                     removed_weight += u64::from(weight);
                     removed_count += 1;
@@ -2719,6 +2916,10 @@ where
                 }
                 #[cfg(feature = "spill")]
                 VictimOutcome::Deferred => {}
+                #[cfg(feature = "spill")]
+                VictimOutcome::PendingReservation(bytes) => {
+                    deficit += u64::from(bytes);
+                }
                 VictimOutcome::Vanished => {}
             }
         }
@@ -2745,7 +2946,10 @@ where
         if removed_count > 0 {
             self.live_count.fetch_sub(removed_count, Ordering::Relaxed);
         }
-        EvictOutcome { removed_weight }
+        EvictOutcome {
+            removed_weight,
+            deficit,
+        }
     }
 
     /// After a write to `start_bucket` may have pushed total weight over
@@ -2768,10 +2972,48 @@ where
     /// [`Engine::evict_one_scanning`]'s full-stripe scan, trusting the
     /// flusher's own installs to bring `pending_spill_weight` back down
     /// shortly with no further eviction needed. With nothing pending, the
-    /// scan runs exactly as it always has, spill tier configured or not.
+    /// scan runs exactly as it always has, spill tier configured or not. A
+    /// thin wrapper, `reservation: None`, over
+    /// [`Engine::enforce_capacity_with_reservation`]; every existing call
+    /// site keeps compiling unchanged. Discards the deficit
+    /// [`Engine::enforce_capacity_with_reservation`] returns: always `0`
+    /// with no reservation in play, since nothing ever constructs
+    /// [`VictimOutcome::PendingReservation`] in that case.
     pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
+        let _ = self.enforce_capacity_with_reservation(start_bucket, None);
+    }
+
+    /// [`Engine::enforce_capacity`], reborrowing `reservation` into every
+    /// batch and scan call this loop makes, so one caller-supplied budget
+    /// carries across as many lock holds as it takes to fall back under
+    /// the cap.
+    ///
+    /// Returns the sum of every [`VictimOutcome::PendingReservation`]
+    /// (`spill_record_len`) bytes this call's own eviction passes hit: a
+    /// `Reservation` was in play, sized only from the batch that carried
+    /// it in, and both its own remaining budget and `admit`'s global
+    /// headroom refused right now, at the same instant, for the same
+    /// victim. `0` means every victim this call touched either fit under
+    /// the cap already, got evicted, or was refused for a reason no retry
+    /// changes (`too_large`/`closed`, or no reservation at all). A nonzero
+    /// return stops this loop immediately rather than let it spin
+    /// retrying the same exhausted budget across pseudo-random buckets:
+    /// the caller (`Shard::apply_grouped`/`ShardOps::apply_remote_batch`,
+    /// via `Shard::retry_reservation_deficit`) is the one positioned to
+    /// pay it down, with a fresh reservation and a bounded wait, once this
+    /// call's own lock-free budget is spent. Every victim this stopped on
+    /// is left exactly as [`VictimOutcome::Deferred`] leaves one: fully
+    /// resident, still a spill candidate, untouched weight, so a later
+    /// pass, with or without its own reservation, samples and resolves it
+    /// like any other cold entry, no separate bookkeeping needed for which
+    /// entries this covers.
+    pub(crate) fn enforce_capacity_with_reservation(
+        &self,
+        start_bucket: usize,
+        mut reservation: Option<&mut Reservation<'_>>,
+    ) -> u64 {
         if self.max_capacity == u64::MAX {
-            return;
+            return 0;
         }
         let mut bucket = start_bucket;
         loop {
@@ -2779,16 +3021,32 @@ where
             let pending = self.pending_spill_weight_or_zero();
             let current = total.saturating_add(pending);
             if current <= self.max_capacity {
-                return;
+                return 0;
             }
             let over_by = current - self.max_capacity;
-            let batch_outcome = self.evict_batch_sampled(bucket, over_by);
+            let batch_outcome = self.evict_batch_sampled_with_reservation(
+                bucket,
+                over_by,
+                reservation.as_deref_mut(),
+            );
+            if batch_outcome.deficit > 0 {
+                let total = self.total_weight.load(Ordering::Relaxed);
+                let pending = self.pending_spill_weight_or_zero();
+                let current = total.saturating_add(pending);
+                return deficit_once_still_over_capacity(
+                    current,
+                    self.max_capacity,
+                    batch_outcome.deficit,
+                );
+            }
             if batch_outcome.made_no_progress() {
                 if defer_to_flusher(self.pending_spill_weight_or_zero()) {
-                    return;
+                    return 0;
                 }
-                if self.evict_one_scanning(bucket).is_none() {
-                    return;
+                match self.evict_one_scanning_with_reservation(bucket, reservation.as_deref_mut()) {
+                    None => return 0,
+                    Some(outcome) if outcome.deficit > 0 => return outcome.deficit,
+                    Some(_) => {}
                 }
             }
             bucket = self.next_pseudo_random_bucket();
@@ -2832,6 +3090,12 @@ where
     /// stored sides off-lock first, before the write lock this call holds
     /// for the whole batch; see [`apply_locked`]'s doc for the under-lock
     /// fallback on a miss.
+    ///
+    /// A thin wrapper, `reservation: None`, over
+    /// [`Engine::apply_many_with_reservation`]; every existing call site
+    /// keeps compiling unchanged. Discards the deficit
+    /// [`Engine::apply_many_with_reservation`] returns alongside its
+    /// outcomes: always `0` with no reservation in play.
     pub(crate) fn apply_many(
         &self,
         bucket: usize,
@@ -2841,6 +3105,43 @@ where
         tombstone_max_ttl_ms: u64,
         now_ms: u64,
     ) -> Vec<ApplyOutcome<K, V>> {
+        self.apply_many_with_reservation(
+            bucket,
+            entries,
+            resolver,
+            tombstone_ttl_ms,
+            tombstone_max_ttl_ms,
+            now_ms,
+            None,
+        )
+        .0
+    }
+
+    /// [`Engine::apply_many`], additionally threading `reservation` into
+    /// [`Engine::enforce_capacity_with_reservation`] when the batch wrote
+    /// anything: the pre-lock budget one `Shard::apply_grouped`/
+    /// `ShardOps::apply_remote_batch` call reserved before its first stripe
+    /// lock, spent here across however many buckets that call's own loop
+    /// visits. The second element of the returned tuple is
+    /// [`Engine::enforce_capacity_with_reservation`]'s own deficit, `0`
+    /// when the batch wrote nothing (`enforce_capacity_with_reservation`
+    /// never runs) or when every victim it touched was resolved one way or
+    /// another; see that method's doc for what a nonzero deficit means and
+    /// who is responsible for paying it down.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one caller per bucket, from an already-grouped batch; splitting these into a struct would not make either call site clearer"
+    )]
+    pub(crate) fn apply_many_with_reservation(
+        &self,
+        bucket: usize,
+        entries: Vec<BatchEntry<K, V>>,
+        resolver: &dyn ConflictResolver,
+        tombstone_ttl_ms: u64,
+        tombstone_max_ttl_ms: u64,
+        now_ms: u64,
+        reservation: Option<&mut Reservation<'_>>,
+    ) -> (Vec<ApplyOutcome<K, V>>, u64) {
         let prefold = resolver.merges() && self.prefold_enabled.load(Ordering::Relaxed);
         #[cfg(feature = "spill")]
         let prefetched_spilled = prefetch_spilled_conflict_bytes(
@@ -2911,10 +3212,12 @@ where
                 outcomes.push(outcome);
             }
         }
-        if wrote {
-            self.enforce_capacity(bucket);
-        }
-        outcomes
+        let deficit = if wrote {
+            self.enforce_capacity_with_reservation(bucket, reservation)
+        } else {
+            0
+        };
+        (outcomes, deficit)
     }
 
     /// Folds a [`RemovedLive`]'s departure into digest, weight, count, and spill bookkeeping; `keep_count` skips the live-count decrement for a caller about to insert a replacement.
@@ -5072,6 +5375,33 @@ mod tests {
     }
 
     #[test]
+    fn deficit_once_still_over_capacity_zeroes_a_deficit_the_cap_no_longer_needs() {
+        assert_eq!(
+            deficit_once_still_over_capacity(35, 30, 15),
+            15,
+            "still 5 units over the cap: the deficit is still owed"
+        );
+        assert_eq!(
+            deficit_once_still_over_capacity(25, 30, 15),
+            0,
+            "already under the cap, by the batch's own other progress or an unrelated \
+             concurrent flusher install: the stale deficit is dropped rather than paid down \
+             with an avoidable extra reserve() wait"
+        );
+        assert_eq!(
+            deficit_once_still_over_capacity(30, 30, 15),
+            0,
+            "exactly at the cap counts as satisfied, matching enforce_capacity_with_reservation's \
+             own loop-top `current <= max_capacity` check"
+        );
+        assert_eq!(
+            deficit_once_still_over_capacity(31, 30, 15),
+            15,
+            "one unit over is still over: the deficit survives unchanged"
+        );
+    }
+
+    #[test]
     fn eviction_batch_size_takes_the_fewest_entries_that_clear_the_overage() {
         assert_eq!(
             eviction_batch_size(0, &[3, 3, 3]),
@@ -5725,7 +6055,13 @@ mod tests {
     #[test]
     fn evict_outcome_made_no_progress_only_when_nothing_was_freed() {
         assert!(EvictOutcome::default().made_no_progress());
-        assert!(!EvictOutcome { removed_weight: 1 }.made_no_progress());
+        assert!(
+            !EvictOutcome {
+                removed_weight: 1,
+                deficit: 0,
+            }
+            .made_no_progress()
+        );
     }
 
     #[test]
@@ -6783,6 +7119,38 @@ mod tests {
             assert_eq!(live_count, 1, "the spilled live entry is untouched");
         }
 
+        #[test]
+        fn is_spill_candidate_excludes_a_weight_zeroed_entry_across_a_longer_pending_window() {
+            // A caller's `Reservation` wait suspends for as long as its own
+            // `spill_wait_timeout`, a window between hand-off and
+            // resolution wider than a non-blocking eviction pass ever
+            // leaves open. However many sampling passes land in that
+            // window, `is_spill_candidate` must keep excluding the
+            // weight-zeroed pending entry.
+            let weigher: Weigher<u32, String> =
+                Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let _ = put(&engine, key, kb.clone(), "x".repeat(9), hlc(1, 1), None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 9);
+
+            for _ in 0..1_000 {
+                assert!(
+                    engine.evict_one_sampled(bucket).made_no_progress(),
+                    "a weight-zeroed pending entry is never re-selected, however long it \
+                     stays pending"
+                );
+            }
+            assert_eq!(
+                engine.get(&key, 0),
+                Some("x".repeat(9)),
+                "still resident and readable throughout"
+            );
+        }
+
         // --- Real disk: the flusher's actual eviction+install lifecycle.
         // Never combined with `sim`: its virtual clock gives no determinism
         // over real filesystem I/O or the flusher's OS thread.
@@ -6933,13 +7301,16 @@ mod tests {
             #[test]
             fn evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full() {
                 let dir = temp_dir("enqueue-err-abandon");
-                // A generous flush_queue_bytes, well past what
-                // FLUSH_QUEUE_CAPACITY fillers plus the real victim's own
-                // record could ever total: this test means to exercise the
-                // channel's own slot-count limit, not the byte bound.
+                // A generous flush_queue_bytes, well past what this many
+                // filler jobs plus the real victim's own record could ever
+                // total: this test means to exercise the channel's own
+                // slot-count limit, not the byte bound. `SpillTier::attach`
+                // derives the channel's actual slot count from this same
+                // `flush_queue_bytes`, via `flush_queue_slots`.
                 let cfg = SpillConfig::new(&dir, 1 << 20)
                     .region_bytes(4096)
                     .flush_queue_bytes(1 << 20);
+                let slots = crate::store::spill::flush_queue_slots(cfg.flush_queue_bytes_value());
                 let tier = Arc::new(SpillTier::open(&cfg, "channel-full").expect("tier opens"));
                 // Paused before the flusher thread is even spawned, so it
                 // never gets a chance to drain any of the filler jobs
@@ -6957,7 +7328,7 @@ mod tests {
                 // with throwaway jobs, so the real eviction below finds no
                 // room: the one way `finish_spill_handoff` reaches
                 // `abandon` rather than `install`.
-                for i in 0..crate::store::spill::FLUSH_QUEUE_CAPACITY {
+                for i in 0..slots {
                     let filler = SpillJob {
                         stripe_idx: 0,
                         hash: 0,
@@ -6966,6 +7337,11 @@ mod tests {
                         expires_at_ms: None,
                         encoded: Bytes::from_static(b"f"),
                         weight: 1,
+                        // These fillers bypass `would_accept` entirely, sent
+                        // straight to `enqueue` to exercise the channel's
+                        // own slot limit rather than `admit`'s byte budget;
+                        // they never own any admitted bytes to release.
+                        admitted_bytes: 0,
                     };
                     tier.enqueue(filler)
                         .unwrap_or_else(|_| panic!("channel has room for filler {i}"));
@@ -7260,6 +7636,503 @@ mod tests {
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, &key_bytes(keys[1]))),
                     "the retried victim is spilled once the tier has room again"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn finish_spill_handoff_err_releases_the_jobs_admitted_bytes() {
+                let dir = temp_dir("release-admitted-bytes-on-err");
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(1 << 20);
+                let slots = crate::store::spill::flush_queue_slots(cfg.flush_queue_bytes_value());
+                let tier = Arc::new(SpillTier::open(&cfg, "release-on-err").expect("tier opens"));
+                // Paused before the flusher thread is even spawned, so it
+                // never gets a chance to drain any of the filler jobs below
+                // before the real eviction's own `enqueue` needs the
+                // channel to still be completely full; exactly
+                // `evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full`'s
+                // setup, this time checking `admit`'s own byte accounting
+                // rather than only the victim's restored weight.
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                for i in 0..slots {
+                    let filler = SpillJob {
+                        stripe_idx: 0,
+                        hash: 0,
+                        key_bytes: Bytes::from(format!("filler-{i}")),
+                        ver: hlc(0, 0),
+                        expires_at_ms: None,
+                        encoded: Bytes::from_static(b"f"),
+                        weight: 1,
+                        admitted_bytes: 0,
+                    };
+                    tier.enqueue(filler)
+                        .unwrap_or_else(|_| panic!("channel has room for filler {i}"));
+                }
+
+                let key = 1u32;
+                let kb = key_bytes(key);
+                let hash = hash_key_bytes(kb.as_ref());
+                let bucket = stripe_index_from_hash(hash);
+                let _ = put(&engine, key, kb.clone(), "x".repeat(30), hlc(1, 1), None, 0);
+
+                let queued_before = tier.queued_bytes();
+                let outcome = engine.evict_one_sampled(bucket);
+                assert_eq!(
+                    outcome.removed_weight, 30,
+                    "the hand-off still commits and frees the weight right away"
+                );
+                let queued_after = tier.queued_bytes();
+
+                assert_eq!(
+                    queued_after, queued_before,
+                    "the abandoned job's admitted bytes return to admit: queued_bytes ends \
+                     where it started, not permanently inflated by a job that never reached \
+                     the flusher's channel"
+                );
+                assert_eq!(
+                    engine.get(&key, 0),
+                    Some("x".repeat(30)),
+                    "abandon restores full residency"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn a_sufficient_reservation_never_falls_back_to_the_global_admit_check() {
+                let dir = temp_dir("reservation-never-falls-back");
+                let value = "x".repeat(20);
+                // The real postcard-encoded byte length, length-prefix
+                // included: what `spill_record_len` and `would_accept`
+                // actually see, not the raw string's own char count.
+                let encoded_len = postcard::to_stdvec(&value)
+                    .expect("test value encodes")
+                    .len();
+                let key = 1u32;
+                let kb = key_bytes(key);
+                let record_len = spill_record_len(kb.len(), encoded_len);
+                // A flush queue sized to exactly one record: with no
+                // reservation threaded through, `would_accept`'s own
+                // fallback refuses the very next admission once `admit` is
+                // drained, exactly as
+                // `would_accept_refuses_once_the_flush_queue_bytes_bound_would_be_exceeded`
+                // proves in `spill.rs`'s own test suite.
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(u64::from(record_len));
+                let tier =
+                    Arc::new(SpillTier::open(&cfg, "reservation-never").expect("tier opens"));
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                let hash = hash_key_bytes(kb.as_ref());
+                let bucket = stripe_index_from_hash(hash);
+                let _ = put(&engine, key, kb.clone(), value.clone(), hlc(1, 1), None, 0);
+
+                // Drain `admit` entirely into a caller-held `Reservation`,
+                // exactly the victim's own record length, before the
+                // eviction ever samples it.
+                let mut reservation = tier
+                    .reserve(record_len, Duration::from_secs(5))
+                    .await
+                    .expect("the whole (single-record) queue is free before this call");
+                assert_eq!(
+                    tier.would_accept(None, kb.len(), encoded_len),
+                    Admission::RefusedFinal,
+                    "with no reservation threaded through, admit's own fallback refuses: \
+                     fully drained by the reservation above"
+                );
+
+                let outcome =
+                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation));
+                assert_eq!(
+                    outcome.removed_weight,
+                    value.len() as u64,
+                    "the reservation's own pre-paid budget admits the victim; admit itself \
+                     never needed to grant anything"
+                );
+                assert_eq!(
+                    engine.get(&key, 0),
+                    Some(value),
+                    "still fully resident: a hand-off, not a removal"
+                );
+
+                drop(reservation);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn committed_bytes_returned_match_the_sum_of_admitted_job_lengths() {
+                let dir = temp_dir("admitted-bytes-sum");
+                let value_a = "x".repeat(20);
+                let value_b = "y".repeat(20);
+                // The real postcard-encoded byte lengths, length prefix
+                // included: what `spill_record_len` and `would_accept`
+                // actually see, not the values' own raw char counts.
+                let encoded_len_a = postcard::to_stdvec(&value_a)
+                    .expect("test value encodes")
+                    .len();
+                let encoded_len_b = postcard::to_stdvec(&value_b)
+                    .expect("test value encodes")
+                    .len();
+                let key_a = 1u32;
+                let kb_a = key_bytes(key_a);
+                let hash_a = hash_key_bytes(kb_a.as_ref());
+                let bucket = stripe_index_from_hash(hash_a);
+                let record_len_a = spill_record_len(kb_a.len(), encoded_len_a);
+
+                let mut key_b = None;
+                for k in 2..100_000u32 {
+                    let kb = key_bytes(k);
+                    if stripe_index_from_hash(hash_key_bytes(kb.as_ref())) == bucket {
+                        key_b = Some(k);
+                        break;
+                    }
+                }
+                let key_b = key_b.expect("a second key collides into the same bucket quickly");
+                let kb_b = key_bytes(key_b);
+                let record_len_b = spill_record_len(kb_b.len(), encoded_len_b);
+
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(u64::from(record_len_a) + u64::from(record_len_b));
+                let tier = Arc::new(SpillTier::open(&cfg, "admitted-bytes").expect("tier opens"));
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                let _ = put(
+                    &engine,
+                    key_a,
+                    kb_a.clone(),
+                    value_a.clone(),
+                    hlc(1, 1),
+                    None,
+                    0,
+                );
+                let _ = put(
+                    &engine,
+                    key_b,
+                    kb_b.clone(),
+                    value_b.clone(),
+                    hlc(2, 1),
+                    None,
+                    1,
+                );
+
+                // A reservation covering exactly one victim's own record
+                // length: the colder key (`key_a`, sampled first) spends it
+                // in full; the second victim finds the reservation's
+                // budget exhausted and falls back to `admit`'s own
+                // `try_acquire_many`, for which exactly enough headroom
+                // remains.
+                let mut reservation = tier
+                    .reserve(record_len_a, Duration::from_secs(5))
+                    .await
+                    .expect("the whole queue is free before this call");
+
+                let first =
+                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation));
+                assert_eq!(
+                    first.removed_weight,
+                    value_a.len() as u64,
+                    "the colder key hands off from the reservation's own budget"
+                );
+                let second =
+                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation));
+                assert_eq!(
+                    second.removed_weight,
+                    value_b.len() as u64,
+                    "the second key hands off from admit's own fallback, the reservation's \
+                     budget already spent"
+                );
+
+                drop(reservation);
+
+                assert_eq!(
+                    tier.queued_bytes(),
+                    u64::from(record_len_a) + u64::from(record_len_b),
+                    "every byte admit ever handed out across this call, whether through the \
+                     caller's own reservation or its own try_acquire_many fallback, is \
+                     accounted for by exactly these two committed jobs"
+                );
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The high-severity gap a proxy-sized reservation leaves
+            /// against a real eviction backlog: [`Engine::enforce_capacity_with_reservation`]
+            /// must report, not swallow, a refusal it hit only because the
+            /// caller's reservation and `admit`'s own headroom were both
+            /// exhausted at that instant. Four colliding keys so
+            /// `eviction_batch_size` (which never takes more than the
+            /// colder half of its sample) attempts two of them in the one
+            /// lock hold this test drives: the coldest hands off cleanly
+            /// from the reservation, the second finds both budgets
+            /// exhausted, and the two untouched warmer keys prove the
+            /// deficit stopped the pass rather than let it keep evicting
+            /// by falling back to an ordinary delete.
+            #[tokio::test]
+            async fn enforce_capacity_with_reservation_returns_the_deficit_once_both_budgets_are_exhausted()
+             {
+                let dir = temp_dir("enforce-capacity-deficit");
+                let value = "x".repeat(20);
+                let encoded_len = postcard::to_stdvec(&value)
+                    .expect("test value encodes")
+                    .len();
+
+                let mut bucket = None;
+                let mut keys = Vec::new();
+                for k in 1..200_000u32 {
+                    let kb = key_bytes(k);
+                    let b = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+                    match bucket {
+                        Some(target) if b != target => continue,
+                        None => bucket = Some(b),
+                        Some(_) => {}
+                    }
+                    keys.push(k);
+                    if keys.len() == 4 {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    keys.len(),
+                    4,
+                    "1024 stripes; four collisions are found quickly"
+                );
+                let bucket = bucket.expect("set once the first key fixed the target stripe");
+
+                let record_len_0 = spill_record_len(key_bytes(keys[0]).len(), encoded_len);
+                let record_len_1 = spill_record_len(key_bytes(keys[1]).len(), encoded_len);
+
+                // Sized to exactly the coldest victim's own record: `reserve`
+                // below drains the tier's entire admit budget into the
+                // reservation, leaving nothing for `admit`'s own fallback to
+                // grant the second victim either.
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(u64::from(record_len_0));
+                let tier = Arc::new(
+                    SpillTier::open(&cfg, "enforce-capacity-deficit").expect("tier opens"),
+                );
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                // Four 20-byte values, weight 20 each: an 80-unit total
+                // against a 30-unit cap is a 50-unit overage, over
+                // `eviction_batch_size`'s own two-victim cap for a
+                // four-entry sample (`4.div_ceil(2)`) at 20 units cleared
+                // after the first victim alone, so the second is attempted
+                // within this same lock hold, not a later pass.
+                let engine = Engine::<u32, String>::new(30, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                for (i, &k) in keys.iter().enumerate() {
+                    let now_ms = u64::try_from(i).expect("four keys, fits comfortably");
+                    let _ = put(
+                        &engine,
+                        k,
+                        key_bytes(k),
+                        value.clone(),
+                        hlc(now_ms + 1, 1),
+                        None,
+                        now_ms,
+                    );
+                }
+
+                let mut reservation = tier
+                    .reserve(record_len_0, Duration::from_secs(5))
+                    .await
+                    .expect("the whole (single-record) queue is free before this call");
+
+                let deficit =
+                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation));
+                assert_eq!(
+                    deficit,
+                    u64::from(record_len_1),
+                    "keys[1]'s own record length: right now, neither the reservation's \
+                     remaining budget nor admit's own headroom covers it"
+                );
+
+                assert_eq!(
+                    engine.get(&keys[0], 0),
+                    Some(value.clone()),
+                    "the coldest victim hands off cleanly, spent from the reservation"
+                );
+                assert_eq!(engine.debug_pending_spill_weight(), 20);
+                assert_eq!(
+                    engine.get(&keys[1], 0),
+                    Some(value.clone()),
+                    "left fully resident: a pending refusal, not a removal and not a \
+                     keep-resident deferral either, no drop of any kind recorded for it"
+                );
+                assert_eq!(
+                    engine.get(&keys[2], 0),
+                    Some(value.clone()),
+                    "never even sampled: the deficit stopped the pass before a second batch \
+                     or scan could reach it"
+                );
+                assert_eq!(engine.get(&keys[3], 0), Some(value));
+                let (_, total_after) = engine.debug_totals();
+                assert_eq!(
+                    total_after, 60,
+                    "keys[1..4] still fully resident and counted: three victims' worth"
+                );
+
+                drop(reservation);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// `Shard::retry_reservation_deficit`'s own closing fallback,
+            /// exercised at the level its own doc describes: once a
+            /// caller's retry budget is spent with a
+            /// [`EvictOutcome::deficit`] still outstanding, it makes one
+            /// more [`Engine::enforce_capacity`] call, `reservation:
+            /// None`, exactly like an ordinary write's own eviction pass.
+            /// Extends [`enforce_capacity_with_reservation_returns_the_deficit_once_both_budgets_are_exhausted`]'s
+            /// own scenario: with `admit` still fully drained and no
+            /// `keep_resident_when_refused` policy set (`false`, this
+            /// tier's default), that closing call must physically delete
+            /// the victim the first pass only left resident, not leave it
+            /// resident forever regardless of how many retries a caller
+            /// gives up on.
+            #[tokio::test]
+            async fn enforce_capacity_deletes_a_deficit_left_victim_once_reservation_retries_give_up()
+             {
+                let dir = temp_dir("enforce-capacity-deficit-fallback");
+                let value = "x".repeat(20);
+                let encoded_len = postcard::to_stdvec(&value)
+                    .expect("test value encodes")
+                    .len();
+
+                let mut bucket = None;
+                let mut keys = Vec::new();
+                for k in 1..200_000u32 {
+                    let kb = key_bytes(k);
+                    let b = stripe_index_from_hash(hash_key_bytes(kb.as_ref()));
+                    match bucket {
+                        Some(target) if b != target => continue,
+                        None => bucket = Some(b),
+                        Some(_) => {}
+                    }
+                    keys.push(k);
+                    if keys.len() == 4 {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    keys.len(),
+                    4,
+                    "1024 stripes; four collisions are found quickly"
+                );
+                let bucket = bucket.expect("set once the first key fixed the target stripe");
+
+                let record_len_0 = spill_record_len(key_bytes(keys[0]).len(), encoded_len);
+                let record_len_1 = spill_record_len(key_bytes(keys[1]).len(), encoded_len);
+
+                let cfg = SpillConfig::new(&dir, 1 << 20)
+                    .region_bytes(4096)
+                    .flush_queue_bytes(u64::from(record_len_0));
+                let tier = Arc::new(
+                    SpillTier::open(&cfg, "enforce-capacity-deficit-fallback").expect("tier opens"),
+                );
+                tier.pause_flusher();
+                let weigher: Weigher<u32, String> =
+                    Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+                let engine = Engine::<u32, String>::new(30, None, Some(weigher));
+                engine.set_spill(Arc::clone(&tier));
+                let engine = Arc::new(engine);
+                tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
+
+                for (i, &k) in keys.iter().enumerate() {
+                    let now_ms = u64::try_from(i).expect("four keys, fits comfortably");
+                    let _ = put(
+                        &engine,
+                        k,
+                        key_bytes(k),
+                        value.clone(),
+                        hlc(now_ms + 1, 1),
+                        None,
+                        now_ms,
+                    );
+                }
+
+                let mut reservation = tier
+                    .reserve(record_len_0, Duration::from_secs(5))
+                    .await
+                    .expect("the whole (single-record) queue is free before this call");
+
+                let deficit =
+                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation));
+                assert_eq!(deficit, u64::from(record_len_1));
+                assert_eq!(
+                    engine.get(&keys[1], 0),
+                    Some(value.clone()),
+                    "left fully resident by the first pass, exactly like the sibling test above"
+                );
+
+                // The reservation returns its own (fully spent) remainder
+                // on drop -- nothing left over for the closing call below
+                // to spend either -- mirroring `retry_reservation_deficit`'s
+                // own per-iteration `Reservation` scoping: by the time its
+                // loop gives up, no reservation from an earlier iteration
+                // is still outstanding.
+                drop(reservation);
+
+                // `retry_reservation_deficit`'s own closing call once its
+                // retry budget is exhausted: `admit` is still fully
+                // drained (nothing ever attached to drain it, and the
+                // flusher stays paused throughout), so every further
+                // refusal this call hits can only resolve through the
+                // ordinary, `reservation: None` path -- it keeps evicting,
+                // same as any other write's own `enforce_capacity` call,
+                // until the cap is actually met or nothing more can be
+                // sampled.
+                engine.enforce_capacity(bucket);
+
+                assert_eq!(
+                    engine.get(&keys[1], 0),
+                    None,
+                    "keep_resident_when_refused defaults to false: the closing fallback must \
+                     physically delete the leftover victim, not leave max_capacity exceeded \
+                     forever because a reservation retry gave up on it"
+                );
+                // `keys[0]`'s hand-off stays genuinely pending throughout
+                // this test (the flusher never resumes, so nothing ever
+                // installs it), which is what makes `defer_to_flusher`
+                // stop the fallback's own loop early rather than keep
+                // scanning for a third victim -- a real, unrelated
+                // trade-off (`Engine::enforce_capacity`'s own doc), not
+                // this fix's concern: what this test pins is that the
+                // fallback resolves the *specific* victim a reservation
+                // retry gave up on, which it does.
+                let (_, total_after_fallback) = engine.debug_totals();
+                assert!(
+                    total_after_fallback < 60,
+                    "the closing fallback must make real progress against the cap, not just \
+                     record a metric: total={total_after_fallback}"
                 );
 
                 let _ = std::fs::remove_dir_all(&dir);

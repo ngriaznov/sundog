@@ -1,7 +1,7 @@
 {
   "max_steady_rss_bytes": 4831838208,
   "max_peak_rss_bytes": 6012954214,
-  "max_spill_dropped_deferred": 100000,
+  "max_spill_dropped_deferred": 0,
   "max_pull_timeouts": 0,
   "max_fetch_p99_us": 100000,
   "require_converged": true,

@@ -34,7 +34,7 @@ use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
-use engine::{ApplyOutcome, Engine, JoinOutcome};
+use engine::{ApplyOutcome, Engine, JoinOutcome, Reservation};
 
 /// Reference CRDT value types (a PN-Counter today) and the
 /// [`ConflictResolver`]s that merge them through [`ConflictResolver::merge`].
@@ -2595,38 +2595,239 @@ where
 
         self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver, v, e, enc)| {
             (hash, key, key_bytes, ver, put_incoming(v, e, enc))
-        });
+        })
+        .await;
         match failure {
             Some(err) => Err(err),
             None => Ok(()),
         }
     }
 
+    /// Reserves flush-queue admission for one whole
+    /// [`Shard::apply_grouped`]/[`ShardOps::apply_remote_batch`] call,
+    /// before any stripe lock that call takes: sums `spill::spill_record_len`
+    /// over every `Incoming::Put` among `entries` (`0` for a tombstone),
+    /// then makes one `SpillTier::reserve` call for the total, waiting at
+    /// most this shard's spill tier's own configured `spill_wait_timeout`.
+    ///
+    /// Also returns the deadline that wait was measured against
+    /// (`Instant::now()` at the moment this call started, plus the tier's
+    /// own `spill_wait_timeout_value()`), so [`Shard::retry_reservation_deficit`]
+    /// can share it rather than start a fresh budget of its own: the whole
+    /// call, this reservation plus every retry the per-bucket loop's own
+    /// deficit later needs, stays bounded by one `spill_wait_timeout`
+    /// total, never `2x` it. `None` for the deadline exactly when `None`
+    /// for the reservation (no spill tier attached), since a deficit can
+    /// only ever be nonzero once a real `Reservation` was threaded into the
+    /// per-bucket loop that follows.
+    ///
+    /// The reservation itself is `None` when no spill tier is attached
+    /// (this build has no `spill` feature, or `Shard::attach_spill` never
+    /// ran) or when `reserve` times out: either way the caller proceeds
+    /// with `reservation: None` for every bucket in its own loop, the
+    /// ordinary non-blocking fallback
+    /// [`engine::Engine::apply_many_with_reservation`] already takes.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_self,
+            reason = "the tier accessor and `reserve` only exist under feature = \"spill\""
+        )
+    )]
+    async fn reserve_for_batch<'e>(
+        &self,
+        entries: impl Iterator<Item = (&'e Bytes, &'e Incoming<V>)>,
+    ) -> (Option<Reservation<'_>>, Option<std::time::Instant>)
+    where
+        V: 'e,
+    {
+        #[cfg(feature = "spill")]
+        {
+            let Some(tier) = self.engine.spill() else {
+                return (None, None);
+            };
+            let reserved: u64 = entries
+                .map(|(key_bytes, incoming)| match incoming {
+                    Incoming::Put { encoded, .. } => {
+                        u64::from(spill::spill_record_len(key_bytes.len(), encoded.len()))
+                    }
+                    Incoming::Tombstone => 0,
+                })
+                .sum();
+            let reserved = u32::try_from(reserved).unwrap_or(u32::MAX);
+            let budget = tier.spill_wait_timeout_value();
+            let deadline = std::time::Instant::now() + budget;
+            let reservation = tier.reserve(reserved, budget).await.ok();
+            (reservation, Some(deadline))
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let _ = entries;
+            (None, None)
+        }
+    }
+
+    /// Pays down `deficit` bytes [`engine::Engine::apply_many_with_reservation`]'s
+    /// per-bucket loop left over: eviction that refused only because the
+    /// call's one `Reservation` (and `admit`'s own headroom) ran out right
+    /// then, with the entry left resident rather than dropped: see
+    /// [`engine::Engine::enforce_capacity_with_reservation`]'s doc. Retries
+    /// with a fresh [`SpillTier::reserve`] for exactly `deficit` more
+    /// bytes, followed by another
+    /// [`engine::Engine::enforce_capacity_with_reservation`] pass threaded
+    /// through `start_bucket`, until the deficit clears or `deadline`
+    /// passes. Every entry the first pass left resident under this
+    /// condition stays an ordinary spill candidate throughout, so a retry
+    /// samples and resolves it exactly like any other cold entry, no
+    /// separate bookkeeping needed for which entries `deficit` covers.
+    ///
+    /// `deadline` is the same one [`Shard::reserve_for_batch`] measured its
+    /// own initial `reserve()` wait against, not a fresh budget of this
+    /// call's own: the whole `apply_grouped`/`apply_remote_batch` call,
+    /// first reservation plus every retry this function makes, is bounded
+    /// by one `spill_wait_timeout` total this way, matching the "once per
+    /// call" reservation-wait budget the rest of this mechanism is sized
+    /// against: a second, independent full `spill_wait_timeout` window
+    /// here would let one call suspend its producer for up to `2x`
+    /// `spill_wait_timeout`, blowing past `state_transfer::per_donor_budget`
+    /// exactly the way that budget's own margin assumes cannot happen.
+    ///
+    /// A no-op when `deficit` is already `0`. `deadline` is `None` only
+    /// when `reserve_for_batch` never got as far as a real `reserve()` call
+    /// (no spill tier attached), a case `deficit` is always `0` in too,
+    /// since nothing can construct a nonzero deficit without a real
+    /// `Reservation` having been threaded through the per-bucket loop
+    /// first; handled the same defensive way regardless; once `deadline`
+    /// is already past (this call's whole budget was spent by the initial
+    /// `reserve_for_batch` wait alone) this makes no further `reserve()`
+    /// call at all, going straight to the closing fallback below. Once the
+    /// budget is exhausted (immediately, for the documented
+    /// `spill_wait_timeout == Duration::ZERO` opt-out) with `deficit` still
+    /// outstanding, this makes exactly one closing
+    /// [`engine::Engine::enforce_capacity`] call, `reservation: None`, the
+    /// same call any ordinary write on this shard would eventually trigger
+    /// on its own, so the deficit is resolved by the time this call
+    /// returns rather than left pending on whatever future write happens
+    /// to touch this shard next, which could be never for the last batch
+    /// of a bulk load. [`SpillTier::would_accept`]'s ordinary fallback
+    /// decides each entry's fate the same way it always has, honoring
+    /// `keep_resident_when_refused` exactly as an unreserved refusal
+    /// would: kept resident (`reason = "deferred"`) or physically deleted
+    /// (`reason` names the specific refusal) so `max_capacity` is actually
+    /// enforced by the time this call returns, regardless of the policy in
+    /// effect.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_self,
+            reason = "the tier accessor and `reserve` only exist under feature = \"spill\""
+        )
+    )]
+    async fn retry_reservation_deficit(
+        &self,
+        start_bucket: usize,
+        deficit: u64,
+        deadline: Option<std::time::Instant>,
+    ) {
+        #[cfg(feature = "spill")]
+        {
+            if deficit == 0 {
+                return;
+            }
+            let Some(tier) = self.engine.spill() else {
+                return;
+            };
+            let Some(deadline) = deadline else {
+                self.engine.enforce_capacity(start_bucket);
+                return;
+            };
+            let mut deficit = deficit;
+            while deficit > 0 {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    // This call's whole `spill_wait_timeout` budget is
+                    // already spent, by `reserve_for_batch`'s own initial
+                    // wait alone or by an earlier iteration of this loop:
+                    // no further `reserve()` call, straight to the closing
+                    // fallback below.
+                    break;
+                }
+                let bytes = u32::try_from(deficit).unwrap_or(u32::MAX);
+                match tier.reserve(bytes, remaining).await {
+                    Ok(mut reservation) => {
+                        deficit = self.engine.enforce_capacity_with_reservation(
+                            start_bucket,
+                            Some(&mut reservation),
+                        );
+                    }
+                    // `reserve` itself already recorded
+                    // `sundog_spill_wait_timeouts_total` for this call's
+                    // budget running out; the fallback below resolves
+                    // whatever deficit remains.
+                    Err(_) => break,
+                }
+            }
+            if deficit > 0 {
+                self.engine.enforce_capacity(start_bucket);
+            }
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let _ = (start_bucket, deficit, deadline);
+        }
+    }
+
     /// [`Shard::insert_many_expiring`]'s and [`Shard::remove_many`]'s shared apply step: groups by stripe, applies each under one lock.
-    fn apply_grouped<T>(
+    ///
+    /// Reserves flush-queue admission once for the whole call, via
+    /// [`Shard::reserve_for_batch`], before splitting `prepared` by stripe;
+    /// the one `Reservation` this gets back, if any, is threaded by
+    /// `&mut` through every bucket's own
+    /// [`engine::Engine::apply_many_with_reservation`] call below. Once
+    /// every bucket has run, [`Shard::retry_reservation_deficit`] pays down
+    /// whatever deficit those calls reported before this returns, sharing
+    /// `reserve_for_batch`'s own deadline rather than starting a fresh
+    /// wait budget: see its doc for what happens once that shared budget
+    /// runs out.
+    async fn apply_grouped<T>(
         &self,
         prepared: Vec<T>,
         to_batch_entry: impl Fn(T) -> (u64, K, Bytes, Hlc, Incoming<V>),
     ) {
+        let batch_entries: Vec<(u64, K, Bytes, Hlc, Incoming<V>)> =
+            prepared.into_iter().map(to_batch_entry).collect();
+
+        let (mut reservation, deadline) = self
+            .reserve_for_batch(
+                batch_entries
+                    .iter()
+                    .map(|(_, _, key_bytes, _, incoming)| (key_bytes, incoming)),
+            )
+            .await;
+
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for entry in prepared {
-            let batch_entry = to_batch_entry(entry);
+        for batch_entry in batch_entries {
             by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push(batch_entry);
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<K> = Vec::new();
+        let mut deficit = 0u64;
         for (bucket, group) in by_stripe.into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
-            let outcomes = self.engine.apply_many(
+            let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
                 bucket,
                 group,
                 self.resolver.as_ref(),
                 self.tombstone_ttl_ms,
                 self.tombstone_max_ttl_ms,
                 now,
+                reservation.as_mut(),
             );
+            deficit += bucket_deficit;
             for outcome in outcomes {
                 applied_keys.extend(outcome.key().cloned());
                 self.handle_apply_outcome(outcome, Origin::Local, false);
@@ -2634,6 +2835,14 @@ where
             self.hand_off_bulk(&mut applied_keys, false);
         }
         self.hand_off_bulk(&mut applied_keys, true);
+        // Returns any never-spent remainder to `admit` immediately, before
+        // `retry_reservation_deficit` asks for a fresh one: on a build
+        // with no `spill` feature this is the placeholder `Reservation`,
+        // never actually held, so `let _ =` (not `drop`, which needs a
+        // real `Drop` impl on every build) is the portable way to end its
+        // borrow here either way.
+        let _ = reservation;
+        self.retry_reservation_deficit(0, deficit, deadline).await;
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
@@ -2700,7 +2909,8 @@ where
 
         self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
             (hash, key, key_bytes, ver, Incoming::Tombstone)
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -3035,11 +3245,7 @@ where
             // never applied here and never dropped. A record for a bucket
             // this node never held is dropped and counted.
             let recs = self.guard_inbound(recs);
-            // Grouping by raw key bytes' stripe needs no decode. Each group
-            // keeps `recs`' relative order, so the same key always
-            // lands in the same stripe in arrival order.
-            let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
-                (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
+            let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
             for rec in recs {
                 self.observe_remote(rec.ver);
                 let hash = engine::hash_key_bytes(rec.key.as_ref());
@@ -3066,10 +3272,36 @@ where
                     }
                     None => Incoming::Tombstone,
                 };
-                by_stripe[engine::stripe_index_from_hash(hash)]
-                    .push((hash, key, rec.key, rec.ver, incoming, origin));
+                decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
+            }
+
+            // One reservation across the whole decoded batch, before any
+            // per-bucket work or stripe lock: see `Shard::reserve_for_batch`.
+            // This is what throttles the one global `inbound_loop` for live
+            // replication, a donor's per-pull anti-entropy repair pace, and
+            // a rebalance/state-transfer chunk apply, all funneled through
+            // this one method. Once every bucket below has run,
+            // `Shard::retry_reservation_deficit` pays down whatever deficit
+            // those calls reported before this returns, sharing this same
+            // reservation's own deadline rather than a fresh budget.
+            let (mut reservation, deadline) = self
+                .reserve_for_batch(
+                    decoded
+                        .iter()
+                        .map(|(_, _, key_bytes, _, incoming, _)| (key_bytes, incoming)),
+                )
+                .await;
+
+            // Grouping by raw key bytes' stripe needs no decode. Each group
+            // keeps `decoded`'s relative order, so the same key always
+            // lands in the same stripe in arrival order.
+            let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
+                (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
+            for entry in decoded {
+                by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
             }
             let now = self.now_ms();
+            let mut deficit = 0u64;
             for (bucket, group) in by_stripe.into_iter().enumerate() {
                 if group.is_empty() {
                     continue;
@@ -3082,18 +3314,24 @@ where
                         (hash, key, key_bytes, ver, incoming)
                     })
                     .collect();
-                let outcomes = self.engine.apply_many(
+                let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
                     bucket,
                     entries,
                     self.resolver.as_ref(),
                     self.tombstone_ttl_ms,
                     self.tombstone_max_ttl_ms,
                     now,
+                    reservation.as_mut(),
                 );
+                deficit += bucket_deficit;
                 for (outcome, origin) in outcomes.into_iter().zip(origins) {
                     self.handle_apply_outcome(outcome, origin, true);
                 }
             }
+            // See `Shard::apply_grouped`'s identical line for why `let _
+            // =` rather than `drop`.
+            let _ = reservation;
+            self.retry_reservation_deficit(0, deficit, deadline).await;
         })
     }
 
@@ -6802,6 +7040,28 @@ mod tests {
         assert_eq!(s.get_sync(&1), Some("a".to_string()));
     }
 
+    /// A cache with no attached spill tier never reaches
+    /// `Shard::reserve_for_batch`'s real body: `self.engine.spill()`
+    /// returns `None` on every call site, so `insert_many`/`remove_many`
+    /// see no behavior change, one `.await` that resolves immediately
+    /// with `reservation: None` threaded through. Guards the "no public
+    /// API change; a cache without spill sees zero behavior change"
+    /// invariant.
+    #[tokio::test]
+    async fn spill_less_cache_never_touches_reserve() {
+        let s = shard::<u32, String>(1);
+        s.insert_many((0..50u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("insert_many");
+        for k in 0..50u32 {
+            assert_eq!(s.get(&k).await, Some(k.to_string()));
+        }
+        s.remove_many(0..50u32).await.expect("remove_many");
+        for k in 0..50u32 {
+            assert_eq!(s.get(&k).await, None);
+        }
+    }
+
     #[test]
     fn remove_sync_tombstones_a_value_with_no_async_runtime() {
         let s = shard::<u32, String>(1);
@@ -8006,6 +8266,516 @@ mod tests {
             assert_eq!(shard.get_sync(&resident_key), None);
             assert!(!shard.contains_key_sync(&resident_key));
 
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `Shard::apply_grouped`'s one `reserve_for_batch` call, made
+        /// before any stripe lock, genuinely suspends the calling
+        /// `insert_many` while another caller holds the tier's entire
+        /// flush-queue budget, and resumes the instant that budget frees:
+        /// the same suspension point `ShardOps::apply_remote_batch` shares.
+        #[tokio::test]
+        async fn apply_grouped_suspends_under_a_saturated_queue_and_resumes_once_room_frees() {
+            let dir = temp_dir("suspend-apply-grouped");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("suspend-apply-grouped"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            // Another caller already holds the tier's entire flush-queue
+            // budget: this batch's own `reserve_for_batch` call has
+            // nothing left to acquire until that reservation is dropped.
+            let held = tier
+                .reserve(64, Duration::from_secs(5))
+                .await
+                .expect("the whole (tiny) queue is free before this call");
+
+            let insert_fut = shard.insert_many([(1u32, "a".to_string())]);
+            tokio::pin!(insert_fut);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut insert_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "insert_many's own apply_grouped call must still be waiting on reserve()"
+            );
+
+            drop(held);
+
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut insert_fut)
+                .await
+                .expect("insert_many resumes once the reservation frees room");
+            assert!(
+                result.is_ok(),
+                "the write itself still succeeds: {result:?}"
+            );
+            assert_eq!(shard.get(&1).await, Some("a".to_string()));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `ShardOps::apply_remote_batch`'s own `reserve_for_batch` call,
+        /// made before any stripe lock, genuinely suspends the calling
+        /// batch while another caller holds the tier's entire flush-queue
+        /// budget, and resumes the instant that budget frees: the same
+        /// suspension point [`apply_grouped_suspends_under_a_saturated_queue_and_resumes_once_room_frees`]
+        /// exercises through `Shard::apply_grouped`, driven here through
+        /// the batch path live replication, anti-entropy pull repair, and
+        /// rebalance/state-transfer pulls all share.
+        #[tokio::test]
+        async fn apply_remote_batch_suspends_identically_under_a_saturated_queue() {
+            let dir = temp_dir("suspend-apply-remote-batch");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("suspend-apply-remote-batch"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            // Another caller already holds the tier's entire flush-queue
+            // budget: this batch's own `reserve_for_batch` call has
+            // nothing left to acquire until that reservation is dropped.
+            let held = tier
+                .reserve(64, Duration::from_secs(5))
+                .await
+                .expect("the whole (tiny) queue is free before this call");
+
+            let rec = WireRecord {
+                key: key_bytes(&1u32),
+                value: Some(Bytes::from(postcard::to_stdvec("a").expect("encode"))),
+                ver: hlc(1, 1),
+                expires_at_ms: None,
+            };
+            let mut batch_fut = ShardOps::apply_remote_batch(&shard, vec![rec]);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut batch_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "apply_remote_batch's own reserve_for_batch call must still be waiting on \
+                 reserve()"
+            );
+
+            drop(held);
+
+            tokio::time::timeout(Duration::from_secs(5), &mut batch_fut)
+                .await
+                .expect("apply_remote_batch resumes once the reservation frees room");
+            assert_eq!(shard.get(&1).await, Some("a".to_string()));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `ShardOps::apply_remote_batch` decodes and groups every record
+        /// by stripe *before* its one `reserve_for_batch` suspension
+        /// point, so that suspension has nothing left to reorder: this
+        /// pins that guarantee by driving two `Put`s for the *same* key at
+        /// the *same* `Hlc` through one batch, with the tier saturated so
+        /// `reserve()` genuinely suspends mid-call. `resolve_conflict`'s
+        /// equal-version fast path (`engine.rs`) means the second of any
+        /// two same-key, same-`Hlc` writes always loses to whichever
+        /// landed first, so the winner directly exposes application
+        /// order: if the suspension let anything reorder the batch, the
+        /// second value would win instead.
+        #[tokio::test]
+        async fn apply_remote_batch_preserves_per_bucket_order_once_reserve_can_suspend() {
+            let dir = temp_dir("order-apply-remote-batch");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("order-apply-remote-batch"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            let held = tier
+                .reserve(64, Duration::from_secs(5))
+                .await
+                .expect("the whole (tiny) queue is free before this call");
+
+            let ver = hlc(1, 1);
+            let first = WireRecord {
+                key: key_bytes(&7u32),
+                value: Some(Bytes::from(postcard::to_stdvec("first").expect("encode"))),
+                ver,
+                expires_at_ms: None,
+            };
+            let second = WireRecord {
+                key: key_bytes(&7u32),
+                value: Some(Bytes::from(postcard::to_stdvec("second").expect("encode"))),
+                ver,
+                expires_at_ms: None,
+            };
+            let mut batch_fut = ShardOps::apply_remote_batch(&shard, vec![first, second]);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut batch_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "this batch's reserve_for_batch call must still be waiting on reserve()"
+            );
+
+            drop(held);
+
+            tokio::time::timeout(Duration::from_secs(5), &mut batch_fut)
+                .await
+                .expect("apply_remote_batch resumes once the reservation frees room");
+            assert_eq!(
+                shard.get(&7).await,
+                Some("first".to_string()),
+                "the batch's own arrival order survives the suspension: \"first\" applies before \
+                 \"second\", so the equal-Hlc \"second\" write loses to it, exactly as it would \
+                 with no suspension at all"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `Shard::retry_reservation_deficit`'s own closing fallback,
+        /// driven end to end through a real `insert_many` call rather
+        /// than at the bare `Engine` level: once its retry budget is
+        /// exhausted with a real
+        /// [`engine::Engine::enforce_capacity_with_reservation`] deficit
+        /// still outstanding, it must make its own closing
+        /// `Engine::enforce_capacity` call rather than simply return,
+        /// leaving `max_capacity` exceeded because nothing else on this
+        /// `Mode::Local` (`keep_resident_when_refused == false`) shard
+        /// happens to write again. Four colliding keys in one
+        /// `insert_many` call, `flush_queue_bytes` sized to exactly one
+        /// record so the call's own reservation covers only the first
+        /// victim, and the flusher paused before anything is ever
+        /// enqueued so nothing ever frees `admit` back: the second
+        /// victim's hand-off is a genuine, persistent deficit, and a
+        /// short `spill_wait_timeout` means the retry loop gives up
+        /// quickly rather than this test waiting on it. The four keys are
+        /// chosen to collide into stripe `0` specifically: both
+        /// `apply_grouped` and `ShardOps::apply_remote_batch` always pass
+        /// `retry_reservation_deficit` a `start_bucket` of `0` (see their
+        /// own call sites), so this is the scenario that call shape
+        /// actually produces, not an easier one this test picked for its
+        /// own convenience.
+        #[tokio::test]
+        async fn retry_reservation_deficit_deletes_the_leftover_victim_once_its_own_budget_is_exhausted()
+         {
+            let dir = temp_dir("retry-deficit-shard-fallback");
+            let value = "x".repeat(20);
+            let encoded_len = postcard::to_stdvec(&value)
+                .expect("test value encodes")
+                .len();
+
+            let mut keys = Vec::new();
+            for k in 1..200_000u32 {
+                let kb = key_bytes(&k);
+                if engine::stripe_index_from_hash(engine::hash_key_bytes(kb.as_ref())) != 0 {
+                    continue;
+                }
+                keys.push(k);
+                if keys.len() == 4 {
+                    break;
+                }
+            }
+            assert_eq!(
+                keys.len(),
+                4,
+                "1024 stripes; four keys landing in stripe 0 specifically are found quickly"
+            );
+
+            let record_len_0 = spill::spill_record_len(key_bytes(&keys[0]).len(), encoded_len);
+
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                // Exactly one record's worth: `apply_grouped`'s own
+                // `reserve_for_batch` reservation, sized from this whole
+                // call's own Put bytes, is clamped down to this tier's
+                // entire (tiny) total, covering at most one victim.
+                .flush_queue_bytes(u64::from(record_len_0))
+                .spill_wait_timeout(Duration::from_millis(150));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("retry-deficit-shard-fallback"),
+                Mode::Local,
+                NodeId::from(1u64),
+                30,
+                None,
+                None,
+            )
+            .with_weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+            // Paused before this call ever enqueues anything: no flusher
+            // installs run, so nothing this test does ever frees a byte
+            // back to `admit` once it is spent.
+            tier.pause_flusher();
+
+            shard
+                .insert_many(keys.iter().map(|&k| (k, value.clone())))
+                .await
+                .expect(
+                    "insert_many completes even though most of its own evictions are refused \
+                     for the whole run",
+                );
+
+            let mut resident_or_spilled = 0;
+            for &k in &keys {
+                if shard.get(&k).await.is_some() {
+                    resident_or_spilled += 1;
+                }
+            }
+            assert!(
+                resident_or_spilled < keys.len(),
+                "keep_resident_when_refused defaults to false: retry_reservation_deficit's own \
+                 closing fallback must physically delete at least the victim a reservation \
+                 retry gave up on, not leave every key resident with max_capacity exceeded \
+                 forever because a background retry ran out of budget"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The high-severity gap this workstream's fix closes:
+        /// `Shard::retry_reservation_deficit` must share
+        /// `Shard::reserve_for_batch`'s own deadline rather than open a
+        /// second, independent `spill_wait_timeout` wait window on top of
+        /// it: the whole `apply_grouped` call, first reservation plus
+        /// every retry, stays bounded by one `spill_wait_timeout` total.
+        ///
+        /// Same four-colliding-keys, one-record-flush-queue scenario as
+        /// `retry_reservation_deficit_deletes_the_leftover_victim_once_its_own_budget_is_exhausted`
+        /// above, but this test forces `reserve_for_batch`'s own initial
+        /// `reserve()` call to genuinely suspend first, for a known slice
+        /// of the budget (`HOG_HOLD`), by having a background task reserve
+        /// the tier's whole (tiny) admission budget and hold it that long
+        /// before releasing it: otherwise, with the queue empty from the
+        /// start, that first `reserve` would resolve instantly and this
+        /// test could not tell a shared deadline apart from a fresh one:
+        /// both would just measure the one retry wait alone. Once the
+        /// deficit retry needs its own wait after that, a shared deadline
+        /// (this workstream's fix) has already spent `HOG_HOLD` of the
+        /// budget and only waits out the remainder, so the whole call
+        /// finishes within roughly one `SPILL_WAIT_TIMEOUT` of wall time;
+        /// a fresh deadline (the regression this guards against) starts a
+        /// second full `SPILL_WAIT_TIMEOUT` on top of `HOG_HOLD`, pushing
+        /// the call well past it.
+        #[tokio::test]
+        async fn apply_grouped_bounds_its_whole_reservation_wait_to_one_spill_wait_timeout() {
+            const SPILL_WAIT_TIMEOUT: Duration = Duration::from_millis(300);
+            /// Half the budget: leaves a comfortable, known remainder for
+            /// the deficit retry's own wait, and a wide enough gap between
+            /// "shared" (~`SPILL_WAIT_TIMEOUT`) and "fresh"
+            /// (~`HOG_HOLD + SPILL_WAIT_TIMEOUT`) totals to stay clear of
+            /// ordinary scheduling jitter either way.
+            const HOG_HOLD: Duration = Duration::from_millis(150);
+
+            let dir = temp_dir("retry-deficit-shared-budget");
+            let value = "x".repeat(20);
+            let encoded_len = postcard::to_stdvec(&value)
+                .expect("test value encodes")
+                .len();
+
+            let mut keys = Vec::new();
+            for k in 1..200_000u32 {
+                let kb = key_bytes(&k);
+                if engine::stripe_index_from_hash(engine::hash_key_bytes(kb.as_ref())) != 0 {
+                    continue;
+                }
+                keys.push(k);
+                if keys.len() == 4 {
+                    break;
+                }
+            }
+            assert_eq!(
+                keys.len(),
+                4,
+                "1024 stripes; four keys landing in stripe 0 specifically are found quickly"
+            );
+
+            let record_len_0 = spill::spill_record_len(key_bytes(&keys[0]).len(), encoded_len);
+
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(u64::from(record_len_0))
+                .spill_wait_timeout(SPILL_WAIT_TIMEOUT);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("retry-deficit-shared-budget"),
+                Mode::Local,
+                NodeId::from(1u64),
+                30,
+                None,
+                None,
+            )
+            .with_weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+            tier.pause_flusher();
+
+            // Reserves the whole (tiny) admission budget on a background
+            // task and holds it for `HOG_HOLD` before releasing it, so
+            // `apply_grouped`'s own `reserve_for_batch` call below is
+            // forced to genuinely wait out a known slice of its
+            // `spill_wait_timeout` before it ever gets a reservation. The
+            // readiness channel guarantees this task's own `reserve()`
+            // call lands first: deterministic ordering, not a race
+            // against `insert_many`'s own call below.
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let hog_tier = Arc::clone(&tier);
+            let hog = tokio::spawn(async move {
+                let reservation = hog_tier
+                    .reserve(record_len_0, Duration::from_secs(5))
+                    .await
+                    .expect("the whole (single-record) queue is free before this task ever runs");
+                let _ = ready_tx.send(());
+                tokio::time::sleep(HOG_HOLD).await;
+                drop(reservation);
+            });
+            ready_rx.await.expect(
+                "the hog task reserves the whole queue before insert_many starts racing it",
+            );
+
+            let started = std::time::Instant::now();
+            shard
+                .insert_many(keys.iter().map(|&k| (k, value.clone())))
+                .await
+                .expect(
+                    "insert_many completes even though most of its own evictions are refused \
+                     for the whole run",
+                );
+            let elapsed = started.elapsed();
+            hog.await.expect("the hog task never panics");
+
+            assert!(
+                elapsed < SPILL_WAIT_TIMEOUT + Duration::from_millis(100),
+                "reserve_for_batch's own wait ({HOG_HOLD:?}, out for the hog) plus \
+                 retry_reservation_deficit's own retry must share one \
+                 {SPILL_WAIT_TIMEOUT:?} budget, not a fresh one each: elapsed {elapsed:?} \
+                 should land around {SPILL_WAIT_TIMEOUT:?}, well short of \
+                 {HOG_HOLD:?} + {SPILL_WAIT_TIMEOUT:?}, which is what a second, independent \
+                 full-budget wait would cost"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `apply_grouped`'s one batch-wide `Reservation` reaches all the
+        /// way through `Engine::apply_many_with_reservation` into a real
+        /// `Engine::enforce_capacity_with_reservation` eviction pass and
+        /// gets spent there via `Engine::evict_batch_sampled_with_reservation`/
+        /// `Engine::evict_one_scanning_with_reservation`: every write this
+        /// batch makes past `max_capacity` still lands, resident or
+        /// spilled, rather than falling back to a plain delete.
+        #[tokio::test]
+        async fn apply_grouped_threads_a_real_reservation_through_a_real_eviction_pass() {
+            let dir = temp_dir("reservation-through-real-eviction");
+            // A generous flush-queue budget: this test's point is that the
+            // reservation reaches the real eviction pass and gets spent
+            // there, not that a tight byte budget is respected exactly
+            // (already covered by `spill.rs`'s and `engine.rs`'s own
+            // reservation tests).
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(1 << 16)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("reservation-through-real-eviction"),
+                Mode::Local,
+                NodeId::from(1u64),
+                5, // weight 1 per entry with no custom weigher: caps at 5 live entries
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+
+            shard
+                .insert_many((0..10u32).map(|k| (k, "v".repeat(5))))
+                .await
+                .expect("insert_many");
+
+            // Every one of the 10 writes landed somewhere, resident or
+            // spilled: the cap evicted the rest through this batch's own
+            // reservation, never a plain delete.
+            for k in 0..10u32 {
+                assert!(
+                    shard.get(&k).await.is_some(),
+                    "key {k} is present, whether resident or spilled"
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// [`insert_sync_writes_a_value_with_no_async_runtime`]'s premise,
+        /// extended: `insert_sync`'s own path never calls
+        /// `SpillTier::reserve`, so it completes on a thread with no async
+        /// runtime of its own even while a real `Reservation`, built and
+        /// held on a separate tokio runtime, currently owns this tier's
+        /// entire flush-queue budget.
+        #[test]
+        fn insert_sync_completes_synchronously_while_another_task_holds_the_whole_reservation() {
+            let dir = temp_dir("insert-sync-under-reservation");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("insert-sync-under-reservation"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("a fresh runtime builds");
+                rt.block_on(async move {
+                    let reservation = tier
+                        .reserve(64, Duration::from_secs(30))
+                        .await
+                        .expect("the whole queue is free before this call");
+                    ready_tx.send(()).expect("the main thread is listening");
+                    let _ = release_rx.recv();
+                    drop(reservation);
+                });
+            });
+            ready_rx
+                .recv()
+                .expect("the holder thread reports it holds the reservation");
+
+            // `insert_sync` runs on this thread, with no async runtime of
+            // its own, while the reservation above stays fully live on a
+            // different thread's own runtime.
+            shard.insert_sync(1, "a".to_string()).expect("insert_sync");
+            assert_eq!(shard.get_sync(&1), Some("a".to_string()));
+
+            release_tx.send(()).expect("the holder thread is listening");
+            holder.join().expect("the holder thread does not panic");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

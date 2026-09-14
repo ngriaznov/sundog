@@ -14,6 +14,8 @@ mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU8;
+#[cfg(feature = "spill")]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -669,7 +671,16 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
               spill_writes_and_promotes_pin_metrics's own doc for why it can't be a separate \
               #[tokio::test]"
 )]
-#[tokio::test]
+// Multi-threaded, matching `spill_replication.rs`'s own reservation/timeout
+// scenarios: `reserve_timeout_pin_metric`'s genuine `SpillWaitTimedOut` race
+// needs the flusher's dedicated OS thread and this test's own tokio tasks
+// to run with real parallelism. On a single-threaded runtime, this test's
+// one worker thread sharing time with every other scenario's background
+// work (gossip, anti-entropy, other clusters still open from earlier in
+// this same function) tends to give the flusher enough real wall-clock
+// time between polls to keep `admit` refilled, so the race that scenario
+// depends on rarely triggers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     let metrics_addr = reserve_tcp_addr().await;
     let gossip_a = common::reserve_gossip_addr().await;
@@ -697,7 +708,18 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_part_mismatch(&cluster, &peer).await;
     count_hits_and_misses(&cluster).await;
     #[cfg(feature = "spill")]
-    let spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
+    let mut spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
+    #[cfg(feature = "spill")]
+    let (disk_error_immutable, disk_error_dropped) = {
+        let (dir, immutable, observed) =
+            disk_error_and_reserve_wait_pin_metrics(&cluster, metrics_addr).await;
+        spill_dirs.push(dir);
+        (immutable, observed)
+    };
+    #[cfg(feature = "spill")]
+    {
+        spill_dirs.push(reserve_timeout_pin_metric().await);
+    }
     // Independent of `peer`/`third`/`fourth`: creates and fully retires its
     // own two scenario-local nodes before returning, so it leaves no peer
     // count `seed_distributed_metrics` below needs to account for.
@@ -913,6 +935,90 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             Some(0.0),
             "the removed key is gone, so zero currently-spilled entries remain; got body:\n{body}"
         );
+
+        // `disk_error_and_reserve_wait_pin_metrics`'s `insert_many` call
+        // threads exactly one `Reservation` through `apply_grouped` ->
+        // `reserve()`, resolved against an otherwise-empty flush queue: no
+        // real wait, no timeout, and the waiter gauge back at zero once
+        // the call returns.
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_wait_seconds_total",
+                &[("cache", "disk-error-pin")]
+            ),
+            Some(0.0),
+            "reserve() resolved against an empty queue, so this whole-second counter has \
+             nothing to accumulate yet; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_waiters",
+                &[("cache", "disk-error-pin")]
+            ),
+            Some(0.0),
+            "the RAII guard decrements sundog_spill_waiters back to zero once reserve() \
+             resolves; got body:\n{body}"
+        );
+        // sundog_spill_wait_timeouts_total is pinned by
+        // `reserve_tracks_waiters_wait_seconds_and_wait_timeouts`
+        // (spill.rs) against a genuine timeout, driven through the
+        // crate-internal `pause_flusher` hook this external test cannot
+        // reach: `admit`'s bytes free the instant the flusher *dequeues* a
+        // job, before its write even starts (`flusher_loop`'s own
+        // doc), so this particular tiny, two-entry scenario's own
+        // `flush_queue_bytes` never comes close to saturating within it.
+        // A `metrics::Counter` series exists only once something
+        // increments it, so a scenario that never times out correctly
+        // never registers this series at all -- this is that expected
+        // absence for *this* scenario, not a gap in coverage:
+        // `reserve_timeout_pin_metric`, below, pins a genuine nonzero
+        // count on its own differently-shaped cache.
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_wait_timeouts_total",
+                &[("cache", "disk-error-pin")]
+            ),
+            None,
+            "reserve() resolved well inside its own timeout, so this series was never \
+             registered; got body:\n{body}"
+        );
+        // `reserve_timeout_pin_metric`'s own scenario: a real donor/joiner
+        // state-transfer pull against a tiny `flush_queue_bytes` and an
+        // absurdly short `spill_wait_timeout` (1 microsecond) forces at
+        // least one `ShardOps::apply_remote_batch` reservation or
+        // `Shard::retry_reservation_deficit` retry call to lose its race
+        // against a genuine wait -- a real, nonzero count pinned through
+        // the actual Prometheus text-exposition path, not just an absence
+        // check.
+        assert!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_wait_timeouts_total",
+                &[("cache", "reserve-timeout-pin")]
+            )
+            .is_some_and(|count| count >= 1.0),
+            "expected at least one genuine reserve() timeout on the 'reserve-timeout-pin' \
+             cache; got body:\n{body}"
+        );
+
+        // disk_error: only pinned when `chattr_dir_entries` could actually
+        // set up the fault (root or passwordless sudo, on an ext2/3/4
+        // filesystem); elsewhere this is skipped rather than failing the
+        // whole scenario, the same tolerance this file already extends to
+        // losing the process-global recorder race. Once the fault *is* set
+        // up, `None` is a real failure, not tolerated.
+        if disk_error_immutable {
+            assert_eq!(
+                disk_error_dropped,
+                Some(1.0),
+                "the one eviction insert_many forces lands in the one region \
+                 chattr_dir_entries made immutable, so exactly one job's write fails; got \
+                 body:\n{body}"
+            );
+        }
     }
 
     // `users` warmed during `seed_sketch_mismatch` above: `is_ready()` and
@@ -1140,4 +1246,236 @@ async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::pa
     dirs.push(dir);
 
     dirs
+}
+
+/// Best-effort: makes every entry directly under `dir` immutable
+/// (`chattr +i`), or mutable again (`chattr -i`) on the reverse call. The
+/// immutable attribute is checked by ext2/3/4 on every write syscall, not
+/// only at `open()` the way permission bits are, so it makes a `pwrite` on
+/// an already-open write handle fail with `EPERM` even though the handle
+/// was opened, and the file preallocated, before this runs --
+/// `SpillTier::open`'s own region files, specifically. Requires
+/// `CAP_LINUX_IMMUTABLE` (root, or passwordless `sudo`) and an
+/// ext2/3/4-family filesystem; returns `false` without changing anything
+/// when either is unavailable, so a caller can skip whatever real
+/// disk-error scenario this was meant to set up instead of failing
+/// outright.
+#[cfg(feature = "spill")]
+fn chattr_dir_entries(dir: &std::path::Path, immutable: bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let paths: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
+    if paths.is_empty() {
+        return false;
+    }
+    let flag = if immutable { "+i" } else { "-i" };
+    let run = |program: &str, prefix: &[&str]| {
+        Command::new(program)
+            .args(prefix)
+            .arg(flag)
+            .args(&paths)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    run("chattr", &[]) || run("sudo", &["-n", "chattr"])
+}
+
+/// Exercises the `reserve()`-backed metrics this workstream adds --
+/// `sundog_spill_wait_seconds_total`, `sundog_spill_waiters`,
+/// `sundog_spill_wait_timeouts_total` -- via `insert_many`, the one
+/// producer reachable through the public API that threads a `Reservation`
+/// through `apply_grouped`; single-key `cache.insert` never calls
+/// `reserve()` at all (`SpillConfig::spill_wait_timeout`'s own doc names
+/// this as an explicit scope boundary). Also exercises
+/// `sundog_spill_dropped_total{reason="disk_error"}` via a real,
+/// deterministic write failure: [`chattr_dir_entries`] makes the tier's
+/// region files immutable right after `SpillTier::open` creates them, so
+/// the flusher's later `pwrite` on its already-open handle for one of them
+/// fails with `EPERM` -- a real filesystem fault, not a simulated one.
+///
+/// Returns the scratch directory to clean up, whether
+/// [`chattr_dir_entries`] actually set up the fault, and, when it did, the
+/// observed `disk_error` count. The caller skips the `disk_error`
+/// assertion entirely when the fault could not be set up (no
+/// `CAP_LINUX_IMMUTABLE`, no `chattr` binary, or a filesystem that does
+/// not support the attribute) instead of failing the whole scenario; when
+/// it *was* set up, `None` for the observed count is a genuine failure to
+/// report, not an environment limitation to tolerate.
+#[cfg(feature = "spill")]
+async fn disk_error_and_reserve_wait_pin_metrics(
+    cluster: &Cluster,
+    metrics_addr: SocketAddr,
+) -> (std::path::PathBuf, bool, Option<f64>) {
+    let dir = fresh_spill_dir("disk-error");
+    let cache_name = "disk-error-pin";
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+    let cache = cluster
+        .cache::<u32, String>(cache_name)
+        .mode(Mode::Local)
+        .max_capacity(1)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("cache opens");
+
+    // `SpillTier::open` creates and preallocates every region file
+    // synchronously before `open()` above ever returns, so the directory
+    // is already fully populated here, before any insert or eviction has
+    // run.
+    let region_dir = dir.join(cache_name);
+    let immutable = chattr_dir_entries(&region_dir, true);
+
+    // `insert_many` threads one `Reservation` through `apply_grouped` ->
+    // `reserve()` for the whole call, so this is the one producer this
+    // file can reach that exercises the new wait metrics; it applies both
+    // entries regardless of whether the eviction this forces later fails.
+    cache
+        .insert_many([(1u32, "one".to_string()), (2u32, "two".to_string())])
+        .await
+        .expect("insert_many applies both entries even when the eviction they force later fails");
+
+    let observed_disk_error = if immutable {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(body) = scrape_metrics(metrics_addr).await
+                && let Some(count) = scraped_metric_value(
+                    &body,
+                    "sundog_spill_dropped_total",
+                    &[("cache", cache_name), ("reason", "disk_error")],
+                )
+            {
+                break Some(count);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    } else {
+        None
+    };
+
+    // Restore normal permissions so the caller's own `remove_dir_all`
+    // cleanup can actually delete these files.
+    let _ = chattr_dir_entries(&region_dir, false);
+
+    (dir, immutable, observed_disk_error)
+}
+
+/// Drives a genuine `sundog_spill_wait_timeouts_total` increment through
+/// the public API alone: `disk_error_and_reserve_wait_pin_metrics`'s own
+/// tiny, two-entry scenario never needs `reserve()` to actually suspend
+/// (its default 64 MiB `flush_queue_bytes` has room for both records many
+/// times over), so that series is never registered there, and pinning it
+/// against a genuine wait needs a scenario shaped like this one instead.
+///
+/// A single local `insert_many` burst, however large, turns out not to
+/// reproduce this reliably: `flusher_loop` frees `admit`'s permits the
+/// instant it *dequeues* a job (`SpillTier::reserve`'s own doc), well
+/// before that job's disk write even starts, so a purely local producer
+/// and the flusher both racing on the same machine's CPU tends to keep
+/// `admit` refilled faster than even a 1-microsecond timeout can lose
+/// against. `ShardOps::apply_remote_batch`'s own `reserve()` call, driven
+/// through a real state-transfer pull between two real nodes exactly as
+/// `spill_replication.rs::a_too_short_spill_wait_timeout_degrades_to_a_
+/// clean_retry_not_a_hang` does, is what reliably produces a genuine
+/// suspension here: a real donor round trip over loopback TCP is
+/// consistently slower than the flusher's own local dequeue-and-free-permit
+/// step, so this joiner's own reservation and retry calls do genuinely
+/// have to wait on real network I/O rather than only local disk/channel
+/// throughput. `Duration::from_micros(1)` then loses that race
+/// deterministically: `tokio::time::timeout` only ever returns early when
+/// its wrapped future resolves on the very first poll, and a real
+/// suspension never does that within one microsecond of real wall-clock
+/// scheduling latency.
+///
+/// Two scenario-local nodes, entirely independent of the caller's own
+/// `cluster`/`peer`: a donor fills `ENTRIES` records unbounded and
+/// spill-free, then a joiner opens with a tiny `flush_queue_bytes`, a
+/// small `max_capacity`, and the too-short timeout, pulling the whole
+/// dataset from the donor at `open()` time. Both nodes are shut down
+/// before this returns. Returns the scratch directory to clean up. Makes
+/// no claim about `queue_full`/`deferred` drops on the joiner's cache --
+/// degrading cleanly under a too-short timeout, not a zero-drop guarantee,
+/// is the property this scenario exercises; `spill_backpressure.rs`'s own
+/// scenarios cover the zero-drop claim with a realistic timeout.
+#[cfg(feature = "spill")]
+async fn reserve_timeout_pin_metric() -> std::path::PathBuf {
+    const REGION_BYTES: u64 = 2 * 1024 * 1024;
+    const CAPACITY_BYTES: u64 = 32 * 1024 * 1024;
+    const FLUSH_QUEUE_BYTES: u64 = 64 * 1024;
+    const MAX_CAPACITY: u64 = 64;
+    const ENTRIES: u32 = 80_000;
+    /// Far too short to ever win a race against a genuine wait; see
+    /// `a_too_short_spill_wait_timeout_degrades_to_a_clean_retry_not_a_hang`'s
+    /// own doc for why `Duration::ZERO` is deliberately not used instead.
+    const TOO_SHORT_TIMEOUT: Duration = Duration::from_micros(1);
+    let cache_name = "reserve-timeout-pin";
+    let cluster_name = "it-prometheus-exporter-reserve-timeout";
+
+    let gossip_a = common::reserve_gossip_addr().await;
+    let donor = Cluster::builder(cluster_name)
+        .seeds(std::iter::empty())
+        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_a))
+        .build()
+        .await
+        .expect("donor builds");
+    let donor_cache = donor
+        .cache::<u32, String>(cache_name)
+        .mode(Mode::Replicated)
+        .open()
+        .await
+        .expect("donor opens alone, unbounded and spill-free, owning everything");
+
+    let mut start = 0u32;
+    while start < ENTRIES {
+        let end = (start + 500).min(ENTRIES);
+        donor_cache
+            .insert_many((start..end).map(|i| (i, "v".repeat(200))))
+            .await
+            .expect("bulk insert on the donor succeeds");
+        start = end;
+    }
+
+    let dir = fresh_spill_dir("reserve-timeout");
+    let cfg = sundog::SpillConfig::new(&dir, CAPACITY_BYTES)
+        .region_bytes(REGION_BYTES)
+        .flush_queue_bytes(FLUSH_QUEUE_BYTES)
+        .spill_wait_timeout(TOO_SHORT_TIMEOUT);
+
+    let gossip_b = common::reserve_gossip_addr().await;
+    let joiner = Cluster::builder(cluster_name)
+        .seeds([gossip_a])
+        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_b))
+        .build()
+        .await
+        .expect("joiner builds");
+    common::wait_for_peer_count(&joiner, 1, Duration::from_secs(15)).await;
+
+    let started = std::time::Instant::now();
+    let _joiner_cache = joiner
+        .cache::<u32, String>(cache_name)
+        .mode(Mode::Replicated)
+        .max_capacity(MAX_CAPACITY)
+        .spill(cfg)
+        .open()
+        .await
+        .expect(
+            "joiner opens, pulling the whole dataset from the donor even though its own \
+             spill_wait_timeout is absurdly short",
+        );
+    eprintln!(
+        "reserve-timeout-pin: joiner open() took {:?}",
+        started.elapsed()
+    );
+
+    donor.shutdown().await;
+    joiner.shutdown().await;
+
+    dir
 }

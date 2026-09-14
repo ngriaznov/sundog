@@ -25,11 +25,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Weak};
 use std::thread;
-#[cfg(test)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 use xxhash_rust::xxh3::Xxh3Default;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -44,18 +44,40 @@ const DEFAULT_REGION_BYTES: u64 = 64 * 1024 * 1024;
 /// engine's read path, `spawn_blocking` behind a semaphore of this size,
 /// not by anything in this module.
 const DEFAULT_READ_CONCURRENCY: usize = 16;
-/// Bound on the flusher's job queue: a scheduling buffer, not a capacity
-/// knob. Config-independent by design: every [`SpillConfig`] gets the same
-/// bound regardless of `capacity_bytes`. A bulk insert can evict thousands
-/// of entries under one `enforce_capacity` lock hold, all queued in a
-/// burst; a smaller bound would drop most of a large burst with `reason =
-/// "queue_full"` instead of spilling it. 8192 absorbs that: a [`SpillJob`]
-/// holds two refcounted [`Bytes`] handles plus a few words, so the queue's
-/// own memory footprint stays small even at this depth, and the bytes
-/// those handles point at are already resident in RAM regardless of
-/// whether the job sits in this queue or the entry sits in `live`, so
-/// queuing it costs nothing beyond what is already paid for.
+/// Wait bound a [`SpillConfig`] uses when
+/// [`SpillConfig::spill_wait_timeout`] is never called. Set against the
+/// actual computed `state_transfer::per_donor_budget` (`total * 2 / 5`, 8s
+/// at the 20s `state_transfer_budget` default), not the unrelated 4s
+/// `first_peer_grace` figure: 2s leaves comfortable margin for one
+/// reservation wait per chunk plus the chunk's own transfer time.
+const DEFAULT_SPILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Sanity cap [`SpillConfig::validate`] enforces on
+/// [`SpillConfig::spill_wait_timeout`]: comparable to or larger than a
+/// reasonable `state_transfer::per_donor_budget` gets a clear error at
+/// `SpillTier::open` time rather than a spurious rebalance failure
+/// discovered later.
+const MAX_SPILL_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Floor on the flusher's job queue slot count: a scheduling buffer, not a
+/// byte-capacity knob. [`SpillTier::attach`] sizes the channel from
+/// `flush_queue_bytes_value() / HEADER_LEN`, clamped between this floor and
+/// [`FLUSH_QUEUE_SLOTS_MAX`], so a config with small typical records, many
+/// of which fit in the byte budget, gets a slot count sized to actually
+/// hold them rather than one fixed independent of `flush_queue_bytes` and
+/// sized only for this floor's own 8192-record shape, while this floor
+/// keeps every config at least this roomy. A bulk insert can evict
+/// thousands of entries under one `enforce_capacity` lock hold, all queued
+/// in a burst; a slot count too small drops most of a large burst with
+/// `reason = "queue_full"` instead of spilling it. A [`SpillJob`] holds two
+/// refcounted [`Bytes`] handles plus a few words, so the queue's own memory
+/// footprint stays small even at this depth, and the bytes those handles
+/// point at are already resident in RAM regardless of whether the job sits
+/// in this queue or the entry sits in `live`, so queuing it costs nothing
+/// beyond what is already paid for.
 pub(crate) const FLUSH_QUEUE_CAPACITY: usize = 8192;
+/// Ceiling [`SpillTier::attach`]'s byte-derived slot count clamps to,
+/// guarding a pathological config, a huge `flush_queue_bytes` paired with
+/// tiny typical records, from allocating an oversized channel buffer.
+pub(crate) const FLUSH_QUEUE_SLOTS_MAX: usize = 262_144;
 /// Bound on how many jobs one flusher batch coalesces into as few
 /// positional writes as its rotations require. After a blocking `recv`
 /// returns the first job, [`flusher_loop`] drains the channel greedily with
@@ -106,12 +128,17 @@ pub struct SpillConfig {
     /// `capacity_bytes`, since `validate` already requires `capacity_bytes`
     /// be at least twice `region_bytes`.
     flush_queue_bytes: Option<u64>,
+    /// See [`SpillConfig::spill_wait_timeout`]. [`SpillTier::open`] reads
+    /// this into the tier's own copy, which [`SpillTier::reserve`] waits
+    /// against.
+    spill_wait_timeout: Duration,
 }
 
 impl SpillConfig {
     /// Starts a config with the default `region_bytes`, 64 MiB,
-    /// `read_concurrency`, 16, and `flush_queue_bytes`, one region (so it
-    /// tracks `region_bytes` for as long as neither is overridden).
+    /// `read_concurrency`, 16, `flush_queue_bytes`, one region (so it
+    /// tracks `region_bytes` for as long as neither is overridden), and
+    /// `spill_wait_timeout`, two seconds.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>, capacity_bytes: u64) -> Self {
         Self {
@@ -120,6 +147,7 @@ impl SpillConfig {
             region_bytes: DEFAULT_REGION_BYTES,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
             flush_queue_bytes: None,
+            spill_wait_timeout: DEFAULT_SPILL_WAIT_TIMEOUT,
         }
     }
 
@@ -151,6 +179,34 @@ impl SpillConfig {
         self
     }
 
+    /// Overrides how long a bulk write or a rebalance/replication/
+    /// anti-entropy chunk apply waits for flush-queue room to free up
+    /// before falling back to today's instant, non-blocking refuse (this
+    /// cache's usual `queue_full`/`deferred` accounting), default two
+    /// seconds. While waiting, the caller is suspended at one `.await`
+    /// point taken before any per-entry work in that call, never mid-batch
+    /// and never under a stripe lock; once the wait resolves, room or
+    /// timeout, the rest of the call proceeds exactly as it does today.
+    /// `Duration::ZERO` is a legal, explicit opt-out: the wait degenerates
+    /// to a single non-blocking check with no suspension, reproducing
+    /// today's instant-refuse behavior exactly.
+    ///
+    /// Set this against `cluster::state_transfer::per_donor_budget`
+    /// (`state_transfer_budget * 2 / 5`, 8 seconds at the 20-second
+    /// `state_transfer_budget` default): a timeout comparable to or larger
+    /// than that budget can turn one merely-slow chunk into a spurious
+    /// rebalance failure, since a whole-cache or bucket-scoped pull spends
+    /// this wait, at most once per chunk, out of that same per-donor
+    /// budget. The two-second default leaves comfortable margin at the
+    /// default ratio; a cluster with a much larger or smaller
+    /// `state_transfer_budget` should scale this accordingly.
+    /// Own-and-return.
+    #[must_use]
+    pub fn spill_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.spill_wait_timeout = timeout;
+        self
+    }
+
     /// The region size currently in effect.
     #[must_use]
     pub fn region_bytes_value(&self) -> u64 {
@@ -171,15 +227,27 @@ impl SpillConfig {
         self.flush_queue_bytes.unwrap_or(self.region_bytes)
     }
 
+    /// The spill-wait timeout currently in effect, default two seconds. See
+    /// [`SpillConfig::spill_wait_timeout`].
+    #[must_use]
+    pub fn spill_wait_timeout_value(&self) -> Duration {
+        self.spill_wait_timeout
+    }
+
     /// Checks this config before [`SpillTier::open`] uses it to open a tier.
     ///
     /// Rejects a zero `region_bytes`, a `region_bytes` too large to address
     /// with the tier's 32-bit on-disk offsets, a `capacity_bytes` less than
     /// twice `region_bytes`, a `flush_queue_bytes` too small to ever hold
     /// even the smallest possible record (header plus a zero-length key and
-    /// value), and a `flush_queue_bytes` bigger than `capacity_bytes`
-    /// itself, since a flush backlog larger than the whole disk budget
-    /// bounds nothing. The `capacity_bytes` rule prevents a hazard where a
+    /// value), a `flush_queue_bytes` bigger than `capacity_bytes` itself,
+    /// since a flush backlog larger than the whole disk budget bounds
+    /// nothing, and a `spill_wait_timeout` at or above the sanity cap
+    /// `MAX_SPILL_WAIT_TIMEOUT`, since a wait that long is comparable to or
+    /// larger than any reasonable `state_transfer::per_donor_budget` and
+    /// almost certainly a misconfiguration rather than an intended value.
+    /// `Duration::ZERO` is explicitly accepted: an explicit opt-out, not an
+    /// absurd value. The `capacity_bytes` rule prevents a hazard where a
     /// single region would be both the active writer and the only candidate
     /// for FIFO reclaim, so `next_region_index` would immediately reclaim the
     /// region it is currently writing to. With this held, `region_count_for`
@@ -204,6 +272,9 @@ impl SpillConfig {
         }
         if flush_queue_bytes > self.capacity_bytes {
             return Err("flush_queue_bytes must not exceed capacity_bytes");
+        }
+        if self.spill_wait_timeout >= MAX_SPILL_WAIT_TIMEOUT {
+            return Err("spill_wait_timeout must be under the sanity cap");
         }
         Ok(())
     }
@@ -239,6 +310,15 @@ pub(crate) struct SpillJob {
     /// releases exactly this amount when the job resolves, whatever
     /// happened to the entry in the meantime.
     pub(crate) weight: u32,
+    /// Bytes of `Inner::admit` capacity this job currently owns: the exact
+    /// [`spill_record_len`] this job admitted with, whether from a
+    /// caller's own [`Reservation`] or from `admit`'s ordinary
+    /// `try_acquire_many` fallback. `engine::Engine::finish_spill_handoff`'s
+    /// `Err` branch returns exactly this many bytes to `admit`, via
+    /// [`SpillTier::release`], before `abandon` restores the victim's
+    /// weight, so a job that never reaches the flusher's channel does not
+    /// permanently shrink this tier's admission budget.
+    pub(crate) admitted_bytes: u32,
 }
 
 /// A record read back off disk: everything a promotion needs to reconstruct
@@ -322,6 +402,27 @@ pub(crate) fn region_count_for(capacity_bytes: u64, region_bytes: u64) -> u32 {
     u32::try_from((capacity_bytes / region_bytes.max(1)).max(1)).unwrap_or(u32::MAX)
 }
 
+/// Slot count for [`SpillTier::attach`]'s flush channel: `flush_queue_bytes`
+/// divided by the on-disk header size, clamped to
+/// `[FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX]`. Sizing by the smallest
+/// possible record, header only, key and value both empty, means a config
+/// whose real records are larger only ever gets *more* slots than that
+/// record shape needs, never fewer: `admit`'s byte budget is what actually
+/// bounds the flusher's backlog; this only has to avoid a slot count so
+/// small it drops a burst of small records well under that byte bound. The
+/// [`FLUSH_QUEUE_CAPACITY`] floor keeps every config at least this roomy;
+/// the [`FLUSH_QUEUE_SLOTS_MAX`] ceiling guards a pathological config, a
+/// huge `flush_queue_bytes` paired with tiny typical records, from
+/// allocating an oversized channel buffer. Pure; unit tested directly.
+pub(crate) fn flush_queue_slots(flush_queue_bytes: u64) -> usize {
+    let slots = (flush_queue_bytes / HEADER_LEN as u64)
+        .clamp(FLUSH_QUEUE_CAPACITY as u64, FLUSH_QUEUE_SLOTS_MAX as u64);
+    // The clamp above bounds this well within `usize` on every real
+    // platform; the fallback keeps the conversion total rather than
+    // panicking.
+    usize::try_from(slots).unwrap_or(FLUSH_QUEUE_SLOTS_MAX)
+}
+
 /// Whether `record_len` more bytes fit in a region of `region_bytes` bytes
 /// whose write cursor already sits at `write_cursor`. Checked arithmetic: a
 /// pathological `record_len` never wraps into a false "yes".
@@ -339,13 +440,14 @@ pub(crate) fn record_too_large(record_len: u64, region_bytes: u64) -> bool {
     record_len > region_bytes
 }
 
-/// Whether a `record_len`-byte record can be queued right now without
-/// pushing the tier's queued-but-unwritten backlog past `flush_queue_bytes`.
-/// [`SpillTier::would_accept`] refuses a job this returns `false` for,
-/// `reason = "queue_full"`, exactly like a channel with no room, so a
-/// lagging flusher becomes an ordinary eviction rather than an unbounded
-/// RAM backlog. Checked arithmetic: a pathological `record_len` never wraps
-/// into a false "yes". Pure; unit tested directly.
+/// Whether a `record_len`-byte record fits in a `flush_queue_bytes`-byte
+/// budget already holding `queued_bytes`. Test-only: pins the
+/// exact-boundary and pathological-overflow arithmetic that
+/// `Inner::admit`'s `try_acquire_many` performs internally for
+/// [`SpillTier::would_accept`]'s own byte check. Checked arithmetic: a
+/// pathological `record_len` never wraps into a false "yes". Pure; unit
+/// tested directly.
+#[cfg(test)]
 pub(crate) fn record_fits_queue(
     queued_bytes: u64,
     record_len: u64,
@@ -354,6 +456,22 @@ pub(crate) fn record_fits_queue(
     queued_bytes
         .checked_add(record_len)
         .is_some_and(|total| total <= flush_queue_bytes)
+}
+
+/// Total on-disk length of a `key_len`+`value_len`-byte record: header
+/// plus key plus value, as a `u32`. [`SpillTier::would_accept`]'s own
+/// admission check and `engine::Engine::try_spill_victim`'s
+/// `SpillJob::admitted_bytes` bookkeeping both call this, so they always
+/// agree on the exact byte count a successful admission takes from
+/// `Inner::admit`. Saturates to `u32::MAX` on overflow rather than
+/// wrapping; unreachable once `would_accept`'s own `record_too_large`
+/// check has passed, since that already bounds `key_len + value_len` well
+/// under `u32::MAX`. Pure; unit tested directly.
+pub(crate) fn spill_record_len(key_len: usize, value_len: usize) -> u32 {
+    let total = (HEADER_LEN as u64)
+        .saturating_add(key_len as u64)
+        .saturating_add(value_len as u64);
+    u32::try_from(total).unwrap_or(u32::MAX)
 }
 
 /// The `sundog_spill_dropped_total` reason a refusal is recorded under:
@@ -448,20 +566,35 @@ struct Inner {
     /// through to the caller's unconditional-delete fallback.
     closed: AtomicBool,
     cache_name: String,
-    /// `SpillConfig::flush_queue_bytes_value()`, validated. The bound
-    /// [`SpillTier::would_accept`] checks `queued_bytes` against.
+    /// `SpillConfig::flush_queue_bytes_value()`, validated. `admit`'s total
+    /// permit count already encodes this as a byte budget; this copy is
+    /// read back by [`SpillTier::attach`] to size the flush channel's slot
+    /// count and by [`SpillTier::queued_bytes`] (test-facing) to recompute
+    /// its value from `admit`'s available permits.
     flush_queue_bytes: u64,
-    /// Summed record length, header included, of every job currently
-    /// sitting in the flusher's channel: added in
-    /// [`SpillTier::enqueue`] once a job is sent, subtracted in
-    /// [`flusher_loop`] the instant the flusher takes it back off the
-    /// channel, whether or not it has been written yet. Bounds the
-    /// flusher's RAM backlog independently of
-    /// [`FLUSH_QUEUE_CAPACITY`]'s slot count: a job holds two refcounted
-    /// [`Bytes`] handles regardless of how large the value behind them is,
-    /// so a slot-count-only bound does nothing to cap the bytes a lagging
-    /// flusher lets pile up.
-    queued_bytes: AtomicU64,
+    /// `SpillConfig::spill_wait_timeout_value()`, validated. Read back by
+    /// [`SpillTier::spill_wait_timeout_value`], the accessor
+    /// `Shard::apply_grouped`/`ShardOps::apply_remote_batch` consult for how
+    /// long their one [`SpillTier::reserve`] call should wait before
+    /// falling through to the ordinary non-blocking admission path: the
+    /// `SpillConfig` itself is not retained past [`SpillTier::open`], so
+    /// this is the only copy of the configured timeout still reachable
+    /// once a tier is open.
+    spill_wait_timeout: Duration,
+    /// One permit per byte of `flush_queue_bytes_value()`, total. A byte's
+    /// worth of permits is acquired, then immediately `.forget()`-ed, for
+    /// every record [`SpillTier::would_accept`] admits, converting the
+    /// guard into a plain count the caller owns from that point on; permits
+    /// return only through an explicit `add_permits` call, from [`flusher_loop`] the
+    /// instant the flusher takes a job back off the channel, whether or not
+    /// it has been written yet. Bounds the flusher's RAM backlog
+    /// independently of [`FLUSH_QUEUE_CAPACITY`]'s slot count: a job holds
+    /// two refcounted [`Bytes`] handles regardless of how large the value
+    /// behind them is, so a slot-count-only bound does nothing to cap the
+    /// bytes a lagging flusher lets pile up. [`SpillTier::queued_bytes`]
+    /// (test-facing) recomputes the byte total this replaces, from
+    /// `flush_queue_bytes - admit.available_permits()`.
+    admit: Semaphore,
     /// Set by [`SpillTier::set_keep_resident_when_refused`], `false` until
     /// then. `true` means a refused hand-off ([`SpillTier::would_accept`]
     /// or [`SpillTier::enqueue`] declining) leaves its victim resident
@@ -485,10 +618,16 @@ impl Inner {
     /// `"queue_full"`, the flusher's bounded channel has no room, or none
     /// is attached; `"obsolete"`, the flusher wrote the record, but
     /// [`SpillSink::install`] rejected it because the key's state had
-    /// already moved on; or `"deferred"`, one of the first three refusals
-    /// but recorded under this reason instead because
+    /// already moved on; `"deferred"`, one of the first three refusals but
+    /// recorded under this reason instead because
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
-    /// policy; see [`refusal_drop_reason`].
+    /// policy (see [`refusal_drop_reason`]); or `"disk_error"`, every job
+    /// in a segment whose [`write_segment`] write failed. The victim
+    /// stays `Resident` at its original weight either way, since
+    /// [`SpillSink::abandon`] restores it regardless of the reason this is
+    /// recorded under, so nothing is actually dropped; this reason exists
+    /// so a persistently failing disk becomes visible here instead of
+    /// only in a warning log line.
     fn record_dropped(&self, reason: &'static str) {
         metrics::counter!(
             "sundog_spill_dropped_total",
@@ -518,6 +657,53 @@ impl Inner {
         metrics::gauge!("sundog_spill_bytes_used", "cache" => self.cache_name.clone())
             .set(bytes_used_f64(self.bytes_used.load(Ordering::Acquire)));
     }
+
+    /// Increments `sundog_spill_wait_seconds_total{cache}` by `elapsed`'s
+    /// whole seconds, the wall-clock time one completed
+    /// [`SpillTier::reserve`] call spent waiting, success or timeout alike.
+    /// `metrics::Counter` only ever accumulates a `u64`, so this truncates
+    /// sub-second waits to zero rather than rounding them away silently as
+    /// a fraction a `Counter` has no way to hold; a tier under real,
+    /// sustained backpressure accumulates whole seconds of this across
+    /// many calls regardless.
+    fn record_wait_seconds(&self, elapsed: Duration) {
+        metrics::counter!("sundog_spill_wait_seconds_total", "cache" => self.cache_name.clone())
+            .increment(elapsed.as_secs());
+    }
+
+    /// Increments `sundog_spill_waiters{cache}` and returns a guard that
+    /// decrements it again on drop. Held across the one `.await` inside
+    /// [`SpillTier::reserve`], so every exit path out of that call,
+    /// success, timeout, or the future itself dropped before either
+    /// resolves, decrements the gauge exactly once, and a cancelled wait
+    /// can never leave it stuck high.
+    fn record_waiter_delta(&self) -> WaiterGuard<'_> {
+        metrics::gauge!("sundog_spill_waiters", "cache" => self.cache_name.clone()).increment(1.0);
+        WaiterGuard { inner: self }
+    }
+
+    /// Increments `sundog_spill_wait_timeouts_total{cache}`. Called only
+    /// when [`SpillTier::reserve`]'s own `tokio::time::timeout` elapses, so
+    /// an operator can distinguish "waited and got room" from "gave up and
+    /// fell through to the non-blocking fallback."
+    fn record_wait_timeout(&self) {
+        metrics::counter!("sundog_spill_wait_timeouts_total", "cache" => self.cache_name.clone())
+            .increment(1);
+    }
+}
+
+/// RAII guard returned by [`Inner::record_waiter_delta`]: decrements
+/// `sundog_spill_waiters{cache}` the instant it drops, on every exit path
+/// out of the [`SpillTier::reserve`] call it guards.
+struct WaiterGuard<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        metrics::gauge!("sundog_spill_waiters", "cache" => self.inner.cache_name.clone())
+            .decrement(1.0);
+    }
 }
 
 #[expect(
@@ -537,6 +723,78 @@ fn bytes_used_f64(bytes: u64) -> f64 {
 pub(crate) struct SpillTier {
     inner: Arc<Inner>,
     sender: Mutex<Option<SyncSender<SpillJob>>>,
+}
+
+/// [`SpillTier::reserve`] gave up waiting for flush-queue room before its
+/// timeout elapsed. The caller's documented fallback is the tier's
+/// ordinary non-blocking [`SpillTier::would_accept`] path with no
+/// reservation, exactly today's instant-refuse behavior: `SpillConfig`'s
+/// own `spill_wait_timeout` doc spells out what a caller does with this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpillWaitTimedOut;
+
+/// [`SpillTier::would_accept`]'s outcome: not a plain `bool`, because a
+/// caller holding a `Reservation` needs to tell "refused, and this call
+/// already recorded why" apart from "refused only because right now, at
+/// this instant, neither this reservation's own budget nor `admit`'s
+/// global headroom covers it: try again, or fall back yourself." See
+/// [`SpillTier::would_accept`]'s doc for exactly which refusal is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Room found; already committed (spent from the reservation, or
+    /// acquired and `.forget()`-ed from `admit`).
+    Accepted,
+    /// Refused, `sundog_spill_dropped_total` already incremented under the
+    /// applicable reason. Nothing about retrying changes this outcome.
+    RefusedFinal,
+    /// Refused only because a `Reservation` was in play and, right now,
+    /// neither its own remaining budget nor `admit`'s global headroom
+    /// covers this record. No drop recorded; the caller decides whether to
+    /// retry or fall back.
+    RefusedPending,
+}
+
+/// The pre-lock flush-queue budget one `Shard::apply_grouped`/
+/// `ShardOps::apply_remote_batch` call carries into
+/// `engine::Engine::apply_many_with_reservation` before it ever takes a
+/// stripe lock. Built once per call by [`SpillTier::reserve`], then
+/// threaded by `&mut` reference through every bucket that call's eviction
+/// touches: [`Reservation::spend`] never awaits and is the only way its
+/// budget is drawn down, so it is always safe to hold across a stripe
+/// write lock. Whatever is never spent by the time this is dropped
+/// returns to the semaphore immediately, via `Drop`, at no cost to a
+/// caller whose batch never triggers an eviction at all.
+pub(crate) struct Reservation<'a> {
+    admit: &'a Semaphore,
+    remaining: u32,
+}
+
+impl Reservation<'_> {
+    /// Spends up to `bytes` of this reservation's own pre-paid budget,
+    /// never touching the semaphore itself. `true`, with `remaining`
+    /// decremented by `bytes`, when the budget covers it: the caller's
+    /// admission is then structurally guaranteed, no semaphore call at
+    /// all. `false` and untouched otherwise, leaving the caller to fall
+    /// back to the tier's ordinary non-blocking `admit.try_acquire_many`
+    /// check. Never awaits.
+    pub(crate) fn spend(&mut self, bytes: u32) -> bool {
+        if self.remaining >= bytes {
+            self.remaining -= bytes;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for Reservation<'_> {
+    /// Returns whatever part of this reservation's budget was never spent
+    /// back to `admit` the instant it goes out of scope: a batch that
+    /// triggers no eviction reserves and gives the room right back with no
+    /// eviction ever running, overhead-free in the common case.
+    fn drop(&mut self) {
+        self.admit.add_permits(self.remaining as usize);
+    }
 }
 
 impl SpillTier {
@@ -632,6 +890,12 @@ impl SpillTier {
             });
         }
 
+        let flush_queue_bytes = cfg.flush_queue_bytes_value();
+        // `validate` above already bounds `flush_queue_bytes` well under any
+        // real disk budget; the fallback keeps this conversion total rather
+        // than panicking on a config this module did not itself validate,
+        // such as a direct, non-`validate`d test caller.
+        let admit_permits = usize::try_from(flush_queue_bytes).unwrap_or(usize::MAX);
         let inner = Arc::new(Inner {
             regions: regions.into_boxed_slice(),
             region_bytes: region_bytes_u32,
@@ -639,8 +903,9 @@ impl SpillTier {
             bytes_used: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             cache_name: cache_name.to_string(),
-            flush_queue_bytes: cfg.flush_queue_bytes_value(),
-            queued_bytes: AtomicU64::new(0),
+            flush_queue_bytes,
+            spill_wait_timeout: cfg.spill_wait_timeout_value(),
+            admit: Semaphore::new(admit_permits),
             keep_resident_when_refused: AtomicBool::new(false),
             #[cfg(test)]
             flusher_paused: AtomicBool::new(false),
@@ -662,8 +927,16 @@ impl SpillTier {
     /// one is dropped along with the old sender, since the old flusher
     /// thread's receiver is dropped too. Callers attach once, right after
     /// constructing the engine that implements [`SpillSink`].
+    ///
+    /// The channel's slot count is `flush_queue_bytes_value() /
+    /// HEADER_LEN`, clamped to `[FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX]`:
+    /// a byte budget alone bounds the flusher's backlog, via `admit`, but a
+    /// slot count fixed independently of it fills long before the byte
+    /// budget does for a config whose typical records are small, dropping
+    /// bursts with `reason = "queue_full"` well under the byte bound the
+    /// operator actually configured.
     pub(crate) fn attach(&self, sink: Weak<dyn SpillSink>) {
-        let (tx, rx) = mpsc::sync_channel(FLUSH_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::sync_channel(flush_queue_slots(self.inner.flush_queue_bytes));
         let inner = Arc::clone(&self.inner);
         let name = format!("sundog-spill-{}", inner.cache_name);
         let spawned = thread::Builder::new()
@@ -731,7 +1004,7 @@ impl SpillTier {
     /// needs them split.
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn try_spill(&self, job: SpillJob) -> bool {
-        if !self.would_accept(job.key_bytes.len(), job.encoded.len()) {
+        if self.would_accept(None, job.key_bytes.len(), job.encoded.len()) != Admission::Accepted {
             return false;
         }
         self.enqueue(job).is_ok()
@@ -740,40 +1013,169 @@ impl SpillTier {
     /// Whether a record built from `key_len` and `value_len` bytes could be
     /// queued right now, judged purely from this tier's own state: not
     /// closed, small enough to ever fit a region, and small enough that
-    /// queuing it would not push the flusher's byte backlog past
-    /// `flush_queue_bytes`. Never touches the flusher's channel, so, unlike
-    /// [`SpillTier::enqueue`], this is cheap enough to call while holding a
-    /// stripe write lock. `false` increments `sundog_spill_dropped_total`
+    /// admitting it would not push the flusher's byte backlog past
+    /// `flush_queue_bytes`. `reservation`, when given, is spent first via
+    /// [`Reservation::spend`]: a caller holding enough pre-paid budget is
+    /// structurally guaranteed admission, no semaphore call at all: see the
+    /// module docs' `1.2`/`1.3`. Otherwise, or once the reservation's own
+    /// budget is exhausted, this falls back to `admit.try_acquire_many`
+    /// exactly as it always has. A successful fallback admission
+    /// immediately `.forget()`s the acquired permits, converting them from
+    /// a semaphore-tracked guard into a plain byte count the caller owns
+    /// from that point on; [`flusher_loop`] returns that count to `admit`
+    /// once the job is pulled off the channel. Never awaits and never
+    /// touches the flusher's channel, so, unlike [`SpillTier::enqueue`],
+    /// this is cheap enough to call while holding a stripe write lock; the
+    /// same holds for `reservation.spend`, which never awaits either.
+    ///
+    /// [`Admission::RefusedFinal`] increments `sundog_spill_dropped_total`
     /// with `reason = "too_large"`, `reason = "closed"`, or `reason =
     /// "queue_full"` for the byte bound, whichever applies, or `reason =
     /// "deferred"` in place of any of those three once
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
     /// policy, since the caller then leaves the victim resident instead of
-    /// deleting it; see [`refusal_drop_reason`]. The byte-bound
-    /// check races the same way the channel-capacity one already does:
-    /// this reads `queued_bytes` before the caller's own hand-off, if
-    /// accepted, ever adds to it via `enqueue`, so a burst of callers that
-    /// all pass this check under their own stripe lock can, together,
-    /// still push the tier somewhat past `flush_queue_bytes` before the
-    /// next call sees the total catch up. That slack is bounded by how
-    /// many stripes race the check at once, not by the size of the flush
-    /// backlog itself.
-    pub(crate) fn would_accept(&self, key_len: usize, value_len: usize) -> bool {
+    /// deleting it; see [`refusal_drop_reason`]. This is the outcome for
+    /// every refusal when `reservation` is `None` (the sync
+    /// `insert_sync`/`remove_sync`/`Shard::apply` chain's unconditional
+    /// fallback, with no `Reservation` in the picture at all), and for a
+    /// `closed`/`too_large` refusal regardless of `reservation`, since a
+    /// caller retrying either of those gains nothing.
+    ///
+    /// [`Admission::RefusedPending`] is the one outcome only a `reservation`
+    /// argument makes reachable: a `reservation` was in play (`Some`, from
+    /// `Shard::apply_grouped`/`ShardOps::apply_remote_batch`) and both its
+    /// own budget and `admit`'s global headroom are exhausted right now.
+    /// No drop is recorded here: the caller is responsible for either
+    /// retrying with a fresh reservation covering more bytes
+    /// (`Shard::retry_reservation_deficit`) or, once its own wait budget
+    /// runs out, leaving the victim resident for a later pass to resolve
+    /// through the ordinary `reservation: None` path, which does record a
+    /// drop. This is what closes the gap a reservation sized only from one
+    /// call's own new bytes leaves against a lagging flusher's real
+    /// backlog: see the module docs' `1.1`/`7`.
+    ///
+    /// The byte-bound fallback check races the same way the
+    /// channel-capacity one already does: a burst of callers that all
+    /// acquire under their own stripe lock can, together, still push the
+    /// tier somewhat past `flush_queue_bytes` before a racing caller's own
+    /// acquire fails; that slack is bounded by how many stripes race the
+    /// check at once, not by the size of the flush backlog itself.
+    pub(crate) fn would_accept(
+        &self,
+        reservation: Option<&mut Reservation<'_>>,
+        key_len: usize,
+        value_len: usize,
+    ) -> Admission {
         if self.inner.closed.load(Ordering::Acquire) {
             self.inner.record_dropped(self.refusal_reason("closed"));
-            return false;
+            return Admission::RefusedFinal;
         }
-        let record_len = HEADER_LEN as u64 + key_len as u64 + value_len as u64;
-        if record_too_large(record_len, u64::from(self.inner.region_bytes)) {
+        let record_len_u64 = HEADER_LEN as u64 + key_len as u64 + value_len as u64;
+        if record_too_large(record_len_u64, u64::from(self.inner.region_bytes)) {
             self.inner.record_dropped(self.refusal_reason("too_large"));
-            return false;
+            return Admission::RefusedFinal;
         }
-        let queued_bytes = self.inner.queued_bytes.load(Ordering::Acquire);
-        if !record_fits_queue(queued_bytes, record_len, self.inner.flush_queue_bytes) {
+        let record_len = spill_record_len(key_len, value_len);
+        let reservation_in_play = reservation.is_some();
+        if let Some(reservation) = reservation
+            && reservation.spend(record_len)
+        {
+            return Admission::Accepted;
+        }
+        if let Ok(permit) = self.inner.admit.try_acquire_many(record_len) {
+            permit.forget();
+            Admission::Accepted
+        } else if reservation_in_play {
+            Admission::RefusedPending
+        } else {
             self.inner.record_dropped(self.refusal_reason("queue_full"));
-            return false;
+            Admission::RefusedFinal
         }
-        true
+    }
+
+    /// This tier's configured [`SpillConfig::spill_wait_timeout`], the wait
+    /// bound `Shard::apply_grouped`/`ShardOps::apply_remote_batch` pass to
+    /// their one [`SpillTier::reserve`] call per batch. Exposed here
+    /// because the `SpillConfig` itself is not retained past
+    /// [`SpillTier::open`].
+    pub(crate) fn spill_wait_timeout_value(&self) -> Duration {
+        self.inner.spill_wait_timeout
+    }
+
+    /// Waits, at most `timeout`, for `bytes` of flush-queue admission to
+    /// become free, then commits them to the returned [`Reservation`]
+    /// immediately: the acquired permits are `.forget()`-ed the moment they
+    /// arrive, so they stop counting as available even though nothing has
+    /// been queued yet. `bytes` is clamped to at most this tier's total
+    /// permit count, `flush_queue_bytes_value()`, before the acquire call:
+    /// a caller asking for more than the tier could ever hold would
+    /// otherwise await forever even with the queue fully empty.
+    ///
+    /// Called once per `Shard::apply_grouped`/`ShardOps::apply_remote_batch`
+    /// call, strictly before any stripe lock that call takes, never inside
+    /// the per-bucket loop that follows; see the module docs' `1.5`.
+    /// `Duration::ZERO` degenerates to a single non-blocking check with no
+    /// suspension: the underlying acquire resolves on its first poll
+    /// whenever enough permits are already free, so the timeout only ever
+    /// elapses when they are not, reproducing today's instant-refuse
+    /// behavior exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpillWaitTimedOut`] once `timeout` elapses with the
+    /// requested bytes still unavailable. The caller's documented fallback
+    /// is `reservation: None` for the rest of that call, taking the
+    /// ordinary non-blocking [`SpillTier::would_accept`] path exactly as
+    /// today.
+    pub(crate) async fn reserve(
+        &self,
+        bytes: u32,
+        timeout: Duration,
+    ) -> Result<Reservation<'_>, SpillWaitTimedOut> {
+        let total_permits = u32::try_from(self.inner.flush_queue_bytes).unwrap_or(u32::MAX);
+        let clamped = bytes.min(total_permits);
+        let started = Instant::now();
+        // `sundog_spill_waiters` covers every exit from this `.await`,
+        // including this future being dropped before it resolves, since
+        // `_waiter`'s `Drop` runs regardless of how the `.await` below
+        // ends.
+        let _waiter = self.inner.record_waiter_delta();
+        // `acquire_many`, not the owned variant: `Inner::admit` is a plain
+        // `Semaphore`, not an `Arc<Semaphore>`, and the permit this returns
+        // is `.forget()`-ed the instant it arrives, exactly like
+        // `would_accept`'s own `try_acquire_many` call, so nothing here
+        // ever needs to outlive this call by holding an owned handle.
+        let outcome = tokio::time::timeout(timeout, self.inner.admit.acquire_many(clamped)).await;
+        self.inner.record_wait_seconds(started.elapsed());
+        match outcome {
+            Ok(Ok(permit)) => {
+                permit.forget();
+                Ok(Reservation {
+                    admit: &self.inner.admit,
+                    remaining: clamped,
+                })
+            }
+            // `self.inner.admit` is never `close()`-d anywhere in this
+            // tier's lifetime, so this arm is unreachable in practice;
+            // treated the same as a timeout rather than assumed away,
+            // since the caller's fallback is identical either way. Not
+            // counted under `sundog_spill_wait_timeouts_total`, which
+            // tracks a genuinely elapsed `timeout` specifically.
+            Ok(Err(_)) => Err(SpillWaitTimedOut),
+            Err(_) => {
+                self.inner.record_wait_timeout();
+                Err(SpillWaitTimedOut)
+            }
+        }
+    }
+
+    /// Returns `bytes` of admitted-but-never-queued capacity to `admit`.
+    /// Called by `engine::Engine::finish_spill_handoff`'s `Err` branch,
+    /// with `job.admitted_bytes`, before `abandon` restores the victim's
+    /// weight: a job that never reaches the flusher's channel must not
+    /// permanently shrink this tier's admission budget.
+    pub(crate) fn release(&self, bytes: u32) {
+        self.inner.admit.add_permits(bytes as usize);
     }
 
     /// Enqueues `job` onto the flusher's channel. Callers that already
@@ -786,11 +1188,12 @@ impl SpillTier {
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
     /// policy. Never touches disk, but does take the channel's own lock,
     /// so, unlike [`SpillTier::would_accept`], this is not meant to run
-    /// while holding a stripe write lock. A successful send adds `job`'s
-    /// record length to `queued_bytes`; [`flusher_loop`] subtracts it back
-    /// out the instant the flusher takes the job off the channel again.
+    /// while holding a stripe write lock. The permits `would_accept`
+    /// admitted for `job` are already the caller's to account for; this
+    /// call touches no counter of its own on success, since only
+    /// [`flusher_loop`] returns them, via `admit.add_permits`, once the job
+    /// is pulled off the channel.
     pub(crate) fn enqueue(&self, job: SpillJob) -> Result<(), Box<SpillJob>> {
-        let record_len = job_record_len_or_zero(&job) as u64;
         let sent = {
             let sender = self.sender.lock();
             let Some(tx) = sender.as_ref() else {
@@ -800,12 +1203,7 @@ impl SpillTier {
             tx.try_send(job)
         };
         match sent {
-            Ok(()) => {
-                self.inner
-                    .queued_bytes
-                    .fetch_add(record_len, Ordering::AcqRel);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => {
                 self.inner.record_dropped(self.refusal_reason("queue_full"));
                 Err(Box::new(job))
@@ -814,11 +1212,14 @@ impl SpillTier {
     }
 
     /// Bytes currently sitting in the flusher's channel, queued but not yet
-    /// taken off it: the same total [`SpillTier::would_accept`] checks
-    /// against `flush_queue_bytes`. Test-facing.
+    /// taken off it: recomputed from `admit`'s available permits, the sole
+    /// place admission is tracked. Byte-for-byte identical to what a
+    /// dedicated `queued_bytes` counter would read at any point in this
+    /// tier's lifecycle. Test-facing.
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn queued_bytes(&self) -> u64 {
-        self.inner.queued_bytes.load(Ordering::Acquire)
+        let available = u64::try_from(self.inner.admit.available_permits()).unwrap_or(u64::MAX);
+        self.inner.flush_queue_bytes.saturating_sub(available)
     }
 
     /// Test-only: blocks [`flusher_loop`] before it pulls its next job off
@@ -970,21 +1371,24 @@ fn flusher_loop(inner: &Arc<Inner>, rx: &Receiver<SpillJob>, sink: &Weak<dyn Spi
         let Ok(first) = rx.recv() else {
             return;
         };
+        // Credited back to `admit` unconditionally, before the `sink`
+        // upgrade check below: `first` is off the channel either way, so
+        // its bytes are free the instant it is dequeued, exactly matching
+        // every other job's credit timing in this loop. Crediting it only
+        // on a live `sink` would permanently shrink this tier's admission
+        // budget by `first`'s own bytes every time `attach`'s caller drops
+        // its last strong `SpillSink` reference at exactly this instant.
+        inner.admit.add_permits(job_record_len_or_zero(&first));
         let Some(sink) = sink.upgrade() else {
             return;
         };
-        inner
-            .queued_bytes
-            .fetch_sub(job_record_len_or_zero(&first) as u64, Ordering::AcqRel);
         let mut batch_bytes = job_record_len_or_zero(&first);
         let mut batch = vec![first];
         while batch.len() < FLUSH_BATCH_MAX_JOBS && batch_bytes < FLUSH_BATCH_MAX_BYTES {
             let Ok(job) = rx.try_recv() else {
                 break;
             };
-            inner
-                .queued_bytes
-                .fetch_sub(job_record_len_or_zero(&job) as u64, Ordering::AcqRel);
+            inner.admit.add_permits(job_record_len_or_zero(&job));
             batch_bytes += job_record_len_or_zero(&job);
             batch.push(job);
         }
@@ -1106,7 +1510,8 @@ fn flush_batch(inner: &Inner, sink: &dyn SpillSink, jobs: Vec<SpillJob>) {
 /// generation, as one positional write, then installs each record
 /// individually. Returns `(installed_count, installed_bytes)`, folded into
 /// the enclosing batch's single counter increment and byte total. A failed
-/// write calls `sink.abandon` for every job in `segment` and returns
+/// write calls `sink.abandon` and records `sundog_spill_dropped_total`
+/// with `reason = "disk_error"` for every job in `segment`, then returns
 /// `(0, 0)`; the region's write cursor is left untouched either way the
 /// write itself resolves, since it only ever advances past bytes on disk.
 fn write_segment(
@@ -1153,6 +1558,7 @@ fn write_segment(
                 job.ver,
                 job.weight,
             );
+            inner.record_dropped("disk_error");
         }
         return (0, 0);
     }
@@ -1270,6 +1676,27 @@ mod tests {
     }
 
     #[test]
+    fn slot_count_exceeds_the_old_fixed_capacity_for_small_records() {
+        // A `flush_queue_bytes` sized for a few thousand 256-byte records
+        // fills a slot count fixed at `FLUSH_QUEUE_CAPACITY` regardless of
+        // `flush_queue_bytes` long before it fills its own byte budget:
+        // this harness's exact shape.
+        let flush_queue_bytes = 8192 * 256;
+        assert!(flush_queue_slots(flush_queue_bytes) > FLUSH_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn flush_queue_slots_stays_at_the_floor_for_a_tiny_byte_budget() {
+        assert_eq!(flush_queue_slots(0), FLUSH_QUEUE_CAPACITY);
+        assert_eq!(flush_queue_slots(1), FLUSH_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn flush_queue_slots_clamps_at_the_ceiling_for_a_huge_byte_budget() {
+        assert_eq!(flush_queue_slots(u64::MAX), FLUSH_QUEUE_SLOTS_MAX);
+    }
+
+    #[test]
     fn record_fits_at_the_exact_boundary_and_one_byte_over() {
         assert!(record_fits(60, 64, 4));
         assert!(!record_fits(61, 64, 4));
@@ -1337,6 +1764,18 @@ mod tests {
     fn record_fits_queue_never_wraps_on_a_pathological_record_len() {
         assert!(!record_fits_queue(u64::MAX - 1, u64::MAX, 64));
         assert!(!record_fits_queue(10, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn spill_record_len_is_header_plus_key_plus_value() {
+        let header_len = u32::try_from(HEADER_LEN).unwrap();
+        assert_eq!(spill_record_len(4, 4), header_len + 8);
+        assert_eq!(spill_record_len(0, 0), header_len);
+    }
+
+    #[test]
+    fn spill_record_len_saturates_instead_of_wrapping_on_a_pathological_input() {
+        assert_eq!(spill_record_len(usize::MAX, usize::MAX), u32::MAX);
     }
 
     #[test]
@@ -1459,6 +1898,39 @@ mod tests {
             .region_bytes(64)
             .flush_queue_bytes(1024);
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_an_absurd_spill_wait_timeout() {
+        let cfg = SpillConfig::new("/tmp/x", 1 << 20)
+            .region_bytes(4096)
+            .spill_wait_timeout(Duration::from_secs(60));
+        assert!(cfg.validate().is_err());
+        let ok = SpillConfig::new("/tmp/x", 1 << 20)
+            .region_bytes(4096)
+            .spill_wait_timeout(Duration::from_secs(59));
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_spill_wait_timeout_zero_as_an_explicit_opt_out() {
+        let cfg = SpillConfig::new("/tmp/x", 1 << 20)
+            .region_bytes(4096)
+            .spill_wait_timeout(Duration::ZERO);
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.spill_wait_timeout_value(), Duration::ZERO);
+    }
+
+    #[test]
+    fn spill_wait_timeout_defaults_to_two_seconds() {
+        let cfg = SpillConfig::new("/tmp/x", 1 << 20);
+        assert_eq!(cfg.spill_wait_timeout_value(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn spill_wait_timeout_builder_overrides_the_default() {
+        let cfg = SpillConfig::new("/tmp/x", 1 << 20).spill_wait_timeout(Duration::from_secs(5));
+        assert_eq!(cfg.spill_wait_timeout_value(), Duration::from_secs(5));
     }
 
     // --- SpillTier: I/O tests. Real disk, real thread; never combined with
@@ -1590,6 +2062,7 @@ mod tests {
                 expires_at_ms: Some(999),
                 encoded: Bytes::copy_from_slice(value),
                 weight: 1,
+                admitted_bytes: 0,
             }
         }
 
@@ -1977,11 +2450,17 @@ mod tests {
             let sink = Arc::new(RecordingSink::default());
             tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
 
-            assert!(tier.would_accept(4, 4));
+            // A standalone `would_accept` check ahead of `try_spill` would
+            // double-count here: under the semaphore-backed design,
+            // `would_accept` itself commits the acquired bytes on success
+            // (immediately `.forget()`-ed), so `try_spill`'s own internal
+            // `would_accept` call below is this job's one and only
+            // admission.
             assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
             assert_eq!(tier.queued_bytes(), record_len);
-            assert!(
-                !tier.would_accept(4, 4),
+            assert_eq!(
+                tier.would_accept(None, 4, 4),
+                Admission::RefusedFinal,
                 "the queue already holds one record's worth; a same-size second job would \
                  push it past flush_queue_bytes"
             );
@@ -1992,9 +2471,561 @@ mod tests {
                 poll_until(POLL_TIMEOUT, || tier.queued_bytes() == 0),
                 "queued_bytes drains back to zero once the flusher takes the job"
             );
-            assert!(
-                tier.would_accept(4, 4),
+            assert_eq!(
+                tier.would_accept(None, 4, 4),
+                Admission::Accepted,
                 "room again once the backlog has drained"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn would_accept_never_refuses_when_the_caller_pre_reserved_enough_bytes() {
+            // Same setup as `would_accept_refuses_once_the_flush_queue_bytes_
+            // bound_would_be_exceeded`, but this time the second job's
+            // caller shows up holding its own `Reservation` for the exact
+            // record length: `would_accept` must succeed via
+            // `Reservation::spend` alone, with `admit` still fully drained
+            // by the first job.
+            let dir = temp_dir("byte-bound-reserved");
+            let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
+            let record_len_u32 = u32::try_from(record_len).unwrap();
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+            assert_eq!(tier.queued_bytes(), record_len, "admit is fully drained");
+            assert_eq!(
+                tier.would_accept(None, 4, 4),
+                Admission::RefusedFinal,
+                "the ordinary fallback still refuses with no reservation and no room"
+            );
+
+            let mut reservation = Reservation {
+                admit: &tier.inner.admit,
+                remaining: record_len_u32,
+            };
+            assert_eq!(
+                tier.would_accept(Some(&mut reservation), 4, 4),
+                Admission::Accepted,
+                "a sufficient reservation admits the record with admit still fully drained"
+            );
+            drop(reservation);
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn would_accept_returns_refused_pending_when_a_reservation_is_in_play_but_both_budgets_are_exhausted()
+         {
+            // Same drained-`admit` setup once more, but this time the
+            // caller's own `Reservation` is *insufficient* rather than
+            // absent: neither `Reservation::spend` nor `admit`'s own
+            // `try_acquire_many` fallback covers the record.
+            // `Admission::RefusedPending` is what lets
+            // `Shard::apply_grouped`/`ShardOps::apply_remote_batch` retry
+            // with a fresh, larger reservation instead of this refusal
+            // becoming a drop right here (see the module docs' `1.1`/`7`).
+            let dir = temp_dir("byte-bound-pending");
+            let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+            assert_eq!(tier.queued_bytes(), record_len, "admit is fully drained");
+
+            let mut reservation = Reservation {
+                admit: &tier.inner.admit,
+                remaining: 1,
+            };
+            assert_eq!(
+                tier.would_accept(Some(&mut reservation), 4, 4),
+                Admission::RefusedPending,
+                "a reservation short of the record's own length, with admit also fully \
+                 drained, is a pending refusal, not a final one"
+            );
+            assert_eq!(
+                reservation.remaining, 1,
+                "the insufficient reservation is left untouched, not partially spent"
+            );
+            assert_eq!(
+                tier.queued_bytes(),
+                record_len,
+                "admit's own accounting is unaffected by a pending refusal: no permits \
+                 acquired, none released"
+            );
+            drop(reservation);
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn reserve_resolves_once_the_flusher_frees_room() {
+            let dir = temp_dir("reserve-resolves");
+            let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
+            let record_len_u32 = u32::try_from(record_len).unwrap();
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            // Paused before the flusher thread is even spawned, so the one
+            // job below stays queued, and `admit` stays fully drained,
+            // until `resume_flusher` runs.
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+            assert_eq!(tier.queued_bytes(), record_len, "admit is fully drained");
+
+            // Polled through the same pinned future across both awaits
+            // below, rather than spawned: a `Reservation` borrows this
+            // tier, so a spawned `'static` task could not carry it back out
+            // anyway. A `tokio::time::timeout` that elapses only stops
+            // polling for that one call; the pinned future itself, and
+            // whatever registration it holds with `admit`, survives to be
+            // polled again on the next line.
+            let reserve_fut = tier.reserve(record_len_u32, Duration::from_secs(5));
+            tokio::pin!(reserve_fut);
+
+            // Not resolved yet: the queue is still fully drained.
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut reserve_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "no room yet; reserve must still be waiting"
+            );
+
+            tier.resume_flusher();
+            let reservation = tokio::time::timeout(Duration::from_secs(5), &mut reserve_fut)
+                .await
+                .expect("reserve resolves once the flusher frees room")
+                .expect("reserve succeeds once the flusher frees room");
+            // The freed bytes belong to this reservation, not admit:
+            // `queued_bytes()`'s own point of view cannot tell this apart
+            // from a job still sitting in the channel.
+            assert_eq!(tier.queued_bytes(), record_len);
+            drop(reservation);
+            assert_eq!(
+                tier.queued_bytes(),
+                0,
+                "dropping the reservation returns its unspent bytes to admit"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn reserve_times_out_when_the_flusher_never_resumes() {
+            let dir = temp_dir("reserve-times-out");
+            let record_len = HEADER_LEN as u64 + 4 + 4;
+            let record_len_u32 = u32::try_from(record_len).unwrap();
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+
+            let start = Instant::now();
+            let short_timeout = Duration::from_millis(100);
+            let result = tier.reserve(record_len_u32, short_timeout).await;
+            let elapsed = start.elapsed();
+
+            assert!(matches!(result, Err(SpillWaitTimedOut)));
+            assert!(
+                elapsed >= short_timeout,
+                "reserve must not return before its own timeout elapses: waited {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "reserve must not hang past its own timeout: waited {elapsed:?}"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn reserve_clamps_a_request_larger_than_total_permits() {
+            let dir = temp_dir("reserve-clamps");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+
+            // The whole queue is empty; a request for far more bytes than
+            // `admit` could ever hold must still succeed against the whole
+            // queue, clamped, rather than hang forever.
+            let reservation = tokio::time::timeout(
+                Duration::from_secs(5),
+                tier.reserve(u32::MAX, Duration::from_secs(5)),
+            )
+            .await
+            .expect("reserve resolves promptly once clamped")
+            .expect("reserve succeeds against the tier's whole, empty queue");
+            drop(reservation);
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn unspent_reservation_bytes_return_on_drop() {
+            let dir = temp_dir("reservation-drop");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(100);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+
+            let mut reservation = tier
+                .reserve(100, Duration::from_secs(5))
+                .await
+                .expect("the whole queue is free");
+            assert_eq!(tier.queued_bytes(), 100, "the full reservation is held");
+
+            assert!(
+                reservation.spend(40),
+                "40 of the 100 reserved bytes spend cleanly"
+            );
+            drop(reservation);
+
+            assert_eq!(
+                tier.queued_bytes(),
+                40,
+                "only the 40 spent bytes stay charged against admit; the 60 never spent \
+                 return to it on drop"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn spill_tier_exposes_its_configured_spill_wait_timeout() {
+            let dir = temp_dir("tier-timeout-accessor");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .spill_wait_timeout(Duration::from_secs(7));
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            assert_eq!(tier.spill_wait_timeout_value(), Duration::from_secs(7));
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn release_returns_bytes_to_admit() {
+            let dir = temp_dir("release");
+            let record_len = HEADER_LEN as u64 + 4 + 4;
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            assert_eq!(
+                tier.would_accept(None, 4, 4),
+                Admission::Accepted,
+                "admits the one record's worth"
+            );
+            assert_eq!(tier.queued_bytes(), record_len);
+
+            tier.release(u32::try_from(record_len).unwrap());
+            assert_eq!(
+                tier.queued_bytes(),
+                0,
+                "release returns the given bytes to admit, exactly the way \
+                 finish_spill_handoff's Err branch relies on for a job that never reaches the \
+                 flusher's channel"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn flusher_loop_credits_a_dequeued_jobs_bytes_even_when_the_sink_has_already_died() {
+            let dir = temp_dir("flusher-loop-dead-sink");
+            let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, "cache-a").unwrap();
+            assert_eq!(tier.queued_bytes(), 0, "nothing queued yet");
+
+            // Debits `admit` by exactly `record_len`, matching the real
+            // precondition `SpillJob::admitted_bytes`'s own doc states:
+            // every job on the channel already had its bytes acquired from
+            // `admit` before `enqueue` ever ran. Without this, the bug this
+            // test guards against is invisible: crediting bytes that were
+            // never debited leaves `queued_bytes()` at `0` either way.
+            assert_eq!(
+                tier.would_accept(None, 4, 4),
+                Admission::Accepted,
+                "admits the one record's worth"
+            );
+            assert_eq!(tier.queued_bytes(), record_len, "admit is fully drained");
+
+            // One job already sitting on the channel, exactly like a job
+            // `try_spill_victim` committed and `finish_spill_handoff` handed
+            // to `enqueue` before the stripe lock was ever released.
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(job("aaaa", b"bbbb", hlc(1, 0))).unwrap();
+            // Dropped so a second `rx.recv()`, were `flusher_loop`'s loop to
+            // reach one, returns `Err` and the call returns -- this test
+            // means to exercise exactly one dequeue.
+            drop(tx);
+
+            // A `Weak` whose strong reference is already gone before
+            // `flusher_loop` ever calls `upgrade()` on it, reproducing
+            // `SpillTier::attach`'s own documented "caller may drop its last
+            // strong reference at any time" contract at the exact instant a
+            // job is in hand.
+            let sink: Weak<dyn SpillSink> = {
+                let strong: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
+                Arc::downgrade(&strong)
+            };
+
+            flusher_loop(&tier.inner, &rx, &sink);
+
+            assert_eq!(
+                tier.queued_bytes(),
+                0,
+                "a job dequeued off the channel must credit its bytes back to `admit` even \
+                 when the sink has already died, or this tier's admission budget shrinks \
+                 permanently by that job's own bytes for the rest of this tier's lifetime"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        /// Captures `sundog_spill_waiters`/`sundog_spill_wait_seconds_total`/
+        /// `sundog_spill_wait_timeouts_total` for one dedicated cache name,
+        /// ignoring every other metric so a concurrently running test using
+        /// a different cache name -- every other test in this file -- never
+        /// perturbs these counts.
+        #[derive(Clone, Default)]
+        struct WaitMetrics {
+            waiters: Arc<StdMutex<f64>>,
+            wait_seconds_total: Arc<StdMutex<u64>>,
+            wait_timeouts_total: Arc<StdMutex<u64>>,
+        }
+
+        struct WaitCounter {
+            field: Arc<StdMutex<u64>>,
+        }
+
+        impl metrics::CounterFn for WaitCounter {
+            fn increment(&self, value: u64) {
+                *self.field.lock().unwrap() += value;
+            }
+
+            fn absolute(&self, value: u64) {
+                *self.field.lock().unwrap() = value;
+            }
+        }
+
+        struct WaitGauge {
+            current: Arc<StdMutex<f64>>,
+        }
+
+        impl metrics::GaugeFn for WaitGauge {
+            fn increment(&self, value: f64) {
+                *self.current.lock().unwrap() += value;
+            }
+
+            fn decrement(&self, value: f64) {
+                *self.current.lock().unwrap() -= value;
+            }
+
+            fn set(&self, value: f64) {
+                *self.current.lock().unwrap() = value;
+            }
+        }
+
+        struct WaitMetricsRecorder {
+            metrics: WaitMetrics,
+        }
+
+        impl metrics::Recorder for WaitMetricsRecorder {
+            fn describe_counter(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn describe_gauge(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn describe_histogram(
+                &self,
+                _key: metrics::KeyName,
+                _unit: Option<metrics::Unit>,
+                _description: metrics::SharedString,
+            ) {
+            }
+
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                let this_cache = key
+                    .labels()
+                    .any(|l| l.key() == "cache" && l.value() == WAIT_METRICS_CACHE);
+                if !this_cache {
+                    return metrics::Counter::noop();
+                }
+                match key.name() {
+                    "sundog_spill_wait_seconds_total" => {
+                        metrics::Counter::from_arc(Arc::new(WaitCounter {
+                            field: self.metrics.wait_seconds_total.clone(),
+                        }))
+                    }
+                    "sundog_spill_wait_timeouts_total" => {
+                        metrics::Counter::from_arc(Arc::new(WaitCounter {
+                            field: self.metrics.wait_timeouts_total.clone(),
+                        }))
+                    }
+                    _ => metrics::Counter::noop(),
+                }
+            }
+
+            fn register_gauge(
+                &self,
+                key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                let this_cache = key
+                    .labels()
+                    .any(|l| l.key() == "cache" && l.value() == WAIT_METRICS_CACHE);
+                if !this_cache || key.name() != "sundog_spill_waiters" {
+                    return metrics::Gauge::noop();
+                }
+                metrics::Gauge::from_arc(Arc::new(WaitGauge {
+                    current: self.metrics.waiters.clone(),
+                }))
+            }
+
+            fn register_histogram(
+                &self,
+                _key: &metrics::Key,
+                _metadata: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        /// The cache name only this test opens, so the process-global
+        /// recorder ignores waiter/wait activity from every other test.
+        const WAIT_METRICS_CACHE: &str = "wait-metrics-only";
+
+        #[tokio::test]
+        async fn reserve_tracks_waiters_wait_seconds_and_wait_timeouts() {
+            let metrics = WaitMetrics::default();
+            let installed = metrics::set_global_recorder(WaitMetricsRecorder {
+                metrics: metrics.clone(),
+            })
+            .is_ok();
+            if !installed {
+                // Another test in this binary already won the process-global
+                // recorder slot; see `try_spill_and_flush_record_the_
+                // documented_drop_reason_for_each_case`'s own comment on
+                // this same tolerance.
+                return;
+            }
+
+            // --- sundog_spill_waiters rises while reserve is pending and
+            // falls back to zero once it resolves; sundog_spill_wait_
+            // seconds_total accumulates at least the real time this call
+            // was genuinely blocked. ---
+            let dir = temp_dir("wait-metrics-resolves");
+            let record_len = HEADER_LEN as u64 + 4 + 4;
+            let record_len_u32 = u32::try_from(record_len).unwrap();
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, WAIT_METRICS_CACHE).unwrap();
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+
+            let reserve_fut = tier.reserve(record_len_u32, Duration::from_secs(10));
+            tokio::pin!(reserve_fut);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut reserve_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "no room yet; reserve must still be pending"
+            );
+            assert!(
+                (*metrics.waiters.lock().unwrap() - 1.0).abs() < f64::EPSILON,
+                "sundog_spill_waiters counts this one pending reserve call"
+            );
+
+            // A real, lower-bounded wait so record_wait_seconds's whole-second
+            // truncation still has something to observe once it resolves.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            tier.resume_flusher();
+            let reservation = tokio::time::timeout(Duration::from_secs(5), &mut reserve_fut)
+                .await
+                .expect("reserve resolves once the flusher frees room")
+                .expect("reserve succeeds once the flusher frees room");
+            drop(reservation);
+
+            assert!(
+                metrics.waiters.lock().unwrap().abs() < f64::EPSILON,
+                "the guard decrements sundog_spill_waiters back to zero once reserve resolves"
+            );
+            assert!(
+                *metrics.wait_seconds_total.lock().unwrap() >= 1,
+                "sundog_spill_wait_seconds_total accumulates at least the one whole second this \
+                 call was genuinely blocked"
+            );
+            assert_eq!(
+                *metrics.wait_timeouts_total.lock().unwrap(),
+                0,
+                "this call resolved on its own; it never hit its own timeout"
+            );
+            let _ = fs::remove_dir_all(&dir);
+
+            // --- a genuinely elapsed timeout increments sundog_spill_wait_
+            // timeouts_total exactly once and still leaves waiters at zero.
+            let dir = temp_dir("wait-metrics-timeout");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(record_len);
+            let tier = SpillTier::open(&cfg, WAIT_METRICS_CACHE).unwrap();
+            tier.pause_flusher();
+            let sink = Arc::new(RecordingSink::default());
+            tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
+            assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
+
+            let result = tier
+                .reserve(record_len_u32, Duration::from_millis(100))
+                .await;
+            assert!(matches!(result, Err(SpillWaitTimedOut)));
+            assert_eq!(
+                *metrics.wait_timeouts_total.lock().unwrap(),
+                1,
+                "the elapsed timeout increments sundog_spill_wait_timeouts_total exactly once"
+            );
+            assert!(
+                metrics.waiters.lock().unwrap().abs() < f64::EPSILON,
+                "the guard decrements sundog_spill_waiters on the timeout path too"
             );
 
             let _ = fs::remove_dir_all(&dir);
@@ -2006,13 +3037,26 @@ mod tests {
             // `flush_batch` call writes them as a single segment; the
             // region's file handle is reopened read-only, so the segment's
             // one positional write fails deterministically for every job it
-            // holds, the first included.
+            // holds, the first included. Uses `DROP_REASONS_CACHE` so the
+            // `disk_error` assertion below can filter this tier's own drops
+            // out from whatever else is running concurrently in this
+            // binary, the same tolerance
+            // `try_spill_and_flush_record_the_documented_drop_reason_for_
+            // each_case` already documents for the same process-global
+            // recorder slot.
+            let counts = DropCounts::default();
+            let installed = metrics::set_global_recorder(DropRecorder {
+                counts: counts.clone(),
+            })
+            .is_ok();
+
             let dir = temp_dir("write-fails");
             let record_len = HEADER_LEN as u64 + 6 + 4; // fixed-width key/value
             let region_bytes = record_len * 4;
             let cfg = SpillConfig::new(&dir, region_bytes * 2).region_bytes(region_bytes);
             let tier =
-                SpillTier::open_with_readonly_regions_for_test(&cfg, "cache-a", &[0]).unwrap();
+                SpillTier::open_with_readonly_regions_for_test(&cfg, DROP_REASONS_CACHE, &[0])
+                    .unwrap();
             let sink = Arc::new(RecordingSink::default());
 
             let jobs: Vec<SpillJob> = (0..3u32)
@@ -2030,6 +3074,15 @@ mod tests {
                 3,
                 "every job in the failed segment reaches abandon, not just the first"
             );
+            if installed {
+                assert_eq!(
+                    counts.get("disk_error"),
+                    3,
+                    "every job in the failed segment is also counted under \
+                     sundog_spill_dropped_total{{reason=\"disk_error\"}}, even though \
+                     abandon's restore-to-resident behavior above is unchanged"
+                );
+            }
 
             let _ = fs::remove_dir_all(&dir);
         }
