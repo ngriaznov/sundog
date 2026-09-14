@@ -12,6 +12,7 @@ mod load;
 mod metrics;
 mod node;
 mod preload;
+mod report;
 mod rss;
 mod sample;
 mod setup;

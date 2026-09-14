@@ -98,6 +98,21 @@ pub(crate) fn totals(body: &str) -> BTreeMap<String, f64> {
     sums
 }
 
+/// Sums every sample of `metric` in Prometheus text-exposition `body` whose
+/// label set includes `label="value"`, across every other label (such as
+/// `cache`). [`totals`]'s single-label-filtered counterpart, for a metric
+/// like `sundog_rebalance_buckets_total{cache, direction}` where the report
+/// wants one direction's total rather than both summed together.
+#[must_use]
+pub(crate) fn labeled_total(body: &str, metric: &str, label: &str, value: &str) -> f64 {
+    let prefix = format!("{metric}{{");
+    let needle = format!("{label}=\"{value}\"");
+    body.lines()
+        .filter(|line| line.starts_with(&prefix) && line.contains(&needle))
+        .filter_map(|line| line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()))
+        .sum()
+}
+
 /// The metrics a spill run is watched by, in the order the summary line
 /// prints them, with the short label each carries there.
 const SUMMARY: &[(&str, &str)] = &[
@@ -197,6 +212,49 @@ mod tests {
         assert_eq!(sums.get("sundog_cache_entries"), Some(&4.5));
         assert!(!sums.contains_key("other_metric"));
         assert_eq!(sums.len(), 3);
+    }
+
+    const DIRECTION_BODY: &str = "sundog_rebalance_buckets_total{cache=\"a\",direction=\"in\"} 4\n\
+        sundog_rebalance_buckets_total{cache=\"b\",direction=\"in\"} 6\n\
+        sundog_rebalance_buckets_total{cache=\"a\",direction=\"out\"} 1\n";
+
+    #[test]
+    fn labeled_total_sums_only_the_matching_label_value_across_other_labels() {
+        assert!(
+            (labeled_total(
+                DIRECTION_BODY,
+                "sundog_rebalance_buckets_total",
+                "direction",
+                "in"
+            ) - 10.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (labeled_total(
+                DIRECTION_BODY,
+                "sundog_rebalance_buckets_total",
+                "direction",
+                "out"
+            ) - 1.0)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn labeled_total_is_zero_when_nothing_matches() {
+        assert!(
+            labeled_total(
+                DIRECTION_BODY,
+                "sundog_rebalance_buckets_total",
+                "direction",
+                "gone"
+            )
+            .abs()
+                < f64::EPSILON
+        );
+        assert!(labeled_total(BODY, "sundog_missing_metric", "cache", "demo").abs() < f64::EPSILON);
     }
 
     #[test]

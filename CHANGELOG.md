@@ -3,6 +3,71 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Entry diet**: a live entry stores one encoded record (key length, key,
+  and value in the postcard form the wire already uses) instead of a typed
+  key and value plus a separate encoded copy, and that record is an enum,
+  inline for records up to 30 bytes and boxed beyond, so a short key and
+  value need no heap allocation at all. The version's three fields sit on
+  the entry itself, with the logical counter packed beside the weight, and
+  `Live::ver` reassembles an `Hlc` for every comparison; `Live` is 72 bytes
+  without spill. Measured on a 4-core box: 4M entries in one local cache
+  settle at 177 bytes per entry against 522 before, the 3-node 4M-key
+  harness settles at 3.24 GiB against 5.26 GiB before under glibc, and
+  local read latency drops from 0.538 to 0.296 microseconds. The entry diet
+  bench (`SUNDOG_BENCH=1 cargo test --release -p sundog --test
+  entry_diet_bench`) pins both the size and the latency.
+- **jemalloc in the demo and the test node**: `demos/sundog-distributed-demo`
+  and `sundog-testnode` both set `tikv_jemallocator::Jemalloc` as their
+  global allocator on every target but MSVC Windows; the `sundog` library
+  itself sets none, leaving the choice to whatever embeds it. glibc's
+  arenas keep the preload's and anti-entropy's transient buffers resident
+  past the point they're needed; jemalloc returns that memory. On the
+  3-node 4M-key harness the demo settles at 1.70 GiB against 3.24 GiB under
+  glibc, and preload throughput rises from 1.49M to 1.66M keys/s.
+- **Distributed demo sizing, metrics, report and gate flags**: `--value-bytes
+  <N>` pads every preload and load value out to N bytes. `--max-entries
+  <N>` caps live entries per node, and needs `--spill-dir <PATH>` (with
+  `--spill-capacity-mb`, `--spill-region-mb`, and `--spill-flush-queue-mb`,
+  all in mebibytes) to size the spill tier that catches what the cap
+  evicts; both need the demo built with `--features spill`. `--metrics`
+  (or `--metrics-interval-secs <N>`, which implies it) installs the
+  process-wide Prometheus recorder before any node opens and prints an
+  in-process `sundog_*` status line every interval during a `--headless`
+  run, needing `--features prometheus`. `--report-json <PATH>` writes a
+  JSON summary of a headless run (RSS, fetch latency, the sample check,
+  convergence, and the summed `sundog_*` totals) at the end of the run.
+  `--gate <PATH>` reads a JSON threshold file of the same shape, checks the
+  run's report against it, and exits nonzero listing every violated
+  threshold. Both need `--metrics`.
+- **Test node sizing knobs**: `sundog-testnode` reads
+  `SUNDOG_TESTNODE_MAX_ENTRIES` as an entry-count cap on `"it"`, alongside
+  the existing byte-denominated `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` (which
+  wins when both are set), and `SUNDOG_TESTNODE_SPILL_CAPACITY_MB`,
+  `SUNDOG_TESTNODE_SPILL_REGION_MB`, and
+  `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_MB` as mebibyte-denominated
+  counterparts of the existing `_BYTES` spill sizing variables (each byte
+  variable still wins when both are set), mirroring the distributed demo's
+  own `--max-entries`/`--spill-capacity-mb`/`--spill-region-mb`/
+  `--spill-flush-queue-mb` flags.
+- `sundog_rebalance_pull_timeouts_total{cache}`: a `Mode::Distributed`
+  cache's seventh Prometheus metric, counting warm-ups that gave up on a
+  bucket pull timing out repeatedly and opened warm with whatever landed,
+  leaving the rest to anti-entropy.
+- **Scale workflow**: `.github/workflows/scale.yml` runs the distributed
+  demo headless overnight (and on demand via `workflow_dispatch`, with
+  `keys`, `duration_secs`, `max_entries`, and `runner` inputs) at 4M keys,
+  three nodes, two owners, 256-byte values, an 800k-entry RAM cap per node
+  over a spill tier, and checks the resulting report against
+  `ops/scale-gate.json`'s thresholds: steady RSS at most 4.5 GiB, peak RSS
+  at most 5.6 GiB, at most 100,000 deferred spill drops, zero pull
+  timeouts, fetch p99 at most 100 milliseconds, full convergence, and a
+  fully passing sample check. It uploads the run's `scale-report.json` and
+  log as workflow artifacts either way.
+
 ## [0.6.1] – 2026-09-12
 
 ### Added

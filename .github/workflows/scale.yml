@@ -1,0 +1,85 @@
+# Nightly scale run: builds the distributed demo with the spill and
+# prometheus features, runs it headless at 4M keys across three nodes with
+# an 800k-entry RAM cap per node over a spill tier, and checks the
+# resulting report against ops/scale-gate.json's RSS, spill-drop,
+# pull-timeout, and fetch-latency thresholds. workflow_dispatch reruns the
+# same shape on demand, overriding the key count, duration, RAM cap, or
+# runner for a one-off run at a different scale.
+name: Scale
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      keys:
+        description: "Preloaded key count"
+        required: false
+        default: "4000000"
+        type: string
+      duration_secs:
+        description: "Headless run duration, in seconds"
+        required: false
+        default: "300"
+        type: string
+      max_entries:
+        description: "Per-node RAM entry cap"
+        required: false
+        default: "800000"
+        type: string
+      runner:
+        description: "Runner label"
+        required: false
+        default: "ubuntu-latest"
+        type: string
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  scale:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    env:
+      SCALE_KEYS: ${{ inputs.keys || '4000000' }}
+      SCALE_DURATION_SECS: ${{ inputs.duration_secs || '300' }}
+      SCALE_MAX_ENTRIES: ${{ inputs.max_entries || '800000' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release -p sundog-distributed-demo --features spill,prometheus
+
+      - name: Run the distributed demo headless at scale
+        env:
+          RUST_LOG: warn
+        run: |
+          mkdir -p "$RUNNER_TEMP/spill"
+          ./target/release/sundog-distributed-demo \
+            --nodes 3 \
+            --keys "$SCALE_KEYS" \
+            --owners 2 \
+            --value-bytes 256 \
+            --max-entries "$SCALE_MAX_ENTRIES" \
+            --spill-dir "$RUNNER_TEMP/spill" \
+            --spill-capacity-mb 2048 \
+            --spill-flush-queue-mb 256 \
+            --metrics-interval-secs 15 \
+            --headless "$SCALE_DURATION_SECS" \
+            --report-json scale-report.json \
+            --gate ops/scale-gate.json \
+            2>&1 | tee scale-run.log
+
+      - name: Upload scale report and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale-report
+          path: |
+            scale-report.json
+            scale-run.log
+          if-no-files-found: warn

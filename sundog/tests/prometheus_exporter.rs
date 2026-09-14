@@ -272,6 +272,78 @@ async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
         .await;
 }
 
+/// Opens `delayed` as `Mode::Distributed { owners: 2 }` on a scenario-local
+/// donor, joins a scenario-local victim configured with a short
+/// `state_transfer_budget`, then kills the donor immediately before the
+/// victim opens the same cache: the victim's ownership view still lists the
+/// donor as live (gossip has not reacted yet, the same gap
+/// `seed_distributed_metrics`'s outcome="error" case relies on), so every
+/// bucket pull dials a closed listener, fails at once, and retries until its
+/// budget runs out. After `state_transfer::MAX_WARM_UP_ATTEMPTS` such rounds
+/// `rebalance::warm_up_task` gives up, opens warm with nothing pulled, and
+/// increments `sundog_rebalance_pull_timeouts_total{cache="delayed"}`.
+/// Independent of `peer`/`third`/`fourth`, like `seed_crdt_compaction_metrics`:
+/// both scenario-local nodes are down by the time this returns.
+async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr) {
+    let name = "delayed";
+    let owners = NonZeroU8::new(2).expect("nonzero");
+
+    let donor = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(node_config(common::reserve_gossip_addr().await))
+        .build()
+        .await
+        .expect("donor builds");
+    common::wait_for_peer_count(&donor, 1, Duration::from_secs(15)).await;
+    donor
+        .cache::<u32, String>(name)
+        .mode(Mode::Distributed { owners })
+        .open()
+        .await
+        .expect("donor opens delayed as the sole owner, warm at once");
+
+    let victim_config = node_config(common::reserve_gossip_addr().await)
+        .with(|c| c.state_transfer_budget = Duration::from_millis(200));
+    let victim = Cluster::builder("it-prometheus-exporter")
+        .seeds([gossip_a])
+        .config(victim_config)
+        .build()
+        .await
+        .expect("victim builds");
+    common::wait_for_peer_count(&victim, 1, Duration::from_secs(15)).await;
+    // Gossip quiescence: gives the donor's `delayed` cache-mode
+    // advertisement time to reach the victim, so the victim's initial
+    // ownership view already lists the donor as a co-owner instead of
+    // opening alone with nothing to pull.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Closes the donor's listeners at once; the victim's ownership view
+    // still lists it as live, so every pull dials it and fails fast rather
+    // than ever finding a real donor to warm from.
+    donor.shutdown().await;
+
+    let _victim_cache = victim
+        .cache::<u32, String>(name)
+        .mode(Mode::Distributed { owners })
+        .open()
+        .await
+        .expect("victim opens cold; a timed-out pull never fails open()");
+
+    common::eventually(Duration::from_secs(15), || async {
+        scrape_metrics(metrics_addr).await.is_some_and(|body| {
+            scraped_metric_value(
+                &body,
+                "sundog_rebalance_pull_timeouts_total",
+                &[("cache", name)],
+            )
+            .is_some_and(|count| count >= 1.0)
+        })
+    })
+    .await;
+
+    victim.shutdown().await;
+}
+
 /// Drives one real writer through CRDT retirement, rejoining
 /// `second_life` under `first_life`'s identical explicit
 /// [`sundog::ClusterBuilder::node_id`] with a fresh incarnation so
@@ -630,6 +702,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // own two scenario-local nodes before returning, so it leaves no peer
     // count `seed_distributed_metrics` below needs to account for.
     seed_crdt_compaction_metrics(&cluster, gossip_a, metrics_addr).await;
+    // Also independent, for the same reason: its donor and victim are both
+    // shut down before it returns.
+    seed_pull_timeout_metric(gossip_a, metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // is done with them, and `peer` isn't touched by anything after it.
     seed_distributed_metrics(&cluster, &peer, gossip_a).await;
@@ -730,6 +805,18 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              >= 1; got body:\n{body}"
         );
     }
+
+    // `seed_pull_timeout_metric`'s victim gives up on exactly one warm-up
+    // pass, ever, once its ownership view moves on and its cache is warm.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_rebalance_pull_timeouts_total",
+            &[("cache", "delayed")]
+        ),
+        Some(1.0),
+        "expected exactly one rebalance pull timeout on the 'delayed' cache; got body:\n{body}"
+    );
 
     // `seed_crdt_compaction_metrics` retires exactly one dead writer, ever
     // (stage-one retirement never calls `retire` on it again once moved),

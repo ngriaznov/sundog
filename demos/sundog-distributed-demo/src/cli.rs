@@ -26,6 +26,13 @@ pub(crate) struct Args {
     /// `Some(interval)` prints an in-process metrics line every `interval`
     /// and a full `sundog_*` dump at each milestone of a headless run.
     pub(crate) metrics: Option<Duration>,
+    /// `Some(path)` writes a JSON [`crate::report::Report`] to `path` at the
+    /// end of a headless run; needs `metrics` on.
+    pub(crate) report_json: Option<PathBuf>,
+    /// `Some(path)` reads a JSON [`crate::report::Gate`] from `path` and
+    /// checks the headless run's report against it, exiting nonzero on any
+    /// violated threshold; needs `metrics` on.
+    pub(crate) gate: Option<PathBuf>,
 }
 
 /// Per-node cache sizing: the RAM entry cap and the spill tier that catches
@@ -73,6 +80,8 @@ impl Default for Args {
             value_bytes: 0,
             tuning: CacheTuning::default(),
             metrics: None,
+            report_json: None,
+            gate: None,
         }
     }
 }
@@ -164,6 +173,12 @@ pub(crate) fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Ar
     if parsed.metrics.is_some() && !cfg!(feature = "prometheus") {
         bail!("--metrics needs the demo built with --features prometheus");
     }
+    if parsed.report_json.is_some() && parsed.metrics.is_none() {
+        bail!("--report-json needs --metrics");
+    }
+    if parsed.gate.is_some() && parsed.metrics.is_none() {
+        bail!("--gate needs --metrics");
+    }
     Ok(parsed)
 }
 
@@ -231,6 +246,14 @@ fn parse_sizing_flag(
                 .context("--metrics-interval-secs must be an integer")?;
             parsed.metrics = Some(Duration::from_secs(secs.max(1)));
         }
+        "--report-json" => {
+            parsed.report_json = Some(PathBuf::from(
+                args.next().context("--report-json needs a value")?,
+            ));
+        }
+        "--gate" => {
+            parsed.gate = Some(PathBuf::from(args.next().context("--gate needs a value")?));
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -270,6 +293,8 @@ fn print_help() {
          \x20   --spill-flush-queue-mb <N>  queued-but-unwritten spill bytes before eviction drops instead (default one region)\n\
          \x20   --metrics                   print in-process sundog_* metrics during a headless run (needs --features prometheus)\n\
          \x20   --metrics-interval-secs <N> seconds between metrics lines (default 15, implies --metrics)\n\
+         \x20   --report-json <PATH>        write a JSON run report to PATH at the end of --headless (needs --metrics)\n\
+         \x20   --gate <PATH>               check the run report against a JSON threshold file, exit nonzero on any violation (needs --metrics)\n\
          \x20   -h, --help                  print this help\n\n\
          KEYS (TUI): up/down or j/k move, 1-9/enter select, K kill, R restart, P pause/resume load, q quit"
     );
@@ -345,6 +370,49 @@ mod tests {
             let args = args.expect("valid args parse");
             assert_eq!(args.value_bytes, 256);
             assert_eq!(args.metrics, Some(Duration::from_secs(5)));
+        } else {
+            assert!(args.is_err(), "--metrics needs the prometheus feature");
+        }
+    }
+
+    #[test]
+    fn report_json_needs_metrics() {
+        let args = parse(
+            ["--report-json", "/tmp/report.json"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(args.is_err(), "--report-json with no --metrics is refused");
+
+        let args = parse(
+            ["--metrics", "--report-json", "/tmp/report.json"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        if cfg!(feature = "prometheus") {
+            let args = args.expect("valid args parse");
+            assert_eq!(
+                args.report_json.as_deref(),
+                Some(Path::new("/tmp/report.json"))
+            );
+        } else {
+            assert!(args.is_err(), "--metrics needs the prometheus feature");
+        }
+    }
+
+    #[test]
+    fn gate_needs_metrics() {
+        let args = parse(["--gate", "/tmp/gate.json"].into_iter().map(str::to_owned));
+        assert!(args.is_err(), "--gate with no --metrics is refused");
+
+        let args = parse(
+            ["--metrics", "--gate", "/tmp/gate.json"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        if cfg!(feature = "prometheus") {
+            let args = args.expect("valid args parse");
+            assert_eq!(args.gate.as_deref(), Some(Path::new("/tmp/gate.json")));
         } else {
             assert!(args.is_err(), "--metrics needs the prometheus feature");
         }

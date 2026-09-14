@@ -329,11 +329,14 @@ Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
-A `Mode::Distributed` cache adds six more:
+A `Mode::Distributed` cache adds seven more:
 
 - `sundog_owned_buckets{cache}`, this node's current bucket count.
 - `sundog_rebalance_buckets_total{cache, direction}`, buckets rebalance
   pulled in or released out.
+- `sundog_rebalance_pull_timeouts_total{cache}`, warm-ups that gave up on a
+  bucket pull timing out repeatedly and opened warm with whatever landed,
+  leaving the rest to anti-entropy.
 - `sundog_fetch_total{cache, outcome}`, each `Cache::fetch` call's outcome
   (`local`, `remote`, `miss`, or `error`).
 - `sundog_forwarded_writes_total{cache}`, writes this node forwarded to a
@@ -469,6 +472,17 @@ SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
 `RUSTFLAGS="-D warnings"` and `RUSTDOCFLAGS="-D warnings"`: a compiler or
 rustdoc warning fails the build.
 
+`.github/workflows/scale.yml` runs nightly and on demand: it builds
+`sundog-distributed-demo` with `--features spill,prometheus` and runs it
+headless at 4M keys across three nodes with an 800k-entry RAM cap per node
+over a spill tier, checking the resulting `--report-json` output against
+[`ops/scale-gate.json`](ops/scale-gate.json)'s thresholds for steady and
+peak RSS, deferred spill drops, pull timeouts, fetch p99 latency,
+convergence, and a fully passing sample check via `--gate`. `workflow_dispatch`
+reruns the same shape on demand with its own key count, duration, RAM cap,
+and runner inputs, for a one-off run at a different scale. Both the report
+and the run log upload as workflow artifacts.
+
 ## Chaos demo
 
 `demos/sundog-demo` spins up N in-process nodes on loopback and runs a background
@@ -529,6 +543,12 @@ against `owners * surviving keys` under a bound wide enough for
 surviving keys against their expected value, and prints one report line
 each for the preload, the fetch counters, the sample check, and
 convergence, exiting nonzero on either a divergence or a failed sample.
+`--report-json <PATH>` writes that same run as a JSON summary (RSS, fetch
+latency, the sample check, convergence, and the summed `sundog_*` totals)
+instead of only printing it, and `--gate <PATH>` reads a JSON threshold
+file of the same shape and checks the run against it, exiting nonzero and
+listing every violated threshold; both need `--metrics`, and the Scale
+workflow described in Testing runs with both set.
 
 Both the demo and the test node set jemalloc as their global allocator on
 every target but MSVC Windows. The library itself sets none, so a service

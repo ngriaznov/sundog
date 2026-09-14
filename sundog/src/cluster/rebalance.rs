@@ -277,7 +277,8 @@ impl PullRequest<'_> {
 /// [`state_transfer::Outcome::needs_warm_up`] left cold: waits for a
 /// co-owner when there is none, then retries every `retry_interval` until a
 /// pass lands or repeated timeouts mark the cache warm with whatever
-/// landed. Shares [`state_transfer::next_warm_up_step`]'s decision and
+/// landed, counted under `sundog_rebalance_pull_timeouts_total{cache}`.
+/// Shares [`state_transfer::next_warm_up_step`]'s decision and
 /// [`state_transfer::MAX_WARM_UP_ATTEMPTS`] cap with the whole-cache
 /// analogue, [`state_transfer::warm_up_task`].
 #[expect(
@@ -346,6 +347,11 @@ pub(crate) async fn warm_up_task(
                     attempts = attempt,
                     "rebalance pull timed out repeatedly; opening warm with what landed, anti-entropy carries the rest"
                 );
+                metrics::counter!(
+                    "sundog_rebalance_pull_timeouts_total",
+                    "cache" => cache.to_string()
+                )
+                .increment(1);
                 residency.clear_all_cold();
                 cluster.mark_warm(&cache);
                 return;

@@ -6,7 +6,15 @@
 //! Usage: `sundog-testnode <cluster-name>`; every other setting comes from
 //! `SUNDOG_*` environment variables (seeds, anti-entropy bucket overrides,
 //! cache mode and capacity, spill tier, conflict resolver): see each
-//! variable's read site in [`run`] for its meaning and default.
+//! variable's read site in [`run`] for its meaning and default. `"it"`'s
+//! sizing knobs mirror `sundog-distributed-demo`'s `--max-entries`/
+//! `--spill-capacity-mb`/`--spill-region-mb`/`--spill-flush-queue-mb`:
+//! `SUNDOG_TESTNODE_MAX_ENTRIES` caps live entry count and
+//! `SUNDOG_TESTNODE_SPILL_CAPACITY_MB`/`_SPILL_REGION_MB`/
+//! `_SPILL_FLUSH_QUEUE_MB` size the spill tier in mebibytes; each has an
+//! older byte-denominated counterpart (`_MAX_CAPACITY_BYTES`,
+//! `_SPILL_CAPACITY_BYTES`, `_SPILL_REGION_BYTES`,
+//! `_SPILL_FLUSH_QUEUE_BYTES`) that wins when both are set.
 //!
 //! Line protocol: one command per line on `CONTROL_PORT`, one
 //! line-terminated reply each; each command's argument shape and reply
@@ -173,12 +181,59 @@ fn byte_weight(key: &str, value: &str) -> u32 {
     (key.len() + value.len()).try_into().unwrap_or(u32::MAX)
 }
 
+/// Which unit `"it"`'s optional `CacheBuilder::max_capacity` bounds: the
+/// pure decision behind `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`/
+/// `SUNDOG_TESTNODE_MAX_ENTRIES`'s already-parsed values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityCap {
+    /// `max_capacity` bounds total UTF-8 bytes across key and value, via
+    /// [`byte_weight`].
+    Bytes(u64),
+    /// `max_capacity` bounds live entry count, via the default per-entry
+    /// weigher: `sundog-distributed-demo`'s `--max-entries` knob.
+    Entries(u64),
+}
+
+/// Decides [`CapacityCap`] from `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`/
+/// `SUNDOG_TESTNODE_MAX_ENTRIES`'s already-parsed values: a byte budget
+/// takes priority when both are set, since it is the older of the two
+/// knobs; `None` when neither is set, leaving `"it"` unbounded exactly as
+/// it always has.
+fn capacity_cap_from_env(
+    max_capacity_bytes: Option<u64>,
+    max_entries: Option<u64>,
+) -> Option<CapacityCap> {
+    max_capacity_bytes
+        .map(CapacityCap::Bytes)
+        .or(max_entries.map(CapacityCap::Entries))
+}
+
+/// One mebibyte, in bytes: `sundog-distributed-demo`'s own `MIB`, backing
+/// the `_MB`-suffixed spill sizing knobs below.
+#[cfg(feature = "spill")]
+const MIB: u64 = 1024 * 1024;
+
+/// The byte value for one spill sizing knob: `bytes`'s value if set,
+/// otherwise `mib` converted to bytes (saturating rather than overflowing
+/// on a pathologically large input), `None` if neither is set. Backs
+/// `SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/`_SPILL_CAPACITY_MB`,
+/// `_SPILL_REGION_BYTES`/`_SPILL_REGION_MB`, and
+/// `_SPILL_FLUSH_QUEUE_BYTES`/`_SPILL_FLUSH_QUEUE_MB` alike: the byte
+/// variable wins when both are set, so an existing byte-denominated run
+/// configuration is unaffected by also setting its MiB counterpart.
+#[cfg(feature = "spill")]
+fn resolve_byte_budget(bytes: Option<u64>, mib: Option<u64>) -> Option<u64> {
+    bytes.or_else(|| mib.map(|mib| mib.saturating_mul(MIB)))
+}
+
 /// Builds `"it"`'s optional spill tier from
 /// `SUNDOG_TESTNODE_SPILL_DIR`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
 /// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`/
 /// `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`'s already-parsed values: `None`
 /// when no spill dir is set, so the cache opens spill-free exactly as it
-/// always has.
+/// always has. `capacity_bytes`/`region_bytes`/`flush_queue_bytes` each
+/// already fold in that knob's `_MB` counterpart via
+/// [`resolve_byte_budget`], so this function itself stays byte-only.
 ///
 /// # Panics
 ///
@@ -284,6 +339,56 @@ impl ConflictResolver for SumCounterResolver {
     }
 }
 
+/// Opens `"it"` with `resolver` and its sizing knobs applied: the RAM cap
+/// (byte- or entry-denominated, via [`capacity_cap_from_env`]) and, with the
+/// `spill` feature, the spill tier (via `spill_config_from_env`). Split
+/// out of [`run`] to keep it under clippy's line-count lint.
+async fn open_it_cache(
+    cluster: &Cluster,
+    mode: Mode,
+    resolver: ResolverKind,
+) -> Result<Cache<String, String>, Box<dyn std::error::Error>> {
+    let max_capacity_bytes = u64_env("SUNDOG_TESTNODE_MAX_CAPACITY_BYTES");
+    let max_entries = u64_env("SUNDOG_TESTNODE_MAX_ENTRIES");
+    let mut it_builder = cluster.cache::<String, String>(CACHE_NAME).mode(mode);
+    if resolver == ResolverKind::SumCounter {
+        it_builder = it_builder.resolver(Arc::new(SumCounterResolver));
+    }
+    match capacity_cap_from_env(max_capacity_bytes, max_entries) {
+        Some(CapacityCap::Bytes(max_capacity_bytes)) => {
+            it_builder = it_builder
+                .max_capacity(max_capacity_bytes)
+                .weigher(|key: &String, value: &String| byte_weight(key, value));
+        }
+        Some(CapacityCap::Entries(max_entries)) => {
+            it_builder = it_builder.max_capacity(max_entries);
+        }
+        None => {}
+    }
+    #[cfg(feature = "spill")]
+    {
+        let spill_cfg = spill_config_from_env(
+            env::var("SUNDOG_TESTNODE_SPILL_DIR").ok(),
+            resolve_byte_budget(
+                u64_env("SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES"),
+                u64_env("SUNDOG_TESTNODE_SPILL_CAPACITY_MB"),
+            ),
+            resolve_byte_budget(
+                u64_env("SUNDOG_TESTNODE_SPILL_REGION_BYTES"),
+                u64_env("SUNDOG_TESTNODE_SPILL_REGION_MB"),
+            ),
+            resolve_byte_budget(
+                u64_env("SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES"),
+                u64_env("SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_MB"),
+            ),
+        );
+        if let Some(spill_cfg) = spill_cfg {
+            it_builder = it_builder.spill(spill_cfg);
+        }
+    }
+    Ok(it_builder.open().await?)
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cluster_name = env::args()
         .nth(1)
@@ -327,29 +432,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cluster = builder.build().await?;
 
-    let max_capacity_bytes = u64_env("SUNDOG_TESTNODE_MAX_CAPACITY_BYTES");
-    let mut it_builder = cluster.cache::<String, String>(CACHE_NAME).mode(it_mode);
-    if it_resolver == ResolverKind::SumCounter {
-        it_builder = it_builder.resolver(Arc::new(SumCounterResolver));
-    }
-    if let Some(max_capacity_bytes) = max_capacity_bytes {
-        it_builder = it_builder
-            .max_capacity(max_capacity_bytes)
-            .weigher(|key: &String, value: &String| byte_weight(key, value));
-    }
-    #[cfg(feature = "spill")]
-    {
-        let spill_cfg = spill_config_from_env(
-            env::var("SUNDOG_TESTNODE_SPILL_DIR").ok(),
-            u64_env("SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES"),
-            u64_env("SUNDOG_TESTNODE_SPILL_REGION_BYTES"),
-            u64_env("SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES"),
-        );
-        if let Some(spill_cfg) = spill_cfg {
-            it_builder = it_builder.spill(spill_cfg);
-        }
-    }
-    let cache = it_builder.open().await?;
+    let cache = open_it_cache(&cluster, it_mode, it_resolver).await?;
     let churn = cluster
         .cache::<String, String>(CHURN_CACHE_NAME)
         .mode(Mode::Replicated)
@@ -976,6 +1059,36 @@ mod tests {
     }
 
     #[test]
+    fn capacity_cap_from_env_is_none_when_neither_knob_is_set() {
+        assert_eq!(capacity_cap_from_env(None, None), None);
+    }
+
+    #[test]
+    fn capacity_cap_from_env_reads_a_byte_budget() {
+        assert_eq!(
+            capacity_cap_from_env(Some(4096), None),
+            Some(CapacityCap::Bytes(4096))
+        );
+    }
+
+    #[test]
+    fn capacity_cap_from_env_reads_an_entry_count() {
+        assert_eq!(
+            capacity_cap_from_env(None, Some(10)),
+            Some(CapacityCap::Entries(10))
+        );
+    }
+
+    #[test]
+    fn capacity_cap_from_env_prefers_the_byte_budget_when_both_are_set() {
+        assert_eq!(
+            capacity_cap_from_env(Some(4096), Some(10)),
+            Some(CapacityCap::Bytes(4096)),
+            "the older byte-denominated knob wins over the entry-count knob"
+        );
+    }
+
+    #[test]
     fn resolver_kind_from_env_defaults_to_lww() {
         assert_eq!(resolver_kind_from_env(None), Ok(ResolverKind::Lww));
         assert_eq!(resolver_kind_from_env(Some("lww")), Ok(ResolverKind::Lww));
@@ -1392,6 +1505,35 @@ mod tests {
         #[should_panic(expected = "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES")]
         fn spill_config_from_env_panics_when_the_dir_is_set_without_a_capacity() {
             let _ = spill_config_from_env(Some("/tmp/spill-it".to_string()), None, None, None);
+        }
+
+        #[test]
+        fn resolve_byte_budget_is_none_when_neither_knob_is_set() {
+            assert_eq!(resolve_byte_budget(None, None), None);
+        }
+
+        #[test]
+        fn resolve_byte_budget_reads_a_raw_byte_value() {
+            assert_eq!(resolve_byte_budget(Some(4096), None), Some(4096));
+        }
+
+        #[test]
+        fn resolve_byte_budget_converts_a_mebibyte_value() {
+            assert_eq!(resolve_byte_budget(None, Some(4)), Some(4 * MIB));
+        }
+
+        #[test]
+        fn resolve_byte_budget_prefers_the_byte_value_when_both_are_set() {
+            assert_eq!(
+                resolve_byte_budget(Some(4096), Some(4)),
+                Some(4096),
+                "the byte-denominated knob wins over its MiB counterpart"
+            );
+        }
+
+        #[test]
+        fn resolve_byte_budget_saturates_instead_of_overflowing() {
+            assert_eq!(resolve_byte_budget(None, Some(u64::MAX)), Some(u64::MAX));
         }
     }
 }
