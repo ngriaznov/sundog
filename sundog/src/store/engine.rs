@@ -22,12 +22,20 @@
 //! between a lookup and a wait. `InflightGuard` frees a cancelled load so a
 //! waiter takes over.
 //!
+//! Each [`Live`] entry holds its record in a [`Record`]: inline in the
+//! entry's own memory for records up to `INLINE_CAP` bytes, a boxed slice on
+//! the heap beyond that. Its version is flattened across the entry's
+//! `wall_ms`, `node`, and `logical` fields instead of held as one `Hlc`
+//! value; `Live::ver` and `Live::set_ver` reassemble and overwrite it as a
+//! whole.
+//!
 //! Under `feature = "spill"`, a live entry can move to disk instead of
 //! being evicted; see [`super::spill::SpillTier`] for that mechanism.
 
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::ops::Deref;
 #[cfg(all(feature = "spill", test))]
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -169,20 +177,127 @@ fn from_stored_expiry(stored: u64) -> Option<u64> {
     (stored != NO_EXPIRY).then_some(stored)
 }
 
+/// Max inline payload length for [`Record`]. The `Inline` variant is a
+/// 1-byte length plus a `[u8; INLINE_CAP]` buffer, 31 bytes; `Heap` is a
+/// `Box<[u8]>`, a 16-byte fat pointer at 8-byte alignment. The enum's own
+/// discriminant costs nothing extra here (the compiler folds it into the
+/// `Inline` variant's own layout), so `Record` sits at exactly 32 bytes,
+/// pinned by `record_size_is_32_bytes` below.
+const INLINE_CAP: usize = 30;
+
+/// A live entry's raw `LEN ++ KEY ++ VALUE` record bytes: inline for
+/// records up to [`INLINE_CAP`] bytes (the profiled 18-byte
+/// `Cache<String, String>` record always lands here: zero heap
+/// allocations), an exclusively owned `Box<[u8]>` beyond that. Never
+/// shared and never `Clone`: a call site that needs an owned copy across
+/// a stripe lock boundary builds a fresh `Bytes::copy_from_slice` from
+/// [`record_key_bytes`]/[`record_value_bytes`] instead. Safe: no raw
+/// pointers, no manual `Drop`, no hand-written `Send`/`Sync` impl. `Box`
+/// already provides all three.
+enum Record {
+    /// Inline payload: the first `len` bytes of `buf` are the record.
+    Inline { len: u8, buf: [u8; INLINE_CAP] },
+    /// Heap payload for a record over [`INLINE_CAP`] bytes.
+    Heap(Box<[u8]>),
+}
+
+impl Record {
+    /// Builds a `Record` holding a copy of `bytes`: inline when
+    /// `bytes.len() <= INLINE_CAP`, a fresh boxed copy otherwise.
+    fn from_slice(bytes: &[u8]) -> Record {
+        if bytes.len() <= INLINE_CAP {
+            let mut buf = [0u8; INLINE_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            let len = u8::try_from(bytes.len()).expect("bytes.len() <= INLINE_CAP fits in a u8");
+            Record::Inline { len, buf }
+        } else {
+            Record::Heap(Box::from(bytes))
+        }
+    }
+
+    /// The record's bytes, from whichever variant holds them.
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Record::Inline { len, buf } => &buf[..*len as usize],
+            Record::Heap(boxed) => boxed.as_ref(),
+        }
+    }
+}
+
+impl Deref for Record {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for Record {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn record_size_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<Record>(), 32);
+    }
+
+    #[test]
+    fn record_round_trips_inline_at_0_18_and_30_bytes() {
+        for len in [0usize, 18, 30] {
+            let bytes = vec![b'x'; len];
+            let record = Record::from_slice(&bytes);
+            assert!(
+                matches!(record, Record::Inline { .. }),
+                "len = {len} should stay inline"
+            );
+            assert_eq!(record.as_slice(), bytes.as_slice(), "len = {len}");
+        }
+    }
+
+    #[test]
+    fn record_round_trips_heap_at_31_and_300_bytes() {
+        for len in [31usize, 300] {
+            let bytes = vec![b'y'; len];
+            let record = Record::from_slice(&bytes);
+            assert!(
+                matches!(record, Record::Heap(_)),
+                "len = {len} should go to the heap"
+            );
+            assert_eq!(record.as_slice(), bytes.as_slice(), "len = {len}");
+        }
+    }
+
+    #[test]
+    fn record_as_slice_and_deref_agree() {
+        for bytes in [&b""[..], &b"short"[..], &vec![b'z'; 100][..]] {
+            let record = Record::from_slice(bytes);
+            assert_eq!(record.as_slice(), bytes);
+            assert_eq!(&*record, bytes, "Deref must match as_slice");
+            assert_eq!(record.as_ref(), bytes, "AsRef must match as_slice");
+        }
+    }
+}
+
 /// Builds a resident record: `LEN ++ KEY ++ VALUE`. `key_bytes` is
 /// `postcard::to_stdvec(&key)`; `value_bytes` is `postcard::to_stdvec(&value)`.
 /// `LEN` is `postcard::to_stdvec(&(key_bytes.len() as u32))`, 1 byte for any
 /// key encoding under 128 bytes. `build_resident_record`,
 /// `build_key_only_record`, and [`split_record`] are the only three
 /// functions in this file allowed to construct or parse a record.
-fn build_resident_record(key_bytes: &[u8], value_bytes: &[u8]) -> Bytes {
+fn build_resident_record(key_bytes: &[u8], value_bytes: &[u8]) -> Record {
     let key_len = u32::try_from(key_bytes.len()).expect("a key's postcard encoding fits in u32");
     let len_prefix = postcard::to_stdvec(&key_len).expect("a u32 always encodes");
     let mut buf = Vec::with_capacity(len_prefix.len() + key_bytes.len() + value_bytes.len());
     buf.extend_from_slice(&len_prefix);
     buf.extend_from_slice(key_bytes);
     buf.extend_from_slice(value_bytes);
-    Bytes::from(buf)
+    Record::from_slice(&buf)
 }
 
 /// Builds a spilled record: `LEN ++ KEY` only, an empty value half. Always a
@@ -192,7 +307,7 @@ fn build_resident_record(key_bytes: &[u8], value_bytes: &[u8]) -> Bytes {
 /// the slice lives. Called by `SpillSink::install` in a `spill` build;
 /// otherwise only test code reaches it.
 #[cfg_attr(not(any(test, feature = "spill")), allow(dead_code))]
-fn build_key_only_record(key_bytes: &[u8]) -> Bytes {
+fn build_key_only_record(key_bytes: &[u8]) -> Record {
     build_resident_record(key_bytes, &[])
 }
 
@@ -214,16 +329,25 @@ fn record_key(record: &[u8]) -> &[u8] {
     split_record(record).0
 }
 
-/// `record`'s key half as an independently owned, zero-copy `Bytes`.
-fn record_key_bytes(record: &Bytes) -> Bytes {
-    record.slice_ref(record_key(record))
+/// `record`'s value half, `split_record(record).1`, zero-copy: the value
+/// counterpart to [`record_key`]. Used by a decode-only reader that only
+/// needs to borrow the bytes for the duration of a postcard decode, never
+/// crossing the stripe lock boundary.
+fn record_value(record: &[u8]) -> &[u8] {
+    split_record(record).1
 }
 
-/// `record`'s value half as an independently owned, zero-copy `Bytes`.
-/// Empty for a spilled record.
-fn record_value_bytes(record: &Bytes) -> Bytes {
-    let (_, value) = split_record(record);
-    record.slice_ref(value)
+/// `record`'s key half as an independently owned `Bytes`, copied out:
+/// [`Record`] holds no shared backing allocation to slice into, so this
+/// always allocates.
+fn record_key_bytes(record: &Record) -> Bytes {
+    Bytes::copy_from_slice(record_key(record))
+}
+
+/// `record`'s value half as an independently owned `Bytes`, copied out the
+/// same way as [`record_key_bytes`]. Empty for a spilled record.
+fn record_value_bytes(record: &Record) -> Bytes {
+    Bytes::copy_from_slice(record_value(record))
 }
 
 /// Decodes `key_bytes`, always this engine's own prior
@@ -242,30 +366,42 @@ fn decode_value<V: DeserializeOwned>(value_bytes: &[u8]) -> V {
 }
 
 /// One live entry. Carries neither a decoded key nor a decoded value: only
-/// `record`'s raw postcard bytes are stored. Every reader that needs a typed
-/// `K` or `V` decodes it on demand from `record` ([`record_key`],
-/// [`record_value_bytes`], [`decode_key`], [`decode_value`]). `K`/`V` are
-/// phantom-only: no field is `K`- or `V`-typed.
+/// `record`'s raw postcard bytes are stored, inline in a [`Record`] for
+/// records up to `INLINE_CAP` bytes, boxed on the heap beyond that. Every
+/// reader that needs a typed `K` or `V` decodes it on demand from `record`
+/// ([`record_key`], [`record_value`], [`record_value_bytes`],
+/// [`decode_key`], [`decode_value`]). This entry's version is flattened
+/// across `wall_ms`, `node`, and `logical` rather than held as one `Hlc`;
+/// [`Live::ver`] and [`Live::set_ver`] reassemble and overwrite it as a
+/// whole. `K`/`V` are phantom-only: no field is `K`- or `V`-typed.
 struct Live<K, V> {
     /// `key || value`, framed as one field: a leading postcard-encoded
     /// `u32` giving the key half's byte length, then the key's own
     /// postcard bytes, then the value's own postcard bytes; see
-    /// [`build_resident_record`]'s doc for the exact framing. One heap
-    /// allocation for a resident entry. For a spilled entry
+    /// [`build_resident_record`]'s doc for the exact framing. Inline, no
+    /// heap allocation, for a record of [`INLINE_CAP`] bytes or fewer; one
+    /// heap allocation beyond that. For a spilled entry
     /// (`feature = "spill"` only) it holds the key half alone, built
     /// fresh by [`build_key_only_record`], never a `.slice()` of the old
     /// resident record: see [`EntryState::Spilled`]'s doc.
-    record: Bytes,
-    /// This write's version. Kept as a plain `Hlc`, not split into
-    /// interned fields: `Hlc`'s total order is the whole cluster's
-    /// conflict-resolution contract.
-    ver: Hlc,
+    record: Record,
+    /// This write's version, flattened: [`Hlc::wall_ms`], the primary
+    /// ordering key.
+    wall_ms: u64,
+    /// This write's version, flattened: [`Hlc::node`], the final tiebreak.
+    /// Stays the full 64-bit [`NodeId`]: a locally assigned index cannot
+    /// stay bit-identical across independently computed replica merges,
+    /// which `NodeId::merge_derived`'s determinism requirement needs.
+    node: NodeId,
     /// Absolute expiry in epoch milliseconds. [`NO_EXPIRY`] (`u64::MAX`)
     /// means "never expires"; any other value is a real timestamp. Every
     /// writer goes through [`to_stored_expiry`], every reader through
     /// [`from_stored_expiry`], so the sentinel is never assigned by
     /// accident.
     expires_at_ms: u64,
+    /// This write's version, flattened: [`Hlc::logical`], packed beside
+    /// `weight` instead of paying `Hlc`'s own tail padding a second time.
+    logical: u32,
     /// Capacity-accounting weight. `1` by default, an arbitrary caller
     /// value when a `Weigher` is configured, `0` while a spill hand-off
     /// for this entry is in flight.
@@ -283,6 +419,50 @@ struct Live<K, V> {
     /// `fn foo<K, V>(&Live<K, V>)` signature in this file compiles even
     /// though no field is `K`- or `V`-typed.
     _marker: PhantomData<fn(&K, &V)>,
+}
+
+impl<K, V> Live<K, V> {
+    /// Reassembles this entry's version from its flattened fields.
+    fn ver(&self) -> Hlc {
+        Hlc {
+            wall_ms: self.wall_ms,
+            logical: self.logical,
+            node: self.node,
+        }
+    }
+
+    /// Overwrites this entry's version, splitting `v` back into the
+    /// flattened `wall_ms`/`node`/`logical` fields.
+    fn set_ver(&mut self, v: Hlc) {
+        self.wall_ms = v.wall_ms;
+        self.logical = v.logical;
+        self.node = v.node;
+    }
+
+    /// Builds a `Live` entry, splitting `ver` into its flattened fields and
+    /// wrapping `last_access_ms` in the entry's own `AtomicU64`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        record: Record,
+        ver: Hlc,
+        expires_at_ms: u64,
+        weight: u32,
+        last_access_ms: u64,
+        #[cfg(feature = "spill")] state: EntryState,
+    ) -> Self {
+        Self {
+            record,
+            wall_ms: ver.wall_ms,
+            node: ver.node,
+            expires_at_ms,
+            logical: ver.logical,
+            weight,
+            last_access_ms: AtomicU64::new(last_access_ms),
+            #[cfg(feature = "spill")]
+            state,
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// [`Live::record`]'s residency.
@@ -429,7 +609,7 @@ fn remove_live<K, V>(
             let (removed, _vacant) = occ.remove();
             Some(RemovedLive {
                 weight: removed.weight,
-                ver: removed.ver,
+                ver: removed.ver(),
                 was_spilled: is_spilled(&removed),
             })
         }
@@ -769,7 +949,7 @@ fn peek_stored_seed<K, V>(
     };
     #[cfg(not(feature = "spill"))]
     let encoded = record_value_bytes(&live.record);
-    Some((live.ver, encoded, from_stored_expiry(live.expires_at_ms)))
+    Some((live.ver(), encoded, from_stored_expiry(live.expires_at_ms)))
 }
 
 /// [`Engine::apply_many`]'s seed lookup: for every `runs` entry long enough
@@ -1194,7 +1374,7 @@ where
                 #[cfg(not(feature = "spill"))]
                 let encoded = Some(record_value_bytes(&l.record));
                 (
-                    l.ver,
+                    l.ver(),
                     encoded,
                     from_stored_expiry(l.expires_at_ms),
                     !absent_at(l, ctx.tti_ms, ctx.now_ms),
@@ -1319,16 +1499,15 @@ where
     // through sampled eviction, never directly on a write.
     stripe.live.insert_unique(
         hash,
-        Live {
-            record: build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
+        Live::new(
+            build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
             ver,
-            expires_at_ms: to_stored_expiry(expires_at_ms),
+            to_stored_expiry(expires_at_ms),
             weight,
-            last_access_ms: AtomicU64::new(ctx.now_ms),
+            ctx.now_ms,
             #[cfg(feature = "spill")]
-            state: EntryState::Resident,
-            _marker: PhantomData,
-        },
+            EntryState::Resident,
+        ),
         hasher_for,
     );
     if let Some(exp) = expires_at_ms {
@@ -1721,7 +1900,7 @@ where
             return None;
         }
         self.touch(live, now_ms);
-        Some(decode_value(record_value_bytes(&live.record).as_ref()))
+        Some(decode_value(record_value(live.record.as_slice())))
     }
 
     /// Whether `key` has a live, unexpired, non-idle entry.
@@ -1805,7 +1984,7 @@ where
         is_resident(live).then(|| WireRecord {
             key: Bytes::copy_from_slice(key_bytes),
             value: Some(record_value_bytes(&live.record)),
-            ver: live.ver,
+            ver: live.ver(),
             expires_at_ms: from_stored_expiry(live.expires_at_ms),
         })
     }
@@ -1827,7 +2006,7 @@ where
                         .filter(|live| !self.is_absent(live, now_ms))
                         .map(|live| KeyVersion {
                             key: record_key_bytes(&live.record),
-                            version: live.ver,
+                            version: live.ver(),
                         }),
                 );
                 entries.extend(stripe.tombstones.iter().map(|(key_bytes, t)| KeyVersion {
@@ -1869,7 +2048,7 @@ where
                 .live
                 .iter()
                 .filter(|live| !self.is_absent(live, now_ms))
-                .map(|live| (record_key_bytes(&live.record), live.ver));
+                .map(|live| (record_key_bytes(&live.record), live.ver()));
             let tombstone_entries = stripe
                 .tombstones
                 .iter()
@@ -1954,7 +2133,7 @@ where
                     .map(|live| WireRecord {
                         key: record_key_bytes(&live.record),
                         value: Some(record_value_bytes(&live.record)),
-                        ver: live.ver,
+                        ver: live.ver(),
                         expires_at_ms: from_stored_expiry(live.expires_at_ms),
                     }),
             );
@@ -1987,7 +2166,7 @@ where
                     .filter_map(|live| match &live.state {
                         EntryState::Spilled(loc) => Some((
                             record_key_bytes(&live.record),
-                            live.ver,
+                            live.ver(),
                             from_stored_expiry(live.expires_at_ms),
                             *loc,
                         )),
@@ -2038,13 +2217,13 @@ where
                 EntryState::Resident => records.push(WireRecord {
                     key: key_bytes.clone(),
                     value: Some(record_value_bytes(&live.record)),
-                    ver: live.ver,
+                    ver: live.ver(),
                     expires_at_ms: from_stored_expiry(live.expires_at_ms),
                 }),
                 EntryState::Spilled(loc) => {
                     spilled.push((
                         key_bytes.clone(),
-                        live.ver,
+                        live.ver(),
                         from_stored_expiry(live.expires_at_ms),
                         *loc,
                     ));
@@ -2093,7 +2272,7 @@ where
                 if self.is_absent(live, now_ms) {
                     let part = part_index_from_hash(hash_key_bytes(record_key(&live.record)));
                     self.digest[digest_slot(idx, part)].fetch_xor(
-                        entry_fingerprint(record_key(&live.record), live.ver),
+                        entry_fingerprint(record_key(&live.record), live.ver()),
                         Ordering::Relaxed,
                     );
                     removed_weight += u64::from(live.weight);
@@ -2183,7 +2362,7 @@ where
                     out.push(CompactCandidate {
                         key: decode_key(record_key(&live.record)),
                         key_bytes: record_key_bytes(&live.record),
-                        stale_ver: live.ver,
+                        stale_ver: live.ver(),
                         new_encoded,
                     });
                 }
@@ -2236,14 +2415,14 @@ where
             else {
                 return false;
             };
-            if live.ver != expected_ver || !is_resident(live) {
+            if live.ver() != expected_ver || !is_resident(live) {
                 return false;
             }
             let new_weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
             let old_weight = live.weight;
             live.record = build_resident_record(record_key(&live.record), encoded.as_ref());
             live.weight = new_weight;
-            live.ver = new_ver;
+            live.set_ver(new_ver);
             (old_weight, new_weight)
         };
         self.digest[digest_slot(bucket, part)].fetch_xor(
@@ -2348,7 +2527,7 @@ where
             stripe_idx: bucket,
             hash,
             key_bytes: record_key_bytes(&live.record),
-            ver: live.ver,
+            ver: live.ver(),
             expires_at_ms: from_stored_expiry(live.expires_at_ms),
             encoded,
             weight,
@@ -2420,7 +2599,7 @@ where
         let (removed, _vacant) = occ.remove();
         let part = part_index_from_hash(hash);
         self.digest[digest_slot(bucket, part)].fetch_xor(
-            entry_fingerprint(record_key(&removed.record), removed.ver),
+            entry_fingerprint(record_key(&removed.record), removed.ver()),
             Ordering::Relaxed,
         );
         VictimOutcome::Removed(removed.weight)
@@ -2770,7 +2949,7 @@ where
             None => stripe
                 .live
                 .find(hash, |l| record_key(&l.record) == key_bytes)
-                .map(|l| l.ver),
+                .map(Live::ver),
         };
         if stored_ver.is_some_and(|sv| ver <= sv) {
             return None;
@@ -2878,7 +3057,7 @@ where
             && !self.is_absent(live, now_ms)
             && is_resident(live)
         {
-            let value = decode_value(record_value_bytes(&live.record).as_ref());
+            let value = decode_value(record_value(live.record.as_slice()));
             self.touch(live, now_ms);
             return JoinOutcome::Hit(value);
         }
@@ -2966,16 +3145,15 @@ where
             let weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
             stripe.live.insert_unique(
                 hash,
-                Live {
-                    record: build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
+                Live::new(
+                    build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
                     ver,
-                    expires_at_ms: to_stored_expiry(expires_at_ms),
+                    to_stored_expiry(expires_at_ms),
                     weight,
-                    last_access_ms: AtomicU64::new(now_ms),
+                    now_ms,
                     #[cfg(feature = "spill")]
-                    state: EntryState::Resident,
-                    _marker: PhantomData,
-                },
+                    EntryState::Resident,
+                ),
                 hasher_for,
             );
             if let Some(exp) = expires_at_ms {
@@ -3031,7 +3209,7 @@ where
         match &live.state {
             EntryState::Spilled(loc) => {
                 let loc = *loc;
-                let ver = live.ver;
+                let ver = live.ver();
                 self.touch(live, now_ms);
                 Some((ver, loc))
             }
@@ -3073,7 +3251,7 @@ where
         else {
             return false;
         };
-        if !spilled_is_current(stored_tombstone_ver, Some(live.ver), read_ver) {
+        if !spilled_is_current(stored_tombstone_ver, Some(live.ver()), read_ver) {
             return false;
         }
         if !matches!(live.state, EntryState::Spilled(_)) {
@@ -3126,7 +3304,7 @@ where
                 .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             {
                 Some(live)
-                    if spilled_is_current(stored_tombstone_ver, Some(live.ver), ver)
+                    if spilled_is_current(stored_tombstone_ver, Some(live.ver()), ver)
                         && live.weight == 0
                         && matches!(live.state, EntryState::Resident) =>
                 {
@@ -3160,7 +3338,7 @@ where
                 .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
             {
                 Some(live)
-                    if live.ver == ver
+                    if live.ver() == ver
                         && live.weight == 0
                         && matches!(live.state, EntryState::Resident) =>
                 {
@@ -3202,7 +3380,7 @@ where
                 let (removed_entry, _vacant) = occ.remove();
                 let part = part_index_from_hash(hash);
                 self.digest[digest_slot(bucket, part)].fetch_xor(
-                    entry_fingerprint(record_key(&removed_entry.record), removed_entry.ver),
+                    entry_fingerprint(record_key(&removed_entry.record), removed_entry.ver()),
                     Ordering::Relaxed,
                 );
                 true
@@ -3256,7 +3434,7 @@ where
             for live in &stripe.live {
                 let part = part_index_from_hash(hash_key_bytes(record_key(&live.record)));
                 out[digest_slot(idx, part)] ^=
-                    entry_fingerprint(record_key(&live.record), live.ver);
+                    entry_fingerprint(record_key(&live.record), live.ver());
             }
             for (key_bytes, t) in &stripe.tombstones {
                 let part = part_index_from_hash(hash_key_bytes(key_bytes));
@@ -3284,7 +3462,7 @@ where
                 live_out.push((
                     record_key_bytes(&live.record),
                     record_value_bytes(&live.record),
-                    live.ver,
+                    live.ver(),
                 ));
             }
             for (key_bytes, t) in &stripe.tombstones {
@@ -3378,15 +3556,14 @@ where
             let mut stripe = self.stripes[bucket].write();
             stripe.live.insert_unique(
                 hash,
-                Live {
-                    record: build_key_only_record(key_bytes.as_ref()),
+                Live::new(
+                    build_key_only_record(key_bytes.as_ref()),
                     ver,
-                    expires_at_ms: to_stored_expiry(expires_at_ms),
-                    weight: 0,
-                    last_access_ms: AtomicU64::new(now_ms),
-                    state: EntryState::Spilled(loc),
-                    _marker: PhantomData,
-                },
+                    to_stored_expiry(expires_at_ms),
+                    0,
+                    now_ms,
+                    EntryState::Spilled(loc),
+                ),
                 hasher_for,
             );
             if let Some(exp) = expires_at_ms {
@@ -3428,6 +3605,14 @@ mod tests {
 
     fn key_bytes(key: u32) -> Bytes {
         Bytes::from(postcard::to_stdvec(&key).expect("u32 encodes"))
+    }
+
+    /// [`key_bytes`]'s `String`-keyed counterpart, for a test that needs a
+    /// key whose postcard encoding is long enough to force [`Record`]'s
+    /// heap path.
+    #[cfg(feature = "spill")]
+    fn string_key_bytes(key: &str) -> Bytes {
+        Bytes::from(postcard::to_stdvec(key).expect("a string key encodes"))
     }
 
     fn hlc(wall_ms: u64, node: u64) -> Hlc {
@@ -5338,62 +5523,58 @@ mod tests {
 
     #[test]
     fn is_resident_true_for_resident_false_for_spilled() {
-        let resident = Live::<u32, String> {
-            record: build_resident_record(key_bytes(1).as_ref(), b"v"),
-            ver: hlc(1, 1),
-            expires_at_ms: to_stored_expiry(None),
-            weight: 1,
-            last_access_ms: AtomicU64::new(0),
+        let resident = Live::<u32, String>::new(
+            build_resident_record(key_bytes(1).as_ref(), b"v"),
+            hlc(1, 1),
+            to_stored_expiry(None),
+            1,
+            0,
             #[cfg(feature = "spill")]
-            state: EntryState::Resident,
-            _marker: PhantomData,
-        };
+            EntryState::Resident,
+        );
         assert!(is_resident(&resident));
 
         #[cfg(feature = "spill")]
         {
-            let spilled = Live::<u32, String> {
-                record: build_key_only_record(key_bytes(1).as_ref()),
-                ver: hlc(1, 1),
-                expires_at_ms: to_stored_expiry(None),
-                weight: 0,
-                last_access_ms: AtomicU64::new(0),
-                state: EntryState::Spilled(SpillLoc {
+            let spilled = Live::<u32, String>::new(
+                build_key_only_record(key_bytes(1).as_ref()),
+                hlc(1, 1),
+                to_stored_expiry(None),
+                0,
+                0,
+                EntryState::Spilled(SpillLoc {
                     region: 0,
                     offset: 0,
                     len: 1,
                     generation: 0,
                 }),
-                _marker: PhantomData,
-            };
+            );
             assert!(!is_resident(&spilled));
         }
     }
 
     #[test]
     fn is_spill_candidate_true_only_for_a_resident_entry_with_nonzero_weight() {
-        let resident_hot = Live::<u32, String> {
-            record: build_resident_record(key_bytes(1).as_ref(), b"v"),
-            ver: hlc(1, 1),
-            expires_at_ms: to_stored_expiry(None),
-            weight: 3,
-            last_access_ms: AtomicU64::new(0),
+        let resident_hot = Live::<u32, String>::new(
+            build_resident_record(key_bytes(1).as_ref(), b"v"),
+            hlc(1, 1),
+            to_stored_expiry(None),
+            3,
+            0,
             #[cfg(feature = "spill")]
-            state: EntryState::Resident,
-            _marker: PhantomData,
-        };
+            EntryState::Resident,
+        );
         assert!(is_spill_candidate(&resident_hot));
 
-        let resident_pending = Live::<u32, String> {
-            record: build_resident_record(key_bytes(1).as_ref(), b"v"),
-            ver: hlc(1, 1),
-            expires_at_ms: to_stored_expiry(None),
-            weight: 0,
-            last_access_ms: AtomicU64::new(0),
+        let resident_pending = Live::<u32, String>::new(
+            build_resident_record(key_bytes(1).as_ref(), b"v"),
+            hlc(1, 1),
+            to_stored_expiry(None),
+            0,
+            0,
             #[cfg(feature = "spill")]
-            state: EntryState::Resident,
-            _marker: PhantomData,
-        };
+            EntryState::Resident,
+        );
         assert!(
             !is_spill_candidate(&resident_pending),
             "weight zero means a hand-off to the spill tier is already in flight"
@@ -5401,20 +5582,19 @@ mod tests {
 
         #[cfg(feature = "spill")]
         {
-            let spilled = Live::<u32, String> {
-                record: build_key_only_record(key_bytes(1).as_ref()),
-                ver: hlc(1, 1),
-                expires_at_ms: to_stored_expiry(None),
-                weight: 0,
-                last_access_ms: AtomicU64::new(0),
-                state: EntryState::Spilled(SpillLoc {
+            let spilled = Live::<u32, String>::new(
+                build_key_only_record(key_bytes(1).as_ref()),
+                hlc(1, 1),
+                to_stored_expiry(None),
+                0,
+                0,
+                EntryState::Spilled(SpillLoc {
                     region: 0,
                     offset: 0,
                     len: 1,
                     generation: 0,
                 }),
-                _marker: PhantomData,
-            };
+            );
             assert!(!is_spill_candidate(&spilled));
         }
     }
@@ -5428,9 +5608,8 @@ mod tests {
         ] {
             let record = build_resident_record(key_bytes, value_bytes);
             assert_eq!(record_key(&record), key_bytes);
-            let record_bytes = Bytes::from(record.to_vec());
-            assert_eq!(record_key_bytes(&record_bytes).as_ref(), key_bytes);
-            assert_eq!(record_value_bytes(&record_bytes).as_ref(), value_bytes);
+            assert_eq!(record_key_bytes(&record).as_ref(), key_bytes);
+            assert_eq!(record_value_bytes(&record).as_ref(), value_bytes);
         }
     }
 
@@ -5455,6 +5634,20 @@ mod tests {
         let (key_half, value_half) = split_record(&record);
         assert_eq!(key_half, b"a-key");
         assert!(value_half.is_empty());
+    }
+
+    #[test]
+    fn record_value_matches_split_record_and_is_zero_copy() {
+        for (key_bytes, value_bytes) in [
+            (&b""[..], &b""[..]),
+            (&b"k"[..], &b"v"[..]),
+            (&b"a-longer-key"[..], &b"a-longer-value-too"[..]),
+        ] {
+            let record = build_resident_record(key_bytes, value_bytes);
+            let value = record_value(&record);
+            assert_eq!(value, split_record(&record).1);
+            assert_eq!(value, value_bytes);
+        }
     }
 
     #[test]
@@ -5488,14 +5681,45 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "spill"))]
-    fn live_size_is_80_bytes_without_spill() {
-        assert_eq!(std::mem::size_of::<Live<String, String>>(), 80);
+    fn live_size_is_72_bytes_without_spill() {
+        assert_eq!(std::mem::size_of::<Live<String, String>>(), 72);
     }
 
+    /// The flattened `wall_ms`/`node`/`logical` fields save 8 bytes over
+    /// the unflattened `Hlc` field in the non-spill layout (see
+    /// `live_size_is_72_bytes_without_spill`), but that saving lands in
+    /// slack `EntryState` already consumes here: `EntryState` has no niche
+    /// to exploit in its `Spilled(SpillLoc)` payload (all four `SpillLoc`
+    /// fields are plain `u32`s), so it costs a 1-byte tag plus 3 bytes of
+    /// padding to realign to `SpillLoc`'s 4-byte alignment, 20 bytes total,
+    /// which rounds `Live`'s total size back up to 96 regardless. Pinned at
+    /// the true, measured value, not the flatten's cross-feature arithmetic
+    /// in isolation.
     #[test]
     #[cfg(feature = "spill")]
     fn live_size_is_96_bytes_with_spill() {
         assert_eq!(std::mem::size_of::<Live<String, String>>(), 96);
+    }
+
+    #[test]
+    fn live_ver_round_trips_through_set_ver() {
+        let mut live = Live::<u32, String>::new(
+            build_resident_record(key_bytes(1).as_ref(), b"v"),
+            hlc(1, 1),
+            to_stored_expiry(None),
+            1,
+            0,
+            #[cfg(feature = "spill")]
+            EntryState::Resident,
+        );
+        assert_eq!(live.ver(), hlc(1, 1));
+        let new_ver = Hlc {
+            wall_ms: 9,
+            logical: 3,
+            node: NodeId::merge_derived(7),
+        };
+        live.set_ver(new_ver);
+        assert_eq!(live.ver(), new_ver);
     }
 
     #[test]
@@ -6008,13 +6232,16 @@ mod tests {
         /// `SpillSink::abandon`/`SpillSink::install` directly, the same way
         /// this module already drives `reclaim` directly, with no real disk
         /// or flusher thread needed.
-        fn simulate_pending_handoff(
-            engine: &Engine<u32, String>,
+        fn simulate_pending_handoff<K, V>(
+            engine: &Engine<K, V>,
             bucket: usize,
             hash: u64,
             kb: &Bytes,
             weight: u32,
-        ) {
+        ) where
+            K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+            V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+        {
             {
                 let mut stripe = engine.stripe_lock(bucket).write();
                 let live = stripe
@@ -6168,9 +6395,16 @@ mod tests {
 
         #[test]
         fn install_copies_the_key_into_a_fresh_allocation_instead_of_slicing() {
-            let engine = engine_u32_string(u64::MAX, None);
-            let key = 1u32;
-            let kb = key_bytes(key);
+            // A key over INLINE_CAP bytes forces `Record`'s heap path: only
+            // there is a pointer-identity check meaningful. An inline
+            // record's bytes live inside `Live`'s own memory, so the
+            // pointer before and after `install` can legitimately alias
+            // even though the bytes were freshly copied: see the
+            // `..._reuses_the_slot_with_no_heap_allocation` companion test
+            // below for that case.
+            let engine = Engine::<String, String>::new(u64::MAX, None, None);
+            let key = "k".repeat(40);
+            let kb = string_key_bytes(&key);
             let hash = hash_key_bytes(kb.as_ref());
             let bucket = stripe_index_from_hash(hash);
             let ver = hlc(1, 1);
@@ -6205,6 +6439,37 @@ mod tests {
                 "install builds a fresh key-only allocation rather than slicing the old \
                  resident record: a slice would share its refcount and keep the value bytes \
                  physically resident in RAM"
+            );
+        }
+
+        #[test]
+        fn install_of_an_inline_record_reuses_the_slot_with_no_heap_allocation() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let ver = hlc(1, 1);
+            let _ = put(&engine, key, kb.clone(), "value".to_string(), ver, None, 0);
+            simulate_pending_handoff(&engine, bucket, hash, &kb, 1);
+
+            let installed = SpillSink::install(&engine, bucket, &kb, hash, ver, loc(0, 0, 4, 0), 1);
+            assert!(installed);
+
+            let stripe = engine.stripe_lock(bucket).read();
+            let live = stripe
+                .live
+                .iter()
+                .find(|l| record_key(&l.record) == kb.as_ref())
+                .expect("entry is present");
+            assert!(
+                matches!(live.record, Record::Inline { .. }),
+                "a key-only record for a small u32 key stays inline: no heap allocation"
+            );
+            assert_eq!(record_key(&live.record), kb.as_ref());
+            assert!(
+                record_value(&live.record).is_empty(),
+                "no old value bytes are retained anywhere"
             );
         }
 
