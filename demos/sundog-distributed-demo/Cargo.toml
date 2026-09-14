@@ -27,3 +27,6 @@ ratatui = "0.30.2"
 sundog = { version = "0.6.1", path = "../../sundog" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "io-std", "signal"] }
 tracing-subscriber = "0.3.23"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7.0"

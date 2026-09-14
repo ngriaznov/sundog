@@ -31,3 +31,6 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 # both explicitly.
 spill = ["sundog/spill"]
 prometheus = ["sundog/prometheus"]
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7.0"

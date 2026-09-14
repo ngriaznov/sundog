@@ -95,6 +95,14 @@ async fn digest_it(cache: &Cache<String, String>) -> u64 {
     digest
 }
 
+/// jemalloc instead of the platform allocator, everywhere but MSVC
+/// Windows where it does not build: under bulk ingest and rebalance glibc
+/// retains about twice the resident set the live entries need, and a
+/// size-class allocator returns that memory and roughly doubles ingest.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {

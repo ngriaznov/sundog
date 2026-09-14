@@ -506,7 +506,11 @@ batches spread round-robin across the live nodes via `Cache::insert_many`
 before the write load starts, printing preload throughput and this
 process's RSS when the preload finishes. Flags: `--owners <N>` (live owners per bucket,
 default 2), `--cluster <NAME>`, `--write-interval-ms <N>`,
-`--gossip-base-port <PORT>`; `--help` lists everything. The TUI shows a
+`--gossip-base-port <PORT>`, `--value-bytes <N>` to pad every value,
+`--max-entries <N>` with `--spill-dir <PATH>` for a per-node RAM cap over a
+spill tier (built with `--features spill`), and `--metrics` for an
+in-process `sundog_*` status line every interval during a headless run
+(built with `--features prometheus`); `--help` lists everything. The TUI shows a
 progress bar during preload, then per node: entry count, an estimated
 owned-bucket share, warmth, and restarts, plus cluster-wide fetch hit/miss/
 error counts and latency. Same keys as the chaos demo: arrow keys or `j`/`k`
@@ -525,6 +529,16 @@ against `owners * surviving keys` under a bound wide enough for
 surviving keys against their expected value, and prints one report line
 each for the preload, the fetch counters, the sample check, and
 convergence, exiting nonzero on either a divergence or a failed sample.
+
+Both the demo and the test node set jemalloc as their global allocator on
+every target but MSVC Windows. The library itself sets none, so a service
+embedding it chooses: on a 4M-key three-node run the demo settles at 1.7
+GiB under jemalloc against 3.2 GiB under glibc's default arenas, which
+keep the preload's and anti-entropy's transient buffers resident, and
+bulk ingest runs about twice as fast. Entries themselves cost 72 bytes
+plus the hash slot and, for a key and value under 30 encoded bytes
+together, no allocation; `SUNDOG_BENCH=1 cargo test --release -p sundog
+--test entry_diet_bench -- --nocapture` measures both on your hardware.
 
 ## MSRV
 
