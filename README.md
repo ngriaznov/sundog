@@ -333,7 +333,9 @@ A `Mode::Distributed` cache adds seven more:
 
 - `sundog_owned_buckets{cache}`, this node's current bucket count.
 - `sundog_rebalance_buckets_total{cache, direction}`, buckets rebalance
-  pulled in or released out.
+  pulled in or released out, credited per bucket the moment its own pull
+  lands or its own release fires, not batched behind the rest of a
+  multi-bucket transfer.
 - `sundog_rebalance_pull_timeouts_total{cache}`, warm-ups that gave up on a
   bucket pull timing out repeatedly and opened warm with whatever landed,
   leaving the rest to anti-entropy.
@@ -478,10 +480,10 @@ headless at 4M keys across three nodes with an 800k-entry RAM cap per node
 over a spill tier, checking the resulting `--report-json` output against
 [`ops/scale-gate.json`](ops/scale-gate.json)'s thresholds for steady and
 peak RSS, deferred spill drops, pull timeouts, fetch p99 latency,
-convergence, and a fully passing sample check via `--gate`. `workflow_dispatch`
-reruns the same shape on demand with its own key count, duration, RAM cap,
-and runner inputs, for a one-off run at a different scale. Both the report
-and the run log upload as workflow artifacts.
+convergence, and a fully passing sample check via `--gate`.
+`workflow_dispatch` reruns the same shape on demand with its own key count,
+duration, RAM cap, and runner inputs, for a one-off run at a different
+scale. Both the report and the run log upload as workflow artifacts.
 
 ## Chaos demo
 
@@ -536,9 +538,12 @@ node and watch the survivors' owned-bucket counts and entry counts climb as
 they pull its buckets; restart it and watch it take its share back.
 
 `--headless <SECS>` preloads, runs the load for `SECS` seconds (killing one
-node at the midpoint and restarting it three-quarters through, to exercise a
-real rebalance), then pauses it, polls the sum of live nodes' entry counts
-against `owners * surviving keys` under a bound wide enough for
+node at the midpoint and restarting it after a downtime of `min(SECS / 4,
+tombstone_ttl / 2)`, so the node comes back after a downtime bounded by
+half the tombstone TTL, letting a removed key's tombstone still outlive
+the restart, to exercise a real rebalance), then pauses it, polls the sum of
+live nodes' entry counts against `owners * surviving keys` under a bound
+wide enough for
 `distributed_disown_grace_rounds` to run out, verifies a random sample of
 surviving keys against their expected value, and prints one report line
 each for the preload, the fetch counters, the sample check, and

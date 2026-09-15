@@ -75,8 +75,11 @@ pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
 /// Headroom reserved below [`MAX_FRAME`] for the `Msg::StChunk` envelope around
-/// a snapshot chunk's records.
-const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
+/// a snapshot chunk's records. `pub(crate)` so
+/// [`crate::config::ClusterConfig::rebalance_chunk_bytes_value`] clamps
+/// against the same headroom a bucket sub-batch's `Msg::StBucketChunk`
+/// envelope needs.
+pub(crate) const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 
 /// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in a
 /// `Msg::StChunk`. Splits on cumulative wire-encoded size as well as
@@ -645,7 +648,7 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// Closes this shard's spill tier, if the `spill` feature is compiled in
-    /// and one is attached via `CacheBuilder::spill`: stops accepting
+    /// and one was ever attached via `CacheBuilder::spill`: stops accepting
     /// new spills and drops the flusher thread's channel sender. A no-op
     /// otherwise. Called by `crate::cache::Cache::close` and by
     /// `crate::cluster::Cluster::shutdown` for every cache still registered
@@ -3003,8 +3006,8 @@ where
         }
     }
 
-    /// Whether this shard's attached spill tier is closed by
-    /// [`Shard::close_spill`], or none is attached. `false` only while a
+    /// Whether this shard's attached spill tier has been closed by
+    /// [`Shard::close_spill`], or there never was one. `false` only while a
     /// tier is attached and still open. Test-facing: lets a test observe
     /// that [`Cache::close`] stopped the tier a surviving clone still
     /// shares, without needing to drive an eviction and infer it

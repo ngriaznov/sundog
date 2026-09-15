@@ -105,6 +105,29 @@ All notable changes to this project are documented in this file. Format follows
   timeouts, fetch p99 at most 100 milliseconds, full convergence, and a
   fully passing sample check. It uploads the run's `scale-report.json` and
   log as workflow artifacts either way.
+- **Chunked bucket pull with independent per-bucket release**: a rebalance
+  donor sub-batches each bucket's key list by `rebalance_chunk_bytes` (a new
+  `ClusterConfig` field, 1 MiB default, clamped below `MAX_FRAME`) instead
+  of materializing a whole bucket's records at once, bounding donor RAM to
+  that budget times `rebalance_concurrency` regardless of bucket size.
+  `wire::PROTOCOL_VERSION` bumps to 4, adding `Msg::StBucketDone` and
+  `Msg::StBucketAck`, gated on `wire::PROTOCOL_ST_BUCKET_DONE_ACK`; a
+  protocol-3 peer on either side of a connection sees byte-for-byte today's
+  traffic. The donor signals a bucket's completion the instant its own last
+  chunk goes out, and the receiver clears that bucket's cold mark and
+  serves it immediately rather than waiting on the rest of its transfer
+  group. The receiver's `Msg::StBucketAck`, trusted for a new bounded
+  `rebalance_ack_window` (default `2 * ae_interval`), lets the donor skip a
+  redundant confirming anti-entropy round before release; `disown_grace`
+  stays the hard floor underneath either way, so a bucket is never
+  released before it.
+### Changed
+
+- `sundog_rebalance_buckets_total{cache, direction="in"}` is now credited
+  per bucket, the moment its own pull lands (via the new
+  `Msg::StBucketDone`/`Msg::StBucketAck` signaling or, against an older
+  peer, its transfer group's completion), instead of once for a whole
+  multi-bucket transfer only after every bucket in it has landed.
 
 ## [0.6.1] – 2026-09-12
 

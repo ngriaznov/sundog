@@ -236,6 +236,13 @@ impl OwnershipView {
 #[derive(Debug, Clone)]
 pub struct OwnershipTracker {
     view: watch::Receiver<Arc<OwnershipView>>,
+    /// This tracker's very first computed view, from the moment
+    /// [`OwnershipTracker::seed`] built it. Distinct from
+    /// [`OwnershipTracker::current`], which a concurrent
+    /// `refresh_task` publish can already have moved past by the time any
+    /// particular caller reads it. See [`OwnershipTracker::baseline`]'s own
+    /// docs for why a reader needs the distinction.
+    baseline: Arc<OwnershipView>,
 }
 
 impl OwnershipTracker {
@@ -254,8 +261,9 @@ impl OwnershipTracker {
     ) -> (Self, watch::Sender<Arc<OwnershipView>>) {
         let eligible = eligible_owners(self_node, peers, modes, cache, k);
         let view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+        let baseline = Arc::clone(&view);
         let (tx, rx) = watch::channel(view);
-        (Self { view: rx }, tx)
+        (Self { view: rx, baseline }, tx)
     }
 
     /// The current view: a `watch::Receiver::borrow()` plus one cheap `Arc`
@@ -264,6 +272,27 @@ impl OwnershipTracker {
     #[must_use]
     pub fn current(&self) -> Arc<OwnershipView> {
         Arc::clone(&self.view.borrow())
+    }
+
+    /// This tracker's original seeded view, pinned for its whole lifetime
+    /// regardless of how many views `refresh_task` has since published.
+    /// `cluster::rebalance::rebalance_task` anchors its very first
+    /// lost-bucket diff (`cluster::rebalance::plan_view_change`) here
+    /// instead of on a live re-borrow of the shared view channel: a
+    /// `Mode::Distributed` `open()` racing gossip convergence can seed this
+    /// tracker with a transient "this node owns every bucket" view, warm-
+    /// reload or pull data into buckets under it, and have `refresh_task`
+    /// publish the real, corrected view before `rebalance_task` ever reads
+    /// the channel -- at which point a live re-borrow would already show
+    /// the corrected view with nothing to compare it against, so a bucket
+    /// only the seed view ever called "owned" would never be recognized as
+    /// lost, and its data would sit unreleased forever. Diffing against
+    /// this instead makes that recognition unconditional: it happens the
+    /// moment `rebalance_task` observes any later view, no matter how much
+    /// gossip had already converged by the time it started watching.
+    #[must_use]
+    pub fn baseline(&self) -> Arc<OwnershipView> {
+        Arc::clone(&self.baseline)
     }
 
     /// A fresh subscription for a caller that awaits the next change, such
@@ -312,6 +341,9 @@ impl ResidencySet {
     }
 
     /// Clears the cold mark from each of `buckets`: their pull landed.
+    /// Every production call site that decides a bucket is ready to serve
+    /// goes through [`ResidencySet::mark_serving`] instead, which stays
+    /// separately reachable as its own named decision point.
     pub(crate) fn clear_cold(&self, buckets: &[u16]) {
         let mut cold = self.cold.write();
         for bucket in buckets {
@@ -320,9 +352,32 @@ impl ResidencySet {
     }
 
     /// Clears every cold mark: the warm-up gave up, so what is here is what
-    /// there is.
+    /// there is. [`ResidencySet::mark_all_serving`] is the production entry
+    /// point for this; see its docs for why.
     pub(crate) fn clear_all_cold(&self) {
         self.cold.write().clear();
+    }
+
+    /// Clears the cold mark from each of `buckets`: the single point where
+    /// this node starts trusting a local miss in these buckets. Every site
+    /// that decides a bucket is ready to serve goes through this method: a
+    /// donor pull landing (`crate::cluster::rebalance::try_donor_buckets`,
+    /// `crate::cluster::rebalance::pull_one_group`'s own success case),
+    /// every donor found cold or unreachable with nothing warm anywhere to
+    /// pull (`pull_one_group`'s `ALL_COLD_PASSES` give-up), and a bucket
+    /// found to have no live co-owner at all
+    /// (`crate::cluster::rebalance::PullRequest::run`'s and
+    /// `rebalance_task`'s "alone" cases).
+    pub(crate) fn mark_serving(&self, buckets: &[u16]) {
+        self.clear_cold(buckets);
+    }
+
+    /// The wholesale analogue of [`ResidencySet::mark_serving`], for
+    /// `crate::cluster::rebalance::warm_up_task`'s `WarmAnyway` give-up
+    /// path: after repeated whole-pull timeouts, every bucket this
+    /// `ResidencySet` still marks cold is declared servable at once.
+    pub(crate) fn mark_all_serving(&self) {
+        self.clear_all_cold();
     }
 
     /// Whether `bucket` is owned here but not yet pulled.
@@ -744,6 +799,48 @@ mod tests {
     }
 
     #[test]
+    fn ownership_tracker_baseline_stays_the_seeded_view_even_after_a_later_publish() {
+        let self_node = NodeId::from(1);
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let cache = SmolStr::new("cache");
+        // Seeded alone: the sole eligible node owns every bucket, exactly
+        // the transient view a `Mode::Distributed` `open()` racing gossip
+        // convergence computes.
+        let (tracker, tx) = OwnershipTracker::seed(self_node, &[], &HashMap::new(), &cache, k);
+        let baseline_hash = tracker.baseline().view_hash();
+        assert_eq!(
+            tracker.baseline().owned_buckets().count(),
+            BUCKET_COUNT,
+            "the seeded, lone-node baseline owns every bucket"
+        );
+
+        // A later publish corrects the view down to a genuine two-node
+        // split, simulating `refresh_task` racing ahead of any reader that
+        // would otherwise re-derive its own starting point from a live
+        // borrow of the channel.
+        let corrected = Arc::new(OwnershipView::compute(
+            self_node,
+            vec![self_node, NodeId::from(2)],
+            k,
+        ));
+        let corrected_hash = corrected.view_hash();
+        tx.send(Arc::clone(&corrected))
+            .expect("receiver still alive");
+
+        assert_eq!(
+            tracker.current().view_hash(),
+            corrected_hash,
+            "current tracks the latest publish"
+        );
+        assert_eq!(
+            tracker.baseline().view_hash(),
+            baseline_hash,
+            "baseline stays pinned to the tracker's original seeded view regardless of later \
+             publishes"
+        );
+    }
+
+    #[test]
     fn residency_set_is_releasing_tracks_marked_buckets() {
         let set = ResidencySet::new();
         assert!(!set.is_releasing(3));
@@ -771,6 +868,31 @@ mod tests {
         assert!(set.is_cold(1) && !set.is_cold(2) && set.is_cold(3));
         set.clear_all_cold();
         assert!(!set.is_cold(1) && !set.is_cold(3));
+    }
+
+    #[test]
+    fn residency_set_mark_serving_clears_the_cold_mark() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1, 2]);
+        assert!(set.is_cold(1) && set.is_cold(2));
+
+        set.mark_serving(&[1, 2]);
+        assert!(!set.is_cold(1) && !set.is_cold(2));
+    }
+
+    #[test]
+    fn residency_set_mark_all_serving_clears_every_cold_mark() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1, 2, 3]);
+        set.mark_releasing(&[9]);
+
+        set.mark_all_serving();
+
+        assert!(!set.is_cold(1) && !set.is_cold(2) && !set.is_cold(3));
+        assert!(
+            set.is_releasing(9),
+            "mark_all_serving touches only the cold mark"
+        );
     }
 
     #[test]

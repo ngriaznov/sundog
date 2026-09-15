@@ -798,7 +798,7 @@ impl Drop for Reservation<'_> {
 }
 
 impl SpillTier {
-    /// Opens, or reopens, the tier at `cfg.dir.join(cache_name)`.
+    /// Opens the tier at `cfg.dir.join(cache_name)`.
     ///
     /// Every `*.reg` file already in that directory is removed, then
     /// `region_count_for(cfg.capacity_bytes, cfg.region_bytes_value())`
@@ -1284,8 +1284,8 @@ impl SpillTier {
     /// `recv()` loop drains whatever is already queued and then exits on its
     /// own. Never joins the flusher thread: this must be safe to call from
     /// an async context without blocking it. Region file handles close via
-    /// `Drop` once every clone of the shared inner state is gone. Nothing is
-    /// fsync'd or persisted, matching the tier's fully lossy contract.
+    /// `Drop` once every clone of the shared inner state is gone.
+    ///
     pub(crate) fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         *self.sender.lock() = None;
@@ -1334,12 +1334,14 @@ fn build_header(job: &SpillJob, key_len: u32, value_len: u32) -> SpillRecordHead
     }
 }
 
-/// Parses `buf`, one record's bytes as read off disk, into
-/// [`SpilledBytes`], or `None` for anything that doesn't check out: a short
-/// buffer, a bad magic, a length mismatch, or a checksum mismatch. Every
-/// one of these is treated identically. A corrupted or torn record reads
-/// like one that is never there.
-fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
+/// Parses `buf`, one record's bytes as read off disk, into its key bytes
+/// alongside [`SpilledBytes`], or `None` for anything that doesn't check
+/// out: a short buffer, a bad magic, a length mismatch, or a checksum
+/// mismatch. Every one of these is treated identically. A corrupted or torn
+/// record reads like one that is never there. [`decode_record`] wraps this,
+/// discarding the key half, for [`SpillTier::read_at`]'s caller, which
+/// already knows which key it asked for.
+fn decode_record_with_key(buf: &[u8]) -> Option<(Bytes, SpilledBytes)> {
     let (header, rest) = SpillRecordHeader::read_from_prefix(buf).ok()?;
     if header.magic != SPILL_MAGIC {
         return None;
@@ -1354,15 +1356,27 @@ fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
         return None;
     }
     let expires_at_ms = (header.expires_at_ms != u64::MAX).then_some(header.expires_at_ms);
-    Some(SpilledBytes {
-        ver: Hlc {
-            wall_ms: header.wall_ms,
-            logical: header.logical,
-            node: NodeId::from(header.node),
+    Some((
+        Bytes::copy_from_slice(key_bytes),
+        SpilledBytes {
+            ver: Hlc {
+                wall_ms: header.wall_ms,
+                logical: header.logical,
+                node: NodeId::from(header.node),
+            },
+            expires_at_ms,
+            encoded: Bytes::copy_from_slice(value_bytes),
         },
-        expires_at_ms,
-        encoded: Bytes::copy_from_slice(value_bytes),
-    })
+    ))
+}
+
+/// Parses `buf`, one record's bytes as read off disk, into
+/// [`SpilledBytes`], or `None` for anything that doesn't check out: a short
+/// buffer, a bad magic, a length mismatch, or a checksum mismatch. Every
+/// one of these is treated identically. A corrupted or torn record reads
+/// like one that is never there.
+fn decode_record(buf: &[u8]) -> Option<SpilledBytes> {
+    decode_record_with_key(buf).map(|(_, sb)| sb)
 }
 
 fn flusher_loop(inner: &Arc<Inner>, rx: &Receiver<SpillJob>, sink: &Weak<dyn SpillSink>) {
@@ -1832,6 +1846,60 @@ mod tests {
     #[test]
     fn spilled_is_current_false_when_nothing_live() {
         assert!(!spilled_is_current(None, None, hlc(10, 0)));
+    }
+
+    /// Builds one record's raw on-disk bytes, `[SpillRecordHeader][key][value]`,
+    /// the same layout [`write_segment`] produces, with no file or tier
+    /// involved: for every test that needs to hand crafted region bytes to
+    /// [`decode_record_with_key`] directly.
+    fn raw_record(key: &[u8], value: &[u8], ver: Hlc, expires_at_ms: Option<u64>) -> Vec<u8> {
+        let job = SpillJob {
+            stripe_idx: 0,
+            hash: 0,
+            key_bytes: Bytes::copy_from_slice(key),
+            ver,
+            expires_at_ms,
+            encoded: Bytes::copy_from_slice(value),
+            weight: 1,
+            admitted_bytes: 0,
+        };
+        let key_len = u32::try_from(key.len()).unwrap();
+        let value_len = u32::try_from(value.len()).unwrap();
+        let header = build_header(&job, key_len, value_len);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    // --- decode_record_with_key ---
+
+    #[test]
+    fn decode_record_with_key_round_trips_the_key_alongside_the_value() {
+        let ver = hlc(7, 2);
+        let buf = raw_record(b"a-key", b"a-value", ver, Some(555));
+
+        let (key, sb) = decode_record_with_key(&buf).expect("a well-formed record decodes");
+        assert_eq!(key.as_ref(), b"a-key");
+        assert_eq!(sb.ver, ver);
+        assert_eq!(sb.expires_at_ms, Some(555));
+        assert_eq!(sb.encoded.as_ref(), b"a-value");
+    }
+
+    #[test]
+    fn decode_record_with_key_rejects_a_bit_flipped_checksum() {
+        let mut buf = raw_record(b"k", b"v", hlc(1, 0), None);
+        let last = buf.len() - 1;
+        buf[last] ^= 0x01;
+        assert!(decode_record_with_key(&buf).is_none());
+    }
+
+    #[test]
+    fn decode_record_still_discards_the_key_exactly_as_before() {
+        let buf = raw_record(b"k", b"v", hlc(1, 0), None);
+        let sb = decode_record(&buf).expect("a well-formed record decodes");
+        assert_eq!(sb.encoded.as_ref(), b"v");
     }
 
     // --- SpillConfig / validate ---

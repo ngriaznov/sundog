@@ -280,8 +280,10 @@ fn print_help() {
          \x20   --nodes <N>                 number of in-process nodes (default 5)\n\
          \x20   --keys <N>                  preloaded key-space size (default 2000000)\n\
          \x20   --owners <N>                live owners per bucket, >= 2 (default 2)\n\
-         \x20   --headless <SECS>           run without a TUI for SECS seconds, then print\n\
-         \x20                               a convergence report and exit nonzero on divergence\n\
+         \x20   --headless <SECS>           run without a TUI for SECS seconds, killing and\n\
+         \x20                               restarting one node after half the tombstone TTL at\n\
+         \x20                               most, then print a convergence report and exit\n\
+         \x20                               nonzero on divergence\n\
          \x20   --cluster <NAME>            cluster name (default sundog-demo-distributed)\n\
          \x20   --write-interval-ms <N>     delay between load ticks (default 50)\n\
          \x20   --gossip-base-port <PORT>   first loopback gossip port (default random)\n\

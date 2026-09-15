@@ -123,6 +123,13 @@ struct ClusterInner {
     node: NodeId,
     name: SmolStr,
     membership: Membership,
+    /// Whether `ClusterBuilder::build` resolved a fixed, nonempty seed
+    /// list. A `Mode::Distributed` cache's `open()` waits briefly for a
+    /// first peer only when this is `true` and `Cluster::peers` is still
+    /// empty, since a seedless cluster (mDNS with nothing found yet, or a
+    /// deliberately standalone node) is a legitimate one-node cluster, not
+    /// a membership race to wait out. See `cache::should_await_first_peer`.
+    has_seeds: bool,
     mesh: Mesh,
     shards: ShardRegistry,
     /// The [`Mode`] each open cache opens under; [`mode_conflict_task`]'s
@@ -332,6 +339,12 @@ impl Cluster {
     #[must_use]
     pub fn peers(&self) -> Vec<Peer> {
         self.inner.membership.peers().borrow().clone()
+    }
+
+    /// Whether this cluster was built with a fixed, nonempty seed list; see
+    /// [`ClusterInner::has_seeds`].
+    pub(crate) fn has_seeds(&self) -> bool {
+        self.inner.has_seeds
     }
 
     /// Whether this node is ready to serve: the data-plane listener is bound
@@ -596,6 +609,7 @@ impl ClusterBuilder {
         let hostname = local_hostname();
         let node_name = NodeName::new(&hostname, node);
         let discovery = resolve_discovery(discovery, &name, &node_name);
+        let has_seeds = discovery.has_seeds();
 
         let data_bind_addr = reserve_data_bind_addr(config.data_bind_addr).await?;
         let advertise_ip = crate::membership::advertise_ip_for(&config, data_bind_addr.ip());
@@ -624,6 +638,7 @@ impl ClusterBuilder {
             ae_part_min_bucket: config.ae_part_min_bucket,
             ae_sketch_min_bucket: config.ae_sketch_min_bucket,
             ae_sketch_cells: config.ae_sketch_cells,
+            rebalance_chunk_bytes: config.rebalance_chunk_bytes_value(),
         });
         let (mesh, inbound_rx) =
             Mesh::spawn(data_bind_addr, node, incarnation, &config, handler).await?;
@@ -633,6 +648,7 @@ impl ClusterBuilder {
                 node,
                 name: name.clone(),
                 membership,
+                has_seeds,
                 mesh,
                 shards,
                 local_modes,
@@ -683,7 +699,15 @@ fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
 
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:
 /// `max_frame` against the wire codec's hard cap and the sketch frame size
-/// it implies.
+/// it implies. `rebalance_chunk_bytes` and `rebalance_ack_window` are
+/// deliberately not checked here even though each has a bound of its own
+/// ([`ClusterConfig::rebalance_chunk_bytes_value`],
+/// [`ClusterConfig::rebalance_ack_window_max`]): both bounds are clamps
+/// applied at the point of use, not build-time rejections, precisely so a
+/// config that intentionally tunes `ae_interval` (shrinking
+/// `rebalance_ack_window_max` along with it, since it is derived from
+/// `ae_interval`) without separately re-tuning `rebalance_ack_window` still
+/// builds -- the accessor keeps the effective value in range regardless.
 fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
     if config.max_frame > wire::MAX_FRAME {
         return Err(JoinError::InvalidConfig(format!(
@@ -806,6 +830,11 @@ struct ClusterRequestHandler {
     ae_part_min_bucket: usize,
     ae_sketch_min_bucket: usize,
     ae_sketch_cells: usize,
+    /// [`crate::config::ClusterConfig::rebalance_chunk_bytes_value`],
+    /// resolved once at construction: the target size `st_bucket_chunks`
+    /// sub-batches one bucket's key list into before each `records_for`
+    /// call.
+    rebalance_chunk_bytes: u64,
 }
 
 impl ClusterRequestHandler {
@@ -996,33 +1025,76 @@ impl RequestHandler for ClusterRequestHandler {
         &self,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxStream<'static, Vec<WireRecord>> {
+    ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
         let Some(shard) = self.lookup(&cache) else {
             return stream::empty().boxed();
         };
-        // One bucket materialized at a time: a pull for a whole owner-set
-        // group never holds more than a bucket's records in memory here.
-        Box::pin(
-            stream::iter(buckets)
-                .then(move |bucket| {
-                    let shard = Arc::clone(&shard);
-                    async move {
-                        let entries = shard.entries_for_buckets(vec![bucket]).await;
-                        let keys: Vec<Bytes> = entries
-                            .into_iter()
-                            .flat_map(|(_, entries)| entries.into_iter().map(|kv| kv.key))
-                            .collect();
-                        let recs = shard.records_for(keys).await;
-                        chunk_records_for_snapshot(recs)
-                    }
+        let chunk_bytes = self.rebalance_chunk_bytes;
+        // One `rebalance_chunk_bytes`-estimated sub-batch of one bucket's
+        // records resident at a time: a pull for a whole owner-set group
+        // never holds more than that much in memory here, not a whole
+        // bucket's. `records_for` (the call that reads value bytes, from
+        // spill when attached) runs once per sub-batch instead of once for
+        // the whole bucket; `chunk_records_for_snapshot` still splits each
+        // sub-batch's records on the wire-frame cap regardless of
+        // `rebalance_chunk_bytes`, so `MAX_FRAME` stays the hard ceiling.
+        Box::pin(stream::iter(buckets).flat_map(move |bucket| {
+            let keys_shard = Arc::clone(&shard);
+            let fetch_shard = Arc::clone(&shard);
+            let keys_fut = async move {
+                let entries = keys_shard.entries_for_buckets(vec![bucket]).await;
+                let keys: Vec<Bytes> = entries
+                    .into_iter()
+                    .flat_map(|(_, entries)| entries.into_iter().map(|kv| kv.key))
+                    .collect();
+                st_bucket_key_sub_batches(keys, chunk_bytes)
+            };
+            stream::once(keys_fut)
+                .flat_map(move |sub_batches| {
+                    let fetch_shard = Arc::clone(&fetch_shard);
+                    stream::iter(sub_batches).then(move |sub_batch| {
+                        let fetch_shard = Arc::clone(&fetch_shard);
+                        async move { fetch_shard.records_for(sub_batch).await }
+                    })
                 })
-                .flat_map(stream::iter),
-        )
+                .flat_map(|recs| stream::iter(chunk_records_for_snapshot(recs)))
+                .map(move |chunk| (bucket, chunk))
+        }))
     }
 }
 
 fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
     shards.read_shards().get(cache).cloned()
+}
+
+/// Splits one bucket's `keys` into groups whose *estimated* encoded size is
+/// `<= chunk_bytes`, so [`ClusterRequestHandler::st_bucket_chunks`] calls
+/// `records_for` once per group instead of once for the whole bucket. The
+/// estimate is `wire::RECORD_HEADER_LEN + key.len()` per key: the only size
+/// information available before `records_for` reads each value, the same
+/// gap [`chunk_records_for_snapshot`] closes afterward with the real,
+/// value-inclusive size once the records are in hand. A key whose own
+/// estimate already meets or exceeds `chunk_bytes` still gets a one-key
+/// group of its own rather than being dropped or blocking every key behind
+/// it; `chunk_bytes` of `0` behaves the same way, one key per group.
+fn st_bucket_key_sub_batches(keys: Vec<Bytes>, chunk_bytes: u64) -> Vec<Vec<Bytes>> {
+    let mut sub_batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size: u64 = 0;
+    for key in keys {
+        let key_size = (wire::RECORD_HEADER_LEN + key.len()) as u64;
+        let over_budget = current_size.saturating_add(key_size) > chunk_bytes;
+        if over_budget && !current.is_empty() {
+            sub_batches.push(std::mem::take(&mut current));
+            current_size = 0;
+        }
+        current_size += key_size;
+        current.push(key);
+    }
+    if !current.is_empty() {
+        sub_batches.push(current);
+    }
+    sub_batches
 }
 
 /// Republishes [`Membership::peers`] changes as [`Mesh::update_peers`] calls.
@@ -1313,6 +1385,8 @@ async fn inbound_loop(
                 | Msg::StBuckets { .. }
                 | Msg::StBucketChunk { .. }
                 | Msg::StaleView { .. }
+                | Msg::StBucketDone { .. }
+                | Msg::StBucketAck { .. }
                 | Msg::ReqDone => {}
             }
         }
@@ -1505,6 +1579,7 @@ fn entry_count_f64(count: u64) -> f64 {
 #[cfg(all(test, not(feature = "sim")))]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::test_support::{
@@ -1692,6 +1767,36 @@ mod tests {
             matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("ae_sketch_cells")),
             "{err:?}"
         );
+    }
+
+    /// `validate_config` deliberately does not reject a `rebalance_ack_window`
+    /// past its own `rebalance_ack_window_max()`: unlike `max_frame`, whose
+    /// bound is a hard wire cap, `rebalance_ack_window`'s bound moves with
+    /// `ae_interval`, and plenty of tests across this crate shrink
+    /// `ae_interval` alone (for speed) without separately re-tuning
+    /// `rebalance_ack_window` to match. A build-time rejection here would
+    /// break every one of them; `rebalance_ack_window_value` clamping the
+    /// effective value at the point of use is the actual, load-bearing
+    /// guard (`config::rebalance_ack_window_value_is_bounded_by_disown_grace_rounds_times_ae_interval`).
+    #[tokio::test]
+    async fn build_succeeds_with_a_rebalance_ack_window_past_its_own_max_since_the_accessor_clamps_it()
+     {
+        let mut config = loopback_config();
+        config.ae_interval = Duration::from_millis(1);
+        // Far past `rebalance_ack_window_max()` once `ae_interval` this
+        // small: exactly the shape a speed-tuned test config takes.
+        assert!(config.rebalance_ack_window > config.rebalance_ack_window_max());
+
+        let cluster = Cluster::builder("cluster-it-ack-window-no-reject")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect(
+                "an over-max rebalance_ack_window never blocks build(); only the accessor \
+                 clamps it",
+            );
+        cluster.shutdown().await;
     }
 
     #[tokio::test]
@@ -3942,6 +4047,7 @@ mod tests {
             ae_part_min_bucket: cluster.config().ae_part_min_bucket,
             ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
             ae_sketch_cells: cluster.config().ae_sketch_cells,
+            rebalance_chunk_bytes: cluster.config().rebalance_chunk_bytes_value(),
         };
         let name = SmolStr::new("users");
         let key_one = Bytes::from(postcard::to_stdvec(&1u32).expect("test key encodes"));
@@ -3974,6 +4080,7 @@ mod tests {
             ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
             ae_sketch_min_bucket: ClusterConfig::default().ae_sketch_min_bucket,
             ae_sketch_cells: ClusterConfig::default().ae_sketch_cells,
+            rebalance_chunk_bytes: ClusterConfig::default().rebalance_chunk_bytes_value(),
         };
         let name = SmolStr::new("users");
 
@@ -4023,6 +4130,7 @@ mod tests {
             ae_part_min_bucket: cluster.config().ae_part_min_bucket,
             ae_sketch_min_bucket: cluster.config().ae_sketch_min_bucket,
             ae_sketch_cells: cluster.config().ae_sketch_cells,
+            rebalance_chunk_bytes: cluster.config().rebalance_chunk_bytes_value(),
         };
         let name = SmolStr::new("prices");
         let view_hash = handler
@@ -4090,7 +4198,11 @@ mod tests {
         let owned_bucket = bucket_of_u32(1);
         let mut chunks = handler.st_bucket_chunks(name.clone(), vec![owned_bucket]);
         let mut got_key = false;
-        while let Some(chunk) = chunks.next().await {
+        while let Some((bucket, chunk)) = chunks.next().await {
+            assert_eq!(
+                bucket, owned_bucket,
+                "every chunk is tagged with the requested bucket"
+            );
             if chunk.iter().any(|r| r.key == key_one) {
                 got_key = true;
             }
@@ -4101,18 +4213,18 @@ mod tests {
         );
 
         // A multi-bucket pull streams one bucket at a time, in request
-        // order, each bucket's records in their own chunks.
+        // order, each bucket's records in their own chunks, tagged by
+        // their owning bucket.
         let key_other = Bytes::from(postcard::to_stdvec(&other_key).expect("test key encodes"));
         let mut chunks =
             handler.st_bucket_chunks(name, vec![bucket_of_u32(other_key), owned_bucket]);
         let mut order: Vec<Bytes> = Vec::new();
-        while let Some(chunk) = chunks.next().await {
+        while let Some((bucket, chunk)) = chunks.next().await {
             assert!(
                 chunk
                     .iter()
-                    .all(|r| crate::store::bucket_of(&r.key)
-                        == crate::store::bucket_of(&chunk[0].key)),
-                "a chunk never spans two buckets"
+                    .all(|r| crate::store::bucket_of(&r.key) == bucket),
+                "a chunk never spans two buckets, and its tag matches its records"
             );
             order.extend(chunk.into_iter().map(|r| r.key));
         }
@@ -4123,6 +4235,230 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn st_bucket_key_sub_batches_of_no_keys_is_empty() {
+        assert_eq!(
+            st_bucket_key_sub_batches(Vec::new(), 1024),
+            Vec::<Vec<Bytes>>::new()
+        );
+    }
+
+    #[test]
+    fn st_bucket_key_sub_batches_splits_by_estimated_size() {
+        let keys: Vec<Bytes> = (0u8..5).map(|n| Bytes::from(vec![n])).collect();
+        let per_key = (wire::RECORD_HEADER_LEN + 1) as u64;
+        let sub_batches = st_bucket_key_sub_batches(keys.clone(), per_key * 2);
+        assert_eq!(
+            sub_batches,
+            vec![
+                vec![keys[0].clone(), keys[1].clone()],
+                vec![keys[2].clone(), keys[3].clone()],
+                vec![keys[4].clone()],
+            ],
+            "two one-byte keys fit the two-key budget exactly before a group closes"
+        );
+    }
+
+    #[test]
+    fn st_bucket_key_sub_batches_gives_an_oversized_key_its_own_batch() {
+        let small = Bytes::from_static(b"a");
+        let big = Bytes::from(vec![0u8; 4096]);
+        // Fits `small` exactly; nowhere near enough for `big`.
+        let budget = (wire::RECORD_HEADER_LEN + 1) as u64;
+        let sub_batches = st_bucket_key_sub_batches(vec![small.clone(), big.clone()], budget);
+        assert_eq!(
+            sub_batches,
+            vec![vec![small], vec![big]],
+            "a key whose own estimate exceeds the budget still gets a batch of its own"
+        );
+    }
+
+    /// A [`ShardOps`] test double for
+    /// [`st_bucket_chunks_never_materializes_more_than_rebalance_chunk_bytes_for_a_bucket_larger_than_the_budget`]:
+    /// records every `records_for` call's key list, so the test can assert
+    /// none of them exceeds the configured sub-batch budget.
+    /// `st_bucket_chunks` only ever calls `entries_for_buckets` and
+    /// `records_for` on a `ShardOps`; every other method here panics if
+    /// called, since that would be a test bug rather than a shape to serve
+    /// quietly.
+    struct RecordingShard {
+        entries: Vec<(u16, Vec<KeyVersion>)>,
+        records: HashMap<Bytes, WireRecord>,
+        records_for_calls: Mutex<Vec<Vec<Bytes>>>,
+    }
+
+    impl ShardOps for RecordingShard {
+        fn apply_remote(&self, _rec: WireRecord) -> BoxFuture<'_, ()> {
+            unimplemented!("st_bucket_chunks never calls apply_remote")
+        }
+
+        fn apply_remote_batch(&self, _recs: Vec<WireRecord>) -> BoxFuture<'_, ()> {
+            unimplemented!("st_bucket_chunks never calls apply_remote_batch")
+        }
+
+        fn invalidate(&self, _key: Bytes, _ver: Hlc) -> BoxFuture<'_, ()> {
+            unimplemented!("st_bucket_chunks never calls invalidate")
+        }
+
+        fn digests(&self) -> BoxFuture<'_, Vec<BucketDigest>> {
+            unimplemented!("st_bucket_chunks never calls digests")
+        }
+
+        fn bucket_entries(&self, _bucket: u16) -> BoxFuture<'_, Vec<KeyVersion>> {
+            unimplemented!("st_bucket_chunks calls entries_for_buckets, not bucket_entries")
+        }
+
+        fn entries_for_buckets(
+            &self,
+            buckets: Vec<u16>,
+        ) -> BoxFuture<'_, crate::store::BucketEntries> {
+            let entries = self.entries.clone();
+            Box::pin(async move {
+                entries
+                    .into_iter()
+                    .filter(|(bucket, _)| buckets.contains(bucket))
+                    .collect()
+            })
+        }
+
+        fn bucket_lens(&self, _buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>> {
+            unimplemented!("st_bucket_chunks never calls bucket_lens")
+        }
+
+        fn part_digests(&self, _buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
+            unimplemented!("st_bucket_chunks never calls part_digests")
+        }
+
+        fn entries_for_parts(
+            &self,
+            _parts: Vec<BucketPart>,
+        ) -> BoxFuture<'_, crate::store::PartEntries> {
+            unimplemented!("st_bucket_chunks never calls entries_for_parts")
+        }
+
+        fn records_for(&self, keys: Vec<Bytes>) -> BoxFuture<'_, Vec<WireRecord>> {
+            self.records_for_calls
+                .lock()
+                .expect("invariant: fixture mutex is never poisoned")
+                .push(keys.clone());
+            Box::pin(async move {
+                keys.into_iter()
+                    .filter_map(|k| self.records.get(&k).cloned())
+                    .collect()
+            })
+        }
+
+        fn snapshot_chunks(&self) -> BoxStream<'static, Vec<WireRecord>> {
+            unimplemented!("st_bucket_chunks never calls snapshot_chunks")
+        }
+
+        fn gc_tombstones(&self, _any_member_absent: bool) -> BoxFuture<'_, ()> {
+            unimplemented!("st_bucket_chunks never calls gc_tombstones")
+        }
+
+        fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
+            unimplemented!("st_bucket_chunks never calls run_pending_tasks")
+        }
+    }
+
+    #[tokio::test]
+    async fn st_bucket_chunks_never_materializes_more_than_rebalance_chunk_bytes_for_a_bucket_larger_than_the_budget()
+     {
+        let bucket: u16 = 7;
+        let key_count = 10u8;
+        let keys: Vec<Bytes> = (0..key_count).map(|n| Bytes::from(vec![n])).collect();
+        let ver = Hlc {
+            wall_ms: 1,
+            logical: 0,
+            node: NodeId::from(1),
+        };
+        let entries: Vec<KeyVersion> = keys
+            .iter()
+            .map(|key| KeyVersion {
+                key: key.clone(),
+                version: ver,
+            })
+            .collect();
+        let records: HashMap<Bytes, WireRecord> = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    WireRecord {
+                        key: key.clone(),
+                        value: Some(Bytes::from_static(b"v")),
+                        ver,
+                        expires_at_ms: None,
+                    },
+                )
+            })
+            .collect();
+
+        // Each key here is one byte, so its estimate is a fixed
+        // `RECORD_HEADER_LEN + 1`; a budget of three keys' worth forces the
+        // ten-key bucket into more than one `records_for` call.
+        let per_key_size = (wire::RECORD_HEADER_LEN + 1) as u64;
+        let chunk_bytes = per_key_size * 3;
+
+        let recording = Arc::new(RecordingShard {
+            entries: vec![(bucket, entries)],
+            records,
+            records_for_calls: Mutex::new(Vec::new()),
+        });
+        let shard: Arc<dyn ShardOps> = recording.clone();
+        let mut registry = HashMap::new();
+        registry.insert(SmolStr::new("cache"), shard);
+        let handler = ClusterRequestHandler {
+            shards: Arc::new(RwLock::new(registry)),
+            warmth: Arc::new(Warmth::default()),
+            ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+            ae_sketch_min_bucket: ClusterConfig::default().ae_sketch_min_bucket,
+            ae_sketch_cells: ClusterConfig::default().ae_sketch_cells,
+            rebalance_chunk_bytes: chunk_bytes,
+        };
+
+        let mut got_keys: Vec<Bytes> = Vec::new();
+        let mut chunks = handler.st_bucket_chunks(SmolStr::new("cache"), vec![bucket]);
+        while let Some((got_bucket, chunk)) = chunks.next().await {
+            assert_eq!(
+                got_bucket, bucket,
+                "every yielded chunk is tagged with the bucket"
+            );
+            got_keys.extend(chunk.into_iter().map(|r| r.key));
+        }
+        got_keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        let mut expected_keys = keys.clone();
+        expected_keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        assert_eq!(
+            got_keys, expected_keys,
+            "every key's record is served exactly once, regardless of sub-batching"
+        );
+
+        let calls = recording
+            .records_for_calls
+            .lock()
+            .expect("invariant: fixture mutex is never poisoned");
+        assert!(
+            calls.len() > 1,
+            "a bucket larger than the budget is fetched over more than one records_for call, not all at once"
+        );
+        for call in calls.iter() {
+            let call_size: u64 = call
+                .iter()
+                .map(|k| (wire::RECORD_HEADER_LEN + k.len()) as u64)
+                .sum();
+            assert!(
+                call_size <= chunk_bytes,
+                "one records_for call never exceeds the rebalance_chunk_bytes estimate: {call_size} > {chunk_bytes}"
+            );
+        }
+        let total_keys: usize = calls.iter().map(Vec::len).sum();
+        assert_eq!(
+            total_keys, key_count as usize,
+            "every key is fetched exactly once across sub-batches"
+        );
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use container_util::{
-    CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode,
+    CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode, build_testnode,
     container_tests_enabled, eventually, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
@@ -1425,6 +1425,126 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
     new.stop().await.expect("new node stops");
     old2.stop().await.expect("second old node stops");
     net.close().await.expect("network closes");
+}
+
+/// Goal 1's chunked-pull-with-independent-release machinery
+/// (`Msg::StBucketDone`/`Msg::StBucketAck`, gated on
+/// `wire::PROTOCOL_ST_BUCKET_DONE_ACK`) interoperates across a mixed-version
+/// `Mode::Distributed` cluster in both donor roles, the bucket-scoped
+/// counterpart to
+/// [`the_previous_release_and_this_one_interoperate_in_both_roles`]'s
+/// whole-cache coverage: two established nodes hold every key (`OWNERS ==
+/// 2` over two nodes means both own everything), then a third node joins on
+/// `donor_bin`'s protocol and pulls its share of the bucket space from
+/// them. When `new_is_donor` is `true` the two established nodes run this
+/// checkout and the joiner runs the previous release (an N donor serving an
+/// N-1 requester, the requester falling back to inferring each bucket's
+/// completion from the group's trailing `done: true` chunk exactly as
+/// protocol 3 does today); when `false` the roles invert (an N-1 donor
+/// serving an N requester, whose donor never sends the new messages a peer
+/// below the threshold protocol never asked for). Either direction must
+/// converge on every key owned by exactly `OWNERS` nodes and fetchable with
+/// the right value everywhere: a premature group termination would surface
+/// here as a key missing from an owner that should hold it, and a duplicate
+/// per-bucket release is harmless by construction (`apply_remote_batch`
+/// resolves re-delivery by `Hlc`), so this final convergence check is the
+/// meaningful assertion a container round trip can make over the unit-level
+/// state-machine coverage in `net::conn` and `cluster::rebalance`.
+async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool) {
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 1_500;
+    const SAMPLE_SIZE: usize = 100;
+    const CLUSTER: &str = "dist-mixed-cluster";
+    const REBALANCE_WAIT: Duration = Duration::from_secs(240);
+    const SETTLE_WAIT: Duration = Duration::from_secs(180);
+
+    require_containers!();
+
+    let previous = build_previous_testnode();
+    let current = build_testnode();
+    let (donor_bin, joiner_bin) = if new_is_donor {
+        (current, previous)
+    } else {
+        (previous, current)
+    };
+
+    let net = Arc::new(Network::new_network());
+    let env = [
+        ("SUNDOG_TESTNODE_MODE", "distributed"),
+        ("SUNDOG_TESTNODE_OWNERS", "2"),
+    ];
+    let n1 = Node::spawn_binary(&net, CLUSTER, "n1", &[], &env, donor_bin).await;
+    let n2 = Node::spawn_binary(&net, CLUSTER, "n2", &[&seed("n1")], &env, donor_bin).await;
+    wait_for_peers(&[&n1, &n2], 1).await;
+
+    n1.fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    eventually(Duration::from_secs(60), || async {
+        sum_counts(&[&n1, &n2]).await == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+
+    let joiner = Node::spawn_binary(
+        &net,
+        CLUSTER,
+        "n3",
+        &[&seed("n1"), &seed("n2")],
+        &env,
+        joiner_bin,
+    )
+    .await;
+    let nodes = [&n1, &n2, &joiner];
+    wait_for_peers(&nodes, 2).await;
+
+    eventually(REBALANCE_WAIT, || async {
+        scrape_metric(
+            &joiner,
+            "sundog_rebalance_buckets_total",
+            ("direction", "in"),
+        )
+        .await
+            > 0
+    })
+    .await;
+
+    let ids = collect_node_ids(&nodes).await;
+    let tagged: Vec<(&Node, u64)> = nodes.iter().copied().zip(ids).collect();
+    let sample = sample_kv_entries(0x6011_ec7e, FILL_KEYS, SAMPLE_SIZE);
+
+    eventually(SETTLE_WAIT, || async {
+        if sum_counts(&nodes).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await
+    })
+    .await;
+
+    let mismatches = fetch_mismatches(&nodes, &sample).await;
+    assert!(
+        mismatches.is_empty(),
+        "every sampled key must be fetchable with the right value from every node, with \
+         no bucket lost to a premature group termination: {mismatches:?}"
+    );
+
+    n1.stop().await.expect("n1 stops");
+    n2.stop().await.expect("n2 stops");
+    joiner.stop().await.expect("joiner stops");
+    net.close().await.expect("network closes");
+}
+
+/// [`distributed_rebalance_interoperates_between_releases`], an N donor
+/// serving an N-1 requester's rebalance pull.
+#[tokio::test]
+async fn distributed_rebalance_interoperates_with_a_current_donor_and_a_previous_release_requester()
+{
+    distributed_rebalance_interoperates_between_releases(true).await;
+}
+
+/// [`distributed_rebalance_interoperates_between_releases`], an N-1 donor
+/// serving an N requester's rebalance pull.
+#[tokio::test]
+async fn distributed_rebalance_interoperates_with_a_previous_release_donor_and_a_current_requester()
+{
+    distributed_rebalance_interoperates_between_releases(false).await;
 }
 
 /// A merge on the current release's node stamps its version with a

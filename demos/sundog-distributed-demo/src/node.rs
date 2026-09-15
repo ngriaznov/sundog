@@ -264,6 +264,8 @@ async fn open(
     #[cfg(feature = "spill")]
     let builder = match &tuning.spill_dir {
         Some(root) => {
+            // `restart()` tears down and reopens against this exact same
+            // `spill_dir/node{index}` path, never deleting it first.
             let mut cfg = sundog::SpillConfig::new(
                 root.join(format!("node{index}")),
                 tuning.spill_capacity_bytes,

@@ -180,7 +180,6 @@ pub(crate) fn check(report: &Report, gate: &Gate) -> Vec<String> {
             report.sample_ok, report.sample_checked
         ));
     }
-
     violations
 }
 

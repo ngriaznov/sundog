@@ -1011,12 +1011,12 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         // losing the process-global recorder race. Once the fault *is* set
         // up, `None` is a real failure, not tolerated.
         if disk_error_immutable {
-            assert_eq!(
-                disk_error_dropped,
-                Some(1.0),
-                "the one eviction insert_many forces lands in the one region \
-                 chattr_dir_entries made immutable, so exactly one job's write fails; got \
-                 body:\n{body}"
+            assert!(
+                disk_error_dropped.is_some_and(|count| count >= 1.0),
+                "the evictions insert_many forces land in the region chattr_dir_entries made \
+                 immutable, so every job in the failing segment counts as a disk_error drop; \
+                 how many jobs share that segment depends on flusher timing, so at least one; \
+                 got body:\n{body}"
             );
         }
     }
