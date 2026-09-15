@@ -28,6 +28,16 @@ const SAMPLE_SIZE: usize = 2_000;
 /// Bounds the retry loop that skips already-removed keys while sampling.
 const SAMPLE_ATTEMPT_CAP: usize = SAMPLE_SIZE * 20;
 
+/// How long the killed node stays down before the headless run restarts it:
+/// `min(duration / 4, tombstone_ttl / 2)`. Capping at half the tombstone TTL
+/// keeps the downtime inside `SpillConfig::warm_reopen`'s budget (it falls
+/// back cold once downtime exceeds the tombstone TTL), so a spill run
+/// exercises the warm reopen instead of always cold-falling-back.
+#[must_use]
+fn restart_delay(duration: Duration, tombstone_ttl: Duration) -> Duration {
+    (duration / 4).min(tombstone_ttl / 2)
+}
+
 /// Runs the headless smoke check, returning `0` if the live nodes converged
 /// and the sample check passed, `1` otherwise.
 ///
@@ -83,11 +93,13 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
         println!("metrics after preload:\n{}", metrics.dump());
     }
 
-    // Kill one node at the midpoint and restart it three-quarters through,
-    // so the run exercises a real rebalance under live load.
+    // Kill one node at the midpoint and bring it back after a bounded
+    // downtime, so the run exercises a real rebalance under live load and
+    // the reopen lands inside the tombstone TTL's warm-reopen budget.
     let killed_index = 0usize;
     let half = duration / 2;
-    let three_quarter = duration.mul_f64(0.75);
+    let downtime = restart_delay(duration, setup::TOMBSTONE_TTL);
+    let restart_at = half + downtime;
     tokio::time::sleep(half).await;
     let steady_rss_kb = record_rss_sample(&peak_rss_kb);
     demo.nodes[killed_index].kill(&demo.feed_tx).await;
@@ -96,7 +108,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
         half.as_secs()
     );
 
-    tokio::time::sleep(three_quarter.saturating_sub(half)).await;
+    tokio::time::sleep(downtime).await;
     let restarted = demo.nodes[killed_index]
         .restart(&demo.topology, &demo.feed_tx)
         .await;
@@ -104,16 +116,16 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     if restarted {
         println!(
             "headless: restarted node{killed_index} at {}s",
-            three_quarter.as_secs()
+            restart_at.as_secs()
         );
     } else {
         println!(
             "headless: restart of node{killed_index} at {}s FAILED",
-            three_quarter.as_secs()
+            restart_at.as_secs()
         );
     }
 
-    tokio::time::sleep(duration.saturating_sub(three_quarter)).await;
+    tokio::time::sleep(duration.saturating_sub(restart_at)).await;
     demo.paused.store(true, Ordering::Relaxed);
     // Grace for whatever write/fetch tick is in flight to land.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -253,6 +265,18 @@ fn build_report(
             "sundog_rebalance_buckets_total",
             "direction",
             "out",
+        )),
+        spill_reopen_warm: as_u64(metrics::labeled_total(
+            metrics_body,
+            "sundog_spill_reopen_total",
+            "outcome",
+            "warm",
+        )),
+        spill_reopen_cold_fallback: as_u64(metrics::labeled_total(
+            metrics_body,
+            "sundog_spill_reopen_total",
+            "outcome",
+            "cold_fallback",
         )),
     }
 }
@@ -505,7 +529,25 @@ mod tests {
         sundog_spill_dropped_total{reason=\"deferred\"} 9\n\
         sundog_spill_dropped_total{reason=\"other\"} 100\n\
         sundog_rebalance_buckets_total{direction=\"in\"} 6\n\
-        sundog_rebalance_buckets_total{direction=\"out\"} 2\n";
+        sundog_rebalance_buckets_total{direction=\"out\"} 2\n\
+        sundog_spill_reopen_total{cache=\"demo\",outcome=\"warm\",reason=\"\"} 1\n\
+        sundog_spill_reopen_total{cache=\"demo\",outcome=\"cold_fallback\",reason=\"downtime_exceeded\"} 2\n";
+
+    #[test]
+    fn restart_delay_is_a_quarter_of_the_duration_when_that_stays_under_half_the_tombstone_ttl() {
+        assert_eq!(
+            restart_delay(Duration::from_secs(60), Duration::from_secs(60)),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn restart_delay_caps_at_half_the_tombstone_ttl_on_a_long_run() {
+        assert_eq!(
+            restart_delay(Duration::from_secs(300), Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
+    }
 
     #[test]
     fn build_report_maps_rss_units_and_metric_names_onto_report_fields() {
@@ -575,6 +617,8 @@ mod tests {
         assert_eq!(report.ae_repaired, 4);
         assert_eq!(report.rebalance_in, 6);
         assert_eq!(report.rebalance_out, 2);
+        assert_eq!(report.spill_reopen_warm, 1);
+        assert_eq!(report.spill_reopen_cold_fallback, 2);
     }
 
     #[test]
@@ -614,5 +658,7 @@ mod tests {
         assert!(!report.converged);
         assert_eq!(report.pull_timeouts, 0);
         assert_eq!(report.spill_dropped_deferred, 0);
+        assert_eq!(report.spill_reopen_warm, 0);
+        assert_eq!(report.spill_reopen_cold_fallback, 0);
     }
 }

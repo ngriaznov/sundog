@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 
 use super::{Cluster, anti_entropy};
 use crate::error::CodecError;
-use crate::net::Mesh;
+use crate::net::{BucketStreamItem, Mesh};
 use crate::node::NodeId;
 use crate::store::ShardOps;
 use crate::wire::WireRecord;
@@ -441,6 +441,67 @@ where
     }
 }
 
+/// [`pull_from_donor`]'s bucket-scoped sibling: applies every
+/// [`BucketStreamItem::Chunk`] the same way, but also invokes
+/// `on_bucket_done` the instant a [`BucketStreamItem::BucketDone`] arrives,
+/// ahead of the stream's own end. `rebalance::pull_one_group` passes a
+/// callback that clears that bucket's cold mark right away -- goal 1's core
+/// requirement, that a partially-transferred group serves what has landed
+/// rather than waiting for the whole group's [`DonorResult::Done`]. Shares
+/// the same classification `pull_from_donor` does: `Done` once the stream
+/// ends cleanly, `Declined` if the donor never had a stream to give,
+/// `Failed` if the request or stream broke -- a bucket already reported
+/// `BucketDone` before a later failure keeps whatever `on_bucket_done`
+/// already did; `try_donor`/`pull_from_donor` (the whole-cache pull) are
+/// untouched by this sibling existing.
+pub(crate) async fn pull_buckets_from_donor<S>(
+    shard: &Arc<dyn ShardOps>,
+    donor: NodeId,
+    pull: impl Future<Output = Result<Option<S>, CodecError>>,
+    mut on_bucket_done: impl FnMut(u16),
+) -> (DonorResult, u64)
+where
+    S: Stream<Item = Result<BucketStreamItem, CodecError>> + Unpin,
+{
+    let mut stream = match pull.await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => {
+            tracing::debug!(%donor, "donor declined: not a valid source right now");
+            return (DonorResult::Declined, 0);
+        }
+        Err(error) => {
+            tracing::debug!(%donor, %error, "bucket transfer request failed");
+            return (DonorResult::Failed, 0);
+        }
+    };
+
+    let mut applied: u64 = 0;
+    loop {
+        match stream.next().await {
+            Some(Ok(BucketStreamItem::Chunk(chunk))) => {
+                // Weakly consistent donor-side iteration is safe, the same
+                // reasoning `pull_from_donor` documents: this is the same
+                // versioned-apply path live `Replicate` uses.
+                applied += chunk.len() as u64;
+                shard.apply_remote_batch(chunk).await;
+            }
+            Some(Ok(BucketStreamItem::BucketDone(bucket))) => {
+                on_bucket_done(bucket);
+            }
+            Some(Err(error)) => {
+                tracing::warn!(
+                    %donor,
+                    %error,
+                    applied,
+                    "bucket transfer stream broke mid-transfer"
+                );
+                return (DonorResult::Failed, applied);
+            }
+            None => return (DonorResult::Done, applied),
+        }
+    }
+}
+
 async fn try_donor(
     shard: &Arc<dyn ShardOps>,
     mesh: &Mesh,
@@ -602,5 +663,77 @@ mod tests {
             None,
             None,
         )) as Arc<dyn ShardOps>
+    }
+
+    fn sample_wire_record(n: u8) -> WireRecord {
+        WireRecord {
+            key: bytes::Bytes::from(vec![n]),
+            value: Some(bytes::Bytes::from(vec![n, n])),
+            ver: crate::hlc::Hlc {
+                wall_ms: u64::from(n),
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_buckets_from_donor_invokes_on_bucket_done_before_a_later_bucket_fails() {
+        let shard = empty_shard();
+        let rec = sample_wire_record(1);
+        let items: Vec<Result<BucketStreamItem, CodecError>> = vec![
+            Ok(BucketStreamItem::Chunk(vec![rec])),
+            Ok(BucketStreamItem::BucketDone(0)),
+            Err(CodecError::Io(std::io::Error::other(
+                "bucket 1 stream broke",
+            ))),
+        ];
+        let stream = futures::stream::iter(items);
+        let mut done_buckets = Vec::new();
+
+        let (result, applied) = pull_buckets_from_donor(
+            &shard,
+            NodeId::from(9),
+            async { Ok(Some(stream)) },
+            |bucket| done_buckets.push(bucket),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            DonorResult::Failed,
+            "the stream errors before it ends cleanly"
+        );
+        assert_eq!(applied, 1, "bucket 0's one record was applied first");
+        assert_eq!(
+            done_buckets,
+            vec![0],
+            "on_bucket_done fired for bucket 0 despite bucket 1's later failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_buckets_from_donor_declines_and_fails_the_same_way_pull_from_donor_does() {
+        let shard = empty_shard();
+
+        let (result, applied) = pull_buckets_from_donor::<
+            futures::stream::Empty<Result<BucketStreamItem, CodecError>>,
+        >(&shard, NodeId::from(9), async { Ok(None) }, |_| {})
+        .await;
+        assert_eq!(result, DonorResult::Declined);
+        assert_eq!(applied, 0);
+
+        let (result, applied) = pull_buckets_from_donor::<
+            futures::stream::Empty<Result<BucketStreamItem, CodecError>>,
+        >(
+            &shard,
+            NodeId::from(9),
+            async { Err(CodecError::Io(std::io::Error::other("dial failed"))) },
+            |_| {},
+        )
+        .await;
+        assert_eq!(result, DonorResult::Failed);
+        assert_eq!(applied, 0);
     }
 }

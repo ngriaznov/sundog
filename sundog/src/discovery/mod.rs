@@ -43,6 +43,19 @@ pub enum DiscoveryKind {
     Custom(Box<dyn Discovery>),
 }
 
+impl DiscoveryKind {
+    /// Whether this discovery source names a fixed, nonempty seed list:
+    /// only [`Self::Static`] ever does, and only when its own
+    /// [`statics::Static::has_seeds`] says so. `Mdns`, `DnsSrv`, and a
+    /// caller-supplied [`Self::Custom`] source all find peers on their own
+    /// schedule rather than naming any upfront, so a lone node under any of
+    /// them is a legitimate standalone cluster, not evidence of a
+    /// membership race `Cache::open` should wait out.
+    pub(crate) fn has_seeds(&self) -> bool {
+        matches!(self, Self::Static(discovery) if discovery.has_seeds())
+    }
+}
+
 impl Discovery for DiscoveryKind {
     fn candidates(&self) -> BoxStream<'static, SocketAddr> {
         match self {
@@ -101,6 +114,20 @@ mod tests {
         for source in &sources {
             let _candidates = source.candidates();
         }
+    }
+
+    #[test]
+    fn has_seeds_is_true_only_for_a_static_source_with_a_nonempty_seed_list() {
+        let seed_addr: SocketAddr = "127.0.0.1:4000".parse().expect("valid addr");
+        let seeded: DiscoveryKind = statics::Static::new([seed_addr]).into();
+        let seedless: DiscoveryKind = statics::Static::new(std::iter::empty()).into();
+        let mdns: DiscoveryKind = mdns::Mdns::new("test-cluster", "test-node").into();
+        let dns: DiscoveryKind = dns::DnsSrv::new("_sundog._tcp.local.", 7946).into();
+
+        assert!(seeded.has_seeds());
+        assert!(!seedless.has_seeds());
+        assert!(!mdns.has_seeds());
+        assert!(!dns.has_seeds());
     }
 
     #[tokio::test]

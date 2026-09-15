@@ -5,5 +5,6 @@
   "max_pull_timeouts": 0,
   "max_fetch_p99_us": 100000,
   "require_converged": true,
-  "require_full_sample": true
+  "require_full_sample": true,
+  "min_spill_reopen_warm": 1
 }

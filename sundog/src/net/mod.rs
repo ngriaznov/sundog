@@ -20,10 +20,12 @@ mod conn;
 pub(crate) use conn::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 mod outbox;
 mod tcp;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) mod test_support;
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 mod tls;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -428,12 +430,28 @@ pub(crate) enum FetchOutcome {
 /// How a donor answered [`Mesh::request_buckets`].
 pub(crate) enum BucketPull {
     /// The donor is transferring: its chunk stream.
-    Stream(BoxStream<'static, Result<Vec<WireRecord>, CodecError>>),
+    Stream(BoxStream<'static, Result<BucketStreamItem, CodecError>>),
     /// The donor's own view hash differs from the request's.
     Stale,
     /// The donor owns a requested bucket but has not pulled it yet, so its
     /// copy is not a source; the requester tries its next donor.
     Cold,
+}
+
+/// One item off a [`BucketPull::Stream`]: an ordinary data chunk, or,
+/// against a donor speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`],
+/// a signal that the donor released one bucket ahead of the group's own
+/// trailing `done: true` chunk. `BucketDone` never appears against an older
+/// donor: [`conn::bucket_stream`] then yields byte-for-byte the same stream
+/// as before this variant existed.
+pub(crate) enum BucketStreamItem {
+    /// A batch of records for the bucket currently streaming.
+    Chunk(Vec<WireRecord>),
+    /// The donor has sent every record it holds for this bucket and
+    /// released it; [`crate::cluster::state_transfer::pull_buckets_from_donor`]
+    /// invokes its caller's `on_bucket_done` the moment this arrives, ahead
+    /// of the stream's own end.
+    BucketDone(u16),
 }
 
 /// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest
@@ -632,11 +650,17 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// [`RequestHandler::st_buckets_available`] said yes. Default: an
     /// immediately-empty stream, never polled unless the caller ignores the
     /// availability check.
+    ///
+    /// Each item is tagged with the bucket it came from: a donor sub-batches
+    /// one bucket's records into more than one chunk (bounded by
+    /// [`crate::config::ClusterConfig::rebalance_chunk_bytes`]), so the tag
+    /// is how a caller detects a bucket's last chunk without inspecting the
+    /// chunk's own contents.
     fn st_bucket_chunks(
         &self,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxStream<'static, Vec<WireRecord>> {
+    ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
         let _ = (cache, buckets);
         Box::pin(futures::stream::empty())
     }
@@ -665,6 +689,13 @@ struct PeerHandle {
     protocol: AtomicU16,
 }
 
+/// `(cache, bucket, requester)`, [`MeshInner::acked_buckets`]'s key: which
+/// donor-served bucket a `Msg::StBucketAck` named and who sent it.
+type AckedBucketKey = (SmolStr, u16, NodeId);
+/// The instant an ack was recorded, plus the `view_hash` it carried,
+/// [`MeshInner::acked_buckets`]'s value.
+type AckedBucketEntry = (Instant, u64);
+
 struct MeshInner {
     node: NodeId,
     incarnation: u64,
@@ -672,6 +703,15 @@ struct MeshInner {
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
+    /// Bucket acks received from `Msg::StBucketAck` on a donor-served
+    /// `StBuckets` connection, keyed by `(cache, bucket, requester)` and the
+    /// instant recorded plus the `view_hash` the ack carried:
+    /// `conn::serve_st_buckets`'s inbound `select!` arm writes here the
+    /// moment a requester signals it released a bucket. `rebalance_task`
+    /// folds a fresh-enough, current-view entry into `buckets_to_release`'s
+    /// per-bucket reconciliation check instead of a redundant confirming AE
+    /// round for that bucket.
+    acked_buckets: RwLock<HashMap<AckedBucketKey, AckedBucketEntry>>,
 }
 
 /// Digests from one peer answered empty in a row before the responder serves
@@ -729,6 +769,69 @@ impl MeshInner {
         }
     }
 
+    /// Records that `from` acked bucket `bucket` of `cache` via
+    /// `Msg::StBucketAck`, called from `conn::serve_st_buckets`'s inbound
+    /// `select!` arm the moment it decodes one mid-stream. `view_hash` is
+    /// the value the ack itself carried (the acker's own view hash at
+    /// request time), checked by [`MeshInner::acked_owners`] against this
+    /// node's current view hash before the ack is ever trusted.
+    fn record_bucket_ack(&self, cache: SmolStr, bucket: u16, from: NodeId, view_hash: u64) {
+        self.acked_buckets
+            .write()
+            .expect("invariant: acked_buckets lock is never poisoned")
+            .insert((cache, bucket, from), (Instant::now(), view_hash));
+    }
+
+    /// Every acked owner of each of `due`'s buckets of `cache`, keyed by
+    /// bucket: `rebalance_task`'s source for folding an accelerated ack
+    /// into `buckets_to_release`'s per-bucket reconciliation check instead
+    /// of running a redundant confirming anti-entropy round against that
+    /// owner for that specific bucket. An ack for one bucket never implies
+    /// reconciliation of any other bucket the same owner co-owns -- the
+    /// caller still needs its own per-owner AE round, or that owner's own
+    /// ack, for those. An ack older than `window`, for a bucket not in
+    /// `due`, or whose carried `view_hash` no longer matches this node's
+    /// `view_hash` (a stale-view ack, from before a view change), does not
+    /// count.
+    fn acked_owners(
+        &self,
+        cache: &SmolStr,
+        due: &[u16],
+        window: Duration,
+        view_hash: u64,
+    ) -> HashMap<u16, HashSet<NodeId>> {
+        let now = Instant::now();
+        let mut acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
+        for ((c, bucket, owner), (acked_at, acked_view_hash)) in self
+            .acked_buckets
+            .read()
+            .expect("invariant: acked_buckets lock is never poisoned")
+            .iter()
+        {
+            if c == cache
+                && due.contains(bucket)
+                && now.saturating_duration_since(*acked_at) <= window
+                && *acked_view_hash == view_hash
+            {
+                acked.entry(*bucket).or_default().insert(*owner);
+            }
+        }
+        acked
+    }
+
+    /// `peer`'s last-known gossiped protocol, `0` for a peer this node has
+    /// never seen in `update_peers`: `conn::bucket_stream`'s way to gate its
+    /// own `Msg::StBucketAck` send on what the donor advertised, alongside
+    /// [`MeshInner::require_peer_protocol`]'s existing `>=` check for a
+    /// send that must be refused outright rather than merely skipped.
+    fn peer_protocol(&self, peer: NodeId) -> u16 {
+        self.peers
+            .read()
+            .expect("invariant: peers lock is never poisoned")
+            .get(&peer)
+            .map_or(0, |handle| handle.protocol.load(Ordering::Relaxed))
+    }
+
     /// A mesh with no peers, for `conn`'s tests that drive
     /// `handle_accepted` over a raw accepted stream.
     #[cfg(all(test, not(feature = "sim")))]
@@ -740,6 +843,7 @@ impl MeshInner {
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,
+            acked_buckets: RwLock::new(HashMap::new()),
         })
     }
 }
@@ -799,6 +903,7 @@ impl Mesh {
             peers: RwLock::new(HashMap::new()),
             accept_cancel: CancellationToken::new(),
             tls,
+            acked_buckets: RwLock::new(HashMap::new()),
         });
         tokio::spawn(conn::accept_loop(
             listener,
@@ -1406,6 +1511,7 @@ impl Mesh {
         // The caller's own transfer budget governs the full chunk stream,
         // exactly as `request_state` does; only the checkout-or-dial step
         // and the donor's first reply are bounded here.
+        let stream_cache = cache.clone();
         let msg = Msg::StBuckets {
             cache,
             buckets,
@@ -1422,7 +1528,37 @@ impl Mesh {
             pool.checkin(framed);
             return Ok(BucketPull::Cold);
         }
-        Ok(BucketPull::Stream(conn::bucket_stream(framed, pool, first)))
+        // The donor's gossiped protocol, so `bucket_stream` gates its own
+        // `Msg::StBucketAck` send exactly as `serve_st_buckets` gates the
+        // `Msg::StBucketDone` it answers: a peer below
+        // `PROTOCOL_ST_BUCKET_DONE_ACK` never receives an ack it never asked
+        // for by never sending a bucket-done signal in the first place.
+        let donor_protocol = self.inner.peer_protocol(donor);
+        Ok(BucketPull::Stream(conn::bucket_stream(
+            framed,
+            pool,
+            first,
+            stream_cache,
+            donor_protocol,
+            view_hash,
+        )))
+    }
+
+    /// See [`MeshInner::acked_owners`]: every acked owner of each of
+    /// `due`'s buckets of `cache`, keyed by bucket, via `Msg::StBucketAck`
+    /// recorded on this node's donor-served connections and still within
+    /// `window` and `view_hash` of now. `rebalance_task`'s way to
+    /// accelerate a bucket's release confirmation without a redundant
+    /// anti-entropy round against an owner that already acked that
+    /// specific bucket.
+    pub(crate) fn acked_owners(
+        &self,
+        cache: &SmolStr,
+        due: &[u16],
+        window: Duration,
+        view_hash: u64,
+    ) -> HashMap<u16, HashSet<NodeId>> {
+        self.inner.acked_owners(cache, due, window, view_hash)
     }
 
     /// Shuts down the mesh: stops accepting, cancels every per-peer writer.
@@ -1512,6 +1648,9 @@ mod tests {
         buckets_available: bool,
         buckets_cold: bool,
         bucket_chunks: Vec<Vec<WireRecord>>,
+        /// Per-`bucket_chunks` entry bucket tag; empty tags every chunk `0`,
+        /// the fixture's original one-bucket behavior.
+        bucket_chunk_tags: Vec<u16>,
     }
 
     impl Default for FixtureHandler {
@@ -1532,6 +1671,7 @@ mod tests {
                 buckets_available: false,
                 buckets_cold: false,
                 bucket_chunks: Vec::new(),
+                bucket_chunk_tags: Vec::new(),
             }
         }
     }
@@ -1701,8 +1841,19 @@ mod tests {
             &self,
             _cache: SmolStr,
             _buckets: Vec<u16>,
-        ) -> BoxStream<'static, Vec<WireRecord>> {
-            Box::pin(futures::stream::iter(self.bucket_chunks.clone()))
+        ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
+            // `bucket_chunk_tags` lets a test control the per-bucket
+            // boundary `conn::serve_st_buckets` detects; empty defaults
+            // every chunk to bucket 0, this fixture's original behavior.
+            let tags = if self.bucket_chunk_tags.is_empty() {
+                vec![0u16; self.bucket_chunks.len()]
+            } else {
+                self.bucket_chunk_tags.clone()
+            };
+            Box::pin(
+                futures::stream::iter(self.bucket_chunks.clone().into_iter().zip(tags))
+                    .map(|(recs, bucket)| (bucket, recs)),
+            )
         }
     }
 
@@ -2341,6 +2492,112 @@ mod tests {
         assert!(
             !defer_ae_digest(5, MAX_AE_DEFERRALS),
             "the bound serves a round even with frames still queued"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    fn no_tls() -> super::TlsCtx {
+        None
+    }
+    #[cfg(not(feature = "tls"))]
+    fn no_tls() -> super::TlsCtx {
+        TlsCtx
+    }
+
+    #[test]
+    fn record_bucket_ack_is_readable_by_cache_bucket_and_requester() {
+        let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
+        mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+        assert!(
+            mesh.acked_buckets
+                .read()
+                .expect("lock is never poisoned")
+                .contains_key(&(SmolStr::new("prices"), 7, NodeId::from(3))),
+            "the ack lands under its (cache, bucket, requester) key"
+        );
+        assert!(
+            !mesh
+                .acked_buckets
+                .read()
+                .expect("lock is never poisoned")
+                .contains_key(&(SmolStr::new("prices"), 8, NodeId::from(3))),
+            "a different bucket is not recorded"
+        );
+    }
+
+    #[test]
+    fn acked_owners_only_counts_a_due_bucket_within_the_window() {
+        let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
+        mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+        mesh.record_bucket_ack(SmolStr::new("prices"), 9, NodeId::from(4), 42);
+        mesh.record_bucket_ack(SmolStr::new("other"), 7, NodeId::from(5), 42);
+        let owners = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 42);
+        assert_eq!(
+            owners,
+            HashMap::from([(7u16, HashSet::from([NodeId::from(3)]))]),
+            "only the acked owner of a bucket actually in `due`, for the right cache, counts, \
+             keyed by the bucket it acked"
+        );
+        // A real, if tiny, sleep so the ack is reliably older than a
+        // zero-length window regardless of clock resolution, rather than
+        // relying on two back-to-back `Instant::now()` calls already
+        // differing.
+        std::thread::sleep(Duration::from_millis(5));
+        let none = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::ZERO, 42);
+        assert!(
+            none.is_empty(),
+            "an ack older than the window does not count as reconciled"
+        );
+    }
+
+    #[test]
+    fn an_ack_carrying_a_stale_view_hash_does_not_count_as_reconciled() {
+        let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
+        // Acked under view hash 1, but this node's current view has since
+        // moved to hash 2: the ack predates the view change and must be
+        // discarded rather than trusted, exactly as an ack older than
+        // `rebalance_ack_window` is discarded.
+        mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 1);
+        let stale = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 2);
+        assert!(
+            stale.is_empty(),
+            "an ack from before a view change does not count as reconciled"
+        );
+        let current = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 1);
+        assert_eq!(
+            current,
+            HashMap::from([(7u16, HashSet::from([NodeId::from(3)]))]),
+            "the same ack counts once the requested view hash matches the ack's own"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_protocol_is_zero_for_an_unknown_peer_and_otherwise_the_gossiped_value() {
+        let mesh_handle = Mesh {
+            local_addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            inner: MeshInner::for_tests(no_tls(), CancellationToken::new()),
+        };
+        assert_eq!(mesh_handle.inner.peer_protocol(NodeId::from(9)), 0);
+        mesh_handle.update_peers(vec![peer_at_protocol(
+            NodeId::from(9),
+            "127.0.0.1:1".parse().expect("valid loopback addr"),
+            3,
+        )]);
+        assert_eq!(mesh_handle.inner.peer_protocol(NodeId::from(9)), 3);
+    }
+
+    #[tokio::test]
+    async fn mesh_acked_owners_delegates_to_the_inner_table() {
+        let mesh_handle = Mesh {
+            local_addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            inner: MeshInner::for_tests(no_tls(), CancellationToken::new()),
+        };
+        mesh_handle
+            .inner
+            .record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+        assert_eq!(
+            mesh_handle.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 42),
+            HashMap::from([(7u16, HashSet::from([NodeId::from(3)]))])
         );
     }
 
@@ -3050,12 +3307,46 @@ mod tests {
             panic!("an available donor streams");
         };
         let mut got = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            got.extend(chunk.expect("chunk decodes"));
+        while let Some(item) = stream.next().await {
+            if let BucketStreamItem::Chunk(recs) = item.expect("item decodes") {
+                got.extend(recs);
+            }
         }
         let mut expected = chunk_a;
         expected.extend(chunk_b);
         assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn request_buckets_yields_bucket_done_once_per_bucket_before_the_stream_ends() {
+        let handler = Arc::new(FixtureHandler {
+            buckets_available: true,
+            bucket_chunks: vec![vec![sample_record(1)], vec![sample_record(2)]],
+            bucket_chunk_tags: vec![0, 1],
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        let BucketPull::Stream(mut stream) = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0, 1], 42)
+            .await
+            .expect("request accepted")
+        else {
+            panic!("an available donor streams");
+        };
+        let mut dones = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let BucketStreamItem::BucketDone(bucket) = item.expect("item decodes") {
+                dones.push(bucket);
+            }
+        }
+        assert_eq!(
+            dones,
+            vec![0, 1],
+            "each bucket's done arrives once, in request order, ahead of the stream's own end"
+        );
     }
 
     #[tokio::test]

@@ -195,6 +195,32 @@ pub struct ClusterConfig {
     /// opens for a `Mode::Distributed` cache, so a mass membership change
     /// can't spawn dozens of concurrent transfers at once. Default: 4.
     pub rebalance_concurrency: usize,
+    /// Target size in bytes `st_bucket_chunks` sub-batches one bucket's key
+    /// list into before calling `shard.records_for` for that sub-batch, so
+    /// a rebalance donor materializes one sub-batch's worth of records at a
+    /// time instead of a whole bucket's. Default: 1 MiB.
+    /// [`rebalance_chunk_bytes_value`](Self::rebalance_chunk_bytes_value)
+    /// is the value actually in effect: this field clamped to
+    /// `MAX_FRAME - SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`, so a misconfigured
+    /// value can never push a single `Msg::StBucketChunk` frame over the
+    /// wire's hard cap. Each sub-batch's records still pass through
+    /// `chunk_records_for_snapshot`, which stays the actual wire-frame
+    /// bound regardless of this setting.
+    pub rebalance_chunk_bytes: u64,
+    /// How long a `Msg::StBucketAck` is trusted as proof a bucket's
+    /// receiver has reconciled it, before `buckets_to_release` falls back
+    /// to the timer-and-confirming-anti-entropy-round path for that bucket.
+    /// Default: 60s, twice the default
+    /// [`ae_interval`](Self::ae_interval). An ack older than this window,
+    /// or from before the current `OwnershipView`, is never trusted.
+    /// [`rebalance_ack_window_value`](Self::rebalance_ack_window_value) is
+    /// the value actually in effect: this field bounded above by
+    /// `distributed_disown_grace_rounds * ae_interval`, since a trust
+    /// window longer than the release floor itself would be meaningless.
+    /// An ack only ever accelerates the confirmation step of a release;
+    /// [`distributed_disown_grace_rounds`](Self::distributed_disown_grace_rounds)'s
+    /// timing floor still applies regardless of any ack.
+    pub rebalance_ack_window: Duration,
 }
 
 impl ClusterConfig {
@@ -240,6 +266,37 @@ impl ClusterConfig {
         CompactionBounds::new(self.crdt_retire_after, self.crdt_sweep_period())
     }
 
+    /// [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes) as it actually
+    /// takes effect: clamped to `MAX_FRAME -
+    /// SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`, the same headroom
+    /// `chunk_records_for_snapshot` reserves for a chunk's envelope, so a
+    /// single `Msg::StBucketChunk` frame a sub-batch produces can never
+    /// itself exceed the wire's hard cap regardless of misconfiguration.
+    #[must_use]
+    pub fn rebalance_chunk_bytes_value(&self) -> u64 {
+        let cap = (MAX_FRAME - crate::store::SNAPSHOT_CHUNK_ENVELOPE_HEADROOM) as u64;
+        self.rebalance_chunk_bytes.min(cap)
+    }
+
+    /// Upper bound [`rebalance_ack_window`](Self::rebalance_ack_window) may
+    /// not exceed: `distributed_disown_grace_rounds * ae_interval`, since a
+    /// trust window longer than the release floor itself would be
+    /// meaningless.
+    #[must_use]
+    pub fn rebalance_ack_window_max(&self) -> Duration {
+        self.ae_interval
+            .saturating_mul(self.distributed_disown_grace_rounds)
+    }
+
+    /// [`rebalance_ack_window`](Self::rebalance_ack_window) as it actually
+    /// takes effect: bounded above by
+    /// [`rebalance_ack_window_max`](Self::rebalance_ack_window_max).
+    #[must_use]
+    pub fn rebalance_ack_window_value(&self) -> Duration {
+        self.rebalance_ack_window
+            .min(self.rebalance_ack_window_max())
+    }
+
     /// Applies `f` to a mutable borrow of `self` and returns it: how code
     /// outside this crate overrides a subset of fields on
     /// [`ClusterConfig::default`] without breaking when a field is added.
@@ -280,6 +337,8 @@ impl Default for ClusterConfig {
             distributed_disown_grace_rounds: 3,
             fetch_timeout: Duration::from_millis(750),
             rebalance_concurrency: 4,
+            rebalance_chunk_bytes: 1024 * 1024,
+            rebalance_ack_window: Duration::from_secs(60),
         }
     }
 }
@@ -372,6 +431,58 @@ mod tests {
     #[test]
     fn default_rebalance_concurrency_is_four() {
         assert_eq!(ClusterConfig::default().rebalance_concurrency, 4);
+    }
+
+    #[test]
+    fn default_rebalance_chunk_bytes_is_one_mebibyte_and_under_max_frame() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.rebalance_chunk_bytes, 1024 * 1024);
+        assert!(config.rebalance_chunk_bytes_value() < MAX_FRAME as u64);
+        assert_eq!(
+            config.rebalance_chunk_bytes_value(),
+            config.rebalance_chunk_bytes
+        );
+    }
+
+    #[test]
+    fn rebalance_chunk_bytes_value_clamps_a_value_over_the_wire_cap() {
+        let config = ClusterConfig::default().with(|c| {
+            c.rebalance_chunk_bytes = MAX_FRAME as u64 * 4;
+        });
+        assert!(config.rebalance_chunk_bytes_value() < MAX_FRAME as u64);
+        assert!(config.rebalance_chunk_bytes_value() < config.rebalance_chunk_bytes);
+    }
+
+    #[test]
+    fn default_rebalance_ack_window_is_bounded_by_disown_grace() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.rebalance_ack_window, Duration::from_secs(60));
+        assert_eq!(
+            config.rebalance_ack_window,
+            config.ae_interval * 2,
+            "documented default is twice ae_interval"
+        );
+        assert!(config.rebalance_ack_window_value() <= config.rebalance_ack_window_max());
+        assert_eq!(
+            config.rebalance_ack_window_value(),
+            config.rebalance_ack_window
+        );
+    }
+
+    #[test]
+    fn rebalance_ack_window_value_is_bounded_by_disown_grace_rounds_times_ae_interval() {
+        let config = ClusterConfig::default().with(|c| {
+            c.rebalance_ack_window = Duration::from_secs(3600);
+        });
+        assert_eq!(
+            config.rebalance_ack_window_max(),
+            config.ae_interval * config.distributed_disown_grace_rounds
+        );
+        assert_eq!(
+            config.rebalance_ack_window_value(),
+            config.rebalance_ack_window_max()
+        );
+        assert!(config.rebalance_ack_window_value() < config.rebalance_ack_window);
     }
 
     #[test]

@@ -504,6 +504,56 @@ mod tests {
         assert!(should_defer_gc(mode, &tracker, HOUR, Some(&view)));
     }
 
+    /// Workstream 3's own risk #1 (`spec.md` §8): a surviving peer stops
+    /// deferring GC for a departed node's tombstones the moment its own
+    /// `OwnershipView` reassigns that node's buckets away from it -- on the
+    /// order of the gossip failure-detection interval that recomputes
+    /// `eligible_owners`, not `tombstone_max_ttl` and not `tombstone_ttl`
+    /// either. The tracker here never changes between the two assertions
+    /// (`departed` stays absent throughout, by the same `tracker.observe`
+    /// calls `should_defer_gc_defers_for_an_absent_member_sharing_an_owned_bucket`
+    /// makes); only the view moves, from `departed` still co-owning every
+    /// bucket to `departed` dropped out of `eligible_owners` entirely, the
+    /// same reassignment rebalance's whole premise relies on. A future
+    /// change to `should_defer_gc`'s `Mode::Distributed` branch that widens
+    /// or narrows this window -- deferring past a reassignment, or not
+    /// deferring before one -- fails this test.
+    #[test]
+    fn should_defer_gc_stops_protecting_a_departed_nodes_buckets_once_ownership_reassigns_them() {
+        let self_node = NodeId::from(1);
+        let departed = NodeId::from(2);
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(2, false)]));
+        tracker.observe(&live(&[]));
+        let mode = Mode::Distributed {
+            owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+        };
+
+        // Before reassignment: `departed` is still eligible and co-owns
+        // every bucket with `self_node`, so its absence defers GC.
+        let view_before = distributed_view(self_node, vec![self_node, departed]);
+        assert!(
+            should_defer_gc(mode, &tracker, HOUR, Some(&view_before)),
+            "departed still co-owns every bucket, so its absence defers GC"
+        );
+
+        // After reassignment: `departed` has dropped out of
+        // `eligible_owners` (the same live-set-driven recompute a real
+        // membership change drives), so it no longer co-owns anything
+        // `self_node` owns, even though the tracker itself still reports it
+        // absent -- unchanged from the assertion above.
+        let view_after = distributed_view(self_node, vec![self_node]);
+        assert!(
+            tracker.any_absent(HOUR),
+            "the tracker's own view of departed's absence is untouched by the ownership move"
+        );
+        assert!(
+            !should_defer_gc(mode, &tracker, HOUR, Some(&view_after)),
+            "once ownership reassigns departed's buckets away from it, its absence no longer \
+             defers GC for any bucket, regardless of how long it has actually been down"
+        );
+    }
+
     #[test]
     fn present_since_is_not_reset_by_jitter_that_never_reaches_the_detector() {
         let tracker = AbsenceTracker::default();
