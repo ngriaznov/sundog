@@ -287,7 +287,15 @@ pub(crate) async fn warm_up_task(
             outcome = run(&cluster, &shard, &cache) => outcome,
         };
         attempt += 1;
-        match next_warm_up_step(outcome, attempt) {
+        let step = next_warm_up_step(outcome, attempt);
+        tracing::debug!(
+            cache = %cache,
+            attempt,
+            outcome = ?outcome,
+            step = ?step,
+            "state transfer warm-up step chosen"
+        );
+        match step {
             WarmUpStep::Done => return,
             // A whole-cache transfer has no view to move, so `RetryNow`
             // never comes back here; running again at once is the right
@@ -342,15 +350,27 @@ async fn transfer_loop(cluster: &Cluster, shard: &Arc<dyn ShardOps>, cache: &Smo
 
         let mut results = Vec::with_capacity(candidates.len());
         for &donor in &candidates {
-            let result = tokio::time::timeout(
-                per_donor,
-                try_donor(shard, cluster.mesh(), cache, donor),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                tracing::debug!(%donor, "state transfer to donor timed out; trying the next");
+            let attempt =
+                tokio::time::timeout(per_donor, try_donor(shard, cluster.mesh(), cache, donor))
+                    .await;
+            let timed_out = attempt.is_err();
+            let result = attempt.unwrap_or_else(|_| {
+                tracing::debug!(
+                    cache = %cache,
+                    %donor,
+                    per_donor_budget = ?per_donor,
+                    "state transfer to donor timed out; trying the next"
+                );
                 DonorResult::Failed
             });
+            tracing::debug!(
+                cache = %cache,
+                %donor,
+                per_donor_budget = ?per_donor,
+                result = ?result,
+                timed_out,
+                "state transfer pull attempt finished"
+            );
             results.push(result);
             if result == DonorResult::Done {
                 break;
@@ -418,12 +438,14 @@ where
     };
 
     let mut applied: u64 = 0;
+    let mut chunks: u64 = 0;
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
                 // Weakly consistent donor-side iteration is safe: this is
                 // the same versioned-apply path live `Replicate` uses, so
                 // concurrency delivers whatever the snapshot misses.
+                chunks += 1;
                 applied += chunk.len() as u64;
                 shard.apply_remote_batch(chunk).await;
             }
@@ -431,12 +453,16 @@ where
                 tracing::warn!(
                     %donor,
                     %error,
+                    chunks,
                     applied,
                     "transfer stream broke mid-transfer"
                 );
                 return (DonorResult::Failed, applied);
             }
-            None => return (DonorResult::Done, applied),
+            None => {
+                tracing::debug!(%donor, chunks, applied, "state transfer pull done");
+                return (DonorResult::Done, applied);
+            }
         }
     }
 }
@@ -476,12 +502,14 @@ where
     };
 
     let mut applied: u64 = 0;
+    let mut chunks: u64 = 0;
     loop {
         match stream.next().await {
             Some(Ok(BucketStreamItem::Chunk(chunk))) => {
                 // Weakly consistent donor-side iteration is safe, the same
                 // reasoning `pull_from_donor` documents: this is the same
                 // versioned-apply path live `Replicate` uses.
+                chunks += 1;
                 applied += chunk.len() as u64;
                 shard.apply_remote_batch(chunk).await;
             }
@@ -492,12 +520,16 @@ where
                 tracing::warn!(
                     %donor,
                     %error,
+                    chunks,
                     applied,
                     "bucket transfer stream broke mid-transfer"
                 );
                 return (DonorResult::Failed, applied);
             }
-            None => return (DonorResult::Done, applied),
+            None => {
+                tracing::debug!(%donor, chunks, applied, "bucket pull from donor done");
+                return (DonorResult::Done, applied);
+            }
         }
     }
 }

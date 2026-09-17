@@ -1053,6 +1053,12 @@ async fn serve_st_buckets(
 ) -> bool {
     if !handler.st_buckets_available(cache.clone(), view_hash).await {
         let responder_view_hash = handler.ownership_view_hash(cache.clone()).unwrap_or(0);
+        tracing::debug!(
+            cache = %cache,
+            requester_view_hash = view_hash,
+            responder_view_hash,
+            "st buckets pull declined: view hash mismatch"
+        );
         return send_or_cancelled(
             framed,
             &Msg::StaleView {
@@ -1069,11 +1075,19 @@ async fn serve_st_buckets(
     {
         // Owned but not yet pulled: not a source. The requester tries its
         // next donor.
+        tracing::debug!(
+            cache = %cache,
+            requested = buckets.len(),
+            "st buckets pull declined: requested buckets not yet warm locally"
+        );
         return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
     }
     let signal_done = wire::peer_supports(peer_protocol, wire::PROTOCOL_ST_BUCKET_DONE_ACK);
     let mut remaining: VecDeque<u16> = buckets.iter().copied().collect();
+    let buckets_requested = remaining.len();
     let mut chunks = handler.st_bucket_chunks(cache.clone(), buckets);
+    let mut chunks_sent: usize = 0;
+    let mut records_sent: usize = 0;
     loop {
         let next = tokio::select! {
             biased;
@@ -1095,7 +1109,27 @@ async fn serve_st_buckets(
                     // torn down, the same tolerance `dispatch_one`'s own
                     // reply-only arms give a stray frame.
                     Some(Ok(_)) => continue,
-                    Some(Err(_)) | None => return true,
+                    Some(Err(ref error)) => {
+                        tracing::debug!(
+                            cache = %cache,
+                            %error,
+                            chunks_sent,
+                            records_sent,
+                            remaining = remaining.len(),
+                            "st buckets pull ended early: requester sent an error"
+                        );
+                        return true;
+                    }
+                    None => {
+                        tracing::debug!(
+                            cache = %cache,
+                            chunks_sent,
+                            records_sent,
+                            remaining = remaining.len(),
+                            "st buckets pull ended early: connection closed"
+                        );
+                        return true;
+                    }
                 }
             }
             next = chunks.next() => next,
@@ -1118,16 +1152,32 @@ async fn serve_st_buckets(
                 )
                 .await
                 {
+                    tracing::debug!(
+                        cache = %cache,
+                        chunks_sent,
+                        records_sent,
+                        remaining = remaining.len(),
+                        "st buckets pull ended early: connection closed sending StBucketDone"
+                    );
                     return true;
                 }
             }
         }
+        chunks_sent += 1;
+        records_sent += recs.len();
         let msg = Msg::StBucketChunk {
             cache: cache.clone(),
             recs,
             done: false,
         };
         if send_or_cancelled(framed, &msg, cancel).await {
+            tracing::debug!(
+                cache = %cache,
+                chunks_sent,
+                records_sent,
+                remaining = remaining.len(),
+                "st buckets pull ended early: connection closed mid-stream"
+            );
             return true;
         }
     }
@@ -1143,10 +1193,25 @@ async fn serve_st_buckets(
             )
             .await
             {
+                tracing::debug!(
+                    cache = %cache,
+                    chunks_sent,
+                    records_sent,
+                    remaining = remaining.len(),
+                    "st buckets pull ended early: connection closed draining StBucketDone"
+                );
                 return true;
             }
         }
     }
+    tracing::debug!(
+        cache = %cache,
+        buckets_served = buckets_requested,
+        chunks_sent,
+        records_sent,
+        signal_done,
+        "st buckets pull stream ended"
+    );
     send_or_cancelled(
         framed,
         &Msg::StBucketChunk {

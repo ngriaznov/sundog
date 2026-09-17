@@ -169,7 +169,7 @@ async fn pull_one_group(
     loop {
         let mut every_donor_cold = !donors.is_empty();
         for &donor in &donors {
-            let (result, count, cold) = tokio::time::timeout(
+            let attempt = tokio::time::timeout(
                 per_donor,
                 try_donor_buckets(
                     shard,
@@ -182,11 +182,30 @@ async fn pull_one_group(
                     &mut credited,
                 ),
             )
-            .await
-            .unwrap_or_else(|_| {
-                tracing::debug!(%donor, "rebalance bucket pull to donor timed out; trying the next");
+            .await;
+            let timed_out = attempt.is_err();
+            let (result, count, cold) = attempt.unwrap_or_else(|_| {
+                tracing::debug!(
+                    cache = %cache,
+                    %donor,
+                    per_donor_budget = ?per_donor,
+                    "rebalance bucket pull to donor timed out; trying the next"
+                );
                 (DonorResult::Failed, 0, false)
             });
+            let stale = result == DonorResult::Declined && !cold;
+            tracing::debug!(
+                cache = %cache,
+                %donor,
+                buckets = buckets.len(),
+                per_donor_budget = ?per_donor,
+                result = ?result,
+                records = count,
+                cold,
+                stale,
+                timed_out,
+                "bucket pull attempt finished"
+            );
             if result == DonorResult::Done {
                 residency.mark_serving(&buckets);
                 let pending = buckets_pending_group_credit(buckets.len(), &credited);
@@ -423,7 +442,15 @@ pub(crate) async fn warm_up_task(
             outcome = pull.run() => outcome,
         };
         attempt += 1;
-        match state_transfer::next_warm_up_step(outcome, attempt) {
+        let step = state_transfer::next_warm_up_step(outcome, attempt);
+        tracing::debug!(
+            cache = %cache,
+            attempt,
+            outcome = ?outcome,
+            step = ?step,
+            "rebalance warm-up step chosen"
+        );
+        match step {
             state_transfer::WarmUpStep::Done => {
                 cluster.mark_warm(&cache);
                 return;
@@ -683,6 +710,12 @@ pub(crate) async fn rebalance_task(
                 let new_view = view_rx.borrow_and_update().clone();
                 let plan = plan_view_change(&prev_view, &pulled_view, &new_view);
                 prev_view = Arc::clone(&new_view);
+                tracing::debug!(
+                    cache = %cache,
+                    gained = plan.to_pull.len(),
+                    lost = plan.lost.len(),
+                    "ownership view changed"
+                );
                 // A bucket this node now owns alone has nobody left to pull
                 // it from, or to verify a warm-reloaded record against:
                 // whatever is here is all there is, so it is neither cold
@@ -799,7 +832,12 @@ pub(crate) async fn rebalance_task(
                         &unreachable,
                     );
                     if due.is_empty() {
-                        tracing::debug!(cache = %cache, "no released bucket's owners all answered its hand-off; holding until the next tick");
+                        tracing::debug!(
+                            cache = %cache,
+                            reconciled = reconciled.len(),
+                            acked = acked.len(),
+                            "no released bucket's owners all answered its hand-off; holding until the next tick"
+                        );
                         continue;
                     }
                     let removed = shard.release_buckets(&due).await;
@@ -810,7 +848,14 @@ pub(crate) async fn rebalance_task(
                         "direction" => "out"
                     )
                     .increment(u64::try_from(due.len()).unwrap_or(u64::MAX));
-                    tracing::debug!(cache = %cache, buckets = due.len(), removed, "released buckets past their disown grace");
+                    tracing::debug!(
+                        cache = %cache,
+                        buckets = due.len(),
+                        removed,
+                        reconciled = reconciled.len(),
+                        acked = acked.len(),
+                        "released buckets past their disown grace"
+                    );
                 }
             }
         }
