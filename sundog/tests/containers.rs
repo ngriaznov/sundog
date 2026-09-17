@@ -19,8 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use container_util::{
-    CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode, build_testnode,
-    container_tests_enabled, eventually, eventually_with_logs, seed, spawn_trio, wait_for_peers,
+    CRDT_RETIRE_AFTER_SECS_ENV, DISTRIBUTED_RUST_LOG, Fleet, METRICS_PORT, Node,
+    build_previous_testnode, build_testnode, container_tests_enabled, eventually,
+    eventually_with_logs, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -124,7 +125,18 @@ async fn warm_join_state_transfer_with_no_new_writes() {
     require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let (n1, n2, n3) = spawn_trio(&net, "warm-cluster").await;
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
+    let n1 = Node::spawn_with_env(&net, "warm-cluster", "n1", &[], &log_env).await;
+    let n2 = Node::spawn_with_env(&net, "warm-cluster", "n2", &[&seed("n1")], &log_env).await;
+    let n3 = Node::spawn_with_env(
+        &net,
+        "warm-cluster",
+        "n3",
+        &[&seed("n1"), &seed("n2")],
+        &log_env,
+    )
+    .await;
+    wait_for_peers(&[&n1, &n2, &n3], 2).await;
 
     for i in 0..ENTRIES {
         n1.put(&format!("k{i}"), &format!("v{i}"))
@@ -140,11 +152,12 @@ async fn warm_join_state_transfer_with_no_new_writes() {
 
     // n1..n3 are already full; state transfer for n4 runs before its
     // control listener binds, so nothing writes after this point.
-    let n4 = Node::spawn(
+    let n4 = Node::spawn_with_env(
         &net,
         "warm-cluster",
         "n4",
         &[&seed("n1"), &seed("n2"), &seed("n3")],
+        &log_env,
     )
     .await;
     eventually(CONVERGE_WAIT, || async { n4.count().await == Ok(ENTRIES) }).await;
@@ -383,8 +396,9 @@ async fn cold_join_warms_a_million_entry_cluster() {
     require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "million-cluster", "n1", &[]).await;
-    let n2 = Node::spawn(&net, "million-cluster", "n2", &[&seed("n1")]).await;
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
+    let n1 = Node::spawn_with_env(&net, "million-cluster", "n1", &[], &log_env).await;
+    let n2 = Node::spawn_with_env(&net, "million-cluster", "n2", &[&seed("n1")], &log_env).await;
     wait_for_peers(&[&n1, &n2], 1).await;
 
     n1.fill(ENTRIES).await.expect("bulk fill succeeds");
@@ -396,7 +410,14 @@ async fn cold_join_warms_a_million_entry_cluster() {
     .await;
 
     let started = std::time::Instant::now();
-    let n3 = Node::spawn(&net, "million-cluster", "n3", &[&seed("n1"), &seed("n2")]).await;
+    let n3 = Node::spawn_with_env(
+        &net,
+        "million-cluster",
+        "n3",
+        &[&seed("n1"), &seed("n2")],
+        &log_env,
+    )
+    .await;
     eventually(Duration::from_secs(300), || async {
         n3.count().await == Ok(ENTRIES as usize)
     })
@@ -436,7 +457,18 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let (n1, n2, n3) = spawn_trio(&net, "pncounter-cluster").await;
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
+    let n1 = Node::spawn_with_env(&net, "pncounter-cluster", "n1", &[], &log_env).await;
+    let n2 = Node::spawn_with_env(&net, "pncounter-cluster", "n2", &[&seed("n1")], &log_env).await;
+    let n3 = Node::spawn_with_env(
+        &net,
+        "pncounter-cluster",
+        "n3",
+        &[&seed("n1"), &seed("n2")],
+        &log_env,
+    )
+    .await;
+    wait_for_peers(&[&n1, &n2, &n3], 2).await;
 
     // Every node increments every counter once, concurrently: `pn0..pn(COUNTERS
     // - 1)` must converge to a total of `WRITERS`, not whichever
@@ -473,11 +505,12 @@ async fn cold_join_warms_a_million_counter_cluster_with_exact_totals() {
     let (f3_before, b3_before) = n3.netstats().await.expect("n3 netstats before the join");
 
     let started = std::time::Instant::now();
-    let n4 = Node::spawn(
+    let n4 = Node::spawn_with_env(
         &net,
         "pncounter-cluster",
         "n4",
         &[&seed("n1"), &seed("n2"), &seed("n3")],
+        &log_env,
     )
     .await;
     eventually(Duration::from_secs(300), || async {
@@ -742,12 +775,13 @@ async fn cold_join_warms_a_hundred_thousand_entry_cluster_in_seconds() {
     require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let n1 = Node::spawn(&net, "scale-cluster", "n1", &[]).await;
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
+    let n1 = Node::spawn_with_env(&net, "scale-cluster", "n1", &[], &log_env).await;
     n1.fill(ENTRIES).await.expect("bulk fill succeeds");
     assert_eq!(n1.count().await, Ok(ENTRIES as usize));
 
     let started = std::time::Instant::now();
-    let n2 = Node::spawn(&net, "scale-cluster", "n2", &[&seed("n1")]).await;
+    let n2 = Node::spawn_with_env(&net, "scale-cluster", "n2", &[&seed("n1")], &log_env).await;
     // Window is wider than the pass bar, so a slow run fails on duration.
     eventually(Duration::from_secs(120), || async {
         n2.count().await == Ok(ENTRIES as usize)
@@ -1472,10 +1506,11 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let env = [
         ("SUNDOG_TESTNODE_MODE", "distributed"),
         ("SUNDOG_TESTNODE_OWNERS", "2"),
-        // Info-level cluster/rebalance/state-transfer tracing, so a wait
-        // that times out has more than a bare "condition not met" to go on
-        // once `eventually_with_logs` prints these nodes' captured logs.
-        ("RUST_LOG", "info,sundog::net=info"),
+        // Info-level everywhere, debug on the cluster state-machine
+        // internals, so a wait that times out has more than a bare
+        // "condition not met" to go on once `eventually_with_logs` prints
+        // these nodes' captured logs.
+        ("RUST_LOG", DISTRIBUTED_RUST_LOG),
     ];
     let n1 = Node::spawn_binary(&net, CLUSTER, "n1", &[], &env, donor_bin).await;
     let n2 = Node::spawn_binary(&net, CLUSTER, "n2", &[&seed("n1")], &env, donor_bin).await;
@@ -2222,6 +2257,7 @@ async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner(
         "distributed".to_string(),
     ));
     a_env.push(("SUNDOG_TESTNODE_OWNERS".to_string(), OWNERS.to_string()));
+    a_env.push(("RUST_LOG".to_string(), DISTRIBUTED_RUST_LOG.to_string()));
     let a_env_refs: Vec<(&str, &str)> = a_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -2229,6 +2265,7 @@ async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner(
     let dist_env = [
         ("SUNDOG_TESTNODE_MODE", "distributed"),
         ("SUNDOG_TESTNODE_OWNERS", "2"),
+        ("RUST_LOG", DISTRIBUTED_RUST_LOG),
     ];
 
     let net = Arc::new(Network::new_network());
@@ -2525,13 +2562,29 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
     require_containers!();
 
     let net = Arc::new(Network::new_network());
-    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
+    // `Fleet`, not a bare `Vec<Node>`: this scenario's own containers were
+    // the leak source a prior CI run traced (its five never reached their
+    // `stop()` calls below once a settle wait timed out, and kept gossiping
+    // into the next test's network under this same `dist-fill-cluster`
+    // name). `Fleet::drop` stops them during a panic's unwind instead.
+    let mut fleet = Fleet(Vec::with_capacity(NODE_COUNT));
     for (i, alias) in ALIASES.iter().enumerate() {
         let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+        fleet.0.push(
+            Node::spawn_distributed_with_env(
+                &net,
+                CLUSTER,
+                alias,
+                &seed_refs,
+                Some(OWNERS),
+                &log_env,
+            )
+            .await,
+        );
     }
-    let node_refs: Vec<&Node> = nodes.iter().collect();
+    let node_refs: Vec<&Node> = fleet.0.iter().collect();
     wait_for_peers(&node_refs, NODE_COUNT - 1).await;
 
     node_refs[0]
@@ -2544,7 +2597,7 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
     let sample = sample_kv_entries(0xd157_fe11, FILL_KEYS, SAMPLE_SIZE);
     let expected_owned_sum = expected_owned_buckets_sum(u64::from(OWNERS));
 
-    eventually(CONVERGE_WAIT, || async {
+    eventually_with_logs(CONVERGE_WAIT, &node_refs, || async {
         let Some(sum) = sum_counts(&node_refs).await else {
             return false;
         };
@@ -2569,7 +2622,7 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
         "every fill key must be fetchable with the right value from every node: {mismatches:?}"
     );
 
-    for node in nodes {
+    for node in fleet.take() {
         node.stop().await.expect("node stops");
     }
     net.close().await.expect("network closes");
@@ -2595,11 +2648,22 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
     require_containers!();
 
     let net = Arc::new(Network::new_network());
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
     let mut nodes = Vec::with_capacity(NODE_COUNT);
     for (i, alias) in ALIASES.iter().enumerate() {
         let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+        nodes.push(
+            Node::spawn_distributed_with_env(
+                &net,
+                CLUSTER,
+                alias,
+                &seed_refs,
+                Some(OWNERS),
+                &log_env,
+            )
+            .await,
+        );
     }
     wait_for_peers(&nodes.iter().collect::<Vec<_>>(), NODE_COUNT - 1).await;
 
@@ -2712,31 +2776,40 @@ async fn distributed_join_and_rebalance() {
 
     require_containers!();
 
-    // Info-level cluster/rebalance/state-transfer tracing, for `eventually_
-    // with_logs`'s diagnostics on a timeout.
-    let log_env = [("RUST_LOG", "info,sundog::net=info")];
+    // Info-level everywhere, debug on the cluster state-machine internals,
+    // for `eventually_with_logs`'s diagnostics on a timeout.
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
     let spawn = Node::spawn_distributed_with_env;
 
     let net = Arc::new(Network::new_network());
-    let mut nodes = Vec::with_capacity(4);
+    // `Fleet`, not a bare `Vec<Node>`: a prior CI run traced this cluster
+    // name (`dist-join-cluster`) receiving gossip from a still-running
+    // `dist-fill-cluster` container whose own test had already timed out
+    // and panicked without reaching its `stop()` calls. `Fleet::drop` stops
+    // these four nodes during a panic's unwind instead of leaking them the
+    // same way into whatever container test runs next.
+    let mut fleet = Fleet(Vec::with_capacity(4));
     for (i, alias) in ALIASES.iter().enumerate() {
         let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
         let node = spawn(&net, CLUSTER, alias, &seed_refs, Some(OWNERS), &log_env).await;
-        nodes.push(node);
+        fleet.0.push(node);
     }
-    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), ALIASES.len() - 1).await;
+    wait_for_peers(&fleet.0.iter().collect::<Vec<_>>(), ALIASES.len() - 1).await;
 
-    nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
-    let initial_node_refs: Vec<&Node> = nodes.iter().collect();
+    fleet.0[0]
+        .fill(FILL_KEYS)
+        .await
+        .expect("bulk fill succeeds");
+    let initial_node_refs: Vec<&Node> = fleet.0.iter().collect();
     eventually_with_logs(Duration::from_secs(60), &initial_node_refs, || async {
-        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+        sum_counts(&fleet.0.iter().collect::<Vec<_>>()).await
             == Some(usize::from(OWNERS) * FILL_KEYS as usize)
     })
     .await;
 
-    let mut out_before = Vec::with_capacity(nodes.len());
-    for node in &nodes {
+    let mut out_before = Vec::with_capacity(fleet.0.len());
+    for node in &fleet.0 {
         out_before.push(
             scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await,
         );
@@ -2753,8 +2826,8 @@ async fn distributed_join_and_rebalance() {
         &log_env,
     )
     .await;
-    nodes.push(joiner_node);
-    let node_refs: Vec<&Node> = nodes.iter().collect();
+    fleet.0.push(joiner_node);
+    let node_refs: Vec<&Node> = fleet.0.iter().collect();
     wait_for_peers(&node_refs, ALIASES.len()).await;
     let joiner: &Node = node_refs
         .last()
@@ -2808,7 +2881,7 @@ async fn distributed_join_and_rebalance() {
         "every sampled key must be fetchable with the right value from every node: {mismatches:?}"
     );
 
-    for node in nodes {
+    for node in fleet.take() {
         node.stop().await.expect("node stops");
     }
     net.close().await.expect("network closes");

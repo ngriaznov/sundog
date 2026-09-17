@@ -90,6 +90,21 @@ pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.0";
 /// way `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET` etc. already are.
 pub const CRDT_RETIRE_AFTER_SECS_ENV: &str = "SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS";
 
+/// `RUST_LOG` value every `distributed_*` container test, plus the
+/// `cold_join_*`/`warm_join_*` ones, passes to its spawned nodes as
+/// `("RUST_LOG", DISTRIBUTED_RUST_LOG)` in `extra_env`: `info` broadly, and
+/// `debug` on exactly the cluster state-machine internals a rebalance,
+/// state-transfer, or anti-entropy timeout needs visible in the log dump
+/// `eventually_with_logs` prints, plus `sundog::net=debug` for the
+/// connection-level detail those hand off through. `chitchat=warn` keeps
+/// gossip's own per-round chatter out of that dump; `eventually_with_logs`
+/// also filters its cross-cluster "addressed to a different cluster"/"wrong
+/// cluster" lines by content, since a previous test's still-running
+/// containers can still emit them at `warn`.
+pub const DISTRIBUTED_RUST_LOG: &str = "info,sundog::cluster::rebalance=debug,\
+     sundog::cluster::state_transfer=debug,sundog::cluster::anti_entropy=debug,\
+     sundog::net=debug,sundog::ownership=debug,chitchat=warn";
+
 /// Builds the previous release's `sundog-testnode` from its git tag, once per
 /// test process, into `target/prev-release/` and returns the musl binary
 /// path. The tag is fetched if the clone lacks it, as a shallow CI checkout
@@ -901,10 +916,24 @@ where
     }
 }
 
+/// Substrings [`eventually_with_logs`] drops from a timeout's log dump: a
+/// previous test's containers, still gossiping into this one's shared
+/// network because a panic never reached their `stop()` calls, spam these
+/// at `warn` regardless of `RUST_LOG`, and at the volume seen in practice
+/// they crowd the capped tail out of everything else. Counted and
+/// summarized instead of silently dropped, so the dump still says a leak
+/// happened.
+const CHITCHAT_MARKERS: [&str; 2] = [
+    "addressed to a different cluster",
+    "message rejected by peer: wrong cluster",
+];
+
 /// [`eventually`], but on a timeout, prints every one of `nodes`' captured
-/// logs (its alias, then the last 400 lines) to stderr before panicking, so
-/// a CI job's log carries enough of the cluster's own state-machine tracing
-/// to diagnose the failure without reproducing it locally.
+/// logs (its alias, then its last 1500 lines, [`CHITCHAT_MARKERS`] filtered
+/// out and counted first so the cap holds state-machine tracing rather than
+/// another test's stale gossip) to stderr before panicking, so a CI job's
+/// log carries enough of the cluster's own state-machine tracing to
+/// diagnose the failure without reproducing it locally.
 /// # Panics
 ///
 /// Panics if `cond` has not returned `true` by `timeout`.
@@ -913,7 +942,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    const TAIL_LINES: usize = 400;
+    const TAIL_LINES: usize = 1500;
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -923,12 +952,31 @@ where
         if tokio::time::Instant::now() >= deadline {
             for (index, node) in nodes.iter().enumerate() {
                 let logs = node.logs().await;
-                let tail: Vec<&str> = logs.lines().rev().take(TAIL_LINES).collect();
+                let mut chitchat_lines = 0usize;
+                let kept: Vec<&str> = logs
+                    .lines()
+                    .filter(|line| {
+                        let is_chitchat =
+                            CHITCHAT_MARKERS.iter().any(|marker| line.contains(*marker));
+                        if is_chitchat {
+                            chitchat_lines += 1;
+                        }
+                        !is_chitchat
+                    })
+                    .collect();
+                let tail: Vec<&str> = kept.iter().rev().take(TAIL_LINES).copied().collect();
                 eprintln!(
                     "----- node[{index}] {} (last {} lines) -----",
                     node.name(),
                     tail.len()
                 );
+                if chitchat_lines > 0 {
+                    eprintln!(
+                        "  ({chitchat_lines} cross-cluster gossip chitchat line(s) filtered out \
+                         of this node's log, likely from a previous test's still-running \
+                         containers)"
+                    );
+                }
                 for line in tail.into_iter().rev() {
                     eprintln!("{line}");
                 }
@@ -973,4 +1021,75 @@ pub async fn spawn_trio(net: &Arc<Network>, cluster_name: &str) -> (Node, Node, 
     let n3 = Node::spawn(net, cluster_name, "n3", &[&seed("n1"), &seed("n2")]).await;
     wait_for_peers(&[&n1, &n2, &n3], 2).await;
     (n1, n2, n3)
+}
+
+/// A `Vec<Node>` that stops every node it still holds, in a blocking
+/// [`Drop`], when the `Fleet` itself is dropped: a panic-only backstop for
+/// a multi-node container test, so its containers stop gossiping into the
+/// next test's network instead of lingering on `rightsize::ContainerGuard`'s
+/// own, slower, backgrounded teardown (see that type's `Drop` impl: it
+/// enqueues the actual backend stop/remove call onto a dedicated cleanup
+/// thread and returns immediately, rather than waiting for it).
+///
+/// [`Node::stop`] both consumes `self` and is `async`, so nothing already
+/// available can stop a node from a borrowed, synchronous `Drop`:
+/// `ContainerGuard` (the type `Node` wraps) exposes no `kill`, and its only
+/// public `stop` also consumes `self`. A test using `Fleet` pushes every
+/// node it spawns onto `fleet.0` and, on the success path, calls
+/// [`Fleet::take`] to get them back and `stop()` each one explicitly
+/// exactly as before (plus `net.close()`); `Fleet::drop` only has anything
+/// to do when a panic skipped that, in which case the `Vec` it takes is
+/// still full.
+pub struct Fleet(pub Vec<Node>);
+
+impl Fleet {
+    /// Empties the fleet and returns its nodes, for the success path to
+    /// `stop()` explicitly (in whatever order/grouping the test wants,
+    /// e.g. alongside a `net.close()`), leaving `Fleet::drop` with nothing
+    /// left to do.
+    pub fn take(&mut self) -> Vec<Node> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        let nodes = std::mem::take(&mut self.0);
+        if nodes.is_empty() {
+            return; // the success path already took them; nothing to stop.
+        }
+        // `Node::stop` is async, and this `Drop` can run while unwinding a
+        // panic on a thread already inside a Tokio runtime (the `#[tokio::
+        // test]` task itself), where `Handle::block_on` panics rather than
+        // nesting. A dedicated OS thread with its own throwaway
+        // current-thread runtime has no such conflict; the only blocking
+        // call back on this thread is `JoinHandle::join`, an ordinary
+        // synchronous thread join, not a nested `block_on`.
+        let spawned = std::thread::Builder::new()
+            .name("fleet-panic-stop".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("invariant: a throwaway current-thread runtime always builds");
+                runtime.block_on(async move {
+                    for node in nodes {
+                        let name = node.name().to_string();
+                        if let Err(error) = node.stop().await {
+                            eprintln!("Fleet::drop: best-effort stop of {name} failed: {error}");
+                        }
+                    }
+                });
+            });
+        match spawned {
+            Ok(handle) => {
+                if handle.join().is_err() {
+                    eprintln!("Fleet::drop: the panic-stop thread itself panicked");
+                }
+            }
+            Err(error) => {
+                eprintln!("Fleet::drop: failed to spawn the panic-stop thread: {error}");
+            }
+        }
+    }
 }
