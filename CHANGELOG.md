@@ -208,6 +208,11 @@ All notable changes to this project are documented in this file. Format follows
   `bad_region`; empty for `warm`), the second counting how many records a
   warm reopen actually replayed.
 
+- `sundog_rebalance_buckets_total{cache, direction="served"}`: a donor
+  credits every bucket of a rebalance pull stream that runs to its end,
+  whatever the requester's protocol, so a node that serves no metrics of
+  its own still leaves its landed pull visible on the node that donated.
+
 ### Changed
 
 - `sundog_rebalance_buckets_total{cache, direction="in"}` is now credited

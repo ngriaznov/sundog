@@ -502,11 +502,17 @@ async fn seed_crdt_compaction_metrics(
 
 /// Opens `prices` as `Mode::Distributed { owners: 2 }` across `cluster`,
 /// `peer`, and two more nodes joined for this scenario, driving every
-/// `sundog_fetch_total` outcome, a forwarded write, and both
+/// `sundog_fetch_total` outcome, a forwarded write, and all three
 /// `sundog_rebalance_buckets_total` directions on `cluster` itself, the
-/// only node whose metrics this test scrapes. Folded into the main test
-/// rather than its own `#[tokio::test]`, for the same process-global
-/// recorder reason `spill_writes_and_promotes_pin_metrics` is.
+/// only node whose metrics this test scrapes: `in` from its own open-time
+/// pull, `served` from the fourth node's pull of the buckets it takes
+/// from `cluster`'s co-owners, `out` from the release of the buckets it
+/// takes from `cluster`. Folded into the main test rather than its own
+/// `#[tokio::test]`, for the same process-global recorder reason
+/// `spill_writes_and_promotes_pin_metrics` is; that shared recorder also
+/// means every `sundog_owned_buckets{cache="prices"}` write from the
+/// four in-process nodes lands in one series, so the gauge this test reads
+/// is whichever node published last, and its pin stays a positivity check.
 #[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
 async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: SocketAddr) {
     let owners = NonZeroU8::new(2).expect("nonzero");
@@ -889,7 +895,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         .is_some_and(|count| count >= 1.0),
         "expected at least one forwarded write on the 'prices' cache; got body:\n{body}"
     );
-    for direction in ["in", "out"] {
+    for direction in ["in", "out", "served"] {
         assert!(
             scraped_metric_value(
                 &body,

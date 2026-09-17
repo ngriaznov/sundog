@@ -1540,17 +1540,33 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let nodes = [&n1, &n2, &joiner];
     wait_for_peers(&nodes, 2).await;
 
-    // The joiner has data. A joiner on this checkout reports its landed
-    // pull through `sundog_rebalance_buckets_total{direction="in"}`; a
-    // joiner on the previous release serves no `/metrics` at all, since
+    // The joiner's pull has landed. A joiner on this checkout reports it
+    // through `sundog_rebalance_buckets_total{direction="in"}`. A joiner
+    // on the previous release serves no `/metrics` at all, since
     // `build_previous_testnode` builds it without the `prometheus`
-    // feature, so a nonzero `count` is the checkpoint there, whether a
-    // pull or an anti-entropy round put the first record on it. The
-    // settle wait and the fetch check below are the assertions for both
-    // roles: every key on exactly `OWNERS` nodes, fetchable everywhere.
+    // feature, so the donors report it instead: each credits
+    // `direction="served"` only when a bucket-pull stream it donates runs
+    // to its end, a path anti-entropy never takes, and both donors serve
+    // one, since each holds the buckets the other lost to the joiner.
+    // The settle wait and the fetch check below are the assertions for
+    // both roles: every key on exactly `OWNERS` nodes, fetchable
+    // everywhere.
     eventually_with_logs(REBALANCE_WAIT, &nodes, || async {
         if new_is_donor {
-            joiner.count().await.is_ok_and(|count| count > 0)
+            scrape_metric(
+                &n1,
+                "sundog_rebalance_buckets_total",
+                ("direction", "served"),
+            )
+            .await
+                > 0
+                && scrape_metric(
+                    &n2,
+                    "sundog_rebalance_buckets_total",
+                    ("direction", "served"),
+                )
+                .await
+                    > 0
         } else {
             scrape_metric(
                 &joiner,

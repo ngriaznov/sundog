@@ -393,9 +393,10 @@ A `Mode::Distributed` cache adds seven more:
 
 - `sundog_owned_buckets{cache}`, this node's current bucket count.
 - `sundog_rebalance_buckets_total{cache, direction}`, buckets rebalance
-  pulled in or released out, credited per bucket the moment its own pull
-  lands or its own release fires, not batched behind the rest of a
-  multi-bucket transfer.
+  pulled `in`, released `out`, or `served` to another node's pull, credited
+  per bucket the moment its own pull lands or its own release fires, not
+  batched behind the rest of a multi-bucket transfer, and per stream on the
+  donor once the stream runs to its end.
 - `sundog_rebalance_pull_timeouts_total{cache}`, warm-ups that gave up on a
   bucket pull timing out repeatedly and opened warm with whatever landed,
   leaving the rest to anti-entropy.

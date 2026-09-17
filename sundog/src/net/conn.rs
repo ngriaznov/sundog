@@ -1204,6 +1204,17 @@ async fn serve_st_buckets(
             }
         }
     }
+    // `sundog_rebalance_buckets_total{direction="served"}` credits every
+    // bucket of a stream that ran to its end here, whatever the requester's
+    // protocol: the donor-side counterpart of the requester's `"in"`, and
+    // the one signal a requester that serves no metrics of its own leaves
+    // behind on the node that donated to it.
+    metrics::counter!(
+        "sundog_rebalance_buckets_total",
+        "cache" => cache.to_string(),
+        "direction" => "served"
+    )
+    .increment(u64::try_from(buckets_requested).unwrap_or(u64::MAX));
     tracing::debug!(
         cache = %cache,
         buckets_served = buckets_requested,
