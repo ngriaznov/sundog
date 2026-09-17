@@ -37,6 +37,27 @@ All notable changes to this project are documented in this file. Format follows
   and reads stay TTL-blind. No wire change: `wire::PROTOCOL_VERSION` and
   `WireRecord` stay exactly as they are; only the in-RAM entry encoding
   changes.
+- **Converge-before-serving reconciliation for a warm spill reopen**:
+  `reconcile_warm_buckets` groups every warm-reloaded bucket by its live
+  co-owners and, per co-owner, loops a bucket-scoped anti-entropy round
+  (`anti_entropy::run_round_for_buckets`) over that peer's still-diverging
+  buckets until the peer's digest exchange itself reports no mismatch for
+  a bucket, up to `RECONCILE_MAX_ROUNDS` (3) rounds or
+  `ClusterConfig::reconcile_byte_budget` (default 32 MiB) wire bytes pushed
+  and pulled, whichever the peer's loop hits first. Different peers' loops
+  run concurrently, so the step's worst case stays bounded by one peer's
+  budget however many live co-owners a node's warm buckets span. A bucket
+  clears cold and unverified via `ResidencySet::mark_serving` the instant
+  its digest matches a live co-owner's; a bucket whose loop exhausts the
+  budget against every live co-owner, or that has no live co-owner at all,
+  keeps both marks exactly as `attach_ownership` set them and falls through
+  to the ordinary cold-pull path, which alone decides whether to trust and
+  serve it, and a failed round never reports a bucket converged. A round
+  classifies its bucket and part-digest mismatches in chunks of 64 buckets,
+  so no round materializes more than one chunk's listings at once. The
+  warm-reopen cluster suite drives a mass overwrite across most buckets
+  while a node is down and reads back only current values after its
+  reopen.
 - **jemalloc in the demo and the test node**: `demos/sundog-distributed-demo`
   and `sundog-testnode` both set `tikv_jemallocator::Jemalloc` as their
   global allocator on every target but MSVC Windows; the `sundog` library

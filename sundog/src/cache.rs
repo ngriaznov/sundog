@@ -1034,16 +1034,76 @@ fn split_round_result(
         .partition(|bucket| outcome.matched.contains(bucket))
 }
 
-/// Goal 2's converge-before-serving reconciliation step: per live co-owner
-/// of a bucket in `warm_buckets`, loops
-/// [`anti_entropy::run_round_for_buckets`] over that peer's still-diverging
-/// subset of its warm buckets, clearing `residency`'s cold and unverified
-/// marks via [`ResidencySet::mark_serving`] for each bucket the instant its
-/// digest exchange against that peer reports no mismatch -- not held back
-/// for the rest of that peer's still-diverging set -- until either nothing
-/// is left diverging against that peer or [`should_keep_reconciling`]'s
-/// [`ReconcileBudget`] stops the loop. Returns the union of every bucket
-/// marked serving this way.
+/// One live co-owner's whole converge loop: repeatedly
+/// [`anti_entropy::run_round_for_buckets`] against `peer` over its
+/// still-diverging subset of `buckets`, `mark_serving` on `residency` the
+/// instant a bucket's digest exchange reports no mismatch -- not held back
+/// for the rest of this peer's still-diverging set -- until either nothing
+/// is left diverging against `peer` or [`should_keep_reconciling`]'s
+/// `budget` stops the loop. Returns every bucket marked serving this way.
+///
+/// Factored out of [`reconcile_warm_buckets`] so its caller can run one of
+/// these per live co-owner concurrently via [`futures::future::join_all`]:
+/// this node's warm buckets can span more than one live co-owner even in a
+/// small cluster, and running each peer's loop one after another would
+/// multiply `open()`'s worst-case stall by the number of distinct peers
+/// instead of staying bounded by a single peer's `budget`.
+async fn reconcile_against_peer(
+    mesh: &crate::net::Mesh,
+    shard_ops: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    residency: &Arc<ResidencySet>,
+    peer: NodeId,
+    buckets: Vec<u16>,
+    budget: ReconcileBudget,
+) -> HashSet<u16> {
+    let mut still_diverging = buckets;
+    let mut rounds_run: u32 = 0;
+    let mut bytes_moved: u64 = 0;
+    let mut reconciled: HashSet<u16> = HashSet::new();
+    while should_keep_reconciling(rounds_run, bytes_moved, still_diverging.len(), &budget) {
+        let outcome =
+            anti_entropy::run_round_for_buckets(mesh, shard_ops, cache, peer, &still_diverging)
+                .await;
+        rounds_run += 1;
+        bytes_moved += outcome.bytes_moved;
+        let (converged, diverging) = split_round_result(&still_diverging, &outcome);
+        if !converged.is_empty() {
+            // Cleared the moment each bucket's digest matches, not held
+            // back for the rest of this peer's still-diverging set.
+            residency.mark_serving(&converged);
+            reconciled.extend(converged.iter().copied());
+        }
+        tracing::info!(
+            cache = %cache,
+            peer = %peer,
+            round = rounds_run,
+            converged = converged.len(),
+            still_diverging = diverging.len(),
+            bytes_moved,
+            failed = outcome.failed,
+            "sundog spill: warm-reopen reconciliation round against co-owner",
+        );
+        still_diverging = diverging;
+    }
+    // Every bucket left in `still_diverging` here -- the round or byte
+    // budget ran out, or every round against this peer failed -- gets no
+    // `ResidencySet` call at all: it keeps exactly the cold-and-unverified
+    // state it already had, falling through to the ordinary cold-pull path
+    // next.
+    reconciled
+}
+
+/// Goal 2's converge-before-serving reconciliation step: groups
+/// `warm_buckets` by live co-owner, then runs [`reconcile_against_peer`]'s
+/// loop for every distinct peer concurrently (see its own docs), returning
+/// the union of every bucket marked serving across all of them. Each
+/// peer's loop clears `residency`'s cold and unverified marks via
+/// [`ResidencySet::mark_serving`] for each bucket the instant its digest
+/// exchange against that peer reports no mismatch -- not held back for the
+/// rest of that peer's still-diverging set -- until either nothing is left
+/// diverging against that peer or [`should_keep_reconciling`]'s
+/// [`ReconcileBudget`] stops the loop.
 ///
 /// A bucket with no live co-owner at all has nobody to verify its replayed
 /// state against: unlike a fresh cold-open, where "what is here" is always
@@ -1108,42 +1168,22 @@ async fn reconcile_warm_buckets(
 
     let mesh = cluster.mesh();
     let budget = ReconcileBudget::from_config(cluster.config());
-    let mut reconciled: HashSet<u16> = HashSet::new();
-    for (peer, buckets) in peer_buckets {
-        let mut still_diverging = buckets;
-        let mut rounds_run: u32 = 0;
-        let mut bytes_moved: u64 = 0;
-        while should_keep_reconciling(rounds_run, bytes_moved, still_diverging.len(), &budget) {
-            let outcome =
-                anti_entropy::run_round_for_buckets(mesh, shard_ops, cache, peer, &still_diverging)
-                    .await;
-            rounds_run += 1;
-            bytes_moved += outcome.bytes_moved;
-            let (converged, diverging) = split_round_result(&still_diverging, &outcome);
-            if !converged.is_empty() {
-                // Cleared the moment each bucket's digest matches, not held
-                // back for the rest of this peer's still-diverging set.
-                residency.mark_serving(&converged);
-                reconciled.extend(converged.iter().copied());
-            }
-            tracing::info!(
-                cache = %cache,
-                peer = %peer,
-                round = rounds_run,
-                converged = converged.len(),
-                still_diverging = diverging.len(),
-                bytes_moved,
-                failed = outcome.failed,
-                "sundog spill: warm-reopen reconciliation round against co-owner",
-            );
-            still_diverging = diverging;
-        }
-        // Every bucket left in `still_diverging` here -- the round or byte
-        // budget ran out, or every round against this peer failed -- gets
-        // no `ResidencySet` call at all: it keeps exactly the cold-and-
-        // unverified state it already had, falling through to the ordinary
-        // cold-pull path next.
-    }
+    // Every live co-owner's converge loop runs concurrently rather than
+    // one after another: a bucket's owners_of() can name a different live
+    // co-owner for different buckets even in a small cluster, so this
+    // node's warm buckets can split across more than one peer, and running
+    // those loops sequentially would multiply open()'s worst-case stall by
+    // the number of distinct peers instead of staying bounded by a single
+    // peer's `ReconcileBudget` as intended. `mark_serving`'s own locking
+    // makes concurrent calls from different peers' loops safe.
+    let per_peer = peer_buckets.into_iter().map(|(peer, buckets)| {
+        reconcile_against_peer(mesh, shard_ops, cache, residency, peer, buckets, budget)
+    });
+    let reconciled: HashSet<u16> = futures::future::join_all(per_peer)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Every warm-reloaded bucket not marked serving here is still cold and
     // unverified: either it has a live co-owner but its loop against that
@@ -2255,6 +2295,239 @@ mod tests {
 
         c.shutdown().await;
         b.shutdown().await;
+    }
+
+    /// Pins [`reconcile_warm_buckets`]'s per-peer processing: three real,
+    /// joined nodes at the default two owners per bucket, so `c`'s warm
+    /// buckets genuinely split across two distinct live co-owners (`b` for
+    /// some, `d` for others) instead of the single-peer shape every other
+    /// real-round test here exercises. One `reconcile_warm_buckets` call
+    /// must converge every one of `c`'s warm buckets, whichever of the two
+    /// peers each is grouped under -- each peer's loop runs via
+    /// [`futures::future::join_all`], and this is the first test where
+    /// more than one entry lands in `reconcile_warm_buckets`'s internal
+    /// `peer_buckets` map.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end three-node scenario (settle b/c/d, split c's warm buckets \
+                  across b and d, reconcile, assert both peers' shares converge): splitting it \
+                  would only scatter state (b, c, d, shard_ops_c, distributed_c, warm_buckets) \
+                  across helper signatures"
+    )]
+    async fn reconcile_warm_buckets_converges_buckets_split_across_two_live_co_owners() {
+        use crate::cluster::test_support::registered_shard;
+
+        let name = SmolStr::new("reconcile-two-peers");
+
+        let b = Cluster::builder("cache-it-reconcile-two-peers")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        b.cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone, owning every bucket");
+
+        let seed = b.local_gossip_addr();
+        let c = Cluster::builder("cache-it-reconcile-two-peers")
+            .seeds([seed])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("c builds");
+        let d = Cluster::builder("cache-it-reconcile-two-peers")
+            .seeds([seed])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("d builds");
+        wait_for_peer_count(&b, 2).await;
+        wait_for_peer_count(&c, 2).await;
+        wait_for_peer_count(&d, 2).await;
+
+        // See the single-peer sibling test above: without this, neither b
+        // nor d ever learns c also has `name` open, and every round
+        // against them answers Stale.
+        c.advertise_cache_mode(&name, Mode::distributed());
+        d.cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("d opens alone of data, owning its own share of buckets");
+
+        let node_b = b.node_id();
+        let node_d = d.node_id();
+
+        // `distributed_context_for_test` seeds its `OwnershipTracker` from
+        // `c`'s own gossiped view of `advertised_cache_modes` at the
+        // instant it's called: until that gossip carries d's advertised
+        // mode to c too, c computes ownership as if only b and c were
+        // eligible, giving every one of c's buckets b as its only co-owner.
+        // Rebuilding the context on each retry, rather than only retrying
+        // the round below, is what actually waits out that convergence
+        // instead of freezing a too-early, single-peer view.
+        let mut built: Option<SplitWarmContext> = None;
+        wait_until(
+            Duration::from_secs(10),
+            "c's own gossiped view learns d also has `name` open, so c's warm buckets split \
+             across both b and d rather than naming b the only co-owner",
+            async || {
+                let (shard_ops, distributed) = distributed_context_for_test(&c, &name);
+                let warm_buckets: Vec<u16> =
+                    distributed.ownership.current().owned_buckets().collect();
+                let view = distributed.ownership.current();
+                let with_b = warm_buckets
+                    .iter()
+                    .copied()
+                    .find(|&bucket| view.owners_of(bucket).contains(&node_b));
+                let with_d = warm_buckets
+                    .iter()
+                    .copied()
+                    .find(|&bucket| view.owners_of(bucket).contains(&node_d));
+                match (with_b, with_d) {
+                    (Some(bucket_with_b), Some(bucket_with_d)) => {
+                        built = Some(SplitWarmContext {
+                            shard_ops,
+                            distributed,
+                            warm_buckets,
+                            bucket_with_b,
+                            bucket_with_d,
+                        });
+                        true
+                    }
+                    _ => false,
+                }
+            },
+        )
+        .await;
+        let SplitWarmContext {
+            shard_ops: shard_ops_c,
+            distributed: distributed_c,
+            warm_buckets,
+            bucket_with_b,
+            bucket_with_d,
+        } = built.expect("wait_until only returns once the closure itself reported ready");
+        distributed_c.residency.mark_cold(&warm_buckets);
+
+        // One planted key per peer, applied straight to each donor's real
+        // shard (bypassing the ordinary write path and its own fan-out, so
+        // this doesn't depend on b's or d's background rebalance/disown
+        // machinery having settled the same instant c's view did): proves
+        // one `reconcile_warm_buckets` call actually pulls in data from
+        // *both* groups, not only whichever peer happens to run first.
+        let key_from_b = key_for_bucket(bucket_with_b);
+        let key_from_d = key_for_bucket(bucket_with_d);
+        registered_shard(&b, &name)
+            .apply_remote_batch(vec![test_record(key_from_b, "from-b", node_b)])
+            .await;
+        registered_shard(&d, &name)
+            .apply_remote_batch(vec![test_record(key_from_d, "from-d", node_d)])
+            .await;
+
+        // b's and d's own `OwnershipTracker`s catch up to c joining on
+        // their own membership-refresh cadence, independent of
+        // `wait_for_peer_count` above (gossip-level peer knowledge, not
+        // cache-level view) -- the same real-time delay the single-peer
+        // sibling test polls around.
+        let mut reconciled: HashSet<u16> = HashSet::new();
+        wait_until(
+            Duration::from_secs(10),
+            "b's and d's views catch up to c joining, so both peers' rounds reconcile",
+            async || {
+                reconciled = reconcile_warm_buckets(
+                    &c,
+                    &shard_ops_c,
+                    &name,
+                    &distributed_c.ownership,
+                    &distributed_c.residency,
+                    &warm_buckets,
+                )
+                .await;
+                reconciled.len() == warm_buckets.len()
+            },
+        )
+        .await;
+
+        for &bucket in &warm_buckets {
+            assert!(
+                !distributed_c.residency.is_cold(bucket),
+                "bucket {bucket} clears cold once its digest matches its live co-owner's, \
+                 whether that co-owner is b or d"
+            );
+        }
+        assert_record_value(&shard_ops_c, key_from_b, "from-b").await;
+        assert_record_value(&shard_ops_c, key_from_d, "from-d").await;
+
+        c.shutdown().await;
+        d.shutdown().await;
+        b.shutdown().await;
+    }
+
+    /// [`reconcile_warm_buckets_converges_buckets_split_across_two_live_co_owners`]'s
+    /// own raw-shard context, rebuilt on each `wait_until` retry until it
+    /// reflects every peer this test needs: the return shape of
+    /// `distributed_context_for_test` plus which of `warm_buckets` landed
+    /// with each of the two live co-owners this test's split hinges on.
+    struct SplitWarmContext {
+        shard_ops: Arc<dyn ShardOps>,
+        distributed: DistributedContext,
+        warm_buckets: Vec<u16>,
+        bucket_with_b: u16,
+        bucket_with_d: u16,
+    }
+
+    /// The first `u32` key, scanning up from `0` and bounded well past
+    /// [`crate::store::BUCKET_COUNT`] so this is never an unbounded scan,
+    /// whose bucket is `bucket`: [`unused_bucket`]'s inverse, for planting a
+    /// record at a specific, already-known bucket rather than an arbitrary
+    /// or unused one.
+    fn key_for_bucket(bucket: u16) -> u32 {
+        (0u32..1_000_000)
+            .find(|key| bucket_of(&encode_key(key).expect("u32 key encodes")) == bucket)
+            .expect("some u32 key among the first million maps to every bucket")
+    }
+
+    /// A [`WireRecord`] for `key`/`value`, versioned at `node`: the same
+    /// versioned-apply shape [`reconcile_warm_buckets_corrects_a_stale_replayed_record_against_a_live_co_owners_tombstone`]
+    /// uses to seed a shard directly, bypassing the ordinary write path.
+    fn test_record(key: u32, value: &str, node: NodeId) -> WireRecord {
+        WireRecord {
+            key: encode_key(&key).expect("u32 encodes"),
+            value: Some(bytes::Bytes::from(
+                postcard::to_stdvec(&value.to_string()).expect("string encodes"),
+            )),
+            ver: crate::hlc::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node,
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    /// Asserts `shard`'s live record for `key` decodes to `expected`.
+    async fn assert_record_value(shard: &Arc<dyn ShardOps>, key: u32, expected: &str) {
+        let recs = shard
+            .records_for(vec![encode_key(&key).expect("u32 encodes")])
+            .await;
+        assert_eq!(
+            recs.len(),
+            1,
+            "key {key} must have landed on the reconciled shard"
+        );
+        let value: String = recs[0]
+            .value
+            .as_ref()
+            .map(|bytes| postcard::from_bytes(bytes).expect("string decodes"))
+            .expect("a live record, not a tombstone");
+        assert_eq!(
+            value, expected,
+            "key {key} must carry the value its donor planted"
+        );
     }
 
     /// Guards CLAUDE.md's "deleted or expired entries never resurrect"

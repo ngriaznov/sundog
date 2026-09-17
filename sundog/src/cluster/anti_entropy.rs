@@ -352,8 +352,12 @@ pub(crate) struct BucketRoundOutcome {
     /// "Match under continuing live load" -- not a claim of permanent
     /// equality, only that this round's digest exchange found none.
     pub(crate) matched: HashSet<u16>,
-    /// Named as mismatched in the round's reply; repair was attempted
-    /// against it via [`reconcile_mismatches`].
+    /// Named as mismatched in the round's reply (repair was attempted
+    /// against it via [`reconcile_mismatches`]), or requested but dropped
+    /// from the round's own outbound digest list because this shard's
+    /// fresh ownership read disagrees that `peer` co-owns it -- either
+    /// way, its digest was never actually compared this round, so it never
+    /// counts as `matched`.
     pub(crate) still_diverged: HashSet<u16>,
     /// Wire bytes pushed plus pulled this round: `0` when nothing
     /// mismatched or the round failed.
@@ -387,10 +391,19 @@ fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
 /// Computes local digests the same way `run_round_against` does
 /// (`shard.ae_digests_for(peer)`), filtered to `buckets` before the
 /// [`Mesh::ae_round_scoped`] request goes out, so a bucket outside
-/// `buckets` never appears in the request or the returned outcome. `matched`
-/// is `buckets` minus whatever the reply names mismatched; `still_diverged`
-/// is what was named. Reuses [`reconcile_mismatches`] for the classify-
-/// through-repair pipeline, the same one `run_round_against` uses.
+/// `buckets` never appears in the request or the returned outcome.
+/// `ae_digests_for` re-reads the shard's own current ownership view on
+/// every call, independent of whatever view a caller grouped `buckets` by;
+/// a requested bucket the live view does not currently say `peer` co-owns
+/// is therefore silently absent from that call's own result too, never sent
+/// in the outbound request at all. `matched` is computed only from buckets
+/// this round actually sent and got an answer for; every bucket named
+/// mismatched, and every requested bucket that was never sent in the first
+/// place, lands in `still_diverged` -- a bucket whose digest was never
+/// compared this round is never reported as having matched one.
+/// `still_diverged` is what was named plus what was dropped. Reuses
+/// [`reconcile_mismatches`] for the classify-through-repair pipeline, the
+/// same one `run_round_against` uses.
 ///
 /// A shard with no ownership view (a `Mode` other than `Distributed`), a
 /// `Stale` reply, or a failed digest exchange reports every requested
@@ -420,6 +433,11 @@ pub(crate) async fn run_round_for_buckets(
         .filter(|bd| requested.contains(&bd.bucket))
         .map(|bd| (bd.bucket, bd.digest))
         .collect();
+    // Every bucket this round actually sent, per the shard's own fresh
+    // ownership read above -- not `requested`, which may name a bucket
+    // that read disagrees `peer` co-owns. Only a bucket in `sent` ever
+    // gets a real answer to be `matched` against.
+    let sent: HashSet<u16> = local_buckets.iter().map(|&(bucket, _)| bucket).collect();
     let mismatched = match mesh
         .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
         .await
@@ -440,8 +458,14 @@ pub(crate) async fn run_round_for_buckets(
             return every_bucket_diverged(&requested);
         }
     };
-    let still_diverged: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
-    let matched: HashSet<u16> = requested.difference(&still_diverged).copied().collect();
+    let named_mismatched: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
+    // `matched` only from buckets this round actually sent and that came
+    // back unnamed; a requested bucket dropped from `sent` (this round's
+    // own fresh view disagrees the peer co-owns it) was never
+    // digest-compared at all, so it folds into `still_diverged` exactly
+    // like a named mismatch does, never into `matched`.
+    let matched: HashSet<u16> = sent.difference(&named_mismatched).copied().collect();
+    let still_diverged: HashSet<u16> = requested.difference(&matched).copied().collect();
     if mismatched.is_empty() {
         return BucketRoundOutcome {
             matched,
@@ -514,12 +538,38 @@ fn classify_versions(local: Option<Hlc>, peer: Option<Hlc>, merging: bool) -> (b
     }
 }
 
+/// Bound on how many mismatched buckets one [`classify_bucket_mismatches`]
+/// call materializes local listings for in a single `entries_for_buckets`
+/// call. A round can name every one of a peer's co-owned buckets mismatched
+/// at once (up to `BUCKET_COUNT`); fetching all of their local listings in
+/// one call would peak at the round's entire mismatched set rather than one
+/// chunk, unlike `apply_repairs`, which already keeps a batch to
+/// `REPAIR_BATCH` records at a time.
+const CLASSIFY_BUCKET_CHUNK: usize = 64;
+
+/// Splits `mismatches` into chunks of at most `chunk_size`, preserving
+/// order and consuming no more than one chunk's worth by value at a time.
+/// Pure so [`classify_bucket_mismatches`]'s batching boundary gets a direct
+/// unit test independent of any real [`ShardOps`].
+fn chunk_mismatches(mismatches: Vec<AeMismatch>, chunk_size: usize) -> Vec<Vec<AeMismatch>> {
+    let chunk_size = chunk_size.max(1);
+    let mut remaining = mismatches;
+    let mut chunks = Vec::new();
+    while !remaining.is_empty() {
+        let take = chunk_size.min(remaining.len());
+        chunks.push(remaining.drain(..take).collect());
+    }
+    chunks
+}
+
 /// Classifies buckets answered with a listing or sketch
-/// (`AeMismatch::Bucket`/`Sketch`): one local shard pass for all of them at
-/// once, since a mostly-divergent peer mismatches many and per-bucket scans
-/// would be quadratic; each is classified into `plan` directly, or, for a
-/// sketch, via [`handle_sketch_mismatch`]. A no-op when `mismatches` is
-/// empty.
+/// (`AeMismatch::Bucket`/`Sketch`): local shard passes in chunks of at most
+/// [`CLASSIFY_BUCKET_CHUNK`] buckets, since a mostly-divergent peer
+/// mismatches many and per-bucket scans would be quadratic, but materializing
+/// every mismatched bucket's listing in one call would be unbounded in the
+/// round's mismatched-bucket count; each mismatch is classified into `plan`
+/// directly, or, for a sketch, via [`handle_sketch_mismatch`]. A no-op when
+/// `mismatches` is empty.
 async fn classify_bucket_mismatches(
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
@@ -527,35 +577,34 @@ async fn classify_bucket_mismatches(
     plan: &mut RepairPlan,
     merging: bool,
 ) {
-    if mismatches.is_empty() {
-        return;
-    }
-    let local_entries = shard
-        .entries_for_buckets(mismatches.iter().map(AeMismatch::bucket).collect())
-        .await;
-    let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries
-        .into_iter()
-        .map(|(bucket, entries)| (bucket, key_versions_to_tuples(entries)))
-        .collect();
+    for chunk in chunk_mismatches(mismatches, CLASSIFY_BUCKET_CHUNK) {
+        let local_entries = shard
+            .entries_for_buckets(chunk.iter().map(AeMismatch::bucket).collect())
+            .await;
+        let local_by_bucket: HashMap<u16, Vec<(Bytes, Hlc)>> = local_entries
+            .into_iter()
+            .map(|(bucket, entries)| (bucket, key_versions_to_tuples(entries)))
+            .collect();
 
-    for mismatch in mismatches {
-        match mismatch {
-            AeMismatch::Bucket(bucket, peer_entries) => {
-                diff_bucket(
-                    local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
-                    &key_versions_to_tuples(peer_entries),
-                    &mut plan.push_keys,
-                    &mut plan.pull_keys,
-                    merging,
-                );
-            }
-            AeMismatch::Sketch(bucket, cells) => {
-                let entries: &[(Bytes, Hlc)] =
-                    local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
-                handle_sketch_mismatch(cache, bucket, cells, entries, plan, merging);
-            }
-            AeMismatch::PartDigests(..) => {
-                unreachable!("invariant: run_round_against partitions this variant out")
+        for mismatch in chunk {
+            match mismatch {
+                AeMismatch::Bucket(bucket, peer_entries) => {
+                    diff_bucket(
+                        local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice),
+                        &key_versions_to_tuples(peer_entries),
+                        &mut plan.push_keys,
+                        &mut plan.pull_keys,
+                        merging,
+                    );
+                }
+                AeMismatch::Sketch(bucket, cells) => {
+                    let entries: &[(Bytes, Hlc)] =
+                        local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
+                    handle_sketch_mismatch(cache, bucket, cells, entries, plan, merging);
+                }
+                AeMismatch::PartDigests(..) => {
+                    unreachable!("invariant: run_round_against partitions this variant out")
+                }
             }
         }
     }
@@ -569,10 +618,13 @@ fn key_versions_to_tuples(entries: Vec<crate::store::KeyVersion>) -> Vec<(Bytes,
 }
 
 /// Classifies buckets answered with part digests (`AeMismatch::PartDigests`):
-/// compares each against this node's own part digests, one shard call for
-/// all of them, then one [`Mesh::ae_parts`] request for every part that
-/// differs, classifying each reply the same way
-/// [`classify_bucket_mismatches`] does at bucket scale. A no-op when
+/// local shard passes in chunks of at most [`CLASSIFY_BUCKET_CHUNK`]
+/// buckets, the same bound [`classify_bucket_mismatches`] applies to
+/// listing/sketch mismatches, since a round can name every one of a peer's
+/// co-owned buckets mismatched at once and each bucket carries up to
+/// `PART_COUNT` parts -- materializing every mismatched bucket's part
+/// digests, part entries, and `Mesh::ae_parts` reply in one call would be
+/// unbounded in the round's mismatched-bucket count. A no-op when
 /// `mismatches` is empty.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
@@ -585,9 +637,27 @@ async fn classify_part_digest_mismatches(
     plan: &mut RepairPlan,
     merging: bool,
 ) {
-    if mismatches.is_empty() {
-        return;
+    for chunk in chunk_mismatches(mismatches, CLASSIFY_BUCKET_CHUNK) {
+        classify_part_digest_mismatch_chunk(mesh, shard, cache, peer, chunk, plan, merging).await;
     }
+}
+
+/// One [`classify_part_digest_mismatches`] chunk: compares each bucket's
+/// part digests against this node's own, one shard call for the whole
+/// chunk, then one [`Mesh::ae_parts`] request for every part that differs
+/// across the chunk, classifying each reply the same way
+/// [`classify_bucket_mismatches`] does at bucket scale.
+///
+/// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
+async fn classify_part_digest_mismatch_chunk(
+    mesh: &crate::net::Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    mismatches: Vec<AeMismatch>,
+    plan: &mut RepairPlan,
+    merging: bool,
+) {
     let buckets: Vec<u16> = mismatches.iter().map(AeMismatch::bucket).collect();
     let local_part_digests = shard.part_digests(buckets).await;
     let local_digests_by_bucket: HashMap<u16, Vec<u64>> = local_part_digests
@@ -1122,6 +1192,142 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
+    /// `count` distinct buckets among `0..n` u32 keys, each with more than
+    /// `min_count` keys in it, for
+    /// [`classify_part_digest_mismatches_repairs_every_bucket_across_more_than_one_chunk`]:
+    /// enough buckets that a part-digest-mismatched round spans more than
+    /// one [`CLASSIFY_BUCKET_CHUNK`] internal chunk. Real-transport only,
+    /// same reason as `encode_test_record` above.
+    #[cfg(not(feature = "sim"))]
+    fn dense_buckets(n: u32, min_count: usize, count: usize) -> Vec<Vec<u32>> {
+        let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
+        for key in 0..n {
+            let bytes = crate::store::encode_key(&key).expect("u32 key encodes");
+            by_bucket.entry(bucket_of(&bytes)).or_default().push(key);
+        }
+        let dense: Vec<Vec<u32>> = by_bucket
+            .into_values()
+            .filter(|keys| keys.len() > min_count)
+            .take(count)
+            .collect();
+        assert_eq!(
+            dense.len(),
+            count,
+            "at least `count` buckets exceed min_count among this many keys"
+        );
+        dense
+    }
+
+    /// A round whose part-digest-mismatched set spans more than one
+    /// [`CLASSIFY_BUCKET_CHUNK`] internal chunk: `classify_part_digest_mismatches`
+    /// now chunks that set the same way `classify_bucket_mismatches` chunks
+    /// listing/sketch mismatches, so a mismatched bucket past the first
+    /// chunk must still be classified and repaired, not silently dropped by
+    /// an off-by-one in the chunk loop. One key per dense bucket is dropped
+    /// on `b`, across more buckets than one chunk holds, and every one of
+    /// them must come back.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn classify_part_digest_mismatches_repairs_every_bucket_across_more_than_one_chunk() {
+        use super::super::test_support::{loopback_config, wait_for_peer_count, wait_until};
+        use crate::config::ClusterConfig;
+        use crate::store::Mode;
+
+        const N: u32 = 60_000;
+        let bucket_count = CLASSIFY_BUCKET_CHUNK + 5;
+
+        let config = ClusterConfig {
+            ae_part_min_bucket: 8,
+            // Keeps every mismatched part on the listing path, never the
+            // sketch path, the same reasoning as the single-bucket
+            // part-digest test above.
+            ae_sketch_min_bucket: 1_000_000,
+            ..loopback_config()
+        };
+
+        let cluster_a = Cluster::builder("cluster-it-ae-part-digest-chunked")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+
+        cache_a
+            .insert_many((0..N).map(|k| (k, k.to_string())))
+            .await
+            .expect("a inserts before b ever joins");
+
+        let dense = dense_buckets(N, config.ae_part_min_bucket + 1, bucket_count);
+        let target_keys: Vec<u32> = dense.iter().map(|keys| keys[0]).collect();
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-part-digest-chunked")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(30),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, u64::from(N));
+
+        let node_a = cluster_a.node_id();
+        let node_b = cluster_b.node_id();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while cluster_a.peer_is_streaming(node_b) || cluster_b.peer_is_streaming(node_a) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replicate traffic settles within the bound");
+
+        for &key in &target_keys {
+            cache_b.invalidate_local(&key).await;
+        }
+        for &key in &target_keys {
+            assert_eq!(
+                cache_b.get(&key).await,
+                None,
+                "dropped before the round runs"
+            );
+        }
+
+        wait_until(
+            Duration::from_secs(25),
+            "anti-entropy repairs every dropped key even though their buckets span more than \
+             one classify_part_digest_mismatches chunk",
+            async || {
+                let mut all_back = true;
+                for &key in &target_keys {
+                    if cache_b.get(&key).await.is_none() {
+                        all_back = false;
+                    }
+                }
+                all_back
+            },
+        )
+        .await;
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
     /// `n` distinct u32 keys, each landing in a different bucket: scans
     /// `0..` until `n` distinct [`bucket_of`] results are seen. Real-
     /// transport only, same reason as `encode_test_record` above.
@@ -1248,6 +1454,165 @@ mod tests {
 
         b.shutdown().await;
         c.shutdown().await;
+    }
+
+    /// Three real, joined nodes at the default two owners per bucket, so
+    /// rendezvous genuinely splits buckets across different owner pairs:
+    /// `c` requests a round against `b` naming one bucket `b` currently
+    /// co-owns and one bucket `c`'s own fresh view says `b` does *not*
+    /// co-own -- the exact shape `reconcile_warm_buckets`'s peer-grouping
+    /// snapshot vs. `run_round_for_buckets`'s own fresh `ae_digests_for`
+    /// read can disagree on when the live view moves between them. The
+    /// dropped bucket is never sent to `b` at all (never named mismatched
+    /// either, since it was never asked about), so it must land in
+    /// `still_diverged`, never `matched` -- reporting it matched would let
+    /// `reconcile_warm_buckets` `mark_serving` a bucket whose digest was
+    /// never actually compared to `b`'s.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end three-node scenario (settle b/c/d, find a bucket dropped from \
+                  the request, run and assert the round): splitting it would only scatter state \
+                  (b, c, d, node_b, shard_c, the split buckets) across helper signatures"
+    )]
+    async fn run_round_for_buckets_never_reports_matched_for_a_bucket_the_peer_does_not_co_own() {
+        use super::super::test_support::{
+            loopback_config, registered_shard, wait_for_peer_count, wait_until,
+        };
+        use crate::store::Mode;
+
+        let name = SmolStr::new("scoped-round-dropped-co-owner");
+        let b = Cluster::builder("cluster-it-scoped-dropped")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        let node_b = b.node_id();
+        b.cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone, owning every bucket");
+
+        let seed = b.local_gossip_addr();
+        let c = Cluster::builder("cluster-it-scoped-dropped")
+            .seeds([seed])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("c builds");
+        let d = Cluster::builder("cluster-it-scoped-dropped")
+            .seeds([seed])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("d builds");
+        wait_for_peer_count(&b, 2).await;
+        wait_for_peer_count(&c, 2).await;
+        wait_for_peer_count(&d, 2).await;
+        let (cache_c, cache_d) = tokio::join!(
+            c.cache::<u32, String>(name.clone())
+                .mode(Mode::distributed())
+                .open(),
+            d.cache::<u32, String>(name.clone())
+                .mode(Mode::distributed())
+                .open(),
+        );
+        cache_c.expect("c opens");
+        cache_d.expect("d opens");
+
+        let shard_c = registered_shard(&c, &name);
+
+        // Three nodes, two owners per bucket: some bucket keeps `b` among
+        // its two owners, and some other bucket `c` owns does not -- `d`
+        // took `b`'s place there once `d` joined. `c`'s own ownership view
+        // catches up to `d`'s advertised cache mode on its own gossip and
+        // membership-refresh cadence, independent of `open()` above having
+        // already returned, so this polls rather than assuming the very
+        // first view already reflects all three nodes.
+        let mut split: Option<(u16, u16)> = None;
+        wait_until(
+            Duration::from_secs(10),
+            "c's own view catches up to d joining, splitting c's owned buckets across both b \
+             and d instead of naming b the only co-owner",
+            async || {
+                let Some(view) = shard_c.ownership_view() else {
+                    return false;
+                };
+                let mut shared_with_b = None;
+                let mut dropped_by_b = None;
+                for bucket in
+                    0..u16::try_from(crate::store::BUCKET_COUNT).expect("BUCKET_COUNT fits u16")
+                {
+                    if !view.owns(bucket) {
+                        continue;
+                    }
+                    if view.owners_of(bucket).contains(&node_b) {
+                        shared_with_b.get_or_insert(bucket);
+                    } else {
+                        dropped_by_b.get_or_insert(bucket);
+                    }
+                    if shared_with_b.is_some() && dropped_by_b.is_some() {
+                        break;
+                    }
+                }
+                match (shared_with_b, dropped_by_b) {
+                    (Some(shared), Some(dropped)) => {
+                        split = Some((shared, dropped));
+                        true
+                    }
+                    _ => false,
+                }
+            },
+        )
+        .await;
+        let (shared_with_b, dropped_by_b) =
+            split.expect("wait_until only returns once the closure itself reported ready");
+
+        // `b`'s own `OwnershipTracker` for `name` catches up to c and d
+        // joining on its own membership-refresh cadence, independent of
+        // `c`'s own view above having already settled -- the same
+        // real-time delay every other real-round test in this file polls
+        // around rather than assuming the very first round already lands
+        // on a shared view hash.
+        let mut outcome = BucketRoundOutcome::default();
+        wait_until(
+            Duration::from_secs(10),
+            "b's view catches up to c and d joining, so the round against it runs instead of \
+             reporting stale",
+            async || {
+                outcome = run_round_for_buckets(
+                    c.mesh(),
+                    &shard_c,
+                    &name,
+                    node_b,
+                    &[shared_with_b, dropped_by_b],
+                )
+                .await;
+                !outcome.failed
+            },
+        )
+        .await;
+        assert!(
+            outcome.still_diverged.contains(&dropped_by_b),
+            "a bucket c's own fresh view says b does not co-own was never sent to b this \
+             round, so its digest was never compared -- it must count as still diverged"
+        );
+        assert!(
+            !outcome.matched.contains(&dropped_by_b),
+            "a bucket dropped from the outbound request must never be reported matched"
+        );
+        assert!(
+            outcome.matched.contains(&shared_with_b),
+            "the bucket genuinely co-owned with b and untouched by either side still matches \
+             normally"
+        );
+
+        b.shutdown().await;
+        c.shutdown().await;
+        d.shutdown().await;
     }
 
     /// A bucket neither side has ever touched matches on the first non-
@@ -1405,6 +1770,72 @@ mod tests {
     #[test]
     fn jittered_floors_at_one_millisecond_for_a_zero_interval() {
         assert!(jittered(Duration::ZERO) >= Duration::from_millis(1));
+    }
+
+    fn mismatch_bucket(bucket: u16) -> AeMismatch {
+        AeMismatch::Bucket(bucket, Vec::new())
+    }
+
+    /// Table-driven: `chunk_mismatches` splits into chunks of at most
+    /// `chunk_size`, preserving every mismatch and their order, and a
+    /// `chunk_size` of `0` is floored to `1` rather than looping forever.
+    #[test]
+    fn chunk_mismatches_splits_into_bounded_chunks_preserving_order() {
+        struct Case {
+            name: &'static str,
+            count: u16,
+            chunk_size: usize,
+            expected_chunk_lens: &'static [usize],
+        }
+        let cases = [
+            Case {
+                name: "fewer mismatches than one chunk: a single chunk",
+                count: 3,
+                chunk_size: 64,
+                expected_chunk_lens: &[3],
+            },
+            Case {
+                name: "exactly one chunk's worth: a single chunk",
+                count: 4,
+                chunk_size: 4,
+                expected_chunk_lens: &[4],
+            },
+            Case {
+                name: "more than one chunk: full chunks then a remainder",
+                count: 10,
+                chunk_size: 4,
+                expected_chunk_lens: &[4, 4, 2],
+            },
+            Case {
+                name: "no mismatches: no chunks at all",
+                count: 0,
+                chunk_size: 4,
+                expected_chunk_lens: &[],
+            },
+            Case {
+                name: "a zero chunk size is floored to one, not an infinite loop",
+                count: 3,
+                chunk_size: 0,
+                expected_chunk_lens: &[1, 1, 1],
+            },
+        ];
+        for case in cases {
+            let mismatches: Vec<AeMismatch> = (0..case.count).map(mismatch_bucket).collect();
+            let chunks = chunk_mismatches(mismatches, case.chunk_size);
+            let lens: Vec<usize> = chunks.iter().map(Vec::len).collect();
+            assert_eq!(lens, case.expected_chunk_lens, "{}", case.name);
+            let flattened: Vec<u16> = chunks
+                .into_iter()
+                .flatten()
+                .map(|m| AeMismatch::bucket(&m))
+                .collect();
+            let expected: Vec<u16> = (0..case.count).collect();
+            assert_eq!(
+                flattened, expected,
+                "{}: every mismatch survives, in order",
+                case.name
+            );
+        }
     }
 
     fn hlc(wall_ms: u64) -> Hlc {
