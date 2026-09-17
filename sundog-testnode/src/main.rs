@@ -177,6 +177,23 @@ fn u64_env(name: &str) -> Option<u64> {
     parse_u64_override(env::var(name).ok().as_deref())
 }
 
+/// Parses `raw` as a boolean env override: `"true"` is `true`, `"false"` and
+/// anything absent or unparsable is `false`. Backs
+/// `SUNDOG_TESTNODE_WARM_REOPEN`, whose own documented default is `false`,
+/// matching `SpillConfig::warm_reopen`'s own default exactly, so a run that
+/// never sets it behaves exactly as one that explicitly sets it to
+/// `"false"`.
+#[cfg(feature = "spill")]
+fn parse_bool_override(raw: Option<&str>) -> bool {
+    raw == Some("true")
+}
+
+/// Reads `name` as a `bool` env override via [`parse_bool_override`].
+#[cfg(feature = "spill")]
+fn bool_env(name: &str) -> bool {
+    parse_bool_override(env::var(name).ok().as_deref())
+}
+
 /// Decides `"it"`'s [`Mode`] from `SUNDOG_TESTNODE_MODE`/`SUNDOG_TESTNODE_OWNERS`'s
 /// already-read values: `mode` absent or `"replicated"` is always
 /// `Mode::Replicated` (`owners` is only meaningful in distributed mode, so
@@ -262,11 +279,14 @@ fn resolve_byte_budget(bytes: Option<u64>, mib: Option<u64>) -> Option<u64> {
 /// Builds `"it"`'s optional spill tier from
 /// `SUNDOG_TESTNODE_SPILL_DIR`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
 /// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`/
-/// `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`'s already-parsed values: `None`
-/// when no spill dir is set, so the cache opens spill-free exactly as it
-/// always has. `capacity_bytes`/`region_bytes`/`flush_queue_bytes` each
-/// already fold in that knob's `_MB` counterpart via
-/// [`resolve_byte_budget`], so this function itself stays byte-only.
+/// `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`/`SUNDOG_TESTNODE_WARM_REOPEN`'s
+/// already-parsed values: `None` when no spill dir is set, so the cache
+/// opens spill-free exactly as it always has. `capacity_bytes`/
+/// `region_bytes`/`flush_queue_bytes` each already fold in that knob's
+/// `_MB` counterpart via [`resolve_byte_budget`], so this function itself
+/// stays byte-only. `warm_reopen` defaults to `false`, matching
+/// `SpillConfig::warm_reopen`'s own default: a container test that wants
+/// warm reopen sets `SUNDOG_TESTNODE_WARM_REOPEN=true` explicitly.
 ///
 /// # Panics
 ///
@@ -278,12 +298,13 @@ fn spill_config_from_env(
     capacity_bytes: Option<u64>,
     region_bytes: Option<u64>,
     flush_queue_bytes: Option<u64>,
+    warm_reopen: bool,
 ) -> Option<SpillConfig> {
     let dir = dir?;
     let capacity_bytes = capacity_bytes.expect(
         "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES must be set alongside SUNDOG_TESTNODE_SPILL_DIR",
     );
-    let mut cfg = SpillConfig::new(dir, capacity_bytes);
+    let mut cfg = SpillConfig::new(dir, capacity_bytes).warm_reopen(warm_reopen);
     if let Some(region_bytes) = region_bytes {
         cfg = cfg.region_bytes(region_bytes);
     }
@@ -414,6 +435,7 @@ async fn open_it_cache(
                 u64_env("SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES"),
                 u64_env("SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_MB"),
             ),
+            bool_env("SUNDOG_TESTNODE_WARM_REOPEN"),
         );
         if let Some(spill_cfg) = spill_cfg {
             it_builder = it_builder.spill(spill_cfg);
@@ -976,6 +998,17 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "spill")]
+    #[test]
+    fn parse_bool_override_reads_true_and_defaults_everything_else_to_false() {
+        assert!(parse_bool_override(Some("true")));
+        assert!(!parse_bool_override(Some("false")));
+        assert!(!parse_bool_override(None));
+        assert!(!parse_bool_override(Some("")));
+        assert!(!parse_bool_override(Some("TRUE")));
+        assert!(!parse_bool_override(Some("not-a-bool")));
+    }
+
     #[test]
     fn log_filter_directive_defaults_to_warn_when_unset() {
         assert_eq!(log_filter_directive(None), "warn");
@@ -1495,33 +1528,44 @@ mod tests {
 
         #[test]
         fn spill_config_from_env_is_none_without_a_dir() {
-            assert!(spill_config_from_env(None, None, None, None).is_none());
+            assert!(spill_config_from_env(None, None, None, None, false).is_none());
             assert!(
-                spill_config_from_env(None, Some(1 << 20), None, None).is_none(),
+                spill_config_from_env(None, Some(1 << 20), None, None, false).is_none(),
                 "a capacity with no dir still opens spill-free"
             );
         }
 
         #[test]
         fn spill_config_from_env_builds_from_a_dir_and_capacity() {
-            let cfg =
-                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None, None)
-                    .expect("dir plus capacity builds a config");
+            let cfg = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                None,
+                None,
+                false,
+            )
+            .expect("dir plus capacity builds a config");
             assert_eq!(cfg.dir, std::path::PathBuf::from("/tmp/spill-it"));
             assert_eq!(cfg.capacity_bytes, 4096);
         }
 
         #[test]
         fn spill_config_from_env_applies_the_region_override() {
-            let default_region =
-                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None, None)
-                    .expect("builds")
-                    .region_bytes_value();
+            let default_region = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                None,
+                None,
+                false,
+            )
+            .expect("builds")
+            .region_bytes_value();
             let cfg = spill_config_from_env(
                 Some("/tmp/spill-it".to_string()),
                 Some(4096),
                 Some(512),
                 None,
+                false,
             )
             .expect("builds");
             assert_eq!(cfg.region_bytes_value(), 512);
@@ -1534,15 +1578,21 @@ mod tests {
 
         #[test]
         fn spill_config_from_env_applies_the_flush_queue_bytes_override() {
-            let default_flush_queue =
-                spill_config_from_env(Some("/tmp/spill-it".to_string()), Some(4096), None, None)
-                    .expect("builds")
-                    .flush_queue_bytes_value();
+            let default_flush_queue = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                None,
+                None,
+                false,
+            )
+            .expect("builds")
+            .flush_queue_bytes_value();
             let cfg = spill_config_from_env(
                 Some("/tmp/spill-it".to_string()),
                 Some(4096),
                 None,
                 Some(1024),
+                false,
             )
             .expect("builds");
             assert_eq!(cfg.flush_queue_bytes_value(), 1024);
@@ -1554,9 +1604,36 @@ mod tests {
         }
 
         #[test]
+        fn spill_config_from_env_defaults_warm_reopen_to_false() {
+            let cfg = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                None,
+                None,
+                false,
+            )
+            .expect("builds");
+            assert!(!cfg.warm_reopen_value());
+        }
+
+        #[test]
+        fn spill_config_from_env_applies_the_warm_reopen_override() {
+            let cfg = spill_config_from_env(
+                Some("/tmp/spill-it".to_string()),
+                Some(4096),
+                None,
+                None,
+                true,
+            )
+            .expect("builds");
+            assert!(cfg.warm_reopen_value());
+        }
+
+        #[test]
         #[should_panic(expected = "SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES")]
         fn spill_config_from_env_panics_when_the_dir_is_set_without_a_capacity() {
-            let _ = spill_config_from_env(Some("/tmp/spill-it".to_string()), None, None, None);
+            let _ =
+                spill_config_from_env(Some("/tmp/spill-it".to_string()), None, None, None, false);
         }
 
         #[test]

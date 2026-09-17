@@ -150,6 +150,64 @@ All notable changes to this project are documented in this file. Format follows
   redundant confirming anti-entropy round before release; `disown_grace`
   stays the hard floor underneath either way, so a bucket is never
   released before it.
+- **Fast spill reopen from a checkpoint snapshot**: with the new
+  `SpillConfig::warm_reopen(true)` (default `false`, so a default tier's
+  open and close cost are unaffected), a clean `SpillTier::close` first
+  writes every currently-resident live record into the region ring
+  alongside every already-spilled one, then writes a snapshot next to the
+  region files listing every live entry's key, version, expiry, and
+  on-disk location; tombstones and expired entries never appear in it, and
+  it is written to a temporary name and renamed into place, so a crash
+  mid-write leaves no snapshot. A restart against the same spill directory
+  replays only that snapshot (`SpillTier::reopen`), never scanning a
+  region file for records it does not already know to look for: it
+  validates the snapshot's magic, format version, and sizing against the
+  current `SpillConfig`, drops (and counts) an entry whose location fails
+  to decode, falling the whole reopen back cold if any entry is bad,
+  filters to buckets the fresh ownership view says this node still owns
+  (for `Mode::Distributed` on a cluster built with seeds, `CacheBuilder::open`
+  now waits briefly, bounded by `min(ClusterConfig::state_transfer_budget,
+  5s)`, for a first known peer before computing that view at all, so a
+  restart racing gossip convergence never treats a warm reopen's ownership
+  filter as "this node owns everything" for want of a peer having reported
+  in yet), drops anything already expired, and installs every survivor via the new
+  `SpillSink::install_new` with no value bytes read into RAM. A crash
+  before a clean close, or a close with `warm_reopen` off, leaves no
+  snapshot, so the next open is cold; a successful warm reopen deletes the
+  snapshot it just replayed, so a second open with no intervening clean
+  close is cold too. A node down longer than `tombstone_ttl` (10 minutes
+  by default) also always falls back to the ordinary cold path, since no
+  live peer is still guaranteed to hold the tombstones that would out-vote
+  a resurrected stale record. A `Mode::Distributed` cache never serves a
+  warm-reloaded bucket straight off replay: it starts both cold and
+  unverified, a marker distinct from cold precisely because a hit in a
+  warm-reloaded bucket is not automatically trustworthy the way a hit in
+  an ordinary cold bucket always was (pulled from a donor or replicated in
+  live), since a co-owner may have deleted the record during this node's
+  downtime; both `Cache::fetch` and a peer's request for the bucket treat
+  a local hit there the same as a miss while unverified is set. Clearing
+  unverified is always the same decision, and the same call
+  (`ResidencySet::mark_serving`/`mark_all_serving`), that clears cold for
+  the bucket, never a separate one: an eager anti-entropy round against
+  every live co-owner confirming the replayed data, or the ordinary
+  cold-pull machinery landing fresh data for the bucket, verifies it and
+  clears both together, the same events that already cleared cold for any
+  other reconciled or pulled bucket. When there is no co-owner left to
+  verify against instead -- a bucket found to have no co-owner at all, or
+  one whose only co-owners never answer before the warm-up's attempts run
+  out -- both marks clear on that decision too: the replayed data, already
+  bounded by the `tombstone_ttl` downtime gate above, is the best available
+  answer, and refusing local hits forever in a bucket whose local misses
+  are already trusted is incoherent, not extra safety.
+- `sundog_spill_reopen_total{cache, outcome, reason}` and
+  `sundog_spill_reopen_records_total{cache}`: a `spill` cache's two new
+  Prometheus metrics, the first incremented once per cache open naming
+  whether it reopened warm or fell back cold and why (`reason` one of
+  `disabled` for `SpillConfig::warm_reopen` off, `no_snapshot`,
+  `stale_snapshot`, `config_mismatch`, `downtime_exceeded`, or
+  `bad_region`; empty for `warm`), the second counting how many records a
+  warm reopen actually replayed.
+
 ### Changed
 
 - `sundog_rebalance_buckets_total{cache, direction="in"}` is now credited

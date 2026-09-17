@@ -92,9 +92,10 @@ async fn try_donor_buckets(
     // never credited a second time when a later donor re-sends it.
     let (result, count) =
         state_transfer::pull_buckets_from_donor(shard, donor, async { stream }, |bucket| {
-            // A pulled bucket is authoritative: this donor's own data
-            // supersedes whatever this node held locally for it.
-            // `mark_serving` clears the cold mark on this one decision.
+            // A pulled bucket is authoritative, warm-reloaded or not: this
+            // donor's own data supersedes whatever a stale on-disk
+            // checkpoint might have replayed for it. `mark_serving` clears
+            // both the cold and unverified marks on this one decision.
             residency.mark_serving(&[bucket]);
             if credited.insert(bucket) {
                 metrics::counter!(
@@ -207,9 +208,10 @@ async fn pull_one_group(
             if all_cold_passes >= ALL_COLD_PASSES {
                 // Every donor is itself waiting on a pull for these buckets:
                 // there is no warm copy anywhere to pull. Whatever a
-                // hand-off or a forwarded write lands here is the best
+                // hand-off or a forwarded write lands here is all there is,
+                // and if a warm-reloaded record is among it, it is the best
                 // available answer with no donor left to verify it against:
-                // `mark_serving` clears the cold mark.
+                // `mark_serving` clears cold and unverified together.
                 tracing::debug!(cache = %cache, buckets = buckets.len(), "every donor is cold for these buckets; nothing warm to pull");
                 residency.mark_serving(&buckets);
                 return Some(0);
@@ -239,16 +241,27 @@ pub(crate) struct PullRequest<'a> {
     /// Whether a bucket this pull finds owned alone (no live co-owner in
     /// the current view) may be trusted as genuinely sole-owned and marked
     /// servable outright ([`ResidencySet::mark_serving`]), rather than left
-    /// cold for the caller's ordinary warm-up retries. `true` for every call
-    /// on this branch, `Cache::open`'s own initial pull included: a cold
-    /// open holds nothing unverified, so a bucket it finds owned alone here
-    /// is exactly what it looks like -- this node's own data, with no other
-    /// copy anywhere to distrust it against. The field exists for a warm
-    /// reopen that replays buckets from a spill snapshot before this pull
-    /// ever runs: there, "owned alone" can be the replay's own stale,
-    /// unverified echo of ownership rather than a live view's real answer,
-    /// so that caller computes this from the replay and passes `false` to
-    /// withhold trust instead.
+    /// cold and unverified for the caller's ordinary warm-up retries.
+    /// `true` for every routine call (the ongoing `rebalance_task` loop,
+    /// `warm_up_task`'s retries): by the time those run, this node's
+    /// ownership view is the library's normal, live-updating one, so "no
+    /// live co-owner" there means what it says.
+    ///
+    /// For `Cache::open`'s own initial pull, this is the merged rule
+    /// `crate::cache::trust_sole_owner_at_open` computes: trust sole
+    /// ownership at open unless this open replayed buckets from a spill
+    /// snapshot *and* its membership wait
+    /// (`crate::cache::await_initial_peers`) timed out. A cold open holds
+    /// nothing unverified -- a bucket it finds owned alone here is exactly
+    /// what it looks like, this node's own data with no other copy
+    /// anywhere to distrust it against -- so it passes `true` outright
+    /// regardless of that wait's outcome. A warm reopen is different:
+    /// there, "no live co-owner" combined with a timed-out wait is exactly
+    /// the symptom of the transient sole-owner view a lone-looking node
+    /// computes before gossip has shown it any peer, not genuine single
+    /// ownership, so trusting it would serve a warm-reloaded bucket's
+    /// on-disk replay -- possibly stale -- with nobody ever having vouched
+    /// for it; that caller passes `false` to withhold trust instead.
     pub(crate) trust_sole_owner: bool,
 }
 
@@ -286,12 +299,14 @@ impl PullRequest<'_> {
             group_buckets_by_donor_set(&view, cluster.node_id(), buckets)
                 .into_iter()
                 .partition(|(donors, _)| !donors.is_empty());
-        // A bucket this node owns alone has nobody to pull from: what is
-        // here is all there is, so it is not cold either -- but only when
-        // `trust_sole_owner` says this view's "alone" answer is real
-        // rather than an unverified echo (a warm reopen replaying from a
-        // spill snapshot, for one). Left untrusted, `alone` buckets stay
-        // exactly as cold as the caller marked them, falling to
+        // A bucket this node owns alone has nobody to pull from, and nobody
+        // to verify a warm-reloaded record against either: what is here is
+        // all there is, so it is neither cold nor unverified -- but only
+        // when `trust_sole_owner` says this view's "alone" answer is real
+        // rather than the transient sole-owner snapshot a membership wait
+        // that timed out leaves behind. Left untrusted, `alone` buckets
+        // stay exactly as cold/unverified as `attach_ownership`/
+        // `attach_spill_and_record_warm` marked them, falling to
         // `warm_up_task`'s ordinary retries below via `Outcome::NoPeers`.
         let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
         if !alone.is_empty() && trust_sole_owner {
@@ -445,9 +460,10 @@ pub(crate) async fn warm_up_task(
                 )
                 .increment(1);
                 // The warm-up attempts ran out with no donor left to try:
-                // whatever this node holds locally is the best available
-                // answer now, so every still-cold bucket is declared
-                // servable.
+                // whatever a warm-reloaded bucket replayed from disk is the
+                // best available answer now, so it is declared servable
+                // right alongside every plain cold bucket that never
+                // landed a donor pull.
                 residency.mark_all_serving();
                 cluster.mark_warm(&cache);
                 return;
@@ -668,8 +684,10 @@ pub(crate) async fn rebalance_task(
                 let plan = plan_view_change(&prev_view, &pulled_view, &new_view);
                 prev_view = Arc::clone(&new_view);
                 // A bucket this node now owns alone has nobody left to pull
-                // it from: whatever is here is all there is, so it is not
-                // cold, and both a miss and a hit in it are answers.
+                // it from, or to verify a warm-reloaded record against:
+                // whatever is here is all there is, so it is neither cold
+                // nor unverified, and both a miss and a hit in it are
+                // answers.
                 let alone: Vec<u16> = new_view
                     .owned_buckets()
                     .filter(|&bucket| new_view.owners_of(bucket).len() == 1)
@@ -1444,9 +1462,10 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    #[cfg(feature = "spill")]
     #[tokio::test]
-    async fn pull_request_marks_a_bucket_servable_when_owned_alone() {
-        let cluster = solo_cluster("rebalance-unit-test-alone").await;
+    async fn pull_request_marks_a_warm_reloaded_bucket_servable_when_owned_alone() {
+        let cluster = solo_cluster("rebalance-unit-test-warm-alone").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
         let (tracker, _tx) = OwnershipTracker::seed(
@@ -1458,15 +1477,20 @@ mod tests {
         );
 
         // Self-only view: every bucket this node owns has no co-owner at
-        // all.
+        // all, exactly what a warm-reloaded bucket looks like when its
+        // co-owners never even joined the cluster.
         let bucket = tracker
             .current()
             .owned_buckets()
             .next()
             .expect("self owns at least one bucket alone");
         let residency = Arc::new(ResidencySet::new());
-        // Cold, like any freshly gained bucket.
+        // Stands in for `attach_spill_and_record_warm`'s marks right after
+        // a warm spill-tier reopen: cold, like any freshly gained bucket,
+        // and unverified besides, since this replay has never been
+        // checked against a live co-owner.
         residency.mark_cold(&[bucket]);
+        residency.mark_unverified(&[bucket]);
 
         let outcome = PullRequest {
             cluster: &cluster,
@@ -1491,20 +1515,29 @@ mod tests {
             !residency.is_cold(bucket),
             "a sole-owned bucket is not cold: what is here is all there is"
         );
+        assert!(
+            !residency.is_unverified(bucket),
+            "a sole-owned warm-reloaded bucket is servable too: with nobody to verify it \
+             against, the replayed data is the best available answer, exactly the same \
+             decision that already clears the cold mark"
+        );
 
         cluster.shutdown().await;
     }
 
+    #[cfg(feature = "spill")]
     #[tokio::test]
-    async fn pull_request_leaves_a_bucket_cold_when_owned_alone_is_untrusted() {
+    async fn pull_request_leaves_a_warm_reloaded_bucket_cold_when_owned_alone_is_untrusted() {
         // The same self-only, owned-alone fixture as
-        // `pull_request_marks_a_bucket_servable_when_owned_alone` above,
-        // but with `trust_sole_owner: false`: the shape a warm reopen that
-        // replays buckets from a spill snapshot passes once it finds this
-        // bucket's replayed ownership record cannot be trusted, so "owned
-        // alone" here stands in for that untrusted echo rather than a
-        // genuine, live answer.
-        let cluster = solo_cluster("rebalance-unit-test-alone-untrusted").await;
+        // `pull_request_marks_a_warm_reloaded_bucket_servable_when_owned_alone`
+        // above, but with `trust_sole_owner: false`: the shape
+        // `Cache::open`'s initial pull passes whenever `trust_sole_owner_at_open`
+        // says a replayed bucket's "owned alone" answer cannot be trusted --
+        // a warm reopen whose own membership wait was needed and timed out.
+        // "Owned alone" here is exactly the transient sole-owner view a
+        // lone-looking node computes before gossip has shown it any peer,
+        // not genuine single ownership.
+        let cluster = solo_cluster("rebalance-unit-test-warm-alone-untrusted").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
         let (tracker, _tx) = OwnershipTracker::seed(
@@ -1522,6 +1555,7 @@ mod tests {
             .expect("self owns at least one bucket alone");
         let residency = Arc::new(ResidencySet::new());
         residency.mark_cold(&[bucket]);
+        residency.mark_unverified(&[bucket]);
 
         let outcome = PullRequest {
             cluster: &cluster,
@@ -1548,13 +1582,20 @@ mod tests {
              final say once a real answer lands, instead of this pull trusting an unverified \
              sole-owner echo outright"
         );
+        assert!(
+            residency.is_unverified(bucket),
+            "untrusted, a warm-reloaded bucket's replay also stays unverified: nobody has \
+             vouched for it yet, and this view's \"nobody to ask\" answer is not proof that \
+             nobody exists"
+        );
 
         cluster.shutdown().await;
     }
 
+    #[cfg(feature = "spill")]
     #[tokio::test]
-    async fn warm_up_task_marks_a_bucket_servable_once_its_pulls_give_up() {
-        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-warm-up-give-up")
+    async fn warm_up_task_marks_a_warm_reloaded_bucket_servable_once_its_pulls_give_up() {
+        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-warm-up-unverified")
             .seeds(std::iter::empty())
             .config(crate::config::ClusterConfig {
                 gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
@@ -1578,8 +1619,8 @@ mod tests {
         // task's loop reads, unlike
         // `warm_up_task_waits_for_a_co_owner_and_warms_once_its_pulls_give_up`'s
         // self-only start: every owned bucket is genuinely co-owned from
-        // attempt 1, so it is cold going in rather than cleared outright
-        // by the "owned alone" case on the first pass.
+        // attempt 1, so it is cold and unverified going in rather than
+        // cleared outright by the "owned alone" case on the first pass.
         let phantom = NodeId::from(u64::MAX);
         let phantom_view = Arc::new(view(cluster.node_id(), vec![cluster.node_id(), phantom], 2));
         tx.send(Arc::clone(&phantom_view))
@@ -1591,6 +1632,7 @@ mod tests {
             .expect("self owns at least one bucket");
         let residency = Arc::new(ResidencySet::new());
         residency.mark_cold(&[bucket]);
+        residency.mark_unverified(&[bucket]);
 
         let cancel = CancellationToken::new();
         let task = tokio::spawn(warm_up_task(
@@ -1613,6 +1655,12 @@ mod tests {
         assert!(
             !residency.is_cold(bucket),
             "the give-up path clears cold for a bucket whose only co-owner never answered"
+        );
+        assert!(
+            !residency.is_unverified(bucket),
+            "the give-up path clears unverified alongside cold: once the warm-up attempts run \
+             out with nobody left to verify against, the replayed data is the best available \
+             answer"
         );
 
         cancel.cancel();

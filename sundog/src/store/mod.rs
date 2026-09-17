@@ -734,10 +734,26 @@ pub trait ShardOps: Send + Sync {
     /// Closes this shard's spill tier, if the `spill` feature is compiled in
     /// and one was ever attached via `CacheBuilder::spill`: stops accepting
     /// new spills and drops the flusher thread's channel sender. A no-op
-    /// otherwise. Called by `crate::cache::Cache::close` and by
-    /// `crate::cluster::Cluster::shutdown` for every cache still registered
-    /// when the cluster shuts down without an explicit `close`.
+    /// otherwise. This plain close writes no checkpoint snapshot, so the
+    /// next open is cold regardless of `SpillConfig::warm_reopen`; use
+    /// [`ShardOps::close_spill_checkpointed`] where a fast, warm reopen
+    /// matters.
     fn close_spill(&self) {}
+
+    /// [`ShardOps::close_spill`], then, with `SpillConfig::warm_reopen` on,
+    /// a checkpoint of every live entry to disk and a snapshot a later warm
+    /// reopen replays; without `warm_reopen`, exactly `close_spill` alone.
+    /// The default here calls `self.close_spill()` and returns already
+    /// resolved, so an implementor that predates checkpointing, or one
+    /// that never attaches a spill tier, keeps working with no snapshot
+    /// written -- the next open of such a shard is cold. Called by
+    /// `crate::cache::Cache::close` and by `crate::cluster::Cluster::shutdown`
+    /// for every cache still registered when the cluster shuts down without
+    /// an explicit `close`.
+    fn close_spill_checkpointed(&self) -> BoxFuture<'_, ()> {
+        self.close_spill();
+        Box::pin(async {})
+    }
 
     /// Stops accepting writes while keeping the fan-out backlog for the
     /// fan-out task's final drain: the first step of a cluster shutdown,
@@ -779,6 +795,18 @@ pub trait ShardOps: Send + Sync {
     /// yet pulled from a co-owner, so a local miss there is not an answer.
     /// `false` for every other mode.
     fn is_cold_bucket(&self, bucket: u16) -> bool {
+        let _ = bucket;
+        false
+    }
+
+    /// Whether `bucket` was warm-reloaded from a spill tier's on-disk
+    /// checkpoint and never yet verified against a live co-owner, so a
+    /// local *hit* there is not an answer either: an ordinary cold bucket
+    /// only ever holds trustworthy local content (pulled from a donor or
+    /// replicated live), while a warm-reloaded bucket can hold a record a
+    /// co-owner deleted during this node's downtime. `false` for every other mode, and for a cold
+    /// bucket that was never warm-reloaded at all.
+    fn is_unverified_bucket(&self, bucket: u16) -> bool {
         let _ = bucket;
         false
     }
@@ -1377,6 +1405,49 @@ struct SpillRead {
     promotions: metrics::Counter,
 }
 
+/// [`Shard::attach_spill`]'s result: exactly which buckets the reopen
+/// actually replayed at least one record for. Empty covers both a cold
+/// fallback and an eligible, cleanly reopened tier with nothing to replay
+/// -- a caller narrowing its eager post-reopen reconciliation to real
+/// warm-reload work only ever needs this set, never a separate whole-tier
+/// "landed warm at all" flag: a bucket this shard currently owns but that
+/// never had a record on disk belongs in neither case.
+#[cfg(feature = "spill")]
+pub(crate) struct AttachSpillOutcome {
+    pub(crate) warm_buckets: HashSet<u16>,
+}
+
+/// Increments `sundog_spill_checkpoint_entries_total{cache,stage}` by
+/// `count`. `stage` is one of `"captured"`, `"written"`, `"drained"`,
+/// `"abandoned"`, `"kept"`, `"dropped_version_changed"`,
+/// `"dropped_tombstoned"`, `"dropped_gone"`, `"dropped_expired"`,
+/// `"listed"`, or `"snapshot"`, naming the same phase
+/// `Shard::close_spill_checkpointed` logs at `info` alongside this call, in
+/// the same order the checkpoint runs them.
+#[cfg(feature = "spill")]
+fn record_checkpoint_stage(cache: &str, stage: &'static str, count: u64) {
+    metrics::counter!(
+        "sundog_spill_checkpoint_entries_total",
+        "cache" => cache.to_string(),
+        "stage" => stage,
+    )
+    .increment(count);
+}
+
+/// Increments `sundog_spill_reopen_entries_total{cache,stage}` by `count`.
+/// `stage` is one of `"read"`, `"dropped_unowned"`, `"dropped_expired"`,
+/// `"dropped_bad"`, `"installed"`, or `"refused_present"`, naming the same
+/// phase [`Shard::attach_spill`] logs at `info` alongside this call.
+#[cfg(feature = "spill")]
+fn record_reopen_stage(cache: &str, stage: &'static str, count: u64) {
+    metrics::counter!(
+        "sundog_spill_reopen_entries_total",
+        "cache" => cache.to_string(),
+        "stage" => stage,
+    )
+    .increment(count);
+}
+
 // Every method here is fully synchronous, with no `.await`, except
 // `Shard::get`/`Shard::get_or_load`'s spilled-key path under `feature =
 // "spill"`: a disk read runs behind `spawn_blocking` and a semaphore
@@ -1697,6 +1768,23 @@ where
     /// builder-chain entry point for a caller that already owns an
     /// unshared `Shard`.
     ///
+    /// Prefers `spill::SpillTier::reopen` over a cold
+    /// `spill::SpillTier::open`: with `SpillConfig::warm_reopen` on and a
+    /// trustworthy checkpoint snapshot within `ClusterConfig::tombstone_ttl`,
+    /// this replays straight from that snapshot instead of wiping the
+    /// existing region files, filtered to whatever bucket this shard
+    /// currently owns per
+    /// [`Shard::with_ownership`]'s already-seeded tracker (every bucket, for
+    /// a shard with none). Returns [`AttachSpillOutcome::warm_buckets`], the
+    /// specific buckets warm reopen actually replayed at least one record
+    /// for -- never every bucket this shard happens to currently own, only
+    /// the subset [`spill::ReopenOutcome::warm_buckets`] names; empty
+    /// covers both a cold fallback and every mode without a spill tier's
+    /// own bucket concept. A warm-reloaded bucket is still exactly as cold,
+    /// per [`ShardOps::is_cold_bucket`], as any other bucket this shard has
+    /// not yet reconciled against a peer: the
+    /// caller decides when to clear that mark.
+    ///
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if the tier's directory or
@@ -1706,14 +1794,76 @@ where
     ///
     /// Panics if called more than once on the same shard.
     #[cfg(feature = "spill")]
-    pub(crate) fn attach_spill(&self, cfg: &spill::SpillConfig) -> Result<(), std::io::Error> {
-        let tier = Arc::new(spill::SpillTier::open(cfg, &self.name)?);
+    pub(crate) fn attach_spill(
+        &self,
+        cfg: &spill::SpillConfig,
+    ) -> Result<AttachSpillOutcome, std::io::Error> {
+        let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
+        let view = self.ownership.as_ref().map(OwnershipTracker::current);
+        let owned = move |bucket: u16| view.as_ref().is_none_or(|v| v.owns(bucket));
+        let outcome = spill::SpillTier::reopen(
+            cfg,
+            &self.name,
+            sink.as_ref(),
+            now_ms(),
+            self.tombstone_ttl_ms,
+            owned,
+        )?;
+        if outcome.warm {
+            tracing::info!(
+                cache = %self.name,
+                records = outcome.records_installed,
+                "sundog spill: warm reopen replayed the tier from disk",
+            );
+            metrics::counter!(
+                "sundog_spill_reopen_total",
+                "cache" => self.name.to_string(),
+                "outcome" => "warm",
+                "reason" => "",
+            )
+            .increment(1);
+        } else {
+            let reason = outcome.reason.unwrap_or("unknown");
+            tracing::info!(
+                cache = %self.name,
+                reason,
+                "sundog spill: cold fallback",
+            );
+            metrics::counter!(
+                "sundog_spill_reopen_total",
+                "cache" => self.name.to_string(),
+                "outcome" => "cold_fallback",
+                "reason" => reason,
+            )
+            .increment(1);
+        }
+        metrics::counter!(
+            "sundog_spill_reopen_records_total",
+            "cache" => self.name.to_string(),
+        )
+        .increment(outcome.records_installed);
+        tracing::info!(
+            cache = %self.name,
+            read = outcome.entries_read,
+            dropped_unowned = outcome.dropped_unowned,
+            dropped_expired = outcome.dropped_expired,
+            dropped_bad = outcome.dropped_bad,
+            installed = outcome.records_installed,
+            refused_present = outcome.refused_present,
+            "sundog spill: reopen entry accounting",
+        );
+        record_reopen_stage(&self.name, "read", outcome.entries_read);
+        record_reopen_stage(&self.name, "dropped_unowned", outcome.dropped_unowned);
+        record_reopen_stage(&self.name, "dropped_expired", outcome.dropped_expired);
+        record_reopen_stage(&self.name, "dropped_bad", outcome.dropped_bad);
+        record_reopen_stage(&self.name, "installed", outcome.records_installed);
+        record_reopen_stage(&self.name, "refused_present", outcome.refused_present);
+        let tier = Arc::new(outcome.tier);
         tier.set_keep_resident_when_refused(matches!(
             self.mode,
             Mode::Replicated | Mode::Distributed { .. }
         ));
         self.engine.set_spill(Arc::clone(&tier));
-        let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
         tier.attach(Arc::downgrade(&sink));
         self.spill_read
             .set(SpillRead {
@@ -1736,7 +1886,9 @@ where
                 ),
             })
             .unwrap_or_else(|_| panic!("invariant: attach_spill runs at most once per shard"));
-        Ok(())
+        Ok(AttachSpillOutcome {
+            warm_buckets: outcome.warm_buckets,
+        })
     }
 
     /// Overrides the clock every timestamp this shard stamps reads from, in
@@ -3142,10 +3294,12 @@ where
     /// Closes this shard's attached spill tier, if `Shard::attach_spill`
     /// ever ran: stops accepting new spills and drops the flusher thread's
     /// channel sender, so its loop drains whatever is queued and exits on
-    /// its own. A no-op otherwise, and always a no-op in a non-`spill`
-    /// build. Called by `Cache::close` and, for a cache still registered at
-    /// cluster shutdown without an explicit `close`, by
-    /// `Cluster::shutdown`'s [`ShardOps::close_spill`] sweep.
+    /// its own, no checkpoint. This writes no snapshot, so the next
+    /// `attach_spill` on this directory opens cold even with
+    /// `SpillConfig::warm_reopen` on; see [`Shard::close_spill_checkpointed`]
+    /// for the checkpointed close a fast, warm reopen needs.
+    ///
+    /// A no-op otherwise, and always a no-op in a non-`spill` build.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3165,12 +3319,212 @@ where
         }
     }
 
-    /// Whether this shard's attached spill tier has been closed by
-    /// [`Shard::close_spill`], or there never was one. `false` only while a
-    /// tier is attached and still open. Test-facing: lets a test observe
-    /// that [`Cache::close`] stopped the tier a surviving clone still
-    /// shares, without needing to drive an eviction and infer it
-    /// indirectly.
+    /// [`Shard::close_spill`], with `SpillConfig::warm_reopen` on, pays a
+    /// checkpoint's cost first, every step on its own blocking task
+    /// (`tokio::task::spawn_blocking`), never inline on this async call:
+    /// gathers every currently-resident live entry
+    /// (`Engine::checkpoint_resident_entries`), hands it to
+    /// `SpillTier::checkpoint_flush`, which first joins the real flusher
+    /// thread so every job already queued lands before the checkpoint
+    /// writes anything else into the same regions, then writes those
+    /// resident entries into the region ring itself with no version check
+    /// at all. Because that write is unconditional, a second `Cache` clone
+    /// can race this close and remove, tombstone, or overwrite one of those
+    /// keys between the capture and the write landing; the next step,
+    /// `Engine::finalize_checkpoint_writes`, re-validates each newly
+    /// written entry under its own stripe lock, keeps only the ones still
+    /// live at exactly the captured version, and flips each survivor's
+    /// state to `Spilled` so RAM and disk agree. Only once that returns
+    /// does this read `Engine::snapshot_spilled` again: by then it reflects
+    /// every entry already on disk before this checkpoint started *and*
+    /// excludes any key a region rotation reclaimed to make room for the
+    /// new writes, so the two halves never disagree about what is actually
+    /// still on disk, and a key that lost the race above is dropped rather
+    /// than resurrected. That combined list becomes the checkpoint snapshot
+    /// (`SpillTier::write_checkpoint_snapshot`), and only then does the
+    /// tier actually close. Without `warm_reopen`, this is exactly
+    /// `Shard::close_spill` alone, no checkpoint, no snapshot.
+    ///
+    /// A no-op otherwise, and always a no-op in a non-`spill` build.
+    /// Called by `Cache::close` and, for a cache still registered at
+    /// cluster shutdown without an explicit `close`, by
+    /// `Cluster::shutdown`'s [`ShardOps::close_spill_checkpointed`] sweep.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_self,
+            clippy::unused_async,
+            reason = "the tier accessor, and everything this awaits, only exist under \
+                      feature = \"spill\""
+        )
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scripted checkpoint sequence, logging and metering each stage in order"
+    )]
+    pub(crate) async fn close_spill_checkpointed(&self) {
+        #[cfg(feature = "spill")]
+        if let Some(tier) = self.engine.spill().cloned() {
+            tracing::debug!(
+                cache = %self.name,
+                bytes_used = tier.bytes_used(),
+                "sundog spill: closing tier"
+            );
+            if tier.warm_reopen_value() {
+                let now = self.now_ms();
+                let engine = Arc::clone(&self.engine);
+                let resident =
+                    tokio::task::spawn_blocking(move || engine.checkpoint_resident_entries(now))
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                cache = %self.name,
+                                error = %err,
+                                "sundog spill: resident-entry scan task panicked; the \
+                                 checkpoint below covers only already-spilled entries",
+                            );
+                            Vec::new()
+                        });
+                tracing::info!(
+                    cache = %self.name,
+                    count = resident.len(),
+                    "sundog spill: checkpoint captured resident entries",
+                );
+                record_checkpoint_stage(&self.name, "captured", resident.len() as u64);
+
+                let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
+                let checkpoint_tier = Arc::clone(&tier);
+                let flush_outcome = tokio::task::spawn_blocking(move || {
+                    checkpoint_tier.checkpoint_flush(sink.as_ref(), resident)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        cache = %self.name,
+                        error = %err,
+                        "sundog spill: checkpoint flush task panicked; the snapshot below \
+                         still covers every already-spilled entry",
+                    );
+                    spill::CheckpointFlushOutcome::default()
+                });
+                let newly_written = flush_outcome.written;
+                tracing::info!(
+                    cache = %self.name,
+                    count = newly_written.len(),
+                    "sundog spill: checkpoint wrote records",
+                );
+                record_checkpoint_stage(&self.name, "written", newly_written.len() as u64);
+                tracing::info!(
+                    cache = %self.name,
+                    jobs_drained = flush_outcome.jobs_drained,
+                    jobs_abandoned = flush_outcome.jobs_abandoned,
+                    "sundog spill: checkpoint drained the flush queue",
+                );
+                record_checkpoint_stage(&self.name, "drained", flush_outcome.jobs_drained);
+                record_checkpoint_stage(&self.name, "abandoned", flush_outcome.jobs_abandoned);
+
+                // `checkpoint_flush` wrote `newly_written` to disk with no
+                // version check (see its own docs): a second `Cache` clone
+                // racing this close can have removed, tombstoned, or
+                // overwritten the key between the resident-entry capture
+                // above and this point. `finalize_checkpoint_writes`
+                // re-validates each one under its own stripe lock and flips
+                // only the survivors to `Spilled`, so a key that lost the
+                // race is silently dropped here rather than resurrected
+                // below.
+                let engine = Arc::clone(&self.engine);
+                let (survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
+                    engine.finalize_checkpoint_writes(newly_written, now)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        cache = %self.name,
+                        error = %err,
+                        "sundog spill: checkpoint finalize task panicked; the snapshot below \
+                         drops every entry this checkpoint just wrote",
+                    );
+                    (Vec::new(), engine::CheckpointFinalizeCounts::default())
+                });
+                tracing::info!(
+                    cache = %self.name,
+                    kept = finalize_counts.kept,
+                    dropped_version_changed = finalize_counts.dropped_version_changed,
+                    dropped_tombstoned = finalize_counts.dropped_tombstoned,
+                    dropped_gone = finalize_counts.dropped_gone,
+                    dropped_expired = finalize_counts.dropped_expired,
+                    "sundog spill: checkpoint finalized writes",
+                );
+                record_checkpoint_stage(&self.name, "kept", finalize_counts.kept);
+                record_checkpoint_stage(
+                    &self.name,
+                    "dropped_version_changed",
+                    finalize_counts.dropped_version_changed,
+                );
+                record_checkpoint_stage(
+                    &self.name,
+                    "dropped_tombstoned",
+                    finalize_counts.dropped_tombstoned,
+                );
+                record_checkpoint_stage(&self.name, "dropped_gone", finalize_counts.dropped_gone);
+                record_checkpoint_stage(
+                    &self.name,
+                    "dropped_expired",
+                    finalize_counts.dropped_expired,
+                );
+
+                let engine = Arc::clone(&self.engine);
+                let mut entries = tokio::task::spawn_blocking(move || engine.snapshot_spilled(now))
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            cache = %self.name,
+                            error = %err,
+                            "sundog spill: spilled-pointer scan task panicked; the \
+                             checkpoint below covers only entries this checkpoint just wrote",
+                        );
+                        Vec::new()
+                    });
+                tracing::info!(
+                    cache = %self.name,
+                    count = entries.len(),
+                    "sundog spill: checkpoint listed already-spilled entries",
+                );
+                record_checkpoint_stage(&self.name, "listed", entries.len() as u64);
+
+                entries.extend(survivors);
+                tracing::info!(
+                    cache = %self.name,
+                    count = entries.len(),
+                    "sundog spill: checkpoint snapshot total",
+                );
+                record_checkpoint_stage(&self.name, "snapshot", entries.len() as u64);
+
+                let snapshot_tier = Arc::clone(&tier);
+                let closed = tokio::task::spawn_blocking(move || {
+                    snapshot_tier.write_checkpoint_snapshot(&entries, now);
+                    snapshot_tier.close();
+                })
+                .await;
+                if let Err(err) = closed {
+                    tracing::warn!(
+                        cache = %self.name,
+                        error = %err,
+                        "sundog spill: checkpoint snapshot task panicked",
+                    );
+                }
+            } else {
+                tier.close();
+            }
+        }
+    }
+
+    /// Whether this shard's attached spill tier is closed by
+    /// [`Shard::close_spill`] or [`Shard::close_spill_checkpointed`], or
+    /// none is attached. `false` only while a tier is attached and still
+    /// open. Test-facing: lets a test observe that [`Cache::close`] stopped
+    /// the tier a surviving clone still shares, without needing to drive an
+    /// eviction and infer it indirectly.
     #[cfg(all(feature = "spill", test, not(feature = "sim")))]
     pub(crate) fn spill_tier_closed(&self) -> bool {
         self.engine.spill().is_none_or(|tier| tier.is_closed())
@@ -3865,6 +4219,10 @@ where
         Shard::close_spill(self);
     }
 
+    fn close_spill_checkpointed(&self) -> BoxFuture<'_, ()> {
+        Box::pin(Shard::close_spill_checkpointed(self))
+    }
+
     fn seal_fan_out(&self) {
         self.fan_out.seal();
     }
@@ -3892,6 +4250,12 @@ where
         self.residency
             .as_ref()
             .is_some_and(|residency| residency.is_cold(bucket))
+    }
+
+    fn is_unverified_bucket(&self, bucket: u16) -> bool {
+        self.residency
+            .as_ref()
+            .is_some_and(|residency| residency.is_unverified(bucket))
     }
 
     fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
@@ -5253,6 +5617,836 @@ mod tests {
             "merging into a spilled record folds both sides' contributions instead of \
              dropping the one that was on disk"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Shard::attach_spill` never clears a warm-reloaded bucket's cold
+    /// mark itself: that is the caller's job, only once its own eager
+    /// per-co-owner reconciliation round completes (`cache.rs`'s
+    /// `reconcile_warm_buckets`). Two lives of the same directory: the
+    /// first spills one owned key to disk and closes cleanly; the second,
+    /// seeded with that key's bucket already marked cold exactly as
+    /// `attach_ownership` seeds it, reopens warm and finds the bucket
+    /// still cold, the record still readable regardless.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end two-life scenario: splitting it would only scatter state \
+                  (dir, cfg, view, key, bucket) across helper signatures"
+    )]
+    async fn attach_spill_via_a_warm_reopen_leaves_the_reloaded_buckets_cold_until_reconciliation()
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-warm-reopen-cold-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+
+        let self_node = NodeId::from(201u64);
+        let peer = NodeId::from(202u64);
+        let owners = NonZeroU8::new(2).expect("nonzero");
+        let view = Arc::new(OwnershipView::compute(
+            self_node,
+            vec![self_node, peer],
+            owners,
+        ));
+        let key = find_key_by_ownership(&view, true);
+        let bucket = bucket_of(&key_bytes(&key));
+
+        // First life: a tiny weight cap forces the one entry onto disk;
+        // closing the tier checkpoints a snapshot the second life's
+        // `attach_spill` can trust.
+        let (tracker1, tx1) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &HashMap::new(),
+            &SmolStr::new("warm-cold"),
+            owners,
+        );
+        tx1.send(Arc::clone(&view)).expect("receiver still alive");
+        let residency1 = Arc::new(ResidencySet::new());
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("warm-cold"),
+            Mode::Distributed { owners },
+            self_node,
+            1, // a tiny weight cap: the one entry spills
+            None,
+            None,
+        )
+        .with_ownership(tracker1, residency1);
+        let warm0 = shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        assert!(
+            warm0.warm_buckets.is_empty(),
+            "a brand-new directory has nothing to warm-reopen the first time"
+        );
+
+        shard1.insert(key, "v".to_string()).await.expect("insert");
+        // Eviction samples candidates within one stripe (bucket) at a time;
+        // filling `key`'s own bucket with several more, newer entries past
+        // the one-entry weight cap concentrates every later eviction pass
+        // exactly where `key`, the oldest entry in that bucket, lives.
+        let fillers: Vec<u32> = (0..1_000_000u32)
+            .filter(|&k| k != key && bucket_of(&key_bytes(&k)) == bucket)
+            .take(20)
+            .collect();
+        assert!(
+            fillers.len() >= 8,
+            "at least an eviction sample's worth of same-bucket fillers is found quickly"
+        );
+        for filler in fillers {
+            shard1
+                .insert(filler, "filler".to_string())
+                .await
+                .expect("insert filler");
+        }
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while shard1.get_sync(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the target key spills to disk once eviction runs past the tiny weight cap"
+        );
+        shard1.close_spill_checkpointed().await;
+
+        // Second life: same directory, a fresh ownership tracker/residency
+        // seeded exactly as `attach_ownership` seeds a real cache open,
+        // with the reloaded bucket marked cold up front.
+        let (tracker2, tx2) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &HashMap::new(),
+            &SmolStr::new("warm-cold"),
+            owners,
+        );
+        tx2.send(Arc::clone(&view)).expect("receiver still alive");
+        let residency2 = Arc::new(ResidencySet::new());
+        residency2.mark_cold(&[bucket]);
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("warm-cold"),
+            Mode::Distributed { owners },
+            self_node,
+            1,
+            None,
+            None,
+        )
+        .with_ownership(tracker2, Arc::clone(&residency2));
+
+        let warm = shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert_eq!(
+            warm.warm_buckets,
+            HashSet::from([bucket]),
+            "the second life's attach_spill warm-reloads exactly the one bucket the \
+             replayed record belongs to"
+        );
+        assert!(
+            residency2.is_cold(bucket),
+            "attach_spill alone never clears cold: only the caller's eager reconciliation does"
+        );
+        assert_eq!(
+            shard2.get(&key).await,
+            Some("v".to_string()),
+            "the warm-reloaded record is still readable even while its bucket stays marked cold"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpointed close's own contract: `Shard::close_spill_checkpointed`, with
+    /// `SpillConfig::warm_reopen` on, recovers every live entry across the
+    /// restart, a still-resident one exactly as much as one already
+    /// spilled, and never a key already tombstoned before the close ran.
+    /// Guards the exact resurrection bug this design fixes: a scan-based
+    /// replay would find the tombstoned key's still-intact on-disk bytes
+    /// and reinstall it, since a delete never rewrites or erases a spilled
+    /// record's region bytes (see `engine::apply_tombstone`); a
+    /// snapshot-based replay never lists it in the first place, because
+    /// `Engine::snapshot_spilled`/`Engine::checkpoint_resident_entries`
+    /// both walk `stripe.live`, which a tombstone has already been removed
+    /// from.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end three-key scenario (resident, spilled, tombstoned): splitting \
+                  it would only scatter state (dir, cfg, node, the three keys) across helper \
+                  signatures"
+    )]
+    async fn a_checkpointed_close_replays_every_live_entry_and_never_a_tombstoned_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-checkpoint-replay-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(301u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("checkpoint-replay"),
+            Mode::Local,
+            node,
+            2, // room for exactly two resident entries at once
+            None,
+            None,
+        );
+        let warm0 = shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        assert!(warm0.warm_buckets.is_empty());
+
+        let resident_key = 1_000_001u32;
+        let spilled_key = 1_000_002u32;
+        let tombstoned_key = 1_000_003u32;
+
+        shard1
+            .insert(resident_key, "resident-value".to_string())
+            .await
+            .expect("insert resident");
+        shard1
+            .insert(spilled_key, "spilled-value".to_string())
+            .await
+            .expect("insert spilled");
+
+        // Filling `spilled_key`'s own bucket with several more, newer
+        // entries past the two-entry weight cap concentrates every later
+        // eviction pass exactly where `spilled_key`, the oldest entry left
+        // in that bucket, lives; `resident_key`'s own, different, bucket is
+        // never touched by any of this pressure.
+        let spilled_bucket = bucket_of(&key_bytes(&spilled_key));
+        let resident_bucket = bucket_of(&key_bytes(&resident_key));
+        assert_ne!(
+            spilled_bucket, resident_bucket,
+            "the two keys must land in different buckets for this test to isolate eviction \
+             pressure onto only one of them"
+        );
+        let fillers: Vec<u32> = (2_000_000..3_000_000u32)
+            .filter(|&k| bucket_of(&key_bytes(&k)) == spilled_bucket)
+            .take(20)
+            .collect();
+        assert!(
+            fillers.len() >= 8,
+            "at least an eviction sample's worth of same-bucket fillers is found quickly"
+        );
+        for filler in fillers {
+            shard1
+                .insert(filler, "filler".to_string())
+                .await
+                .expect("insert filler");
+        }
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while shard1.get_sync(&spilled_key).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the target key spills to disk once eviction runs past the weight cap"
+        );
+
+        shard1
+            .insert(tombstoned_key, "gone".to_string())
+            .await
+            .expect("insert tombstoned");
+        shard1
+            .remove(&tombstoned_key)
+            .await
+            .expect("remove tombstoned");
+
+        shard1.close_spill_checkpointed().await;
+
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("checkpoint-replay"),
+            Mode::Local,
+            node,
+            2,
+            None,
+            None,
+        );
+        let warm = shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert!(
+            warm.warm_buckets.contains(&resident_bucket),
+            "the still-resident key's bucket replayed too, not only the spilled one"
+        );
+        assert!(warm.warm_buckets.contains(&spilled_bucket));
+
+        assert_eq!(
+            shard2.get(&resident_key).await,
+            Some("resident-value".to_string()),
+            "a key never spilled during the first life still survives the checkpoint"
+        );
+        assert_eq!(
+            shard2.get(&spilled_key).await,
+            Some("spilled-value".to_string()),
+            "a key already spilled when the tier closed survives the checkpoint too"
+        );
+        assert_eq!(
+            shard2.get(&tombstoned_key).await,
+            None,
+            "a key tombstoned before the close never resurrects via checkpoint replay"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact resurrection bug this design fixes, isolated to its
+    /// simplest shape: a key is written, spills to disk, and is deleted
+    /// before a clean close; reopening well inside the downtime gate must
+    /// never see it again, with no peer, no anti-entropy round, and no
+    /// tombstone GC involved at all -- the on-disk record's own bytes,
+    /// unerased by the delete, are never enough to bring it back on their
+    /// own.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn a_deleted_spilled_key_never_resurrects_across_a_checkpointed_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-no-resurrection-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(302u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("no-resurrection"),
+            Mode::Local,
+            node,
+            1, // a tiny weight cap: the one entry spills
+            None,
+            None,
+        );
+        shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+
+        let key = 42u32;
+        shard1.insert(key, "v".to_string()).await.expect("insert");
+        let bucket = bucket_of(&key_bytes(&key));
+        let fillers: Vec<u32> = (0..1_000_000u32)
+            .filter(|&k| k != key && bucket_of(&key_bytes(&k)) == bucket)
+            .take(20)
+            .collect();
+        assert!(fillers.len() >= 8);
+        for filler in fillers {
+            shard1
+                .insert(filler, "filler".to_string())
+                .await
+                .expect("insert filler");
+        }
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while shard1.get_sync(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the key spills to disk once eviction runs past the tiny weight cap"
+        );
+
+        // The key is deleted while still spilled: the on-disk region bytes
+        // for its last live record are never rewritten or erased by this
+        // (`engine::apply_tombstone`'s doc spells out exactly why), so a
+        // scan-based reopen would still find and reinstall them.
+        shard1.remove(&key).await.expect("remove the spilled key");
+
+        shard1.close_spill_checkpointed().await;
+
+        // Reopen well inside the downtime gate (`Shard::new`'s own default,
+        // `ClusterConfig::default().tombstone_ttl`, ten minutes, since this
+        // real wall-clock round-trip runs in well under a second): the
+        // resurrection this guards against, if it happened, is not a
+        // matter of the gate being too wide.
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("no-resurrection"),
+            Mode::Local,
+            node,
+            1,
+            None,
+            None,
+        );
+        // `bucket` still warm-reloads: it holds every filler key too, all
+        // of them legitimately live and un-deleted. The one property this
+        // test guards is that the deleted key specifically never comes
+        // back, asserted directly below.
+        let _warm = shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert_eq!(
+            shard2.get(&key).await,
+            None,
+            "the deleted key never resurrects: no peer, no anti-entropy round, no tombstone \
+             GC, just replay from the checkpoint snapshot alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact race `Engine::finalize_checkpoint_writes` closes:
+    /// `SpillTier::checkpoint_flush` writes a resident entry's captured
+    /// bytes to disk with no version check at all, so a second `Cache`
+    /// clone deleting the same still-resident key between
+    /// `Engine::checkpoint_resident_entries`'s capture and that write
+    /// landing must never let the stale entry survive into the checkpoint
+    /// snapshot. Drives `Shard::close_spill_checkpointed`'s own phases directly, in
+    /// order, with the delete injected exactly between the first two, so
+    /// the race is deterministic rather than a best-effort timing gamble.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn close_spill_checkpoint_drops_a_key_deleted_between_capture_and_disk_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-close-spill-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(303u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("close-spill-race"),
+            Mode::Local,
+            node,
+            1 << 20, // generous cap: this test drives the checkpoint's own
+            // engine methods directly rather than forcing a real eviction
+            None,
+            None,
+        );
+        shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+
+        let key = 77u32;
+        shard1.insert(key, "v".to_string()).await.expect("insert");
+
+        let now = shard1.now_ms();
+        // Phase 1, `Shard::close_spill_checkpointed`'s own first step: capture every
+        // resident live entry before anything else changes.
+        let resident = shard1.engine.checkpoint_resident_entries(now);
+        assert_eq!(resident.len(), 1, "the one resident key is captured");
+
+        // The race: a second `Cache` clone deletes the key after the
+        // capture above but before the checkpoint write below lands.
+        shard1
+            .remove(&key)
+            .await
+            .expect("remove races the checkpoint");
+
+        let tier = Arc::clone(shard1.engine.spill().expect("attach_spill attaches a tier"));
+        let sink = Arc::clone(&shard1.engine) as Arc<dyn spill::SpillSink>;
+        // Phase 2, `Shard::close_spill_checkpointed`'s own checkpoint write: this writes
+        // the now-stale bytes to disk regardless of the race, exactly as
+        // `SpillTier::checkpoint_flush`'s own docs describe.
+        let flush_outcome = tier.checkpoint_flush(sink.as_ref(), resident);
+        let newly_written = flush_outcome.written;
+        assert_eq!(
+            newly_written.len(),
+            1,
+            "checkpoint_flush writes the captured entry to disk with no version check, \
+             exactly as its own docs describe -- this is the vulnerable write the next phase \
+             must correct for"
+        );
+
+        // Phase 3, the fix: `finalize_checkpoint_writes` re-validates the
+        // written entry against the live engine state and must drop it,
+        // since it is now tombstoned.
+        let (survivors, finalize_counts) =
+            shard1.engine.finalize_checkpoint_writes(newly_written, now);
+        assert!(
+            survivors.is_empty(),
+            "a key deleted between the capture and the checkpoint write must never survive \
+             finalize_checkpoint_writes"
+        );
+        assert_eq!(
+            finalize_counts.dropped_tombstoned, 1,
+            "the race drops the entry under the tombstoned reason specifically"
+        );
+
+        let mut entries = shard1.engine.snapshot_spilled(now);
+        entries.extend(survivors);
+        assert!(
+            entries.is_empty(),
+            "the deleted key must be absent from the final checkpoint snapshot"
+        );
+
+        tier.write_checkpoint_snapshot(&entries, now);
+        tier.close();
+
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("close-spill-race"),
+            Mode::Local,
+            node,
+            1 << 20,
+            None,
+            None,
+        );
+        shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert_eq!(
+            shard2.get(&key).await,
+            None,
+            "the key deleted mid-checkpoint never resurrects on reopen"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Engine::finalize_checkpoint_writes` flips a surviving entry from
+    /// `Resident` to `Spilled` directly, never through `SpillSink::install`,
+    /// so it must call `note_spill_arrival` itself or `sundog_spill_entries`
+    /// silently undercounts every checkpoint-written entry. A generous
+    /// capacity keeps eviction out of the picture entirely: the one entry
+    /// here only ever becomes `Spilled` via the checkpoint itself, so the
+    /// gauge's count is unambiguous.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn close_spill_checkpoint_counts_a_surviving_resident_entry_toward_the_spill_entries_metric()
+     {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-checkpoint-gauge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(304u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("checkpoint-gauge"),
+            Mode::Local,
+            node,
+            1 << 20, // generous: nothing is ever evicted by ordinary means
+            None,
+            None,
+        );
+        shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        shard1.insert(1u32, "v".to_string()).await.expect("insert");
+        assert_eq!(
+            shard1.engine.debug_spill_entries_count(),
+            0,
+            "a resident entry never counts toward sundog_spill_entries before any checkpoint"
+        );
+
+        shard1.close_spill_checkpointed().await;
+
+        assert_eq!(
+            shard1.engine.debug_spill_entries_count(),
+            1,
+            "close_spill_checkpointed's checkpoint flips the one resident entry to Spilled via \
+             Engine::finalize_checkpoint_writes, which must call note_spill_arrival itself \
+             since it never goes through SpillSink::install"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Captures `sundog_spill_reopen_total{outcome, reason}` increments for
+    /// one fixed cache name, ignoring every other metric and cache: the
+    /// same filtered-counter shape `spill`'s own `DropRecorder` uses for
+    /// the identical process-global-recorder reason.
+    #[cfg(feature = "spill")]
+    #[derive(Clone, Default)]
+    struct ReopenCounts(Arc<StdMutex<HashMap<(String, String), u64>>>);
+
+    #[cfg(feature = "spill")]
+    impl ReopenCounts {
+        fn get(&self, outcome: &str, reason: &str) -> u64 {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(outcome.to_string(), reason.to_string()))
+                .unwrap_or(&0)
+        }
+    }
+
+    #[cfg(feature = "spill")]
+    struct ReopenOutcomeCounter {
+        outcome_reason: (String, String),
+        counts: ReopenCounts,
+    }
+
+    #[cfg(feature = "spill")]
+    impl metrics::CounterFn for ReopenOutcomeCounter {
+        fn increment(&self, value: u64) {
+            *self
+                .counts
+                .0
+                .lock()
+                .unwrap()
+                .entry(self.outcome_reason.clone())
+                .or_insert(0) += value;
+        }
+
+        fn absolute(&self, value: u64) {
+            *self
+                .counts
+                .0
+                .lock()
+                .unwrap()
+                .entry(self.outcome_reason.clone())
+                .or_insert(0) = value;
+        }
+    }
+
+    #[cfg(feature = "spill")]
+    struct ReopenRecorder {
+        cache: String,
+        counts: ReopenCounts,
+    }
+
+    #[cfg(feature = "spill")]
+    impl metrics::Recorder for ReopenRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let this_cache = key
+                .labels()
+                .any(|l| l.key() == "cache" && l.value() == self.cache);
+            if key.name() != "sundog_spill_reopen_total" || !this_cache {
+                return metrics::Counter::noop();
+            }
+            let outcome = key
+                .labels()
+                .find(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            let reason = key
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            metrics::Counter::from_arc(Arc::new(ReopenOutcomeCounter {
+                outcome_reason: (outcome, reason),
+                counts: self.counts.clone(),
+            }))
+        }
+
+        fn register_gauge(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// `SpillTier::reopen`'s own return value already proves
+    /// `reason="stale_snapshot"`
+    /// (`spill::tests::reopen_refuses_on_a_stale_snapshot_format_version_and_falls_back_to_open`);
+    /// this proves `Shard::attach_spill`'s metric-recording glue actually
+    /// carries that reason through to `sundog_spill_reopen_total`, the one
+    /// reason CLAUDE.md's "pinned in the exporter test" rule cannot cover
+    /// from `tests/prometheus_exporter.rs` itself, since producing a
+    /// `stale_snapshot` cold fallback means forging a snapshot with a
+    /// valid checksum but a wrong `format_version`, a private on-disk
+    /// format this test's own crate access reaches but an external
+    /// integration test cannot.
+    #[cfg(feature = "spill")]
+    #[test]
+    fn attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric() {
+        const CACHE: &str = "attach-spill-stale-snapshot-metric";
+        let counts = ReopenCounts::default();
+        // `metrics::set_global_recorder` is a single process-global slot:
+        // if another test in this binary already won it, this one
+        // silently observes nothing and skips its assertions, the same
+        // tolerance `spill::tests` and `tests/prometheus_exporter.rs`
+        // already document for the identical race.
+        let installed = metrics::set_global_recorder(ReopenRecorder {
+            cache: CACHE.to_string(),
+            counts: counts.clone(),
+        })
+        .is_ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-stale-snapshot-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let region_bytes = 4096u64;
+        let capacity_bytes = 1u64 << 20;
+        let cfg = spill::SpillConfig::new(&dir, capacity_bytes)
+            .region_bytes(region_bytes)
+            .warm_reopen(true);
+        let cache_dir = dir.join(CACHE);
+        std::fs::create_dir_all(&cache_dir).expect("scratch tier directory creates");
+        let region_count = spill::region_count_for(capacity_bytes, region_bytes).max(2);
+        spill::write_stale_snapshot_for_test(&cache_dir, region_bytes, region_count, 1_000);
+
+        let s = Shard::<u32, String>::new(
+            SmolStr::new(CACHE),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        let warm = s
+            .attach_spill(&cfg)
+            .expect("the cold fallback still succeeds even against a stale snapshot");
+        assert!(
+            warm.warm_buckets.is_empty(),
+            "a stale snapshot never reopens warm, so nothing is in warm_buckets"
+        );
+
+        if installed {
+            assert_eq!(
+                counts.get("cold_fallback", "stale_snapshot"),
+                1,
+                "sundog_spill_reopen_total{{outcome=\"cold_fallback\", \
+                 reason=\"stale_snapshot\"}} records the stale-snapshot cold fallback"
+            );
+            assert_eq!(
+                counts.get("warm", ""),
+                0,
+                "a stale snapshot never records a warm reopen"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Shard::attach_spill` called twice against the same directory with
+    /// no clean close in between: the first life's tier is simply dropped,
+    /// never `close_spill_checkpointed`d, so it never writes a checkpoint snapshot --
+    /// exactly the ordinary shape of a crash. The second life's
+    /// `attach_spill` must fall back cold with reason `"no_snapshot"`,
+    /// [`spill::SpillTier::reopen`]'s own first eligibility check.
+    #[cfg(feature = "spill")]
+    #[test]
+    fn attach_spill_twice_with_no_close_between_falls_back_cold_with_reason_no_snapshot() {
+        const CACHE: &str = "attach-spill-twice-no-close";
+        let counts = ReopenCounts::default();
+        // `metrics::set_global_recorder` is a single process-global slot:
+        // if another test in this binary already won it, this one silently
+        // observes nothing and skips its assertions, the same tolerance
+        // `attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric`
+        // above already documents for the identical race.
+        let installed = metrics::set_global_recorder(ReopenRecorder {
+            cache: CACHE.to_string(),
+            counts: counts.clone(),
+        })
+        .is_ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-twice-no-close-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new(CACHE),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        let warm1 = shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        assert!(warm1.warm_buckets.is_empty());
+        // Life 1 ends here with no `close_spill_checkpointed` call at all: the tier is
+        // simply dropped, so no checkpoint snapshot is ever written to this
+        // directory, even though `warm_reopen` is on.
+        drop(shard1);
+
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new(CACHE),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        let warm2 = shard2
+            .attach_spill(&cfg)
+            .expect("the cold fallback still succeeds against a directory with no snapshot");
+        assert!(
+            warm2.warm_buckets.is_empty(),
+            "no snapshot exists to warm-reopen from"
+        );
+
+        if installed {
+            assert_eq!(
+                counts.get("cold_fallback", "no_snapshot"),
+                2,
+                "sundog_spill_reopen_total{{outcome=\"cold_fallback\", \
+                 reason=\"no_snapshot\"}} records both lives' cold fallback: the first life's \
+                 directory starts out with no snapshot exactly as much as the second life's \
+                 does after a close with no checkpoint"
+            );
+            assert_eq!(counts.get("warm", ""), 0, "no snapshot ever reopens warm");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7957,6 +9151,28 @@ mod tests {
         assert!(ShardOps::is_cold_bucket(&s, 7));
         residency.clear_cold(&[7]);
         assert!(!ShardOps::is_cold_bucket(&s, 7));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn is_unverified_bucket_follows_the_residency_set_and_is_false_elsewhere() {
+        let plain = shard::<u32, String>(1);
+        assert!(!ShardOps::is_unverified_bucket(&plain, 7));
+
+        let residency = Arc::new(ResidencySet::new());
+        let (s, _view, _tx) = distributed_shard::<u32, String>(
+            NodeId::from(1),
+            (1..=3u64).map(NodeId::from).collect(),
+            2,
+            Arc::clone(&residency),
+        );
+        assert!(!ShardOps::is_unverified_bucket(&s, 7));
+        residency.mark_unverified(&[7]);
+        assert!(ShardOps::is_unverified_bucket(&s, 7));
+        // Distinct from cold: marking one never marks or clears the other.
+        assert!(!ShardOps::is_cold_bucket(&s, 7));
+        residency.clear_unverified(&[7]);
+        assert!(!ShardOps::is_unverified_bucket(&s, 7));
     }
 
     #[test]

@@ -484,7 +484,7 @@ impl Cluster {
 
     /// Leaves the cluster gracefully: background loops are cancelled and
     /// joined, every still-registered cache has its spill tier closed (see
-    /// [`ShardOps::close_spill`], a no-op if already closed), then chitchat
+    /// [`ShardOps::close_spill_checkpointed`], a no-op if already closed), then chitchat
     /// departs and the data plane closes its connections. No further calls
     /// on any clone of this handle; cache handles opened before this call
     /// keep working for local reads/writes.
@@ -504,8 +504,15 @@ impl Cluster {
         self.inner.cancel.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
-        for shard in self.inner.shards.read_shards().values() {
-            shard.close_spill();
+        // Collected into an owned `Vec` before awaiting anything: the read
+        // guard below is never held across an `.await` point, and a
+        // checkpointed close (`SpillConfig::warm_reopen` on) can run its
+        // blocking work while every other shard's close proceeds
+        // independently.
+        let shards: Vec<Arc<dyn ShardOps>> =
+            self.inner.shards.read_shards().values().cloned().collect();
+        for shard in shards {
+            shard.close_spill_checkpointed().await;
         }
         self.inner.membership.clone().shutdown().await;
         self.inner.mesh.clone().shutdown().await;
@@ -966,6 +973,16 @@ impl RequestHandler for ClusterRequestHandler {
                 return FetchServe::Unavailable;
             };
             let bucket = bucket_of(&key);
+            // An unverified bucket -- warm-reloaded from a spill tier's
+            // on-disk checkpoint, never yet checked against a live
+            // co-owner -- answers `Unavailable` even on a hit: unlike an
+            // ordinary cold bucket, whose only possible local content was
+            // already trustworthy (pulled from a donor or replicated
+            // live), a warm-reloaded bucket can hold a record a co-owner
+            // deleted during this node's downtime.
+            if shard.is_unverified_bucket(bucket) {
+                return FetchServe::Unavailable;
+            }
             // A held record is an answer whatever the two views say: it is
             // what a local `get` here would return. Only a miss depends on
             // this node being a current, warm owner of the bucket.
@@ -4257,6 +4274,93 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    /// The request-handler half of goal 2's serve-gating fix: a hit in an
+    /// unverified bucket -- a warm-reloaded record never yet checked
+    /// against a live co-owner -- answers `Unavailable`, never the record
+    /// itself, exactly as if this responder held nothing at all. A raw
+    /// `Shard`/`ResidencySet` pair, built directly the way
+    /// `cache::attach_ownership` builds one but without a real `Cache`
+    /// around it, since only `ShardOps::is_unverified_bucket` and a bare
+    /// `fetch` call are needed here.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn cluster_request_handler_answers_unavailable_for_a_hit_in_an_unverified_bucket() {
+        let name = SmolStr::new("prices");
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let node = NodeId::from(1u64);
+        let (tracker, tx) =
+            crate::ownership::OwnershipTracker::seed(node, &[], &HashMap::new(), &name, owners);
+        let view = Arc::new(OwnershipView::compute(node, vec![node], owners));
+        tx.send(Arc::clone(&view)).expect("receiver alive");
+        let residency = Arc::new(crate::ownership::ResidencySet::new());
+        let shard = Shard::<u32, String>::new(
+            name.clone(),
+            Mode::Distributed { owners },
+            node,
+            u64::MAX,
+            None,
+            None,
+        )
+        .with_ownership(tracker, Arc::clone(&residency));
+        let shard_ops: Arc<dyn ShardOps> = Arc::new(shard);
+
+        let key = 1u32;
+        let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("test key encodes"));
+        let record = WireRecord {
+            key: key_bytes.clone(),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&"one".to_string()).expect("test value encodes"),
+            )),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node,
+            },
+            expires_at_ms: None,
+        };
+        shard_ops.apply_remote_batch(vec![record]).await;
+
+        let shards: ShardRegistry = Arc::new(RwLock::new(HashMap::from([(
+            name.clone(),
+            Arc::clone(&shard_ops),
+        )])));
+        let handler = ClusterRequestHandler {
+            shards,
+            warmth: Arc::new(Warmth::default()),
+            ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+            ae_sketch_min_bucket: ClusterConfig::default().ae_sketch_min_bucket,
+            ae_sketch_cells: ClusterConfig::default().ae_sketch_cells,
+            rebalance_chunk_bytes: ClusterConfig::default().rebalance_chunk_bytes_value(),
+        };
+        let view_hash = handler
+            .ownership_view_hash(name.clone())
+            .expect("a registered distributed cache reports a view hash");
+
+        let bucket = bucket_of(&key_bytes);
+        residency.mark_cold(&[bucket]);
+        residency.mark_unverified(&[bucket]);
+
+        assert!(
+            matches!(
+                handler
+                    .fetch(name.clone(), key_bytes.clone(), view_hash)
+                    .await,
+                FetchServe::Unavailable
+            ),
+            "a hit in an unverified bucket answers Unavailable, never the record itself"
+        );
+
+        residency.clear_cold(&[bucket]);
+        residency.clear_unverified(&[bucket]);
+        let FetchServe::Found(Some(rec)) = handler
+            .fetch(name.clone(), key_bytes.clone(), view_hash)
+            .await
+        else {
+            panic!("expected the record again once the bucket is no longer unverified");
+        };
+        assert_eq!(rec.key, key_bytes);
+    }
+
     #[test]
     fn st_bucket_key_sub_batches_of_no_keys_is_empty() {
         assert_eq!(
@@ -4302,11 +4406,15 @@ mod tests {
     /// `st_bucket_chunks` only ever calls `entries_for_buckets` and
     /// `records_for` on a `ShardOps`; every other method here panics if
     /// called, since that would be a test bug rather than a shape to serve
-    /// quietly.
+    /// quietly. The exception is `close_spill`, overridden below to count
+    /// its calls for
+    /// [`close_spill_checkpointed_default_resolves_and_calls_the_sync_close`],
+    /// which never touches any of the bucket-chunking machinery above.
     struct RecordingShard {
         entries: Vec<(u16, Vec<KeyVersion>)>,
         records: HashMap<Bytes, WireRecord>,
         records_for_calls: Mutex<Vec<Vec<Bytes>>>,
+        close_spill_calls: AtomicUsize,
     }
 
     impl ShardOps for RecordingShard {
@@ -4381,6 +4489,10 @@ mod tests {
         fn run_pending_tasks(&self) -> BoxFuture<'_, ()> {
             unimplemented!("st_bucket_chunks never calls run_pending_tasks")
         }
+
+        fn close_spill(&self) {
+            self.close_spill_calls.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[tokio::test]
@@ -4426,6 +4538,7 @@ mod tests {
             entries: vec![(bucket, entries)],
             records,
             records_for_calls: Mutex::new(Vec::new()),
+            close_spill_calls: AtomicUsize::new(0),
         });
         let shard: Arc<dyn ShardOps> = recording.clone();
         let mut registry = HashMap::new();
@@ -4478,6 +4591,32 @@ mod tests {
         assert_eq!(
             total_keys, key_count as usize,
             "every key is fetched exactly once across sub-batches"
+        );
+    }
+
+    /// [`ShardOps::close_spill_checkpointed`]'s provided default, for an
+    /// implementor that never overrides it (`RecordingShard` here overrides
+    /// only the sync [`ShardOps::close_spill`]): resolves immediately, and
+    /// its only effect is the one call to `self.close_spill()` its own
+    /// default body makes, so a `ShardOps` implementor written before
+    /// checkpointed close existed keeps compiling and behaving exactly as
+    /// it always did, just without a checkpoint snapshot.
+    #[tokio::test]
+    async fn close_spill_checkpointed_default_resolves_and_calls_the_sync_close() {
+        let recording = Arc::new(RecordingShard {
+            entries: Vec::new(),
+            records: HashMap::new(),
+            records_for_calls: Mutex::new(Vec::new()),
+            close_spill_calls: AtomicUsize::new(0),
+        });
+        let shard: Arc<dyn ShardOps> = recording.clone();
+
+        shard.close_spill_checkpointed().await;
+
+        assert_eq!(
+            recording.close_spill_calls.load(Ordering::Relaxed),
+            1,
+            "the default close_spill_checkpointed calls the sync close_spill exactly once"
         );
     }
 

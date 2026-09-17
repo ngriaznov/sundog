@@ -30,9 +30,9 @@ const SAMPLE_ATTEMPT_CAP: usize = SAMPLE_SIZE * 20;
 
 /// How long the killed node stays down before the headless run restarts it:
 /// `min(duration / 4, tombstone_ttl / 2)`. Capping at half the tombstone TTL
-/// keeps the downtime bounded well inside the tombstone TTL, so a removed
-/// key's tombstone still outlives the restart and anti-entropy never
-/// resurrects it once the node rejoins.
+/// keeps the downtime inside `SpillConfig::warm_reopen`'s budget (it falls
+/// back cold once downtime exceeds the tombstone TTL), so a spill run
+/// exercises the warm reopen instead of always cold-falling-back.
 #[must_use]
 fn restart_delay(duration: Duration, tombstone_ttl: Duration) -> Duration {
     (duration / 4).min(tombstone_ttl / 2)
@@ -95,8 +95,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
 
     // Kill one node at the midpoint and bring it back after a bounded
     // downtime, so the run exercises a real rebalance under live load and
-    // the restart lands well inside the tombstone TTL, so a removed key's
-    // tombstone still outlives it.
+    // the reopen lands inside the tombstone TTL's warm-reopen budget.
     let killed_index = 0usize;
     let half = duration / 2;
     let downtime = restart_delay(duration, setup::TOMBSTONE_TTL);
@@ -269,6 +268,18 @@ fn build_report(
         )),
         backlog_dropped: as_u64(total_of("sundog_backlog_dropped_total")),
         fan_out_wait_timeouts: as_u64(total_of("sundog_fan_out_wait_timeouts_total")),
+        spill_reopen_warm: as_u64(metrics::labeled_total(
+            metrics_body,
+            "sundog_spill_reopen_total",
+            "outcome",
+            "warm",
+        )),
+        spill_reopen_cold_fallback: as_u64(metrics::labeled_total(
+            metrics_body,
+            "sundog_spill_reopen_total",
+            "outcome",
+            "cold_fallback",
+        )),
     }
 }
 
@@ -524,7 +535,9 @@ mod tests {
         sundog_backlog_dropped_total{peer=\"1\"} 5\n\
         sundog_backlog_dropped_total{peer=\"2\"} 3\n\
         sundog_fan_out_wait_timeouts_total{cache=\"demo\"} 8\n\
-        sundog_fan_out_wait_timeouts_total{cache=\"other\"} 1\n";
+        sundog_fan_out_wait_timeouts_total{cache=\"other\"} 1\n\
+        sundog_spill_reopen_total{cache=\"demo\",outcome=\"warm\",reason=\"\"} 1\n\
+        sundog_spill_reopen_total{cache=\"demo\",outcome=\"cold_fallback\",reason=\"downtime_exceeded\"} 2\n";
 
     #[test]
     fn restart_delay_is_a_quarter_of_the_duration_when_that_stays_under_half_the_tombstone_ttl() {
@@ -612,6 +625,8 @@ mod tests {
         assert_eq!(report.rebalance_out, 2);
         assert_eq!(report.backlog_dropped, 8);
         assert_eq!(report.fan_out_wait_timeouts, 9);
+        assert_eq!(report.spill_reopen_warm, 1);
+        assert_eq!(report.spill_reopen_cold_fallback, 2);
     }
 
     #[test]
@@ -653,5 +668,7 @@ mod tests {
         assert_eq!(report.spill_dropped_deferred, 0);
         assert_eq!(report.backlog_dropped, 0);
         assert_eq!(report.fan_out_wait_timeouts, 0);
+        assert_eq!(report.spill_reopen_warm, 0);
+        assert_eq!(report.spill_reopen_cold_fallback, 0);
     }
 }

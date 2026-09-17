@@ -1721,12 +1721,18 @@ const SPILL_DIR: &str = "/spill";
 /// worth: with `region_bytes` set as small as [`SPILL_REGION_BYTES`] for
 /// these tests, that default would bound the backlog far tighter than the
 /// disk budget it is meant to protect, refusing hand-offs the tier has
-/// ample room for.
+/// ample room for. `warm_reopen` sets `SUNDOG_TESTNODE_WARM_REOPEN`: `true`
+/// only for the scenarios that preserve the spill dir across a restart and
+/// mean to exercise the warm path; `false` elsewhere, matching
+/// `SpillConfig::warm_reopen`'s own default, since a node whose restart
+/// lands in a fresh container filesystem has nothing to warm-reopen either
+/// way.
 fn spill_node_env(
     ram_budget_bytes: u64,
     spill_capacity_bytes: u64,
     region_bytes: u64,
     flush_queue_bytes: u64,
+    warm_reopen: bool,
 ) -> Vec<(String, String)> {
     vec![
         (
@@ -1748,6 +1754,10 @@ fn spill_node_env(
         (
             "SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES".to_string(),
             flush_queue_bytes.to_string(),
+        ),
+        (
+            "SUNDOG_TESTNODE_WARM_REOPEN".to_string(),
+            warm_reopen.to_string(),
         ),
     ]
 }
@@ -1803,6 +1813,7 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
         spill_capacity_bytes,
         SPILL_REGION_BYTES,
         spill_capacity_bytes,
+        false,
     );
     let a_env_refs: Vec<(&str, &str)> = a_env
         .iter()
@@ -1922,6 +1933,7 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
         spill_capacity_bytes,
         SPILL_REGION_BYTES,
         spill_capacity_bytes,
+        false,
     );
     let a_env_refs: Vec<(&str, &str)> = a_env
         .iter()
@@ -2015,6 +2027,320 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
     b_stopped.expect("b stops");
     c_stopped.expect("c stops");
     net.close().await.expect("network closes");
+}
+
+/// The warm-reopen companion to `spilling_node_survives_a_restart_and_rewarms_from_peers`:
+/// that scenario's restart lands in a fresh container filesystem, so
+/// `attach_spill` always takes the cold, wipe-and-recreate path regardless
+/// of `SpillTier::reopen`'s own warm path. This one instead bind-mounts a
+/// host directory at the spill dir, so it survives the restart intact --
+/// the shape a real deployment's restart gives it, and the one
+/// `demos/sundog-distributed-demo/src/node.rs`'s own `restart()` already
+/// preserves -- and asserts the restart actually lands warm:
+/// `sundog_spill_reopen_total{outcome="warm"}` fires, never
+/// `{outcome="cold_fallback"}`, and `sundog_spill_reopen_records_total`
+/// accounts for the large majority of what `a` recovers, close to
+/// `spilled_before_restart` since almost nothing else changes `a`'s spill
+/// tier between the two scrapes.
+#[tokio::test]
+async fn spilling_node_reopens_warm_across_a_restart_with_its_spill_dir_preserved() {
+    const FILL_COUNT: u32 = 3_000;
+    const SPILL_REGION_BYTES: u64 = 16 * 1024;
+    const CLUSTER: &str = "spill-warm-reopen-cluster";
+
+    require_containers!();
+
+    let host_spill_dir = std::env::temp_dir().join(format!(
+        "sundog-it-containers-spill-warm-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&host_spill_dir).expect("create the host-side spill dir to mount in");
+    let host_spill_dir = host_spill_dir.to_string_lossy().into_owned();
+    let mounts = [(host_spill_dir.as_str(), SPILL_DIR)];
+
+    let total_weight = fill_weight_bytes(FILL_COUNT);
+    let ram_budget_bytes = total_weight / 3;
+    let spill_capacity_bytes = (total_weight + u64::from(FILL_COUNT) * 64) * 2;
+    let a_env = spill_node_env(
+        ram_budget_bytes,
+        spill_capacity_bytes,
+        SPILL_REGION_BYTES,
+        spill_capacity_bytes,
+        true,
+    );
+    let a_env_refs: Vec<(&str, &str)> = a_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let net = Arc::new(Network::new_network());
+    let a = Node::spawn_with_env_mounts_and_wait(
+        &net,
+        CLUSTER,
+        "a",
+        &[],
+        &a_env_refs,
+        &mounts,
+        Wait::for_log_message("testnode-ready", 1),
+    )
+    .await;
+    let b = Node::spawn(&net, CLUSTER, "b", &[&seed("a")]).await;
+    let c = Node::spawn(&net, CLUSTER, "c", &[&seed("a"), &seed("b")]).await;
+    wait_for_peers(&[&a, &b, &c], 2).await;
+
+    b.fill(FILL_COUNT)
+        .await
+        .expect("bulk fill through b succeeds");
+    for node in [&a, &b, &c] {
+        eventually(CONVERGE_WAIT, || async {
+            node.count().await == Ok(FILL_COUNT as usize)
+        })
+        .await;
+    }
+    let spilled_before_restart = scrape_metric(&a, "sundog_spill_entries", ("cache", "it")).await;
+    assert!(
+        spilled_before_restart > 0,
+        "a should already be spilling some of the {FILL_COUNT} entries before the restart"
+    );
+    // `a`'s very first open, against the still-empty mounted directory, has
+    // no checkpoint snapshot to trust yet: a cold fallback, same as any
+    // first open.
+    assert_eq!(
+        scrape_metric(&a, "sundog_spill_reopen_total", ("outcome", "warm")).await,
+        0,
+        "nothing to warm-reopen before a has ever closed its spill tier"
+    );
+
+    a.stop().await.expect("a stops ahead of its restart");
+    wait_for_peers(&[&b, &c], 1).await;
+
+    // Same host directory mounted again under the same alias: the spill
+    // tier's region files and checkpoint snapshot survive this restart,
+    // unlike `spilling_node_survives_a_restart_and_rewarms_from_peers`'s
+    // ordinary, ephemeral-filesystem restart, so `attach_spill` finds a
+    // snapshot it trusts and takes the warm path.
+    let a = Node::spawn_with_env_mounts_and_wait(
+        &net,
+        CLUSTER,
+        "a",
+        &[&seed("b"), &seed("c")],
+        &a_env_refs,
+        &mounts,
+        Wait::for_http("/metrics").for_port(METRICS_PORT),
+    )
+    .await;
+
+    eventually(CONVERGE_WAIT, || async {
+        a.count().await == Ok(FILL_COUNT as usize)
+    })
+    .await;
+
+    assert_eq!(
+        scrape_metric(&a, "sundog_spill_reopen_total", ("outcome", "warm")).await,
+        1,
+        "the restart's own attach_spill call lands exactly one warm reopen"
+    );
+    let records_installed =
+        scrape_metric(&a, "sundog_spill_reopen_records_total", ("cache", "it")).await;
+    assert!(
+        records_installed * 4 >= spilled_before_restart * 3,
+        "the warm reopen should recover the large majority of what was spilled before the \
+         restart ({records_installed} of {spilled_before_restart})"
+    );
+
+    let (a_stopped, b_stopped, c_stopped) = tokio::join!(a.stop(), b.stop(), c.stop());
+    a_stopped.expect("a stops");
+    b_stopped.expect("b stops");
+    c_stopped.expect("c stops");
+    net.close().await.expect("network closes");
+    let _ = std::fs::remove_dir_all(&host_spill_dir);
+}
+
+/// Goal 2's third mixed-version case, distinct from the two goal-1 cases
+/// above (`distributed_rebalance_interoperates_with_a_current_donor_and_a_previous_release_requester`/
+/// `..._with_a_previous_release_donor_and_a_current_requester`): an N-1
+/// peer answering an N node's eager post-reopen anti-entropy round after a
+/// warm reload. `a` runs this checkout with a bind-mounted spill dir; `b`
+/// and `c` run the previous release. All three hold `"it"` in
+/// `Mode::Distributed` with `OWNERS == 2` over three live nodes, so while
+/// `a` is down the only two live nodes, `b` and `c`, both become every
+/// bucket's owner. A batch of writes made through `b` during that window
+/// lands on both -- exactly the state `a`'s own warm replay from its
+/// preserved spill dir never observes, since replay only reads what was on
+/// disk when `a` last closed. `a` restarts against the same spill dir,
+/// reopens warm (never clearing cold on replay alone, goal 2's own safety
+/// boundary), and must still pick those writes up through its eager
+/// per-co-owner `anti_entropy::run_round_against` round -- served here by a
+/// previous-release peer -- rather than missing them or needing a full
+/// pull to recover buckets that warm-reopened.
+#[tokio::test]
+#[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
+async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner() {
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 1_500;
+    const POST_RESTART_KEYS: u32 = 200;
+    const SAMPLE_SIZE: usize = 100;
+    const SPILL_REGION_BYTES: u64 = 16 * 1024;
+    const CLUSTER: &str = "dist-warm-reopen-mixed-cluster";
+    const REBALANCE_WAIT: Duration = Duration::from_secs(240);
+    const SETTLE_WAIT: Duration = Duration::from_secs(180);
+
+    require_containers!();
+
+    let previous = build_previous_testnode();
+    let host_spill_dir = std::env::temp_dir().join(format!(
+        "sundog-it-containers-spill-warm-mixed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&host_spill_dir).expect("create the host-side spill dir to mount in");
+    let host_spill_dir = host_spill_dir.to_string_lossy().into_owned();
+    let mounts = [(host_spill_dir.as_str(), SPILL_DIR)];
+
+    // Sized off the whole fill, not `a`'s own ~2/3 share of it: generous
+    // capacity is harmless, and a RAM budget well under that share still
+    // forces real spilling once eviction runs.
+    let total_weight = fill_weight_bytes(FILL_KEYS);
+    let ram_budget_bytes = total_weight / 3;
+    let spill_capacity_bytes = (total_weight + u64::from(FILL_KEYS) * 64) * 2;
+    let mut a_env = spill_node_env(
+        ram_budget_bytes,
+        spill_capacity_bytes,
+        SPILL_REGION_BYTES,
+        spill_capacity_bytes,
+        true,
+    );
+    a_env.push((
+        "SUNDOG_TESTNODE_MODE".to_string(),
+        "distributed".to_string(),
+    ));
+    a_env.push(("SUNDOG_TESTNODE_OWNERS".to_string(), OWNERS.to_string()));
+    let a_env_refs: Vec<(&str, &str)> = a_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let dist_env = [
+        ("SUNDOG_TESTNODE_MODE", "distributed"),
+        ("SUNDOG_TESTNODE_OWNERS", "2"),
+    ];
+
+    let net = Arc::new(Network::new_network());
+    let a = Node::spawn_binary_with_env_mounts_and_wait(
+        &net,
+        CLUSTER,
+        "a",
+        &[],
+        &a_env_refs,
+        &mounts,
+        build_testnode(),
+        Wait::for_log_message("testnode-ready", 1),
+    )
+    .await;
+    let b = Node::spawn_binary(&net, CLUSTER, "b", &[&seed("a")], &dist_env, previous).await;
+    let c = Node::spawn_binary(
+        &net,
+        CLUSTER,
+        "c",
+        &[&seed("a"), &seed("b")],
+        &dist_env,
+        previous,
+    )
+    .await;
+    wait_for_peers(&[&a, &b, &c], 2).await;
+
+    a.fill(FILL_KEYS)
+        .await
+        .expect("bulk fill through a succeeds");
+    eventually(REBALANCE_WAIT, || async {
+        sum_counts(&[&a, &b, &c]).await == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+
+    let spilled_before_restart = scrape_metric(&a, "sundog_spill_entries", ("cache", "it")).await;
+    assert!(
+        spilled_before_restart > 0,
+        "a should already be spilling some of the {FILL_KEYS} entries before the restart"
+    );
+
+    a.stop().await.expect("a stops ahead of its restart");
+    wait_for_peers(&[&b, &c], 1).await;
+
+    // While a is down, a fresh batch of writes through b -- the previous
+    // release -- lands on every bucket's now-only-two live owners, b and
+    // c. This is exactly the state a's own spill replay never observes:
+    // only the eager post-reopen AE round below can still recover it.
+    for (key, value) in (0..POST_RESTART_KEYS).map(|i| kv_entry(FILL_KEYS + i)) {
+        b.put(&key, &value)
+            .await
+            .expect("a write during a's downtime still succeeds against its live co-owners");
+    }
+
+    // Same host directory mounted again under the same alias: the spill
+    // tier's region files and checkpoint snapshot survive this restart.
+    let a = Node::spawn_binary_with_env_mounts_and_wait(
+        &net,
+        CLUSTER,
+        "a",
+        &[&seed("b"), &seed("c")],
+        &a_env_refs,
+        &mounts,
+        build_testnode(),
+        Wait::for_http("/metrics").for_port(METRICS_PORT),
+    )
+    .await;
+
+    let nodes = [&a, &b, &c];
+    wait_for_peers(&nodes, 2).await;
+
+    eventually(SETTLE_WAIT, || async {
+        sum_counts(&nodes).await
+            == Some(usize::from(OWNERS) * (FILL_KEYS + POST_RESTART_KEYS) as usize)
+    })
+    .await;
+
+    assert_eq!(
+        scrape_metric(&a, "sundog_spill_reopen_total", ("outcome", "warm")).await,
+        1,
+        "a's restart against its preserved spill dir must land warm, not fall back cold, for \
+         this to actually exercise goal 2's eager post-reopen reconciliation path"
+    );
+
+    // Every write made during a's downtime must be fetchable everywhere,
+    // proving the eager AE round against a previous-release co-owner
+    // actually recovered them, not merely that some later full pull did.
+    let post_restart_entries: Vec<(String, String)> = (0..POST_RESTART_KEYS)
+        .map(|i| kv_entry(FILL_KEYS + i))
+        .collect();
+    let post_restart_mismatches = fetch_mismatches(&nodes, &post_restart_entries).await;
+    assert!(
+        post_restart_mismatches.is_empty(),
+        "every key written during a's downtime must be fetchable with the right value from \
+         every node once a's eager post-reopen AE round against its previous-release co-owner \
+         completes: {post_restart_mismatches:?}"
+    );
+
+    let pre_restart_sample = sample_kv_entries(0x6011_ec7e, FILL_KEYS, SAMPLE_SIZE);
+    let pre_restart_mismatches = fetch_mismatches(&nodes, &pre_restart_sample).await;
+    assert!(
+        pre_restart_mismatches.is_empty(),
+        "every sampled key from before the restart must still be fetchable with the right \
+         value, with no bucket lost to a's warm reopen or the ownership churn around its \
+         downtime: {pre_restart_mismatches:?}"
+    );
+
+    let (a_stopped, b_stopped, c_stopped) = tokio::join!(a.stop(), b.stop(), c.stop());
+    a_stopped.expect("a stops");
+    b_stopped.expect("b stops");
+    c_stopped.expect("c stops");
+    net.close().await.expect("network closes");
+    let _ = std::fs::remove_dir_all(&host_spill_dir);
 }
 
 /// Node ids for `nodes`, in the same order, read via each node's own `id`

@@ -766,6 +766,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     {
         spill_dirs.push(reserve_timeout_pin_metric().await);
     }
+    #[cfg(feature = "spill")]
+    spill_dirs.extend(spill_reopen_pins_metrics(&cluster).await);
     // Independent of `peer`/`third`/`fourth`: creates and fully retires its
     // own two scenario-local nodes before returning, so it leaves no peer
     // count `seed_distributed_metrics` below needs to account for.
@@ -1006,6 +1008,156 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             scraped_metric_value(&body, "sundog_spill_entries", &[("cache", "spill-remove")]),
             Some(0.0),
             "the removed key is gone, so zero currently-spilled entries remain; got body:\n{body}"
+        );
+
+        // sundog_spill_reopen_total/sundog_spill_reopen_records_total: the
+        // "spilled" cache's very first open, with `SpillConfig::warm_reopen`
+        // left at its default, `false`, already takes the disabled cold
+        // fallback with nothing to install.
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
+                    ("cache", "spilled"),
+                    ("outcome", "cold_fallback"),
+                    ("reason", "disabled")
+                ]
+            ),
+            Some(1.0),
+            "expected exactly one disabled cold fallback on the 'spilled' cache's first open; \
+             got body:\n{body}"
+        );
+        // spill_reopen_pins_metrics's own scenarios: a real warm reopen,
+        // with every live entry it recovers counted (both the key still
+        // resident and the key already spilled when the tier closed), and
+        // a first-ever open with nothing yet to replay.
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
+                    ("cache", "spill-reopen-warm"),
+                    ("outcome", "warm"),
+                    ("reason", "")
+                ]
+            ),
+            Some(1.0),
+            "expected exactly one warm reopen on 'spill-reopen-warm'; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_records_total",
+                &[("cache", "spill-reopen-warm")]
+            ),
+            Some(2.0),
+            "expected the warm reopen to have installed both live entries, the one still \
+             resident and the one already spilled when the tier closed; got body:\n{body}"
+        );
+        // sundog_spill_checkpoint_entries_total{cache,stage}: the same
+        // 'spill-reopen-warm' close, staged. `max_capacity(1)` leaves
+        // exactly one of the two inserted keys resident (the other already
+        // spilled by eviction), so the checkpoint captures and writes one
+        // entry, and finalize keeps it (nothing races the close in this
+        // scenario), flipping it to `Spilled` in the live engine. By the
+        // time `snapshot_spilled` runs right after, it scans that same
+        // now-current engine state, so it lists both the entry already
+        // spilled before this checkpoint started and the one finalize just
+        // flipped -- two, not one -- and the final snapshot then totals
+        // three once the explicit `entries.extend(survivors)` appends that
+        // same just-finalized entry a second time (harmless: the reopen
+        // below installs it once and refuses the duplicate).
+        for (stage, expected) in [
+            ("captured", 1.0),
+            ("written", 1.0),
+            ("kept", 1.0),
+            ("listed", 2.0),
+            ("snapshot", 3.0),
+        ] {
+            assert_eq!(
+                scraped_metric_value(
+                    &body,
+                    "sundog_spill_checkpoint_entries_total",
+                    &[("cache", "spill-reopen-warm"), ("stage", stage)]
+                ),
+                Some(expected),
+                "expected sundog_spill_checkpoint_entries_total{{stage=\"{stage}\"}} = \
+                 {expected} on 'spill-reopen-warm'; got body:\n{body}"
+            );
+        }
+        // sundog_spill_reopen_entries_total{cache,stage}: the matching
+        // reopen, staged. All three snapshot entries are read; the two
+        // distinct keys install, and the duplicate entry the checkpoint's
+        // own double-listing above produced is refused as already present,
+        // never installed twice.
+        for (stage, expected) in [("read", 3.0), ("installed", 2.0), ("refused_present", 1.0)] {
+            assert_eq!(
+                scraped_metric_value(
+                    &body,
+                    "sundog_spill_reopen_entries_total",
+                    &[("cache", "spill-reopen-warm"), ("stage", stage)]
+                ),
+                Some(expected),
+                "expected sundog_spill_reopen_entries_total{{stage=\"{stage}\"}} = {expected} \
+                 on 'spill-reopen-warm'; got body:\n{body}"
+            );
+        }
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
+                    ("cache", "spill-reopen-no-snapshot"),
+                    ("outcome", "cold_fallback"),
+                    ("reason", "no_snapshot")
+                ]
+            ),
+            Some(1.0),
+            "expected exactly one no_snapshot cold fallback on 'spill-reopen-no-snapshot'; got \
+             body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
+                    ("cache", "spill-reopen-config-mismatch"),
+                    ("outcome", "cold_fallback"),
+                    ("reason", "config_mismatch")
+                ]
+            ),
+            Some(1.0),
+            "expected exactly one config_mismatch cold fallback on \
+             'spill-reopen-config-mismatch'; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
+                    ("cache", "spill-reopen-downtime-exceeded"),
+                    ("outcome", "cold_fallback"),
+                    ("reason", "downtime_exceeded")
+                ]
+            ),
+            Some(1.0),
+            "expected exactly one downtime_exceeded cold fallback on \
+             'spill-reopen-downtime-exceeded'; got body:\n{body}"
+        );
+        assert_eq!(
+            scraped_metric_value(
+                &body,
+                "sundog_spill_reopen_total",
+                &[
+                    ("cache", "spill-reopen-bad-region"),
+                    ("outcome", "cold_fallback"),
+                    ("reason", "bad_region")
+                ]
+            ),
+            Some(1.0),
+            "expected exactly one bad_region cold fallback on 'spill-reopen-bad-region'; got \
+             body:\n{body}"
         );
 
         // `disk_error_and_reserve_wait_pin_metrics`'s `insert_many` call
@@ -1336,6 +1488,179 @@ async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::pa
         .remove(&spilled_key)
         .await
         .expect("remove the spilled key");
+    dirs.push(dir);
+
+    dirs
+}
+
+/// `sundog_spill_reopen_total`/`sundog_spill_reopen_records_total`: a
+/// tiny-capacity `Mode::Local` cache, `warm_reopen(true)`, spills one entry
+/// (past its one-entry capacity) while a second stays resident, closes
+/// cleanly (checkpointing both into a snapshot `Shard::attach_spill`'s warm
+/// path trusts), then reopens the same directory, landing `outcome="warm"`
+/// with both live entries installed. Four further, independent directories
+/// each pin one `outcome="cold_fallback"` reason: a first-ever open against
+/// a brand-new directory with `warm_reopen(true)` and nothing ever closed
+/// (`reason="no_snapshot"`), a second open whose `region_bytes` no longer
+/// matches the snapshot (`reason="config_mismatch"`), a second open past
+/// `tombstone_ttl` of the first close (`reason="downtime_exceeded"`), and a
+/// second open against a directory with one region file truncated to a
+/// length `region_bytes` no longer matches (`reason="bad_region"`). The
+/// `reason="disabled"` cold fallback needs no scenario of its own: every
+/// cache in this module that never calls `SpillConfig::warm_reopen` (the
+/// default, `false`) already takes it on every open, and
+/// `metrics_endpoint_serves_sundog_metrics_after_cache_ops` pins it
+/// straight off the `"spilled"` cache's own first open. `reason="stale_snapshot"`
+/// is pinned separately, at the unit level
+/// (`store::tests::attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric`):
+/// producing one from here would mean forging a snapshot with a valid
+/// checksum but a wrong `format_version` byte-for-byte against a format
+/// this test has no legitimate way to construct, so this reason is proved
+/// through the metrics-recording call site directly instead.
+///
+/// Runs inside `metrics_endpoint_serves_sundog_metrics_after_cache_ops`
+/// for the same process-global-recorder reason every other seed function
+/// here does.
+///
+/// Returns every directory opened, for the caller to clean up.
+#[cfg(feature = "spill")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario per cold-fallback reason, kept together"
+)]
+async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+
+    // --- warm reopen: close cleanly, then reopen the same directory. ---
+    let dir = fresh_spill_dir("reopen-warm");
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let cache = cluster
+        .cache::<u32, String>("spill-reopen-warm")
+        .mode(Mode::Local)
+        .max_capacity(1)
+        .spill(cfg.clone())
+        .open()
+        .await
+        .expect("first open, against a brand-new directory, opens cold");
+    cache.insert(1, "one".to_string()).await.expect("insert 1");
+    cache.insert(2, "two".to_string()).await.expect("insert 2");
+    common::eventually(Duration::from_secs(5), || async {
+        cache.get_sync(&1).is_none() || cache.get_sync(&2).is_none()
+    })
+    .await;
+    // Closes without ever promoting the spilled key back to resident: the
+    // checkpoint below still recovers it from disk, and the other key
+    // straight from RAM, so the reopen counts both under
+    // sundog_spill_reopen_records_total, neither reinserted fresh.
+    cache.close().await;
+
+    let _reopened = cluster
+        .cache::<u32, String>("spill-reopen-warm")
+        .mode(Mode::Local)
+        .max_capacity(1)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("second open, against the same directory, reopens warm");
+    dirs.push(dir);
+
+    // --- no_snapshot: a brand-new directory, warm_reopen(true), never
+    // closed. ---
+    let dir = fresh_spill_dir("reopen-no-snapshot");
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let _fresh = cluster
+        .cache::<u32, String>("spill-reopen-no-snapshot")
+        .mode(Mode::Local)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("a brand-new directory still opens, cold, with nothing to replay");
+    dirs.push(dir);
+
+    // --- config_mismatch: reopen the same directory with a different
+    // `region_bytes` than the snapshot was written under. ---
+    let dir = fresh_spill_dir("reopen-config-mismatch");
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let cache = cluster
+        .cache::<u32, String>("spill-reopen-config-mismatch")
+        .mode(Mode::Local)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("first open, against a brand-new directory, opens cold");
+    cache.close().await;
+    let resized = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(8192)
+        .warm_reopen(true);
+    let _mismatched = cluster
+        .cache::<u32, String>("spill-reopen-config-mismatch")
+        .mode(Mode::Local)
+        .spill(resized)
+        .open()
+        .await
+        .expect("a resized tier still opens, cold, via the wipe-and-recreate fallback");
+    dirs.push(dir);
+
+    // --- downtime_exceeded: reopen once the snapshot's closed_at_ms is
+    // older than `tombstone_ttl` (2s under this test's `fast_config`). ---
+    let dir = fresh_spill_dir("reopen-downtime-exceeded");
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let cache = cluster
+        .cache::<u32, String>("spill-reopen-downtime-exceeded")
+        .mode(Mode::Local)
+        .spill(cfg.clone())
+        .open()
+        .await
+        .expect("first open, against a brand-new directory, opens cold");
+    cache.close().await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _stale = cluster
+        .cache::<u32, String>("spill-reopen-downtime-exceeded")
+        .mode(Mode::Local)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("a tier closed longer than tombstone_ttl still opens, cold");
+    dirs.push(dir);
+
+    // --- bad_region: reopen after one region file's length no longer
+    // matches the configured region_bytes, a real on-disk fault the
+    // snapshot and its closed_at_ms both check out fine against. ---
+    let dir = fresh_spill_dir("reopen-bad-region");
+    let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
+        .region_bytes(4096)
+        .warm_reopen(true);
+    let cache = cluster
+        .cache::<u32, String>("spill-reopen-bad-region")
+        .mode(Mode::Local)
+        .spill(cfg.clone())
+        .open()
+        .await
+        .expect("first open, against a brand-new directory, opens cold");
+    cache.close().await;
+    let tier_dir = dir.join("spill-reopen-bad-region");
+    let region_file = std::fs::read_dir(&tier_dir)
+        .expect("the tier's own directory exists once opened")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("reg"))
+        .expect("a tier with at least one region has at least one .reg file on disk");
+    std::fs::write(&region_file, b"short")
+        .expect("truncate one region file to a length region_bytes no longer matches");
+    let _bad_region = cluster
+        .cache::<u32, String>("spill-reopen-bad-region")
+        .mode(Mode::Local)
+        .spill(cfg)
+        .open()
+        .await
+        .expect("a tier with one corrupt region file still opens, cold");
     dirs.push(dir);
 
     dirs

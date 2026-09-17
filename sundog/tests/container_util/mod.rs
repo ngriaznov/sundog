@@ -283,8 +283,81 @@ impl Node {
             alias,
             seeds,
             extra_env,
+            &[],
             bin,
             Wait::for_log_message(READY_LOG, 1),
+        )
+        .await
+    }
+
+    /// [`Node::spawn_with_env_and_wait`] plus `mounts`, each a
+    /// `(host_path, guest_path)` pair bind-mounted read-write into the
+    /// container: on both backends a guest write reaches the host path, so
+    /// the same `host_path` mounted again under the same alias after a
+    /// [`Node::stop`] sees whatever the previous container's process left
+    /// behind there, unlike every other path inside the container's own
+    /// otherwise-fresh filesystem. The way to test a restart that is
+    /// expected to find its spill directory preserved, `sundog-testnode`'s
+    /// `SUNDOG_TESTNODE_SPILL_DIR` pointed at a mount's `guest_path`.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never satisfies `wait`.
+    pub async fn spawn_with_env_mounts_and_wait(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        mounts: &[(&str, &str)],
+        wait: impl WaitStrategy + 'static,
+    ) -> Node {
+        Self::spawn_binary_with_wait(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            extra_env,
+            mounts,
+            build_testnode(),
+            wait,
+        )
+        .await
+    }
+
+    /// [`Node::spawn_with_env_mounts_and_wait`] running `bin` instead of
+    /// this checkout's test node: [`build_previous_testnode`] for a mixed-
+    /// version cluster whose restarting node also needs a bind-mounted
+    /// spill directory, the combination
+    /// [`Node::spawn_binary`]/[`Node::spawn_with_env_mounts_and_wait`] each
+    /// cover only one half of.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never satisfies `wait`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a thin wrapper over spawn_binary_with_wait, itself already carrying the \
+                  same too-many-arguments allowance for the same reason: every parameter is \
+                  independent container-boot context"
+    )]
+    pub async fn spawn_binary_with_env_mounts_and_wait(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        mounts: &[(&str, &str)],
+        bin: &Path,
+        wait: impl WaitStrategy + 'static,
+    ) -> Node {
+        Self::spawn_binary_with_wait(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            extra_env,
+            mounts,
+            bin,
+            wait,
         )
         .await
     }
@@ -314,6 +387,7 @@ impl Node {
             alias,
             seeds,
             extra_env,
+            &[],
             build_testnode(),
             wait,
         )
@@ -322,16 +396,26 @@ impl Node {
 
     /// The actual container-boot logic every `spawn*` constructor shares,
     /// parametrized on the readiness check so [`Node::spawn_with_env_and_wait`]
-    /// can substitute its own without duplicating the rest.
+    /// can substitute its own without duplicating the rest. `mounts`, each a
+    /// `(host_path, guest_path)` pair, is bind-mounted read-write into the
+    /// container alongside the test-node binary itself; see
+    /// [`Node::spawn_with_env_mounts_and_wait`].
     /// # Panics
     ///
     /// Panics if the container fails to start or never satisfies `wait`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every parameter is independent container-boot context every spawn* \
+                  constructor shares; grouping any subset into a struct would only rename the \
+                  same eight pieces of state"
+    )]
     async fn spawn_binary_with_wait(
         net: &Arc<Network>,
         cluster_name: &str,
         alias: &str,
         seeds: &[&str],
         extra_env: &[(&str, &str)],
+        mounts: &[(&str, &str)],
         bin: &Path,
         wait: impl WaitStrategy + 'static,
     ) -> Node {
@@ -347,6 +431,10 @@ impl Node {
             )
             .with_env("SUNDOG_SEEDS", &seeds.join(","))
             .with_command(&["/sundog-testnode", cluster_name]);
+        for &(host_path, guest_path) in mounts {
+            container = container
+                .with_copy_file_to_container(MountableFile::for_host_path(host_path), guest_path);
+        }
         for &(key, value) in extra_env {
             container = container.with_env(key, value);
         }

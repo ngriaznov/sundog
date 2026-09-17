@@ -57,6 +57,13 @@ pub(crate) struct Report {
     /// writes whose wait for fan-out backlog room ran out before finding
     /// any, and proceeded over capacity regardless.
     pub(crate) fan_out_wait_timeouts: u64,
+    /// `sundog_spill_reopen_total{outcome="warm"}`, summed across caches:
+    /// restarts whose spill tier reopened from its on-disk snapshot rather
+    /// than refilling cold.
+    pub(crate) spill_reopen_warm: u64,
+    /// `sundog_spill_reopen_total{outcome="cold_fallback"}`, summed across
+    /// caches.
+    pub(crate) spill_reopen_cold_fallback: u64,
 }
 
 impl Report {
@@ -125,6 +132,10 @@ pub(crate) struct Gate {
     /// until it opts in.
     #[serde(default)]
     pub(crate) max_backlog_dropped: Option<u64>,
+    /// Minimum `spill_reopen_warm` the run must report; `None` (the
+    /// default) skips the check.
+    #[serde(default)]
+    pub(crate) min_spill_reopen_warm: Option<u64>,
 }
 
 /// Reads and parses a `--gate <PATH>` file.
@@ -201,6 +212,15 @@ pub(crate) fn check(report: &Report, gate: &Gate) -> Vec<String> {
             report.sample_ok, report.sample_checked
         ));
     }
+    if let Some(min) = gate.min_spill_reopen_warm
+        && report.spill_reopen_warm < min
+    {
+        violations.push(format!(
+            "spill_reopen_warm {} is below min_spill_reopen_warm {min}",
+            report.spill_reopen_warm
+        ));
+    }
+
     violations
 }
 
@@ -238,6 +258,8 @@ mod tests {
             rebalance_out: 4_000,
             backlog_dropped: 0,
             fan_out_wait_timeouts: 12,
+            spill_reopen_warm: 1,
+            spill_reopen_cold_fallback: 0,
         }
     }
 
@@ -251,6 +273,7 @@ mod tests {
             require_converged: true,
             require_full_sample: true,
             max_backlog_dropped: Some(0),
+            min_spill_reopen_warm: Some(1),
         }
     }
 
@@ -353,6 +376,19 @@ mod tests {
     }
 
     #[test]
+    fn check_passes_when_spill_reopen_warm_meets_the_minimum() {
+        let report = Report {
+            spill_reopen_warm: 3,
+            ..sample_report()
+        };
+        let gate = Gate {
+            min_spill_reopen_warm: Some(3),
+            ..passing_gate()
+        };
+        assert_eq!(check(&report, &gate), Vec::<String>::new());
+    }
+
+    #[test]
     fn gate_without_max_backlog_dropped_defaults_to_none() {
         let mut value =
             serde_json::to_value(passing_gate()).expect("gate serializes to a JSON value");
@@ -363,5 +399,48 @@ mod tests {
         let gate: Gate = serde_json::from_value(value)
             .expect("an older gate file with no max_backlog_dropped field still parses");
         assert_eq!(gate.max_backlog_dropped, None);
+    }
+
+    #[test]
+    fn check_fails_when_spill_reopen_warm_is_below_the_minimum() {
+        let report = Report {
+            spill_reopen_warm: 0,
+            ..sample_report()
+        };
+        let gate = Gate {
+            min_spill_reopen_warm: Some(1),
+            ..passing_gate()
+        };
+        let violations = check(&report, &gate);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("spill_reopen_warm"));
+    }
+
+    #[test]
+    fn check_skips_spill_reopen_warm_when_the_gate_leaves_it_unset() {
+        let report = Report {
+            spill_reopen_warm: 0,
+            ..sample_report()
+        };
+        let gate = Gate {
+            min_spill_reopen_warm: None,
+            ..passing_gate()
+        };
+        assert_eq!(check(&report, &gate), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gate_json_without_min_spill_reopen_warm_defaults_to_none() {
+        let json = r#"{
+            "max_steady_rss_bytes": 1,
+            "max_peak_rss_bytes": 1,
+            "max_spill_dropped_deferred": 1,
+            "max_pull_timeouts": 1,
+            "max_fetch_p99_us": 1,
+            "require_converged": true,
+            "require_full_sample": true
+        }"#;
+        let gate: Gate = serde_json::from_str(json).expect("gate deserializes");
+        assert_eq!(gate.min_spill_reopen_warm, None);
     }
 }
