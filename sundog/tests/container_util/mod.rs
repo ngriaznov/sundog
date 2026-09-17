@@ -933,7 +933,12 @@ const CHITCHAT_MARKERS: [&str; 2] = [
 /// out and counted first so the cap holds state-machine tracing rather than
 /// another test's stale gossip) to stderr before panicking, so a CI job's
 /// log carries enough of the cluster's own state-machine tracing to
-/// diagnose the failure without reproducing it locally.
+/// diagnose the failure without reproducing it locally. Follows each node's
+/// log dump with its `sundog_`-prefixed Prometheus metric lines (`# HELP`/
+/// `# TYPE` lines and histogram bucket lines omitted), since a previous-
+/// release node installs no tracing subscriber and so has nothing in its
+/// log dump, but every test node still serves `/metrics`; a metrics fetch
+/// error prints in place of the metric lines.
 /// # Panics
 ///
 /// Panics if `cond` has not returned `true` by `timeout`.
@@ -979,6 +984,27 @@ where
                 }
                 for line in tail.into_iter().rev() {
                     eprintln!("{line}");
+                }
+                eprintln!("----- node[{index}] {} metrics -----", node.name());
+                match node.metrics().await {
+                    Ok(body) => {
+                        for line in body.lines() {
+                            if line.starts_with("# HELP") || line.starts_with("# TYPE") {
+                                continue;
+                            }
+                            let metric_name = line
+                                .split(|c: char| c == '{' || c.is_whitespace())
+                                .next()
+                                .unwrap_or("");
+                            if !metric_name.starts_with("sundog_")
+                                || metric_name.ends_with("_bucket")
+                            {
+                                continue;
+                            }
+                            eprintln!("{line}");
+                        }
+                    }
+                    Err(error) => eprintln!("{error}"),
                 }
             }
             panic!("condition not met within {timeout:?}");

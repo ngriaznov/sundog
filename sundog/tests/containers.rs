@@ -1517,6 +1517,12 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     wait_for_peers(&[&n1, &n2], 1).await;
 
     n1.fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    for (node, id) in [&n1, &n2]
+        .into_iter()
+        .zip(collect_node_ids(&[&n1, &n2]).await)
+    {
+        eprintln!("node {} has id {id}", node.name());
+    }
     eventually_with_logs(Duration::from_secs(60), &[&n1, &n2], || async {
         sum_counts(&[&n1, &n2]).await == Some(usize::from(OWNERS) * FILL_KEYS as usize)
     })
