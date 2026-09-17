@@ -239,18 +239,16 @@ pub(crate) struct PullRequest<'a> {
     /// Whether a bucket this pull finds owned alone (no live co-owner in
     /// the current view) may be trusted as genuinely sole-owned and marked
     /// servable outright ([`ResidencySet::mark_serving`]), rather than left
-    /// cold for the caller's ordinary warm-up retries. `true` for every
-    /// routine call (the ongoing `rebalance_task` loop, `warm_up_task`'s
-    /// retries): by the time those run, this node's ownership view is the
-    /// library's normal, live-updating one, so "no live co-owner" there
-    /// means what it says. `false` only for `Cache::open`'s own initial
-    /// pull when its membership wait
-    /// (`crate::cache::await_initial_peers`) was needed and timed out:
-    /// there, "no live co-owner" is exactly the symptom of the transient
-    /// sole-owner view a lone-looking node computes before gossip has
-    /// shown it any peer, not genuine single ownership, so trusting it
-    /// would serve this node's own local data outright with nobody ever
-    /// having vouched for it.
+    /// cold for the caller's ordinary warm-up retries. `true` for every call
+    /// on this branch, `Cache::open`'s own initial pull included: a cold
+    /// open holds nothing unverified, so a bucket it finds owned alone here
+    /// is exactly what it looks like -- this node's own data, with no other
+    /// copy anywhere to distrust it against. The field exists for a warm
+    /// reopen that replays buckets from a spill snapshot before this pull
+    /// ever runs: there, "owned alone" can be the replay's own stale,
+    /// unverified echo of ownership rather than a live view's real answer,
+    /// so that caller computes this from the replay and passes `false` to
+    /// withhold trust instead.
     pub(crate) trust_sole_owner: bool,
 }
 
@@ -291,11 +289,10 @@ impl PullRequest<'_> {
         // A bucket this node owns alone has nobody to pull from: what is
         // here is all there is, so it is not cold either -- but only when
         // `trust_sole_owner` says this view's "alone" answer is real
-        // rather than the transient sole-owner snapshot a membership wait
-        // that timed out leaves behind. Left untrusted, `alone` buckets
-        // stay exactly as cold as `attach_ownership` marked them, falling
-        // to `warm_up_task`'s ordinary retries below via
-        // `Outcome::NoPeers`.
+        // rather than an unverified echo (a warm reopen replaying from a
+        // spill snapshot, for one). Left untrusted, `alone` buckets stay
+        // exactly as cold as the caller marked them, falling to
+        // `warm_up_task`'s ordinary retries below via `Outcome::NoPeers`.
         let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
         if !alone.is_empty() && trust_sole_owner {
             residency.mark_serving(&alone);
@@ -1502,11 +1499,11 @@ mod tests {
     async fn pull_request_leaves_a_bucket_cold_when_owned_alone_is_untrusted() {
         // The same self-only, owned-alone fixture as
         // `pull_request_marks_a_bucket_servable_when_owned_alone` above,
-        // but with `trust_sole_owner: false`: the shape `Cache::open`'s
-        // initial pull is in whenever its own membership wait was needed
-        // and timed out, so "owned alone" here is exactly the transient
-        // sole-owner view a lone-looking node computes before gossip has
-        // shown it any peer, not genuine single ownership.
+        // but with `trust_sole_owner: false`: the shape a warm reopen that
+        // replays buckets from a spill snapshot passes once it finds this
+        // bucket's replayed ownership record cannot be trusted, so "owned
+        // alone" here stands in for that untrusted echo rather than a
+        // genuine, live answer.
         let cluster = solo_cluster("rebalance-unit-test-alone-untrusted").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
@@ -1547,9 +1544,9 @@ mod tests {
         );
         assert!(
             residency.is_cold(bucket),
-            "untrusted, this bucket stays cold: `Cache::open`'s own ordinary warm-up retries \
-             get the final say once membership actually settles, instead of this pull trusting \
-             a transient sole-owner view outright"
+            "untrusted, this bucket stays cold: the caller's ordinary warm-up retries get the \
+             final say once a real answer lands, instead of this pull trusting an unverified \
+             sole-owner echo outright"
         );
 
         cluster.shutdown().await;

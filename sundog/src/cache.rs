@@ -275,15 +275,14 @@ where
         // Bounded wait for a first known peer, `Mode::Distributed` only,
         // before `attach_ownership` computes the first view: see
         // `should_await_first_peer`'s own docs for when this actually
-        // waits. `membership_settled` records whether the view about to be
-        // computed can be trusted as more than a transient "I own
-        // everything" snapshot; `distributed_warm_and_rebalance` uses it to
-        // gate the sole-owner serving shortcut for its own initial pull.
-        let membership_settled = if matches!(mode, Mode::Distributed { .. }) {
-            await_initial_peers(&cluster).await
-        } else {
-            true
-        };
+        // waits. Worth doing regardless of what it finds: a view computed
+        // once a real peer has shown up is a better first view than one
+        // computed alone, so this still runs even though a cold open's
+        // own initial pull, below, trusts sole ownership outright either
+        // way and never waits on this outcome to decide that.
+        if matches!(mode, Mode::Distributed { .. }) {
+            await_initial_peers(&cluster).await;
+        }
         let (shard, distributed) = attach_ownership(shard, &cluster, &name, mode);
         let shard = Arc::new(shard);
 
@@ -334,17 +333,7 @@ where
 
         let cancel = cluster.cancel_token().child_token();
         let tasks = TaskTracker::new();
-        spawn_cache_tasks(
-            &cluster,
-            &shard,
-            &name,
-            mode,
-            &cancel,
-            &tasks,
-            distributed,
-            membership_settled,
-        )
-        .await;
+        spawn_cache_tasks(&cluster, &shard, &name, mode, &cancel, &tasks, distributed).await;
 
         Ok(Cache {
             shard,
@@ -485,20 +474,24 @@ fn should_await_first_peer(has_seeds: bool, peers_known: bool) -> bool {
 /// with seeds and genuinely knows none yet, blocks for the first non-empty
 /// update on the peers watch channel, bounded by
 /// `min(ClusterConfig::state_transfer_budget, INITIAL_PEER_WAIT_CAP)`.
-/// Without this, `Cluster::peers()` seeded from
-/// zero known peers makes `attach_ownership`'s `OwnershipTracker::seed`
-/// compute a transient "this node owns every bucket" view -- rendezvous
-/// ranking over the single eligible candidate a lone node always is -- that
-/// the initial pull would otherwise trust outright.
+/// Without this, `Cluster::peers()` seeded from zero known peers makes
+/// `attach_ownership`'s `OwnershipTracker::seed` compute a transient "this
+/// node owns every bucket" view -- rendezvous ranking over the single
+/// eligible candidate a lone node always is -- for longer than it needs to:
+/// a peer that shows up mid-wait lands in that very first view instead of
+/// only in a later refresh. A cold open trusts that view's sole ownership
+/// either way, waited for or not: the initial pull downstream never leaves
+/// an owned-alone bucket cold behind this wait's own outcome, so this wait
+/// is purely about how soon a real peer's ownership shows up, never about
+/// whether a genuinely sole-owned bucket gets served.
 ///
-/// Returns whether the view `attach_ownership` is about to compute can be
-/// trusted: `true` when no wait was needed at all, or the wait landed a
-/// peer in time; `false` only when a wait was needed and it timed out, so
-/// this node opens exactly as alone as it would have without this wait, but
-/// now knowingly so -- `distributed_warm_and_rebalance` uses that to gate
-/// its own initial pull's sole-owner serving shortcut. Logs at `info` only
-/// when a wait actually happens, since the common case (no seeds, or peers
-/// already known) needs no line of its own.
+/// Returns whether the wait, when one was needed, actually landed a peer
+/// before its bound: `true` when no wait was needed at all, or the wait
+/// landed a peer in time; `false` when a wait was needed and it timed out,
+/// so this node computes its first view exactly as alone as it would have
+/// without this wait, only later than skipping the wait would have.
+/// Logs at `info` only when a wait actually happens, since the common
+/// case (no seeds, or peers already known) needs no line of its own.
 async fn await_initial_peers(cluster: &Cluster) -> bool {
     let peers_known = !cluster.peers().is_empty();
     if !should_await_first_peer(cluster.has_seeds(), peers_known) {
@@ -589,11 +582,6 @@ where
 /// bucket-scoped pull, refresh, and rebalance loops for `Distributed`,
 /// tombstone GC, and the entry gauge, all under `cancel` and tracked by
 /// `tasks`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each parameter is independent context `open()` already has to hand; a struct would \
-              only rename these same eight fields"
-)]
 async fn spawn_cache_tasks<K, V>(
     cluster: &Cluster,
     shard: &Arc<Shard<K, V>>,
@@ -602,7 +590,6 @@ async fn spawn_cache_tasks<K, V>(
     cancel: &CancellationToken,
     tasks: &TaskTracker,
     distributed: Option<DistributedContext>,
-    membership_settled: bool,
 ) where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -636,7 +623,6 @@ async fn spawn_cache_tasks<K, V>(
             Arc::clone(shard) as Arc<dyn ShardOps>,
             name,
             distributed,
-            membership_settled,
             cancel.clone(),
             tasks,
         )
@@ -722,11 +708,11 @@ where
 /// warming to [`crate::cluster::rebalance::warm_up_task`], the same
 /// "wait for a peer, retry a few times, then open warm with what landed"
 /// shape [`state_transfer::warm_up_task`] already has for
-/// `Mode::Replicated`. `membership_settled` is `open()`'s own
-/// [`await_initial_peers`] outcome, threaded through to the initial
-/// [`crate::cluster::rebalance::PullRequest`]'s `trust_sole_owner` so a
-/// timed-out wait never lets that pull trust a transient "owned alone"
-/// answer.
+/// `Mode::Replicated`. A cold open holds nothing unverified -- there is no
+/// spill-replayed data here for a bucket found owned alone to be a stale
+/// echo of -- so its initial [`crate::cluster::rebalance::PullRequest`]
+/// passes `trust_sole_owner: true` outright and serves such a bucket at
+/// once.
 ///
 /// [`state_transfer::warm_up_task`]: crate::cluster::state_transfer::warm_up_task
 async fn distributed_warm_and_rebalance(
@@ -734,7 +720,6 @@ async fn distributed_warm_and_rebalance(
     shard_ops: Arc<dyn ShardOps>,
     name: &SmolStr,
     distributed: DistributedContext,
-    membership_settled: bool,
     cancel: CancellationToken,
     tasks: &TaskTracker,
 ) {
@@ -789,17 +774,17 @@ async fn distributed_warm_and_rebalance(
         buckets: initially_owned,
         budget,
         concurrency,
-        // A bucket this call finds owned alone is trusted outright only
-        // when `membership_settled` -- either no wait was needed, or
-        // `await_initial_peers` actually landed a peer in time. When a
-        // wait was needed and timed out, "owned alone" here is exactly the
-        // symptom of the transient sole-owner view the wait failed to
-        // correct, not genuine single ownership: any such bucket stays
-        // cold instead, falling to `warm_up_task`'s ordinary retries --
-        // which pull once a real peer shows up, or give up per its own
-        // attempt cap -- rather than being served here with nobody ever
-        // having vouched for it.
-        trust_sole_owner: membership_settled,
+        // A cold open holds nothing unverified: every initially owned
+        // bucket found owned alone here is genuinely this node's own
+        // data, with no other copy anywhere to distrust it against, so
+        // it is trusted and served outright regardless of whether the
+        // membership wait above landed a peer or timed out. `false`
+        // exists for a warm reopen that replays buckets from a spill
+        // snapshot -- a feature on another branch -- where a bucket found
+        // "owned alone" could be the replay's own stale, unverified
+        // echo of ownership; this cold-open call has nothing of the kind
+        // to withhold trust from.
+        trust_sole_owner: true,
     }
     .run()
     .await;
@@ -1453,6 +1438,92 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "the wait must not run anywhere near the `INITIAL_PEER_WAIT_CAP` default, took \
              {elapsed:?}"
+        );
+
+        cluster.shutdown().await;
+    }
+
+    /// Reserves a loopback TCP port, then releases it: an address nobody
+    /// ever listens on, distinct from [`dead_gossip_addr`]'s UDP one, so a
+    /// seed pointed at it can never be answered.
+    fn dead_tcp_addr() -> SocketAddr {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind an ephemeral loopback tcp port to reserve a dead address");
+        listener
+            .local_addr()
+            .expect("a freshly bound tcp listener reports a local address")
+    }
+
+    /// A cold open of a `Mode::Distributed` cache whose only seed never
+    /// answers trusts its own sole ownership outright: `open()` returns
+    /// with every initially owned bucket already servable, not left cold
+    /// waiting on a peer that is never coming. Guards the regression where
+    /// the open-time pull threaded `await_initial_peers`'s timed-out
+    /// outcome into `trust_sole_owner`, leaving every bucket cold and the
+    /// node unable to answer a joiner's own pull (`StUnavailable` from
+    /// `st_buckets_cold`), so a real cluster's first node never finished
+    /// warming and every join hung until the container suite's bound.
+    #[tokio::test]
+    async fn distributed_open_trusts_sole_ownership_when_its_membership_wait_times_out() {
+        let dead_seed = dead_tcp_addr();
+        let config = ClusterConfig {
+            // Short enough that `await_initial_peers`'s wait (bounded by
+            // `min(state_transfer_budget, INITIAL_PEER_WAIT_CAP)`) times
+            // out quickly, well inside this test's own patience.
+            state_transfer_budget: Duration::from_secs(1),
+            ..loopback_config()
+        };
+        let cluster = Cluster::builder("cache-it-cold-open-sole-owner")
+            .seeds([dead_seed])
+            .config(config)
+            .build()
+            .await
+            .expect("cluster builds even though its one seed answers nobody");
+
+        let cache = tokio::time::timeout(
+            Duration::from_secs(10),
+            cluster
+                .cache::<u32, String>("prices")
+                .mode(Mode::Distributed {
+                    owners: NonZeroU8::new(2).expect("nonzero"),
+                })
+                .open(),
+        )
+        .await
+        .expect("open completes within its own short membership wait")
+        .expect("open succeeds even though the wait timed out");
+
+        cache
+            .insert(1, "one".to_string())
+            .await
+            .expect("insert succeeds on a node that owns every bucket alone");
+
+        let key_bytes = encode_key(&1u32).expect("a u32 key always encodes");
+        let bucket = bucket_of(&key_bytes);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cache.shard.is_cold_bucket(bucket) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the key's bucket is not cold within a few seconds");
+
+        assert!(
+            !cache.shard.is_cold_bucket(bucket),
+            "sole ownership on a cold open is trusted outright, not left cold behind a peer \
+             that never appears"
+        );
+        assert_eq!(
+            cache.fetch(&1).await.expect("fetch succeeds"),
+            Some("one".to_string()),
+            "a bucket trusted as sole-owned is served locally, not held back for a peer that \
+             never appears"
+        );
+        assert!(
+            cluster.peers().is_empty(),
+            "this assertion holds before any peer ever appears, exactly the shape the timed-out \
+             wait leaves behind"
         );
 
         cluster.shutdown().await;
