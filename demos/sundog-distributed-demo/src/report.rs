@@ -49,6 +49,14 @@ pub(crate) struct Report {
     /// `sundog_rebalance_buckets_total{direction="out"}`, summed across
     /// caches.
     pub(crate) rebalance_out: u64,
+    /// `sundog_backlog_dropped_total`, summed across peers: replicate
+    /// frames `net::Mesh::send_frames_awaiting` gave up on once their
+    /// target peer left the mesh's peer table mid-wait.
+    pub(crate) backlog_dropped: u64,
+    /// `sundog_fan_out_wait_timeouts_total`, summed across caches: async
+    /// writes whose wait for fan-out backlog room ran out before finding
+    /// any, and proceeded over capacity regardless.
+    pub(crate) fan_out_wait_timeouts: u64,
 }
 
 impl Report {
@@ -112,6 +120,11 @@ pub(crate) struct Gate {
     pub(crate) max_fetch_p99_us: u64,
     pub(crate) require_converged: bool,
     pub(crate) require_full_sample: bool,
+    /// `None` (the default, absent from an older gate file) skips this
+    /// check entirely, so an existing gate file keeps its old behavior
+    /// until it opts in.
+    #[serde(default)]
+    pub(crate) max_backlog_dropped: Option<u64>,
 }
 
 /// Reads and parses a `--gate <PATH>` file.
@@ -171,6 +184,14 @@ pub(crate) fn check(report: &Report, gate: &Gate) -> Vec<String> {
             report.fetch_p99_us, gate.max_fetch_p99_us
         ));
     }
+    if let Some(max_backlog_dropped) = gate.max_backlog_dropped
+        && report.backlog_dropped > max_backlog_dropped
+    {
+        violations.push(format!(
+            "backlog_dropped {} exceeds max_backlog_dropped {max_backlog_dropped}",
+            report.backlog_dropped
+        ));
+    }
     if gate.require_converged && !report.converged {
         violations.push("converged is false but require_converged is set".to_owned());
     }
@@ -215,6 +236,8 @@ mod tests {
             ae_repaired: 10,
             rebalance_in: 4_000,
             rebalance_out: 4_000,
+            backlog_dropped: 0,
+            fan_out_wait_timeouts: 12,
         }
     }
 
@@ -227,6 +250,7 @@ mod tests {
             max_fetch_p99_us: 100_000,
             require_converged: true,
             require_full_sample: true,
+            max_backlog_dropped: Some(0),
         }
     }
 
@@ -280,10 +304,11 @@ mod tests {
             converged: false,
             sample_checked: 2_000,
             sample_ok: 1_999,
+            backlog_dropped: 3,
             ..sample_report()
         };
         let violations = check(&report, &passing_gate());
-        assert_eq!(violations.len(), 7, "{violations:?}");
+        assert_eq!(violations.len(), 8, "{violations:?}");
         assert!(violations.iter().any(|v| v.contains("steady_rss_bytes")));
         assert!(violations.iter().any(|v| v.contains("peak_rss_bytes")));
         assert!(
@@ -295,6 +320,7 @@ mod tests {
         assert!(violations.iter().any(|v| v.contains("fetch_p99_us")));
         assert!(violations.iter().any(|v| v.contains("require_converged")));
         assert!(violations.iter().any(|v| v.contains("require_full_sample")));
+        assert!(violations.iter().any(|v| v.contains("backlog_dropped")));
     }
 
     #[test]
@@ -311,5 +337,31 @@ mod tests {
             ..passing_gate()
         };
         assert_eq!(check(&report, &gate), Vec::<String>::new());
+    }
+
+    #[test]
+    fn check_skips_backlog_dropped_when_the_gate_leaves_it_unset() {
+        let report = Report {
+            backlog_dropped: 1_000,
+            ..sample_report()
+        };
+        let gate = Gate {
+            max_backlog_dropped: None,
+            ..passing_gate()
+        };
+        assert_eq!(check(&report, &gate), Vec::<String>::new());
+    }
+
+    #[test]
+    fn gate_without_max_backlog_dropped_defaults_to_none() {
+        let mut value =
+            serde_json::to_value(passing_gate()).expect("gate serializes to a JSON value");
+        value
+            .as_object_mut()
+            .expect("a Gate serializes as a JSON object")
+            .remove("max_backlog_dropped");
+        let gate: Gate = serde_json::from_value(value)
+            .expect("an older gate file with no max_backlog_dropped field still parses");
+        assert_eq!(gate.max_backlog_dropped, None);
     }
 }

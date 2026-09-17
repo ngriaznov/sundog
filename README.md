@@ -310,7 +310,16 @@ entry and a local delete would only have anti-entropy repair it back in. A
 
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,
-`sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,
+`sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`, frames
+dropped only once a peer is gone from the mesh -- a peer that is merely slow
+is never dropped for; `sundog_fan_out_wait_seconds_total{peer}`, whole
+seconds spent instead waiting out such a live peer's full outbox,
+`sundog_fan_out_wait_timeouts_total{cache}`, an async write (`insert`,
+`insert_many`, `remove`, `merge`, and their siblings) whose own wait for
+fan-out backlog room under `ClusterConfig::fan_out_backlog_capacity` ran out
+its `ClusterConfig::fan_out_wait_timeout` and proceeded over capacity anyway
+rather than ever dropping the write, and `sundog_fan_out_backlog{cache}`, a
+cache's current not-yet-fanned-out backlog length,
 `sundog_live_peers`, `sundog_open_caches`, `sundog_ae_sketch_total{cache,
 outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
 tags anti-entropy's IBLT-sketch reconciliation on large buckets, where
@@ -479,8 +488,10 @@ rustdoc warning fails the build.
 headless at 4M keys across three nodes with an 800k-entry RAM cap per node
 over a spill tier, checking the resulting `--report-json` output against
 [`ops/scale-gate.json`](ops/scale-gate.json)'s thresholds for steady and
-peak RSS, deferred spill drops, pull timeouts, fetch p99 latency,
-convergence, and a fully passing sample check via `--gate`.
+peak RSS, deferred spill drops, pull timeouts, dropped replicate backlog
+(`max_backlog_dropped`, summing `sundog_backlog_dropped_total` across
+peers), fetch p99 latency, convergence, and a fully passing sample check
+via `--gate`.
 `workflow_dispatch` reruns the same shape on demand with its own key count,
 duration, RAM cap, and runner inputs, for a one-off run at a different
 scale. Both the report and the run log upload as workflow artifacts.

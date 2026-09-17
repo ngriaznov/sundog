@@ -5,7 +5,7 @@
 //! shard's fan-out queue and publishes an `Origin::Local` [`Event`]; the
 //! cluster layer turns those into wire traffic.
 
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
@@ -131,8 +131,15 @@ const EVENTS_CAPACITY: usize = 1024;
 /// `records_for_typed` re-fetches fresh wire bytes. A queue nothing drains, a
 /// `Mode::Local` shard's or a closed cache's, accepts nothing.
 pub(crate) struct FanOutQueue<K> {
+    /// This cache's name, for the `cache` label on
+    /// `sundog_fan_out_backlog`/`sundog_fan_out_wait_timeouts_total`.
+    name: SmolStr,
     pending: StdMutex<Vec<K>>,
     notify: tokio::sync::Notify,
+    /// Notified whenever [`FanOutQueue::drain`] takes a non-empty backlog:
+    /// [`FanOutQueue::wait_for_room`]'s waiters recheck capacity off this
+    /// instead of polling.
+    drained: tokio::sync::Notify,
     /// Whether a push lands in `pending` at all: `false` for a
     /// `Mode::Local` shard, whose writes never fan out and are not errors.
     accepting: AtomicBool,
@@ -146,13 +153,23 @@ pub(crate) struct FanOutQueue<K> {
 }
 
 impl<K> FanOutQueue<K> {
-    fn new(accepting: bool) -> Self {
+    fn new(name: SmolStr, accepting: bool) -> Self {
         Self {
+            name,
             pending: StdMutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
+            drained: tokio::sync::Notify::new(),
             accepting: AtomicBool::new(accepting),
             closed: StdMutex::new(false),
         }
+    }
+
+    /// Publishes `sundog_fan_out_backlog{cache}` as `len`: the single choke
+    /// point every mutation of `pending` reports its new length through, so
+    /// the gauge can never drift from what `pending` actually holds.
+    fn publish_backlog(&self, len: usize) {
+        metrics::gauge!("sundog_fan_out_backlog", "cache" => self.name.to_string())
+            .set(fan_out_backlog_gauge_value(len));
     }
 
     /// Stops accepting writes but keeps the backlog for the fan-out task's
@@ -171,6 +188,8 @@ impl<K> FanOutQueue<K> {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
         pending.clear();
+        self.publish_backlog(0);
+        self.drained.notify_waiters();
     }
 
     /// Whether a write may still be accepted: `false` once sealed or
@@ -191,6 +210,7 @@ impl<K> FanOutQueue<K> {
             return true;
         }
         pending.push(key);
+        self.publish_backlog(pending.len());
         self.notify.notify_one();
         true
     }
@@ -206,13 +226,21 @@ impl<K> FanOutQueue<K> {
             return true;
         }
         pending.extend(keys);
+        self.publish_backlog(pending.len());
         self.notify.notify_one();
         true
     }
 
-    /// Takes every pending key, leaving the queue empty.
+    /// Takes every pending key, leaving the queue empty, and wakes
+    /// [`FanOutQueue::wait_for_room`]'s waiters so they recheck capacity.
     pub(crate) fn drain(&self) -> Vec<K> {
-        std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner))
+        let items =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
+        self.publish_backlog(0);
+        if !items.is_empty() {
+            self.drained.notify_waiters();
+        }
+        items
     }
 
     /// Resolves once the queue holds at least one key. A push that lands before
@@ -231,13 +259,69 @@ impl<K> FanOutQueue<K> {
         }
     }
 
-    #[cfg(test)]
+    /// Waits, up to `timeout`, for this queue's backlog to fall under
+    /// `capacity`: an async write path's way to apply backpressure to
+    /// itself instead of growing this queue without bound while a stalled
+    /// fan-out (`net::Mesh::send_frames_awaiting` waiting out a still-live
+    /// peer) never drains it. Returns either way -- room found, or
+    /// `timeout` elapsed with the backlog still over capacity, in which
+    /// case `sundog_fan_out_wait_timeouts_total{cache}` counts it -- since
+    /// the caller's write always proceeds regardless: memory over
+    /// `capacity` is the documented fallback, never a dropped or refused
+    /// write. The synchronous write chain (`Shard::insert_sync`,
+    /// `remove_sync`, `Shard::apply`) never calls this: there is no async
+    /// runtime there to await on, so it pushes straight through no matter
+    /// the backlog size.
+    pub(crate) async fn wait_for_room(&self, capacity: usize, timeout: Duration) {
+        if !fan_out_over_capacity(self.len(), capacity) {
+            return;
+        }
+        let waited = tokio::time::timeout(timeout, async {
+            loop {
+                // Armed before the recheck below, exactly the pattern
+                // `tokio::sync::Notify::notify_waiters` itself documents,
+                // so a `drain` landing between the check and the `.await`
+                // is never missed.
+                let notified = self.drained.notified();
+                if !fan_out_over_capacity(self.len(), capacity) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        if waited.is_err() {
+            metrics::counter!(
+                "sundog_fan_out_wait_timeouts_total",
+                "cache" => self.name.to_string()
+            )
+            .increment(1);
+        }
+    }
+
     fn len(&self) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Whether [`FanOutQueue::wait_for_room`] should keep waiting: `true` while
+/// `pending_len` is at or above `capacity`. Pulled out as its own pure
+/// function so the capacity comparison has a standalone unit test.
+fn fan_out_over_capacity(pending_len: usize, capacity: usize) -> bool {
+    pending_len >= capacity
+}
+
+/// `len` as `sundog_fan_out_backlog`'s gauge value.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge only needs f64's exact-integer range, up to 2^53, which comfortably \
+              covers any realistic fan-out backlog"
+)]
+fn fan_out_backlog_gauge_value(len: usize) -> f64 {
+    len as f64
 }
 
 /// One entry in a shard's fan-out queue. `Applied` is every write this
@@ -1214,6 +1298,14 @@ where
     /// per pass.
     crdt_bounds: CompactionBounds,
     max_frame: usize,
+    /// [`Shard::with_fan_out_backlog_capacity`]'s configured backlog cap,
+    /// [`Shard::wait_for_fan_out_room`]'s threshold. Defaults to
+    /// [`ClusterConfig::default`]'s.
+    fan_out_backlog_capacity: usize,
+    /// [`Shard::with_fan_out_wait_timeout`]'s configured bound on
+    /// [`Shard::wait_for_fan_out_room`]'s wait. Defaults to
+    /// [`ClusterConfig::default`]'s.
+    fan_out_wait_timeout: Duration,
     /// [`Shard::with_merge_coalesce_window`]'s configured window. Zero (the
     /// default) means every [`Shard::merge`] call applies at once;
     /// `crate::cache::CacheBuilder::merge_coalesce_window` is the validated
@@ -1318,13 +1410,14 @@ where
         let engine = Arc::new(Engine::new(max_capacity, tti, None));
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
+        let fan_out = Arc::new(FanOutQueue::new(name.clone(), !matches!(mode, Mode::Local)));
 
         Self {
             name,
             mode,
             engine,
             events: broadcast::channel(EVENTS_CAPACITY).0,
-            fan_out: Arc::new(FanOutQueue::new(!matches!(mode, Mode::Local))),
+            fan_out,
             clock: StdMutex::new(HlcClock::new(node)),
             clock_fn: Arc::new(now_ms),
             ttl,
@@ -1334,6 +1427,8 @@ where
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),
             max_frame: MAX_FRAME,
+            fan_out_backlog_capacity: ClusterConfig::default().fan_out_backlog_capacity,
+            fan_out_wait_timeout: ClusterConfig::default().fan_out_wait_timeout,
             merge_window: Duration::ZERO,
             pending_merges: (0..BUCKET_COUNT)
                 .map(|_| StdMutex::new(PendingMergeStripe::new()))
@@ -1392,14 +1487,16 @@ where
     }
 
     /// Applies everything a live cluster's configuration decides for a
-    /// shard: both tombstone bounds, the CRDT compaction bounds, and the
-    /// frame cap.
+    /// shard: both tombstone bounds, the CRDT compaction bounds, the frame
+    /// cap, and the fan-out backlog capacity and its wait timeout.
     #[must_use]
     pub fn with_cluster_config(self, config: &ClusterConfig) -> Self {
         self.with_tombstone_ttl(config.tombstone_ttl)
             .with_tombstone_max_ttl(config.tombstone_max_ttl)
             .with_crdt_bounds(config.crdt_compaction_bounds())
             .with_max_frame(config.max_frame)
+            .with_fan_out_backlog_capacity(config.fan_out_backlog_capacity)
+            .with_fan_out_wait_timeout(config.fan_out_wait_timeout)
     }
 
     /// Rewraps `raw_resolver` with the current bound and clock. A
@@ -1423,6 +1520,26 @@ where
     #[must_use]
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
+        self
+    }
+
+    /// Overrides the fan-out backlog capacity an async write path (such as
+    /// [`Shard::insert`]) waits against before pushing onto the fan-out
+    /// queue, threaded from a live cluster's configured
+    /// [`ClusterConfig::fan_out_backlog_capacity`]. Defaults to
+    /// [`ClusterConfig::default`]'s.
+    #[must_use]
+    pub fn with_fan_out_backlog_capacity(mut self, capacity: usize) -> Self {
+        self.fan_out_backlog_capacity = capacity;
+        self
+    }
+
+    /// Overrides the bound on that fan-out backlog wait, threaded from a
+    /// live cluster's configured [`ClusterConfig::fan_out_wait_timeout`].
+    /// Defaults to [`ClusterConfig::default`]'s.
+    #[must_use]
+    pub fn with_fan_out_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.fan_out_wait_timeout = timeout;
         self
     }
 
@@ -2319,6 +2436,7 @@ where
     /// replicate as exceeds the configured frame cap. See
     /// [`Shard::with_max_frame`], default [`MAX_FRAME`].
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.wait_for_fan_out_room().await;
         self.insert_sync(key, value)
     }
 
@@ -2338,6 +2456,7 @@ where
     ///
     /// As [`Shard::insert`].
     pub async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
+        self.wait_for_fan_out_room().await;
         self.insert_expiring(key, value, Some(ttl))
     }
 
@@ -2360,6 +2479,24 @@ where
             encoded,
         };
         self.apply_or_forward(key, key_bytes, ver, incoming)
+    }
+
+    /// Waits for [`Shard::fan_out`]'s backlog to fall under
+    /// [`Shard::fan_out_backlog_capacity`], bounded by
+    /// [`Shard::fan_out_wait_timeout`]; see
+    /// [`FanOutQueue::wait_for_room`]. Called from every async write entry
+    /// point before it pushes onto the queue -- [`Shard::insert`],
+    /// [`Shard::insert_with_ttl`], `insert_many_expiring` (covering
+    /// [`Shard::insert_many`]/[`Shard::insert_many_with_ttl`]),
+    /// [`Shard::remove`], [`Shard::remove_many`], and [`Shard::merge`]'s
+    /// immediate-apply path -- never from the synchronous write chain
+    /// (`insert_sync`, `remove_sync`, `Shard::apply`), which has no async
+    /// runtime to await on and pushes straight through regardless of
+    /// backlog size.
+    async fn wait_for_fan_out_room(&self) {
+        self.fan_out
+            .wait_for_room(self.fan_out_backlog_capacity, self.fan_out_wait_timeout)
+            .await;
     }
 
     /// Applies a versioned write locally if this shard owns `key_bytes`'
@@ -2418,6 +2555,7 @@ where
         }
         let ver = self.stamp_local();
         if self.merge_window.is_zero() {
+            self.wait_for_fan_out_room().await;
             let expires_at_ms = self.expiry_for(None);
             return self.apply_or_forward(
                 key,
@@ -2441,56 +2579,7 @@ where
         } = &mut *stripe;
         match entries.entry(key) {
             Entry::Occupied(slot) => {
-                let (a, b) = {
-                    let existing = slot.get();
-                    (
-                        RecordView {
-                            value: Some(existing.encoded.as_ref()),
-                            ver: existing.ver,
-                            expires_at_ms: existing.expires_at_ms,
-                        },
-                        RecordView {
-                            value: Some(encoded.as_ref()),
-                            ver,
-                            expires_at_ms: self.expiry_for(None),
-                        },
-                    )
-                };
-                let merged = self
-                    .resolver
-                    .merges()
-                    .then(|| self.resolver.merge(key_bytes.as_ref(), a, b))
-                    .flatten();
-                match merged {
-                    Some(Merged {
-                        value: merged_bytes,
-                        expires_at_ms,
-                    }) => {
-                        let merged_value: V =
-                            postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
-                        let entry = slot.into_mut();
-                        entry.value = merged_value;
-                        entry.encoded = merged_bytes;
-                        entry.expires_at_ms = expires_at_ms;
-                        entry.ver = ver;
-                    }
-                    None => match self.resolver.winner(key_bytes.as_ref(), a, b) {
-                        Winner::B => {
-                            let entry = slot.into_mut();
-                            entry.value = value;
-                            entry.encoded = encoded;
-                            entry.expires_at_ms = self.expiry_for(None);
-                            entry.ver = ver;
-                        }
-                        Winner::A => {
-                            // The incoming call lost outright: nothing about the
-                            // pending entry changes, version included, mirroring
-                            // `resolve_and_rebind`'s `IncomingLoses => None` in
-                            // the engine: a losing write never advances the
-                            // version of the record it lost against.
-                        }
-                    },
-                }
+                self.fold_into_occupied_merge(slot, &key_bytes, encoded, value, ver)?;
             }
             Entry::Vacant(slot) => {
                 let deadline_ms = merge_deadline_ms(self.now_ms(), self.merge_window);
@@ -2507,6 +2596,73 @@ where
                 drop(stripe);
                 self.merge_wake.notify_one();
             }
+        }
+        Ok(())
+    }
+
+    /// [`Shard::merge`]'s occupied-slot branch: folds `value` (with `encoded`
+    /// and `ver`, already computed by the caller) into whatever this stripe
+    /// already holds pending for `slot`'s key, through the resolver's
+    /// `merge` when it merges, else its `winner` call. Split out of
+    /// `merge` only to keep that function's line count down; not called
+    /// from anywhere else.
+    fn fold_into_occupied_merge(
+        &self,
+        slot: OccupiedEntry<'_, K, PendingMerge<V>>,
+        key_bytes: &Bytes,
+        encoded: Bytes,
+        value: V,
+        ver: Hlc,
+    ) -> Result<(), CacheError> {
+        let (a, b) = {
+            let existing = slot.get();
+            (
+                RecordView {
+                    value: Some(existing.encoded.as_ref()),
+                    ver: existing.ver,
+                    expires_at_ms: existing.expires_at_ms,
+                },
+                RecordView {
+                    value: Some(encoded.as_ref()),
+                    ver,
+                    expires_at_ms: self.expiry_for(None),
+                },
+            )
+        };
+        let merged = self
+            .resolver
+            .merges()
+            .then(|| self.resolver.merge(key_bytes.as_ref(), a, b))
+            .flatten();
+        match merged {
+            Some(Merged {
+                value: merged_bytes,
+                expires_at_ms,
+            }) => {
+                let merged_value: V =
+                    postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
+                let entry = slot.into_mut();
+                entry.value = merged_value;
+                entry.encoded = merged_bytes;
+                entry.expires_at_ms = expires_at_ms;
+                entry.ver = ver;
+            }
+            None => match self.resolver.winner(key_bytes.as_ref(), a, b) {
+                Winner::B => {
+                    let entry = slot.into_mut();
+                    entry.value = value;
+                    entry.encoded = encoded;
+                    entry.expires_at_ms = self.expiry_for(None);
+                    entry.ver = ver;
+                }
+                Winner::A => {
+                    // The incoming call lost outright: nothing about the
+                    // pending entry changes, version included, mirroring
+                    // `resolve_and_rebind`'s `IncomingLoses => None` in the
+                    // engine: a losing write never advances the version of
+                    // the record it lost against.
+                }
+            },
         }
         Ok(())
     }
@@ -2590,6 +2746,7 @@ where
         // by-stripe apply below: a forwarded entry never reaches `engine`,
         // matching `Shard::insert`'s single-write guard.
         let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
+        self.wait_for_fan_out_room().await;
         if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver, v, e, enc)| {
             (key, key_bytes, ver, put_incoming(v, e, enc))
         }) {
@@ -2855,6 +3012,7 @@ where
     ///
     /// Returns a [`CacheError`] if the key cannot be encoded for the wire.
     pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
+        self.wait_for_fan_out_room().await;
         self.remove_sync(key)
     }
 
@@ -2904,6 +3062,7 @@ where
         // Same owner-vs-forward split as `Shard::insert_many_expiring`: a
         // forwarded tombstone never reaches `engine`.
         let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
+        self.wait_for_fan_out_room().await;
         if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver)| {
             (key, key_bytes, ver, Incoming::Tombstone)
         }) {
@@ -3037,6 +3196,12 @@ where
     /// freshly [`Shard::insert`]ed: a fresh version stamped now, so
     /// replication and events see the fold as one write happening at flush
     /// time, not backdated to whichever `merge` call opened the window.
+    /// Pushes onto the fan-out queue without awaiting room first, unlike
+    /// `Shard::merge`'s own immediate-apply branch: this runs from
+    /// `flush_due_pending_merges`/`flush_all_pending_merges`, called from
+    /// the background `crate::cache::merge_coalesce_task` and from `Drop`,
+    /// neither of which can await a wait bounded by an async runtime that
+    /// may no longer be there by the time `Drop` runs.
     fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
         let ver = self.stamp_local();
         let incoming = Incoming::Put {
@@ -6805,9 +6970,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fan_out_over_capacity_at_or_above_the_cap_only() {
+        assert!(!fan_out_over_capacity(4, 5), "under capacity: no wait");
+        assert!(fan_out_over_capacity(5, 5), "at capacity: wait");
+        assert!(fan_out_over_capacity(6, 5), "over capacity: wait");
+        assert!(
+            !fan_out_over_capacity(0, 1),
+            "an empty queue is always under a nonzero capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_many_awaits_fan_out_room_and_proceeds_once_the_backlog_drains() {
+        let s = shard::<u32, String>(1)
+            .with_fan_out_backlog_capacity(5)
+            .with_fan_out_wait_timeout(Duration::from_secs(10));
+        let queue = s.fan_out_queue();
+
+        // Fills the backlog to exactly its capacity: this call itself sees
+        // an empty queue and never waits.
+        s.insert_many((0..5u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("fills the backlog to capacity");
+        assert_eq!(queue.len(), 5);
+
+        // At capacity, so the next `insert_many` must await room before it
+        // pushes.
+        let insert_fut = s.insert_many((5..7u32).map(|k| (k, k.to_string())));
+        tokio::pin!(insert_fut);
+        let not_yet = tokio::time::timeout(Duration::from_millis(150), &mut insert_fut).await;
+        assert!(
+            not_yet.is_err(),
+            "insert_many must still be waiting for backlog room at capacity"
+        );
+
+        // The fan-out task's own drain: frees room and wakes the waiter.
+        let drained = queue.drain();
+        assert_eq!(
+            drained.len(),
+            5,
+            "drains exactly what was there before the wait"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), &mut insert_fut)
+            .await
+            .expect("insert_many proceeds once the backlog drains")
+            .expect("insert_many succeeds");
+        let mut keys = applied_keys(queue.drain());
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![5, 6],
+            "the write that waited still lands once room frees up"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_many_proceeds_once_its_fan_out_wait_times_out() {
+        let s = shard::<u32, String>(1)
+            .with_fan_out_backlog_capacity(1)
+            .with_fan_out_wait_timeout(Duration::from_millis(100));
+        let queue = s.fan_out_queue();
+
+        s.insert(0, "zero".into())
+            .await
+            .expect("fills the backlog to capacity");
+        assert_eq!(queue.len(), 1);
+
+        // Nothing ever drains the queue this time: the wait must time out
+        // on its own, and the write must still land, over capacity.
+        let started = tokio::time::Instant::now();
+        s.insert_many([(1u32, "one".to_string())])
+            .await
+            .expect("insert_many proceeds regardless once its wait times out");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the call actually waited out its configured timeout"
+        );
+
+        let mut keys = applied_keys(queue.drain());
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![0, 1],
+            "the write is never dropped or refused: it lands over capacity instead"
+        );
+    }
+
     #[tokio::test]
     async fn fan_out_queue_wakes_a_waiter_for_a_push_before_or_after_the_wait() {
-        let queue = Arc::new(FanOutQueue::<u32>::new(true));
+        let queue = Arc::new(FanOutQueue::<u32>::new(SmolStr::new("test"), true));
         let _ = queue.push(7);
         tokio::time::timeout(Duration::from_secs(1), queue.wait_nonempty())
             .await
@@ -7579,7 +7832,7 @@ mod tests {
 
     #[test]
     fn fan_out_item_applied_and_forward_both_drain_through_one_queue() {
-        let queue = FanOutQueue::<FanOutItem<u32>>::new(true);
+        let queue = FanOutQueue::<FanOutItem<u32>>::new(SmolStr::new("test"), true);
         let rec = wire_record(7, "v", hlc(1, 1));
         let _ = queue.push(FanOutItem::Applied(1));
         let _ = queue.push(FanOutItem::Forward(rec.clone()));

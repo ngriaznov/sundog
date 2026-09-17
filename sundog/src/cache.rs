@@ -2792,12 +2792,7 @@ mod tests {
             let mesh = a.mesh().clone();
             let to = b.node_id();
             async move {
-                mesh.send_frames_awaiting(
-                    to,
-                    vec![frame],
-                    tokio::time::Instant::now() + Duration::from_secs(2),
-                )
-                .await;
+                mesh.send_frames_awaiting(to, vec![frame]).await;
             }
         };
 

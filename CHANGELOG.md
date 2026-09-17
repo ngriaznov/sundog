@@ -95,6 +95,35 @@ All notable changes to this project are documented in this file. Format follows
   whose write fails; the victim stays resident on this path exactly as
   every other refusal reason leaves it, so this counter is the only
   visible sign of the failure.
+- **Fan-out backpressure, on both the send and the write side**: a live
+  peer's replicate frame is never dropped. `net::Mesh::send_frames_awaiting`
+  now waits for outbox room in `FAN_OUT_SEND_DEADLINE` (2s) slices for as
+  long as the target peer stays live in the mesh's peer table, logging each
+  timed-out slice at debug and counting it, in whole seconds, in the new
+  `sundog_fan_out_wait_seconds_total{peer}`, instead of giving up; only a
+  peer that has actually left the table (or whose outbox channel has
+  already closed) falls back to today's drop-and-count-and-warn path
+  against `sundog_backlog_dropped_total`. On the write side, `ClusterConfig`
+  gains `fan_out_backlog_capacity` (a new `usize` field, 262,144 keys
+  default, validated nonzero; `ClusterBuilder::build` rejects zero) and
+  `fan_out_wait_timeout` (a new `Duration` field, 30s default): every async
+  write (`insert`, `insert_with_ttl`, `insert_many`, `insert_many_with_ttl`,
+  `remove`, `remove_many`, and `merge`'s immediate-apply path) awaits room
+  in the shard's fan-out queue below that capacity, up to the timeout,
+  before pushing, so a stalled fan-out grows in memory instead of without
+  bound. The write always lands regardless: past the timeout it proceeds
+  anyway, over capacity, counted in the new
+  `sundog_fan_out_wait_timeouts_total{cache}`. A new gauge,
+  `sundog_fan_out_backlog{cache}`, exposes the queue's current length. The
+  synchronous write paths (`insert_sync`, `remove_sync`, `Shard::apply`)
+  keep pushing without waiting, as before; a default-configured caller who
+  never hits either new limit sees no behavior change. The distributed
+  demo's `--report-json` gains `backlog_dropped` (`sundog_backlog_dropped_total`
+  summed across peers) and `fan_out_wait_timeouts`
+  (`sundog_fan_out_wait_timeouts_total` summed across caches), and its
+  `--gate` file gains `max_backlog_dropped` (optional, an older gate file
+  with the field absent skips the check exactly as before);
+  `ops/scale-gate.json` sets it to 0.
 - **Scale workflow**: `.github/workflows/scale.yml` runs the distributed
   demo headless overnight (and on demand via `workflow_dispatch`, with
   `keys`, `duration_secs`, `max_entries`, and `runner` inputs) at 4M keys,

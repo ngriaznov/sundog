@@ -221,6 +221,32 @@ pub struct ClusterConfig {
     /// [`distributed_disown_grace_rounds`](Self::distributed_disown_grace_rounds)'s
     /// timing floor still applies regardless of any ack.
     pub rebalance_ack_window: Duration,
+    /// Backlog capacity, in keys, a cache's fan-out queue (the backlog of
+    /// locally written keys not yet fanned out to peers) tries to stay
+    /// under before an async write path (`Cache::insert`,
+    /// `insert_with_ttl`, `insert_many`, `insert_many_with_ttl`, `remove`,
+    /// `remove_many`, `merge`'s immediate-apply path) pushes onto it. Past
+    /// this many pending keys such a write awaits room, up to
+    /// [`fan_out_wait_timeout`](Self::fan_out_wait_timeout), before it
+    /// proceeds: a stalled fan-out (a peer's outbox stuck full past
+    /// `net::Mesh::send_frames_awaiting`'s wait-slice deadline while still
+    /// live) applies backpressure to the writer instead of growing this
+    /// queue without bound. The write always lands regardless of whether
+    /// room was ever
+    /// found -- past the timeout it proceeds anyway, over capacity,
+    /// counted in `sundog_fan_out_wait_timeouts_total{cache}`; memory over
+    /// capacity is the fallback, never a dropped or refused write. The
+    /// queue's synchronous push (`Cache::insert_sync`, `remove_sync`,
+    /// `Shard::apply`) never waits on this at all: there is no async
+    /// runtime there to await on. Must be nonzero; [`ClusterBuilder::build`]
+    /// rejects zero. Default: 262,144.
+    ///
+    /// [`ClusterBuilder::build`]: crate::ClusterBuilder::build
+    pub fan_out_backlog_capacity: usize,
+    /// Bound on [`fan_out_backlog_capacity`](Self::fan_out_backlog_capacity)'s
+    /// wait: how long an async write path awaits room below that capacity
+    /// before proceeding regardless. Default: 30s.
+    pub fan_out_wait_timeout: Duration,
 }
 
 impl ClusterConfig {
@@ -339,6 +365,8 @@ impl Default for ClusterConfig {
             rebalance_concurrency: 4,
             rebalance_chunk_bytes: 1024 * 1024,
             rebalance_ack_window: Duration::from_secs(60),
+            fan_out_backlog_capacity: 262_144,
+            fan_out_wait_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -580,5 +608,31 @@ mod tests {
             root_ca_certs: vec![cert],
         };
         assert_eq!(tls.clone(), tls);
+    }
+
+    #[test]
+    fn default_fan_out_backlog_capacity_is_262_144() {
+        assert_eq!(ClusterConfig::default().fan_out_backlog_capacity, 262_144);
+    }
+
+    #[test]
+    fn default_fan_out_wait_timeout_is_thirty_seconds() {
+        assert_eq!(
+            ClusterConfig::default().fan_out_wait_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn with_overrides_fan_out_backlog_capacity_independently() {
+        let config = ClusterConfig::default().with(|c| {
+            c.fan_out_backlog_capacity = 10;
+        });
+        assert_eq!(config.fan_out_backlog_capacity, 10);
+        assert_eq!(
+            config.fan_out_wait_timeout,
+            ClusterConfig::default().fan_out_wait_timeout,
+            "overriding the new capacity knob leaves the wait timeout at its default"
+        );
     }
 }

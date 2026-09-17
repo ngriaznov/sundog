@@ -267,6 +267,8 @@ fn build_report(
             "direction",
             "out",
         )),
+        backlog_dropped: as_u64(total_of("sundog_backlog_dropped_total")),
+        fan_out_wait_timeouts: as_u64(total_of("sundog_fan_out_wait_timeouts_total")),
     }
 }
 
@@ -518,7 +520,11 @@ mod tests {
         sundog_spill_dropped_total{reason=\"deferred\"} 9\n\
         sundog_spill_dropped_total{reason=\"other\"} 100\n\
         sundog_rebalance_buckets_total{direction=\"in\"} 6\n\
-        sundog_rebalance_buckets_total{direction=\"out\"} 2\n";
+        sundog_rebalance_buckets_total{direction=\"out\"} 2\n\
+        sundog_backlog_dropped_total{peer=\"1\"} 5\n\
+        sundog_backlog_dropped_total{peer=\"2\"} 3\n\
+        sundog_fan_out_wait_timeouts_total{cache=\"demo\"} 8\n\
+        sundog_fan_out_wait_timeouts_total{cache=\"other\"} 1\n";
 
     #[test]
     fn restart_delay_is_a_quarter_of_the_duration_when_that_stays_under_half_the_tombstone_ttl() {
@@ -604,6 +610,8 @@ mod tests {
         assert_eq!(report.ae_repaired, 4);
         assert_eq!(report.rebalance_in, 6);
         assert_eq!(report.rebalance_out, 2);
+        assert_eq!(report.backlog_dropped, 8);
+        assert_eq!(report.fan_out_wait_timeouts, 9);
     }
 
     #[test]
@@ -643,5 +651,7 @@ mod tests {
         assert!(!report.converged);
         assert_eq!(report.pull_timeouts, 0);
         assert_eq!(report.spill_dropped_deferred, 0);
+        assert_eq!(report.backlog_dropped, 0);
+        assert_eq!(report.fan_out_wait_timeouts, 0);
     }
 }

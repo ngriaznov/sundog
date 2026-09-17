@@ -25,7 +25,7 @@ pub(crate) mod test_support;
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 mod tls;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -132,6 +132,14 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 /// the writers' last frames to go out.
 const OUTBOX_FLUSH_DEADLINE: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
+
+/// The slice [`Mesh::send_frames_awaiting`] waits for outbox space in before
+/// rechecking whether the target peer is still live: a frame for a live
+/// peer is never dropped, so this bounds how often that liveness recheck
+/// (and, on a timed-out slice, the `sundog_fan_out_wait_seconds_total{peer}`
+/// bump) happens, not how long a live peer's send is ultimately allowed to
+/// take.
+pub(crate) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Process-wide wire-frame counters, incremented at [`conn::send_msg`], the
 /// single choke point every outbound frame passes through:
@@ -726,6 +734,16 @@ fn defer_ae_digest(queued: usize, deferred_so_far: u32) -> bool {
     queued > 0 && deferred_so_far < MAX_AE_DEFERRALS
 }
 
+/// [`Mesh::send_frames_awaiting`]'s decision, on one timed-out
+/// [`FAN_OUT_SEND_DEADLINE`] slice, between waiting again and giving up:
+/// `true` (keep waiting) exactly when `peer_live` -- the peer is still
+/// present in the mesh's peer table -- so a frame for a live peer is never
+/// dropped. Pulled out as its own pure function so this call is unit
+/// tested without a running mesh.
+const fn fan_out_keep_waiting(peer_live: bool) -> bool {
+    peer_live
+}
+
 impl MeshInner {
     /// Whether replicate traffic toward `peer` is still in motion: frames
     /// queued in its outbox, or a frame enqueued within the last `window`.
@@ -1078,21 +1096,23 @@ impl Mesh {
 
     /// [`Mesh::send_frames`] for records the sender keeps no copy of: a
     /// `Mode::Distributed` fan-out, where a forwarded write's only copy is
-    /// the frame itself. Waits for outbox space instead of dropping on
-    /// overflow, up to `deadline` for the whole batch; a frame that still
-    /// finds no space by then is dropped and counted in
-    /// `sundog_backlog_dropped_total`, and the peer marked dirty. A `peer`
-    /// the mesh doesn't know about is a silent no-op.
+    /// the frame itself, so a frame for a peer still live in the peer
+    /// table is never dropped. Waits for outbox space in
+    /// [`FAN_OUT_SEND_DEADLINE`] slices; each slice
+    /// that times out with `peer` still present in the peer table is logged
+    /// at debug and counted, in whole seconds, in
+    /// `sundog_fan_out_wait_seconds_total{peer}`, then waited again. Once
+    /// `peer` is no longer in the table (removed by [`Mesh::update_peers`],
+    /// or its outbox channel closed because its writer already ended), the
+    /// remaining frames are dropped, counted in
+    /// `sundog_backlog_dropped_total`, the peer marked dirty, and a warning
+    /// logged -- today's overflow behavior. A `peer` the mesh never knew
+    /// about is a silent no-op.
     ///
     /// # Panics
     ///
     /// Panics if the peer-table lock is poisoned.
-    pub(crate) async fn send_frames_awaiting(
-        &self,
-        peer: NodeId,
-        frames: Vec<OutFrame>,
-        deadline: tokio::time::Instant,
-    ) {
+    pub(crate) async fn send_frames_awaiting(&self, peer: NodeId, frames: Vec<OutFrame>) {
         let (tx, dirty, enqueued_stamp) = {
             let table = self
                 .inner
@@ -1108,11 +1128,38 @@ impl Mesh {
                 Arc::clone(&handle.last_replicate_enqueued),
             )
         };
+        let mut queue: VecDeque<OutFrame> = frames.into();
         let mut dropped = 0u64;
-        for frame in frames {
-            match tokio::time::timeout_at(deadline, tx.reserve()).await {
+        while let Some(frame) = queue.pop_front() {
+            let slice_deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
+            match tokio::time::timeout_at(slice_deadline, tx.reserve()).await {
                 Ok(Ok(permit)) => permit.send(frame),
-                Ok(Err(_)) | Err(_) => dropped += 1,
+                Ok(Err(_)) => {
+                    // The outbox channel itself closed: this peer's writer
+                    // already ended, so it is as good as gone regardless of
+                    // whether `update_peers` has removed its table entry
+                    // yet.
+                    dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                    queue.clear();
+                }
+                Err(_) => {
+                    if fan_out_keep_waiting(self.peer_is_live(peer)) {
+                        metrics::counter!(
+                            "sundog_fan_out_wait_seconds_total",
+                            "peer" => peer.to_string()
+                        )
+                        .increment(FAN_OUT_SEND_DEADLINE.as_secs());
+                        tracing::debug!(
+                            %peer,
+                            "outbox still full past one fan-out wait slice; peer is still \
+                             live, waiting again"
+                        );
+                        queue.push_front(frame);
+                    } else {
+                        dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                        queue.clear();
+                    }
+                }
             }
         }
         enqueued_stamp.store(mono_ms() + 1, Ordering::Relaxed);
@@ -1122,6 +1169,21 @@ impl Mesh {
                 .increment(dropped);
             tracing::warn!(%peer, dropped, "outbox stayed full past the fan-out deadline; frames dropped");
         }
+    }
+
+    /// Whether `peer` is still in the peer table: [`Mesh::update_peers`]
+    /// removes an entry the instant a peer departs, so this is
+    /// [`Mesh::send_frames_awaiting`]'s liveness check between wait slices.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock is poisoned.
+    fn peer_is_live(&self, peer: NodeId) -> bool {
+        self.inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned")
+            .contains_key(&peer)
     }
 
     /// Waits, up to `deadline`, until every peer's replicate outbox has been
@@ -3269,13 +3331,7 @@ mod tests {
             .into_iter()
             .map(|msg| OutFrame::new(msg).expect("encodes"))
             .collect();
-        sender
-            .send_frames_awaiting(
-                NodeId::from(2),
-                frames,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-            )
-            .await;
+        sender.send_frames_awaiting(NodeId::from(2), frames).await;
         sender.shutdown().await;
 
         let got = count_replicated(&mut inbound, Duration::from_secs(3)).await;
@@ -3284,6 +3340,159 @@ mod tests {
             "a four-slot outbox carries two hundred frames when the sender waits for space"
         );
         receiver.shutdown().await;
+    }
+
+    #[test]
+    fn fan_out_keep_waiting_only_for_a_live_peer() {
+        assert!(
+            fan_out_keep_waiting(true),
+            "a live peer's frame is never dropped: keep waiting"
+        );
+        assert!(
+            !fan_out_keep_waiting(false),
+            "a peer gone from the table falls back to today's drop-and-count path"
+        );
+    }
+
+    /// A peer whose outbox never drains -- a tiny `outbox_capacity` and no
+    /// listener behind `dead_peer`, exactly
+    /// `invalidate_overflow_drops_oldest_not_newest` and
+    /// `replicate_overflow_drops_newest_and_marks_peer_dirty`'s own setup --
+    /// but stays live in the peer table throughout: `send_frames_awaiting`
+    /// keeps waiting past one `FAN_OUT_SEND_DEADLINE` rather than dropping,
+    /// and `sundog_backlog_dropped_total` (observed here via
+    /// `take_dirty_peers`, only ever set alongside that counter) never
+    /// fires.
+    #[tokio::test]
+    async fn send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer() {
+        let config = ClusterConfig {
+            outbox_capacity: 1,
+            ..ClusterConfig::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+        let (sender, _sender_inbound) =
+            Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+                .await
+                .expect("bind loopback");
+
+        // A peer with no listener: the writer spins on connection failures
+        // without ever draining `replicate_rx`, so the one-slot outbox
+        // fills and stays full.
+        let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+        sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+        // Fills the one-slot outbox so the call below has to wait.
+        sender.send(
+            NodeId::from(2),
+            MsgClass::Replicate,
+            Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: sample_record(0),
+            },
+        );
+
+        let frames: Vec<OutFrame> = replicate_msgs(3)
+            .into_iter()
+            .map(|msg| OutFrame::new(msg).expect("encodes"))
+            .collect();
+        let started = tokio::time::Instant::now();
+        // The peer is never removed and its outbox is never drained: this
+        // call would hang forever if it kept the peer live indefinitely,
+        // so bound it generously past one deadline slice and assert it is
+        // still waiting, not that it returns.
+        let outcome = tokio::time::timeout(
+            FAN_OUT_SEND_DEADLINE * 2,
+            sender.send_frames_awaiting(NodeId::from(2), frames),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a live peer's frames are never dropped, so the wait outlives one deadline slice"
+        );
+        assert!(
+            started.elapsed() >= FAN_OUT_SEND_DEADLINE,
+            "the call keeps waiting past at least one full slice"
+        );
+        assert!(
+            sender.take_dirty_peers().is_empty(),
+            "a live peer's stalled outbox is never marked dirty, so nothing was dropped"
+        );
+    }
+
+    /// The same never-draining outbox as
+    /// `send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer`,
+    /// but the peer is removed from the table mid-wait: the remaining
+    /// frames are dropped and counted rather than waited on forever.
+    #[tokio::test]
+    async fn send_frames_awaiting_drops_once_the_peer_leaves_the_table_mid_wait() {
+        let config = ClusterConfig {
+            outbox_capacity: 1,
+            ..ClusterConfig::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+        let (sender, _sender_inbound) =
+            Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+                .await
+                .expect("bind loopback");
+
+        let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+        sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+        // `take_dirty_peers` only reports peers still in the table, and
+        // this one is about to leave it, so this test reads the `dirty`
+        // flag directly off the handle instead -- the same internal-field
+        // peek `invalidate_overflow_drops_oldest_not_newest` uses for its
+        // own outbox.
+        let dirty_flag = {
+            let table = sender.inner.peers.read().expect("lock");
+            Arc::clone(&table.get(&NodeId::from(2)).expect("peer registered").dirty)
+        };
+
+        sender.send(
+            NodeId::from(2),
+            MsgClass::Replicate,
+            Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: sample_record(0),
+            },
+        );
+
+        let frames: Vec<OutFrame> = replicate_msgs(3)
+            .into_iter()
+            .map(|msg| OutFrame::new(msg).expect("encodes"))
+            .collect();
+        let wait_fut = sender.send_frames_awaiting(NodeId::from(2), frames);
+        tokio::pin!(wait_fut);
+
+        // Confirms the call is genuinely pending on outbox room, not a
+        // scheduling race against the `update_peers` call below, before the
+        // peer is removed from the table.
+        let not_yet = tokio::time::timeout(Duration::from_millis(200), &mut wait_fut).await;
+        assert!(
+            not_yet.is_err(),
+            "the one-slot outbox is still full; the call must still be waiting"
+        );
+        assert!(
+            !dirty_flag.load(Ordering::Relaxed),
+            "nothing dropped yet while the peer is still live"
+        );
+
+        sender.update_peers(vec![]);
+
+        tokio::time::timeout(Duration::from_secs(3), &mut wait_fut)
+            .await
+            .expect("send_frames_awaiting returns once the peer is gone");
+
+        // `dirty` is only ever set alongside the `sundog_backlog_dropped_total`
+        // bump, in the same `if dropped > 0` branch
+        // (`replicate_overflow_drops_newest_and_marks_peer_dirty` asserts
+        // the same pairing for the ordinary overflow path), so this is
+        // proof the remaining frames were dropped and counted rather than
+        // waited on.
+        assert!(
+            dirty_flag.load(Ordering::Relaxed),
+            "a peer that leaves mid-wait drops its remaining frames and is marked dirty"
+        );
     }
 
     #[tokio::test]

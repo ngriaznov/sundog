@@ -725,6 +725,11 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
             config.max_frame
         )));
     }
+    if config.fan_out_backlog_capacity == 0 {
+        return Err(JoinError::InvalidConfig(
+            "ClusterConfig::fan_out_backlog_capacity must be nonzero".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1495,7 +1500,6 @@ async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
         records = forwarded,
         "forward batch routed under another view; re-forwarded to its owners under ours"
     );
-    let deadline = tokio::time::Instant::now() + fan_out::FAN_OUT_SEND_DEADLINE;
     for fan_out::OwnerGroup { owners, records } in groups {
         let frames: Vec<OutFrame> = batch_forward(cache_name, view.view_hash(), hops + 1, records)
             .into_iter()
@@ -1508,8 +1512,7 @@ async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
             })
             .collect();
         for peer in owners {
-            mesh.send_frames_awaiting(peer, frames.clone(), deadline)
-                .await;
+            mesh.send_frames_awaiting(peer, frames.clone()).await;
         }
     }
 }
@@ -1765,6 +1768,23 @@ mod tests {
             .expect_err("a sketch wider than max_frame must be rejected at build() time");
         assert!(
             matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("ae_sketch_cells")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_zero_fan_out_backlog_capacity() {
+        let mut config = loopback_config();
+        config.fan_out_backlog_capacity = 0;
+
+        let err = Cluster::builder("cluster-it-fan-out-backlog-capacity-guard")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect_err("a zero fan_out_backlog_capacity must be rejected at build() time");
+        assert!(
+            matches!(err, JoinError::InvalidConfig(ref msg) if msg.contains("fan_out_backlog_capacity")),
             "{err:?}"
         );
     }

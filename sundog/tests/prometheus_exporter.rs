@@ -19,7 +19,9 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use smol_str::SmolStr;
 use sundog::crdt::{PnCounter, PnCounterResolver};
+use sundog::store::Shard;
 use sundog::{CacheError, Cluster, Mode, NodeId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -209,6 +211,49 @@ async fn count_hits_and_misses(cluster: &Cluster) {
     }))
     .await;
     assert!(loads.iter().all(|value| value == "joined"));
+}
+
+/// Drives a genuine `sundog_fan_out_wait_timeouts_total{cache}` increment,
+/// and pins `sundog_fan_out_backlog{cache}` at a real nonzero value,
+/// through a bare `sundog::store::Shard` with no `Cluster`/mesh involved
+/// at all: `cluster::fan_out_task`, the only thing that ever drains a
+/// shard's fan-out queue, is spawned by `Cluster`/`Cache`, never by
+/// `Shard` itself, so nothing here races this scenario's own two `insert`
+/// calls to drain the queue first -- unlike a live cluster's real
+/// background fan-out, which would need genuine network backpressure to
+/// reproduce the same wait reliably (see `reserve_timeout_pin_metric`'s
+/// own doc on why a purely local producer/consumer pair tends not to
+/// reproduce a spill-side wait either).
+///
+/// A `fan_out_backlog_capacity` of 1 and a one-microsecond
+/// `fan_out_wait_timeout` force the second `insert` call's wait to time
+/// out deterministically, not just probably: `Notify::notified()`'s
+/// first poll can never resolve synchronously, since nothing ever
+/// notifies before it exists to be notified (unlike a semaphore permit
+/// that might already be free), so `tokio::time::timeout` always finds it
+/// genuinely pending on the very first poll, and a one-microsecond bound
+/// always loses that race. The write still lands regardless, over
+/// capacity: two keys queued against a capacity of one.
+async fn fan_out_wait_timeout_pin_metrics() {
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("fan-out-timeout-pin"),
+        Mode::Replicated,
+        NodeId::from(1),
+        10_000,
+        None,
+        None,
+    )
+    .with_fan_out_backlog_capacity(1)
+    .with_fan_out_wait_timeout(Duration::from_micros(1));
+
+    shard
+        .insert(0, "a".to_string())
+        .await
+        .expect("first insert fills the backlog to its capacity of one");
+    shard
+        .insert(1, "b".to_string())
+        .await
+        .expect("second insert proceeds once its wait times out, over capacity");
 }
 
 /// Opens `users` on both `cluster` and `peer`, does one plain insert/remove
@@ -707,6 +752,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_sketch_mismatch(&cluster, &peer).await;
     seed_part_mismatch(&cluster, &peer).await;
     count_hits_and_misses(&cluster).await;
+    fan_out_wait_timeout_pin_metrics().await;
     #[cfg(feature = "spill")]
     let mut spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
     #[cfg(feature = "spill")]
@@ -776,6 +822,32 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     assert!(
         scraped_metric_value(&body, "sundog_cache_entries", &[("cache", "counted")]).is_some(),
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
+    );
+
+    // sundog_fan_out_wait_timeouts_total / sundog_fan_out_backlog: pinned by
+    // `fan_out_wait_timeout_pin_metrics`'s bare-`Shard` scenario -- one
+    // genuine, deterministic wait timeout, and two keys left sitting in the
+    // backlog against a configured capacity of one, since nothing ever
+    // drains a `Shard` with no `Cluster` behind it.
+    assert!(
+        scraped_metric_value(
+            &body,
+            "sundog_fan_out_wait_timeouts_total",
+            &[("cache", "fan-out-timeout-pin")]
+        )
+        .is_some_and(|count| count >= 1.0),
+        "expected at least one genuine fan-out wait timeout on the 'fan-out-timeout-pin' \
+         cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_fan_out_backlog",
+            &[("cache", "fan-out-timeout-pin")]
+        ),
+        Some(2.0),
+        "both keys landed over the configured capacity of one, with nothing to drain them; \
+         got body:\n{body}"
     );
     assert!(
         scraped_metric_value(&body, "sundog_ae_sketch_total", &[("cache", "users")])
@@ -1020,6 +1092,27 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             );
         }
     }
+
+    // sundog_fan_out_wait_seconds_total{peer}: `net::Mesh::send_frames_awaiting`
+    // only ever bumps this when a real per-peer outbox stays full past a
+    // whole `FAN_OUT_SEND_DEADLINE` (2s) slice while the peer is still
+    // live -- every real peer this whole scenario ever talks to (`peer`,
+    // `third`, `fourth`) drains its own inbound traffic far faster than
+    // that on loopback with no artificial slowdown, the same reason
+    // `disk_error_and_reserve_wait_pin_metrics`'s tiny scenario never
+    // registers `sundog_spill_wait_timeouts_total` either: reproducing a
+    // genuine multi-second mesh stall needs a deliberately slow receiver
+    // (a real network round trip, or a receiver-side admission wait), not
+    // just a small buffer, so this series is correctly never registered
+    // here. `send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer`
+    // and `send_frames_awaiting_drops_once_the_peer_leaves_the_table_mid_wait`
+    // (net/mod.rs) pin this counter's actual increment in-process instead,
+    // against a mesh outbox held full by construction.
+    assert!(
+        !body.contains("sundog_fan_out_wait_seconds_total"),
+        "no peer in this scenario ever stalls its outbox for a whole deadline slice; got \
+         body:\n{body}"
+    );
 
     // `users` warmed during `seed_sketch_mismatch` above: `is_ready()` and
     // `/readyz` on the same listener must both already agree.
