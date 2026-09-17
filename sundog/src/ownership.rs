@@ -318,6 +318,30 @@ pub struct ResidencySet {
     /// answer a remote fetch's miss for them. Cleared bucket by bucket as
     /// each pull lands, or wholesale when the warm-up gives up.
     cold: RwLock<HashSet<u16>>,
+    /// Buckets a warm spill-tier reopen replayed from disk, not yet
+    /// verified against a live co-owner. Distinct from `cold`: before a
+    /// spill tier could warm-reopen, a cold bucket held nothing but records
+    /// pulled from a donor or replicated in live, both trustworthy, so a
+    /// local *hit* there was always safe to serve. A warm-reloaded bucket
+    /// can instead hold a record a co-owner deleted during this node's
+    /// downtime, so a hit there is not enough on its own; a miss already
+    /// goes through the same "ask the other owners" path `cold` drives.
+    /// Marked the moment a bucket's replay lands
+    /// (`crate::cache::attach_spill_and_record_warm`), cleared the moment
+    /// this node decides the bucket is ready to serve: the same decision,
+    /// and the same call, that clears `cold` for it. Verification against a
+    /// live co-owner is preferred whenever one exists --
+    /// `reconcile_warm_buckets`'s own eager round, or the ordinary
+    /// cold-pull machinery landing fresh data for it, since a pulled bucket
+    /// is authoritative regardless of whether it was ever warm-reloaded --
+    /// but when the code instead decides to serve a bucket with no donor to
+    /// verify against (every donor cold or unreachable once the warm-up's
+    /// attempts run out, or a bucket with no co-owner at all), the replayed
+    /// data, already bounded by the tombstone-downtime gate at open time,
+    /// is the best available answer and this mark clears too: refusing
+    /// local hits forever while already trusting local misses is
+    /// incoherent, not extra safety.
+    unverified: RwLock<HashSet<u16>>,
 }
 
 impl Default for ResidencySet {
@@ -332,6 +356,7 @@ impl ResidencySet {
         Self {
             releasing: RwLock::new(HashMap::new()),
             cold: RwLock::new(HashSet::new()),
+            unverified: RwLock::new(HashSet::new()),
         }
     }
 
@@ -342,8 +367,11 @@ impl ResidencySet {
 
     /// Clears the cold mark from each of `buckets`: their pull landed.
     /// Every production call site that decides a bucket is ready to serve
-    /// goes through [`ResidencySet::mark_serving`] instead, which stays
-    /// separately reachable as its own named decision point.
+    /// goes through [`ResidencySet::mark_serving`] instead, which clears
+    /// this and `unverified` together on the same decision so neither can
+    /// be forgotten; this method stays separately reachable because the two
+    /// marks are otherwise independent state (see
+    /// `residency_set_cold_and_unverified_clear_independently`).
     pub(crate) fn clear_cold(&self, buckets: &[u16]) {
         let mut cold = self.cold.write();
         for bucket in buckets {
@@ -353,16 +381,20 @@ impl ResidencySet {
 
     /// Clears every cold mark: the warm-up gave up, so what is here is what
     /// there is. [`ResidencySet::mark_all_serving`] is the production entry
-    /// point for this; see its docs for why.
+    /// point that clears this and every unverified mark together; see its
+    /// docs for why.
     pub(crate) fn clear_all_cold(&self) {
         self.cold.write().clear();
     }
 
-    /// Clears the cold mark from each of `buckets`: the single point where
-    /// this node starts trusting a local miss in these buckets. Every site
-    /// that decides a bucket is ready to serve goes through this method: a
-    /// donor pull landing (`crate::cluster::rebalance::try_donor_buckets`,
-    /// `crate::cluster::rebalance::pull_one_group`'s own success case),
+    /// Clears the cold and unverified marks from each of `buckets` at once:
+    /// the single point where this node starts trusting both a local miss
+    /// and a local hit in the same buckets, so a future call site can never
+    /// clear one and forget the other. Every site that decides a bucket is
+    /// ready to serve goes through this method: a donor pull landing
+    /// (`crate::cluster::rebalance::try_donor_buckets`,
+    /// `crate::cluster::rebalance::pull_one_group`'s own success case), an
+    /// eager verification round vouching for it (`reconcile_warm_buckets`),
     /// every donor found cold or unreachable with nothing warm anywhere to
     /// pull (`pull_one_group`'s `ALL_COLD_PASSES` give-up), and a bucket
     /// found to have no live co-owner at all
@@ -370,19 +402,53 @@ impl ResidencySet {
     /// `rebalance_task`'s "alone" cases).
     pub(crate) fn mark_serving(&self, buckets: &[u16]) {
         self.clear_cold(buckets);
+        self.clear_unverified(buckets);
     }
 
     /// The wholesale analogue of [`ResidencySet::mark_serving`], for
     /// `crate::cluster::rebalance::warm_up_task`'s `WarmAnyway` give-up
     /// path: after repeated whole-pull timeouts, every bucket this
-    /// `ResidencySet` still marks cold is declared servable at once.
+    /// `ResidencySet` still marks cold or unverified is declared servable
+    /// at once, on the same "nothing better is coming" decision that used
+    /// to clear only `cold`.
     pub(crate) fn mark_all_serving(&self) {
         self.clear_all_cold();
+        self.unverified.write().clear();
     }
 
     /// Whether `bucket` is owned here but not yet pulled.
     pub(crate) fn is_cold(&self, bucket: u16) -> bool {
         self.cold.read().contains(&bucket)
+    }
+
+    /// Marks each of `buckets` unverified: a warm spill-tier reopen just
+    /// replayed them from disk, with no live co-owner check yet. Only ever
+    /// called from `crate::cache::attach_spill_and_record_warm`, itself
+    /// `feature = "spill"`-only: without that feature nothing ever warm-
+    /// reopens, so nothing ever marks a bucket unverified in the first
+    /// place, though `is_unverified`/`clear_unverified` stay unconditional
+    /// since a plain `false`/no-op is exactly what an always-empty set
+    /// already gives every caller.
+    #[cfg(feature = "spill")]
+    pub(crate) fn mark_unverified(&self, buckets: &[u16]) {
+        self.unverified.write().extend(buckets.iter().copied());
+    }
+
+    /// Clears the unverified mark from each of `buckets`: either
+    /// `reconcile_warm_buckets`'s own eager round vouched for them, or the
+    /// ordinary cold-pull machinery landed fresh data for them.
+    pub(crate) fn clear_unverified(&self, buckets: &[u16]) {
+        let mut unverified = self.unverified.write();
+        for bucket in buckets {
+            unverified.remove(bucket);
+        }
+    }
+
+    /// Whether `bucket` was warm-reloaded from disk and never yet verified
+    /// against a live co-owner. A hit in such a bucket is never served
+    /// locally: see [`ResidencySet::unverified`]'s own docs.
+    pub(crate) fn is_unverified(&self, bucket: u16) -> bool {
+        self.unverified.read().contains(&bucket)
     }
 
     /// Marks each of `buckets` as releasing, starting its grace clock. A
@@ -870,28 +936,75 @@ mod tests {
         assert!(!set.is_cold(1) && !set.is_cold(3));
     }
 
+    #[cfg(feature = "spill")]
     #[test]
-    fn residency_set_mark_serving_clears_the_cold_mark() {
+    fn residency_set_unverified_marks_clear_per_bucket_and_are_distinct_from_cold() {
         let set = ResidencySet::new();
-        set.mark_cold(&[1, 2]);
-        assert!(set.is_cold(1) && set.is_cold(2));
+        assert!(!set.is_unverified(1));
 
-        set.mark_serving(&[1, 2]);
-        assert!(!set.is_cold(1) && !set.is_cold(2));
+        set.mark_unverified(&[1, 2, 3]);
+        assert!(set.is_unverified(1) && set.is_unverified(2) && set.is_unverified(3));
+        assert!(
+            !set.is_cold(1),
+            "unverified and cold are separate marks: marking one never marks the other"
+        );
+
+        set.clear_unverified(&[2]);
+        assert!(set.is_unverified(1) && !set.is_unverified(2) && set.is_unverified(3));
     }
 
+    #[cfg(feature = "spill")]
     #[test]
-    fn residency_set_mark_all_serving_clears_every_cold_mark() {
+    fn residency_set_cold_and_unverified_clear_independently() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1]);
+        set.mark_unverified(&[1]);
+        assert!(set.is_cold(1) && set.is_unverified(1));
+
+        // Clearing cold alone (the ordinary un-warm-reloaded pull path)
+        // never clears unverified, and clearing unverified alone (an eager
+        // reconciliation round) never clears cold: `Shard::close_spill_checkpointed`'s
+        // caller always clears both together for a warm-reloaded bucket,
+        // but the two marks themselves are independent state.
+        set.clear_cold(&[1]);
+        assert!(!set.is_cold(1) && set.is_unverified(1));
+
+        set.mark_cold(&[1]);
+        set.clear_unverified(&[1]);
+        assert!(set.is_cold(1) && !set.is_unverified(1));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_set_mark_serving_clears_both_cold_and_unverified_together() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1, 2]);
+        set.mark_unverified(&[1]);
+        assert!(set.is_cold(1) && set.is_cold(2) && set.is_unverified(1));
+
+        // A bucket that is both cold and unverified, and a bucket that is
+        // cold only, both come out fully served: `mark_serving` is the one
+        // decision point that clears whichever of the two marks a bucket
+        // actually carries, so a caller never has to know which.
+        set.mark_serving(&[1, 2]);
+        assert!(!set.is_cold(1) && !set.is_cold(2) && !set.is_unverified(1));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_set_mark_all_serving_clears_every_cold_and_unverified_mark() {
         let set = ResidencySet::new();
         set.mark_cold(&[1, 2, 3]);
+        set.mark_unverified(&[2, 3]);
         set.mark_releasing(&[9]);
 
         set.mark_all_serving();
 
         assert!(!set.is_cold(1) && !set.is_cold(2) && !set.is_cold(3));
+        assert!(!set.is_unverified(2) && !set.is_unverified(3));
         assert!(
             set.is_releasing(9),
-            "mark_all_serving touches only the cold mark"
+            "mark_all_serving touches only the cold and unverified marks"
         );
     }
 

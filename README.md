@@ -308,6 +308,48 @@ a later eviction pass to retry instead, since every peer still holds the
 entry and a local delete would only have anti-entropy repair it back in. A
 `Local` or `Invalidation` cache evicts it as described above.
 
+With `SpillConfig::warm_reopen(true)` (default `false`, so a default tier's
+open and close cost stay exactly what they are without this setting), a
+clean close checkpoints the tier: every currently-resident live record is
+written to disk alongside every already-spilled one, and a snapshot next
+to the region files lists every live entry's key, version, expiry, and
+on-disk location. Tombstones and expired entries are never written into
+it. A restart against the same directory then replays only that snapshot,
+never scanning a region file for records it does not already know to look
+for, filters what it recovers to buckets this node currently owns, drops
+anything already expired, and folds every survivor straight into the
+shard's digests with no value bytes read into RAM. For `Mode::Distributed`
+on a cluster built with seeds, `CacheBuilder::open` waits briefly (bounded
+by `min(ClusterConfig::state_transfer_budget, 5s)`) for a first known peer
+before computing that owned-buckets filter at all, so a restart racing
+gossip convergence never treats this node as the sole owner of every
+bucket just because no peer has reported in yet. A crash, or a close
+with `warm_reopen` off, leaves no snapshot, so the next open is cold; a
+successful warm reopen deletes the snapshot it just replayed, so a second
+open with no intervening clean close is cold too. A node down longer than
+`tombstone_ttl` (10 minutes by default) also always falls back to the
+ordinary cold, wipe-and-recreate open, since no live peer is still
+guaranteed to hold the tombstones that would out-vote a resurrected stale
+record. Either way, a warm-reloaded bucket starts both cold and
+unverified: unlike an ordinary cold bucket, whose only possible content
+before a live pull lands is already trustworthy (pulled from a donor or
+replicated in live), a replayed bucket can hold a record a co-owner
+deleted during this node's downtime, so `Cache::fetch` and a peer's
+request for it both treat a local hit there the same as a miss, asking
+the other owners instead of answering short. A `Mode::Distributed` cache
+clears the unverified mark on the same decision, and at the same call,
+that clears cold. Verification is preferred whenever a live co-owner
+exists to check against: an eager anti-entropy round against every live
+co-owner confirming the replayed data, or the ordinary cold-pull machinery
+landing fresh data for the bucket, clears both marks together. When the
+code instead decides to serve a bucket with no donor to verify against --
+a bucket found to have no co-owner at all, or one whose only co-owners
+never answer before the warm-up's attempts run out -- the replayed data,
+already bounded by the `tombstone_ttl` downtime gate above, is the best
+available answer, and it clears both marks too rather than refusing local
+hits forever while already trusting local misses in the same bucket. A
+bucket this node does not own any more is never served short regardless.
+
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,
 `sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`, frames
@@ -337,6 +379,15 @@ underneath the scan). Without
 Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
+
+With `spill`, every cache open also emits
+`sundog_spill_reopen_total{cache, outcome, reason}`, `outcome` `warm` for a
+fast reopen straight from a checkpoint snapshot or `cold_fallback` for the
+ordinary wipe-and-recreate path, with `reason` naming why for a fallback
+(`disabled` when `SpillConfig::warm_reopen` is off, `no_snapshot`,
+`stale_snapshot`, `config_mismatch`, `downtime_exceeded`, or `bad_region`;
+empty for `warm`), and `sundog_spill_reopen_records_total{cache}`, how many
+records a warm reopen actually replayed.
 
 A `Mode::Distributed` cache adds seven more:
 
@@ -490,8 +541,8 @@ over a spill tier, checking the resulting `--report-json` output against
 [`ops/scale-gate.json`](ops/scale-gate.json)'s thresholds for steady and
 peak RSS, deferred spill drops, pull timeouts, dropped replicate backlog
 (`max_backlog_dropped`, summing `sundog_backlog_dropped_total` across
-peers), fetch p99 latency, convergence, and a fully passing sample check
-via `--gate`.
+peers), fetch p99 latency, warm spill reopens, convergence, and a fully
+passing sample check via `--gate`.
 `workflow_dispatch` reruns the same shape on demand with its own key count,
 duration, RAM cap, and runner inputs, for a one-off run at a different
 scale. Both the report and the run log upload as workflow artifacts.
@@ -550,9 +601,9 @@ they pull its buckets; restart it and watch it take its share back.
 
 `--headless <SECS>` preloads, runs the load for `SECS` seconds (killing one
 node at the midpoint and restarting it after a downtime of `min(SECS / 4,
-tombstone_ttl / 2)`, so the node comes back after a downtime bounded by
-half the tombstone TTL, letting a removed key's tombstone still outlive
-the restart, to exercise a real rebalance), then pauses it, polls the sum of
+tombstone_ttl / 2)`, so the node comes back after half the tombstone TTL at
+most and a spill run exercises the warm reopen instead of always falling
+back cold, to exercise a real rebalance), then pauses it, polls the sum of
 live nodes' entry counts against `owners * surviving keys` under a bound
 wide enough for
 `distributed_disown_grace_rounds` to run out, verifies a random sample of

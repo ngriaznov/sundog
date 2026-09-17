@@ -1765,6 +1765,43 @@ pub(crate) struct Engine<K, V> {
     compact_lock_acquisitions: AtomicU64,
 }
 
+/// [`Engine::finalize_checkpoint_writes`]'s outcome for one entry, kept out
+/// of the loop body only to give each drop reason a name; never constructed
+/// outside that method.
+#[cfg(feature = "spill")]
+enum FinalizeWriteOutcome {
+    /// The entry was still `Resident` at exactly its captured version and
+    /// not expired: flipped to `Spilled` and kept, carrying the weight
+    /// [`Engine::finalize_checkpoint_writes`] still needs to subtract from
+    /// `total_weight`.
+    Kept(u32),
+    /// The key gained a tombstone between capture and this call.
+    DroppedTombstoned,
+    /// The key is no longer present at all (removed and its tombstone
+    /// already collected, or never found).
+    DroppedGone,
+    /// The live entry's version no longer matches what was captured, or it
+    /// is no longer `Resident` (already spilled a second way).
+    DroppedVersionChanged,
+    /// The live entry is now past its expiry.
+    DroppedExpired,
+}
+
+/// Per-reason breakdown [`Engine::finalize_checkpoint_writes`] returns
+/// alongside its survivors: how many entries it kept, and how many it
+/// dropped under each reason. `Shard::close_spill_checkpointed` logs this at
+/// `info` and folds it into `sundog_spill_checkpoint_entries_total{cache,
+/// stage}`.
+#[cfg(feature = "spill")]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CheckpointFinalizeCounts {
+    pub(crate) kept: u64,
+    pub(crate) dropped_tombstoned: u64,
+    pub(crate) dropped_gone: u64,
+    pub(crate) dropped_version_changed: u64,
+    pub(crate) dropped_expired: u64,
+}
+
 impl<K, V> Engine<K, V>
 where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -1873,8 +1910,9 @@ where
     /// Increments `sundog_spill_entries{cache}`, plus the test-only mirror
     /// counter. The counterpart to [`Engine::note_spill_departures`], called
     /// wherever a `live` entry newly becomes [`EntryState::Spilled`]: from
-    /// `SpillSink::install`, and from the test-only
-    /// [`Engine::debug_insert_spilled`].
+    /// `SpillSink::install`, from [`Engine::finalize_checkpoint_writes`]'s
+    /// own direct flip for a checkpoint-written entry, and from the
+    /// test-only [`Engine::debug_insert_spilled`].
     #[cfg(feature = "spill")]
     fn note_spill_arrival(&self) {
         if let Some(gauge) = self.spill_entries_gauge.get() {
@@ -2243,6 +2281,124 @@ where
             );
         }
         out
+    }
+
+    /// A warm-reopen checkpoint's other half: every currently-resident live
+    /// entry's key, version, expiry, and encoded value bytes, snapshotted
+    /// under each stripe's read lock exactly like [`Engine::snapshot_spilled`],
+    /// but for the `EntryState::Resident` entries that method skips.
+    /// `Shard::close_spill_checkpointed` hands this to `SpillTier::checkpoint_flush`,
+    /// which writes each one into the region ring; a value never spilled
+    /// during this process's life is written for the first time only at
+    /// this checkpoint, so a clean close can still warm-reopen every live
+    /// entry, not only the ones an eviction pass happened to spill first.
+    #[cfg(feature = "spill")]
+    pub(crate) fn checkpoint_resident_entries(
+        &self,
+        now_ms: u64,
+    ) -> Vec<(Bytes, Hlc, Option<u64>, Bytes)> {
+        let mut out = Vec::new();
+        for stripe_lock in &self.stripes {
+            let stripe = stripe_lock.read();
+            out.extend(
+                stripe
+                    .live
+                    .iter()
+                    .filter(|live| !self.is_absent(live, now_ms))
+                    .filter(|live| is_resident(live))
+                    .map(|live| {
+                        (
+                            record_key_bytes(&live.record),
+                            live.ver(),
+                            from_stored_expiry(live.expires_at_ms),
+                            record_value_bytes(&live.record),
+                        )
+                    }),
+            );
+        }
+        out
+    }
+
+    /// Re-validates every entry [`SpillTier::checkpoint_flush`] just wrote
+    /// to disk against the live engine state, under each key's own stripe
+    /// write lock, before `Shard::close_spill_checkpointed` folds the survivors into its
+    /// final checkpoint snapshot.
+    ///
+    /// `checkpoint_flush` writes `entries`' bytes to disk with no version
+    /// check at all -- see its own docs -- because none of them ever went
+    /// through the ordinary pending-spill hand-off (`SpillSink::install`'s
+    /// `weight == 0` gate never applied to a still-fully-weighted resident
+    /// entry). That leaves a window between
+    /// [`Engine::checkpoint_resident_entries`]'s capture and this call: a
+    /// second `Cache` clone racing the close can remove the key, tombstone
+    /// it, or overwrite it with a newer version, and the disk write already
+    /// landed regardless. Keeps only the entries still `Resident` with
+    /// exactly the captured version and no tombstone, and flips each
+    /// survivor's state to [`EntryState::Spilled`] in the same lock
+    /// acquisition, so RAM and disk agree from this point on exactly as
+    /// every other spill hand-off leaves them: `total_weight` drops by the
+    /// entry's own weight and the entry's weight goes to `0`, preserving
+    /// the invariant that a `Spilled` entry always carries weight `0`. This
+    /// never touches `pending_spill_weight`: these writes never entered
+    /// that accounting in the first place, so there is nothing to release.
+    /// `now_ms` is the same timestamp `Shard::close_spill_checkpointed` already captured
+    /// before calling [`Engine::checkpoint_resident_entries`], so a key
+    /// that expired during the checkpoint write is excluded exactly as it
+    /// would have been had the capture run this late instead.
+    ///
+    /// Returns the survivors alongside a [`CheckpointFinalizeCounts`]
+    /// breaking down every entry this dropped by reason, so
+    /// `Shard::close_spill_checkpointed` can log and meter each stage of the
+    /// checkpoint without re-deriving the same classification.
+    #[cfg(feature = "spill")]
+    pub(crate) fn finalize_checkpoint_writes(
+        &self,
+        entries: Vec<SpilledPointer>,
+        now_ms: u64,
+    ) -> (Vec<SpilledPointer>, CheckpointFinalizeCounts) {
+        let mut survivors = Vec::with_capacity(entries.len());
+        let mut counts = CheckpointFinalizeCounts::default();
+        for (key_bytes, ver, expires_at_ms, loc) in entries {
+            let hash = hash_key_bytes(key_bytes.as_ref());
+            let stripe_idx = stripe_index_from_hash(hash);
+            let outcome = {
+                let mut stripe = self.stripes[stripe_idx].write();
+                if stripe.tombstones.contains_key(key_bytes.as_ref()) {
+                    FinalizeWriteOutcome::DroppedTombstoned
+                } else if let Some(live) = stripe
+                    .live
+                    .find_mut(hash, |l| record_key(&l.record) == key_bytes.as_ref())
+                {
+                    if live.ver() != ver || !matches!(live.state, EntryState::Resident) {
+                        FinalizeWriteOutcome::DroppedVersionChanged
+                    } else if self.is_absent(live, now_ms) {
+                        FinalizeWriteOutcome::DroppedExpired
+                    } else {
+                        let weight = live.weight;
+                        live.record = build_key_only_record(record_key(&live.record));
+                        live.state = EntryState::Spilled(loc);
+                        live.weight = 0;
+                        FinalizeWriteOutcome::Kept(weight)
+                    }
+                } else {
+                    FinalizeWriteOutcome::DroppedGone
+                }
+            };
+            match outcome {
+                FinalizeWriteOutcome::Kept(weight) => {
+                    self.total_weight
+                        .fetch_sub(u64::from(weight), Ordering::Relaxed);
+                    self.note_spill_arrival();
+                    counts.kept += 1;
+                    survivors.push((key_bytes, ver, expires_at_ms, loc));
+                }
+                FinalizeWriteOutcome::DroppedTombstoned => counts.dropped_tombstoned += 1,
+                FinalizeWriteOutcome::DroppedGone => counts.dropped_gone += 1,
+                FinalizeWriteOutcome::DroppedVersionChanged => counts.dropped_version_changed += 1,
+                FinalizeWriteOutcome::DroppedExpired => counts.dropped_expired += 1,
+            }
+        }
+        (survivors, counts)
     }
 
     /// [`Engine::record_for`] for many keys in one pass, but reporting a
@@ -3628,6 +3784,77 @@ where
             self.note_spill_arrival();
         }
         flipped
+    }
+
+    /// Originates a fresh entry straight from an on-disk [`SpillLoc`], with
+    /// no value bytes ever read into RAM: the primitive a warm tier-reopen
+    /// replay uses, distinct from `install`, which only ever flips an
+    /// already-present entry and never creates one. `record` holds only
+    /// the key half
+    /// ([`build_key_only_record`]), and the entry starts at weight `0`
+    /// exactly like a freshly flushed-and-installed one, since
+    /// [`RemovedLive::weight`]/[`Engine::account_removed`] assume every
+    /// currently-`Spilled` entry carries weight `0`; a later
+    /// [`Engine::promote_locked`] recomputes the real weight through the
+    /// weigher when it matters. `weight` mirrors `install`'s own parameter
+    /// for signature symmetry between the two primitives and, like
+    /// `install`, is never folded into `total_weight`.
+    ///
+    /// Never overwrites a key that is already present, live or tombstoned:
+    /// `false` and a no-op either way, so this can never resurrect a
+    /// deleted key or clobber a fresher write that landed first. Folds the
+    /// fresh entry's fingerprint into the bucket's digest exactly as every
+    /// other insert path does, so `Engine::digests` stays correct
+    /// immediately, with no separate pass.
+    #[allow(clippy::too_many_arguments)]
+    fn install_new(
+        &self,
+        stripe_idx: usize,
+        key_bytes: &Bytes,
+        hash: u64,
+        ver: Hlc,
+        expires_at_ms: Option<u64>,
+        loc: SpillLoc,
+        _weight: u32,
+    ) -> bool {
+        let part = part_index_from_hash(hash);
+        let inserted = {
+            let mut stripe = self.stripes[stripe_idx].write();
+            if stripe.tombstones.contains_key(key_bytes.as_ref())
+                || stripe
+                    .live
+                    .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
+                    .is_some()
+            {
+                false
+            } else {
+                stripe.live.insert_unique(
+                    hash,
+                    Live::new(
+                        build_key_only_record(key_bytes.as_ref()),
+                        ver,
+                        to_stored_expiry(expires_at_ms),
+                        0,
+                        ver.wall_ms,
+                        EntryState::Spilled(loc),
+                    ),
+                    hasher_for,
+                );
+                if let Some(exp) = expires_at_ms {
+                    stripe.next_expiry_ms = stripe.next_expiry_ms.min(exp);
+                }
+                true
+            }
+        };
+        if inserted {
+            self.digest[digest_slot(stripe_idx, part)].fetch_xor(
+                entry_fingerprint(key_bytes.as_ref(), ver),
+                Ordering::Relaxed,
+            );
+            self.live_count.fetch_add(1, Ordering::Relaxed);
+            self.note_spill_arrival();
+        }
+        inserted
     }
 
     /// Resolves a job the tier could not write: `weight` leaves
@@ -6810,6 +7037,78 @@ mod tests {
         }
 
         #[test]
+        fn install_new_never_resurrects_a_tombstoned_key() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            tombstone(&engine, key, kb.clone(), hlc(1, 1), 0);
+
+            let inserted = SpillSink::install_new(
+                &engine,
+                bucket,
+                &kb,
+                hash,
+                hlc(0, 0),
+                None,
+                loc(0, 0, 4, 0),
+                1,
+            );
+
+            assert!(
+                !inserted,
+                "install_new never resurrects a key a tombstone already covers"
+            );
+            assert_eq!(engine.get(&key, 0), None);
+            let (live_count, _) = engine.debug_totals();
+            assert_eq!(live_count, 0);
+        }
+
+        #[test]
+        fn install_new_never_overwrites_an_already_present_live_entry() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let ver = hlc(2, 1);
+            let _ = put(
+                &engine,
+                key,
+                kb.clone(),
+                "resident".to_string(),
+                ver,
+                None,
+                0,
+            );
+            let digest_before = engine.digests();
+
+            let inserted = SpillSink::install_new(
+                &engine,
+                bucket,
+                &kb,
+                hash,
+                hlc(1, 1),
+                None,
+                loc(0, 0, 4, 0),
+                1,
+            );
+
+            assert!(
+                !inserted,
+                "install_new never overwrites a key that is already present, even at an \
+                 older version"
+            );
+            assert_eq!(engine.get(&key, 0), Some("resident".to_string()));
+            assert_eq!(
+                engine.digests(),
+                digest_before,
+                "a refused install_new never touches the digest"
+            );
+        }
+
+        #[test]
         fn install_releases_pending_weight_even_when_a_newer_write_displaced_the_key() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
@@ -7295,6 +7594,115 @@ mod tests {
                      and freed at hand-off, so total_weight does not move again here"
                 );
 
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn install_new_creates_a_fresh_spilled_entry_readable_via_read_at_and_folds_the_digest()
+            {
+                let dir = temp_dir("install-new");
+                let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
+                let tier = Arc::new(SpillTier::open(&cfg, "install-new").expect("tier opens"));
+
+                // A throwaway producer engine spills one real record to disk,
+                // purely to get a genuine `SpillLoc` pointing at real,
+                // checksummed bytes on disk: `install_new` itself is tested
+                // below against a completely separate, otherwise-empty
+                // engine that never wrote this key, the same shape a warm
+                // reopen replay starts from.
+                let producer: Arc<Engine<u32, String>> =
+                    Arc::new(Engine::new(u64::MAX, None, None));
+                producer.set_spill(Arc::clone(&tier));
+                tier.attach(Arc::downgrade(
+                    &(Arc::clone(&producer) as Arc<dyn SpillSink>),
+                ));
+                let key = 7u32;
+                let kb = key_bytes(key);
+                let hash = hash_key_bytes(kb.as_ref());
+                let bucket = stripe_index_from_hash(hash);
+                let ver = hlc(1, 1);
+                let _ = put(
+                    &producer,
+                    key,
+                    kb.clone(),
+                    "spilled-value".to_string(),
+                    ver,
+                    Some(999),
+                    0,
+                );
+                let _ = producer.evict_one_sampled(bucket);
+                assert!(poll_until(POLL_TIMEOUT, || is_spilled(&producer, &kb)));
+                let loc = {
+                    let stripe = producer.stripe_lock(bucket).read();
+                    let live = stripe
+                        .live
+                        .iter()
+                        .find(|l| record_key(&l.record) == kb.as_ref())
+                        .expect("entry is present");
+                    match live.state {
+                        EntryState::Spilled(loc) => loc,
+                        EntryState::Resident => {
+                            panic!("poll_until above confirms the producer's entry is spilled")
+                        }
+                    }
+                };
+
+                let target = Engine::<u32, String>::new(u64::MAX, None, None);
+                let digest_before = target.digests();
+
+                let inserted =
+                    SpillSink::install_new(&target, bucket, &kb, hash, ver, Some(999), loc, 1);
+                assert!(inserted);
+
+                // Resident-free: `get` reads nothing, since no value ever
+                // landed in RAM on the target engine.
+                assert_eq!(target.get(&key, 0), None);
+                {
+                    let stripe = target.stripe_lock(bucket).read();
+                    let live = stripe
+                        .live
+                        .iter()
+                        .find(|l| record_key(&l.record) == kb.as_ref())
+                        .expect("entry is present");
+                    assert!(
+                        matches!(live.state, EntryState::Spilled(l) if l == loc),
+                        "Spilled(loc)-only, pointing at the exact same on-disk location"
+                    );
+                    assert_eq!(live.weight, 0, "a Spilled entry always carries weight 0");
+                }
+
+                // Readable via read_at: the same bytes a real disk read of
+                // `loc` gives any other reader; install_new never re-writes
+                // or copies them, and never reads the value bytes itself.
+                let read_back = tier
+                    .read_at(loc)
+                    .expect("read_at succeeds")
+                    .expect("the record is still there");
+                assert_eq!(read_back.ver, ver);
+                assert_eq!(read_back.expires_at_ms, Some(999));
+                assert_eq!(decode_value::<String>(&read_back.encoded), "spilled-value");
+
+                let (live_count, weight) = target.debug_totals();
+                assert_eq!(live_count, 1);
+                assert_eq!(
+                    weight, 0,
+                    "a spilled entry never counts toward total_weight"
+                );
+
+                let mut expected_digest = digest_before;
+                expected_digest[bucket].1 ^= entry_fingerprint(kb.as_ref(), ver);
+                assert_eq!(
+                    target.digests(),
+                    expected_digest,
+                    "install_new folds the fresh entry's fingerprint into the bucket digest"
+                );
+                assert_eq!(
+                    target.digests(),
+                    target.recompute_digests_paired(),
+                    "the incrementally folded digest matches a full recompute from scratch"
+                );
+
+                tier.close();
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
