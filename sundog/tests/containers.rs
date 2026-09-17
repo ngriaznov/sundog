@@ -1540,12 +1540,14 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let nodes = [&n1, &n2, &joiner];
     wait_for_peers(&nodes, 2).await;
 
-    // The joiner's pull has landed. A joiner on this checkout reports it
-    // through `sundog_rebalance_buckets_total{direction="in"}`; a joiner
-    // on the previous release serves no `/metrics` at all, since
+    // The joiner has data. A joiner on this checkout reports its landed
+    // pull through `sundog_rebalance_buckets_total{direction="in"}`; a
+    // joiner on the previous release serves no `/metrics` at all, since
     // `build_previous_testnode` builds it without the `prometheus`
-    // feature, so its `count` standing in for the pull is the signal
-    // there: nothing else writes to a joiner that owns nothing yet.
+    // feature, so a nonzero `count` is the checkpoint there, whether a
+    // pull or an anti-entropy round put the first record on it. The
+    // settle wait and the fetch check below are the assertions for both
+    // roles: every key on exactly `OWNERS` nodes, fetchable everywhere.
     eventually_with_logs(REBALANCE_WAIT, &nodes, || async {
         if new_is_donor {
             joiner.count().await.is_ok_and(|count| count > 0)
@@ -1951,10 +1953,10 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
         "no spilled-value read on a should ever hit a disk io_error in this run"
     );
 
-    // Concurrent, not sequential: each `stop()` waits out the container's
-    // ungraceful-shutdown grace period (`sundog-testnode` does not trap
-    // `SIGTERM`), so stopping three nodes one after another would triple
-    // that wait for no reason.
+    // Concurrent, not sequential: each `stop()` waits for the node's
+    // graceful leave (`sundog-testnode` shuts its cluster down on
+    // `SIGTERM`, departure notice included), so stopping three nodes one
+    // after another would triple that wait for no reason.
     let (a_stopped, b_stopped, c_stopped) = tokio::join!(a.stop(), b.stop(), c.stop());
     a_stopped.expect("a stops");
     b_stopped.expect("b stops");

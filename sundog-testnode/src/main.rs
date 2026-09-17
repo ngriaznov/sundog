@@ -528,7 +528,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the cluster the way an embedding process's own shutdown does, which
     // checkpoints a spill tier opened with warm reopen on, so a restart
     // against a preserved spill dir finds the snapshot a warm reopen
-    // needs. `quit` and `crash` stay what they are: an exit with no leave.
+    // needs. `quit` and `crash` are what they are: an exit with no leave.
     let stop = stop_requested();
     tokio::pin!(stop);
     println!("testnode-ready");
@@ -552,7 +552,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Resolves once the process is asked to stop: on SIGTERM on Unix, which
 /// is what a container stop sends, and on Ctrl-C elsewhere, where no
-/// container test runs this node and the workspace still has to build.
+/// container test runs this node and the workspace has to build all the
+/// same. A shutdown that outlasts the container stop's grace is killed
+/// mid-way, and a spill tier's next open then falls back cold.
 async fn stop_requested() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1557,6 +1559,39 @@ mod tests {
         let node = test_node("testnode-dispatch-quit").await;
         assert!(matches!(node.dispatch("quit").await, Reply::Quit));
         node.cluster.clone().shutdown().await;
+    }
+
+    /// `stop_requested` resolves on the signal a container stop sends. The
+    /// test registers its own SIGTERM listener first, so the process-wide
+    /// handler is installed before any SIGTERM is raised, and raises the
+    /// signal until the pending `stop_requested` observes one: a raise
+    /// that lands before its own registration is missed, never fatal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_requested_resolves_on_sigterm() {
+        let _guard = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("a SIGTERM listener registers");
+        let mut requested = tokio::spawn(stop_requested());
+        let pid = std::process::id().to_string();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = std::process::Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .expect("kill runs");
+            assert!(status.success(), "kill -TERM delivers to this process");
+            tokio::select! {
+                result = &mut requested => {
+                    result.expect("the task is not cancelled").expect("the stop request is Ok");
+                    return;
+                }
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stop_requested did not resolve within 10 s of repeated SIGTERMs"
+            );
+        }
     }
 
     #[cfg(feature = "spill")]

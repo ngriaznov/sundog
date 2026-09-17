@@ -935,10 +935,11 @@ const CHITCHAT_MARKERS: [&str; 2] = [
 /// log carries enough of the cluster's own state-machine tracing to
 /// diagnose the failure without reproducing it locally. Follows each node's
 /// log dump with its `sundog_`-prefixed Prometheus metric lines (`# HELP`/
-/// `# TYPE` lines and histogram bucket lines omitted), since a previous-
-/// release node installs no tracing subscriber and so has nothing in its
-/// log dump, but every test node still serves `/metrics`; a metrics fetch
-/// error prints in place of the metric lines.
+/// `# TYPE` lines and histogram bucket lines omitted), the state a node
+/// whose log dump is empty has to offer; a metrics fetch error prints in
+/// place of the metric lines, which is what a previous-release node built
+/// by [`build_previous_testnode`] shows, since that build serves no
+/// `/metrics` and installs no tracing subscriber.
 /// # Panics
 ///
 /// Panics if `cond` has not returned `true` by `timeout`.

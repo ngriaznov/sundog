@@ -218,8 +218,9 @@ All notable changes to this project are documented in this file. Format follows
 - `sundog-testnode` shuts its cluster down and exits 0 on SIGTERM, which is
   what a container stop sends, so a spill tier opened with warm reopen on
   writes its checkpoint before the process ends and a restart against a
-  preserved spill dir reopens warm; `quit` and `crash` still exit without
-  leaving.
+  preserved spill dir reopens warm. A shutdown that outlasts the container
+  stop's grace is killed, and the next open falls back cold. `quit` and
+  `crash` exit without leaving.
 
 ### Fixed
 
