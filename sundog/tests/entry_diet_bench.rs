@@ -15,9 +15,57 @@
 
 mod common;
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use sundog::{Cluster, Mode};
+
+/// The process allocator, wrapped to count the bytes currently allocated:
+/// what the engine and everything else in the process hold live, as
+/// opposed to the resident set, which also carries what the allocator
+/// keeps after a free. The gap between the two is allocator retention;
+/// [`entry_diet_rss_budget`] prints both per entry.
+struct CountingAlloc;
+
+static LIVE_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: every call forwards to `System` unchanged; the counter is
+// updated with the sizes the layout carries, never touching the memory.
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc` is forwarded as is.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            LIVE_HEAP_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_HEAP_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller's contract for `dealloc` is forwarded as is.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller's contract for `realloc` is forwarded as is.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            LIVE_HEAP_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+            LIVE_HEAP_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+/// Bytes the process holds allocated right now, per [`CountingAlloc`].
+fn live_heap_bytes() -> u64 {
+    u64::try_from(LIVE_HEAP_BYTES.load(Ordering::Relaxed)).unwrap_or(u64::MAX)
+}
 
 fn bench_enabled() -> bool {
     std::env::var("SUNDOG_BENCH").as_deref() == Ok("1")
@@ -228,18 +276,39 @@ async fn settled_vm_rss_bytes(timeout: Duration) -> Option<u64> {
 )]
 const RSS_BUDGET_BYTES: u64 = (0.75 * 1024.0 * 1024.0 * 1024.0) as u64;
 
-/// RSS budget: 4,000,000 entries inserted into a spill-disabled
-/// `Cache<String, String>` at this file's stated profile, asserting the
-/// settled resident set stays at or under [`RSS_BUDGET_BYTES`].
+/// The entry count [`entry_diet_rss_budget`] inserts and pins its budget
+/// against.
+const RSS_BUDGET_ENTRIES: u32 = 4_000_000;
+
+/// The entry count [`entry_diet_rss_budget`] inserts:
+/// [`RSS_BUDGET_ENTRIES`], or `SUNDOG_BENCH_ENTRIES` when set to a
+/// positive integer, for a density measurement at another size. The
+/// budget assertion only runs at [`RSS_BUDGET_ENTRIES`], the size the
+/// budget is stated for.
+fn rss_bench_entries() -> u32 {
+    std::env::var("SUNDOG_BENCH_ENTRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|&entries| entries > 0)
+        .unwrap_or(RSS_BUDGET_ENTRIES)
+}
+
+/// RSS budget: [`RSS_BUDGET_ENTRIES`] entries inserted into a
+/// spill-disabled `Cache<String, String>` at this file's stated profile,
+/// asserting the settled resident set stays at or under
+/// [`RSS_BUDGET_BYTES`]. Prints the settled resident set before the first
+/// insert too, so the per-entry cost the line reports comes in two forms:
+/// the whole process divided by the count, and the growth alone divided by
+/// the count, which is the engine's own marginal cost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn entry_diet_rss_budget() {
-    const ENTRIES: u32 = 4_000_000;
     const CHUNK: u32 = 50_000;
 
     if !bench_enabled() {
         eprintln!("skipping: SUNDOG_BENCH=1 not set");
         return;
     }
+    let entries = rss_bench_entries();
 
     let cluster = local_cluster("bench-entry-diet-rss").await;
     let cache = cluster
@@ -248,11 +317,13 @@ async fn entry_diet_rss_budget() {
         .open()
         .await
         .expect("cache opens");
+    let baseline = settled_vm_rss_bytes(Duration::from_secs(10)).await;
+    let baseline_live = live_heap_bytes();
 
     let started = Instant::now();
     let mut start = 0u32;
-    while start < ENTRIES {
-        let end = (start + CHUNK).min(ENTRIES);
+    while start < entries {
+        let end = (start + CHUNK).min(entries);
         cache
             .insert_many((start..end).map(|i| (rss_key(i), rss_value(i))))
             .await
@@ -262,27 +333,38 @@ async fn entry_diet_rss_budget() {
     let insert_elapsed = started.elapsed();
 
     let rss = settled_vm_rss_bytes(Duration::from_secs(60)).await;
+    let live = live_heap_bytes();
     let entry_count = cache.entry_count().await;
 
     #[allow(clippy::cast_precision_loss, reason = "reporting only, not compared")]
     let rss_gib = rss.map_or(0.0, |b| b as f64 / (1024.0 * 1024.0 * 1024.0));
     #[allow(clippy::cast_precision_loss, reason = "reporting only, not compared")]
-    let bytes_per_entry = rss.map_or(0.0, |b| b as f64 / f64::from(ENTRIES));
+    let bytes_per_entry = rss.map_or(0.0, |b| b as f64 / f64::from(entries));
+    #[allow(clippy::cast_precision_loss, reason = "reporting only, not compared")]
+    let marginal_bytes_per_entry = match (rss, baseline) {
+        (Some(rss), Some(baseline)) => rss.saturating_sub(baseline) as f64 / f64::from(entries),
+        _ => 0.0,
+    };
+    #[allow(clippy::cast_precision_loss, reason = "reporting only, not compared")]
+    let live_heap_bytes_per_entry = live.saturating_sub(baseline_live) as f64 / f64::from(entries);
 
     println!(
-        "BENCH entry_diet_rss_budget entries={ENTRIES} entry_count={entry_count} \
-         insert_secs={:.3} rss_bytes={} rss_gib={rss_gib:.3} bytes_per_entry={bytes_per_entry:.1} \
-         budget_bytes={RSS_BUDGET_BYTES}",
+        "BENCH entry_diet_rss_budget entries={entries} entry_count={entry_count} \
+         insert_secs={:.3} baseline_rss_bytes={} rss_bytes={} rss_gib={rss_gib:.3} \
+         bytes_per_entry={bytes_per_entry:.1} \
+         marginal_bytes_per_entry={marginal_bytes_per_entry:.1} \
+         live_heap_bytes_per_entry={live_heap_bytes_per_entry:.1} budget_bytes={RSS_BUDGET_BYTES}",
         insert_elapsed.as_secs_f64(),
+        baseline.map_or("unavailable".to_string(), |b| b.to_string()),
         rss.map_or("unavailable".to_string(), |b| b.to_string()),
     );
 
-    assert_eq!(entry_count, u64::from(ENTRIES), "every insert lands");
-    if let Some(rss) = rss {
+    assert_eq!(entry_count, u64::from(entries), "every insert lands");
+    if let (Some(rss), true) = (rss, entries == RSS_BUDGET_ENTRIES) {
         assert!(
             rss <= RSS_BUDGET_BYTES,
             "steady-state RSS {rss} bytes ({rss_gib:.3} GiB) exceeds the {RSS_BUDGET_BYTES}-byte \
-             budget for {ENTRIES} entries"
+             budget for {entries} entries"
         );
     } else {
         eprintln!("skipping the RSS assertion: /proc/self/status is unavailable on this platform");
