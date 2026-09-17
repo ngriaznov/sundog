@@ -215,6 +215,19 @@ All notable changes to this project are documented in this file. Format follows
   `Msg::StBucketDone`/`Msg::StBucketAck` signaling or, against an older
   peer, its transfer group's completion), instead of once for a whole
   multi-bucket transfer only after every bucket in it has landed.
+- `sundog-testnode` shuts its cluster down and exits 0 on SIGTERM, which is
+  what a container stop sends, so a spill tier opened with warm reopen on
+  writes its checkpoint before the process ends and a restart against a
+  preserved spill dir reopens warm; `quit` and `crash` still exit without
+  leaving.
+
+### Fixed
+
+- `sundog_owned_buckets` is set for a distributed cache's first ownership
+  view, at open, not only when a later membership change republishes the
+  view. With the bounded membership wait at open, a node joining a settled
+  cluster computes its final view first and may never republish, which
+  left the gauge absent for that node.
 
 ## [0.6.1] – 2026-09-12
 

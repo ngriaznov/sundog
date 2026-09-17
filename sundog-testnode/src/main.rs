@@ -24,7 +24,10 @@
 //! Built with the `prometheus` feature, every run also serves `GET /metrics`
 //! (and `/readyz`, `/healthz`) on `METRICS_PORT`. Built with the `spill`
 //! feature, `"it"` can open a `SpillConfig` disk tier; see
-//! `spill_config_from_env`.
+//! `spill_config_from_env`. A SIGTERM, which is what a container stop
+//! sends, shuts the cluster down and exits 0, so a spill tier opened with
+//! warm reopen on writes its checkpoint the way an embedding process's
+//! own shutdown would; `quit` and `crash` exit without leaving.
 
 use std::env;
 use std::io::Write as _;
@@ -521,12 +524,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
+    // A container stop is a SIGTERM with a grace period: the node leaves
+    // the cluster the way an embedding process's own shutdown does, which
+    // checkpoints a spill tier opened with warm reopen on, so a restart
+    // against a preserved spill dir finds the snapshot a warm reopen
+    // needs. `quit` and `crash` stay what they are: an exit with no leave.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     println!("testnode-ready");
     let _ = std::io::stdout().flush();
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        tokio::spawn(serve(socket, node.clone()));
+        tokio::select! {
+            biased;
+            _ = terminate.recv() => {
+                node.cluster.clone().shutdown().await;
+                std::process::exit(0);
+            }
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                tokio::spawn(serve(socket, node.clone()));
+            }
+        }
     }
 }
 

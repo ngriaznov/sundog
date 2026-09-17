@@ -261,6 +261,10 @@ impl OwnershipTracker {
     ) -> (Self, watch::Sender<Arc<OwnershipView>>) {
         let eligible = eligible_owners(self_node, peers, modes, cache, k);
         let view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+        // The seeded view is the only one a cache whose membership never
+        // changes again ever computes, so its gauge is published here, not
+        // left to a `refresh_task` publish that may never come.
+        publish_owned_buckets(cache, &view, "ownership view seeded");
         let baseline = Arc::clone(&view);
         let (tx, rx) = watch::channel(view);
         (Self { view: rx, baseline }, tx)
@@ -489,11 +493,29 @@ impl ResidencySet {
     }
 }
 
+/// Sets `cache`'s `sundog_owned_buckets` gauge to `view`'s owned-bucket
+/// count and logs the view under `message`: [`OwnershipTracker::seed`]'s
+/// first view and every later one [`refresh_task`] publishes go through
+/// here, so the gauge reads the current view from the moment the cache
+/// opens, membership change or not.
+fn publish_owned_buckets(cache: &SmolStr, view: &OwnershipView, message: &'static str) {
+    let owned = u32::try_from(view.owned_buckets().count()).unwrap_or(u32::MAX);
+    metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string()).set(f64::from(owned));
+    tracing::debug!(
+        cache = %cache,
+        self_node = %view.self_node,
+        view_hash = view.view_hash(),
+        owned_buckets = owned,
+        "{message}"
+    );
+}
+
 /// Recomputes and republishes `cache`'s view on every change to `cluster`'s
 /// live peer set or its advertised cache modes, for as long as `cancel`
 /// stays live. Spawned once [`Shard::with_ownership`](crate::store::Shard::with_ownership)
 /// has already installed `tx`'s receiver half, so this task's first publish
-/// is already the second view a reader could ever see, never the first.
+/// is already the second view a reader could ever see, never the first:
+/// [`OwnershipTracker::seed`] publishes the first view's gauge itself.
 /// Publishes with [`watch::Sender::send_if_modified`], keyed on
 /// `view_hash`, so a peer's unrelated gossip key changing never ripples
 /// through this cache: the `sundog_owned_buckets` gauge only moves on a
@@ -537,16 +559,7 @@ pub(crate) async fn refresh_task(
             }
         });
         if published {
-            let owned = u32::try_from(view.owned_buckets().count()).unwrap_or(u32::MAX);
-            metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string())
-                .set(f64::from(owned));
-            tracing::debug!(
-                cache = %cache,
-                self_node = %view.self_node,
-                view_hash = new_hash,
-                owned_buckets = owned,
-                "ownership view republished"
-            );
+            publish_owned_buckets(&cache, &view, "ownership view republished");
         }
     }
 }
@@ -903,6 +916,115 @@ mod tests {
             baseline_hash,
             "baseline stays pinned to the tracker's original seeded view regardless of later \
              publishes"
+        );
+    }
+
+    /// A `metrics::Recorder` that records every `sundog_owned_buckets` set
+    /// for one cache, so a test can observe a gauge publish without the
+    /// process-global recorder slot.
+    struct OwnedGaugeRecorder {
+        cache: String,
+        sets: Arc<parking_lot::Mutex<Vec<f64>>>,
+    }
+
+    struct OwnedGauge(Arc<parking_lot::Mutex<Vec<f64>>>);
+
+    impl metrics::GaugeFn for OwnedGauge {
+        fn increment(&self, _value: f64) {}
+        fn decrement(&self, _value: f64) {}
+        fn set(&self, value: f64) {
+            self.0.lock().push(value);
+        }
+    }
+
+    impl metrics::Recorder for OwnedGaugeRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            let this_cache = key
+                .labels()
+                .any(|l| l.key() == "cache" && l.value() == self.cache);
+            if key.name() != "sundog_owned_buckets" || !this_cache {
+                return metrics::Gauge::noop();
+            }
+            metrics::Gauge::from_arc(Arc::new(OwnedGauge(Arc::clone(&self.sets))))
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn ownership_tracker_seed_publishes_the_owned_buckets_gauge_for_its_first_view() {
+        let self_node = NodeId::from(1);
+        let other = NodeId::from(2);
+        let k = NonZeroU8::new(1).expect("nonzero");
+        let cache = SmolStr::new("seeded");
+        let sets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = OwnedGaugeRecorder {
+            cache: cache.to_string(),
+            sets: Arc::clone(&sets),
+        };
+        let modes = modes_with(&[(other, "seeded", Mode::Distributed { owners: k })]);
+        let peers = vec![peer(2, wire::PROTOCOL_DISTRIBUTED)];
+        // Seeded with a peer already known, exactly the view a
+        // `Mode::Distributed` `open()` computes once its membership wait
+        // has landed one: nothing about membership need ever change again,
+        // so this seed is the only publish the cache may ever make.
+        let (tracker, _tx) = metrics::with_local_recorder(&recorder, || {
+            OwnershipTracker::seed(self_node, &peers, &modes, &cache, k)
+        });
+        let owned =
+            f64::from(u32::try_from(tracker.current().owned_buckets().count()).expect("fits u32"));
+        assert_eq!(
+            sets.lock().as_slice(),
+            &[owned],
+            "the seed sets the gauge once, to the seeded view's owned-bucket count"
+        );
+        let total = f64::from(u32::try_from(BUCKET_COUNT).expect("fits u32"));
+        assert!(
+            owned > 0.0 && owned < total,
+            "one owner over two nodes is a real split of the bucket space, not all or nothing: \
+             {owned} of {total}"
         );
     }
 

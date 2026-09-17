@@ -1540,14 +1540,24 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let nodes = [&n1, &n2, &joiner];
     wait_for_peers(&nodes, 2).await;
 
+    // The joiner's pull has landed. A joiner on this checkout reports it
+    // through `sundog_rebalance_buckets_total{direction="in"}`; a joiner
+    // on the previous release serves no `/metrics` at all, since
+    // `build_previous_testnode` builds it without the `prometheus`
+    // feature, so its `count` standing in for the pull is the signal
+    // there: nothing else writes to a joiner that owns nothing yet.
     eventually_with_logs(REBALANCE_WAIT, &nodes, || async {
-        scrape_metric(
-            &joiner,
-            "sundog_rebalance_buckets_total",
-            ("direction", "in"),
-        )
-        .await
-            > 0
+        if new_is_donor {
+            joiner.count().await.is_ok_and(|count| count > 0)
+        } else {
+            scrape_metric(
+                &joiner,
+                "sundog_rebalance_buckets_total",
+                ("direction", "in"),
+            )
+            .await
+                > 0
+        }
     })
     .await;
 
