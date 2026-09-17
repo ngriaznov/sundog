@@ -237,12 +237,30 @@ impl Node {
         seeds: &[&str],
         owners: Option<u8>,
     ) -> Node {
+        Self::spawn_distributed_with_env(net, cluster_name, alias, seeds, owners, &[]).await
+    }
+
+    /// [`Node::spawn_distributed`] with additional container environment
+    /// variables layered on top of the `Mode::Distributed` defaults, the
+    /// same shape [`Node::spawn_with_env`] adds to [`Node::spawn`].
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never becomes ready.
+    pub async fn spawn_distributed_with_env(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        owners: Option<u8>,
+        extra_env: &[(&str, &str)],
+    ) -> Node {
         let owners_str;
         let mut env = vec![("SUNDOG_TESTNODE_MODE", "distributed")];
         if let Some(owners) = owners {
             owners_str = owners.to_string();
             env.push(("SUNDOG_TESTNODE_OWNERS", owners_str.as_str()));
         }
+        env.extend_from_slice(extra_env);
         Self::spawn_with_env(net, cluster_name, alias, seeds, &env).await
     }
 
@@ -699,6 +717,19 @@ impl Node {
             .ok_or_else(|| format!("no header/body separator in metrics response: {response:?}"))
     }
 
+    /// This node's captured container logs (stdout/stderr), for a timeout
+    /// failure's diagnostics. Never fails: a backend error comes back as
+    /// part of the returned string instead of `Err`, since the only caller,
+    /// [`eventually_with_logs`], is already mid-panic over a different
+    /// failure and has nothing useful to do with a second one.
+    #[must_use]
+    pub async fn logs(&self) -> String {
+        self.guard
+            .logs()
+            .await
+            .unwrap_or_else(|error| format!("<failed to fetch logs for {}: {error}>", self.name()))
+    }
+
     /// `crash`: sends the command, waits for the backend to confirm the
     /// container process died, then removes the (already-dead)
     /// container so `name()`'s alias is free for a fresh [`Node::spawn`].
@@ -778,6 +809,44 @@ where
             tokio::time::Instant::now() < deadline,
             "condition not met within {timeout:?}"
         );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// [`eventually`], but on a timeout, prints every one of `nodes`' captured
+/// logs (its alias, then the last 400 lines) to stderr before panicking, so
+/// a CI job's log carries enough of the cluster's own state-machine tracing
+/// to diagnose the failure without reproducing it locally.
+/// # Panics
+///
+/// Panics if `cond` has not returned `true` by `timeout`.
+pub async fn eventually_with_logs<F, Fut>(timeout: Duration, nodes: &[&Node], mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    const TAIL_LINES: usize = 400;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond().await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            for (index, node) in nodes.iter().enumerate() {
+                let logs = node.logs().await;
+                let tail: Vec<&str> = logs.lines().rev().take(TAIL_LINES).collect();
+                eprintln!(
+                    "----- node[{index}] {} (last {} lines) -----",
+                    node.name(),
+                    tail.len()
+                );
+                for line in tail.into_iter().rev() {
+                    eprintln!("{line}");
+                }
+            }
+            panic!("condition not met within {timeout:?}");
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

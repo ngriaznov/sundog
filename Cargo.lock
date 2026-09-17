@@ -2978,6 +2978,7 @@ dependencies = [
  "sundog",
  "tikv-jemallocator",
  "tokio",
+ "tracing-subscriber",
  "xxhash-rust",
 ]
 

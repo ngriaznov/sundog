@@ -113,10 +113,43 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() {
+    install_tracing();
     if let Err(error) = run().await {
         eprintln!("sundog-testnode: {error}");
         std::process::exit(1);
     }
+}
+
+/// The `EnvFilter` directive string [`install_tracing`] builds its filter
+/// from: `raw`'s value verbatim when it parses as a valid directive,
+/// `"warn"` when `RUST_LOG` is unset or its value fails to parse. Pure so
+/// the default and the fallback are both testable without touching the
+/// real environment.
+fn log_filter_directive(raw: Option<&str>) -> &str {
+    match raw {
+        Some(value) if tracing_subscriber::EnvFilter::try_new(value).is_ok() => value,
+        _ => "warn",
+    }
+}
+
+/// Installs the process-wide `tracing` subscriber, so every
+/// `tracing::info!`/`warn!`/etc. the `sundog` library emits lands somewhere
+/// instead of being silently dropped. Writes to stderr only, uncolored,
+/// with each event's target, filtered by [`log_filter_directive`]'s reading
+/// of `RUST_LOG`; called first thing in [`main`], before anything else can
+/// log. Stdout stays untouched, so `testnode-ready` and every other control
+/// protocol line the harness parses are unaffected.
+fn install_tracing() {
+    let raw_log = env::var("RUST_LOG").ok();
+    let directive = log_filter_directive(raw_log.as_deref());
+    let filter = tracing_subscriber::EnvFilter::try_new(directive)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(true)
+        .with_env_filter(filter)
+        .init();
 }
 
 /// Parses an env override's raw string into a `usize`, `None` for an absent
@@ -941,6 +974,25 @@ mod tests {
             None,
             "usize rejects a negative value"
         );
+    }
+
+    #[test]
+    fn log_filter_directive_defaults_to_warn_when_unset() {
+        assert_eq!(log_filter_directive(None), "warn");
+    }
+
+    #[test]
+    fn log_filter_directive_uses_a_valid_value_verbatim() {
+        assert_eq!(log_filter_directive(Some("info")), "info");
+        assert_eq!(
+            log_filter_directive(Some("sundog=debug,warn")),
+            "sundog=debug,warn"
+        );
+    }
+
+    #[test]
+    fn log_filter_directive_falls_back_to_warn_for_an_invalid_value() {
+        assert_eq!(log_filter_directive(Some("sundog=nonsense_level")), "warn");
     }
 
     #[test]

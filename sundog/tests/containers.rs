@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use container_util::{
     CRDT_RETIRE_AFTER_SECS_ENV, METRICS_PORT, Node, build_previous_testnode, build_testnode,
-    container_tests_enabled, eventually, seed, spawn_trio, wait_for_peers,
+    container_tests_enabled, eventually, eventually_with_logs, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -1472,13 +1472,17 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let env = [
         ("SUNDOG_TESTNODE_MODE", "distributed"),
         ("SUNDOG_TESTNODE_OWNERS", "2"),
+        // Info-level cluster/rebalance/state-transfer tracing, so a wait
+        // that times out has more than a bare "condition not met" to go on
+        // once `eventually_with_logs` prints these nodes' captured logs.
+        ("RUST_LOG", "info,sundog::net=info"),
     ];
     let n1 = Node::spawn_binary(&net, CLUSTER, "n1", &[], &env, donor_bin).await;
     let n2 = Node::spawn_binary(&net, CLUSTER, "n2", &[&seed("n1")], &env, donor_bin).await;
     wait_for_peers(&[&n1, &n2], 1).await;
 
     n1.fill(FILL_KEYS).await.expect("bulk fill succeeds");
-    eventually(Duration::from_secs(60), || async {
+    eventually_with_logs(Duration::from_secs(60), &[&n1, &n2], || async {
         sum_counts(&[&n1, &n2]).await == Some(usize::from(OWNERS) * FILL_KEYS as usize)
     })
     .await;
@@ -1495,7 +1499,7 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let nodes = [&n1, &n2, &joiner];
     wait_for_peers(&nodes, 2).await;
 
-    eventually(REBALANCE_WAIT, || async {
+    eventually_with_logs(REBALANCE_WAIT, &nodes, || async {
         scrape_metric(
             &joiner,
             "sundog_rebalance_buckets_total",
@@ -1510,7 +1514,7 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let tagged: Vec<(&Node, u64)> = nodes.iter().copied().zip(ids).collect();
     let sample = sample_kv_entries(0x6011_ec7e, FILL_KEYS, SAMPLE_SIZE);
 
-    eventually(SETTLE_WAIT, || async {
+    eventually_with_logs(SETTLE_WAIT, &nodes, || async {
         if sum_counts(&nodes).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
             return false;
         }
@@ -2382,17 +2386,24 @@ async fn distributed_join_and_rebalance() {
 
     require_containers!();
 
+    // Info-level cluster/rebalance/state-transfer tracing, for `eventually_
+    // with_logs`'s diagnostics on a timeout.
+    let log_env = [("RUST_LOG", "info,sundog::net=info")];
+    let spawn = Node::spawn_distributed_with_env;
+
     let net = Arc::new(Network::new_network());
     let mut nodes = Vec::with_capacity(4);
     for (i, alias) in ALIASES.iter().enumerate() {
         let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
         let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
-        nodes.push(Node::spawn_distributed(&net, CLUSTER, alias, &seed_refs, Some(OWNERS)).await);
+        let node = spawn(&net, CLUSTER, alias, &seed_refs, Some(OWNERS), &log_env).await;
+        nodes.push(node);
     }
     wait_for_peers(&nodes.iter().collect::<Vec<_>>(), ALIASES.len() - 1).await;
 
     nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
-    eventually(Duration::from_secs(60), || async {
+    let initial_node_refs: Vec<&Node> = nodes.iter().collect();
+    eventually_with_logs(Duration::from_secs(60), &initial_node_refs, || async {
         sum_counts(&nodes.iter().collect::<Vec<_>>()).await
             == Some(usize::from(OWNERS) * FILL_KEYS as usize)
     })
@@ -2407,7 +2418,16 @@ async fn distributed_join_and_rebalance() {
 
     let all_seeds: Vec<String> = ALIASES.iter().map(|a| seed(a)).collect();
     let all_seed_refs: Vec<&str> = all_seeds.iter().map(String::as_str).collect();
-    nodes.push(Node::spawn_distributed(&net, CLUSTER, JOINER, &all_seed_refs, Some(OWNERS)).await);
+    let joiner_node = spawn(
+        &net,
+        CLUSTER,
+        JOINER,
+        &all_seed_refs,
+        Some(OWNERS),
+        &log_env,
+    )
+    .await;
+    nodes.push(joiner_node);
     let node_refs: Vec<&Node> = nodes.iter().collect();
     wait_for_peers(&node_refs, ALIASES.len()).await;
     let joiner: &Node = node_refs
@@ -2415,7 +2435,7 @@ async fn distributed_join_and_rebalance() {
         .expect("nodes always has the joiner as its last element");
 
     let expected_joiner_buckets = expected_owned_buckets_sum(u64::from(OWNERS)) / 4;
-    eventually(REBALANCE_WAIT, || async {
+    eventually_with_logs(REBALANCE_WAIT, &node_refs, || async {
         let owned = scrape_metric(joiner, "sundog_owned_buckets", ("cache", "it")).await;
         let pulled_in = scrape_metric(
             joiner,
@@ -2432,7 +2452,7 @@ async fn distributed_join_and_rebalance() {
     // to the joiner, and only then drops it: `direction="out"` moves at
     // that point, not when the joiner's pull lands.
     tokio::time::sleep(DISOWN_GRACE_WAIT).await;
-    eventually(SETTLE_WAIT, || async {
+    eventually_with_logs(SETTLE_WAIT, &node_refs, || async {
         for (node, before) in node_refs[..ALIASES.len()].iter().zip(out_before.iter()) {
             let after =
                 scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
@@ -2448,7 +2468,7 @@ async fn distributed_join_and_rebalance() {
     let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
     let sample = sample_kv_entries(0x5ca1_ab1e, FILL_KEYS, SAMPLE_SIZE);
 
-    eventually(SETTLE_WAIT, || async {
+    eventually_with_logs(SETTLE_WAIT, &node_refs, || async {
         if sum_counts(&node_refs).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
             return false;
         }
