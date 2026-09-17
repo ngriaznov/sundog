@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use sundog::{Cache, Cluster, ClusterConfig, Event, Mode, Origin};
+use sundog::{Cache, Cluster, ClusterConfig, Event, Mode, NodeId, Origin};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -137,7 +137,7 @@ impl NodeSlot {
         topology: &Topology,
         feed_tx: &UnboundedSender<String>,
     ) -> anyhow::Result<()> {
-        let handle = open(self.gossip_addr, self.index, topology).await?;
+        let handle = open(self.gossip_addr, self.index, topology, None).await?;
         self.status
             .node_id
             .store(handle.cluster.node_id().as_u64(), Ordering::Relaxed);
@@ -179,7 +179,12 @@ impl NodeSlot {
         }
         self.teardown().await;
         let _ = feed_tx.send(format!("node{}: restarting…", self.index));
-        let succeeded = match open(self.gossip_addr, self.index, topology).await {
+        // The same identity as before the restart, the way a deployment
+        // persists its node id: ownership stays where it was, so a warm
+        // spill reopen replays into buckets this node still owns instead
+        // of dropping the share a fresh random id would reassign.
+        let node_id = restart_node_id(self.status.node_id.load(Ordering::Relaxed));
+        let succeeded = match open(self.gossip_addr, self.index, topology, node_id).await {
             Ok(handle) => {
                 self.status
                     .node_id
@@ -236,21 +241,31 @@ fn config(
 /// Opens a cluster on `gossip_addr` and the demo cache on it, sized per
 /// `topology.tuning`: the RAM entry cap, and a spill tier under
 /// `spill_dir/node{index}` so in-process nodes never share region files.
+/// The node id a restart reuses: the id `status.node_id` recorded at the
+/// last successful open, or `None` for a node that never opened, whose
+/// restart then mints a fresh one like a first start.
+fn restart_node_id(recorded: u64) -> Option<NodeId> {
+    (recorded != 0).then(|| NodeId::from(recorded))
+}
+
 async fn open(
     gossip_addr: SocketAddr,
     index: usize,
     topology: &Topology,
+    node_id: Option<NodeId>,
 ) -> anyhow::Result<Handle> {
-    let cluster = Cluster::builder(topology.cluster_name.as_str())
+    let builder = Cluster::builder(topology.cluster_name.as_str())
         .seeds(topology.seeds.iter().copied())
         .config(config(
             gossip_addr,
             topology.ae_interval,
             topology.tombstone_ttl,
-        ))
-        .build()
-        .await
-        .context("failed to form cluster")?;
+        ));
+    let builder = match node_id {
+        Some(id) => builder.node_id(id),
+        None => builder,
+    };
+    let cluster = builder.build().await.context("failed to form cluster")?;
     let tuning = &topology.tuning;
     let builder = cluster
         .cache::<String, String>(CACHE_NAME)
@@ -426,6 +441,20 @@ mod tests {
         assert_eq!(slots[0].status.entry_count.load(Ordering::Relaxed), 0);
         assert_eq!(slots[0].status.owned_buckets.load(Ordering::Relaxed), 0);
         assert!(!slots[0].status.warm.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn restart_node_id_reuses_a_recorded_id_and_mints_afresh_for_an_unopened_node() {
+        assert_eq!(
+            restart_node_id(0),
+            None,
+            "a node that never opened has no id to keep"
+        );
+        assert_eq!(
+            restart_node_id(0x6f79_f24e_0acf_0188),
+            Some(NodeId::from(0x6f79_f24e_0acf_0188)),
+            "a restart keeps the id the last open recorded"
+        );
     }
 
     #[tokio::test]

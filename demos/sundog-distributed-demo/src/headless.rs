@@ -163,6 +163,10 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
         let body = metrics
             .as_ref()
             .map_or_else(String::new, |(metrics, _)| metrics.render());
+        let killed_node_id = demo.nodes[killed_index]
+            .status
+            .node_id
+            .load(Ordering::Relaxed);
         let report = build_report(
             args,
             duration,
@@ -174,6 +178,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
             &convergence_report,
             &fetch_summary,
             &body,
+            killed_node_id,
         );
         if let Some(path) = &args.report_json {
             report.write_to(path)?;
@@ -212,11 +217,22 @@ fn build_report(
     convergence_report: &Convergence,
     fetch_summary: &FetchSummary,
     metrics_body: &str,
+    killed_node_id: u64,
 ) -> Report {
     let steady_rss_bytes = steady_rss_kb.unwrap_or(0) * 1024;
     let copies_expected = report::copies_expected(args.owners.get(), surviving_keys);
     let totals = metrics::totals(metrics_body);
     let total_of = |metric: &str| totals.get(metric).copied().unwrap_or(0.0);
+    // `sundog_backlog_dropped_total` carries the target peer as its label,
+    // so the drops toward the node this run killed, which its departure
+    // produces by design, separate from a drop toward any other peer.
+    let backlog_dropped = total_of("sundog_backlog_dropped_total");
+    let backlog_dropped_killed = metrics::labeled_total(
+        metrics_body,
+        "sundog_backlog_dropped_total",
+        "peer",
+        &sundog::NodeId::from(killed_node_id).to_string(),
+    );
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -266,7 +282,8 @@ fn build_report(
             "direction",
             "out",
         )),
-        backlog_dropped: as_u64(total_of("sundog_backlog_dropped_total")),
+        backlog_dropped: as_u64(backlog_dropped),
+        backlog_dropped_other_peers: as_u64((backlog_dropped - backlog_dropped_killed).max(0.0)),
         fan_out_wait_timeouts: as_u64(total_of("sundog_fan_out_wait_timeouts_total")),
         spill_reopen_warm: as_u64(metrics::labeled_total(
             metrics_body,
@@ -532,8 +549,8 @@ mod tests {
         sundog_spill_dropped_total{reason=\"other\"} 100\n\
         sundog_rebalance_buckets_total{direction=\"in\"} 6\n\
         sundog_rebalance_buckets_total{direction=\"out\"} 2\n\
-        sundog_backlog_dropped_total{peer=\"1\"} 5\n\
-        sundog_backlog_dropped_total{peer=\"2\"} 3\n\
+        sundog_backlog_dropped_total{peer=\"0000000000000001\"} 5\n\
+        sundog_backlog_dropped_total{peer=\"0000000000000002\"} 3\n\
         sundog_fan_out_wait_timeouts_total{cache=\"demo\"} 8\n\
         sundog_fan_out_wait_timeouts_total{cache=\"other\"} 1\n\
         sundog_spill_reopen_total{cache=\"demo\",outcome=\"warm\",reason=\"\"} 1\n\
@@ -595,6 +612,7 @@ mod tests {
             &convergence_report,
             &fetch_summary,
             METRICS_BODY,
+            1,
         );
 
         assert_eq!(report.nodes, 3);
@@ -624,6 +642,11 @@ mod tests {
         assert_eq!(report.rebalance_in, 6);
         assert_eq!(report.rebalance_out, 2);
         assert_eq!(report.backlog_dropped, 8);
+        assert_eq!(
+            report.backlog_dropped_other_peers, 3,
+            "the five drops toward the killed node, labeled by its hex id, fall out of the \
+             other-peers count"
+        );
         assert_eq!(report.fan_out_wait_timeouts, 9);
         assert_eq!(report.spill_reopen_warm, 1);
         assert_eq!(report.spill_reopen_cold_fallback, 2);
@@ -657,6 +680,7 @@ mod tests {
             &Convergence::NoLiveNodes,
             &fetch_summary,
             "",
+            0,
         );
 
         assert_eq!(report.preload_rss_bytes, 0);

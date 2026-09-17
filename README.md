@@ -541,9 +541,11 @@ headless at 4M keys across three nodes with an 800k-entry RAM cap per node
 over a spill tier, checking the resulting `--report-json` output against
 [`ops/scale-gate.json`](ops/scale-gate.json)'s thresholds for steady and
 peak RSS, deferred spill drops, pull timeouts, dropped replicate backlog
-(`max_backlog_dropped`, summing `sundog_backlog_dropped_total` across
-peers), fetch p99 latency, warm spill reopens, convergence, and a fully
-passing sample check via `--gate`.
+(`max_backlog_dropped_other_peers`, the `sundog_backlog_dropped_total`
+frames dropped toward any peer other than the node the run kills, whose
+departure drops the frames queued for it by design; `max_backlog_dropped`
+bounds the total across every peer instead), fetch p99 latency, warm spill
+reopens, convergence, and a fully passing sample check via `--gate`.
 `workflow_dispatch` reruns the same shape on demand with its own key count,
 duration, RAM cap, and runner inputs, for a one-off run at a different
 scale. Both the report and the run log upload as workflow artifacts.

@@ -53,6 +53,11 @@ pub(crate) struct Report {
     /// frames `net::Mesh::send_frames_awaiting` gave up on once their
     /// target peer left the mesh's peer table mid-wait.
     pub(crate) backlog_dropped: u64,
+    /// The part of `backlog_dropped` for peers other than the node the run
+    /// kills: frames for the killed node are dropped by design the moment
+    /// it leaves the peer table, and its restart pulls or reconciles what
+    /// they carried, so only a drop toward any other peer is a fault.
+    pub(crate) backlog_dropped_other_peers: u64,
     /// `sundog_fan_out_wait_timeouts_total`, summed across caches: async
     /// writes whose wait for fan-out backlog room ran out before finding
     /// any, and proceeded over capacity regardless.
@@ -132,6 +137,10 @@ pub(crate) struct Gate {
     /// until it opts in.
     #[serde(default)]
     pub(crate) max_backlog_dropped: Option<u64>,
+    /// Bound on `backlog_dropped_other_peers`, the drops the kill step never
+    /// produces by design; `None` (the default) skips the check.
+    #[serde(default)]
+    pub(crate) max_backlog_dropped_other_peers: Option<u64>,
     /// Minimum `spill_reopen_warm` the run must report; `None` (the
     /// default) skips the check.
     #[serde(default)]
@@ -203,6 +212,14 @@ pub(crate) fn check(report: &Report, gate: &Gate) -> Vec<String> {
             report.backlog_dropped
         ));
     }
+    if let Some(max_other) = gate.max_backlog_dropped_other_peers
+        && report.backlog_dropped_other_peers > max_other
+    {
+        violations.push(format!(
+            "backlog_dropped_other_peers {} exceeds max_backlog_dropped_other_peers {max_other}",
+            report.backlog_dropped_other_peers
+        ));
+    }
     if gate.require_converged && !report.converged {
         violations.push("converged is false but require_converged is set".to_owned());
     }
@@ -257,6 +274,7 @@ mod tests {
             rebalance_in: 4_000,
             rebalance_out: 4_000,
             backlog_dropped: 0,
+            backlog_dropped_other_peers: 0,
             fan_out_wait_timeouts: 12,
             spill_reopen_warm: 1,
             spill_reopen_cold_fallback: 0,
@@ -273,6 +291,7 @@ mod tests {
             require_converged: true,
             require_full_sample: true,
             max_backlog_dropped: Some(0),
+            max_backlog_dropped_other_peers: Some(0),
             min_spill_reopen_warm: Some(1),
         }
     }
@@ -370,9 +389,46 @@ mod tests {
         };
         let gate = Gate {
             max_backlog_dropped: None,
+            max_backlog_dropped_other_peers: None,
             ..passing_gate()
         };
         assert_eq!(check(&report, &gate), Vec::<String>::new());
+    }
+
+    #[test]
+    fn check_flags_drops_toward_other_peers_while_tolerating_the_killed_nodes() {
+        let report = Report {
+            backlog_dropped: 80,
+            backlog_dropped_other_peers: 0,
+            ..sample_report()
+        };
+        let gate = Gate {
+            max_backlog_dropped: None,
+            max_backlog_dropped_other_peers: Some(0),
+            ..passing_gate()
+        };
+        assert_eq!(check(&report, &gate), Vec::<String>::new());
+        let report = Report {
+            backlog_dropped: 80,
+            backlog_dropped_other_peers: 1,
+            ..sample_report()
+        };
+        let violations = check(&report, &gate);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("backlog_dropped_other_peers 1 exceeds"));
+    }
+
+    #[test]
+    fn gate_without_max_backlog_dropped_other_peers_defaults_to_none() {
+        let mut value =
+            serde_json::to_value(passing_gate()).expect("gate serializes to a JSON value");
+        value
+            .as_object_mut()
+            .expect("a Gate serializes as a JSON object")
+            .remove("max_backlog_dropped_other_peers");
+        let gate: Gate = serde_json::from_value(value)
+            .expect("a gate file with no max_backlog_dropped_other_peers field still parses");
+        assert_eq!(gate.max_backlog_dropped_other_peers, None);
     }
 
     #[test]

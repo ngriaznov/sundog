@@ -215,6 +215,14 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- The distributed demo's restart reopens a node under the id it had, the
+  way a deployment persists its node id, so ownership stays where it was
+  and a warm spill reopen replays into buckets the node still owns. Its
+  report carries `backlog_dropped_other_peers`, the replicate frames
+  dropped toward any peer other than the node the run kills, and the scale
+  gate bounds that at zero through `max_backlog_dropped_other_peers`; the
+  frames the killed node's departure drops are counted in
+  `backlog_dropped` and left to its restart to pull or reconcile.
 - `sundog_rebalance_buckets_total{cache, direction="in"}` is now credited
   per bucket, the moment its own pull lands (via the new
   `Msg::StBucketDone`/`Msg::StBucketAck` signaling or, against an older
