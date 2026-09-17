@@ -529,14 +529,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // checkpoints a spill tier opened with warm reopen on, so a restart
     // against a preserved spill dir finds the snapshot a warm reopen
     // needs. `quit` and `crash` stay what they are: an exit with no leave.
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let stop = stop_requested();
+    tokio::pin!(stop);
     println!("testnode-ready");
     let _ = std::io::stdout().flush();
 
     loop {
         tokio::select! {
             biased;
-            _ = terminate.recv() => {
+            requested = &mut stop => {
+                requested?;
                 node.cluster.clone().shutdown().await;
                 std::process::exit(0);
             }
@@ -545,6 +547,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(serve(socket, node.clone()));
             }
         }
+    }
+}
+
+/// Resolves once the process is asked to stop: on SIGTERM on Unix, which
+/// is what a container stop sends, and on Ctrl-C elsewhere, where no
+/// container test runs this node and the workspace still has to build.
+async fn stop_requested() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        terminate.recv().await;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
     }
 }
 
