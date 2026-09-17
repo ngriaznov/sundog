@@ -247,6 +247,19 @@ pub struct ClusterConfig {
     /// wait: how long an async write path awaits room below that capacity
     /// before proceeding regardless. Default: 30s.
     pub fan_out_wait_timeout: Duration,
+    /// Per-peer wire-byte budget on a warm reopen's converge-before-serving
+    /// reconciliation loop (`Cache::reconcile_warm_buckets`): once one
+    /// peer's rounds have pushed and pulled this many bytes, that peer's
+    /// still-diverging warm buckets stop looping and fall through to the
+    /// ordinary cold-pull path, cold and unverified, rather than trusting a
+    /// round's outcome without ever re-checking. Paired with a fixed
+    /// round cap, following [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes)'s
+    /// naming and shape: large enough that a bucket's full listing or
+    /// `AeEntries` fallback (bounded by `wire::MAX_FRAME`) always fits
+    /// inside a handful of rounds, small enough that a co-owner that keeps
+    /// re-diverging every round can't stall `open()` indefinitely. Default:
+    /// 32 MiB.
+    pub reconcile_byte_budget: u64,
 }
 
 impl ClusterConfig {
@@ -367,6 +380,7 @@ impl Default for ClusterConfig {
             rebalance_ack_window: Duration::from_secs(60),
             fan_out_backlog_capacity: 262_144,
             fan_out_wait_timeout: Duration::from_secs(30),
+            reconcile_byte_budget: 32 * 1024 * 1024,
         }
     }
 }
@@ -620,6 +634,14 @@ mod tests {
         assert_eq!(
             ClusterConfig::default().fan_out_wait_timeout,
             Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn default_reconcile_byte_budget_is_32_mebibytes() {
+        assert_eq!(
+            ClusterConfig::default().reconcile_byte_budget,
+            32 * 1024 * 1024
         );
     }
 

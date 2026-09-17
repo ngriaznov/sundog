@@ -1064,16 +1064,15 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         // time `snapshot_spilled` runs right after, it scans that same
         // now-current engine state, so it lists both the entry already
         // spilled before this checkpoint started and the one finalize just
-        // flipped -- two, not one -- and the final snapshot then totals
-        // three once the explicit `entries.extend(survivors)` appends that
-        // same just-finalized entry a second time (harmless: the reopen
-        // below installs it once and refuses the duplicate).
+        // flipped -- two, not one -- and the final snapshot totals the same
+        // two: `entries` already carries every checkpoint-kept survivor via
+        // that scan, so there is no second append of the same entry.
         for (stage, expected) in [
             ("captured", 1.0),
             ("written", 1.0),
             ("kept", 1.0),
             ("listed", 2.0),
-            ("snapshot", 3.0),
+            ("snapshot", 2.0),
         ] {
             assert_eq!(
                 scraped_metric_value(
@@ -1087,11 +1086,10 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             );
         }
         // sundog_spill_reopen_entries_total{cache,stage}: the matching
-        // reopen, staged. All three snapshot entries are read; the two
-        // distinct keys install, and the duplicate entry the checkpoint's
-        // own double-listing above produced is refused as already present,
-        // never installed twice.
-        for (stage, expected) in [("read", 3.0), ("installed", 2.0), ("refused_present", 1.0)] {
+        // reopen, staged. Both snapshot entries are read and both distinct
+        // keys install; the snapshot carries no duplicate, so nothing is
+        // ever refused as already present.
+        for (stage, expected) in [("read", 2.0), ("installed", 2.0), ("refused_present", 0.0)] {
             assert_eq!(
                 scraped_metric_value(
                     &body,

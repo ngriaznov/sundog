@@ -31,6 +31,7 @@ use crate::hlc::Hlc;
 use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
 use crate::node::NodeId;
 use crate::store::{BucketPart, ShardOps, bucket_of};
+use crate::wire::{self, WireRecord};
 
 /// Runs anti-entropy for one shard while `cancel` stays live: every jittered
 /// `ae_interval`, picks one live peer, a dirty-marked one first, and runs
@@ -175,10 +176,6 @@ pub enum RoundOutcome {
 /// this same seam under `feature = "sim"` against a hand-built
 /// `Mesh`/`ShardOps` pair, skipping a real `Cluster`'s gossip and discovery.
 #[tracing::instrument(skip_all, fields(cache = %cache, peer = %peer))]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one round's whole digest-exchange-through-repair sequence reads best kept together"
-)]
 pub async fn run_round_against(
     mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -248,10 +245,29 @@ pub async fn run_round_against(
         return RoundOutcome::Reconciled;
     }
 
-    // Buckets past `ae_part_min_bucket` answered with part digests never
-    // load their full entries here: that's the cost this feature removes.
-    // Only the buckets answered with a listing or sketch go through
-    // `entries_for_buckets`.
+    let _ = reconcile_mismatches(mesh, shard, cache, peer, mismatched, merging).await;
+    RoundOutcome::Reconciled
+}
+
+/// The classify-through-repair pipeline shared by [`run_round_against`] and
+/// [`run_round_for_buckets`]: given one round's non-empty `mismatched`
+/// reply, classifies each mismatch into a [`RepairPlan`], issues the one
+/// `Msg::AeEntries` fallback for every bucket whose sketch failed to
+/// decode, then runs [`apply_repairs`]. Returns the total wire bytes
+/// `apply_repairs` moved.
+///
+/// Buckets past `ae_part_min_bucket` answered with part digests never load
+/// their full entries here: that's the cost this feature removes. Only the
+/// buckets answered with a listing or sketch go through
+/// `entries_for_buckets`.
+async fn reconcile_mismatches(
+    mesh: &Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    mismatched: Vec<AeMismatch>,
+    merging: bool,
+) -> u64 {
     let (part_digest_mismatches, bucket_mismatches): (Vec<AeMismatch>, Vec<AeMismatch>) =
         mismatched
             .into_iter()
@@ -318,8 +334,129 @@ pub async fn run_round_against(
         plan.pull_keys,
         plan.pull_hashes,
     )
-    .await;
-    RoundOutcome::Reconciled
+    .await
+}
+
+/// How one [`run_round_for_buckets`] round ended, per bucket: which of the
+/// requested buckets matched at the instant the exchange was answered,
+/// which were named as mismatched (repair was attempted against them), the
+/// wire bytes [`reconcile_mismatches`] moved, and whether the exchange
+/// itself failed.
+// Only exercised by this file's own real-transport tests today (`cfg(not(feature =
+// "sim"))`, like `apply_repairs_reports_the_bytes_it_moved`); `Cache::reconcile_warm_buckets`
+// wires it into its converge-before-serving loop once that rewrite lands.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BucketRoundOutcome {
+    /// No mismatch this round: converged, at this instant. See the design's
+    /// "Match under continuing live load" -- not a claim of permanent
+    /// equality, only that this round's digest exchange found none.
+    pub(crate) matched: HashSet<u16>,
+    /// Named as mismatched in the round's reply; repair was attempted
+    /// against it via [`reconcile_mismatches`].
+    pub(crate) still_diverged: HashSet<u16>,
+    /// Wire bytes pushed plus pulled this round: `0` when nothing
+    /// mismatched or the round failed.
+    pub(crate) bytes_moved: u64,
+    /// The digest exchange itself errored, the shard has no ownership view
+    /// to scope it with, or the peer answered `Stale`: no repair ran, and
+    /// every requested bucket counts as `still_diverged`.
+    pub(crate) failed: bool,
+}
+
+/// Every requested bucket reported `still_diverged`, nothing matched, and
+/// no repair ran: [`run_round_for_buckets`]'s outcome for a round that
+/// could not be scoped or answered at all.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
+    BucketRoundOutcome {
+        matched: HashSet::new(),
+        still_diverged: requested.clone(),
+        bytes_moved: 0,
+        failed: true,
+    }
+}
+
+/// Bucket-scoped sibling of [`run_round_against`]: like it, but scoped to
+/// `buckets` (a subset of what `shard` and `peer` co-own) and reporting
+/// which of those specifically matched instead of collapsing to one
+/// [`RoundOutcome`]. `Cache::reconcile_warm_buckets`'s converge-before-
+/// serving loop calls this per live co-owner, per round, over that peer's
+/// still-diverging warm buckets.
+///
+/// Computes local digests the same way `run_round_against` does
+/// (`shard.ae_digests_for(peer)`), filtered to `buckets` before the
+/// [`Mesh::ae_round_scoped`] request goes out, so a bucket outside
+/// `buckets` never appears in the request or the returned outcome. `matched`
+/// is `buckets` minus whatever the reply names mismatched; `still_diverged`
+/// is what was named. Reuses [`reconcile_mismatches`] for the classify-
+/// through-repair pipeline, the same one `run_round_against` uses.
+///
+/// A shard with no ownership view (a `Mode` other than `Distributed`), a
+/// `Stale` reply, or a failed digest exchange reports every requested
+/// bucket `still_diverged` with `failed: true` ([`every_bucket_diverged`]):
+/// no progress this round, the same "counts as a used round" shape a
+/// caller's own round/byte budget bounds against.
+// Only exercised by this file's own real-transport tests today (`cfg(not(feature =
+// "sim"))`, like `apply_repairs_reports_the_bytes_it_moved`); `Cache::reconcile_warm_buckets`
+// wires it into its converge-before-serving loop once that rewrite lands.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+pub(crate) async fn run_round_for_buckets(
+    mesh: &Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    buckets: &[u16],
+) -> BucketRoundOutcome {
+    let requested: HashSet<u16> = buckets.iter().copied().collect();
+    let Some(view_hash) = shard.ownership_view_hash() else {
+        return every_bucket_diverged(&requested);
+    };
+    let merging = shard.merges();
+    let local_buckets: Vec<(u16, u64)> = shard
+        .ae_digests_for(peer)
+        .await
+        .into_iter()
+        .filter(|bd| requested.contains(&bd.bucket))
+        .map(|bd| (bd.bucket, bd.digest))
+        .collect();
+    let mismatched = match mesh
+        .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
+        .await
+    {
+        Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
+        Ok(AeRoundOutcome::Stale {
+            responder_view_hash,
+        }) => {
+            metrics::counter!("sundog_stale_view_total", "cache" => cache.to_string()).increment(1);
+            tracing::debug!(
+                responder_view_hash,
+                "anti-entropy bucket-scoped round ended: responder's view has diverged"
+            );
+            return every_bucket_diverged(&requested);
+        }
+        Err(error) => {
+            tracing::debug!(%error, "anti-entropy bucket-scoped digest exchange failed");
+            return every_bucket_diverged(&requested);
+        }
+    };
+    let still_diverged: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
+    let matched: HashSet<u16> = requested.difference(&still_diverged).copied().collect();
+    if mismatched.is_empty() {
+        return BucketRoundOutcome {
+            matched,
+            still_diverged,
+            bytes_moved: 0,
+            failed: false,
+        };
+    }
+    let bytes_moved = reconcile_mismatches(mesh, shard, cache, peer, mismatched, merging).await;
+    BucketRoundOutcome {
+        matched,
+        still_diverged,
+        bytes_moved,
+        failed: false,
+    }
 }
 
 /// Drops every queued pull for a bucket a `Mode::Distributed` shard does
@@ -537,8 +674,21 @@ async fn classify_part_digest_mismatches(
     }
 }
 
+/// This record's wire size once framed as a [`crate::wire::Msg::Replicate`]
+/// under a `cache_len`-byte cache name: the same accounting
+/// `net::chunk_records` sizes a replication batch with, applied here to one
+/// record at a time so [`apply_repairs`] can total it up per direction.
+fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
+    wire::replicate_frame_len(
+        cache_len,
+        record.key.len(),
+        record.value.as_ref().map_or(0, Bytes::len),
+    ) as u64
+}
+
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
-/// [`REPAIR_BATCH`] chunks, and emits `sundog_ae_repaired_total{cache}`.
+/// [`REPAIR_BATCH`] chunks, emits `sundog_ae_repaired_total{cache}`, and
+/// returns the total wire bytes moved (pushed plus pulled).
 async fn apply_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -547,14 +697,19 @@ async fn apply_repairs(
     push_keys: Vec<Bytes>,
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
-) {
+) -> u64 {
     let mut repaired: u64 = 0;
+    let mut bytes_moved: u64 = 0;
     // Batched so a large divergence makes durable incremental progress:
     // each landed batch shrinks the next round's diff, instead of one
     // all-or-nothing exchange racing a request timeout.
     for batch in push_keys.chunks(REPAIR_BATCH) {
         let records = shard.records_for(batch.to_vec()).await;
         repaired += records.len() as u64;
+        bytes_moved += records
+            .iter()
+            .map(|rec| wire_record_len(cache.len(), rec))
+            .sum::<u64>();
         // `net::batch_replicate` chunks this into a handful of full frames, not
         // one `Msg::Replicate` per record.
         let msgs = crate::net::batch_replicate(cache, records);
@@ -564,6 +719,10 @@ async fn apply_repairs(
         match mesh.ae_pull(peer, cache.clone(), batch.to_vec()).await {
             Ok(records) => {
                 repaired += records.len() as u64;
+                bytes_moved += records
+                    .iter()
+                    .map(|rec| wire_record_len(cache.len(), rec))
+                    .sum::<u64>();
                 shard.apply_remote_batch(records).await;
             }
             Err(error) => {
@@ -580,6 +739,10 @@ async fn apply_repairs(
             {
                 Ok(records) => {
                     repaired += records.len() as u64;
+                    bytes_moved += records
+                        .iter()
+                        .map(|rec| wire_record_len(cache.len(), rec))
+                        .sum::<u64>();
                     shard.apply_remote_batch(records).await;
                 }
                 Err(error) => {
@@ -597,7 +760,8 @@ async fn apply_repairs(
         metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
             .increment(repaired);
     }
-    tracing::debug!(repaired, "anti-entropy round complete");
+    tracing::debug!(repaired, bytes_moved, "anti-entropy round complete");
+    bytes_moved
 }
 
 /// Classifies one `AeMismatch::Sketch(bucket, cells)` reply through
@@ -851,6 +1015,329 @@ mod tests {
 
     use super::super::sketch::Elem;
     use super::*;
+
+    /// A postcard-encoded `(key, value)` pair, for a test record's key and
+    /// value bytes, and the `WireRecord` `ShardOps::apply_remote` takes.
+    /// Real-transport only: `sim` swaps the whole data plane to turmoil, and
+    /// `apply_repairs_reports_the_bytes_it_moved` below is the only user.
+    #[cfg(not(feature = "sim"))]
+    fn encode_test_record(key: u32, value: &str, node: NodeId) -> (Bytes, WireRecord) {
+        let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("test key encodes"));
+        let value_bytes = Bytes::from(postcard::to_stdvec(value).expect("test value encodes"));
+        let rec = WireRecord {
+            key: key_bytes.clone(),
+            value: Some(value_bytes),
+            ver: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node,
+            },
+            expires_at_ms: None,
+        };
+        (key_bytes, rec)
+    }
+
+    /// Two real, connected nodes: `apply_repairs` pushes one key `b` holds
+    /// straight to `a` and pulls one key `a` holds straight from `a`, each
+    /// applied to its shard via `ShardOps::apply_remote` (bypasses fan-out,
+    /// so `apply_repairs` is the only path either side learns of the
+    /// other's key). The returned byte count matches the wire size of
+    /// exactly those two records, computed independently via
+    /// `wire_record_len`. Real-transport only, same reason as
+    /// `encode_test_record` above.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn apply_repairs_reports_the_bytes_it_moved() {
+        use super::super::test_support::{loopback_config, registered_shard, wait_for_peer_count};
+        use crate::store::Mode;
+
+        let config = loopback_config();
+        let cluster_a = Cluster::builder("cluster-it-apply-repairs-bytes")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let node_a = cluster_a.node_id();
+        cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-apply-repairs-bytes")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+
+        let name = SmolStr::new("users");
+        let shard_a = registered_shard(&cluster_a, &name);
+        let shard_b = registered_shard(&cluster_b, &name);
+
+        let (pull_key_bytes, pull_rec) = encode_test_record(1, "a-value", node_a);
+        shard_a.apply_remote(pull_rec.clone()).await;
+        let (push_key_bytes, push_rec) = encode_test_record(2, "b-value", cluster_b.node_id());
+        shard_b.apply_remote(push_rec.clone()).await;
+
+        let expected =
+            wire_record_len(name.len(), &push_rec) + wire_record_len(name.len(), &pull_rec);
+
+        let bytes_moved = apply_repairs(
+            cluster_b.mesh(),
+            &shard_b,
+            &name,
+            node_a,
+            vec![push_key_bytes],
+            vec![pull_key_bytes],
+            Vec::new(),
+        )
+        .await;
+
+        assert_eq!(
+            bytes_moved, expected,
+            "the byte count covers exactly the pushed and pulled record, no more and no less"
+        );
+        assert_eq!(
+            cache_b.get(&1u32).await,
+            Some("a-value".to_string()),
+            "the pull side of apply_repairs actually landed the record it counted"
+        );
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    /// `n` distinct u32 keys, each landing in a different bucket: scans
+    /// `0..` until `n` distinct [`bucket_of`] results are seen. Real-
+    /// transport only, same reason as `encode_test_record` above.
+    #[cfg(not(feature = "sim"))]
+    fn keys_in_distinct_buckets(n: usize) -> Vec<(u32, u16)> {
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        for key in 0u32.. {
+            let bytes = crate::store::encode_key(&key).expect("u32 key encodes");
+            let bucket = bucket_of(&bytes);
+            if seen.insert(bucket) {
+                found.push((key, bucket));
+                if found.len() == n {
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    /// Two real, joined `Mode::Distributed` nodes, both open on `name` and
+    /// co-owning every bucket -- the only two eligible nodes at the default
+    /// `owners = 2`: `b`'s node id and its and `c`'s registered shards, for
+    /// `run_round_for_buckets`'s own real-transport tests. Real-transport
+    /// only, same reason as `encode_test_record` above.
+    #[cfg(not(feature = "sim"))]
+    async fn two_distributed_co_owners(
+        test_id: &str,
+        name: &SmolStr,
+    ) -> (
+        Cluster,
+        Cluster,
+        NodeId,
+        Arc<dyn ShardOps>,
+        Arc<dyn ShardOps>,
+    ) {
+        use super::super::test_support::{loopback_config, registered_shard, wait_for_peer_count};
+        use crate::store::Mode;
+
+        let b = Cluster::builder(format!("cluster-it-{test_id}"))
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        let node_b = b.node_id();
+        b.cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone, owning every bucket");
+
+        let c = Cluster::builder(format!("cluster-it-{test_id}"))
+            .seeds([b.local_gossip_addr()])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("c builds");
+        wait_for_peer_count(&b, 1).await;
+        wait_for_peer_count(&c, 1).await;
+        c.cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("c opens, co-owning every bucket alongside b");
+
+        let shard_b = registered_shard(&b, name);
+        let shard_c = registered_shard(&c, name);
+        (b, c, node_b, shard_b, shard_c)
+    }
+
+    /// Two real buckets diverge on `b` (applied straight to its shard,
+    /// bypassing fan-out, so `c` never learns of either on its own): one is
+    /// the round's only requested bucket, the other is not requested at
+    /// all. `still_diverged` names the requested one and only the requested
+    /// one -- the un-requested bucket's real divergence never surfaces,
+    /// proving the request is actually scoped to `buckets` rather than
+    /// reporting every mismatch the peer happens to have.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn run_round_for_buckets_reports_only_the_requested_buckets_still_diverged() {
+        use super::super::test_support::wait_until;
+
+        let name = SmolStr::new("scoped-round-diverged");
+        let (b, c, node_b, shard_b, shard_c) =
+            two_distributed_co_owners("scoped-diverged", &name).await;
+
+        let keys = keys_in_distinct_buckets(2);
+        let (requested_key, requested_bucket) = keys[0];
+        let (extra_key, extra_bucket) = keys[1];
+
+        let (_, requested_rec) = encode_test_record(requested_key, "requested", node_b);
+        shard_b.apply_remote(requested_rec).await;
+        let (_, extra_rec) = encode_test_record(extra_key, "extra", node_b);
+        shard_b.apply_remote(extra_rec).await;
+
+        let mut outcome = BucketRoundOutcome::default();
+        wait_until(
+            Duration::from_secs(10),
+            "b's view catches up to c joining, so the round runs instead of reporting stale",
+            async || {
+                outcome =
+                    run_round_for_buckets(c.mesh(), &shard_c, &name, node_b, &[requested_bucket])
+                        .await;
+                !outcome.failed
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.still_diverged,
+            HashSet::from([requested_bucket]),
+            "the requested bucket's real divergence is reported"
+        );
+        assert!(
+            outcome.matched.is_empty(),
+            "the only requested bucket diverged, so nothing is reported matched"
+        );
+        assert!(
+            !outcome.still_diverged.contains(&extra_bucket)
+                && !outcome.matched.contains(&extra_bucket),
+            "the un-requested bucket's real divergence never surfaces in this scoped round's outcome"
+        );
+
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    /// A bucket neither side has ever touched matches on the first non-
+    /// stale round: `matched` names it, `still_diverged` is empty, and no
+    /// bytes move since nothing needed repair.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn run_round_for_buckets_marks_a_bucket_matched_once_its_digest_exchange_reports_no_mismatch()
+     {
+        use super::super::test_support::wait_until;
+
+        let name = SmolStr::new("scoped-round-matched");
+        let (b, c, node_b, _shard_b, shard_c) =
+            two_distributed_co_owners("scoped-matched", &name).await;
+
+        let (_, matched_bucket) = keys_in_distinct_buckets(1)[0];
+
+        let mut outcome = BucketRoundOutcome::default();
+        wait_until(
+            Duration::from_secs(10),
+            "b's view catches up to c joining, so the round runs instead of reporting stale",
+            async || {
+                outcome =
+                    run_round_for_buckets(c.mesh(), &shard_c, &name, node_b, &[matched_bucket])
+                        .await;
+                !outcome.failed
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.matched,
+            HashSet::from([matched_bucket]),
+            "an untouched bucket's digests already agree, so it matches at once"
+        );
+        assert!(outcome.still_diverged.is_empty());
+        assert_eq!(
+            outcome.bytes_moved, 0,
+            "nothing needed repair, so nothing moved"
+        );
+
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    /// A peer this node's mesh has never heard of cannot answer a scoped
+    /// digest exchange: every requested bucket lands in `still_diverged`,
+    /// nothing matches, nothing moves, and the round reports `failed`.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn run_round_for_buckets_treats_every_requested_bucket_as_still_diverged_when_the_peer_is_unreachable()
+     {
+        use super::super::test_support::{loopback_config, registered_shard};
+        use crate::store::Mode;
+
+        let name = SmolStr::new("scoped-round-unreachable");
+        let cluster = Cluster::builder("cluster-it-scoped-unreachable")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("cluster builds alone");
+        cluster
+            .cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("opens alone, owning every bucket");
+
+        let shard = registered_shard(&cluster, &name);
+        let unknown_peer = NodeId::from(u64::MAX);
+        let requested = [1u16, 2, 3];
+
+        let outcome =
+            run_round_for_buckets(cluster.mesh(), &shard, &name, unknown_peer, &requested).await;
+
+        assert!(
+            outcome.failed,
+            "an unknown peer's digest exchange cannot succeed"
+        );
+        assert_eq!(
+            outcome.still_diverged,
+            requested.iter().copied().collect::<HashSet<u16>>(),
+            "every requested bucket is treated as still diverged when the round cannot run"
+        );
+        assert!(outcome.matched.is_empty());
+        assert_eq!(outcome.bytes_moved, 0);
+
+        cluster.shutdown().await;
+    }
 
     #[test]
     fn a_streaming_peer_is_skipped_a_bounded_number_of_times() {

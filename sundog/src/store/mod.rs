@@ -3433,7 +3433,7 @@ where
                 // race is silently dropped here rather than resurrected
                 // below.
                 let engine = Arc::clone(&self.engine);
-                let (survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
+                let (_survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
                     engine.finalize_checkpoint_writes(newly_written, now)
                 })
                 .await
@@ -3474,7 +3474,7 @@ where
                 );
 
                 let engine = Arc::clone(&self.engine);
-                let mut entries = tokio::task::spawn_blocking(move || engine.snapshot_spilled(now))
+                let entries = tokio::task::spawn_blocking(move || engine.snapshot_spilled(now))
                     .await
                     .unwrap_or_else(|err| {
                         tracing::warn!(
@@ -3492,7 +3492,11 @@ where
                 );
                 record_checkpoint_stage(&self.name, "listed", entries.len() as u64);
 
-                entries.extend(survivors);
+                // `entries` already contains every checkpoint-kept survivor: the
+                // `finalize_checkpoint_writes` call above flips each survivor's live
+                // engine state to `Spilled` in place, so `snapshot_spilled`'s scan just
+                // above already lists it once. Extending with the survivors again would
+                // list each one twice in the snapshot.
                 tracing::info!(
                     cache = %self.name,
                     count = entries.len(),

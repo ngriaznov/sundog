@@ -972,6 +972,81 @@ async fn distributed_warm_and_rebalance(
     );
 }
 
+/// Fixed round cap on [`reconcile_warm_buckets`]'s per-peer converge-loop,
+/// matching the codebase's own precedent for giving a self-healing
+/// mechanism a few tries before falling back to the authoritative path
+/// (`crate::cluster::state_transfer::MAX_WARM_UP_ATTEMPTS`,
+/// `crate::cluster::rebalance::ALL_COLD_PASSES`). Because each round
+/// already applies its entire diff, bounded only by RPC success, this is
+/// not "N batches of a fixed-size chunk" but "N chances to survive a
+/// transient RPC failure or a bucket still moving under live writes."
+// Only exercised by this file's own unit tests until `reconcile_warm_buckets`'s
+// loop rewrite wires it into the converge-before-serving path.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+const RECONCILE_MAX_ROUNDS: u32 = 3;
+
+/// Per-peer, per-bucket-set bound on [`reconcile_warm_buckets`]'s
+/// converge-before-serving loop: whichever of `max_rounds`/`byte_budget` is
+/// hit first stops the loop for that peer's still-diverging buckets,
+/// leaving them cold and unverified for the ordinary cold-pull path.
+// Only exercised by this file's own unit tests until `reconcile_warm_buckets`'s
+// loop rewrite wires it into the converge-before-serving path.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct ReconcileBudget {
+    max_rounds: u32,
+    byte_budget: u64,
+}
+
+impl ReconcileBudget {
+    /// `max_rounds` fixed at [`RECONCILE_MAX_ROUNDS`]; `byte_budget` taken
+    /// from [`ClusterConfig::reconcile_byte_budget`].
+    #[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+    fn from_config(config: &ClusterConfig) -> Self {
+        Self {
+            max_rounds: RECONCILE_MAX_ROUNDS,
+            byte_budget: config.reconcile_byte_budget,
+        }
+    }
+}
+
+/// Pure: whether [`reconcile_warm_buckets`]'s per-peer loop keeps going,
+/// given rounds run and bytes moved so far against `budget`, and that at
+/// least one bucket is still diverging. `still_diverging == 0` stops the
+/// loop regardless of the budget: nothing left to check.
+// Only exercised by this file's own unit tests until `reconcile_warm_buckets`'s
+// loop rewrite wires it into the converge-before-serving path.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+fn should_keep_reconciling(
+    rounds_run: u32,
+    bytes_moved: u64,
+    still_diverging: usize,
+    budget: &ReconcileBudget,
+) -> bool {
+    still_diverging > 0 && rounds_run < budget.max_rounds && bytes_moved < budget.byte_budget
+}
+
+/// Pure: splits `requested` into (converged, still-diverging) given one
+/// round's [`anti_entropy::BucketRoundOutcome`], folding a `failed` round
+/// (the whole peer is unreachable or stale this round) as "every requested
+/// bucket stays diverging" -- no bucket in `requested` is ever reported
+/// converged from a round that did not actually run.
+// Only exercised by this file's own unit tests until `reconcile_warm_buckets`'s
+// loop rewrite wires it into the converge-before-serving path.
+#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+fn split_round_result(
+    requested: &[u16],
+    outcome: &anti_entropy::BucketRoundOutcome,
+) -> (Vec<u16>, Vec<u16>) {
+    if outcome.failed {
+        return (Vec::new(), requested.to_vec());
+    }
+    requested
+        .iter()
+        .copied()
+        .partition(|bucket| outcome.matched.contains(bucket))
+}
+
 /// Goal 2's eager reconciliation-before-serving step: one
 /// [`anti_entropy::run_round_against`] per distinct live co-owner across
 /// every bucket in `warm_buckets`, run once, sequentially, before this
@@ -1828,6 +1903,158 @@ mod tests {
         );
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn reconcile_budget_from_config_uses_the_configured_byte_budget_and_the_fixed_round_cap() {
+        let config = ClusterConfig {
+            reconcile_byte_budget: 12_345,
+            ..ClusterConfig::default()
+        };
+        let budget = ReconcileBudget::from_config(&config);
+        assert_eq!(budget.max_rounds, RECONCILE_MAX_ROUNDS);
+        assert_eq!(budget.byte_budget, 12_345);
+    }
+
+    /// Table-driven: `should_keep_reconciling` stops at whichever of
+    /// rounds-exhausted, byte-budget-exhausted or nothing-left-diverging is
+    /// hit first, and keeps going only when none of the three holds.
+    #[test]
+    fn should_keep_reconciling_stops_at_whichever_bound_is_hit_first() {
+        struct Case {
+            name: &'static str,
+            rounds_run: u32,
+            bytes_moved: u64,
+            still_diverging: usize,
+            expect_continue: bool,
+        }
+        let budget = ReconcileBudget {
+            max_rounds: 3,
+            byte_budget: 1_000,
+        };
+        let cases = [
+            Case {
+                name: "rounds exhausted",
+                rounds_run: 3,
+                bytes_moved: 0,
+                still_diverging: 5,
+                expect_continue: false,
+            },
+            Case {
+                name: "rounds past the cap",
+                rounds_run: 4,
+                bytes_moved: 0,
+                still_diverging: 5,
+                expect_continue: false,
+            },
+            Case {
+                name: "byte budget exhausted",
+                rounds_run: 0,
+                bytes_moved: 1_000,
+                still_diverging: 5,
+                expect_continue: false,
+            },
+            Case {
+                name: "byte budget exceeded",
+                rounds_run: 0,
+                bytes_moved: 1_001,
+                still_diverging: 5,
+                expect_continue: false,
+            },
+            Case {
+                name: "nothing left diverging",
+                rounds_run: 0,
+                bytes_moved: 0,
+                still_diverging: 0,
+                expect_continue: false,
+            },
+            Case {
+                name: "a failed round counted as a used round with zero progress, one left",
+                rounds_run: 1,
+                bytes_moved: 0,
+                still_diverging: 5,
+                expect_continue: true,
+            },
+            Case {
+                name: "under both bounds with work left",
+                rounds_run: 1,
+                bytes_moved: 10,
+                still_diverging: 2,
+                expect_continue: true,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                should_keep_reconciling(
+                    case.rounds_run,
+                    case.bytes_moved,
+                    case.still_diverging,
+                    &budget
+                ),
+                case.expect_continue,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    /// Table-driven: `split_round_result` folds a `failed` round as every
+    /// requested bucket staying diverged regardless of what `matched`
+    /// happens to hold, and otherwise splits `requested` by membership in
+    /// `outcome.matched`.
+    #[test]
+    fn split_round_result_folds_a_failed_round_and_otherwise_splits_by_matched() {
+        struct Case {
+            name: &'static str,
+            requested: &'static [u16],
+            outcome: anti_entropy::BucketRoundOutcome,
+            expect_converged: &'static [u16],
+            expect_diverging: &'static [u16],
+        }
+        let cases = [
+            Case {
+                name: "a failed round leaves every requested bucket diverging, even one \
+                       nominally in matched",
+                requested: &[1, 2, 3],
+                outcome: anti_entropy::BucketRoundOutcome {
+                    matched: HashSet::from([1]),
+                    still_diverged: HashSet::new(),
+                    bytes_moved: 0,
+                    failed: true,
+                },
+                expect_converged: &[],
+                expect_diverging: &[1, 2, 3],
+            },
+            Case {
+                name: "a successful round splits matched from still-diverging",
+                requested: &[1, 2, 3],
+                outcome: anti_entropy::BucketRoundOutcome {
+                    matched: HashSet::from([1, 3]),
+                    still_diverged: HashSet::from([2]),
+                    bytes_moved: 500,
+                    failed: false,
+                },
+                expect_converged: &[1, 3],
+                expect_diverging: &[2],
+            },
+            Case {
+                name: "everything requested matched: nothing left diverging",
+                requested: &[4, 5],
+                outcome: anti_entropy::BucketRoundOutcome {
+                    matched: HashSet::from([4, 5]),
+                    still_diverged: HashSet::new(),
+                    bytes_moved: 0,
+                    failed: false,
+                },
+                expect_converged: &[4, 5],
+                expect_diverging: &[],
+            },
+        ];
+        for case in cases {
+            let (converged, diverging) = split_round_result(case.requested, &case.outcome);
+            assert_eq!(converged, case.expect_converged, "case: {}", case.name);
+            assert_eq!(diverging, case.expect_diverging, "case: {}", case.name);
+        }
     }
 
     /// A `Mode::Distributed` shard-and-context pair for `cluster`,
