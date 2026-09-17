@@ -263,18 +263,19 @@ async fn settled_vm_rss_bytes(timeout: Duration) -> Option<u64> {
 }
 
 /// The settled RSS the diet measures at 4,000,000 entries on a 4-core
-/// Linux box is 0.66 GiB, 177 bytes per entry, the same under glibc and
-/// jemalloc: a 72-byte `Live` in hashbrown tables that size each stripe
-/// to a power of two, and no heap allocation for this profile's 18-byte
-/// inline records. This budget sits 13% above that reading, so a
-/// regression of a few bytes per entry fails the bench while allocator
-/// and kernel noise between runs does not.
+/// Linux box, after Phase A's packed `Live` (`sundog/src/store/engine.rs`),
+/// is 0.525 GiB, 141 bytes per entry, 119.5 of it live heap: a 56-byte
+/// `Live` in hashbrown tables that size each stripe to a power of two, and
+/// no heap allocation for this profile's 18-byte inline records. This
+/// budget sits at 0.6 GiB, over 13% above that reading, so a regression of
+/// a few bytes per entry fails the bench while allocator and kernel noise
+/// between runs does not.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "0.75 GiB is a small positive constant, exact in f64 up to a rounding sub-byte"
+    reason = "0.6 GiB is a small positive constant, exact in f64 up to a rounding sub-byte"
 )]
-const RSS_BUDGET_BYTES: u64 = (0.75 * 1024.0 * 1024.0 * 1024.0) as u64;
+const RSS_BUDGET_BYTES: u64 = (0.6 * 1024.0 * 1024.0 * 1024.0) as u64;
 
 /// The entry count [`entry_diet_rss_budget`] inserts and pins its budget
 /// against.

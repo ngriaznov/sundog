@@ -38,7 +38,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 #[cfg(all(feature = "spill", test))]
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -174,35 +174,116 @@ fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
     xxh3_64(record_key(&live.record))
 }
 
-/// Sentinel `expires_at_ms` for "no expiry". Never a real timestamp:
-/// `u64::MAX` milliseconds since the epoch is ~584 million years out.
-const NO_EXPIRY: u64 = u64::MAX;
+/// Sentinel [`Live::expiry`] marking "never expires".
+const NEVER_EXPIRES: u32 = u32::MAX;
 
-/// The write-side counterpart to [`from_stored_expiry`]. `store::duration_ms`'s
-/// own `unwrap_or(u64::MAX)` overflow fallback, and a peer-supplied wire
-/// `expires_at_ms` of exactly `u64::MAX`, can both legitimately produce
-/// `Some(u64::MAX)`: functionally indistinguishable from "never" for any
-/// real clock, but distinct from `None` in `Option<u64>`'s own
-/// representation. Clamps at the storage boundary only, so `duration_ms`
-/// and wire ingest need no change: `None` becomes [`NO_EXPIRY`], `Some(v)`
-/// becomes `v.min(NO_EXPIRY - 1)`.
-fn to_stored_expiry(expires_at_ms: Option<u64>) -> u64 {
-    expires_at_ms.map_or(NO_EXPIRY, |v| v.min(NO_EXPIRY - 1))
+/// Sentinel [`Live::expiry`] marking a deadline that lies past
+/// [`MAX_INLINE_TTL_MS`] above the entry's own `wall_ms`: the real absolute
+/// millisecond deadline lives in `Stripe::long_ttl` under the entry's key
+/// instead of inline.
+const LONG_TTL: u32 = u32::MAX - 1;
+
+/// The largest inline delta [`encode_expiry`] stores above an entry's
+/// `wall_ms`, in milliseconds: `u32::MAX - 2`, ~49.71 days. A deadline
+/// further out than this stores [`LONG_TTL`] inline and its exact absolute
+/// value in `Stripe::long_ttl` instead.
+const MAX_INLINE_TTL_MS: u64 = (u32::MAX - 2) as u64;
+
+/// Encodes a write's absolute `expires_at_ms` relative to its own `wall_ms`,
+/// for [`Live::expiry`]: [`NEVER_EXPIRES`] for `None`, an exact millisecond
+/// delta above `wall_ms` when it fits within [`MAX_INLINE_TTL_MS`], or
+/// [`LONG_TTL`] paired with the exact absolute deadline otherwise. The
+/// second element of the returned pair is `Some` exactly when the caller
+/// must insert or refresh `Stripe::long_ttl`'s row for this key; the caller
+/// clears any stale row itself when it is `None`, since this function never
+/// sees the stripe.
+fn encode_expiry(wall_ms: u64, expires_at_ms: Option<u64>) -> (u32, Option<u64>) {
+    match expires_at_ms {
+        None => (NEVER_EXPIRES, None),
+        Some(exp) => match exp.checked_sub(wall_ms) {
+            // `exp < wall_ms` is a real, exercised case (a dead-on-arrival
+            // TTL, or a remote write whose expiry predates its own wall_ms):
+            // it cannot be an inline delta at all, since `expiry` only ever
+            // adds to `wall_ms`, so it always takes the exact side-table
+            // path rather than silently rounding up to `wall_ms`.
+            Some(delta) if delta <= MAX_INLINE_TTL_MS => (
+                u32::try_from(delta).expect("delta <= MAX_INLINE_TTL_MS < u32::MAX fits in a u32"),
+                None,
+            ),
+            _ => (LONG_TTL, Some(exp)),
+        },
+    }
 }
 
-/// The inverse of [`to_stored_expiry`]: `None` for the [`NO_EXPIRY`]
-/// sentinel, `Some(stored)` for any other value.
-fn from_stored_expiry(stored: u64) -> Option<u64> {
-    (stored != NO_EXPIRY).then_some(stored)
+/// The sole reader of a stored [`Live::expiry`]: `None` for
+/// [`NEVER_EXPIRES`], the exact deadline `long_ttl` holds under `key_bytes`
+/// for [`LONG_TTL`], or `wall_ms` plus the inline delta otherwise. Every
+/// call site that needs a live entry's real deadline goes through this, so
+/// millisecond precision never depends on where the deadline is stored.
+fn decode_expiry(
+    wall_ms: u64,
+    expiry: u32,
+    key_bytes: &[u8],
+    long_ttl: &HashMap<Bytes, u64>,
+) -> Option<u64> {
+    match expiry {
+        NEVER_EXPIRES => None,
+        LONG_TTL => long_ttl.get(key_bytes).copied(),
+        delta => Some(wall_ms + u64::from(delta)),
+    }
+}
+
+/// Truncates `now_ms` to [`Live::last_access_ms`]'s stored form: the low 32
+/// bits of the epoch millisecond clock. [`Engine::touch`] writes this on
+/// every access that needs recency tracked; [`idle_elapsed_ms`] is the only
+/// reader, and its wrapping subtraction recovers the true elapsed duration
+/// from the truncated stamp alone, so the truncation itself never loses
+/// precision for any gap under [`MAX_INLINE_TTL_MS`].
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the truncation is the point: idle_elapsed_ms recovers the true elapsed \
+              duration from the low 32 bits alone via a wrapping subtraction"
+)]
+fn touch_stamp(now_ms: u64) -> u32 {
+    now_ms as u32
+}
+
+/// How long ago, in milliseconds, an entry last touched at
+/// [`touch_stamp`]`(some earlier now)` was read, as of `now_ms`: a wrapping
+/// subtraction on the low 32 bits of both timestamps. Correct regardless of
+/// whether `now_ms` or the touch it is compared against crossed a
+/// `u32::MAX`-millisecond (~49.71 day) rollover in between, as long as the
+/// true gap between them is under that same ~49.71 days: [`clamp_tti_ms`]
+/// enforces exactly that ceiling on every configured time-to-idle, so this
+/// never has to compare against a `tti_ms` past the range it can represent.
+/// The sole reader of [`Live::last_access_ms`].
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "matches touch_stamp's own truncation of now_ms before the wrapping subtraction"
+)]
+fn idle_elapsed_ms(now_ms: u64, last_access_ms: u32) -> u64 {
+    u64::from((now_ms as u32).wrapping_sub(last_access_ms))
+}
+
+/// Clamps a configured time-to-idle to [`MAX_INLINE_TTL_MS`], the largest
+/// value [`idle_elapsed_ms`] ever returns. [`idle_elapsed_ms`]'s wrapping
+/// subtraction tops out at `u32::MAX`, so a `tti_ms` at or past that point
+/// never fires at all: the entry stays readable forever, not just late.
+/// [`crate::CacheBuilder::tti`] takes an unbounded `Duration` with no
+/// validation of its own; [`Engine::new`] is the one place this ceiling gets
+/// enforced, since `idle_elapsed_ms` is the sole reader of a stored
+/// `last_access_ms`.
+fn clamp_tti_ms(tti_ms: u64) -> u64 {
+    tti_ms.min(MAX_INLINE_TTL_MS)
 }
 
 /// Max inline payload length for [`Record`]. The `Inline` variant is a
-/// 1-byte length plus a `[u8; INLINE_CAP]` buffer, 31 bytes; `Heap` is a
+/// 1-byte length plus a `[u8; INLINE_CAP]` buffer, 23 bytes; `Heap` is a
 /// `Box<[u8]>`, a 16-byte fat pointer at 8-byte alignment. The enum's own
 /// discriminant costs nothing extra here (the compiler folds it into the
-/// `Inline` variant's own layout), so `Record` sits at exactly 32 bytes,
-/// pinned by `record_size_is_32_bytes` below.
-const INLINE_CAP: usize = 30;
+/// `Inline` variant's own layout), so `Record` sits at exactly 24 bytes,
+/// pinned by `record_size_is_24_bytes` below.
+const INLINE_CAP: usize = 22;
 
 /// A live entry's raw `LEN ++ KEY ++ VALUE` record bytes: inline for
 /// records up to [`INLINE_CAP`] bytes (the profiled 18-byte
@@ -262,13 +343,13 @@ mod record_tests {
     use super::*;
 
     #[test]
-    fn record_size_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<Record>(), 32);
+    fn record_size_is_24_bytes() {
+        assert_eq!(std::mem::size_of::<Record>(), 24);
     }
 
     #[test]
-    fn record_round_trips_inline_at_0_18_and_30_bytes() {
-        for len in [0usize, 18, 30] {
+    fn record_round_trips_inline_at_0_18_and_22_bytes() {
+        for len in [0usize, 18, 22] {
             let bytes = vec![b'x'; len];
             let record = Record::from_slice(&bytes);
             assert!(
@@ -280,8 +361,8 @@ mod record_tests {
     }
 
     #[test]
-    fn record_round_trips_heap_at_31_and_300_bytes() {
-        for len in [31usize, 300] {
+    fn record_round_trips_heap_at_23_and_300_bytes() {
+        for len in [23usize, 300] {
             let bytes = vec![b'y'; len];
             let record = Record::from_slice(&bytes);
             assert!(
@@ -412,12 +493,13 @@ struct Live<K, V> {
     /// stay bit-identical across independently computed replica merges,
     /// which `NodeId::merge_derived`'s determinism requirement needs.
     node: NodeId,
-    /// Absolute expiry in epoch milliseconds. [`NO_EXPIRY`] (`u64::MAX`)
-    /// means "never expires"; any other value is a real timestamp. Every
-    /// writer goes through [`to_stored_expiry`], every reader through
-    /// [`from_stored_expiry`], so the sentinel is never assigned by
-    /// accident.
-    expires_at_ms: u64,
+    /// This entry's expiry, flattened above `wall_ms`: [`NEVER_EXPIRES`]
+    /// means "never expires", [`LONG_TTL`] means the real absolute deadline
+    /// lives in `Stripe::long_ttl` under this entry's key, and any other
+    /// value is an exact millisecond delta above `wall_ms`. Every writer
+    /// goes through [`encode_expiry`], every reader through
+    /// [`decode_expiry`], so the sentinels are never assigned by accident.
+    expiry: u32,
     /// This write's version, flattened: [`Hlc::logical`], packed beside
     /// `weight` instead of paying `Hlc`'s own tail padding a second time.
     logical: u32,
@@ -425,10 +507,13 @@ struct Live<K, V> {
     /// value when a `Weigher` is configured, `0` while a spill hand-off
     /// for this entry is in flight.
     weight: u32,
-    /// Epoch milliseconds this entry was last read, written only when
-    /// [`Engine::tracks_last_access`] is true (TTI or a finite capacity
-    /// configured).
-    last_access_ms: AtomicU64,
+    /// [`touch_stamp`] of the epoch millisecond this entry was last read,
+    /// written only when [`Engine::tracks_last_access`] is true (TTI or a
+    /// finite capacity configured). Read back only through
+    /// [`idle_elapsed_ms`], never compared directly: a raw stamp alone
+    /// cannot tell which of two entries is colder once either has crossed
+    /// a rollover.
+    last_access_ms: AtomicU32,
     /// Whether `record` holds a value ([`EntryState::Resident`]) or points
     /// at disk with no value in RAM ([`EntryState::Spilled`]). Absent in a
     /// non-`spill` build: every entry is implicitly resident.
@@ -459,12 +544,13 @@ impl<K, V> Live<K, V> {
     }
 
     /// Builds a `Live` entry, splitting `ver` into its flattened fields and
-    /// wrapping `last_access_ms` in the entry's own `AtomicU64`.
+    /// storing `last_access_ms` through [`touch_stamp`] in the entry's own
+    /// `AtomicU32`.
     #[allow(clippy::too_many_arguments)]
     fn new(
         record: Record,
         ver: Hlc,
-        expires_at_ms: u64,
+        expiry: u32,
         weight: u32,
         last_access_ms: u64,
         #[cfg(feature = "spill")] state: EntryState,
@@ -473,10 +559,10 @@ impl<K, V> Live<K, V> {
             record,
             wall_ms: ver.wall_ms,
             node: ver.node,
-            expires_at_ms,
+            expiry,
             logical: ver.logical,
             weight,
-            last_access_ms: AtomicU64::new(last_access_ms),
+            last_access_ms: AtomicU32::new(touch_stamp(last_access_ms)),
             #[cfg(feature = "spill")]
             state,
             _marker: PhantomData,
@@ -588,6 +674,15 @@ pub(crate) struct Stripe<K, V> {
     live: HashTable<Live<K, V>>,
     tombstones: HashMap<Bytes, Tombstone>,
     inflight: HashMap<Bytes, Arc<Inflight<V>>>,
+    /// The absolute `expires_at_ms` for every currently-live entry whose
+    /// [`Live::expiry`] holds the [`LONG_TTL`] marker: a deadline more than
+    /// [`MAX_INLINE_TTL_MS`] out, too far to fit the inline delta. Cleared
+    /// at every removal, expiry, eviction, release, and overwrite site that
+    /// touches the entry it belongs to, so no row ever outlives its entry;
+    /// [`decode_expiry`] is the only reader. `HashMap::new()`, zero
+    /// allocation until the first long-TTL write, matching `tombstones` and
+    /// `inflight`'s own pattern.
+    long_ttl: HashMap<Bytes, u64>,
     /// The minimum `expires_at_ms` among this stripe's live entries, `u64::MAX`
     /// if none. A lower bound, not necessarily tight, since only
     /// [`Engine::sweep`] recomputes it exactly.
@@ -600,6 +695,7 @@ impl<K, V> Stripe<K, V> {
             live: HashTable::new(),
             tombstones: HashMap::new(),
             inflight: HashMap::new(),
+            long_ttl: HashMap::new(),
             next_expiry_ms: u64::MAX,
         }
     }
@@ -617,15 +713,23 @@ struct RemovedLive {
     was_spilled: bool,
 }
 
-/// Removes the live entry at `key_bytes`, hashing to `hash`.
+/// Removes the live entry at `key_bytes`, hashing to `hash`, and clears any
+/// `long_ttl` row it held: the one place every removal path
+/// (`apply_tombstone`, `invalidate`, `invalidate_local`, and `apply_put`'s
+/// and `complete_fresh_load`'s own displacement) funnels through, so none of
+/// them can forget the side-table cleanup individually.
 fn remove_live<K, V>(
-    table: &mut HashTable<Live<K, V>>,
+    stripe: &mut Stripe<K, V>,
     hash: u64,
     key_bytes: &[u8],
 ) -> Option<RemovedLive> {
-    match table.entry(hash, |l| record_key(&l.record) == key_bytes, hasher_for) {
+    match stripe
+        .live
+        .entry(hash, |l| record_key(&l.record) == key_bytes, hasher_for)
+    {
         Entry::Occupied(occ) => {
             let (removed, _vacant) = occ.remove();
+            stripe.long_ttl.remove(key_bytes);
             Some(RemovedLive {
                 weight: removed.weight,
                 ver: removed.ver(),
@@ -968,7 +1072,11 @@ fn peek_stored_seed<K, V>(
     };
     #[cfg(not(feature = "spill"))]
     let encoded = record_value_bytes(&live.record);
-    Some((live.ver(), encoded, from_stored_expiry(live.expires_at_ms)))
+    Some((
+        live.ver(),
+        encoded,
+        decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
+    ))
 }
 
 /// [`Engine::apply_many`]'s seed lookup: for every `runs` entry long enough
@@ -1077,15 +1185,21 @@ fn prefold_batch<K, V: DeserializeOwned>(
 /// Whether a read of `live` at `now_ms` sees nothing: past its expiry, or
 /// idle for `tti_ms` or longer. Lazy expiry and idle eviction both hinge on
 /// this; a sweep only reclaims what it already reports absent.
-fn absent_at<K, V>(live: &Live<K, V>, tti_ms: Option<u64>, now_ms: u64) -> bool {
-    if let Some(exp) = from_stored_expiry(live.expires_at_ms)
+fn absent_at<K, V>(
+    live: &Live<K, V>,
+    key_bytes: &[u8],
+    long_ttl: &HashMap<Bytes, u64>,
+    tti_ms: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    if let Some(exp) = decode_expiry(live.wall_ms, live.expiry, key_bytes, long_ttl)
         && now_ms >= exp
     {
         return true;
     }
     if let Some(tti) = tti_ms {
         let last = live.last_access_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) >= tti {
+        if idle_elapsed_ms(now_ms, last) >= tti {
             return true;
         }
     }
@@ -1441,11 +1555,12 @@ where
                 };
                 #[cfg(not(feature = "spill"))]
                 let encoded = Some(record_value_bytes(&l.record));
+                let kb = key_bytes.as_ref();
                 (
                     l.ver(),
                     encoded,
-                    from_stored_expiry(l.expires_at_ms),
-                    !absent_at(l, ctx.tti_ms, ctx.now_ms),
+                    decode_expiry(l.wall_ms, l.expiry, kb, &stripe.long_ttl),
+                    !absent_at(l, kb, &stripe.long_ttl, ctx.tti_ms, ctx.now_ms),
                 )
             })
     } else {
@@ -1557,12 +1672,18 @@ where
     } = put;
     let weight = ctx.weigher.map_or(1, |w| w(&key, &value));
     let removed = if had_live {
-        remove_live(&mut stripe.live, hash, key_bytes.as_ref())
+        remove_live(stripe, hash, key_bytes.as_ref())
     } else {
         None
     };
     let displaced_spilled = removed.as_ref().is_some_and(|r| r.was_spilled);
     let old_weight = removed.map(|r| r.weight);
+    // `remove_live` already cleared any stale `long_ttl` row this write
+    // displaces; only a genuinely long TTL needs a fresh one.
+    let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
+    if let Some(deadline) = long_ttl_value {
+        stripe.long_ttl.insert(key_bytes.clone(), deadline);
+    }
     // A fresh write always installs resident: spilling only ever happens
     // through sampled eviction, never directly on a write.
     stripe.live.insert_unique(
@@ -1570,7 +1691,7 @@ where
         Live::new(
             build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
             ver,
-            to_stored_expiry(expires_at_ms),
+            expiry,
             weight,
             ctx.now_ms,
             #[cfg(feature = "spill")]
@@ -1618,7 +1739,7 @@ where
         key_bytes,
     } = entry;
     let mut displaced_spilled = false;
-    if had_live && let Some(removed) = remove_live(&mut stripe.live, hash, key_bytes.as_ref()) {
+    if had_live && let Some(removed) = remove_live(stripe, hash, key_bytes.as_ref()) {
         ctx.total_weight
             .fetch_sub(u64::from(removed.weight), Ordering::Relaxed);
         ctx.live_count.fetch_sub(1, Ordering::Relaxed);
@@ -1695,6 +1816,9 @@ pub(crate) struct Engine<K, V> {
     total_weight: AtomicU64,
     live_count: AtomicU64,
     max_capacity: u64,
+    /// The configured time-to-idle, clamped by [`clamp_tti_ms`] to
+    /// [`MAX_INLINE_TTL_MS`] so it always sits inside the range
+    /// [`idle_elapsed_ms`] compares correctly against.
     tti_ms: Option<u64>,
     weigher: Option<Weigher<K, V>>,
     evict_cursor: AtomicU64,
@@ -1824,7 +1948,7 @@ where
             total_weight: AtomicU64::new(0),
             live_count: AtomicU64::new(0),
             max_capacity,
-            tti_ms: tti.map(super::duration_ms),
+            tti_ms: tti.map(|d| clamp_tti_ms(super::duration_ms(d))),
             weigher,
             // Any nonzero seed; xorshift64* never recovers from a zero state.
             evict_cursor: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
@@ -1962,8 +2086,14 @@ where
         self.pending_spill_weight_or_zero()
     }
 
-    fn is_absent(&self, live: &Live<K, V>, now_ms: u64) -> bool {
-        absent_at(live, self.tti_ms, now_ms)
+    fn is_absent(
+        &self,
+        live: &Live<K, V>,
+        key_bytes: &[u8],
+        long_ttl: &HashMap<Bytes, u64>,
+        now_ms: u64,
+    ) -> bool {
+        absent_at(live, key_bytes, long_ttl, self.tti_ms, now_ms)
     }
 
     /// Whether a read updates `last_access_ms`, only when it is consulted for
@@ -1974,7 +2104,8 @@ where
 
     fn touch(&self, live: &Live<K, V>, now_ms: u64) {
         if self.tracks_last_access() {
-            live.last_access_ms.store(now_ms, Ordering::Relaxed);
+            live.last_access_ms
+                .store(touch_stamp(now_ms), Ordering::Relaxed);
         }
     }
 
@@ -1999,7 +2130,7 @@ where
         let live = stripe
             .live
             .find(hash, |l| record_key(&l.record) == key_bytes)?;
-        if self.is_absent(live, now_ms) {
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
             return None;
         }
         if !is_resident(live) {
@@ -2023,7 +2154,7 @@ where
         else {
             return false;
         };
-        if self.is_absent(live, now_ms) {
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
             return false;
         }
         self.touch(live, now_ms);
@@ -2040,7 +2171,9 @@ where
                 stripe
                     .live
                     .iter()
-                    .filter(|live| !self.is_absent(live, now_ms))
+                    .filter(|live| {
+                        !self.is_absent(live, record_key(&live.record), &stripe.long_ttl, now_ms)
+                    })
                     .map(|live| decode_key(record_key(&live.record))),
             );
         }
@@ -2056,7 +2189,9 @@ where
                 stripe
                     .live
                     .iter()
-                    .filter(|live| !self.is_absent(live, now_ms))
+                    .filter(|live| {
+                        !self.is_absent(live, record_key(&live.record), &stripe.long_ttl, now_ms)
+                    })
                     .map(|live| decode_key(record_key(&live.record)))
                     .collect()
             };
@@ -2084,14 +2219,14 @@ where
         let live = stripe
             .live
             .find(hash, |l| record_key(&l.record) == key_bytes)?;
-        if self.is_absent(live, now_ms) {
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
             return None;
         }
         is_resident(live).then(|| WireRecord {
             key: Bytes::copy_from_slice(key_bytes),
             value: Some(record_value_bytes(&live.record)),
             ver: live.ver(),
-            expires_at_ms: from_stored_expiry(live.expires_at_ms),
+            expires_at_ms: decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl),
         })
     }
 
@@ -2109,7 +2244,14 @@ where
                     stripe
                         .live
                         .iter()
-                        .filter(|live| !self.is_absent(live, now_ms))
+                        .filter(|live| {
+                            !self.is_absent(
+                                live,
+                                record_key(&live.record),
+                                &stripe.long_ttl,
+                                now_ms,
+                            )
+                        })
                         .map(|live| KeyVersion {
                             key: record_key_bytes(&live.record),
                             version: live.ver(),
@@ -2153,7 +2295,9 @@ where
             let live_entries = stripe
                 .live
                 .iter()
-                .filter(|live| !self.is_absent(live, now_ms))
+                .filter(|live| {
+                    !self.is_absent(live, record_key(&live.record), &stripe.long_ttl, now_ms)
+                })
                 .map(|live| (record_key_bytes(&live.record), live.ver()));
             let tombstone_entries = stripe
                 .tombstones
@@ -2234,13 +2378,20 @@ where
                 stripe
                     .live
                     .iter()
-                    .filter(|live| !self.is_absent(live, now_ms))
+                    .filter(|live| {
+                        !self.is_absent(live, record_key(&live.record), &stripe.long_ttl, now_ms)
+                    })
                     .filter(|&live| is_resident(live))
                     .map(|live| WireRecord {
                         key: record_key_bytes(&live.record),
                         value: Some(record_value_bytes(&live.record)),
                         ver: live.ver(),
-                        expires_at_ms: from_stored_expiry(live.expires_at_ms),
+                        expires_at_ms: decode_expiry(
+                            live.wall_ms,
+                            live.expiry,
+                            record_key(&live.record),
+                            &stripe.long_ttl,
+                        ),
                     }),
             );
             out.extend(stripe.tombstones.iter().map(|(key_bytes, t)| WireRecord {
@@ -2268,12 +2419,19 @@ where
                 stripe
                     .live
                     .iter()
-                    .filter(|live| !self.is_absent(live, now_ms))
+                    .filter(|live| {
+                        !self.is_absent(live, record_key(&live.record), &stripe.long_ttl, now_ms)
+                    })
                     .filter_map(|live| match &live.state {
                         EntryState::Spilled(loc) => Some((
                             record_key_bytes(&live.record),
                             live.ver(),
-                            from_stored_expiry(live.expires_at_ms),
+                            decode_expiry(
+                                live.wall_ms,
+                                live.expiry,
+                                record_key(&live.record),
+                                &stripe.long_ttl,
+                            ),
                             *loc,
                         )),
                         EntryState::Resident => None,
@@ -2304,13 +2462,20 @@ where
                 stripe
                     .live
                     .iter()
-                    .filter(|live| !self.is_absent(live, now_ms))
+                    .filter(|live| {
+                        !self.is_absent(live, record_key(&live.record), &stripe.long_ttl, now_ms)
+                    })
                     .filter(|live| is_resident(live))
                     .map(|live| {
                         (
                             record_key_bytes(&live.record),
                             live.ver(),
-                            from_stored_expiry(live.expires_at_ms),
+                            decode_expiry(
+                                live.wall_ms,
+                                live.expiry,
+                                record_key(&live.record),
+                                &stripe.long_ttl,
+                            ),
                             record_value_bytes(&live.record),
                         )
                     }),
@@ -2362,7 +2527,9 @@ where
             let hash = hash_key_bytes(key_bytes.as_ref());
             let stripe_idx = stripe_index_from_hash(hash);
             let outcome = {
-                let mut stripe = self.stripes[stripe_idx].write();
+                let mut guard = self.stripes[stripe_idx].write();
+                // One explicit reborrow: see `sweep`'s identical comment.
+                let stripe: &mut Stripe<K, V> = &mut guard;
                 if stripe.tombstones.contains_key(key_bytes.as_ref()) {
                     FinalizeWriteOutcome::DroppedTombstoned
                 } else if let Some(live) = stripe
@@ -2371,7 +2538,7 @@ where
                 {
                     if live.ver() != ver || !matches!(live.state, EntryState::Resident) {
                         FinalizeWriteOutcome::DroppedVersionChanged
-                    } else if self.is_absent(live, now_ms) {
+                    } else if self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms) {
                         FinalizeWriteOutcome::DroppedExpired
                     } else {
                         let weight = live.weight;
@@ -2434,7 +2601,7 @@ where
             else {
                 continue;
             };
-            if self.is_absent(live, now_ms) {
+            if self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms) {
                 continue;
             }
             match &live.state {
@@ -2442,13 +2609,23 @@ where
                     key: key_bytes.clone(),
                     value: Some(record_value_bytes(&live.record)),
                     ver: live.ver(),
-                    expires_at_ms: from_stored_expiry(live.expires_at_ms),
+                    expires_at_ms: decode_expiry(
+                        live.wall_ms,
+                        live.expiry,
+                        key_bytes.as_ref(),
+                        &stripe.long_ttl,
+                    ),
                 }),
                 EntryState::Spilled(loc) => {
                     spilled.push((
                         key_bytes.clone(),
                         live.ver(),
-                        from_stored_expiry(live.expires_at_ms),
+                        decode_expiry(
+                            live.wall_ms,
+                            live.expiry,
+                            key_bytes.as_ref(),
+                            &stripe.long_ttl,
+                        ),
                         *loc,
                     ));
                 }
@@ -2487,33 +2664,46 @@ where
             if !due && self.tti_ms.is_none() {
                 continue;
             }
-            let mut stripe = stripe_lock.write();
+            let mut guard = stripe_lock.write();
+            // One explicit reborrow: `stripe.live`/`stripe.long_ttl` below
+            // are then plain, disjoint field projections on a real `&mut
+            // Stripe`, not two separate `DerefMut` calls through the lock
+            // guard, which the borrow checker cannot split field-by-field.
+            let stripe: &mut Stripe<K, V> = &mut guard;
             let mut removed_weight = 0u64;
             let mut removed_count = 0u64;
             let mut removed_spilled = 0usize;
             let mut new_next = u64::MAX;
+            let mut cleared_long_ttl: Vec<Bytes> = Vec::new();
             stripe.live.retain(|live| {
-                if self.is_absent(live, now_ms) {
-                    let part = part_index_from_hash(hash_key_bytes(record_key(&live.record)));
-                    self.digest[digest_slot(idx, part)].fetch_xor(
-                        entry_fingerprint(record_key(&live.record), live.ver()),
-                        Ordering::Relaxed,
-                    );
+                let key_bytes = record_key(&live.record);
+                if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+                    let part = part_index_from_hash(hash_key_bytes(key_bytes));
+                    self.digest[digest_slot(idx, part)]
+                        .fetch_xor(entry_fingerprint(key_bytes, live.ver()), Ordering::Relaxed);
                     removed_weight += u64::from(live.weight);
                     removed_count += 1;
                     if is_spilled(live) {
                         removed_spilled += 1;
                     }
+                    if live.expiry == LONG_TTL {
+                        cleared_long_ttl.push(Bytes::copy_from_slice(key_bytes));
+                    }
                     false
                 } else {
-                    if let Some(exp) = from_stored_expiry(live.expires_at_ms) {
+                    if let Some(exp) =
+                        decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl)
+                    {
                         new_next = new_next.min(exp);
                     }
                     true
                 }
             });
+            for key_bytes in &cleared_long_ttl {
+                stripe.long_ttl.remove(key_bytes.as_ref());
+            }
             stripe.next_expiry_ms = new_next;
-            drop(stripe);
+            drop(guard);
             if removed_weight > 0 {
                 self.total_weight
                     .fetch_sub(removed_weight, Ordering::Relaxed);
@@ -2632,7 +2822,11 @@ where
         let bucket = stripe_index_from_hash(hash);
         let part = part_index_from_hash(hash);
         let (old_weight, new_weight) = {
-            let mut stripe = self.stripes[bucket].write();
+            let mut guard = self.stripes[bucket].write();
+            // One explicit reborrow: see `sweep`'s identical comment for why
+            // this, rather than `guard.live`/`guard.long_ttl` directly, is
+            // what lets the two fields below borrow disjointly.
+            let stripe: &mut Stripe<K, V> = &mut guard;
             let Some(live) = stripe
                 .live
                 .find_mut(hash, |l| record_key(&l.record) == key_bytes)
@@ -2644,9 +2838,29 @@ where
             }
             let new_weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
             let old_weight = live.weight;
+            let old_wall_ms = live.wall_ms;
+            let old_expiry = live.expiry;
             live.record = build_resident_record(record_key(&live.record), encoded.as_ref());
             live.weight = new_weight;
             live.set_ver(new_ver);
+            // `new_ver` carries a new `wall_ms`, and `expiry` is a delta
+            // above it: re-deriving `expiry` from the entry's real absolute
+            // deadline, rather than carrying the old delta forward
+            // unchanged, is what keeps that deadline exact across the
+            // version bump.
+            let abs_expiry = decode_expiry(old_wall_ms, old_expiry, key_bytes, &stripe.long_ttl);
+            let (expiry, long_ttl_value) = encode_expiry(new_ver.wall_ms, abs_expiry);
+            live.expiry = expiry;
+            match long_ttl_value {
+                Some(deadline) => {
+                    stripe
+                        .long_ttl
+                        .insert(Bytes::copy_from_slice(key_bytes), deadline);
+                }
+                None => {
+                    stripe.long_ttl.remove(key_bytes);
+                }
+            }
             (old_weight, new_weight)
         };
         self.digest[digest_slot(bucket, part)].fetch_xor(
@@ -2762,7 +2976,12 @@ where
             hash,
             key_bytes: record_key_bytes(&live.record),
             ver: live.ver(),
-            expires_at_ms: from_stored_expiry(live.expires_at_ms),
+            expires_at_ms: decode_expiry(
+                live.wall_ms,
+                live.expiry,
+                victim_bytes.as_ref(),
+                &stripe.long_ttl,
+            ),
             encoded,
             weight,
             admitted_bytes,
@@ -2856,6 +3075,7 @@ where
             return VictimOutcome::Vanished;
         };
         let (removed, _vacant) = occ.remove();
+        stripe.long_ttl.remove(victim_bytes.as_ref());
         let part = part_index_from_hash(hash);
         self.digest[digest_slot(bucket, part)].fetch_xor(
             entry_fingerprint(record_key(&removed.record), removed.ver()),
@@ -2896,22 +3116,26 @@ where
                       test call site already uses"
         )
     )]
-    fn evict_one_sampled(&self, bucket: usize) -> EvictOutcome {
-        self.evict_one_sampled_with_reservation(bucket, None)
+    fn evict_one_sampled(&self, bucket: usize, now_ms: u64) -> EvictOutcome {
+        self.evict_one_sampled_with_reservation(bucket, None, now_ms)
     }
 
     /// [`Engine::evict_one_sampled`], threading `reservation` through to
-    /// [`Engine::evict_victim_locked`] for the one victim this samples.
+    /// [`Engine::evict_victim_locked`] for the one victim this samples. The
+    /// coldest pick is the sampled candidate with the largest
+    /// [`idle_elapsed_ms`] as of `now_ms`, correct across a `last_access_ms`
+    /// rollover on any candidate.
     fn evict_one_sampled_with_reservation(
         &self,
         bucket: usize,
         reservation: Option<&mut Reservation<'_>>,
+        now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
         let Some(victim_bytes) = self
             .sample_candidates(&stripe, EVICTION_SAMPLE)
-            .min_by_key(|live| live.last_access_ms.load(Ordering::Relaxed))
+            .max_by_key(|live| idle_elapsed_ms(now_ms, live.last_access_ms.load(Ordering::Relaxed)))
             .map(|live| record_key_bytes(&live.record))
         else {
             return EvictOutcome::default();
@@ -2964,8 +3188,8 @@ where
                       test call site already uses"
         )
     )]
-    fn evict_one_scanning(&self, bucket: usize) -> Option<EvictOutcome> {
-        self.evict_one_scanning_with_reservation(bucket, None)
+    fn evict_one_scanning(&self, bucket: usize, now_ms: u64) -> Option<EvictOutcome> {
+        self.evict_one_scanning_with_reservation(bucket, None, now_ms)
     }
 
     /// [`Engine::evict_one_scanning`], reborrowing `reservation` into each
@@ -2980,12 +3204,16 @@ where
         &self,
         bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
+        now_ms: u64,
     ) -> Option<EvictOutcome> {
         (0..BUCKET_COUNT)
             .map(|step| (bucket + step) % BUCKET_COUNT)
             .find_map(|candidate| {
-                let outcome =
-                    self.evict_one_sampled_with_reservation(candidate, reservation.as_deref_mut());
+                let outcome = self.evict_one_sampled_with_reservation(
+                    candidate,
+                    reservation.as_deref_mut(),
+                    now_ms,
+                );
                 (!outcome.made_no_progress() || outcome.deficit > 0).then_some(outcome)
             })
     }
@@ -3006,19 +3234,23 @@ where
                       test call site already uses"
         )
     )]
-    fn evict_batch_sampled(&self, bucket: usize, over_by: u64) -> EvictOutcome {
-        self.evict_batch_sampled_with_reservation(bucket, over_by, None)
+    fn evict_batch_sampled(&self, bucket: usize, over_by: u64, now_ms: u64) -> EvictOutcome {
+        self.evict_batch_sampled_with_reservation(bucket, over_by, None, now_ms)
     }
 
     /// [`Engine::evict_batch_sampled`], reborrowing `reservation` into each
     /// victim's own [`Engine::evict_victim_locked`] call in turn, so the
     /// same pre-lock budget carries across every victim this one lock hold
-    /// evicts, spending down as `try_spill_victim` commits each one.
+    /// evicts, spending down as `try_spill_victim` commits each one. Victims
+    /// are ranked coldest-first by [`idle_elapsed_ms`] as of `now_ms`,
+    /// descending, correct across a `last_access_ms` rollover on any
+    /// candidate.
     fn evict_batch_sampled_with_reservation(
         &self,
         bucket: usize,
         over_by: u64,
         mut reservation: Option<&mut Reservation<'_>>,
+        now_ms: u64,
     ) -> EvictOutcome {
         self.note_eviction_lock_acquisition();
         let mut stripe = self.stripes[bucket].write();
@@ -3027,7 +3259,7 @@ where
             .map(|live| {
                 (
                     record_key_bytes(&live.record),
-                    live.last_access_ms.load(Ordering::Relaxed),
+                    idle_elapsed_ms(now_ms, live.last_access_ms.load(Ordering::Relaxed)),
                     live.weight,
                 )
             })
@@ -3035,7 +3267,7 @@ where
         if sampled.is_empty() {
             return EvictOutcome::default();
         }
-        sampled.sort_unstable_by_key(|&(_, last_access, _)| last_access);
+        sampled.sort_unstable_by_key(|&(_, idle, _)| std::cmp::Reverse(idle));
         let weights: Vec<u32> = sampled.iter().map(|&(_, _, w)| w).collect();
         let victims = eviction_batch_size(over_by, &weights);
 
@@ -3135,8 +3367,8 @@ where
     /// [`Engine::enforce_capacity_with_reservation`] returns: always `0`
     /// with no reservation in play, since nothing ever constructs
     /// [`VictimOutcome::PendingReservation`] in that case.
-    pub(crate) fn enforce_capacity(&self, start_bucket: usize) {
-        let _ = self.enforce_capacity_with_reservation(start_bucket, None);
+    pub(crate) fn enforce_capacity(&self, start_bucket: usize, now_ms: u64) {
+        let _ = self.enforce_capacity_with_reservation(start_bucket, None, now_ms);
     }
 
     /// [`Engine::enforce_capacity`], reborrowing `reservation` into every
@@ -3167,6 +3399,7 @@ where
         &self,
         start_bucket: usize,
         mut reservation: Option<&mut Reservation<'_>>,
+        now_ms: u64,
     ) -> u64 {
         if self.max_capacity == u64::MAX {
             return 0;
@@ -3184,6 +3417,7 @@ where
                 bucket,
                 over_by,
                 reservation.as_deref_mut(),
+                now_ms,
             );
             if batch_outcome.deficit > 0 {
                 let total = self.total_weight.load(Ordering::Relaxed);
@@ -3199,7 +3433,11 @@ where
                 if defer_to_flusher(self.pending_spill_weight_or_zero()) {
                     return 0;
                 }
-                match self.evict_one_scanning_with_reservation(bucket, reservation.as_deref_mut()) {
+                match self.evict_one_scanning_with_reservation(
+                    bucket,
+                    reservation.as_deref_mut(),
+                    now_ms,
+                ) {
                     None => return 0,
                     Some(outcome) if outcome.deficit > 0 => return outcome.deficit,
                     Some(_) => {}
@@ -3369,7 +3607,7 @@ where
             }
         }
         let deficit = if wrote {
-            self.enforce_capacity_with_reservation(bucket, reservation)
+            self.enforce_capacity_with_reservation(bucket, reservation, now_ms)
         } else {
             0
         };
@@ -3417,7 +3655,7 @@ where
         if !had_live {
             return None;
         }
-        let removed = remove_live(&mut stripe.live, hash, key_bytes)?;
+        let removed = remove_live(&mut stripe, hash, key_bytes)?;
         drop(stripe);
         let ver_out = removed.ver;
         let part = part_index_from_hash(hash);
@@ -3431,7 +3669,7 @@ where
     pub(crate) fn invalidate_local(&self, key_bytes: &[u8], hash: u64) {
         let bucket = stripe_index_from_hash(hash);
         let mut stripe = self.stripes[bucket].write();
-        if let Some(removed) = remove_live(&mut stripe.live, hash, key_bytes) {
+        if let Some(removed) = remove_live(&mut stripe, hash, key_bytes) {
             drop(stripe);
             let part = part_index_from_hash(hash);
             self.account_removed(bucket, part, key_bytes, &removed, false);
@@ -3472,6 +3710,7 @@ where
                 }
                 let removed_tombstones = stripe.tombstones.len();
                 stripe.tombstones.clear();
+                stripe.long_ttl.clear();
                 stripe.next_expiry_ms = u64::MAX;
                 (
                     removed_weight,
@@ -3513,7 +3752,7 @@ where
         if let Some(live) = stripe
             .live
             .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
-            && !self.is_absent(live, now_ms)
+            && !self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms)
             && is_resident(live)
         {
             let value = decode_value(record_value(live.record.as_slice()));
@@ -3588,7 +3827,7 @@ where
                     entry_fingerprint(key_bytes.as_ref(), t.ver),
                     Ordering::Relaxed,
                 );
-            } else if let Some(removed) = remove_live(&mut stripe.live, hash, key_bytes.as_ref()) {
+            } else if let Some(removed) = remove_live(&mut stripe, hash, key_bytes.as_ref()) {
                 had_live = true;
                 // A replacement is about to land below, so `live_count` nets
                 // to no change: `keep_count = true`.
@@ -3602,12 +3841,17 @@ where
                 Ordering::Relaxed,
             );
             let weight = self.weigher.as_ref().map_or(1, |w| w(key, &value));
+            // `remove_live` already cleared any stale `long_ttl` row above.
+            let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
+            if let Some(deadline) = long_ttl_value {
+                stripe.long_ttl.insert(key_bytes.clone(), deadline);
+            }
             stripe.live.insert_unique(
                 hash,
                 Live::new(
                     build_resident_record(key_bytes.as_ref(), encoded.as_ref()),
                     ver,
-                    to_stored_expiry(expires_at_ms),
+                    expiry,
                     weight,
                     now_ms,
                     #[cfg(feature = "spill")]
@@ -3623,7 +3867,7 @@ where
             had_live
         };
         inflight.finish();
-        self.enforce_capacity(bucket);
+        self.enforce_capacity(bucket, now_ms);
         had_live
     }
 
@@ -3662,7 +3906,7 @@ where
         let live = stripe
             .live
             .find(hash, |l| record_key(&l.record) == key_bytes)?;
-        if self.is_absent(live, now_ms) {
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
             return None;
         }
         match &live.state {
@@ -3828,12 +4072,16 @@ where
             {
                 false
             } else {
+                let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
+                if let Some(deadline) = long_ttl_value {
+                    stripe.long_ttl.insert(key_bytes.clone(), deadline);
+                }
                 stripe.live.insert_unique(
                     hash,
                     Live::new(
                         build_key_only_record(key_bytes.as_ref()),
                         ver,
-                        to_stored_expiry(expires_at_ms),
+                        expiry,
                         0,
                         ver.wall_ms,
                         EntryState::Spilled(loc),
@@ -3908,6 +4156,7 @@ where
                     continue;
                 }
                 let (removed_entry, _vacant) = occ.remove();
+                stripe.long_ttl.remove(key_bytes.as_ref());
                 let part = part_index_from_hash(hash);
                 self.digest[digest_slot(bucket, part)].fetch_xor(
                     entry_fingerprint(record_key(&removed_entry.record), removed_entry.ver()),
@@ -4084,12 +4333,16 @@ where
         let part = part_index_from_hash(hash);
         {
             let mut stripe = self.stripes[bucket].write();
+            let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
+            if let Some(deadline) = long_ttl_value {
+                stripe.long_ttl.insert(key_bytes.clone(), deadline);
+            }
             stripe.live.insert_unique(
                 hash,
                 Live::new(
                     build_key_only_record(key_bytes.as_ref()),
                     ver,
-                    to_stored_expiry(expires_at_ms),
+                    expiry,
                     0,
                     now_ms,
                     EntryState::Spilled(loc),
@@ -4807,6 +5060,399 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_long_ttl_entry_also_clears_its_side_table_row() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(1);
+        let hash = hash_key_bytes(kb.as_ref());
+        let bucket = stripe_index_from_hash(hash);
+        let long_deadline = MAX_INLINE_TTL_MS + 5_000;
+        let _ = put(
+            &engine,
+            1,
+            kb.clone(),
+            "a".into(),
+            hlc(1, 1),
+            Some(long_deadline),
+            0,
+        );
+        assert!(
+            engine
+                .stripe_lock(bucket)
+                .read()
+                .long_ttl
+                .contains_key(kb.as_ref()),
+            "a long TTL write leaves its absolute deadline in the side table"
+        );
+
+        engine.invalidate_local(kb.as_ref(), hash);
+
+        assert!(
+            !engine
+                .stripe_lock(bucket)
+                .read()
+                .long_ttl
+                .contains_key(kb.as_ref()),
+            "removing the entry clears its side-table row"
+        );
+    }
+
+    #[test]
+    fn sweep_of_an_expired_long_ttl_entry_clears_its_side_table_row() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let kb = key_bytes(1);
+        let hash = hash_key_bytes(kb.as_ref());
+        let bucket = stripe_index_from_hash(hash);
+        let deadline = MAX_INLINE_TTL_MS + 5_000;
+        let _ = put(
+            &engine,
+            1,
+            kb.clone(),
+            "a".into(),
+            hlc(1, 1),
+            Some(deadline),
+            0,
+        );
+        assert!(
+            engine
+                .stripe_lock(bucket)
+                .read()
+                .long_ttl
+                .contains_key(kb.as_ref())
+        );
+
+        engine.sweep(deadline + 1);
+
+        assert_eq!(engine.get(&1, deadline + 1), None, "swept: reads as absent");
+        assert!(
+            !engine
+                .stripe_lock(bucket)
+                .read()
+                .long_ttl
+                .contains_key(kb.as_ref()),
+            "sweep clears the side-table row of what it expires"
+        );
+    }
+
+    #[test]
+    fn sweep_of_a_tti_idle_long_ttl_entry_clears_its_side_table_row() {
+        // A TTI far shorter than the entry's own long-TTL deadline: the
+        // entry goes idle and gets swept through `absent_at`'s TTI branch
+        // long before its absolute deadline is anywhere close.
+        let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
+        let kb = key_bytes(1);
+        let hash = hash_key_bytes(kb.as_ref());
+        let bucket = stripe_index_from_hash(hash);
+        let deadline = MAX_INLINE_TTL_MS + 5_000;
+        let _ = put(
+            &engine,
+            1,
+            kb.clone(),
+            "a".into(),
+            hlc(1, 1),
+            Some(deadline),
+            0,
+        );
+        assert!(
+            engine
+                .stripe_lock(bucket)
+                .read()
+                .long_ttl
+                .contains_key(kb.as_ref()),
+            "a long TTL write leaves its absolute deadline in the side table"
+        );
+        let (entries_before, _) = engine.debug_totals();
+        assert_eq!(entries_before, 1);
+
+        // Idle past the 100ms TTI, nowhere near `deadline`.
+        engine.sweep(500);
+
+        let (entries_after, _) = engine.debug_totals();
+        assert_eq!(entries_after, 0, "sweep evicts the tti-idle entry");
+        assert_eq!(engine.get(&1, 500), None, "swept: reads as absent");
+        assert!(
+            !engine
+                .stripe_lock(bucket)
+                .read()
+                .long_ttl
+                .contains_key(kb.as_ref()),
+            "sweep clears the side-table row of what it evicts for idleness, \
+             not only what it expires"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario per named overwrite site (apply_put, complete_fresh_load, \
+                  compact_replace_if_current), matching the spec's single test name; splitting \
+                  it would only scatter the shared long_deadline setup"
+    )]
+    fn overwriting_a_long_ttl_key_clears_its_stale_side_table_row() {
+        let long_deadline = MAX_INLINE_TTL_MS + 5_000;
+
+        // `apply_put`'s overwrite path.
+        {
+            let engine = engine_u32_string(u64::MAX, None);
+            let kb = key_bytes(1);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let _ = put(
+                &engine,
+                1,
+                kb.clone(),
+                "a".into(),
+                hlc(1, 1),
+                Some(long_deadline),
+                0,
+            );
+            assert!(
+                engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref())
+            );
+            let _ = put(&engine, 1, kb.clone(), "b".into(), hlc(2, 1), None, 0);
+            assert!(
+                !engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "apply_put clears the displaced entry's stale side-table row"
+            );
+        }
+
+        // `complete_fresh_load`'s overwrite path.
+        {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 2u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+                panic!("first caller becomes the owner");
+            };
+            let _ = put(
+                &engine,
+                key,
+                kb.clone(),
+                "a".into(),
+                hlc(1, 1),
+                Some(long_deadline),
+                0,
+            );
+            assert!(
+                engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref())
+            );
+            let encoded = Bytes::from(postcard::to_stdvec("loaded").expect("encode"));
+            let _ = engine.complete_fresh_load(
+                FreshLoad {
+                    key: &key,
+                    key_bytes: &kb,
+                    hash,
+                    ver: hlc(2, 1),
+                    value: "loaded".to_string(),
+                    encoded,
+                    expires_at_ms: None,
+                },
+                0,
+                &inflight,
+            );
+            assert!(
+                !engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "complete_fresh_load clears the displaced entry's stale side-table row"
+            );
+        }
+
+        // `compact_replace_if_current`'s path: a wall_ms jump alone, with no
+        // change to the real absolute deadline, can make a stored `LONG_TTL`
+        // row stale by making the same deadline representable inline again.
+        {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 3u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let _ = put(
+                &engine,
+                key,
+                kb.clone(),
+                "a".into(),
+                hlc(1, 1),
+                Some(long_deadline),
+                0,
+            );
+            assert!(
+                engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref())
+            );
+            let new_ver = hlc(long_deadline - 10, 1);
+            let replaced = engine.compact_replace_if_current(CompactReplace {
+                key: &key,
+                key_bytes: kb.as_ref(),
+                hash,
+                expected_ver: hlc(1, 1),
+                new_ver,
+                value: "compacted".to_string(),
+                encoded: Bytes::from(postcard::to_stdvec("compacted").expect("encode")),
+            });
+            assert!(replaced);
+            assert!(
+                !engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "compact_replace_if_current clears a row a wall_ms jump made stale"
+            );
+            assert_eq!(
+                engine.get(&key, long_deadline - 1),
+                Some("compacted".to_string()),
+                "still readable just before its unchanged absolute deadline"
+            );
+            assert_eq!(
+                engine.get(&key, long_deadline + 1),
+                None,
+                "expired exactly at its unchanged absolute deadline"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario per named overwrite site (apply_put, complete_fresh_load), \
+                  matching the spec's single test name; splitting it would only scatter the \
+                  shared long_deadline setup"
+    )]
+    fn overwriting_a_short_ttl_key_with_a_long_ttl_value_installs_its_side_table_row() {
+        let long_deadline = MAX_INLINE_TTL_MS + 5_000;
+
+        // `apply_put`'s overwrite path: a short-TTL live entry, then a fresh
+        // write past `MAX_INLINE_TTL_MS` lands on the same key.
+        {
+            let engine = engine_u32_string(u64::MAX, None);
+            let kb = key_bytes(1);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let _ = put(
+                &engine,
+                1,
+                kb.clone(),
+                "a".into(),
+                hlc(1, 1),
+                Some(5_000),
+                0,
+            );
+            assert!(
+                !engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "the displaced entry's TTL fit inline: no side-table row yet"
+            );
+            let _ = put(
+                &engine,
+                1,
+                kb.clone(),
+                "b".into(),
+                hlc(2, 1),
+                Some(long_deadline),
+                0,
+            );
+            assert_eq!(
+                engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .get(kb.as_ref())
+                    .copied(),
+                Some(long_deadline),
+                "apply_put installs a fresh side-table row when the new write is the long one"
+            );
+            assert_eq!(
+                engine.get(&1, long_deadline - 1),
+                Some("b".to_string()),
+                "still readable just before its long deadline"
+            );
+            assert_eq!(
+                engine.get(&1, long_deadline + 1),
+                None,
+                "expired exactly at its long deadline"
+            );
+        }
+
+        // `complete_fresh_load`'s overwrite path: a no-TTL live entry, then a
+        // fresh load installs a long TTL.
+        {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 2u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+                panic!("first caller becomes the owner");
+            };
+            let _ = put(&engine, key, kb.clone(), "a".into(), hlc(1, 1), None, 0);
+            assert!(
+                !engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "the displaced entry never expires: no side-table row yet"
+            );
+            let encoded = Bytes::from(postcard::to_stdvec("loaded").expect("encode"));
+            let _ = engine.complete_fresh_load(
+                FreshLoad {
+                    key: &key,
+                    key_bytes: &kb,
+                    hash,
+                    ver: hlc(2, 1),
+                    value: "loaded".to_string(),
+                    encoded,
+                    expires_at_ms: Some(long_deadline),
+                },
+                0,
+                &inflight,
+            );
+            assert_eq!(
+                engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .get(kb.as_ref())
+                    .copied(),
+                Some(long_deadline),
+                "complete_fresh_load installs a fresh side-table row when the new write is the long one"
+            );
+            assert_eq!(
+                engine.get(&key, long_deadline - 1),
+                Some("loaded".to_string()),
+                "still readable just before its long deadline"
+            );
+            assert_eq!(
+                engine.get(&key, long_deadline + 1),
+                None,
+                "expired exactly at its long deadline"
+            );
+        }
+    }
+
+    #[test]
     fn next_expiry_ms_skip_logic_leaves_stripes_with_nothing_due_untouched() {
         let engine = engine_u32_string(u64::MAX, None);
         let key = 1u32;
@@ -4875,7 +5521,7 @@ mod tests {
         assert_eq!(entries_before, 5);
         assert_eq!(weight_before, 25);
 
-        engine.enforce_capacity(target_bucket);
+        engine.enforce_capacity(target_bucket, 500);
 
         let (entries_after, weight_after) = engine.debug_totals();
         assert!(
@@ -5088,7 +5734,7 @@ mod tests {
         assert_eq!(entries_before, 9);
         assert_eq!(weight_before, 9);
 
-        engine.enforce_capacity(start_bucket);
+        engine.enforce_capacity(start_bucket, 500);
 
         let (entries_after, weight_after) = engine.debug_totals();
         assert!(
@@ -5575,7 +6221,7 @@ mod tests {
         );
         assert_eq!(engine.debug_totals().1, 15_500);
 
-        engine.enforce_capacity(start_bucket);
+        engine.enforce_capacity(start_bucket, 100);
 
         let (entries, weight) = engine.debug_totals();
         assert!(
@@ -5691,7 +6337,7 @@ mod tests {
         assert_eq!(entries_before, 50_000);
         assert_eq!(weight_before, 50_000);
 
-        engine.enforce_capacity(0);
+        engine.enforce_capacity(0, 0);
 
         let (entries_after, weight_after) = engine.debug_totals();
         assert!(
@@ -5734,13 +6380,13 @@ mod tests {
         let engine = Engine::<u32, String>::new(5, None, Some(weigher));
         // One entry heavier than the whole cap: evicting it is all there is.
         let _ = put(&engine, 1, key_bytes(1), "z".repeat(50), hlc(1, 1), None, 0);
-        engine.enforce_capacity(0);
+        engine.enforce_capacity(0, 0);
         assert_eq!(engine.debug_totals(), (0, 0));
         assert!(
-            engine.evict_one_sampled(0).made_no_progress(),
+            engine.evict_one_sampled(0, 0).made_no_progress(),
             "an empty stripe evicts nothing"
         );
-        assert_eq!(engine.evict_one_scanning(0), None);
+        assert_eq!(engine.evict_one_scanning(0, 0), None);
     }
 
     /// [`digest_matches_full_recompute_after_random_ops_including_sweeps_and_evictions`]'s
@@ -5801,7 +6447,7 @@ mod tests {
                         },
                         now,
                     );
-                    engine.enforce_capacity(bucket);
+                    engine.enforce_capacity(bucket, now);
                 }
                 1 => {
                     let ver = clock.now(now);
@@ -6083,7 +6729,7 @@ mod tests {
         let resident = Live::<u32, String>::new(
             build_resident_record(key_bytes(1).as_ref(), b"v"),
             hlc(1, 1),
-            to_stored_expiry(None),
+            NEVER_EXPIRES,
             1,
             0,
             #[cfg(feature = "spill")]
@@ -6096,7 +6742,7 @@ mod tests {
             let spilled = Live::<u32, String>::new(
                 build_key_only_record(key_bytes(1).as_ref()),
                 hlc(1, 1),
-                to_stored_expiry(None),
+                NEVER_EXPIRES,
                 0,
                 0,
                 EntryState::Spilled(SpillLoc {
@@ -6115,7 +6761,7 @@ mod tests {
         let resident_hot = Live::<u32, String>::new(
             build_resident_record(key_bytes(1).as_ref(), b"v"),
             hlc(1, 1),
-            to_stored_expiry(None),
+            NEVER_EXPIRES,
             3,
             0,
             #[cfg(feature = "spill")]
@@ -6126,7 +6772,7 @@ mod tests {
         let resident_pending = Live::<u32, String>::new(
             build_resident_record(key_bytes(1).as_ref(), b"v"),
             hlc(1, 1),
-            to_stored_expiry(None),
+            NEVER_EXPIRES,
             0,
             0,
             #[cfg(feature = "spill")]
@@ -6142,7 +6788,7 @@ mod tests {
             let spilled = Live::<u32, String>::new(
                 build_key_only_record(key_bytes(1).as_ref()),
                 hlc(1, 1),
-                to_stored_expiry(None),
+                NEVER_EXPIRES,
                 0,
                 0,
                 EntryState::Spilled(SpillLoc {
@@ -6208,24 +6854,172 @@ mod tests {
     }
 
     #[test]
-    fn to_stored_expiry_round_trips_every_option() {
-        for expires_at_ms in [None, Some(0), Some(1), Some(u64::MAX - 2)] {
+    fn encode_expiry_round_trips_never_a_short_delta_and_the_max_inline_ttl_boundary() {
+        let wall_ms = 1_000u64;
+        let empty: HashMap<Bytes, u64> = HashMap::new();
+
+        let (expiry, side_table) = encode_expiry(wall_ms, None);
+        assert_eq!(expiry, NEVER_EXPIRES);
+        assert_eq!(side_table, None);
+        assert_eq!(decode_expiry(wall_ms, expiry, b"k", &empty), None);
+
+        for delta in [0u64, 1, 50, MAX_INLINE_TTL_MS] {
+            let exp = wall_ms + delta;
+            let (expiry, side_table) = encode_expiry(wall_ms, Some(exp));
+            assert_eq!(side_table, None, "delta = {delta} fits inline");
+            assert_ne!(expiry, NEVER_EXPIRES, "delta = {delta}");
+            assert_ne!(expiry, LONG_TTL, "delta = {delta}");
             assert_eq!(
-                from_stored_expiry(to_stored_expiry(expires_at_ms)),
-                expires_at_ms
+                decode_expiry(wall_ms, expiry, b"k", &empty),
+                Some(exp),
+                "delta = {delta}"
             );
         }
     }
 
     #[test]
-    fn to_stored_expiry_clamps_a_legitimate_u64_max_below_the_sentinel() {
-        let stored = to_stored_expiry(Some(u64::MAX));
-        assert_ne!(
-            stored, NO_EXPIRY,
-            "a real Some(u64::MAX) timestamp must not collide with the no-expiry sentinel"
+    fn encode_expiry_falls_back_to_the_long_ttl_marker_past_max_inline_ttl_ms() {
+        let wall_ms = 1_000u64;
+        for exp in [
+            wall_ms + MAX_INLINE_TTL_MS + 1,
+            wall_ms + MAX_INLINE_TTL_MS + 1_000,
+            u64::MAX,
+        ] {
+            let (expiry, side_table) = encode_expiry(wall_ms, Some(exp));
+            assert_eq!(expiry, LONG_TTL, "exp = {exp}");
+            assert_eq!(side_table, Some(exp), "exp = {exp}");
+        }
+    }
+
+    #[test]
+    fn encode_expiry_falls_back_to_the_long_ttl_marker_for_a_dead_on_arrival_expiry_before_wall_ms()
+    {
+        // `expires_at_ms < wall_ms` is a real, exercised shape (a
+        // dead-on-arrival TTL record, or a remote write whose expiry
+        // predates its own wall_ms): `expiry` only ever adds a delta to
+        // `wall_ms`, so it can never encode this inline, and must not
+        // round it up to `wall_ms` either, or the record would silently
+        // gain a few milliseconds of life it never had.
+        let wall_ms = 20_000u64;
+        for exp in [0u64, wall_ms - 1, wall_ms - 10_135] {
+            let (expiry, side_table) = encode_expiry(wall_ms, Some(exp));
+            assert_eq!(expiry, LONG_TTL, "exp = {exp}");
+            assert_eq!(side_table, Some(exp), "exp = {exp}");
+            let mut long_ttl: HashMap<Bytes, u64> = HashMap::new();
+            long_ttl.insert(Bytes::from_static(b"k"), exp);
+            assert_eq!(
+                decode_expiry(wall_ms, expiry, b"k", &long_ttl),
+                Some(exp),
+                "exp = {exp}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_expiry_reads_the_long_ttl_side_table_for_the_long_ttl_marker() {
+        let wall_ms = 1_000u64;
+        let mut long_ttl: HashMap<Bytes, u64> = HashMap::new();
+        long_ttl.insert(key_bytes(1), 9_999_999_999u64);
+        assert_eq!(
+            decode_expiry(wall_ms, LONG_TTL, key_bytes(1).as_ref(), &long_ttl),
+            Some(9_999_999_999)
         );
-        assert_eq!(stored, NO_EXPIRY - 1);
-        assert_eq!(from_stored_expiry(stored), Some(NO_EXPIRY - 1));
+        assert_eq!(
+            decode_expiry(wall_ms, LONG_TTL, key_bytes(2).as_ref(), &long_ttl),
+            None,
+            "no row for this key: never invents a deadline that isn't there"
+        );
+    }
+
+    #[test]
+    fn idle_elapsed_ms_is_correct_across_a_touch_stamp_rollover() {
+        // No rollover: an ordinary elapsed duration, well under u32::MAX.
+        assert_eq!(idle_elapsed_ms(1_000, touch_stamp(400)), 600);
+        assert_eq!(idle_elapsed_ms(1_000, touch_stamp(1_000)), 0);
+
+        // `now_ms` itself crossed one u32::MAX-millisecond rollover after
+        // the touch: `touch_stamp` truncates both to their low 32 bits, so
+        // the wrapping subtraction still recovers the true gap.
+        let touched_at = u64::from(u32::MAX) - 50;
+        let now = touched_at + 200;
+        assert!(
+            now > u64::from(u32::MAX),
+            "now must actually cross the rollover for this case to mean anything"
+        );
+        assert_eq!(idle_elapsed_ms(now, touch_stamp(touched_at)), 200);
+
+        // The touch itself lands just past a rollover boundary relative to
+        // an even later `now_ms`, exercised directly on the truncated
+        // stamp rather than through `touch_stamp` a second time.
+        let last_access_ms: u32 = 5; // wrapped just past 0
+        let now_ms = (1u64 << 32) + 105; // one rollover past the touch, true elapsed: 100ms
+        assert_eq!(idle_elapsed_ms(now_ms, last_access_ms), 100);
+    }
+
+    #[test]
+    fn clamp_tti_ms_caps_a_tti_past_max_inline_ttl_ms_to_it() {
+        assert_eq!(
+            clamp_tti_ms(1_000),
+            1_000,
+            "well under the ceiling: untouched"
+        );
+        assert_eq!(
+            clamp_tti_ms(MAX_INLINE_TTL_MS),
+            MAX_INLINE_TTL_MS,
+            "exactly at the ceiling: untouched"
+        );
+        assert_eq!(
+            clamp_tti_ms(MAX_INLINE_TTL_MS + 1),
+            MAX_INLINE_TTL_MS,
+            "one past the ceiling: capped"
+        );
+        assert_eq!(
+            clamp_tti_ms(u64::MAX),
+            MAX_INLINE_TTL_MS,
+            "far past the ceiling: capped"
+        );
+    }
+
+    #[test]
+    fn engine_new_clamps_a_configured_tti_past_max_inline_ttl_ms() {
+        let past_ceiling = Duration::from_millis(MAX_INLINE_TTL_MS + 10_000);
+        let engine = engine_u32_string(u64::MAX, Some(past_ceiling));
+        assert_eq!(engine.tti_ms, Some(MAX_INLINE_TTL_MS));
+    }
+
+    #[test]
+    fn tti_past_max_inline_ttl_ms_still_expires_within_the_clamped_bound() {
+        // Before `clamp_tti_ms`, a tti this far past `MAX_INLINE_TTL_MS`
+        // would leave this entry readable forever: `idle_elapsed_ms` never
+        // returns a value large enough to reach the unclamped deadline. Two
+        // separate engines, not two reads of one: a read touches the entry
+        // and would otherwise reset the idle clock the second assertion
+        // means to check.
+        let past_ceiling = Duration::from_millis(MAX_INLINE_TTL_MS + 10_000);
+
+        let still_within = engine_u32_string(u64::MAX, Some(past_ceiling));
+        let _ = put(
+            &still_within,
+            1,
+            key_bytes(1),
+            "a".into(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        assert_eq!(
+            still_within.get(&1, MAX_INLINE_TTL_MS - 1),
+            Some("a".to_string()),
+            "still within the clamped tti"
+        );
+
+        let past_clamp = engine_u32_string(u64::MAX, Some(past_ceiling));
+        let _ = put(&past_clamp, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 0);
+        assert_eq!(
+            past_clamp.get(&1, MAX_INLINE_TTL_MS),
+            None,
+            "idle past the clamped tti"
+        );
     }
 
     #[test]
@@ -6236,26 +7030,29 @@ mod tests {
         assert_eq!(decode_value::<String>(&value_bytes), "a value".to_string());
     }
 
+    /// `record` at 24 bytes (`Inline { len: u8, buf: [u8; 22] }`, 23 bytes,
+    /// rounded up to `Heap`'s 8-byte-aligned `Box<[u8]>`), `wall_ms` at 8,
+    /// `node` at 8, and `expiry`/`logical`/`weight`/`last_access_ms` at 4
+    /// bytes each (16 bytes together, no gap: four 4-byte fields fill one
+    /// 8-byte-aligned group exactly) sum to 56 with no padding anywhere:
+    /// `24 + 8 + 8 + 16 = 56`.
     #[test]
     #[cfg(not(feature = "spill"))]
-    fn live_size_is_72_bytes_without_spill() {
-        assert_eq!(std::mem::size_of::<Live<String, String>>(), 72);
+    fn live_size_is_56_bytes_without_spill() {
+        assert_eq!(std::mem::size_of::<Live<String, String>>(), 56);
     }
 
-    /// The flattened `wall_ms`/`node`/`logical` fields save 8 bytes over
-    /// the unflattened `Hlc` field in the non-spill layout (see
-    /// `live_size_is_72_bytes_without_spill`), but that saving lands in
-    /// slack `EntryState` already consumes here: `EntryState` has no niche
-    /// to exploit in its `Spilled(SpillLoc)` payload (all four `SpillLoc`
-    /// fields are plain `u32`s), so it costs a 1-byte tag plus 3 bytes of
-    /// padding to realign to `SpillLoc`'s 4-byte alignment, 20 bytes total,
-    /// which rounds `Live`'s total size back up to 96 regardless. Pinned at
-    /// the true, measured value, not the flatten's cross-feature arithmetic
-    /// in isolation.
+    /// `EntryState` costs a 1-byte tag plus 3 bytes of padding to realign
+    /// to `SpillLoc`'s 4-byte alignment, 20 bytes total, added on top of
+    /// the 56-byte non-spill layout (see
+    /// `live_size_is_56_bytes_without_spill`): `56 + 20 = 76`, rounded up
+    /// to 80 to keep the whole struct's size a multiple of its own 8-byte
+    /// alignment. Pinned at the true, measured value, not cross-feature
+    /// arithmetic in isolation.
     #[test]
     #[cfg(feature = "spill")]
-    fn live_size_is_96_bytes_with_spill() {
-        assert_eq!(std::mem::size_of::<Live<String, String>>(), 96);
+    fn live_size_is_80_bytes_with_spill() {
+        assert_eq!(std::mem::size_of::<Live<String, String>>(), 80);
     }
 
     #[test]
@@ -6263,7 +7060,7 @@ mod tests {
         let mut live = Live::<u32, String>::new(
             build_resident_record(key_bytes(1).as_ref(), b"v"),
             hlc(1, 1),
-            to_stored_expiry(None),
+            NEVER_EXPIRES,
             1,
             0,
             #[cfg(feature = "spill")]
@@ -6315,17 +7112,78 @@ mod tests {
         }
 
         assert!(
-            engine.evict_one_sampled(bucket).made_no_progress(),
+            engine.evict_one_sampled(bucket, 0).made_no_progress(),
             "the only entry in this stripe is pending; single-victim sampling finds nothing"
         );
         assert!(
-            engine.evict_batch_sampled(bucket, 100).made_no_progress(),
+            engine
+                .evict_batch_sampled(bucket, 100, 0)
+                .made_no_progress(),
             "the only entry in this stripe is pending; batch sampling finds nothing either"
         );
         assert_eq!(
             engine.get(&key, 0),
             Some("x".repeat(5)),
             "the pending entry is untouched: still resident, still readable"
+        );
+    }
+
+    #[test]
+    fn sampled_eviction_still_picks_the_coldest_entry_across_a_last_access_rollover() {
+        // `key_old`'s last touch predates a `touch_stamp` rollover;
+        // `key_new`'s comes just after one. `key_old`'s truncated stamp
+        // (near `u32::MAX`) is numerically *larger* than `key_new`'s
+        // (small, just past the wrap), so a naive `min_by_key` over the
+        // raw stamps would call `key_new` colder. `idle_elapsed_ms`'s
+        // wrapping subtraction against a real `now_ms` past both touches
+        // gets it right: `key_old`, touched longer ago in true time, is
+        // the true coldest and the one evicted.
+        let target_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(0).as_ref()));
+        let key_old = 0u32;
+        let mut candidate = 1u32;
+        let key_new = loop {
+            if stripe_index_from_hash(hash_key_bytes(key_bytes(candidate).as_ref()))
+                == target_bucket
+            {
+                break candidate;
+            }
+            candidate += 1;
+        };
+
+        let engine = Engine::<u32, String>::new(u64::MAX, None, None);
+        let before_rollover = (1u64 << 32) - 100;
+        let after_rollover = (1u64 << 32) + 50;
+        let _ = put(
+            &engine,
+            key_old,
+            key_bytes(key_old),
+            "old".to_string(),
+            hlc(1, 1),
+            None,
+            before_rollover,
+        );
+        let _ = put(
+            &engine,
+            key_new,
+            key_bytes(key_new),
+            "new".to_string(),
+            hlc(2, 1),
+            None,
+            after_rollover,
+        );
+
+        let now_ms = after_rollover + 10;
+        let outcome = engine.evict_one_sampled(target_bucket, now_ms);
+        assert_eq!(outcome.removed_weight, 1, "one entry evicted");
+        assert_eq!(
+            engine.get(&key_old, now_ms),
+            None,
+            "key_old, touched longest ago in true time, is the one evicted"
+        );
+        assert_eq!(
+            engine.get(&key_new, now_ms),
+            Some("new".to_string()),
+            "key_new survives: its truncated stamp is smaller, but it is the true warmer entry"
         );
     }
 
@@ -6733,6 +7591,39 @@ mod tests {
             assert_eq!(engine.get(&key, 0), None);
             let (live_count, weight) = engine.debug_totals();
             assert_eq!((live_count, weight), (0, 0));
+        }
+
+        #[test]
+        fn region_reclaim_of_a_long_ttl_key_clears_its_side_table_row() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let long_deadline = MAX_INLINE_TTL_MS + 5_000;
+            engine.debug_insert_spilled(&kb, hlc(1, 1), Some(long_deadline), loc(3, 0, 10, 0), 0);
+            assert!(
+                engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "a long TTL spilled entry leaves its absolute deadline in the side table"
+            );
+
+            let removed = SpillSink::reclaim(&engine, 3, 0, &[(bucket, kb.clone())]);
+            assert_eq!(
+                removed, 1,
+                "the key's pointer still names this exact region and generation"
+            );
+            assert!(
+                !engine
+                    .stripe_lock(bucket)
+                    .read()
+                    .long_ttl
+                    .contains_key(kb.as_ref()),
+                "reclaiming the entry clears its side-table row; no row outlives its entry"
+            );
         }
 
         #[test]
@@ -7188,7 +8079,7 @@ mod tests {
             assert_eq!(engine.debug_totals().1, 0);
             assert_eq!(engine.debug_pending_spill_weight(), 80);
 
-            engine.enforce_capacity(bucket);
+            engine.enforce_capacity(bucket, 0);
 
             assert_eq!(
                 engine.debug_eviction_lock_acquisitions(),
@@ -7438,7 +8329,7 @@ mod tests {
 
             for _ in 0..1_000 {
                 assert!(
-                    engine.evict_one_sampled(bucket).made_no_progress(),
+                    engine.evict_one_sampled(bucket, 0).made_no_progress(),
                     "a weight-zeroed pending entry is never re-selected, however long it \
                      stays pending"
                 );
@@ -7535,7 +8426,7 @@ mod tests {
                 // `evict_victim_locked`'s freed weight into `total_weight`
                 // right there, synchronously, with no dependency on the
                 // flusher thread ever running.
-                let pass_outcome = engine.evict_one_sampled(bucket);
+                let pass_outcome = engine.evict_one_sampled(bucket, 0);
                 assert_eq!(
                     pass_outcome.removed_weight, 20,
                     "a spill hand-off's freed weight counts the same as a physical removal's"
@@ -7568,7 +8459,7 @@ mod tests {
                 // has already been flipped to `Spilled` by now, either way
                 // `is_spill_candidate` excludes it.
                 assert!(
-                    engine.evict_one_sampled(bucket).made_no_progress(),
+                    engine.evict_one_sampled(bucket, 0).made_no_progress(),
                     "the only entry in this stripe is either still pending or already \
                      spilled; double-sampling before install must find nothing"
                 );
@@ -7630,7 +8521,7 @@ mod tests {
                     Some(999),
                     0,
                 );
-                let _ = producer.evict_one_sampled(bucket);
+                let _ = producer.evict_one_sampled(bucket, 0);
                 assert!(poll_until(POLL_TIMEOUT, || is_spilled(&producer, &kb)));
                 let loc = {
                     let stripe = producer.stripe_lock(bucket).read();
@@ -7761,7 +8652,7 @@ mod tests {
                 let bucket = stripe_index_from_hash(hash);
                 let _ = put(&engine, key, kb.clone(), "x".repeat(30), hlc(1, 1), None, 0);
 
-                let outcome = engine.evict_one_sampled(bucket);
+                let outcome = engine.evict_one_sampled(bucket, 0);
                 assert_eq!(
                     outcome.removed_weight, 30,
                     "the hand-off still commits and frees the weight from total_weight \
@@ -7865,7 +8756,7 @@ mod tests {
 
                 // First eviction: the colder key (`now_ms: 0`) hands off
                 // cleanly, with the queue empty.
-                engine.evict_one_sampled(bucket);
+                engine.evict_one_sampled(bucket, 2);
                 assert_eq!(
                     engine.get(&keys[0], 0),
                     Some("x".repeat(200)),
@@ -7884,7 +8775,7 @@ mod tests {
                 // worth and the flusher is paused, so `would_accept` now
                 // refuses; the victim falls back to an ordinary delete
                 // instead of piling up a second fully-resident value.
-                engine.evict_one_sampled(bucket);
+                engine.evict_one_sampled(bucket, 2);
                 assert_eq!(
                     engine.get(&keys[1], 0),
                     None,
@@ -7902,7 +8793,7 @@ mod tests {
                 // The public entry point sees the same combined accounting
                 // and returns immediately: nothing left to evict in this
                 // bucket, and pending_spill_weight is still positive.
-                engine.enforce_capacity(bucket);
+                engine.enforce_capacity(bucket, 2);
 
                 // Once the flusher is allowed to run, the one queued job
                 // installs and pending_spill_weight drains back to zero.
@@ -7989,7 +8880,7 @@ mod tests {
 
                 // First eviction: the colder key hands off cleanly, with
                 // the queue empty.
-                engine.evict_one_sampled(bucket);
+                engine.evict_one_sampled(bucket, 2);
                 assert_eq!(engine.debug_pending_spill_weight(), 200);
 
                 // Second eviction: the queue already holds one record's
@@ -7997,7 +8888,7 @@ mod tests {
                 // refuses again, but this tier's `keep_resident_when_
                 // refused` is set, so the victim is left fully resident
                 // instead of deleted.
-                engine.evict_one_sampled(bucket);
+                engine.evict_one_sampled(bucket, 2);
                 assert_eq!(
                     engine.get(&keys[1], 0),
                     Some("y".repeat(200)),
@@ -8028,7 +8919,7 @@ mod tests {
                 // The public entry point sees the same combined accounting,
                 // finds no further progress to make while a hand-off is
                 // still pending, and returns rather than spin.
-                engine.enforce_capacity(bucket);
+                engine.enforce_capacity(bucket, 2);
                 assert_eq!(
                     engine.debug_totals().1,
                     200,
@@ -8040,7 +8931,7 @@ mod tests {
                 // `enforce_capacity` pass spills it.
                 tier.resume_flusher();
                 assert!(poll_until(POLL_TIMEOUT, || tier.queued_bytes() == 0));
-                engine.enforce_capacity(bucket);
+                engine.enforce_capacity(bucket, 2);
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, &key_bytes(keys[1]))),
                     "the retried victim is spilled once the tier has room again"
@@ -8094,7 +8985,7 @@ mod tests {
                 let _ = put(&engine, key, kb.clone(), "x".repeat(30), hlc(1, 1), None, 0);
 
                 let queued_before = tier.queued_bytes();
-                let outcome = engine.evict_one_sampled(bucket);
+                let outcome = engine.evict_one_sampled(bucket, 0);
                 assert_eq!(
                     outcome.removed_weight, 30,
                     "the hand-off still commits and frees the weight right away"
@@ -8167,7 +9058,7 @@ mod tests {
                 );
 
                 let outcome =
-                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation));
+                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation), 0);
                 assert_eq!(
                     outcome.removed_weight,
                     value.len() as u64,
@@ -8259,14 +9150,14 @@ mod tests {
                     .expect("the whole queue is free before this call");
 
                 let first =
-                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation));
+                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation), 2);
                 assert_eq!(
                     first.removed_weight,
                     value_a.len() as u64,
                     "the colder key hands off from the reservation's own budget"
                 );
                 let second =
-                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation));
+                    engine.evict_one_sampled_with_reservation(bucket, Some(&mut reservation), 2);
                 assert_eq!(
                     second.removed_weight,
                     value_b.len() as u64,
@@ -8376,7 +9267,7 @@ mod tests {
                     .expect("the whole (single-record) queue is free before this call");
 
                 let deficit =
-                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation));
+                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation), 10);
                 assert_eq!(
                     deficit,
                     u64::from(record_len_1),
@@ -8493,7 +9384,7 @@ mod tests {
                     .expect("the whole (single-record) queue is free before this call");
 
                 let deficit =
-                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation));
+                    engine.enforce_capacity_with_reservation(bucket, Some(&mut reservation), 10);
                 assert_eq!(deficit, u64::from(record_len_1));
                 assert_eq!(
                     engine.get(&keys[1], 0),
@@ -8518,7 +9409,7 @@ mod tests {
                 // same as any other write's own `enforce_capacity` call,
                 // until the cap is actually met or nothing more can be
                 // sampled.
-                engine.enforce_capacity(bucket);
+                engine.enforce_capacity(bucket, 10);
 
                 assert_eq!(
                     engine.get(&keys[1], 0),
@@ -8587,7 +9478,7 @@ mod tests {
                     &resolver,
                 );
 
-                let _ = engine.evict_one_sampled(bucket);
+                let _ = engine.evict_one_sampled(bucket, 0);
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, &kb)),
                     "the flusher installs the spilled entry"
@@ -8696,7 +9587,7 @@ mod tests {
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
                 let _ =
                     put_with_resolver(&engine, key, kb.clone(), seed, seed_ver, None, 0, resolver);
-                let _ = engine.evict_one_sampled(bucket);
+                let _ = engine.evict_one_sampled(bucket, 0);
                 assert!(
                     poll_until(POLL_TIMEOUT, || is_spilled(&engine, kb)),
                     "the flusher installs the spilled entry"

@@ -20,6 +20,23 @@ All notable changes to this project are documented in this file. Format follows
   local read latency drops from 0.538 to 0.296 microseconds. The entry diet
   bench (`SUNDOG_BENCH=1 cargo test --release -p sundog --test
   entry_diet_bench`) pins both the size and the latency.
+- **Entry diet, phase A, a packed `Live`**: a live entry's record inlines up
+  to 22 bytes instead of 30, folding the enum discriminant into a 24-byte
+  `Record` with no separate tag; the expiry packs into a `u32` delta above
+  the entry's own `wall_ms`, with a per-stripe side table holding the exact
+  absolute deadline for the rare TTL past `u32::MAX` milliseconds (about
+  49.71 days); the last-access timestamp packs into a `u32` touch stamp,
+  read back only through a wrapping-subtraction helper that stays correct
+  across a stamp rollover, including in sampled eviction's coldest-entry
+  pick. `Live` sits at 56 bytes without spill, 80 with it. `wall_ms`,
+  `node` (the full 64-bit `NodeId`), and `logical` keep their full width:
+  `node` must stay bit-identical across independently computed replica
+  merges, and `logical` mints past `u32::MAX` on every merge-driven
+  compaction with no periodic reset. Every TTL keeps millisecond
+  precision, on both sides of the inline delta's own ~49.71-day ceiling,
+  and reads stay TTL-blind. No wire change: `wire::PROTOCOL_VERSION` and
+  `WireRecord` stay exactly as they are; only the in-RAM entry encoding
+  changes.
 - **jemalloc in the demo and the test node**: `demos/sundog-distributed-demo`
   and `sundog-testnode` both set `tikv_jemallocator::Jemalloc` as their
   global allocator on every target but MSVC Windows; the `sundog` library

@@ -3052,7 +3052,7 @@ where
                 return;
             };
             let Some(deadline) = deadline else {
-                self.engine.enforce_capacity(start_bucket);
+                self.engine.enforce_capacity(start_bucket, self.now_ms());
                 return;
             };
             let mut deficit = deficit;
@@ -3072,6 +3072,7 @@ where
                         deficit = self.engine.enforce_capacity_with_reservation(
                             start_bucket,
                             Some(&mut reservation),
+                            self.now_ms(),
                         );
                     }
                     // `reserve` itself already recorded
@@ -3082,7 +3083,7 @@ where
                 }
             }
             if deficit > 0 {
-                self.engine.enforce_capacity(start_bucket);
+                self.engine.enforce_capacity(start_bucket, self.now_ms());
             }
         }
         #[cfg(not(feature = "spill"))]
