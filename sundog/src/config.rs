@@ -134,12 +134,9 @@ pub struct ClusterConfig {
     /// out opens cold, declining to donate, and keeps pulling in the
     /// background every `ae_interval`; after three timed-out pulls it opens
     /// warm with what landed. Zero is honored: `open()` skips the transfer
-    /// entirely and the cache is warm with what it has. A warm spill
-    /// reopen's converge-before-serving reconciliation (see
-    /// [`reconcile_byte_budget`](Self::reconcile_byte_budget)) runs on the
-    /// same bound: a round a co-owner fails or answers stale is retried on
-    /// a backoff from 200 ms doubling up to [`ae_interval`](Self::ae_interval)
-    /// until this budget runs out.
+    /// entirely and the cache is warm with what it has. A warm reopen's
+    /// reconciliation loop (see [`reconcile_byte_budget`](Self::reconcile_byte_budget))
+    /// also runs on this bound.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
@@ -200,74 +197,42 @@ pub struct ClusterConfig {
     /// opens for a `Mode::Distributed` cache, so a mass membership change
     /// can't spawn dozens of concurrent transfers at once. Default: 4.
     pub rebalance_concurrency: usize,
-    /// Target size in bytes `st_bucket_chunks` sub-batches one bucket's key
-    /// list into before calling `shard.records_for` for that sub-batch, so
-    /// a rebalance donor materializes one sub-batch's worth of records at a
-    /// time instead of a whole bucket's. Default: 1 MiB.
+    /// Target size in bytes for `st_bucket_chunks` sub-batches of a
+    /// bucket's key list. Default: 1 MiB.
     /// [`rebalance_chunk_bytes_value`](Self::rebalance_chunk_bytes_value)
-    /// is the value actually in effect: this field clamped to
-    /// `MAX_FRAME - SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`, so a misconfigured
-    /// value can never push a single `Msg::StBucketChunk` frame over the
-    /// wire's hard cap. Each sub-batch's records still pass through
-    /// `chunk_records_for_snapshot`, which stays the actual wire-frame
-    /// bound regardless of this setting.
+    /// clamps this to `MAX_FRAME - SNAPSHOT_CHUNK_ENVELOPE_HEADROOM` so a
+    /// `Msg::StBucketChunk` frame can't exceed the wire cap.
     pub rebalance_chunk_bytes: u64,
-    /// How long a `Msg::StBucketAck` is trusted as proof a bucket's
-    /// receiver has reconciled it, before `buckets_to_release` falls back
-    /// to the timer-and-confirming-anti-entropy-round path for that bucket.
-    /// Default: 60s, twice the default
-    /// [`ae_interval`](Self::ae_interval). An ack older than this window,
-    /// or from before the current `OwnershipView`, is never trusted.
-    /// [`rebalance_ack_window_value`](Self::rebalance_ack_window_value) is
-    /// the value actually in effect: this field bounded above by
-    /// `distributed_disown_grace_rounds * ae_interval`, since a trust
-    /// window longer than the release floor itself would be meaningless.
-    /// An ack only ever accelerates the confirmation step of a release;
-    /// [`distributed_disown_grace_rounds`](Self::distributed_disown_grace_rounds)'s
-    /// timing floor still applies regardless of any ack.
+    /// How long a `Msg::StBucketAck` is trusted as proof a bucket is
+    /// reconciled, before `buckets_to_release` falls back to the
+    /// timer-and-anti-entropy path. Default: 60s, twice
+    /// [`ae_interval`](Self::ae_interval); an ack predating the current
+    /// `OwnershipView` is never trusted.
+    /// [`rebalance_ack_window_value`](Self::rebalance_ack_window_value)
+    /// bounds this by `distributed_disown_grace_rounds * ae_interval` -- an
+    /// ack only speeds up confirmation, never bypasses the grace-round
+    /// floor.
     pub rebalance_ack_window: Duration,
-    /// Backlog capacity, in keys, a cache's fan-out queue (the backlog of
-    /// locally written keys not yet fanned out to peers) tries to stay
-    /// under before an async write path (`Cache::insert`,
-    /// `insert_with_ttl`, `insert_many`, `insert_many_with_ttl`, `remove`,
-    /// `remove_many`, `merge`'s immediate-apply path) pushes onto it. Past
-    /// this many pending keys such a write awaits room, up to
-    /// [`fan_out_wait_timeout`](Self::fan_out_wait_timeout), before it
-    /// proceeds: a stalled fan-out (a peer's outbox stuck full past
-    /// `net::Mesh::send_frames_awaiting`'s wait-slice deadline while still
-    /// live) applies backpressure to the writer instead of growing this
-    /// queue without bound. The write always lands regardless of whether
-    /// room was ever
-    /// found -- past the timeout it proceeds anyway, over capacity,
-    /// counted in `sundog_fan_out_wait_timeouts_total{cache}`; memory over
-    /// capacity is the fallback, never a dropped or refused write. The
-    /// queue's synchronous push (`Cache::insert_sync`, `remove_sync`,
-    /// `Shard::apply`) never waits on this at all: there is no async
-    /// runtime there to await on. Must be nonzero; [`ClusterBuilder::build`]
-    /// rejects zero. Default: 262,144.
-    ///
-    /// [`ClusterBuilder::build`]: crate::ClusterBuilder::build
+    /// Backlog capacity, in keys, for a cache's fan-out queue. An async
+    /// write (`Cache::insert` and friends) awaits room under this cap, up
+    /// to [`fan_out_wait_timeout`](Self::fan_out_wait_timeout), then
+    /// proceeds anyway over capacity -- the write always lands, and
+    /// overflow is counted in `sundog_fan_out_wait_timeouts_total{cache}`.
+    /// The synchronous push path (`Cache::insert_sync`, `remove_sync`,
+    /// `Shard::apply`) never waits on this. Must be nonzero:
+    /// `ClusterBuilder::build` rejects zero. Default: 262,144.
     pub fan_out_backlog_capacity: usize,
-    /// Bound on [`fan_out_backlog_capacity`](Self::fan_out_backlog_capacity)'s
-    /// wait: how long an async write path awaits room below that capacity
-    /// before proceeding regardless. Default: 30s.
+    /// How long an async write waits for room under
+    /// [`fan_out_backlog_capacity`](Self::fan_out_backlog_capacity) before
+    /// proceeding regardless. Default: 30s.
     pub fan_out_wait_timeout: Duration,
-    /// Per-peer wire-byte budget on a warm reopen's converge-before-serving
-    /// reconciliation loop (`Cache::reconcile_warm_buckets`): once one
-    /// peer's rounds have pushed and pulled this many bytes, that peer's
-    /// still-diverging warm buckets stop looping and fall through to the
-    /// ordinary cold-pull path, cold and unverified, rather than trusting a
-    /// round's outcome without ever re-checking. Paired with a fixed cap on
-    /// rounds that ran and the
-    /// [`state_transfer_budget`](Self::state_transfer_budget) time bound, a
-    /// round the co-owner fails or answers stale retried on a backoff capped
-    /// at [`ae_interval`](Self::ae_interval) and never counted as a round;
-    /// following [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes)'s
-    /// naming and shape: large enough that a bucket's full listing or
-    /// `AeEntries` fallback (bounded by `wire::MAX_FRAME`) always fits
-    /// inside a handful of rounds, small enough that a co-owner that keeps
-    /// re-diverging every round can't stall `open()` indefinitely. Default:
-    /// 32 MiB.
+    /// Per-peer wire-byte budget for a warm reopen's reconciliation loop
+    /// (`Cache::reconcile_warm_buckets`). A peer's still-diverging buckets
+    /// fall through to the cold-pull path once its rounds push and pull
+    /// this many bytes, paired with the round cap in
+    /// [`state_transfer_budget`](Self::state_transfer_budget). Sized so a
+    /// bucket's full listing fits in a handful of rounds without letting a
+    /// re-diverging peer stall `open()` indefinitely. Default: 32 MiB.
     pub reconcile_byte_budget: u64,
 }
 
@@ -314,30 +279,23 @@ impl ClusterConfig {
         CompactionBounds::new(self.crdt_retire_after, self.crdt_sweep_period())
     }
 
-    /// [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes) as it actually
-    /// takes effect: clamped to `MAX_FRAME -
-    /// SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`, the same headroom
-    /// `chunk_records_for_snapshot` reserves for a chunk's envelope, so a
-    /// single `Msg::StBucketChunk` frame a sub-batch produces can never
-    /// itself exceed the wire's hard cap regardless of misconfiguration.
+    /// [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes) clamped to
+    /// `MAX_FRAME - SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`.
     #[must_use]
     pub fn rebalance_chunk_bytes_value(&self) -> u64 {
         let cap = (MAX_FRAME - crate::store::SNAPSHOT_CHUNK_ENVELOPE_HEADROOM) as u64;
         self.rebalance_chunk_bytes.min(cap)
     }
 
-    /// Upper bound [`rebalance_ack_window`](Self::rebalance_ack_window) may
-    /// not exceed: `distributed_disown_grace_rounds * ae_interval`, since a
-    /// trust window longer than the release floor itself would be
-    /// meaningless.
+    /// Upper bound for [`rebalance_ack_window`](Self::rebalance_ack_window):
+    /// `distributed_disown_grace_rounds * ae_interval`.
     #[must_use]
     pub fn rebalance_ack_window_max(&self) -> Duration {
         self.ae_interval
             .saturating_mul(self.distributed_disown_grace_rounds)
     }
 
-    /// [`rebalance_ack_window`](Self::rebalance_ack_window) as it actually
-    /// takes effect: bounded above by
+    /// [`rebalance_ack_window`](Self::rebalance_ack_window) clamped to
     /// [`rebalance_ack_window_max`](Self::rebalance_ack_window_max).
     #[must_use]
     pub fn rebalance_ack_window_value(&self) -> Duration {

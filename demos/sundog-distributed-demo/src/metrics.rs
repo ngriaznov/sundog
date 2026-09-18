@@ -1,11 +1,6 @@
-//! In-process metrics capture for a headless run: installs the `metrics`
-//! recorder every node in this process reports into, and reduces its
-//! Prometheus text rendering to per-metric totals and a one-line summary.
-//!
-//! Every in-process node shares one recorder and names its cache the same,
-//! so a counter sums across nodes while a gauge shows whichever node set it
-//! last. The summary line therefore pairs the gauges with the demo's own
-//! per-node entry counts and the spill directories' sizes on disk.
+//! In-process metrics for a headless run. Installs the shared `metrics`
+//! recorder and reduces its Prometheus rendering to per-metric totals and
+//! a summary line.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,13 +12,11 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
-    /// Installs the recorder. Call before the first node opens: a metric
-    /// registered earlier stays on the no-op recorder and never reports.
+    /// Installs the recorder. Call before the first node opens.
     ///
     /// # Errors
     ///
-    /// Returns an error if the recorder is already installed, or, in a
-    /// build without the `prometheus` feature, always.
+    /// Errors if already installed, or always without the `prometheus` feature.
     pub(crate) fn install() -> anyhow::Result<Self> {
         #[cfg(feature = "prometheus")]
         {
@@ -78,9 +71,7 @@ impl Metrics {
     }
 }
 
-/// Sums every `sundog_*` sample in Prometheus text-exposition `body` by
-/// metric name, across label sets. `#` comment lines and other metrics are
-/// skipped.
+/// Sums every `sundog_*` sample in `body` by metric name, across labels.
 #[must_use]
 pub(crate) fn totals(body: &str) -> BTreeMap<String, f64> {
     let mut sums = BTreeMap::new();
@@ -98,11 +89,7 @@ pub(crate) fn totals(body: &str) -> BTreeMap<String, f64> {
     sums
 }
 
-/// Sums every sample of `metric` in Prometheus text-exposition `body` whose
-/// label set includes `label="value"`, across every other label (such as
-/// `cache`). [`totals`]'s single-label-filtered counterpart, for a metric
-/// like `sundog_rebalance_buckets_total{cache, direction}` where the report
-/// wants one direction's total rather than both summed together.
+/// Sums samples of `metric` whose labels include `label="value"`.
 #[must_use]
 pub(crate) fn labeled_total(body: &str, metric: &str, label: &str, value: &str) -> f64 {
     let prefix = format!("{metric}{{");
@@ -113,8 +100,7 @@ pub(crate) fn labeled_total(body: &str, metric: &str, label: &str, value: &str) 
         .sum()
 }
 
-/// The metrics a spill run is watched by, in the order the summary line
-/// prints them, with the short label each carries there.
+/// Metrics a spill run watches, in the order and label `summary_line` uses.
 const SUMMARY: &[(&str, &str)] = &[
     ("sundog_spill_entries", "spill_entries"),
     ("sundog_spill_bytes_used", "spill_bytes"),
@@ -131,8 +117,7 @@ const SUMMARY: &[(&str, &str)] = &[
     ("sundog_cache_misses_total", "misses"),
 ];
 
-/// One line of the watched totals, `label=value` pairs in [`SUMMARY`]
-/// order; a metric nothing has reported yet prints as `0`.
+/// One line of `label=value` pairs in [`SUMMARY`] order.
 #[must_use]
 pub(crate) fn summary_line(totals: &BTreeMap<String, f64>) -> String {
     SUMMARY
@@ -145,10 +130,7 @@ pub(crate) fn summary_line(totals: &BTreeMap<String, f64>) -> String {
         .join(" ")
 }
 
-/// Bytes on disk of every regular file under `dir`, recursively; `0` when
-/// the directory does not exist yet. On Unix this counts allocated blocks,
-/// so a preallocated but still empty region file counts what the
-/// filesystem has really given it, not its nominal length.
+/// Bytes on disk under `dir`, recursively; `0` if missing.
 #[must_use]
 pub(crate) fn dir_bytes(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -276,9 +258,7 @@ mod tests {
         std::fs::write(root.join("x"), [1u8; 10]).expect("file writes");
         std::fs::write(nested.join("y"), [1u8; 5]).expect("file writes");
         let total = dir_bytes(&root);
-        // Allocated blocks round each file up to the filesystem's block
-        // size, so the sum is at least the bytes written and covers both
-        // files.
+        // Block rounding only grows the total, never shrinks it below the bytes written.
         assert!(total >= 15, "{total}");
         assert_eq!(dir_bytes(&root.join("missing")), 0);
         std::fs::remove_dir_all(&root).expect("temp dir removes");

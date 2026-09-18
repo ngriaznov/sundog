@@ -79,23 +79,17 @@ async fn try_donor_buckets(
         BucketPull::Stream(stream) => Some(stream),
         BucketPull::Stale | BucketPull::Cold => None,
     });
-    // Clearing cold the moment each bucket's own `BucketDone` lands, rather
-    // than waiting for the whole group, is goal 1's core requirement: a
-    // group that never finishes (this donor stalls or the connection
-    // drops) still leaves every bucket it did finish servable.
-    // `sundog_rebalance_buckets_total{direction="in"}` is credited right
-    // here too, per bucket, the moment its own `BucketDone` lands, rather
-    // than batched behind the whole `PullRequest`'s completion: `credited`
-    // is shared across every donor this group's `pull_one_group` retries
-    // against, not local to this one attempt, so a bucket a prior donor
-    // already landed and credited before the group as a whole failed is
-    // never credited a second time when a later donor re-sends it.
+    // Cold clears per bucket as its BucketDone lands, so a group that never
+    // finishes still leaves every finished bucket servable.
+    // sundog_rebalance_buckets_total{direction="in"} is credited here too,
+    // per bucket; `credited` is shared across every donor this group's
+    // pull_one_group retries against, so a bucket a prior donor already
+    // credited is never credited twice on a later donor's re-send.
     let (result, count) =
         state_transfer::pull_buckets_from_donor(shard, donor, async { stream }, |bucket| {
-            // A pulled bucket is authoritative, warm-reloaded or not: this
-            // donor's own data supersedes whatever a stale on-disk
-            // checkpoint might have replayed for it. `mark_serving` clears
-            // both the cold and unverified marks on this one decision.
+            // A pulled bucket is authoritative regardless of any
+            // warm-reloaded on-disk checkpoint; mark_serving clears both
+            // the cold and unverified marks in one decision.
             residency.mark_serving(&[bucket]);
             if credited.insert(bucket) {
                 metrics::counter!(
@@ -111,14 +105,11 @@ async fn try_donor_buckets(
 }
 
 /// How many of a group's `total_buckets` still need
-/// `sundog_rebalance_buckets_total{direction="in"}` credited once the
-/// group's own [`DonorResult::Done`] fires: every bucket in
-/// `already_credited` was already counted live, as its own `BucketDone`
-/// arrived, so crediting it again at the group level would double-count it.
+/// `sundog_rebalance_buckets_total{direction="in"}` credited once
+/// [`DonorResult::Done`] fires: buckets in `already_credited` were
+/// already counted live, so crediting them again here would double-count.
 /// A protocol-3 donor, which never sends per-bucket `BucketDone`, credits
-/// every bucket in the group this way instead, still no later than that
-/// group's own completion rather than the whole multi-group
-/// [`PullRequest`]'s.
+/// every bucket this way instead.
 fn buckets_pending_group_credit(total_buckets: usize, already_credited: &HashSet<u16>) -> usize {
     total_buckets.saturating_sub(already_credited.len())
 }
@@ -159,12 +150,8 @@ async fn pull_one_group(
     per_donor: Duration,
 ) -> Option<u64> {
     let mut all_cold_passes = 0u32;
-    // Shared across every donor this group is retried against, within one
-    // pass over `donors` and across every retried pass of the outer
-    // `loop`: a bucket a prior donor already landed (and credited) before
-    // the group as a whole failed or moved to the next donor is never
-    // credited again when a later donor re-sends it as part of the same
-    // `buckets.clone()` request.
+    // Shared across every donor and retry pass, so a bucket a prior
+    // donor already credited is never credited again on a re-send.
     let mut credited: HashSet<u16> = HashSet::new();
     loop {
         let mut every_donor_cold = !donors.is_empty();
@@ -225,12 +212,9 @@ async fn pull_one_group(
         if every_donor_cold {
             all_cold_passes += 1;
             if all_cold_passes >= ALL_COLD_PASSES {
-                // Every donor is itself waiting on a pull for these buckets:
-                // there is no warm copy anywhere to pull. Whatever a
-                // hand-off or a forwarded write lands here is all there is,
-                // and if a warm-reloaded record is among it, it is the best
-                // available answer with no donor left to verify it against:
-                // `mark_serving` clears cold and unverified together.
+                // No warm copy anywhere to pull; whatever landed here,
+                // warm-reloaded or not, is the best available answer with
+                // nobody left to verify it against.
                 tracing::debug!(cache = %cache, buckets = buckets.len(), "every donor is cold for these buckets; nothing warm to pull");
                 residency.mark_serving(&buckets);
                 return Some(0);
@@ -257,30 +241,19 @@ pub(crate) struct PullRequest<'a> {
     pub(crate) buckets: Vec<u16>,
     pub(crate) budget: Duration,
     pub(crate) concurrency: usize,
-    /// Whether a bucket this pull finds owned alone (no live co-owner in
-    /// the current view) may be trusted as genuinely sole-owned and marked
-    /// servable outright ([`ResidencySet::mark_serving`]), rather than left
-    /// cold and unverified for the caller's ordinary warm-up retries.
-    /// `true` for every routine call (the ongoing `rebalance_task` loop,
-    /// `warm_up_task`'s retries): by the time those run, this node's
-    /// ownership view is the library's normal, live-updating one, so "no
-    /// live co-owner" there means what it says.
+    /// Whether a bucket found owned alone (no live co-owner) may be
+    /// trusted as sole-owned and marked servable outright,
+    /// rather than left cold/unverified for ordinary warm-up retries.
+    /// `true` for every routine call, where the ownership view is the
+    /// library's normal live-updating one.
     ///
-    /// For `Cache::open`'s own initial pull, this is the merged rule
-    /// `crate::cache::trust_sole_owner_at_open` computes: trust sole
-    /// ownership at open unless this open replayed buckets from a spill
-    /// snapshot *and* its membership wait
-    /// (`crate::cache::await_initial_peers`) timed out. A cold open holds
-    /// nothing unverified -- a bucket it finds owned alone here is exactly
-    /// what it looks like, this node's own data with no other copy
-    /// anywhere to distrust it against -- so it passes `true` outright
-    /// regardless of that wait's outcome. A warm reopen is different:
-    /// there, "no live co-owner" combined with a timed-out wait is exactly
-    /// the symptom of the transient sole-owner view a lone-looking node
-    /// computes before gossip has shown it any peer, not genuine single
-    /// ownership, so trusting it would serve a warm-reloaded bucket's
-    /// on-disk replay -- possibly stale -- with nobody ever having vouched
-    /// for it; that caller passes `false` to withhold trust instead.
+    /// For `Cache::open`'s initial pull, `crate::cache::trust_sole_owner_at_open`
+    /// computes this: a cold open passes `true` regardless, since a
+    /// sole-owned bucket there is this node's own data. A warm
+    /// reopen whose membership wait timed out passes `false`, since "no
+    /// live co-owner" there can be the transient view a lone-looking node
+    /// computes before gossip shows it any peer, not genuine single
+    /// ownership.
     pub(crate) trust_sole_owner: bool,
 }
 
@@ -318,15 +291,11 @@ impl PullRequest<'_> {
             group_buckets_by_donor_set(&view, cluster.node_id(), buckets)
                 .into_iter()
                 .partition(|(donors, _)| !donors.is_empty());
-        // A bucket this node owns alone has nobody to pull from, and nobody
-        // to verify a warm-reloaded record against either: what is here is
-        // all there is, so it is neither cold nor unverified -- but only
-        // when `trust_sole_owner` says this view's "alone" answer is real
-        // rather than the transient sole-owner snapshot a membership wait
-        // that timed out leaves behind. Left untrusted, `alone` buckets
-        // stay exactly as cold/unverified as `attach_ownership`/
-        // `attach_spill_and_record_warm` marked them, falling to
-        // `warm_up_task`'s ordinary retries below via `Outcome::NoPeers`.
+        // A bucket this node owns alone has nobody to pull from or verify
+        // a warm-reloaded record against, so it is neither cold nor
+        // unverified, but only when `trust_sole_owner` says this view's
+        // "alone" answer is real. Left untrusted, it falls to
+        // warm_up_task's ordinary retries via Outcome::NoPeers.
         let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
         if !alone.is_empty() && trust_sole_owner {
             residency.mark_serving(&alone);
@@ -368,10 +337,9 @@ impl PullRequest<'_> {
                     .await
                 });
             }
-            // `sundog_rebalance_buckets_total{direction="in"}` is already
-            // credited per bucket, inside `pull_one_group`/`try_donor_buckets`,
-            // the moment each one's own `BucketDone`/group completion fires;
-            // this loop only needs `superseded` for the overall `Outcome`.
+            // sundog_rebalance_buckets_total{direction="in"} is already
+            // credited per bucket inside pull_one_group/try_donor_buckets;
+            // this loop only needs `superseded` for the overall Outcome.
             let mut superseded = false;
             while let Some(result) = set.join_next().await {
                 if result.ok().flatten().is_none() {
@@ -431,9 +399,7 @@ pub(crate) async fn warm_up_task(
             buckets,
             budget,
             concurrency,
-            // By the time this retry loop runs, this node's ownership view
-            // is the library's normal, live-updating one: "no live
-            // co-owner" here means what it says.
+            // The library's normal, live-updating view by the time this retry loop runs.
             trust_sole_owner: true,
         };
         let outcome = tokio::select! {
@@ -486,11 +452,8 @@ pub(crate) async fn warm_up_task(
                     "cache" => cache.to_string()
                 )
                 .increment(1);
-                // The warm-up attempts ran out with no donor left to try:
-                // whatever a warm-reloaded bucket replayed from disk is the
-                // best available answer now, so it is declared servable
-                // right alongside every plain cold bucket that never
-                // landed a donor pull.
+                // No donor left to try: whatever landed, warm-reloaded or
+                // not, is declared servable.
                 residency.mark_all_serving();
                 cluster.mark_warm(&cache);
                 return;
@@ -576,14 +539,12 @@ async fn release_without_hand_off(
 }
 
 /// The buckets in `due` a release may drop now: those whose every other
-/// current owner is in `reconciled` (its anti-entropy round completed
-/// since the bucket came due, which reconciles every bucket that round's
-/// owner co-owns), has acked that *specific* bucket per `acked` (keyed by
-/// bucket: an ack for one bucket a co-owner holds is never treated as
-/// reconciling any other bucket the same co-owner holds), or, once
-/// `overdue`, is in `unreachable` (its round failed, or it has dropped out
-/// of the live set). An owner whose view still differs from this node's is
-/// none of these, so the bucket stays resident until the views converge.
+/// current owner is in `reconciled` (its round completed since the
+/// bucket came due), has acked that specific bucket per `acked` (keyed
+/// by bucket, never treated as reconciling any other bucket that owner
+/// holds), or, once `overdue`, is in `unreachable`. An owner whose view
+/// still differs from this node's is none of these, so the bucket stays
+/// resident until the views converge.
 pub(crate) fn buckets_to_release(
     view: &OwnershipView,
     self_node: NodeId,
@@ -609,15 +570,10 @@ pub(crate) fn buckets_to_release(
 }
 
 /// Which of `hand_off_owners`'s `owners` still need a confirming
-/// anti-entropy round: an owner already in `reconciled` (a completed round
-/// against it covers every bucket it co-owns) needs none; otherwise an
-/// owner is skipped only once `acked`
-/// ([`crate::net::Mesh::acked_owners`], bounded by
-/// [`crate::config::ClusterConfig::rebalance_ack_window_value`]) covers
-/// *every* bucket in `due` that owner co-owns, never on a single acked
-/// bucket among several -- an ack for one bucket a co-owner holds must
-/// never let another due bucket that same co-owner holds skip its
-/// confirming round.
+/// anti-entropy round: an owner already in `reconciled` needs none;
+/// otherwise an owner is skipped only once [`crate::net::Mesh::acked_owners`]
+/// covers every bucket in `due` that owner co-owns, never on a single
+/// acked bucket among several.
 fn owners_needing_confirmation(
     view: &OwnershipView,
     owners: &[NodeId],
@@ -653,16 +609,13 @@ fn owners_needing_confirmation(
 /// calls [`ShardOps::release_buckets`] for the buckets every owner answered
 /// ([`buckets_to_release`]); an owner that never answers keeps the bucket
 /// resident until it is reachable again or its view converges. An owner
-/// that acked a specific due bucket via `Msg::StBucketAck`, within
-/// [`crate::config::ClusterConfig::rebalance_ack_window_value`] and this
-/// node's current view hash of now ([`crate::net::Mesh::acked_owners`]),
-/// counts as reconciled for that bucket without a redundant confirming AE
-/// round for it -- an ack is scoped to the one bucket it names, never
-/// treated as reconciling any other due bucket the same owner co-owns, so
-/// [`owners_needing_confirmation`] still runs a round against that owner
-/// unless every due bucket it co-owns was acked. `disown_grace` still gates
-/// which buckets reach this hand-off at all, so an ack only ever
-/// accelerates the confirmation step, never the release timing floor.
+/// that acked a specific due bucket, within the ack window and current
+/// view hash, counts as reconciled for that bucket without a redundant
+/// confirming round; an ack is scoped to the one bucket it names, so
+/// [`owners_needing_confirmation`] still runs a round unless every due
+/// bucket that owner co-owns was acked. `disown_grace` still gates which
+/// buckets reach this hand-off, so an ack only accelerates confirmation,
+/// never the release timing floor.
 #[expect(
     clippy::too_many_arguments,
     reason = "a long-running per-cache background task carries this cache's full context for its whole lifetime; a struct would only rename these same eight fields"
@@ -686,14 +639,11 @@ pub(crate) async fn rebalance_task(
     let cutoff = hand_off_cutoff(cluster.config().tombstone_ttl, ae_interval);
     let mut view_rx = ownership.subscribe();
     // `prev_view` starts from `ownership.baseline()`, the tracker's
-    // original seeded view -- never from a live `view_rx.borrow_and_update()`
-    // here, which could already show a `refresh_task` publish that raced
-    // ahead of this task's own start. See `OwnershipTracker::baseline`'s
-    // own docs for why that race matters: a bucket only the seed view ever
-    // called "owned" must still be recognized as lost on the first view
-    // change this task observes, not silently excluded from every diff
-    // because it was already gone by the time `prev_view` was captured.
-    // `pulled_view` is the latest view without a superseded pull. See
+    // original seeded view, never a live re-borrow that could already
+    // show a raced-ahead publish (see `OwnershipTracker::baseline`): a
+    // bucket only the seed view ever called owned must still be
+    // recognized as lost on the first view change this task observes.
+    // `pulled_view` is the latest view without a superseded pull; see
     // `plan_view_change` for why the two differ.
     let mut prev_view = ownership.baseline();
     let mut pulled_view = Arc::clone(&prev_view);
@@ -716,11 +666,8 @@ pub(crate) async fn rebalance_task(
                     lost = plan.lost.len(),
                     "ownership view changed"
                 );
-                // A bucket this node now owns alone has nobody left to pull
-                // it from, or to verify a warm-reloaded record against:
-                // whatever is here is all there is, so it is neither cold
-                // nor unverified, and both a miss and a hit in it are
-                // answers.
+                // A bucket owned alone has nobody to pull from or verify
+                // a record against, so it is neither cold nor unverified.
                 let alone: Vec<u16> = new_view
                     .owned_buckets()
                     .filter(|&bucket| new_view.owners_of(bucket).len() == 1)
@@ -750,11 +697,7 @@ pub(crate) async fn rebalance_task(
                         buckets: plan.to_pull,
                         budget,
                         concurrency,
-                        // This is the ongoing rebalance loop, well past
-                        // `Cache::open`'s own membership wait: this node's
-                        // ownership view is the library's normal,
-                        // live-updating one, so "no live co-owner" here
-                        // means what it says.
+                        // The ongoing rebalance loop, well past open()'s membership wait.
                         trust_sole_owner: true,
                     }
                     .run()
@@ -779,17 +722,11 @@ pub(crate) async fn rebalance_task(
                     let view = ownership.current();
                     let self_node = cluster.node_id();
                     let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
-                    // An owner that already acked a due bucket, within
-                    // `rebalance_ack_window` and this node's current view
-                    // hash, counts as reconciled for that specific bucket
-                    // without a redundant confirming AE round for it;
-                    // `disown_grace` still gates `due` itself, so an ack
-                    // only ever accelerates this confirmation step, never
-                    // the release timing. Kept separate from `reconciled`
-                    // (AE-round-derived, and correctly owner-global since a
-                    // round reconciles every bucket that owner co-owns):
-                    // an ack names one bucket, never every bucket the
-                    // acking owner co-owns.
+                    // An owner that already acked a due bucket counts as
+                    // reconciled for that bucket without a redundant
+                    // round; kept separate from `reconciled` (AE-round
+                    // derived, owner-global) since an ack names one
+                    // bucket, never every bucket the owner co-owns.
                     let acked: HashMap<u16, HashSet<NodeId>> = cluster.mesh().acked_owners(
                         &cache,
                         &due,
@@ -996,22 +933,13 @@ mod tests {
             &name,
             k,
         );
-        // The seeded, lone-node view: exactly the transient "this node owns
-        // every bucket" state a `Mode::Distributed` `open()` racing gossip
-        // convergence installs.
+        // The seeded, lone-node view: the transient "owns everything" state.
         let baseline = tracker.baseline();
         assert_eq!(baseline.owned_buckets().count(), crate::store::BUCKET_COUNT);
 
-        // Published *before* `rebalance_task` is spawned: two more real
-        // nodes joining (three eligible in total, over `k=2`, so ownership
-        // actually shrinks rather than every node still owning every
-        // bucket) corrects ownership down to roughly two thirds, exactly as
-        // if `refresh_task` had already raced ahead and republished before
-        // this task ever read the tracker's channel -- the very race
-        // `OwnershipTracker::baseline` exists to make irrelevant. By the
-        // time `rebalance_task`'s `ownership.subscribe()` runs below, this
-        // is already the live value, not a pending "change" the fresh
-        // receiver would ever observe.
+        // Published before rebalance_task is spawned: as if refresh_task
+        // had already raced ahead, the very race baseline() exists to
+        // make irrelevant.
         let other_a = NodeId::from(u64::MAX);
         let other_b = NodeId::from(u64::MAX - 1);
         let corrected = Arc::new(view(
@@ -1039,17 +967,11 @@ mod tests {
             cancel.clone(),
         ));
 
-        // Gives `rebalance_task` time to subscribe (capturing `corrected`
-        // as already-seen) and start awaiting the next view change before
-        // this test publishes one.
+        // Gives rebalance_task time to subscribe before this test publishes.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // A raw `send` of the same ownership set again: a genuine new
-        // version in the watch channel, so `rebalance_task`'s
-        // `view_rx.changed()` fires, without this test needing a third,
-        // distinct real membership change to prove the point. What is
-        // under test is `rebalance_task`'s own starting point for the
-        // diff, not this second transition's content.
+        // A raw resend, a genuine new channel version, so view_rx.changed()
+        // fires without needing a third distinct membership change.
         tx.send(Arc::clone(&corrected))
             .expect("the tracker's own receiver keeps the channel open");
 
@@ -1188,11 +1110,8 @@ mod tests {
 
     #[test]
     fn buckets_to_release_accepts_an_acked_owner_without_a_confirming_ae_round() {
-        // An owner `acked` names for this specific bucket directly releases
-        // it exactly as one whose confirming AE round completed
-        // (`reconciled`) would have. A bucket still needs every one of its
-        // other current owners covered first: an ack accelerates
-        // confirmation, it does not relax the release requirement itself.
+        // An acked owner releases like a reconciled one; other current
+        // owners must still be covered.
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
@@ -1228,12 +1147,8 @@ mod tests {
     #[test]
     fn buckets_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_different_bucket()
      {
-        // Regression for the bucket-blind version of this check: two due
-        // buckets share the same other owner, who acked only one of them.
-        // The un-acked bucket must stay resident -- an ack is scoped to the
-        // bucket it names, never folded into a flat per-owner set that
-        // would let it stand in for every other due bucket that owner also
-        // co-owns.
+        // Regression: two due buckets share an owner who acked only one;
+        // the un-acked bucket must stay resident.
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
@@ -1289,12 +1204,9 @@ mod tests {
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
         let owners = vec![NodeId::from(2), NodeId::from(3)];
-        // The full bucket range, not an empty list: `owners_needing_confirmation`
-        // is only ever called (in `rebalance_task`) with owners
-        // `hand_off_owners` derived from `due`, so every passed-in owner
-        // co-owns at least one bucket actually in `due`; an owner with none
-        // vacuously has "acked every due bucket it co-owns" and would
-        // wrongly appear reconciled, a case that cannot arise in practice.
+        // The full bucket range: every real caller's owners co-own at
+        // least one bucket in `due`, so an empty range here would
+        // vacuously look reconciled.
         let due: Vec<u16> = (0..256).collect();
         let reconciled: HashSet<NodeId> = [NodeId::from(2)].into_iter().collect();
         let no_acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
@@ -1313,11 +1225,8 @@ mod tests {
 
     #[test]
     fn owners_needing_confirmation_still_runs_a_round_for_an_owner_who_only_partly_acked() {
-        // The same partial-ack scenario as
-        // `buckets_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_different_bucket`,
-        // from the confirming-round side: an owner who acked only one of
-        // several due buckets it co-owns must still get a confirming round,
-        // since that round is what reconciles the buckets it did not ack.
+        // Same partial-ack scenario from the confirming-round side: an
+        // owner who acked only one of several due buckets still needs a round.
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
@@ -1521,19 +1430,14 @@ mod tests {
             k,
         );
 
-        // Self-only view: every bucket this node owns has no co-owner at
-        // all, exactly what a warm-reloaded bucket looks like when its
-        // co-owners never even joined the cluster.
+        // Self-only view: no co-owner ever joined the cluster.
         let bucket = tracker
             .current()
             .owned_buckets()
             .next()
             .expect("self owns at least one bucket alone");
         let residency = Arc::new(ResidencySet::new());
-        // Stands in for `attach_spill_and_record_warm`'s marks right after
-        // a warm spill-tier reopen: cold, like any freshly gained bucket,
-        // and unverified besides, since this replay has never been
-        // checked against a live co-owner.
+        // Stands in for attach_spill_and_record_warm's marks after a warm reopen.
         residency.mark_cold(&[bucket]);
         residency.mark_unverified(&[bucket]);
 
@@ -1573,15 +1477,9 @@ mod tests {
     #[cfg(feature = "spill")]
     #[tokio::test]
     async fn pull_request_leaves_a_warm_reloaded_bucket_cold_when_owned_alone_is_untrusted() {
-        // The same self-only, owned-alone fixture as
-        // `pull_request_marks_a_warm_reloaded_bucket_servable_when_owned_alone`
-        // above, but with `trust_sole_owner: false`: the shape
-        // `Cache::open`'s initial pull passes whenever `trust_sole_owner_at_open`
-        // says a replayed bucket's "owned alone" answer cannot be trusted --
-        // a warm reopen whose own membership wait was needed and timed out.
-        // "Owned alone" here is exactly the transient sole-owner view a
-        // lone-looking node computes before gossip has shown it any peer,
-        // not genuine single ownership.
+        // Same fixture as the servable test above, but trust_sole_owner:
+        // false, the shape open() passes when a warm reopen's membership
+        // wait timed out.
         let cluster = solo_cluster("rebalance-unit-test-warm-alone-untrusted").await;
         let name = SmolStr::new("prices");
         let k = NonZeroU8::new(2).expect("nonzero");
@@ -1660,12 +1558,8 @@ mod tests {
             &name,
             k,
         );
-        // The phantom co-owner is already in the very first view this
-        // task's loop reads, unlike
-        // `warm_up_task_waits_for_a_co_owner_and_warms_once_its_pulls_give_up`'s
-        // self-only start: every owned bucket is genuinely co-owned from
-        // attempt 1, so it is cold and unverified going in rather than
-        // cleared outright by the "owned alone" case on the first pass.
+        // The phantom co-owner is already in the first view read, so
+        // every owned bucket is co-owned from attempt 1.
         let phantom = NodeId::from(u64::MAX);
         let phantom_view = Arc::new(view(cluster.node_id(), vec![cluster.node_id(), phantom], 2));
         tx.send(Arc::clone(&phantom_view))
@@ -1753,10 +1647,8 @@ mod tests {
         let donor_node = NodeId::from(101);
         let requester_node = NodeId::from(102);
 
-        // Bucket 0 completes; bucket 1's own chunk lands but the donor then
-        // stalls forever instead of ever signaling its done -- a stand-in
-        // for a connection that drops mid-group, since either way the
-        // requester never observes bucket 1's `BucketDone`.
+        // Bucket 0 completes; bucket 1's chunk lands but the donor then
+        // stalls, a stand-in for a mid-group connection drop.
         let donor_handler = Arc::new(BucketPullHandler {
             view_hash,
             chunks: vec![
@@ -1814,24 +1706,10 @@ mod tests {
         requester.shutdown().await;
     }
 
-    /// `try_donor_buckets`'s `credited` parameter is shared across every
-    /// donor `pull_one_group` retries a group against, precisely so a
-    /// bucket the first donor already landed (and credited) before the
-    /// group as a whole moved to a second donor is never credited again
-    /// when that second donor re-sends it. The first donor's stream, the
-    /// same stall shape
-    /// `pull_one_group_clears_cold_per_bucket_as_each_done_arrives_before_the_group_finishes`
-    /// uses, lands bucket 0's `BucketDone` (flushed once bucket 1's chunk
-    /// proves bucket 0 is behind it) and then stalls before bucket 1's own
-    /// `BucketDone` ever arrives -- a stand-in for the connection dropping
-    /// mid-group, exactly the case `pull_one_group`'s per-donor
-    /// `tokio::time::timeout` moves on from. The second donor then answers
-    /// the same still-cold group's request with both buckets and completes
-    /// it. Threading one `credited` set across both calls, exactly as
-    /// `pull_one_group`'s own loop does, must end with bucket 0 counted
-    /// once, not twice, guarding the regression where
-    /// `sundog_rebalance_buckets_total{direction="in"}` double-counted a
-    /// bucket on a donor retry.
+    /// Pins that `credited`, threaded across two donor calls the way
+    /// `pull_one_group` does, counts bucket 0 once even though the first
+    /// donor stalls after landing it and the second donor re-sends it:
+    /// guards the regression where a donor retry double-counted a bucket.
     #[tokio::test]
     async fn try_donor_buckets_shares_credited_buckets_across_repeated_calls_for_one_group() {
         use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
@@ -1878,9 +1756,8 @@ mod tests {
         let shard = empty_shard();
         let mut credited: HashSet<u16> = HashSet::new();
 
-        // Mirrors `pull_one_group`'s own per-donor timeout: the first
-        // donor's stream stalls after bucket 1's chunk, so this never
-        // resolves on its own within the test's patience.
+        // Mirrors pull_one_group's per-donor timeout; the first donor
+        // stalls after bucket 1's chunk.
         let first_call = tokio::time::timeout(
             Duration::from_millis(200),
             try_donor_buckets(

@@ -3,9 +3,8 @@
 //! tombstones.
 //!
 //! A read takes a stripe's read lock, finds the key by its postcard bytes in
-//! a [`hashbrown::HashTable`], and decodes the stored record's value half.
-//! Keys up to
-//! `KEY_STACK_BUF` bytes encode on the stack. A versioned write
+//! a [`hashbrown::HashTable`], and decodes the record's value half. Keys up
+//! to `KEY_STACK_BUF` bytes encode on the stack. A versioned write
 //! (`apply_locked`) runs synchronously under the stripe's write lock.
 //! Anti-entropy enumerates a bucket by locking one stripe.
 //!
@@ -22,12 +21,10 @@
 //! between a lookup and a wait. `InflightGuard` frees a cancelled load so a
 //! waiter takes over.
 //!
-//! Each [`Live`] entry holds its record in a [`Record`]: inline in the
-//! entry's own memory for records up to `INLINE_CAP` bytes, a boxed slice on
-//! the heap beyond that. Its version is flattened across the entry's
-//! `wall_ms`, `node`, and `logical` fields instead of held as one `Hlc`
-//! value; `Live::ver` and `Live::set_ver` reassemble and overwrite it as a
-//! whole.
+//! Each [`Live`] entry holds its record in a [`Record`]: inline up to
+//! `INLINE_CAP` bytes, boxed on the heap beyond that. Its version is
+//! flattened across `wall_ms`/`node`/`logical` instead of one `Hlc` field;
+//! `Live::ver`/`Live::set_ver` reassemble and overwrite it as a whole.
 //!
 //! Under `feature = "spill"`, a live entry can move to disk instead of
 //! being evicted; see [`super::spill::SpillTier`] for that mechanism.
@@ -67,14 +64,9 @@ use super::{
     PART_COUNT, PartEntries, Quiescence, RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
 };
 
-/// [`spill::Reservation`](super::spill::Reservation), reduced to an
-/// always-`None` placeholder on a build with no `spill` feature: nothing on
-/// this build can ever construct one (every real reservation comes from
-/// `SpillTier::reserve`, itself only nameable under `feature = "spill"`),
-/// but the type still needs to be nameable here so
-/// `Engine::apply_many_with_reservation`, `Engine::enforce_capacity_with_reservation`,
-/// and the rest of the eviction chain keep one signature shared by both
-/// builds instead of a duplicated, feature-gated body each.
+/// A never-constructed placeholder for
+/// [`spill::Reservation`](super::spill::Reservation), so both builds share
+/// one eviction-chain signature.
 #[cfg(not(feature = "spill"))]
 #[allow(
     dead_code,
@@ -176,35 +168,25 @@ fn hasher_for<K, V>(live: &Live<K, V>) -> u64 {
 /// Sentinel [`Live::expiry`] marking "never expires".
 const NEVER_EXPIRES: u32 = u32::MAX;
 
-/// Sentinel [`Live::expiry`] marking a deadline that lies past
-/// [`MAX_INLINE_TTL_MS`] above the entry's own `wall_ms`: the real absolute
-/// millisecond deadline lives in `Stripe::long_ttl` under the entry's key
-/// instead of inline.
+/// Sentinel [`Live::expiry`] for a deadline past [`MAX_INLINE_TTL_MS`]
+/// above `wall_ms`; the real deadline then lives in `Stripe::long_ttl`.
 const LONG_TTL: u32 = u32::MAX - 1;
 
-/// The largest inline delta [`encode_expiry`] stores above an entry's
-/// `wall_ms`, in milliseconds: `u32::MAX - 2`, ~49.71 days. A deadline
-/// further out than this stores [`LONG_TTL`] inline and its exact absolute
-/// value in `Stripe::long_ttl` instead.
+/// The largest inline delta [`encode_expiry`] stores above `wall_ms`
+/// (`u32::MAX - 2`, ~49.71 days); past this, [`LONG_TTL`] applies instead.
 const MAX_INLINE_TTL_MS: u64 = (u32::MAX - 2) as u64;
 
-/// Encodes a write's absolute `expires_at_ms` relative to its own `wall_ms`,
-/// for [`Live::expiry`]: [`NEVER_EXPIRES`] for `None`, an exact millisecond
-/// delta above `wall_ms` when it fits within [`MAX_INLINE_TTL_MS`], or
-/// [`LONG_TTL`] paired with the exact absolute deadline otherwise. The
-/// second element of the returned pair is `Some` exactly when the caller
-/// must insert or refresh `Stripe::long_ttl`'s row for this key; the caller
-/// clears any stale row itself when it is `None`, since this function never
-/// sees the stripe.
+/// Encodes a write's `expires_at_ms` relative to `wall_ms`, for
+/// [`Live::expiry`]: [`NEVER_EXPIRES`] for `None`, an exact delta within
+/// [`MAX_INLINE_TTL_MS`], or [`LONG_TTL`] with the deadline as the pair's
+/// `Some` second element, stored in `Stripe::long_ttl`.
 fn encode_expiry(wall_ms: u64, expires_at_ms: Option<u64>) -> (u32, Option<u64>) {
     match expires_at_ms {
         None => (NEVER_EXPIRES, None),
         Some(exp) => match exp.checked_sub(wall_ms) {
-            // `exp < wall_ms` is a real, exercised case (a dead-on-arrival
-            // TTL, or a remote write whose expiry predates its own wall_ms):
-            // it cannot be an inline delta at all, since `expiry` only ever
-            // adds to `wall_ms`, so it always takes the exact side-table
-            // path rather than silently rounding up to `wall_ms`.
+            // `exp < wall_ms` happens (a dead-on-arrival TTL, or a remote
+            // write predating its own wall_ms); `expiry` only ever adds to
+            // `wall_ms`, so this always takes the exact side-table path.
             Some(delta) if delta <= MAX_INLINE_TTL_MS => (
                 u32::try_from(delta).expect("delta <= MAX_INLINE_TTL_MS < u32::MAX fits in a u32"),
                 None,
@@ -214,11 +196,8 @@ fn encode_expiry(wall_ms: u64, expires_at_ms: Option<u64>) -> (u32, Option<u64>)
     }
 }
 
-/// The sole reader of a stored [`Live::expiry`]: `None` for
-/// [`NEVER_EXPIRES`], the exact deadline `long_ttl` holds under `key_bytes`
-/// for [`LONG_TTL`], or `wall_ms` plus the inline delta otherwise. Every
-/// call site that needs a live entry's real deadline goes through this, so
-/// millisecond precision never depends on where the deadline is stored.
+/// The sole reader of a stored [`Live::expiry`]: `None`, `long_ttl`'s
+/// value, or `wall_ms` plus the inline delta, per the sentinel.
 fn decode_expiry(
     wall_ms: u64,
     expiry: u32,
@@ -232,12 +211,8 @@ fn decode_expiry(
     }
 }
 
-/// Truncates `now_ms` to [`Live::last_access_ms`]'s stored form: the low 32
-/// bits of the epoch millisecond clock. [`Engine::touch`] writes this on
-/// every access that needs recency tracked; [`idle_elapsed_ms`] is the only
-/// reader, and its wrapping subtraction recovers the true elapsed duration
-/// from the truncated stamp alone, so the truncation itself never loses
-/// precision for any gap under [`MAX_INLINE_TTL_MS`].
+/// Truncates `now_ms` to [`Live::last_access_ms`]'s stored form (the low 32
+/// bits); [`idle_elapsed_ms`] recovers the true gap from this alone.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "the truncation is the point: idle_elapsed_ms recovers the true elapsed \
@@ -247,15 +222,9 @@ fn touch_stamp(now_ms: u64) -> u32 {
     now_ms as u32
 }
 
-/// How long ago, in milliseconds, an entry last touched at
-/// [`touch_stamp`]`(some earlier now)` was read, as of `now_ms`: a wrapping
-/// subtraction on the low 32 bits of both timestamps. Correct regardless of
-/// whether `now_ms` or the touch it is compared against crossed a
-/// `u32::MAX`-millisecond (~49.71 day) rollover in between, as long as the
-/// true gap between them is under that same ~49.71 days: [`clamp_tti_ms`]
-/// enforces exactly that ceiling on every configured time-to-idle, so this
-/// never has to compare against a `tti_ms` past the range it can represent.
-/// The sole reader of [`Live::last_access_ms`].
+/// Milliseconds since an entry was last touched at
+/// [`touch_stamp`]`(earlier now)`, correct as long as the true gap is under
+/// ~49.71 days, the ceiling [`clamp_tti_ms`] enforces.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "matches touch_stamp's own truncation of now_ms before the wrapping subtraction"
@@ -264,35 +233,22 @@ fn idle_elapsed_ms(now_ms: u64, last_access_ms: u32) -> u64 {
     u64::from((now_ms as u32).wrapping_sub(last_access_ms))
 }
 
-/// Clamps a configured time-to-idle to [`MAX_INLINE_TTL_MS`], the largest
-/// value [`idle_elapsed_ms`] ever returns. [`idle_elapsed_ms`]'s wrapping
-/// subtraction tops out at `u32::MAX`, so a `tti_ms` at or past that point
-/// never fires at all: the entry stays readable forever, not just late.
-/// [`crate::CacheBuilder::tti`] takes an unbounded `Duration` with no
-/// validation of its own; [`Engine::new`] is the one place this ceiling gets
-/// enforced, since `idle_elapsed_ms` is the sole reader of a stored
-/// `last_access_ms`.
+/// Clamps a configured time-to-idle to [`MAX_INLINE_TTL_MS`], past which
+/// [`idle_elapsed_ms`] never fires and the entry stays readable forever.
 fn clamp_tti_ms(tti_ms: u64) -> u64 {
     tti_ms.min(MAX_INLINE_TTL_MS)
 }
 
-/// Max inline payload length for [`Record`]. The `Inline` variant is a
-/// 1-byte length plus a `[u8; INLINE_CAP]` buffer, 23 bytes; `Heap` is a
-/// `Box<[u8]>`, a 16-byte fat pointer at 8-byte alignment. The enum's own
-/// discriminant costs nothing extra here (the compiler folds it into the
-/// `Inline` variant's own layout), so `Record` sits at exactly 24 bytes,
-/// pinned by `record_size_is_24_bytes` below.
+/// Max inline payload length for [`Record`], which sits at exactly 24
+/// bytes either way, pinned by `record_size_is_24_bytes`.
 const INLINE_CAP: usize = 22;
 
 /// A live entry's raw `LEN ++ KEY ++ VALUE` record bytes: inline for
-/// records up to [`INLINE_CAP`] bytes (the profiled 18-byte
-/// `Cache<String, String>` record always lands here: zero heap
-/// allocations), an exclusively owned `Box<[u8]>` beyond that. Never
-/// shared and never `Clone`: a call site that needs an owned copy across
-/// a stripe lock boundary builds a fresh `Bytes::copy_from_slice` from
-/// [`record_key_bytes`]/[`record_value_bytes`] instead. Safe: no raw
-/// pointers, no manual `Drop`, no hand-written `Send`/`Sync` impl. `Box`
-/// already provides all three.
+/// records up to [`INLINE_CAP`] bytes (a `Cache<String, String>` record
+/// always lands here, with zero heap allocations), an owned `Box<[u8]>`
+/// beyond that. Never shared and never `Clone`: a caller needing an owned
+/// copy builds a fresh `Bytes::copy_from_slice` from
+/// [`record_key_bytes`]/[`record_value_bytes`] instead.
 enum Record {
     /// Inline payload: the first `len` bytes of `buf` are the record.
     Inline { len: u8, buf: [u8; INLINE_CAP] },
@@ -383,12 +339,8 @@ mod record_tests {
     }
 }
 
-/// Builds a resident record: `LEN ++ KEY ++ VALUE`. `key_bytes` is
-/// `postcard::to_stdvec(&key)`; `value_bytes` is `postcard::to_stdvec(&value)`.
-/// `LEN` is `postcard::to_stdvec(&(key_bytes.len() as u32))`, 1 byte for any
-/// key encoding under 128 bytes. `build_resident_record`,
-/// `build_key_only_record`, and [`split_record`] are the only three
-/// functions in this file allowed to construct or parse a record.
+/// Builds a resident record: `LEN ++ KEY ++ VALUE`, where `LEN` is
+/// `key_bytes.len()` postcard-encoded (1 byte under 128 bytes).
 fn build_resident_record(key_bytes: &[u8], value_bytes: &[u8]) -> Record {
     let key_len = u32::try_from(key_bytes.len()).expect("a key's postcard encoding fits in u32");
     let len_prefix = postcard::to_stdvec(&key_len).expect("a u32 always encodes");
@@ -399,23 +351,16 @@ fn build_resident_record(key_bytes: &[u8], value_bytes: &[u8]) -> Record {
     Record::from_slice(&buf)
 }
 
-/// Builds a spilled record: `LEN ++ KEY` only, an empty value half. Always a
-/// fresh allocation copying `key_bytes` out, never a slice of an existing
-/// resident record: a slice shares the old allocation's refcount, keeping
-/// the value bytes it is supposed to shed resident in RAM for as long as
-/// the slice lives. Called by `SpillSink::install` in a `spill` build;
-/// otherwise only test code reaches it.
+/// Builds a spilled record: `LEN ++ KEY` only, always a fresh allocation
+/// rather than a slice of the old record (which would keep its value
+/// bytes resident).
 #[cfg_attr(not(any(test, feature = "spill")), allow(dead_code))]
 fn build_key_only_record(key_bytes: &[u8]) -> Record {
     build_resident_record(key_bytes, &[])
 }
 
 /// Splits a record (`LEN ++ KEY ++ VALUE`) into its `(KEY, VALUE)` halves,
-/// zero-copy. `record` is always this engine's own output of
-/// [`build_resident_record`]/[`build_key_only_record`], so the postcard
-/// parse of `LEN` cannot fail in practice: the same reasoning
-/// [`decode_key`]/[`decode_value`] lean on for postcard round-trips
-/// elsewhere in this file.
+/// zero-copy.
 fn split_record(record: &[u8]) -> (&[u8], &[u8]) {
     let (key_len, rest): (u32, &[u8]) = postcard::take_from_bytes(record)
         .expect("record's LEN prefix is this engine's own postcard output");
@@ -429,16 +374,13 @@ fn record_key(record: &[u8]) -> &[u8] {
 }
 
 /// `record`'s value half, `split_record(record).1`, zero-copy: the value
-/// counterpart to [`record_key`]. Used by a decode-only reader that only
-/// needs to borrow the bytes for the duration of a postcard decode, never
-/// crossing the stripe lock boundary.
+/// counterpart to [`record_key`], for a decode that never crosses the lock.
 fn record_value(record: &[u8]) -> &[u8] {
     split_record(record).1
 }
 
-/// `record`'s key half as an independently owned `Bytes`, copied out:
-/// [`Record`] holds no shared backing allocation to slice into, so this
-/// always allocates.
+/// `record`'s key half as an owned `Bytes`, copied out: [`Record`] holds
+/// no shared backing to slice into, so this always allocates.
 fn record_key_bytes(record: &Record) -> Bytes {
     Bytes::copy_from_slice(record_key(record))
 }
@@ -449,78 +391,51 @@ fn record_value_bytes(record: &Record) -> Bytes {
     Bytes::copy_from_slice(record_value(record))
 }
 
-/// Decodes `key_bytes`, always this engine's own prior
-/// `postcard::to_stdvec(&key)` output, back into `K`. Panics on a decode
-/// failure: a live key reading as absent is a worse lie than a loud panic.
+/// Decodes `key_bytes` back into `K`. Panics on a decode failure: a live
+/// key reading as absent is a worse lie than a loud panic.
 fn decode_key<K: DeserializeOwned>(key_bytes: &[u8]) -> K {
     postcard::from_bytes(key_bytes).expect("key_bytes is this engine's own postcard output")
 }
 
-/// Decodes `value_bytes`, always this engine's own prior
-/// `postcard::to_stdvec(&value)` output or verbatim wire bytes decoding to a
-/// structurally equal value, back into `V`. Panics on a decode failure,
-/// mirroring [`decode_key`].
+/// Decodes `value_bytes` back into `V`, mirroring [`decode_key`].
 fn decode_value<V: DeserializeOwned>(value_bytes: &[u8]) -> V {
     postcard::from_bytes(value_bytes).expect("value_bytes is this engine's own postcard output")
 }
 
-/// One live entry. Carries neither a decoded key nor a decoded value: only
-/// `record`'s raw postcard bytes are stored, inline in a [`Record`] for
-/// records up to `INLINE_CAP` bytes, boxed on the heap beyond that. Every
-/// reader that needs a typed `K` or `V` decodes it on demand from `record`
-/// ([`record_key`], [`record_value`], [`record_value_bytes`],
-/// [`decode_key`], [`decode_value`]). This entry's version is flattened
-/// across `wall_ms`, `node`, and `logical` rather than held as one `Hlc`;
-/// [`Live::ver`] and [`Live::set_ver`] reassemble and overwrite it as a
-/// whole. `K`/`V` are phantom-only: no field is `K`- or `V`-typed.
+/// One live entry. Stores only `record`'s raw postcard bytes, never a
+/// decoded key or value; a reader decodes on demand
+/// ([`record_key`]/[`record_value`]/[`record_value_bytes`]/[`decode_key`]/
+/// [`decode_value`]). Its version is flattened across `wall_ms`/`node`/
+/// `logical` rather than one `Hlc`; [`Live::ver`]/[`Live::set_ver`]
+/// reassemble it. `K`/`V` are phantom-only.
 struct Live<K, V> {
-    /// `key || value`, framed as one field: a leading postcard-encoded
-    /// `u32` giving the key half's byte length, then the key's own
-    /// postcard bytes, then the value's own postcard bytes; see
-    /// [`build_resident_record`]'s doc for the exact framing. Inline, no
-    /// heap allocation, for a record of [`INLINE_CAP`] bytes or fewer; one
-    /// heap allocation beyond that. For a spilled entry
-    /// (`feature = "spill"` only) it holds the key half alone, built
-    /// fresh by [`build_key_only_record`], never a `.slice()` of the old
-    /// resident record: see [`EntryState::Spilled`]'s doc.
+    /// `key || value`, framed per [`build_resident_record`]. A spilled
+    /// entry (`feature = "spill"`) holds the key half alone.
     record: Record,
     /// This write's version, flattened: [`Hlc::wall_ms`], the primary
     /// ordering key.
     wall_ms: u64,
     /// This write's version, flattened: [`Hlc::node`], the final tiebreak.
-    /// Stays the full 64-bit [`NodeId`]: a locally assigned index cannot
-    /// stay bit-identical across independently computed replica merges,
-    /// which `NodeId::merge_derived`'s determinism requirement needs.
+    /// Kept as the full [`NodeId`] for `NodeId::merge_derived`'s determinism.
     node: NodeId,
-    /// This entry's expiry, flattened above `wall_ms`: [`NEVER_EXPIRES`]
-    /// means "never expires", [`LONG_TTL`] means the real absolute deadline
-    /// lives in `Stripe::long_ttl` under this entry's key, and any other
-    /// value is an exact millisecond delta above `wall_ms`. Every writer
-    /// goes through [`encode_expiry`], every reader through
-    /// [`decode_expiry`], so the sentinels are never assigned by accident.
+    /// This entry's expiry, flattened above `wall_ms`. Written via
+    /// [`encode_expiry`], read via [`decode_expiry`].
     expiry: u32,
     /// This write's version, flattened: [`Hlc::logical`], packed beside
     /// `weight` instead of paying `Hlc`'s own tail padding a second time.
     logical: u32,
-    /// Capacity-accounting weight. `1` by default, an arbitrary caller
-    /// value when a `Weigher` is configured, `0` while a spill hand-off
-    /// for this entry is in flight.
+    /// Capacity-accounting weight: `1` by default, a caller value under a
+    /// `Weigher`, `0` while a spill hand-off for this entry is in flight.
     weight: u32,
-    /// [`touch_stamp`] of the epoch millisecond this entry was last read,
-    /// written only when [`Engine::tracks_last_access`] is true (TTI or a
-    /// finite capacity configured). Read back only through
-    /// [`idle_elapsed_ms`], never compared directly: a raw stamp alone
-    /// cannot tell which of two entries is colder once either has crossed
-    /// a rollover.
+    /// [`touch_stamp`] of this entry's last read, read only through
+    /// [`idle_elapsed_ms`] (a rollover confuses a raw comparison).
     last_access_ms: AtomicU32,
-    /// Whether `record` holds a value ([`EntryState::Resident`]) or points
-    /// at disk with no value in RAM ([`EntryState::Spilled`]). Absent in a
-    /// non-`spill` build: every entry is implicitly resident.
+    /// Whether `record` holds a value or points at disk with none. Absent
+    /// in a non-`spill` build: every entry is implicitly resident.
     #[cfg(feature = "spill")]
     state: EntryState,
-    /// Zero-sized. Carries `Live`'s variance over `K`/`V` so every existing
-    /// `fn foo<K, V>(&Live<K, V>)` signature in this file compiles even
-    /// though no field is `K`- or `V`-typed.
+    /// Zero-sized; carries `Live`'s variance over `K`/`V` since no field
+    /// is `K`- or `V`-typed.
     _marker: PhantomData<fn(&K, &V)>,
 }
 
@@ -543,8 +458,7 @@ impl<K, V> Live<K, V> {
     }
 
     /// Builds a `Live` entry, splitting `ver` into its flattened fields and
-    /// storing `last_access_ms` through [`touch_stamp`] in the entry's own
-    /// `AtomicU32`.
+    /// storing `last_access_ms` via [`touch_stamp`].
     #[allow(clippy::too_many_arguments)]
     fn new(
         record: Record,
@@ -574,21 +488,13 @@ impl<K, V> Live<K, V> {
 enum EntryState {
     /// `record` is `[key_len][key][value]`; the value is in RAM.
     Resident,
-    /// `record` is `[key_len][key]` only, built by [`build_key_only_record`]
-    /// as a fresh copy of the old record's key half. Never a `.slice()` of
-    /// a still-resident record: a slice shares the old allocation's
-    /// refcount, so the value bytes it is supposed to shed stay physically
-    /// resident in RAM for as long as that slice lives, silently breaking
-    /// the promise this variant makes ("nothing here is in RAM").
+    /// `record` is `[key_len][key]` only, a fresh copy of the key half,
+    /// never a `.slice()` of the old record.
     Spilled(SpillLoc),
 }
 
-/// Whether `live`'s record currently holds a value in RAM: eviction and
-/// spill candidacy hinge on this, since a spilled entry is never sampled
-/// as a victim. It holds nothing to spill, and physically deleting it is
-/// region reclaim's job alone, not sampled LRU's. Always `true` in a
-/// non-`spill` build, which never compiles an entry that is anything but
-/// resident.
+/// Whether `live`'s record currently holds a value in RAM. Always `true`
+/// in a non-`spill` build.
 fn is_resident<K, V>(live: &Live<K, V>) -> bool {
     #[cfg(feature = "spill")]
     {
@@ -611,9 +517,7 @@ fn is_spill_candidate<K, V>(live: &Live<K, V>) -> bool {
 }
 
 /// Whether `live`'s record is currently spilled: the mirror of
-/// [`is_resident`], used only to decide whether removing this entry from
-/// `live` must also decrement `sundog_spill_entries{cache}`. Always `false`
-/// in a non-`spill` build, which never compiles the `Spilled` arm.
+/// [`is_resident`]. Always `false` in a non-`spill` build.
 fn is_spilled<K, V>(live: &Live<K, V>) -> bool {
     #[cfg(feature = "spill")]
     {
@@ -673,14 +577,8 @@ pub(crate) struct Stripe<K, V> {
     live: Slab<K, V>,
     tombstones: HashMap<Bytes, Tombstone>,
     inflight: HashMap<Bytes, Arc<Inflight<V>>>,
-    /// The absolute `expires_at_ms` for every currently-live entry whose
-    /// [`Live::expiry`] holds the [`LONG_TTL`] marker: a deadline more than
-    /// [`MAX_INLINE_TTL_MS`] out, too far to fit the inline delta. Cleared
-    /// at every removal, expiry, eviction, release, and overwrite site that
-    /// touches the entry it belongs to, so no row ever outlives its entry;
-    /// [`decode_expiry`] is the only reader. `HashMap::new()`, zero
-    /// allocation until the first long-TTL write, matching `tombstones` and
-    /// `inflight`'s own pattern.
+    /// The absolute `expires_at_ms` for every live entry whose
+    /// [`Live::expiry`] holds [`LONG_TTL`].
     long_ttl: HashMap<Bytes, u64>,
     /// The minimum `expires_at_ms` among this stripe's live entries, `u64::MAX`
     /// if none. A lower bound, not necessarily tight, since only
@@ -700,10 +598,7 @@ impl<K, V> Stripe<K, V> {
     }
 
     /// A stripe whose `live` slab presizes its arena and index for
-    /// `capacity` entries, matching [`Slab::with_capacity`]. Every other
-    /// field starts exactly as [`Stripe::new`] leaves it: no live entry
-    /// count is implied by a capacity hint alone. [`Engine::new`] calls
-    /// this per stripe when its `capacity_hint` is `Some`.
+    /// `capacity` entries.
     fn with_capacity(capacity: usize) -> Self {
         Self {
             live: Slab::with_capacity(capacity),
@@ -716,21 +611,15 @@ impl<K, V> Stripe<K, V> {
 }
 
 /// One stripe's live entries: a dense arena plus a hash index mapping each
-/// live key's hash to its arena slot. `entries[i]` for every
-/// `i < entries.len()` is reachable from exactly one `index` row: no holes,
-/// no free list. `entries.len()` is always the exact live count, so a
-/// full-stripe walker (digest XOR, snapshot/state-transfer, sampled
-/// eviction, sweep's retain) iterates `entries` directly with no liveness
-/// check, doing less work than a hash table's own iterator, which walks
-/// every control-byte group including its empty and tombstoned slots.
-/// [`Stripe::live`]'s storage.
+/// live key's hash to its arena slot. No holes, no free list:
+/// `entries.len()` is always the exact live count, so a full-stripe walker
+/// iterates `entries` directly with no liveness check. [`Stripe::live`]'s
+/// storage.
 struct Slab<K, V> {
     /// The arena: one slot per live entry, indexed by `u32`.
     entries: Vec<Live<K, V>>,
-    /// `u32` slot indices, hashed and compared through [`hasher_for`] and
-    /// [`record_key`] on the slot's own record: the same functions a
-    /// `HashTable<Live<K, V>>` storing entries directly hashes and compares
-    /// its own elements with.
+    /// `u32` slot indices, hashed and compared through [`hasher_for`]/
+    /// [`record_key`] on the slot's own record.
     index: HashTable<u32>,
 }
 
@@ -744,11 +633,8 @@ impl<K, V> Slab<K, V> {
         }
     }
 
-    /// A slab presized for `capacity` entries: the arena and the index each
-    /// allocate once, up front, instead of growing incrementally. Reached
-    /// through [`Stripe::with_capacity`], which [`Engine::new`]'s
-    /// `capacity_hint` parameter wires in; exercised directly here by
-    /// `slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint`.
+    /// A slab presized for `capacity` entries: the arena and index each
+    /// allocate once, up front, reached through [`Stripe::with_capacity`].
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
@@ -762,12 +648,7 @@ impl<K, V> Slab<K, V> {
         self.entries.len()
     }
 
-    /// This slab's reserved arena capacity: `entries.capacity()`, the
-    /// memory-dominant side of a stripe's allocation (`size_of::<Live<K,
-    /// V>>()` bytes/slot against the index's ~5 bytes/bucket, per the
-    /// density pass's own accounting). [`Engine::compact`]'s
-    /// [`should_shrink_stripe`] check and [`Engine::stripe_capacities`]
-    /// both read this.
+    /// This slab's reserved arena capacity: `entries.capacity()`.
     fn capacity(&self) -> usize {
         self.entries.capacity()
     }
@@ -790,9 +671,8 @@ impl<K, V> Slab<K, V> {
         Some(&mut self.entries[slot as usize])
     }
 
-    /// Looks `hash` up under `eq`: [`SlabEntry::Occupied`] naming the arena
-    /// slot when found, [`SlabEntry::Vacant`] carrying `hash` and `hasher`
-    /// for a later [`SlabVacantEntry::insert`] otherwise.
+    /// Looks `hash` up under `eq`: [`SlabEntry::Occupied`] naming the slot
+    /// when found, [`SlabEntry::Vacant`] carrying `hash`/`hasher` otherwise.
     fn entry<F>(
         &mut self,
         hash: u64,
@@ -823,11 +703,8 @@ impl<K, V> Slab<K, V> {
         }
     }
 
-    /// Pushes `value` onto the arena and indexes it at `hash`, computed
-    /// through `hasher` for any later index growth. Returns the arena slot
-    /// it landed in. The caller is responsible for `hash` and `value`
-    /// agreeing on the same key, exactly as `HashTable::insert_unique`
-    /// itself trusts its own caller: no duplicate-key check.
+    /// Pushes `value` onto the arena and indexes it at `hash`, returning
+    /// the slot. No duplicate-key check.
     fn insert_unique(
         &mut self,
         hash: u64,
@@ -843,14 +720,8 @@ impl<K, V> Slab<K, V> {
         slot
     }
 
-    /// Removes the live entry at `hash` for which `eq` holds, if any:
-    /// [`Slab::entry`] plus [`SlabOccupiedEntry::remove`] in one call. Every
-    /// production removal site (`remove_live`, `evict_victim_locked`,
-    /// `reclaim`) goes through `entry`/`OccupiedEntry::remove` directly
-    /// instead, reading the occupied entry's own fields as part of the same
-    /// removal; this convenience wrapper is exercised directly by
-    /// `slab_remove_of_absent_key_returns_none` and
-    /// `slab_random_permutation_insert_remove_matches_a_hashmap_mirror`.
+    /// Removes the live entry at `hash` for which `eq` holds, if any. No
+    /// production call site uses this; only tests do.
     #[allow(
         dead_code,
         reason = "no production call site removes through this convenience wrapper yet; \
@@ -869,12 +740,8 @@ impl<K, V> Slab<K, V> {
         }
     }
 
-    /// Swap-removes the arena slot `slot` (whose index row hashes to
-    /// `hash`) and, when the swap moves a different entry into `slot`,
-    /// rehashes that moved entry through `hasher` and repoints its index
-    /// row from `entries.len() - 1` (its slot up to this call) to `slot`.
-    /// `entries` stays dense either way: no holes, no free list,
-    /// `entries.len()` always the live count.
+    /// Swap-removes arena slot `slot` (index row hashing to `hash`),
+    /// repointing the moved entry's index row so `entries` stays dense.
     fn remove_at(
         &mut self,
         hash: u64,
@@ -902,10 +769,8 @@ impl<K, V> Slab<K, V> {
         removed
     }
 
-    /// Keeps only the entries for which `f` returns `true`, dense
-    /// afterwards: a kept entry's own arena slot never moves, a dropped one
-    /// is swap-removed via [`Slab::remove_at`]. Visits every entry, kept or
-    /// dropped, exactly once.
+    /// Keeps only entries for which `f` returns `true`, dense afterwards: a
+    /// kept entry's slot never moves; a dropped one is swap-removed.
     fn retain(
         &mut self,
         hasher: impl Fn(&Live<K, V>) -> u64,
@@ -922,9 +787,7 @@ impl<K, V> Slab<K, V> {
         }
     }
 
-    /// Every live entry, in arena order: an order no caller depends on,
-    /// since every reader either lands results in a `Vec`/`HashMap` or
-    /// folds them via commutative XOR into a digest.
+    /// Every live entry, in arena order (no caller depends on the order).
     fn iter(&self) -> std::slice::Iter<'_, Live<K, V>> {
         self.entries.iter()
     }
@@ -936,11 +799,8 @@ impl<K, V> Slab<K, V> {
         self.entries.drain(..)
     }
 
-    /// Shrinks both the arena and the index to fit their current length,
-    /// rehashing every remaining entry's index row through `hasher`.
-    /// [`Engine::compact`]'s paced shrink pass calls this once
-    /// [`should_shrink_stripe`] finds a stripe left oversized by an
-    /// inflated capacity hint or ownership rebalancing.
+    /// Shrinks the arena and index to fit, rehashing every entry's index
+    /// row. Called by [`Engine::compact`]'s paced shrink pass.
     fn shrink_to_fit(&mut self, hasher: impl Fn(&Live<K, V>) -> u64) {
         self.entries.shrink_to_fit();
         let entries = &self.entries;
@@ -967,19 +827,14 @@ impl<'a, K, V, F> SlabOccupiedEntry<'a, K, V, F>
 where
     F: Fn(&Live<K, V>) -> u64,
 {
-    /// A reference to this slot's entry. `SpillSink::reclaim`'s only
-    /// caller in a non-test build; otherwise only test code reaches it.
+    /// A reference to this slot's entry.
     #[cfg_attr(not(any(test, feature = "spill")), allow(dead_code))]
     fn get(&self) -> &Live<K, V> {
         &self.slab.entries[self.slot]
     }
 
-    /// A mutable reference to this slot's entry. Every production mutation
-    /// site rebinds through [`Slab::find_mut`] directly instead, since none
-    /// of them also needs to remove the slot in the same step; kept for
-    /// symmetry with [`SlabOccupiedEntry::get`] and hashbrown's own
-    /// `OccupiedEntry` API this mirrors. Exercised directly by
-    /// `slab_occupied_entry_get_mut_mutates_the_slot_visibly_through_find`.
+    /// A mutable reference to this slot's entry. No production site uses
+    /// this; kept for symmetry with hashbrown's own `OccupiedEntry` API.
     #[cfg_attr(
         not(test),
         allow(
@@ -994,8 +849,7 @@ where
     }
 
     /// Takes this slot's entry out via [`Slab::remove_at`], returning it
-    /// alongside a [`SlabVacantEntry`] for the same hash, ready to insert a
-    /// replacement.
+    /// with a [`SlabVacantEntry`] for the same hash.
     fn remove(self) -> (Live<K, V>, SlabVacantEntry<'a, K, V, F>) {
         let removed = self.slab.remove_at(self.hash, self.slot, &self.hasher);
         (
@@ -1021,15 +875,8 @@ impl<K, V, F> SlabVacantEntry<'_, K, V, F>
 where
     F: Fn(&Live<K, V>) -> u64,
 {
-    /// Inserts `value` at this vacant hash: [`Slab::insert_unique`] under
-    /// the hood. Every production write path calls `insert_unique`
-    /// directly instead, since each already knows it holds no live entry
-    /// for the key: an overwrite removes any entry already stored under
-    /// the key as its own separate step, then inserts the replacement
-    /// unconditionally. Kept for a vacant caller that only has a
-    /// [`SlabEntry::Vacant`] in hand, and for symmetry with hashbrown's own
-    /// `VacantEntry` API this mirrors. Exercised directly by
-    /// `slab_vacant_entry_insert_makes_the_value_findable`.
+    /// Inserts `value` at this vacant hash via [`Slab::insert_unique`]. No
+    /// production path uses this; kept for symmetry with hashbrown's API.
     #[cfg_attr(
         not(test),
         allow(
@@ -1151,9 +998,8 @@ mod slab_tests {
         slab.insert_unique(hc, live_for(30, b"c"), hasher_for);
         assert_eq!(slab.len(), 3);
 
-        // Removing slot 0 swap-moves the last-inserted entry (key 30) into
-        // it; that moved entry's index row must repoint from slot 2 to
-        // slot 0.
+        // Removing slot 0 swap-moves key 30 into it; its index row must
+        // repoint.
         let SlabEntry::Occupied(occ) = slab.entry(ha, eq_for(10), hasher_for) else {
             panic!("key 10 is present");
         };
@@ -1169,8 +1015,7 @@ mod slab_tests {
         assert!(slab.find(hb, eq_for(20)).is_some());
         assert!(slab.find(ha, eq_for(10)).is_none());
 
-        // Every remaining arena entry is reachable from its own hash: no
-        // stale index row, no entry left unindexed.
+        // Every remaining entry is still reachable from its own hash.
         let keys: Vec<u32> = slab
             .iter()
             .map(|live| decode_key(record_key(&live.record)))
@@ -1283,9 +1128,8 @@ mod slab_tests {
             assert!(slab.find(hash_of(key), eq_for(key)).is_some());
         }
 
-        // shrink_to_fit, exercised here: after removing all but one entry,
-        // it drops the oversized allocation without losing the survivor's
-        // findability.
+        // After removing all but one entry, shrink drops the oversized
+        // allocation.
         for key in 1..64u32 {
             slab.remove(hash_of(key), eq_for(key), hasher_for);
         }
@@ -1375,10 +1219,7 @@ struct RemovedLive {
 }
 
 /// Removes the live entry at `key_bytes`, hashing to `hash`, and clears any
-/// `long_ttl` row it held: the one place every removal path
-/// (`apply_tombstone`, `invalidate`, `invalidate_local`, and `apply_put`'s
-/// and `complete_fresh_load`'s own displacement) funnels through, so none of
-/// them can forget the side-table cleanup individually.
+/// `long_ttl` row it held: the one place every removal path funnels through.
 fn remove_live<K, V>(
     stripe: &mut Stripe<K, V>,
     hash: u64,
@@ -1720,12 +1561,8 @@ fn peek_stored_seed<K, V>(
     let live = stripe
         .live
         .find(hash, |l| record_key(&l.record) == key_bytes)?;
-    // `prefetched_spilled` is read entirely off-lock, before this stripe's
-    // read lock is taken, in `prefetch_spilled_conflict_bytes`. A miss
-    // (never fetched because the resolver doesn't need value bytes, the
-    // read failed, or this entry moved to a different location since the
-    // prefetch pass) degrades to no seed, exactly as an always-value-less
-    // spilled entry does without prefetching.
+    // `prefetched_spilled` is read off-lock, before this stripe's lock, in
+    // `prefetch_spilled_conflict_bytes`; a miss degrades to no seed.
     #[cfg(feature = "spill")]
     let encoded = match &live.state {
         EntryState::Resident => record_value_bytes(&live.record),
@@ -1867,19 +1704,13 @@ fn absent_at<K, V>(
     false
 }
 
-/// [`Engine::compact`]'s paced shrink-pass rule for one visited stripe
-/// holding `len` live entries in a `live` slab allocated for `capacity`:
-/// `true` once `len` sits at or below an eighth of `capacity`, the point
-/// past which the stripe's arena wastes at least seven times what it
-/// holds. The eighth is well under the one-half to one range an
-/// unhinted `Vec`'s own amortized-doubling growth settles into on a
-/// steady fill, so an actively growing stripe with no hint is never
-/// shrunk out from under its own growth; it only fires for a stripe an
-/// inflated [`Engine::new`] `capacity_hint` reserved well past what it
-/// filled, or one ownership rebalancing drained well past what
-/// [`super::ShardOps::release_buckets`] (which never shrinks on its own)
-/// left it holding. `capacity` of zero (nothing ever allocated) is never
-/// shrunk further. Pure; unit tested directly.
+/// [`Engine::compact`]'s paced shrink-pass rule: `true` once a stripe's
+/// live count `len` sits at or below an eighth of its slab `capacity`,
+/// the point past which the arena wastes at least seven times what it
+/// holds. Well under the range an unhinted `Vec`'s own amortized growth
+/// settles into, so a naturally growing stripe is never shrunk out from
+/// under itself; this only fires for an oversized `capacity_hint` or a
+/// stripe drained by ownership rebalancing. Pure; unit tested directly.
 fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
     capacity > 0 && len <= capacity / 8
 }
@@ -1897,22 +1728,13 @@ fn defer_to_flusher(pending_spill_weight: u64) -> bool {
     pending_spill_weight > 0
 }
 
-/// [`Engine::enforce_capacity_with_reservation`]'s stop rule once one batch
-/// reports a nonzero [`EvictOutcome::deficit`]: whether that deficit still
-/// needs paying down, or `current` (`total_weight + pending_spill_weight`,
-/// read fresh right after the batch that produced `deficit` returns) has
-/// already dropped back to `max_capacity` or under. A batch commits every
-/// victim it attempts under one lock hold before reporting anything, so a
-/// deficit from one victim refused there can coexist with other victims in
-/// the same hold succeeding, or with an unrelated flusher install
-/// completing concurrently on its own thread mid-batch: either way,
-/// `current` can already be satisfied by the time this is called even
-/// though `deficit` alone, taken at face value, still looks like more work
-/// is owed. Returns `0` once `current <= max_capacity` (the exact stop
-/// condition [`Engine::enforce_capacity_with_reservation`]'s own loop top
-/// checks), `deficit` unchanged otherwise, so a caller never spends an
-/// avoidable extra `SpillTier::reserve` wait paying down a deficit the cap
-/// already covers. Pure; unit tested directly.
+/// [`Engine::enforce_capacity_with_reservation`]'s stop rule after a batch
+/// reports a nonzero [`EvictOutcome::deficit`]: `0` once `current`
+/// (weight read fresh after the batch) has already dropped to
+/// `max_capacity` or under, `deficit` unchanged otherwise. A concurrent
+/// flusher install or another victim's success can already satisfy
+/// `current` even though `deficit` alone still looks owed. Pure; unit
+/// tested directly.
 fn deficit_once_still_over_capacity(current: u64, max_capacity: u64, deficit: u64) -> u64 {
     if current <= max_capacity { 0 } else { deficit }
 }
@@ -1946,13 +1768,10 @@ struct EvictOutcome {
     /// empty stripe among them.
     removed_weight: u64,
     /// Sum of every [`VictimOutcome::PendingReservation`] this pass
-    /// reported: bytes a `Reservation` in play, and `admit`'s own global
-    /// headroom, both refused right now. Always `0` when `reservation` was
-    /// `None` throughout the call that produced this outcome, `feature =
-    /// "spill"` or not: nothing constructs `PendingReservation` in that
-    /// case. A nonzero value is [`Engine::enforce_capacity_with_reservation`]'s
-    /// signal to stop its own loop rather than spin retrying the same
-    /// exhausted budget, and to hand the amount back to its caller.
+    /// reported: bytes both the reservation and `admit`'s global headroom
+    /// refused. Always `0` when `reservation` was `None`. A nonzero value
+    /// tells [`Engine::enforce_capacity_with_reservation`] to stop rather
+    /// than spin retrying an exhausted budget.
     deficit: u64,
 }
 
@@ -1997,16 +1816,8 @@ enum VictimOutcome {
     /// constructed under `feature = "spill"`.
     #[cfg(feature = "spill")]
     Deferred,
-    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`]:
-    /// a `Reservation` was in play and, right now, neither its own
-    /// remaining budget nor `admit`'s global headroom covers this victim.
-    /// `stripe.live` is untouched, exactly like [`VictimOutcome::Deferred`],
-    /// but no drop is recorded: `deficit` (this victim's own
-    /// `spill_record_len`) is the caller's to fold into
-    /// [`EvictOutcome::deficit`] and either cover with a fresh
-    /// reservation (`Shard::retry_reservation_deficit`) or leave for a
-    /// later pass with `reservation: None`, which does resolve it, one way
-    /// or the other. Only ever constructed under `feature = "spill"`.
+    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`];
+    /// `stripe.live` is untouched, like [`VictimOutcome::Deferred`].
     #[cfg(feature = "spill")]
     PendingReservation(u32),
     /// Vanished between sampling and this call, a race with another
@@ -2020,18 +1831,11 @@ enum SpillAttempt {
     /// The tier commits to taking the victim; see
     /// [`Engine::try_spill_victim`]'s docs for what the two fields mean.
     Committed(u32, SpillJob),
-    /// [`SpillTier::would_accept`] returned [`Admission::RefusedFinal`]:
-    /// too large, closed, or the flush queue is full with no reservation
-    /// in play (or one that makes no difference here: `too_large`/`closed`
-    /// refuse regardless). `keep_resident` is the tier's own
-    /// [`SpillTier::keep_resident_when_refused`] policy at the moment of
-    /// refusal, carried back here so the caller need not re-look it up.
+    /// [`SpillTier::would_accept`] returned [`Admission::RefusedFinal`].
+    /// `keep_resident` is the tier's policy at refusal time.
     Refused { keep_resident: bool },
-    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`]:
-    /// a `Reservation` was in play but, right now, insufficient, and
-    /// `admit`'s own headroom is too. `deficit` is this victim's own
-    /// `spill_record_len`: how many more reserved bytes would have
-    /// covered it.
+    /// [`SpillTier::would_accept`] returned [`Admission::RefusedPending`].
+    /// `deficit` is how many more reserved bytes would have covered it.
     Pending { deficit: u32 },
     /// No tier configured, or the victim raced away, removed or not
     /// resident anymore, between sampling and this call. The ordinary
@@ -2356,8 +2160,8 @@ where
     };
     let displaced_spilled = removed.as_ref().is_some_and(|r| r.was_spilled);
     let old_weight = removed.map(|r| r.weight);
-    // `remove_live` already cleared any stale `long_ttl` row this write
-    // displaces; only a genuinely long TTL needs a fresh one.
+    // `remove_live` cleared any stale `long_ttl` row this write displaces;
+    // only a TTL past the delta's range needs a fresh one.
     let (expiry, long_ttl_value) = encode_expiry(ver.wall_ms, expires_at_ms);
     if let Some(deadline) = long_ttl_value {
         stripe.long_ttl.insert(key_bytes.clone(), deadline);
@@ -2494,9 +2298,7 @@ pub(crate) struct Engine<K, V> {
     total_weight: AtomicU64,
     live_count: AtomicU64,
     max_capacity: u64,
-    /// The configured time-to-idle, clamped by [`clamp_tti_ms`] to
-    /// [`MAX_INLINE_TTL_MS`] so it always sits inside the range
-    /// [`idle_elapsed_ms`] compares correctly against.
+    /// The configured time-to-idle, clamped by [`clamp_tti_ms`].
     tti_ms: Option<u64>,
     weigher: Option<Weigher<K, V>>,
     evict_cursor: AtomicU64,
@@ -2567,33 +2369,25 @@ pub(crate) struct Engine<K, V> {
     compact_lock_acquisitions: AtomicU64,
 }
 
-/// [`Engine::finalize_checkpoint_writes`]'s outcome for one entry, kept out
-/// of the loop body only to give each drop reason a name; never constructed
-/// outside that method.
+/// [`Engine::finalize_checkpoint_writes`]'s outcome for one entry.
 #[cfg(feature = "spill")]
 enum FinalizeWriteOutcome {
-    /// The entry was still `Resident` at exactly its captured version and
-    /// not expired: flipped to `Spilled` and kept, carrying the weight
-    /// [`Engine::finalize_checkpoint_writes`] still needs to subtract from
-    /// `total_weight`.
+    /// Still `Resident` at its captured version and not expired: flipped
+    /// to `Spilled` and kept.
     Kept(u32),
     /// The key gained a tombstone between capture and this call.
     DroppedTombstoned,
-    /// The key is no longer present at all (removed and its tombstone
-    /// already collected, or never found).
+    /// No longer present (removed, or its tombstone already collected).
     DroppedGone,
-    /// The live entry's version no longer matches what was captured, or it
-    /// is no longer `Resident` (already spilled a second way).
+    /// The version no longer matches what was captured, or it's no longer
+    /// `Resident`.
     DroppedVersionChanged,
     /// The live entry is now past its expiry.
     DroppedExpired,
 }
 
 /// Per-reason breakdown [`Engine::finalize_checkpoint_writes`] returns
-/// alongside its survivors: how many entries it kept, and how many it
-/// dropped under each reason. `Shard::close_spill_checkpointed` logs this at
-/// `info` and folds it into `sundog_spill_checkpoint_entries_total{cache,
-/// stage}`.
+/// alongside its survivors.
 #[cfg(feature = "spill")]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct CheckpointFinalizeCounts {
@@ -2609,15 +2403,8 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
-    /// `capacity_hint`, when `Some`, presizes every stripe's arena and
-    /// index for `ceil(hint / BUCKET_COUNT)` entries via
-    /// [`Stripe::with_capacity`], so a cold fill up to `hint` grows neither
-    /// while it fills. `None` builds every stripe via [`Stripe::new`]
-    /// instead: zero allocation until its first write, exactly as an
-    /// engine with no hint at all behaves. Not semver-visible:
-    /// [`super::Shard::with_capacity_hint`] and
-    /// [`crate::cache::CacheBuilder::capacity_hint`] are the public entry
-    /// points.
+    /// `capacity_hint`, when `Some`, presizes every stripe for
+    /// `ceil(hint / BUCKET_COUNT)` entries, so a cold fill never grows.
     pub(crate) fn new(
         max_capacity: u64,
         tti: Option<Duration>,
@@ -2730,10 +2517,7 @@ where
 
     /// Increments `sundog_spill_entries{cache}`, plus the test-only mirror
     /// counter. The counterpart to [`Engine::note_spill_departures`], called
-    /// wherever a `live` entry newly becomes [`EntryState::Spilled`]: from
-    /// `SpillSink::install`, from [`Engine::finalize_checkpoint_writes`]'s
-    /// own direct flip for a checkpoint-written entry, and from the
-    /// test-only [`Engine::debug_insert_spilled`].
+    /// wherever a `live` entry newly becomes [`EntryState::Spilled`].
     #[cfg(feature = "spill")]
     fn note_spill_arrival(&self) {
         if let Some(gauge) = self.spill_entries_gauge.get() {
@@ -3049,11 +2833,7 @@ where
         stripe.live.len() + stripe.tombstones.len()
     }
 
-    /// Every stripe's current `live` arena capacity, in stripe order:
-    /// [`super::Shard::stripe_capacities`]'s backing call, for a test to
-    /// confirm a [`Engine::new`] capacity hint reached every stripe, or
-    /// that [`Engine::compact`]'s shrink pass brought an oversized one back
-    /// down.
+    /// Every stripe's current `live` arena capacity, in stripe order.
     pub(crate) fn stripe_capacities(&self) -> Vec<usize> {
         self.stripes
             .iter()
@@ -3152,13 +2932,10 @@ where
 
     /// A warm-reopen checkpoint's other half: every currently-resident live
     /// entry's key, version, expiry, and encoded value bytes, snapshotted
-    /// under each stripe's read lock exactly like [`Engine::snapshot_spilled`],
-    /// but for the `EntryState::Resident` entries that method skips.
-    /// `Shard::close_spill_checkpointed` hands this to `SpillTier::checkpoint_flush`,
-    /// which writes each one into the region ring; a value never spilled
-    /// during this process's life is written for the first time only at
-    /// this checkpoint, so a clean close can still warm-reopen every live
-    /// entry, not only the ones an eviction pass happened to spill first.
+    /// under each stripe's read lock like [`Engine::snapshot_spilled`], but
+    /// for the entries that method skips. `Shard::close_spill_checkpointed`
+    /// hands this to `SpillTier::checkpoint_flush`, so a clean close can
+    /// warm-reopen every live entry, not only ones already spilled.
     #[cfg(feature = "spill")]
     pub(crate) fn checkpoint_resident_entries(
         &self,
@@ -3195,35 +2972,23 @@ where
 
     /// Re-validates every entry [`SpillTier::checkpoint_flush`] just wrote
     /// to disk against the live engine state, under each key's own stripe
-    /// write lock, before `Shard::close_spill_checkpointed` folds the survivors into its
-    /// final checkpoint snapshot.
+    /// write lock, before `Shard::close_spill_checkpointed` folds the
+    /// survivors into the final checkpoint snapshot.
     ///
-    /// `checkpoint_flush` writes `entries`' bytes to disk with no version
-    /// check at all -- see its own docs -- because none of them ever went
-    /// through the ordinary pending-spill hand-off (`SpillSink::install`'s
-    /// `weight == 0` gate never applied to a still-fully-weighted resident
-    /// entry). That leaves a window between
-    /// [`Engine::checkpoint_resident_entries`]'s capture and this call: a
-    /// second `Cache` clone racing the close can remove the key, tombstone
-    /// it, or overwrite it with a newer version, and the disk write already
-    /// landed regardless. Keeps only the entries still `Resident` with
-    /// exactly the captured version and no tombstone, and flips each
-    /// survivor's state to [`EntryState::Spilled`] in the same lock
-    /// acquisition, so RAM and disk agree from this point on exactly as
-    /// every other spill hand-off leaves them: `total_weight` drops by the
-    /// entry's own weight and the entry's weight goes to `0`, preserving
-    /// the invariant that a `Spilled` entry always carries weight `0`. This
-    /// never touches `pending_spill_weight`: these writes never entered
-    /// that accounting in the first place, so there is nothing to release.
-    /// `now_ms` is the same timestamp `Shard::close_spill_checkpointed` already captured
-    /// before calling [`Engine::checkpoint_resident_entries`], so a key
-    /// that expired during the checkpoint write is excluded exactly as it
-    /// would have been had the capture run this late instead.
+    /// `checkpoint_flush` writes with no version check, since these entries
+    /// never went through the ordinary pending-spill hand-off, leaving a
+    /// window for a racing `Cache` clone to remove, tombstone, or overwrite
+    /// the key before this call. Keeps only entries still `Resident` at
+    /// exactly the captured version with no tombstone, flips each survivor
+    /// to [`EntryState::Spilled`] in the same lock (dropping `total_weight`
+    /// by its weight, zeroing the entry's own weight), and leaves
+    /// `pending_spill_weight` untouched since these writes never entered
+    /// that accounting. `now_ms` is the timestamp already captured before
+    /// this call, so an entry that expired during the write is excluded.
     ///
-    /// Returns the survivors alongside a [`CheckpointFinalizeCounts`]
-    /// breaking down every entry this dropped by reason, so
-    /// `Shard::close_spill_checkpointed` can log and meter each stage of the
-    /// checkpoint without re-deriving the same classification.
+    /// Returns the survivors with a [`CheckpointFinalizeCounts`] breakdown
+    /// by drop reason, for `Shard::close_spill_checkpointed` to log and
+    /// meter.
     #[cfg(feature = "spill")]
     pub(crate) fn finalize_checkpoint_writes(
         &self,
@@ -3374,10 +3139,8 @@ where
                 continue;
             }
             let mut guard = stripe_lock.write();
-            // One explicit reborrow: `stripe.live`/`stripe.long_ttl` below
-            // are then plain, disjoint field projections on a real `&mut
-            // Stripe`, not two separate `DerefMut` calls through the lock
-            // guard, which the borrow checker cannot split field-by-field.
+            // One explicit reborrow, so stripe.live/stripe.long_ttl below
+            // are disjoint field projections the borrow checker can split.
             let stripe: &mut Stripe<K, V> = &mut guard;
             let mut removed_weight = 0u64;
             let mut removed_count = 0u64;
@@ -3434,13 +3197,10 @@ where
     /// [`EntryState::Spilled`] entry is skipped until promoted back to
     /// `Resident`.
     ///
-    /// Once a visited stripe's read-locked scan finishes,
-    /// [`should_shrink_stripe`] decides whether its `live` slab sits far
-    /// enough below its own reserved capacity, from an inflated
-    /// [`Engine::new`] `capacity_hint` or from ownership rebalancing
-    /// draining it, to be worth reclaiming: if so, this pass takes one
-    /// separate write lock on the same stripe and calls
-    /// [`Slab::shrink_to_fit`] on it before moving to the next stripe.
+    /// Once a visited stripe's scan finishes, [`should_shrink_stripe`]
+    /// decides whether its `live` slab is worth reclaiming (an oversized
+    /// `capacity_hint` or a stripe drained by rebalancing): if so, this
+    /// pass takes a separate write lock and calls [`Slab::shrink_to_fit`].
     ///
     /// `max_entries` bounds entries examined, not entries eligible; a
     /// stripe already in progress always finishes. The cursor advances past
@@ -3474,10 +3234,8 @@ where
             let stripe = self.stripes[idx].read();
             self.note_compact_lock_acquisition();
             for live in stripe.live.iter() {
-                // Never compacted off-lock: its bytes aren't resident, and
-                // reading them back in would cost a disk read this sweep
-                // does not pay for. Reconsidered once a later read or write
-                // promotes it back to resident.
+                // Never compacted off-lock: reading its bytes back in would
+                // cost a disk read this sweep does not pay for.
                 if !is_resident(live) {
                     continue;
                 }
@@ -3501,13 +3259,8 @@ where
             }
             let shrink = should_shrink_stripe(stripe.live.len(), stripe.live.capacity());
             drop(stripe);
-            // A separate write-lock acquisition, not counted by
-            // `note_compact_lock_acquisition` (that counter is read locks
-            // only, per its own doc): reclaiming an oversized stripe is
-            // rare enough, and shrinking is cheap enough at this stripe's
-            // own entry count, that paying for a second lock on the rare
-            // stripe that needs it beats holding a write lock for every
-            // stripe's whole scan on the chance it might.
+            // A separate write lock: reclaiming is rare enough that a
+            // second lock here beats holding one for the whole scan.
             if shrink {
                 self.stripes[idx].write().live.shrink_to_fit(hasher_for);
             }
@@ -3552,9 +3305,8 @@ where
         let part = part_index_from_hash(hash);
         let (old_weight, new_weight) = {
             let mut guard = self.stripes[bucket].write();
-            // One explicit reborrow: see `sweep`'s identical comment for why
-            // this, rather than `guard.live`/`guard.long_ttl` directly, is
-            // what lets the two fields below borrow disjointly.
+            // One explicit reborrow, as in `sweep`, so the fields below
+            // borrow disjointly.
             let stripe: &mut Stripe<K, V> = &mut guard;
             let Some(live) = stripe
                 .live
@@ -3572,11 +3324,8 @@ where
             live.record = build_resident_record(record_key(&live.record), encoded.as_ref());
             live.weight = new_weight;
             live.set_ver(new_ver);
-            // `new_ver` carries a new `wall_ms`, and `expiry` is a delta
-            // above it: re-deriving `expiry` from the entry's real absolute
-            // deadline, rather than carrying the old delta forward
-            // unchanged, is what keeps that deadline exact across the
-            // version bump.
+            // new_ver carries a new wall_ms; re-deriving expiry from the
+            // real absolute deadline keeps it exact across the version bump.
             let abs_expiry = decode_expiry(old_wall_ms, old_expiry, key_bytes, &stripe.long_ttl);
             let (expiry, long_ttl_value) = encode_expiry(new_ver.wall_ms, abs_expiry);
             live.expiry = expiry;
@@ -3736,9 +3485,8 @@ where
         let weight = job.weight;
         let admitted_bytes = job.admitted_bytes;
         if let Err(job) = tier.enqueue(job) {
-            // A job that never reaches the flusher's channel must not
-            // permanently shrink `admit`'s total: release its admitted
-            // bytes back before `abandon` restores the victim's weight.
+            // A job that never reaches the flusher must not permanently
+            // shrink `admit`'s total, so release its bytes before abandon.
             tier.release(admitted_bytes);
             let job = *job;
             self.abandon(stripe_idx, &job.key_bytes, hash, ver, weight);
@@ -3758,11 +3506,8 @@ where
     /// [`VictimOutcome::Vanished`]. Total weight and `live_count` stay the
     /// caller's job; a [`VictimOutcome::PendingSpill`] job still needs
     /// [`Engine::finish_spill_handoff`] once `stripe` is dropped.
-    /// `reservation`, forwarded unchanged to [`Engine::try_spill_victim`],
-    /// is the pre-lock budget a caller carried in from
-    /// `Engine::apply_many_with_reservation`; unused (and unread) once the
-    /// `spill` feature is off, since nothing can be handed off in that
-    /// build.
+    /// `reservation`, forwarded to [`Engine::try_spill_victim`], is the
+    /// pre-lock budget a caller carried in; unused once `spill` is off.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3814,14 +3559,8 @@ where
     }
 
     /// The sampling window [`Engine::evict_one_sampled`] and [`Engine::evict_batch_sampled`] both draw from.
-    /// The order this walks `stripe.live` in is the arena's dense insertion
-    /// order (shifting under a swap-remove), not hashbrown's probe order,
-    /// so two candidates tied on [`idle_elapsed_ms`] resolve to whichever
-    /// this order places last: a concrete, undocumented tie-break. Nothing
-    /// in this codebase treats that tie-break as a contract:
-    /// `evict_one_sampled_breaks_a_last_access_tie_by_arena_order`
-    /// pins today's concrete resolution as a regression guard, not as a
-    /// documented guarantee.
+    /// Walks `stripe.live` in arena order, so a tie on [`idle_elapsed_ms`]
+    /// resolves to whichever comes last: an undocumented tie-break.
     fn sample_candidates<'s>(
         &self,
         stripe: &'s Stripe<K, V>,
@@ -3839,12 +3578,11 @@ where
 
     /// Evicts the coldest of up to [`EVICTION_SAMPLE`] resident entries in
     /// `bucket`. Returns what happened: nothing to evict, a physical
-    /// removal, or a hand-off to the spill tier. A thin wrapper, `reservation:
-    /// None`, over [`Engine::evict_one_sampled_with_reservation`]; every
-    /// existing direct test call site keeps compiling unchanged. Production
-    /// code reaches eviction only through [`Engine::enforce_capacity`],
-    /// which calls the `_with_reservation` twin directly, so this wrapper
-    /// is test-only outside a `spill` build's own test suite.
+    /// removal, or a hand-off to the spill tier. A thin wrapper,
+    /// `reservation: None`, over
+    /// [`Engine::evict_one_sampled_with_reservation`]; production code
+    /// reaches eviction only through [`Engine::enforce_capacity`], calling
+    /// the `_with_reservation` twin directly, so this wrapper is test-only.
     #[cfg_attr(
         not(test),
         allow(
@@ -3858,10 +3596,7 @@ where
     }
 
     /// [`Engine::evict_one_sampled`], threading `reservation` through to
-    /// [`Engine::evict_victim_locked`] for the one victim this samples. The
-    /// coldest pick is the sampled candidate with the largest
-    /// [`idle_elapsed_ms`] as of `now_ms`, correct across a `last_access_ms`
-    /// rollover on any candidate.
+    /// [`Engine::evict_victim_locked`].
     fn evict_one_sampled_with_reservation(
         &self,
         bucket: usize,
@@ -3915,8 +3650,7 @@ where
     /// Evicts one entry from the first non-empty stripe at or after `bucket`,
     /// wrapping around once. Returns `None` only when every stripe holds
     /// nothing to evict. A thin wrapper, `reservation: None`, over
-    /// [`Engine::evict_one_scanning_with_reservation`]; test-only outside a
-    /// `spill` build's own test suite, like [`Engine::evict_one_sampled`].
+    /// [`Engine::evict_one_scanning_with_reservation`]; test-only.
     #[cfg_attr(
         not(test),
         allow(
@@ -3930,13 +3664,10 @@ where
     }
 
     /// [`Engine::evict_one_scanning`], reborrowing `reservation` into each
-    /// candidate stripe's own [`Engine::evict_one_sampled_with_reservation`]
-    /// call in turn, so the same budget carries across however many
-    /// stripes this scan visits before it finds one to evict from. Also
-    /// stops early, `Some`, the first time a candidate reports
-    /// [`EvictOutcome::deficit`]: an exhausted reservation is very likely
-    /// exhausted everywhere, so scanning up to [`BUCKET_COUNT`] further
-    /// stripes chasing the same refusal would only spin.
+    /// candidate stripe's scan, so the same budget carries across every
+    /// stripe visited. Stops early, `Some`, the first time a candidate
+    /// reports [`EvictOutcome::deficit`]: one reservation covers every
+    /// stripe, so a deficit in one is a deficit in all.
     fn evict_one_scanning_with_reservation(
         &self,
         bucket: usize,
@@ -3961,8 +3692,7 @@ where
     /// or, with a spill tier configured and room in its queue, handed off
     /// instead; see [`Engine::evict_victim_locked`]. A thin wrapper,
     /// `reservation: None`, over
-    /// [`Engine::evict_batch_sampled_with_reservation`]; every existing
-    /// direct test call site keeps compiling unchanged.
+    /// [`Engine::evict_batch_sampled_with_reservation`].
     #[cfg_attr(
         not(test),
         allow(
@@ -3976,12 +3706,10 @@ where
     }
 
     /// [`Engine::evict_batch_sampled`], reborrowing `reservation` into each
-    /// victim's own [`Engine::evict_victim_locked`] call in turn, so the
-    /// same pre-lock budget carries across every victim this one lock hold
-    /// evicts, spending down as `try_spill_victim` commits each one. Victims
-    /// are ranked coldest-first by [`idle_elapsed_ms`] as of `now_ms`,
-    /// descending, correct across a `last_access_ms` rollover on any
-    /// candidate.
+    /// victim's own [`Engine::evict_victim_locked`] call, so the same
+    /// pre-lock budget carries across every victim this lock hold evicts.
+    /// Victims are ranked coldest-first by [`idle_elapsed_ms`] as of
+    /// `now_ms`, correct across a `last_access_ms` rollover.
     fn evict_batch_sampled_with_reservation(
         &self,
         bucket: usize,
@@ -4099,11 +3827,7 @@ where
     /// shortly with no further eviction needed. With nothing pending, the
     /// scan runs exactly as it always has, spill tier configured or not. A
     /// thin wrapper, `reservation: None`, over
-    /// [`Engine::enforce_capacity_with_reservation`]; every existing call
-    /// site keeps compiling unchanged. Discards the deficit
-    /// [`Engine::enforce_capacity_with_reservation`] returns: always `0`
-    /// with no reservation in play, since nothing ever constructs
-    /// [`VictimOutcome::PendingReservation`] in that case.
+    /// [`Engine::enforce_capacity_with_reservation`].
     pub(crate) fn enforce_capacity(&self, start_bucket: usize, now_ms: u64) {
         let _ = self.enforce_capacity_with_reservation(start_bucket, None, now_ms);
     }
@@ -4113,25 +3837,15 @@ where
     /// carries across as many lock holds as it takes to fall back under
     /// the cap.
     ///
-    /// Returns the sum of every [`VictimOutcome::PendingReservation`]
-    /// (`spill_record_len`) bytes this call's own eviction passes hit: a
-    /// `Reservation` was in play, sized only from the batch that carried
-    /// it in, and both its own remaining budget and `admit`'s global
-    /// headroom refused right now, at the same instant, for the same
-    /// victim. `0` means every victim this call touched either fit under
-    /// the cap already, got evicted, or was refused for a reason no retry
-    /// changes (`too_large`/`closed`, or no reservation at all). A nonzero
-    /// return stops this loop immediately rather than let it spin
-    /// retrying the same exhausted budget across pseudo-random buckets:
-    /// the caller (`Shard::apply_grouped`/`ShardOps::apply_remote_batch`,
-    /// via `Shard::retry_reservation_deficit`) is the one positioned to
-    /// pay it down, with a fresh reservation and a bounded wait, once this
-    /// call's own lock-free budget is spent. Every victim this stopped on
-    /// is left exactly as [`VictimOutcome::Deferred`] leaves one: fully
-    /// resident, still a spill candidate, untouched weight, so a later
-    /// pass, with or without its own reservation, samples and resolves it
-    /// like any other cold entry, no separate bookkeeping needed for which
-    /// entries this covers.
+    /// Returns the sum of [`VictimOutcome::PendingReservation`] bytes this
+    /// call's eviction passes hit, where both the reservation's remaining
+    /// budget and `admit`'s global headroom refused the same victim. `0`
+    /// means every victim fit, was evicted, or was refused for a reason no
+    /// retry changes. A nonzero return stops the loop immediately, leaving
+    /// each stopped victim as [`VictimOutcome::Deferred`] does (fully
+    /// resident, untouched weight) for a later pass to resolve; the caller
+    /// (`Shard::retry_reservation_deficit`) pays it down with a fresh
+    /// reservation.
     pub(crate) fn enforce_capacity_with_reservation(
         &self,
         start_bucket: usize,
@@ -4223,10 +3937,7 @@ where
     /// fallback on a miss.
     ///
     /// A thin wrapper, `reservation: None`, over
-    /// [`Engine::apply_many_with_reservation`]; every existing call site
-    /// keeps compiling unchanged. Discards the deficit
-    /// [`Engine::apply_many_with_reservation`] returns alongside its
-    /// outcomes: always `0` with no reservation in play.
+    /// [`Engine::apply_many_with_reservation`].
     pub(crate) fn apply_many(
         &self,
         bucket: usize,
@@ -4250,15 +3961,9 @@ where
 
     /// [`Engine::apply_many`], additionally threading `reservation` into
     /// [`Engine::enforce_capacity_with_reservation`] when the batch wrote
-    /// anything: the pre-lock budget one `Shard::apply_grouped`/
-    /// `ShardOps::apply_remote_batch` call reserved before its first stripe
-    /// lock, spent here across however many buckets that call's own loop
-    /// visits. The second element of the returned tuple is
-    /// [`Engine::enforce_capacity_with_reservation`]'s own deficit, `0`
-    /// when the batch wrote nothing (`enforce_capacity_with_reservation`
-    /// never runs) or when every victim it touched was resolved one way or
-    /// another; see that method's doc for what a nonzero deficit means and
-    /// who is responsible for paying it down.
+    /// anything, spending the pre-lock budget one caller reserved before
+    /// its first stripe lock. The tuple's second element is that method's
+    /// own deficit, `0` when nothing was written or every victim resolved.
     #[allow(
         clippy::too_many_arguments,
         reason = "one caller per bucket, from an already-grouped batch; splitting these into a struct would not make either call site clearer"
@@ -4663,10 +4368,8 @@ where
     /// or a version change since the disk read started means the
     /// promotion is a silent no-op. The caller's read already succeeded
     /// independently of this; only the RAM reinstall is skipped. Decodes
-    /// `key` from `key_bytes` for the one weigher call this makes: see the
-    /// design note on why `promote_locked` decodes its own key rather than
-    /// taking one from the caller. Adds the freshly weighed entry's weight
-    /// back to `total_weight`. **Never touches the digest or
+    /// `key` from `key_bytes` for the one weigher call this makes. Adds the
+    /// freshly weighed entry's weight back to `total_weight`. **Never touches the digest or
     /// `live_count`**: same key, same `ver`, same fingerprint, so nothing
     /// about the entry's replicated identity changes. Also decrements
     /// `sundog_spill_entries{cache}`, the mirror of
@@ -4749,9 +4452,7 @@ where
                         && matches!(live.state, EntryState::Resident) =>
                 {
                     // A fresh copy of the key half, never a slice of the
-                    // still-resident record: a slice would share the old
-                    // allocation's refcount, keeping the value bytes this
-                    // flip is supposed to shed physically resident in RAM.
+                    // record (which would keep its value bytes resident).
                     live.record = build_key_only_record(record_key(&live.record));
                     live.state = EntryState::Spilled(loc);
                     true
@@ -4768,25 +4469,18 @@ where
     }
 
     /// Originates a fresh entry straight from an on-disk [`SpillLoc`], with
-    /// no value bytes ever read into RAM: the primitive a warm tier-reopen
-    /// replay uses, distinct from `install`, which only ever flips an
-    /// already-present entry and never creates one. `record` holds only
-    /// the key half
-    /// ([`build_key_only_record`]), and the entry starts at weight `0`
-    /// exactly like a freshly flushed-and-installed one, since
-    /// [`RemovedLive::weight`]/[`Engine::account_removed`] assume every
-    /// currently-`Spilled` entry carries weight `0`; a later
-    /// [`Engine::promote_locked`] recomputes the real weight through the
-    /// weigher when it matters. `weight` mirrors `install`'s own parameter
-    /// for signature symmetry between the two primitives and, like
-    /// `install`, is never folded into `total_weight`.
+    /// no value bytes ever read into RAM: the warm tier-reopen replay
+    /// primitive, distinct from `install`, which only flips an
+    /// already-present entry. `record` holds only the key half
+    /// ([`build_key_only_record`]); the entry starts at weight `0` like a
+    /// freshly installed one (a later [`Engine::promote_locked`] recomputes
+    /// the real weight). `weight` mirrors `install`'s parameter for
+    /// signature symmetry and is never folded into `total_weight`.
     ///
-    /// Never overwrites a key that is already present, live or tombstoned:
-    /// `false` and a no-op either way, so this can never resurrect a
-    /// deleted key or clobber a fresher write that landed first. Folds the
-    /// fresh entry's fingerprint into the bucket's digest exactly as every
-    /// other insert path does, so `Engine::digests` stays correct
-    /// immediately, with no separate pass.
+    /// Never overwrites a key already present, live or tombstoned: `false`
+    /// and a no-op either way, so this can never resurrect a deleted key or
+    /// clobber a fresher write. Folds the fresh entry's fingerprint into
+    /// the bucket's digest like every other insert path.
     #[allow(clippy::too_many_arguments)]
     fn install_new(
         &self,
@@ -5127,9 +4821,8 @@ mod tests {
         Bytes::from(postcard::to_stdvec(&key).expect("u32 encodes"))
     }
 
-    /// [`key_bytes`]'s `String`-keyed counterpart, for a test that needs a
-    /// key whose postcard encoding is long enough to force [`Record`]'s
-    /// heap path.
+    /// [`key_bytes`]'s `String`-keyed counterpart, for a key long enough to
+    /// force [`Record`]'s heap path.
     #[cfg(feature = "spill")]
     fn string_key_bytes(key: &str) -> Bytes {
         Bytes::from(postcard::to_stdvec(key).expect("a string key encodes"))
@@ -5872,9 +5565,8 @@ mod tests {
 
     #[test]
     fn sweep_of_a_tti_idle_long_ttl_entry_clears_its_side_table_row() {
-        // A TTI far shorter than the entry's own long-TTL deadline: the
-        // entry goes idle and gets swept through `absent_at`'s TTI branch
-        // long before its absolute deadline is anywhere close.
+        // A TTI far shorter than the long-TTL deadline, so this entry
+        // goes idle and is swept through absent_at's TTI branch first.
         let engine = engine_u32_string(u64::MAX, Some(Duration::from_millis(100)));
         let kb = key_bytes(1);
         let hash = hash_key_bytes(kb.as_ref());
@@ -6010,9 +5702,8 @@ mod tests {
             );
         }
 
-        // `compact_replace_if_current`'s path: a wall_ms jump alone, with no
-        // change to the real absolute deadline, can make a stored `LONG_TTL`
-        // row stale by making the same deadline representable inline again.
+        // compact_replace_if_current's path: a wall_ms jump alone can make
+        // a stored LONG_TTL row stale by making the deadline inline again.
         {
             let engine = engine_u32_string(u64::MAX, None);
             let key = 3u32;
@@ -7309,24 +7000,14 @@ mod tests {
             .collect()
     }
 
-    /// One key's state in
-    /// [`apply_locked_put_overwrite_tombstone_evict_interleaving_matches_pre_slab_behavior`]'s
-    /// own ground truth: a live value or a tombstone.
+    /// One key's mirror state for the interleaving test below.
     enum MirrorState {
         Live(String),
         Tombstoned,
     }
 
-    /// A fixed-seed, put/overwrite/tombstone/evict interleaving cross-checked
-    /// after every step against this test's own `mirror`: independent proof
-    /// that `get_by_bytes`, `keys`, `digests`, and `bucket_len` agree with
-    /// each other and with what `apply_locked`'s LWW resolution and
-    /// eviction should leave live, regardless of `Stripe::live`'s internal
-    /// storage (a `Slab`). A small keyspace over a tight weight cap
-    /// forces frequent overwrites and capacity-driven eviction on top of
-    /// the explicit `evict_one_sampled` calls, so both eviction paths
-    /// exercise the same `Slab`-backed removal `remove_live` and
-    /// `evict_victim_locked` share.
+    /// Pins that `get_by_bytes`/`keys`/`digests`/`bucket_len` agree with a
+    /// fixed-seed put/overwrite/tombstone/evict interleaving's own mirror.
     #[test]
     fn apply_locked_put_overwrite_tombstone_evict_interleaving_matches_pre_slab_behavior() {
         use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
@@ -7345,10 +7026,8 @@ mod tests {
             let bucket = stripe_index_from_hash(hash);
             let now = i * 10;
             match rng.random_range(0..4u32) {
-                // Put and overwrite are the same call here: a fresh HLC
-                // tick always wins over whatever is or isn't already
-                // stored, so this creates a fresh key or overwrites an
-                // existing one depending on `key`'s current mirror state.
+                // Put and overwrite are the same call: a fresh HLC tick
+                // always wins.
                 0 | 1 => {
                     let ver = clock.now(now);
                     let value = format!("v{key}-{i}");
@@ -7366,12 +7045,8 @@ mod tests {
                 }
             }
 
-            // `enforce_capacity` and `evict_one_sampled` can each remove any
-            // resident entry, in any bucket, with no tombstone left behind:
-            // resync every mirror key still marked `Live` to whatever the
-            // engine actually kept before checking it against every other
-            // query surface below. A `Tombstoned` mirror row is never
-            // touched by eviction, so it needs no resync.
+            // enforce_capacity/evict_one_sampled can remove any resident
+            // entry, so resync every Live mirror row before checking below.
             mirror.retain(|&k, state| match state {
                 MirrorState::Live(_) => {
                     let kb = key_bytes(k);
@@ -7710,9 +7385,8 @@ mod tests {
 
     #[test]
     fn split_record_recovers_the_value_half_at_every_key_length_boundary() {
-        // Key lengths 0, 1, 127, 128, 129 bytes: 127 and below encode LEN in
-        // one postcard varint byte, 128 and above spill into a second,
-        // crossing the varint continuation-bit boundary.
+        // 127 and below encode LEN in one postcard varint byte; 128 and
+        // above spill into a second, crossing the continuation-bit boundary.
         for key_len in [0usize, 1, 127, 128, 129] {
             let key_bytes = vec![b'k'; key_len];
             let value_bytes = b"value".to_vec();
@@ -7786,12 +7460,8 @@ mod tests {
     #[test]
     fn encode_expiry_falls_back_to_the_long_ttl_marker_for_a_dead_on_arrival_expiry_before_wall_ms()
     {
-        // `expires_at_ms < wall_ms` is a real, exercised shape (a
-        // dead-on-arrival TTL record, or a remote write whose expiry
-        // predates its own wall_ms): `expiry` only ever adds a delta to
-        // `wall_ms`, so it can never encode this inline, and must not
-        // round it up to `wall_ms` either, or the record would silently
-        // gain a few milliseconds of life it never had.
+        // expires_at_ms < wall_ms happens (a dead-on-arrival TTL); expiry
+        // must not silently round up to wall_ms.
         let wall_ms = 20_000u64;
         for exp in [0u64, wall_ms - 1, wall_ms - 10_135] {
             let (expiry, side_table) = encode_expiry(wall_ms, Some(exp));
@@ -7829,9 +7499,8 @@ mod tests {
         assert_eq!(idle_elapsed_ms(1_000, touch_stamp(400)), 600);
         assert_eq!(idle_elapsed_ms(1_000, touch_stamp(1_000)), 0);
 
-        // `now_ms` itself crossed one u32::MAX-millisecond rollover after
-        // the touch: `touch_stamp` truncates both to their low 32 bits, so
-        // the wrapping subtraction still recovers the true gap.
+        // now_ms crossed one u32::MAX rollover after the touch: both
+        // truncate to their low 32 bits, so wrapping subtraction still works.
         let touched_at = u64::from(u32::MAX) - 50;
         let now = touched_at + 200;
         assert!(
@@ -7840,9 +7509,8 @@ mod tests {
         );
         assert_eq!(idle_elapsed_ms(now, touch_stamp(touched_at)), 200);
 
-        // The touch itself lands just past a rollover boundary relative to
-        // an even later `now_ms`, exercised directly on the truncated
-        // stamp rather than through `touch_stamp` a second time.
+        // The touch lands just past a rollover, exercised on the truncated
+        // stamp directly.
         let last_access_ms: u32 = 5; // wrapped just past 0
         let now_ms = (1u64 << 32) + 105; // one rollover past the touch, true elapsed: 100ms
         assert_eq!(idle_elapsed_ms(now_ms, last_access_ms), 100);
@@ -7913,12 +7581,9 @@ mod tests {
 
     #[test]
     fn tti_past_max_inline_ttl_ms_still_expires_within_the_clamped_bound() {
-        // Before `clamp_tti_ms`, a tti this far past `MAX_INLINE_TTL_MS`
-        // would leave this entry readable forever: `idle_elapsed_ms` never
-        // returns a value large enough to reach the unclamped deadline. Two
-        // separate engines, not two reads of one: a read touches the entry
-        // and would otherwise reset the idle clock the second assertion
-        // means to check.
+        // With no clamp, a tti this far past MAX_INLINE_TTL_MS would leave
+        // the entry readable forever. Two separate engines, since a read
+        // would reset the idle clock the second assertion checks.
         let past_ceiling = Duration::from_millis(MAX_INLINE_TTL_MS + 10_000);
 
         let still_within = engine_u32_string(u64::MAX, Some(past_ceiling));
@@ -7954,25 +7619,16 @@ mod tests {
         assert_eq!(decode_value::<String>(&value_bytes), "a value".to_string());
     }
 
-    /// `record` at 24 bytes (`Inline { len: u8, buf: [u8; 22] }`, 23 bytes,
-    /// rounded up to `Heap`'s 8-byte-aligned `Box<[u8]>`), `wall_ms` at 8,
-    /// `node` at 8, and `expiry`/`logical`/`weight`/`last_access_ms` at 4
-    /// bytes each (16 bytes together, no gap: four 4-byte fields fill one
-    /// 8-byte-aligned group exactly) sum to 56 with no padding anywhere:
-    /// `24 + 8 + 8 + 16 = 56`.
+    /// Pins `Live`'s non-spill size: `record` (24) + `wall_ms` (8) +
+    /// `node` (8) + four 4-byte fields (16) = 56, no padding.
     #[test]
     #[cfg(not(feature = "spill"))]
     fn live_size_is_56_bytes_without_spill() {
         assert_eq!(std::mem::size_of::<Live<String, String>>(), 56);
     }
 
-    /// `EntryState` costs a 1-byte tag plus 3 bytes of padding to realign
-    /// to `SpillLoc`'s 4-byte alignment, 20 bytes total, added on top of
-    /// the 56-byte non-spill layout (see
-    /// `live_size_is_56_bytes_without_spill`): `56 + 20 = 76`, rounded up
-    /// to 80 to keep the whole struct's size a multiple of its own 8-byte
-    /// alignment. Pinned at the true, measured value, not cross-feature
-    /// arithmetic in isolation.
+    /// Pins `Live`'s spill-enabled size: `EntryState` adds a 1-byte tag
+    /// plus padding, 76 bytes rounded up to 80 for 8-byte alignment.
     #[test]
     #[cfg(feature = "spill")]
     fn live_size_is_80_bytes_with_spill() {
@@ -8054,14 +7710,8 @@ mod tests {
 
     #[test]
     fn sampled_eviction_still_picks_the_coldest_entry_across_a_last_access_rollover() {
-        // `key_old`'s last touch predates a `touch_stamp` rollover;
-        // `key_new`'s comes just after one. `key_old`'s truncated stamp
-        // (near `u32::MAX`) is numerically *larger* than `key_new`'s
-        // (small, just past the wrap), so a naive `min_by_key` over the
-        // raw stamps would call `key_new` colder. `idle_elapsed_ms`'s
-        // wrapping subtraction against a real `now_ms` past both touches
-        // gets it right: `key_old`, touched longer ago in true time, is
-        // the true coldest and the one evicted.
+        // key_old's touch predates a touch_stamp rollover; a naive
+        // min_by_key over raw stamps would wrongly call key_new colder.
         let target_bucket = stripe_index_from_hash(hash_key_bytes(key_bytes(0).as_ref()));
         let key_old = 0u32;
         let mut candidate = 1u32;
@@ -8113,15 +7763,11 @@ mod tests {
 
     #[test]
     fn evict_one_sampled_breaks_a_last_access_tie_by_arena_order() {
-        // `key_first` and `key_second` share a bucket and are inserted (so
-        // last-touched) at the exact same `now_ms`: `idle_elapsed_ms` ties
-        // between them, so the sampled winner comes down entirely to
-        // `sample_candidates`'s arena-order walk feeding
-        // `Iterator::max_by_key`, which returns the *last* equally-maximal
-        // element it sees. This pins today's concrete resolution as a
-        // regression guard against a future change to that walk's order
-        // (see `Engine::sample_candidates`'s doc comment); it is not itself
-        // a documented tie-break contract.
+        // key_first/key_second share a bucket and the same now_ms, so
+        // idle_elapsed_ms ties; the winner comes down to arena order in
+        // sample_candidates feeding max_by_key, which returns the last
+        // equally-maximal element. Pins today's resolution as a regression
+        // guard, not a documented contract.
         let (key_first, key_second, bucket) = same_bucket_pair(100_000);
         let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
         let now = 0u64;
@@ -8820,13 +8466,8 @@ mod tests {
 
         #[test]
         fn install_copies_the_key_into_a_fresh_allocation_instead_of_slicing() {
-            // A key over INLINE_CAP bytes forces `Record`'s heap path: only
-            // there is a pointer-identity check meaningful. An inline
-            // record's bytes live inside `Live`'s own memory, so the
-            // pointer before and after `install` can legitimately alias
-            // even though the bytes were freshly copied: see the
-            // `..._reuses_the_slot_with_no_heap_allocation` companion test
-            // below for that case.
+            // A key over INLINE_CAP forces the heap path, where a
+            // pointer-identity check is meaningful.
             let engine = Engine::<String, String>::new(u64::MAX, None, None, None);
             let key = "k".repeat(40);
             let kb = string_key_bytes(&key);
@@ -9282,12 +8923,8 @@ mod tests {
 
         #[test]
         fn is_spill_candidate_excludes_a_weight_zeroed_entry_across_a_longer_pending_window() {
-            // A caller's `Reservation` wait suspends for as long as its own
-            // `spill_wait_timeout`, a window between hand-off and
-            // resolution wider than a non-blocking eviction pass ever
-            // leaves open. However many sampling passes land in that
-            // window, `is_spill_candidate` must keep excluding the
-            // weight-zeroed pending entry.
+            // A `Reservation` wait suspends longer than a non-blocking pass
+            // leaves open.
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
             let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
@@ -9466,12 +9103,8 @@ mod tests {
                 let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
                 let tier = Arc::new(SpillTier::open(&cfg, "install-new").expect("tier opens"));
 
-                // A throwaway producer engine spills one real record to disk,
-                // purely to get a genuine `SpillLoc` pointing at real,
-                // checksummed bytes on disk: `install_new` itself is tested
-                // below against a completely separate, otherwise-empty
-                // engine that never wrote this key, the same shape a warm
-                // reopen replay starts from.
+                // A throwaway producer spills one record to disk to get a
+                // genuine SpillLoc.
                 let producer: Arc<Engine<u32, String>> =
                     Arc::new(Engine::new(u64::MAX, None, None, None));
                 producer.set_spill(Arc::clone(&tier));
@@ -9533,9 +9166,8 @@ mod tests {
                     assert_eq!(live.weight, 0, "a Spilled entry always carries weight 0");
                 }
 
-                // Readable via read_at: the same bytes a real disk read of
-                // `loc` gives any other reader; install_new never re-writes
-                // or copies them, and never reads the value bytes itself.
+                // Readable via read_at, since install_new never re-writes
+                // or copies the value bytes itself.
                 let read_back = tier
                     .read_at(loc)
                     .expect("read_at succeeds")
@@ -9571,12 +9203,8 @@ mod tests {
             #[test]
             fn evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full() {
                 let dir = temp_dir("enqueue-err-abandon");
-                // A generous flush_queue_bytes, well past what this many
-                // filler jobs plus the real victim's own record could ever
-                // total: this test means to exercise the channel's own
-                // slot-count limit, not the byte bound. `SpillTier::attach`
-                // derives the channel's actual slot count from this same
-                // `flush_queue_bytes`, via `flush_queue_slots`.
+                // A generous flush_queue_bytes exercises the channel's
+                // slot-count limit, not the byte bound.
                 let cfg = SpillConfig::new(&dir, 1 << 20)
                     .region_bytes(4096)
                     .flush_queue_bytes(1 << 20);
@@ -9607,10 +9235,8 @@ mod tests {
                         expires_at_ms: None,
                         encoded: Bytes::from_static(b"f"),
                         weight: 1,
-                        // These fillers bypass `would_accept` entirely, sent
-                        // straight to `enqueue` to exercise the channel's
-                        // own slot limit rather than `admit`'s byte budget;
-                        // they never own any admitted bytes to release.
+                        // These fillers bypass would_accept, sent straight
+                        // to enqueue to exercise the channel's slot limit.
                         admitted_bytes: 0,
                     };
                     tier.enqueue(filler)
@@ -9919,13 +9545,8 @@ mod tests {
                     .flush_queue_bytes(1 << 20);
                 let slots = crate::store::spill::flush_queue_slots(cfg.flush_queue_bytes_value());
                 let tier = Arc::new(SpillTier::open(&cfg, "release-on-err").expect("tier opens"));
-                // Paused before the flusher thread is even spawned, so it
-                // never gets a chance to drain any of the filler jobs below
-                // before the real eviction's own `enqueue` needs the
-                // channel to still be completely full; exactly
-                // `evict_one_sampled_abandons_the_victim_when_the_flush_queue_channel_is_full`'s
-                // setup, this time checking `admit`'s own byte accounting
-                // rather than only the victim's restored weight.
+                // Paused before the flusher spawns, so the channel stays
+                // completely full when the real eviction's enqueue needs it.
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
@@ -9982,21 +9603,16 @@ mod tests {
             async fn a_sufficient_reservation_never_falls_back_to_the_global_admit_check() {
                 let dir = temp_dir("reservation-never-falls-back");
                 let value = "x".repeat(20);
-                // The real postcard-encoded byte length, length-prefix
-                // included: what `spill_record_len` and `would_accept`
-                // actually see, not the raw string's own char count.
+                // The real postcard-encoded byte length, what
+                // spill_record_len/would_accept see, not the char count.
                 let encoded_len = postcard::to_stdvec(&value)
                     .expect("test value encodes")
                     .len();
                 let key = 1u32;
                 let kb = key_bytes(key);
                 let record_len = spill_record_len(kb.len(), encoded_len);
-                // A flush queue sized to exactly one record: with no
-                // reservation threaded through, `would_accept`'s own
-                // fallback refuses the very next admission once `admit` is
-                // drained, exactly as
-                // `would_accept_refuses_once_the_flush_queue_bytes_bound_would_be_exceeded`
-                // proves in `spill.rs`'s own test suite.
+                // A flush queue sized to exactly one record, so the next
+                // admission is refused once admit is drained.
                 let cfg = SpillConfig::new(&dir, 1 << 20)
                     .region_bytes(4096)
                     .flush_queue_bytes(u64::from(record_len));
@@ -10014,9 +9630,8 @@ mod tests {
                 let bucket = stripe_index_from_hash(hash);
                 let _ = put(&engine, key, kb.clone(), value.clone(), hlc(1, 1), None, 0);
 
-                // Drain `admit` entirely into a caller-held `Reservation`,
-                // exactly the victim's own record length, before the
-                // eviction ever samples it.
+                // Drains admit entirely into a caller-held Reservation
+                // before eviction ever samples the victim.
                 let mut reservation = tier
                     .reserve(record_len, Duration::from_secs(5))
                     .await
@@ -10051,9 +9666,8 @@ mod tests {
                 let dir = temp_dir("admitted-bytes-sum");
                 let value_a = "x".repeat(20);
                 let value_b = "y".repeat(20);
-                // The real postcard-encoded byte lengths, length prefix
-                // included: what `spill_record_len` and `would_accept`
-                // actually see, not the values' own raw char counts.
+                // The real postcard-encoded byte lengths, what
+                // spill_record_len/would_accept see.
                 let encoded_len_a = postcard::to_stdvec(&value_a)
                     .expect("test value encodes")
                     .len();
@@ -10109,12 +9723,8 @@ mod tests {
                     1,
                 );
 
-                // A reservation covering exactly one victim's own record
-                // length: the colder key (`key_a`, sampled first) spends it
-                // in full; the second victim finds the reservation's
-                // budget exhausted and falls back to `admit`'s own
-                // `try_acquire_many`, for which exactly enough headroom
-                // remains.
+                // A reservation covering exactly one victim's record: the
+                // colder key spends it fully; the second falls back to admit.
                 let mut reservation = tier
                     .reserve(record_len_a, Duration::from_secs(5))
                     .await
@@ -10149,18 +9759,8 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
-            /// The high-severity gap a proxy-sized reservation leaves
-            /// against a real eviction backlog: [`Engine::enforce_capacity_with_reservation`]
-            /// must report, not swallow, a refusal it hit only because the
-            /// caller's reservation and `admit`'s own headroom were both
-            /// exhausted at that instant. Four colliding keys so
-            /// `eviction_batch_size` (which never takes more than the
-            /// colder half of its sample) attempts two of them in the one
-            /// lock hold this test drives: the coldest hands off cleanly
-            /// from the reservation, the second finds both budgets
-            /// exhausted, and the two untouched warmer keys prove the
-            /// deficit stopped the pass rather than let it keep evicting
-            /// by falling back to an ordinary delete.
+            /// Pins that [`Engine::enforce_capacity_with_reservation`]
+            /// reports a deficit once both budgets are exhausted mid-batch.
             #[tokio::test]
             async fn enforce_capacity_with_reservation_returns_the_deficit_once_both_budgets_are_exhausted()
              {
@@ -10195,10 +9795,8 @@ mod tests {
                 let record_len_0 = spill_record_len(key_bytes(keys[0]).len(), encoded_len);
                 let record_len_1 = spill_record_len(key_bytes(keys[1]).len(), encoded_len);
 
-                // Sized to exactly the coldest victim's own record: `reserve`
-                // below drains the tier's entire admit budget into the
-                // reservation, leaving nothing for `admit`'s own fallback to
-                // grant the second victim either.
+                // Sized to exactly the coldest victim's record, so reserve
+                // drains the tier's whole admit budget into the reservation.
                 let cfg = SpillConfig::new(&dir, 1 << 20)
                     .region_bytes(4096)
                     .flush_queue_bytes(u64::from(record_len_0));
@@ -10208,12 +9806,8 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                // Four 20-byte values, weight 20 each: an 80-unit total
-                // against a 30-unit cap is a 50-unit overage, over
-                // `eviction_batch_size`'s own two-victim cap for a
-                // four-entry sample (`4.div_ceil(2)`) at 20 units cleared
-                // after the first victim alone, so the second is attempted
-                // within this same lock hold, not a later pass.
+                // Four 20-byte values against a 30-unit cap attempts the
+                // second victim within this same lock hold.
                 let engine = Engine::<u32, String>::new(30, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
@@ -10275,19 +9869,8 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
-            /// `Shard::retry_reservation_deficit`'s own closing fallback,
-            /// exercised at the level its own doc describes: once a
-            /// caller's retry budget is spent with a
-            /// [`EvictOutcome::deficit`] still outstanding, it makes one
-            /// more [`Engine::enforce_capacity`] call, `reservation:
-            /// None`, exactly like an ordinary write's own eviction pass.
-            /// Extends [`enforce_capacity_with_reservation_returns_the_deficit_once_both_budgets_are_exhausted`]'s
-            /// own scenario: with `admit` still fully drained and no
-            /// `keep_resident_when_refused` policy set (`false`, this
-            /// tier's default), that closing call must physically delete
-            /// the victim the first pass only left resident, not leave it
-            /// resident forever regardless of how many retries a caller
-            /// gives up on.
+            /// Pins that the closing `enforce_capacity` call physically
+            /// deletes a deficit-left victim once retries are exhausted.
             #[tokio::test]
             async fn enforce_capacity_deletes_a_deficit_left_victim_once_reservation_retries_give_up()
              {
@@ -10363,23 +9946,12 @@ mod tests {
                     "left fully resident by the first pass, exactly like the sibling test above"
                 );
 
-                // The reservation returns its own (fully spent) remainder
-                // on drop -- nothing left over for the closing call below
-                // to spend either -- mirroring `retry_reservation_deficit`'s
-                // own per-iteration `Reservation` scoping: by the time its
-                // loop gives up, no reservation from an earlier iteration
-                // is still outstanding.
+                // The reservation returns its spent remainder on drop, so
+                // nothing is left for the closing call below to spend.
                 drop(reservation);
 
-                // `retry_reservation_deficit`'s own closing call once its
-                // retry budget is exhausted: `admit` is still fully
-                // drained (nothing ever attached to drain it, and the
-                // flusher stays paused throughout), so every further
-                // refusal this call hits can only resolve through the
-                // ordinary, `reservation: None` path -- it keeps evicting,
-                // same as any other write's own `enforce_capacity` call,
-                // until the cap is actually met or nothing more can be
-                // sampled.
+                // The closing call falls back to the ordinary
+                // `reservation: None` path and keeps evicting.
                 engine.enforce_capacity(bucket, 10);
 
                 assert_eq!(
@@ -10389,15 +9961,8 @@ mod tests {
                      physically delete the leftover victim, not leave max_capacity exceeded \
                      forever because a reservation retry gave up on it"
                 );
-                // `keys[0]`'s hand-off stays genuinely pending throughout
-                // this test (the flusher never resumes, so nothing ever
-                // installs it), which is what makes `defer_to_flusher`
-                // stop the fallback's own loop early rather than keep
-                // scanning for a third victim -- a real, unrelated
-                // trade-off (`Engine::enforce_capacity`'s own doc), not
-                // this fix's concern: what this test pins is that the
-                // fallback resolves the *specific* victim a reservation
-                // retry gave up on, which it does.
+                // keys[0]'s pending hand-off makes defer_to_flusher stop
+                // this fallback early instead of scanning further.
                 let (_, total_after_fallback) = engine.debug_totals();
                 assert!(
                     total_after_fallback < 60,
@@ -10719,9 +10284,7 @@ mod tests {
             WriterId::new(NodeId::from(id), 1)
         }
 
-        /// `count` distinct keys, all landing in stripe `target`, smallest
-        /// keys first: extends [`key_for_stripe`] to a stripe holding more
-        /// than one entry.
+        /// `count` distinct keys, all landing in stripe `target`.
         fn same_stripe_keys(target: usize, count: usize) -> Vec<u32> {
             (0u32..1 << 20)
                 .filter(|&k| {
@@ -10889,8 +10452,7 @@ mod tests {
         }
 
         /// Four entries seeded into an 8-capacity stripe: `4 > 8 / 8`, so
-        /// [`should_shrink_stripe`] says no and [`Engine::compact`]'s visit
-        /// leaves the stripe's allocation exactly as it found it.
+        /// [`should_shrink_stripe`] says no.
         #[test]
         fn compact_leaves_a_well_utilized_stripe_alone() {
             let target = 9usize;

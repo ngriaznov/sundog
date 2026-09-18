@@ -1,46 +1,25 @@
-//! Public-API integration test for the semaphore-based spill admission
-//! control (`SpillTier::reserve`/`Reservation`): a bulk `insert_many` over a
-//! deliberately tiny flush queue drops nothing.
+//! Integration test for spill admission control
+//! (`SpillTier::reserve`/`Reservation`) through the public API only: a
+//! bulk `insert_many` over a deliberately tiny flush queue drops nothing.
+//! `pause_flusher`/`resume_flusher` are `pub(crate)` test-only hooks used
+//! by `spill.rs`'s unit tests and unreachable here, so this drives a real
+//! `Cluster` and on-disk `SpillTier` and saturates the admission
+//! semaphore against real disk and channel throughput instead.
 //!
-//! `SpillTier::pause_flusher`/`resume_flusher` are `pub(crate)` test-only
-//! hooks (`spill.rs`'s own unit tests use them to hold `admit` saturated
-//! for an exact, deterministic duration) and unreachable from an
-//! integration-test binary outside the crate. This scenario instead drives
-//! a real, loopback, in-process `Cluster` and a real on-disk `SpillTier`
-//! through the public API only, sizing `SpillConfig::flush_queue_bytes` far
-//! below the data volume the scenario moves so the admission semaphore
-//! genuinely saturates against real disk and channel throughput, not a
-//! paused flusher.
+//! The larger, multi-tens-of-MB pacing scenarios live in
+//! `spill_replication.rs` instead of here: running them in the same
+//! binary as this file's small, tightly-margined scenario measurably
+//! raised this test's flake rate under real disk contention, since their
+//! writes could delay this scenario's flusher long enough for
+//! `pending_spill_weight` to outgrow one chunk's reservation.
 //!
-//! The rebalance/anti-entropy pacing test and the too-short-timeout test
-//! this workstream's spec also calls for live in `spill_replication.rs`
-//! instead of here, appended alongside its own `Mode::Replicated`
-//! scenario: both drive a much larger, multi-tens-of-MB bulk transfer to
-//! get a reliable signal, and running that concurrently with this file's
-//! own tiny, tightly-margined scenario in the same test binary measurably
-//! increased this test's flake rate under real disk contention (observed
-//! directly on this suite's own sandbox), the two heavier scenarios'
-//! large writes could occasionally delay this scenario's own flusher
-//! thread long enough for `pending_spill_weight` (committed but not yet
-//! physically installed, `engine.rs`'s own doc on `enforce_capacity`) to
-//! grow past what one small chunk's own reservation was sized to cover.
-//! Splitting them into separate test binaries removes that specific,
-//! avoidable cross-scenario contention.
+//! `sundog_spill_waiters` bumps on every `reserve()` call before the
+//! acquire is awaited and drops on exit, so a nonzero reading only proves
+//! `reserve()` ran, not that it suspended; the assertion using
+//! it is a sanity check, not proof of a wait.
 //!
-//! One consequence of measuring through the public API alone, documented
-//! here rather than silently worked around: `sundog_spill_waiters` bumps
-//! on every `reserve()` call unconditionally (`Inner::record_waiter_delta`
-//! runs before the acquire is even awaited) and drops on every exit, so
-//! observing it above zero proves only that `reserve()` was called and a
-//! concurrent sampler's own OS thread happened to catch it mid-flight:
-//! not that the call genuinely suspended rather than resolving on an
-//! uncontended, effectively instant acquire. The one assertion below that
-//! uses it treats it only as a sanity check that `reserve()` was
-//! exercised at all, not as proof of a genuine wait.
-//!
-//! Its own test binary, a separate process from every other `tests/*.rs`
-//! file, so installing the process-global Prometheus recorder here never
-//! races another test for the slot.
+//! Own test binary, so installing the process-global Prometheus recorder
+//! here never races another test for the slot.
 
 #![cfg(all(feature = "spill", feature = "prometheus", not(feature = "sim")))]
 
@@ -52,12 +31,9 @@ use std::time::Duration;
 
 use sundog::{Cluster, Mode, SpillConfig};
 
-/// This binary's one claim on the process-global Prometheus recorder
-/// slot, installed lazily on first use and shared by every test that
-/// runs after it: two `#[tokio::test]`s in one binary run concurrently by
-/// default, so each calling `sundog::prometheus_handle()` directly would
-/// race the other for the single process-global slot instead of sharing
-/// it. Mirrors `tests/spill_replication.rs::metrics_handle`.
+/// This binary's lazily-installed claim on the process-global Prometheus
+/// recorder slot, shared so concurrent `#[tokio::test]`s in this binary
+/// don't race each other for it. Mirrors `spill_replication.rs::metrics_handle`.
 fn metrics_handle() -> &'static sundog::PrometheusHandle {
     static HANDLE: std::sync::OnceLock<sundog::PrometheusHandle> = std::sync::OnceLock::new();
     HANDLE.get_or_init(|| {
@@ -66,16 +42,13 @@ fn metrics_handle() -> &'static sundog::PrometheusHandle {
     })
 }
 
-/// Every value this file writes is padded to exactly this many bytes,
-/// mirroring `tests/spill_bench.rs`'s own fixed-length convention: makes
-/// the byte math behind every `flush_queue_bytes`/`capacity_bytes` choice
-/// below an intentional multiple of one record's real size rather than a
-/// guess.
+/// Fixed length every value in this file is padded to, so the
+/// `flush_queue_bytes`/`capacity_bytes` choices below are exact multiples
+/// of one record's real size.
 const VALUE_LEN: usize = 256;
 
 /// A fixed-length, easily eyeballed value: `v0000000042-xxxx...`, padded
-/// with `x` out to [`VALUE_LEN`] bytes regardless of `i`'s digit count.
-/// Mirrors `tests/spill_bench.rs::bench_value`.
+/// with `x` to [`VALUE_LEN`] bytes.
 fn fixed_value(i: u32) -> String {
     let prefix = format!("v{i:010}-");
     let pad = VALUE_LEN.saturating_sub(prefix.len());
@@ -86,8 +59,7 @@ fn fixed_value(i: u32) -> String {
 }
 
 /// A directory under [`std::env::temp_dir`], unique to this process and
-/// this call, never created ahead of time: `SpillTier::open` creates it.
-/// Mirrors `tests/spill_bench.rs::fresh_temp_dir`.
+/// call; `SpillTier::open` creates it.
 fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "sundog-it-spill-backpressure-{label}-{}-{}",
@@ -100,8 +72,7 @@ fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
 }
 
 /// Finds `metric{label1="value1",...} <number>` in Prometheus
-/// text-exposition `body`, tolerant of label ordering and
-/// integer-vs-float rendering. Mirrors `tests/spill_bench.rs::scraped_metric`.
+/// text-exposition `body`, tolerant of label ordering.
 fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f64> {
     let wanted: Vec<String> = labels
         .iter()
@@ -119,8 +90,7 @@ fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f
     })
 }
 
-/// Every `sundog_spill_*` counter/gauge this file reads holds an
-/// exact-integer count. Mirrors `tests/spill_bench.rs::metric_count`.
+/// Rounds a scraped metric to its exact-integer count.
 #[allow(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
@@ -130,18 +100,11 @@ fn metric_count(body: &str, metric: &str, labels: &[(&str, &str)]) -> u64 {
     scraped_metric(body, metric, labels).unwrap_or(0.0).round() as u64
 }
 
-/// Bulk `insert_many` over a deliberately tiny flush queue drops nothing:
-/// each `CHUNK`-sized `insert_many` call reserves its own whole chunk's
-/// encoded `Put` bytes up front (`Shard::apply_grouped`'s one
-/// `reserve().await`), so every eviction that chunk's own writes cause is
-/// structurally covered by `Reservation::spend` and never falls back to
-/// the non-blocking `admit.try_acquire_many` refusal this cache's tiny
-/// `flush_queue_bytes` would otherwise trigger throughout the load. `CHUNK`
-/// is sized well under `FLUSH_QUEUE_BYTES` (roughly 40%) precisely so this
-/// holds without ever exercising `reserve`'s own clamp-to-total fallback
-/// path (`SpillTier::reserve`'s doc): this test's point is the reservation
-/// mechanism working as designed, not the correctness backstop that covers
-/// its known sizing-proxy limitation.
+/// Bulk `insert_many` over a deliberately tiny flush queue drops nothing.
+/// Each `CHUNK`-sized call reserves its whole chunk up front
+/// (`Shard::apply_grouped`), so evictions stay covered by
+/// `Reservation::spend`; `CHUNK` stays under 40% of `FLUSH_QUEUE_BYTES` so
+/// a chunk's reservation is never clamped.
 #[allow(
     clippy::too_many_lines,
     reason = "one self-contained scenario: open, a concurrent sampler, the chunked insert loop, and one metric-by-metric assertion block"
@@ -150,17 +113,14 @@ fn metric_count(body: &str, metric: &str, labels: &[(&str, &str)]) -> u64 {
 async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
     const REGION_BYTES: u64 = 256 * 1024;
     const CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
-    /// Roughly 1/20th of the ~640 KB this test actually spills: small
-    /// enough that a channel whose slot count stays fixed at
-    /// `FLUSH_QUEUE_CAPACITY` (8192) regardless of `flush_queue_bytes`,
-    /// paired with a byte-only `queued_bytes` bound, would drop most of a
-    /// burst this size with `queue_full`.
+    /// Small enough, against the ~640 KB this test spills, that a
+    /// byte-only `queued_bytes` bound would drop most of the burst.
     const FLUSH_QUEUE_BYTES: u64 = 4 * 1024;
     const MAX_CAPACITY: u64 = 100;
     const ENTRIES: u32 = 2_000;
-    /// `CHUNK * ~320` (a real record's header+key+value length, rounded up
-    /// generously) sits at about 40% of `FLUSH_QUEUE_BYTES`, leaving
-    /// comfortable margin so a whole chunk's reservation is never clamped.
+    /// `CHUNK * ~320` bytes/record sits at about 40% of
+    /// `FLUSH_QUEUE_BYTES`, leaving margin so a chunk's reservation is
+    /// never clamped.
     const CHUNK: u32 = 5;
     const CACHE_NAME: &str = "bulk";
 
@@ -178,13 +138,9 @@ async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
     let cfg = SpillConfig::new(&dir, CAPACITY_BYTES)
         .region_bytes(REGION_BYTES)
         .flush_queue_bytes(FLUSH_QUEUE_BYTES)
-        // Generous past the 2s default: `cargo test --workspace` runs many
-        // test binaries concurrently, so this scenario's own flusher
-        // thread can occasionally see real, contention-driven scheduling
-        // delays with nothing to do with disk speed. A short timeout
-        // under that contention would turn a merely-slow-to-drain chunk
-        // into a spurious deferred drop, which is exactly the false
-        // failure this test must not produce.
+        // Generous past the 2s default: concurrent test binaries can
+        // delay this scenario's flusher enough to turn a slow drain into
+        // a spurious deferred drop.
         .spill_wait_timeout(Duration::from_secs(20));
     let cache = cluster
         .cache::<u32, String>(CACHE_NAME)
@@ -195,16 +151,9 @@ async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
         .await
         .expect("cache opens with a tiny flush queue");
 
-    // A concurrent sampler polling `sundog_spill_waiters{cache}` (a gauge
-    // `Inner::record_waiter_delta` bumps on every `reserve()` call, before
-    // the acquire is even awaited, and drops on every exit) as fast as
-    // `tokio::task::yield_now` will schedule it. This cannot, on its own,
-    // tell a genuine multi-poll suspension apart from an instant,
-    // uncontended acquire that this sampler's other OS thread happened to
-    // observe mid-flight; what it does confirm is that `reserve()` itself
-    // was exercised, repeatedly, by this chunked load, i.e. that the
-    // reservation path this test targets was actually on this run's call
-    // graph and not silently bypassed.
+    // Polls sundog_spill_waiters as fast as yield_now allows. Confirms
+    // reserve() was exercised repeatedly; cannot prove a genuine wait
+    // over an instant, uncontended acquire.
     let seen_waiter = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = tokio::spawn({
@@ -299,40 +248,24 @@ async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The gap a reservation sized only from one call's own new Put bytes
-/// leaves when it cannot cover the eviction backlog a real, merely-slow
-/// flusher accumulates: unlike `bulk_insert_over_a_saturated_flush_queue_
-/// drops_nothing` above, deliberately chunked so every chunk's own
-/// reservation is always sufficient (its own doc comment says so), this
-/// scenario drives the whole run through **one** `insert_many` call whose
-/// own reservation structurally cannot cover it, forcing
-/// `Shard::apply_grouped`'s per-bucket loop past the reservation entirely
-/// and onto `Shard::retry_reservation_deficit`'s bounded post-loop retry.
+/// Unlike the chunked scenario above, this drives the whole run through
+/// **one** `insert_many` call whose reservation structurally cannot cover
+/// its eviction backlog, forcing `Shard::apply_grouped` past the
+/// reservation and onto `Shard::retry_reservation_deficit`'s bounded
+/// retry.
 ///
-/// The arithmetic, made explicit rather than left to be eyeballed:
-/// `ENTRIES` (2,000) records at roughly 280 real encoded bytes each
-/// (`HEADER_LEN` + a ~11-byte key + the 256-byte value) put this one
-/// call's own *requested* reservation at roughly 2,000 × 280 ≈ 560,000
-/// bytes. `SpillTier::reserve` clamps any request to at most the tier's
-/// own total permit count (`FLUSH_QUEUE_BYTES` here, 4,096), so the one
-/// reservation this call actually receives covers at most about 14 of its
-/// 2,000 records, under 1% of the run. Every other eviction this call
-/// triggers must be paid down by `retry_reservation_deficit`'s repeated
-/// `reserve`-then-`enforce_capacity_with_reservation` rounds, each still
-/// individually capped at 4,096 bytes by that same clamp, waiting on the
-/// real flusher between rounds to free room. Zero `deferred`/`queue_full`
-/// drops here is what proves that retry loop, not a bigger up-front
-/// reservation, is what closes the gap the high-severity review finding
-/// against this workstream's first cut described.
+/// `ENTRIES` (2,000) records at ~280 bytes each request a ~560,000-byte
+/// reservation, but `SpillTier::reserve` clamps it to `FLUSH_QUEUE_BYTES`
+/// (4,096), covering under 1% of the run; `retry_reservation_deficit`
+/// pays down the rest in rounds, each still capped at 4,096 bytes, so
+/// zero drops here proves the retry loop closes the gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_insert_in_one_call_over_a_flush_queue_too_small_for_the_first_reservation_drops_nothing()
  {
     const REGION_BYTES: u64 = 256 * 1024;
     const CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
-    /// Far under one record's own share of the 2,000-record run this
-    /// scenario drives through a single `insert_many` call: see this
-    /// function's own doc comment for the exact arithmetic this constant
-    /// is chosen against.
+    /// Far under one record's share of the 2,000-record run; see this
+    /// function's doc for the arithmetic.
     const FLUSH_QUEUE_BYTES: u64 = 4 * 1024;
     const MAX_CAPACITY: u64 = 100;
     const ENTRIES: u32 = 2_000;
@@ -352,10 +285,7 @@ async fn bulk_insert_in_one_call_over_a_flush_queue_too_small_for_the_first_rese
     let cfg = SpillConfig::new(&dir, CAPACITY_BYTES)
         .region_bytes(REGION_BYTES)
         .flush_queue_bytes(FLUSH_QUEUE_BYTES)
-        // Generous: real disk under concurrent test-binary contention,
-        // plus this scenario's own retry loop needing many real,
-        // individually-small flusher drains to pay its deficit down, not
-        // just one.
+        // Generous: real disk contention plus many small retry-loop drains.
         .spill_wait_timeout(Duration::from_secs(20));
     let cache = cluster
         .cache::<u32, String>(CACHE_NAME)
@@ -366,9 +296,8 @@ async fn bulk_insert_in_one_call_over_a_flush_queue_too_small_for_the_first_rese
         .await
         .expect("cache opens with a tiny flush queue");
 
-    // One call, every record: no chunking anywhere in this scenario, so
-    // `Shard::apply_grouped`'s one reservation is sized from, and then
-    // immediately clamped far below, this whole run's own Put bytes.
+    // One call, every record: no chunking, so the one reservation is
+    // clamped far below the run's Put bytes.
     cache
         .insert_many((0..ENTRIES).map(|i| (i, fixed_value(i))))
         .await

@@ -6,15 +6,10 @@
 //! Usage: `sundog-testnode <cluster-name>`; every other setting comes from
 //! `SUNDOG_*` environment variables (seeds, anti-entropy bucket overrides,
 //! cache mode and capacity, spill tier, conflict resolver): see each
-//! variable's read site in [`run`] for its meaning and default. `"it"`'s
-//! sizing knobs mirror `sundog-distributed-demo`'s `--max-entries`/
-//! `--spill-capacity-mb`/`--spill-region-mb`/`--spill-flush-queue-mb`:
-//! `SUNDOG_TESTNODE_MAX_ENTRIES` caps live entry count and
-//! `SUNDOG_TESTNODE_SPILL_CAPACITY_MB`/`_SPILL_REGION_MB`/
-//! `_SPILL_FLUSH_QUEUE_MB` size the spill tier in mebibytes; each has an
-//! older byte-denominated counterpart (`_MAX_CAPACITY_BYTES`,
-//! `_SPILL_CAPACITY_BYTES`, `_SPILL_REGION_BYTES`,
-//! `_SPILL_FLUSH_QUEUE_BYTES`) that wins when both are set.
+//! variable's read site in [`run`] for its meaning and default.
+//! `SUNDOG_TESTNODE_MAX_ENTRIES` and the `_SPILL_*_MB` knobs mirror
+//! `sundog-distributed-demo`'s own sizing flags; each has an older
+//! byte-denominated counterpart that wins when both are set.
 //!
 //! Line protocol: one command per line on `CONTROL_PORT`, one
 //! line-terminated reply each; each command's argument shape and reply
@@ -24,10 +19,9 @@
 //! Built with the `prometheus` feature, every run also serves `GET /metrics`
 //! (and `/readyz`, `/healthz`) on `METRICS_PORT`. Built with the `spill`
 //! feature, `"it"` can open a `SpillConfig` disk tier; see
-//! `spill_config_from_env`. A SIGTERM, which is what a container stop
-//! sends, shuts the cluster down and exits 0, so a spill tier opened with
-//! warm reopen on writes its checkpoint the way an embedding process's
-//! own shutdown would; `quit` and `crash` exit without leaving.
+//! `spill_config_from_env`. A SIGTERM, sent by a container stop, leaves the
+//! cluster and exits 0, checkpointing a warm-reopen spill tier; `quit` and
+//! `crash` exit without leaving.
 
 use std::env;
 use std::io::Write as _;
@@ -108,10 +102,8 @@ async fn digest_it(cache: &Cache<String, String>) -> u64 {
     digest
 }
 
-/// jemalloc instead of the platform allocator, everywhere but MSVC
-/// Windows where it does not build: under bulk ingest and rebalance glibc
-/// retains about twice the resident set the live entries need, and a
-/// size-class allocator returns that memory and roughly doubles ingest.
+/// jemalloc instead of the platform allocator (not on MSVC): glibc retains
+/// about twice the resident set live entries need under bulk ingest.
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -125,11 +117,8 @@ async fn main() {
     }
 }
 
-/// The `EnvFilter` directive string [`install_tracing`] builds its filter
-/// from: `raw`'s value verbatim when it parses as a valid directive,
-/// `"warn"` when `RUST_LOG` is unset or its value fails to parse. Pure so
-/// the default and the fallback are both testable without touching the
-/// real environment.
+/// The `EnvFilter` directive [`install_tracing`] builds from: `raw`
+/// verbatim when it parses, `"warn"` when unset or invalid.
 fn log_filter_directive(raw: Option<&str>) -> &str {
     match raw {
         Some(value) if tracing_subscriber::EnvFilter::try_new(value).is_ok() => value,
@@ -137,13 +126,9 @@ fn log_filter_directive(raw: Option<&str>) -> &str {
     }
 }
 
-/// Installs the process-wide `tracing` subscriber, so every
-/// `tracing::info!`/`warn!`/etc. the `sundog` library emits lands somewhere
-/// instead of being silently dropped. Writes to stderr only, uncolored,
-/// with each event's target, filtered by [`log_filter_directive`]'s reading
-/// of `RUST_LOG`; called first thing in [`main`], before anything else can
-/// log. Stdout stays untouched, so `testnode-ready` and every other control
-/// protocol line the harness parses are unaffected.
+/// Installs the process-wide `tracing` subscriber: stderr only, uncolored,
+/// filtered by [`log_filter_directive`]'s reading of `RUST_LOG`. Leaves
+/// stdout untouched for the harness's control protocol.
 fn install_tracing() {
     let raw_log = env::var("RUST_LOG").ok();
     let directive = log_filter_directive(raw_log.as_deref());
@@ -182,12 +167,8 @@ fn u64_env(name: &str) -> Option<u64> {
     parse_u64_override(env::var(name).ok().as_deref())
 }
 
-/// Parses `raw` as a boolean env override: `"true"` is `true`, `"false"` and
-/// anything absent or unparsable is `false`. Backs
-/// `SUNDOG_TESTNODE_WARM_REOPEN`, whose own documented default is `false`,
-/// matching `SpillConfig::warm_reopen`'s own default exactly, so a run that
-/// never sets it behaves exactly as one that explicitly sets it to
-/// `"false"`.
+/// Parses `raw` as a boolean env override: `"true"` is `true`, else
+/// `false`. Backs `SUNDOG_TESTNODE_WARM_REOPEN`, default `false`.
 #[cfg(feature = "spill")]
 fn parse_bool_override(raw: Option<&str>) -> bool {
     raw == Some("true")
@@ -236,24 +217,18 @@ fn byte_weight(key: &str, value: &str) -> u32 {
     (key.len() + value.len()).try_into().unwrap_or(u32::MAX)
 }
 
-/// Which unit `"it"`'s optional `CacheBuilder::max_capacity` bounds: the
-/// pure decision behind `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`/
-/// `SUNDOG_TESTNODE_MAX_ENTRIES`'s already-parsed values.
+/// Which unit `"it"`'s optional `CacheBuilder::max_capacity` bounds, from
+/// `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`/`SUNDOG_TESTNODE_MAX_ENTRIES`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapacityCap {
-    /// `max_capacity` bounds total UTF-8 bytes across key and value, via
-    /// [`byte_weight`].
+    /// Bounds total UTF-8 bytes across key and value, via [`byte_weight`].
     Bytes(u64),
-    /// `max_capacity` bounds live entry count, via the default per-entry
-    /// weigher: `sundog-distributed-demo`'s `--max-entries` knob.
+    /// Bounds live entry count via the default per-entry weigher.
     Entries(u64),
 }
 
-/// Decides [`CapacityCap`] from `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES`/
-/// `SUNDOG_TESTNODE_MAX_ENTRIES`'s already-parsed values: a byte budget
-/// takes priority when both are set, since it is the older of the two
-/// knobs; `None` when neither is set, leaving `"it"` unbounded exactly as
-/// it always has.
+/// Decides [`CapacityCap`] from the two env knobs: a byte budget wins when
+/// both are set (the older knob); `None` leaves `"it"` unbounded.
 fn capacity_cap_from_env(
     max_capacity_bytes: Option<u64>,
     max_entries: Option<u64>,
@@ -268,14 +243,9 @@ fn capacity_cap_from_env(
 #[cfg(feature = "spill")]
 const MIB: u64 = 1024 * 1024;
 
-/// The byte value for one spill sizing knob: `bytes`'s value if set,
-/// otherwise `mib` converted to bytes (saturating rather than overflowing
-/// on a pathologically large input), `None` if neither is set. Backs
-/// `SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/`_SPILL_CAPACITY_MB`,
-/// `_SPILL_REGION_BYTES`/`_SPILL_REGION_MB`, and
-/// `_SPILL_FLUSH_QUEUE_BYTES`/`_SPILL_FLUSH_QUEUE_MB` alike: the byte
-/// variable wins when both are set, so an existing byte-denominated run
-/// configuration is unaffected by also setting its MiB counterpart.
+/// The byte value for one spill sizing knob: `bytes` if set, otherwise
+/// `mib` converted (saturating on overflow), else `None`. The byte
+/// variable always wins when both are set.
 #[cfg(feature = "spill")]
 fn resolve_byte_budget(bytes: Option<u64>, mib: Option<u64>) -> Option<u64> {
     bytes.or_else(|| mib.map(|mib| mib.saturating_mul(MIB)))
@@ -285,13 +255,8 @@ fn resolve_byte_budget(bytes: Option<u64>, mib: Option<u64>) -> Option<u64> {
 /// `SUNDOG_TESTNODE_SPILL_DIR`/`SUNDOG_TESTNODE_SPILL_CAPACITY_BYTES`/
 /// `SUNDOG_TESTNODE_SPILL_REGION_BYTES`/
 /// `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_BYTES`/`SUNDOG_TESTNODE_WARM_REOPEN`'s
-/// already-parsed values: `None` when no spill dir is set, so the cache
-/// opens spill-free exactly as it always has. `capacity_bytes`/
-/// `region_bytes`/`flush_queue_bytes` each already fold in that knob's
-/// `_MB` counterpart via [`resolve_byte_budget`], so this function itself
-/// stays byte-only. `warm_reopen` defaults to `false`, matching
-/// `SpillConfig::warm_reopen`'s own default: a container test that wants
-/// warm reopen sets `SUNDOG_TESTNODE_WARM_REOPEN=true` explicitly.
+/// already-parsed values (byte knobs folded with their `_MB` counterpart):
+/// `None` when no spill dir is set. `warm_reopen` defaults to `false`.
 ///
 /// # Panics
 ///
@@ -399,14 +364,8 @@ impl ConflictResolver for SumCounterResolver {
 }
 
 /// Applies `cap` (from [`capacity_cap_from_env`]) to `builder`: a byte
-/// budget installs the byte weigher alongside its own `max_capacity`; an
-/// entry count installs both `max_capacity` and `capacity_hint`, since
-/// `capacity_hint` is always an entry count and only makes sense next to
-/// the entry-denominated `max_capacity` call, never the byte-budget arm,
-/// where `max_capacity` bounds weight rather than entries; no cap leaves
-/// `builder` untouched. Split out of [`open_it_cache`] as a pure decision
-/// step a test can drive against a real builder without reading process
-/// environment.
+/// budget installs the byte weigher with `max_capacity`; an entry count
+/// installs `max_capacity` and `capacity_hint` together. No cap is a no-op.
 fn apply_capacity_cap(
     mut builder: CacheBuilder<String, String>,
     cap: Option<CapacityCap>,
@@ -425,10 +384,8 @@ fn apply_capacity_cap(
     builder
 }
 
-/// Opens `"it"` with `resolver` and its sizing knobs applied: the RAM cap
-/// (byte- or entry-denominated, via [`capacity_cap_from_env`] and
-/// [`apply_capacity_cap`]) and, with the `spill` feature, the spill tier
-/// (via `spill_config_from_env`). Split out of [`run`] to keep it under
+/// Opens `"it"` with `resolver` and its sizing knobs: the RAM cap and,
+/// with `spill`, the spill tier. Split out of [`run`] to keep it under
 /// clippy's line-count lint.
 async fn open_it_cache(
     cluster: &Cluster,
@@ -548,11 +505,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
-    // A container stop is a SIGTERM with a grace period: the node leaves
-    // the cluster the way an embedding process's own shutdown does, which
-    // checkpoints a spill tier opened with warm reopen on, so a restart
-    // against a preserved spill dir finds the snapshot a warm reopen
-    // needs. `quit` and `crash` are what they are: an exit with no leave.
+    // A container stop sends SIGTERM: leave the cluster and checkpoint a
+    // warm-reopen spill tier; `quit`/`crash` exit with no leave.
     let stop = stop_requested();
     tokio::pin!(stop);
     println!("testnode-ready");
@@ -574,11 +528,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Resolves once the process is asked to stop: on SIGTERM on Unix, which
-/// is what a container stop sends, and on Ctrl-C elsewhere, where no
-/// container test runs this node and the workspace has to build all the
-/// same. A shutdown that outlasts the container stop's grace is killed
-/// mid-way, and a spill tier's next open then falls back cold.
+/// Resolves once the process is asked to stop: SIGTERM on Unix (what a
+/// container stop sends), Ctrl-C elsewhere. A shutdown that outlasts the
+/// stop's grace period is killed mid-way; the next spill open falls back
+/// cold.
 async fn stop_requested() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1620,11 +1573,8 @@ mod tests {
         node.cluster.clone().shutdown().await;
     }
 
-    /// `stop_requested` resolves on the signal a container stop sends. The
-    /// test registers its own SIGTERM listener first, so the process-wide
-    /// handler is installed before any SIGTERM is raised, and raises the
-    /// signal until the pending `stop_requested` observes one: a raise
-    /// that lands before its own registration is missed, never fatal.
+    /// Pins that `stop_requested` resolves on SIGTERM, retrying the raise
+    /// until the pending future observes one.
     #[cfg(unix)]
     #[tokio::test]
     async fn stop_requested_resolves_on_sigterm() {

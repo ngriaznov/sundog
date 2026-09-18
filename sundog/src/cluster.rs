@@ -124,11 +124,10 @@ struct ClusterInner {
     name: SmolStr,
     membership: Membership,
     /// Whether `ClusterBuilder::build` resolved a fixed, nonempty seed
-    /// list. A `Mode::Distributed` cache's `open()` waits briefly for a
-    /// first peer only when this is `true` and `Cluster::peers` is still
-    /// empty, since a seedless cluster (mDNS with nothing found yet, or a
-    /// deliberately standalone node) is a legitimate one-node cluster, not
-    /// a membership race to wait out. See `cache::should_await_first_peer`.
+    /// list. `open()` waits briefly for a first peer only when this is
+    /// `true` and `Cluster::peers` is still empty; a seedless cluster is a
+    /// legitimate one-node cluster, not a membership race to wait out. See
+    /// `cache::should_await_first_peer`.
     has_seeds: bool,
     mesh: Mesh,
     shards: ShardRegistry,
@@ -504,11 +503,7 @@ impl Cluster {
         self.inner.cancel.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
-        // Collected into an owned `Vec` before awaiting anything: the read
-        // guard below is never held across an `.await` point, and a
-        // checkpointed close (`SpillConfig::warm_reopen` on) can run its
-        // blocking work while every other shard's close proceeds
-        // independently.
+        // Collected first so the read guard is never held across an .await.
         let shards: Vec<Arc<dyn ShardOps>> =
             self.inner.shards.read_shards().values().cloned().collect();
         for shard in shards {
@@ -706,15 +701,12 @@ fn use_static_from_env(discovery_set: bool, seeds_env: Option<&str>) -> bool {
 
 /// Validates the `ClusterConfig` invariants `build()` cannot recover from:
 /// `max_frame` against the wire codec's hard cap and the sketch frame size
-/// it implies. `rebalance_chunk_bytes` and `rebalance_ack_window` are
-/// deliberately not checked here even though each has a bound of its own
+/// it implies. `rebalance_chunk_bytes` and `rebalance_ack_window` are not
+/// checked here: both have a bound of their own
 /// ([`ClusterConfig::rebalance_chunk_bytes_value`],
-/// [`ClusterConfig::rebalance_ack_window_max`]): both bounds are clamps
-/// applied at the point of use, not build-time rejections, precisely so a
-/// config that intentionally tunes `ae_interval` (shrinking
-/// `rebalance_ack_window_max` along with it, since it is derived from
-/// `ae_interval`) without separately re-tuning `rebalance_ack_window` still
-/// builds -- the accessor keeps the effective value in range regardless.
+/// [`ClusterConfig::rebalance_ack_window_max`]) applied as a clamp at the
+/// point of use, so tuning `ae_interval` without separately re-tuning
+/// `rebalance_ack_window` still builds.
 fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
     if config.max_frame > wire::MAX_FRAME {
         return Err(JoinError::InvalidConfig(format!(
@@ -843,9 +835,7 @@ struct ClusterRequestHandler {
     ae_sketch_min_bucket: usize,
     ae_sketch_cells: usize,
     /// [`crate::config::ClusterConfig::rebalance_chunk_bytes_value`],
-    /// resolved once at construction: the target size `st_bucket_chunks`
-    /// sub-batches one bucket's key list into before each `records_for`
-    /// call.
+    /// resolved once at construction.
     rebalance_chunk_bytes: u64,
 }
 
@@ -973,13 +963,9 @@ impl RequestHandler for ClusterRequestHandler {
                 return FetchServe::Unavailable;
             };
             let bucket = bucket_of(&key);
-            // An unverified bucket -- warm-reloaded from a spill tier's
-            // on-disk checkpoint, never yet checked against a live
-            // co-owner -- answers `Unavailable` even on a hit: unlike an
-            // ordinary cold bucket, whose only possible local content was
-            // already trustworthy (pulled from a donor or replicated
-            // live), a warm-reloaded bucket can hold a record a co-owner
-            // deleted during this node's downtime.
+            // An unverified bucket (warm-reloaded, not yet checked against
+            // a live co-owner) answers Unavailable even on a hit: it may
+            // hold a record a co-owner deleted during this node's downtime.
             if shard.is_unverified_bucket(bucket) {
                 return FetchServe::Unavailable;
             }
@@ -1052,14 +1038,10 @@ impl RequestHandler for ClusterRequestHandler {
             return stream::empty().boxed();
         };
         let chunk_bytes = self.rebalance_chunk_bytes;
-        // One `rebalance_chunk_bytes`-estimated sub-batch of one bucket's
-        // records resident at a time: a pull for a whole owner-set group
-        // never holds more than that much in memory here, not a whole
-        // bucket's. `records_for` (the call that reads value bytes, from
-        // spill when attached) runs once per sub-batch instead of once for
-        // the whole bucket; `chunk_records_for_snapshot` still splits each
-        // sub-batch's records on the wire-frame cap regardless of
-        // `rebalance_chunk_bytes`, so `MAX_FRAME` stays the hard ceiling.
+        // One `rebalance_chunk_bytes` sub-batch resident at a time, not a
+        // whole bucket's records; `chunk_records_for_snapshot` still splits
+        // each sub-batch on the wire-frame cap, so `MAX_FRAME` stays the
+        // hard ceiling regardless of this setting.
         Box::pin(stream::iter(buckets).flat_map(move |bucket| {
             let keys_shard = Arc::clone(&shard);
             let fetch_shard = Arc::clone(&shard);
@@ -1089,16 +1071,11 @@ fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn Shard
     shards.read_shards().get(cache).cloned()
 }
 
-/// Splits one bucket's `keys` into groups whose *estimated* encoded size is
-/// `<= chunk_bytes`, so [`ClusterRequestHandler::st_bucket_chunks`] calls
-/// `records_for` once per group instead of once for the whole bucket. The
-/// estimate is `wire::RECORD_HEADER_LEN + key.len()` per key: the only size
-/// information available before `records_for` reads each value, the same
-/// gap [`chunk_records_for_snapshot`] closes afterward with the real,
-/// value-inclusive size once the records are in hand. A key whose own
-/// estimate already meets or exceeds `chunk_bytes` still gets a one-key
-/// group of its own rather than being dropped or blocking every key behind
-/// it; `chunk_bytes` of `0` behaves the same way, one key per group.
+/// Splits one bucket's `keys` into groups whose estimated encoded size
+/// (`wire::RECORD_HEADER_LEN + key.len()` per key, the only size known
+/// before `records_for` reads each value) is `<= chunk_bytes`. A key whose
+/// own estimate already meets or exceeds `chunk_bytes` still gets a
+/// one-key group of its own rather than being dropped.
 fn st_bucket_key_sub_batches(keys: Vec<Bytes>, chunk_bytes: u64) -> Vec<Vec<Bytes>> {
     let mut sub_batches = Vec::new();
     let mut current = Vec::new();
@@ -1806,22 +1783,16 @@ mod tests {
         );
     }
 
-    /// `validate_config` deliberately does not reject a `rebalance_ack_window`
-    /// past its own `rebalance_ack_window_max()`: unlike `max_frame`, whose
-    /// bound is a hard wire cap, `rebalance_ack_window`'s bound moves with
-    /// `ae_interval`, and plenty of tests across this crate shrink
-    /// `ae_interval` alone (for speed) without separately re-tuning
-    /// `rebalance_ack_window` to match. A build-time rejection here would
-    /// break every one of them; `rebalance_ack_window_value` clamping the
-    /// effective value at the point of use is the actual, load-bearing
-    /// guard (`config::rebalance_ack_window_value_is_bounded_by_disown_grace_rounds_times_ae_interval`).
+    /// `validate_config` does not reject a `rebalance_ack_window` past its
+    /// own max: unlike `max_frame`, its bound moves with `ae_interval`, and
+    /// many tests shrink `ae_interval` alone without re-tuning it to match.
+    /// `rebalance_ack_window_value` clamps the effective value at the point
+    /// of use instead.
     #[tokio::test]
     async fn build_succeeds_with_a_rebalance_ack_window_past_its_own_max_since_the_accessor_clamps_it()
      {
         let mut config = loopback_config();
         config.ae_interval = Duration::from_millis(1);
-        // Far past `rebalance_ack_window_max()` once `ae_interval` this
-        // small: exactly the shape a speed-tuned test config takes.
         assert!(config.rebalance_ack_window > config.rebalance_ack_window_max());
 
         let cluster = Cluster::builder("cluster-it-ack-window-no-reject")
@@ -4250,8 +4221,7 @@ mod tests {
         );
 
         // A multi-bucket pull streams one bucket at a time, in request
-        // order, each bucket's records in their own chunks, tagged by
-        // their owning bucket.
+        // order, each chunk tagged with its owning bucket.
         let key_other = Bytes::from(postcard::to_stdvec(&other_key).expect("test key encodes"));
         let mut chunks =
             handler.st_bucket_chunks(name, vec![bucket_of_u32(other_key), owned_bucket]);
@@ -4274,14 +4244,8 @@ mod tests {
         cluster.shutdown().await;
     }
 
-    /// The request-handler half of goal 2's serve-gating fix: a hit in an
-    /// unverified bucket -- a warm-reloaded record never yet checked
-    /// against a live co-owner -- answers `Unavailable`, never the record
-    /// itself, exactly as if this responder held nothing at all. A raw
-    /// `Shard`/`ResidencySet` pair, built directly the way
-    /// `cache::attach_ownership` builds one but without a real `Cache`
-    /// around it, since only `ShardOps::is_unverified_bucket` and a bare
-    /// `fetch` call are needed here.
+    /// A hit in an unverified bucket answers `Unavailable`, never the
+    /// record itself, as if this responder held nothing at all.
     #[cfg(feature = "spill")]
     #[tokio::test]
     async fn cluster_request_handler_answers_unavailable_for_a_hit_in_an_unverified_bucket() {
@@ -4389,7 +4353,7 @@ mod tests {
     fn st_bucket_key_sub_batches_gives_an_oversized_key_its_own_batch() {
         let small = Bytes::from_static(b"a");
         let big = Bytes::from(vec![0u8; 4096]);
-        // Fits `small` exactly; nowhere near enough for `big`.
+        // Fits `small`; nowhere near enough for `big`.
         let budget = (wire::RECORD_HEADER_LEN + 1) as u64;
         let sub_batches = st_bucket_key_sub_batches(vec![small.clone(), big.clone()], budget);
         assert_eq!(
@@ -4399,17 +4363,9 @@ mod tests {
         );
     }
 
-    /// A [`ShardOps`] test double for
-    /// [`st_bucket_chunks_never_materializes_more_than_rebalance_chunk_bytes_for_a_bucket_larger_than_the_budget`]:
-    /// records every `records_for` call's key list, so the test can assert
-    /// none of them exceeds the configured sub-batch budget.
-    /// `st_bucket_chunks` only ever calls `entries_for_buckets` and
-    /// `records_for` on a `ShardOps`; every other method here panics if
-    /// called, since that would be a test bug rather than a shape to serve
-    /// quietly. The exception is `close_spill`, overridden below to count
-    /// its calls for
-    /// [`close_spill_checkpointed_default_resolves_and_calls_the_sync_close`],
-    /// which never touches any of the bucket-chunking machinery above.
+    /// A [`ShardOps`] test double recording every `records_for` call's key
+    /// list. Every method but `entries_for_buckets`, `records_for`, and
+    /// `close_spill` panics if called, since that would be a test bug.
     struct RecordingShard {
         entries: Vec<(u16, Vec<KeyVersion>)>,
         records: HashMap<Bytes, WireRecord>,
@@ -4528,9 +4484,8 @@ mod tests {
             })
             .collect();
 
-        // Each key here is one byte, so its estimate is a fixed
-        // `RECORD_HEADER_LEN + 1`; a budget of three keys' worth forces the
-        // ten-key bucket into more than one `records_for` call.
+        // A budget of three keys' worth forces the ten-key bucket into
+        // more than one `records_for` call.
         let per_key_size = (wire::RECORD_HEADER_LEN + 1) as u64;
         let chunk_bytes = per_key_size * 3;
 
@@ -4594,13 +4549,9 @@ mod tests {
         );
     }
 
-    /// [`ShardOps::close_spill_checkpointed`]'s provided default, for an
-    /// implementor that never overrides it (`RecordingShard` here overrides
-    /// only the sync [`ShardOps::close_spill`]): resolves immediately, and
-    /// its only effect is the one call to `self.close_spill()` its own
-    /// default body makes, so a `ShardOps` implementor written before
-    /// checkpointed close existed keeps compiling and behaving exactly as
-    /// it always did, just without a checkpoint snapshot.
+    /// [`ShardOps::close_spill_checkpointed`]'s default, for an implementor
+    /// that never overrides it, calls the sync [`ShardOps::close_spill`]
+    /// once.
     #[tokio::test]
     async fn close_spill_checkpointed_default_resolves_and_calls_the_sync_close() {
         let recording = Arc::new(RecordingShard {

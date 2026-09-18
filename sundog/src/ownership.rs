@@ -236,12 +236,8 @@ impl OwnershipView {
 #[derive(Debug, Clone)]
 pub struct OwnershipTracker {
     view: watch::Receiver<Arc<OwnershipView>>,
-    /// This tracker's very first computed view, from the moment
-    /// [`OwnershipTracker::seed`] built it. Distinct from
-    /// [`OwnershipTracker::current`], which a concurrent
-    /// `refresh_task` publish can already have moved past by the time any
-    /// particular caller reads it. See [`OwnershipTracker::baseline`]'s own
-    /// docs for why a reader needs the distinction.
+    /// This tracker's first computed view, kept distinct from the live
+    /// [`OwnershipTracker::current`] channel; see [`OwnershipTracker::baseline`].
     baseline: Arc<OwnershipView>,
 }
 
@@ -261,9 +257,8 @@ impl OwnershipTracker {
     ) -> (Self, watch::Sender<Arc<OwnershipView>>) {
         let eligible = eligible_owners(self_node, peers, modes, cache, k);
         let view = Arc::new(OwnershipView::compute(self_node, eligible, k));
-        // The seeded view is the only one a cache whose membership never
-        // changes again ever computes, so its gauge is published here, not
-        // left to a `refresh_task` publish that may never come.
+        // Published here since a cache whose membership never changes again
+        // never gets a refresh_task publish to do it.
         publish_owned_buckets(cache, &view, "ownership view seeded");
         let baseline = Arc::clone(&view);
         let (tx, rx) = watch::channel(view);
@@ -278,22 +273,11 @@ impl OwnershipTracker {
         Arc::clone(&self.view.borrow())
     }
 
-    /// This tracker's original seeded view, pinned for its whole lifetime
-    /// regardless of how many views `refresh_task` has since published.
-    /// `cluster::rebalance::rebalance_task` anchors its very first
-    /// lost-bucket diff (`cluster::rebalance::plan_view_change`) here
-    /// instead of on a live re-borrow of the shared view channel: a
-    /// `Mode::Distributed` `open()` racing gossip convergence can seed this
-    /// tracker with a transient "this node owns every bucket" view, warm-
-    /// reload or pull data into buckets under it, and have `refresh_task`
-    /// publish the real, corrected view before `rebalance_task` ever reads
-    /// the channel -- at which point a live re-borrow would already show
-    /// the corrected view with nothing to compare it against, so a bucket
-    /// only the seed view ever called "owned" would never be recognized as
-    /// lost, and its data would sit unreleased forever. Diffing against
-    /// this instead makes that recognition unconditional: it happens the
-    /// moment `rebalance_task` observes any later view, no matter how much
-    /// gossip had already converged by the time it started watching.
+    /// This tracker's original seeded view, pinned for its whole lifetime.
+    /// `rebalance_task` diffs its first lost-bucket check against this
+    /// instead of a live re-borrow of the view channel, which could already
+    /// show a view `refresh_task` corrected before `rebalance_task` started
+    /// watching, missing a bucket only the seed view ever called owned.
     #[must_use]
     pub fn baseline(&self) -> Arc<OwnershipView> {
         Arc::clone(&self.baseline)
@@ -322,29 +306,11 @@ pub struct ResidencySet {
     /// answer a remote fetch's miss for them. Cleared bucket by bucket as
     /// each pull lands, or wholesale when the warm-up gives up.
     cold: RwLock<HashSet<u16>>,
-    /// Buckets a warm spill-tier reopen replayed from disk, not yet
-    /// verified against a live co-owner. Distinct from `cold`: before a
-    /// spill tier could warm-reopen, a cold bucket held nothing but records
-    /// pulled from a donor or replicated in live, both trustworthy, so a
-    /// local *hit* there was always safe to serve. A warm-reloaded bucket
-    /// can instead hold a record a co-owner deleted during this node's
-    /// downtime, so a hit there is not enough on its own; a miss already
-    /// goes through the same "ask the other owners" path `cold` drives.
-    /// Marked the moment a bucket's replay lands
-    /// (`crate::cache::attach_spill_and_record_warm`), cleared the moment
-    /// this node decides the bucket is ready to serve: the same decision,
-    /// and the same call, that clears `cold` for it. Verification against a
-    /// live co-owner is preferred whenever one exists --
-    /// `reconcile_warm_buckets`'s own eager round, or the ordinary
-    /// cold-pull machinery landing fresh data for it, since a pulled bucket
-    /// is authoritative regardless of whether it was ever warm-reloaded --
-    /// but when the code instead decides to serve a bucket with no donor to
-    /// verify against (every donor cold or unreachable once the warm-up's
-    /// attempts run out, or a bucket with no co-owner at all), the replayed
-    /// data, already bounded by the tombstone-downtime gate at open time,
-    /// is the best available answer and this mark clears too: refusing
-    /// local hits forever while already trusting local misses is
-    /// incoherent, not extra safety.
+    /// Buckets a warm spill-tier reopen replayed from disk but not yet
+    /// verified against a live co-owner. Unlike `cold`, a bucket here may
+    /// hold a record a co-owner deleted during this node's downtime, so a
+    /// local hit isn't trusted until verification lands or every donor
+    /// turns out cold or unreachable, at which point this clears anyway.
     unverified: RwLock<HashSet<u16>>,
 }
 
@@ -370,12 +336,9 @@ impl ResidencySet {
     }
 
     /// Clears the cold mark from each of `buckets`: their pull landed.
-    /// Every production call site that decides a bucket is ready to serve
-    /// goes through [`ResidencySet::mark_serving`] instead, which clears
-    /// this and `unverified` together on the same decision so neither can
-    /// be forgotten; this method stays separately reachable because the two
-    /// marks are otherwise independent state (see
-    /// `residency_set_cold_and_unverified_clear_independently`).
+    /// Production call sites use [`ResidencySet::mark_serving`] instead,
+    /// which clears this and `unverified` together; kept separate since the
+    /// two marks are independent state.
     pub(crate) fn clear_cold(&self, buckets: &[u16]) {
         let mut cold = self.cold.write();
         for bucket in buckets {
@@ -384,37 +347,25 @@ impl ResidencySet {
     }
 
     /// Clears every cold mark: the warm-up gave up, so what is here is what
-    /// there is. [`ResidencySet::mark_all_serving`] is the production entry
-    /// point that clears this and every unverified mark together; see its
-    /// docs for why.
+    /// there is. [`ResidencySet::mark_all_serving`] clears this and every
+    /// unverified mark together in production.
     pub(crate) fn clear_all_cold(&self) {
         self.cold.write().clear();
     }
 
-    /// Clears the cold and unverified marks from each of `buckets` at once:
-    /// the single point where this node starts trusting both a local miss
-    /// and a local hit in the same buckets, so a future call site can never
-    /// clear one and forget the other. Every site that decides a bucket is
-    /// ready to serve goes through this method: a donor pull landing
-    /// (`crate::cluster::rebalance::try_donor_buckets`,
-    /// `crate::cluster::rebalance::pull_one_group`'s own success case), an
-    /// eager verification round vouching for it (`reconcile_warm_buckets`),
-    /// every donor found cold or unreachable with nothing warm anywhere to
-    /// pull (`pull_one_group`'s `ALL_COLD_PASSES` give-up), and a bucket
-    /// found to have no live co-owner at all
-    /// (`crate::cluster::rebalance::PullRequest::run`'s and
-    /// `rebalance_task`'s "alone" cases).
+    /// Clears the cold and unverified marks from `buckets` together: the
+    /// single point where this node starts trusting both a local miss and a
+    /// local hit in these buckets. Called from every site that decides a
+    /// bucket is ready to serve -- a donor pull landing, an eager
+    /// verification round, or every donor turning out cold or unreachable.
     pub(crate) fn mark_serving(&self, buckets: &[u16]) {
         self.clear_cold(buckets);
         self.clear_unverified(buckets);
     }
 
-    /// The wholesale analogue of [`ResidencySet::mark_serving`], for
-    /// `crate::cluster::rebalance::warm_up_task`'s `WarmAnyway` give-up
-    /// path: after repeated whole-pull timeouts, every bucket this
-    /// `ResidencySet` still marks cold or unverified is declared servable
-    /// at once, on the same "nothing better is coming" decision that used
-    /// to clear only `cold`.
+    /// Wholesale analogue of [`ResidencySet::mark_serving`]: after
+    /// `warm_up_task`'s `WarmAnyway` give-up, every bucket still marked
+    /// cold or unverified is declared servable at once.
     pub(crate) fn mark_all_serving(&self) {
         self.clear_all_cold();
         self.unverified.write().clear();
@@ -426,21 +377,18 @@ impl ResidencySet {
     }
 
     /// Marks each of `buckets` unverified: a warm spill-tier reopen just
-    /// replayed them from disk, with no live co-owner check yet. Only ever
-    /// called from `crate::cache::attach_spill_and_record_warm`, itself
-    /// `feature = "spill"`-only: without that feature nothing ever warm-
-    /// reopens, so nothing ever marks a bucket unverified in the first
-    /// place, though `is_unverified`/`clear_unverified` stay unconditional
-    /// since a plain `false`/no-op is exactly what an always-empty set
-    /// already gives every caller.
+    /// replayed them from disk with no live co-owner check yet. `spill`-gated
+    /// since only `attach_spill_and_record_warm` calls it; `is_unverified`
+    /// and `clear_unverified` stay unconditional, since an always-empty set
+    /// already behaves correctly without the feature.
     #[cfg(feature = "spill")]
     pub(crate) fn mark_unverified(&self, buckets: &[u16]) {
         self.unverified.write().extend(buckets.iter().copied());
     }
 
-    /// Clears the unverified mark from each of `buckets`: either
-    /// `reconcile_warm_buckets`'s own eager round vouched for them, or the
-    /// ordinary cold-pull machinery landed fresh data for them.
+    /// Clears the unverified mark from `buckets`: either an eager
+    /// `reconcile_warm_buckets` round vouched for them, or the cold-pull
+    /// path landed fresh data.
     pub(crate) fn clear_unverified(&self, buckets: &[u16]) {
         let mut unverified = self.unverified.write();
         for bucket in buckets {
@@ -448,9 +396,8 @@ impl ResidencySet {
         }
     }
 
-    /// Whether `bucket` was warm-reloaded from disk and never yet verified
-    /// against a live co-owner. A hit in such a bucket is never served
-    /// locally: see [`ResidencySet::unverified`]'s own docs.
+    /// Whether `bucket` was warm-reloaded and not yet verified against a
+    /// live co-owner; see [`ResidencySet::unverified`].
     pub(crate) fn is_unverified(&self, bucket: u16) -> bool {
         self.unverified.read().contains(&bucket)
     }
@@ -494,10 +441,8 @@ impl ResidencySet {
 }
 
 /// Sets `cache`'s `sundog_owned_buckets` gauge to `view`'s owned-bucket
-/// count and logs the view under `message`: [`OwnershipTracker::seed`]'s
-/// first view and every later one [`refresh_task`] publishes go through
-/// here, so the gauge reads the current view from the moment the cache
-/// opens, membership change or not.
+/// count and logs it under `message`; used by both `OwnershipTracker::seed`
+/// and [`refresh_task`].
 fn publish_owned_buckets(cache: &SmolStr, view: &OwnershipView, message: &'static str) {
     let owned = u32::try_from(view.owned_buckets().count()).unwrap_or(u32::MAX);
     metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string()).set(f64::from(owned));
@@ -882,9 +827,8 @@ mod tests {
         let self_node = NodeId::from(1);
         let k = NonZeroU8::new(2).expect("nonzero");
         let cache = SmolStr::new("cache");
-        // Seeded alone: the sole eligible node owns every bucket, exactly
-        // the transient view a `Mode::Distributed` `open()` racing gossip
-        // convergence computes.
+        // The sole eligible node owns every bucket: the transient view
+        // open() computes while racing gossip convergence.
         let (tracker, tx) = OwnershipTracker::seed(self_node, &[], &HashMap::new(), &cache, k);
         let baseline_hash = tracker.baseline().view_hash();
         assert_eq!(
@@ -893,10 +837,8 @@ mod tests {
             "the seeded, lone-node baseline owns every bucket"
         );
 
-        // A later publish corrects the view down to a genuine two-node
-        // split, simulating `refresh_task` racing ahead of any reader that
-        // would otherwise re-derive its own starting point from a live
-        // borrow of the channel.
+        // Simulates refresh_task correcting the view before a reader ever
+        // re-derives its own starting point from the channel.
         let corrected = Arc::new(OwnershipView::compute(
             self_node,
             vec![self_node, NodeId::from(2)],
@@ -1006,10 +948,8 @@ mod tests {
         };
         let modes = modes_with(&[(other, "seeded", Mode::Distributed { owners: k })]);
         let peers = vec![peer(2, wire::PROTOCOL_DISTRIBUTED)];
-        // Seeded with a peer already known, exactly the view a
-        // `Mode::Distributed` `open()` computes once its membership wait
-        // has landed one: nothing about membership need ever change again,
-        // so this seed is the only publish the cache may ever make.
+        // The view once open()'s membership wait lands a peer; membership
+        // won't change again so this seed is the only publish.
         let (tracker, _tx) = metrics::with_local_recorder(&recorder, || {
             OwnershipTracker::seed(self_node, &peers, &modes, &cache, k)
         });
@@ -1083,11 +1023,8 @@ mod tests {
         set.mark_unverified(&[1]);
         assert!(set.is_cold(1) && set.is_unverified(1));
 
-        // Clearing cold alone (the ordinary un-warm-reloaded pull path)
-        // never clears unverified, and clearing unverified alone (an eager
-        // reconciliation round) never clears cold: `Shard::close_spill_checkpointed`'s
-        // caller always clears both together for a warm-reloaded bucket,
-        // but the two marks themselves are independent state.
+        // cold and unverified clear independently; only mark_serving
+        // clears both together.
         set.clear_cold(&[1]);
         assert!(!set.is_cold(1) && set.is_unverified(1));
 
@@ -1104,10 +1041,7 @@ mod tests {
         set.mark_unverified(&[1]);
         assert!(set.is_cold(1) && set.is_cold(2) && set.is_unverified(1));
 
-        // A bucket that is both cold and unverified, and a bucket that is
-        // cold only, both come out fully served: `mark_serving` is the one
-        // decision point that clears whichever of the two marks a bucket
-        // actually carries, so a caller never has to know which.
+        // mark_serving clears whichever marks a bucket carries.
         set.mark_serving(&[1, 2]);
         assert!(!set.is_cold(1) && !set.is_cold(2) && !set.is_unverified(1));
     }

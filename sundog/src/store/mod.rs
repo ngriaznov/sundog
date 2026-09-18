@@ -69,17 +69,12 @@ pub const PART_COUNT: usize = 64;
 /// [`Shard::with_weigher`] can store one before its closure type is nameable.
 pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
-/// [`Shard::with_weigher`]'s installed weigher, remembered outside the
-/// engine it rebuilds so a later [`Shard::with_capacity_hint`] rebuild can
-/// carry it forward. `Arc`, not [`Weigher`]'s own `Box`, since the shard
-/// keeps this copy alive across a rebuild while also handing the engine its
-/// own boxed closure calling into it.
+/// [`Shard::with_weigher`]'s installed weigher, kept as an `Arc` outside the
+/// engine so a [`Shard::with_capacity_hint`] rebuild can carry it forward.
 pub(crate) type SharedWeigher<K, V> = Arc<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
-/// Wraps a remembered [`SharedWeigher`] in a fresh [`Weigher`] box calling
-/// into it, so a `Shard` builder rebuild can hand `engine::Engine::new` an
-/// owned closure while keeping its own `Arc` alive for a later rebuild to
-/// carry forward too.
+/// Boxes a remembered [`SharedWeigher`] into a fresh [`Weigher`] for
+/// `engine::Engine::new`, keeping the `Arc` alive for the next rebuild.
 fn boxed_weigher<K, V>(weigher: SharedWeigher<K, V>) -> Weigher<K, V>
 where
     K: 'static,
@@ -95,9 +90,8 @@ const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
 /// Headroom reserved below [`MAX_FRAME`] for the `Msg::StChunk` envelope around
 /// a snapshot chunk's records. `pub(crate)` so
-/// [`crate::config::ClusterConfig::rebalance_chunk_bytes_value`] clamps
-/// against the same headroom a bucket sub-batch's `Msg::StBucketChunk`
-/// envelope needs.
+/// [`crate::config::ClusterConfig::rebalance_chunk_bytes_value`] shares this
+/// headroom with `Msg::StBucketChunk`.
 pub(crate) const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 
 /// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in a
@@ -150,14 +144,12 @@ const EVENTS_CAPACITY: usize = 1024;
 /// `records_for_typed` re-fetches fresh wire bytes. A queue nothing drains, a
 /// `Mode::Local` shard's or a closed cache's, accepts nothing.
 pub(crate) struct FanOutQueue<K> {
-    /// This cache's name, for the `cache` label on
-    /// `sundog_fan_out_backlog`/`sundog_fan_out_wait_timeouts_total`.
+    /// This cache's name, used as the `cache` label on the fan-out metrics.
     name: SmolStr,
     pending: StdMutex<Vec<K>>,
     notify: tokio::sync::Notify,
-    /// Notified whenever [`FanOutQueue::drain`] takes a non-empty backlog:
-    /// [`FanOutQueue::wait_for_room`]'s waiters recheck capacity off this
-    /// instead of polling.
+    /// Notified when [`FanOutQueue::drain`] empties a non-empty backlog, so
+    /// [`FanOutQueue::wait_for_room`] waiters recheck instead of polling.
     drained: tokio::sync::Notify,
     /// Whether a push lands in `pending` at all: `false` for a
     /// `Mode::Local` shard, whose writes never fan out and are not errors.
@@ -183,9 +175,8 @@ impl<K> FanOutQueue<K> {
         }
     }
 
-    /// Publishes `sundog_fan_out_backlog{cache}` as `len`: the single choke
-    /// point every mutation of `pending` reports its new length through, so
-    /// the gauge can never drift from what `pending` actually holds.
+    /// Publishes `sundog_fan_out_backlog{cache}` as `len`, the one place
+    /// every mutation of `pending` reports its length through.
     fn publish_backlog(&self, len: usize) {
         metrics::gauge!("sundog_fan_out_backlog", "cache" => self.name.to_string())
             .set(fan_out_backlog_gauge_value(len));
@@ -250,8 +241,7 @@ impl<K> FanOutQueue<K> {
         true
     }
 
-    /// Takes every pending key, leaving the queue empty, and wakes
-    /// [`FanOutQueue::wait_for_room`]'s waiters so they recheck capacity.
+    /// Takes every pending key and wakes [`FanOutQueue::wait_for_room`]'s waiters.
     pub(crate) fn drain(&self) -> Vec<K> {
         let items =
             std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
@@ -278,29 +268,19 @@ impl<K> FanOutQueue<K> {
         }
     }
 
-    /// Waits, up to `timeout`, for this queue's backlog to fall under
-    /// `capacity`: an async write path's way to apply backpressure to
-    /// itself instead of growing this queue without bound while a stalled
-    /// fan-out (`net::Mesh::send_frames_awaiting` waiting out a still-live
-    /// peer) never drains it. Returns either way -- room found, or
-    /// `timeout` elapsed with the backlog still over capacity, in which
-    /// case `sundog_fan_out_wait_timeouts_total{cache}` counts it -- since
-    /// the caller's write always proceeds regardless: memory over
-    /// `capacity` is the documented fallback, never a dropped or refused
-    /// write. The synchronous write chain (`Shard::insert_sync`,
-    /// `remove_sync`, `Shard::apply`) never calls this: there is no async
-    /// runtime there to await on, so it pushes straight through no matter
-    /// the backlog size.
+    /// Waits up to `timeout` for the backlog to fall under `capacity`, giving
+    /// an async write path a way to apply its own backpressure. The write
+    /// proceeds either way; on timeout,
+    /// `sundog_fan_out_wait_timeouts_total{cache}` counts it. The synchronous
+    /// write chain has no runtime to await on and never calls this.
     pub(crate) async fn wait_for_room(&self, capacity: usize, timeout: Duration) {
         if !fan_out_over_capacity(self.len(), capacity) {
             return;
         }
         let waited = tokio::time::timeout(timeout, async {
             loop {
-                // Armed before the recheck below, exactly the pattern
-                // `tokio::sync::Notify::notify_waiters` itself documents,
-                // so a `drain` landing between the check and the `.await`
-                // is never missed.
+                // Armed before the recheck so a `drain` landing between the
+                // check and the `.await` is never missed.
                 let notified = self.drained.notified();
                 if !fan_out_over_capacity(self.len(), capacity) {
                     return;
@@ -326,9 +306,8 @@ impl<K> FanOutQueue<K> {
     }
 }
 
-/// Whether [`FanOutQueue::wait_for_room`] should keep waiting: `true` while
-/// `pending_len` is at or above `capacity`. Pulled out as its own pure
-/// function so the capacity comparison has a standalone unit test.
+/// Whether [`FanOutQueue::wait_for_room`] keeps waiting: `true` while
+/// `pending_len` is at or above `capacity`.
 fn fan_out_over_capacity(pending_len: usize, capacity: usize) -> bool {
     pending_len >= capacity
 }
@@ -629,11 +608,10 @@ pub struct CompactPassOutcome {
 }
 
 /// The type-erased surface the network layer drives a shard through, wire bytes
-/// in and out. This is the boundary where postcard (de)serialization happens
-/// for the wire; a local read decodes its own stored record under the
-/// stripe's read lock, the same lock hold a clone used to take. Implemented by
-/// `Shard<K, V>` for any `K`, `V` meeting its bounds, and held as
-/// `Arc<dyn ShardOps>` in the cluster's cache registry.
+/// in and out: the boundary where postcard (de)serialization happens for the
+/// wire. A local read decodes its own stored record under the stripe's read
+/// lock. Implemented by `Shard<K, V>` for any `K`, `V` meeting its bounds, and
+/// held as `Arc<dyn ShardOps>` in the cluster's cache registry.
 ///
 /// Async methods return `BoxFuture` rather than `async fn` so `dyn ShardOps`
 /// stays usable from a `HashMap<SmolStr, Arc<dyn ShardOps>>`.
@@ -751,24 +729,18 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// Closes this shard's spill tier, if the `spill` feature is compiled in
-    /// and one was ever attached via `CacheBuilder::spill`: stops accepting
+    /// and one was attached via `CacheBuilder::spill`: stops accepting
     /// new spills and drops the flusher thread's channel sender. A no-op
-    /// otherwise. This plain close writes no checkpoint snapshot, so the
-    /// next open is cold regardless of `SpillConfig::warm_reopen`; use
-    /// [`ShardOps::close_spill_checkpointed`] where a fast, warm reopen
-    /// matters.
+    /// otherwise. This close writes no checkpoint, so the next open is cold
+    /// regardless of `SpillConfig::warm_reopen`; use
+    /// [`ShardOps::close_spill_checkpointed`] for a warm reopen.
     fn close_spill(&self) {}
 
-    /// [`ShardOps::close_spill`], then, with `SpillConfig::warm_reopen` on,
-    /// a checkpoint of every live entry to disk and a snapshot a later warm
-    /// reopen replays; without `warm_reopen`, exactly `close_spill` alone.
-    /// The default here calls `self.close_spill()` and returns already
-    /// resolved, so an implementor that predates checkpointing, or one
-    /// that never attaches a spill tier, keeps working with no snapshot
-    /// written -- the next open of such a shard is cold. Called by
-    /// `crate::cache::Cache::close` and by `crate::cluster::Cluster::shutdown`
-    /// for every cache still registered when the cluster shuts down without
-    /// an explicit `close`.
+    /// [`ShardOps::close_spill`], plus, with `SpillConfig::warm_reopen` on, a
+    /// checkpoint of every live entry and a snapshot a later warm reopen
+    /// replays. The default just calls `close_spill`, so an implementor with
+    /// no spill tier keeps working, cold on the next open. Called by
+    /// `crate::cache::Cache::close` and cluster shutdown.
     fn close_spill_checkpointed(&self) -> BoxFuture<'_, ()> {
         self.close_spill();
         Box::pin(async {})
@@ -818,13 +790,10 @@ pub trait ShardOps: Send + Sync {
         false
     }
 
-    /// Whether `bucket` was warm-reloaded from a spill tier's on-disk
-    /// checkpoint and never yet verified against a live co-owner, so a
-    /// local *hit* there is not an answer either: an ordinary cold bucket
-    /// only ever holds trustworthy local content (pulled from a donor or
-    /// replicated live), while a warm-reloaded bucket can hold a record a
-    /// co-owner deleted during this node's downtime. `false` for every other mode, and for a cold
-    /// bucket that was never warm-reloaded at all.
+    /// Whether `bucket` was warm-reloaded from spill and not yet verified
+    /// against a co-owner: a local hit there is not trustworthy, since a
+    /// co-owner may have deleted the record during this node's downtime.
+    /// `false` for every other mode and for a bucket never warm-reloaded.
     fn is_unverified_bucket(&self, bucket: u16) -> bool {
         let _ = bucket;
         false
@@ -1345,13 +1314,11 @@ where
     /// per pass.
     crdt_bounds: CompactionBounds,
     max_frame: usize,
-    /// [`Shard::with_fan_out_backlog_capacity`]'s configured backlog cap,
-    /// [`Shard::wait_for_fan_out_room`]'s threshold. Defaults to
-    /// [`ClusterConfig::default`]'s.
+    /// [`Shard::with_fan_out_backlog_capacity`]'s cap: the threshold
+    /// [`Shard::wait_for_fan_out_room`] waits against, default from [`ClusterConfig::default`].
     fan_out_backlog_capacity: usize,
-    /// [`Shard::with_fan_out_wait_timeout`]'s configured bound on
-    /// [`Shard::wait_for_fan_out_room`]'s wait. Defaults to
-    /// [`ClusterConfig::default`]'s.
+    /// [`Shard::with_fan_out_wait_timeout`]'s bound on
+    /// [`Shard::wait_for_fan_out_room`]'s wait, default from [`ClusterConfig::default`].
     fan_out_wait_timeout: Duration,
     /// [`Shard::with_merge_coalesce_window`]'s configured window. Zero (the
     /// default) means every [`Shard::merge`] call applies at once;
@@ -1372,23 +1339,17 @@ where
     /// sleep-until instead of parking past a deadline that did not exist
     /// yet when it last checked.
     merge_wake: Notify,
-    /// Remembered, with `tti`, `capacity_hint`, and `weigher` below, so
+    /// Remembered alongside `tti`/`capacity_hint`/`weigher` so
     /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can each
-    /// rebuild `engine::Engine` from scratch without losing what the other
-    /// already set: a weigher and a capacity hint both install only at
+    /// rebuild the engine without losing what the other already set.
     /// construction.
     max_capacity: u64,
     tti: Option<Duration>,
-    /// [`Shard::with_capacity_hint`]'s configured hint, `None` until then.
-    /// Threaded into every engine rebuild alongside `max_capacity`/`tti`
-    /// so a capacity hint set before [`Shard::with_weigher`] survives that
-    /// rebuild too.
+    /// [`Shard::with_capacity_hint`]'s hint, `None` until set. Threaded into
+    /// every rebuild so it survives a later [`Shard::with_weigher`] call.
     capacity_hint: Option<u64>,
-    /// [`Shard::with_weigher`]'s installed weigher, `None` until then.
-    /// Threaded into every engine rebuild alongside `max_capacity`/`tti`
-    /// so a weigher set before [`Shard::with_capacity_hint`] survives that
-    /// rebuild too, the same way `capacity_hint` survives a rebuild from
-    /// the other side.
+    /// [`Shard::with_weigher`]'s installed weigher, `None` until set.
+    /// Threaded into every rebuild so it survives a later capacity-hint call.
     weigher: Option<SharedWeigher<K, V>>,
     /// Handle for `sundog_cache_hits_total{cache}`, created once here since
     /// label resolution costs more than the read path can afford per call.
@@ -1437,25 +1398,17 @@ struct SpillRead {
     promotions: metrics::Counter,
 }
 
-/// [`Shard::attach_spill`]'s result: exactly which buckets the reopen
-/// actually replayed at least one record for. Empty covers both a cold
-/// fallback and an eligible, cleanly reopened tier with nothing to replay
-/// -- a caller narrowing its eager post-reopen reconciliation to real
-/// warm-reload work only ever needs this set, never a separate whole-tier
-/// "landed warm at all" flag: a bucket this shard currently owns but that
-/// never had a record on disk belongs in neither case.
+/// [`Shard::attach_spill`]'s result: the buckets the reopen replayed at
+/// least one record for. Empty covers both a cold fallback and
+/// a clean reopen with nothing to replay.
 #[cfg(feature = "spill")]
 pub(crate) struct AttachSpillOutcome {
     pub(crate) warm_buckets: HashSet<u16>,
 }
 
 /// Increments `sundog_spill_checkpoint_entries_total{cache,stage}` by
-/// `count`. `stage` is one of `"captured"`, `"written"`, `"drained"`,
-/// `"abandoned"`, `"kept"`, `"dropped_version_changed"`,
-/// `"dropped_tombstoned"`, `"dropped_gone"`, `"dropped_expired"`,
-/// `"listed"`, or `"snapshot"`, naming the same phase
-/// `Shard::close_spill_checkpointed` logs at `info` alongside this call, in
-/// the same order the checkpoint runs them.
+/// `count` for one checkpoint phase, matching
+/// `Shard::close_spill_checkpointed`'s `info` logs.
 #[cfg(feature = "spill")]
 fn record_checkpoint_stage(cache: &str, stage: &'static str, count: u64) {
     metrics::counter!(
@@ -1466,10 +1419,8 @@ fn record_checkpoint_stage(cache: &str, stage: &'static str, count: u64) {
     .increment(count);
 }
 
-/// Increments `sundog_spill_reopen_entries_total{cache,stage}` by `count`.
-/// `stage` is one of `"read"`, `"dropped_unowned"`, `"dropped_expired"`,
-/// `"dropped_bad"`, `"installed"`, or `"refused_present"`, naming the same
-/// phase [`Shard::attach_spill`] logs at `info` alongside this call.
+/// Increments `sundog_spill_reopen_entries_total{cache,stage}` by `count`
+/// for one reopen phase, matching [`Shard::attach_spill`]'s `info` logs.
 #[cfg(feature = "spill")]
 fn record_reopen_stage(cache: &str, stage: &'static str, count: u64) {
     metrics::counter!(
@@ -1592,8 +1543,8 @@ where
     }
 
     /// Applies everything a live cluster's configuration decides for a
-    /// shard: both tombstone bounds, the CRDT compaction bounds, the frame
-    /// cap, and the fan-out backlog capacity and its wait timeout.
+    /// shard: tombstone bounds, CRDT bounds, frame cap, fan-out capacity,
+    /// and its wait timeout.
     #[must_use]
     pub fn with_cluster_config(self, config: &ClusterConfig) -> Self {
         self.with_tombstone_ttl(config.tombstone_ttl)
@@ -1628,20 +1579,16 @@ where
         self
     }
 
-    /// Overrides the fan-out backlog capacity an async write path (such as
-    /// [`Shard::insert`]) waits against before pushing onto the fan-out
-    /// queue, threaded from a live cluster's configured
-    /// [`ClusterConfig::fan_out_backlog_capacity`]. Defaults to
-    /// [`ClusterConfig::default`]'s.
+    /// Overrides the fan-out backlog capacity an async write waits against
+    /// before queuing. Defaults to [`ClusterConfig::default`]'s.
     #[must_use]
     pub fn with_fan_out_backlog_capacity(mut self, capacity: usize) -> Self {
         self.fan_out_backlog_capacity = capacity;
         self
     }
 
-    /// Overrides the bound on that fan-out backlog wait, threaded from a
-    /// live cluster's configured [`ClusterConfig::fan_out_wait_timeout`].
-    /// Defaults to [`ClusterConfig::default`]'s.
+    /// Overrides the bound on that fan-out backlog wait. Defaults to
+    /// [`ClusterConfig::default`]'s.
     #[must_use]
     pub fn with_fan_out_wait_timeout(mut self, timeout: Duration) -> Self {
         self.fan_out_wait_timeout = timeout;
@@ -1748,11 +1695,9 @@ where
     /// Installs a custom per-entry weigher for size-bounded eviction, in place
     /// of the default of one weight unit per entry. Rebuilds
     /// `engine::Engine` from scratch, carrying forward any
-    /// [`Shard::with_capacity_hint`] already set, so call this immediately
-    /// after [`Shard::new`], before any reads or writes reach this shard.
-    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can run in
-    /// either order: whichever runs second carries the other's setting
-    /// forward into its own rebuild.
+    /// [`Shard::with_capacity_hint`] already set. Call this right after
+    /// [`Shard::new`], before any reads or writes reach this shard; the two
+    /// builders can run in either order.
     #[must_use]
     pub fn with_weigher<W>(mut self, weigher: W) -> Self
     where
@@ -1770,15 +1715,10 @@ where
     }
 
     /// Hints this shard's expected local entry count, presizing every
-    /// stripe's arena and index up front instead of growing them one
-    /// insert at a time; see [`crate::cache::CacheBuilder::capacity_hint`]
-    /// for the full contract this validates and forwards. Rebuilds
-    /// `engine::Engine` from scratch, carrying forward any
-    /// [`Shard::with_weigher`] already set, so call this immediately after
-    /// [`Shard::new`], before any reads or writes reach this shard.
-    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can run in
-    /// either order: whichever runs second carries the other's setting
-    /// forward into its own rebuild.
+    /// stripe up front; see [`crate::cache::CacheBuilder::capacity_hint`]
+    /// for the contract. Rebuilds the engine, carrying forward any
+    /// [`Shard::with_weigher`] already set, in either order. Call right
+    /// after [`Shard::new`], before any reads or writes reach this shard.
     #[must_use]
     pub fn with_capacity_hint(mut self, hint: u64) -> Self {
         self.capacity_hint = Some(hint);
@@ -1792,11 +1732,8 @@ where
         self
     }
 
-    /// This shard's engine's current per-stripe `live` arena capacities,
-    /// one per [`BUCKET_COUNT`] stripe, in stripe order. `#[doc(hidden)]`:
-    /// a test accessor reachable from an integration-test binary outside
-    /// this crate, mirroring [`Shard::with_prefold_enabled`]'s own reach.
-    /// Never call this outside a benchmark or test.
+    /// Per-stripe `live` arena capacities, in stripe order. `#[doc(hidden)]`
+    /// test/benchmark accessor for an integration-test binary outside this crate.
     #[doc(hidden)]
     pub fn stripe_capacities(&self) -> Vec<usize> {
         self.engine.stripe_capacities()
@@ -1842,23 +1779,14 @@ where
     /// builder-chain entry point for a caller that already owns an
     /// unshared `Shard`.
     ///
-    /// Prefers `spill::SpillTier::reopen` over a cold
-    /// `spill::SpillTier::open`: with `SpillConfig::warm_reopen` on and a
-    /// trustworthy checkpoint snapshot within `ClusterConfig::tombstone_ttl`,
-    /// this replays straight from that snapshot instead of wiping the
-    /// existing region files, filtered to whatever bucket this shard
-    /// currently owns per
-    /// [`Shard::with_ownership`]'s already-seeded tracker (every bucket, for
-    /// a shard with none). Returns [`AttachSpillOutcome::warm_buckets`], the
-    /// specific buckets warm reopen actually replayed at least one record
-    /// for -- never every bucket this shard happens to currently own, only
-    /// the subset [`spill::ReopenOutcome::warm_buckets`] names; empty
-    /// covers both a cold fallback and every mode without a spill tier's
-    /// own bucket concept. A warm-reloaded bucket is still exactly as cold,
-    /// per [`ShardOps::is_cold_bucket`], as any other bucket this shard has
-    /// not yet reconciled against a peer: the
-    /// caller decides when to clear that mark.
     ///
+    /// Prefers `spill::SpillTier::reopen` over a cold open when
+    /// `SpillConfig::warm_reopen` is on and a checkpoint is still inside
+    /// `ClusterConfig::tombstone_ttl`, replaying it instead of wiping the
+    /// region files, filtered to [`Shard::with_ownership`]'s owned buckets.
+    /// Returns [`AttachSpillOutcome::warm_buckets`], the subset it replayed.
+    /// A warm-reloaded bucket still counts as cold per
+    /// [`ShardOps::is_cold_bucket`] until the caller clears it.
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if the tier's directory or
@@ -2707,18 +2635,9 @@ where
         self.apply_or_forward(key, key_bytes, ver, incoming)
     }
 
-    /// Waits for [`Shard::fan_out`]'s backlog to fall under
-    /// [`Shard::fan_out_backlog_capacity`], bounded by
-    /// [`Shard::fan_out_wait_timeout`]; see
-    /// [`FanOutQueue::wait_for_room`]. Called from every async write entry
-    /// point before it pushes onto the queue -- [`Shard::insert`],
-    /// [`Shard::insert_with_ttl`], `insert_many_expiring` (covering
-    /// [`Shard::insert_many`]/[`Shard::insert_many_with_ttl`]),
-    /// [`Shard::remove`], [`Shard::remove_many`], and [`Shard::merge`]'s
-    /// immediate-apply path -- never from the synchronous write chain
-    /// (`insert_sync`, `remove_sync`, `Shard::apply`), which has no async
-    /// runtime to await on and pushes straight through regardless of
-    /// backlog size.
+    /// Waits for the fan-out backlog to fall under capacity via
+    /// [`FanOutQueue::wait_for_room`]. Every async write path calls this; the
+    /// synchronous chain never does.
     async fn wait_for_fan_out_room(&self) {
         self.fan_out
             .wait_for_room(self.fan_out_backlog_capacity, self.fan_out_wait_timeout)
@@ -2826,12 +2745,8 @@ where
         Ok(())
     }
 
-    /// [`Shard::merge`]'s occupied-slot branch: folds `value` (with `encoded`
-    /// and `ver`, already computed by the caller) into whatever this stripe
-    /// already holds pending for `slot`'s key, through the resolver's
-    /// `merge` when it merges, else its `winner` call. Split out of
-    /// `merge` only to keep that function's line count down; not called
-    /// from anywhere else.
+    /// [`Shard::merge`]'s occupied-slot branch: folds `value` into whatever
+    /// this stripe already holds pending, via the resolver's `merge` or `winner` call.
     fn fold_into_occupied_merge(
         &self,
         slot: OccupiedEntry<'_, K, PendingMerge<V>>,
@@ -2882,11 +2797,8 @@ where
                     entry.ver = ver;
                 }
                 Winner::A => {
-                    // The incoming call lost outright: nothing about the
-                    // pending entry changes, version included, mirroring
-                    // `resolve_and_rebind`'s `IncomingLoses => None` in the
-                    // engine: a losing write never advances the version of
-                    // the record it lost against.
+                    // The incoming call lost outright: nothing about the pending entry
+                    // changes, mirroring `resolve_and_rebind`'s `IncomingLoses => None`.
                 }
             },
         }
@@ -2990,29 +2902,14 @@ where
     }
 
     /// Reserves flush-queue admission for one whole
-    /// [`Shard::apply_grouped`]/[`ShardOps::apply_remote_batch`] call,
-    /// before any stripe lock that call takes: sums `spill::spill_record_len`
-    /// over every `Incoming::Put` among `entries` (`0` for a tombstone),
-    /// then makes one `SpillTier::reserve` call for the total, waiting at
-    /// most this shard's spill tier's own configured `spill_wait_timeout`.
-    ///
-    /// Also returns the deadline that wait was measured against
-    /// (`Instant::now()` at the moment this call started, plus the tier's
-    /// own `spill_wait_timeout_value()`), so [`Shard::retry_reservation_deficit`]
-    /// can share it rather than start a fresh budget of its own: the whole
-    /// call, this reservation plus every retry the per-bucket loop's own
-    /// deficit later needs, stays bounded by one `spill_wait_timeout`
-    /// total, never `2x` it. `None` for the deadline exactly when `None`
-    /// for the reservation (no spill tier attached), since a deficit can
-    /// only ever be nonzero once a real `Reservation` was threaded into the
-    /// per-bucket loop that follows.
-    ///
-    /// The reservation itself is `None` when no spill tier is attached
-    /// (this build has no `spill` feature, or `Shard::attach_spill` never
-    /// ran) or when `reserve` times out: either way the caller proceeds
-    /// with `reservation: None` for every bucket in its own loop, the
-    /// ordinary non-blocking fallback
-    /// [`engine::Engine::apply_many_with_reservation`] already takes.
+    /// [`Shard::apply_grouped`]/[`ShardOps::apply_remote_batch`] call, before
+    /// any stripe lock: sums `spill::spill_record_len` over every
+    /// `Incoming::Put`, then makes one `SpillTier::reserve` call bounded by
+    /// the tier's `spill_wait_timeout`. Also returns that wait's deadline so
+    /// [`Shard::retry_reservation_deficit`] shares the same budget instead of
+    /// starting a fresh one. `None` for both when no spill tier is attached
+    /// or the reserve times out; the caller then falls back to
+    /// [`engine::Engine::apply_many_with_reservation`]'s non-blocking path.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3054,55 +2951,19 @@ where
         }
     }
 
-    /// Pays down `deficit` bytes [`engine::Engine::apply_many_with_reservation`]'s
-    /// per-bucket loop left over: eviction that refused only because the
-    /// call's one `Reservation` (and `admit`'s own headroom) ran out right
-    /// then, with the entry left resident rather than dropped: see
-    /// [`engine::Engine::enforce_capacity_with_reservation`]'s doc. Retries
-    /// with a fresh [`SpillTier::reserve`] for exactly `deficit` more
-    /// bytes, followed by another
-    /// [`engine::Engine::enforce_capacity_with_reservation`] pass threaded
-    /// through `start_bucket`, until the deficit clears or `deadline`
-    /// passes. Every entry the first pass left resident under this
-    /// condition stays an ordinary spill candidate throughout, so a retry
-    /// samples and resolves it exactly like any other cold entry, no
-    /// separate bookkeeping needed for which entries `deficit` covers.
-    ///
-    /// `deadline` is the same one [`Shard::reserve_for_batch`] measured its
-    /// own initial `reserve()` wait against, not a fresh budget of this
-    /// call's own: the whole `apply_grouped`/`apply_remote_batch` call,
-    /// first reservation plus every retry this function makes, is bounded
-    /// by one `spill_wait_timeout` total this way, matching the "once per
-    /// call" reservation-wait budget the rest of this mechanism is sized
-    /// against: a second, independent full `spill_wait_timeout` window
-    /// here would let one call suspend its producer for up to `2x`
-    /// `spill_wait_timeout`, blowing past `state_transfer::per_donor_budget`
-    /// exactly the way that budget's own margin assumes cannot happen.
-    ///
-    /// A no-op when `deficit` is already `0`. `deadline` is `None` only
-    /// when `reserve_for_batch` never got as far as a real `reserve()` call
-    /// (no spill tier attached), a case `deficit` is always `0` in too,
-    /// since nothing can construct a nonzero deficit without a real
-    /// `Reservation` having been threaded through the per-bucket loop
-    /// first; handled the same defensive way regardless; once `deadline`
-    /// is already past (this call's whole budget was spent by the initial
-    /// `reserve_for_batch` wait alone) this makes no further `reserve()`
-    /// call at all, going straight to the closing fallback below. Once the
-    /// budget is exhausted (immediately, for the documented
-    /// `spill_wait_timeout == Duration::ZERO` opt-out) with `deficit` still
-    /// outstanding, this makes exactly one closing
-    /// [`engine::Engine::enforce_capacity`] call, `reservation: None`, the
-    /// same call any ordinary write on this shard would eventually trigger
-    /// on its own, so the deficit is resolved by the time this call
-    /// returns rather than left pending on whatever future write happens
-    /// to touch this shard next, which could be never for the last batch
-    /// of a bulk load. [`SpillTier::would_accept`]'s ordinary fallback
-    /// decides each entry's fate the same way it always has, honoring
-    /// `keep_resident_when_refused` exactly as an unreserved refusal
-    /// would: kept resident (`reason = "deferred"`) or physically deleted
-    /// (`reason` names the specific refusal) so `max_capacity` is actually
-    /// enforced by the time this call returns, regardless of the policy in
-    /// effect.
+    /// Pays down `deficit` bytes
+    /// [`engine::Engine::apply_many_with_reservation`]'s per-bucket loop left
+    /// resident (never dropped) when the call's one `Reservation` ran out.
+    /// Retries with a fresh [`SpillTier::reserve`] for the remainder, then
+    /// another `enforce_capacity_with_reservation` pass, until the deficit
+    /// clears or `deadline` passes. `deadline` is the same one
+    /// [`Shard::reserve_for_batch`] measured, not a fresh budget, so the
+    /// whole call stays bounded by one `spill_wait_timeout` rather than `2x`
+    /// it. A no-op when `deficit` is `0`. Once the budget runs out with a
+    /// deficit still outstanding, this makes one closing
+    /// [`engine::Engine::enforce_capacity`] call (`reservation: None`) so the
+    /// deficit is resolved before this call returns, not deferred to
+    /// whatever write happens to touch this shard next.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3133,11 +2994,8 @@ where
             while deficit > 0 {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    // This call's whole `spill_wait_timeout` budget is
-                    // already spent, by `reserve_for_batch`'s own initial
-                    // wait alone or by an earlier iteration of this loop:
-                    // no further `reserve()` call, straight to the closing
-                    // fallback below.
+                    // Budget already spent (initial wait or an earlier
+                    // iteration): skip straight to the closing fallback.
                     break;
                 }
                 let bytes = u32::try_from(deficit).unwrap_or(u32::MAX);
@@ -3149,10 +3007,8 @@ where
                             self.now_ms(),
                         );
                     }
-                    // `reserve` itself already recorded
-                    // `sundog_spill_wait_timeouts_total` for this call's
-                    // budget running out; the fallback below resolves
-                    // whatever deficit remains.
+                    // `reserve` already recorded
+                    // `sundog_spill_wait_timeouts_total`; the fallback below resolves the rest.
                     Err(_) => break,
                 }
             }
@@ -3168,16 +3024,11 @@ where
 
     /// [`Shard::insert_many_expiring`]'s and [`Shard::remove_many`]'s shared apply step: groups by stripe, applies each under one lock.
     ///
-    /// Reserves flush-queue admission once for the whole call, via
-    /// [`Shard::reserve_for_batch`], before splitting `prepared` by stripe;
-    /// the one `Reservation` this gets back, if any, is threaded by
-    /// `&mut` through every bucket's own
-    /// [`engine::Engine::apply_many_with_reservation`] call below. Once
-    /// every bucket has run, [`Shard::retry_reservation_deficit`] pays down
-    /// whatever deficit those calls reported before this returns, sharing
-    /// `reserve_for_batch`'s own deadline rather than starting a fresh
-    /// wait budget: see its doc for what happens once that shared budget
-    /// runs out.
+    /// Reserves flush-queue admission once for the whole call via
+    /// [`Shard::reserve_for_batch`], threading the `Reservation` through
+    /// every bucket's [`engine::Engine::apply_many_with_reservation`] call.
+    /// [`Shard::retry_reservation_deficit`] then pays down any deficit,
+    /// sharing the same deadline rather than a fresh budget.
     async fn apply_grouped<T>(
         &self,
         prepared: Vec<T>,
@@ -3222,12 +3073,8 @@ where
             self.hand_off_bulk(&mut applied_keys, false);
         }
         self.hand_off_bulk(&mut applied_keys, true);
-        // Returns any never-spent remainder to `admit` immediately, before
-        // `retry_reservation_deficit` asks for a fresh one: on a build
-        // with no `spill` feature this is the placeholder `Reservation`,
-        // never actually held, so `let _ =` (not `drop`, which needs a
-        // real `Drop` impl on every build) is the portable way to end its
-        // borrow here either way.
+        // Ends the reservation's borrow before requesting a fresh one; `let
+        // _ =` works on every build, including the placeholder without `spill`.
         let _ = reservation;
         self.retry_reservation_deficit(0, deficit, deadline).await;
     }
@@ -3369,12 +3216,10 @@ where
     /// Closes this shard's attached spill tier, if `Shard::attach_spill`
     /// ever ran: stops accepting new spills and drops the flusher thread's
     /// channel sender, so its loop drains whatever is queued and exits on
-    /// its own, no checkpoint. This writes no snapshot, so the next
-    /// `attach_spill` on this directory opens cold even with
-    /// `SpillConfig::warm_reopen` on; see [`Shard::close_spill_checkpointed`]
-    /// for the checkpointed close a fast, warm reopen needs.
-    ///
-    /// A no-op otherwise, and always a no-op in a non-`spill` build.
+    /// its own, writing no checkpoint. The next `attach_spill` here opens
+    /// cold even with `SpillConfig::warm_reopen` on; see
+    /// [`Shard::close_spill_checkpointed`] for a warm reopen. A no-op
+    /// otherwise, and always a no-op in a non-`spill` build.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3394,36 +3239,18 @@ where
         }
     }
 
-    /// [`Shard::close_spill`], with `SpillConfig::warm_reopen` on, pays a
-    /// checkpoint's cost first, every step on its own blocking task
-    /// (`tokio::task::spawn_blocking`), never inline on this async call:
-    /// gathers every currently-resident live entry
-    /// (`Engine::checkpoint_resident_entries`), hands it to
-    /// `SpillTier::checkpoint_flush`, which first joins the real flusher
-    /// thread so every job already queued lands before the checkpoint
-    /// writes anything else into the same regions, then writes those
-    /// resident entries into the region ring itself with no version check
-    /// at all. Because that write is unconditional, a second `Cache` clone
-    /// can race this close and remove, tombstone, or overwrite one of those
-    /// keys between the capture and the write landing; the next step,
-    /// `Engine::finalize_checkpoint_writes`, re-validates each newly
-    /// written entry under its own stripe lock, keeps only the ones still
-    /// live at exactly the captured version, and flips each survivor's
-    /// state to `Spilled` so RAM and disk agree. Only once that returns
-    /// does this read `Engine::snapshot_spilled` again: by then it reflects
-    /// every entry already on disk before this checkpoint started *and*
-    /// excludes any key a region rotation reclaimed to make room for the
-    /// new writes, so the two halves never disagree about what is actually
-    /// still on disk, and a key that lost the race above is dropped rather
-    /// than resurrected. That combined list becomes the checkpoint snapshot
-    /// (`SpillTier::write_checkpoint_snapshot`), and only then does the
-    /// tier actually close. Without `warm_reopen`, this is exactly
-    /// `Shard::close_spill` alone, no checkpoint, no snapshot.
+    /// [`Shard::close_spill`], plus, with `SpillConfig::warm_reopen` on, a
+    /// checkpoint of every resident entry to disk before closing, each step a
+    /// separate blocking task. The disk write is unconditional, racy against
+    /// a concurrent `Cache` clone's remove/overwrite;
+    /// `Engine::finalize_checkpoint_writes` re-validates under the stripe
+    /// lock afterward and keeps only entries still live at the captured
+    /// version, so a losing key is dropped, never resurrected. Without
+    /// `warm_reopen`, this is [`Shard::close_spill`] alone: no checkpoint.
     ///
-    /// A no-op otherwise, and always a no-op in a non-`spill` build.
-    /// Called by `Cache::close` and, for a cache still registered at
-    /// cluster shutdown without an explicit `close`, by
-    /// `Cluster::shutdown`'s [`ShardOps::close_spill_checkpointed`] sweep.
+    /// A no-op otherwise, and always a no-op in a non-`spill` build. Called
+    /// by `Cache::close` and, for a cache still registered at cluster
+    /// shutdown, by `Cluster::shutdown`'s sweep.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -3498,15 +3325,8 @@ where
                 record_checkpoint_stage(&self.name, "drained", flush_outcome.jobs_drained);
                 record_checkpoint_stage(&self.name, "abandoned", flush_outcome.jobs_abandoned);
 
-                // `checkpoint_flush` wrote `newly_written` to disk with no
-                // version check (see its own docs): a second `Cache` clone
-                // racing this close can have removed, tombstoned, or
-                // overwritten the key between the resident-entry capture
-                // above and this point. `finalize_checkpoint_writes`
-                // re-validates each one under its own stripe lock and flips
-                // only the survivors to `Spilled`, so a key that lost the
-                // race is silently dropped here rather than resurrected
-                // below.
+                // Re-validates under the stripe lock: a concurrent write may have
+                // changed the key since capture, so a losing entry is dropped here.
                 let engine = Arc::clone(&self.engine);
                 let (_survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
                     engine.finalize_checkpoint_writes(newly_written, now)
@@ -3567,11 +3387,9 @@ where
                 );
                 record_checkpoint_stage(&self.name, "listed", entries.len() as u64);
 
-                // `entries` already contains every checkpoint-kept survivor: the
-                // `finalize_checkpoint_writes` call above flips each survivor's live
-                // engine state to `Spilled` in place, so `snapshot_spilled`'s scan just
-                // above already lists it once. Extending with the survivors again would
-                // list each one twice in the snapshot.
+                // `entries` already includes every survivor:
+                // `finalize_checkpoint_writes` flipped each to `Spilled` before this
+                // scan ran, so extending again would double-count.
                 tracing::info!(
                     cache = %self.name,
                     count = entries.len(),
@@ -3599,11 +3417,8 @@ where
     }
 
     /// Whether this shard's attached spill tier is closed by
-    /// [`Shard::close_spill`] or [`Shard::close_spill_checkpointed`], or
-    /// none is attached. `false` only while a tier is attached and still
-    /// open. Test-facing: lets a test observe that [`Cache::close`] stopped
-    /// the tier a surviving clone still shares, without needing to drive an
-    /// eviction and infer it indirectly.
+    /// Whether this shard's spill tier is closed (by either close path) or
+    /// none is attached. Test-only: lets a test check closure directly.
     #[cfg(all(feature = "spill", test, not(feature = "sim")))]
     pub(crate) fn spill_tier_closed(&self) -> bool {
         self.engine.spill().is_none_or(|tier| tier.is_closed())
@@ -3630,11 +3445,9 @@ where
     /// replication and events see the fold as one write happening at flush
     /// time, not backdated to whichever `merge` call opened the window.
     /// Pushes onto the fan-out queue without awaiting room first, unlike
-    /// `Shard::merge`'s own immediate-apply branch: this runs from
-    /// `flush_due_pending_merges`/`flush_all_pending_merges`, called from
-    /// the background `crate::cache::merge_coalesce_task` and from `Drop`,
-    /// neither of which can await a wait bounded by an async runtime that
-    /// may no longer be there by the time `Drop` runs.
+    /// `Shard::merge`'s immediate-apply branch: this runs from the
+    /// merge-coalesce sweep and from `Drop`, where no async runtime may be
+    /// left to await on.
     fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
         let ver = self.stamp_local();
         let incoming = Incoming::Put {
@@ -3876,15 +3689,9 @@ where
                 decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
             }
 
-            // One reservation across the whole decoded batch, before any
-            // per-bucket work or stripe lock: see `Shard::reserve_for_batch`.
-            // This is what throttles the one global `inbound_loop` for live
-            // replication, a donor's per-pull anti-entropy repair pace, and
-            // a rebalance/state-transfer chunk apply, all funneled through
-            // this one method. Once every bucket below has run,
-            // `Shard::retry_reservation_deficit` pays down whatever deficit
-            // those calls reported before this returns, sharing this same
-            // reservation's own deadline rather than a fresh budget.
+            // One reservation for the whole decoded batch (see
+            // `Shard::reserve_for_batch`) throttles replication, anti-entropy
+            // repair, and state-transfer apply alike through this one method.
             let (mut reservation, deadline) = self
                 .reserve_for_batch(
                     decoded
@@ -3893,9 +3700,8 @@ where
                 )
                 .await;
 
-            // Grouping by raw key bytes' stripe needs no decode. Each group
-            // keeps `decoded`'s relative order, so the same key always
-            // lands in the same stripe in arrival order.
+            // Groups by raw key-byte stripe, no decode needed; order within
+            // a stripe is preserved.
             let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
                 (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
             for entry in decoded {
@@ -3929,8 +3735,8 @@ where
                     self.handle_apply_outcome(outcome, origin, true);
                 }
             }
-            // See `Shard::apply_grouped`'s identical line for why `let _
-            // =` rather than `drop`.
+            // See `Shard::apply_grouped`'s identical line: `let _ =` works
+            // on every build.
             let _ = reservation;
             self.retry_reservation_deficit(0, deficit, deadline).await;
         })
@@ -5700,14 +5506,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Shard::attach_spill` never clears a warm-reloaded bucket's cold
-    /// mark itself: that is the caller's job, only once its own eager
-    /// per-co-owner reconciliation round completes (`cache.rs`'s
-    /// `reconcile_warm_buckets`). Two lives of the same directory: the
-    /// first spills one owned key to disk and closes cleanly; the second,
-    /// seeded with that key's bucket already marked cold exactly as
-    /// `attach_ownership` seeds it, reopens warm and finds the bucket
-    /// still cold, the record still readable regardless.
+    /// Pins that a warm reopen leaves a reloaded bucket cold until the
+    /// caller's own reconciliation clears it; the record stays readable meanwhile.
     #[cfg(feature = "spill")]
     #[tokio::test]
     #[expect(
@@ -5738,9 +5538,8 @@ mod tests {
         let key = find_key_by_ownership(&view, true);
         let bucket = bucket_of(&key_bytes(&key));
 
-        // First life: a tiny weight cap forces the one entry onto disk;
-        // closing the tier checkpoints a snapshot the second life's
-        // `attach_spill` can trust.
+        // First life: a tiny weight cap forces the entry to disk before the
+        // checkpointed close.
         let (tracker1, tx1) = OwnershipTracker::seed(
             self_node,
             &[],
@@ -5768,10 +5567,8 @@ mod tests {
         );
 
         shard1.insert(key, "v".to_string()).await.expect("insert");
-        // Eviction samples candidates within one stripe (bucket) at a time;
-        // filling `key`'s own bucket with several more, newer entries past
-        // the one-entry weight cap concentrates every later eviction pass
-        // exactly where `key`, the oldest entry in that bucket, lives.
+        // Eviction samples within one bucket at a time; filling `key`'s bucket
+        // with newer entries concentrates eviction onto `key`, the oldest one there.
         let fillers: Vec<u32> = (0..1_000_000u32)
             .filter(|&k| k != key && bucket_of(&key_bytes(&k)) == bucket)
             .take(20)
@@ -5799,9 +5596,8 @@ mod tests {
         );
         shard1.close_spill_checkpointed().await;
 
-        // Second life: same directory, a fresh ownership tracker/residency
-        // seeded exactly as `attach_ownership` seeds a real cache open,
-        // with the reloaded bucket marked cold up front.
+        // Second life: same directory, fresh tracker/residency, bucket marked
+        // cold up front.
         let (tracker2, tx2) = OwnershipTracker::seed(
             self_node,
             &[],
@@ -5844,18 +5640,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A checkpointed close's own contract: `Shard::close_spill_checkpointed`, with
-    /// `SpillConfig::warm_reopen` on, recovers every live entry across the
-    /// restart, a still-resident one exactly as much as one already
-    /// spilled, and never a key already tombstoned before the close ran.
-    /// Guards the exact resurrection bug this design fixes: a scan-based
-    /// replay would find the tombstoned key's still-intact on-disk bytes
-    /// and reinstall it, since a delete never rewrites or erases a spilled
-    /// record's region bytes (see `engine::apply_tombstone`); a
-    /// snapshot-based replay never lists it in the first place, because
-    /// `Engine::snapshot_spilled`/`Engine::checkpoint_resident_entries`
-    /// both walk `stripe.live`, which a tombstone has already been removed
-    /// from.
+    /// Pins that a checkpointed close recovers every live entry, resident or
+    /// already spilled, and never resurrects a key tombstoned before the close.
     #[cfg(feature = "spill")]
     #[tokio::test]
     #[expect(
@@ -5902,11 +5688,8 @@ mod tests {
             .await
             .expect("insert spilled");
 
-        // Filling `spilled_key`'s own bucket with several more, newer
-        // entries past the two-entry weight cap concentrates every later
-        // eviction pass exactly where `spilled_key`, the oldest entry left
-        // in that bucket, lives; `resident_key`'s own, different, bucket is
-        // never touched by any of this pressure.
+        // Filling `spilled_key`'s bucket concentrates eviction there,
+        // leaving `resident_key`'s different bucket untouched.
         let spilled_bucket = bucket_of(&key_bytes(&spilled_key));
         let resident_bucket = bucket_of(&key_bytes(&resident_key));
         assert_ne!(
@@ -5987,13 +5770,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The exact resurrection bug this design fixes, isolated to its
-    /// simplest shape: a key is written, spills to disk, and is deleted
-    /// before a clean close; reopening well inside the downtime gate must
-    /// never see it again, with no peer, no anti-entropy round, and no
-    /// tombstone GC involved at all -- the on-disk record's own bytes,
-    /// unerased by the delete, are never enough to bring it back on their
-    /// own.
+    /// Pins the simplest resurrection case: a spilled-then-deleted key must
+    /// never come back on a checkpointed reopen, with no peer or GC involved.
     #[cfg(feature = "spill")]
     #[tokio::test]
     async fn a_deleted_spilled_key_never_resurrects_across_a_checkpointed_reopen() {
@@ -6046,19 +5824,14 @@ mod tests {
             "the key spills to disk once eviction runs past the tiny weight cap"
         );
 
-        // The key is deleted while still spilled: the on-disk region bytes
-        // for its last live record are never rewritten or erased by this
-        // (`engine::apply_tombstone`'s doc spells out exactly why), so a
-        // scan-based reopen would still find and reinstall them.
+        // Deleted while still spilled: a delete never rewrites the on-disk
+        // region bytes (see `engine::apply_tombstone`), so a scan-based
+        // reopen would still find them.
         shard1.remove(&key).await.expect("remove the spilled key");
 
         shard1.close_spill_checkpointed().await;
 
-        // Reopen well inside the downtime gate (`Shard::new`'s own default,
-        // `ClusterConfig::default().tombstone_ttl`, ten minutes, since this
-        // real wall-clock round-trip runs in well under a second): the
-        // resurrection this guards against, if it happened, is not a
-        // matter of the gate being too wide.
+        // Reopens well inside the default ten-minute tombstone_ttl gate.
         let shard2 = Shard::<u32, String>::new(
             SmolStr::new("no-resurrection"),
             Mode::Local,
@@ -6067,10 +5840,8 @@ mod tests {
             None,
             None,
         );
-        // `bucket` still warm-reloads: it holds every filler key too, all
-        // of them legitimately live and un-deleted. The one property this
-        // test guards is that the deleted key specifically never comes
-        // back, asserted directly below.
+        // `bucket` still warm-reloads its live filler keys; only the deleted
+        // key is checked below.
         let _warm = shard2
             .attach_spill(&cfg)
             .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
@@ -6084,15 +5855,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The exact race `Engine::finalize_checkpoint_writes` closes:
-    /// `SpillTier::checkpoint_flush` writes a resident entry's captured
-    /// bytes to disk with no version check at all, so a second `Cache`
-    /// clone deleting the same still-resident key between
-    /// `Engine::checkpoint_resident_entries`'s capture and that write
-    /// landing must never let the stale entry survive into the checkpoint
-    /// snapshot. Drives `Shard::close_spill_checkpointed`'s own phases directly, in
-    /// order, with the delete injected exactly between the first two, so
-    /// the race is deterministic rather than a best-effort timing gamble.
+    /// Pins the exact race `Engine::finalize_checkpoint_writes` closes: a
+    /// key deleted between resident-capture and disk-write must not survive
+    /// the checkpoint.
     #[cfg(feature = "spill")]
     #[tokio::test]
     async fn close_spill_checkpoint_drops_a_key_deleted_between_capture_and_disk_write() {
@@ -6112,7 +5877,7 @@ mod tests {
             Mode::Local,
             node,
             1 << 20, // generous cap: this test drives the checkpoint's own
-            // engine methods directly rather than forcing a real eviction
+            // engine methods directly, not a real eviction
             None,
             None,
         );
@@ -6124,13 +5889,11 @@ mod tests {
         shard1.insert(key, "v".to_string()).await.expect("insert");
 
         let now = shard1.now_ms();
-        // Phase 1, `Shard::close_spill_checkpointed`'s own first step: capture every
-        // resident live entry before anything else changes.
+        // Phase 1: capture every resident live entry before anything else changes.
         let resident = shard1.engine.checkpoint_resident_entries(now);
         assert_eq!(resident.len(), 1, "the one resident key is captured");
 
-        // The race: a second `Cache` clone deletes the key after the
-        // capture above but before the checkpoint write below lands.
+        // The race: a second clone deletes the key between capture and the write below.
         shard1
             .remove(&key)
             .await
@@ -6138,9 +5901,7 @@ mod tests {
 
         let tier = Arc::clone(shard1.engine.spill().expect("attach_spill attaches a tier"));
         let sink = Arc::clone(&shard1.engine) as Arc<dyn spill::SpillSink>;
-        // Phase 2, `Shard::close_spill_checkpointed`'s own checkpoint write: this writes
-        // the now-stale bytes to disk regardless of the race, exactly as
-        // `SpillTier::checkpoint_flush`'s own docs describe.
+        // Phase 2: writes the now-stale bytes to disk regardless of the race.
         let flush_outcome = tier.checkpoint_flush(sink.as_ref(), resident);
         let newly_written = flush_outcome.written;
         assert_eq!(
@@ -6151,9 +5912,8 @@ mod tests {
              must correct for"
         );
 
-        // Phase 3, the fix: `finalize_checkpoint_writes` re-validates the
-        // written entry against the live engine state and must drop it,
-        // since it is now tombstoned.
+        // Phase 3, the fix: re-validates against live state and drops the
+        // now-tombstoned entry.
         let (survivors, finalize_counts) =
             shard1.engine.finalize_checkpoint_writes(newly_written, now);
         assert!(
@@ -6196,13 +5956,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Engine::finalize_checkpoint_writes` flips a surviving entry from
-    /// `Resident` to `Spilled` directly, never through `SpillSink::install`,
-    /// so it must call `note_spill_arrival` itself or `sundog_spill_entries`
-    /// silently undercounts every checkpoint-written entry. A generous
-    /// capacity keeps eviction out of the picture entirely: the one entry
-    /// here only ever becomes `Spilled` via the checkpoint itself, so the
-    /// gauge's count is unambiguous.
+    /// Pins that `finalize_checkpoint_writes` calls `note_spill_arrival`
+    /// itself, since it flips `Resident` to `Spilled` without going through
+    /// `SpillSink::install`.
     #[cfg(feature = "spill")]
     #[tokio::test]
     async fn close_spill_checkpoint_counts_a_surviving_resident_entry_toward_the_spill_entries_metric()
@@ -6249,10 +6005,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Captures `sundog_spill_reopen_total{outcome, reason}` increments for
-    /// one fixed cache name, ignoring every other metric and cache: the
-    /// same filtered-counter shape `spill`'s own `DropRecorder` uses for
-    /// the identical process-global-recorder reason.
+    /// Captures `sundog_spill_reopen_total{outcome,reason}` increments for one
+    /// cache name.
     #[cfg(feature = "spill")]
     #[derive(Clone, Default)]
     struct ReopenCounts(Arc<StdMutex<HashMap<(String, String), u64>>>);
@@ -6374,27 +6128,16 @@ mod tests {
         }
     }
 
-    /// `SpillTier::reopen`'s own return value already proves
-    /// `reason="stale_snapshot"`
-    /// (`spill::tests::reopen_refuses_on_a_stale_snapshot_format_version_and_falls_back_to_open`);
-    /// this proves `Shard::attach_spill`'s metric-recording glue actually
-    /// carries that reason through to `sundog_spill_reopen_total`, the one
-    /// reason CLAUDE.md's "pinned in the exporter test" rule cannot cover
-    /// from `tests/prometheus_exporter.rs` itself, since producing a
-    /// `stale_snapshot` cold fallback means forging a snapshot with a
-    /// valid checksum but a wrong `format_version`, a private on-disk
-    /// format this test's own crate access reaches but an external
-    /// integration test cannot.
+    /// Pins that `attach_spill` records a `stale_snapshot` cold fallback
+    /// under `sundog_spill_reopen_total`, the one reopen reason the exporter
+    /// test cannot reach.
     #[cfg(feature = "spill")]
     #[test]
     fn attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric() {
         const CACHE: &str = "attach-spill-stale-snapshot-metric";
         let counts = ReopenCounts::default();
-        // `metrics::set_global_recorder` is a single process-global slot:
-        // if another test in this binary already won it, this one
-        // silently observes nothing and skips its assertions, the same
-        // tolerance `spill::tests` and `tests/prometheus_exporter.rs`
-        // already document for the identical race.
+        // The global recorder slot is process-wide; if another test already
+        // won it, this one observes nothing and skips its assertions.
         let installed = metrics::set_global_recorder(ReopenRecorder {
             cache: CACHE.to_string(),
             counts: counts.clone(),
@@ -6450,22 +6193,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Shard::attach_spill` called twice against the same directory with
-    /// no clean close in between: the first life's tier is simply dropped,
-    /// never `close_spill_checkpointed`d, so it never writes a checkpoint snapshot --
-    /// exactly the ordinary shape of a crash. The second life's
-    /// `attach_spill` must fall back cold with reason `"no_snapshot"`,
-    /// [`spill::SpillTier::reopen`]'s own first eligibility check.
+    /// Pins that reattaching with no clean close in between (a crash) falls
+    /// back cold with reason `"no_snapshot"`.
     #[cfg(feature = "spill")]
     #[test]
     fn attach_spill_twice_with_no_close_between_falls_back_cold_with_reason_no_snapshot() {
         const CACHE: &str = "attach-spill-twice-no-close";
         let counts = ReopenCounts::default();
-        // `metrics::set_global_recorder` is a single process-global slot:
-        // if another test in this binary already won it, this one silently
-        // observes nothing and skips its assertions, the same tolerance
-        // `attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric`
-        // above already documents for the identical race.
+        // The global recorder slot is process-wide; if already won, this
+        // test skips its assertions.
         let installed = metrics::set_global_recorder(ReopenRecorder {
             cache: CACHE.to_string(),
             counts: counts.clone(),
@@ -6494,9 +6230,8 @@ mod tests {
             .attach_spill(&cfg)
             .expect("a brand-new directory opens cold");
         assert!(warm1.warm_buckets.is_empty());
-        // Life 1 ends here with no `close_spill_checkpointed` call at all: the tier is
-        // simply dropped, so no checkpoint snapshot is ever written to this
-        // directory, even though `warm_reopen` is on.
+        // Life 1 ends with no checkpointed close: the tier drops, writing no
+        // snapshot.
         drop(shard1);
 
         let shard2 = Shard::<u32, String>::new(
@@ -8297,15 +8032,13 @@ mod tests {
             .with_fan_out_wait_timeout(Duration::from_secs(10));
         let queue = s.fan_out_queue();
 
-        // Fills the backlog to exactly its capacity: this call itself sees
-        // an empty queue and never waits.
+        // Fills the backlog to capacity; this call itself never waits.
         s.insert_many((0..5u32).map(|k| (k, k.to_string())))
             .await
             .expect("fills the backlog to capacity");
         assert_eq!(queue.len(), 5);
 
-        // At capacity, so the next `insert_many` must await room before it
-        // pushes.
+        // At capacity: the next insert_many must await room before pushing.
         let insert_fut = s.insert_many((5..7u32).map(|k| (k, k.to_string())));
         tokio::pin!(insert_fut);
         let not_yet = tokio::time::timeout(Duration::from_millis(150), &mut insert_fut).await;
@@ -8314,7 +8047,7 @@ mod tests {
             "insert_many must still be waiting for backlog room at capacity"
         );
 
-        // The fan-out task's own drain: frees room and wakes the waiter.
+        // The fan-out task's drain frees room and wakes the waiter.
         let drained = queue.drain();
         assert_eq!(
             drained.len(),
@@ -8347,8 +8080,7 @@ mod tests {
             .expect("fills the backlog to capacity");
         assert_eq!(queue.len(), 1);
 
-        // Nothing ever drains the queue this time: the wait must time out
-        // on its own, and the write must still land, over capacity.
+        // Nothing drains the queue; the wait must time out and the write still land.
         let started = tokio::time::Instant::now();
         s.insert_many([(1u32, "one".to_string())])
             .await
@@ -8605,13 +8337,8 @@ mod tests {
         assert_eq!(s.get_sync(&1), Some("a".to_string()));
     }
 
-    /// A cache with no attached spill tier never reaches
-    /// `Shard::reserve_for_batch`'s real body: `self.engine.spill()`
-    /// returns `None` on every call site, so `insert_many`/`remove_many`
-    /// see no behavior change, one `.await` that resolves immediately
-    /// with `reservation: None` threaded through. Guards the "no public
-    /// API change; a cache without spill sees zero behavior change"
-    /// invariant.
+    /// Pins that a cache with no spill tier sees zero behavior change:
+    /// `reserve_for_batch` resolves immediately with `reservation: None`.
     #[tokio::test]
     async fn spill_less_cache_never_touches_reserve() {
         let s = shard::<u32, String>(1);
@@ -9284,7 +9011,7 @@ mod tests {
         assert!(!ShardOps::is_unverified_bucket(&s, 7));
         residency.mark_unverified(&[7]);
         assert!(ShardOps::is_unverified_bucket(&s, 7));
-        // Distinct from cold: marking one never marks or clears the other.
+        // Distinct from cold: marking one leaves the other alone.
         assert!(!ShardOps::is_cold_bucket(&s, 7));
         residency.clear_unverified(&[7]);
         assert!(!ShardOps::is_unverified_bucket(&s, 7));
@@ -9856,11 +9583,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// `Shard::apply_grouped`'s one `reserve_for_batch` call, made
-        /// before any stripe lock, genuinely suspends the calling
-        /// `insert_many` while another caller holds the tier's entire
-        /// flush-queue budget, and resumes the instant that budget frees:
-        /// the same suspension point `ShardOps::apply_remote_batch` shares.
+        /// Pins that `reserve_for_batch` suspends `insert_many` while another
+        /// caller holds the tier's flush-queue budget, resuming
+        /// once it frees.
         #[tokio::test]
         async fn apply_grouped_suspends_under_a_saturated_queue_and_resumes_once_room_frees() {
             let dir = temp_dir("suspend-apply-grouped");
@@ -9880,9 +9605,7 @@ mod tests {
             .expect("tier opens");
             let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
 
-            // Another caller already holds the tier's entire flush-queue
-            // budget: this batch's own `reserve_for_batch` call has
-            // nothing left to acquire until that reservation is dropped.
+            // Another caller holds the entire flush-queue budget already.
             let held = tier
                 .reserve(64, Duration::from_secs(5))
                 .await
@@ -9910,14 +9633,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// `ShardOps::apply_remote_batch`'s own `reserve_for_batch` call,
-        /// made before any stripe lock, genuinely suspends the calling
-        /// batch while another caller holds the tier's entire flush-queue
-        /// budget, and resumes the instant that budget frees: the same
-        /// suspension point [`apply_grouped_suspends_under_a_saturated_queue_and_resumes_once_room_frees`]
-        /// exercises through `Shard::apply_grouped`, driven here through
-        /// the batch path live replication, anti-entropy pull repair, and
-        /// rebalance/state-transfer pulls all share.
+        /// Pins that `apply_remote_batch` suspends and resumes identically to
+        /// `apply_grouped` under a saturated flush-queue.
         #[tokio::test]
         async fn apply_remote_batch_suspends_identically_under_a_saturated_queue() {
             let dir = temp_dir("suspend-apply-remote-batch");
@@ -9937,9 +9654,7 @@ mod tests {
             .expect("tier opens");
             let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
 
-            // Another caller already holds the tier's entire flush-queue
-            // budget: this batch's own `reserve_for_batch` call has
-            // nothing left to acquire until that reservation is dropped.
+            // Another caller holds the entire flush-queue budget already.
             let held = tier
                 .reserve(64, Duration::from_secs(5))
                 .await
@@ -9969,17 +9684,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// `ShardOps::apply_remote_batch` decodes and groups every record
-        /// by stripe *before* its one `reserve_for_batch` suspension
-        /// point, so that suspension has nothing left to reorder: this
-        /// pins that guarantee by driving two `Put`s for the *same* key at
-        /// the *same* `Hlc` through one batch, with the tier saturated so
-        /// `reserve()` genuinely suspends mid-call. `resolve_conflict`'s
-        /// equal-version fast path (`engine.rs`) means the second of any
-        /// two same-key, same-`Hlc` writes always loses to whichever
-        /// landed first, so the winner directly exposes application
-        /// order: if the suspension let anything reorder the batch, the
-        /// second value would win instead.
+        /// Pins that `apply_remote_batch` groups by stripe before its one
+        /// `reserve_for_batch` suspension point, so the suspension cannot
+        /// reorder a batch: two same-key, same-`Hlc` puts must apply first-wins.
         #[tokio::test]
         async fn apply_remote_batch_preserves_per_bucket_order_once_reserve_can_suspend() {
             let dir = temp_dir("order-apply-remote-batch");
@@ -10040,29 +9747,11 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// `Shard::retry_reservation_deficit`'s own closing fallback,
-        /// driven end to end through a real `insert_many` call rather
-        /// than at the bare `Engine` level: once its retry budget is
-        /// exhausted with a real
-        /// [`engine::Engine::enforce_capacity_with_reservation`] deficit
-        /// still outstanding, it must make its own closing
-        /// `Engine::enforce_capacity` call rather than simply return,
-        /// leaving `max_capacity` exceeded because nothing else on this
-        /// `Mode::Local` (`keep_resident_when_refused == false`) shard
-        /// happens to write again. Four colliding keys in one
-        /// `insert_many` call, `flush_queue_bytes` sized to exactly one
-        /// record so the call's own reservation covers only the first
-        /// victim, and the flusher paused before anything is ever
-        /// enqueued so nothing ever frees `admit` back: the second
-        /// victim's hand-off is a genuine, persistent deficit, and a
-        /// short `spill_wait_timeout` means the retry loop gives up
-        /// quickly rather than this test waiting on it. The four keys are
-        /// chosen to collide into stripe `0` specifically: both
-        /// `apply_grouped` and `ShardOps::apply_remote_batch` always pass
-        /// `retry_reservation_deficit` a `start_bucket` of `0` (see their
-        /// own call sites), so this is the scenario that call shape
-        /// actually produces, not an easier one this test picked for its
-        /// own convenience.
+        /// Pins `retry_reservation_deficit`'s closing fallback end to end:
+        /// once its retry budget is exhausted with a real deficit outstanding,
+        /// it must call `Engine::enforce_capacity` itself rather than leave
+        /// `max_capacity` exceeded. The four keys collide into stripe 0,
+        /// the `start_bucket` both call sites pass.
         #[tokio::test]
         async fn retry_reservation_deficit_deletes_the_leftover_victim_once_its_own_budget_is_exhausted()
          {
@@ -10093,10 +9782,8 @@ mod tests {
 
             let cfg = SpillConfig::new(&dir, 1 << 20)
                 .region_bytes(4096)
-                // Exactly one record's worth: `apply_grouped`'s own
-                // `reserve_for_batch` reservation, sized from this whole
-                // call's own Put bytes, is clamped down to this tier's
-                // entire (tiny) total, covering at most one victim.
+                // One record's worth: the reservation clamps down to this
+                // tiny tier total, covering at most one victim.
                 .flush_queue_bytes(u64::from(record_len_0))
                 .spill_wait_timeout(Duration::from_millis(150));
             let shard = Shard::<u32, String>::new(
@@ -10111,9 +9798,8 @@ mod tests {
             .with_spill(&cfg)
             .expect("tier opens");
             let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
-            // Paused before this call ever enqueues anything: no flusher
-            // installs run, so nothing this test does ever frees a byte
-            // back to `admit` once it is spent.
+            // Paused before this call enqueues anything, so nothing ever
+            // frees a byte back.
             tier.pause_flusher();
 
             shard
@@ -10141,38 +9827,18 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// The high-severity gap this workstream's fix closes:
-        /// `Shard::retry_reservation_deficit` must share
-        /// `Shard::reserve_for_batch`'s own deadline rather than open a
-        /// second, independent `spill_wait_timeout` wait window on top of
-        /// it: the whole `apply_grouped` call, first reservation plus
-        /// every retry, stays bounded by one `spill_wait_timeout` total.
-        ///
-        /// Same four-colliding-keys, one-record-flush-queue scenario as
-        /// `retry_reservation_deficit_deletes_the_leftover_victim_once_its_own_budget_is_exhausted`
-        /// above, but this test forces `reserve_for_batch`'s own initial
-        /// `reserve()` call to genuinely suspend first, for a known slice
-        /// of the budget (`HOG_HOLD`), by having a background task reserve
-        /// the tier's whole (tiny) admission budget and hold it that long
-        /// before releasing it: otherwise, with the queue empty from the
-        /// start, that first `reserve` would resolve instantly and this
-        /// test could not tell a shared deadline apart from a fresh one:
-        /// both would just measure the one retry wait alone. Once the
-        /// deficit retry needs its own wait after that, a shared deadline
-        /// (this workstream's fix) has already spent `HOG_HOLD` of the
-        /// budget and only waits out the remainder, so the whole call
-        /// finishes within roughly one `SPILL_WAIT_TIMEOUT` of wall time;
-        /// a fresh deadline (the regression this guards against) starts a
-        /// second full `SPILL_WAIT_TIMEOUT` on top of `HOG_HOLD`, pushing
-        /// the call well past it.
+        /// Pins that `retry_reservation_deficit` shares
+        /// `reserve_for_batch`'s deadline instead of opening a second, fresh
+        /// `spill_wait_timeout` window: the whole `apply_grouped` call stays
+        /// bounded by one timeout total. A background task holds the tier's
+        /// admission budget for `HOG_HOLD` first, so a shared deadline
+        /// (finishes near `SPILL_WAIT_TIMEOUT`) is distinguishable from a
+        /// fresh one (`HOG_HOLD` + `SPILL_WAIT_TIMEOUT`).
         #[tokio::test]
         async fn apply_grouped_bounds_its_whole_reservation_wait_to_one_spill_wait_timeout() {
             const SPILL_WAIT_TIMEOUT: Duration = Duration::from_millis(300);
-            /// Half the budget: leaves a comfortable, known remainder for
-            /// the deficit retry's own wait, and a wide enough gap between
-            /// "shared" (~`SPILL_WAIT_TIMEOUT`) and "fresh"
-            /// (~`HOG_HOLD + SPILL_WAIT_TIMEOUT`) totals to stay clear of
-            /// ordinary scheduling jitter either way.
+            /// Half the budget, leaving a clear gap between the "shared" and
+            /// "fresh" deadline totals so scheduling jitter cannot blur them.
             const HOG_HOLD: Duration = Duration::from_millis(150);
 
             let dir = temp_dir("retry-deficit-shared-budget");
@@ -10218,14 +9884,8 @@ mod tests {
             let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
             tier.pause_flusher();
 
-            // Reserves the whole (tiny) admission budget on a background
-            // task and holds it for `HOG_HOLD` before releasing it, so
-            // `apply_grouped`'s own `reserve_for_batch` call below is
-            // forced to genuinely wait out a known slice of its
-            // `spill_wait_timeout` before it ever gets a reservation. The
-            // readiness channel guarantees this task's own `reserve()`
-            // call lands first: deterministic ordering, not a race
-            // against `insert_many`'s own call below.
+            // Holds the whole admission budget for `HOG_HOLD`, forcing
+            // `reserve_for_batch` below to wait a known slice of its timeout.
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let hog_tier = Arc::clone(&tier);
             let hog = tokio::spawn(async move {
@@ -10265,21 +9925,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// `apply_grouped`'s one batch-wide `Reservation` reaches all the
-        /// way through `Engine::apply_many_with_reservation` into a real
-        /// `Engine::enforce_capacity_with_reservation` eviction pass and
-        /// gets spent there via `Engine::evict_batch_sampled_with_reservation`/
-        /// `Engine::evict_one_scanning_with_reservation`: every write this
-        /// batch makes past `max_capacity` still lands, resident or
-        /// spilled, rather than falling back to a plain delete.
+        /// Pins that `apply_grouped`'s batch-wide `Reservation` reaches a real
+        /// eviction pass: every write past `max_capacity` still lands, never a
+        /// plain delete.
         #[tokio::test]
         async fn apply_grouped_threads_a_real_reservation_through_a_real_eviction_pass() {
             let dir = temp_dir("reservation-through-real-eviction");
-            // A generous flush-queue budget: this test's point is that the
-            // reservation reaches the real eviction pass and gets spent
-            // there, not that a tight byte budget is respected exactly
-            // (already covered by `spill.rs`'s and `engine.rs`'s own
-            // reservation tests).
+            // Generous budget: the point is that the reservation reaches
+            // real eviction, not byte-budget precision.
             let cfg = SpillConfig::new(&dir, 1 << 20)
                 .region_bytes(4096)
                 .flush_queue_bytes(1 << 16)
@@ -10300,9 +9953,7 @@ mod tests {
                 .await
                 .expect("insert_many");
 
-            // Every one of the 10 writes landed somewhere, resident or
-            // spilled: the cap evicted the rest through this batch's own
-            // reservation, never a plain delete.
+            // Every write landed, resident or spilled, never a plain delete.
             for k in 0..10u32 {
                 assert!(
                     shard.get(&k).await.is_some(),
@@ -10313,12 +9964,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// [`insert_sync_writes_a_value_with_no_async_runtime`]'s premise,
-        /// extended: `insert_sync`'s own path never calls
-        /// `SpillTier::reserve`, so it completes on a thread with no async
-        /// runtime of its own even while a real `Reservation`, built and
-        /// held on a separate tokio runtime, currently owns this tier's
-        /// entire flush-queue budget.
+        /// Extends [`insert_sync_writes_a_value_with_no_async_runtime`]:
+        /// `insert_sync` completes with no runtime even while another task
+        /// holds the whole reservation.
         #[test]
         fn insert_sync_completes_synchronously_while_another_task_holds_the_whole_reservation() {
             let dir = temp_dir("insert-sync-under-reservation");
@@ -10355,9 +10003,8 @@ mod tests {
                 .recv()
                 .expect("the holder thread reports it holds the reservation");
 
-            // `insert_sync` runs on this thread, with no async runtime of
-            // its own, while the reservation above stays fully live on a
-            // different thread's own runtime.
+            // Runs with no async runtime here while the reservation stays
+            // live on another thread.
             shard.insert_sync(1, "a".to_string()).expect("insert_sync");
             assert_eq!(shard.get_sync(&1), Some("a".to_string()));
 

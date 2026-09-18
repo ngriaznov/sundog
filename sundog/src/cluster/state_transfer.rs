@@ -469,11 +469,10 @@ where
 
 /// [`pull_from_donor`]'s bucket-scoped sibling: applies every
 /// [`BucketStreamItem::Chunk`] the same way, but also invokes
-/// `on_bucket_done` the instant a [`BucketStreamItem::BucketDone`] arrives,
-/// ahead of the stream's own end. `rebalance::pull_one_group` passes a
-/// callback that clears that bucket's cold mark right away -- goal 1's core
-/// requirement, that a partially-transferred group serves what has landed
-/// rather than waiting for the whole group's [`DonorResult::Done`]. Shares
+/// `on_bucket_done` as each [`BucketStreamItem::BucketDone`] arrives, ahead
+/// of the stream's end; `rebalance::pull_one_group` passes a callback that
+/// clears that bucket's cold mark, so a partially transferred group serves
+/// what has landed without waiting for [`DonorResult::Done`]. Shares
 /// the same classification `pull_from_donor` does: `Done` once the stream
 /// ends cleanly, `Declined` if the donor never had a stream to give,
 /// `Failed` if the request or stream broke -- a bucket already reported

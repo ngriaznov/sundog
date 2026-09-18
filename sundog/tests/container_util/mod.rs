@@ -90,17 +90,10 @@ pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.0";
 /// way `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET` etc. already are.
 pub const CRDT_RETIRE_AFTER_SECS_ENV: &str = "SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS";
 
-/// `RUST_LOG` value every `distributed_*` container test, plus the
-/// `cold_join_*`/`warm_join_*` ones, passes to its spawned nodes as
-/// `("RUST_LOG", DISTRIBUTED_RUST_LOG)` in `extra_env`: `info` broadly, and
-/// `debug` on exactly the cluster state-machine internals a rebalance,
-/// state-transfer, or anti-entropy timeout needs visible in the log dump
-/// `eventually_with_logs` prints, plus `sundog::net=debug` for the
-/// connection-level detail those hand off through. `chitchat=warn` keeps
-/// gossip's own per-round chatter out of that dump; `eventually_with_logs`
-/// also filters its cross-cluster "addressed to a different cluster"/"wrong
-/// cluster" lines by content, since a previous test's still-running
-/// containers can still emit them at `warn`.
+/// `RUST_LOG` for the distributed/join container tests: `info` broadly,
+/// `debug` on the cluster state-machine and `sundog::net` internals a
+/// rebalance/state-transfer/AE timeout needs in `eventually_with_logs`'s
+/// dump, and `chitchat=warn` to keep gossip chatter out of it.
 pub const DISTRIBUTED_RUST_LOG: &str = "info,sundog::cluster::rebalance=debug,\
      sundog::cluster::state_transfer=debug,sundog::cluster::anti_entropy=debug,\
      sundog::net=debug,sundog::ownership=debug,chitchat=warn";
@@ -255,9 +248,8 @@ impl Node {
         Self::spawn_distributed_with_env(net, cluster_name, alias, seeds, owners, &[]).await
     }
 
-    /// [`Node::spawn_distributed`] with additional container environment
-    /// variables layered on top of the `Mode::Distributed` defaults, the
-    /// same shape [`Node::spawn_with_env`] adds to [`Node::spawn`].
+    /// [`Node::spawn_distributed`] plus extra environment variables layered
+    /// on the `Mode::Distributed` defaults.
     /// # Panics
     ///
     /// Panics if the container fails to start or never becomes ready.
@@ -307,13 +299,7 @@ impl Node {
 
     /// [`Node::spawn_with_env_and_wait`] plus `mounts`, each a
     /// `(host_path, guest_path)` pair bind-mounted read-write into the
-    /// container: on both backends a guest write reaches the host path, so
-    /// the same `host_path` mounted again under the same alias after a
-    /// [`Node::stop`] sees whatever the previous container's process left
-    /// behind there, unlike every other path inside the container's own
-    /// otherwise-fresh filesystem. The way to test a restart that is
-    /// expected to find its spill directory preserved, `sundog-testnode`'s
-    /// `SUNDOG_TESTNODE_SPILL_DIR` pointed at a mount's `guest_path`.
+    /// container, so a restart sees what the previous container left there.
     /// # Panics
     ///
     /// Panics if the container fails to start or never satisfies `wait`.
@@ -340,11 +326,7 @@ impl Node {
     }
 
     /// [`Node::spawn_with_env_mounts_and_wait`] running `bin` instead of
-    /// this checkout's test node: [`build_previous_testnode`] for a mixed-
-    /// version cluster whose restarting node also needs a bind-mounted
-    /// spill directory, the combination
-    /// [`Node::spawn_binary`]/[`Node::spawn_with_env_mounts_and_wait`] each
-    /// cover only one half of.
+    /// this checkout's test node.
     /// # Panics
     ///
     /// Panics if the container fails to start or never satisfies `wait`.
@@ -412,9 +394,8 @@ impl Node {
     /// The actual container-boot logic every `spawn*` constructor shares,
     /// parametrized on the readiness check so [`Node::spawn_with_env_and_wait`]
     /// can substitute its own without duplicating the rest. `mounts`, each a
-    /// `(host_path, guest_path)` pair, is bind-mounted read-write into the
-    /// container alongside the test-node binary itself; see
-    /// [`Node::spawn_with_env_mounts_and_wait`].
+    /// `(host_path, guest_path)` pair, is bind-mounted into the container
+    /// alongside the test-node binary.
     /// # Panics
     ///
     /// Panics if the container fails to start or never satisfies `wait`.
@@ -820,11 +801,9 @@ impl Node {
             .ok_or_else(|| format!("no header/body separator in metrics response: {response:?}"))
     }
 
-    /// This node's captured container logs (stdout/stderr), for a timeout
-    /// failure's diagnostics. Never fails: a backend error comes back as
-    /// part of the returned string instead of `Err`, since the only caller,
-    /// [`eventually_with_logs`], is already mid-panic over a different
-    /// failure and has nothing useful to do with a second one.
+    /// This node's captured container logs (stdout/stderr). Never fails: a
+    /// backend error is folded into the returned string instead, since the
+    /// only caller is already mid-panic over a different failure.
     #[must_use]
     pub async fn logs(&self) -> String {
         self.guard
@@ -917,29 +896,17 @@ where
 }
 
 /// Substrings [`eventually_with_logs`] drops from a timeout's log dump: a
-/// previous test's containers, still gossiping into this one's shared
-/// network because a panic never reached their `stop()` calls, spam these
-/// at `warn` regardless of `RUST_LOG`, and at the volume seen in practice
-/// they crowd the capped tail out of everything else. Counted and
-/// summarized instead of silently dropped, so the dump still says a leak
-/// happened.
+/// leaked previous test's containers spam these at `warn`, crowding out
+/// the capped tail. Counted and reported rather than silently dropped.
 const CHITCHAT_MARKERS: [&str; 2] = [
     "addressed to a different cluster",
     "message rejected by peer: wrong cluster",
 ];
 
-/// [`eventually`], but on a timeout, prints every one of `nodes`' captured
-/// logs (its alias, then its last 1500 lines, [`CHITCHAT_MARKERS`] filtered
-/// out and counted first so the cap holds state-machine tracing rather than
-/// another test's stale gossip) to stderr before panicking, so a CI job's
-/// log carries enough of the cluster's own state-machine tracing to
-/// diagnose the failure without reproducing it locally. Follows each node's
-/// log dump with its `sundog_`-prefixed Prometheus metric lines (`# HELP`/
-/// `# TYPE` lines and histogram bucket lines omitted), the state a node
-/// whose log dump is empty has to offer; a metrics fetch error prints in
-/// place of the metric lines, which is what a previous-release node built
-/// by [`build_previous_testnode`] shows, since that build serves no
-/// `/metrics` and installs no tracing subscriber.
+/// [`eventually`], but on a timeout, prints each node's captured logs (last
+/// 1500 lines, [`CHITCHAT_MARKERS`] filtered and counted) and its
+/// `sundog_`-prefixed Prometheus metrics to stderr before panicking, so CI
+/// carries enough tracing to diagnose the failure without reproducing it.
 /// # Panics
 ///
 /// Panics if `cond` has not returned `true` by `timeout`.
@@ -1051,29 +1018,17 @@ pub async fn spawn_trio(net: &Arc<Network>, cluster_name: &str) -> (Node, Node, 
 }
 
 /// A `Vec<Node>` that stops every node it still holds, in a blocking
-/// [`Drop`], when the `Fleet` itself is dropped: a panic-only backstop for
-/// a multi-node container test, so its containers stop gossiping into the
-/// next test's network instead of lingering on `rightsize::ContainerGuard`'s
-/// own, slower, backgrounded teardown (see that type's `Drop` impl: it
-/// enqueues the actual backend stop/remove call onto a dedicated cleanup
-/// thread and returns immediately, rather than waiting for it).
+/// [`Drop`]: a panic-only backstop so a failed test's containers stop
+/// gossiping into the next test's network instead of waiting on
+/// `rightsize::ContainerGuard`'s own backgrounded teardown.
 ///
-/// [`Node::stop`] both consumes `self` and is `async`, so nothing already
-/// available can stop a node from a borrowed, synchronous `Drop`:
-/// `ContainerGuard` (the type `Node` wraps) exposes no `kill`, and its only
-/// public `stop` also consumes `self`. A test using `Fleet` pushes every
-/// node it spawns onto `fleet.0` and, on the success path, calls
-/// [`Fleet::take`] to get them back and `stop()` each one explicitly
-/// exactly as before (plus `net.close()`); `Fleet::drop` only has anything
-/// to do when a panic skipped that, in which case the `Vec` it takes is
-/// still full.
+/// A test pushes spawned nodes onto `fleet.0` and, on success, calls
+/// [`Fleet::take`] to stop them explicitly; `drop` only acts otherwise.
 pub struct Fleet(pub Vec<Node>);
 
 impl Fleet {
     /// Empties the fleet and returns its nodes, for the success path to
-    /// `stop()` explicitly (in whatever order/grouping the test wants,
-    /// e.g. alongside a `net.close()`), leaving `Fleet::drop` with nothing
-    /// left to do.
+    /// stop explicitly, leaving `Fleet::drop` nothing to do.
     pub fn take(&mut self) -> Vec<Node> {
         std::mem::take(&mut self.0)
     }
@@ -1085,13 +1040,9 @@ impl Drop for Fleet {
         if nodes.is_empty() {
             return; // the success path already took them; nothing to stop.
         }
-        // `Node::stop` is async, and this `Drop` can run while unwinding a
-        // panic on a thread already inside a Tokio runtime (the `#[tokio::
-        // test]` task itself), where `Handle::block_on` panics rather than
-        // nesting. A dedicated OS thread with its own throwaway
-        // current-thread runtime has no such conflict; the only blocking
-        // call back on this thread is `JoinHandle::join`, an ordinary
-        // synchronous thread join, not a nested `block_on`.
+        // `Node::stop` is async, and this `Drop` may run inside a Tokio
+        // runtime, where `block_on` would panic rather than nest. A
+        // dedicated OS thread with its own runtime joins back instead.
         let spawned = std::thread::Builder::new()
             .name("fleet-panic-stop".to_string())
             .spawn(move || {

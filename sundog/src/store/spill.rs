@@ -18,21 +18,14 @@
 //! representation choice for an already-accepted, versioned value, needing
 //! no `wire::PROTOCOL_VERSION` bump.
 //!
-//! With `SpillConfig::warm_reopen` on, a clean `SpillTier::close` first
-//! writes every currently-resident live record into the region ring, then
-//! writes a checkpoint snapshot next to the region files: every live
-//! spilled entry's key, version, expiry, and on-disk location. Tombstones
-//! and expired entries are never written into it. `SpillTier::reopen`
-//! trusts that snapshot alone, never scanning a region file for records it
-//! does not already know to look for, and refuses it (falling back to
-//! `SpillTier::open`'s cold, wipe-and-recreate path) once the tier has
-//! sat closed longer than the cluster's tombstone TTL: past that bound, no
-//! live peer is guaranteed to still hold a tombstone that would out-vote a
-//! resurrected stale record. A crash, or a close with `warm_reopen` off,
-//! leaves no snapshot, so the next open is cold; a successful warm reopen
-//! deletes the snapshot it just replayed, so a second open with no
-//! intervening clean close is cold too. Default `warm_reopen` is `false`:
-//! a default tier's open and close cost stay exactly what they are today.
+//! With `SpillConfig::warm_reopen` on, a clean close writes every resident
+//! live record into the region ring, then a checkpoint snapshot (key,
+//! version, expiry, and on-disk location per live entry) next to the
+//! region files. `SpillTier::reopen` trusts that snapshot alone, falling
+//! back to `SpillTier::open`'s cold path once the tier sat closed longer
+//! than the tombstone TTL. A crash, a close with `warm_reopen` off, or a
+//! successful reopen (which deletes the snapshot it replayed) all leave
+//! the next open cold. Default: `false`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -61,39 +54,21 @@ const DEFAULT_REGION_BYTES: u64 = 64 * 1024 * 1024;
 /// engine's read path, `spawn_blocking` behind a semaphore of this size,
 /// not by anything in this module.
 const DEFAULT_READ_CONCURRENCY: usize = 16;
-/// Wait bound a [`SpillConfig`] uses when
-/// [`SpillConfig::spill_wait_timeout`] is never called. Set against the
-/// actual computed `state_transfer::per_donor_budget` (`total * 2 / 5`, 8s
-/// at the 20s `state_transfer_budget` default), not the unrelated 4s
-/// `first_peer_grace` figure: 2s leaves comfortable margin for one
-/// reservation wait per chunk plus the chunk's own transfer time.
+/// Wait bound used when [`SpillConfig::spill_wait_timeout`] is never
+/// called: 2s, leaving margin over the ~8s
+/// `state_transfer::per_donor_budget`.
 const DEFAULT_SPILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Sanity cap [`SpillConfig::validate`] enforces on
-/// [`SpillConfig::spill_wait_timeout`]: comparable to or larger than a
-/// reasonable `state_transfer::per_donor_budget` gets a clear error at
-/// `SpillTier::open` time rather than a spurious rebalance failure
-/// discovered later.
+/// [`SpillConfig::spill_wait_timeout`], so an absurd value errors at open
+/// time rather than as a later rebalance failure.
 const MAX_SPILL_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Floor on the flusher's job queue slot count: a scheduling buffer, not a
-/// byte-capacity knob. [`SpillTier::attach`] sizes the channel from
-/// `flush_queue_bytes_value() / HEADER_LEN`, clamped between this floor and
-/// [`FLUSH_QUEUE_SLOTS_MAX`], so a config with small typical records, many
-/// of which fit in the byte budget, gets a slot count sized to actually
-/// hold them rather than one fixed independent of `flush_queue_bytes` and
-/// sized only for this floor's own 8192-record shape, while this floor
-/// keeps every config at least this roomy. A bulk insert can evict
-/// thousands of entries under one `enforce_capacity` lock hold, all queued
-/// in a burst; a slot count too small drops most of a large burst with
-/// `reason = "queue_full"` instead of spilling it. A [`SpillJob`] holds two
-/// refcounted [`Bytes`] handles plus a few words, so the queue's own memory
-/// footprint stays small even at this depth, and the bytes those handles
-/// point at are already resident in RAM regardless of whether the job sits
-/// in this queue or the entry sits in `live`, so queuing it costs nothing
-/// beyond what is already paid for.
+/// Floor on the flusher's job queue slot count. [`SpillTier::attach`]
+/// sizes the channel from `flush_queue_bytes_value() / HEADER_LEN`,
+/// clamped between this and [`FLUSH_QUEUE_SLOTS_MAX`].
 pub(crate) const FLUSH_QUEUE_CAPACITY: usize = 8192;
 /// Ceiling [`SpillTier::attach`]'s byte-derived slot count clamps to,
-/// guarding a pathological config, a huge `flush_queue_bytes` paired with
-/// tiny typical records, from allocating an oversized channel buffer.
+/// guarding a huge `flush_queue_bytes` paired with tiny records from
+/// allocating an oversized channel buffer.
 pub(crate) const FLUSH_QUEUE_SLOTS_MAX: usize = 262_144;
 /// Bound on how many jobs one flusher batch coalesces into as few
 /// positional writes as its rotations require. After a blocking `recv`
@@ -112,31 +87,24 @@ const FLUSH_BATCH_MAX_BYTES: usize = 1024 * 1024;
 const SPILL_MAGIC: u32 = u32::from_le_bytes(*b"SPIL");
 /// Fixed on-disk header size preceding every record's key and value bytes.
 const HEADER_LEN: usize = size_of::<SpillRecordHeader>();
-/// Corruption/format-skew guard at the front of every persisted
-/// [`SnapshotHeader`], distinct from [`SPILL_MAGIC`] so a snapshot file and a
-/// region file can never be confused for one another even if misnamed.
+/// Corruption/format-skew guard at the front of every [`SnapshotHeader`],
+/// distinct from [`SPILL_MAGIC`] so a snapshot and a region file can't be
+/// confused even if misnamed.
 const SNAPSHOT_MAGIC: u32 = u32::from_le_bytes(*b"SPLS");
-/// Format version stamped into every persisted snapshot. A writer bumps
-/// this whenever the snapshot's own binary layout changes; a stored value
-/// that doesn't match is `"stale_snapshot"`, distinct from a snapshot that
-/// fails to parse at all (`"no_snapshot"`).
+/// Format version stamped into every snapshot, bumped when its binary
+/// layout changes. A mismatch is `"stale_snapshot"`, distinct from
+/// `"no_snapshot"` (fails to parse at all).
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
-/// File name a tier's checkpoint snapshot is written under, inside its own
-/// `cfg.dir.join(cache_name)` directory: present only right after a clean
-/// [`SpillTier::close`] with [`SpillConfig::warm_reopen`] on, and deleted
-/// again the moment [`SpillTier::reopen`] replays it successfully.
+/// File name a tier's checkpoint snapshot is written under, inside
+/// `cfg.dir.join(cache_name)`.
 const SNAPSHOT_FILE_NAME: &str = "snapshot";
-/// The name [`write_snapshot_atomic`] writes the snapshot's bytes under
-/// before renaming it into place at [`SNAPSHOT_FILE_NAME`]: a crash between
-/// the write and the rename leaves this file behind and no
-/// [`SNAPSHOT_FILE_NAME`], so the next [`SpillTier::reopen`] sees a missing
-/// snapshot, `"no_snapshot"`, exactly as if [`SpillTier::close`] had never
-/// run.
+/// Name [`write_snapshot_atomic`] writes bytes under before renaming to
+/// [`SNAPSHOT_FILE_NAME`]; a crash in between leaves this file and no real
+/// one, so the next reopen sees `"no_snapshot"`.
 const SNAPSHOT_TMP_FILE_NAME: &str = "snapshot.tmp";
-/// Byte length of every [`SnapshotHeader`], fixed regardless of how many
-/// entries follow it: `checksum`(8) + `magic`(4) + `format_version`(4) +
-/// `region_bytes`(8) + `region_count`(4) + `closed_at_ms`(8) +
-/// `entry_count`(8).
+/// Byte length of every [`SnapshotHeader`]: `checksum`(8) + `magic`(4) +
+/// `format_version`(4) + `region_bytes`(8) + `region_count`(4) +
+/// `closed_at_ms`(8) + `entry_count`(8).
 const SNAPSHOT_HEADER_LEN: usize = 44;
 /// Byte length of one [`SnapshotEntry`]'s fixed portion, before its
 /// variable-length key bytes: `wall_ms`(8) + `logical`(4) + `node`(8) +
@@ -176,9 +144,8 @@ pub struct SpillConfig {
     /// `capacity_bytes`, since `validate` already requires `capacity_bytes`
     /// be at least twice `region_bytes`.
     flush_queue_bytes: Option<u64>,
-    /// See [`SpillConfig::spill_wait_timeout`]. [`SpillTier::open`] reads
-    /// this into the tier's own copy, which [`SpillTier::reserve`] waits
-    /// against.
+    /// See [`SpillConfig::spill_wait_timeout`]; read once by
+    /// [`SpillTier::open`].
     spill_wait_timeout: Duration,
     /// See [`SpillConfig::warm_reopen`].
     warm_reopen: bool,
@@ -230,28 +197,12 @@ impl SpillConfig {
         self
     }
 
-    /// Overrides how long a bulk write or a rebalance/replication/
-    /// anti-entropy chunk apply waits for flush-queue room to free up
-    /// before falling back to today's instant, non-blocking refuse (this
-    /// cache's usual `queue_full`/`deferred` accounting), default two
-    /// seconds. While waiting, the caller is suspended at one `.await`
-    /// point taken before any per-entry work in that call, never mid-batch
-    /// and never under a stripe lock; once the wait resolves, room or
-    /// timeout, the rest of the call proceeds exactly as it does today.
-    /// `Duration::ZERO` is a legal, explicit opt-out: the wait degenerates
-    /// to a single non-blocking check with no suspension, reproducing
-    /// today's instant-refuse behavior exactly.
-    ///
-    /// Set this against `cluster::state_transfer::per_donor_budget`
-    /// (`state_transfer_budget * 2 / 5`, 8 seconds at the 20-second
-    /// `state_transfer_budget` default): a timeout comparable to or larger
-    /// than that budget can turn one merely-slow chunk into a spurious
-    /// rebalance failure, since a whole-cache or bucket-scoped pull spends
-    /// this wait, at most once per chunk, out of that same per-donor
-    /// budget. The two-second default leaves comfortable margin at the
-    /// default ratio; a cluster with a much larger or smaller
-    /// `state_transfer_budget` should scale this accordingly.
-    /// Own-and-return.
+    /// Overrides how long a bulk write or rebalance/replication chunk
+    /// apply waits for flush-queue room before the immediate
+    /// `queue_full`/`deferred` refuse. Default two seconds;
+    /// `Duration::ZERO` disables the wait. Set against
+    /// `cluster::state_transfer::per_donor_budget`: too large a value can
+    /// turn a slow chunk into a spurious rebalance failure.
     #[must_use]
     pub fn spill_wait_timeout(mut self, timeout: Duration) -> Self {
         self.spill_wait_timeout = timeout;
@@ -259,13 +210,8 @@ impl SpillConfig {
     }
 
     /// Whether `SpillTier::open` may replay a clean close's snapshot
-    /// instead of always taking the wipe-and-recreate cold path, default
-    /// `false`: a default tier keeps today's behavior exactly, cold open,
-    /// unchanged close cost. Set this once a directory's region files are
-    /// worth recovering across a restart, such as a node whose spill
-    /// directory survives a process restart. See `SpillTier::reopen`'s doc
-    /// for the snapshot this checks and every way a reopen still falls
-    /// back cold even with this on. Own-and-return.
+    /// instead of the wipe-and-recreate cold path. Default `false`. See
+    /// `SpillTier::reopen`'s docs for when it still falls back cold.
     #[must_use]
     pub fn warm_reopen(mut self, enabled: bool) -> Self {
         self.warm_reopen = enabled;
@@ -292,14 +238,14 @@ impl SpillConfig {
         self.flush_queue_bytes.unwrap_or(self.region_bytes)
     }
 
-    /// The spill-wait timeout currently in effect, default two seconds. See
+    /// This config's spill-wait timeout, default two seconds. See
     /// [`SpillConfig::spill_wait_timeout`].
     #[must_use]
     pub fn spill_wait_timeout_value(&self) -> Duration {
         self.spill_wait_timeout
     }
 
-    /// The `warm_reopen` setting currently in effect, default `false`. See
+    /// This config's `warm_reopen` setting, default `false`. See
     /// [`SpillConfig::warm_reopen`].
     #[must_use]
     pub fn warm_reopen_value(&self) -> bool {
@@ -313,13 +259,9 @@ impl SpillConfig {
     /// twice `region_bytes`, a `flush_queue_bytes` too small to ever hold
     /// even the smallest possible record (header plus a zero-length key and
     /// value), a `flush_queue_bytes` bigger than `capacity_bytes` itself,
-    /// since a flush backlog larger than the whole disk budget bounds
-    /// nothing, and a `spill_wait_timeout` at or above the sanity cap
-    /// `MAX_SPILL_WAIT_TIMEOUT`, since a wait that long is comparable to or
-    /// larger than any reasonable `state_transfer::per_donor_budget` and
-    /// almost certainly a misconfiguration rather than an intended value.
-    /// `Duration::ZERO` is explicitly accepted: an explicit opt-out, not an
-    /// absurd value. The `capacity_bytes` rule prevents a hazard where a
+    /// and a `spill_wait_timeout` at or above the sanity cap
+    /// `MAX_SPILL_WAIT_TIMEOUT` (`Duration::ZERO` remains a valid opt-out).
+    /// The `capacity_bytes` rule prevents a hazard where a
     /// single region would be both the active writer and the only candidate
     /// for FIFO reclaim, so `next_region_index` would immediately reclaim the
     /// region it is currently writing to. With this held, `region_count_for`
@@ -382,14 +324,10 @@ pub(crate) struct SpillJob {
     /// releases exactly this amount when the job resolves, whatever
     /// happened to the entry in the meantime.
     pub(crate) weight: u32,
-    /// Bytes of `Inner::admit` capacity this job currently owns: the exact
-    /// [`spill_record_len`] this job admitted with, whether from a
-    /// caller's own [`Reservation`] or from `admit`'s ordinary
-    /// `try_acquire_many` fallback. `engine::Engine::finish_spill_handoff`'s
-    /// `Err` branch returns exactly this many bytes to `admit`, via
-    /// [`SpillTier::release`], before `abandon` restores the victim's
-    /// weight, so a job that never reaches the flusher's channel does not
-    /// permanently shrink this tier's admission budget.
+    /// Bytes of `Inner::admit` capacity this job owns, acquired from a
+    /// [`Reservation`] or `admit`'s fallback. Released via
+    /// [`SpillTier::release`] if the job never reaches the flusher, so the
+    /// admission budget isn't shrunk permanently.
     pub(crate) admitted_bytes: u32,
 }
 
@@ -423,19 +361,13 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
         weight: u32,
     ) -> bool;
 
-    /// Originates a fresh entry pointing straight at `loc`, with no value
-    /// bytes ever read into RAM: distinct from [`SpillSink::install`],
-    /// which only ever flips an *already-present* entry and explicitly
-    /// never creates one. [`SpillTier::reopen`]'s replay is this method's
-    /// caller, reconstructing an engine's index straight from
-    /// on-disk locations with no re-write to disk and no value bytes ever
-    /// touched. Under the stripe write lock: if `key_bytes` is already
-    /// present, live or tombstoned, leave it untouched and return `false`,
-    /// so this can never resurrect a deleted key or clobber a fresher
-    /// write that landed first; otherwise insert a fresh entry at
-    /// `Payload::Spilled(loc)`, fold its fingerprint into the bucket's
-    /// digest the same incremental way every other insert path does, and
-    /// return `true`.
+    /// Originates a fresh entry pointing at `loc`, with no value bytes read
+    /// into RAM; distinct from [`SpillSink::install`], which only flips an
+    /// already-present entry. Used by [`SpillTier::reopen`]'s replay.
+    /// Under the stripe write lock: leaves an already-present key
+    /// untouched and returns `false` (never resurrects or clobbers);
+    /// otherwise inserts at `Payload::Spilled(loc)`, folds its fingerprint
+    /// into the digest, and returns `true`.
     #[allow(clippy::too_many_arguments)]
     fn install_new(
         &self,
@@ -490,40 +422,23 @@ struct SpillRecordHeader {
     logical: u32,
 }
 
-/// A checkpoint snapshot's fixed header, as parsed back out of the file
-/// [`build_snapshot_bytes`] writes: not a `zerocopy` struct, since the
-/// variable-length entries that follow it on disk make a single fixed-shape
-/// view of the whole file impossible; [`parse_snapshot`] reads every field
-/// by hand at a fixed byte offset instead.
-///
-/// Written once, at a clean [`SpillTier::close`] with
-/// [`SpillConfig::warm_reopen`] on, next to the tier's region files, and
-/// deleted the moment [`SpillTier::reopen`] replays it successfully: unlike
-/// the tier's region files, this never describes more than one incarnation
-/// at a time. Local-only bookkeeping, consistent with this module's
-/// "spilling never changes what goes on the wire" contract. No fsync: a
-/// torn write here, from an unclean shutdown, degrades to `checksum`
-/// failing to verify on the next read, the same "nothing to trust" outcome
-/// a missing file gets, never a wrong snapshot silently accepted; see
-/// [`write_snapshot_atomic`] for how the write itself avoids ever leaving a
-/// half-written file at the real name.
+/// A checkpoint snapshot's fixed header (not `zerocopy`, since entries
+/// after it vary in length), written once at a clean [`SpillTier::close`]
+/// and deleted once [`SpillTier::reopen`] replays it; no fsync, so a torn
+/// write just fails its checksum, like a missing file.
 struct SnapshotHeader {
     region_bytes: u64,
     /// Epoch milliseconds the writing [`SpillTier::close`] ran the
-    /// checkpoint at. [`SpillTier::reopen`] refuses a snapshot whose
-    /// `closed_at_ms` is far enough in the past that no live peer is still
-    /// guaranteed to hold a tombstone that would out-vote a resurrected
-    /// stale record via anti-entropy; see its doc for the exact bound.
+    /// checkpoint at; [`SpillTier::reopen`] refuses one too old to trust
+    /// against the cluster's tombstone TTL (see its docs).
     closed_at_ms: u64,
     format_version: u32,
     region_count: u32,
 }
 
-/// One live entry a checkpoint recorded: enough for
-/// [`SpillSink::install_new`] and nothing more, mirroring
-/// [`SpillTier::reopen`]'s own past region-scan record shape. Tombstones and
-/// expired entries are never written here at all: see
-/// [`SpillTier::write_checkpoint_snapshot`].
+/// One live entry a checkpoint recorded, enough for
+/// [`SpillSink::install_new`]. Tombstones and expired entries are never
+/// written here; see [`SpillTier::write_checkpoint_snapshot`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SnapshotEntry {
     key: Bytes,
@@ -541,24 +456,15 @@ pub(crate) fn region_count_for(capacity_bytes: u64, region_bytes: u64) -> u32 {
     u32::try_from((capacity_bytes / region_bytes.max(1)).max(1)).unwrap_or(u32::MAX)
 }
 
-/// Slot count for [`SpillTier::attach`]'s flush channel: `flush_queue_bytes`
-/// divided by the on-disk header size, clamped to
-/// `[FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX]`. Sizing by the smallest
-/// possible record, header only, key and value both empty, means a config
-/// whose real records are larger only ever gets *more* slots than that
-/// record shape needs, never fewer: `admit`'s byte budget is what actually
-/// bounds the flusher's backlog; this only has to avoid a slot count so
-/// small it drops a burst of small records well under that byte bound. The
-/// [`FLUSH_QUEUE_CAPACITY`] floor keeps every config at least this roomy;
-/// the [`FLUSH_QUEUE_SLOTS_MAX`] ceiling guards a pathological config, a
-/// huge `flush_queue_bytes` paired with tiny typical records, from
-/// allocating an oversized channel buffer. Pure; unit tested directly.
+/// Slot count for [`SpillTier::attach`]'s flush channel:
+/// `flush_queue_bytes` divided by the header size, clamped to
+/// `[FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX]`, so larger records get
+/// more slots than a fixed count would. Pure; unit tested directly.
 pub(crate) fn flush_queue_slots(flush_queue_bytes: u64) -> usize {
     let slots = (flush_queue_bytes / HEADER_LEN as u64)
         .clamp(FLUSH_QUEUE_CAPACITY as u64, FLUSH_QUEUE_SLOTS_MAX as u64);
-    // The clamp above bounds this well within `usize` on every real
-    // platform; the fallback keeps the conversion total rather than
-    // panicking.
+    // Bounded well within `usize` by the clamp; the fallback keeps this
+    // total instead of panicking.
     usize::try_from(slots).unwrap_or(FLUSH_QUEUE_SLOTS_MAX)
 }
 
@@ -580,12 +486,8 @@ pub(crate) fn record_too_large(record_len: u64, region_bytes: u64) -> bool {
 }
 
 /// Whether a `record_len`-byte record fits in a `flush_queue_bytes`-byte
-/// budget already holding `queued_bytes`. Test-only: pins the
-/// exact-boundary and pathological-overflow arithmetic that
-/// `Inner::admit`'s `try_acquire_many` performs internally for
-/// [`SpillTier::would_accept`]'s own byte check. Checked arithmetic: a
-/// pathological `record_len` never wraps into a false "yes". Pure; unit
-/// tested directly.
+/// budget already holding `queued_bytes`. Test-only: pins the boundary and
+/// overflow arithmetic `Inner::admit` performs internally. Pure.
 #[cfg(test)]
 pub(crate) fn record_fits_queue(
     queued_bytes: u64,
@@ -598,14 +500,10 @@ pub(crate) fn record_fits_queue(
 }
 
 /// Total on-disk length of a `key_len`+`value_len`-byte record: header
-/// plus key plus value, as a `u32`. [`SpillTier::would_accept`]'s own
-/// admission check and `engine::Engine::try_spill_victim`'s
-/// `SpillJob::admitted_bytes` bookkeeping both call this, so they always
-/// agree on the exact byte count a successful admission takes from
-/// `Inner::admit`. Saturates to `u32::MAX` on overflow rather than
-/// wrapping; unreachable once `would_accept`'s own `record_too_large`
-/// check has passed, since that already bounds `key_len + value_len` well
-/// under `u32::MAX`. Pure; unit tested directly.
+/// plus key plus value, as a `u32`. Called by both `would_accept`'s
+/// admission check and `try_spill_victim`'s bookkeeping so they agree on
+/// the exact byte count. Saturates to `u32::MAX` on overflow. Pure; unit
+/// tested directly.
 pub(crate) fn spill_record_len(key_len: usize, value_len: usize) -> u32 {
     let total = (HEADER_LEN as u64)
         .saturating_add(key_len as u64)
@@ -705,45 +603,26 @@ struct Inner {
     /// through to the caller's unconditional-delete fallback.
     closed: AtomicBool,
     cache_name: String,
-    /// This tier's own directory, `cfg.dir.join(cache_name)`: where a
-    /// checkpoint snapshot lives, when one exists. Kept past `open()` so
-    /// [`SpillTier::close`] can write it with no `SpillConfig` still in
-    /// hand.
+    /// This tier's own directory, `cfg.dir.join(cache_name)`, kept past
+    /// `open()` so [`SpillTier::close`] can write a checkpoint snapshot
+    /// with no `SpillConfig` in hand.
     dir: PathBuf,
-    /// [`SpillConfig::warm_reopen_value`], validated. Read back by
-    /// [`SpillTier::warm_reopen_value`] to decide, at close time, whether
-    /// [`Shard::close_spill_checkpointed`](crate::store::Shard::close_spill_checkpointed) pays a
-    /// checkpoint's cost at all: `false` keeps close exactly as cheap as
-    /// it is today, no checkpoint, no snapshot.
+    /// [`SpillConfig::warm_reopen_value`], validated, read by
+    /// [`SpillTier::warm_reopen_value`] at close time.
     warm_reopen: bool,
-    /// `SpillConfig::flush_queue_bytes_value()`, validated. `admit`'s total
-    /// permit count already encodes this as a byte budget; this copy is
-    /// read back by [`SpillTier::attach`] to size the flush channel's slot
-    /// count and by [`SpillTier::queued_bytes`] (test-facing) to recompute
-    /// its value from `admit`'s available permits.
+    /// `SpillConfig::flush_queue_bytes_value()`, validated: the byte
+    /// budget `admit`'s permits encode, read back by [`SpillTier::attach`]
+    /// and [`SpillTier::queued_bytes`].
     flush_queue_bytes: u64,
-    /// `SpillConfig::spill_wait_timeout_value()`, validated. Read back by
-    /// [`SpillTier::spill_wait_timeout_value`], the accessor
-    /// `Shard::apply_grouped`/`ShardOps::apply_remote_batch` consult for how
-    /// long their one [`SpillTier::reserve`] call should wait before
-    /// falling through to the ordinary non-blocking admission path: the
-    /// `SpillConfig` itself is not retained past [`SpillTier::open`], so
-    /// this is the only copy of the configured timeout still reachable
-    /// once a tier is open.
+    /// `SpillConfig::spill_wait_timeout_value()`, validated: consulted by
+    /// [`SpillTier::reserve`] callers deciding how long to wait before
+    /// non-blocking admission.
     spill_wait_timeout: Duration,
-    /// One permit per byte of `flush_queue_bytes_value()`, total. A byte's
-    /// worth of permits is acquired, then immediately `.forget()`-ed, for
-    /// every record [`SpillTier::would_accept`] admits, converting the
-    /// guard into a plain count the caller owns from that point on; permits
-    /// return only through an explicit `add_permits` call, from [`flusher_loop`] the
-    /// instant the flusher takes a job back off the channel, whether or not
-    /// it has been written yet. Bounds the flusher's RAM backlog
-    /// independently of [`FLUSH_QUEUE_CAPACITY`]'s slot count: a job holds
-    /// two refcounted [`Bytes`] handles regardless of how large the value
-    /// behind them is, so a slot-count-only bound does nothing to cap the
-    /// bytes a lagging flusher lets pile up. [`SpillTier::queued_bytes`]
-    /// (test-facing) recomputes the byte total this replaces, from
-    /// `flush_queue_bytes - admit.available_permits()`.
+    /// One permit per byte of `flush_queue_bytes_value()`, acquired and
+    /// `.forget()`-ed on admission, returned via `add_permits` from
+    /// [`flusher_loop`] once a job leaves the channel. Bounds the
+    /// flusher's RAM backlog independently of [`FLUSH_QUEUE_CAPACITY`]'s
+    /// slot count.
     admit: Semaphore,
     /// Set by [`SpillTier::set_keep_resident_when_refused`], `false` until
     /// then. `true` means a refused hand-off ([`SpillTier::would_accept`]
@@ -758,16 +637,12 @@ struct Inner {
     /// `flush_queue_bytes`, for as long as it needs to.
     #[cfg(test)]
     flusher_paused: AtomicBool,
-    /// Lifetime count of jobs [`flusher_loop`] has pulled off its channel,
-    /// across every batch, incremented the instant each batch is drained
-    /// regardless of whether its jobs go on to install or get abandoned.
-    /// [`SpillTier::checkpoint_flush`] diffs this around its own join with
-    /// the flusher thread to report how many jobs that final drain
-    /// processed.
+    /// Lifetime count of jobs [`flusher_loop`] pulled off its channel.
+    /// [`SpillTier::checkpoint_flush`] diffs this around its join to
+    /// report this drain's count.
     flusher_jobs_drained: AtomicU64,
     /// Lifetime count of jobs [`write_segment`] abandoned rather than
-    /// installed: every job in a segment whose on-disk write itself failed
-    /// (`reason = "disk_error"`). Diffed the same way as
+    /// installed (`reason = "disk_error"`). Diffed the same way as
     /// `flusher_jobs_drained`.
     flusher_jobs_abandoned: AtomicU64,
 }
@@ -784,12 +659,9 @@ impl Inner {
     /// recorded under this reason instead because
     /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
     /// policy (see [`refusal_drop_reason`]); or `"disk_error"`, every job
-    /// in a segment whose [`write_segment`] write failed. The victim
-    /// stays `Resident` at its original weight either way, since
-    /// [`SpillSink::abandon`] restores it regardless of the reason this is
-    /// recorded under, so nothing is actually dropped; this reason exists
-    /// so a persistently failing disk becomes visible here instead of
-    /// only in a warning log line.
+    /// in a segment whose write failed, though `abandon` still restores
+    /// the victim, making a failing disk visible here, not just in a log
+    /// line.
     fn record_dropped(&self, reason: &'static str) {
         metrics::counter!(
             "sundog_spill_dropped_total",
@@ -821,42 +693,31 @@ impl Inner {
     }
 
     /// Increments `sundog_spill_wait_seconds_total{cache}` by `elapsed`'s
-    /// whole seconds, the wall-clock time one completed
-    /// [`SpillTier::reserve`] call spent waiting, success or timeout alike.
-    /// `metrics::Counter` only ever accumulates a `u64`, so this truncates
-    /// sub-second waits to zero rather than rounding them away silently as
-    /// a fraction a `Counter` has no way to hold; a tier under real,
-    /// sustained backpressure accumulates whole seconds of this across
-    /// many calls regardless.
+    /// whole seconds. `metrics::Counter` only holds a `u64`, so sub-second
+    /// waits truncate to zero.
     fn record_wait_seconds(&self, elapsed: Duration) {
         metrics::counter!("sundog_spill_wait_seconds_total", "cache" => self.cache_name.clone())
             .increment(elapsed.as_secs());
     }
 
-    /// Increments `sundog_spill_waiters{cache}` and returns a guard that
-    /// decrements it again on drop. Held across the one `.await` inside
-    /// [`SpillTier::reserve`], so every exit path out of that call,
-    /// success, timeout, or the future itself dropped before either
-    /// resolves, decrements the gauge exactly once, and a cancelled wait
-    /// can never leave it stuck high.
+    /// Increments `sundog_spill_waiters{cache}` and returns a guard
+    /// decrementing it on drop, held across [`SpillTier::reserve`]'s one
+    /// `.await` so every exit path decrements it once.
     fn record_waiter_delta(&self) -> WaiterGuard<'_> {
         metrics::gauge!("sundog_spill_waiters", "cache" => self.cache_name.clone()).increment(1.0);
         WaiterGuard { inner: self }
     }
 
-    /// Increments `sundog_spill_wait_timeouts_total{cache}`. Called only
-    /// when [`SpillTier::reserve`]'s own `tokio::time::timeout` elapses, so
-    /// an operator can distinguish "waited and got room" from "gave up and
-    /// fell through to the non-blocking fallback."
+    /// Increments `sundog_spill_wait_timeouts_total{cache}`, called only
+    /// when [`SpillTier::reserve`]'s timeout elapses.
     fn record_wait_timeout(&self) {
         metrics::counter!("sundog_spill_wait_timeouts_total", "cache" => self.cache_name.clone())
             .increment(1);
     }
 }
 
-/// RAII guard returned by [`Inner::record_waiter_delta`]: decrements
-/// `sundog_spill_waiters{cache}` the instant it drops, on every exit path
-/// out of the [`SpillTier::reserve`] call it guards.
+/// RAII guard from [`Inner::record_waiter_delta`]: decrements
+/// `sundog_spill_waiters{cache}` on drop.
 struct WaiterGuard<'a> {
     inner: &'a Inner,
 }
@@ -877,12 +738,9 @@ fn bytes_used_f64(bytes: u64) -> f64 {
     bytes as f64
 }
 
-/// [`SpillTier::checkpoint_flush`]'s result: the records it wrote for the
-/// caller's resident entries, alongside how many jobs its own flush-queue
-/// drain (joining the real flusher thread) processed and how many of those
-/// it abandoned rather than installed. `Default` covers a panicked
-/// `spawn_blocking` task the same way an empty `written` already did before
-/// this carried the drain counts too.
+/// [`SpillTier::checkpoint_flush`]'s result: written records plus how many
+/// flush-queue jobs were drained and abandoned. `Default` covers a
+/// panicked `spawn_blocking` task.
 #[derive(Default)]
 pub(crate) struct CheckpointFlushOutcome {
     pub(crate) written: Vec<(Bytes, Hlc, Option<u64>, SpillLoc)>,
@@ -899,67 +757,50 @@ pub(crate) struct SpillTier {
     inner: Arc<Inner>,
     sender: Mutex<Option<SyncSender<SpillJob>>>,
     /// The real flusher thread's join handle, set by [`SpillTier::attach`].
-    /// [`SpillTier::checkpoint_flush`] joins it to guarantee every job
-    /// already queued before a checkpoint has actually landed on disk
-    /// before the checkpoint writes anything else into the same regions;
-    /// ordinary [`SpillTier::close`] never joins it, matching this
-    /// module's documented "never joins the flusher thread" contract for
-    /// the common, non-checkpointed close.
+    /// [`SpillTier::checkpoint_flush`] joins it so every already-queued job
+    /// lands before the checkpoint writes; ordinary [`SpillTier::close`]
+    /// never joins it.
     flusher_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
-/// [`SpillTier::reserve`] gave up waiting for flush-queue room before its
-/// timeout elapsed. The caller's documented fallback is the tier's
-/// ordinary non-blocking [`SpillTier::would_accept`] path with no
-/// reservation, exactly today's instant-refuse behavior: `SpillConfig`'s
-/// own `spill_wait_timeout` doc spells out what a caller does with this.
+/// [`SpillTier::reserve`] gave up waiting before its timeout elapsed. The
+/// caller falls back to the ordinary non-blocking [`SpillTier::would_accept`]
+/// path; see `SpillConfig::spill_wait_timeout`'s docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SpillWaitTimedOut;
 
-/// [`SpillTier::would_accept`]'s outcome: not a plain `bool`, because a
-/// caller holding a `Reservation` needs to tell "refused, and this call
-/// already recorded why" apart from "refused only because right now, at
-/// this instant, neither this reservation's own budget nor `admit`'s
-/// global headroom covers it: try again, or fall back yourself." See
-/// [`SpillTier::would_accept`]'s doc for exactly which refusal is which.
+/// [`SpillTier::would_accept`]'s outcome: not a plain `bool`, since a
+/// caller holding a `Reservation` must tell a recorded refusal apart from
+/// a transient one it may retry. See [`SpillTier::would_accept`]'s docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admission {
-    /// Room found; already committed (spent from the reservation, or
-    /// acquired and `.forget()`-ed from `admit`).
+    /// Room found; already committed (from the reservation, or acquired
+    /// and `.forget()`-ed from `admit`).
     Accepted,
     /// Refused, `sundog_spill_dropped_total` already incremented under the
-    /// applicable reason. Nothing about retrying changes this outcome.
+    /// applicable reason.
     RefusedFinal,
-    /// Refused only because a `Reservation` was in play and, right now,
-    /// neither its own remaining budget nor `admit`'s global headroom
-    /// covers this record. No drop recorded; the caller decides whether to
-    /// retry or fall back.
+    /// Refused only because a `Reservation`'s remaining budget and
+    /// `admit`'s headroom don't cover this record right now. No drop
+    /// recorded; the caller may retry or fall back.
     RefusedPending,
 }
 
-/// The pre-lock flush-queue budget one `Shard::apply_grouped`/
-/// `ShardOps::apply_remote_batch` call carries into
-/// `engine::Engine::apply_many_with_reservation` before it ever takes a
-/// stripe lock. Built once per call by [`SpillTier::reserve`], then
-/// threaded by `&mut` reference through every bucket that call's eviction
-/// touches: [`Reservation::spend`] never awaits and is the only way its
-/// budget is drawn down, so it is always safe to hold across a stripe
-/// write lock. Whatever is never spent by the time this is dropped
-/// returns to the semaphore immediately, via `Drop`, at no cost to a
-/// caller whose batch never triggers an eviction at all.
+/// Pre-lock flush-queue budget an apply call carries into
+/// `apply_many_with_reservation`, threaded by `&mut` through every bucket
+/// its eviction touches. [`Reservation::spend`] never awaits, so it's
+/// safe to hold across a stripe write lock; unspent budget returns to the
+/// semaphore on drop.
 pub(crate) struct Reservation<'a> {
     admit: &'a Semaphore,
     remaining: u32,
 }
 
 impl Reservation<'_> {
-    /// Spends up to `bytes` of this reservation's own pre-paid budget,
-    /// never touching the semaphore itself. `true`, with `remaining`
-    /// decremented by `bytes`, when the budget covers it: the caller's
-    /// admission is then structurally guaranteed, no semaphore call at
-    /// all. `false` and untouched otherwise, leaving the caller to fall
-    /// back to the tier's ordinary non-blocking `admit.try_acquire_many`
-    /// check. Never awaits.
+    /// Spends up to `bytes` from this reservation's pre-paid budget
+    /// without touching the semaphore. Returns `true` with `remaining`
+    /// decremented if covered; `false` and untouched otherwise, leaving
+    /// the caller to fall back to `admit.try_acquire_many`. Never awaits.
     pub(crate) fn spend(&mut self, bytes: u32) -> bool {
         if self.remaining >= bytes {
             self.remaining -= bytes;
@@ -971,10 +812,8 @@ impl Reservation<'_> {
 }
 
 impl Drop for Reservation<'_> {
-    /// Returns whatever part of this reservation's budget was never spent
-    /// back to `admit` the instant it goes out of scope: a batch that
-    /// triggers no eviction reserves and gives the room right back with no
-    /// eviction ever running, overhead-free in the common case.
+    /// Returns any unspent budget to `admit`, overhead-free when a batch
+    /// triggers no eviction.
     fn drop(&mut self) {
         self.admit.add_permits(self.remaining as usize);
     }
@@ -992,7 +831,9 @@ impl SpillTier {
     /// from a previous incarnation's region files.
     ///
     /// Does not start the flusher thread. Call [`SpillTier::attach`] once
-    /// the engine implementing [`SpillSink`] exists.
+    /// the engine implementing [`SpillSink`] exists. `Shard::attach_spill`
+    /// goes through [`SpillTier::reopen`] instead, whose cold-fallback
+    /// calls `open_impl` directly, so nothing else still calls this.
     ///
     /// Under `feature = "sim"`, this still does real filesystem I/O and
     /// runs the flusher on a real OS thread: `sim` swaps only `net::tcp`'s
@@ -1005,13 +846,6 @@ impl SpillTier {
     /// Returns an error if `cfg` fails [`SpillConfig::validate`], the
     /// directory cannot be created or listed, a stale `*.reg` file cannot be
     /// removed, or a region file cannot be created or preallocated.
-    ///
-    /// `Shard::attach_spill` always goes through [`SpillTier::reopen`]
-    /// instead, whose own cold-fallback path calls `open_impl` directly:
-    /// this wrapper's only callers left in a non-test build would be
-    /// nothing, so it stays test-only in practice, still exercised
-    /// directly by every test in this module that wants an ordinary cold
-    /// tier with no manifest history to consider.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open(cfg: &SpillConfig, cache_name: &str) -> io::Result<Self> {
         Self::open_impl(cfg, cache_name, &[])
@@ -1083,10 +917,9 @@ impl SpillTier {
         }
 
         let flush_queue_bytes = cfg.flush_queue_bytes_value();
-        // `validate` above already bounds `flush_queue_bytes` well under any
-        // real disk budget; the fallback keeps this conversion total rather
-        // than panicking on a config this module did not itself validate,
-        // such as a direct, non-`validate`d test caller.
+        // `validate` bounds this well under any real disk budget; the
+        // fallback keeps it total rather than panicking on an unvalidated
+        // config.
         let admit_permits = usize::try_from(flush_queue_bytes).unwrap_or(usize::MAX);
         let inner = Arc::new(Inner {
             regions: regions.into_boxed_slice(),
@@ -1123,15 +956,10 @@ impl SpillTier {
     /// A second call replaces the channel: any job still buffered on the old
     /// one is dropped along with the old sender, since the old flusher
     /// thread's receiver is dropped too. Callers attach once, right after
-    /// constructing the engine that implements [`SpillSink`].
-    ///
-    /// The channel's slot count is `flush_queue_bytes_value() /
-    /// HEADER_LEN`, clamped to `[FLUSH_QUEUE_CAPACITY, FLUSH_QUEUE_SLOTS_MAX]`:
-    /// a byte budget alone bounds the flusher's backlog, via `admit`, but a
-    /// slot count fixed independently of it fills long before the byte
-    /// budget does for a config whose typical records are small, dropping
-    /// bursts with `reason = "queue_full"` well under the byte bound the
-    /// operator actually configured.
+    /// constructing the engine that implements [`SpillSink`]. The
+    /// channel's slot count is [`flush_queue_slots`], so a config with
+    /// small typical records gets a slot count sized to its byte budget
+    /// instead of always [`FLUSH_QUEUE_CAPACITY`].
     pub(crate) fn attach(&self, sink: Weak<dyn SpillSink>) {
         let (tx, rx) = mpsc::sync_channel(flush_queue_slots(self.inner.flush_queue_bytes));
         let inner = Arc::clone(&self.inner);
@@ -1209,55 +1037,19 @@ impl SpillTier {
     }
 
     /// Whether a record built from `key_len` and `value_len` bytes could be
-    /// queued right now, judged purely from this tier's own state: not
-    /// closed, small enough to ever fit a region, and small enough that
-    /// admitting it would not push the flusher's byte backlog past
-    /// `flush_queue_bytes`. `reservation`, when given, is spent first via
-    /// [`Reservation::spend`]: a caller holding enough pre-paid budget is
-    /// structurally guaranteed admission, no semaphore call at all: see the
-    /// module docs' `1.2`/`1.3`. Otherwise, or once the reservation's own
-    /// budget is exhausted, this falls back to `admit.try_acquire_many`
-    /// exactly as it always has. A successful fallback admission
-    /// immediately `.forget()`s the acquired permits, converting them from
-    /// a semaphore-tracked guard into a plain byte count the caller owns
-    /// from that point on; [`flusher_loop`] returns that count to `admit`
-    /// once the job is pulled off the channel. Never awaits and never
-    /// touches the flusher's channel, so, unlike [`SpillTier::enqueue`],
-    /// this is cheap enough to call while holding a stripe write lock; the
-    /// same holds for `reservation.spend`, which never awaits either.
-    ///
-    /// [`Admission::RefusedFinal`] increments `sundog_spill_dropped_total`
-    /// with `reason = "too_large"`, `reason = "closed"`, or `reason =
-    /// "queue_full"` for the byte bound, whichever applies, or `reason =
-    /// "deferred"` in place of any of those three once
-    /// [`SpillTier::set_keep_resident_when_refused`] set this tier's
-    /// policy, since the caller then leaves the victim resident instead of
-    /// deleting it; see [`refusal_drop_reason`]. This is the outcome for
-    /// every refusal when `reservation` is `None` (the sync
-    /// `insert_sync`/`remove_sync`/`Shard::apply` chain's unconditional
-    /// fallback, with no `Reservation` in the picture at all), and for a
-    /// `closed`/`too_large` refusal regardless of `reservation`, since a
-    /// caller retrying either of those gains nothing.
-    ///
-    /// [`Admission::RefusedPending`] is the one outcome only a `reservation`
-    /// argument makes reachable: a `reservation` was in play (`Some`, from
-    /// `Shard::apply_grouped`/`ShardOps::apply_remote_batch`) and both its
-    /// own budget and `admit`'s global headroom are exhausted right now.
-    /// No drop is recorded here: the caller is responsible for either
-    /// retrying with a fresh reservation covering more bytes
-    /// (`Shard::retry_reservation_deficit`) or, once its own wait budget
-    /// runs out, leaving the victim resident for a later pass to resolve
-    /// through the ordinary `reservation: None` path, which does record a
-    /// drop. This is what closes the gap a reservation sized only from one
-    /// call's own new bytes leaves against a lagging flusher's real
-    /// backlog: see the module docs' `1.1`/`7`.
-    ///
-    /// The byte-bound fallback check races the same way the
-    /// channel-capacity one already does: a burst of callers that all
-    /// acquire under their own stripe lock can, together, still push the
-    /// tier somewhat past `flush_queue_bytes` before a racing caller's own
-    /// acquire fails; that slack is bounded by how many stripes race the
-    /// check at once, not by the size of the flush backlog itself.
+    /// admitted right now: not closed, small enough for a region, and
+    /// within `flush_queue_bytes`. `reservation`, when given, is spent
+    /// first via [`Reservation::spend`]; otherwise this falls back to
+    /// `admit.try_acquire_many`. Never awaits, so, unlike
+    /// [`SpillTier::enqueue`], this is cheap enough to call under a stripe
+    /// write lock. [`Admission::RefusedFinal`] records a drop under
+    /// `sundog_spill_dropped_total` (`"too_large"`, `"closed"`,
+    /// `"queue_full"`, or `"deferred"` once
+    /// [`SpillTier::set_keep_resident_when_refused`] is set) -- always for
+    /// `closed`/`too_large`, and for `queue_full` when `reservation` is
+    /// `None`. [`Admission::RefusedPending`] is reachable only with an
+    /// insufficient `reservation` and a drained `admit`; no drop is
+    /// recorded, and the caller retries or falls back later.
     pub(crate) fn would_accept(
         &self,
         reservation: Option<&mut Reservation<'_>>,
@@ -1291,40 +1083,27 @@ impl SpillTier {
         }
     }
 
-    /// This tier's configured [`SpillConfig::spill_wait_timeout`], the wait
-    /// bound `Shard::apply_grouped`/`ShardOps::apply_remote_batch` pass to
-    /// their one [`SpillTier::reserve`] call per batch. Exposed here
-    /// because the `SpillConfig` itself is not retained past
-    /// [`SpillTier::open`].
+    /// This tier's configured [`SpillConfig::spill_wait_timeout`], exposed
+    /// here since `SpillConfig` isn't retained past [`SpillTier::open`].
     pub(crate) fn spill_wait_timeout_value(&self) -> Duration {
         self.inner.spill_wait_timeout
     }
 
     /// Waits, at most `timeout`, for `bytes` of flush-queue admission to
-    /// become free, then commits them to the returned [`Reservation`]
-    /// immediately: the acquired permits are `.forget()`-ed the moment they
-    /// arrive, so they stop counting as available even though nothing has
-    /// been queued yet. `bytes` is clamped to at most this tier's total
-    /// permit count, `flush_queue_bytes_value()`, before the acquire call:
-    /// a caller asking for more than the tier could ever hold would
-    /// otherwise await forever even with the queue fully empty.
-    ///
-    /// Called once per `Shard::apply_grouped`/`ShardOps::apply_remote_batch`
-    /// call, strictly before any stripe lock that call takes, never inside
-    /// the per-bucket loop that follows; see the module docs' `1.5`.
-    /// `Duration::ZERO` degenerates to a single non-blocking check with no
-    /// suspension: the underlying acquire resolves on its first poll
-    /// whenever enough permits are already free, so the timeout only ever
-    /// elapses when they are not, reproducing today's instant-refuse
-    /// behavior exactly.
+    /// become free, then commits them to the returned [`Reservation`]: the
+    /// acquired permits are `.forget()`-ed on arrival, so they stop
+    /// counting as available before anything is queued. `bytes` is clamped
+    /// to this tier's total permit count so a request larger than the tier
+    /// could ever hold does not await forever. Called once per apply-batch
+    /// call, strictly before any stripe lock.
+    /// `Duration::ZERO` degenerates to a single non-blocking check,
+    /// reproducing today's instant-refuse behavior.
     ///
     /// # Errors
     ///
     /// Returns [`SpillWaitTimedOut`] once `timeout` elapses with the
-    /// requested bytes still unavailable. The caller's documented fallback
-    /// is `reservation: None` for the rest of that call, taking the
-    /// ordinary non-blocking [`SpillTier::would_accept`] path exactly as
-    /// today.
+    /// requested bytes still unavailable; the caller falls back to
+    /// `reservation: None` for the rest of that call.
     pub(crate) async fn reserve(
         &self,
         bytes: u32,
@@ -1333,16 +1112,10 @@ impl SpillTier {
         let total_permits = u32::try_from(self.inner.flush_queue_bytes).unwrap_or(u32::MAX);
         let clamped = bytes.min(total_permits);
         let started = Instant::now();
-        // `sundog_spill_waiters` covers every exit from this `.await`,
-        // including this future being dropped before it resolves, since
-        // `_waiter`'s `Drop` runs regardless of how the `.await` below
-        // ends.
+        // Covers every exit, including a dropped future, since
+        // `_waiter`'s Drop always runs.
         let _waiter = self.inner.record_waiter_delta();
-        // `acquire_many`, not the owned variant: `Inner::admit` is a plain
-        // `Semaphore`, not an `Arc<Semaphore>`, and the permit this returns
-        // is `.forget()`-ed the instant it arrives, exactly like
-        // `would_accept`'s own `try_acquire_many` call, so nothing here
-        // ever needs to outlive this call by holding an owned handle.
+        // Not the owned variant: nothing here needs to outlive this call.
         let outcome = tokio::time::timeout(timeout, self.inner.admit.acquire_many(clamped)).await;
         self.inner.record_wait_seconds(started.elapsed());
         match outcome {
@@ -1353,12 +1126,9 @@ impl SpillTier {
                     remaining: clamped,
                 })
             }
-            // `self.inner.admit` is never `close()`-d anywhere in this
-            // tier's lifetime, so this arm is unreachable in practice;
-            // treated the same as a timeout rather than assumed away,
-            // since the caller's fallback is identical either way. Not
-            // counted under `sundog_spill_wait_timeouts_total`, which
-            // tracks a genuinely elapsed `timeout` specifically.
+            // Unreachable, since `admit` is never closed; treated as a
+            // timeout since the fallback is identical, but not counted
+            // under `sundog_spill_wait_timeouts_total`.
             Ok(Err(_)) => Err(SpillWaitTimedOut),
             Err(_) => {
                 self.inner.record_wait_timeout();
@@ -1368,10 +1138,9 @@ impl SpillTier {
     }
 
     /// Returns `bytes` of admitted-but-never-queued capacity to `admit`.
-    /// Called by `engine::Engine::finish_spill_handoff`'s `Err` branch,
-    /// with `job.admitted_bytes`, before `abandon` restores the victim's
-    /// weight: a job that never reaches the flusher's channel must not
-    /// permanently shrink this tier's admission budget.
+    /// Called by `finish_spill_handoff`'s `Err` branch before `abandon`
+    /// restores the victim's weight, so an unqueued job doesn't
+    /// permanently shrink the admission budget.
     pub(crate) fn release(&self, bytes: u32) {
         self.inner.admit.add_permits(bytes as usize);
     }
@@ -1387,10 +1156,9 @@ impl SpillTier {
     /// policy. Never touches disk, but does take the channel's own lock,
     /// so, unlike [`SpillTier::would_accept`], this is not meant to run
     /// while holding a stripe write lock. The permits `would_accept`
-    /// admitted for `job` are already the caller's to account for; this
-    /// call touches no counter of its own on success, since only
-    /// [`flusher_loop`] returns them, via `admit.add_permits`, once the job
-    /// is pulled off the channel.
+    /// admitted for `job` are already the caller's; this call touches no
+    /// counter of its own, since only [`flusher_loop`] returns them via
+    /// `admit.add_permits` once the job is pulled off the channel.
     pub(crate) fn enqueue(&self, job: SpillJob) -> Result<(), Box<SpillJob>> {
         let sent = {
             let sender = self.sender.lock();
@@ -1410,10 +1178,8 @@ impl SpillTier {
     }
 
     /// Bytes currently sitting in the flusher's channel, queued but not yet
-    /// taken off it: recomputed from `admit`'s available permits, the sole
-    /// place admission is tracked. Byte-for-byte identical to what a
-    /// dedicated `queued_bytes` counter would read at any point in this
-    /// tier's lifecycle. Test-facing.
+    /// taken off it: recomputed from `admit`'s available permits.
+    /// Test-facing.
     #[cfg(all(test, not(feature = "sim")))]
     pub(crate) fn queued_bytes(&self) -> u64 {
         let available = u64::try_from(self.inner.admit.available_permits()).unwrap_or(u64::MAX);
@@ -1482,53 +1248,31 @@ impl SpillTier {
     /// `recv()` loop drains whatever is already queued and then exits on its
     /// own. Never joins the flusher thread: this must be safe to call from
     /// an async context without blocking it. Region file handles close via
-    /// `Drop` once every clone of the shared inner state is gone.
-    ///
-    /// This alone never checkpoints: [`SpillConfig::warm_reopen`] being on
-    /// is what makes `Shard::close_spill_checkpointed` pay a checkpoint's cost first,
-    /// via [`SpillTier::checkpoint_flush`] and
-    /// [`SpillTier::write_checkpoint_snapshot`], before this runs. A tier
-    /// with `warm_reopen` off closes exactly this cheaply regardless, same
-    /// as every tier does today.
+    /// `Drop` once every clone of the shared inner state is gone. This
+    /// alone never checkpoints; `warm_reopen` on is what makes
+    /// `Shard::close_spill_checkpointed` pay that cost first, via
+    /// [`SpillTier::checkpoint_flush`] and
+    /// [`SpillTier::write_checkpoint_snapshot`].
     pub(crate) fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         *self.sender.lock() = None;
     }
 
-    /// Whether [`SpillConfig::warm_reopen`] is on for this tier. Read by
-    /// `Shard::close_spill_checkpointed` to decide whether closing pays a checkpoint's
-    /// cost at all.
+    /// Whether [`SpillConfig::warm_reopen`] is on for this tier.
     pub(crate) fn warm_reopen_value(&self) -> bool {
         self.inner.warm_reopen
     }
 
-    /// The checkpoint half of a warm-reopen-enabled close: first blocks
-    /// until the real flusher thread [`SpillTier::attach`] started has
-    /// drained every job already queued before this call and exited (this
-    /// is the one place this module ever joins that thread, safe only
-    /// because the caller is expected to run this inside a blocking
-    /// context, such as `tokio::task::spawn_blocking`, never inline on an
-    /// async task), then writes `entries`, every currently-resident live
-    /// record the caller gathered, into the region ring through the same
-    /// on-disk framing and rotation/reclaim machinery [`flush_batch`] uses.
-    ///
-    /// Unlike an ordinary eviction hand-off, none of `entries`' engine-side
-    /// weight was ever zeroed for a pending spill, so this never calls
-    /// [`SpillSink::install`]: that gate requires exactly that
-    /// precondition, and none of these records went through it. The
-    /// process closing this tier has no further use for the engine's own
-    /// in-RAM `Payload` regardless; only the resulting on-disk
-    /// [`SpillLoc`] this returns matters, which the caller folds into the
-    /// checkpoint's snapshot listing alongside every entry already
-    /// `Spilled` before this call (`Engine::snapshot_spilled`, read again
-    /// by the caller only after this returns, so a key
-    /// [`rotate`]/`sink.reclaim` purges to make room for these writes is
-    /// correctly absent from that second read).
-    ///
-    /// Also reports the flush-queue drain this pays for: `jobs_drained` and
-    /// `jobs_abandoned` are diffs of [`Inner`]'s own lifetime counters taken
-    /// around the join, so they count only the jobs *this* call's drain
-    /// processed, not the tier's whole life.
+    /// The checkpoint half of a warm-reopen-enabled close: blocks until the
+    /// flusher thread [`SpillTier::attach`] started drains its queue and
+    /// exits (the only place this module joins that thread; run this in a
+    /// blocking context), then writes `entries`, the caller's
+    /// currently-resident records, into the region ring via
+    /// [`flush_batch`]'s framing, without calling [`SpillSink::install`]
+    /// since none of their weight was zeroed for a pending spill; only the
+    /// resulting [`SpillLoc`] matters. Also reports `jobs_drained` and
+    /// `jobs_abandoned` as diffs of [`Inner`]'s lifetime counters taken
+    /// around the join.
     pub(crate) fn checkpoint_flush(
         &self,
         sink: &dyn SpillSink,
@@ -1563,11 +1307,9 @@ impl SpillTier {
     }
 
     /// Serializes `entries`, every live spilled pointer the caller's
-    /// checkpoint gathered (already-spilled and freshly
-    /// [`SpillTier::checkpoint_flush`]-written alike), into this
-    /// directory's checkpoint snapshot file, atomically: see
-    /// [`write_snapshot_atomic`]. Called once, right before
-    /// [`SpillTier::close`], only when [`SpillConfig::warm_reopen`] is on.
+    /// checkpoint gathered, into this directory's checkpoint snapshot file
+    /// atomically (see [`write_snapshot_atomic`]). Called once, right
+    /// before [`SpillTier::close`], only when `warm_reopen` is on.
     pub(crate) fn write_checkpoint_snapshot(
         &self,
         entries: &[(Bytes, Hlc, Option<u64>, SpillLoc)],
@@ -1588,65 +1330,32 @@ impl SpillTier {
     }
 
     /// Opens the tier at `cfg.dir.join(cache_name)`, preferring to replay a
-    /// clean close's checkpoint snapshot over [`SpillTier::open`]'s
-    /// wipe-and-recreate path. Never fails outright over a warm reopen not
-    /// panning out: every ineligibility or corruption case degrades to the
-    /// same cold [`SpillTier::open_impl`] this tier would have taken
-    /// anyway, so the only way this returns `Err` is the same way
-    /// `SpillTier::open` can, a genuine I/O failure even the cold fallback
-    /// hits.
+    /// clean close's checkpoint snapshot over [`SpillTier::open`]'s cold
+    /// path. Never fails outright over an ineligible or corrupt snapshot:
+    /// every such case falls back to [`SpillTier::open_impl`], so this
+    /// returns `Err` only on a genuine I/O failure even the cold fallback
+    /// would hit. [`ReopenOutcome::reason`] names whichever eligibility
+    /// check first rules out a warm reopen:
     ///
-    /// Eligibility, checked in order, [`ReopenOutcome::reason`] naming
-    /// whichever first rules a warm reopen out:
+    /// 1. `"disabled"`: [`SpillConfig::warm_reopen_value`] is `false`.
+    /// 2. `"no_snapshot"`: no trusted snapshot (missing, truncated, bad
+    ///    checksum).
+    /// 3. `"stale_snapshot"`: an older [`SNAPSHOT_FORMAT_VERSION`].
+    /// 4. `"config_mismatch"`: `region_bytes`/`region_count` don't match
+    ///    `cfg`, meaning the tier was resized.
+    /// 5. `"downtime_exceeded"`: closed longer ago than `tombstone_ttl_ms`.
+    /// 6. `"bad_region"`: a region or entry fails to validate; one bad
+    ///    entry falls the whole tier back cold.
     ///
-    /// 1. `"disabled"`: `cfg`'s [`SpillConfig::warm_reopen_value`] is
-    ///    `false`, today's default: a directory with region files from a
-    ///    prior life is never even read.
-    /// 2. `"no_snapshot"`: the directory has no checkpoint snapshot
-    ///    [`snapshot_eligibility`] trusts (missing, truncated, or a
-    ///    checksum that fails to verify) -- the ordinary shape of a crash,
-    ///    or a prior close with `warm_reopen` off.
-    /// 3. `"stale_snapshot"`: the snapshot reads back fine but names an
-    ///    older [`SNAPSHOT_FORMAT_VERSION`] than this build writes.
-    /// 4. `"config_mismatch"`: the snapshot's `region_bytes`/`region_count`
-    ///    don't match what `cfg` computes right now, meaning an operator
-    ///    resized the tier since the snapshot was written; every on-disk
-    ///    offset it names is meaningless at the new sizing.
-    /// 5. `"downtime_exceeded"`: `now_ms - closed_at_ms` exceeds
-    ///    `tombstone_ttl_ms`. Past this bound, no live peer is guaranteed
-    ///    to still hold a tombstone that would out-vote a resurrected
-    ///    stale record via anti-entropy: see the module docs.
-    /// 6. `"bad_region"`: reopening one of the expected region files
-    ///    itself fails (missing, the wrong length, or a read that fails
-    ///    outright), or any one snapshot entry fails to validate against
-    ///    the region bytes it names (an offset past the region's length,
-    ///    or a [`decode_record`] checksum/magic/length failure at that
-    ///    offset). Conservative: one bad entry falls the whole reopen back
-    ///    cold rather than installing every entry but that one, since a
-    ///    snapshot with even one inconsistency is not worth trusting
-    ///    further.
-    ///
-    /// Past those checks, this replays *only* the snapshot: it never scans
-    /// a region file for records it does not already know to look for.
-    /// Every surviving entry is dropped if `owned` says this node no
-    /// longer owns its bucket, or if its `expires_at_ms` is already past
-    /// `now_ms`, and otherwise installed via [`SpillSink::install_new`],
-    /// which folds its fingerprint into the sink's digest exactly like
-    /// every other insert path, so the sink's digests are correct the
-    /// instant this returns with no separate pass.
-    /// [`ReopenOutcome::records_installed`] counts only the records
-    /// `install_new` actually accepted. The snapshot itself is deleted the
-    /// moment a warm reopen succeeds, so a second open of the same
-    /// directory with no intervening clean close is cold.
-    ///
-    /// Reads and in-RAM installs only: this never writes a record, so a
-    /// crash mid-reopen leaves every region file and the last-written
-    /// snapshot untouched, and the next restart attempt replays
-    /// deterministically from the same starting point.
+    /// Past those checks, this replays only the snapshot. Each surviving
+    /// entry is dropped if `owned` disallows its bucket or `expires_at_ms`
+    /// is past `now_ms`, and otherwise installed via
+    /// [`SpillSink::install_new`]. The snapshot is deleted on success, so
+    /// a second open with no intervening clean close is cold.
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`io::Error`] only if the cold fallback path
+    /// Returns the underlying [`io::Error`] only if the cold fallback
     /// itself fails; see [`SpillTier::open`].
     #[allow(
         clippy::too_many_lines,
@@ -1669,10 +1378,7 @@ impl SpillTier {
 
         let dir = cfg.dir.join(cache_name);
         let region_bytes = cfg.region_bytes_value();
-        // `validate` above already guarantees this fits; the fallback keeps
-        // this conversion total rather than panicking on a config this
-        // module did not itself validate, the same reasoning `open_impl`
-        // documents for its own copy of this conversion.
+        // See open_impl's copy of this conversion.
         let region_bytes_u32 = u32::try_from(region_bytes).unwrap_or(u32::MAX);
         let region_count = region_count_for(cfg.capacity_bytes, region_bytes).max(2);
 
@@ -1764,10 +1470,7 @@ impl SpillTier {
         }
 
         let flush_queue_bytes = cfg.flush_queue_bytes_value();
-        // `validate` above already bounds `flush_queue_bytes` well under any
-        // real disk budget; the fallback keeps this conversion total rather
-        // than panicking, the same reasoning `open_impl` documents for its
-        // own copy of this conversion.
+        // See open_impl's copy of this conversion.
         let admit_permits = usize::try_from(flush_queue_bytes).unwrap_or(usize::MAX);
 
         let inner = Arc::new(Inner {
@@ -1789,10 +1492,8 @@ impl SpillTier {
             flusher_jobs_abandoned: AtomicU64::new(0),
         });
 
-        // Only now, with every check passed and every entry installed, is
-        // this snapshot safe to remove: a crash any time before this line
-        // leaves it in place for the next attempt to replay from the same
-        // starting point.
+        // Only safe to remove now that every entry is installed; a crash
+        // before this line leaves it for the next attempt to replay.
         delete_snapshot(&dir);
 
         Ok(ReopenOutcome {
@@ -1813,13 +1514,10 @@ impl SpillTier {
         })
     }
 
-    /// [`SpillTier::reopen`]'s fallback: the same wipe-and-recreate
-    /// [`SpillTier::open_impl`] path [`SpillTier::open`] always takes,
-    /// wrapped in a [`ReopenOutcome`] naming why the warm path was never
-    /// tried. `entries_read`/`dropped_bad` carry whatever
-    /// [`SpillTier::reopen`] already knew about the snapshot before this
-    /// reason cut the warm attempt short; `0` for every reason that never
-    /// got that far.
+    /// [`SpillTier::reopen`]'s fallback: [`SpillTier::open_impl`] wrapped
+    /// in a [`ReopenOutcome`] naming why the warm path failed.
+    /// `entries_read`/`dropped_bad` carry whatever was already known; `0`
+    /// for a reason that never got that far.
     fn reopen_cold_fallback(
         cfg: &SpillConfig,
         cache_name: &str,
@@ -1843,67 +1541,49 @@ impl SpillTier {
     }
 }
 
-/// [`SpillTier::reopen`]'s outcome: the tier itself, ready to use exactly
-/// like one [`SpillTier::open`] returns, alongside whether the warm path
-/// was taken and, when it was not, [`ReopenOutcome::reason`] naming why.
+/// [`SpillTier::reopen`]'s outcome: the tier itself, ready to use like
+/// [`SpillTier::open`]'s, alongside whether the warm path was taken and,
+/// when not, [`ReopenOutcome::reason`] naming why. Every count below is
+/// `0` (and `warm_buckets` empty) for a cold fallback.
 pub(crate) struct ReopenOutcome {
     pub(crate) tier: SpillTier,
-    /// `true` once every eligibility check passed and every snapshot entry
-    /// validated; `false` for the same cold [`SpillTier::open_impl`] path
-    /// [`SpillTier::open`] always takes.
+    /// `true` once every eligibility check passed and every snapshot
+    /// entry validated.
     pub(crate) warm: bool,
-    /// `None` for a warm reopen; the specific reason a cold fallback was
-    /// taken otherwise. See [`SpillTier::reopen`]'s doc for the exact set.
+    /// `None` for a warm reopen; otherwise the reason a cold fallback was
+    /// taken. See [`SpillTier::reopen`]'s docs for the exact set.
     pub(crate) reason: Option<&'static str>,
-    /// How many records [`SpillSink::install_new`] actually accepted during
-    /// a warm reopen's replay; always `0` for a cold fallback.
+    /// Records [`SpillSink::install_new`] accepted during a warm replay.
     pub(crate) records_installed: u64,
-    /// The distinct buckets `records_installed` came from: a warm reopen
-    /// replayed at least one record for each of these, and none for any
-    /// other bucket this node currently owns. Always empty for a cold
-    /// fallback, and possibly empty even for a warm reopen (an eligible
-    /// snapshot with nothing left to replay after the owned/expiry
-    /// filters). The caller narrows its eager reconciliation to exactly
-    /// this set rather than treating every currently owned bucket as
-    /// warm-reloaded.
+    /// Distinct buckets `records_installed` came from, so the caller can
+    /// narrow eager reconciliation to these buckets instead of every
+    /// owned bucket.
     pub(crate) warm_buckets: HashSet<u16>,
-    /// Total entries the snapshot named, read before any filter ran. `0`
-    /// for every cold-fallback reason that never got as far as reading a
-    /// snapshot at all.
+    /// Total entries the snapshot named, before any filter ran.
     pub(crate) entries_read: u64,
-    /// Entries a warm reopen dropped because `owned` no longer allows
-    /// their bucket. Always `0` for a cold fallback.
+    /// Entries dropped because `owned` no longer allows their bucket.
     pub(crate) dropped_unowned: u64,
-    /// Entries a warm reopen dropped because their `expires_at_ms` was
-    /// already past `now_ms`. Always `0` for a cold fallback.
+    /// Entries dropped because their `expires_at_ms` was already past
+    /// `now_ms`.
     pub(crate) dropped_expired: u64,
-    /// Entries [`validate_snapshot_entries`] rejected: pointing past a
-    /// region, or failing to decode/checksum at the offset they name. Any
-    /// nonzero count here is also why this reopen fell back cold under
-    /// `reason = "bad_region"`, since one bad entry falls the whole tier
-    /// back rather than installing every entry but that one.
+    /// Entries [`validate_snapshot_entries`] rejected; nonzero here is why
+    /// this reopen fell back cold under `reason = "bad_region"`.
     pub(crate) dropped_bad: u64,
     /// Entries [`SpillSink::install_new`] refused because the key was
-    /// already present, live or tombstoned. Always `0` for a cold
-    /// fallback.
+    /// already present, live or tombstoned.
     pub(crate) refused_present: u64,
 }
 
 /// Opens every region file `0..region_count` in `dir` for continued
-/// read/write, no truncate and no wipe: the whole point of a warm reopen is
-/// keeping what is already there. Unlike a scan-based reopen, this never
-/// reads a region's content; [`validate_snapshot_entries`] reads only the
-/// exact byte ranges the snapshot names.
+/// read/write, no truncate. Never reads a region's content;
+/// [`validate_snapshot_entries`] reads only the byte ranges the snapshot
+/// names.
 ///
 /// # Errors
 ///
 /// Returns the underlying [`io::Error`] if a region file cannot be opened
-/// or its length does not match `region_bytes` exactly (an operator
-/// resizing the tier is already caught by the snapshot's own
-/// `region_bytes` check; a mismatched individual file otherwise means
-/// something is wrong with this specific file). [`SpillTier::reopen`]
-/// treats either as reason for the whole tier to fall back cold, never a
-/// partial warm reopen.
+/// or its length doesn't match `region_bytes`; [`SpillTier::reopen`] then
+/// falls the whole tier back cold, never a partial warm reopen.
 fn open_regions_for_replay(
     dir: &Path,
     region_count: u32,
@@ -1925,39 +1605,24 @@ fn open_regions_for_replay(
     Ok(files)
 }
 
-/// One region's replayed cursor/generation, derived purely from the
-/// snapshot entries that name it: `write_cursor` is the highest
-/// `offset + len` among them, and `generation` is the (single, validated
-/// consistent) generation they all carry. A region no entry names defaults
-/// to generation `0`, cursor `0`, exactly like a freshly opened one: no
-/// live pointer names it, so nothing depends on what its bytes actually
-/// hold.
+/// One region's replayed cursor/generation, derived from the snapshot
+/// entries naming it: `write_cursor` is the highest `offset + len` among
+/// them, `generation` their shared value. A region no entry names
+/// defaults to `0`/`0`, like a freshly opened one.
 #[derive(Clone, Copy, Default)]
 struct RegionReplayState {
     generation: u32,
     write_cursor: u32,
 }
 
-/// Validates every one of `entries` against the region bytes it claims to
-/// point at: `region` must be a real region index, `offset + len` must
-/// fit within `region_bytes`, and reading exactly `loc.len` bytes at
-/// `loc.offset` in that region must [`decode_record_with_key`] into the
-/// same key and version the entry itself names (catching a corrupt or
-/// stale-relative-to-itself record the checksum alone would already
-/// reject, plus a snapshot entry that silently drifted from what the
-/// region actually holds). Also requires every entry naming the same
-/// region to agree on its generation: a region genuinely has only one at
-/// any instant.
-///
-/// Scans every entry rather than stopping at the first bad one, purely so
-/// the second element of the return, the count of entries that failed any
-/// of the above, is exact for [`SpillTier::reopen`]'s own logging and
-/// `sundog_spill_reopen_entries_total{stage="dropped_bad"}`. The first
-/// element is `None` the moment that count is nonzero, conservatively:
-/// [`SpillTier::reopen`] still treats one bad entry as reason for the whole
-/// tier to fall back cold rather than install every entry but the bad
-/// ones. `Some` otherwise, naming every region's replayed cursor and
-/// generation, `region_count` long.
+/// Validates each `entries` item: `region` must be real, `offset + len`
+/// must fit `region_bytes`, [`decode_record_with_key`] at that offset must
+/// match the entry's key/version, and every entry naming a region must
+/// agree on its generation. Scans all of them so the returned count is
+/// exact for `sundog_spill_reopen_entries_total{stage="dropped_bad"}`; the
+/// first element is `None` once that count is nonzero (one bad entry
+/// falls the whole tier back cold), `Some` otherwise, naming every
+/// region's replayed cursor and generation.
 fn validate_snapshot_entries(
     region_files: &[File],
     region_bytes: u32,
@@ -2012,14 +1677,9 @@ fn validate_snapshot_entries(
     }
 }
 
-/// [`install_snapshot_entries`]'s result: each region's reverse index (the
-/// `(stripe_idx, key_bytes)` pairs installed into it) and used-byte total,
-/// parallel `Vec`s of length `region_count`, the overall count
-/// [`SpillSink::install_new`] actually accepted, and the distinct set of
-/// buckets that count came from -- the buckets a warm reopen genuinely
-/// replayed at least one record for, as opposed to every bucket this node
-/// happens to currently own -- plus a per-reason breakdown of everything
-/// this dropped instead of installing.
+/// [`install_snapshot_entries`]'s result: each region's reverse index and
+/// used-byte total, the overall accepted count and the distinct buckets it
+/// came from, plus a per-reason breakdown of everything dropped instead.
 struct InstalledRecords {
     reverse_index_by_region: Vec<Vec<(usize, Bytes)>>,
     used_bytes_by_region: Vec<u64>,
@@ -2099,37 +1759,18 @@ fn install_snapshot_entries(
     }
 }
 
-/// Writes `entries`, every currently-resident live record
-/// `Shard::close_spill_checkpointed`'s checkpoint gathered (key, version, expiry, and
-/// encoded value bytes), into the region ring: the same on-disk framing
-/// [`write_segment`] uses, batched by [`records_fitting_region`] and
-/// rotated with [`rotate`] exactly like ordinary flushing, but never
-/// through [`SpillSink::install`] -- see [`SpillTier::checkpoint_flush`]'s
-/// doc for why. An entry too large to ever fit any region (unreachable in
-/// practice, since nothing bypasses [`SpillTier::would_accept`]'s own
-/// check on the ordinary write path, but never assumed) is skipped rather
-/// than looping forever trying to rotate room for it. A region write that
-/// fails is logged and its entries skipped, exactly as a flusher write
-/// failure is today, rather than the whole checkpoint aborting.
-///
-/// `entries` can outgrow the whole ring: `region_count` regions' worth of
-/// resident data written in one call, once past the first lap, starts
-/// reusing regions this very call already wrote into. None of those
-/// writes ever reach [`Inner`]'s per-region reverse index -- that only
-/// ever tracks the ordinary flush path -- so [`rotate`]'s own
-/// `sink.reclaim` call cannot see them and never asks the sink to drop
-/// them. Left alone that would leave a self-collision in `out`: an
-/// earlier entry's [`SpillLoc`] would still name a region/generation whose
-/// bytes this same call has since overwritten with a later entry. Guarded
-/// against here instead, with no sink round-trip needed since this call
-/// already knows exactly what it wrote and where:
-/// `pending_keys_by_region` tracks, per region, the keys this call has
-/// written there since it was last rotated into; whenever a region this
-/// call already used gets reused again, every key it had tracked for that
-/// region is retired into `stale_keys` before the new write lands, and
-/// every retired key is dropped from `out` before this returns, so the
-/// only entries left describe bytes that survived to the end of this
-/// call.
+/// Writes `entries`, the checkpoint's currently-resident live records,
+/// into the region ring using [`write_segment`]'s framing, batched by
+/// [`records_fitting_region`] and rotated with [`rotate`], but never
+/// through [`SpillSink::install`] (see [`SpillTier::checkpoint_flush`]).
+/// An oversized entry is skipped; a failed region write is logged and its
+/// entries skipped, rather than aborting the whole checkpoint. `entries`
+/// can outgrow the ring, so a later write here can reuse a
+/// region an earlier write in this call already used, which `rotate`'s
+/// `sink.reclaim` can't see. `pending_keys_by_region` tracks the keys
+/// this call wrote per region, so on reuse they retire into `stale_keys`
+/// and get dropped from `out`, leaving only entries that survived to the
+/// end of the call.
 fn checkpoint_write_resident(
     inner: &Inner,
     sink: &dyn SpillSink,
@@ -2160,9 +1801,8 @@ fn checkpoint_write_resident(
             .collect();
         let take = records_fitting_region(cursor, inner.region_bytes, &lens);
         if take == 0 {
-            // The region about to rotate in may hold keys this same call
-            // wrote there on an earlier lap; their bytes are about to be
-            // overwritten, so they can never survive to the final `out`.
+            // Keys this call already wrote to the region rotating in are
+            // about to be overwritten.
             let next = next_region_index(active, region_count);
             if let Some(keys) = pending_keys_by_region.remove(&next) {
                 stale_keys.extend(keys);
@@ -2257,13 +1897,9 @@ fn remove_stale_region_files(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes a leftover checkpoint snapshot, its temporary write name
-/// included: [`SpillTier::open`]'s cold path recreates every region from
-/// scratch, so a snapshot naming offsets into a prior incarnation's content
-/// must never survive alongside the fresh, empty regions it would
-/// otherwise describe. A missing file either way is not an error: that is
-/// already the common case, since a snapshot exists at all only right
-/// after a clean, `warm_reopen`-enabled close.
+/// Removes a leftover checkpoint snapshot, temp name included, since a
+/// cold open recreates every region from scratch. A missing file is not
+/// an error.
 fn remove_stale_snapshot_files(dir: &Path) -> io::Result<()> {
     for path in [snapshot_path(dir), snapshot_tmp_path(dir)] {
         match fs::remove_file(&path) {
@@ -2286,26 +1922,20 @@ fn snapshot_tmp_path(dir: &Path) -> PathBuf {
     dir.join(SNAPSHOT_TMP_FILE_NAME)
 }
 
-/// `xxh3_64` over every byte of a snapshot buffer but its own leading
-/// `checksum` field, mirroring [`SpillRecordHeader`]'s checksum reasoning:
-/// the same function builds a fresh checksum, over a buffer whose checksum
-/// bytes are still `0`, and re-verifies one read back off disk.
+/// `xxh3_64` over every byte but the leading `checksum` field, mirroring
+/// [`SpillRecordHeader`]'s checksum reasoning.
 fn snapshot_checksum(buf: &[u8]) -> u64 {
     let mut hasher = Xxh3Default::new();
     hasher.update(&buf[size_of::<u64>()..]);
     hasher.digest()
 }
 
-/// Serializes `entries` (each a live, un-tombstoned, un-expired spilled
-/// pointer: key bytes, version, expiry, and on-disk location) into one
-/// checkpoint snapshot buffer: a fixed [`SnapshotHeader`] naming
-/// `region_bytes`/`region_count` (so [`SpillTier::reopen`] can refuse a
-/// snapshot written under a since-resized config) and `closed_at_ms` (so it
-/// can refuse one written too long ago), followed by one variable-length
-/// record per entry. Manual byte-at-a-time serialization, not a `zerocopy`
-/// struct: entries carry a variable-length key, which no fixed-shape
-/// `#[repr(C)]` type can describe. `checksum` is computed over the whole
-/// buffer last and patched into its first eight bytes.
+/// Serializes `entries` (live, un-tombstoned, un-expired pointers) into
+/// one snapshot buffer: a fixed [`SnapshotHeader`] naming
+/// `region_bytes`/`region_count`/`closed_at_ms`, followed by one
+/// variable-length record per entry. Manual serialization, not
+/// `zerocopy`, since keys vary in length. `checksum` is computed last and
+/// patched into the first eight bytes.
 fn build_snapshot_bytes(
     entries: &[(Bytes, Hlc, Option<u64>, SpillLoc)],
     region_bytes: u64,
@@ -2339,15 +1969,10 @@ fn build_snapshot_bytes(
     buf
 }
 
-/// Writes `bytes` to a temporary file in `dir`, then renames it into place
-/// at [`snapshot_path`]: a crash between the write and the rename leaves
-/// only the temporary file behind and no snapshot at the real name, so the
-/// next [`SpillTier::reopen`] sees a missing snapshot, `"no_snapshot"`,
-/// never a half-written one. No fsync, matching this module's documented
-/// "no fsync is ever issued" contract exactly as every region write
-/// already does: a write or rename that fails outright is logged and
-/// otherwise ignored rather than propagated, since a checkpoint that never
-/// lands only costs a slower, cold-fallback restart, never a wrong replay.
+/// Writes `bytes` to a temp file, then renames it to [`snapshot_path`]: a
+/// crash in between leaves only the temp file, so reopen sees
+/// `"no_snapshot"`. No fsync. A failed write or rename is logged and
+/// ignored.
 fn write_snapshot_atomic(dir: &Path, bytes: &[u8]) {
     let tmp = snapshot_tmp_path(dir);
     if let Err(err) = fs::write(&tmp, bytes) {
@@ -2367,12 +1992,9 @@ fn write_snapshot_atomic(dir: &Path, bytes: &[u8]) {
     }
 }
 
-/// Removes `dir`'s checkpoint snapshot after [`SpillTier::reopen`] replays
-/// it successfully: a second open of the same directory with no
-/// intervening clean close finds no snapshot and takes the cold path,
-/// exactly like a crash would, rather than replaying the same snapshot
-/// twice against region files a first warm reopen has already started
-/// writing new records into.
+/// Removes `dir`'s checkpoint snapshot after a successful reopen, so a
+/// second open with no intervening close takes the cold path instead of
+/// replaying against overwritten regions.
 fn delete_snapshot(dir: &Path) {
     match fs::remove_file(snapshot_path(dir)) {
         Ok(()) => {}
@@ -2387,17 +2009,11 @@ fn delete_snapshot(dir: &Path) {
     }
 }
 
-/// Parses `buf`, a whole checkpoint snapshot file's bytes, into a
-/// [`SnapshotHeader`] and its [`SnapshotEntry`] list, or `None` for
-/// anything that doesn't check out: too short a buffer, a checksum that
-/// fails to verify, a bad magic, or an entry list truncated relative to
-/// what `entry_count` promised. Every failure mode is the same "nothing to
-/// trust" outcome a missing file gets; `format_version` is deliberately not
-/// checked here, since a byte layout from a future format could fail to
-/// parse at all under this build's fixed offsets:
-/// [`snapshot_eligibility`] checks it once parsing itself has already
-/// succeeded, so a stale-but-still-this-shape snapshot is told apart from
-/// one this build cannot read at all.
+/// Parses `buf`, a whole snapshot file's bytes, into a [`SnapshotHeader`]
+/// and its [`SnapshotEntry`] list, or `None` if it doesn't check out (too
+/// short, bad checksum/magic, truncated). `format_version` isn't checked
+/// here, since a future format may not even parse;
+/// [`snapshot_eligibility`] checks it after parsing succeeds.
 fn parse_snapshot(buf: &[u8]) -> Option<(SnapshotHeader, Vec<SnapshotEntry>)> {
     if buf.len() < SNAPSHOT_HEADER_LEN {
         return None;
@@ -2473,15 +2089,11 @@ fn parse_snapshot(buf: &[u8]) -> Option<(SnapshotHeader, Vec<SnapshotEntry>)> {
     ))
 }
 
-/// Test-only: writes `dir` a snapshot that is stale by exactly one format
-/// version, everything else about it (magic, sizing, `closed_at_ms`, entry
-/// list, and a checksum computed over the result) intact, so
-/// [`snapshot_eligibility`]'s `"stale_snapshot"` check is the only one that
-/// can fail against it. `store::tests` calls this to prove
-/// [`crate::store::Shard::attach_spill`]'s metric recording actually
-/// records `reason="stale_snapshot"` through the real call site, since
-/// `SpillTier::reopen`'s own return value alone does not exercise that
-/// glue code.
+/// Test-only: writes `dir` a snapshot stale by one format version,
+/// everything else intact, so only [`snapshot_eligibility`]'s
+/// `"stale_snapshot"` check can fail against it. Used to prove
+/// `Shard::attach_spill`'s metric recording hits `reason="stale_snapshot"`
+/// through the real call site.
 #[cfg(test)]
 pub(crate) fn write_stale_snapshot_for_test(
     dir: &Path,
@@ -2497,17 +2109,12 @@ pub(crate) fn write_stale_snapshot_for_test(
 }
 
 /// [`SpillTier::reopen`]'s eligibility check: a snapshot must be present
-/// and parse cleanly (`"no_snapshot"` otherwise, collapsing a missing file
-/// and a corrupt or truncated one into the same "nothing to trust"
-/// outcome), name the current [`SNAPSHOT_FORMAT_VERSION`] (`"stale_snapshot"`
-/// otherwise), match `region_bytes`/`region_count` exactly
-/// (`"config_mismatch"` otherwise, an operator having resized the tier
-/// since the snapshot was written), and have closed within
-/// `tombstone_ttl_ms` of `now_ms` (`"downtime_exceeded"` otherwise: past
-/// that bound no live peer is guaranteed to still hold a tombstone that
-/// would out-vote a resurrected stale record via anti-entropy). `Ok` names
-/// the parsed snapshot; `Err` names the [`ReopenOutcome::reason`] a cold
-/// fallback should be recorded under.
+/// and parse cleanly (`"no_snapshot"` otherwise), name the current
+/// [`SNAPSHOT_FORMAT_VERSION`] (`"stale_snapshot"`), match
+/// `region_bytes`/`region_count` (`"config_mismatch"`), and have closed
+/// within `tombstone_ttl_ms` of `now_ms` (`"downtime_exceeded"`). `Ok`
+/// names the parsed snapshot; `Err` names the [`ReopenOutcome::reason`]
+/// to record.
 fn snapshot_eligibility(
     dir: &Path,
     region_bytes: u64,
@@ -2550,13 +2157,10 @@ fn build_header(job: &SpillJob, key_len: u32, value_len: u32) -> SpillRecordHead
 }
 
 /// Parses `buf`, one record's bytes as read off disk, into its key bytes
-/// alongside [`SpilledBytes`], or `None` for anything that doesn't check
-/// out: a short buffer, a bad magic, a length mismatch, or a checksum
-/// mismatch. Every one of these is treated identically. A corrupted or torn
-/// record reads like one that is never there. [`decode_record`] wraps this,
-/// discarding the key half, for [`SpillTier::read_at`]'s caller, which
-/// already knows which key it asked for; [`SpillTier::reopen`]'s region
-/// scan does not, so it needs the key back out of the record itself.
+/// alongside [`SpilledBytes`], or `None` for a bad buffer, magic, length,
+/// or checksum. [`decode_record`] wraps this, discarding the key, for
+/// [`SpillTier::read_at`]'s caller, which already knows the key; reopen's
+/// region scan does not.
 fn decode_record_with_key(buf: &[u8]) -> Option<(Bytes, SpilledBytes)> {
     let (header, rest) = SpillRecordHeader::read_from_prefix(buf).ok()?;
     if header.magic != SPILL_MAGIC {
@@ -2601,13 +2205,9 @@ fn flusher_loop(inner: &Arc<Inner>, rx: &Receiver<SpillJob>, sink: &Weak<dyn Spi
         let Ok(first) = rx.recv() else {
             return;
         };
-        // Credited back to `admit` unconditionally, before the `sink`
-        // upgrade check below: `first` is off the channel either way, so
-        // its bytes are free the instant it is dequeued, exactly matching
-        // every other job's credit timing in this loop. Crediting it only
-        // on a live `sink` would permanently shrink this tier's admission
-        // budget by `first`'s own bytes every time `attach`'s caller drops
-        // its last strong `SpillSink` reference at exactly this instant.
+        // Credited back before the sink-upgrade check: crediting only on a
+        // live sink would permanently shrink the admission budget whenever
+        // the last strong SpillSink reference drops at this instant.
         inner.admit.add_permits(job_record_len_or_zero(&first));
         let Some(sink) = sink.upgrade() else {
             return;
@@ -2630,8 +2230,8 @@ fn flusher_loop(inner: &Arc<Inner>, rx: &Receiver<SpillJob>, sink: &Weak<dyn Spi
 }
 
 /// Test-only hook [`flusher_loop`] polls before pulling its next job off
-/// the channel: spins while [`SpillTier::pause_flusher`] is in effect, a
-/// no-op otherwise. Always a no-op outside `cfg(test)`, so this costs
+/// the channel: spins while [`SpillTier::pause_flusher`] holds it paused,
+/// a no-op otherwise. Always a no-op outside `cfg(test)`, so this costs
 /// nothing in production.
 #[cfg(test)]
 fn wait_while_flusher_paused(inner: &Inner) {
@@ -2674,7 +2274,7 @@ struct PreparedJob {
 
 /// Encodes and writes `jobs` in as few positional writes as the active
 /// region's remaining space allows: one per region the batch touches, a
-/// rotation between them exactly where [`records_fitting_region`] says the
+/// rotation between them where [`records_fitting_region`] says the
 /// next record stops fitting, never a record straddling two regions. Each
 /// written record then installs through `sink` individually, since its
 /// stripe lock is necessarily per-entry, but the batch's confirmed write
@@ -2913,10 +2513,8 @@ mod tests {
 
     #[test]
     fn slot_count_exceeds_the_old_fixed_capacity_for_small_records() {
-        // A `flush_queue_bytes` sized for a few thousand 256-byte records
-        // fills a slot count fixed at `FLUSH_QUEUE_CAPACITY` regardless of
-        // `flush_queue_bytes` long before it fills its own byte budget:
-        // this harness's exact shape.
+        // Enough 256-byte records to fill FLUSH_QUEUE_CAPACITY well before
+        // this byte budget.
         let flush_queue_bytes = 8192 * 256;
         assert!(flush_queue_slots(flush_queue_bytes) > FLUSH_QUEUE_CAPACITY);
     }
@@ -3070,10 +2668,8 @@ mod tests {
         assert!(!spilled_is_current(None, None, hlc(10, 0)));
     }
 
-    /// Builds one record's raw on-disk bytes, `[SpillRecordHeader][key][value]`,
-    /// the same layout [`write_segment`] produces, with no file or tier
-    /// involved: for every test that needs to hand crafted region bytes to
-    /// [`decode_record_with_key`] directly.
+    /// Builds one record's raw on-disk bytes for
+    /// [`decode_record_with_key`] tests.
     fn raw_record(key: &[u8], value: &[u8], ver: Hlc, expires_at_ms: Option<u64>) -> Vec<u8> {
         let job = SpillJob {
             stripe_idx: 0,
@@ -3268,8 +2864,7 @@ mod tests {
         /// the `(stripe_idx, key_bytes)` pairs to purge.
         type ReclaimCall = (u32, u32, Vec<(usize, Bytes)>);
 
-        /// One `install_new` call: `install`'s own four fields plus the
-        /// `expires_at_ms` `install` never took.
+        /// One `install_new` call: `install`'s fields plus `expires_at_ms`.
         type InstallNewCall = (usize, Bytes, Hlc, Option<u64>, SpillLoc);
 
         #[derive(Default)]
@@ -3577,15 +3172,9 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        /// `checkpoint_write_resident`'s own self-collision guard: a region
-        /// holding exactly one record, a two-region ring, and three
-        /// checkpoint-time resident entries force one full lap plus one
-        /// record, wrapping back over a region this very call already wrote
-        /// into. Guards the bug that guard closes: without it, the
-        /// checkpoint's returned entries would include one whose `SpillLoc`
-        /// names a region/generation this same call has since overwritten,
-        /// corrupting the checkpoint snapshot with a pointer into bytes that
-        /// no longer hold what it claims.
+        /// `checkpoint_write_resident`'s self-collision guard: a
+        /// wraparound overwrites a region this call already wrote, and
+        /// only surviving entries' `SpillLoc`s come back.
         #[test]
         fn checkpoint_write_resident_drops_entries_its_own_wraparound_overwrites_and_reopen_replays_the_survivors()
          {
@@ -3598,20 +3187,14 @@ mod tests {
             let tier = SpillTier::open(&cfg, "cache-a").unwrap();
             let sink = RecordingSink::default();
 
-            // Phase 1, the ordinary flush path: "old-0" lands in region 0
-            // through `flush_batch`, so region 0's own reverse index -- the
-            // thing `rotate`'s reclaim actually walks -- knows about it.
+            // Ordinary flush: old-0 lands in region 0, so its reverse index
+            // knows about it.
             flush_batch(&tier.inner, &sink, vec![job("old-0", b"1234", hlc(1, 0))]);
             assert_eq!(sink.install_count(), 1);
 
-            // Phase 2, the checkpoint: three resident entries into a ring
-            // that holds only two records total. Region 0 is already full
-            // from phase 1, so this rotates into region 1 (empty) for
-            // "res-0", rotates back into region 0 (reclaiming "old-0") for
-            // "res-1", then rotates into region 1 again -- now on its
-            // second generation, having already held "res-0" earlier in
-            // this same call -- for "res-2", overwriting "res-0"'s bytes
-            // before this call ever returns.
+            // Three entries into a two-record ring: res-0, then res-1
+            // (reclaiming old-0), then res-2 wraps back and overwrites
+            // res-0.
             let entries: Vec<(Bytes, Hlc, Option<u64>, Bytes)> = ["res-0", "res-1", "res-2"]
                 .iter()
                 .enumerate()
@@ -3899,12 +3482,8 @@ mod tests {
             let sink = Arc::new(RecordingSink::default());
             tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
 
-            // A standalone `would_accept` check ahead of `try_spill` would
-            // double-count here: under the semaphore-backed design,
-            // `would_accept` itself commits the acquired bytes on success
-            // (immediately `.forget()`-ed), so `try_spill`'s own internal
-            // `would_accept` call below is this job's one and only
-            // admission.
+            // A standalone check here would double-count: try_spill's own
+            // would_accept call below already commits the bytes on success.
             assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
             assert_eq!(tier.queued_bytes(), record_len);
             assert_eq!(
@@ -3931,12 +3510,7 @@ mod tests {
 
         #[test]
         fn would_accept_never_refuses_when_the_caller_pre_reserved_enough_bytes() {
-            // Same setup as `would_accept_refuses_once_the_flush_queue_bytes_
-            // bound_would_be_exceeded`, but this time the second job's
-            // caller shows up holding its own `Reservation` for the exact
-            // record length: `would_accept` must succeed via
-            // `Reservation::spend` alone, with `admit` still fully drained
-            // by the first job.
+            // A pre-reserved second job succeeds via Reservation::spend alone.
             let dir = temp_dir("byte-bound-reserved");
             let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
             let record_len_u32 = u32::try_from(record_len).unwrap();
@@ -3973,14 +3547,7 @@ mod tests {
         #[test]
         fn would_accept_returns_refused_pending_when_a_reservation_is_in_play_but_both_budgets_are_exhausted()
          {
-            // Same drained-`admit` setup once more, but this time the
-            // caller's own `Reservation` is *insufficient* rather than
-            // absent: neither `Reservation::spend` nor `admit`'s own
-            // `try_acquire_many` fallback covers the record.
-            // `Admission::RefusedPending` is what lets
-            // `Shard::apply_grouped`/`ShardOps::apply_remote_batch` retry
-            // with a fresh, larger reservation instead of this refusal
-            // becoming a drop right here (see the module docs' `1.1`/`7`).
+            // Insufficient reservation + drained admit: RefusedPending, not a drop.
             let dir = temp_dir("byte-bound-pending");
             let record_len = HEADER_LEN as u64 + 4 + 4; // "aaaa"/"bbbb"
             let cfg = SpillConfig::new(&dir, 1 << 20)
@@ -4028,9 +3595,7 @@ mod tests {
                 .region_bytes(4096)
                 .flush_queue_bytes(record_len);
             let tier = SpillTier::open(&cfg, "cache-a").unwrap();
-            // Paused before the flusher thread is even spawned, so the one
-            // job below stays queued, and `admit` stays fully drained,
-            // until `resume_flusher` runs.
+            // Paused before the flusher spawns, so admit stays drained.
             tier.pause_flusher();
             let sink = Arc::new(RecordingSink::default());
             tier.attach(Arc::downgrade(&(Arc::clone(&sink) as Arc<dyn SpillSink>)));
@@ -4038,13 +3603,8 @@ mod tests {
             assert!(tier.try_spill(job("aaaa", b"bbbb", hlc(1, 0))));
             assert_eq!(tier.queued_bytes(), record_len, "admit is fully drained");
 
-            // Polled through the same pinned future across both awaits
-            // below, rather than spawned: a `Reservation` borrows this
-            // tier, so a spawned `'static` task could not carry it back out
-            // anyway. A `tokio::time::timeout` that elapses only stops
-            // polling for that one call; the pinned future itself, and
-            // whatever registration it holds with `admit`, survives to be
-            // polled again on the next line.
+            // Pinned since a Reservation borrows this tier; a timed-out
+            // poll keeps the future's registration with admit.
             let reserve_fut = tier.reserve(record_len_u32, Duration::from_secs(5));
             tokio::pin!(reserve_fut);
 
@@ -4060,9 +3620,7 @@ mod tests {
                 .await
                 .expect("reserve resolves once the flusher frees room")
                 .expect("reserve succeeds once the flusher frees room");
-            // The freed bytes belong to this reservation, not admit:
-            // `queued_bytes()`'s own point of view cannot tell this apart
-            // from a job still sitting in the channel.
+            // queued_bytes() can't tell this apart from a job still queued.
             assert_eq!(tier.queued_bytes(), record_len);
             drop(reservation);
             assert_eq!(
@@ -4115,9 +3673,7 @@ mod tests {
                 .flush_queue_bytes(64);
             let tier = SpillTier::open(&cfg, "cache-a").unwrap();
 
-            // The whole queue is empty; a request for far more bytes than
-            // `admit` could ever hold must still succeed against the whole
-            // queue, clamped, rather than hang forever.
+            // Larger than admit could ever hold: must clamp, not hang.
             let reservation = tokio::time::timeout(
                 Duration::from_secs(5),
                 tier.reserve(u32::MAX, Duration::from_secs(5)),
@@ -4208,12 +3764,7 @@ mod tests {
             let tier = SpillTier::open(&cfg, "cache-a").unwrap();
             assert_eq!(tier.queued_bytes(), 0, "nothing queued yet");
 
-            // Debits `admit` by exactly `record_len`, matching the real
-            // precondition `SpillJob::admitted_bytes`'s own doc states:
-            // every job on the channel already had its bytes acquired from
-            // `admit` before `enqueue` ever ran. Without this, the bug this
-            // test guards against is invisible: crediting bytes that were
-            // never debited leaves `queued_bytes()` at `0` either way.
+            // Debits admit first so crediting it back is observable.
             assert_eq!(
                 tier.would_accept(None, 4, 4),
                 Admission::Accepted,
@@ -4221,21 +3772,13 @@ mod tests {
             );
             assert_eq!(tier.queued_bytes(), record_len, "admit is fully drained");
 
-            // One job already sitting on the channel, exactly like a job
-            // `try_spill_victim` committed and `finish_spill_handoff` handed
-            // to `enqueue` before the stripe lock was ever released.
+            // One job already on the channel, as finish_spill_handoff leaves it.
             let (tx, rx) = mpsc::sync_channel(1);
             tx.send(job("aaaa", b"bbbb", hlc(1, 0))).unwrap();
-            // Dropped so a second `rx.recv()`, were `flusher_loop`'s loop to
-            // reach one, returns `Err` and the call returns -- this test
-            // means to exercise exactly one dequeue.
+            // Dropped so a second recv() returns Err, forcing one dequeue.
             drop(tx);
 
-            // A `Weak` whose strong reference is already gone before
-            // `flusher_loop` ever calls `upgrade()` on it, reproducing
-            // `SpillTier::attach`'s own documented "caller may drop its last
-            // strong reference at any time" contract at the exact instant a
-            // job is in hand.
+            // Strong reference already gone before upgrade().
             let sink: Weak<dyn SpillSink> = {
                 let strong: Arc<dyn SpillSink> = Arc::new(RecordingSink::default());
                 Arc::downgrade(&strong)
@@ -4254,11 +3797,8 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
         }
 
-        /// Captures `sundog_spill_waiters`/`sundog_spill_wait_seconds_total`/
-        /// `sundog_spill_wait_timeouts_total` for one dedicated cache name,
-        /// ignoring every other metric so a concurrently running test using
-        /// a different cache name -- every other test in this file -- never
-        /// perturbs these counts.
+        /// Captures wait-related metrics for one dedicated cache name, so
+        /// concurrent tests never perturb these counts.
         #[derive(Clone, Default)]
         struct WaitMetrics {
             waiters: Arc<StdMutex<f64>>,
@@ -4390,17 +3930,11 @@ mod tests {
             })
             .is_ok();
             if !installed {
-                // Another test in this binary already won the process-global
-                // recorder slot; see `try_spill_and_flush_record_the_
-                // documented_drop_reason_for_each_case`'s own comment on
-                // this same tolerance.
+                // Another test already holds the global recorder slot.
                 return;
             }
 
-            // --- sundog_spill_waiters rises while reserve is pending and
-            // falls back to zero once it resolves; sundog_spill_wait_
-            // seconds_total accumulates at least the real time this call
-            // was genuinely blocked. ---
+            // waiters rises while pending; wait_seconds accumulates real time.
             let dir = temp_dir("wait-metrics-resolves");
             let record_len = HEADER_LEN as u64 + 4 + 4;
             let record_len_u32 = u32::try_from(record_len).unwrap();
@@ -4425,8 +3959,7 @@ mod tests {
                 "sundog_spill_waiters counts this one pending reserve call"
             );
 
-            // A real, lower-bounded wait so record_wait_seconds's whole-second
-            // truncation still has something to observe once it resolves.
+            // Lower-bounded so the whole-second truncation is observable.
             tokio::time::sleep(Duration::from_millis(1200)).await;
             tier.resume_flusher();
             let reservation = tokio::time::timeout(Duration::from_secs(5), &mut reserve_fut)
@@ -4451,8 +3984,7 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
 
-            // --- a genuinely elapsed timeout increments sundog_spill_wait_
-            // timeouts_total exactly once and still leaves waiters at zero.
+            // An elapsed timeout increments wait_timeouts_total once.
             let dir = temp_dir("wait-metrics-timeout");
             let cfg = SpillConfig::new(&dir, 1 << 20)
                 .region_bytes(4096)
@@ -4482,17 +4014,8 @@ mod tests {
 
         #[test]
         fn write_segment_failure_abandons_every_job_in_the_failed_segment() {
-            // Three fixed-width records that all fit in one region, so one
-            // `flush_batch` call writes them as a single segment; the
-            // region's file handle is reopened read-only, so the segment's
-            // one positional write fails deterministically for every job it
-            // holds, the first included. Uses `DROP_REASONS_CACHE` so the
-            // `disk_error` assertion below can filter this tier's own drops
-            // out from whatever else is running concurrently in this
-            // binary, the same tolerance
-            // `try_spill_and_flush_record_the_documented_drop_reason_for_
-            // each_case` already documents for the same process-global
-            // recorder slot.
+            // One region reopened read-only, so writing fails for every
+            // job; DROP_REASONS_CACHE filters this tier's drops.
             let counts = DropCounts::default();
             let installed = metrics::set_global_recorder(DropRecorder {
                 counts: counts.clone(),
@@ -4666,12 +4189,8 @@ mod tests {
 
         #[test]
         fn a_truncated_snapshot_falls_back_to_open_cleanly() {
-            // `root` plays `SpillConfig::dir`'s role; `SpillTier::open`
-            // computes its own directory as `root.join(cache_name)`, the
-            // same directory this test writes a truncated snapshot into
-            // directly, so the two halves of this test share exactly one
-            // directory and this test cleans up exactly the one root it
-            // created, nothing above it.
+            // root plays SpillConfig::dir; open() computes the same
+            // root.join(cache_name) this test writes into.
             let root = temp_dir("snapshot-truncated");
             let cache_name = "cache-a";
             let cache_dir = root.join(cache_name);
@@ -4684,10 +4203,8 @@ mod tests {
                 "a truncated snapshot is never trusted"
             );
 
-            // A real `SpillTier::open` against the same directory never
-            // reads the snapshot at all on this, its only entry point
-            // today: a corrupt snapshot can never block or break an
-            // ordinary open.
+            // open() never reads the snapshot, so a corrupt one can't
+            // block it.
             let cfg = SpillConfig::new(&root, 1 << 20).region_bytes(4096);
             assert!(SpillTier::open(&cfg, cache_name).is_ok());
 
@@ -4703,9 +4220,7 @@ mod tests {
 
             let path = snapshot_path(&dir);
             let mut bytes = fs::read(&path).unwrap();
-            // Flip a bit well past the checksum's own eight bytes, in
-            // `region_bytes`: the length stays exactly right, so only the
-            // checksum comparison itself catches this.
+            // Flips a bit past the checksum field, so only it catches this.
             let flip_at = size_of::<u64>();
             bytes[flip_at] ^= 0x01;
             fs::write(&path, &bytes).unwrap();
@@ -4775,12 +4290,8 @@ mod tests {
 
         // --- SpillTier::reopen ---
 
-        /// Builds a checkpoint snapshot on disk under `cache_dir` from
-        /// `sink`'s recorded live entries after a direct `flush_batch`
-        /// call, every entry sharing `expires_at_ms` (`job`'s own fixed
-        /// `Some(999)` stamp, unless a test overrides it): the same shape
-        /// `Shard::close_spill_checkpointed`'s real checkpoint writes, without needing
-        /// a real `Engine`/`Shard` to gather it from.
+        /// Builds a checkpoint snapshot on disk from `sink`'s recorded
+        /// live entries, mirroring what a real checkpoint writes.
         fn write_snapshot_for_test(
             cache_dir: &Path,
             sink: &RecordingSink,
@@ -4866,14 +4377,8 @@ mod tests {
             let region_count = region_count_for(1 << 20, 4096);
             write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, Some(999));
 
-            // Corrupt the on-disk record the snapshot's one entry points
-            // at: its checksum no longer verifies, so
-            // `validate_snapshot_entries` rejects this entry, and
-            // `SpillTier::reopen` conservatively falls the whole tier back
-            // cold rather than installing every entry but this one. The
-            // region file is preallocated far larger than the one small
-            // record it holds, so the flipped bit must land inside the
-            // record's own bytes, not the zero-filled padding past it.
+            // Corrupts the pointed-at record; the flip must land inside
+            // its bytes, not the zero-filled padding.
             let record_len = HEADER_LEN + 1 + 1;
             let region_path = cache_dir.join(region_file_name(0));
             let mut bytes = fs::read(&region_path).unwrap();
@@ -4962,9 +4467,8 @@ mod tests {
 
         #[test]
         fn reopen_with_no_snapshot_falls_back_to_open_with_reason_no_snapshot() {
-            // The ordinary shape of a crash: region files exist (a prior
-            // `open`/`attach` ran), but nothing ever closed cleanly, so no
-            // snapshot was ever written.
+            // A crash: region files exist but nothing ever closed cleanly,
+            // so no snapshot was written.
             let dir = temp_dir("reopen-no-snapshot");
             let cfg = SpillConfig::new(&dir, 1 << 20)
                 .region_bytes(4096)
@@ -4994,9 +4498,8 @@ mod tests {
             flush_batch(&tier.inner, &*sink, vec![job("k", b"1", hlc(1, 0))]);
             tier.close();
             let region_count = region_count_for(1 << 20, 4096);
-            // A deterministic `closed_at_ms`, independent of this test's own
-            // wall-clock timing, so the tombstone_ttl comparison below is
-            // exact rather than racing the test's own execution speed.
+            // A deterministic closed_at_ms so the tombstone_ttl comparison
+            // is exact, independent of test timing.
             write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, Some(999));
 
             let fresh_sink = RecordingSink::default();
@@ -5029,11 +4532,7 @@ mod tests {
             let _tier = SpillTier::open(&cfg, "cache-a").unwrap();
             let cache_dir = dir.join("cache-a");
 
-            // A snapshot an older build wrote: everything else about it
-            // checks out (magic, region sizing, a `closed_at_ms` well
-            // within `tombstone_ttl`), but its `format_version` names a
-            // version this build does not write, so it must never be
-            // trusted regardless of how fresh it otherwise looks.
+            // Everything but format_version checks out.
             let region_count = region_count_for(1 << 20, 4096);
             write_stale_snapshot_for_test(&cache_dir, 4096, region_count, 1_000);
 
@@ -5071,9 +4570,7 @@ mod tests {
                 Some(999),
             );
 
-            // The operator resized the tier since the snapshot was written:
-            // a different region_bytes, so every on-disk offset the
-            // snapshot describes is meaningless at the new sizing.
+            // A different region_bytes than the snapshot was written under.
             let resized_cfg = SpillConfig::new(&dir, 4 * region_len)
                 .region_bytes(2 * region_len)
                 .warm_reopen(true);
@@ -5129,8 +4626,7 @@ mod tests {
             let region_count = region_count_for(1 << 20, 4096);
             write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, Some(999));
 
-            // The snapshot still names this directory eligible for a warm
-            // reopen, but one of its region files is simply gone.
+            // The snapshot names this dir eligible, but a region file is gone.
             fs::remove_file(cache_dir.join(region_file_name(1))).unwrap();
 
             let fresh_sink = RecordingSink::default();
@@ -5179,10 +4675,8 @@ mod tests {
 
         #[test]
         fn reopen_warm_buckets_names_only_the_buckets_a_record_survived_the_owned_filter_for() {
-            // Two keys in different buckets; the owned predicate keeps
-            // only one of them, so `warm_buckets` must name exactly that
-            // bucket, not every bucket a naive "warm reopen happened at
-            // all" flag would otherwise suggest was replayed.
+            // Two keys in different buckets; only one passes the owned
+            // predicate, so warm_buckets must name only that one.
             let dir = temp_dir("reopen-owned-filter-partial");
             let cfg = SpillConfig::new(&dir, 1 << 20)
                 .region_bytes(4096)

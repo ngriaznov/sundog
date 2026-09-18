@@ -250,15 +250,13 @@ pub async fn run_round_against(
 }
 
 /// The classify-through-repair pipeline shared by [`run_round_against`] and
-/// [`run_round_for_buckets`]: given one round's non-empty `mismatched`
-/// reply, classifies each mismatch into a [`RepairPlan`], issues the one
-/// `Msg::AeEntries` fallback for every bucket whose sketch failed to
-/// decode, then runs [`apply_repairs`]. Returns the total wire bytes
-/// `apply_repairs` moved.
+/// [`run_round_for_buckets`]: classifies one round's `mismatched` reply
+/// into a [`RepairPlan`], issues the `Msg::AeEntries` fallback for a
+/// sketch that failed to decode, then runs [`apply_repairs`]. Returns the
+/// total wire bytes moved.
 ///
-/// Buckets past `ae_part_min_bucket` answered with part digests never load
-/// their full entries here: that's the cost this feature removes. Only the
-/// buckets answered with a listing or sketch go through
+/// Buckets past `ae_part_min_bucket` answered with part digests never
+/// load their full entries here; only listing/sketch buckets go through
 /// `entries_for_buckets`.
 async fn reconcile_mismatches(
     mesh: &Mesh,
@@ -337,40 +335,30 @@ async fn reconcile_mismatches(
     .await
 }
 
-/// How one [`run_round_for_buckets`] round ended, per bucket: which of the
-/// requested buckets matched at the instant the exchange was answered,
-/// which were named as mismatched (repair was attempted against them), the
-/// wire bytes [`reconcile_mismatches`] moved, and whether the exchange
-/// itself failed.
-// Only exercised by this file's own real-transport tests today (`cfg(not(feature =
-// "sim"))`, like `apply_repairs_reports_the_bytes_it_moved`); `Cache::reconcile_warm_buckets`
-// wires it into its converge-before-serving loop once that rewrite lands.
+/// How one [`run_round_for_buckets`] round ended, per bucket: which
+/// matched, which were mismatched, wire bytes moved, and whether it failed.
+// Only exercised by this file's own real-transport tests today;
+// `Cache::reconcile_warm_buckets` wires it in once that rewrite lands.
 #[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BucketRoundOutcome {
-    /// No mismatch this round: converged, at this instant. See the design's
-    /// "Match under continuing live load" -- not a claim of permanent
-    /// equality, only that this round's digest exchange found none.
+    /// No mismatch this round: converged at this instant, not a claim of
+    /// permanent equality.
     pub(crate) matched: HashSet<u16>,
-    /// Named as mismatched in the round's reply (repair was attempted
-    /// against it via [`reconcile_mismatches`]), or requested but dropped
-    /// from the round's own outbound digest list because this shard's
-    /// fresh ownership read disagrees that `peer` co-owns it -- either
-    /// way, its digest was never actually compared this round, so it never
-    /// counts as `matched`.
+    /// Named mismatched, or requested but dropped because this shard's
+    /// fresh ownership read disagrees `peer` co-owns it; either way never
+    /// compared this round, so never `matched`.
     pub(crate) still_diverged: HashSet<u16>,
     /// Wire bytes pushed plus pulled this round: `0` when nothing
     /// mismatched or the round failed.
     pub(crate) bytes_moved: u64,
-    /// The digest exchange itself errored, the shard has no ownership view
-    /// to scope it with, or the peer answered `Stale`: no repair ran, and
-    /// every requested bucket counts as `still_diverged`.
+    /// The digest exchange errored, the shard has no ownership view, or
+    /// the peer answered `Stale`: no repair ran.
     pub(crate) failed: bool,
 }
 
-/// Every requested bucket reported `still_diverged`, nothing matched, and
-/// no repair ran: [`run_round_for_buckets`]'s outcome for a round that
-/// could not be scoped or answered at all.
+/// [`run_round_for_buckets`]'s outcome for a round that could not be
+/// scoped or answered at all: everything requested counts as `still_diverged`.
 #[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
 fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
     BucketRoundOutcome {
@@ -381,38 +369,19 @@ fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
     }
 }
 
-/// Bucket-scoped sibling of [`run_round_against`]: like it, but scoped to
-/// `buckets` (a subset of what `shard` and `peer` co-own) and reporting
-/// which of those specifically matched instead of collapsing to one
+/// Bucket-scoped sibling of [`run_round_against`]: scoped to `buckets`
+/// and reports which specifically matched instead of collapsing to one
 /// [`RoundOutcome`]. `Cache::reconcile_warm_buckets`'s converge-before-
-/// serving loop calls this per live co-owner, per round, over that peer's
-/// still-diverging warm buckets.
+/// serving loop calls this per live co-owner, per round.
 ///
-/// Computes local digests the same way `run_round_against` does
-/// (`shard.ae_digests_for(peer)`), filtered to `buckets` before the
-/// [`Mesh::ae_round_scoped`] request goes out, so a bucket outside
-/// `buckets` never appears in the request or the returned outcome.
-/// `ae_digests_for` re-reads the shard's own current ownership view on
-/// every call, independent of whatever view a caller grouped `buckets` by;
-/// a requested bucket the live view does not currently say `peer` co-owns
-/// is therefore silently absent from that call's own result too, never sent
-/// in the outbound request at all. `matched` is computed only from buckets
-/// this round actually sent and got an answer for; every bucket named
-/// mismatched, and every requested bucket that was never sent in the first
-/// place, lands in `still_diverged` -- a bucket whose digest was never
-/// compared this round is never reported as having matched one.
-/// `still_diverged` is what was named plus what was dropped. Reuses
-/// [`reconcile_mismatches`] for the classify-through-repair pipeline, the
-/// same one `run_round_against` uses.
-///
-/// A shard with no ownership view (a `Mode` other than `Distributed`), a
-/// `Stale` reply, or a failed digest exchange reports every requested
-/// bucket `still_diverged` with `failed: true` ([`every_bucket_diverged`]):
-/// no progress this round, the same "counts as a used round" shape a
-/// caller's own round/byte budget bounds against.
-// Only exercised by this file's own real-transport tests today (`cfg(not(feature =
-// "sim"))`, like `apply_repairs_reports_the_bytes_it_moved`); `Cache::reconcile_warm_buckets`
-// wires it into its converge-before-serving loop once that rewrite lands.
+/// Filters local digests to `buckets` before the request goes out; a
+/// requested bucket the live ownership view says `peer` does not
+/// co-own is silently absent from `sent` and lands in `still_diverged`
+/// rather than `matched`. A shard with no ownership view, a `Stale`
+/// reply, or a failed exchange reports everything `still_diverged` with
+/// `failed: true`.
+// Only exercised by this file's own real-transport tests today;
+// `Cache::reconcile_warm_buckets` wires it in once that rewrite lands.
 #[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
 pub(crate) async fn run_round_for_buckets(
     mesh: &Mesh,
@@ -433,10 +402,8 @@ pub(crate) async fn run_round_for_buckets(
         .filter(|bd| requested.contains(&bd.bucket))
         .map(|bd| (bd.bucket, bd.digest))
         .collect();
-    // Every bucket this round actually sent, per the shard's own fresh
-    // ownership read above -- not `requested`, which may name a bucket
-    // that read disagrees `peer` co-owns. Only a bucket in `sent` ever
-    // gets a real answer to be `matched` against.
+    // Every bucket this round sent, per the fresh ownership read
+    // above, not `requested`; only `sent` buckets get a real answer.
     let sent: HashSet<u16> = local_buckets.iter().map(|&(bucket, _)| bucket).collect();
     let mismatched = match mesh
         .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
@@ -459,11 +426,8 @@ pub(crate) async fn run_round_for_buckets(
         }
     };
     let named_mismatched: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
-    // `matched` only from buckets this round actually sent and that came
-    // back unnamed; a requested bucket dropped from `sent` (this round's
-    // own fresh view disagrees the peer co-owns it) was never
-    // digest-compared at all, so it folds into `still_diverged` exactly
-    // like a named mismatch does, never into `matched`.
+    // matched: sent buckets that came back unnamed; a bucket dropped
+    // from sent was never digest-compared, so it folds into still_diverged.
     let matched: HashSet<u16> = sent.difference(&named_mismatched).copied().collect();
     let still_diverged: HashSet<u16> = requested.difference(&matched).copied().collect();
     if mismatched.is_empty() {
@@ -538,19 +502,14 @@ fn classify_versions(local: Option<Hlc>, peer: Option<Hlc>, merging: bool) -> (b
     }
 }
 
-/// Bound on how many mismatched buckets one [`classify_bucket_mismatches`]
-/// call materializes local listings for in a single `entries_for_buckets`
-/// call. A round can name every one of a peer's co-owned buckets mismatched
-/// at once (up to `BUCKET_COUNT`); fetching all of their local listings in
-/// one call would peak at the round's entire mismatched set rather than one
-/// chunk, unlike `apply_repairs`, which already keeps a batch to
-/// `REPAIR_BATCH` records at a time.
+/// Bound on mismatched buckets one [`classify_bucket_mismatches`] call
+/// materializes listings for; a round can name every co-owned bucket at
+/// once, which would otherwise be unbounded.
 const CLASSIFY_BUCKET_CHUNK: usize = 64;
 
-/// Splits `mismatches` into chunks of at most `chunk_size`, preserving
-/// order and consuming no more than one chunk's worth by value at a time.
-/// Pure so [`classify_bucket_mismatches`]'s batching boundary gets a direct
-/// unit test independent of any real [`ShardOps`].
+/// Splits `mismatches` into chunks of at most `chunk_size`. Pure so
+/// [`classify_bucket_mismatches`]'s batching boundary gets a direct unit
+/// test independent of any real [`ShardOps`].
 fn chunk_mismatches(mismatches: Vec<AeMismatch>, chunk_size: usize) -> Vec<Vec<AeMismatch>> {
     let chunk_size = chunk_size.max(1);
     let mut remaining = mismatches;
@@ -563,13 +522,9 @@ fn chunk_mismatches(mismatches: Vec<AeMismatch>, chunk_size: usize) -> Vec<Vec<A
 }
 
 /// Classifies buckets answered with a listing or sketch
-/// (`AeMismatch::Bucket`/`Sketch`): local shard passes in chunks of at most
-/// [`CLASSIFY_BUCKET_CHUNK`] buckets, since a mostly-divergent peer
-/// mismatches many and per-bucket scans would be quadratic, but materializing
-/// every mismatched bucket's listing in one call would be unbounded in the
-/// round's mismatched-bucket count; each mismatch is classified into `plan`
-/// directly, or, for a sketch, via [`handle_sketch_mismatch`]. A no-op when
-/// `mismatches` is empty.
+/// (`AeMismatch::Bucket`/`Sketch`): local shard passes in chunks of at
+/// most [`CLASSIFY_BUCKET_CHUNK`] buckets; each mismatch is classified
+/// into `plan` directly, or, for a sketch, via [`handle_sketch_mismatch`].
 async fn classify_bucket_mismatches(
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
@@ -619,18 +574,12 @@ fn key_versions_to_tuples(entries: Vec<crate::store::KeyVersion>) -> Vec<(Bytes,
 
 /// Classifies buckets answered with part digests (`AeMismatch::PartDigests`):
 /// local shard passes in chunks of at most [`CLASSIFY_BUCKET_CHUNK`]
-/// buckets, the same bound [`classify_bucket_mismatches`] applies to
-/// listing/sketch mismatches, since a round can name every one of a peer's
-/// co-owned buckets mismatched at once and each bucket carries up to
-/// `PART_COUNT` parts -- materializing every mismatched bucket's part
-/// digests, part entries, and `Mesh::ae_parts` reply in one call would be
-/// unbounded in the round's mismatched-bucket count. A no-op when
-/// `mismatches` is empty.
+/// buckets, the same bound [`classify_bucket_mismatches`] applies, since
+/// each bucket carries up to `PART_COUNT` parts.
 ///
-/// Stops at the first chunk whose [`Mesh::ae_parts`] call fails, the same
-/// keep-progress-and-break pattern [`apply_repairs`]'s own pull loops use:
-/// a peer that stalls mid-round costs this round at most one
-/// `REQUEST_TIMEOUT`, not one per remaining chunk.
+/// Stops at the first chunk whose [`Mesh::ae_parts`] call fails, so a
+/// peer that stalls mid-round costs at most one `REQUEST_TIMEOUT`, not
+/// one per remaining chunk.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
 async fn classify_part_digest_mismatches(
@@ -653,13 +602,10 @@ async fn classify_part_digest_mismatches(
 }
 
 /// One [`classify_part_digest_mismatches`] chunk: compares each bucket's
-/// part digests against this node's own, one shard call for the whole
-/// chunk, then one [`Mesh::ae_parts`] request for every part that differs
-/// across the chunk, classifying each reply the same way
-/// [`classify_bucket_mismatches`] does at bucket scale. Returns `false`
-/// when the chunk's `ae_parts` call fails, so the caller can stop issuing
-/// further chunk RPCs against a peer that has stopped answering; `true`
-/// otherwise, including the empty-`wanted_parts` no-op.
+/// part digests against this node's own, then one [`Mesh::ae_parts`]
+/// request for every differing part, classifying replies the same way
+/// [`classify_bucket_mismatches`] does. Returns `false` when `ae_parts`
+/// fails, so the caller stops issuing further chunk RPCs.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
 async fn classify_part_digest_mismatch_chunk(
@@ -759,10 +705,9 @@ async fn classify_part_digest_mismatch_chunk(
     }
 }
 
-/// This record's wire size once framed as a [`crate::wire::Msg::Replicate`]
-/// under a `cache_len`-byte cache name: the same accounting
-/// `net::chunk_records` sizes a replication batch with, applied here to one
-/// record at a time so [`apply_repairs`] can total it up per direction.
+/// This record's wire size framed as a [`crate::wire::Msg::Replicate`]
+/// under a `cache_len`-byte cache name, so [`apply_repairs`] can total it
+/// up per direction.
 fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
     wire::replicate_frame_len(
         cache_len,
@@ -1101,10 +1046,8 @@ mod tests {
     use super::super::sketch::Elem;
     use super::*;
 
-    /// A postcard-encoded `(key, value)` pair, for a test record's key and
-    /// value bytes, and the `WireRecord` `ShardOps::apply_remote` takes.
-    /// Real-transport only: `sim` swaps the whole data plane to turmoil, and
-    /// `apply_repairs_reports_the_bytes_it_moved` below is the only user.
+    /// A postcard-encoded `(key, value)` pair and the `WireRecord`
+    /// `apply_remote` takes. Real-transport only.
     #[cfg(not(feature = "sim"))]
     fn encode_test_record(key: u32, value: &str, node: NodeId) -> (Bytes, WireRecord) {
         let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("test key encodes"));
@@ -1122,14 +1065,9 @@ mod tests {
         (key_bytes, rec)
     }
 
-    /// Two real, connected nodes: `apply_repairs` pushes one key `b` holds
-    /// straight to `a` and pulls one key `a` holds straight from `a`, each
-    /// applied to its shard via `ShardOps::apply_remote` (bypasses fan-out,
-    /// so `apply_repairs` is the only path either side learns of the
-    /// other's key). The returned byte count matches the wire size of
-    /// exactly those two records, computed independently via
-    /// `wire_record_len`. Real-transport only, same reason as
-    /// `encode_test_record` above.
+    /// Pins that `apply_repairs`'s pushed/pulled byte count matches
+    /// `wire_record_len` computed independently for one pushed and one
+    /// pulled record between two real nodes.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn apply_repairs_reports_the_bytes_it_moved() {
@@ -1207,12 +1145,9 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    /// `count` distinct buckets among `0..n` u32 keys, each with more than
-    /// `min_count` keys in it, for
-    /// [`classify_part_digest_mismatches_repairs_every_bucket_across_more_than_one_chunk`]:
-    /// enough buckets that a part-digest-mismatched round spans more than
-    /// one [`CLASSIFY_BUCKET_CHUNK`] internal chunk. Real-transport only,
-    /// same reason as `encode_test_record` above.
+    /// `count` distinct buckets among `0..n` u32 keys with more than
+    /// `min_count` keys each, enough to span more than one
+    /// [`CLASSIFY_BUCKET_CHUNK`]. Real-transport only.
     #[cfg(not(feature = "sim"))]
     fn dense_buckets(n: u32, min_count: usize, count: usize) -> Vec<Vec<u32>> {
         let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
@@ -1233,14 +1168,10 @@ mod tests {
         dense
     }
 
-    /// A round whose part-digest-mismatched set spans more than one
-    /// [`CLASSIFY_BUCKET_CHUNK`] internal chunk: `classify_part_digest_mismatches`
-    /// now chunks that set the same way `classify_bucket_mismatches` chunks
-    /// listing/sketch mismatches, so a mismatched bucket past the first
-    /// chunk must still be classified and repaired, not silently dropped by
-    /// an off-by-one in the chunk loop. One key per dense bucket is dropped
-    /// on `b`, across more buckets than one chunk holds, and every one of
-    /// them must come back.
+    /// Pins that a mismatched bucket past the first
+    /// [`CLASSIFY_BUCKET_CHUNK`] chunk is still classified and repaired,
+    /// not dropped by an off-by-one. One key per dense bucket is dropped
+    /// on `b`, across more buckets than one chunk holds.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn classify_part_digest_mismatches_repairs_every_bucket_across_more_than_one_chunk() {
@@ -1253,9 +1184,7 @@ mod tests {
 
         let config = ClusterConfig {
             ae_part_min_bucket: 8,
-            // Keeps every mismatched part on the listing path, never the
-            // sketch path, the same reasoning as the single-bucket
-            // part-digest test above.
+            // Keeps every mismatched part on the listing path, not sketch.
             ae_sketch_min_bucket: 1_000_000,
             ..loopback_config()
         };
@@ -1343,12 +1272,9 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    /// Wraps a real [`ShardOps`], counting calls to [`ShardOps::part_digests`]
-    /// on a shared counter, forwarding everything else unchanged: the seam
-    /// [`classify_part_digest_mismatches_stops_issuing_ae_parts_after_the_
-    /// first_chunk_fails`] uses to observe how many chunks the loop actually
-    /// visited, since a chunk visited but whose `Mesh::ae_parts` call fails
-    /// leaves no other trace in `RepairPlan`.
+    /// Wraps a real [`ShardOps`], counting `part_digests` calls on a
+    /// shared counter, to observe how many chunks a loop visited when a
+    /// failed `ae_parts` call leaves no other trace.
     #[cfg(not(feature = "sim"))]
     struct CountingPartDigestsShard {
         inner: Arc<dyn ShardOps>,
@@ -1415,15 +1341,9 @@ mod tests {
         }
     }
 
-    /// A round's part-digest classification spans two [`CLASSIFY_BUCKET_CHUNK`]
-    /// chunks; the peer's `Mesh::ae_parts` call fails outright (an unknown
-    /// peer, never registered with this node's mesh). The first chunk's
-    /// failure must stop the loop: the second chunk's local
-    /// `ShardOps::part_digests` lookup -- which runs before any RPC, so it
-    /// is a faithful proxy for "this chunk was visited at all" -- must
-    /// never happen. Without the fix, both chunks are visited and this
-    /// node pays a second `REQUEST_TIMEOUT` for a peer that already proved
-    /// unreachable.
+    /// Pins that a failed `ae_parts` call on the first of two chunks
+    /// stops the loop: the second chunk's `part_digests` lookup, a
+    /// faithful proxy for "visited", must never happen.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn classify_part_digest_mismatches_stops_issuing_ae_parts_after_the_first_chunk_fails() {
@@ -1451,10 +1371,8 @@ mod tests {
             part_digests_calls: Arc::clone(&part_digests_calls),
         });
 
-        // Every bucket's local part digests are empty (nothing was ever
-        // written to this cache), so a non-empty remote digest list makes
-        // every one of them mismatched: `wanted_parts` is never empty and
-        // every chunk actually calls `Mesh::ae_parts`.
+        // Empty local part digests make every remote one mismatched, so
+        // every chunk calls Mesh::ae_parts.
         let bucket_count = CLASSIFY_BUCKET_CHUNK + 5;
         let mismatches: Vec<AeMismatch> = (0..u16::try_from(bucket_count).expect("fits u16"))
             .map(|bucket| AeMismatch::PartDigests(bucket, vec![1u64]))
@@ -1487,9 +1405,8 @@ mod tests {
         cluster.shutdown().await;
     }
 
-    /// `n` distinct u32 keys, each landing in a different bucket: scans
-    /// `0..` until `n` distinct [`bucket_of`] results are seen. Real-
-    /// transport only, same reason as `encode_test_record` above.
+    /// `n` distinct u32 keys, each landing in a different bucket.
+    /// Real-transport only.
     #[cfg(not(feature = "sim"))]
     fn keys_in_distinct_buckets(n: usize) -> Vec<(u32, u16)> {
         let mut found = Vec::new();
@@ -1507,17 +1424,10 @@ mod tests {
         found
     }
 
-    /// A round whose *listing/sketch*-mismatched set spans more than one
-    /// [`CLASSIFY_BUCKET_CHUNK`] internal chunk: `classify_bucket_mismatches`
-    /// chunks its shard-fetch-then-classify pass the same way
-    /// `classify_part_digest_mismatches` chunks its part-digest pass (see
-    /// `classify_part_digest_mismatches_repairs_every_bucket_across_more_than_
-    /// one_chunk` above), but until now only the part-digest path had a
-    /// real-transport test at more-than-one-chunk scale. One key per bucket,
-    /// each bucket's single entry keeping it under the default
-    /// `ae_sketch_min_bucket` (384) so every mismatch answers with
-    /// `AeMismatch::Bucket`, never `Sketch` or `PartDigests`. Every dropped
-    /// key, across more buckets than one chunk holds, must still come back.
+    /// Pins the listing/sketch chunking analogue of the part-digest test
+    /// above: one key per bucket, under `ae_sketch_min_bucket` so every
+    /// mismatch answers `AeMismatch::Bucket`. Every dropped key, across
+    /// more buckets than one chunk holds, must come back.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn classify_bucket_mismatches_repairs_every_bucket_across_more_than_one_chunk() {
@@ -1609,11 +1519,8 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
-    /// Two real, joined `Mode::Distributed` nodes, both open on `name` and
-    /// co-owning every bucket -- the only two eligible nodes at the default
-    /// `owners = 2`: `b`'s node id and its and `c`'s registered shards, for
-    /// `run_round_for_buckets`'s own real-transport tests. Real-transport
-    /// only, same reason as `encode_test_record` above.
+    /// Two real, joined `Mode::Distributed` nodes co-owning every bucket,
+    /// for `run_round_for_buckets`'s real-transport tests. Real-transport only.
     #[cfg(not(feature = "sim"))]
     async fn two_distributed_co_owners(
         test_id: &str,
@@ -1660,13 +1567,9 @@ mod tests {
         (b, c, node_b, shard_b, shard_c)
     }
 
-    /// Two real buckets diverge on `b` (applied straight to its shard,
-    /// bypassing fan-out, so `c` never learns of either on its own): one is
-    /// the round's only requested bucket, the other is not requested at
-    /// all. `still_diverged` names the requested one and only the requested
-    /// one -- the un-requested bucket's real divergence never surfaces,
-    /// proving the request is actually scoped to `buckets` rather than
-    /// reporting every mismatch the peer happens to have.
+    /// Pins that `still_diverged` names only the requested bucket even
+    /// when a second, un-requested bucket also diverges, proving the
+    /// request is scoped to `buckets`.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn run_round_for_buckets_reports_only_the_requested_buckets_still_diverged() {
@@ -1717,18 +1620,9 @@ mod tests {
         c.shutdown().await;
     }
 
-    /// Three real, joined nodes at the default two owners per bucket, so
-    /// rendezvous genuinely splits buckets across different owner pairs:
-    /// `c` requests a round against `b` naming one bucket `b` currently
-    /// co-owns and one bucket `c`'s own fresh view says `b` does *not*
-    /// co-own -- the exact shape `reconcile_warm_buckets`'s peer-grouping
-    /// snapshot vs. `run_round_for_buckets`'s own fresh `ae_digests_for`
-    /// read can disagree on when the live view moves between them. The
-    /// dropped bucket is never sent to `b` at all (never named mismatched
-    /// either, since it was never asked about), so it must land in
-    /// `still_diverged`, never `matched` -- reporting it matched would let
-    /// `reconcile_warm_buckets` `mark_serving` a bucket whose digest was
-    /// never actually compared to `b`'s.
+    /// Pins the view-disagreement case: `c` requests one bucket its
+    /// fresh view says `b` does not co-own. That bucket is never sent
+    /// to `b`, so it must land in `still_diverged`, never `matched`.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     #[expect(
@@ -1786,13 +1680,8 @@ mod tests {
 
         let shard_c = registered_shard(&c, &name);
 
-        // Three nodes, two owners per bucket: some bucket keeps `b` among
-        // its two owners, and some other bucket `c` owns does not -- `d`
-        // took `b`'s place there once `d` joined. `c`'s own ownership view
-        // catches up to `d`'s advertised cache mode on its own gossip and
-        // membership-refresh cadence, independent of `open()` above having
-        // already returned, so this polls rather than assuming the very
-        // first view already reflects all three nodes.
+        // c's ownership view catches up to d's cache mode on its own
+        // cadence, so this polls rather than assuming the first view is settled.
         let mut split: Option<(u16, u16)> = None;
         wait_until(
             Duration::from_secs(10),
@@ -1832,12 +1721,8 @@ mod tests {
         let (shared_with_b, dropped_by_b) =
             split.expect("wait_until only returns once the closure itself reported ready");
 
-        // `b`'s own `OwnershipTracker` for `name` catches up to c and d
-        // joining on its own membership-refresh cadence, independent of
-        // `c`'s own view above having already settled -- the same
-        // real-time delay every other real-round test in this file polls
-        // around rather than assuming the very first round already lands
-        // on a shared view hash.
+        // b's own OwnershipTracker catches up to c/d joining on its own
+        // cadence, so this polls rather than assuming a shared view hash.
         let mut outcome = BucketRoundOutcome::default();
         wait_until(
             Duration::from_secs(10),
@@ -1876,9 +1761,8 @@ mod tests {
         d.shutdown().await;
     }
 
-    /// A bucket neither side has ever touched matches on the first non-
-    /// stale round: `matched` names it, `still_diverged` is empty, and no
-    /// bytes move since nothing needed repair.
+    /// Pins that an untouched bucket matches on the first round: no
+    /// divergence, no bytes moved.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn run_round_for_buckets_marks_a_bucket_matched_once_its_digest_exchange_reports_no_mismatch()
@@ -1919,9 +1803,8 @@ mod tests {
         c.shutdown().await;
     }
 
-    /// A peer this node's mesh has never heard of cannot answer a scoped
-    /// digest exchange: every requested bucket lands in `still_diverged`,
-    /// nothing matches, nothing moves, and the round reports `failed`.
+    /// Pins that an unknown peer fails the round: everything requested
+    /// lands in `still_diverged`.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
     async fn run_round_for_buckets_treats_every_requested_bucket_as_still_diverged_when_the_peer_is_unreachable()
@@ -2037,9 +1920,8 @@ mod tests {
         AeMismatch::Bucket(bucket, Vec::new())
     }
 
-    /// Table-driven: `chunk_mismatches` splits into chunks of at most
-    /// `chunk_size`, preserving every mismatch and their order, and a
-    /// `chunk_size` of `0` is floored to `1` rather than looping forever.
+    /// Pins `chunk_mismatches`'s chunk sizes and order, and that `0`
+    /// floors to `1` rather than looping forever.
     #[test]
     fn chunk_mismatches_splits_into_bounded_chunks_preserving_order() {
         struct Case {

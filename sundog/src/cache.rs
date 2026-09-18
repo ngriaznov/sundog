@@ -1,6 +1,5 @@
 //! The typed cache handle and its builder. `Cache<K, V>` wraps
-//! `Arc<Shard<K, V>>`; a local read decodes its own stored record under the
-//! stripe's read lock, the same lock hold a clone used to take.
+//! `Arc<Shard<K, V>>`; a local read decodes its own stored record under the stripe's read lock.
 //!
 //! [`CacheBuilder::open`] checks the requested [`Mode`] against what live
 //! peers advertise for the same name before registering the shard, and
@@ -97,20 +96,12 @@ where
         self
     }
 
-    /// Hints this shard's expected local entry count so each of
-    /// `BUCKET_COUNT` stripes' `Slab` (arena and index) preallocates
-    /// instead of growing one insert at a time. Pass this node's own
-    /// expected resident share of the keyspace, never the cluster-wide
-    /// total in `Mode::Distributed`. `None`, the default, keeps
-    /// zero-allocation-until-first-write behavior exactly as it is with no
-    /// hint at all. A hint below the real count costs nothing beyond
-    /// ordinary unhinted growth for the overage; a hint above it reserves
-    /// memory that sits unused until `Engine::compact`'s paced shrink pass
-    /// reclaims it (see `should_shrink_stripe`). At [`CacheBuilder::open`],
-    /// clamped to [`CacheBuilder::max_capacity`] unless
-    /// [`CacheBuilder::weigher`] is configured, since a weigher turns
-    /// `max_capacity` into a weight budget rather than an entry count, and
-    /// this hint is always an entry count.
+    /// Hints this shard's expected local entry count so each stripe's arena
+    /// and index preallocate instead of growing one insert at a time. Pass
+    /// this node's own expected resident share, never the cluster-wide total
+    /// in `Mode::Distributed`. Clamped to [`CacheBuilder::max_capacity`] at
+    /// [`CacheBuilder::open`] unless [`CacheBuilder::weigher`] is set, since a
+    /// weigher turns `max_capacity` into a weight budget, not an entry count.
     pub fn capacity_hint(mut self, entries: u64) -> Self {
         self.capacity_hint = Some(entries);
         self
@@ -293,11 +284,8 @@ where
         .with_resolver(resolver)
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled);
-        // `Shard::with_capacity_hint` and `Shard::with_weigher` each
-        // rebuild the engine carrying the other's remembered setting, so
-        // their order here is free. The clamp skips a configured weigher,
-        // since `max_capacity` bounds weight there, not entry count, and
-        // this hint is always an entry count.
+        // `with_capacity_hint`/`with_weigher` each carry the other's setting
+        // forward, so order is free. Skips the clamp when a weigher is set.
         if let Some(hint) = capacity_hint {
             let hint = if weigher.is_some() {
                 hint
@@ -310,19 +298,12 @@ where
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
         // Bounded wait for a first known peer, `Mode::Distributed` only,
-        // before `attach_ownership` computes the first view and before
-        // `attach_spill` (below) replays anything: see
-        // `should_await_first_peer`'s own docs for when this actually
-        // waits. Worth doing regardless of what it finds: a view computed
-        // once a real peer has shown up is a better first view than one
-        // computed alone, so this still runs even for a cold open, whose
-        // own initial pull below trusts sole ownership outright either way
-        // and never waits on this outcome to decide that. `membership_settled`
-        // records whether the wait, when one was needed, actually landed a
-        // peer: `distributed_warm_and_rebalance` uses it to gate the
-        // sole-owner serving shortcut for a bucket this open's spill tier
-        // replayed from disk, never for a bucket found owned alone with
-        // nothing replayed for it.
+        // before `attach_ownership` computes the first view; see
+        // `should_await_first_peer` for when this waits. Runs even
+        // for a cold open, since a view computed once a peer shows up beats
+        // one computed alone. `membership_settled` records whether the wait
+        // landed a peer; `distributed_warm_and_rebalance` uses it to gate the
+        // sole-owner shortcut for a bucket this open's spill tier replayed.
         let membership_settled = if matches!(mode, Mode::Distributed { .. }) {
             await_initial_peers(&cluster).await
         } else {
@@ -353,12 +334,10 @@ where
         // `Engine`/`SpillRead` fields are `OnceLock`s, so it runs on a
         // shard already `Arc`-shared in the registry. A failure here rolls
         // the reservation back: nothing has advertised or scheduled tasks
-        // for this name yet, so removing it is enough. A success reports
-        // whether the tier actually landed a warm reopen, threaded into
-        // `distributed` (for `Mode::Distributed`) so
-        // `distributed_warm_and_rebalance` knows which of this node's
-        // initially owned buckets to run the eager reconciliation round for
-        // instead of an ordinary cold pull.
+        // for this name yet, so removing it is enough. A success threads
+        // whether the tier landed a warm reopen into `distributed`, so
+        // `distributed_warm_and_rebalance` knows which owned buckets get
+        // eager reconciliation instead of an ordinary cold pull.
         #[cfg(feature = "spill")]
         let mut distributed = distributed;
         #[cfg(feature = "spill")]
@@ -405,17 +384,13 @@ where
     }
 }
 
-/// [`CacheBuilder::open`]'s own spill-attach step, factored out to keep
-/// `open` itself short: a no-op when `spill` is `None`, otherwise
-/// [`Shard::attach_spill`], recording exactly which buckets it warm-
-/// reloaded into `distributed`'s
-/// [`DistributedContext::warm_reloaded_buckets`] when this cache is
-/// `Mode::Distributed`.
+/// [`CacheBuilder::open`]'s spill-attach step: a no-op when `spill` is
+/// `None`, otherwise [`Shard::attach_spill`], recording the warm-reloaded
+/// buckets into `distributed`'s [`DistributedContext::warm_reloaded_buckets`].
 ///
 /// # Errors
 ///
-/// Returns the underlying [`std::io::Error`] [`Shard::attach_spill`] itself
-/// can return.
+/// Returns the underlying [`std::io::Error`] [`Shard::attach_spill`] returns.
 #[cfg(feature = "spill")]
 fn attach_spill_and_record_warm<K, V>(
     shard: &Shard<K, V>,
@@ -431,12 +406,8 @@ where
     };
     let outcome = shard.attach_spill(cfg)?;
     if let Some(ctx) = distributed.as_mut() {
-        // Every bucket this warm reopen actually replayed a record for is
-        // unverified until a live co-owner vouches for it
-        // (`reconcile_warm_buckets`) or the ordinary cold-pull machinery
-        // lands fresh data for it: see `ResidencySet::mark_unverified`'s
-        // own docs for why a warm-reloaded bucket needs this and an
-        // ordinary cold one never did.
+        // Every bucket this warm reopen replayed is unverified until
+        // `reconcile_warm_buckets` or an ordinary cold pull lands fresh data.
         let warm: Vec<u16> = outcome.warm_buckets.iter().copied().collect();
         ctx.residency.mark_unverified(&warm);
         ctx.warm_reloaded_buckets = outcome.warm_buckets;
@@ -546,89 +517,43 @@ struct DistributedContext {
     view_tx: watch::Sender<Arc<OwnershipView>>,
     residency: Arc<ResidencySet>,
     owners: NonZeroU8,
-    /// The buckets `Shard::attach_spill` actually warm-reloaded at least
-    /// one record for, via `store::spill::SpillTier::reopen`. Empty by
-    /// default here, from `attach_ownership` alone, since the spill tier
-    /// attaches only afterward, once the shard is `Arc`-shared;
-    /// `CacheBuilder::open` sets this once `attach_spill`'s own outcome
-    /// (`store::AttachSpillOutcome::warm_buckets`) is known, before
-    /// `spawn_cache_tasks` consumes it. `distributed_warm_and_rebalance`
-    /// intersects it with this node's initially owned buckets to decide
-    /// which are candidates for the eager per-co-owner reconciliation round
-    /// instead of the ordinary cold pull -- never every currently owned
-    /// bucket, only the ones actually replayed from disk.
+    /// The buckets `Shard::attach_spill` warm-reloaded at least one record
+    /// for. Empty here (the spill tier attaches only after the shard is
+    /// shared); `CacheBuilder::open` fills it in before
+    /// `spawn_cache_tasks` runs, for `distributed_warm_and_rebalance` to
+    /// intersect with the initially owned buckets and pick eager
+    /// reconciliation candidates over an ordinary cold pull.
     warm_reloaded_buckets: HashSet<u16>,
 }
 
-/// The bound [`await_initial_peers`] never waits past, regardless of how
-/// large [`ClusterConfig::state_transfer_budget`] is configured: long
-/// enough for one or two gossip rounds on a real LAN, short enough that a
-/// misconfigured seed list never stalls `open()` for the whole transfer
-/// budget.
+/// The cap [`await_initial_peers`] never waits past: long enough for a
+/// gossip round or two, short enough a bad seed list never stalls `open()`.
 const INITIAL_PEER_WAIT_CAP: Duration = Duration::from_secs(5);
 
-/// Whether [`CacheBuilder::open`]'s `Mode::Distributed` path should block
-/// for a first known peer before `attach_ownership` computes this node's
-/// initial ownership view, rather than trusting whatever [`Cluster::peers`]
-/// already reports. `true` only when this cluster was built with a fixed,
-/// nonempty seed list (`has_seeds`) and genuinely knows no peer yet
-/// (`!peers_known`): a seedless cluster -- mDNS with nothing found yet, or a
-/// deliberately standalone node -- is a legitimate one-node cluster, not a
-/// membership race to wait out, and a cluster that already has heard from
-/// at least one peer has nothing left to wait for.
+/// Whether [`CacheBuilder::open`]'s `Mode::Distributed` path blocks for a
+/// first known peer before computing the initial ownership view:
+/// `true` only with a fixed seed list (`has_seeds`) and no peer known yet.
 fn should_await_first_peer(has_seeds: bool, peers_known: bool) -> bool {
     has_seeds && !peers_known
 }
 
-/// The merged rule behind the `trust_sole_owner` passed to
-/// [`distributed_warm_and_rebalance`]'s own initial
-/// [`crate::cluster::rebalance::PullRequest`]: trust sole ownership at open
-/// unless this open replayed buckets from a spill snapshot *and* the
-/// membership wait ([`await_initial_peers`]) timed out. `replayed` is the
-/// count of buckets `DistributedContext::warm_reloaded_buckets` actually
-/// holds -- zero for a cold open, which then trusts sole ownership
-/// regardless of `membership_settled`, since there is no spill-replayed
-/// data here for a bucket found owned alone to be a stale echo of. A
-/// nonzero `replayed` is a warm reopen, which trusts sole ownership only
-/// once `membership_settled` too, so a timed-out wait never lets a replayed
-/// bucket's "owned alone" answer be taken as genuine.
+/// The rule behind `trust_sole_owner` for
+/// [`distributed_warm_and_rebalance`]'s initial pull: trust sole ownership
+/// at open unless this open replayed buckets from a spill snapshot
+/// (`replayed > 0`) and the membership wait timed out.
 fn trust_sole_owner_at_open(membership_settled: bool, replayed: usize) -> bool {
     membership_settled || replayed == 0
 }
 
-/// [`CacheBuilder::open`]'s bounded wait for a first known peer, for a
-/// `Mode::Distributed` cache, run before `attach_ownership` computes the
-/// first view and before `attach_spill` replays anything: when
-/// [`should_await_first_peer`] says this cluster was built with seeds and
-/// genuinely knows none yet, blocks for the first non-empty update on the
-/// peers watch channel, bounded by
-/// `min(ClusterConfig::state_transfer_budget, INITIAL_PEER_WAIT_CAP)`.
-/// Without this, `Cluster::peers()` seeded from zero known peers makes
-/// `attach_ownership`'s `OwnershipTracker::seed` compute a transient "this
-/// node owns every bucket" view -- rendezvous ranking over the single
-/// eligible candidate a lone node always is -- for longer than it needs to:
-/// a peer that shows up mid-wait lands in that very first view instead of
-/// only in a later refresh. A cold open (nothing replayed from a spill
-/// snapshot) trusts that view's sole ownership either way, waited for or
-/// not: the initial pull downstream never leaves an owned-alone bucket cold
-/// behind this wait's own outcome. A warm reopen is different: a bucket the
-/// spill tier actually replayed a record for and that this view finds
-/// "owned alone" could be the replay's own stale, unverified echo of
-/// ownership rather than genuine single ownership, so its initial pull
-/// trusts sole ownership on such a bucket only when this wait actually
-/// settled -- either no wait was needed or it landed a peer in time; see
-/// [`distributed_warm_and_rebalance`]'s own docs and the `trust_sole_owner`
-/// field on [`crate::cluster::rebalance::PullRequest`]. Either way this wait
-/// is only about how soon a real peer's ownership shows up, never about
-/// whether a bucket with nothing replayed for it gets served.
-///
-/// Returns whether the wait, when one was needed, actually landed a peer
-/// before its bound: `true` when no wait was needed at all, or the wait
-/// landed a peer in time; `false` when a wait was needed and it timed out,
-/// so this node computes its first view exactly as alone as it would have
-/// without this wait, only later than skipping the wait would have.
-/// Logs at `info` only when a wait actually happens, since the common
-/// case (no seeds, or peers already known) needs no line of its own.
+/// [`CacheBuilder::open`]'s bounded wait for a first known peer,
+/// `Mode::Distributed` only, run before `attach_ownership` computes the
+/// first view. When [`should_await_first_peer`] says this cluster has seeds
+/// and knows no peer yet, blocks for the first peers-watch update, bounded
+/// by `min(ClusterConfig::state_transfer_budget, INITIAL_PEER_WAIT_CAP)`.
+/// Without this, a lone node's transient "I own everything" view could
+/// outlive a peer that shows up moments later. Returns whether the wait,
+/// when needed, landed a peer before its bound; logs at `info` only when a
+/// wait happens.
 async fn await_initial_peers(cluster: &Cluster) -> bool {
     let peers_known = !cluster.peers().is_empty();
     if !should_await_first_peer(cluster.has_seeds(), peers_known) {
@@ -720,8 +645,7 @@ where
 /// bucket-scoped pull, refresh, and rebalance loops for `Distributed`,
 /// tombstone GC, and the entry gauge, all under `cancel` and tracked by
 /// `tasks`. `membership_settled` is `open()`'s own [`await_initial_peers`]
-/// outcome, threaded through to [`distributed_warm_and_rebalance`] alone --
-/// every other mode here has no sole-owner shortcut for it to gate.
+/// outcome, used only by [`distributed_warm_and_rebalance`]'s sole-owner shortcut.
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is independent context `open()` already has to hand; a struct would \
@@ -856,16 +780,10 @@ where
 /// "wait for a peer, retry a few times, then open warm with what landed"
 /// shape [`state_transfer::warm_up_task`] already has for
 /// `Mode::Replicated`. `membership_settled` is `open()`'s own
-/// [`await_initial_peers`] outcome, threaded through to the initial
-/// [`crate::cluster::rebalance::PullRequest`]'s `trust_sole_owner`: a cold
-/// open (`distributed.warm_reloaded_buckets` empty) holds nothing
-/// unverified -- there is no spill-replayed data here for a bucket found
-/// owned alone to be a stale echo of -- so it trusts sole ownership and
-/// serves such a bucket at once regardless of `membership_settled`. A warm
-/// reopen has no such guarantee: a warm-reloaded bucket found owned alone
-/// trusts that outright only when `membership_settled` too, never letting a
-/// timed-out membership wait vouch for a replay's own stale echo of
-/// ownership.
+/// [`await_initial_peers`] outcome, fed into the initial pull's
+/// `trust_sole_owner`: a cold open trusts sole ownership regardless of
+/// it, but a warm reopen trusts it only once membership has settled, so
+/// a timed-out wait never vouches for a replay's stale ownership echo.
 ///
 /// [`state_transfer::warm_up_task`]: crate::cluster::state_transfer::warm_up_task
 async fn distributed_warm_and_rebalance(
@@ -889,10 +807,8 @@ async fn distributed_warm_and_rebalance(
     let concurrency = cluster.config().rebalance_concurrency;
     let disown_grace =
         cluster.config().ae_interval * cluster.config().distributed_disown_grace_rounds;
-    // The refresh loop runs from before the first pull: a membership change
-    // during it moves the view under the pull, which then answers
-    // `Superseded` and is planned again, instead of the view standing still
-    // until the pull's whole budget has passed.
+    // The refresh loop starts before the first pull, so a membership change
+    // during it moves the view under the pull, which replans instead of stalling.
     cluster.spawn_tracked_in(
         tasks,
         crate::ownership::refresh_task(
@@ -905,20 +821,10 @@ async fn distributed_warm_and_rebalance(
     );
 
     let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
-    // A warm-reloaded bucket still starts exactly as cold as any other
-    // bucket `attach_ownership` seeded (goal 2's serve-gating fix): this
-    // eager per-co-owner reconciliation round runs before the
-    // rebalance/pull machinery starts below, clearing cold only for a
-    // bucket whose round against every live co-owner comes back
-    // reconciled. Everything else, never warm-reloaded at all, or
-    // warm-reloaded but a round failed, timed out, or found a stale view,
-    // falls straight through to the ordinary cold-pull path, exactly the
-    // behavior a bucket with no spill tier at all already gets. Narrowed to
-    // `warm_reloaded_buckets` specifically, not every currently owned
-    // bucket: a bucket this node just gained ownership of, with nothing
-    // replayed for it from disk, is not a warm-reload candidate at all and
-    // skips straight to the ordinary cold-pull path below rather than
-    // paying for an eager AE round with nothing local to verify.
+    // A warm-reloaded bucket starts as cold as any other: this eager
+    // reconciliation round runs first, clearing cold only for a bucket whose
+    // round against every live co-owner comes back reconciled. Everything
+    // else falls to the ordinary cold-pull path below, same as with no spill tier.
     let warm_candidates: Vec<u16> = initially_owned
         .iter()
         .copied()
@@ -961,19 +867,9 @@ async fn distributed_warm_and_rebalance(
         buckets: pull_buckets,
         budget,
         concurrency,
-        // See `trust_sole_owner_at_open`'s own docs for the merged rule: a
-        // cold open (`warm_reloaded_buckets` empty) holds nothing
-        // unverified, so every initially owned bucket found owned alone
-        // here is trusted and served outright regardless of whether the
-        // membership wait above landed a peer or timed out. A warm reopen
-        // is different -- a bucket found "owned alone" here could be the
-        // replay's own stale, unverified echo of ownership -- so it is
-        // trusted outright only when `membership_settled` too. When a wait
-        // was needed and timed out, any warm-reloaded bucket among these
-        // stays cold and unverified instead, falling to `warm_up_task`'s
-        // ordinary retries -- which pull once a real peer shows up, or give
-        // up per its own attempt cap -- rather than being served here with
-        // nobody ever having vouched for it.
+        // See `trust_sole_owner_at_open`: a cold open trusts sole ownership
+        // outright; a warm reopen trusts it only once membership_settled too,
+        // else the bucket stays cold for `warm_up_task`'s ordinary retries.
         trust_sole_owner: trust_sole_owner_at_open(membership_settled, warm_reloaded_buckets.len()),
     }
     .run()
@@ -1007,29 +903,18 @@ async fn distributed_warm_and_rebalance(
     );
 }
 
-/// Cap on the rounds that ran in [`reconcile_warm_buckets`]'s per-peer
-/// converge loop, matching the codebase's own precedent for giving a
-/// self-healing mechanism a few tries before falling back to the
-/// authoritative path (`crate::cluster::state_transfer::MAX_WARM_UP_ATTEMPTS`,
-/// `crate::cluster::rebalance::ALL_COLD_PASSES`). Each round applies its
-/// entire diff, so this is not "N batches of a fixed-size chunk" but "N
-/// chances for a bucket still moving under live writes to settle." A round
-/// the peer failed or answered `Stale` never counts here: it is retried on
-/// [`retry_delay`]'s backoff inside [`ReconcileBudget::time_budget`].
+/// Cap on rounds in [`reconcile_warm_buckets`]'s per-peer converge loop:
+/// chances for a bucket still moving under live writes to settle, not chunks
+/// of a fixed size. A failed or `Stale` round doesn't count; it retries.
 const RECONCILE_MAX_ROUNDS: u32 = 3;
 
-/// Base delay before the first retry of a failed round in
-/// [`reconcile_against_peer`]: doubles with every consecutive failure,
-/// capped at [`ReconcileBudget::backoff_cap`].
+/// Base retry delay after a failed round in [`reconcile_against_peer`];
+/// doubles per consecutive failure, capped at [`ReconcileBudget::backoff_cap`].
 const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(200);
 
-/// Per-peer, per-bucket-set bound on [`reconcile_warm_buckets`]'s
-/// converge-before-serving loop: whichever of `max_rounds` (rounds that
-/// ran), `byte_budget` or `time_budget` is hit first stops the loop for
-/// that peer's still-diverging buckets, leaving them cold and unverified
-/// for the ordinary cold-pull path. A failed round never counts toward
-/// `max_rounds`; it is retried after a backoff that doubles from
-/// [`RECONCILE_RETRY_BASE`] up to `backoff_cap`, inside `time_budget`.
+/// Per-peer bound on [`reconcile_warm_buckets`]'s converge loop: whichever
+/// of `max_rounds`, `byte_budget` or `time_budget` is hit first stops it,
+/// leaving that peer's still-diverging buckets cold for the ordinary pull.
 #[derive(Debug, Clone, Copy)]
 struct ReconcileBudget {
     max_rounds: u32,
@@ -1039,12 +924,8 @@ struct ReconcileBudget {
 }
 
 impl ReconcileBudget {
-    /// `max_rounds` fixed at [`RECONCILE_MAX_ROUNDS`]; `byte_budget` from
-    /// [`ClusterConfig::reconcile_byte_budget`]; `time_budget` from
-    /// [`ClusterConfig::state_transfer_budget`], the same startup-latency
-    /// bound the initial pull honors; `backoff_cap` from
-    /// [`ClusterConfig::ae_interval`], the cadence a co-owner's ownership
-    /// view catches up on.
+    /// Builds from `ClusterConfig`: `byte_budget`, `time_budget` (the same
+    /// startup bound the initial pull honors), and `backoff_cap` from `ae_interval`.
     fn from_config(config: &ClusterConfig) -> Self {
         Self {
             max_rounds: RECONCILE_MAX_ROUNDS,
@@ -1055,10 +936,8 @@ impl ReconcileBudget {
     }
 }
 
-/// Pure: whether [`reconcile_warm_buckets`]'s per-peer loop keeps going,
-/// given rounds run, bytes moved and time elapsed so far against `budget`,
-/// and that at least one bucket is still diverging. `still_diverging == 0`
-/// stops the loop regardless of the budget: nothing left to check.
+/// Whether [`reconcile_warm_buckets`]'s per-peer loop keeps going, given
+/// progress so far against `budget`; `still_diverging == 0` always stops it.
 fn should_keep_reconciling(
     rounds_run: u32,
     bytes_moved: u64,
@@ -1072,12 +951,9 @@ fn should_keep_reconciling(
         && elapsed < budget.time_budget
 }
 
-/// Pure: how long [`reconcile_against_peer`] waits before retrying after
-/// `consecutive_failures` failed rounds in a row (at least one):
-/// [`RECONCILE_RETRY_BASE`] doubled per failure beyond the first, capped at
-/// `budget.backoff_cap`. `None` when that wait would reach the end of
-/// `budget.time_budget` from `elapsed`, so the loop stops instead of
-/// sleeping past its bound.
+/// How long [`reconcile_against_peer`] waits before its next retry:
+/// [`RECONCILE_RETRY_BASE`] doubled per failure, capped at `backoff_cap`;
+/// `None` once that wait would run past `budget.time_budget`.
 fn retry_delay(
     consecutive_failures: u32,
     elapsed: Duration,
@@ -1091,11 +967,8 @@ fn retry_delay(
     (delay < remaining).then_some(delay)
 }
 
-/// Pure: splits `requested` into (converged, still-diverging) given one
-/// round's [`anti_entropy::BucketRoundOutcome`], folding a `failed` round
-/// (the whole peer is unreachable or stale this round) as "every requested
-/// bucket stays diverging" -- no bucket in `requested` is ever reported
-/// converged from a round that did not actually run.
+/// Splits `requested` into (converged, still-diverging) from one round's
+/// outcome; a `failed` round reports every bucket as still diverging.
 fn split_round_result(
     requested: &[u16],
     outcome: &anti_entropy::BucketRoundOutcome,
@@ -1109,25 +982,17 @@ fn split_round_result(
         .partition(|bucket| outcome.matched.contains(bucket))
 }
 
-/// One live co-owner's whole converge loop: repeatedly
+/// One live co-owner's converge loop: repeatedly
 /// [`anti_entropy::run_round_for_buckets`] against `peer` over its
-/// still-diverging subset of `buckets`, `mark_serving` on `residency` the
-/// instant a bucket's digest exchange reports no mismatch -- not held back
-/// for the rest of this peer's still-diverging set -- until either nothing
-/// is left diverging against `peer` or [`should_keep_reconciling`]'s
-/// `budget` stops the loop. A round `peer` failed or answered `Stale` is
-/// retried after [`retry_delay`]'s backoff without counting as a round,
-/// while `peer` stays on `cluster`'s live list and the wait fits inside
-/// the time budget: at a restart every co-owner answers `Stale` until its
-/// ownership view catches up to this node rejoining, on its own refresh
-/// cadence. Returns every bucket marked serving this way.
+/// still-diverging subset of `buckets`, calling `mark_serving` as soon as a
+/// bucket's digest matches, until nothing is left diverging or
+/// [`should_keep_reconciling`]'s `budget` stops it. A failed or `Stale`
+/// round retries via [`retry_delay`] without counting as a round. Returns
+/// every bucket marked serving this way.
 ///
-/// Factored out of [`reconcile_warm_buckets`] so its caller can run one of
-/// these per live co-owner concurrently via [`futures::future::join_all`]:
-/// this node's warm buckets can span more than one live co-owner even in a
-/// small cluster, and running each peer's loop one after another would
-/// multiply `open()`'s worst-case stall by the number of distinct peers
-/// instead of staying bounded by a single peer's `budget`.
+/// Factored out so [`reconcile_warm_buckets`] can run one of these per live
+/// co-owner concurrently, bounding the wait by one peer's `budget` instead
+/// of the sum across peers.
 async fn reconcile_against_peer(
     cluster: &Cluster,
     shard_ops: &Arc<dyn ShardOps>,
@@ -1163,8 +1028,7 @@ async fn reconcile_against_peer(
         bytes_moved += outcome.bytes_moved;
         let (converged, diverging) = split_round_result(&still_diverging, &outcome);
         if !converged.is_empty() {
-            // Cleared the moment each bucket's digest matches, not held
-            // back for the rest of this peer's still-diverging set.
+            // Cleared per bucket once its digest matches, not held back for the rest.
             residency.mark_serving(&converged);
             reconciled.extend(converged.iter().copied());
         }
@@ -1182,10 +1046,8 @@ async fn reconcile_against_peer(
         );
         still_diverging = diverging;
         if outcome.failed {
-            // Retried on a backoff rather than counted against
-            // `max_rounds`: a peer that has left the live list has nobody
-            // to retry against, and a wait that would run past the time
-            // budget stops the loop instead of sleeping through it.
+            // Retried on a backoff, not counted against `max_rounds`. A peer
+            // that left the live list has nobody to retry against.
             if !cluster.live_peer_ids().contains(&peer) {
                 break;
             }
@@ -1195,49 +1057,22 @@ async fn reconcile_against_peer(
             }
         }
     }
-    // Every bucket left in `still_diverging` here -- the round, byte or
-    // time budget ran out, or the peer left the live list with its rounds
-    // still failing -- gets no `ResidencySet` call at all: it keeps exactly
-    // the cold-and-unverified state it already had, falling through to the
-    // ordinary cold-pull path next.
+    // Every bucket still in `still_diverging` here gets no `ResidencySet`
+    // call: it stays cold and unverified, falling to the ordinary cold-pull path.
     reconciled
 }
 
-/// Goal 2's converge-before-serving reconciliation step: groups
-/// `warm_buckets` by live co-owner, then runs [`reconcile_against_peer`]'s
-/// loop for every distinct peer concurrently (see its own docs), returning
-/// the union of every bucket marked serving across all of them. Each
-/// peer's loop clears `residency`'s cold and unverified marks via
-/// [`ResidencySet::mark_serving`] for each bucket the instant its digest
-/// exchange against that peer reports no mismatch -- not held back for the
-/// rest of that peer's still-diverging set -- until either nothing is left
-/// diverging against that peer or [`should_keep_reconciling`]'s
-/// [`ReconcileBudget`] stops the loop.
+/// Converge-before-serving reconciliation: groups `warm_buckets` by live
+/// co-owner, then runs [`reconcile_against_peer`]'s loop for each peer
+/// concurrently, returning the union of buckets marked serving.
 ///
-/// A bucket with no live co-owner at all has nobody to verify its replayed
-/// state against: unlike a fresh cold-open, where "what is here" is always
-/// empty, a warm-reloaded bucket's local state came from replaying on-disk
-/// records that predate this restart and can include a value this node
-/// itself deleted before going down (deletes never persist to the spill
-/// tier, only the in-RAM tombstone, which the restart drops), so
-/// verification is preferred over trusting it outright whenever a live
-/// co-owner exists to check it against. Such a bucket, and any bucket still
-/// in a peer's diverging set when that peer's loop stops (the budget
-/// exhausted, or every round against that peer failed), gets no
-/// [`ResidencySet`] call at all here: it keeps exactly the cold-and-
-/// unverified state `attach_ownership`/`attach_spill_and_record_warm`
-/// already gave it -- [`split_round_result`]'s failed-round handling never
-/// reports a bucket converged from a round that did not actually run, so a
-/// give-up here can never clear `unverified` while leaving `cold` set (the
-/// resurrection hazard a local hit's serve-gate depends on both marks to
-/// close) -- falling through to the caller's ordinary cold-pull path next,
-/// exactly as it would for a bucket that was never warm-reloaded at all: a
-/// co-owner still live and reachable there eventually verifies it the same
-/// as any other pull, and `crate::cluster::rebalance::PullRequest::run`'s
-/// identical "owned alone" case marks a bucket found to have no live
-/// co-owner at all servable outright, on the same "nothing better is
-/// coming" reasoning that lets a fresh cold-open trust an empty bucket
-/// owned alone.
+/// A warm-reloaded bucket's local state came from replaying on-disk records
+/// that predate this restart and can include a value this node itself
+/// deleted before going down (deletes never persist to the spill tier), so
+/// it needs verification against a live co-owner rather than outright
+/// trust. A bucket with no live co-owner, or one whose loop against a peer
+/// never closed the gap, gets no [`ResidencySet`] call and stays cold and
+/// unverified, falling to the caller's ordinary cold-pull path.
 async fn reconcile_warm_buckets(
     cluster: &Cluster,
     shard_ops: &Arc<dyn ShardOps>,
@@ -1254,9 +1089,7 @@ async fn reconcile_warm_buckets(
     let self_node = cluster.node_id();
     let live: HashSet<NodeId> = cluster.live_peer_ids().into_iter().collect();
 
-    // Grouped by live co-owner, as before: a bucket with no live co-owner
-    // has nobody to verify its replayed state against, so it is excluded
-    // from the loop below outright, staying cold and unverified.
+    // Grouped by live co-owner; a bucket with none is excluded, staying cold and unverified.
     let mut peer_buckets: HashMap<NodeId, Vec<u16>> = HashMap::new();
     let mut cold_left: usize = 0;
     for &bucket in warm_buckets {
@@ -1276,14 +1109,9 @@ async fn reconcile_warm_buckets(
     }
 
     let budget = ReconcileBudget::from_config(cluster.config());
-    // Every live co-owner's converge loop runs concurrently rather than
-    // one after another: a bucket's owners_of() can name a different live
-    // co-owner for different buckets even in a small cluster, so this
-    // node's warm buckets can split across more than one peer, and running
-    // those loops sequentially would multiply open()'s worst-case stall by
-    // the number of distinct peers instead of staying bounded by a single
-    // peer's `ReconcileBudget` as intended. `mark_serving`'s own locking
-    // makes concurrent calls from different peers' loops safe.
+    // Runs concurrently, not sequentially: warm buckets can split across
+    // several peers, and running loops one after another would multiply the
+    // stall by peer count instead of bounding it by one `ReconcileBudget`.
     let per_peer = peer_buckets.into_iter().map(|(peer, buckets)| {
         reconcile_against_peer(cluster, shard_ops, cache, residency, peer, buckets, budget)
     });
@@ -1293,11 +1121,8 @@ async fn reconcile_warm_buckets(
         .flatten()
         .collect();
 
-    // Every warm-reloaded bucket not marked serving here is still cold and
-    // unverified: either it has a live co-owner but its loop against that
-    // peer never closed the gap (retried later by `warm_up_task`), or it
-    // has no live co-owner at all (`cold_left`, falling to the "owned
-    // alone" trust path).
+    // Every bucket not marked serving stays cold and unverified: either its
+    // loop never closed the gap (retried by `warm_up_task`), or it had no live co-owner.
     let unverified_left = warm_buckets.len() - reconciled.len() - cold_left;
     tracing::info!(
         cache = %cache,
@@ -1383,12 +1208,8 @@ where
         self.shard.name()
     }
 
-    /// This cache's shard's current per-stripe `live` arena capacities; see
-    /// [`crate::store::Shard::stripe_capacities`]. `#[doc(hidden)]`: a test
-    /// accessor for confirming a [`CacheBuilder::capacity_hint`] reaches
-    /// the opened cache's stripes from an integration-test binary outside
-    /// this crate, which cannot otherwise reach the private `shard` field.
-    /// Never call this outside a benchmark or test.
+    /// Per-stripe `live` arena capacities; see [`crate::store::Shard::stripe_capacities`].
+    /// `#[doc(hidden)]` test accessor reaching the private `shard` field. Test/benchmark only.
     #[doc(hidden)]
     #[must_use]
     pub fn stripe_capacities(&self) -> Vec<usize> {
@@ -1451,13 +1272,8 @@ where
         };
         let key_bytes = encode_key(key)?;
         let bucket = bucket_of(&key_bytes);
-        // An unverified bucket -- warm-reloaded from a spill tier's on-disk
-        // checkpoint, never yet checked against a live co-owner -- is
-        // treated as not owned locally here: unlike an ordinary cold
-        // bucket, whose only possible local content was already
-        // trustworthy, a warm-reloaded bucket can hold a record a co-owner
-        // deleted during this node's downtime, so even a local *hit* is
-        // never served from it while the marker is set.
+        // An unverified bucket (warm-reloaded, not yet checked against a live
+        // co-owner) counts as not owned here: it can hold a record a co-owner deleted during downtime.
         let mut owns = view.owns(bucket) && !self.shard.is_unverified_bucket(bucket);
         if owns {
             let value = self.shard.get(key).await;
@@ -1829,9 +1645,7 @@ mod tests {
         .await;
     }
 
-    /// Reserves a loopback UDP port, then releases it: a gossip seed
-    /// address nothing ever listens on, for a test that needs
-    /// `await_initial_peers` to time out rather than settle.
+    /// A loopback UDP address nothing listens on, for forcing a wait to time out.
     async fn dead_gossip_addr() -> SocketAddr {
         let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1925,8 +1739,7 @@ mod tests {
             .await
             .expect("a builds");
 
-        // Deliberately no prior `wait_for_peer_count`: `await_initial_peers`
-        // itself is what is under test here.
+        // No prior `wait_for_peer_count`: `await_initial_peers` itself is under test.
         let settled = await_initial_peers(&a).await;
 
         assert!(settled, "the seeded peer shows up well within the bound");
@@ -1975,9 +1788,7 @@ mod tests {
         cluster.shutdown().await;
     }
 
-    /// Reserves a loopback TCP port, then releases it: an address nobody
-    /// ever listens on, distinct from [`dead_gossip_addr`]'s UDP one, so a
-    /// seed pointed at it can never be answered.
+    /// A loopback TCP address nobody listens on, distinct from [`dead_gossip_addr`]'s UDP one.
     fn dead_tcp_addr() -> SocketAddr {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .expect("bind an ephemeral loopback tcp port to reserve a dead address");
@@ -1986,22 +1797,14 @@ mod tests {
             .expect("a freshly bound tcp listener reports a local address")
     }
 
-    /// A cold open of a `Mode::Distributed` cache whose only seed never
-    /// answers trusts its own sole ownership outright: `open()` returns
-    /// with every initially owned bucket already servable, not left cold
-    /// waiting on a peer that is never coming. Guards the regression where
-    /// the open-time pull threaded `await_initial_peers`'s timed-out
-    /// outcome into `trust_sole_owner`, leaving every bucket cold and the
-    /// node unable to answer a joiner's own pull (`StUnavailable` from
-    /// `st_buckets_cold`), so a real cluster's first node never finished
-    /// warming and every join hung until the container suite's bound.
+    /// Pins that a cold open trusts sole ownership outright even when its
+    /// only seed never answers, guarding the regression that left every
+    /// bucket cold behind a timed-out membership wait.
     #[tokio::test]
     async fn distributed_open_trusts_sole_ownership_when_its_membership_wait_times_out() {
         let dead_seed = dead_tcp_addr();
         let config = ClusterConfig {
-            // Short enough that `await_initial_peers`'s wait (bounded by
-            // `min(state_transfer_budget, INITIAL_PEER_WAIT_CAP)`) times
-            // out quickly, well inside this test's own patience.
+            // Short enough that `await_initial_peers`'s wait times out quickly.
             state_transfer_budget: Duration::from_secs(1),
             ..loopback_config()
         };
@@ -2076,9 +1879,7 @@ mod tests {
         assert_eq!(budget.backoff_cap, Duration::from_millis(765));
     }
 
-    /// The time bound on its own: `should_keep_reconciling` stops once
-    /// `elapsed` reaches the budget's `time_budget`, with every other bound
-    /// untouched and work left.
+    /// Pins that `should_keep_reconciling` stops once `elapsed` alone reaches `time_budget`.
     #[test]
     fn should_keep_reconciling_stops_once_the_time_budget_is_spent() {
         let budget = ReconcileBudget {
@@ -2100,9 +1901,8 @@ mod tests {
         }
     }
 
-    /// Table-driven: `retry_delay` doubles from `RECONCILE_RETRY_BASE` per
-    /// consecutive failure, caps at the budget's `backoff_cap`, and answers
-    /// `None` once the wait would reach the end of the time budget.
+    /// Pins that `retry_delay` doubles from `RECONCILE_RETRY_BASE` per
+    /// failure, caps at `backoff_cap`, and stops at the time budget.
     #[test]
     fn retry_delay_doubles_from_the_base_caps_at_the_backoff_cap_and_stops_at_the_time_budget() {
         struct Case {
@@ -2183,10 +1983,8 @@ mod tests {
         }
     }
 
-    /// Table-driven: `should_keep_reconciling` stops at whichever of
-    /// rounds-exhausted, byte-budget-exhausted, time-budget-exhausted or
-    /// nothing-left-diverging is hit first, and keeps going only when none
-    /// of the four holds.
+    /// Pins that `should_keep_reconciling` stops at whichever bound (rounds,
+    /// bytes, time, or nothing left diverging) is hit first.
     #[test]
     fn should_keep_reconciling_stops_at_whichever_bound_is_hit_first() {
         struct Case {
@@ -2277,10 +2075,8 @@ mod tests {
         }
     }
 
-    /// Table-driven: `split_round_result` folds a `failed` round as every
-    /// requested bucket staying diverged regardless of what `matched`
-    /// happens to hold, and otherwise splits `requested` by membership in
-    /// `outcome.matched`.
+    /// Pins that `split_round_result` folds a `failed` round as every bucket
+    /// diverging regardless of `matched`, else splits by membership in it.
     #[test]
     fn split_round_result_folds_a_failed_round_and_otherwise_splits_by_matched() {
         struct Case {
@@ -2336,11 +2132,8 @@ mod tests {
         }
     }
 
-    /// A `Mode::Distributed` shard-and-context pair for `cluster`,
-    /// `attach_ownership`'s own production shape, cast to `Arc<dyn
-    /// ShardOps>` the way `CacheBuilder::open` does right after building
-    /// it: everything `reconcile_warm_buckets` needs to run against,
-    /// without going through a full cache `open()`.
+    /// A `Mode::Distributed` shard-and-context pair, `attach_ownership`'s
+    /// shape, for testing without a full `open()`.
     fn distributed_context_for_test(
         cluster: &Cluster,
         name: &SmolStr,
@@ -2430,17 +2223,9 @@ mod tests {
         cluster.shutdown().await;
     }
 
-    /// Goal 2's core safety mechanism exercised against a real live
-    /// co-owner, not only the trivial no-live-co-owner and empty-list
-    /// branches the two tests above cover: `b` holds real, already-written
-    /// data under `name`; `c`'s own shard starts empty, its bucket set
-    /// seeded cold exactly as `attach_ownership` seeds a real warm reopen.
-    /// `reconcile_warm_buckets` must run a genuine
-    /// `anti_entropy::run_round_for_buckets` round against `b`, pull its
-    /// data in, see every bucket land in that round's `matched` set, and
-    /// only then clear cold via `ResidencySet::mark_serving` -- proving the
-    /// converged branch of the loop actually runs, not only that it is
-    /// never reached.
+    /// Pins the core reconciliation mechanism against a real live co-owner:
+    /// `c` starts cold-seeded, pulls `b`'s real data via a genuine
+    /// anti-entropy round, and only then clears cold via `mark_serving`.
     #[tokio::test]
     async fn reconcile_warm_buckets_clears_cold_once_a_real_round_against_a_live_co_owner_reconciles()
      {
@@ -2474,17 +2259,11 @@ mod tests {
             .expect("c builds");
         wait_for_peer_count(&b, 1).await;
         wait_for_peer_count(&c, 1).await;
-        // `distributed_context_for_test` builds `c`'s shard directly,
-        // bypassing `CacheBuilder::open()`'s own call to this: without it
-        // `b` never learns `c` also has `name` open in `Mode::Distributed`,
-        // so `b`'s `OwnershipTracker` never adds `c` as eligible and every
-        // round against it answers `Stale` forever.
+        // Bypasses `open()`'s own advertise call: without it b never learns c
+        // has `name` open, so every round against it answers `Stale`.
         c.advertise_cache_mode(&name, Mode::distributed());
 
-        // `c`'s own shard for `name`, built directly rather than through a
-        // real `open()`, the same seam `reconcile_warm_buckets`'s other
-        // tests use: everything a warm-reopened `Shard` would have handed
-        // its caller, before any pull or reconciliation has run.
+        // c's shard for `name`, built directly rather than through a real `open()`.
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
         let warm_buckets: Vec<u16> = distributed_c.ownership.current().owned_buckets().collect();
         assert!(
@@ -2493,13 +2272,9 @@ mod tests {
         );
         distributed_c.residency.mark_cold(&warm_buckets);
 
-        // `b`'s own `OwnershipTracker` for `name` was seeded while `b` was
-        // still alone; it catches up to `c` joining on its own membership-
-        // refresh cadence, independent of `wait_for_peer_count` above
-        // (gossip-level peer knowledge, not `b`'s cache-level view). Until
-        // it does, `b` answers every round `Stale`, so this polls the same
-        // way any other convergence wait here does rather than assuming
-        // one round suffices.
+        // b's tracker catches up to c joining on its own refresh cadence,
+        // answering every round `Stale` until then, so this polls rather
+        // than assuming one round suffices.
         let mut reconciled: HashSet<u16> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
@@ -2540,16 +2315,10 @@ mod tests {
         b.shutdown().await;
     }
 
-    /// Pins [`reconcile_warm_buckets`]'s per-peer processing: three real,
-    /// joined nodes at the default two owners per bucket, so `c`'s warm
-    /// buckets genuinely split across two distinct live co-owners (`b` for
-    /// some, `d` for others) instead of the single-peer shape every other
-    /// real-round test here exercises. One `reconcile_warm_buckets` call
-    /// must converge every one of `c`'s warm buckets, whichever of the two
-    /// peers each is grouped under -- each peer's loop runs via
-    /// [`futures::future::join_all`], and this is the first test where
-    /// more than one entry lands in `reconcile_warm_buckets`'s internal
-    /// `peer_buckets` map.
+    /// Pins [`reconcile_warm_buckets`]'s per-peer processing: three real
+    /// nodes so `c`'s warm buckets split across two live co-owners (`b` and
+    /// `d`), and one call converges every bucket regardless of which peer
+    /// it's grouped under.
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -2592,9 +2361,7 @@ mod tests {
         wait_for_peer_count(&c, 2).await;
         wait_for_peer_count(&d, 2).await;
 
-        // See the single-peer sibling test above: without this, neither b
-        // nor d ever learns c also has `name` open, and every round
-        // against them answers Stale.
+        // Without this, neither b nor d learns c has `name` open, and every round answers Stale.
         c.advertise_cache_mode(&name, Mode::distributed());
         d.cache::<u32, String>(name.clone())
             .mode(Mode::distributed())
@@ -2605,14 +2372,9 @@ mod tests {
         let node_b = b.node_id();
         let node_d = d.node_id();
 
-        // `distributed_context_for_test` seeds its `OwnershipTracker` from
-        // `c`'s own gossiped view of `advertised_cache_modes` at the
-        // instant it's called: until that gossip carries d's advertised
-        // mode to c too, c computes ownership as if only b and c were
-        // eligible, giving every one of c's buckets b as its only co-owner.
-        // Rebuilding the context on each retry, rather than only retrying
-        // the round below, is what actually waits out that convergence
-        // instead of freezing a too-early, single-peer view.
+        // Until gossip carries d's mode to c, c sees only b as a co-owner.
+        // Rebuilding the context on each retry (not just the round) is what
+        // waits out that convergence instead of freezing an early view.
         let mut built: Option<SplitWarmContext> = None;
         wait_until(
             Duration::from_secs(10),
@@ -2656,12 +2418,8 @@ mod tests {
         } = built.expect("wait_until only returns once the closure itself reported ready");
         distributed_c.residency.mark_cold(&warm_buckets);
 
-        // One planted key per peer, applied straight to each donor's real
-        // shard (bypassing the ordinary write path and its own fan-out, so
-        // this doesn't depend on b's or d's background rebalance/disown
-        // machinery having settled the same instant c's view did): proves
-        // one `reconcile_warm_buckets` call actually pulls in data from
-        // *both* groups, not only whichever peer happens to run first.
+        // One planted key per peer, applied straight to each donor's shard,
+        // proves one call pulls data from both groups, not just whichever runs first.
         let key_from_b = key_for_bucket(bucket_with_b);
         let key_from_d = key_for_bucket(bucket_with_d);
         registered_shard(&b, &name)
@@ -2671,11 +2429,8 @@ mod tests {
             .apply_remote_batch(vec![test_record(key_from_d, "from-d", node_d)])
             .await;
 
-        // b's and d's own `OwnershipTracker`s catch up to c joining on
-        // their own membership-refresh cadence, independent of
-        // `wait_for_peer_count` above (gossip-level peer knowledge, not
-        // cache-level view) -- the same real-time delay the single-peer
-        // sibling test polls around.
+        // b's and d's trackers catch up to c joining on their own refresh
+        // cadence, the same real-time delay the single-peer test polls around.
         let mut reconciled: HashSet<u16> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
@@ -2710,11 +2465,8 @@ mod tests {
         b.shutdown().await;
     }
 
-    /// [`reconcile_warm_buckets_converges_buckets_split_across_two_live_co_owners`]'s
-    /// own raw-shard context, rebuilt on each `wait_until` retry until it
-    /// reflects every peer this test needs: the return shape of
-    /// `distributed_context_for_test` plus which of `warm_buckets` landed
-    /// with each of the two live co-owners this test's split hinges on.
+    /// Raw-shard test context, rebuilt on each `wait_until` retry, plus
+    /// which of `warm_buckets` landed with each of the two live co-owners.
     struct SplitWarmContext {
         shard_ops: Arc<dyn ShardOps>,
         distributed: DistributedContext,
@@ -2723,20 +2475,15 @@ mod tests {
         bucket_with_d: u16,
     }
 
-    /// The first `u32` key, scanning up from `0` and bounded well past
-    /// [`crate::store::BUCKET_COUNT`] so this is never an unbounded scan,
-    /// whose bucket is `bucket`: [`unused_bucket`]'s inverse, for planting a
-    /// record at a specific, already-known bucket rather than an arbitrary
-    /// or unused one.
+    /// The first `u32` key (bounded scan) whose bucket is `bucket`:
+    /// [`unused_bucket`]'s inverse, for planting a record at a known bucket.
     fn key_for_bucket(bucket: u16) -> u32 {
         (0u32..1_000_000)
             .find(|key| bucket_of(&encode_key(key).expect("u32 key encodes")) == bucket)
             .expect("some u32 key among the first million maps to every bucket")
     }
 
-    /// A [`WireRecord`] for `key`/`value`, versioned at `node`: the same
-    /// versioned-apply shape [`reconcile_warm_buckets_corrects_a_stale_replayed_record_against_a_live_co_owners_tombstone`]
-    /// uses to seed a shard directly, bypassing the ordinary write path.
+    /// A [`WireRecord`] for `key`/`value`, versioned at `node`, for seeding a shard directly.
     fn test_record(key: u32, value: &str, node: NodeId) -> WireRecord {
         WireRecord {
             key: encode_key(&key).expect("u32 encodes"),
@@ -2773,30 +2520,19 @@ mod tests {
         );
     }
 
-    /// Guards CLAUDE.md's "deleted or expired entries never resurrect"
-    /// through goal 2's specific hazard: a warm reopen's on-disk replay can
-    /// carry a stale live copy of a key this node itself deleted before
-    /// going down (the delete's in-RAM tombstone never persists to the
-    /// spill tier). `c` here stands in for such a replay: its shard is
-    /// seeded, via the same versioned-apply entry point state transfer
-    /// uses, with a live record for `key` stamped older than a tombstone
-    /// `b` genuinely holds. `reconcile_warm_buckets`'s converge-before-
-    /// serving loop against `b` must correct that stale copy to the
-    /// tombstone before the bucket ever clears cold -- proving the
-    /// resurrection guard runs
-    /// end-to-end, not only that a bucket stays cold until reconciliation
-    /// (the tests above) or that a pull into an empty shard lands fresh
-    /// data (the real-round test above).
+    /// Guards CLAUDE.md's "deleted or expired entries never resurrect":
+    /// a warm reopen's on-disk replay can carry a stale live copy of a key
+    /// this node itself deleted before going down. `c` stands in for such a
+    /// replay, seeded with a live record older than a tombstone `b` holds;
+    /// `reconcile_warm_buckets` must correct it to the tombstone before the
+    /// bucket clears cold.
     #[tokio::test]
     async fn reconcile_warm_buckets_corrects_a_stale_replayed_record_against_a_live_co_owners_tombstone()
      {
         let name = SmolStr::new("reconcile-resurrection-guard");
         let key = 7u32;
-        // The default `loopback_config`'s 2s `tombstone_ttl` exists to make
-        // *other* tests' GC-deferral checks fast; here it would race the
-        // test's own `wait_until` against a real tombstone GC sweep on b.
-        // A generous ttl keeps b's tombstone alive for as long as the test
-        // needs it, independent of that unrelated tuning.
+        // The default loopback config's short tombstone_ttl would race this
+        // test's wait_until against a real GC sweep; a generous ttl avoids that.
         let config = ClusterConfig {
             tombstone_ttl: Duration::from_secs(300),
             ..loopback_config()
@@ -2840,14 +2576,9 @@ mod tests {
             "with only b and c eligible at owners=2, c owns every bucket"
         );
 
-        // Stands in for what a warm reopen's replay would have installed:
-        // a stale live copy of `key`, versioned older than b's tombstone
-        // above. `apply_remote_batch` is the same versioned-apply entry
-        // point `install_new`'s replay uses to land a record without
-        // going through the ordinary write path, so this reproduces
-        // replay's effect precisely enough to exercise reconciliation,
-        // while the replay mechanics themselves stay covered separately in
-        // `store/spill.rs`/`store/mod.rs`.
+        // Stands in for what a warm reopen's replay would install: a stale
+        // live copy of `key`, versioned older than b's tombstone above,
+        // applied via the same versioned-apply entry point replay uses.
         let stale = WireRecord {
             key: encode_key(&key).expect("u32 encodes"),
             value: Some(bytes::Bytes::from(
@@ -2863,10 +2594,7 @@ mod tests {
         shard_ops_c.apply_remote_batch(vec![stale]).await;
         distributed_c.residency.mark_cold(&warm_buckets);
 
-        // `b`'s own `OwnershipTracker` for `name` was seeded while `b` was
-        // still alone; it catches up to `c` joining on its own membership-
-        // refresh cadence, the same convergence wait the real-round test
-        // above uses.
+        // b's tracker catches up to c joining on its own refresh cadence, as above.
         let mut reconciled: HashSet<u16> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
@@ -2912,13 +2640,9 @@ mod tests {
         b.shutdown().await;
     }
 
-    /// The other side of the real-round test above: `c`'s only live
-    /// co-owner, `b`, is unreachable (its mesh listener is already closed)
-    /// by the time the loop runs, so every round's digest exchange itself
-    /// fails ([`anti_entropy::BucketRoundOutcome::failed`]) and the loop
-    /// exhausts its round budget with zero progress -- the warm bucket must
-    /// stay cold, falling through to the ordinary cold-pull path exactly
-    /// as any other cold bucket would, never served short.
+    /// Pins that when the only co-owner is unreachable, every round fails
+    /// and the warm bucket stays cold, falling through to the ordinary
+    /// cold-pull path.
     #[tokio::test]
     async fn reconcile_warm_buckets_leaves_a_bucket_cold_when_its_only_co_owners_round_fails() {
         let name = SmolStr::new("reconcile-real-round-failed");
@@ -2938,9 +2662,7 @@ mod tests {
 
         let c = Cluster::builder("cache-it-reconcile-real-round-failed")
             .seeds([b.local_gossip_addr()])
-            // The failed rounds below retry until b drops off c's live
-            // list or this time budget runs out; tightened so the test
-            // bounds itself instead of waiting out `loopback_config`'s 5s.
+            // Tightened so the test bounds itself instead of waiting out loopback_config's 5s.
             .config(loopback_config().with(|config| {
                 config.state_transfer_budget = Duration::from_secs(1);
             }))
@@ -2949,8 +2671,7 @@ mod tests {
             .expect("c builds");
         wait_for_peer_count(&b, 1).await;
         wait_for_peer_count(&c, 1).await;
-        // See the sibling test above: without this, b never learns c also
-        // has `name` open, and every round against it answers Stale.
+        // Without this, b never learns c has `name` open, and every round answers Stale.
         c.advertise_cache_mode(&name, Mode::distributed());
 
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
@@ -2958,12 +2679,8 @@ mod tests {
         assert!(!warm_buckets.is_empty());
         distributed_c.residency.mark_cold(&warm_buckets);
 
-        // Warms up to a first real converged round against b, the same
-        // wait the sibling test above needs for the same reason (b's own
-        // view catches up to c joining on its own cadence): this confirms
-        // the round below fails on b's *unreachability* specifically,
-        // never incidentally on a view mismatch that just hadn't settled
-        // yet.
+        // Warms up to a first converged round first, so the round below
+        // fails on b's unreachability specifically, not an unsettled view.
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c joining, so a warm-up round against it reconciles",
@@ -2983,12 +2700,8 @@ mod tests {
         .await;
         distributed_c.residency.mark_cold(&warm_buckets);
 
-        // b's mesh listener closes right away; c's own gossip-derived live
-        // peer list still names b live for at least one more failure-
-        // detection round, so the round below is attempted -- and fails on
-        // the dial, not skipped for having no live co-owner at all. Its
-        // retries stop once b drops off that list or the 1s time budget
-        // above ends.
+        // c's gossip-derived live list still names b live briefly, so the
+        // round below attempts and fails on the dial, not a no-co-owner skip.
         b.shutdown().await;
 
         let started = Instant::now();
@@ -3023,13 +2736,8 @@ mod tests {
         c.shutdown().await;
     }
 
-    /// A bucket neither `0..total` nor anything else this test writes ever
-    /// lands in: [`crate::store::BUCKET_COUNT`] buckets is far more than a
-    /// small `total` can fill, so an untouched one always exists. Both `b`
-    /// and `c` compute the same digest (the empty fold) for it, so a
-    /// scoped round against it matches the instant `b`'s view stops
-    /// answering `Stale`, without repairing or even touching either side's
-    /// real data.
+    /// A bucket `0..total` never touches, so both sides' empty digests
+    /// match once b's view stops answering `Stale`, untouched by real data.
     fn unused_bucket(total: u32) -> u16 {
         let used: HashSet<u16> = (0..total)
             .map(|key| bucket_of(&encode_key(&key).expect("u32 key encodes")))
@@ -3039,15 +2747,9 @@ mod tests {
             .expect("BUCKET_COUNT buckets is far more than a small test's `total` can fill")
     }
 
-    /// Polls `probe_bucket` (an [`unused_bucket`]) via a direct
-    /// `anti_entropy::run_round_for_buckets` call until it comes back
-    /// non-`failed`: `b`'s own `OwnershipTracker` for `name` catches up to
-    /// `c` joining on its own membership-refresh cadence, answering every
-    /// round `Stale` until then, the same real-time delay
-    /// `reconcile_warm_buckets_clears_cold_once_a_real_round_against_a_live_co_owner_reconciles`
-    /// polls around via its own outer `wait_until`. Using a bucket neither
-    /// side ever wrote to keeps this warm-up from repairing the real data
-    /// the test below means to exercise itself.
+    /// Polls `probe_bucket` (an [`unused_bucket`]) until a round against it
+    /// stops answering `Stale`: b's tracker catching up to c joining. An
+    /// untouched bucket avoids repairing the real data the caller tests.
     async fn wait_for_live_co_owner_view_to_settle(
         c: &Cluster,
         shard_ops_c: &Arc<dyn ShardOps>,
@@ -3073,25 +2775,14 @@ mod tests {
         .await;
     }
 
-    /// A single `reconcile_warm_buckets` call -- not the outer
-    /// `wait_until`-retries-the-call pattern the tests above use to ride
-    /// out `b`'s view catching up -- must itself loop more than one round
-    /// to close a real gap: `anti_entropy::run_round_for_buckets` reports a
-    /// bucket named mismatched at digest-exchange time as `still_diverged`
-    /// for that same round regardless of whether the repair it triggers
-    /// actually lands (`still_diverged` is computed from the mismatch list
-    /// before `reconcile_mismatches` ever runs) -- only a later round's
-    /// fresh digest exchange, once the repair has landed, can report a
-    /// bucket `matched`. So a bucket with real data to pull can never
-    /// converge in exactly one round; [`RECONCILE_MAX_ROUNDS`]'s bound of
-    /// three exists precisely to give the loop the second, confirming round
-    /// this needs.
+    /// A single `reconcile_warm_buckets` call must itself loop more than one
+    /// round to close a real gap: a round reports a bucket `still_diverged`
+    /// from the mismatch list before the repair lands, so only a later
+    /// round's fresh digest exchange reports it `matched`.
+    /// [`RECONCILE_MAX_ROUNDS`] gives the loop that confirming round.
     ///
-    /// `b`'s view is warmed up first against a genuinely untouched bucket
-    /// ([`unused_bucket`]/[`wait_for_live_co_owner_view_to_settle`]), so the
-    /// real call below starts once `b` already recognizes `c` -- isolating
-    /// "the loop needs two rounds to repair-then-confirm" from the
-    /// unrelated real-time delay of `b`'s own membership-refresh cadence.
+    /// `b`'s view is warmed up first against an untouched bucket, isolating
+    /// the two-rounds-needed behavior from b's own refresh-cadence delay.
     #[tokio::test]
     async fn reconcile_warm_buckets_loops_a_bounded_number_of_times_when_one_round_cannot_close_the_gap()
      {
@@ -3142,9 +2833,8 @@ mod tests {
 
         wait_for_live_co_owner_view_to_settle(&c, &shard_ops_c, &name, node_b, probe_bucket).await;
 
-        // A single call, no outer retry loop: if the function ran only one
-        // internal round, every genuinely divergent bucket would come back
-        // repaired but still reported `still_diverged`, never reconciled.
+        // A single call: if it ran only one round, a repaired bucket would
+        // still report `still_diverged`.
         let reconciled = reconcile_warm_buckets(
             &c,
             &shard_ops_c,
@@ -3183,22 +2873,11 @@ mod tests {
         b.shutdown().await;
     }
 
-    /// The other side of the loop-needs-two-rounds test above: with
-    /// [`ClusterConfig::reconcile_byte_budget`] set low enough that the
-    /// very first round's real repair already exceeds it,
-    /// [`should_keep_reconciling`] refuses the second, confirming round --
-    /// the genuinely divergent buckets' data lands in `c`'s shard (round
-    /// one's repair really ran), but `c` never re-checks digests to
-    /// confirm the match, so those buckets must stay exactly as cold and
-    /// unverified as they started: [`split_round_result`]'s "still
-    /// diverged after a round that was named mismatched" semantics never
-    /// let a give-up here call `ResidencySet::mark_serving`, guarding
-    /// CLAUDE.md's "deleted or expired entries never resurrect" the same
-    /// way a give-up must never clear `unverified` alone (see
-    /// [`reconcile_warm_buckets`]'s own docs). The untouched buckets sharing
-    /// this same round, having no divergence to begin with, still converge
-    /// immediately regardless of the budget: the budget only ever stops a
-    /// bucket that actually needed a second round.
+    /// The other side of the loop-needs-two-rounds test: a byte budget too
+    /// low for a second round makes [`should_keep_reconciling`] refuse it,
+    /// so a repaired-but-unconfirmed bucket stays cold and unverified rather
+    /// than clearing via `mark_serving` on an unconfirmed repair. Untouched
+    /// buckets in the same round still converge immediately.
     #[tokio::test]
     async fn reconcile_warm_buckets_stops_at_the_byte_budget_and_leaves_the_bucket_cold_and_unverified()
      {
@@ -3229,9 +2908,7 @@ mod tests {
             .map(|key| bucket_of(&encode_key(&key).expect("u32 key encodes")))
             .collect();
 
-        // A budget so small that any real repair's very first byte exceeds
-        // it: the loop gets its one repairing round for the genuinely
-        // divergent buckets and no more.
+        // A budget so small the first repair byte exceeds it: one round only.
         let config = ClusterConfig {
             reconcile_byte_budget: 1,
             ..loopback_config()
@@ -3548,18 +3225,10 @@ mod tests {
         a.shutdown().await;
     }
 
-    /// Goal 2's own hazard, at the `Cache::fetch` layer: a warm-reloaded
-    /// bucket can hold a record a co-owner deleted during this node's
-    /// downtime, so a local *hit* there is not trustworthy the way an
-    /// ordinary cold bucket's local content always was. `a`'s shard is
-    /// seeded, via the same versioned-apply entry point a real warm
-    /// reopen's replay uses, with a stale live copy of `key`; `b`, a real
-    /// co-owner, genuinely deleted it first. While `a`'s bucket is marked
-    /// both cold and unverified, `fetch` must ask `b` rather than trust its
-    /// own stale hit, and once a real `reconcile_warm_buckets` round
-    /// against `b` corrects `a`'s copy and clears the marker, `fetch`
-    /// answers correctly straight from `a`'s own now-verified local state,
-    /// with no help from `b` at all.
+    /// Pins the unverified-bucket guard at the `Cache::fetch` layer: `a`'s
+    /// shard is seeded with a stale replay of `key` that `b` deleted first.
+    /// `fetch` must ask `b` while the bucket is unverified,
+    /// then answer locally once reconciliation clears the marker.
     #[cfg(feature = "spill")]
     #[tokio::test]
     #[expect(
@@ -3609,10 +3278,8 @@ mod tests {
         wait_for_peer_count(&a, 1).await;
         a.advertise_cache_mode(&name, Mode::distributed());
 
-        // Built directly through `attach_ownership`, the same shape
-        // `distributed_context_for_test` above gives `reconcile_warm_buckets`
-        // itself, but keeping the typed `Shard` so a real `Cache` can wrap
-        // it for `fetch`.
+        // Built directly via `attach_ownership`, keeping the typed `Shard`
+        // so a real `Cache` can wrap it.
         let shard = Shard::<u32, String>::new(
             name.clone(),
             Mode::distributed(),
@@ -3641,12 +3308,8 @@ mod tests {
             "with owners=2 and exactly two real nodes, a owns key's bucket too"
         );
 
-        // Stands in for what a warm reopen's replay would have installed:
-        // a stale live copy of `key`, exactly as
-        // `reconcile_warm_buckets_corrects_a_stale_replayed_record_against_a_live_co_owners_tombstone`
-        // above stages it, via the same versioned-apply entry point
-        // `install_new`'s replay uses, never going through the ordinary
-        // ownership-aware write path.
+        // Stands in for what a warm reopen's replay would install: a stale
+        // live copy of `key`, via the same versioned-apply entry point replay uses.
         let shard_ops_a = Arc::clone(&cache_a.shard) as Arc<dyn ShardOps>;
         let stale = WireRecord {
             key: encode_key(&key).expect("u32 encodes"),
@@ -3700,9 +3363,7 @@ mod tests {
             "reconciliation clears the unverified mark alongside cold"
         );
 
-        // `b` goes away entirely: if `a`'s answer below still comes from
-        // its own now-corrected local state rather than a lingering ask-b
-        // path, this proves the bucket serves itself again once verified.
+        // b goes away entirely, so a's answer below must come from its own corrected state.
         cache_b.close().await;
         b.shutdown().await;
 

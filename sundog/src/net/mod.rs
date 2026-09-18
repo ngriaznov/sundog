@@ -133,12 +133,9 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 const OUTBOX_FLUSH_DEADLINE: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
 
-/// The slice [`Mesh::send_frames_awaiting`] waits for outbox space in before
-/// rechecking whether the target peer is still live: a frame for a live
-/// peer is never dropped, so this bounds how often that liveness recheck
-/// (and, on a timed-out slice, the `sundog_fan_out_wait_seconds_total{peer}`
-/// bump) happens, not how long a live peer's send is ultimately allowed to
-/// take.
+/// How long [`Mesh::send_frames_awaiting`] waits for outbox space before
+/// rechecking peer liveness. Bounds the recheck interval, not the total
+/// time a live peer's send may take.
 pub(crate) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Process-wide wire-frame counters, incremented at [`conn::send_msg`], the
@@ -446,19 +443,15 @@ pub(crate) enum BucketPull {
     Cold,
 }
 
-/// One item off a [`BucketPull::Stream`]: an ordinary data chunk, or,
-/// against a donor speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`],
-/// a signal that the donor released one bucket ahead of the group's own
-/// trailing `done: true` chunk. `BucketDone` never appears against an older
-/// donor: [`conn::bucket_stream`] then yields byte-for-byte the same stream
-/// as before this variant existed.
+/// One item off a [`BucketPull::Stream`]: a data chunk, or, against a donor
+/// speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`], a signal that
+/// the donor released one bucket ahead of the group's trailing `done: true`
+/// chunk. An older donor never sends `BucketDone`.
 pub(crate) enum BucketStreamItem {
-    /// A batch of records for the bucket currently streaming.
+    /// Records for the bucket currently streaming.
     Chunk(Vec<WireRecord>),
-    /// The donor has sent every record it holds for this bucket and
-    /// released it; [`crate::cluster::state_transfer::pull_buckets_from_donor`]
-    /// invokes its caller's `on_bucket_done` the moment this arrives, ahead
-    /// of the stream's own end.
+    /// The donor released this bucket; triggers the caller's
+    /// `on_bucket_done` ahead of the stream's own end.
     BucketDone(u16),
 }
 
@@ -659,11 +652,9 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// immediately-empty stream, never polled unless the caller ignores the
     /// availability check.
     ///
-    /// Each item is tagged with the bucket it came from: a donor sub-batches
-    /// one bucket's records into more than one chunk (bounded by
-    /// [`crate::config::ClusterConfig::rebalance_chunk_bytes`]), so the tag
-    /// is how a caller detects a bucket's last chunk without inspecting the
-    /// chunk's own contents.
+    /// Each item is tagged with its bucket, since a donor may split one
+    /// bucket's records into several chunks
+    /// ([`crate::config::ClusterConfig::rebalance_chunk_bytes`]).
     fn st_bucket_chunks(
         &self,
         cache: SmolStr,
@@ -697,11 +688,11 @@ struct PeerHandle {
     protocol: AtomicU16,
 }
 
-/// `(cache, bucket, requester)`, [`MeshInner::acked_buckets`]'s key: which
-/// donor-served bucket a `Msg::StBucketAck` named and who sent it.
+/// [`MeshInner::acked_buckets`]'s key: the bucket a `Msg::StBucketAck`
+/// named and who sent it.
 type AckedBucketKey = (SmolStr, u16, NodeId);
-/// The instant an ack was recorded, plus the `view_hash` it carried,
-/// [`MeshInner::acked_buckets`]'s value.
+/// [`MeshInner::acked_buckets`]'s value: when the ack was recorded and the
+/// `view_hash` it carried.
 type AckedBucketEntry = (Instant, u64);
 
 struct MeshInner {
@@ -711,14 +702,10 @@ struct MeshInner {
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
-    /// Bucket acks received from `Msg::StBucketAck` on a donor-served
-    /// `StBuckets` connection, keyed by `(cache, bucket, requester)` and the
-    /// instant recorded plus the `view_hash` the ack carried:
-    /// `conn::serve_st_buckets`'s inbound `select!` arm writes here the
-    /// moment a requester signals it released a bucket. `rebalance_task`
-    /// folds a fresh-enough, current-view entry into `buckets_to_release`'s
-    /// per-bucket reconciliation check instead of a redundant confirming AE
-    /// round for that bucket.
+    /// Bucket acks from `Msg::StBucketAck`, written by
+    /// `conn::serve_st_buckets` when a requester releases a bucket.
+    /// `rebalance_task` uses a fresh, current-view entry to skip a
+    /// redundant confirming AE round for that bucket.
     acked_buckets: RwLock<HashMap<AckedBucketKey, AckedBucketEntry>>,
 }
 
@@ -734,12 +721,9 @@ fn defer_ae_digest(queued: usize, deferred_so_far: u32) -> bool {
     queued > 0 && deferred_so_far < MAX_AE_DEFERRALS
 }
 
-/// [`Mesh::send_frames_awaiting`]'s decision, on one timed-out
-/// [`FAN_OUT_SEND_DEADLINE`] slice, between waiting again and giving up:
-/// `true` (keep waiting) exactly when `peer_live` -- the peer is still
-/// present in the mesh's peer table -- so a frame for a live peer is never
-/// dropped. Pulled out as its own pure function so this call is unit
-/// tested without a running mesh.
+/// Whether [`Mesh::send_frames_awaiting`] should wait again after a
+/// timed-out [`FAN_OUT_SEND_DEADLINE`] slice: yes while `peer_live`, so a
+/// live peer's frame is never dropped.
 const fn fan_out_keep_waiting(peer_live: bool) -> bool {
     peer_live
 }
@@ -787,12 +771,9 @@ impl MeshInner {
         }
     }
 
-    /// Records that `from` acked bucket `bucket` of `cache` via
-    /// `Msg::StBucketAck`, called from `conn::serve_st_buckets`'s inbound
-    /// `select!` arm the moment it decodes one mid-stream. `view_hash` is
-    /// the value the ack itself carried (the acker's own view hash at
-    /// request time), checked by [`MeshInner::acked_owners`] against this
-    /// node's current view hash before the ack is ever trusted.
+    /// Records that `from` acked `bucket` of `cache` via `Msg::StBucketAck`.
+    /// `view_hash` is the acker's own view hash at request time;
+    /// [`MeshInner::acked_owners`] checks it against this node's current one.
     fn record_bucket_ack(&self, cache: SmolStr, bucket: u16, from: NodeId, view_hash: u64) {
         self.acked_buckets
             .write()
@@ -801,16 +782,10 @@ impl MeshInner {
     }
 
     /// Every acked owner of each of `due`'s buckets of `cache`, keyed by
-    /// bucket: `rebalance_task`'s source for folding an accelerated ack
-    /// into `buckets_to_release`'s per-bucket reconciliation check instead
-    /// of running a redundant confirming anti-entropy round against that
-    /// owner for that specific bucket. An ack for one bucket never implies
-    /// reconciliation of any other bucket the same owner co-owns -- the
-    /// caller still needs its own per-owner AE round, or that owner's own
-    /// ack, for those. An ack older than `window`, for a bucket not in
-    /// `due`, or whose carried `view_hash` no longer matches this node's
-    /// `view_hash` (a stale-view ack, from before a view change), does not
-    /// count.
+    /// bucket. An ack for one bucket says nothing about any other bucket the
+    /// same owner co-owns. An ack older than `window`, for a bucket not in
+    /// `due`, or carrying a `view_hash` other than this node's current one,
+    /// does not count.
     fn acked_owners(
         &self,
         cache: &SmolStr,
@@ -837,11 +812,9 @@ impl MeshInner {
         acked
     }
 
-    /// `peer`'s last-known gossiped protocol, `0` for a peer this node has
-    /// never seen in `update_peers`: `conn::bucket_stream`'s way to gate its
-    /// own `Msg::StBucketAck` send on what the donor advertised, alongside
-    /// [`MeshInner::require_peer_protocol`]'s existing `>=` check for a
-    /// send that must be refused outright rather than merely skipped.
+    /// `peer`'s last-known gossiped protocol, or `0` if unseen. Lets
+    /// `conn::bucket_stream` gate its `Msg::StBucketAck` send on what the
+    /// donor advertised.
     fn peer_protocol(&self, peer: NodeId) -> u16 {
         self.peers
             .read()
@@ -1096,18 +1069,13 @@ impl Mesh {
 
     /// [`Mesh::send_frames`] for records the sender keeps no copy of: a
     /// `Mode::Distributed` fan-out, where a forwarded write's only copy is
-    /// the frame itself, so a frame for a peer still live in the peer
-    /// table is never dropped. Waits for outbox space in
-    /// [`FAN_OUT_SEND_DEADLINE`] slices; each slice
-    /// that times out with `peer` still present in the peer table is logged
-    /// at debug and counted, in whole seconds, in
-    /// `sundog_fan_out_wait_seconds_total{peer}`, then waited again. Once
-    /// `peer` is no longer in the table (removed by [`Mesh::update_peers`],
-    /// or its outbox channel closed because its writer already ended), the
-    /// remaining frames are dropped, counted in
-    /// `sundog_backlog_dropped_total`, the peer marked dirty, and a warning
-    /// logged -- today's overflow behavior. A `peer` the mesh never knew
-    /// about is a silent no-op.
+    /// the frame itself, so a frame for a peer still live in the peer table
+    /// is never dropped. Waits for outbox space in
+    /// [`FAN_OUT_SEND_DEADLINE`] slices, logging and counting each timed-out
+    /// one in `sundog_fan_out_wait_seconds_total{peer}`. Once `peer` leaves
+    /// the table or its outbox closes, remaining frames are dropped,
+    /// counted in `sundog_backlog_dropped_total`, and the peer marked
+    /// dirty. An unknown `peer` is a silent no-op.
     ///
     /// # Panics
     ///
@@ -1135,10 +1103,7 @@ impl Mesh {
             match tokio::time::timeout_at(slice_deadline, tx.reserve()).await {
                 Ok(Ok(permit)) => permit.send(frame),
                 Ok(Err(_)) => {
-                    // The outbox channel itself closed: this peer's writer
-                    // already ended, so it is as good as gone regardless of
-                    // whether `update_peers` has removed its table entry
-                    // yet.
+                    // The channel closed: this peer's writer already ended.
                     dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
                     queue.clear();
                 }
@@ -1171,8 +1136,7 @@ impl Mesh {
         }
     }
 
-    /// Whether `peer` is still in the peer table: [`Mesh::update_peers`]
-    /// removes an entry the instant a peer departs, so this is
+    /// Whether `peer` is still in the peer table:
     /// [`Mesh::send_frames_awaiting`]'s liveness check between wait slices.
     ///
     /// # Panics
@@ -1590,11 +1554,8 @@ impl Mesh {
             pool.checkin(framed);
             return Ok(BucketPull::Cold);
         }
-        // The donor's gossiped protocol, so `bucket_stream` gates its own
-        // `Msg::StBucketAck` send exactly as `serve_st_buckets` gates the
-        // `Msg::StBucketDone` it answers: a peer below
-        // `PROTOCOL_ST_BUCKET_DONE_ACK` never receives an ack it never asked
-        // for by never sending a bucket-done signal in the first place.
+        // The donor's gossiped protocol, so `bucket_stream` gates its ack
+        // send the same way `serve_st_buckets` gates `StBucketDone`.
         let donor_protocol = self.inner.peer_protocol(donor);
         Ok(BucketPull::Stream(conn::bucket_stream(
             framed,
@@ -1606,13 +1567,9 @@ impl Mesh {
         )))
     }
 
-    /// See [`MeshInner::acked_owners`]: every acked owner of each of
-    /// `due`'s buckets of `cache`, keyed by bucket, via `Msg::StBucketAck`
-    /// recorded on this node's donor-served connections and still within
-    /// `window` and `view_hash` of now. `rebalance_task`'s way to
-    /// accelerate a bucket's release confirmation without a redundant
-    /// anti-entropy round against an owner that already acked that
-    /// specific bucket.
+    /// See [`MeshInner::acked_owners`]. Lets `rebalance_task` skip a
+    /// redundant anti-entropy round against an owner that already acked a
+    /// bucket.
     pub(crate) fn acked_owners(
         &self,
         cache: &SmolStr,
@@ -1710,8 +1667,7 @@ mod tests {
         buckets_available: bool,
         buckets_cold: bool,
         bucket_chunks: Vec<Vec<WireRecord>>,
-        /// Per-`bucket_chunks` entry bucket tag; empty tags every chunk `0`,
-        /// the fixture's original one-bucket behavior.
+        /// Per-`bucket_chunks` entry bucket tag; empty tags every chunk `0`.
         bucket_chunk_tags: Vec<u16>,
     }
 
@@ -1904,9 +1860,7 @@ mod tests {
             _cache: SmolStr,
             _buckets: Vec<u16>,
         ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
-            // `bucket_chunk_tags` lets a test control the per-bucket
-            // boundary `conn::serve_st_buckets` detects; empty defaults
-            // every chunk to bucket 0, this fixture's original behavior.
+            // Empty tags default every chunk to bucket 0.
             let tags = if self.bucket_chunk_tags.is_empty() {
                 vec![0u16; self.bucket_chunks.len()]
             } else {
@@ -2600,10 +2554,7 @@ mod tests {
             "only the acked owner of a bucket actually in `due`, for the right cache, counts, \
              keyed by the bucket it acked"
         );
-        // A real, if tiny, sleep so the ack is reliably older than a
-        // zero-length window regardless of clock resolution, rather than
-        // relying on two back-to-back `Instant::now()` calls already
-        // differing.
+        // Sleeps briefly so the ack is reliably older than a zero window.
         std::thread::sleep(Duration::from_millis(5));
         let none = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::ZERO, 42);
         assert!(
@@ -2615,10 +2566,7 @@ mod tests {
     #[test]
     fn an_ack_carrying_a_stale_view_hash_does_not_count_as_reconciled() {
         let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
-        // Acked under view hash 1, but this node's current view has since
-        // moved to hash 2: the ack predates the view change and must be
-        // discarded rather than trusted, exactly as an ack older than
-        // `rebalance_ack_window` is discarded.
+        // Acked under view hash 1; this node's current view has moved to 2.
         mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 1);
         let stale = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 2);
         assert!(
@@ -3354,15 +3302,8 @@ mod tests {
         );
     }
 
-    /// A peer whose outbox never drains -- a tiny `outbox_capacity` and no
-    /// listener behind `dead_peer`, exactly
-    /// `invalidate_overflow_drops_oldest_not_newest` and
-    /// `replicate_overflow_drops_newest_and_marks_peer_dirty`'s own setup --
-    /// but stays live in the peer table throughout: `send_frames_awaiting`
-    /// keeps waiting past one `FAN_OUT_SEND_DEADLINE` rather than dropping,
-    /// and `sundog_backlog_dropped_total` (observed here via
-    /// `take_dirty_peers`, only ever set alongside that counter) never
-    /// fires.
+    /// Pins that a live peer's stalled outbox keeps `send_frames_awaiting`
+    /// waiting past one `FAN_OUT_SEND_DEADLINE` instead of dropping frames.
     #[tokio::test]
     async fn send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer() {
         let config = ClusterConfig {
@@ -3375,9 +3316,7 @@ mod tests {
                 .await
                 .expect("bind loopback");
 
-        // A peer with no listener: the writer spins on connection failures
-        // without ever draining `replicate_rx`, so the one-slot outbox
-        // fills and stays full.
+        // No listener behind this peer, so its outbox never drains.
         let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
         sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
 
@@ -3396,10 +3335,7 @@ mod tests {
             .map(|msg| OutFrame::new(msg).expect("encodes"))
             .collect();
         let started = tokio::time::Instant::now();
-        // The peer is never removed and its outbox is never drained: this
-        // call would hang forever if it kept the peer live indefinitely,
-        // so bound it generously past one deadline slice and assert it is
-        // still waiting, not that it returns.
+        // Bounded past one deadline slice; the call should still be waiting.
         let outcome = tokio::time::timeout(
             FAN_OUT_SEND_DEADLINE * 2,
             sender.send_frames_awaiting(NodeId::from(2), frames),
@@ -3419,10 +3355,8 @@ mod tests {
         );
     }
 
-    /// The same never-draining outbox as
-    /// `send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer`,
-    /// but the peer is removed from the table mid-wait: the remaining
-    /// frames are dropped and counted rather than waited on forever.
+    /// Pins that removing the peer mid-wait drops its remaining frames
+    /// instead of waiting forever.
     #[tokio::test]
     async fn send_frames_awaiting_drops_once_the_peer_leaves_the_table_mid_wait() {
         let config = ClusterConfig {
@@ -3438,11 +3372,8 @@ mod tests {
         let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
         sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
 
-        // `take_dirty_peers` only reports peers still in the table, and
-        // this one is about to leave it, so this test reads the `dirty`
-        // flag directly off the handle instead -- the same internal-field
-        // peek `invalidate_overflow_drops_oldest_not_newest` uses for its
-        // own outbox.
+        // take_dirty_peers only reports peers still in the table, so this
+        // reads the dirty flag directly off the handle instead.
         let dirty_flag = {
             let table = sender.inner.peers.read().expect("lock");
             Arc::clone(&table.get(&NodeId::from(2)).expect("peer registered").dirty)
@@ -3464,9 +3395,7 @@ mod tests {
         let wait_fut = sender.send_frames_awaiting(NodeId::from(2), frames);
         tokio::pin!(wait_fut);
 
-        // Confirms the call is genuinely pending on outbox room, not a
-        // scheduling race against the `update_peers` call below, before the
-        // peer is removed from the table.
+        // Confirms the call is still pending before the peer is removed.
         let not_yet = tokio::time::timeout(Duration::from_millis(200), &mut wait_fut).await;
         assert!(
             not_yet.is_err(),
@@ -3483,12 +3412,8 @@ mod tests {
             .await
             .expect("send_frames_awaiting returns once the peer is gone");
 
-        // `dirty` is only ever set alongside the `sundog_backlog_dropped_total`
-        // bump, in the same `if dropped > 0` branch
-        // (`replicate_overflow_drops_newest_and_marks_peer_dirty` asserts
-        // the same pairing for the ordinary overflow path), so this is
-        // proof the remaining frames were dropped and counted rather than
-        // waited on.
+        // `dirty` is set only alongside the drop counter, so this proves
+        // the remaining frames were dropped rather than waited on.
         assert!(
             dirty_flag.load(Ordering::Relaxed),
             "a peer that leaves mid-wait drops its remaining frames and is marked dirty"

@@ -712,18 +712,9 @@ async fn dispatch_one(
             )
             .await
         }
-        // `serve_st_buckets` reads every ack it can while it is still
-        // racing outbound chunks against inbound frames, but the group's
-        // last bucket's `StBucketDone` (and any bucket `st_bucket_chunks`
-        // never yielded a chunk for) is sent from its unraced tail after
-        // the chunk stream ends -- the requester's matching ack for that
-        // bucket then arrives only after `serve_st_buckets` has already
-        // returned. This connection's own read loop (`handle_accepted`)
-        // keeps polling it afterward, so recording the ack here instead of
-        // treating it as a no-op is what actually catches that case; a
-        // mid-stream ack `serve_st_buckets` already recorded lands here as
-        // a harmless duplicate `insert` on the rare chance it is read here
-        // instead of there.
+        // The last bucket's `StBucketDone` is sent after `serve_st_buckets`
+        // returns, so its ack lands here instead; recording it catches that
+        // case. A mid-stream ack it already recorded just re-inserts.
         Msg::StBucketAck {
             cache,
             bucket,
@@ -737,8 +728,7 @@ async fn dispatch_one(
         // `FetchReply`/`StBucketChunk`/`StaleView`/`ReqDone` sent only as
         // replies on a connection this node initiated, never on one being
         // served here. `StBucketDone` is likewise never dispatched here:
-        // only `serve_st_buckets` sends it, to a requester, never to this
-        // node.
+        // only `serve_st_buckets` sends it, to a requester.
         Msg::Hello { .. }
         | Msg::StChunk { .. }
         | Msg::AeBucket { .. }
@@ -1019,19 +1009,11 @@ async fn serve_ae_digest_scoped(
 /// this connection is done.
 ///
 /// Against a requester speaking at least
-/// [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`], sends [`Msg::StBucketDone`] the
-/// moment a bucket's chunks are exhausted (detected by the next yielded
-/// chunk tagging a different bucket, or the stream ending: `buckets`, not
-/// the stream's own tags, is the ground truth for which buckets were
-/// requested, so a bucket [`RequestHandler::st_bucket_chunks`] never yields
-/// a single chunk for -- because it is empty locally -- still gets its
-/// `Msg::StBucketDone`), and races the outbound send loop against inbound
-/// frames to fold a mid-stream [`Msg::StBucketAck`] into `mesh`'s
-/// acked-owners table via [`MeshInner::record_bucket_ack`]. Absence of an
-/// ack, or of `StBucketDone` support altogether, is never an error: the
-/// donor moves on to the next bucket regardless, and release for a bucket
-/// neither signaled falls back to the existing timer+confirming-AE-round
-/// path.
+/// [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`], sends [`Msg::StBucketDone`] once a
+/// bucket's chunks are exhausted, including buckets left empty locally, and
+/// folds any [`Msg::StBucketAck`] read meanwhile into `mesh` via
+/// [`MeshInner::record_bucket_ack`]. A missing ack or an older peer is not
+/// an error: release then falls back to the timer/AE-round path.
 #[allow(
     clippy::too_many_arguments,
     reason = "the bucket-done/ack wiring needs the serving peer's identity and protocol alongside every parameter serve_st_buckets already took"
@@ -1104,10 +1086,8 @@ async fn serve_st_buckets(
                         }
                         continue;
                     }
-                    // An unrecognized message on this connection: nothing
-                    // else is expected here, so it is ignored rather than
-                    // torn down, the same tolerance `dispatch_one`'s own
-                    // reply-only arms give a stray frame.
+                    // An unrecognized message here is ignored, not fatal,
+                    // like the reply-only arms in `dispatch_one`.
                     Some(Ok(_)) => continue,
                     Some(Err(ref error)) => {
                         tracing::debug!(
@@ -1204,11 +1184,7 @@ async fn serve_st_buckets(
             }
         }
     }
-    // `sundog_rebalance_buckets_total{direction="served"}` credits every
-    // bucket of a stream that ran to its end here, whatever the requester's
-    // protocol: the donor-side counterpart of the requester's `"in"`, and
-    // the one signal a requester that serves no metrics of its own leaves
-    // behind on the node that donated to it.
+    // The donor-side counterpart of the requester's "in" direction.
     metrics::counter!(
         "sundog_rebalance_buckets_total",
         "cache" => cache.to_string(),
@@ -1595,23 +1571,15 @@ pub(super) fn state_stream(
 }
 
 /// Adapts a rebalance bucket-pull connection into a lazy stream of
-/// [`BucketStreamItem`]s, the `StBucketChunk`/`StBucketDone` counterpart of
-/// [`state_stream`]: a `Chunk` for every [`Msg::StBucketChunk`], keyed like
-/// [`state_stream`]'s, plus, against a donor speaking at least
-/// [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`], a `BucketDone` for every
-/// [`Msg::StBucketDone`]. A donor below that protocol never sends the
-/// latter, so this yields byte-for-byte the same `Chunk` sequence as before
-/// `BucketDone` existed.
+/// [`BucketStreamItem`]s: a `Chunk` for every [`Msg::StBucketChunk`], plus,
+/// against a donor speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`],
+/// a `BucketDone` for every [`Msg::StBucketDone`]. An older donor never
+/// sends `BucketDone`, so this then yields only `Chunk`s, as before.
 ///
-/// The moment a `BucketDone` is yielded, the *next* poll of this stream
-/// sends `Msg::StBucketAck` back to the donor before reading anything else
-/// -- gated on `donor_protocol` the same way the donor gates its own send --
-/// so the ack always follows whatever the caller did with the `BucketDone`
-/// item (`cluster::state_transfer::pull_buckets_from_donor`'s
-/// `on_bucket_done` callback, which clears the bucket's cold mark) rather
-/// than racing it. A caller that stops polling after a `BucketDone` (a
-/// group retried against a different donor) simply never sends that ack;
-/// [`serve_st_buckets`] already treats a missing ack as no error.
+/// After yielding a `BucketDone`, the next poll sends `Msg::StBucketAck`
+/// back to the donor first (gated the same way), so the ack follows
+/// whatever the caller did with that item. A caller that stops polling
+/// instead just never sends the ack, which [`serve_st_buckets`] tolerates.
 pub(super) fn bucket_stream(
     framed: PeerFramed,
     pool: Arc<ReqPool>,
@@ -1629,13 +1597,10 @@ pub(super) fn bucket_stream(
             async move {
                 let (mut framed, mut pending, pending_ack) = state?;
                 if ack_gated && let Some(bucket) = pending_ack {
-                    // Best-effort: a broken connection here surfaces on the
-                    // read below, not as this send's own error. `view_hash`
-                    // is this node's own view hash at the moment it
-                    // requested these buckets (the same value sent on
-                    // `Msg::StBuckets`): the donor discards the ack rather
-                    // than trusting it once its own current view hash has
-                    // moved past this one.
+                    // Best-effort: a broken send surfaces on the read below.
+                    // `view_hash` is this node's view when it requested the
+                    // buckets; the donor drops the ack once its own view
+                    // has moved past it.
                     let _ = send_msg(
                         &mut framed,
                         &Msg::StBucketAck {
@@ -2587,8 +2552,7 @@ mod tests {
             .expect("writer task did not panic");
     }
 
-    /// A `WireRecord` distinguished by `n`, for the bucket-done/ack tests
-    /// below.
+    /// A distinct `WireRecord` for the bucket-done/ack tests below.
     #[cfg(not(feature = "sim"))]
     fn bucket_wire_record(n: u8) -> WireRecord {
         WireRecord {
@@ -2658,10 +2622,7 @@ mod tests {
     #[cfg(not(feature = "sim"))]
     #[tokio::test]
     async fn bucket_stream_yields_nothing_new_when_the_peer_does_not_support_bucket_done() {
-        // A protocol-3 donor never sends `Msg::StBucketDone` in the first
-        // place (`serve_st_buckets` gates it); this is exactly the stream
-        // such a donor produces, byte-for-byte what `bucket_stream` yielded
-        // before `BucketDone` existed, just wrapped in `Chunk`.
+        // An older donor never sends StBucketDone, so only Chunks result.
         let cache = SmolStr::new("users");
         let rec1 = bucket_wire_record(1);
         let rec2 = bucket_wire_record(2);
@@ -2696,9 +2657,7 @@ mod tests {
         assert!(matches!(&got[1], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec2]));
     }
 
-    /// A [`RequestHandler`] serving one `StBuckets` pull across two
-    /// buckets, each one chunk, for
-    /// `serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid_stream_ack`.
+    /// Serves two one-chunk buckets, for the bucket-done/ack test below.
     #[cfg(not(feature = "sim"))]
     struct TwoBucketHandler;
     #[cfg(not(feature = "sim"))]
@@ -2769,13 +2728,8 @@ mod tests {
             _cache: SmolStr,
             _buckets: Vec<u16>,
         ) -> futures::stream::BoxStream<'static, (u16, Vec<WireRecord>)> {
-            // Padding after the two real items: a genuine `await` that
-            // keeps `serve_st_buckets`'s select loop polling `recv_msg`
-            // for a while instead of finding `chunks.next()` immediately
-            // `Ready(None)` and exiting the loop before the requester's
-            // ack for bucket 0 -- sent only once it has read bucket 0's
-            // `StBucketDone`, itself sent only once this stream's bucket-1
-            // item arrives -- has a real chance to be read.
+            // Keeps the select loop polling for the ack instead of exiting
+            // as soon as the chunk stream ends.
             let padding = futures::stream::once(tokio::time::sleep(Duration::from_millis(200)))
                 .filter_map(|()| async { None });
             Box::pin(
@@ -2892,15 +2846,9 @@ mod tests {
         );
     }
 
-    /// `serve_st_buckets` never reads again once its chunk stream is
-    /// exhausted: the group's last bucket's `StBucketDone` (and any bucket
-    /// `st_bucket_chunks` never yielded a chunk for) is sent from its
-    /// unraced tail, so the requester's matching ack for that bucket always
-    /// arrives after `serve_st_buckets` has returned. This drives the ack
-    /// straight at `handle_accepted`'s own connection loop -- with no
-    /// `serve_st_buckets` in the way at all -- proving that loop's
-    /// `dispatch_one` arm for `Msg::StBucketAck` is what actually catches
-    /// an ack arriving in that position.
+    /// Pins that an ack arriving after `serve_st_buckets` has already
+    /// returned is still caught, by `handle_accepted`'s own `dispatch_one`
+    /// arm for `Msg::StBucketAck`.
     #[cfg(not(feature = "sim"))]
     #[tokio::test]
     async fn handle_accepted_records_a_bucket_ack_that_arrives_after_any_serve_st_buckets_call_would_have_returned()

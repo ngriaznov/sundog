@@ -1,17 +1,12 @@
-//! `--report-json <PATH>`: one JSON object summarizing a headless run's
-//! shape, RSS, fetch latency, the sample check, convergence, and the
-//! summed `sundog_*` totals the metrics module already computes.
-//! `--gate <PATH>` reads a threshold file of the same shape and checks the
-//! report against it with the pure [`check`], so the gate itself never
-//! touches a live cluster and is exercised from a plain [`Report`] value.
+//! `--report-json <PATH>` writes one JSON [`Report`]. `--gate <PATH>`
+//! reads a threshold file of the same shape and checks it with [`check`].
 
 use std::path::Path;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-/// One headless run's shape, sizing, and outcome, written as JSON by
-/// `--report-json`.
+/// One headless run's shape, sizing, and outcome.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Report {
     pub(crate) nodes: usize,
@@ -23,9 +18,9 @@ pub(crate) struct Report {
     pub(crate) duration_secs: f64,
     pub(crate) preload_keys_per_sec: f64,
     pub(crate) preload_rss_bytes: u64,
-    /// The last status sample recorded before the midpoint kill.
+    /// RSS just before the midpoint kill.
     pub(crate) steady_rss_bytes: u64,
-    /// The largest RSS reading seen across every sample this run took.
+    /// Largest RSS reading across the whole run.
     pub(crate) peak_rss_bytes: u64,
     pub(crate) copies_expected: u64,
     pub(crate) bytes_per_copy: f64,
@@ -36,56 +31,38 @@ pub(crate) struct Report {
     pub(crate) sample_checked: usize,
     pub(crate) sample_ok: usize,
     pub(crate) converged: bool,
-    /// `sundog_spill_dropped_total{reason="deferred"}`, summed across
-    /// caches: refusals kept resident rather than actually dropped.
+    /// `sundog_spill_dropped_total{reason="deferred"}`, summed across caches.
     pub(crate) spill_dropped_deferred: u64,
     /// `sundog_rebalance_pull_timeouts_total`, summed across caches.
     pub(crate) pull_timeouts: u64,
     pub(crate) spill_writes: u64,
     pub(crate) ae_repaired: u64,
-    /// `sundog_rebalance_buckets_total{direction="in"}`, summed across
-    /// caches.
+    /// `sundog_rebalance_buckets_total{direction="in"}`, summed across caches.
     pub(crate) rebalance_in: u64,
-    /// `sundog_rebalance_buckets_total{direction="out"}`, summed across
-    /// caches.
+    /// `sundog_rebalance_buckets_total{direction="out"}`, summed across caches.
     pub(crate) rebalance_out: u64,
-    /// `sundog_backlog_dropped_total`, summed across peers: replicate
-    /// frames `net::Mesh::send_frames_awaiting` gave up on once their
-    /// target peer left the mesh's peer table mid-wait.
+    /// `sundog_backlog_dropped_total`, summed across peers.
     pub(crate) backlog_dropped: u64,
-    /// The part of `backlog_dropped` for peers other than the node the run
-    /// kills: frames for the killed node are dropped by design the moment
-    /// it leaves the peer table, and its restart pulls or reconciles what
-    /// they carried, so only a drop toward any other peer is a fault.
+    /// `backlog_dropped` excluding the killed node, whose departure causes those drops.
     pub(crate) backlog_dropped_other_peers: u64,
-    /// `sundog_fan_out_wait_timeouts_total`, summed across caches: async
-    /// writes whose wait for fan-out backlog room ran out before finding
-    /// any, and proceeded over capacity regardless.
+    /// `sundog_fan_out_wait_timeouts_total`, summed across caches.
     pub(crate) fan_out_wait_timeouts: u64,
-    /// `sundog_spill_reopen_total{outcome="warm"}`, summed across caches:
-    /// restarts whose spill tier reopened from its on-disk snapshot rather
-    /// than refilling cold.
+    /// `sundog_spill_reopen_total{outcome="warm"}`, summed across caches.
     pub(crate) spill_reopen_warm: u64,
-    /// `sundog_spill_reopen_total{outcome="cold_fallback"}`, summed across
-    /// caches.
+    /// `sundog_spill_reopen_total{outcome="cold_fallback"}`, summed across caches.
     pub(crate) spill_reopen_cold_fallback: u64,
 }
 
 impl Report {
     /// Renders `self` as pretty-printed JSON.
-    ///
     /// # Errors
-    ///
-    /// Returns an error if serialization fails, which `Report`'s all-plain
-    /// fields never trigger in practice.
+    /// Returns an error if serialization fails.
     pub(crate) fn to_json(&self) -> anyhow::Result<String> {
         serde_json::to_string_pretty(self).context("report serializes to JSON")
     }
 
     /// Writes [`Self::to_json`]'s rendering to `path`.
-    ///
     /// # Errors
-    ///
     /// Returns an error if serialization or the write fails.
     pub(crate) fn write_to(&self, path: &Path) -> anyhow::Result<()> {
         let json = self.to_json()?;
@@ -94,15 +71,13 @@ impl Report {
     }
 }
 
-/// `owners * surviving_keys`: the entry count a fully converged cluster's
-/// live nodes sum to.
+/// `owners * surviving_keys`, the entry count a converged cluster sums to.
 #[must_use]
 pub(crate) fn copies_expected(owners: u8, surviving_keys: usize) -> u64 {
     u64::from(owners).saturating_mul(u64::try_from(surviving_keys).unwrap_or(u64::MAX))
 }
 
-/// `steady_rss_bytes / copies_expected`, `0.0` when nothing is expected
-/// rather than dividing by zero.
+/// `steady_rss_bytes / copies_expected`, `0.0` if `copies_expected` is zero.
 #[must_use]
 pub(crate) fn bytes_per_copy(steady_rss_bytes: u64, copies_expected: u64) -> f64 {
     if copies_expected == 0 {
@@ -114,15 +89,13 @@ pub(crate) fn bytes_per_copy(steady_rss_bytes: u64, copies_expected: u64) -> f64
     }
 }
 
-/// Folds one more RSS `sample` into a running `peak`: the larger of the
-/// two, so a sequence of samples reduces to the maximum any of them read.
+/// The larger of `peak` and `sample`.
 #[must_use]
 pub(crate) fn track_peak(peak: u64, sample: u64) -> u64 {
     peak.max(sample)
 }
 
-/// A `--gate <PATH>` file's thresholds: [`check`] reports a line for every
-/// one `report` violates.
+/// A `--gate <PATH>` file's thresholds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Gate {
     pub(crate) max_steady_rss_bytes: u64,
@@ -132,27 +105,20 @@ pub(crate) struct Gate {
     pub(crate) max_fetch_p99_us: u64,
     pub(crate) require_converged: bool,
     pub(crate) require_full_sample: bool,
-    /// `None` (the default, absent from an older gate file) skips this
-    /// check entirely, so an existing gate file keeps its old behavior
-    /// until it opts in.
+    /// `None` (default, absent from an older gate file) skips this check.
     #[serde(default)]
     pub(crate) max_backlog_dropped: Option<u64>,
-    /// Bound on `backlog_dropped_other_peers`, the drops the kill step never
-    /// produces by design; `None` (the default) skips the check.
+    /// Bound on `backlog_dropped_other_peers`; `None` skips the check.
     #[serde(default)]
     pub(crate) max_backlog_dropped_other_peers: Option<u64>,
-    /// Minimum `spill_reopen_warm` the run must report; `None` (the
-    /// default) skips the check.
+    /// Minimum required `spill_reopen_warm`; `None` skips the check.
     #[serde(default)]
     pub(crate) min_spill_reopen_warm: Option<u64>,
 }
 
 /// Reads and parses a `--gate <PATH>` file.
-///
 /// # Errors
-///
-/// Returns an error if the file can't be read or doesn't parse as a
-/// [`Gate`].
+/// Returns an error if the file can't be read or parsed as a [`Gate`].
 pub(crate) fn read_gate(path: &Path) -> anyhow::Result<Gate> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading the gate file {}", path.display()))?;
@@ -160,16 +126,14 @@ pub(crate) fn read_gate(path: &Path) -> anyhow::Result<Gate> {
         .with_context(|| format!("parsing the gate file {} as JSON", path.display()))
 }
 
-/// Whether the sample check ran and every key it checked matched: the same
-/// pass condition `headless::run`'s own exit code uses.
+/// Whether the sample check ran and every checked key matched.
 #[must_use]
 fn sample_fully_passed(report: &Report) -> bool {
     report.sample_checked > 0 && report.sample_checked == report.sample_ok
 }
 
-/// Checks `report` against every threshold in `gate`, returning one
-/// human-readable line per threshold `report` violates. Pure: every input
-/// is a plain value, so a passing and a failing case need no live cluster.
+/// Checks `report` against every threshold in `gate`, returning one line
+/// per threshold violated.
 #[must_use]
 pub(crate) fn check(report: &Report, gate: &Gate) -> Vec<String> {
     let mut violations = Vec::new();

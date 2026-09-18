@@ -1010,13 +1010,9 @@ fn fill_payload_bytes(count: u32) -> u64 {
 /// bulk fill on a live three-node cluster must replicate as a handful of
 /// batched frames fanned out once per peer, not one frame per record and not
 /// a second copy from anti-entropy racing in behind it. Anti-entropy skips a
-/// round while replicate traffic is in motion toward a peer, at most
-/// `MAX_STREAMING_SKIPS` rounds running, so a fill that outlasts those
-/// rounds on a loaded box legitimately sees a round repair what the fan-out
-/// has not yet delivered; every record such a round moves counts toward
-/// `sundog_ae_repaired_total` on the node that applied it, and the byte
-/// budget below grants each of them one record's wire cost twice over
-/// rather than treating the whole fill's traffic as one opaque multiple.
+/// round while replicate traffic moves toward a peer, so a fill outlasting
+/// `MAX_STREAMING_SKIPS` rounds may see a legitimate repair; the byte budget
+/// below allows for that record's wire cost twice over, not as a duplicate.
 #[tokio::test]
 async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
     const ENTRIES: u32 = 100_000;
@@ -1051,11 +1047,8 @@ async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
         "n1 sent {frames_for_fill} frames for a {ENTRIES}-entry fill to 2 peers; the batched \
          fan-out queue should coalesce at least ten records per frame, not one frame per record"
     );
-    // Records anti-entropy rounds applied anywhere in the cluster while the
-    // fill was in flight: zero on an idle box, where the fan-out lands
-    // before the streaming skip runs out, and each one a legitimate,
-    // counted repair rather than a duplicate copy when the fill outlasts
-    // those skipped rounds on a loaded one.
+    // Anti-entropy repairs applied cluster-wide during the fill: zero on an
+    // idle box, a legitimate repair count when the fill outlasts the streaming skip.
     let mut repaired: u64 = 0;
     for node in [&n1, &n2, &n3] {
         repaired += scrape_metric(node, "sundog_ae_repaired_total", ("cache", "it")).await;
@@ -1484,29 +1477,15 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
     net.close().await.expect("network closes");
 }
 
-/// Goal 1's chunked-pull-with-independent-release machinery
+/// Chunked-pull-with-independent-release interop
 /// (`Msg::StBucketDone`/`Msg::StBucketAck`, gated on
-/// `wire::PROTOCOL_ST_BUCKET_DONE_ACK`) interoperates across a mixed-version
-/// `Mode::Distributed` cluster in both donor roles, the bucket-scoped
-/// counterpart to
-/// [`the_previous_release_and_this_one_interoperate_in_both_roles`]'s
-/// whole-cache coverage: two established nodes hold every key (`OWNERS ==
-/// 2` over two nodes means both own everything), then a third node joins on
-/// `donor_bin`'s protocol and pulls its share of the bucket space from
-/// them. When `new_is_donor` is `true` the two established nodes run this
-/// checkout and the joiner runs the previous release (an N donor serving an
-/// N-1 requester, the requester falling back to inferring each bucket's
-/// completion from the group's trailing `done: true` chunk exactly as
-/// protocol 3 does today); when `false` the roles invert (an N-1 donor
-/// serving an N requester, whose donor never sends the new messages a peer
-/// below the threshold protocol never asked for). Either direction must
-/// converge on every key owned by exactly `OWNERS` nodes and fetchable with
-/// the right value everywhere: a premature group termination would surface
-/// here as a key missing from an owner that should hold it, and a duplicate
-/// per-bucket release is harmless by construction (`apply_remote_batch`
-/// resolves re-delivery by `Hlc`), so this final convergence check is the
-/// meaningful assertion a container round trip can make over the unit-level
-/// state-machine coverage in `net::conn` and `cluster::rebalance`.
+/// `wire::PROTOCOL_ST_BUCKET_DONE_ACK`) across a mixed-version
+/// `Mode::Distributed` cluster in both donor roles: two established nodes
+/// hold every key, then a third joins on `donor_bin`'s protocol and pulls
+/// its share. `new_is_donor` swaps which release runs the donor pair versus
+/// the joiner. Either direction must converge on every key, fetchable
+/// everywhere, since a premature group termination would leave a key
+/// missing and a duplicate release is harmless by construction.
 async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool) {
     const OWNERS: u8 = 2;
     const FILL_KEYS: u32 = 1_500;
@@ -1529,10 +1508,8 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let env = [
         ("SUNDOG_TESTNODE_MODE", "distributed"),
         ("SUNDOG_TESTNODE_OWNERS", "2"),
-        // Info-level everywhere, debug on the cluster state-machine
-        // internals, so a wait that times out has more than a bare
-        // "condition not met" to go on once `eventually_with_logs` prints
-        // these nodes' captured logs.
+        // Debug on the cluster state machine, so a timeout has more than
+        // "condition not met" to go on.
         ("RUST_LOG", DISTRIBUTED_RUST_LOG),
     ];
     let n1 = Node::spawn_binary(&net, CLUSTER, "n1", &[], &env, donor_bin).await;
@@ -1563,17 +1540,11 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     let nodes = [&n1, &n2, &joiner];
     wait_for_peers(&nodes, 2).await;
 
-    // The joiner's pull has landed. A joiner on this checkout reports it
-    // through `sundog_rebalance_buckets_total{direction="in"}`. A joiner
-    // on the previous release serves no `/metrics` at all, since
-    // `build_previous_testnode` builds it without the `prometheus`
-    // feature, so the donors report it instead: each credits
-    // `direction="served"` only when a bucket-pull stream it donates runs
-    // to its end, a path anti-entropy never takes, and both donors serve
-    // one, since each holds the buckets the other lost to the joiner.
-    // The settle wait and the fetch check below are the assertions for
-    // both roles: every key on exactly `OWNERS` nodes, fetchable
-    // everywhere.
+    // The joiner's pull has landed. This checkout's joiner reports it via
+    // `sundog_rebalance_buckets_total{direction="in"}`; a previous-release
+    // joiner serves no metrics, so the donors report `direction="served"`
+    // instead. The settle wait and fetch check below assert both roles:
+    // every key on exactly `OWNERS` nodes, fetchable everywhere.
     eventually_with_logs(REBALANCE_WAIT, &nodes, || async {
         if new_is_donor {
             scrape_metric(
@@ -1627,16 +1598,14 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     net.close().await.expect("network closes");
 }
 
-/// [`distributed_rebalance_interoperates_between_releases`], an N donor
-/// serving an N-1 requester's rebalance pull.
+/// [`distributed_rebalance_interoperates_between_releases`], an N donor serving an N-1 requester's rebalance pull.
 #[tokio::test]
 async fn distributed_rebalance_interoperates_with_a_current_donor_and_a_previous_release_requester()
 {
     distributed_rebalance_interoperates_between_releases(true).await;
 }
 
-/// [`distributed_rebalance_interoperates_between_releases`], an N-1 donor
-/// serving an N requester's rebalance pull.
+/// [`distributed_rebalance_interoperates_between_releases`], an N-1 donor serving an N requester's rebalance pull.
 #[tokio::test]
 async fn distributed_rebalance_interoperates_with_a_previous_release_donor_and_a_current_requester()
 {
@@ -1813,12 +1782,9 @@ const SPILL_DIR: &str = "/spill";
 /// worth: with `region_bytes` set as small as [`SPILL_REGION_BYTES`] for
 /// these tests, that default would bound the backlog far tighter than the
 /// disk budget it is meant to protect, refusing hand-offs the tier has
-/// ample room for. `warm_reopen` sets `SUNDOG_TESTNODE_WARM_REOPEN`: `true`
-/// only for the scenarios that preserve the spill dir across a restart and
-/// mean to exercise the warm path; `false` elsewhere, matching
-/// `SpillConfig::warm_reopen`'s own default, since a node whose restart
-/// lands in a fresh container filesystem has nothing to warm-reopen either
-/// way.
+/// ample room for. `warm_reopen` sets `SUNDOG_TESTNODE_WARM_REOPEN`,
+/// `true` only for scenarios that preserve the spill dir across a
+/// restart to exercise the warm path, `false` elsewhere.
 fn spill_node_env(
     ram_budget_bytes: u64,
     spill_capacity_bytes: u64,
@@ -1992,10 +1958,8 @@ async fn replicated_cluster_serves_spilled_entries_and_settles_without_repair_lo
         "no spilled-value read on a should ever hit a disk io_error in this run"
     );
 
-    // Concurrent, not sequential: each `stop()` waits for the node's
-    // graceful leave (`sundog-testnode` shuts its cluster down on
-    // `SIGTERM`, departure notice included), so stopping three nodes one
-    // after another would triple that wait for no reason.
+    // Concurrent, not sequential: each `stop()` waits for a graceful leave,
+    // so stopping three nodes one after another would triple that wait.
     let (a_stopped, b_stopped, c_stopped) = tokio::join!(a.stop(), b.stop(), c.stop());
     a_stopped.expect("a stops");
     b_stopped.expect("b stops");
@@ -2121,19 +2085,12 @@ async fn spilling_node_survives_a_restart_and_rewarms_from_peers() {
     net.close().await.expect("network closes");
 }
 
-/// The warm-reopen companion to `spilling_node_survives_a_restart_and_rewarms_from_peers`:
-/// that scenario's restart lands in a fresh container filesystem, so
-/// `attach_spill` always takes the cold, wipe-and-recreate path regardless
-/// of `SpillTier::reopen`'s own warm path. This one instead bind-mounts a
-/// host directory at the spill dir, so it survives the restart intact --
-/// the shape a real deployment's restart gives it, and the one
-/// `demos/sundog-distributed-demo/src/node.rs`'s own `restart()` already
-/// preserves -- and asserts the restart actually lands warm:
-/// `sundog_spill_reopen_total{outcome="warm"}` fires, never
-/// `{outcome="cold_fallback"}`, and `sundog_spill_reopen_records_total`
-/// accounts for the large majority of what `a` recovers, close to
-/// `spilled_before_restart` since almost nothing else changes `a`'s spill
-/// tier between the two scrapes.
+/// The warm-reopen companion to
+/// `spilling_node_survives_a_restart_and_rewarms_from_peers`: that scenario's
+/// restart always lands cold since its filesystem is fresh, while this one
+/// bind-mounts a host directory so the spill dir survives the restart and
+/// asserts it lands warm (`outcome="warm"`, never `"cold_fallback"`), with
+/// `sundog_spill_reopen_records_total` close to what was spilled before.
 #[tokio::test]
 async fn spilling_node_reopens_warm_across_a_restart_with_its_spill_dir_preserved() {
     const FILL_COUNT: u32 = 3_000;
@@ -2198,9 +2155,8 @@ async fn spilling_node_reopens_warm_across_a_restart_with_its_spill_dir_preserve
         spilled_before_restart > 0,
         "a should already be spilling some of the {FILL_COUNT} entries before the restart"
     );
-    // `a`'s very first open, against the still-empty mounted directory, has
-    // no checkpoint snapshot to trust yet: a cold fallback, same as any
-    // first open.
+    // a's first open, against the still-empty mounted directory, is a cold
+    // fallback like any first open.
     assert_eq!(
         scrape_metric(&a, "sundog_spill_reopen_total", ("outcome", "warm")).await,
         0,
@@ -2210,11 +2166,8 @@ async fn spilling_node_reopens_warm_across_a_restart_with_its_spill_dir_preserve
     a.stop().await.expect("a stops ahead of its restart");
     wait_for_peers(&[&b, &c], 1).await;
 
-    // Same host directory mounted again under the same alias: the spill
-    // tier's region files and checkpoint snapshot survive this restart,
-    // unlike `spilling_node_survives_a_restart_and_rewarms_from_peers`'s
-    // ordinary, ephemeral-filesystem restart, so `attach_spill` finds a
-    // snapshot it trusts and takes the warm path.
+    // Same host directory remounted: the region files and checkpoint survive
+    // this restart, so `attach_spill` finds a snapshot it trusts and warms up.
     let a = Node::spawn_with_env_mounts_and_wait(
         &net,
         CLUSTER,
@@ -2252,23 +2205,14 @@ async fn spilling_node_reopens_warm_across_a_restart_with_its_spill_dir_preserve
     let _ = std::fs::remove_dir_all(&host_spill_dir);
 }
 
-/// Goal 2's third mixed-version case, distinct from the two goal-1 cases
-/// above (`distributed_rebalance_interoperates_with_a_current_donor_and_a_previous_release_requester`/
-/// `..._with_a_previous_release_donor_and_a_current_requester`): an N-1
-/// peer answering an N node's eager post-reopen anti-entropy round after a
-/// warm reload. `a` runs this checkout with a bind-mounted spill dir; `b`
-/// and `c` run the previous release. All three hold `"it"` in
-/// `Mode::Distributed` with `OWNERS == 2` over three live nodes, so while
-/// `a` is down the only two live nodes, `b` and `c`, both become every
-/// bucket's owner. A batch of writes made through `b` during that window
-/// lands on both -- exactly the state `a`'s own warm replay from its
-/// preserved spill dir never observes, since replay only reads what was on
-/// disk when `a` last closed. `a` restarts against the same spill dir,
-/// reopens warm (never clearing cold on replay alone, goal 2's own safety
-/// boundary), and must still pick those writes up through its eager
-/// per-co-owner `anti_entropy::run_round_against` round -- served here by a
-/// previous-release peer -- rather than missing them or needing a full
-/// pull to recover buckets that warm-reopened.
+/// A mixed-version case: an N-1 peer answering an N node's eager
+/// post-reopen anti-entropy round after a warm reload. `a` runs this
+/// checkout with a bind-mounted spill dir; `b` and `c` run the previous
+/// release. While `a` is down, `b` and `c` become every bucket's owner and
+/// take a batch of writes `a`'s warm replay never observes (replay only
+/// reads what was on disk when `a` last closed). `a` restarts, reopens
+/// warm (never clearing cold on replay alone), and must pick those writes
+/// up through its eager per-co-owner round served by a previous-release peer.
 #[tokio::test]
 #[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
 async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner() {
@@ -2296,9 +2240,8 @@ async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner(
     let host_spill_dir = host_spill_dir.to_string_lossy().into_owned();
     let mounts = [(host_spill_dir.as_str(), SPILL_DIR)];
 
-    // Sized off the whole fill, not `a`'s own ~2/3 share of it: generous
-    // capacity is harmless, and a RAM budget well under that share still
-    // forces real spilling once eviction runs.
+    // Sized off the whole fill; generous capacity is harmless and still
+    // forces real spilling.
     let total_weight = fill_weight_bytes(FILL_KEYS);
     let ram_budget_bytes = total_weight / 3;
     let spill_capacity_bytes = (total_weight + u64::from(FILL_KEYS) * 64) * 2;
@@ -2366,18 +2309,15 @@ async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner(
     a.stop().await.expect("a stops ahead of its restart");
     wait_for_peers(&[&b, &c], 1).await;
 
-    // While a is down, a fresh batch of writes through b -- the previous
-    // release -- lands on every bucket's now-only-two live owners, b and
-    // c. This is exactly the state a's own spill replay never observes:
-    // only the eager post-reopen AE round below can still recover it.
+    // While a is down, writes through b land on b and c, the only two live
+    // owners: a's own spill replay never observes this state.
     for (key, value) in (0..POST_RESTART_KEYS).map(|i| kv_entry(FILL_KEYS + i)) {
         b.put(&key, &value)
             .await
             .expect("a write during a's downtime still succeeds against its live co-owners");
     }
 
-    // Same host directory mounted again under the same alias: the spill
-    // tier's region files and checkpoint snapshot survive this restart.
+    // Same host directory remounted: the region files and checkpoint survive this restart.
     let a = Node::spawn_binary_with_env_mounts_and_wait(
         &net,
         CLUSTER,
@@ -2406,9 +2346,8 @@ async fn distributed_warm_reopen_interoperates_with_a_previous_release_co_owner(
          this to actually exercise goal 2's eager post-reopen reconciliation path"
     );
 
-    // Every write made during a's downtime must be fetchable everywhere,
-    // proving the eager AE round against a previous-release co-owner
-    // actually recovered them, not merely that some later full pull did.
+    // Every write during a's downtime must be fetchable everywhere via the
+    // eager AE round, not a later full pull.
     let post_restart_entries: Vec<(String, String)> = (0..POST_RESTART_KEYS)
         .map(|i| kv_entry(FILL_KEYS + i))
         .collect();
@@ -2620,11 +2559,8 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
 
     let net = Arc::new(Network::new_network());
     let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
-    // `Fleet`, not a bare `Vec<Node>`: this scenario's own containers were
-    // the leak source a prior CI run traced (its five never reached their
-    // `stop()` calls below once a settle wait timed out, and kept gossiping
-    // into the next test's network under this same `dist-fill-cluster`
-    // name). `Fleet::drop` stops them during a panic's unwind instead.
+    // `Fleet`, not a bare `Vec<Node>`: a prior CI run traced a leak to these
+    // five never reaching `stop()` after a timeout; `Fleet::drop` stops them on unwind.
     let mut fleet = Fleet(Vec::with_capacity(NODE_COUNT));
     for (i, alias) in ALIASES.iter().enumerate() {
         let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
@@ -2833,18 +2769,13 @@ async fn distributed_join_and_rebalance() {
 
     require_containers!();
 
-    // Info-level everywhere, debug on the cluster state-machine internals,
-    // for `eventually_with_logs`'s diagnostics on a timeout.
+    // Info-level everywhere, debug on the cluster state machine, for diagnostics on a timeout.
     let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
     let spawn = Node::spawn_distributed_with_env;
 
     let net = Arc::new(Network::new_network());
-    // `Fleet`, not a bare `Vec<Node>`: a prior CI run traced this cluster
-    // name (`dist-join-cluster`) receiving gossip from a still-running
-    // `dist-fill-cluster` container whose own test had already timed out
-    // and panicked without reaching its `stop()` calls. `Fleet::drop` stops
-    // these four nodes during a panic's unwind instead of leaking them the
-    // same way into whatever container test runs next.
+    // `Fleet`, not a bare `Vec<Node>`: a prior CI run traced leaked gossip to
+    // a timed-out test's containers; `Fleet::drop` stops these on unwind too.
     let mut fleet = Fleet(Vec::with_capacity(4));
     for (i, alias) in ALIASES.iter().enumerate() {
         let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();

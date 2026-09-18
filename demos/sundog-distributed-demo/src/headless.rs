@@ -28,11 +28,8 @@ const SAMPLE_SIZE: usize = 2_000;
 /// Bounds the retry loop that skips already-removed keys while sampling.
 const SAMPLE_ATTEMPT_CAP: usize = SAMPLE_SIZE * 20;
 
-/// How long the killed node stays down before the headless run restarts it:
-/// `min(duration / 4, tombstone_ttl / 2)`. Capping at half the tombstone TTL
-/// keeps the downtime inside `SpillConfig::warm_reopen`'s budget (it falls
-/// back cold once downtime exceeds the tombstone TTL), so a spill run
-/// exercises the warm reopen instead of always cold-falling-back.
+/// How long the killed node stays down, capped at half the tombstone TTL
+/// so a spill run reopens warm instead of falling back cold.
 #[must_use]
 fn restart_delay(duration: Duration, tombstone_ttl: Duration) -> Duration {
     (duration / 4).min(tombstone_ttl / 2)
@@ -49,8 +46,7 @@ fn restart_delay(duration: Duration, tombstone_ttl: Duration) -> Duration {
     reason = "one scripted end-to-end run: preload, kill, restart, converge, sample, report"
 )]
 pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> {
-    // The recorder must exist before the first node opens, or every metric
-    // registered until then stays on the no-op recorder.
+    // Must exist before the first node opens, or early metrics stay no-op.
     let metrics = match args.metrics {
         Some(interval) => Some((Arc::new(Metrics::install()?), interval)),
         None => None,
@@ -65,9 +61,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     let demo = demo;
 
     print_banner(args, duration);
-    // Tracks the largest RSS reading across every sample this run takes
-    // (preload, each periodic tick, and just before the kill), in
-    // kibibytes to match `rss::read_rss_kb`.
+    // Peak RSS across all samples, in kibibytes to match `rss::read_rss_kb`.
     let peak_rss_kb = Arc::new(AtomicU64::new(0));
     let reporter = metrics.as_ref().map(|(metrics, interval)| {
         tokio::spawn(report_periodically(
@@ -93,9 +87,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
         println!("metrics after preload:\n{}", metrics.dump());
     }
 
-    // Kill one node at the midpoint and bring it back after a bounded
-    // downtime, so the run exercises a real rebalance under live load and
-    // the reopen lands inside the tombstone TTL's warm-reopen budget.
+    // Kill one node at the midpoint, restart after a bounded downtime.
     let killed_index = 0usize;
     let half = duration / 2;
     let downtime = restart_delay(duration, setup::TOMBSTONE_TTL);
@@ -203,8 +195,7 @@ pub(crate) async fn run(args: &Args, duration: Duration) -> anyhow::Result<i32> 
     Ok(i32::from(failed))
 }
 
-/// Builds the `--report-json` [`Report`] from a headless run's collected
-/// state and its final metrics scrape.
+/// Builds the `--report-json` [`Report`] from a run's collected state.
 #[allow(clippy::too_many_arguments, reason = "one report, one call site")]
 fn build_report(
     args: &Args,
@@ -223,9 +214,8 @@ fn build_report(
     let copies_expected = report::copies_expected(args.owners.get(), surviving_keys);
     let totals = metrics::totals(metrics_body);
     let total_of = |metric: &str| totals.get(metric).copied().unwrap_or(0.0);
-    // `sundog_backlog_dropped_total` carries the target peer as its label,
-    // so the drops toward the node this run killed, which its departure
-    // produces by design, separate from a drop toward any other peer.
+    // Split off drops toward the killed node's peer label; its departure
+    // causes those regardless of backpressure.
     let backlog_dropped = total_of("sundog_backlog_dropped_total");
     let backlog_dropped_killed = metrics::labeled_total(
         metrics_body,
@@ -300,10 +290,8 @@ fn build_report(
     }
 }
 
-/// Reads the current RSS, folding it into `peak_kb` via
-/// [`report::track_peak`] with a compare-and-swap loop rather than a plain
-/// load-then-store, since the periodic reporter task and the main run
-/// loop both call this concurrently.
+/// Reads the current RSS and folds it into `peak_kb` via
+/// [`report::track_peak`]; uses compare-and-swap since callers race.
 fn record_rss_sample(peak_kb: &AtomicU64) -> Option<u64> {
     let sample = rss::read_rss_kb()?;
     let mut current = peak_kb.load(Ordering::Relaxed);
@@ -320,9 +308,7 @@ fn record_rss_sample(peak_kb: &AtomicU64) -> Option<u64> {
     }
 }
 
-/// The fetch counters, latency percentiles, and sample-check outcome
-/// [`report_fetches_and_sample`] gathers and prints, kept together so
-/// `--report-json` can reuse exactly what the console already reported.
+/// Fetch counters, latency, and sample-check outcome, shared with `--report-json`.
 struct FetchSummary {
     sample_checked: usize,
     sample_ok: usize,
@@ -333,9 +319,8 @@ struct FetchSummary {
     sample_failed: bool,
 }
 
-/// Prints the fetch counters, the sample check and the convergence report,
-/// with the per-node explanation on divergence. Returns the gathered
-/// counts, including whether the sample check failed.
+/// Prints fetch counters, the sample check, and convergence, and returns
+/// the gathered counts.
 async fn report_fetches_and_sample(
     demo: &setup::Demo,
     convergence_report: &Convergence,
@@ -366,8 +351,7 @@ async fn report_fetches_and_sample(
     }
 }
 
-/// Prints the run's shape: cluster, key space, value size, RAM cap and
-/// spill tier.
+/// Prints the run's shape: cluster, key space, value size, RAM cap, spill.
 fn print_banner(args: &Args, duration: Duration) {
     println!(
         "sundog-distributed-demo headless: {} nodes, {} keys, {} owners, cluster {:?}, running for {}s",
@@ -400,8 +384,7 @@ fn print_banner(args: &Args, duration: Duration) {
     );
 }
 
-/// Prints [`status_line`] every `interval` until aborted, folding each
-/// tick's RSS reading into `peak_rss_kb`.
+/// Prints [`status_line`] every `interval` until aborted.
 async fn report_periodically(
     metrics: Arc<Metrics>,
     interval: Duration,
@@ -423,9 +406,7 @@ async fn report_periodically(
     }
 }
 
-/// One line of run state: elapsed time, RSS, each node's own entry and
-/// bucket counts, the size of each node's spill directory on disk, and the
-/// watched metric totals.
+/// One line of run state: elapsed time, RSS, per-node stats, and watched metrics.
 fn status_line(
     metrics: &Metrics,
     nodes: &[Arc<NodeSlot>],

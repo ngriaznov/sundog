@@ -4,24 +4,15 @@
 //! than in RAM. This exercises the AE-pull-reply path's off-lock
 //! spilled-value read, end to end.
 //!
-//! Also carries the workstream's rebalance/anti-entropy backpressure-pacing
-//! test and its too-short-`spill_wait_timeout` sibling
-//! (`a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor`,
-//! `a_too_short_spill_wait_timeout_degrades_to_a_clean_retry_not_a_hang`):
-//! both drive a fresh `Mode::Replicated` node's own `open()`-time
-//! whole-cache pull, the same `state_transfer::run`/`pull_from_donor`/
-//! `apply_remote_batch` chain `rebalance.rs::try_donor_buckets` and
-//! anti-entropy repair share, at tens of MB rather than this file's own
-//! five-key scenario. `tests/spill_backpressure.rs` deliberately does not
-//! host them: its own tiny, tightly-margined bulk-insert scenario measured
-//! a real, higher flake rate under the disk contention these two heavier
-//! scenarios produce when sharing one test binary.
+//! Also carries the rebalance/anti-entropy backpressure-pacing test and
+//! its too-short-timeout sibling, both driving a fresh `Mode::Replicated`
+//! node's `open()`-time whole-cache pull at tens of MB.
+//! `spill_backpressure.rs` does not host them: sharing a binary with its
+//! tiny bulk-insert scenario raised its flake rate under disk contention.
 //!
-//! Its own test binary, a separate process from every other `tests/*.rs`
-//! file, so installing the process-global Prometheus recorder here never
-//! races another test for the slot; three tests share it, so
-//! [`metrics_handle`] lazily installs it once instead of each test racing
-//! its own direct `sundog::prometheus_handle()` call.
+//! Own test binary, so installing the process-global Prometheus recorder
+//! here never races another test; [`metrics_handle`] shares one
+//! installation across this file's three tests.
 
 #![cfg(all(feature = "spill", feature = "prometheus", not(feature = "sim")))]
 
@@ -33,9 +24,8 @@ use std::time::{Duration, Instant};
 
 use sundog::{Cache, Cluster, Mode, PrometheusHandle, SpillConfig};
 
-/// This binary's one claim on the process-global Prometheus recorder slot,
-/// installed lazily on first use and shared by every test that runs after
-/// it. Mirrors `tests/spill_bench.rs::metrics_handle`.
+/// This binary's lazily-installed claim on the process-global Prometheus
+/// recorder slot. Mirrors `spill_bench.rs::metrics_handle`.
 fn metrics_handle() -> &'static PrometheusHandle {
     static HANDLE: std::sync::OnceLock<PrometheusHandle> = std::sync::OnceLock::new();
     HANDLE.get_or_init(|| {
@@ -62,9 +52,7 @@ fn metric_value(body: &str, metric: &str, label: (&str, &str)) -> Option<f64> {
     })
 }
 
-/// [`metric_value`]'s multi-label counterpart, for a metric keyed by more
-/// than one label (e.g. `cache` and `reason` together). Mirrors
-/// `tests/spill_bench.rs::scraped_metric`.
+/// [`metric_value`]'s multi-label counterpart.
 fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f64> {
     let wanted: Vec<String> = labels
         .iter()
@@ -82,8 +70,7 @@ fn scraped_metric(body: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f
     })
 }
 
-/// Every `sundog_spill_*` counter/gauge this file reads holds an
-/// exact-integer count. Mirrors `tests/spill_bench.rs::metric_count`.
+/// Rounds a scraped metric to its exact-integer count.
 #[allow(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
@@ -93,13 +80,11 @@ fn metric_count(body: &str, metric: &str, labels: &[(&str, &str)]) -> u64 {
     scraped_metric(body, metric, labels).unwrap_or(0.0).round() as u64
 }
 
-/// Every value [`join_after_bulk_insert`]'s scenarios write is padded to
-/// exactly this many bytes. Mirrors `tests/spill_bench.rs::VALUE_LEN`.
+/// Fixed length every value [`join_after_bulk_insert`] writes is padded to.
 const VALUE_LEN: usize = 256;
 
 /// A fixed-length, easily eyeballed value: `v0000000042-xxxx...`, padded
-/// with `x` out to [`VALUE_LEN`] bytes regardless of `i`'s digit count.
-/// Mirrors `tests/spill_bench.rs::bench_value`.
+/// with `x` to [`VALUE_LEN`] bytes.
 fn fixed_value(i: u32) -> String {
     let prefix = format!("v{i:010}-");
     let pad = VALUE_LEN.saturating_sub(prefix.len());
@@ -110,7 +95,7 @@ fn fixed_value(i: u32) -> String {
 }
 
 /// A directory under [`std::env::temp_dir`], unique to this process and
-/// this call, never created ahead of time: `SpillTier::open` creates it.
+/// call; `SpillTier::open` creates it.
 fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "sundog-it-spill-repl-{label}-{}-{}",
@@ -254,18 +239,10 @@ async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Builds a solo `Mode::Replicated` node `a`, no spill, fully warm with
-/// `entries` fixed-size values already inserted, then joins a second node
-/// `b` against it and opens `b`'s own `Mode::Replicated` cache with
-/// `spill_cfg`/`max_capacity`. `b`'s `open()` call is exactly
-/// `state_transfer::run`'s whole-cache joiner-bootstrap pull, the same
-/// mechanism a fresh `Mode::Replicated` node always runs at `open()`:
-/// `apply_remote_batch`'s per-chunk `reserve()` gate applies here exactly
-/// as it does to live replication or anti-entropy repair (`spec.md` §2).
-///
-/// Returns both clusters/caches, kept alive so a caller can verify
-/// correctness before tearing down, `b`'s own `open()` wall-clock duration,
-/// and `b`'s spill directory (for the caller to clean up).
+/// Builds a solo warm `Mode::Replicated` node `a` with `entries` values,
+/// then joins node `b` against it, opening `b` with `spill_cfg`/
+/// `max_capacity`. Returns both clusters/caches and `b`'s `open()`
+/// wall-clock duration.
 async fn join_after_bulk_insert(
     cluster_name: &str,
     cache_name: &str,
@@ -326,16 +303,11 @@ async fn join_after_bulk_insert(
     (cluster_a, cache_a, cluster_b, cache_b, elapsed)
 }
 
-/// Runs `fut` to completion while a concurrent sampler polls
-/// `sundog_spill_waiters{cache=cache_name}` as fast as this runtime will
-/// schedule it (`tokio::task::yield_now`, not a timed sleep: a genuine
-/// `reserve()` suspension here is real-disk-and-channel-bound, often well
-/// under a millisecond). Returns `fut`'s own output alongside whether the
-/// gauge was ever observed above zero during that window. See this file's
-/// own module doc and
-/// `a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor`'s
-/// doc for why that observation is logged context, not load-bearing proof
-/// of a genuine suspension.
+/// Runs `fut` while a sampler polls `sundog_spill_waiters{cache=cache_name}`
+/// as fast as `yield_now` allows. Returns `fut`'s output plus whether the
+/// gauge was ever seen above zero; that observation is logged context,
+/// not proof of a genuine suspension (see
+/// `a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor`).
 async fn observe_waiters_during<F, T>(cache_name: &'static str, fut: F) -> (T, bool)
 where
     F: std::future::Future<Output = T>,
@@ -365,77 +337,36 @@ where
     (result, seen_waiter.load(Ordering::Relaxed))
 }
 
-/// A saturated flush queue measurably slows down node `b`'s whole-cache
-/// joiner-bootstrap pull from `a`, confirming admission backpressure
-/// genuinely reaches `apply_remote_batch`'s replication path and not only
-/// the local write path it shares a mechanism with (`spec.md` §2's
-/// rebalance/anti-entropy/replication coupling, exercised here through the
-/// simplest producer that shares the same `pull_from_donor`/
-/// `apply_remote_batch` chain: a fresh `Mode::Replicated` joiner's own
-/// `open()`-time pull).
+/// A saturated flush queue measurably slows node `b`'s joiner-bootstrap
+/// pull, confirming admission backpressure reaches the replication path
+/// and not only the local write path it shares.
 ///
-/// Compares two otherwise-identical scenarios differing only in
-/// `flush_queue_bytes`: "saturated" (a small fraction of the whole
-/// dataset's bytes, so `reserve()` genuinely has to wait for the flusher to
-/// free room, repeatedly, across the pull) versus "generous" (the whole
-/// disk budget, comfortably more than the whole dataset, so `reserve`
-/// essentially never has to wait). `SpillTier::pause_flusher` is
-/// `pub(crate)` and unreachable here (this file's own module doc), so the
-/// proof this test rests on is a real wall-clock difference in `b`'s own
-/// `open()` time, attributable to the one variable that changed, at a data
-/// volume large enough for that variable cost to dominate the fixed cost
-/// every joiner pays regardless (loopback gossip settle, the one
-/// anti-entropy reconcile round `state_transfer::run` always runs once a
-/// donor pull lands). `sundog_spill_waiters` is *not* that proof: it bumps
-/// on every `reserve()` call unconditionally (`Inner::record_waiter_delta`
-/// runs before the acquire is even awaited), so it cannot by itself
-/// distinguish "never had to wait" from "waited and immediately got room":
-/// [`observe_waiters_during`]'s result is logged below purely as extra
-/// context, not asserted on.
-///
-/// `sundog_spill_wait_timeouts_total` is also logged rather than asserted
-/// at zero: `Shard::retry_reservation_deficit`'s own post-loop retry pays
-/// down whatever deficit one reservation, sized only from one chunk's own
-/// bytes, could not cover, against this scenario's genuinely,
-/// persistently saturated queue (`MAX_CAPACITY`/`SATURATED_FLUSH_QUEUE_
-/// BYTES` far below what the pull needs throughout its run, not a
-/// transient spike), that retry legitimately spends whatever is left of
-/// this whole chunk's own `spill_wait_timeout` budget (shared with its own
-/// initial reservation, never a fresh budget of its own) before giving up
-/// on one chunk, so a real timeout firing here is an expected outcome of
-/// the design, not a bug: the reservation mechanism's correctness backstop
-/// (§7 of the spec) is exactly this bounded wait-then-fall-back, one
-/// `spill_wait_timeout` per chunk total, and every key's own value staying
-/// correct below is what proves it never costs correctness.
+/// Compares saturated `flush_queue_bytes` (`reserve()` repeatedly waits)
+/// against generous (`reserve` essentially never waits). The proof is the
+/// wall-clock difference in `b`'s `open()` time; `sundog_spill_waiters`
+/// is logged context only, since it bumps before the acquire is awaited
+/// and can't tell "never waited" from "waited and got room instantly".
+/// `sundog_spill_wait_timeouts_total` is likewise logged, not asserted at
+/// zero: the retry loop can legitimately exhaust the timeout here, so a
+/// real timeout is expected, and every key staying correct below is what
+/// proves it costs no correctness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() {
-    /// Large enough that the two scenarios' *variable* cost (real disk and
-    /// channel throughput under a saturated admission semaphore) dominates
-    /// the *fixed* cost every joiner pays regardless (loopback gossip
-    /// settle, the anti-entropy reconcile round `state_transfer::run`
-    /// always runs once a donor pull lands): at a much smaller 10k-entry
-    /// scale that fixed cost alone (measured around 110-140ms on this
-    /// suite's own sandbox) swamped any real admission delay entirely.
+    /// Large enough that the variable cost (disk/channel throughput under
+    /// a saturated semaphore) dominates the fixed cost every joiner pays
+    /// (gossip settle, one anti-entropy round); at 10k entries the fixed
+    /// cost alone swamped any real admission delay.
     const ENTRIES: u32 = 80_000;
     const MAX_CAPACITY: u64 = 64;
     const REGION_BYTES: u64 = 2 * 1024 * 1024;
     const CAPACITY_BYTES: u64 = 32 * 1024 * 1024;
-    /// A small fraction of the ~22 MB [`ENTRIES`] worth of 256-byte values
-    /// actually moves.
+    /// A small fraction of the ~22 MB [`ENTRIES`] moves.
     const SATURATED_FLUSH_QUEUE_BYTES: u64 = 64 * 1024;
-    /// The whole disk budget, comfortably more than the whole dataset:
-    /// `reserve` should never genuinely have to wait for room here.
+    /// The whole disk budget; `reserve` should never have to wait here.
     const GENEROUS_FLUSH_QUEUE_BYTES: u64 = CAPACITY_BYTES;
-    /// Observed on this suite's own sandbox: generous consistently
-    /// ~0.6-0.7s; saturated ranges from ~1.9s up into the tens of seconds
-    /// once `Shard::retry_reservation_deficit`'s own post-loop retry
-    /// spends a real chunk of this scenario's 15s `spill_wait_timeout`
-    /// waiting for the flusher to catch up (this scenario's queue is
-    /// genuinely, persistently saturated throughout the whole pull, not
-    /// just briefly), always comfortably over a second regardless. 300ms
-    /// is a deliberately conservative fraction of the smallest observed
-    /// gap, proof against a slower or more loaded machine without
-    /// weakening the claim this test makes.
+    /// Observed: generous ~0.6-0.7s; saturated ~1.9s or more, always
+    /// over a second. 300ms is a conservative fraction of the smallest
+    /// observed gap.
     const MIN_SLOWDOWN: Duration = Duration::from_millis(300);
 
     let handle = metrics_handle();
@@ -503,12 +434,8 @@ async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() 
     }
 
     let body = handle.render();
-    // Logged, not asserted at zero: see this test's own doc for why a
-    // genuine timeout here, from `Shard::retry_reservation_deficit`'s own
-    // post-loop retry against this scenario's persistently saturated
-    // queue, is an expected outcome of the reservation-deficit design, not
-    // a bug: the `get` loop just above is what proves it costs no
-    // correctness regardless of how many fire.
+    // Logged, not asserted at zero: a real timeout here is an expected
+    // outcome of the retry design (see the test doc), not a bug.
     let saturated_timeouts = metric_count(
         &body,
         "sundog_spill_wait_timeouts_total",
@@ -516,18 +443,9 @@ async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() 
     );
     eprintln!("pacing: saturated_timeouts={saturated_timeouts}");
 
-    // `sundog_spill_waiters` bumps on every `reserve()` call unconditionally
-    // (`Inner::record_waiter_delta`, called before the acquire is even
-    // awaited), so an instant, uncontended acquire can still transiently
-    // touch it on a multi-thread runtime racing a concurrent sampler onto
-    // another core; it cannot, by itself, distinguish "never had to wait"
-    // from "waited and immediately got room." It is not this test's load-
-    // bearing signal (kept only as one more data point in the log line
-    // above): the actual proof a saturated flush queue measurably slows
-    // this pull is the wall-clock comparison below, at a scale where the
-    // two scenarios' fixed costs (loopback settle, one anti-entropy
-    // reconcile round) are the same and only the admission-semaphore
-    // behavior differs.
+    // sundog_spill_waiters can't distinguish "never waited" from "waited
+    // and got room instantly", so it is logged context only; the
+    // wall-clock comparison below is the actual proof.
     assert!(
         saturated_elapsed >= generous_elapsed + MIN_SLOWDOWN,
         "a saturated flush queue must measurably slow the joiner's own bulk pull: \
@@ -547,37 +465,26 @@ async fn a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor() 
     let _ = std::fs::remove_dir_all(&dir_generous);
 }
 
-/// A `spill_wait_timeout` far shorter than any of this scenario's real
-/// waits degrades to the existing non-blocking refuse/keep-resident
-/// fallback instead of hanging the whole joiner-bootstrap pull: every
-/// `apply_remote_batch` call still returns, `b`'s `open()` still completes
-/// well inside the 20s `state_transfer_budget`, and, since `b` is
-/// `Mode::Replicated` (`keep_resident_when_refused` is set for it), every
-/// refused eviction simply stays resident rather than being lost, so
-/// correctness holds regardless of how many timeouts fire.
+/// A `spill_wait_timeout` far shorter than any real wait degrades to the
+/// non-blocking refuse/keep-resident fallback instead of hanging the
+/// pull: `b`'s `open()` still completes, and since `b` is
+/// `Mode::Replicated`, a refused eviction stays resident rather than
+/// being lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_too_short_spill_wait_timeout_degrades_to_a_clean_retry_not_a_hang() {
-    /// The same scale
-    /// `a_saturated_flush_queue_measurably_slows_the_joiners_pull_from_donor`
-    /// uses for its own "saturated" scenario: at a much smaller 10k-entry
-    /// scale, `reserve()` resolves so quickly against real disk that a
-    /// too-short timeout was never actually reached.
+    /// Same scale as the saturated-pacing test; at 10k entries `reserve()`
+    /// resolved too quickly to ever hit a too-short timeout.
     const ENTRIES: u32 = 80_000;
     const MAX_CAPACITY: u64 = 64;
     const REGION_BYTES: u64 = 2 * 1024 * 1024;
     const CAPACITY_BYTES: u64 = 32 * 1024 * 1024;
     const FLUSH_QUEUE_BYTES: u64 = 64 * 1024;
-    /// Far too short to ever win the race against a genuine wait: a real
-    /// wake-up alone (context switch plus timer-wheel granularity) takes
-    /// longer than this, so any `reserve()` call that actually needs to
-    /// suspend loses to the timeout, exercising the fallback rather than
-    /// happening to succeed anyway. `Duration::ZERO` is deliberately not
-    /// used here: it takes a documented, different code path (`reserve`
-    /// degenerates to a single non-blocking check with no `.await` at
-    /// all) rather than a genuine timeout race.
+    /// Shorter than a real wake-up (context switch plus timer-wheel
+    /// granularity), so any suspending `reserve()` call loses the race.
+    /// `Duration::ZERO` is avoided since it takes a different, non-blocking
+    /// code path instead of a genuine timeout race.
     const TOO_SHORT_TIMEOUT: Duration = Duration::from_micros(1);
-    /// Generous past the 20s default `state_transfer_budget`: this is the
-    /// "must not hang" ceiling, not an expected duration.
+    /// Generous ceiling past the 20s default budget; not an expected duration.
     const MUST_NOT_HANG_WITHIN: Duration = Duration::from_secs(30);
 
     let handle = metrics_handle();

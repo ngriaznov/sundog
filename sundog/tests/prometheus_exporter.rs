@@ -213,27 +213,12 @@ async fn count_hits_and_misses(cluster: &Cluster) {
     assert!(loads.iter().all(|value| value == "joined"));
 }
 
-/// Drives a genuine `sundog_fan_out_wait_timeouts_total{cache}` increment,
-/// and pins `sundog_fan_out_backlog{cache}` at a real nonzero value,
-/// through a bare `sundog::store::Shard` with no `Cluster`/mesh involved
-/// at all: `cluster::fan_out_task`, the only thing that ever drains a
-/// shard's fan-out queue, is spawned by `Cluster`/`Cache`, never by
-/// `Shard` itself, so nothing here races this scenario's own two `insert`
-/// calls to drain the queue first -- unlike a live cluster's real
-/// background fan-out, which would need genuine network backpressure to
-/// reproduce the same wait reliably (see `reserve_timeout_pin_metric`'s
-/// own doc on why a purely local producer/consumer pair tends not to
-/// reproduce a spill-side wait either).
-///
-/// A `fan_out_backlog_capacity` of 1 and a one-microsecond
-/// `fan_out_wait_timeout` force the second `insert` call's wait to time
-/// out deterministically, not just probably: `Notify::notified()`'s
-/// first poll can never resolve synchronously, since nothing ever
-/// notifies before it exists to be notified (unlike a semaphore permit
-/// that might already be free), so `tokio::time::timeout` always finds it
-/// genuinely pending on the very first poll, and a one-microsecond bound
-/// always loses that race. The write still lands regardless, over
-/// capacity: two keys queued against a capacity of one.
+/// Drives a genuine `sundog_fan_out_wait_timeouts_total{cache}` increment
+/// and pins `sundog_fan_out_backlog{cache}` nonzero through a bare
+/// `Shard`, with no `Cluster`/mesh to drain the fan-out queue. A
+/// `fan_out_backlog_capacity` of 1 and a one-microsecond
+/// `fan_out_wait_timeout` force the second `insert`'s wait to time out
+/// deterministically; the write still lands, over capacity.
 async fn fan_out_wait_timeout_pin_metrics() {
     let shard = Shard::<u32, String>::new(
         SmolStr::new("fan-out-timeout-pin"),
@@ -319,18 +304,14 @@ async fn seed_part_mismatch(cluster: &Cluster, peer: &Cluster) {
         .await;
 }
 
-/// Opens `delayed` as `Mode::Distributed { owners: 2 }` on a scenario-local
-/// donor, joins a scenario-local victim configured with a short
-/// `state_transfer_budget`, then kills the donor immediately before the
-/// victim opens the same cache: the victim's ownership view still lists the
-/// donor as live (gossip has not reacted yet, the same gap
-/// `seed_distributed_metrics`'s outcome="error" case relies on), so every
-/// bucket pull dials a closed listener, fails at once, and retries until its
-/// budget runs out. After `state_transfer::MAX_WARM_UP_ATTEMPTS` such rounds
-/// `rebalance::warm_up_task` gives up, opens warm with nothing pulled, and
-/// increments `sundog_rebalance_pull_timeouts_total{cache="delayed"}`.
-/// Independent of `peer`/`third`/`fourth`, like `seed_crdt_compaction_metrics`:
-/// both scenario-local nodes are down by the time this returns.
+/// Opens `delayed` on a scenario-local donor, joins a scenario-local
+/// victim with a short `state_transfer_budget`, then kills the donor
+/// before the victim opens the same cache: the victim's view still lists
+/// the donor as live, so every bucket pull dials a closed listener and
+/// fails until the budget runs out, incrementing
+/// `sundog_rebalance_pull_timeouts_total{cache="delayed"}`. Independent
+/// of `peer`/`third`/`fourth`: both scenario-local nodes are down by the
+/// time this returns.
 async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr) {
     let name = "delayed";
     let owners = NonZeroU8::new(2).expect("nonzero");
@@ -358,15 +339,10 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
         .await
         .expect("victim builds");
     common::wait_for_peer_count(&victim, 1, Duration::from_secs(15)).await;
-    // Gossip quiescence: gives the donor's `delayed` cache-mode
-    // advertisement time to reach the victim, so the victim's initial
-    // ownership view already lists the donor as a co-owner instead of
-    // opening alone with nothing to pull.
+    // Gossip quiescence, so the victim's view lists the donor before it opens.
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Closes the donor's listeners at once; the victim's ownership view
-    // still lists it as live, so every pull dials it and fails fast rather
-    // than ever finding a real donor to warm from.
+    // Closes the donor's listeners while the victim's view still lists it live.
     donor.shutdown().await;
 
     let _victim_cache = victim
@@ -500,19 +476,14 @@ async fn seed_crdt_compaction_metrics(
     second_life.shutdown().await;
 }
 
-/// Opens `prices` as `Mode::Distributed { owners: 2 }` across `cluster`,
-/// `peer`, and two more nodes joined for this scenario, driving every
-/// `sundog_fetch_total` outcome, a forwarded write, and all three
-/// `sundog_rebalance_buckets_total` directions on `cluster` itself, the
-/// only node whose metrics this test scrapes: `in` from its own open-time
-/// pull, `served` from the fourth node's pull of the buckets it takes
-/// from `cluster`'s co-owners, `out` from the release of the buckets it
-/// takes from `cluster`. Folded into the main test rather than its own
-/// `#[tokio::test]`, for the same process-global recorder reason
-/// `spill_writes_and_promotes_pin_metrics` is; that shared recorder also
-/// means every `sundog_owned_buckets{cache="prices"}` write from the
-/// four in-process nodes lands in one series, so the gauge this test reads
-/// is whichever node published last, and its pin stays a positivity check.
+/// Opens `prices` across `cluster`, `peer`, and two more nodes joined
+/// for this scenario, driving every `sundog_fetch_total` outcome, a
+/// forwarded write, and all three `sundog_rebalance_buckets_total`
+/// directions on `cluster` itself, the only node whose metrics this test
+/// scrapes. Folded into the main test for the same process-global
+/// recorder reason `spill_writes_and_promotes_pin_metrics` is; the shared
+/// recorder also means `sundog_owned_buckets{cache="prices"}`'s pin stays
+/// a positivity check.
 #[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
 async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: SocketAddr) {
     let owners = NonZeroU8::new(2).expect("nonzero");
@@ -722,15 +693,9 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
               spill_writes_and_promotes_pin_metrics's own doc for why it can't be a separate \
               #[tokio::test]"
 )]
-// Multi-threaded, matching `spill_replication.rs`'s own reservation/timeout
-// scenarios: `reserve_timeout_pin_metric`'s genuine `SpillWaitTimedOut` race
-// needs the flusher's dedicated OS thread and this test's own tokio tasks
-// to run with real parallelism. On a single-threaded runtime, this test's
-// one worker thread sharing time with every other scenario's background
-// work (gossip, anti-entropy, other clusters still open from earlier in
-// this same function) tends to give the flusher enough real wall-clock
-// time between polls to keep `admit` refilled, so the race that scenario
-// depends on rarely triggers.
+// Multi-threaded: reserve_timeout_pin_metric's genuine timeout race needs
+// the flusher's OS thread and this test's tasks to run with real
+// parallelism, or the flusher tends to keep `admit` refilled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     let metrics_addr = reserve_tcp_addr().await;
@@ -774,12 +739,10 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     }
     #[cfg(feature = "spill")]
     spill_dirs.extend(spill_reopen_pins_metrics(&cluster).await);
-    // Independent of `peer`/`third`/`fourth`: creates and fully retires its
-    // own two scenario-local nodes before returning, so it leaves no peer
-    // count `seed_distributed_metrics` below needs to account for.
+    // Independent of `peer`/`third`/`fourth`: fully retires its own
+    // scenario-local nodes before returning.
     seed_crdt_compaction_metrics(&cluster, gossip_a, metrics_addr).await;
-    // Also independent, for the same reason: its donor and victim are both
-    // shut down before it returns.
+    // Also independent: donor and victim are both shut down before it returns.
     seed_pull_timeout_metric(gossip_a, metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // is done with them, and `peer` isn't touched by anything after it.
@@ -832,11 +795,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
     );
 
-    // sundog_fan_out_wait_timeouts_total / sundog_fan_out_backlog: pinned by
-    // `fan_out_wait_timeout_pin_metrics`'s bare-`Shard` scenario -- one
-    // genuine, deterministic wait timeout, and two keys left sitting in the
-    // backlog against a configured capacity of one, since nothing ever
-    // drains a `Shard` with no `Cluster` behind it.
+    // sundog_fan_out_wait_timeouts_total / sundog_fan_out_backlog: pinned
+    // by the bare-Shard scenario above; nothing drains it, so both keys
+    // sit in the backlog against a capacity of one.
     assert!(
         scraped_metric_value(
             &body,
@@ -908,8 +869,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         );
     }
 
-    // `seed_pull_timeout_metric`'s victim gives up on exactly one warm-up
-    // pass, ever, once its ownership view moves on and its cache is warm.
+    // `seed_pull_timeout_metric`'s victim gives up on one warm-up pass,
+    // ever, once its ownership view moves on and its cache is warm.
     assert_eq!(
         scraped_metric_value(
             &body,
@@ -1016,10 +977,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "the removed key is gone, so zero currently-spilled entries remain; got body:\n{body}"
         );
 
-        // sundog_spill_reopen_total/sundog_spill_reopen_records_total: the
-        // "spilled" cache's very first open, with `SpillConfig::warm_reopen`
-        // left at its default, `false`, already takes the disabled cold
-        // fallback with nothing to install.
+        // sundog_spill_reopen_total/records_total: "spilled"'s first
+        // open, warm_reopen defaulted false, takes the disabled cold
+        // fallback.
         assert_eq!(
             scraped_metric_value(
                 &body,
@@ -1034,10 +994,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "expected exactly one disabled cold fallback on the 'spilled' cache's first open; \
              got body:\n{body}"
         );
-        // spill_reopen_pins_metrics's own scenarios: a real warm reopen,
-        // with every live entry it recovers counted (both the key still
-        // resident and the key already spilled when the tier closed), and
-        // a first-ever open with nothing yet to replay.
+        // spill_reopen_pins_metrics's scenarios: a real warm reopen
+        // counting both the resident and the already-spilled key.
         assert_eq!(
             scraped_metric_value(
                 &body,
@@ -1062,17 +1020,10 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              resident and the one already spilled when the tier closed; got body:\n{body}"
         );
         // sundog_spill_checkpoint_entries_total{cache,stage}: the same
-        // 'spill-reopen-warm' close, staged. `max_capacity(1)` leaves
-        // exactly one of the two inserted keys resident (the other already
-        // spilled by eviction), so the checkpoint captures and writes one
-        // entry, and finalize keeps it (nothing races the close in this
-        // scenario), flipping it to `Spilled` in the live engine. By the
-        // time `snapshot_spilled` runs right after, it scans that same
-        // now-current engine state, so it lists both the entry already
-        // spilled before this checkpoint started and the one finalize just
-        // flipped -- two, not one -- and the final snapshot totals the same
-        // two: `entries` already carries every checkpoint-kept survivor via
-        // that scan, so there is no second append of the same entry.
+        // close, staged. max_capacity(1) leaves one key resident, so the
+        // checkpoint captures/writes/keeps one entry; the post-checkpoint
+        // scan then lists both it and the already-spilled key, so listed
+        // and snapshot total two, not one.
         for (stage, expected) in [
             ("captured", 1.0),
             ("written", 1.0),
@@ -1092,9 +1043,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             );
         }
         // sundog_spill_reopen_entries_total{cache,stage}: the matching
-        // reopen, staged. Both snapshot entries are read and both distinct
-        // keys install; the snapshot carries no duplicate, so nothing is
-        // ever refused as already present.
+        // reopen; both snapshot entries are read and installed, none refused.
         for (stage, expected) in [("read", 2.0), ("installed", 2.0), ("refused_present", 0.0)] {
             assert_eq!(
                 scraped_metric_value(
@@ -1164,11 +1113,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              body:\n{body}"
         );
 
-        // `disk_error_and_reserve_wait_pin_metrics`'s `insert_many` call
-        // threads exactly one `Reservation` through `apply_grouped` ->
-        // `reserve()`, resolved against an otherwise-empty flush queue: no
-        // real wait, no timeout, and the waiter gauge back at zero once
-        // the call returns.
+        // disk_error_and_reserve_wait_pin_metrics's insert_many resolves
+        // its one reservation against an empty flush queue: no wait, no
+        // timeout, waiters back at zero.
         assert_eq!(
             scraped_metric_value(
                 &body,
@@ -1189,20 +1136,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "the RAII guard decrements sundog_spill_waiters back to zero once reserve() \
              resolves; got body:\n{body}"
         );
-        // sundog_spill_wait_timeouts_total is pinned by
-        // `reserve_tracks_waiters_wait_seconds_and_wait_timeouts`
-        // (spill.rs) against a genuine timeout, driven through the
-        // crate-internal `pause_flusher` hook this external test cannot
-        // reach: `admit`'s bytes free the instant the flusher *dequeues* a
-        // job, before its write even starts (`flusher_loop`'s own
-        // doc), so this particular tiny, two-entry scenario's own
-        // `flush_queue_bytes` never comes close to saturating within it.
-        // A `metrics::Counter` series exists only once something
-        // increments it, so a scenario that never times out correctly
-        // never registers this series at all -- this is that expected
-        // absence for *this* scenario, not a gap in coverage:
-        // `reserve_timeout_pin_metric`, below, pins a genuine nonzero
-        // count on its own differently-shaped cache.
+        // sundog_spill_wait_timeouts_total: pinned at the unit level
+        // (spill.rs) via `pause_flusher`, unreachable here. This tiny
+        // scenario never saturates its flush queue, so the series is
+        // correctly never registered; reserve_timeout_pin_metric below
+        // pins a genuine nonzero count instead.
         assert_eq!(
             scraped_metric_value(
                 &body,
@@ -1213,14 +1151,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             "reserve() resolved well inside its own timeout, so this series was never \
              registered; got body:\n{body}"
         );
-        // `reserve_timeout_pin_metric`'s own scenario: a real donor/joiner
-        // state-transfer pull against a tiny `flush_queue_bytes` and an
-        // absurdly short `spill_wait_timeout` (1 microsecond) forces at
-        // least one `ShardOps::apply_remote_batch` reservation or
-        // `Shard::retry_reservation_deficit` retry call to lose its race
-        // against a genuine wait -- a real, nonzero count pinned through
-        // the actual Prometheus text-exposition path, not just an absence
-        // check.
+        // reserve_timeout_pin_metric: a real donor/joiner pull against a
+        // tiny flush queue and a 1us timeout forces a reservation to lose
+        // its race against a genuine wait.
         assert!(
             scraped_metric_value(
                 &body,
@@ -1232,12 +1165,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
              cache; got body:\n{body}"
         );
 
-        // disk_error: only pinned when `chattr_dir_entries` could actually
-        // set up the fault (root or passwordless sudo, on an ext2/3/4
-        // filesystem); elsewhere this is skipped rather than failing the
-        // whole scenario, the same tolerance this file already extends to
-        // losing the process-global recorder race. Once the fault *is* set
-        // up, `None` is a real failure, not tolerated.
+        // disk_error: only pinned when chattr_dir_entries could set up
+        // the fault (root/sudo, ext2/3/4); otherwise skipped. Once set up,
+        // None is a real failure.
         if disk_error_immutable {
             assert!(
                 disk_error_dropped.is_some_and(|count| count >= 1.0),
@@ -1249,21 +1179,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         }
     }
 
-    // sundog_fan_out_wait_seconds_total{peer}: `net::Mesh::send_frames_awaiting`
-    // only ever bumps this when a real per-peer outbox stays full past a
-    // whole `FAN_OUT_SEND_DEADLINE` (2s) slice while the peer is still
-    // live -- every real peer this whole scenario ever talks to (`peer`,
-    // `third`, `fourth`) drains its own inbound traffic far faster than
-    // that on loopback with no artificial slowdown, the same reason
-    // `disk_error_and_reserve_wait_pin_metrics`'s tiny scenario never
-    // registers `sundog_spill_wait_timeouts_total` either: reproducing a
-    // genuine multi-second mesh stall needs a deliberately slow receiver
-    // (a real network round trip, or a receiver-side admission wait), not
-    // just a small buffer, so this series is correctly never registered
-    // here. `send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer`
-    // and `send_frames_awaiting_drops_once_the_peer_leaves_the_table_mid_wait`
-    // (net/mod.rs) pin this counter's actual increment in-process instead,
-    // against a mesh outbox held full by construction.
+    // sundog_fan_out_wait_seconds_total{peer}: only bumps when a
+    // per-peer outbox stays full past a whole deadline slice; every real
+    // peer here drains loopback traffic far faster than that, so this
+    // series is correctly never registered. net/mod.rs's own unit tests
+    // pin the actual increment against an outbox held full by construction.
     assert!(
         !body.contains("sundog_fan_out_wait_seconds_total"),
         "no peer in this scenario ever stalls its outbox for a whole deadline slice; got \
@@ -1497,34 +1417,18 @@ async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::pa
     dirs
 }
 
-/// `sundog_spill_reopen_total`/`sundog_spill_reopen_records_total`: a
-/// tiny-capacity `Mode::Local` cache, `warm_reopen(true)`, spills one entry
-/// (past its one-entry capacity) while a second stays resident, closes
-/// cleanly (checkpointing both into a snapshot `Shard::attach_spill`'s warm
-/// path trusts), then reopens the same directory, landing `outcome="warm"`
-/// with both live entries installed. Four further, independent directories
-/// each pin one `outcome="cold_fallback"` reason: a first-ever open against
-/// a brand-new directory with `warm_reopen(true)` and nothing ever closed
-/// (`reason="no_snapshot"`), a second open whose `region_bytes` no longer
-/// matches the snapshot (`reason="config_mismatch"`), a second open past
-/// `tombstone_ttl` of the first close (`reason="downtime_exceeded"`), and a
-/// second open against a directory with one region file truncated to a
-/// length `region_bytes` no longer matches (`reason="bad_region"`). The
-/// `reason="disabled"` cold fallback needs no scenario of its own: every
-/// cache in this module that never calls `SpillConfig::warm_reopen` (the
-/// default, `false`) already takes it on every open, and
-/// `metrics_endpoint_serves_sundog_metrics_after_cache_ops` pins it
-/// straight off the `"spilled"` cache's own first open. `reason="stale_snapshot"`
-/// is pinned separately, at the unit level
-/// (`store::tests::attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric`):
-/// producing one from here would mean forging a snapshot with a valid
-/// checksum but a wrong `format_version` byte-for-byte against a format
-/// this test has no legitimate way to construct, so this reason is proved
-/// through the metrics-recording call site directly instead.
-///
-/// Runs inside `metrics_endpoint_serves_sundog_metrics_after_cache_ops`
-/// for the same process-global-recorder reason every other seed function
-/// here does.
+/// `sundog_spill_reopen_total`/`records_total`: a tiny-capacity
+/// `Mode::Local` cache, `warm_reopen(true)`, spills one entry while a
+/// second stays resident, closes cleanly, then reopens the same
+/// directory, landing `outcome="warm"` with both installed. Four further
+/// directories each pin one `outcome="cold_fallback"` reason:
+/// `no_snapshot` (never closed), `config_mismatch` (`region_bytes`
+/// changed), `downtime_exceeded` (past `tombstone_ttl`), and `bad_region`
+/// (a truncated region file). `reason="disabled"` is pinned off the
+/// `"spilled"` cache's first open elsewhere in this file;
+/// `reason="stale_snapshot"` is pinned at the unit level, since forging a
+/// snapshot with a wrong `format_version` has no legitimate construction
+/// here.
 ///
 /// Returns every directory opened, for the caller to clean up.
 #[cfg(feature = "spill")]
@@ -1535,7 +1439,7 @@ async fn spill_writes_and_promotes_pin_metrics(cluster: &Cluster) -> Vec<std::pa
 async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
 
-    // --- warm reopen: close cleanly, then reopen the same directory. ---
+    // warm reopen: close cleanly, then reopen the same directory.
     let dir = fresh_spill_dir("reopen-warm");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
@@ -1554,10 +1458,8 @@ async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf>
         cache.get_sync(&1).is_none() || cache.get_sync(&2).is_none()
     })
     .await;
-    // Closes without ever promoting the spilled key back to resident: the
-    // checkpoint below still recovers it from disk, and the other key
-    // straight from RAM, so the reopen counts both under
-    // sundog_spill_reopen_records_total, neither reinserted fresh.
+    // Closes without promoting the spilled key back resident; the
+    // reopen recovers it from disk and the other from RAM.
     cache.close().await;
 
     let _reopened = cluster
@@ -1570,8 +1472,7 @@ async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf>
         .expect("second open, against the same directory, reopens warm");
     dirs.push(dir);
 
-    // --- no_snapshot: a brand-new directory, warm_reopen(true), never
-    // closed. ---
+    // no_snapshot: a brand-new directory, warm_reopen(true), never closed.
     let dir = fresh_spill_dir("reopen-no-snapshot");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
@@ -1585,8 +1486,7 @@ async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf>
         .expect("a brand-new directory still opens, cold, with nothing to replay");
     dirs.push(dir);
 
-    // --- config_mismatch: reopen the same directory with a different
-    // `region_bytes` than the snapshot was written under. ---
+    // config_mismatch: reopen with a different region_bytes than the snapshot.
     let dir = fresh_spill_dir("reopen-config-mismatch");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
@@ -1611,8 +1511,7 @@ async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf>
         .expect("a resized tier still opens, cold, via the wipe-and-recreate fallback");
     dirs.push(dir);
 
-    // --- downtime_exceeded: reopen once the snapshot's closed_at_ms is
-    // older than `tombstone_ttl` (2s under this test's `fast_config`). ---
+    // downtime_exceeded: reopen once closed_at_ms is older than tombstone_ttl.
     let dir = fresh_spill_dir("reopen-downtime-exceeded");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
@@ -1635,9 +1534,7 @@ async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf>
         .expect("a tier closed longer than tombstone_ttl still opens, cold");
     dirs.push(dir);
 
-    // --- bad_region: reopen after one region file's length no longer
-    // matches the configured region_bytes, a real on-disk fault the
-    // snapshot and its closed_at_ms both check out fine against. ---
+    // bad_region: reopen after one region file's length mismatches region_bytes.
     let dir = fresh_spill_dir("reopen-bad-region");
     let cfg = sundog::SpillConfig::new(&dir, 1 << 20)
         .region_bytes(4096)
@@ -1671,17 +1568,11 @@ async fn spill_reopen_pins_metrics(cluster: &Cluster) -> Vec<std::path::PathBuf>
 }
 
 /// Best-effort: makes every entry directly under `dir` immutable
-/// (`chattr +i`), or mutable again (`chattr -i`) on the reverse call. The
-/// immutable attribute is checked by ext2/3/4 on every write syscall, not
-/// only at `open()` the way permission bits are, so it makes a `pwrite` on
-/// an already-open write handle fail with `EPERM` even though the handle
-/// was opened, and the file preallocated, before this runs --
-/// `SpillTier::open`'s own region files, specifically. Requires
-/// `CAP_LINUX_IMMUTABLE` (root, or passwordless `sudo`) and an
-/// ext2/3/4-family filesystem; returns `false` without changing anything
-/// when either is unavailable, so a caller can skip whatever real
-/// disk-error scenario this was meant to set up instead of failing
-/// outright.
+/// (`chattr +i`), or mutable again on the reverse call. Checked by
+/// ext2/3/4 on every write syscall, so it fails an already-open write
+/// handle's `pwrite` with `EPERM`. Requires `CAP_LINUX_IMMUTABLE` and an
+/// ext2/3/4 filesystem; returns `false` without changing anything
+/// otherwise, so a caller can skip the scenario instead of failing.
 #[cfg(feature = "spill")]
 fn chattr_dir_entries(dir: &std::path::Path, immutable: bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1707,27 +1598,17 @@ fn chattr_dir_entries(dir: &std::path::Path, immutable: bool) -> bool {
     run("chattr", &[]) || run("sudo", &["-n", "chattr"])
 }
 
-/// Exercises the `reserve()`-backed metrics this workstream adds --
-/// `sundog_spill_wait_seconds_total`, `sundog_spill_waiters`,
-/// `sundog_spill_wait_timeouts_total` -- via `insert_many`, the one
-/// producer reachable through the public API that threads a `Reservation`
-/// through `apply_grouped`; single-key `cache.insert` never calls
-/// `reserve()` at all (`SpillConfig::spill_wait_timeout`'s own doc names
-/// this as an explicit scope boundary). Also exercises
-/// `sundog_spill_dropped_total{reason="disk_error"}` via a real,
-/// deterministic write failure: [`chattr_dir_entries`] makes the tier's
-/// region files immutable right after `SpillTier::open` creates them, so
-/// the flusher's later `pwrite` on its already-open handle for one of them
-/// fails with `EPERM` -- a real filesystem fault, not a simulated one.
+/// Exercises the `reserve()`-backed metrics via `insert_many`, the one
+/// public-API producer that threads a `Reservation` through
+/// `apply_grouped` (single-key `insert` never calls `reserve()`). Also
+/// exercises `sundog_spill_dropped_total{reason="disk_error"}`:
+/// [`chattr_dir_entries`] makes the tier's region files immutable, so the
+/// flusher's later `pwrite` fails with a real `EPERM`.
 ///
-/// Returns the scratch directory to clean up, whether
-/// [`chattr_dir_entries`] actually set up the fault, and, when it did, the
-/// observed `disk_error` count. The caller skips the `disk_error`
-/// assertion entirely when the fault could not be set up (no
-/// `CAP_LINUX_IMMUTABLE`, no `chattr` binary, or a filesystem that does
-/// not support the attribute) instead of failing the whole scenario; when
-/// it *was* set up, `None` for the observed count is a genuine failure to
-/// report, not an environment limitation to tolerate.
+/// Returns the scratch directory, whether the fault was set up, and, if
+/// so, the observed `disk_error` count. The caller skips the assertion
+/// when the fault couldn't be set up; once set up, `None` is a real
+/// failure.
 #[cfg(feature = "spill")]
 async fn disk_error_and_reserve_wait_pin_metrics(
     cluster: &Cluster,
@@ -1745,17 +1626,13 @@ async fn disk_error_and_reserve_wait_pin_metrics(
         .await
         .expect("cache opens");
 
-    // `SpillTier::open` creates and preallocates every region file
-    // synchronously before `open()` above ever returns, so the directory
-    // is already fully populated here, before any insert or eviction has
-    // run.
+    // SpillTier::open preallocates every region file synchronously,
+    // so the directory is fully populated here already.
     let region_dir = dir.join(cache_name);
     let immutable = chattr_dir_entries(&region_dir, true);
 
-    // `insert_many` threads one `Reservation` through `apply_grouped` ->
-    // `reserve()` for the whole call, so this is the one producer this
-    // file can reach that exercises the new wait metrics; it applies both
-    // entries regardless of whether the eviction this forces later fails.
+    // insert_many threads one Reservation through apply_grouped for the
+    // whole call, applying both entries regardless of a later eviction failure.
     cache
         .insert_many([(1u32, "one".to_string()), (2u32, "two".to_string())])
         .await
@@ -1782,50 +1659,31 @@ async fn disk_error_and_reserve_wait_pin_metrics(
         None
     };
 
-    // Restore normal permissions so the caller's own `remove_dir_all`
-    // cleanup can actually delete these files.
+    // Restore permissions so the caller's cleanup can delete these files.
     let _ = chattr_dir_entries(&region_dir, false);
 
     (dir, immutable, observed_disk_error)
 }
 
 /// Drives a genuine `sundog_spill_wait_timeouts_total` increment through
-/// the public API alone: `disk_error_and_reserve_wait_pin_metrics`'s own
-/// tiny, two-entry scenario never needs `reserve()` to actually suspend
-/// (its default 64 MiB `flush_queue_bytes` has room for both records many
-/// times over), so that series is never registered there, and pinning it
-/// against a genuine wait needs a scenario shaped like this one instead.
+/// the public API: `disk_error_and_reserve_wait_pin_metrics`'s tiny
+/// scenario never needs `reserve()` to suspend, so that series is never
+/// registered there.
 ///
-/// A single local `insert_many` burst, however large, turns out not to
-/// reproduce this reliably: `flusher_loop` frees `admit`'s permits the
-/// instant it *dequeues* a job (`SpillTier::reserve`'s own doc), well
-/// before that job's disk write even starts, so a purely local producer
-/// and the flusher both racing on the same machine's CPU tends to keep
-/// `admit` refilled faster than even a 1-microsecond timeout can lose
-/// against. `ShardOps::apply_remote_batch`'s own `reserve()` call, driven
-/// through a real state-transfer pull between two real nodes exactly as
-/// `spill_replication.rs::a_too_short_spill_wait_timeout_degrades_to_a_
-/// clean_retry_not_a_hang` does, is what reliably produces a genuine
-/// suspension here: a real donor round trip over loopback TCP is
-/// consistently slower than the flusher's own local dequeue-and-free-permit
-/// step, so this joiner's own reservation and retry calls do genuinely
-/// have to wait on real network I/O rather than only local disk/channel
-/// throughput. `Duration::from_micros(1)` then loses that race
-/// deterministically: `tokio::time::timeout` only ever returns early when
-/// its wrapped future resolves on the very first poll, and a real
-/// suspension never does that within one microsecond of real wall-clock
-/// scheduling latency.
+/// A local `insert_many` burst doesn't reproduce this reliably, since
+/// the flusher frees permits the instant it dequeues a job, well before
+/// the disk write starts, racing ahead of even a 1-microsecond timeout.
+/// A real state-transfer pull between two nodes does: a loopback TCP
+/// round trip is consistently slower than the flusher's local dequeue,
+/// so the joiner's reservation waits on network I/O, and the
+/// 1-microsecond timeout loses that race deterministically.
 ///
-/// Two scenario-local nodes, entirely independent of the caller's own
-/// `cluster`/`peer`: a donor fills `ENTRIES` records unbounded and
-/// spill-free, then a joiner opens with a tiny `flush_queue_bytes`, a
-/// small `max_capacity`, and the too-short timeout, pulling the whole
-/// dataset from the donor at `open()` time. Both nodes are shut down
-/// before this returns. Returns the scratch directory to clean up. Makes
-/// no claim about `queue_full`/`deferred` drops on the joiner's cache --
-/// degrading cleanly under a too-short timeout, not a zero-drop guarantee,
-/// is the property this scenario exercises; `spill_backpressure.rs`'s own
-/// scenarios cover the zero-drop claim with a realistic timeout.
+/// Two scenario-local nodes, independent of the caller's own
+/// `cluster`/`peer`: a donor fills `ENTRIES` records, then a joiner opens
+/// with a tiny `flush_queue_bytes` and the too-short timeout, pulling the
+/// whole dataset at `open()` time. Both nodes are shut down before this
+/// returns. Returns the scratch directory. Makes no zero-drop claim;
+/// `spill_backpressure.rs` covers that with a realistic timeout.
 #[cfg(feature = "spill")]
 async fn reserve_timeout_pin_metric() -> std::path::PathBuf {
     const REGION_BYTES: u64 = 2 * 1024 * 1024;
@@ -1833,9 +1691,7 @@ async fn reserve_timeout_pin_metric() -> std::path::PathBuf {
     const FLUSH_QUEUE_BYTES: u64 = 64 * 1024;
     const MAX_CAPACITY: u64 = 64;
     const ENTRIES: u32 = 80_000;
-    /// Far too short to ever win a race against a genuine wait; see
-    /// `a_too_short_spill_wait_timeout_degrades_to_a_clean_retry_not_a_hang`'s
-    /// own doc for why `Duration::ZERO` is deliberately not used instead.
+    /// Far too short to ever win a race against a genuine wait.
     const TOO_SHORT_TIMEOUT: Duration = Duration::from_micros(1);
     let cache_name = "reserve-timeout-pin";
     let cluster_name = "it-prometheus-exporter-reserve-timeout";
