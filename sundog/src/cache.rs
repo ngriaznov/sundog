@@ -293,13 +293,11 @@ where
         .with_resolver(resolver)
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled);
-        // Applied before `with_weigher` below: `Shard::with_capacity_hint`
-        // rebuilds the engine same as `with_weigher` does, and only
-        // `with_weigher`'s own rebuild carries a capacity hint forward
-        // through `Shard`'s remembered field, not the other way around.
-        // The clamp itself skips a configured weigher, since `max_capacity`
-        // bounds weight there, not entry count, and this hint is always an
-        // entry count.
+        // `Shard::with_capacity_hint` and `Shard::with_weigher` each
+        // rebuild the engine carrying the other's remembered setting, so
+        // their order here is free. The clamp skips a configured weigher,
+        // since `max_capacity` bounds weight there, not entry count, and
+        // this hint is always an entry count.
         if let Some(hint) = capacity_hint {
             let hint = if weigher.is_some() {
                 hint
