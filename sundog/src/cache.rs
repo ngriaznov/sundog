@@ -1385,6 +1385,18 @@ where
         self.shard.name()
     }
 
+    /// This cache's shard's current per-stripe `live` arena capacities; see
+    /// [`crate::store::Shard::stripe_capacities`]. `#[doc(hidden)]`: a test
+    /// accessor for confirming a [`CacheBuilder::capacity_hint`] reaches
+    /// the opened cache's stripes from an integration-test binary outside
+    /// this crate, which cannot otherwise reach the private `shard` field.
+    /// Never call this outside a benchmark or test.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stripe_capacities(&self) -> Vec<usize> {
+        self.shard.stripe_capacities()
+    }
+
     /// This node's current [`WriterId`]: its own [`Cluster::node_id`] paired
     /// with the cluster's current membership incarnation. Every caller of
     /// a merging cache's [`Cache::merge`], including the CRDT types' own
@@ -4107,6 +4119,34 @@ mod tests {
             cache.shard.stripe_capacities(),
             vec![expected; crate::store::BUCKET_COUNT],
             "the hint reached the shard's engine, presizing every stripe"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_stripe_capacities_matches_the_shards() {
+        let cluster = Cluster::builder("cache-it-cache-stripe-capacities")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let hint = 500u64;
+        let cache = cluster
+            .cache::<u32, u32>("counters")
+            .mode(Mode::Local)
+            .capacity_hint(hint)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert_eq!(
+            cache.stripe_capacities(),
+            cache.shard.stripe_capacities(),
+            "Cache::stripe_capacities is a plain forward to the shard's own accessor, for a \
+             crate outside sundog to reach it without seeing the private `shard` field"
         );
 
         cache.close().await;

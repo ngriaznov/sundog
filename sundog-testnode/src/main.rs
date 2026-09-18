@@ -40,7 +40,9 @@ use bytes::Bytes;
 #[cfg(feature = "spill")]
 use sundog::SpillConfig;
 use sundog::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver, WriterId};
-use sundog::{Cache, Cluster, ClusterConfig, ConflictResolver, Merged, Mode, RecordView, Winner};
+use sundog::{
+    Cache, CacheBuilder, Cluster, ClusterConfig, ConflictResolver, Merged, Mode, RecordView, Winner,
+};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use xxhash_rust::xxh3::xxh3_64;
@@ -396,10 +398,38 @@ impl ConflictResolver for SumCounterResolver {
     }
 }
 
+/// Applies `cap` (from [`capacity_cap_from_env`]) to `builder`: a byte
+/// budget installs the byte weigher alongside its own `max_capacity`; an
+/// entry count installs both `max_capacity` and `capacity_hint`, since
+/// `capacity_hint` is always an entry count and only makes sense next to
+/// the entry-denominated `max_capacity` call, never the byte-budget arm,
+/// where `max_capacity` bounds weight rather than entries; no cap leaves
+/// `builder` untouched. Split out of [`open_it_cache`] as a pure decision
+/// step a test can drive against a real builder without reading process
+/// environment.
+fn apply_capacity_cap(
+    mut builder: CacheBuilder<String, String>,
+    cap: Option<CapacityCap>,
+) -> CacheBuilder<String, String> {
+    match cap {
+        Some(CapacityCap::Bytes(max_capacity_bytes)) => {
+            builder = builder
+                .max_capacity(max_capacity_bytes)
+                .weigher(|key: &String, value: &String| byte_weight(key, value));
+        }
+        Some(CapacityCap::Entries(max_entries)) => {
+            builder = builder.max_capacity(max_entries).capacity_hint(max_entries);
+        }
+        None => {}
+    }
+    builder
+}
+
 /// Opens `"it"` with `resolver` and its sizing knobs applied: the RAM cap
-/// (byte- or entry-denominated, via [`capacity_cap_from_env`]) and, with the
-/// `spill` feature, the spill tier (via `spill_config_from_env`). Split
-/// out of [`run`] to keep it under clippy's line-count lint.
+/// (byte- or entry-denominated, via [`capacity_cap_from_env`] and
+/// [`apply_capacity_cap`]) and, with the `spill` feature, the spill tier
+/// (via `spill_config_from_env`). Split out of [`run`] to keep it under
+/// clippy's line-count lint.
 async fn open_it_cache(
     cluster: &Cluster,
     mode: Mode,
@@ -411,25 +441,12 @@ async fn open_it_cache(
     if resolver == ResolverKind::SumCounter {
         it_builder = it_builder.resolver(Arc::new(SumCounterResolver));
     }
-    match capacity_cap_from_env(max_capacity_bytes, max_entries) {
-        Some(CapacityCap::Bytes(max_capacity_bytes)) => {
-            it_builder = it_builder
-                .max_capacity(max_capacity_bytes)
-                .weigher(|key: &String, value: &String| byte_weight(key, value));
-        }
-        Some(CapacityCap::Entries(max_entries)) => {
-            // `capacity_hint` is always an entry count, so it is only
-            // wired here, next to the entry-denominated `max_capacity`
-            // call, and not in the byte-budget arm above, where
-            // `max_capacity` bounds weight rather than entries.
-            it_builder = it_builder
-                .max_capacity(max_entries)
-                .capacity_hint(max_entries);
-        }
-        None => {}
-    }
+    let it_builder = apply_capacity_cap(
+        it_builder,
+        capacity_cap_from_env(max_capacity_bytes, max_entries),
+    );
     #[cfg(feature = "spill")]
-    {
+    let it_builder = {
         let spill_cfg = spill_config_from_env(
             env::var("SUNDOG_TESTNODE_SPILL_DIR").ok(),
             resolve_byte_budget(
@@ -446,10 +463,11 @@ async fn open_it_cache(
             ),
             bool_env("SUNDOG_TESTNODE_WARM_REOPEN"),
         );
-        if let Some(spill_cfg) = spill_cfg {
-            it_builder = it_builder.spill(spill_cfg);
+        match spill_cfg {
+            Some(spill_cfg) => it_builder.spill(spill_cfg),
+            None => it_builder,
         }
-    }
+    };
     Ok(it_builder.open().await?)
 }
 
@@ -1216,6 +1234,41 @@ mod tests {
             Some(CapacityCap::Bytes(4096)),
             "the older byte-denominated knob wins over the entry-count knob"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_capacity_cap_entries_reaches_the_opened_caches_stripes() {
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let config = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = loopback;
+            c.data_bind_addr = loopback;
+        });
+        let cluster = Cluster::builder("testnode-apply-capacity-cap")
+            .seeds(std::iter::empty())
+            .config(config)
+            .build()
+            .await
+            .expect("a single-node cluster builds with no seeds");
+
+        let hint = 500u64;
+        let expected = usize::try_from(hint.div_ceil(sundog::store::BUCKET_COUNT as u64))
+            .expect("hint fits usize");
+        let builder = apply_capacity_cap(
+            cluster
+                .cache::<String, String>(CACHE_NAME)
+                .mode(Mode::Local),
+            Some(CapacityCap::Entries(hint)),
+        );
+        let cache = builder.open().await.expect("open succeeds");
+        assert_eq!(
+            cache.stripe_capacities(),
+            vec![expected; sundog::store::BUCKET_COUNT],
+            "an entry-count cap reaches the opened cache's stripes through capacity_hint, \
+             backing open_it_cache's forwarding of SUNDOG_TESTNODE_MAX_ENTRIES"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
     }
 
     #[test]

@@ -650,18 +650,18 @@ entry_diet_bench -- --nocapture` on a 4-core Linux box, glibc, one node,
 
 | Shape | Entries | sundog, no hint | sundog, hinted | Redis 7 computed | Redis 7 practical |
 |---|---:|---:|---:|---:|---:|
-| 8-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 74.7 B/entry | 77.3 B/entry | 80 B/copy | 85-100 B/copy |
-| 8-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.4 B/entry | 67.3 B/entry | 80 B/copy | 85-100 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 74.7 B/entry | 77.3 B/entry | 80 B/copy | 85-100 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.4 B/entry | 67.3 B/entry | 80 B/copy | 85-100 B/copy |
 | 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 209.6 B/entry | not measured | 184 B/copy | 195-230 B/copy |
 
-The Redis 7 figures for the 8-byte shape are its own `dictEntry` (24
+The Redis 7 figures for the 7-byte-key/8-byte-value shape are its own `dictEntry` (24
 bytes) plus an `sdshdr8` key plus an `embstr`-encoded value sharing one
 allocation with its `robj` header plus one bucket-array slot, computed;
 for the 16/100-byte shape, past `embstr`'s threshold, the value takes its
 own `raw`-encoded allocation instead. `used_memory / DBSIZE` from public
 Redis benchmarks gives the practical range for both.
 
-For the 8-byte shape, every one of sundog's four figures sits under 90
+For the 7-byte-key/8-byte-value shape, every one of sundog's four figures sits under 90
 bytes per entry and under Redis 7's own practical range, at both
 4,000,000 and 64,000,000 entries; the byte cost drops further as the
 entry count grows (fixed per-stripe overhead amortizing over more
@@ -690,11 +690,11 @@ SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
     entry_diet_rss_budget_heap_shape -- --exact entry_diet_rss_budget_heap_shape --test-threads=1 --nocapture
 ```
 
-Reproducing Redis 7's figures at the same widths, 8-byte keys and values:
+Reproducing Redis 7's figures at the same widths, 7-byte keys and 8-byte values:
 
 ```sh
 redis-server --daemonize yes --save '' --appendonly no
-seq 1 4000000 | awk '{printf "SET %08d %08d\n", $1, $1}' | redis-cli --pipe
+seq 1 4000000 | awk '{printf "SET %07d %08d\n", $1, $1}' | redis-cli --pipe
 redis-cli info memory | grep used_memory:
 redis-cli dbsize
 ```

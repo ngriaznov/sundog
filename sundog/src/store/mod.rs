@@ -69,6 +69,25 @@ pub const PART_COUNT: usize = 64;
 /// [`Shard::with_weigher`] can store one before its closure type is nameable.
 pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
+/// [`Shard::with_weigher`]'s installed weigher, remembered outside the
+/// engine it rebuilds so a later [`Shard::with_capacity_hint`] rebuild can
+/// carry it forward. `Arc`, not [`Weigher`]'s own `Box`, since the shard
+/// keeps this copy alive across a rebuild while also handing the engine its
+/// own boxed closure calling into it.
+pub(crate) type SharedWeigher<K, V> = Arc<dyn Fn(&K, &V) -> u32 + Send + Sync>;
+
+/// Wraps a remembered [`SharedWeigher`] in a fresh [`Weigher`] box calling
+/// into it, so a `Shard` builder rebuild can hand `engine::Engine::new` an
+/// owned closure while keeping its own `Arc` alive for a later rebuild to
+/// carry forward too.
+fn boxed_weigher<K, V>(weigher: SharedWeigher<K, V>) -> Weigher<K, V>
+where
+    K: 'static,
+    V: 'static,
+{
+    Box::new(move |k: &K, v: &V| weigher(k, v))
+}
+
 /// Upper bound on records per [`WireRecord`] batch yielded by
 /// [`ShardOps::snapshot_chunks`], caps chunk size only for small-value caches:
 /// a chunk breaks sooner once its encoded size approaches [`MAX_FRAME`].
@@ -1353,7 +1372,7 @@ where
     /// sleep-until instead of parking past a deadline that did not exist
     /// yet when it last checked.
     merge_wake: Notify,
-    /// Remembered, with `tti` and `capacity_hint` below, so
+    /// Remembered, with `tti`, `capacity_hint`, and `weigher` below, so
     /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can each
     /// rebuild `engine::Engine` from scratch without losing what the other
     /// already set: a weigher and a capacity hint both install only at
@@ -1365,6 +1384,12 @@ where
     /// so a capacity hint set before [`Shard::with_weigher`] survives that
     /// rebuild too.
     capacity_hint: Option<u64>,
+    /// [`Shard::with_weigher`]'s installed weigher, `None` until then.
+    /// Threaded into every engine rebuild alongside `max_capacity`/`tti`
+    /// so a weigher set before [`Shard::with_capacity_hint`] survives that
+    /// rebuild too, the same way `capacity_hint` survives a rebuild from
+    /// the other side.
+    weigher: Option<SharedWeigher<K, V>>,
     /// Handle for `sundog_cache_hits_total{cache}`, created once here since
     /// label resolution costs more than the read path can afford per call.
     hits: metrics::Counter,
@@ -1516,6 +1541,7 @@ where
             max_capacity,
             tti,
             capacity_hint: None,
+            weigher: None,
             hits,
             misses,
             ownership: None,
@@ -1724,15 +1750,20 @@ where
     /// `engine::Engine` from scratch, carrying forward any
     /// [`Shard::with_capacity_hint`] already set, so call this immediately
     /// after [`Shard::new`], before any reads or writes reach this shard.
+    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can run in
+    /// either order: whichever runs second carries the other's setting
+    /// forward into its own rebuild.
     #[must_use]
     pub fn with_weigher<W>(mut self, weigher: W) -> Self
     where
         W: Fn(&K, &V) -> u32 + Send + Sync + 'static,
     {
+        let weigher: SharedWeigher<K, V> = Arc::new(weigher);
+        self.weigher = Some(Arc::clone(&weigher));
         self.engine = Arc::new(Engine::new(
             self.max_capacity,
             self.tti,
-            Some(Box::new(weigher)),
+            Some(boxed_weigher(weigher)),
             self.capacity_hint,
         ));
         self
@@ -1742,20 +1773,20 @@ where
     /// stripe's arena and index up front instead of growing them one
     /// insert at a time; see [`crate::cache::CacheBuilder::capacity_hint`]
     /// for the full contract this validates and forwards. Rebuilds
-    /// `engine::Engine` from scratch, so call this immediately after
-    /// [`Shard::new`] and before [`Shard::with_weigher`] if both are used:
-    /// `with_weigher`'s own rebuild carries this hint forward through
-    /// `capacity_hint`, but this rebuild has no way to carry an
-    /// already-installed weigher forward, since nothing here stores it
-    /// outside the engine it rebuilds. Call this before any reads or
-    /// writes reach this shard either way.
+    /// `engine::Engine` from scratch, carrying forward any
+    /// [`Shard::with_weigher`] already set, so call this immediately after
+    /// [`Shard::new`], before any reads or writes reach this shard.
+    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can run in
+    /// either order: whichever runs second carries the other's setting
+    /// forward into its own rebuild.
     #[must_use]
     pub fn with_capacity_hint(mut self, hint: u64) -> Self {
         self.capacity_hint = Some(hint);
+        let weigher = self.weigher.clone().map(boxed_weigher);
         self.engine = Arc::new(Engine::new(
             self.max_capacity,
             self.tti,
-            None,
+            weigher,
             self.capacity_hint,
         ));
         self
@@ -1763,10 +1794,9 @@ where
 
     /// This shard's engine's current per-stripe `live` arena capacities,
     /// one per [`BUCKET_COUNT`] stripe, in stripe order. `#[doc(hidden)]`:
-    /// a test accessor reachable from `sundog/tests/entry_diet_bench.rs`,
-    /// an integration-test binary outside this crate, mirroring
-    /// [`Shard::with_prefold_enabled`]'s own reach. Never call this outside
-    /// a benchmark or test.
+    /// a test accessor reachable from an integration-test binary outside
+    /// this crate, mirroring [`Shard::with_prefold_enabled`]'s own reach.
+    /// Never call this outside a benchmark or test.
     #[doc(hidden)]
     pub fn stripe_capacities(&self) -> Vec<usize> {
         self.engine.stripe_capacities()
@@ -8107,6 +8137,22 @@ mod tests {
             s.stripe_capacities(),
             vec![expected; BUCKET_COUNT],
             "the hint reached the engine and presized every stripe"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_capacity_hint_after_with_weigher_keeps_the_weigher() {
+        let s = shard::<u32, Vec<u8>>(1)
+            .with_weigher(|_key: &u32, value: &Vec<u8>| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_capacity_hint(10);
+        s.insert(1, vec![0u8; 7]).await.expect("insert");
+        let (_, weight) = s.engine.debug_totals();
+        assert_eq!(
+            weight, 7,
+            "with_capacity_hint's rebuild must carry an already-installed weigher forward \
+             instead of reverting to the default of 1 per entry"
         );
     }
 
