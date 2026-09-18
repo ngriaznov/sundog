@@ -263,19 +263,21 @@ async fn settled_vm_rss_bytes(timeout: Duration) -> Option<u64> {
 }
 
 /// The settled RSS the diet measures at 4,000,000 entries on a 4-core
-/// Linux box, after Phase A's packed `Live` (`sundog/src/store/engine.rs`),
-/// is 0.525 GiB, 141 bytes per entry, 119.5 of it live heap: a 56-byte
-/// `Live` in hashbrown tables that size each stripe to a power of two, and
-/// no heap allocation for this profile's 18-byte inline records. This
-/// budget sits at 0.6 GiB, over 13% above that reading, so a regression of
-/// a few bytes per entry fails the bench while allocator and kernel noise
-/// between runs does not.
+/// Linux box, with `Stripe::live` (`sundog/src/store/engine.rs`) a `Slab`
+/// (a dense `Vec<Live<K, V>>` arena plus a `u32`-keyed `HashTable` index)
+/// over Phase A's packed 56-byte `Live`, is 0.305 GiB, about 81 bytes per
+/// entry, 69.4 of it live heap: the arena's own power-of-two growth plus
+/// the index's roughly 5 bytes per bucket at this profile's load factor,
+/// and no heap allocation for this profile's 18-byte inline records. This
+/// budget sits at 0.35 GiB, over 13% above that reading, so a regression
+/// of a few bytes per entry fails the bench while allocator and kernel
+/// noise between runs does not.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "0.6 GiB is a small positive constant, exact in f64 up to a rounding sub-byte"
+    reason = "0.35 GiB is a small positive constant, exact in f64 up to a rounding sub-byte"
 )]
-const RSS_BUDGET_BYTES: u64 = (0.6 * 1024.0 * 1024.0 * 1024.0) as u64;
+const RSS_BUDGET_BYTES: u64 = (0.35 * 1024.0 * 1024.0 * 1024.0) as u64;
 
 /// The entry count [`entry_diet_rss_budget`] inserts and pins its budget
 /// against.

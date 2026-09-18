@@ -44,7 +44,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use hashbrown::HashTable;
-use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -671,7 +670,7 @@ impl<V> Inflight<V> {
 /// in-flight loads, all under the one [`parking_lot::RwLock`] that owns this
 /// struct.
 pub(crate) struct Stripe<K, V> {
-    live: HashTable<Live<K, V>>,
+    live: Slab<K, V>,
     tombstones: HashMap<Bytes, Tombstone>,
     inflight: HashMap<Bytes, Arc<Inflight<V>>>,
     /// The absolute `expires_at_ms` for every currently-live entry whose
@@ -692,11 +691,677 @@ pub(crate) struct Stripe<K, V> {
 impl<K, V> Stripe<K, V> {
     fn new() -> Self {
         Self {
-            live: HashTable::new(),
+            live: Slab::new(),
             tombstones: HashMap::new(),
             inflight: HashMap::new(),
             long_ttl: HashMap::new(),
             next_expiry_ms: u64::MAX,
+        }
+    }
+
+    /// A stripe whose `live` slab presizes its arena and index for
+    /// `capacity` entries, matching [`Slab::with_capacity`]. Every other
+    /// field starts exactly as [`Stripe::new`] leaves it: no live entry
+    /// count is implied by a capacity hint alone. A capacity hint wires
+    /// this into `Engine::new` in a later step.
+    #[allow(
+        dead_code,
+        reason = "a capacity hint wires this into Engine::new in a later step"
+    )]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            live: Slab::with_capacity(capacity),
+            tombstones: HashMap::new(),
+            inflight: HashMap::new(),
+            long_ttl: HashMap::new(),
+            next_expiry_ms: u64::MAX,
+        }
+    }
+}
+
+/// One stripe's live entries: a dense arena plus a hash index mapping each
+/// live key's hash to its arena slot. `entries[i]` for every
+/// `i < entries.len()` is reachable from exactly one `index` row: no holes,
+/// no free list. `entries.len()` is always the exact live count, so a
+/// full-stripe walker (digest XOR, snapshot/state-transfer, sampled
+/// eviction, sweep's retain) iterates `entries` directly with no liveness
+/// check, doing less work than a hash table's own iterator, which walks
+/// every control-byte group including its empty and tombstoned slots.
+/// [`Stripe::live`]'s storage.
+struct Slab<K, V> {
+    /// The arena: one slot per live entry, indexed by `u32`.
+    entries: Vec<Live<K, V>>,
+    /// `u32` slot indices, hashed and compared through [`hasher_for`] and
+    /// [`record_key`] on the slot's own record: the same functions a
+    /// `HashTable<Live<K, V>>` storing entries directly hashes and compares
+    /// its own elements with.
+    index: HashTable<u32>,
+}
+
+impl<K, V> Slab<K, V> {
+    /// An empty slab: no allocation until the first insert, matching
+    /// `HashTable::new()`'s own zero-allocation behavior.
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: HashTable::new(),
+        }
+    }
+
+    /// A slab presized for `capacity` entries: the arena and the index each
+    /// allocate once, up front, instead of growing incrementally. Reached
+    /// through [`Stripe::with_capacity`], which a capacity hint wires into
+    /// `Engine::new` in a later step; exercised directly here by
+    /// `slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint`.
+    #[allow(
+        dead_code,
+        reason = "reached through Stripe::with_capacity, which a capacity hint wires into \
+                  Engine::new in a later step; exercised directly by \
+                  slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint"
+    )]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            index: HashTable::with_capacity(capacity),
+        }
+    }
+
+    /// This slab's live entry count: `entries.len()`, always exact since
+    /// the arena carries no holes or tombstoned slots.
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The live entry at `hash` for which `eq` holds, if any.
+    fn find(&self, hash: u64, mut eq: impl FnMut(&Live<K, V>) -> bool) -> Option<&Live<K, V>> {
+        let entries = &self.entries;
+        let &slot = self.index.find(hash, |&i| eq(&entries[i as usize]))?;
+        Some(&self.entries[slot as usize])
+    }
+
+    /// [`Slab::find`]'s mutable counterpart.
+    fn find_mut(
+        &mut self,
+        hash: u64,
+        mut eq: impl FnMut(&Live<K, V>) -> bool,
+    ) -> Option<&mut Live<K, V>> {
+        let entries = &self.entries;
+        let slot = *self.index.find(hash, |&i| eq(&entries[i as usize]))?;
+        Some(&mut self.entries[slot as usize])
+    }
+
+    /// Looks `hash` up under `eq`: [`SlabEntry::Occupied`] naming the arena
+    /// slot when found, [`SlabEntry::Vacant`] carrying `hash` and `hasher`
+    /// for a later [`SlabVacantEntry::insert`] otherwise.
+    fn entry<F>(
+        &mut self,
+        hash: u64,
+        mut eq: impl FnMut(&Live<K, V>) -> bool,
+        hasher: F,
+    ) -> SlabEntry<'_, K, V, F>
+    where
+        F: Fn(&Live<K, V>) -> u64,
+    {
+        let found = {
+            let entries = &self.entries;
+            self.index
+                .find(hash, |&i| eq(&entries[i as usize]))
+                .copied()
+        };
+        match found {
+            Some(slot) => SlabEntry::Occupied(SlabOccupiedEntry {
+                slab: self,
+                hash,
+                slot: slot as usize,
+                hasher,
+            }),
+            None => SlabEntry::Vacant(SlabVacantEntry {
+                slab: self,
+                hash,
+                hasher,
+            }),
+        }
+    }
+
+    /// Pushes `value` onto the arena and indexes it at `hash`, computed
+    /// through `hasher` for any later index growth. Returns the arena slot
+    /// it landed in. The caller is responsible for `hash` and `value`
+    /// agreeing on the same key, exactly as `HashTable::insert_unique`
+    /// itself trusts its own caller: no duplicate-key check.
+    fn insert_unique(
+        &mut self,
+        hash: u64,
+        value: Live<K, V>,
+        hasher: impl Fn(&Live<K, V>) -> u64,
+    ) -> u32 {
+        let slot = u32::try_from(self.entries.len())
+            .expect("a stripe never holds anywhere near u32::MAX live entries");
+        self.entries.push(value);
+        let entries = &self.entries;
+        self.index
+            .insert_unique(hash, slot, |&i| hasher(&entries[i as usize]));
+        slot
+    }
+
+    /// Removes the live entry at `hash` for which `eq` holds, if any:
+    /// [`Slab::entry`] plus [`SlabOccupiedEntry::remove`] in one call. Every
+    /// production removal site (`remove_live`, `evict_victim_locked`,
+    /// `reclaim`) goes through `entry`/`OccupiedEntry::remove` directly
+    /// instead, reading the occupied entry's own fields as part of the same
+    /// removal; this convenience wrapper is exercised directly by
+    /// `slab_remove_of_absent_key_returns_none` and the permutation
+    /// property test.
+    #[allow(
+        dead_code,
+        reason = "no production call site removes through this convenience wrapper yet; \
+                  exercised directly by slab_remove_of_absent_key_returns_none and the \
+                  permutation property test"
+    )]
+    fn remove(
+        &mut self,
+        hash: u64,
+        eq: impl FnMut(&Live<K, V>) -> bool,
+        hasher: impl Fn(&Live<K, V>) -> u64,
+    ) -> Option<Live<K, V>> {
+        match self.entry(hash, eq, hasher) {
+            SlabEntry::Occupied(occ) => Some(occ.remove().0),
+            SlabEntry::Vacant(_) => None,
+        }
+    }
+
+    /// Swap-removes the arena slot `slot` (whose index row hashes to
+    /// `hash`) and, when the swap moves a different entry into `slot`,
+    /// rehashes that moved entry through `hasher` and repoints its index
+    /// row from `entries.len() - 1` (its slot up to this call) to `slot`.
+    /// `entries` stays dense either way: no holes, no free list,
+    /// `entries.len()` always the live count.
+    fn remove_at(
+        &mut self,
+        hash: u64,
+        slot: usize,
+        hasher: &impl Fn(&Live<K, V>) -> u64,
+    ) -> Live<K, V> {
+        let slot_u32 = u32::try_from(slot).expect("slot is a valid arena index, so it fits a u32");
+        let index_row = self
+            .index
+            .find_entry(hash, |&i| i == slot_u32)
+            .expect("remove_at is only called for a slot this slab's index still names");
+        index_row.remove();
+        let last = self.entries.len() - 1;
+        let removed = self.entries.swap_remove(slot);
+        if slot != last {
+            let moved_hash = hasher(&self.entries[slot]);
+            let last_u32 =
+                u32::try_from(last).expect("last is a valid arena index, so it fits a u32");
+            let moved_row = self
+                .index
+                .find_mut(moved_hash, |&i| i == last_u32)
+                .expect("the entry swapped into `slot` still has its own index row at `last`");
+            *moved_row = slot_u32;
+        }
+        removed
+    }
+
+    /// Keeps only the entries for which `f` returns `true`, dense
+    /// afterwards: a kept entry's own arena slot never moves, a dropped one
+    /// is swap-removed via [`Slab::remove_at`]. Visits every entry, kept or
+    /// dropped, exactly once.
+    fn retain(
+        &mut self,
+        hasher: impl Fn(&Live<K, V>) -> u64,
+        mut f: impl FnMut(&Live<K, V>) -> bool,
+    ) {
+        let mut i = 0;
+        while i < self.entries.len() {
+            if f(&self.entries[i]) {
+                i += 1;
+            } else {
+                let hash = hasher(&self.entries[i]);
+                self.remove_at(hash, i, &hasher);
+            }
+        }
+    }
+
+    /// Every live entry, in arena order: an order no caller depends on,
+    /// since every reader either lands results in a `Vec`/`HashMap` or
+    /// folds them via commutative XOR into a digest.
+    fn iter(&self) -> std::slice::Iter<'_, Live<K, V>> {
+        self.entries.iter()
+    }
+
+    /// Drains and returns every live entry, emptying both the arena and the
+    /// index.
+    fn drain(&mut self) -> std::vec::Drain<'_, Live<K, V>> {
+        self.index.clear();
+        self.entries.drain(..)
+    }
+
+    /// Shrinks both the arena and the index to fit their current length,
+    /// rehashing every remaining entry's index row through `hasher`.
+    /// `Engine::compact`'s paced shrink pass calls this in a later step,
+    /// once a stripe is left oversized by an inflated capacity hint or
+    /// ownership rebalancing.
+    #[allow(
+        dead_code,
+        reason = "Engine::compact's paced shrink pass calls this in a later step"
+    )]
+    fn shrink_to_fit(&mut self, hasher: impl Fn(&Live<K, V>) -> u64) {
+        self.entries.shrink_to_fit();
+        let entries = &self.entries;
+        self.index.shrink_to_fit(|&i| hasher(&entries[i as usize]));
+    }
+}
+
+/// [`Slab::entry`]'s result: an occupied arena slot or a vacant hash+hasher
+/// pair ready for [`SlabVacantEntry::insert`].
+enum SlabEntry<'a, K, V, F> {
+    Occupied(SlabOccupiedEntry<'a, K, V, F>),
+    Vacant(SlabVacantEntry<'a, K, V, F>),
+}
+
+/// An occupied [`Slab`] arena slot found by [`Slab::entry`].
+struct SlabOccupiedEntry<'a, K, V, F> {
+    slab: &'a mut Slab<K, V>,
+    hash: u64,
+    slot: usize,
+    hasher: F,
+}
+
+impl<'a, K, V, F> SlabOccupiedEntry<'a, K, V, F>
+where
+    F: Fn(&Live<K, V>) -> u64,
+{
+    /// A reference to this slot's entry. `SpillSink::reclaim`'s only
+    /// caller in a non-test build; otherwise only test code reaches it.
+    #[cfg_attr(not(any(test, feature = "spill")), allow(dead_code))]
+    fn get(&self) -> &Live<K, V> {
+        &self.slab.entries[self.slot]
+    }
+
+    /// A mutable reference to this slot's entry. Every production mutation
+    /// site rebinds through [`Slab::find_mut`] directly instead, since none
+    /// of them also needs to remove the slot in the same step; kept for
+    /// symmetry with [`SlabOccupiedEntry::get`] and hashbrown's own
+    /// `OccupiedEntry` API this mirrors. Exercised directly by
+    /// `slab_occupied_entry_get_mut_mutates_the_slot_visibly_through_find`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "every production mutation site uses Slab::find_mut directly instead; \
+                      kept for symmetry with SlabOccupiedEntry::get and hashbrown's own \
+                      OccupiedEntry API"
+        )
+    )]
+    fn get_mut(&mut self) -> &mut Live<K, V> {
+        &mut self.slab.entries[self.slot]
+    }
+
+    /// Takes this slot's entry out via [`Slab::remove_at`], returning it
+    /// alongside a [`SlabVacantEntry`] for the same hash, ready to insert a
+    /// replacement.
+    fn remove(self) -> (Live<K, V>, SlabVacantEntry<'a, K, V, F>) {
+        let removed = self.slab.remove_at(self.hash, self.slot, &self.hasher);
+        (
+            removed,
+            SlabVacantEntry {
+                slab: self.slab,
+                hash: self.hash,
+                hasher: self.hasher,
+            },
+        )
+    }
+}
+
+/// A vacant [`Slab`] hash slot found by [`Slab::entry`], or handed back by
+/// [`SlabOccupiedEntry::remove`].
+struct SlabVacantEntry<'a, K, V, F> {
+    slab: &'a mut Slab<K, V>,
+    hash: u64,
+    hasher: F,
+}
+
+impl<K, V, F> SlabVacantEntry<'_, K, V, F>
+where
+    F: Fn(&Live<K, V>) -> u64,
+{
+    /// Inserts `value` at this vacant hash: [`Slab::insert_unique`] under
+    /// the hood. Every production write path calls `insert_unique`
+    /// directly instead, since each already knows it holds no live entry
+    /// for the key: an overwrite removes any entry already stored under
+    /// the key as its own separate step, then inserts the replacement
+    /// unconditionally. Kept for a vacant caller that only has a
+    /// [`SlabEntry::Vacant`] in hand, and for symmetry with hashbrown's own
+    /// `VacantEntry` API this mirrors. Exercised directly by
+    /// `slab_vacant_entry_insert_makes_the_value_findable`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "every production write path calls Slab::insert_unique directly instead; \
+                      kept for a caller that only has a SlabEntry::Vacant in hand, and for \
+                      symmetry with hashbrown's own VacantEntry API"
+        )
+    )]
+    fn insert(self, value: Live<K, V>) -> u32 {
+        self.slab.insert_unique(self.hash, value, self.hasher)
+    }
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::*;
+
+    fn key_bytes(key: u32) -> Bytes {
+        Bytes::from(postcard::to_stdvec(&key).expect("u32 encodes"))
+    }
+
+    fn hash_of(key: u32) -> u64 {
+        hash_key_bytes(key_bytes(key).as_ref())
+    }
+
+    fn eq_for(key: u32) -> impl FnMut(&Live<u32, Vec<u8>>) -> bool {
+        move |l: &Live<u32, Vec<u8>>| record_key(&l.record) == key_bytes(key).as_ref()
+    }
+
+    fn live_for(key: u32, value: &[u8]) -> Live<u32, Vec<u8>> {
+        Live::new(
+            build_resident_record(key_bytes(key).as_ref(), value),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            NEVER_EXPIRES,
+            1,
+            0,
+            #[cfg(feature = "spill")]
+            EntryState::Resident,
+        )
+    }
+
+    #[test]
+    fn slab_find_locates_inserted_key() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let hash = hash_of(7);
+        slab.insert_unique(hash, live_for(7, b"v7"), hasher_for);
+        let found = slab
+            .find(hash, eq_for(7))
+            .expect("just-inserted key is findable");
+        assert_eq!(record_value(&found.record), b"v7");
+    }
+
+    #[test]
+    fn slab_find_returns_none_for_absent_key() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        slab.insert_unique(hash_of(1), live_for(1, b"v1"), hasher_for);
+        assert!(slab.find(hash_of(2), eq_for(2)).is_none());
+    }
+
+    #[test]
+    fn slab_insert_grows_entries_by_one_and_is_findable() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        assert_eq!(slab.len(), 0);
+        let hash = hash_of(3);
+        let slot = slab.insert_unique(hash, live_for(3, b"v3"), hasher_for);
+        assert_eq!(slot, 0);
+        assert_eq!(slab.len(), 1);
+        assert!(slab.find(hash, eq_for(3)).is_some());
+        let live = slab
+            .find_mut(hash, eq_for(3))
+            .expect("just-inserted key is mutably findable");
+        live.weight = 42;
+        assert_eq!(slab.find(hash, eq_for(3)).unwrap().weight, 42);
+    }
+
+    #[test]
+    fn slab_occupied_entry_get_mut_mutates_the_slot_visibly_through_find() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let hash = hash_of(9);
+        slab.insert_unique(hash, live_for(9, b"v9"), hasher_for);
+        let SlabEntry::Occupied(mut occ) = slab.entry(hash, eq_for(9), hasher_for) else {
+            panic!("key 9 is present");
+        };
+        occ.get_mut().weight = 77;
+        assert_eq!(
+            slab.find(hash, eq_for(9)).unwrap().weight,
+            77,
+            "a mutation through get_mut is visible on a later find"
+        );
+    }
+
+    #[test]
+    fn slab_vacant_entry_insert_makes_the_value_findable() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let hash = hash_of(11);
+        let SlabEntry::Vacant(vacant) = slab.entry(hash, eq_for(11), hasher_for) else {
+            panic!("key 11 is absent from an empty slab");
+        };
+        let slot = vacant.insert(live_for(11, b"v11"));
+        assert_eq!(slot, 0, "the first insert lands in arena slot 0");
+        assert_eq!(slab.len(), 1);
+        let found = slab
+            .find(hash, eq_for(11))
+            .expect("the value inserted through a vacant entry is findable");
+        assert_eq!(record_value(&found.record), b"v11");
+    }
+
+    #[test]
+    fn slab_remove_swaps_last_entry_into_freed_slot_and_fixes_its_index() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let (ha, hb, hc) = (hash_of(10), hash_of(20), hash_of(30));
+        slab.insert_unique(ha, live_for(10, b"a"), hasher_for);
+        slab.insert_unique(hb, live_for(20, b"b"), hasher_for);
+        slab.insert_unique(hc, live_for(30, b"c"), hasher_for);
+        assert_eq!(slab.len(), 3);
+
+        // Removing slot 0 swap-moves the last-inserted entry (key 30) into
+        // it; that moved entry's index row must repoint from slot 2 to
+        // slot 0.
+        let SlabEntry::Occupied(occ) = slab.entry(ha, eq_for(10), hasher_for) else {
+            panic!("key 10 is present");
+        };
+        assert_eq!(record_value(&occ.get().record), b"a");
+        let (removed, _vacant) = occ.remove();
+        assert_eq!(record_value(&removed.record), b"a");
+
+        assert_eq!(slab.len(), 2);
+        let moved = slab
+            .find(hc, eq_for(30))
+            .expect("the swapped-in entry keeps its own findability at its own hash");
+        assert_eq!(record_value(&moved.record), b"c");
+        assert!(slab.find(hb, eq_for(20)).is_some());
+        assert!(slab.find(ha, eq_for(10)).is_none());
+
+        // Every remaining arena entry is reachable from its own hash: no
+        // stale index row, no entry left unindexed.
+        let keys: Vec<u32> = slab
+            .iter()
+            .map(|live| decode_key(record_key(&live.record)))
+            .collect();
+        for key in keys {
+            assert!(slab.find(hash_of(key), eq_for(key)).is_some());
+        }
+    }
+
+    #[test]
+    fn slab_remove_of_the_last_slot_needs_no_fixup() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let (ha, hb) = (hash_of(1), hash_of(2));
+        slab.insert_unique(ha, live_for(1, b"a"), hasher_for);
+        slab.insert_unique(hb, live_for(2, b"b"), hasher_for);
+
+        let SlabEntry::Occupied(occ) = slab.entry(hb, eq_for(2), hasher_for) else {
+            panic!("key 2 is present");
+        };
+        let (removed, _vacant) = occ.remove();
+        assert_eq!(record_value(&removed.record), b"b");
+        assert_eq!(slab.len(), 1);
+        assert!(slab.find(ha, eq_for(1)).is_some());
+        assert!(slab.find(hb, eq_for(2)).is_none());
+    }
+
+    #[test]
+    fn slab_remove_of_absent_key_returns_none() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        slab.insert_unique(hash_of(1), live_for(1, b"a"), hasher_for);
+        assert!(slab.remove(hash_of(99), eq_for(99), hasher_for).is_none());
+        assert_eq!(slab.len(), 1);
+    }
+
+    #[test]
+    fn slab_retain_keeps_dense_and_visits_every_removed_entry_once() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        for key in 0..10u32 {
+            slab.insert_unique(hash_of(key), live_for(key, b"v"), hasher_for);
+        }
+        let mut visited: Vec<u32> = Vec::new();
+        slab.retain(hasher_for, |live| {
+            let k: u32 = decode_key(record_key(&live.record));
+            assert!(!visited.contains(&k), "key {k} visited more than once");
+            visited.push(k);
+            k.is_multiple_of(2)
+        });
+        visited.sort_unstable();
+        assert_eq!(
+            visited,
+            (0..10).collect::<Vec<_>>(),
+            "retain visits every entry exactly once"
+        );
+        assert_eq!(slab.len(), 5);
+        for key in (0..10u32).step_by(2) {
+            assert!(slab.find(hash_of(key), eq_for(key)).is_some());
+        }
+        for key in (1..10u32).step_by(2) {
+            assert!(slab.find(hash_of(key), eq_for(key)).is_none());
+        }
+    }
+
+    #[test]
+    fn slab_iter_visits_every_live_entry_exactly_once_in_some_order() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let keys: Vec<u32> = (0..7).collect();
+        for &key in &keys {
+            slab.insert_unique(hash_of(key), live_for(key, b"v"), hasher_for);
+        }
+        let mut seen: Vec<u32> = slab
+            .iter()
+            .map(|live| decode_key(record_key(&live.record)))
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, keys);
+    }
+
+    #[test]
+    fn slab_drain_empties_and_returns_every_entry() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let keys: Vec<u32> = (0..5).collect();
+        for &key in &keys {
+            slab.insert_unique(hash_of(key), live_for(key, b"v"), hasher_for);
+        }
+        let mut drained: Vec<u32> = slab
+            .drain()
+            .map(|live| decode_key(record_key(&live.record)))
+            .collect();
+        drained.sort_unstable();
+        assert_eq!(drained, keys);
+        assert_eq!(slab.len(), 0);
+        assert!(slab.find(hash_of(0), eq_for(0)).is_none());
+    }
+
+    #[test]
+    fn slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::with_capacity(64);
+        assert!(slab.entries.capacity() >= 64);
+        let entries_cap_before = slab.entries.capacity();
+        for key in 0..64u32 {
+            slab.insert_unique(hash_of(key), live_for(key, b"v"), hasher_for);
+        }
+        assert_eq!(
+            slab.entries.capacity(),
+            entries_cap_before,
+            "no growth up to the hint"
+        );
+        assert_eq!(slab.len(), 64);
+        for key in 0..64u32 {
+            assert!(slab.find(hash_of(key), eq_for(key)).is_some());
+        }
+
+        // shrink_to_fit, exercised here: after removing all but one entry,
+        // it drops the oversized allocation without losing the survivor's
+        // findability.
+        for key in 1..64u32 {
+            slab.remove(hash_of(key), eq_for(key), hasher_for);
+        }
+        assert_eq!(slab.len(), 1);
+        slab.shrink_to_fit(hasher_for);
+        assert!(slab.entries.capacity() < entries_cap_before);
+        assert!(slab.find(hash_of(0), eq_for(0)).is_some());
+    }
+
+    #[test]
+    fn slab_random_permutation_insert_remove_matches_a_hashmap_mirror() {
+        use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        let mut mirror: HashMap<u32, u8> = HashMap::new();
+        let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF);
+
+        for step in 0..2000u32 {
+            let key = rng.random_range(0..64u32);
+            let hash = hash_of(key);
+            let value_byte = (step % 251) as u8;
+            let was_present = mirror.contains_key(&key);
+            if was_present {
+                if rng.random_bool(0.5) {
+                    let removed = slab.remove(hash, eq_for(key), hasher_for);
+                    assert!(
+                        removed.is_some(),
+                        "step {step}: key {key} is in the mirror but not the slab"
+                    );
+                    slab.insert_unique(hash, live_for(key, &[value_byte]), hasher_for);
+                    mirror.insert(key, value_byte);
+                } else {
+                    let removed = slab.remove(hash, eq_for(key), hasher_for);
+                    assert!(
+                        removed.is_some(),
+                        "step {step}: key {key} is in the mirror but not the slab"
+                    );
+                    mirror.remove(&key);
+                }
+            } else {
+                assert!(
+                    slab.remove(hash, eq_for(key), hasher_for).is_none(),
+                    "step {step}: key {key} is absent from the mirror but the slab found it"
+                );
+                slab.insert_unique(hash, live_for(key, &[value_byte]), hasher_for);
+                mirror.insert(key, value_byte);
+            }
+
+            assert_eq!(
+                slab.len(),
+                mirror.len(),
+                "step {step}: length diverged from the mirror"
+            );
+            for (&k, &v) in &mirror {
+                let found = slab.find(hash_of(k), eq_for(k)).unwrap_or_else(|| {
+                    panic!("step {step}: key {k} is in the mirror but not the slab")
+                });
+                assert_eq!(
+                    record_value(&found.record),
+                    [v],
+                    "step {step}: key {k}'s value diverged"
+                );
+            }
+        }
+
+        // shrink_to_fit at the end must not disturb any surviving entry.
+        slab.shrink_to_fit(hasher_for);
+        for (&k, &v) in &mirror {
+            let found = slab
+                .find(hash_of(k), eq_for(k))
+                .expect("shrink_to_fit must not drop or misplace a surviving entry");
+            assert_eq!(record_value(&found.record), [v]);
         }
     }
 }
@@ -727,7 +1392,7 @@ fn remove_live<K, V>(
         .live
         .entry(hash, |l| record_key(&l.record) == key_bytes, hasher_for)
     {
-        Entry::Occupied(occ) => {
+        SlabEntry::Occupied(occ) => {
             let (removed, _vacant) = occ.remove();
             stripe.long_ttl.remove(key_bytes);
             Some(RemovedLive {
@@ -736,7 +1401,7 @@ fn remove_live<K, V>(
                 was_spilled: is_spilled(&removed),
             })
         }
-        Entry::Vacant(_) => None,
+        SlabEntry::Vacant(_) => None,
     }
 }
 
@@ -2675,7 +3340,7 @@ where
             let mut removed_spilled = 0usize;
             let mut new_next = u64::MAX;
             let mut cleared_long_ttl: Vec<Bytes> = Vec::new();
-            stripe.live.retain(|live| {
+            stripe.live.retain(hasher_for, |live| {
                 let key_bytes = record_key(&live.record);
                 if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
                     let part = part_index_from_hash(hash_key_bytes(key_bytes));
@@ -2755,7 +3420,7 @@ where
             next_start = (idx + 1) % BUCKET_COUNT;
             let stripe = self.stripes[idx].read();
             self.note_compact_lock_acquisition();
-            for live in &stripe.live {
+            for live in stripe.live.iter() {
                 // Never compacted off-lock: its bytes aren't resident, and
                 // reading them back in would cost a disk read this sweep
                 // does not pay for. Reconsidered once a later read or write
@@ -3067,7 +3732,7 @@ where
             }
             SpillAttempt::NotApplicable => {}
         }
-        let Entry::Occupied(occ) = stripe.live.entry(
+        let SlabEntry::Occupied(occ) = stripe.live.entry(
             hash,
             |l| record_key(&l.record) == victim_bytes.as_ref(),
             hasher_for,
@@ -3085,6 +3750,14 @@ where
     }
 
     /// The sampling window [`Engine::evict_one_sampled`] and [`Engine::evict_batch_sampled`] both draw from.
+    /// The order this walks `stripe.live` in is the arena's dense insertion
+    /// order (shifting under a swap-remove), not hashbrown's probe order,
+    /// so two candidates tied on [`idle_elapsed_ms`] resolve to whichever
+    /// this order places last, not whichever slot order used to place
+    /// last. Nothing in this codebase treats that tie-break as a
+    /// contract: `evict_one_sampled_breaks_a_last_access_tie_by_arena_order`
+    /// pins today's concrete resolution as a regression guard, not as a
+    /// documented guarantee.
     fn sample_candidates<'s>(
         &self,
         stripe: &'s Stripe<K, V>,
@@ -4141,7 +4814,7 @@ where
             let bucket = *stripe_idx;
             let removed_this = {
                 let mut stripe = self.stripes[bucket].write();
-                let Entry::Occupied(occ) = stripe.live.entry(
+                let SlabEntry::Occupied(occ) = stripe.live.entry(
                     hash,
                     |l| record_key(&l.record) == key_bytes.as_ref(),
                     hasher_for,
@@ -4210,7 +4883,7 @@ where
         let mut out = vec![0u64; BUCKET_COUNT * PART_COUNT];
         for (idx, stripe_lock) in self.stripes.iter().enumerate() {
             let stripe = stripe_lock.read();
-            for live in &stripe.live {
+            for live in stripe.live.iter() {
                 let part = part_index_from_hash(hash_key_bytes(record_key(&live.record)));
                 out[digest_slot(idx, part)] ^=
                     entry_fingerprint(record_key(&live.record), live.ver());
@@ -4232,7 +4905,7 @@ where
         let mut tomb_out = Vec::new();
         for stripe_lock in &self.stripes {
             let stripe = stripe_lock.read();
-            for live in &stripe.live {
+            for live in stripe.live.iter() {
                 assert!(
                     is_resident(live),
                     "debug_snapshot: no resident bytes for a spilled entry; this helper is \
@@ -6536,6 +7209,126 @@ mod tests {
             .collect()
     }
 
+    /// One key's state in
+    /// [`apply_locked_put_overwrite_tombstone_evict_interleaving_matches_pre_slab_behavior`]'s
+    /// own ground truth: a live value or a tombstone.
+    enum MirrorState {
+        Live(String),
+        Tombstoned,
+    }
+
+    /// A fixed-seed, put/overwrite/tombstone/evict interleaving cross-checked
+    /// after every step against this test's own `mirror`: independent proof
+    /// that `get_by_bytes`, `keys`, `digests`, and `bucket_len` agree with
+    /// each other and with what `apply_locked`'s LWW resolution and
+    /// eviction should leave live, regardless of whether `Stripe::live`
+    /// stores its entries in a `HashTable<Live<K, V>>` directly or, as it
+    /// does now, in a `Slab`. A small keyspace over a tight weight cap
+    /// forces frequent overwrites and capacity-driven eviction on top of
+    /// the explicit `evict_one_sampled` calls, so both eviction paths
+    /// exercise the same `Slab`-backed removal `remove_live` and
+    /// `evict_victim_locked` share.
+    #[test]
+    fn apply_locked_put_overwrite_tombstone_evict_interleaving_matches_pre_slab_behavior() {
+        use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+
+        let weigher: Weigher<u32, String> =
+            Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
+        let engine = Engine::<u32, String>::new(60, None, Some(weigher));
+        let mut rng = StdRng::seed_from_u64(0x5AB5_1AB5);
+        let mut clock = HlcClock::new(NodeId::from(1));
+        let mut mirror: HashMap<u32, MirrorState> = HashMap::new();
+
+        for i in 0..2000u64 {
+            let key = rng.random_range(0..16u32);
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let now = i * 10;
+            match rng.random_range(0..4u32) {
+                // Put and overwrite are the same call here: a fresh HLC
+                // tick always wins over whatever is or isn't already
+                // stored, so this creates a fresh key or overwrites an
+                // existing one depending on `key`'s current mirror state.
+                0 | 1 => {
+                    let ver = clock.now(now);
+                    let value = format!("v{key}-{i}");
+                    let _ = put(&engine, key, kb, value.clone(), ver, None, now);
+                    mirror.insert(key, MirrorState::Live(value));
+                    engine.enforce_capacity(bucket, now);
+                }
+                2 => {
+                    let ver = clock.now(now);
+                    tombstone(&engine, key, kb, ver, now);
+                    mirror.insert(key, MirrorState::Tombstoned);
+                }
+                _ => {
+                    let _ = engine.evict_one_sampled(bucket, now);
+                }
+            }
+
+            // `enforce_capacity` and `evict_one_sampled` can each remove any
+            // resident entry, in any bucket, with no tombstone left behind:
+            // resync every mirror key still marked `Live` to whatever the
+            // engine actually kept before checking it against every other
+            // query surface below. A `Tombstoned` mirror row is never
+            // touched by eviction, so it needs no resync.
+            mirror.retain(|&k, state| match state {
+                MirrorState::Live(_) => {
+                    let kb = key_bytes(k);
+                    let khash = hash_key_bytes(kb.as_ref());
+                    engine.get_by_bytes(kb.as_ref(), khash, now).is_some()
+                }
+                MirrorState::Tombstoned => true,
+            });
+
+            for (&k, state) in &mirror {
+                if let MirrorState::Live(v) = state {
+                    let kb = key_bytes(k);
+                    let khash = hash_key_bytes(kb.as_ref());
+                    assert_eq!(
+                        engine.get_by_bytes(kb.as_ref(), khash, now),
+                        Some(v.clone()),
+                        "iteration {i}: key {k} diverged from the mirror"
+                    );
+                }
+            }
+
+            let mut expected_keys: Vec<u32> = mirror
+                .iter()
+                .filter_map(|(&k, state)| matches!(state, MirrorState::Live(_)).then_some(k))
+                .collect();
+            expected_keys.sort_unstable();
+            let mut actual_keys = engine.keys(now);
+            actual_keys.sort_unstable();
+            assert_eq!(
+                actual_keys, expected_keys,
+                "iteration {i}: keys() diverged from the mirror"
+            );
+
+            assert_eq!(
+                engine.digests(),
+                engine.recompute_digests_paired(),
+                "iteration {i}: digests() diverged from a full recompute"
+            );
+
+            let mut expected_bucket_counts = vec![0usize; BUCKET_COUNT];
+            for &k in mirror.keys() {
+                let kb = key_bytes(k);
+                let khash = hash_key_bytes(kb.as_ref());
+                expected_bucket_counts[stripe_index_from_hash(khash)] += 1;
+            }
+            for (b, &expected) in expected_bucket_counts.iter().enumerate() {
+                let bucket_u16 = u16::try_from(b).expect("fits");
+                assert_eq!(
+                    engine.bucket_len(bucket_u16),
+                    expected,
+                    "iteration {i}: bucket {b}'s len diverged from the mirror"
+                );
+            }
+        }
+    }
+
     #[test]
     fn bucket_len_counts_live_entries_and_tombstones_without_materializing_them() {
         let engine = engine_u32_string(u64::MAX, None);
@@ -7184,6 +7977,53 @@ mod tests {
             engine.get(&key_new, now_ms),
             Some("new".to_string()),
             "key_new survives: its truncated stamp is smaller, but it is the true warmer entry"
+        );
+    }
+
+    #[test]
+    fn evict_one_sampled_breaks_a_last_access_tie_by_arena_order() {
+        // `key_first` and `key_second` share a bucket and are inserted (so
+        // last-touched) at the exact same `now_ms`: `idle_elapsed_ms` ties
+        // between them, so the sampled winner comes down entirely to
+        // `sample_candidates`'s arena-order walk feeding
+        // `Iterator::max_by_key`, which returns the *last* equally-maximal
+        // element it sees. This pins today's concrete resolution as a
+        // regression guard against a future change to that walk's order
+        // (see `Engine::sample_candidates`'s doc comment); it is not itself
+        // a documented tie-break contract.
+        let (key_first, key_second, bucket) = same_bucket_pair(100_000);
+        let engine = Engine::<u32, String>::new(u64::MAX, None, None);
+        let now = 0u64;
+        let _ = put(
+            &engine,
+            key_first,
+            key_bytes(key_first),
+            "first".to_string(),
+            hlc(1, 1),
+            None,
+            now,
+        );
+        let _ = put(
+            &engine,
+            key_second,
+            key_bytes(key_second),
+            "second".to_string(),
+            hlc(2, 1),
+            None,
+            now,
+        );
+
+        let outcome = engine.evict_one_sampled(bucket, now);
+        assert_eq!(outcome.removed_weight, 1, "one entry evicted");
+        assert_eq!(
+            engine.get(&key_first, now),
+            None,
+            "today's concrete tie-break: the first-inserted key is evicted"
+        );
+        assert_eq!(
+            engine.get(&key_second, now),
+            Some("second".to_string()),
+            "today's concrete tie-break: the second-inserted key survives"
         );
     }
 

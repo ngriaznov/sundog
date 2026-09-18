@@ -37,6 +37,30 @@ All notable changes to this project are documented in this file. Format follows
   and reads stay TTL-blind. No wire change: `wire::PROTOCOL_VERSION` and
   `WireRecord` stay exactly as they are; only the in-RAM entry encoding
   changes.
+- **Entry diet, phase B, a `Slab` replaces `Stripe::live`'s hash table**:
+  `Stripe::live` (`sundog/src/store/engine.rs`) is a `Slab<K, V>`, a dense
+  `Vec<Live<K, V>>` arena plus a `HashTable<u32>` index mapping each live
+  key's hash to its arena slot, in place of a `HashTable<Live<K, V>>`
+  holding entries directly. `Slab::remove` swap-removes an entry and fixes
+  the moved entry's index row in the same call, under the stripe's own
+  lock, so the arena stays dense with no holes and `entries.len()` is
+  always the exact live count; every full-stripe walker (digest XOR,
+  snapshot and state-transfer, sampled eviction, sweep's retain,
+  `release_buckets`' drain) iterates the arena directly with no liveness
+  check. An idle index bucket costs about 5 bytes against the roughly 73
+  bytes an idle `Live`-holding bucket costs at the same load factor, since
+  the index stores a 4-byte slot number instead of a 56-byte `Live`. On
+  the entry diet bench's profile (`Cache<String, String>`, 8-byte keys and
+  values, 4,000,000 entries, one node, `Mode::Local`, glibc, a 4-core
+  box), live heap drops to 69.4 bytes per entry (119.5 after phase A
+  alone) and the settled resident set drops to 0.305 GiB, about 81 bytes
+  per entry; read p50 stays at 0.24-0.28 microseconds, inside the
+  existing 0.616-microsecond ceiling, with no measurable cost from the
+  slab's extra index-then-arena dereference on this profile.
+  `entry_diet_rss_budget`'s `RSS_BUDGET_BYTES` tightens from 0.6 GiB to
+  0.35 GiB to match. No public API change, no wire change, no
+  `BUCKET_COUNT` change: this is an intra-stripe storage change the
+  mixed-version container test needs no new gate for.
 - **Converge-before-serving reconciliation for a warm spill reopen**:
   `reconcile_warm_buckets` groups every warm-reloaded bucket by its live
   co-owners and, per co-owner, loops a bucket-scoped anti-entropy round
