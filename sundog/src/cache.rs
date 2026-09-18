@@ -972,48 +972,88 @@ async fn distributed_warm_and_rebalance(
     );
 }
 
-/// Fixed round cap on [`reconcile_warm_buckets`]'s per-peer converge-loop,
-/// matching the codebase's own precedent for giving a self-healing
-/// mechanism a few tries before falling back to the authoritative path
-/// (`crate::cluster::state_transfer::MAX_WARM_UP_ATTEMPTS`,
-/// `crate::cluster::rebalance::ALL_COLD_PASSES`). Because each round
-/// already applies its entire diff, bounded only by RPC success, this is
-/// not "N batches of a fixed-size chunk" but "N chances to survive a
-/// transient RPC failure or a bucket still moving under live writes."
+/// Cap on the rounds that ran in [`reconcile_warm_buckets`]'s per-peer
+/// converge loop, matching the codebase's own precedent for giving a
+/// self-healing mechanism a few tries before falling back to the
+/// authoritative path (`crate::cluster::state_transfer::MAX_WARM_UP_ATTEMPTS`,
+/// `crate::cluster::rebalance::ALL_COLD_PASSES`). Each round applies its
+/// entire diff, so this is not "N batches of a fixed-size chunk" but "N
+/// chances for a bucket still moving under live writes to settle." A round
+/// the peer failed or answered `Stale` never counts here: it is retried on
+/// [`retry_delay`]'s backoff inside [`ReconcileBudget::time_budget`].
 const RECONCILE_MAX_ROUNDS: u32 = 3;
 
+/// Base delay before the first retry of a failed round in
+/// [`reconcile_against_peer`]: doubles with every consecutive failure,
+/// capped at [`ReconcileBudget::backoff_cap`].
+const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(200);
+
 /// Per-peer, per-bucket-set bound on [`reconcile_warm_buckets`]'s
-/// converge-before-serving loop: whichever of `max_rounds`/`byte_budget` is
-/// hit first stops the loop for that peer's still-diverging buckets,
-/// leaving them cold and unverified for the ordinary cold-pull path.
+/// converge-before-serving loop: whichever of `max_rounds` (rounds that
+/// ran), `byte_budget` or `time_budget` is hit first stops the loop for
+/// that peer's still-diverging buckets, leaving them cold and unverified
+/// for the ordinary cold-pull path. A failed round never counts toward
+/// `max_rounds`; it is retried after a backoff that doubles from
+/// [`RECONCILE_RETRY_BASE`] up to `backoff_cap`, inside `time_budget`.
 #[derive(Debug, Clone, Copy)]
 struct ReconcileBudget {
     max_rounds: u32,
     byte_budget: u64,
+    time_budget: Duration,
+    backoff_cap: Duration,
 }
 
 impl ReconcileBudget {
-    /// `max_rounds` fixed at [`RECONCILE_MAX_ROUNDS`]; `byte_budget` taken
-    /// from [`ClusterConfig::reconcile_byte_budget`].
+    /// `max_rounds` fixed at [`RECONCILE_MAX_ROUNDS`]; `byte_budget` from
+    /// [`ClusterConfig::reconcile_byte_budget`]; `time_budget` from
+    /// [`ClusterConfig::state_transfer_budget`], the same startup-latency
+    /// bound the initial pull honors; `backoff_cap` from
+    /// [`ClusterConfig::ae_interval`], the cadence a co-owner's ownership
+    /// view catches up on.
     fn from_config(config: &ClusterConfig) -> Self {
         Self {
             max_rounds: RECONCILE_MAX_ROUNDS,
             byte_budget: config.reconcile_byte_budget,
+            time_budget: config.state_transfer_budget,
+            backoff_cap: config.ae_interval,
         }
     }
 }
 
 /// Pure: whether [`reconcile_warm_buckets`]'s per-peer loop keeps going,
-/// given rounds run and bytes moved so far against `budget`, and that at
-/// least one bucket is still diverging. `still_diverging == 0` stops the
-/// loop regardless of the budget: nothing left to check.
+/// given rounds run, bytes moved and time elapsed so far against `budget`,
+/// and that at least one bucket is still diverging. `still_diverging == 0`
+/// stops the loop regardless of the budget: nothing left to check.
 fn should_keep_reconciling(
     rounds_run: u32,
     bytes_moved: u64,
     still_diverging: usize,
+    elapsed: Duration,
     budget: &ReconcileBudget,
 ) -> bool {
-    still_diverging > 0 && rounds_run < budget.max_rounds && bytes_moved < budget.byte_budget
+    still_diverging > 0
+        && rounds_run < budget.max_rounds
+        && bytes_moved < budget.byte_budget
+        && elapsed < budget.time_budget
+}
+
+/// Pure: how long [`reconcile_against_peer`] waits before retrying after
+/// `consecutive_failures` failed rounds in a row (at least one):
+/// [`RECONCILE_RETRY_BASE`] doubled per failure beyond the first, capped at
+/// `budget.backoff_cap`. `None` when that wait would reach the end of
+/// `budget.time_budget` from `elapsed`, so the loop stops instead of
+/// sleeping past its bound.
+fn retry_delay(
+    consecutive_failures: u32,
+    elapsed: Duration,
+    budget: &ReconcileBudget,
+) -> Option<Duration> {
+    let exponent = consecutive_failures.saturating_sub(1).min(31);
+    let delay = RECONCILE_RETRY_BASE
+        .saturating_mul(1_u32 << exponent)
+        .min(budget.backoff_cap);
+    let remaining = budget.time_budget.checked_sub(elapsed)?;
+    (delay < remaining).then_some(delay)
 }
 
 /// Pure: splits `requested` into (converged, still-diverging) given one
@@ -1040,7 +1080,12 @@ fn split_round_result(
 /// instant a bucket's digest exchange reports no mismatch -- not held back
 /// for the rest of this peer's still-diverging set -- until either nothing
 /// is left diverging against `peer` or [`should_keep_reconciling`]'s
-/// `budget` stops the loop. Returns every bucket marked serving this way.
+/// `budget` stops the loop. A round `peer` failed or answered `Stale` is
+/// retried after [`retry_delay`]'s backoff without counting as a round,
+/// while `peer` stays on `cluster`'s live list and the wait fits inside
+/// the time budget: at a restart every co-owner answers `Stale` until its
+/// ownership view catches up to this node rejoining, on its own refresh
+/// cadence. Returns every bucket marked serving this way.
 ///
 /// Factored out of [`reconcile_warm_buckets`] so its caller can run one of
 /// these per live co-owner concurrently via [`futures::future::join_all`]:
@@ -1049,7 +1094,7 @@ fn split_round_result(
 /// multiply `open()`'s worst-case stall by the number of distinct peers
 /// instead of staying bounded by a single peer's `budget`.
 async fn reconcile_against_peer(
-    mesh: &crate::net::Mesh,
+    cluster: &Cluster,
     shard_ops: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     residency: &Arc<ResidencySet>,
@@ -1057,15 +1102,29 @@ async fn reconcile_against_peer(
     buckets: Vec<u16>,
     budget: ReconcileBudget,
 ) -> HashSet<u16> {
+    let mesh = cluster.mesh();
+    let started = Instant::now();
     let mut still_diverging = buckets;
     let mut rounds_run: u32 = 0;
+    let mut failed_in_a_row: u32 = 0;
     let mut bytes_moved: u64 = 0;
     let mut reconciled: HashSet<u16> = HashSet::new();
-    while should_keep_reconciling(rounds_run, bytes_moved, still_diverging.len(), &budget) {
+    while should_keep_reconciling(
+        rounds_run,
+        bytes_moved,
+        still_diverging.len(),
+        started.elapsed(),
+        &budget,
+    ) {
         let outcome =
             anti_entropy::run_round_for_buckets(mesh, shard_ops, cache, peer, &still_diverging)
                 .await;
-        rounds_run += 1;
+        if outcome.failed {
+            failed_in_a_row += 1;
+        } else {
+            rounds_run += 1;
+            failed_in_a_row = 0;
+        }
         bytes_moved += outcome.bytes_moved;
         let (converged, diverging) = split_round_result(&still_diverging, &outcome);
         if !converged.is_empty() {
@@ -1082,15 +1141,30 @@ async fn reconcile_against_peer(
             still_diverging = diverging.len(),
             bytes_moved,
             failed = outcome.failed,
+            failed_in_a_row,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "sundog spill: warm-reopen reconciliation round against co-owner",
         );
         still_diverging = diverging;
+        if outcome.failed {
+            // Retried on a backoff rather than counted against
+            // `max_rounds`: a peer that has left the live list has nobody
+            // to retry against, and a wait that would run past the time
+            // budget stops the loop instead of sleeping through it.
+            if !cluster.live_peer_ids().contains(&peer) {
+                break;
+            }
+            match retry_delay(failed_in_a_row, started.elapsed(), &budget) {
+                Some(delay) => tokio::time::sleep(delay).await,
+                None => break,
+            }
+        }
     }
-    // Every bucket left in `still_diverging` here -- the round or byte
-    // budget ran out, or every round against this peer failed -- gets no
-    // `ResidencySet` call at all: it keeps exactly the cold-and-unverified
-    // state it already had, falling through to the ordinary cold-pull path
-    // next.
+    // Every bucket left in `still_diverging` here -- the round, byte or
+    // time budget ran out, or the peer left the live list with its rounds
+    // still failing -- gets no `ResidencySet` call at all: it keeps exactly
+    // the cold-and-unverified state it already had, falling through to the
+    // ordinary cold-pull path next.
     reconciled
 }
 
@@ -1166,7 +1240,6 @@ async fn reconcile_warm_buckets(
         }
     }
 
-    let mesh = cluster.mesh();
     let budget = ReconcileBudget::from_config(cluster.config());
     // Every live co-owner's converge loop runs concurrently rather than
     // one after another: a bucket's owners_of() can name a different live
@@ -1177,7 +1250,7 @@ async fn reconcile_warm_buckets(
     // peer's `ReconcileBudget` as intended. `mark_serving`'s own locking
     // makes concurrent calls from different peers' loops safe.
     let per_peer = peer_buckets.into_iter().map(|(peer, buckets)| {
-        reconcile_against_peer(mesh, shard_ops, cache, residency, peer, buckets, budget)
+        reconcile_against_peer(cluster, shard_ops, cache, residency, peer, buckets, budget)
     });
     let reconciled: HashSet<u16> = futures::future::join_all(per_peer)
         .await
@@ -1942,19 +2015,131 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_budget_from_config_uses_the_configured_byte_budget_and_the_fixed_round_cap() {
+    fn reconcile_budget_from_config_takes_its_byte_time_and_backoff_bounds_from_the_config() {
         let config = ClusterConfig {
             reconcile_byte_budget: 12_345,
+            state_transfer_budget: Duration::from_millis(4_321),
+            ae_interval: Duration::from_millis(765),
             ..ClusterConfig::default()
         };
         let budget = ReconcileBudget::from_config(&config);
         assert_eq!(budget.max_rounds, RECONCILE_MAX_ROUNDS);
         assert_eq!(budget.byte_budget, 12_345);
+        assert_eq!(budget.time_budget, Duration::from_millis(4_321));
+        assert_eq!(budget.backoff_cap, Duration::from_millis(765));
+    }
+
+    /// The time bound on its own: `should_keep_reconciling` stops once
+    /// `elapsed` reaches the budget's `time_budget`, with every other bound
+    /// untouched and work left.
+    #[test]
+    fn should_keep_reconciling_stops_once_the_time_budget_is_spent() {
+        let budget = ReconcileBudget {
+            max_rounds: 3,
+            byte_budget: 1_000,
+            time_budget: Duration::from_secs(1),
+            backoff_cap: Duration::from_millis(200),
+        };
+        for (elapsed, expect_continue) in [
+            (Duration::from_millis(999), true),
+            (Duration::from_secs(1), false),
+            (Duration::from_secs(2), false),
+        ] {
+            assert_eq!(
+                should_keep_reconciling(0, 0, 5, elapsed, &budget),
+                expect_continue,
+                "elapsed {elapsed:?}"
+            );
+        }
+    }
+
+    /// Table-driven: `retry_delay` doubles from `RECONCILE_RETRY_BASE` per
+    /// consecutive failure, caps at the budget's `backoff_cap`, and answers
+    /// `None` once the wait would reach the end of the time budget.
+    #[test]
+    fn retry_delay_doubles_from_the_base_caps_at_the_backoff_cap_and_stops_at_the_time_budget() {
+        struct Case {
+            name: &'static str,
+            consecutive_failures: u32,
+            elapsed: Duration,
+            expect: Option<Duration>,
+        }
+        let budget = ReconcileBudget {
+            max_rounds: 3,
+            byte_budget: 1_000,
+            time_budget: Duration::from_secs(1),
+            backoff_cap: Duration::from_millis(500),
+        };
+        let cases = [
+            Case {
+                name: "first failure waits the base delay",
+                consecutive_failures: 1,
+                elapsed: Duration::ZERO,
+                expect: Some(Duration::from_millis(200)),
+            },
+            Case {
+                name: "second failure doubles it",
+                consecutive_failures: 2,
+                elapsed: Duration::ZERO,
+                expect: Some(Duration::from_millis(400)),
+            },
+            Case {
+                name: "third failure caps at the backoff cap",
+                consecutive_failures: 3,
+                elapsed: Duration::ZERO,
+                expect: Some(Duration::from_millis(500)),
+            },
+            Case {
+                name: "a failure count past the shift width still caps, never overflows",
+                consecutive_failures: 40,
+                elapsed: Duration::ZERO,
+                expect: Some(Duration::from_millis(500)),
+            },
+            Case {
+                name: "a zero failure count is treated as the first",
+                consecutive_failures: 0,
+                elapsed: Duration::ZERO,
+                expect: Some(Duration::from_millis(200)),
+            },
+            Case {
+                name: "a wait that still ends inside the time budget is taken",
+                consecutive_failures: 1,
+                elapsed: Duration::from_millis(799),
+                expect: Some(Duration::from_millis(200)),
+            },
+            Case {
+                name: "a wait that would land exactly on the deadline stops the loop",
+                consecutive_failures: 1,
+                elapsed: Duration::from_millis(800),
+                expect: None,
+            },
+            Case {
+                name: "time budget already spent",
+                consecutive_failures: 1,
+                elapsed: Duration::from_secs(1),
+                expect: None,
+            },
+            Case {
+                name: "time budget already exceeded",
+                consecutive_failures: 2,
+                elapsed: Duration::from_secs(3),
+                expect: None,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                retry_delay(case.consecutive_failures, case.elapsed, &budget),
+                case.expect,
+                "case: {}",
+                case.name
+            );
+        }
     }
 
     /// Table-driven: `should_keep_reconciling` stops at whichever of
-    /// rounds-exhausted, byte-budget-exhausted or nothing-left-diverging is
-    /// hit first, and keeps going only when none of the three holds.
+    /// rounds-exhausted, byte-budget-exhausted, time-budget-exhausted or
+    /// nothing-left-diverging is hit first, and keeps going only when none
+    /// of the four holds.
     #[test]
     fn should_keep_reconciling_stops_at_whichever_bound_is_hit_first() {
         struct Case {
@@ -1962,11 +2147,14 @@ mod tests {
             rounds_run: u32,
             bytes_moved: u64,
             still_diverging: usize,
+            elapsed: Duration,
             expect_continue: bool,
         }
         let budget = ReconcileBudget {
             max_rounds: 3,
             byte_budget: 1_000,
+            time_budget: Duration::from_secs(1),
+            backoff_cap: Duration::from_millis(200),
         };
         let cases = [
             Case {
@@ -1974,6 +2162,7 @@ mod tests {
                 rounds_run: 3,
                 bytes_moved: 0,
                 still_diverging: 5,
+                elapsed: Duration::ZERO,
                 expect_continue: false,
             },
             Case {
@@ -1981,6 +2170,7 @@ mod tests {
                 rounds_run: 4,
                 bytes_moved: 0,
                 still_diverging: 5,
+                elapsed: Duration::ZERO,
                 expect_continue: false,
             },
             Case {
@@ -1988,6 +2178,7 @@ mod tests {
                 rounds_run: 0,
                 bytes_moved: 1_000,
                 still_diverging: 5,
+                elapsed: Duration::ZERO,
                 expect_continue: false,
             },
             Case {
@@ -1995,6 +2186,7 @@ mod tests {
                 rounds_run: 0,
                 bytes_moved: 1_001,
                 still_diverging: 5,
+                elapsed: Duration::ZERO,
                 expect_continue: false,
             },
             Case {
@@ -2002,20 +2194,23 @@ mod tests {
                 rounds_run: 0,
                 bytes_moved: 0,
                 still_diverging: 0,
+                elapsed: Duration::ZERO,
                 expect_continue: false,
             },
             Case {
-                name: "a failed round counted as a used round with zero progress, one left",
+                name: "one round ran with zero progress, two left",
                 rounds_run: 1,
                 bytes_moved: 0,
                 still_diverging: 5,
+                elapsed: Duration::ZERO,
                 expect_continue: true,
             },
             Case {
-                name: "under both bounds with work left",
+                name: "under every bound with work left and the time budget nearly spent",
                 rounds_run: 1,
                 bytes_moved: 10,
                 still_diverging: 2,
+                elapsed: Duration::from_millis(999),
                 expect_continue: true,
             },
         ];
@@ -2025,6 +2220,7 @@ mod tests {
                     case.rounds_run,
                     case.bytes_moved,
                     case.still_diverging,
+                    case.elapsed,
                     &budget
                 ),
                 case.expect_continue,
@@ -2695,7 +2891,12 @@ mod tests {
 
         let c = Cluster::builder("cache-it-reconcile-real-round-failed")
             .seeds([b.local_gossip_addr()])
-            .config(loopback_config())
+            // The failed rounds below retry until b drops off c's live
+            // list or this time budget runs out; tightened so the test
+            // bounds itself instead of waiting out `loopback_config`'s 5s.
+            .config(loopback_config().with(|config| {
+                config.state_transfer_budget = Duration::from_secs(1);
+            }))
             .build()
             .await
             .expect("c builds");
@@ -2738,9 +2939,12 @@ mod tests {
         // b's mesh listener closes right away; c's own gossip-derived live
         // peer list still names b live for at least one more failure-
         // detection round, so the round below is attempted -- and fails on
-        // the dial, not skipped for having no live co-owner at all.
+        // the dial, not skipped for having no live co-owner at all. Its
+        // retries stop once b drops off that list or the 1s time budget
+        // above ends.
         b.shutdown().await;
 
+        let started = Instant::now();
         let reconciled = reconcile_warm_buckets(
             &c,
             &shard_ops_c,
@@ -2754,6 +2958,12 @@ mod tests {
         assert!(
             reconciled.is_empty(),
             "a round against an unreachable co-owner never reconciles any bucket"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the retries stop at the 1s time budget or when b leaves the live list, never \
+             running on to loopback_config's 5s: took {:?}",
+            started.elapsed()
         );
         for &bucket in &warm_buckets {
             assert!(

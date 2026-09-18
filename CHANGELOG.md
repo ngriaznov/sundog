@@ -42,9 +42,19 @@ All notable changes to this project are documented in this file. Format follows
   co-owners and, per co-owner, loops a bucket-scoped anti-entropy round
   (`anti_entropy::run_round_for_buckets`) over that peer's still-diverging
   buckets until the peer's digest exchange itself reports no mismatch for
-  a bucket, up to `RECONCILE_MAX_ROUNDS` (3) rounds or
-  `ClusterConfig::reconcile_byte_budget` (default 32 MiB) wire bytes pushed
-  and pulled, whichever the peer's loop hits first. Different peers' loops
+  a bucket, up to three rounds that ran, `ClusterConfig::reconcile_byte_budget`
+  (default 32 MiB) wire bytes pushed and pulled, or
+  `ClusterConfig::state_transfer_budget` of wall time, whichever the
+  peer's loop hits first. A round the peer fails or answers stale, as every
+  co-owner does at a restart until its ownership view catches up to the
+  node rejoining, never counts as a round: the loop retries it after a
+  backoff from 200 ms doubling per consecutive failure up to `ae_interval`,
+  while the peer stays live and the wait ends inside the time budget.
+  On the 3-node 4M-key harness the restarted node's first round against each
+  co-owner comes back stale, and two rounds after a 200 ms backoff mark all
+  672 replayed buckets serving with none left unverified, the gate
+  satisfied.
+  Different peers' loops
   run concurrently, so the step's worst case stays bounded by one peer's
   budget however many live co-owners a node's warm buckets span. A bucket
   clears cold and unverified via `ResidencySet::mark_serving` the instant

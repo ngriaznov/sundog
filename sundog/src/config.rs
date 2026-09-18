@@ -134,7 +134,12 @@ pub struct ClusterConfig {
     /// out opens cold, declining to donate, and keeps pulling in the
     /// background every `ae_interval`; after three timed-out pulls it opens
     /// warm with what landed. Zero is honored: `open()` skips the transfer
-    /// entirely and the cache is warm with what it has.
+    /// entirely and the cache is warm with what it has. A warm spill
+    /// reopen's converge-before-serving reconciliation (see
+    /// [`reconcile_byte_budget`](Self::reconcile_byte_budget)) runs on the
+    /// same bound: a round a co-owner fails or answers stale is retried on
+    /// a backoff from 200 ms doubling up to [`ae_interval`](Self::ae_interval)
+    /// until this budget runs out.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
@@ -252,8 +257,12 @@ pub struct ClusterConfig {
     /// peer's rounds have pushed and pulled this many bytes, that peer's
     /// still-diverging warm buckets stop looping and fall through to the
     /// ordinary cold-pull path, cold and unverified, rather than trusting a
-    /// round's outcome without ever re-checking. Paired with a fixed
-    /// round cap, following [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes)'s
+    /// round's outcome without ever re-checking. Paired with a fixed cap on
+    /// rounds that ran and the
+    /// [`state_transfer_budget`](Self::state_transfer_budget) time bound, a
+    /// round the co-owner fails or answers stale retried on a backoff capped
+    /// at [`ae_interval`](Self::ae_interval) and never counted as a round;
+    /// following [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes)'s
     /// naming and shape: large enough that a bucket's full listing or
     /// `AeEntries` fallback (bounded by `wire::MAX_FRAME`) always fits
     /// inside a handful of rounds, small enough that a co-owner that keeps
