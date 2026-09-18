@@ -625,10 +625,90 @@ every target but MSVC Windows. The library itself sets none, so a service
 embedding it chooses: on a 4M-key three-node run the demo settles at 1.7
 GiB under jemalloc against 3.2 GiB under glibc's default arenas, which
 keep the preload's and anti-entropy's transient buffers resident, and
-bulk ingest runs about twice as fast. Entries themselves cost 72 bytes
-plus the hash slot and, for a key and value under 30 encoded bytes
-together, no allocation; `SUNDOG_BENCH=1 cargo test --release -p sundog
---test entry_diet_bench -- --nocapture` measures both on your hardware.
+bulk ingest runs about twice as fast. Entries themselves cost 56 bytes
+(80 with `spill`) plus the slab's index slot and, for a key and value
+under 23 encoded bytes together, no allocation; see Memory per entry
+below for the full accounting against Redis.
+
+## Memory per entry
+
+`Live<K, V>` (`sundog/src/store/engine.rs`) packs a key and value under 23
+encoded bytes together, an absolute-millisecond HLC, the full 64-bit
+`NodeId` and logical counter a merge needs bit-identical, a packed expiry,
+and a packed last-access stamp into 56 bytes, no heap allocation, no
+separate typed copy of the key or value. `Stripe::live` is a `Slab`, a
+dense arena plus a `u32`-keyed hash index in place of a hash table holding
+entries directly, so an idle index slot costs about 5 bytes against the
+roughly 73 bytes an idle table slot holding a `Live` directly would cost
+at the same load factor. `CacheBuilder::capacity_hint` presizes a shard's
+stripes for its own expected local entry count up front, at `open()`,
+instead of growing one insert at a time.
+
+Measured with `SUNDOG_BENCH=1 cargo test --release -p sundog --test
+entry_diet_bench -- --nocapture` on a 4-core Linux box, glibc, one node,
+`Mode::Local`, settled resident set (`VmRSS`) divided by entry count:
+
+| Shape | Entries | sundog, no hint | sundog, hinted | Redis 7 computed | Redis 7 practical |
+|---|---:|---:|---:|---:|---:|
+| 8-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 74.7 B/entry | 77.3 B/entry | 80 B/copy | 85-100 B/copy |
+| 8-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.4 B/entry | 67.3 B/entry | 80 B/copy | 85-100 B/copy |
+| 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 209.6 B/entry | not measured | 184 B/copy | 195-230 B/copy |
+
+The Redis 7 figures for the 8-byte shape are its own `dictEntry` (24
+bytes) plus an `sdshdr8` key plus an `embstr`-encoded value sharing one
+allocation with its `robj` header plus one bucket-array slot, computed;
+for the 16/100-byte shape, past `embstr`'s threshold, the value takes its
+own `raw`-encoded allocation instead. `used_memory / DBSIZE` from public
+Redis benchmarks gives the practical range for both.
+
+For the 8-byte shape, every one of sundog's four figures sits under 90
+bytes per entry and under Redis 7's own practical range, at both
+4,000,000 and 64,000,000 entries; the byte cost drops further as the
+entry count grows (fixed per-stripe overhead amortizing over more
+entries) rather than staying flat or climbing. `capacity_hint` costs a
+little more at 4,000,000 entries (77.3 against 74.7 bytes per entry):
+hinting the exact expected count means a stripe whose real share lands
+even one key over its reserved capacity still pays a full doubling
+growth from that reserved base, and about half of 1024 stripes do at
+this entry count under ordinary hash variance. At 64,000,000 entries the
+per-stripe hint is large enough that this variance rarely crosses it, so
+hinted and unhinted are effectively tied (67.3 against 67.4). The
+16-byte-key/100-byte-value shape takes one heap allocation on both
+engines, past sundog's 22-byte `Record::Inline` cap and Redis's `embstr`
+threshold alike; sundog's target there is parity with Redis, not another
+win, and it measures at 209.6 bytes per entry, inside Redis's 195-230
+practical range and a little above its 184 computed figure.
+
+Reproducing sundog's figures:
+
+```sh
+SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
+    entry_diet_rss_budget -- --exact entry_diet_rss_budget --test-threads=1 --nocapture
+SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
+    entry_diet_rss_budget_64m -- --exact entry_diet_rss_budget_64m --test-threads=1 --nocapture
+SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
+    entry_diet_rss_budget_heap_shape -- --exact entry_diet_rss_budget_heap_shape --test-threads=1 --nocapture
+```
+
+Reproducing Redis 7's figures at the same widths, 8-byte keys and values:
+
+```sh
+redis-server --daemonize yes --save '' --appendonly no
+seq 1 4000000 | awk '{printf "SET %08d %08d\n", $1, $1}' | redis-cli --pipe
+redis-cli info memory | grep used_memory:
+redis-cli dbsize
+```
+
+And 16-byte keys, 100-byte values (`redis-cli flushall` first):
+
+```sh
+seq 1 4000000 | awk '{printf "SET %016d %0100d\n", $1, $1}' | redis-cli --pipe
+redis-cli info memory | grep used_memory:
+redis-cli dbsize
+```
+
+`used_memory` divided by `dbsize` is Redis's own bytes/copy in both
+cases. `redis-cli shutdown nosave` when done.
 
 ## MSRV
 

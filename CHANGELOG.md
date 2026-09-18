@@ -61,6 +61,29 @@ All notable changes to this project are documented in this file. Format follows
   0.35 GiB to match. No public API change, no wire change, no
   `BUCKET_COUNT` change: this is an intra-stripe storage change the
   mixed-version container test needs no new gate for.
+- **`CacheBuilder::capacity_hint`**: hints this shard's expected local
+  entry count so each of `BUCKET_COUNT` stripes' `Slab` (arena and index)
+  preallocates up front instead of growing one insert at a time. `None`,
+  the default, keeps today's zero-allocation-until-first-write behavior
+  exactly. `open()` clamps the hint to `max_capacity` unless a weigher is
+  configured, since a weigher turns `max_capacity` into a weight budget
+  rather than an entry count. An oversized hint costs memory rather than
+  correctness: `Engine::compact`'s existing paced pass reclaims a stripe
+  left far below its own reserved capacity, from an inflated hint or from
+  ownership rebalancing draining it, via a new `should_shrink_stripe`
+  check and a `Slab::shrink_to_fit` call. `demos/sundog-distributed-demo`
+  and `sundog-testnode` each pass `capacity_hint` the same per-node figure
+  they already pass `max_capacity`. The entry diet bench's
+  `entry_diet_rss_budget` runs a hinted 4,000,000-entry pass beside the
+  unhinted one (74.7 unhinted, 77.3 hinted bytes per entry on a 4-core
+  glibc box, both under the 90-byte target) and a 64,000,000-entry variant
+  of both (67.4 unhinted, 67.3 hinted, confirming the byte cost holds or
+  improves at scale rather than climbing), and a new
+  `entry_diet_rss_budget_heap_shape` measures a 16-byte-key/100-byte-value
+  shape at 209.6 bytes per entry, inside Redis 7's own 195-230
+  bytes/copy practical range for the same shape. The README's new Memory
+  per entry section lays out both shapes against Redis 7's computed and
+  practical figures, with the exact commands to reproduce either side.
 - **Converge-before-serving reconciliation for a warm spill reopen**:
   `reconcile_warm_buckets` groups every warm-reloaded bucket by its live
   co-owners and, per co-owner, loops a bucket-scoped anti-entropy round

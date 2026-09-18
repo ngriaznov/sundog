@@ -702,12 +702,8 @@ impl<K, V> Stripe<K, V> {
     /// A stripe whose `live` slab presizes its arena and index for
     /// `capacity` entries, matching [`Slab::with_capacity`]. Every other
     /// field starts exactly as [`Stripe::new`] leaves it: no live entry
-    /// count is implied by a capacity hint alone. A capacity hint wires
-    /// this into `Engine::new` in a later step.
-    #[allow(
-        dead_code,
-        reason = "a capacity hint wires this into Engine::new in a later step"
-    )]
+    /// count is implied by a capacity hint alone. [`Engine::new`] calls
+    /// this per stripe when its `capacity_hint` is `Some`.
     fn with_capacity(capacity: usize) -> Self {
         Self {
             live: Slab::with_capacity(capacity),
@@ -750,15 +746,9 @@ impl<K, V> Slab<K, V> {
 
     /// A slab presized for `capacity` entries: the arena and the index each
     /// allocate once, up front, instead of growing incrementally. Reached
-    /// through [`Stripe::with_capacity`], which a capacity hint wires into
-    /// `Engine::new` in a later step; exercised directly here by
+    /// through [`Stripe::with_capacity`], which [`Engine::new`]'s
+    /// `capacity_hint` parameter wires in; exercised directly here by
     /// `slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint`.
-    #[allow(
-        dead_code,
-        reason = "reached through Stripe::with_capacity, which a capacity hint wires into \
-                  Engine::new in a later step; exercised directly by \
-                  slab_with_capacity_presizes_entries_and_index_with_no_growth_up_to_hint"
-    )]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: Vec::with_capacity(capacity),
@@ -770,6 +760,16 @@ impl<K, V> Slab<K, V> {
     /// the arena carries no holes or tombstoned slots.
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// This slab's reserved arena capacity: `entries.capacity()`, the
+    /// memory-dominant side of a stripe's allocation (`size_of::<Live<K,
+    /// V>>()` bytes/slot against the index's ~5 bytes/bucket, per the
+    /// density pass's own accounting). [`Engine::compact`]'s
+    /// [`should_shrink_stripe`] check and [`Engine::stripe_capacities`]
+    /// both read this.
+    fn capacity(&self) -> usize {
+        self.entries.capacity()
     }
 
     /// The live entry at `hash` for which `eq` holds, if any.
@@ -849,13 +849,13 @@ impl<K, V> Slab<K, V> {
     /// `reclaim`) goes through `entry`/`OccupiedEntry::remove` directly
     /// instead, reading the occupied entry's own fields as part of the same
     /// removal; this convenience wrapper is exercised directly by
-    /// `slab_remove_of_absent_key_returns_none` and the permutation
-    /// property test.
+    /// `slab_remove_of_absent_key_returns_none` and
+    /// `slab_random_permutation_insert_remove_matches_a_hashmap_mirror`.
     #[allow(
         dead_code,
         reason = "no production call site removes through this convenience wrapper yet; \
-                  exercised directly by slab_remove_of_absent_key_returns_none and the \
-                  permutation property test"
+                  exercised directly by slab_remove_of_absent_key_returns_none and \
+                  slab_random_permutation_insert_remove_matches_a_hashmap_mirror"
     )]
     fn remove(
         &mut self,
@@ -938,13 +938,9 @@ impl<K, V> Slab<K, V> {
 
     /// Shrinks both the arena and the index to fit their current length,
     /// rehashing every remaining entry's index row through `hasher`.
-    /// `Engine::compact`'s paced shrink pass calls this in a later step,
-    /// once a stripe is left oversized by an inflated capacity hint or
-    /// ownership rebalancing.
-    #[allow(
-        dead_code,
-        reason = "Engine::compact's paced shrink pass calls this in a later step"
-    )]
+    /// [`Engine::compact`]'s paced shrink pass calls this once
+    /// [`should_shrink_stripe`] finds a stripe left oversized by an
+    /// inflated capacity hint or ownership rebalancing.
     fn shrink_to_fit(&mut self, hasher: impl Fn(&Live<K, V>) -> u64) {
         self.entries.shrink_to_fit();
         let entries = &self.entries;
@@ -1871,6 +1867,23 @@ fn absent_at<K, V>(
     false
 }
 
+/// [`Engine::compact`]'s paced shrink-pass rule for one visited stripe
+/// holding `len` live entries in a `live` slab allocated for `capacity`:
+/// `true` once `len` sits at or below an eighth of `capacity`, the point
+/// past which the stripe's arena wastes at least seven times what it
+/// holds. The eighth is well under the one-half to one range an
+/// unhinted `Vec`'s own amortized-doubling growth settles into on a
+/// steady fill, so an actively growing stripe with no hint is never
+/// shrunk out from under its own growth; it only fires for a stripe an
+/// inflated [`Engine::new`] `capacity_hint` reserved well past what it
+/// filled, or one ownership rebalancing drained well past what
+/// [`super::ShardOps::release_buckets`] (which never shrinks on its own)
+/// left it holding. `capacity` of zero (nothing ever allocated) is never
+/// shrunk further. Pure; unit tested directly.
+fn should_shrink_stripe(len: usize, capacity: usize) -> bool {
+    capacity > 0 && len <= capacity / 8
+}
+
 /// [`Engine::enforce_capacity`]'s stop rule once one pass evicted nothing:
 /// whether to return immediately, rather than pay for
 /// [`Engine::evict_one_scanning`]'s full-stripe scan, and instead let the
@@ -2596,14 +2609,33 @@ where
     K: Hash + Eq + Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
+    /// `capacity_hint`, when `Some`, presizes every stripe's arena and
+    /// index for `ceil(hint / BUCKET_COUNT)` entries via
+    /// [`Stripe::with_capacity`], so a cold fill up to `hint` grows neither
+    /// while it fills. `None` builds every stripe via [`Stripe::new`]
+    /// instead: zero allocation until its first write, exactly as an
+    /// engine with no hint at all behaves. Not semver-visible:
+    /// [`super::Shard::with_capacity_hint`] and
+    /// [`crate::cache::CacheBuilder::capacity_hint`] are the public entry
+    /// points.
     pub(crate) fn new(
         max_capacity: u64,
         tti: Option<Duration>,
         weigher: Option<Weigher<K, V>>,
+        capacity_hint: Option<u64>,
     ) -> Self {
+        let per_stripe_capacity = capacity_hint.map(|hint| {
+            usize::try_from(hint.div_ceil(BUCKET_COUNT as u64))
+                .expect("invariant: a capacity hint divided by BUCKET_COUNT fits in usize")
+        });
         Self {
             stripes: (0..BUCKET_COUNT)
-                .map(|_| RwLock::new(Stripe::new()))
+                .map(|_| {
+                    RwLock::new(match per_stripe_capacity {
+                        Some(capacity) => Stripe::with_capacity(capacity),
+                        None => Stripe::new(),
+                    })
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             digest: (0..BUCKET_COUNT * PART_COUNT)
@@ -3017,6 +3049,18 @@ where
         stripe.live.len() + stripe.tombstones.len()
     }
 
+    /// Every stripe's current `live` arena capacity, in stripe order:
+    /// [`super::Shard::stripe_capacities`]'s backing call, for a test to
+    /// confirm a [`Engine::new`] capacity hint reached every stripe, or
+    /// that [`Engine::compact`]'s shrink pass brought an oversized one back
+    /// down.
+    pub(crate) fn stripe_capacities(&self) -> Vec<usize> {
+        self.stripes
+            .iter()
+            .map(|s| s.read().live.capacity())
+            .collect()
+    }
+
     /// This engine's current part digests for `bucket`: [`PART_COUNT`] values,
     /// one per part, in ascending part order. A bucket at or past
     /// [`BUCKET_COUNT`], which only a misbehaving peer names, yields an empty
@@ -3381,13 +3425,22 @@ where
     }
 
     /// One rate-limited pass of the CRDT writer-retirement sweep: visits
-    /// stripes from [`Engine::compact_cursor`] under read locks only,
+    /// stripes from [`Engine::compact_cursor`] under a read lock each,
     /// calling `resolver.compact(key_bytes, encoded, now_ms, retire, quiet,
     /// bounds)` on every resident live entry and collecting the `Some`
-    /// results. Never mutates a stripe; [`super::ShardOps::compact_pass`]
-    /// applies each candidate via [`Engine::compact_replace_if_current`]. A
+    /// results; never mutates a stripe's live entries, versions, or keys
+    /// this way, and [`super::ShardOps::compact_pass`] applies each
+    /// candidate separately, via [`Engine::compact_replace_if_current`]. A
     /// [`EntryState::Spilled`] entry is skipped until promoted back to
     /// `Resident`.
+    ///
+    /// Once a visited stripe's read-locked scan finishes,
+    /// [`should_shrink_stripe`] decides whether its `live` slab sits far
+    /// enough below its own reserved capacity, from an inflated
+    /// [`Engine::new`] `capacity_hint` or from ownership rebalancing
+    /// draining it, to be worth reclaiming: if so, this pass takes one
+    /// separate write lock on the same stripe and calls
+    /// [`Slab::shrink_to_fit`] on it before moving to the next stripe.
     ///
     /// `max_entries` bounds entries examined, not entries eligible; a
     /// stripe already in progress always finishes. The cursor advances past
@@ -3446,7 +3499,18 @@ where
                     });
                 }
             }
+            let shrink = should_shrink_stripe(stripe.live.len(), stripe.live.capacity());
             drop(stripe);
+            // A separate write-lock acquisition, not counted by
+            // `note_compact_lock_acquisition` (that counter is read locks
+            // only, per its own doc): reclaiming an oversized stripe is
+            // rare enough, and shrinking is cheap enough at this stripe's
+            // own entry count, that paying for a second lock on the rare
+            // stripe that needs it beats holding a write lock for every
+            // stripe's whole scan on the chance it might.
+            if shrink {
+                self.stripes[idx].write().live.shrink_to_fit(hasher_for);
+            }
             if examined >= max_entries {
                 break;
             }
@@ -5056,7 +5120,7 @@ mod tests {
     use crate::store::LwwResolver;
 
     fn engine_u32_string(max_capacity: u64, tti: Option<Duration>) -> Engine<u32, String> {
-        Engine::new(max_capacity, tti, None)
+        Engine::new(max_capacity, tti, None, None)
     }
 
     fn key_bytes(key: u32) -> Bytes {
@@ -5414,7 +5478,7 @@ mod tests {
     #[test]
     fn apply_locked_treats_a_redelivered_absorbed_merge_as_a_no_op() {
         let engine: Engine<u32, std::collections::BTreeSet<String>> =
-            Engine::new(u64::MAX, None, None);
+            Engine::new(u64::MAX, None, None, None);
         let resolver = UnionSetResolver;
         let va = hlc(1, 1);
         let vb = hlc(5, 2);
@@ -5514,7 +5578,7 @@ mod tests {
     fn apply_locked_merge_that_grows_content_mints_a_strictly_greater_version_even_on_a_wall_ms_tie()
      {
         let engine: Engine<u32, std::collections::BTreeSet<String>> =
-            Engine::new(u64::MAX, None, None);
+            Engine::new(u64::MAX, None, None, None);
         let resolver = UnionSetResolver;
 
         let va = hlc(1, 1);
@@ -6177,7 +6241,7 @@ mod tests {
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
         // Five 5-unit entries under a 20-unit cap: exactly one goes.
-        let engine = Engine::<u32, String>::new(20, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(20, None, Some(weigher), None);
         for (i, &k) in same_bucket_keys.iter().enumerate() {
             let now = u64::try_from(i).expect("small") * 100;
             let _ = put(
@@ -6357,7 +6421,7 @@ mod tests {
     #[test]
     fn capacity_eviction_rotates_past_an_empty_start_bucket_into_other_stripes() {
         let weigher: Weigher<u32, String> = Box::new(|_k, _v| 1);
-        let engine = Engine::<u32, String>::new(3, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(3, None, Some(weigher), None);
 
         // 8 keys landing in 8 distinct, non-empty stripes.
         let mut other_keys = Vec::new();
@@ -6866,7 +6930,7 @@ mod tests {
     fn enforce_capacity_clears_an_overage_needing_thousands_of_evictions() {
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-        let engine = Engine::<u32, String>::new(10_000, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(10_000, None, Some(weigher), None);
         // 6,000 one-unit entries, then one warmer 9,500-unit entry: back
         // under the cap only after more than 5,500 evictions of cold ones.
         for k in 1..=6_000u32 {
@@ -6918,6 +6982,42 @@ mod tests {
             "anything still pending: trust the flusher rather than scan every stripe"
         );
         assert!(defer_to_flusher(u64::MAX));
+    }
+
+    #[test]
+    fn should_shrink_stripe_true_well_below_its_allocation() {
+        assert!(
+            should_shrink_stripe(1, 64),
+            "1/64 is well below the eighth threshold"
+        );
+        assert!(
+            should_shrink_stripe(0, 100),
+            "a fully drained stripe is always well below its own allocation"
+        );
+        assert!(
+            should_shrink_stripe(8, 64),
+            "8/64 sits exactly at the eighth threshold, still shrunk"
+        );
+    }
+
+    #[test]
+    fn should_shrink_stripe_false_near_or_above_its_allocation() {
+        assert!(
+            !should_shrink_stripe(64, 64),
+            "at capacity: nothing to reclaim"
+        );
+        assert!(
+            !should_shrink_stripe(40, 64),
+            "40/64 is well past the eighth threshold"
+        );
+        assert!(
+            !should_shrink_stripe(9, 64),
+            "9/64 sits one entry past the eighth threshold"
+        );
+        assert!(
+            !should_shrink_stripe(0, 0),
+            "never allocated: nothing to shrink further"
+        );
     }
 
     #[test]
@@ -6993,7 +7093,7 @@ mod tests {
         // so a random probe rarely lands on an already-empty stripe; the
         // point here is measuring the batch size, not the scanning
         // fallback's cost on a nearly-drained table.
-        let engine = Engine::<u32, String>::new(40_000, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(40_000, None, Some(weigher), None);
         // 50,000 one-unit entries: 10,000 over the cap.
         for k in 1..=50_000u32 {
             let _ = put(
@@ -7028,7 +7128,7 @@ mod tests {
 
     #[test]
     fn engine_reads_back_an_arc_string_value_serialized_via_serdes_rc_feature() {
-        let engine = Engine::<u32, Arc<String>>::new(u64::MAX, None, None);
+        let engine = Engine::<u32, Arc<String>>::new(u64::MAX, None, None, None);
         let value = Arc::new("shared".to_string());
         let _ = put(
             &engine,
@@ -7050,7 +7150,7 @@ mod tests {
     fn enforce_capacity_stops_once_every_stripe_is_empty() {
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-        let engine = Engine::<u32, String>::new(5, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(5, None, Some(weigher), None);
         // One entry heavier than the whole cap: evicting it is all there is.
         let _ = put(&engine, 1, key_bytes(1), "z".repeat(50), hlc(1, 1), None, 0);
         engine.enforce_capacity(0, 0);
@@ -7089,7 +7189,7 @@ mod tests {
         use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
         let weigher: Weigher<u32, u64> = Box::new(|_k, _v| 1);
-        let engine = Engine::<u32, u64>::new(12, None, Some(weigher));
+        let engine = Engine::<u32, u64>::new(12, None, Some(weigher), None);
         let mut rng = StdRng::seed_from_u64(0x5EED);
         let mut clock = HlcClock::new(NodeId::from(1));
 
@@ -7233,7 +7333,7 @@ mod tests {
 
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-        let engine = Engine::<u32, String>::new(60, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(60, None, Some(weigher), None);
         let mut rng = StdRng::seed_from_u64(0x5AB5_1AB5);
         let mut clock = HlcClock::new(NodeId::from(1));
         let mut mirror: HashMap<u32, MirrorState> = HashMap::new();
@@ -7780,6 +7880,38 @@ mod tests {
     }
 
     #[test]
+    fn engine_capacity_hint_presizes_each_stripe_to_ceil_hint_over_bucket_count() {
+        // Not a multiple of BUCKET_COUNT, so every stripe's own share only
+        // divides evenly once rounded up.
+        let hint = 3_000u64;
+        let expected = usize::try_from(hint.div_ceil(BUCKET_COUNT as u64))
+            .expect("a hint this small divided by BUCKET_COUNT fits in usize");
+        let engine = Engine::<u32, String>::new(u64::MAX, None, None, Some(hint));
+        assert_eq!(
+            engine.stripe_capacities(),
+            vec![expected; BUCKET_COUNT],
+            "every stripe presizes to ceil(hint / BUCKET_COUNT), none left at zero or grown past it"
+        );
+    }
+
+    #[test]
+    fn engine_no_capacity_hint_allocates_nothing_until_first_write() {
+        let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
+        assert_eq!(
+            engine.stripe_capacities(),
+            vec![0; BUCKET_COUNT],
+            "no hint: every stripe starts exactly as Stripe::new leaves it, zero allocation"
+        );
+        let _ = put(&engine, 1, key_bytes(1), "a".into(), hlc(1, 1), None, 0);
+        let total: usize = engine.stripe_capacities().into_iter().sum();
+        assert!(
+            total > 0,
+            "the first write grows only the one stripe its key lands in, matching today's \
+             unhinted behavior exactly"
+        );
+    }
+
+    #[test]
     fn tti_past_max_inline_ttl_ms_still_expires_within_the_clamped_bound() {
         // Before `clamp_tti_ms`, a tti this far past `MAX_INLINE_TTL_MS`
         // would leave this entry readable forever: `idle_elapsed_ms` never
@@ -7888,7 +8020,7 @@ mod tests {
         // sampler, and not by the batch one.
         let weigher: Weigher<u32, String> =
             Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-        let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+        let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
         let key = 1u32;
         let kb = key_bytes(key);
         let hash = hash_key_bytes(kb.as_ref());
@@ -7942,7 +8074,7 @@ mod tests {
             candidate += 1;
         };
 
-        let engine = Engine::<u32, String>::new(u64::MAX, None, None);
+        let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
         let before_rollover = (1u64 << 32) - 100;
         let after_rollover = (1u64 << 32) + 50;
         let _ = put(
@@ -7991,7 +8123,7 @@ mod tests {
         // (see `Engine::sample_candidates`'s doc comment); it is not itself
         // a documented tie-break contract.
         let (key_first, key_second, bucket) = same_bucket_pair(100_000);
-        let engine = Engine::<u32, String>::new(u64::MAX, None, None);
+        let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
         let now = 0u64;
         let _ = put(
             &engine,
@@ -8194,7 +8326,7 @@ mod tests {
 
         #[test]
         fn spilled_loc_snapshots_the_pointer_and_touches_last_access() {
-            let engine = Engine::<u32, String>::new(10, None, None);
+            let engine = Engine::<u32, String>::new(10, None, None, None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8325,7 +8457,7 @@ mod tests {
                 recorded.lock().expect("lock").push((*k, v.clone()));
                 1
             });
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8555,7 +8687,7 @@ mod tests {
         fn abandon_restores_the_weight_of_a_still_pending_entry() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8603,7 +8735,7 @@ mod tests {
         fn abandon_is_a_noop_once_the_keys_stored_state_has_changed() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8660,7 +8792,7 @@ mod tests {
         fn install_releases_its_share_of_pending_spill_weight() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8695,7 +8827,7 @@ mod tests {
             // even though the bytes were freshly copied: see the
             // `..._reuses_the_slot_with_no_heap_allocation` companion test
             // below for that case.
-            let engine = Engine::<String, String>::new(u64::MAX, None, None);
+            let engine = Engine::<String, String>::new(u64::MAX, None, None, None);
             let key = "k".repeat(40);
             let kb = string_key_bytes(&key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8842,7 +8974,7 @@ mod tests {
         fn install_releases_pending_weight_even_when_a_newer_write_displaced_the_key() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8880,7 +9012,7 @@ mod tests {
         fn abandon_releases_pending_weight_even_when_a_tombstone_displaced_the_key() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8905,7 +9037,7 @@ mod tests {
         fn enforce_capacity_counts_pending_spill_weight_toward_the_cap_and_defers_to_the_flusher() {
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(50, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(50, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -9158,7 +9290,7 @@ mod tests {
             // weight-zeroed pending entry.
             let weigher: Weigher<u32, String> =
                 Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+            let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -9234,7 +9366,7 @@ mod tests {
                 let dir = temp_dir("set-spill-accessor");
                 let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
                 let tier = Arc::new(SpillTier::open(&cfg, "accessor").expect("tier opens"));
-                let engine = Engine::<u32, String>::new(u64::MAX, None, None);
+                let engine = Engine::<u32, String>::new(u64::MAX, None, None, None);
                 assert!(engine.spill().is_none());
                 engine.set_spill(Arc::clone(&tier));
                 assert!(engine.spill().is_some());
@@ -9248,7 +9380,7 @@ mod tests {
                 let tier = Arc::new(SpillTier::open(&cfg, "evict").expect("tier opens"));
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -9341,7 +9473,7 @@ mod tests {
                 // engine that never wrote this key, the same shape a warm
                 // reopen replay starts from.
                 let producer: Arc<Engine<u32, String>> =
-                    Arc::new(Engine::new(u64::MAX, None, None));
+                    Arc::new(Engine::new(u64::MAX, None, None, None));
                 producer.set_spill(Arc::clone(&tier));
                 tier.attach(Arc::downgrade(
                     &(Arc::clone(&producer) as Arc<dyn SpillSink>),
@@ -9377,7 +9509,7 @@ mod tests {
                     }
                 };
 
-                let target = Engine::<u32, String>::new(u64::MAX, None, None);
+                let target = Engine::<u32, String>::new(u64::MAX, None, None, None);
                 let digest_before = target.digests();
 
                 let inserted =
@@ -9457,7 +9589,7 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -9549,7 +9681,7 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(250, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(250, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -9675,7 +9807,7 @@ mod tests {
                 // one means to keep the deferred victim's weight alone
                 // over the cap even after the first hand-off fully
                 // resolves, so the later retry has something left to do.
-                let engine = Engine::<u32, String>::new(50, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(50, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -9797,7 +9929,7 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -9873,7 +10005,7 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -9953,7 +10085,7 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(u64::MAX, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -10082,7 +10214,7 @@ mod tests {
                 // four-entry sample (`4.div_ceil(2)`) at 20 units cleared
                 // after the first victim alone, so the second is attempted
                 // within this same lock hold, not a later pass.
-                let engine = Engine::<u32, String>::new(30, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(30, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -10199,7 +10331,7 @@ mod tests {
                 tier.pause_flusher();
                 let weigher: Weigher<u32, String> =
                     Box::new(|_k, v| u32::try_from(v.len()).unwrap_or(u32::MAX));
-                let engine = Engine::<u32, String>::new(30, None, Some(weigher));
+                let engine = Engine::<u32, String>::new(30, None, Some(weigher), None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -10294,7 +10426,7 @@ mod tests {
                 let dir = temp_dir("merge-spilled");
                 let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
                 let tier = Arc::new(SpillTier::open(&cfg, "merge-spilled").expect("tier opens"));
-                let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+                let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -10420,7 +10552,7 @@ mod tests {
                 let dir = temp_dir(dir_name);
                 let cfg = SpillConfig::new(&dir, 1 << 20).region_bytes(4096);
                 let tier = Arc::new(SpillTier::open(&cfg, dir_name).expect("tier opens"));
-                let engine = Engine::new(u64::MAX, None, None);
+                let engine = Engine::new(u64::MAX, None, None, None);
                 engine.set_spill(Arc::clone(&tier));
                 let engine = Arc::new(engine);
                 tier.attach(Arc::downgrade(&(Arc::clone(&engine) as Arc<dyn SpillSink>)));
@@ -10466,7 +10598,7 @@ mod tests {
                 // `apply_many` call at a time against a plain resident
                 // engine, never spilled, since spilling is this test's own
                 // artifact, not part of the CRDT history being compared.
-                let sequential = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+                let sequential = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
                 for (value, ver) in [
                     (PnCounter::local_delta(node_p, 3), p_ver),
                     (e0.1.clone(), e0.0),
@@ -10587,6 +10719,18 @@ mod tests {
             WriterId::new(NodeId::from(id), 1)
         }
 
+        /// `count` distinct keys, all landing in stripe `target`, smallest
+        /// keys first: extends [`key_for_stripe`] to a stripe holding more
+        /// than one entry.
+        fn same_stripe_keys(target: usize, count: usize) -> Vec<u32> {
+            (0u32..1 << 20)
+                .filter(|&k| {
+                    stripe_index_from_hash(hash_key_bytes(key_bytes(k).as_ref())) == target
+                })
+                .take(count)
+                .collect()
+        }
+
         fn seed_counter(
             engine: &Engine<u32, PnCounter>,
             resolver: PnCounterResolver,
@@ -10617,7 +10761,7 @@ mod tests {
         /// first entry every time) or skipping ahead arbitrarily.
         #[test]
         fn compact_rotates_the_cursor_across_stripes_between_calls() {
-            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
             let resolver = PnCounterResolver;
             let targets = [3usize, 200, 500, 900];
             let keys: Vec<u32> = targets.iter().map(|&t| key_for_stripe(t)).collect();
@@ -10670,7 +10814,7 @@ mod tests {
         /// distinct stripes visited, one lock each.
         #[test]
         fn compact_locks_only_as_many_stripes_as_its_budget_needs() {
-            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
             let resolver = PnCounterResolver;
             let key = key_for_stripe(5);
             seed_counter(&engine, resolver, key, writer(1));
@@ -10698,6 +10842,89 @@ mod tests {
             );
         }
 
+        /// One entry seeded into a stripe an inflated [`Engine::new`]
+        /// `capacity_hint` presized far past what it ever held:
+        /// [`Engine::compact`]'s visit to that stripe must call
+        /// [`should_shrink_stripe`] and, finding `1 <= 100 / 8`, shrink the
+        /// slab back down toward its one live entry instead of leaving it
+        /// at its original oversized allocation.
+        #[test]
+        fn compact_shrinks_an_overallocated_stripe_toward_its_len() {
+            let target = 7usize;
+            let per_stripe_capacity = 100usize;
+            let hint = per_stripe_capacity as u64 * BUCKET_COUNT as u64;
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, Some(hint));
+            assert_eq!(
+                engine.stripe_capacities()[target],
+                per_stripe_capacity,
+                "the hint presizes every stripe, including this one, before any write"
+            );
+
+            let resolver = PnCounterResolver;
+            let key = key_for_stripe(target);
+            seed_counter(&engine, resolver, key, writer(1));
+
+            engine.debug_set_compact_cursor(target as u64);
+            let retire_everyone = |_: WriterId| true;
+            let _ = engine.compact(
+                &resolver,
+                1_000,
+                &retire_everyone,
+                Quiescence::Churning,
+                crate::store::CompactionBounds::three_bounds(0),
+                1,
+            );
+
+            let shrunk = engine.stripe_capacities()[target];
+            assert!(
+                shrunk < per_stripe_capacity,
+                "one entry in a 100-capacity stripe sits well under the eighth-capacity \
+                 threshold, so the visit shrinks it: got {shrunk}"
+            );
+            assert!(
+                shrunk <= 8,
+                "shrink_to_fit brings the arena back down toward its one live entry, not only \
+                 partway: got {shrunk}"
+            );
+        }
+
+        /// Four entries seeded into an 8-capacity stripe: `4 > 8 / 8`, so
+        /// [`should_shrink_stripe`] says no and [`Engine::compact`]'s visit
+        /// leaves the stripe's allocation exactly as it found it.
+        #[test]
+        fn compact_leaves_a_well_utilized_stripe_alone() {
+            let target = 9usize;
+            let per_stripe_capacity = 8usize;
+            let hint = per_stripe_capacity as u64 * BUCKET_COUNT as u64;
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, Some(hint));
+
+            let resolver = PnCounterResolver;
+            let keys = same_stripe_keys(target, 4);
+            assert_eq!(keys.len(), 4, "four distinct keys land in this stripe");
+            for (i, &k) in keys.iter().enumerate() {
+                seed_counter(&engine, resolver, k, writer(u64::try_from(i).unwrap()));
+            }
+            assert_eq!(engine.stripe_capacities()[target], per_stripe_capacity);
+
+            engine.debug_set_compact_cursor(target as u64);
+            let retire_everyone = |_: WriterId| true;
+            let _ = engine.compact(
+                &resolver,
+                1_000,
+                &retire_everyone,
+                Quiescence::Churning,
+                crate::store::CompactionBounds::three_bounds(0),
+                4,
+            );
+
+            assert_eq!(
+                engine.stripe_capacities()[target],
+                per_stripe_capacity,
+                "4 of 8 slots filled sits above the eighth-capacity shrink threshold, so the \
+                 visit leaves this stripe's allocation untouched"
+            );
+        }
+
         /// A resident entry and a spilled one, both carrying a
         /// retirement-eligible writer: only the resident entry is ever
         /// handed to [`ConflictResolver::compact`]. A spilled payload has
@@ -10708,7 +10935,7 @@ mod tests {
         #[cfg(feature = "spill")]
         #[test]
         fn compact_never_hands_a_spilled_payload_to_the_resolver() {
-            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None);
+            let engine = Engine::<u32, PnCounter>::new(u64::MAX, None, None, None);
             let resolver = PnCounterResolver;
 
             let spilled_key = 1u32;
@@ -11047,8 +11274,8 @@ mod tests {
                         .collect()
                 };
 
-                let on: SetEngine = Engine::new(u64::MAX, None, None);
-                let off: SetEngine = Engine::new(u64::MAX, None, None);
+                let on: SetEngine = Engine::new(u64::MAX, None, None, None);
+                let off: SetEngine = Engine::new(u64::MAX, None, None, None);
                 off.set_prefold_enabled(false);
 
                 // Seeds each engine with real stored state per key before
@@ -11155,7 +11382,7 @@ mod tests {
                 ]
             };
 
-            let prefolded: SetEngine = Engine::new(u64::MAX, None, None);
+            let prefolded: SetEngine = Engine::new(u64::MAX, None, None, None);
             let outcomes = prefolded.apply_many(bucket, build(), &resolver, 60_000, 600_000, 0);
             assert_eq!(outcomes.len(), 4);
             assert!(
@@ -11177,7 +11404,7 @@ mod tests {
                 "the tombstone must cut the fold: the post-tombstone put never sees \"a\"/\"b\""
             );
 
-            let sequential: SetEngine = Engine::new(u64::MAX, None, None);
+            let sequential: SetEngine = Engine::new(u64::MAX, None, None, None);
             sequential.set_prefold_enabled(false);
             let sequential_outcomes =
                 sequential.apply_many(bucket, build(), &resolver, 60_000, 600_000, 0);
@@ -11208,7 +11435,7 @@ mod tests {
 
         #[test]
         fn set_prefold_enabled_toggles_the_flag_the_getter_reports() {
-            let engine: SetEngine = Engine::new(u64::MAX, None, None);
+            let engine: SetEngine = Engine::new(u64::MAX, None, None, None);
             assert!(
                 engine.prefold_enabled(),
                 "pre-fold defaults to on, matching apply_many's own default"

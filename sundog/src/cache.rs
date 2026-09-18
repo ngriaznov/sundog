@@ -51,6 +51,7 @@ pub struct CacheBuilder<K, V> {
     max_capacity: u64,
     ttl: Option<Duration>,
     tti: Option<Duration>,
+    capacity_hint: Option<u64>,
     resolver: Arc<dyn ConflictResolver>,
     weigher: Option<Weigher<K, V>>,
     #[cfg(feature = "spill")]
@@ -73,6 +74,7 @@ where
             max_capacity: u64::MAX,
             ttl: None,
             tti: None,
+            capacity_hint: None,
             resolver: Arc::new(LwwResolver),
             weigher: None,
             #[cfg(feature = "spill")]
@@ -92,6 +94,25 @@ where
     /// Bounds local entry count. Default: unbounded.
     pub fn max_capacity(mut self, max_capacity: u64) -> Self {
         self.max_capacity = max_capacity;
+        self
+    }
+
+    /// Hints this shard's expected local entry count so each of
+    /// `BUCKET_COUNT` stripes' `Slab` (arena and index) preallocates
+    /// instead of growing one insert at a time. Pass this node's own
+    /// expected resident share of the keyspace, never the cluster-wide
+    /// total in `Mode::Distributed`. `None`, the default, keeps
+    /// zero-allocation-until-first-write behavior exactly as it is with no
+    /// hint at all. A hint below the real count costs nothing beyond
+    /// ordinary unhinted growth for the overage; a hint above it reserves
+    /// memory that sits unused until `Engine::compact`'s paced shrink pass
+    /// reclaims it (see `should_shrink_stripe`). At [`CacheBuilder::open`],
+    /// clamped to [`CacheBuilder::max_capacity`] unless
+    /// [`CacheBuilder::weigher`] is configured, since a weigher turns
+    /// `max_capacity` into a weight budget rather than an entry count, and
+    /// this hint is always an entry count.
+    pub fn capacity_hint(mut self, entries: u64) -> Self {
+        self.capacity_hint = Some(entries);
         self
     }
 
@@ -216,6 +237,7 @@ where
             max_capacity,
             ttl,
             tti,
+            capacity_hint,
             resolver,
             weigher,
             #[cfg(feature = "spill")]
@@ -271,6 +293,21 @@ where
         .with_resolver(resolver)
         .with_merge_coalesce_window(merge_coalesce_window)
         .with_prefold_enabled(prefold_enabled);
+        // Applied before `with_weigher` below: `Shard::with_capacity_hint`
+        // rebuilds the engine same as `with_weigher` does, and only
+        // `with_weigher`'s own rebuild carries a capacity hint forward
+        // through `Shard`'s remembered field, not the other way around.
+        // The clamp itself skips a configured weigher, since `max_capacity`
+        // bounds weight there, not entry count, and this hint is always an
+        // entry count.
+        if let Some(hint) = capacity_hint {
+            let hint = if weigher.is_some() {
+                hint
+            } else {
+                hint.min(max_capacity)
+            };
+            shard = shard.with_capacity_hint(hint);
+        }
         if let Some(weigher) = weigher {
             shard = shard.with_weigher(move |key: &K, value: &V| weigher(key, value));
         }
@@ -4044,6 +4081,124 @@ mod tests {
 
         on.close().await;
         off.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cache_builder_capacity_hint_reaches_the_shard() {
+        let cluster = Cluster::builder("cache-it-capacity-hint")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let hint = 3_000u64;
+        let expected = usize::try_from(hint.div_ceil(crate::store::BUCKET_COUNT as u64))
+            .expect("hint fits usize");
+        let cache = cluster
+            .cache::<u32, u32>("counters")
+            .mode(Mode::Local)
+            .capacity_hint(hint)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert_eq!(
+            cache.shard.stripe_capacities(),
+            vec![expected; crate::store::BUCKET_COUNT],
+            "the hint reached the shard's engine, presizing every stripe"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn capacity_hint_above_max_capacity_is_clamped_without_a_weigher() {
+        let cluster = Cluster::builder("cache-it-capacity-hint-clamped")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let max_capacity = 100u64;
+        let hint = 3_000u64;
+        let expected = usize::try_from(max_capacity.div_ceil(crate::store::BUCKET_COUNT as u64))
+            .expect("clamped hint fits usize");
+        let cache = cluster
+            .cache::<u32, u32>("counters")
+            .mode(Mode::Local)
+            .max_capacity(max_capacity)
+            .capacity_hint(hint)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert_eq!(
+            cache.shard.stripe_capacities(),
+            vec![expected; crate::store::BUCKET_COUNT],
+            "with no weigher, max_capacity bounds entry count, so a hint above it is clamped"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn capacity_hint_above_max_capacity_is_kept_as_is_with_a_weigher() {
+        let cluster = Cluster::builder("cache-it-capacity-hint-unclamped")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let max_capacity = 100u64;
+        let hint = 3_000u64;
+        let expected = usize::try_from(hint.div_ceil(crate::store::BUCKET_COUNT as u64))
+            .expect("hint fits usize");
+        let cache = cluster
+            .cache::<u32, u32>("counters")
+            .mode(Mode::Local)
+            .max_capacity(max_capacity)
+            .weigher(|_key: &u32, _value: &u32| 1)
+            .capacity_hint(hint)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert_eq!(
+            cache.shard.stripe_capacities(),
+            vec![expected; crate::store::BUCKET_COUNT],
+            "with a weigher, max_capacity bounds weight, not entry count, so the hint is kept as is"
+        );
+
+        cache.close().await;
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn capacity_hint_defaults_to_none_and_matches_pre_change_rss() {
+        let cluster = Cluster::builder("cache-it-capacity-hint-none")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+
+        let cache = cluster
+            .cache::<u32, u32>("counters")
+            .mode(Mode::Local)
+            .open()
+            .await
+            .expect("open succeeds");
+        assert_eq!(
+            cache.shard.stripe_capacities(),
+            vec![0; crate::store::BUCKET_COUNT],
+            "no hint: every stripe starts at zero allocation, matching an engine with no \
+             capacity_hint at all"
+        );
+
+        cache.close().await;
         cluster.shutdown().await;
     }
 

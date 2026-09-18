@@ -272,8 +272,13 @@ async fn open(
         .mode(Mode::Distributed {
             owners: topology.owners,
         });
+    // `max_entries` already bounds this node's own local RAM, so it is
+    // exactly this node's expected resident share, the figure
+    // `capacity_hint` needs in `Mode::Distributed` (never the cluster-wide
+    // total): the same value presizes each stripe instead of only capping
+    // it.
     let builder = match tuning.max_entries {
-        Some(max) => builder.max_capacity(max),
+        Some(max) => builder.max_capacity(max).capacity_hint(max),
         None => builder,
     };
     #[cfg(feature = "spill")]

@@ -1353,11 +1353,18 @@ where
     /// sleep-until instead of parking past a deadline that did not exist
     /// yet when it last checked.
     merge_wake: Notify,
-    /// Remembered, with `tti` below, so [`Shard::with_weigher`] can rebuild
-    /// `engine::Engine` from scratch: a weigher installs only at
+    /// Remembered, with `tti` and `capacity_hint` below, so
+    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can each
+    /// rebuild `engine::Engine` from scratch without losing what the other
+    /// already set: a weigher and a capacity hint both install only at
     /// construction.
     max_capacity: u64,
     tti: Option<Duration>,
+    /// [`Shard::with_capacity_hint`]'s configured hint, `None` until then.
+    /// Threaded into every engine rebuild alongside `max_capacity`/`tti`
+    /// so a capacity hint set before [`Shard::with_weigher`] survives that
+    /// rebuild too.
+    capacity_hint: Option<u64>,
     /// Handle for `sundog_cache_hits_total{cache}`, created once here since
     /// label resolution costs more than the read path can afford per call.
     hits: metrics::Counter,
@@ -1478,7 +1485,7 @@ where
         ttl: Option<Duration>,
         tti: Option<Duration>,
     ) -> Self {
-        let engine = Arc::new(Engine::new(max_capacity, tti, None));
+        let engine = Arc::new(Engine::new(max_capacity, tti, None, None));
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
         let fan_out = Arc::new(FanOutQueue::new(name.clone(), !matches!(mode, Mode::Local)));
@@ -1508,6 +1515,7 @@ where
             merge_wake: Notify::new(),
             max_capacity,
             tti,
+            capacity_hint: None,
             hits,
             misses,
             ownership: None,
@@ -1713,8 +1721,9 @@ where
 
     /// Installs a custom per-entry weigher for size-bounded eviction, in place
     /// of the default of one weight unit per entry. Rebuilds
-    /// `engine::Engine` from scratch, so call this immediately after
-    /// [`Shard::new`], before any reads or writes reach this shard.
+    /// `engine::Engine` from scratch, carrying forward any
+    /// [`Shard::with_capacity_hint`] already set, so call this immediately
+    /// after [`Shard::new`], before any reads or writes reach this shard.
     #[must_use]
     pub fn with_weigher<W>(mut self, weigher: W) -> Self
     where
@@ -1724,8 +1733,43 @@ where
             self.max_capacity,
             self.tti,
             Some(Box::new(weigher)),
+            self.capacity_hint,
         ));
         self
+    }
+
+    /// Hints this shard's expected local entry count, presizing every
+    /// stripe's arena and index up front instead of growing them one
+    /// insert at a time; see [`crate::cache::CacheBuilder::capacity_hint`]
+    /// for the full contract this validates and forwards. Rebuilds
+    /// `engine::Engine` from scratch, so call this immediately after
+    /// [`Shard::new`] and before [`Shard::with_weigher`] if both are used:
+    /// `with_weigher`'s own rebuild carries this hint forward through
+    /// `capacity_hint`, but this rebuild has no way to carry an
+    /// already-installed weigher forward, since nothing here stores it
+    /// outside the engine it rebuilds. Call this before any reads or
+    /// writes reach this shard either way.
+    #[must_use]
+    pub fn with_capacity_hint(mut self, hint: u64) -> Self {
+        self.capacity_hint = Some(hint);
+        self.engine = Arc::new(Engine::new(
+            self.max_capacity,
+            self.tti,
+            None,
+            self.capacity_hint,
+        ));
+        self
+    }
+
+    /// This shard's engine's current per-stripe `live` arena capacities,
+    /// one per [`BUCKET_COUNT`] stripe, in stripe order. `#[doc(hidden)]`:
+    /// a test accessor reachable from `sundog/tests/entry_diet_bench.rs`,
+    /// an integration-test binary outside this crate, mirroring
+    /// [`Shard::with_prefold_enabled`]'s own reach. Never call this outside
+    /// a benchmark or test.
+    #[doc(hidden)]
+    pub fn stripe_capacities(&self) -> Vec<usize> {
+        self.engine.stripe_capacities()
     }
 
     /// Opens a local SSD/NVMe spill tier at `cfg` and attaches it to this
@@ -8044,6 +8088,26 @@ mod tests {
 
         let s = s.with_prefold_enabled(true);
         assert!(s.prefold_enabled());
+    }
+
+    #[test]
+    fn shard_with_capacity_hint_presizes_engine() {
+        let s = shard::<u32, u32>(1);
+        assert_eq!(
+            s.stripe_capacities(),
+            vec![0; BUCKET_COUNT],
+            "no hint yet: every stripe starts at zero allocation"
+        );
+
+        let hint = 3_000u64;
+        let expected =
+            usize::try_from(hint.div_ceil(BUCKET_COUNT as u64)).expect("hint fits usize");
+        let s = s.with_capacity_hint(hint);
+        assert_eq!(
+            s.stripe_capacities(),
+            vec![expected; BUCKET_COUNT],
+            "the hint reached the engine and presized every stripe"
+        );
     }
 
     #[test]

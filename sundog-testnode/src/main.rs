@@ -418,7 +418,13 @@ async fn open_it_cache(
                 .weigher(|key: &String, value: &String| byte_weight(key, value));
         }
         Some(CapacityCap::Entries(max_entries)) => {
-            it_builder = it_builder.max_capacity(max_entries);
+            // `capacity_hint` is always an entry count, so it is only
+            // wired here, next to the entry-denominated `max_capacity`
+            // call, and not in the byte-budget arm above, where
+            // `max_capacity` bounds weight rather than entries.
+            it_builder = it_builder
+                .max_capacity(max_entries)
+                .capacity_hint(max_entries);
         }
         None => {}
     }
