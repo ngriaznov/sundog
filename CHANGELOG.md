@@ -332,6 +332,12 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- A node whose `gossip_bind_addr` asks for port 0 probes a free port,
+  releases it and lets chitchat bind it; when another socket takes the
+  port in between, chitchat's address-in-use answer sends membership
+  back to probe a fresh port, up to five times, instead of failing the
+  join. A fixed port never moves: one another socket holds fails the
+  join with that address in the error.
 - `sundog_owned_buckets` is set for a distributed cache's first ownership
   view, at open, not only when a later membership change republishes the
   view. With the bounded membership wait at open, a node joining a settled

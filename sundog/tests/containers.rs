@@ -1009,7 +1009,14 @@ fn fill_payload_bytes(count: u32) -> u64 {
 /// Pins the fan-out queue and the anti-entropy streaming skip together: a
 /// bulk fill on a live three-node cluster must replicate as a handful of
 /// batched frames fanned out once per peer, not one frame per record and not
-/// a second copy from anti-entropy racing in behind it.
+/// a second copy from anti-entropy racing in behind it. Anti-entropy skips a
+/// round while replicate traffic is in motion toward a peer, at most
+/// `MAX_STREAMING_SKIPS` rounds running, so a fill that outlasts those
+/// rounds on a loaded box legitimately sees a round repair what the fan-out
+/// has not yet delivered; every record such a round moves counts toward
+/// `sundog_ae_repaired_total` on the node that applied it, and the byte
+/// budget below grants each of them one record's wire cost twice over
+/// rather than treating the whole fill's traffic as one opaque multiple.
 #[tokio::test]
 async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
     const ENTRIES: u32 = 100_000;
@@ -1044,13 +1051,29 @@ async fn bulk_fill_replicates_without_anti_entropy_duplicating_it() {
         "n1 sent {frames_for_fill} frames for a {ENTRIES}-entry fill to 2 peers; the batched \
          fan-out queue should coalesce at least ten records per frame, not one frame per record"
     );
+    // Records anti-entropy rounds applied anywhere in the cluster while the
+    // fill was in flight: zero on an idle box, where the fan-out lands
+    // before the streaming skip runs out, and each one a legitimate,
+    // counted repair rather than a duplicate copy when the fill outlasts
+    // those skipped rounds on a loaded one.
+    let mut repaired: u64 = 0;
+    for node in [&n1, &n2, &n3] {
+        repaired += scrape_metric(node, "sundog_ae_repaired_total", ("cache", "it")).await;
+    }
+    let per_record = payload_estimate.div_ceil(u64::from(ENTRIES));
+    let repair_allowance = repaired * per_record * 2;
+    eprintln!(
+        "bulk fill: n1 sent {bytes_for_fill} bytes against a {payload_estimate}-byte single copy; \
+         anti-entropy repaired {repaired} records"
+    );
     assert!(
-        bytes_for_fill < payload_estimate * 3,
+        bytes_for_fill < payload_estimate * 3 + repair_allowance,
         "n1 sent {bytes_for_fill} bytes for a {ENTRIES}-entry fill against an estimated \
          single-copy wire payload of {payload_estimate} bytes (each entry's `k{{i}}`/`v{{i}}` \
          bytes plus its fixed {RECORD_HEADER_BYTES}-byte record header); a normal 2-peer fan-out \
-         costs about 2x that, so 3x leaves headroom for batch/frame overhead without also \
-         covering anti-entropy re-sending a duplicate copy behind it"
+         costs about 2x that, 3x leaves headroom for batch/frame overhead, and the \
+         {repaired} records anti-entropy repaired in flight are granted {repair_allowance} \
+         bytes on top; anything past that is a copy nothing accounts for"
     );
 
     n1.stop().await.expect("n1 stops");

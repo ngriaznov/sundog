@@ -129,56 +129,9 @@ impl Membership {
         config: &ClusterConfig,
         mut seeds: BoxStream<'static, SocketAddr>,
     ) -> Result<Self, JoinError> {
-        let bind_addr = config.gossip_bind_addr;
-        let port = if bind_addr.port() == 0 {
-            // Probe-bind to claim a free port, then release it for
-            // chitchat's own transport. The resulting race is accepted on a
-            // trusted LAN.
-            let probe = tokio::net::UdpSocket::bind(bind_addr)
-                .await
-                .map_err(|source| JoinError::Bind {
-                    addr: bind_addr,
-                    source,
-                })?;
-            probe
-                .local_addr()
-                .map_err(|source| JoinError::Bind {
-                    addr: bind_addr,
-                    source,
-                })?
-                .port()
-        } else {
-            bind_addr.port()
-        };
-        let listen_addr = SocketAddr::new(bind_addr.ip(), port);
-        let advertise_ip = advertise_ip_for(config, listen_addr.ip());
-        let gossip_advertise_addr = SocketAddr::new(advertise_ip, port);
-
         let incarnation = now_incarnation_ms();
         let name = NodeName::new(hostname, node);
-        let chitchat_id = ChitchatId::new(name.to_string(), incarnation, gossip_advertise_addr);
-
         let seed_nodes = collect_initial_seeds(&mut seeds).await;
-
-        let chitchat_config = ChitchatConfig {
-            chitchat_id: chitchat_id.clone(),
-            cluster_id: cluster_name.to_string(),
-            gossip_interval: config.gossip_interval,
-            listen_addr,
-            seed_nodes,
-            failure_detector_config: FailureDetectorConfig {
-                phi_threshold: config.phi_threshold,
-                sampling_window_size: config.phi_sampling_window_size,
-                max_interval: config.phi_max_interval,
-                initial_interval: config.phi_initial_interval,
-                dead_node_grace_period: config.dead_node_grace_period,
-            },
-            marked_for_deletion_grace_period: config.kv_tombstone_grace_period,
-            catchup_callback: None,
-            extra_liveness_predicate: None,
-            protocol_version: ProtocolVersion::V0,
-        };
-
         let initial_key_values = vec![
             (NODE_ID_KEY.to_string(), node.to_string()),
             (DATA_ADDR_KEY.to_string(), data_addr.to_string()),
@@ -189,9 +142,15 @@ impl Membership {
             ),
         ];
 
-        let handle = spawn_chitchat(chitchat_config, initial_key_values, &UdpTransport)
-            .await
-            .map_err(|err| JoinError::Membership(Box::new(io::Error::other(format!("{err:#}")))))?;
+        let (handle, chitchat_id, gossip_advertise_addr) = start_gossip(
+            &cluster_name,
+            &name,
+            incarnation,
+            config,
+            seed_nodes,
+            initial_key_values,
+        )
+        .await?;
 
         tracing::info!(
             %cluster_name,
@@ -353,6 +312,109 @@ fn resolve_advertise_ip(bind_ip: IpAddr) -> IpAddr {
         .map(|interfaces| interfaces.into_iter().map(|iface| iface.ip()).collect())
         .unwrap_or_default();
     fallback_advertise_ip(&candidates, bind_ip.is_ipv6())
+}
+
+/// Starts chitchat on `config.gossip_bind_addr` and returns its handle, the
+/// id it advertises and the gossip address inside it. With port 0, a probe
+/// bind claims a free port and releases it for chitchat's own transport,
+/// whose bind of that port can lose a race against another process, or
+/// another node in the same test binary, taking it in between: chitchat's
+/// address-in-use answer sends the loop back to probe a fresh port, up to
+/// [`GOSSIP_BIND_ATTEMPTS`] times. A fixed port never moves.
+async fn start_gossip(
+    cluster_name: &SmolStr,
+    name: &NodeName,
+    incarnation: u64,
+    config: &ClusterConfig,
+    seed_nodes: Vec<String>,
+    initial_key_values: Vec<(String, String)>,
+) -> Result<(ChitchatHandle, ChitchatId, SocketAddr), JoinError> {
+    let bind_addr = config.gossip_bind_addr;
+    let mut attempt: u32 = 0;
+    loop {
+        let port = if bind_addr.port() == 0 {
+            let probe = tokio::net::UdpSocket::bind(bind_addr)
+                .await
+                .map_err(|source| JoinError::Bind {
+                    addr: bind_addr,
+                    source,
+                })?;
+            probe
+                .local_addr()
+                .map_err(|source| JoinError::Bind {
+                    addr: bind_addr,
+                    source,
+                })?
+                .port()
+        } else {
+            bind_addr.port()
+        };
+        let listen_addr = SocketAddr::new(bind_addr.ip(), port);
+        let advertise_ip = advertise_ip_for(config, listen_addr.ip());
+        let gossip_advertise_addr = SocketAddr::new(advertise_ip, port);
+        let chitchat_id = ChitchatId::new(name.to_string(), incarnation, gossip_advertise_addr);
+
+        let chitchat_config = ChitchatConfig {
+            chitchat_id: chitchat_id.clone(),
+            cluster_id: cluster_name.to_string(),
+            gossip_interval: config.gossip_interval,
+            listen_addr,
+            seed_nodes: seed_nodes.clone(),
+            failure_detector_config: FailureDetectorConfig {
+                phi_threshold: config.phi_threshold,
+                sampling_window_size: config.phi_sampling_window_size,
+                max_interval: config.phi_max_interval,
+                initial_interval: config.phi_initial_interval,
+                dead_node_grace_period: config.dead_node_grace_period,
+            },
+            marked_for_deletion_grace_period: config.kv_tombstone_grace_period,
+            catchup_callback: None,
+            extra_liveness_predicate: None,
+            protocol_version: ProtocolVersion::V0,
+        };
+
+        match spawn_chitchat(chitchat_config, initial_key_values.clone(), &UdpTransport).await {
+            Ok(handle) => return Ok((handle, chitchat_id, gossip_advertise_addr)),
+            Err(err) => {
+                let lost_the_port = err
+                    .chain()
+                    .any(|cause| is_addr_in_use(cause.downcast_ref::<io::Error>()));
+                if should_retry_gossip_bind(bind_addr.port(), lost_the_port, attempt) {
+                    attempt += 1;
+                    tracing::warn!(
+                        %listen_addr,
+                        attempt,
+                        "gossip port taken between its probe and chitchat's bind; probing another"
+                    );
+                    continue;
+                }
+                return Err(JoinError::Membership(Box::new(io::Error::other(format!(
+                    "{err:#}"
+                )))));
+            }
+        }
+    }
+}
+
+/// Fresh ports [`Membership::spawn`] probes for a port-0 bind before giving
+/// up: each attempt loses only to a bind landing on the probed port inside
+/// the microseconds between the probe's release and chitchat's own bind,
+/// so a handful of tries outlasts any plausible run of collisions.
+const GOSSIP_BIND_ATTEMPTS: u32 = 5;
+
+/// Whether `error` is the kernel refusing a bind because the address is
+/// taken (`EADDRINUSE`, `WSAEADDRINUSE` on Windows).
+fn is_addr_in_use(error: Option<&io::Error>) -> bool {
+    error.is_some_and(|error| error.kind() == io::ErrorKind::AddrInUse)
+}
+
+/// Pure: whether [`Membership::spawn`] probes another port after chitchat's
+/// bind failed. Only a port-0 request moves (a fixed `requested_port` is
+/// the operator's choice, and a taken one is an error to report), only for
+/// an address-in-use failure (anything else is not a race), and only while
+/// `attempt` is under [`GOSSIP_BIND_ATTEMPTS`].
+fn should_retry_gossip_bind(requested_port: u16, addr_in_use: bool, attempt: u32) -> bool {
+    requested_port == 0 && addr_in_use && attempt < GOSSIP_BIND_ATTEMPTS
 }
 
 /// The outbound-interface probe: a UDP "connect" toward a public address,
@@ -974,6 +1036,113 @@ mod tests {
         assert!(membership.peers().borrow().is_empty());
 
         membership.shutdown().await;
+    }
+
+    /// Table-driven: `should_retry_gossip_bind` moves only a port-0
+    /// request, only on an address-in-use failure, and only while the
+    /// attempt count is under `GOSSIP_BIND_ATTEMPTS`.
+    #[test]
+    fn should_retry_gossip_bind_moves_only_a_port_zero_request_on_addr_in_use_within_the_cap() {
+        struct Case {
+            name: &'static str,
+            requested_port: u16,
+            addr_in_use: bool,
+            attempt: u32,
+            expect: bool,
+        }
+        let cases = [
+            Case {
+                name: "port 0, taken, first attempt",
+                requested_port: 0,
+                addr_in_use: true,
+                attempt: 0,
+                expect: true,
+            },
+            Case {
+                name: "port 0, taken, last attempt under the cap",
+                requested_port: 0,
+                addr_in_use: true,
+                attempt: GOSSIP_BIND_ATTEMPTS - 1,
+                expect: true,
+            },
+            Case {
+                name: "port 0, taken, cap reached",
+                requested_port: 0,
+                addr_in_use: true,
+                attempt: GOSSIP_BIND_ATTEMPTS,
+                expect: false,
+            },
+            Case {
+                name: "port 0, some other failure",
+                requested_port: 0,
+                addr_in_use: false,
+                attempt: 0,
+                expect: false,
+            },
+            Case {
+                name: "a fixed port never moves",
+                requested_port: 7946,
+                addr_in_use: true,
+                attempt: 0,
+                expect: false,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                should_retry_gossip_bind(case.requested_port, case.addr_in_use, case.attempt),
+                case.expect,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn is_addr_in_use_recognizes_only_the_kernel_address_taken_error() {
+        assert!(is_addr_in_use(Some(&io::Error::from(
+            io::ErrorKind::AddrInUse
+        ))));
+        assert!(!is_addr_in_use(Some(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        ))));
+        assert!(!is_addr_in_use(Some(&io::Error::other("failed to bind"))));
+        assert!(!is_addr_in_use(None));
+    }
+
+    /// A fixed gossip port that another socket holds fails `spawn` outright:
+    /// the operator chose that port, so it never silently moves, and the
+    /// error names the address-in-use cause chitchat reported.
+    #[tokio::test]
+    async fn a_fixed_gossip_port_already_taken_fails_without_moving() {
+        let holder = std::net::UdpSocket::bind(addr(0)).expect("hold a loopback udp port");
+        let taken = holder.local_addr().expect("held socket has an address");
+        let config = ClusterConfig {
+            gossip_bind_addr: taken,
+            ..ClusterConfig::default()
+        };
+        let error = Membership::spawn(
+            "membership-test-fixed-port-taken".into(),
+            NodeId::random(),
+            "fixed",
+            addr(9402),
+            &config,
+            stream::pending().boxed(),
+        )
+        .await
+        .err()
+        .expect("a held fixed port fails to start membership");
+        assert!(
+            matches!(error, JoinError::Membership(_)),
+            "chitchat's own bind reports the taken port: {error:?}"
+        );
+        let cause = std::error::Error::source(&error)
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            cause.contains(&taken.to_string()),
+            "the cause names the held address: {cause}"
+        );
+        drop(holder);
     }
 
     #[tokio::test]
