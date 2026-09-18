@@ -627,6 +627,11 @@ fn key_versions_to_tuples(entries: Vec<crate::store::KeyVersion>) -> Vec<(Bytes,
 /// unbounded in the round's mismatched-bucket count. A no-op when
 /// `mismatches` is empty.
 ///
+/// Stops at the first chunk whose [`Mesh::ae_parts`] call fails, the same
+/// keep-progress-and-break pattern [`apply_repairs`]'s own pull loops use:
+/// a peer that stalls mid-round costs this round at most one
+/// `REQUEST_TIMEOUT`, not one per remaining chunk.
+///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
 async fn classify_part_digest_mismatches(
     mesh: &crate::net::Mesh,
@@ -638,7 +643,12 @@ async fn classify_part_digest_mismatches(
     merging: bool,
 ) {
     for chunk in chunk_mismatches(mismatches, CLASSIFY_BUCKET_CHUNK) {
-        classify_part_digest_mismatch_chunk(mesh, shard, cache, peer, chunk, plan, merging).await;
+        let ok =
+            classify_part_digest_mismatch_chunk(mesh, shard, cache, peer, chunk, plan, merging)
+                .await;
+        if !ok {
+            break;
+        }
     }
 }
 
@@ -646,7 +656,10 @@ async fn classify_part_digest_mismatches(
 /// part digests against this node's own, one shard call for the whole
 /// chunk, then one [`Mesh::ae_parts`] request for every part that differs
 /// across the chunk, classifying each reply the same way
-/// [`classify_bucket_mismatches`] does at bucket scale.
+/// [`classify_bucket_mismatches`] does at bucket scale. Returns `false`
+/// when the chunk's `ae_parts` call fails, so the caller can stop issuing
+/// further chunk RPCs against a peer that has stopped answering; `true`
+/// otherwise, including the empty-`wanted_parts` no-op.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
 async fn classify_part_digest_mismatch_chunk(
@@ -657,7 +670,7 @@ async fn classify_part_digest_mismatch_chunk(
     mismatches: Vec<AeMismatch>,
     plan: &mut RepairPlan,
     merging: bool,
-) {
+) -> bool {
     let buckets: Vec<u16> = mismatches.iter().map(AeMismatch::bucket).collect();
     let local_part_digests = shard.part_digests(buckets).await;
     let local_digests_by_bucket: HashMap<u16, Vec<u64>> = local_part_digests
@@ -681,7 +694,7 @@ async fn classify_part_digest_mismatch_chunk(
         );
     }
     if wanted_parts.is_empty() {
-        return;
+        return true;
     }
 
     let wanted_parts_wire: Vec<(u16, u8)> =
@@ -737,9 +750,11 @@ async fn classify_part_digest_mismatch_chunk(
                 }
             }
             settle_bucket_parts(gathered, plan);
+            true
         }
         Err(error) => {
             tracing::debug!(%error, "anti-entropy part exchange failed");
+            false
         }
     }
 }
@@ -1328,6 +1343,150 @@ mod tests {
         cluster_b.shutdown().await;
     }
 
+    /// Wraps a real [`ShardOps`], counting calls to [`ShardOps::part_digests`]
+    /// on a shared counter, forwarding everything else unchanged: the seam
+    /// [`classify_part_digest_mismatches_stops_issuing_ae_parts_after_the_
+    /// first_chunk_fails`] uses to observe how many chunks the loop actually
+    /// visited, since a chunk visited but whose `Mesh::ae_parts` call fails
+    /// leaves no other trace in `RepairPlan`.
+    #[cfg(not(feature = "sim"))]
+    struct CountingPartDigestsShard {
+        inner: Arc<dyn ShardOps>,
+        part_digests_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(not(feature = "sim"))]
+    impl ShardOps for CountingPartDigestsShard {
+        fn apply_remote(&self, rec: WireRecord) -> futures::future::BoxFuture<'_, ()> {
+            self.inner.apply_remote(rec)
+        }
+        fn apply_remote_batch(&self, recs: Vec<WireRecord>) -> futures::future::BoxFuture<'_, ()> {
+            self.inner.apply_remote_batch(recs)
+        }
+        fn invalidate(&self, key: Bytes, ver: Hlc) -> futures::future::BoxFuture<'_, ()> {
+            self.inner.invalidate(key, ver)
+        }
+        fn digests(&self) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketDigest>> {
+            self.inner.digests()
+        }
+        fn bucket_entries(
+            &self,
+            bucket: u16,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::KeyVersion>> {
+            self.inner.bucket_entries(bucket)
+        }
+        fn entries_for_buckets(
+            &self,
+            buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, crate::store::BucketEntries> {
+            self.inner.entries_for_buckets(buckets)
+        }
+        fn bucket_lens(
+            &self,
+            buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketLen>> {
+            self.inner.bucket_lens(buckets)
+        }
+        fn part_digests(
+            &self,
+            buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketPartDigests>> {
+            self.part_digests_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.part_digests(buckets)
+        }
+        fn entries_for_parts(
+            &self,
+            parts: Vec<BucketPart>,
+        ) -> futures::future::BoxFuture<'_, crate::store::PartEntries> {
+            self.inner.entries_for_parts(parts)
+        }
+        fn records_for(&self, keys: Vec<Bytes>) -> futures::future::BoxFuture<'_, Vec<WireRecord>> {
+            self.inner.records_for(keys)
+        }
+        fn snapshot_chunks(&self) -> futures::stream::BoxStream<'static, Vec<WireRecord>> {
+            self.inner.snapshot_chunks()
+        }
+        fn gc_tombstones(&self, any_member_absent: bool) -> futures::future::BoxFuture<'_, ()> {
+            self.inner.gc_tombstones(any_member_absent)
+        }
+        fn run_pending_tasks(&self) -> futures::future::BoxFuture<'_, ()> {
+            self.inner.run_pending_tasks()
+        }
+    }
+
+    /// A round's part-digest classification spans two [`CLASSIFY_BUCKET_CHUNK`]
+    /// chunks; the peer's `Mesh::ae_parts` call fails outright (an unknown
+    /// peer, never registered with this node's mesh). The first chunk's
+    /// failure must stop the loop: the second chunk's local
+    /// `ShardOps::part_digests` lookup -- which runs before any RPC, so it
+    /// is a faithful proxy for "this chunk was visited at all" -- must
+    /// never happen. Without the fix, both chunks are visited and this
+    /// node pays a second `REQUEST_TIMEOUT` for a peer that already proved
+    /// unreachable.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn classify_part_digest_mismatches_stops_issuing_ae_parts_after_the_first_chunk_fails() {
+        use super::super::test_support::{loopback_config, registered_shard};
+        use crate::store::Mode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let name = SmolStr::new("part-digest-chunk-break");
+        let cluster = Cluster::builder("cluster-it-part-digest-chunk-break")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("cluster builds alone");
+        cluster
+            .cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("opens alone, owning every bucket");
+
+        let part_digests_calls = Arc::new(AtomicUsize::new(0));
+        let shard: Arc<dyn ShardOps> = Arc::new(CountingPartDigestsShard {
+            inner: registered_shard(&cluster, &name),
+            part_digests_calls: Arc::clone(&part_digests_calls),
+        });
+
+        // Every bucket's local part digests are empty (nothing was ever
+        // written to this cache), so a non-empty remote digest list makes
+        // every one of them mismatched: `wanted_parts` is never empty and
+        // every chunk actually calls `Mesh::ae_parts`.
+        let bucket_count = CLASSIFY_BUCKET_CHUNK + 5;
+        let mismatches: Vec<AeMismatch> = (0..u16::try_from(bucket_count).expect("fits u16"))
+            .map(|bucket| AeMismatch::PartDigests(bucket, vec![1u64]))
+            .collect();
+
+        let unreachable_peer = NodeId::from(u64::MAX);
+        let mut plan = RepairPlan::default();
+        classify_part_digest_mismatches(
+            cluster.mesh(),
+            &shard,
+            &name,
+            unreachable_peer,
+            mismatches,
+            &mut plan,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            part_digests_calls.load(Ordering::SeqCst),
+            1,
+            "the loop must stop after the first chunk's ae_parts call fails, never reaching \
+             the second chunk's local part_digests lookup"
+        );
+        assert!(
+            plan.push_keys.is_empty() && plan.pull_keys.is_empty(),
+            "an unreachable peer repairs nothing"
+        );
+
+        cluster.shutdown().await;
+    }
+
     /// `n` distinct u32 keys, each landing in a different bucket: scans
     /// `0..` until `n` distinct [`bucket_of`] results are seen. Real-
     /// transport only, same reason as `encode_test_record` above.
@@ -1346,6 +1505,108 @@ mod tests {
             }
         }
         found
+    }
+
+    /// A round whose *listing/sketch*-mismatched set spans more than one
+    /// [`CLASSIFY_BUCKET_CHUNK`] internal chunk: `classify_bucket_mismatches`
+    /// chunks its shard-fetch-then-classify pass the same way
+    /// `classify_part_digest_mismatches` chunks its part-digest pass (see
+    /// `classify_part_digest_mismatches_repairs_every_bucket_across_more_than_
+    /// one_chunk` above), but until now only the part-digest path had a
+    /// real-transport test at more-than-one-chunk scale. One key per bucket,
+    /// each bucket's single entry keeping it under the default
+    /// `ae_sketch_min_bucket` (384) so every mismatch answers with
+    /// `AeMismatch::Bucket`, never `Sketch` or `PartDigests`. Every dropped
+    /// key, across more buckets than one chunk holds, must still come back.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn classify_bucket_mismatches_repairs_every_bucket_across_more_than_one_chunk() {
+        use super::super::test_support::{loopback_config, wait_for_peer_count, wait_until};
+        use crate::store::Mode;
+
+        let bucket_count = CLASSIFY_BUCKET_CHUNK + 5;
+        let targets = keys_in_distinct_buckets(bucket_count);
+        let target_keys: Vec<u32> = targets.iter().map(|(key, _)| *key).collect();
+
+        let config = loopback_config();
+        let cluster_a = Cluster::builder("cluster-it-ae-bucket-listing-chunked")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("a opens");
+
+        cache_a
+            .insert_many(target_keys.iter().map(|&k| (k, k.to_string())))
+            .await
+            .expect("a inserts before b ever joins");
+
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-ae-bucket-listing-chunked")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(30),
+            cluster_b
+                .cache::<u32, String>("users")
+                .mode(Mode::Replicated)
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+        assert_eq!(cache_b.entry_count().await, target_keys.len() as u64);
+
+        let node_a = cluster_a.node_id();
+        let node_b = cluster_b.node_id();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while cluster_a.peer_is_streaming(node_b) || cluster_b.peer_is_streaming(node_a) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replicate traffic settles within the bound");
+
+        for &key in &target_keys {
+            cache_b.invalidate_local(&key).await;
+        }
+        for &key in &target_keys {
+            assert_eq!(
+                cache_b.get(&key).await,
+                None,
+                "dropped before the round runs"
+            );
+        }
+
+        wait_until(
+            Duration::from_secs(25),
+            "anti-entropy repairs every dropped key even though their buckets span more than \
+             one classify_bucket_mismatches chunk",
+            async || {
+                let mut all_back = true;
+                for &key in &target_keys {
+                    if cache_b.get(&key).await.is_none() {
+                        all_back = false;
+                    }
+                }
+                all_back
+            },
+        )
+        .await;
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
     }
 
     /// Two real, joined `Mode::Distributed` nodes, both open on `name` and
