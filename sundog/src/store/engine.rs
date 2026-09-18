@@ -3753,9 +3753,9 @@ where
     /// The order this walks `stripe.live` in is the arena's dense insertion
     /// order (shifting under a swap-remove), not hashbrown's probe order,
     /// so two candidates tied on [`idle_elapsed_ms`] resolve to whichever
-    /// this order places last, not whichever slot order used to place
-    /// last. Nothing in this codebase treats that tie-break as a
-    /// contract: `evict_one_sampled_breaks_a_last_access_tie_by_arena_order`
+    /// this order places last: a concrete, undocumented tie-break. Nothing
+    /// in this codebase treats that tie-break as a contract:
+    /// `evict_one_sampled_breaks_a_last_access_tie_by_arena_order`
     /// pins today's concrete resolution as a regression guard, not as a
     /// documented guarantee.
     fn sample_candidates<'s>(
@@ -7221,9 +7221,8 @@ mod tests {
     /// after every step against this test's own `mirror`: independent proof
     /// that `get_by_bytes`, `keys`, `digests`, and `bucket_len` agree with
     /// each other and with what `apply_locked`'s LWW resolution and
-    /// eviction should leave live, regardless of whether `Stripe::live`
-    /// stores its entries in a `HashTable<Live<K, V>>` directly or, as it
-    /// does now, in a `Slab`. A small keyspace over a tight weight cap
+    /// eviction should leave live, regardless of `Stripe::live`'s internal
+    /// storage (a `Slab`). A small keyspace over a tight weight cap
     /// forces frequent overwrites and capacity-driven eviction on top of
     /// the explicit `evict_one_sampled` calls, so both eviction paths
     /// exercise the same `Slab`-backed removal `remove_live` and
