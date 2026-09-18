@@ -276,7 +276,7 @@ const MIN_MEM_AVAILABLE_FOR_64M_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Pure decision behind [`entry_diet_rss_budget_64m`]'s early skip:
 /// `mem_available_bytes` must both be readable and meet
-/// [`MIN_MEM_AVAILABLE_FOR_64M_BYTES`] — an unreadable `MemAvailable` (
+/// [`MIN_MEM_AVAILABLE_FOR_64M_BYTES`], an unreadable `MemAvailable` (
 /// `None`) gives no basis for judging headroom, so it counts as
 /// insufficient rather than being assumed fine.
 fn has_enough_ram_for_64m(mem_available_bytes: Option<u64>) -> bool {
@@ -344,7 +344,7 @@ const MMAP_THRESHOLD_BYTES: i32 = 64 * 1024;
 /// on `Drop`, rather than through the arena, where a previous scenario's
 /// same-sized-but-not-identical freed chunks can sit unreturned (`free()`
 /// alone never shrinks `VmRSS`) and inflate a later scenario's own
-/// reading by tens of bytes per entry — an artifact of two scenarios
+/// reading by tens of bytes per entry, an artifact of two scenarios
 /// sharing a process, not a real cost either one pays standalone. A no-op
 /// on a non-Linux target, where this file's other `/proc`-based readings
 /// already return `None` regardless.
@@ -637,7 +637,7 @@ const RSS_BUDGET_BYTES_64M: u64 = (4.55 * 1024.0 * 1024.0 * 1024.0) as u64;
 /// hinted at the exact entry count: measures at about 4.010 GiB, 67.3
 /// bytes per entry, essentially the same as the unhinted reading at this
 /// scale (unlike at [`RSS_BUDGET_ENTRIES`], where hinting the exact count
-/// costs a little more) — at 64,000,000 entries the per-stripe hint is
+/// costs a little more); at 64,000,000 entries the per-stripe hint is
 /// large enough that ordinary hash variance rarely pushes a stripe's real
 /// share past its reserved capacity. Set the same way as
 /// [`RSS_BUDGET_BYTES_64M`].
