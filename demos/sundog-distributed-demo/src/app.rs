@@ -46,7 +46,7 @@ impl App {
     pub(crate) fn convergence(&self) -> Convergence {
         let (total, live) = convergence::total_live_entries(&self.demo.nodes);
         let expected = convergence::expected_entries(
-            u64::from(self.demo.owners.get()),
+            u64::from(self.demo.topology.owners.get()),
             live,
             self.demo.state.surviving_keys(),
         );
@@ -111,19 +111,9 @@ impl App {
     fn spawn_restart(&self) {
         let node = Arc::clone(&self.demo.nodes[self.selected]);
         let feed_tx = self.demo.feed_tx.clone();
-        let cluster_name = self.demo.cluster_name.clone();
-        let seeds = self.demo.seeds.clone();
-        let owners = self.demo.owners;
+        let topology = self.demo.topology.clone();
         tokio::spawn(async move {
-            node.restart(
-                &cluster_name,
-                &seeds,
-                setup::AE_INTERVAL,
-                setup::TOMBSTONE_TTL,
-                owners,
-                &feed_tx,
-            )
-            .await;
+            node.restart(&topology, &feed_tx).await;
         });
     }
 }

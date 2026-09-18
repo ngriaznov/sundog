@@ -53,7 +53,8 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 3: 0.6. Adds distribution mode's [`Msg::Fetch`], [`Msg::FetchReply`],
 ///   [`Msg::FetchDeclined`], [`Msg::AeDigestScoped`], [`Msg::StBuckets`],
 ///   [`Msg::StBucketChunk`], [`Msg::ForwardBatch`], and [`Msg::StaleView`].
-pub const PROTOCOL_VERSION: u16 = 3;
+/// - 4: Adds [`Msg::StBucketDone`] and [`Msg::StBucketAck`].
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -75,6 +76,14 @@ pub const PROTOCOL_ST_UNAVAILABLE: u16 = 2;
 /// eligible to own a bucket in the first place, but the wire layer gates it
 /// regardless, as the hard guarantee.
 pub const PROTOCOL_DISTRIBUTED: u16 = 3;
+
+/// The protocol that introduced [`Msg::StBucketDone`] and
+/// [`Msg::StBucketAck`]: a donor gates sending the first on the requester's
+/// advertised protocol, and a receiver gates sending the second on the
+/// donor's. A peer speaking less never sees either message; the state
+/// transfer that bucket is part of falls back to today's whole-group
+/// release timing for that pull, exactly as protocol 3 behaves now.
+pub const PROTOCOL_ST_BUCKET_DONE_ACK: u16 = 4;
 
 /// Whether a peer speaking `peer_protocol` understands a message kind
 /// introduced in protocol `since`.
@@ -305,6 +314,32 @@ pub enum Msg {
         view_hash: u64,
         hops: u8,
         recs: Vec<WireRecord>,
+    },
+    /// Marks the donor's last chunk for one bucket of an [`Msg::StBuckets`]
+    /// group: "bucket `bucket` is fully sent." Sent on the same connection
+    /// right after that bucket's final [`Msg::StBucketChunk{done: false}`],
+    /// gated on the requester's advertised protocol. Lets the receiver
+    /// release that bucket from cold as soon as it lands, instead of
+    /// waiting for the whole group's trailing `done: true` chunk. Declared
+    /// last, after every variant that predates it, so their postcard
+    /// encodings stay unchanged. Introduced in protocol 4.
+    StBucketDone { cache: SmolStr, bucket: u16 },
+    /// Answers [`Msg::StBucketDone`]: "I applied and released `bucket`."
+    /// Best-effort: its absence (an older peer, a requester crash, a
+    /// connection break) is never an error, only a slower release via the
+    /// existing timer-and-confirming-AE-round path. `view_hash` is the
+    /// requester's own `OwnershipView` hash at the
+    /// moment it requested the buckets carrying this ack (the same value
+    /// sent on [`Msg::StBuckets`]): the donor discards the ack rather than
+    /// trusting it once its own current view hash has moved past that
+    /// value, so an ack from before a view change never counts toward a
+    /// bucket's release. Declared last, after every variant that predates
+    /// it, so their postcard encodings stay unchanged. Introduced in
+    /// protocol 4.
+    StBucketAck {
+        cache: SmolStr,
+        bucket: u16,
+        view_hash: u64,
     },
 }
 
@@ -1096,6 +1131,31 @@ mod tests {
             recs: Vec::new(),
             done: false,
         });
+    }
+
+    #[test]
+    fn st_bucket_done_ack_roundtrips() {
+        roundtrip(&Msg::StBucketDone {
+            cache: SmolStr::new("users"),
+            bucket: 42,
+        });
+    }
+
+    #[test]
+    fn st_bucket_ack_roundtrips() {
+        roundtrip(&Msg::StBucketAck {
+            cache: SmolStr::new("users"),
+            bucket: 1023,
+            view_hash: 0xDEAD_BEEF,
+        });
+    }
+
+    #[test]
+    fn a_protocol_three_peer_never_supports_st_bucket_done_ack() {
+        assert!(!peer_supports(3, PROTOCOL_ST_BUCKET_DONE_ACK));
+        assert!(!peer_supports(2, PROTOCOL_ST_BUCKET_DONE_ACK));
+        assert!(!peer_supports(1, PROTOCOL_ST_BUCKET_DONE_ACK));
+        assert!(peer_supports(4, PROTOCOL_ST_BUCKET_DONE_ACK));
     }
 
     #[test]

@@ -90,6 +90,14 @@ pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.0";
 /// way `SUNDOG_TESTNODE_AE_PART_MIN_BUCKET` etc. already are.
 pub const CRDT_RETIRE_AFTER_SECS_ENV: &str = "SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS";
 
+/// `RUST_LOG` for the distributed/join container tests: `info` broadly,
+/// `debug` on the cluster state-machine and `sundog::net` internals a
+/// rebalance/state-transfer/AE timeout needs in `eventually_with_logs`'s
+/// dump, and `chitchat=warn` to keep gossip chatter out of it.
+pub const DISTRIBUTED_RUST_LOG: &str = "info,sundog::cluster::rebalance=debug,\
+     sundog::cluster::state_transfer=debug,sundog::cluster::anti_entropy=debug,\
+     sundog::net=debug,sundog::ownership=debug,chitchat=warn";
+
 /// Builds the previous release's `sundog-testnode` from its git tag, once per
 /// test process, into `target/prev-release/` and returns the musl binary
 /// path. The tag is fetched if the clone lacks it, as a shallow CI checkout
@@ -237,12 +245,29 @@ impl Node {
         seeds: &[&str],
         owners: Option<u8>,
     ) -> Node {
+        Self::spawn_distributed_with_env(net, cluster_name, alias, seeds, owners, &[]).await
+    }
+
+    /// [`Node::spawn_distributed`] plus extra environment variables layered
+    /// on the `Mode::Distributed` defaults.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never becomes ready.
+    pub async fn spawn_distributed_with_env(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        owners: Option<u8>,
+        extra_env: &[(&str, &str)],
+    ) -> Node {
         let owners_str;
         let mut env = vec![("SUNDOG_TESTNODE_MODE", "distributed")];
         if let Some(owners) = owners {
             owners_str = owners.to_string();
             env.push(("SUNDOG_TESTNODE_OWNERS", owners_str.as_str()));
         }
+        env.extend_from_slice(extra_env);
         Self::spawn_with_env(net, cluster_name, alias, seeds, &env).await
     }
 
@@ -265,8 +290,71 @@ impl Node {
             alias,
             seeds,
             extra_env,
+            &[],
             bin,
             Wait::for_log_message(READY_LOG, 1),
+        )
+        .await
+    }
+
+    /// [`Node::spawn_with_env_and_wait`] plus `mounts`, each a
+    /// `(host_path, guest_path)` pair bind-mounted read-write into the
+    /// container, so a restart sees what the previous container left there.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never satisfies `wait`.
+    pub async fn spawn_with_env_mounts_and_wait(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        mounts: &[(&str, &str)],
+        wait: impl WaitStrategy + 'static,
+    ) -> Node {
+        Self::spawn_binary_with_wait(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            extra_env,
+            mounts,
+            build_testnode(),
+            wait,
+        )
+        .await
+    }
+
+    /// [`Node::spawn_with_env_mounts_and_wait`] running `bin` instead of
+    /// this checkout's test node.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never satisfies `wait`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a thin wrapper over spawn_binary_with_wait, itself already carrying the \
+                  same too-many-arguments allowance for the same reason: every parameter is \
+                  independent container-boot context"
+    )]
+    pub async fn spawn_binary_with_env_mounts_and_wait(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+        extra_env: &[(&str, &str)],
+        mounts: &[(&str, &str)],
+        bin: &Path,
+        wait: impl WaitStrategy + 'static,
+    ) -> Node {
+        Self::spawn_binary_with_wait(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            extra_env,
+            mounts,
+            bin,
+            wait,
         )
         .await
     }
@@ -296,6 +384,7 @@ impl Node {
             alias,
             seeds,
             extra_env,
+            &[],
             build_testnode(),
             wait,
         )
@@ -304,16 +393,25 @@ impl Node {
 
     /// The actual container-boot logic every `spawn*` constructor shares,
     /// parametrized on the readiness check so [`Node::spawn_with_env_and_wait`]
-    /// can substitute its own without duplicating the rest.
+    /// can substitute its own without duplicating the rest. `mounts`, each a
+    /// `(host_path, guest_path)` pair, is bind-mounted into the container
+    /// alongside the test-node binary.
     /// # Panics
     ///
     /// Panics if the container fails to start or never satisfies `wait`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every parameter is independent container-boot context every spawn* \
+                  constructor shares; grouping any subset into a struct would only rename the \
+                  same eight pieces of state"
+    )]
     async fn spawn_binary_with_wait(
         net: &Arc<Network>,
         cluster_name: &str,
         alias: &str,
         seeds: &[&str],
         extra_env: &[(&str, &str)],
+        mounts: &[(&str, &str)],
         bin: &Path,
         wait: impl WaitStrategy + 'static,
     ) -> Node {
@@ -329,6 +427,10 @@ impl Node {
             )
             .with_env("SUNDOG_SEEDS", &seeds.join(","))
             .with_command(&["/sundog-testnode", cluster_name]);
+        for &(host_path, guest_path) in mounts {
+            container = container
+                .with_copy_file_to_container(MountableFile::for_host_path(host_path), guest_path);
+        }
         for &(key, value) in extra_env {
             container = container.with_env(key, value);
         }
@@ -699,6 +801,17 @@ impl Node {
             .ok_or_else(|| format!("no header/body separator in metrics response: {response:?}"))
     }
 
+    /// This node's captured container logs (stdout/stderr). Never fails: a
+    /// backend error is folded into the returned string instead, since the
+    /// only caller is already mid-panic over a different failure.
+    #[must_use]
+    pub async fn logs(&self) -> String {
+        self.guard
+            .logs()
+            .await
+            .unwrap_or_else(|error| format!("<failed to fetch logs for {}: {error}>", self.name()))
+    }
+
     /// `crash`: sends the command, waits for the backend to confirm the
     /// container process died, then removes the (already-dead)
     /// container so `name()`'s alias is free for a fresh [`Node::spawn`].
@@ -782,6 +895,92 @@ where
     }
 }
 
+/// Substrings [`eventually_with_logs`] drops from a timeout's log dump: a
+/// leaked previous test's containers spam these at `warn`, crowding out
+/// the capped tail. Counted and reported rather than silently dropped.
+const CHITCHAT_MARKERS: [&str; 2] = [
+    "addressed to a different cluster",
+    "message rejected by peer: wrong cluster",
+];
+
+/// [`eventually`], but on a timeout, prints each node's captured logs (last
+/// 1500 lines, [`CHITCHAT_MARKERS`] filtered and counted) and its
+/// `sundog_`-prefixed Prometheus metrics to stderr before panicking, so CI
+/// carries enough tracing to diagnose the failure without reproducing it.
+/// # Panics
+///
+/// Panics if `cond` has not returned `true` by `timeout`.
+pub async fn eventually_with_logs<F, Fut>(timeout: Duration, nodes: &[&Node], mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    const TAIL_LINES: usize = 1500;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond().await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            for (index, node) in nodes.iter().enumerate() {
+                let logs = node.logs().await;
+                let mut chitchat_lines = 0usize;
+                let kept: Vec<&str> = logs
+                    .lines()
+                    .filter(|line| {
+                        let is_chitchat =
+                            CHITCHAT_MARKERS.iter().any(|marker| line.contains(*marker));
+                        if is_chitchat {
+                            chitchat_lines += 1;
+                        }
+                        !is_chitchat
+                    })
+                    .collect();
+                let tail: Vec<&str> = kept.iter().rev().take(TAIL_LINES).copied().collect();
+                eprintln!(
+                    "----- node[{index}] {} (last {} lines) -----",
+                    node.name(),
+                    tail.len()
+                );
+                if chitchat_lines > 0 {
+                    eprintln!(
+                        "  ({chitchat_lines} cross-cluster gossip chitchat line(s) filtered out \
+                         of this node's log, likely from a previous test's still-running \
+                         containers)"
+                    );
+                }
+                for line in tail.into_iter().rev() {
+                    eprintln!("{line}");
+                }
+                eprintln!("----- node[{index}] {} metrics -----", node.name());
+                match node.metrics().await {
+                    Ok(body) => {
+                        for line in body.lines() {
+                            if line.starts_with("# HELP") || line.starts_with("# TYPE") {
+                                continue;
+                            }
+                            let metric_name = line
+                                .split(|c: char| c == '{' || c.is_whitespace())
+                                .next()
+                                .unwrap_or("");
+                            if !metric_name.starts_with("sundog_")
+                                || metric_name.ends_with("_bucket")
+                            {
+                                continue;
+                            }
+                            eprintln!("{line}");
+                        }
+                    }
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+            panic!("condition not met within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Every `sundog-testnode` binds gossip on this fixed port; a seed string
 /// is `<alias>:<GOSSIP_PORT>`, resolved via DNS against the alias.
 pub const GOSSIP_PORT: u16 = 7946;
@@ -816,4 +1015,59 @@ pub async fn spawn_trio(net: &Arc<Network>, cluster_name: &str) -> (Node, Node, 
     let n3 = Node::spawn(net, cluster_name, "n3", &[&seed("n1"), &seed("n2")]).await;
     wait_for_peers(&[&n1, &n2, &n3], 2).await;
     (n1, n2, n3)
+}
+
+/// A `Vec<Node>` that stops every node it still holds, in a blocking
+/// [`Drop`]: a panic-only backstop so a failed test's containers stop
+/// gossiping into the next test's network instead of waiting on
+/// `rightsize::ContainerGuard`'s own backgrounded teardown.
+///
+/// A test pushes spawned nodes onto `fleet.0` and, on success, calls
+/// [`Fleet::take`] to stop them explicitly; `drop` only acts otherwise.
+pub struct Fleet(pub Vec<Node>);
+
+impl Fleet {
+    /// Empties the fleet and returns its nodes, for the success path to
+    /// stop explicitly, leaving `Fleet::drop` nothing to do.
+    pub fn take(&mut self) -> Vec<Node> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        let nodes = std::mem::take(&mut self.0);
+        if nodes.is_empty() {
+            return; // the success path already took them; nothing to stop.
+        }
+        // `Node::stop` is async, and this `Drop` may run inside a Tokio
+        // runtime, where `block_on` would panic rather than nest. A
+        // dedicated OS thread with its own runtime joins back instead.
+        let spawned = std::thread::Builder::new()
+            .name("fleet-panic-stop".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("invariant: a throwaway current-thread runtime always builds");
+                runtime.block_on(async move {
+                    for node in nodes {
+                        let name = node.name().to_string();
+                        if let Err(error) = node.stop().await {
+                            eprintln!("Fleet::drop: best-effort stop of {name} failed: {error}");
+                        }
+                    }
+                });
+            });
+        match spawned {
+            Ok(handle) => {
+                if handle.join().is_err() {
+                    eprintln!("Fleet::drop: the panic-stop thread itself panicked");
+                }
+            }
+            Err(error) => {
+                eprintln!("Fleet::drop: failed to spawn the panic-stop thread: {error}");
+            }
+        }
+    }
 }

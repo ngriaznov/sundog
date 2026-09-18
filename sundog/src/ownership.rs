@@ -236,6 +236,9 @@ impl OwnershipView {
 #[derive(Debug, Clone)]
 pub struct OwnershipTracker {
     view: watch::Receiver<Arc<OwnershipView>>,
+    /// This tracker's first computed view, kept distinct from the live
+    /// [`OwnershipTracker::current`] channel; see [`OwnershipTracker::baseline`].
+    baseline: Arc<OwnershipView>,
 }
 
 impl OwnershipTracker {
@@ -254,8 +257,12 @@ impl OwnershipTracker {
     ) -> (Self, watch::Sender<Arc<OwnershipView>>) {
         let eligible = eligible_owners(self_node, peers, modes, cache, k);
         let view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+        // Published here since a cache whose membership never changes again
+        // never gets a refresh_task publish to do it.
+        publish_owned_buckets(cache, &view, "ownership view seeded");
+        let baseline = Arc::clone(&view);
         let (tx, rx) = watch::channel(view);
-        (Self { view: rx }, tx)
+        (Self { view: rx, baseline }, tx)
     }
 
     /// The current view: a `watch::Receiver::borrow()` plus one cheap `Arc`
@@ -264,6 +271,16 @@ impl OwnershipTracker {
     #[must_use]
     pub fn current(&self) -> Arc<OwnershipView> {
         Arc::clone(&self.view.borrow())
+    }
+
+    /// This tracker's original seeded view, pinned for its whole lifetime.
+    /// `rebalance_task` diffs its first lost-bucket check against this
+    /// instead of a live re-borrow of the view channel, which could already
+    /// show a view `refresh_task` corrected before `rebalance_task` started
+    /// watching, missing a bucket only the seed view ever called owned.
+    #[must_use]
+    pub fn baseline(&self) -> Arc<OwnershipView> {
+        Arc::clone(&self.baseline)
     }
 
     /// A fresh subscription for a caller that awaits the next change, such
@@ -289,6 +306,12 @@ pub struct ResidencySet {
     /// answer a remote fetch's miss for them. Cleared bucket by bucket as
     /// each pull lands, or wholesale when the warm-up gives up.
     cold: RwLock<HashSet<u16>>,
+    /// Buckets a warm spill-tier reopen replayed from disk but not yet
+    /// verified against a live co-owner. Unlike `cold`, a bucket here may
+    /// hold a record a co-owner deleted during this node's downtime, so a
+    /// local hit isn't trusted until verification lands or every donor
+    /// turns out cold or unreachable, at which point this clears anyway.
+    unverified: RwLock<HashSet<u16>>,
 }
 
 impl Default for ResidencySet {
@@ -303,6 +326,7 @@ impl ResidencySet {
         Self {
             releasing: RwLock::new(HashMap::new()),
             cold: RwLock::new(HashSet::new()),
+            unverified: RwLock::new(HashSet::new()),
         }
     }
 
@@ -312,6 +336,9 @@ impl ResidencySet {
     }
 
     /// Clears the cold mark from each of `buckets`: their pull landed.
+    /// Production call sites use [`ResidencySet::mark_serving`] instead,
+    /// which clears this and `unverified` together; kept separate since the
+    /// two marks are independent state.
     pub(crate) fn clear_cold(&self, buckets: &[u16]) {
         let mut cold = self.cold.write();
         for bucket in buckets {
@@ -320,14 +347,59 @@ impl ResidencySet {
     }
 
     /// Clears every cold mark: the warm-up gave up, so what is here is what
-    /// there is.
+    /// there is. [`ResidencySet::mark_all_serving`] clears this and every
+    /// unverified mark together in production.
     pub(crate) fn clear_all_cold(&self) {
         self.cold.write().clear();
+    }
+
+    /// Clears the cold and unverified marks from `buckets` together: the
+    /// single point where this node starts trusting both a local miss and a
+    /// local hit in these buckets. Called from every site that decides a
+    /// bucket is ready to serve -- a donor pull landing, an eager
+    /// verification round, or every donor turning out cold or unreachable.
+    pub(crate) fn mark_serving(&self, buckets: &[u16]) {
+        self.clear_cold(buckets);
+        self.clear_unverified(buckets);
+    }
+
+    /// Wholesale analogue of [`ResidencySet::mark_serving`]: after
+    /// `warm_up_task`'s `WarmAnyway` give-up, every bucket still marked
+    /// cold or unverified is declared servable at once.
+    pub(crate) fn mark_all_serving(&self) {
+        self.clear_all_cold();
+        self.unverified.write().clear();
     }
 
     /// Whether `bucket` is owned here but not yet pulled.
     pub(crate) fn is_cold(&self, bucket: u16) -> bool {
         self.cold.read().contains(&bucket)
+    }
+
+    /// Marks each of `buckets` unverified: a warm spill-tier reopen just
+    /// replayed them from disk with no live co-owner check yet. `spill`-gated
+    /// since only `attach_spill_and_record_warm` calls it; `is_unverified`
+    /// and `clear_unverified` stay unconditional, since an always-empty set
+    /// already behaves correctly without the feature.
+    #[cfg(feature = "spill")]
+    pub(crate) fn mark_unverified(&self, buckets: &[u16]) {
+        self.unverified.write().extend(buckets.iter().copied());
+    }
+
+    /// Clears the unverified mark from `buckets`: either an eager
+    /// `reconcile_warm_buckets` round vouched for them, or the cold-pull
+    /// path landed fresh data.
+    pub(crate) fn clear_unverified(&self, buckets: &[u16]) {
+        let mut unverified = self.unverified.write();
+        for bucket in buckets {
+            unverified.remove(bucket);
+        }
+    }
+
+    /// Whether `bucket` was warm-reloaded and not yet verified against a
+    /// live co-owner; see [`ResidencySet::unverified`].
+    pub(crate) fn is_unverified(&self, bucket: u16) -> bool {
+        self.unverified.read().contains(&bucket)
     }
 
     /// Marks each of `buckets` as releasing, starting its grace clock. A
@@ -368,11 +440,27 @@ impl ResidencySet {
     }
 }
 
+/// Sets `cache`'s `sundog_owned_buckets` gauge to `view`'s owned-bucket
+/// count and logs it under `message`; used by both `OwnershipTracker::seed`
+/// and [`refresh_task`].
+fn publish_owned_buckets(cache: &SmolStr, view: &OwnershipView, message: &'static str) {
+    let owned = u32::try_from(view.owned_buckets().count()).unwrap_or(u32::MAX);
+    metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string()).set(f64::from(owned));
+    tracing::debug!(
+        cache = %cache,
+        self_node = %view.self_node,
+        view_hash = view.view_hash(),
+        owned_buckets = owned,
+        "{message}"
+    );
+}
+
 /// Recomputes and republishes `cache`'s view on every change to `cluster`'s
 /// live peer set or its advertised cache modes, for as long as `cancel`
 /// stays live. Spawned once [`Shard::with_ownership`](crate::store::Shard::with_ownership)
 /// has already installed `tx`'s receiver half, so this task's first publish
-/// is already the second view a reader could ever see, never the first.
+/// is already the second view a reader could ever see, never the first:
+/// [`OwnershipTracker::seed`] publishes the first view's gauge itself.
 /// Publishes with [`watch::Sender::send_if_modified`], keyed on
 /// `view_hash`, so a peer's unrelated gossip key changing never ripples
 /// through this cache: the `sundog_owned_buckets` gauge only moves on a
@@ -416,16 +504,7 @@ pub(crate) async fn refresh_task(
             }
         });
         if published {
-            let owned = u32::try_from(view.owned_buckets().count()).unwrap_or(u32::MAX);
-            metrics::gauge!("sundog_owned_buckets", "cache" => cache.to_string())
-                .set(f64::from(owned));
-            tracing::debug!(
-                cache = %cache,
-                self_node = %view.self_node,
-                view_hash = new_hash,
-                owned_buckets = owned,
-                "ownership view republished"
-            );
+            publish_owned_buckets(&cache, &view, "ownership view republished");
         }
     }
 }
@@ -744,6 +823,152 @@ mod tests {
     }
 
     #[test]
+    fn ownership_tracker_baseline_stays_the_seeded_view_even_after_a_later_publish() {
+        let self_node = NodeId::from(1);
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let cache = SmolStr::new("cache");
+        // The sole eligible node owns every bucket: the transient view
+        // open() computes while racing gossip convergence.
+        let (tracker, tx) = OwnershipTracker::seed(self_node, &[], &HashMap::new(), &cache, k);
+        let baseline_hash = tracker.baseline().view_hash();
+        assert_eq!(
+            tracker.baseline().owned_buckets().count(),
+            BUCKET_COUNT,
+            "the seeded, lone-node baseline owns every bucket"
+        );
+
+        // Simulates refresh_task correcting the view before a reader ever
+        // re-derives its own starting point from the channel.
+        let corrected = Arc::new(OwnershipView::compute(
+            self_node,
+            vec![self_node, NodeId::from(2)],
+            k,
+        ));
+        let corrected_hash = corrected.view_hash();
+        tx.send(Arc::clone(&corrected))
+            .expect("receiver still alive");
+
+        assert_eq!(
+            tracker.current().view_hash(),
+            corrected_hash,
+            "current tracks the latest publish"
+        );
+        assert_eq!(
+            tracker.baseline().view_hash(),
+            baseline_hash,
+            "baseline stays pinned to the tracker's original seeded view regardless of later \
+             publishes"
+        );
+    }
+
+    /// A `metrics::Recorder` that records every `sundog_owned_buckets` set
+    /// for one cache, so a test can observe a gauge publish without the
+    /// process-global recorder slot.
+    struct OwnedGaugeRecorder {
+        cache: String,
+        sets: Arc<parking_lot::Mutex<Vec<f64>>>,
+    }
+
+    struct OwnedGauge(Arc<parking_lot::Mutex<Vec<f64>>>);
+
+    impl metrics::GaugeFn for OwnedGauge {
+        fn increment(&self, _value: f64) {}
+        fn decrement(&self, _value: f64) {}
+        fn set(&self, value: f64) {
+            self.0.lock().push(value);
+        }
+    }
+
+    impl metrics::Recorder for OwnedGaugeRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            let this_cache = key
+                .labels()
+                .any(|l| l.key() == "cache" && l.value() == self.cache);
+            if key.name() != "sundog_owned_buckets" || !this_cache {
+                return metrics::Gauge::noop();
+            }
+            metrics::Gauge::from_arc(Arc::new(OwnedGauge(Arc::clone(&self.sets))))
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    #[test]
+    fn ownership_tracker_seed_publishes_the_owned_buckets_gauge_for_its_first_view() {
+        let self_node = NodeId::from(1);
+        let other = NodeId::from(2);
+        let k = NonZeroU8::new(1).expect("nonzero");
+        let cache = SmolStr::new("seeded");
+        let sets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder = OwnedGaugeRecorder {
+            cache: cache.to_string(),
+            sets: Arc::clone(&sets),
+        };
+        let modes = modes_with(&[(other, "seeded", Mode::Distributed { owners: k })]);
+        let peers = vec![peer(2, wire::PROTOCOL_DISTRIBUTED)];
+        // The view once open()'s membership wait lands a peer; membership
+        // won't change again so this seed is the only publish.
+        let (tracker, _tx) = metrics::with_local_recorder(&recorder, || {
+            OwnershipTracker::seed(self_node, &peers, &modes, &cache, k)
+        });
+        let owned =
+            f64::from(u32::try_from(tracker.current().owned_buckets().count()).expect("fits u32"));
+        assert_eq!(
+            sets.lock().as_slice(),
+            &[owned],
+            "the seed sets the gauge once, to the seeded view's owned-bucket count"
+        );
+        let total = f64::from(u32::try_from(BUCKET_COUNT).expect("fits u32"));
+        assert!(
+            owned > 0.0 && owned < total,
+            "one owner over two nodes is a real split of the bucket space, not all or nothing: \
+             {owned} of {total}"
+        );
+    }
+
+    #[test]
     fn residency_set_is_releasing_tracks_marked_buckets() {
         let set = ResidencySet::new();
         assert!(!set.is_releasing(3));
@@ -771,6 +996,72 @@ mod tests {
         assert!(set.is_cold(1) && !set.is_cold(2) && set.is_cold(3));
         set.clear_all_cold();
         assert!(!set.is_cold(1) && !set.is_cold(3));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_set_unverified_marks_clear_per_bucket_and_are_distinct_from_cold() {
+        let set = ResidencySet::new();
+        assert!(!set.is_unverified(1));
+
+        set.mark_unverified(&[1, 2, 3]);
+        assert!(set.is_unverified(1) && set.is_unverified(2) && set.is_unverified(3));
+        assert!(
+            !set.is_cold(1),
+            "unverified and cold are separate marks: marking one never marks the other"
+        );
+
+        set.clear_unverified(&[2]);
+        assert!(set.is_unverified(1) && !set.is_unverified(2) && set.is_unverified(3));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_set_cold_and_unverified_clear_independently() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1]);
+        set.mark_unverified(&[1]);
+        assert!(set.is_cold(1) && set.is_unverified(1));
+
+        // cold and unverified clear independently; only mark_serving
+        // clears both together.
+        set.clear_cold(&[1]);
+        assert!(!set.is_cold(1) && set.is_unverified(1));
+
+        set.mark_cold(&[1]);
+        set.clear_unverified(&[1]);
+        assert!(set.is_cold(1) && !set.is_unverified(1));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_set_mark_serving_clears_both_cold_and_unverified_together() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1, 2]);
+        set.mark_unverified(&[1]);
+        assert!(set.is_cold(1) && set.is_cold(2) && set.is_unverified(1));
+
+        // mark_serving clears whichever marks a bucket carries.
+        set.mark_serving(&[1, 2]);
+        assert!(!set.is_cold(1) && !set.is_cold(2) && !set.is_unverified(1));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn residency_set_mark_all_serving_clears_every_cold_and_unverified_mark() {
+        let set = ResidencySet::new();
+        set.mark_cold(&[1, 2, 3]);
+        set.mark_unverified(&[2, 3]);
+        set.mark_releasing(&[9]);
+
+        set.mark_all_serving();
+
+        assert!(!set.is_cold(1) && !set.is_cold(2) && !set.is_cold(3));
+        assert!(!set.is_unverified(2) && !set.is_unverified(3));
+        assert!(
+            set.is_releasing(9),
+            "mark_all_serving touches only the cold and unverified marks"
+        );
     }
 
     #[test]

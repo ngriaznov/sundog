@@ -134,7 +134,9 @@ pub struct ClusterConfig {
     /// out opens cold, declining to donate, and keeps pulling in the
     /// background every `ae_interval`; after three timed-out pulls it opens
     /// warm with what landed. Zero is honored: `open()` skips the transfer
-    /// entirely and the cache is warm with what it has.
+    /// entirely and the cache is warm with what it has. A warm reopen's
+    /// reconciliation loop (see [`reconcile_byte_budget`](Self::reconcile_byte_budget))
+    /// also runs on this bound.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
     pub state_transfer_budget: Duration,
@@ -195,6 +197,43 @@ pub struct ClusterConfig {
     /// opens for a `Mode::Distributed` cache, so a mass membership change
     /// can't spawn dozens of concurrent transfers at once. Default: 4.
     pub rebalance_concurrency: usize,
+    /// Target size in bytes for `st_bucket_chunks` sub-batches of a
+    /// bucket's key list. Default: 1 MiB.
+    /// [`rebalance_chunk_bytes_value`](Self::rebalance_chunk_bytes_value)
+    /// clamps this to `MAX_FRAME - SNAPSHOT_CHUNK_ENVELOPE_HEADROOM` so a
+    /// `Msg::StBucketChunk` frame can't exceed the wire cap.
+    pub rebalance_chunk_bytes: u64,
+    /// How long a `Msg::StBucketAck` is trusted as proof a bucket is
+    /// reconciled, before `buckets_to_release` falls back to the
+    /// timer-and-anti-entropy path. Default: 60s, twice
+    /// [`ae_interval`](Self::ae_interval); an ack predating the current
+    /// `OwnershipView` is never trusted.
+    /// [`rebalance_ack_window_value`](Self::rebalance_ack_window_value)
+    /// bounds this by `distributed_disown_grace_rounds * ae_interval` -- an
+    /// ack only speeds up confirmation, never bypasses the grace-round
+    /// floor.
+    pub rebalance_ack_window: Duration,
+    /// Backlog capacity, in keys, for a cache's fan-out queue. An async
+    /// write (`Cache::insert` and friends) awaits room under this cap, up
+    /// to [`fan_out_wait_timeout`](Self::fan_out_wait_timeout), then
+    /// proceeds anyway over capacity -- the write always lands, and
+    /// overflow is counted in `sundog_fan_out_wait_timeouts_total{cache}`.
+    /// The synchronous push path (`Cache::insert_sync`, `remove_sync`,
+    /// `Shard::apply`) never waits on this. Must be nonzero:
+    /// `ClusterBuilder::build` rejects zero. Default: 262,144.
+    pub fan_out_backlog_capacity: usize,
+    /// How long an async write waits for room under
+    /// [`fan_out_backlog_capacity`](Self::fan_out_backlog_capacity) before
+    /// proceeding regardless. Default: 30s.
+    pub fan_out_wait_timeout: Duration,
+    /// Per-peer wire-byte budget for a warm reopen's reconciliation loop
+    /// (`Cache::reconcile_warm_buckets`). A peer's still-diverging buckets
+    /// fall through to the cold-pull path once its rounds push and pull
+    /// this many bytes, paired with the round cap in
+    /// [`state_transfer_budget`](Self::state_transfer_budget). Sized so a
+    /// bucket's full listing fits in a handful of rounds without letting a
+    /// re-diverging peer stall `open()` indefinitely. Default: 32 MiB.
+    pub reconcile_byte_budget: u64,
 }
 
 impl ClusterConfig {
@@ -240,6 +279,30 @@ impl ClusterConfig {
         CompactionBounds::new(self.crdt_retire_after, self.crdt_sweep_period())
     }
 
+    /// [`rebalance_chunk_bytes`](Self::rebalance_chunk_bytes) clamped to
+    /// `MAX_FRAME - SNAPSHOT_CHUNK_ENVELOPE_HEADROOM`.
+    #[must_use]
+    pub fn rebalance_chunk_bytes_value(&self) -> u64 {
+        let cap = (MAX_FRAME - crate::store::SNAPSHOT_CHUNK_ENVELOPE_HEADROOM) as u64;
+        self.rebalance_chunk_bytes.min(cap)
+    }
+
+    /// Upper bound for [`rebalance_ack_window`](Self::rebalance_ack_window):
+    /// `distributed_disown_grace_rounds * ae_interval`.
+    #[must_use]
+    pub fn rebalance_ack_window_max(&self) -> Duration {
+        self.ae_interval
+            .saturating_mul(self.distributed_disown_grace_rounds)
+    }
+
+    /// [`rebalance_ack_window`](Self::rebalance_ack_window) clamped to
+    /// [`rebalance_ack_window_max`](Self::rebalance_ack_window_max).
+    #[must_use]
+    pub fn rebalance_ack_window_value(&self) -> Duration {
+        self.rebalance_ack_window
+            .min(self.rebalance_ack_window_max())
+    }
+
     /// Applies `f` to a mutable borrow of `self` and returns it: how code
     /// outside this crate overrides a subset of fields on
     /// [`ClusterConfig::default`] without breaking when a field is added.
@@ -280,6 +343,11 @@ impl Default for ClusterConfig {
             distributed_disown_grace_rounds: 3,
             fetch_timeout: Duration::from_millis(750),
             rebalance_concurrency: 4,
+            rebalance_chunk_bytes: 1024 * 1024,
+            rebalance_ack_window: Duration::from_secs(60),
+            fan_out_backlog_capacity: 262_144,
+            fan_out_wait_timeout: Duration::from_secs(30),
+            reconcile_byte_budget: 32 * 1024 * 1024,
         }
     }
 }
@@ -372,6 +440,58 @@ mod tests {
     #[test]
     fn default_rebalance_concurrency_is_four() {
         assert_eq!(ClusterConfig::default().rebalance_concurrency, 4);
+    }
+
+    #[test]
+    fn default_rebalance_chunk_bytes_is_one_mebibyte_and_under_max_frame() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.rebalance_chunk_bytes, 1024 * 1024);
+        assert!(config.rebalance_chunk_bytes_value() < MAX_FRAME as u64);
+        assert_eq!(
+            config.rebalance_chunk_bytes_value(),
+            config.rebalance_chunk_bytes
+        );
+    }
+
+    #[test]
+    fn rebalance_chunk_bytes_value_clamps_a_value_over_the_wire_cap() {
+        let config = ClusterConfig::default().with(|c| {
+            c.rebalance_chunk_bytes = MAX_FRAME as u64 * 4;
+        });
+        assert!(config.rebalance_chunk_bytes_value() < MAX_FRAME as u64);
+        assert!(config.rebalance_chunk_bytes_value() < config.rebalance_chunk_bytes);
+    }
+
+    #[test]
+    fn default_rebalance_ack_window_is_bounded_by_disown_grace() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.rebalance_ack_window, Duration::from_secs(60));
+        assert_eq!(
+            config.rebalance_ack_window,
+            config.ae_interval * 2,
+            "documented default is twice ae_interval"
+        );
+        assert!(config.rebalance_ack_window_value() <= config.rebalance_ack_window_max());
+        assert_eq!(
+            config.rebalance_ack_window_value(),
+            config.rebalance_ack_window
+        );
+    }
+
+    #[test]
+    fn rebalance_ack_window_value_is_bounded_by_disown_grace_rounds_times_ae_interval() {
+        let config = ClusterConfig::default().with(|c| {
+            c.rebalance_ack_window = Duration::from_secs(3600);
+        });
+        assert_eq!(
+            config.rebalance_ack_window_max(),
+            config.ae_interval * config.distributed_disown_grace_rounds
+        );
+        assert_eq!(
+            config.rebalance_ack_window_value(),
+            config.rebalance_ack_window_max()
+        );
+        assert!(config.rebalance_ack_window_value() < config.rebalance_ack_window);
     }
 
     #[test]
@@ -469,5 +589,39 @@ mod tests {
             root_ca_certs: vec![cert],
         };
         assert_eq!(tls.clone(), tls);
+    }
+
+    #[test]
+    fn default_fan_out_backlog_capacity_is_262_144() {
+        assert_eq!(ClusterConfig::default().fan_out_backlog_capacity, 262_144);
+    }
+
+    #[test]
+    fn default_fan_out_wait_timeout_is_thirty_seconds() {
+        assert_eq!(
+            ClusterConfig::default().fan_out_wait_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn default_reconcile_byte_budget_is_32_mebibytes() {
+        assert_eq!(
+            ClusterConfig::default().reconcile_byte_budget,
+            32 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn with_overrides_fan_out_backlog_capacity_independently() {
+        let config = ClusterConfig::default().with(|c| {
+            c.fan_out_backlog_capacity = 10;
+        });
+        assert_eq!(config.fan_out_backlog_capacity, 10);
+        assert_eq!(
+            config.fan_out_wait_timeout,
+            ClusterConfig::default().fan_out_wait_timeout,
+            "overriding the new capacity knob leaves the wait timeout at its default"
+        );
     }
 }

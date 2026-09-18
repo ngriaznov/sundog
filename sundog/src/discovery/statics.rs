@@ -48,6 +48,14 @@ impl Static {
         self
     }
 
+    /// Whether this seed list names at least one address, explicit or from
+    /// `SUNDOG_SEEDS`: `Cluster::builder(..).seeds(std::iter::empty())` with
+    /// no env fallback is a deliberately seedless, standalone cluster, not
+    /// a race to wait out.
+    pub(crate) fn has_seeds(&self) -> bool {
+        !self.specs.is_empty()
+    }
+
     fn from_specs(specs: impl IntoIterator<Item = String>) -> Self {
         let mut seen = HashSet::new();
         let deduped: Vec<String> = specs
@@ -123,6 +131,18 @@ mod tests {
         let discovery =
             Static::from_specs([a.to_string(), a.to_string(), "127.0.0.1:4001".to_string()]);
         assert_eq!(discovery.specs.len(), 2);
+    }
+
+    #[test]
+    fn has_seeds_reflects_whether_any_spec_survived_dedup() {
+        assert!(
+            !Static::from_specs(std::iter::empty::<String>()).has_seeds(),
+            "an empty spec list has no seeds"
+        );
+        assert!(
+            Static::from_specs(["127.0.0.1:4000".to_string()]).has_seeds(),
+            "one explicit spec is a seed"
+        );
     }
 
     #[tokio::test]

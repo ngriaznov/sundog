@@ -3,6 +3,347 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Entry diet**: a live entry stores one encoded record (key length, key,
+  and value in the postcard form the wire already uses) instead of a typed
+  key and value plus a separate encoded copy, and that record is an enum,
+  inline for records up to 30 bytes and boxed beyond, so a short key and
+  value need no heap allocation at all. The version's three fields sit on
+  the entry itself, with the logical counter packed beside the weight, and
+  `Live::ver` reassembles an `Hlc` for every comparison; `Live` is 72 bytes
+  without spill. Measured on a 4-core box: 4M entries in one local cache
+  settle at 177 bytes per entry against 522 before, the 3-node 4M-key
+  harness settles at 3.24 GiB against 5.26 GiB before under glibc, and
+  local read latency drops from 0.538 to 0.296 microseconds. The entry diet
+  bench (`SUNDOG_BENCH=1 cargo test --release -p sundog --test
+  entry_diet_bench`) pins both the size and the latency.
+- **Entry diet, phase A, a packed `Live`**: a live entry's record inlines up
+  to 22 bytes instead of 30, folding the enum discriminant into a 24-byte
+  `Record` with no separate tag; the expiry packs into a `u32` delta above
+  the entry's own `wall_ms`, with a per-stripe side table holding the exact
+  absolute deadline for the rare TTL past `u32::MAX` milliseconds (about
+  49.71 days); the last-access timestamp packs into a `u32` touch stamp,
+  read back only through a wrapping-subtraction helper that stays correct
+  across a stamp rollover, including in sampled eviction's coldest-entry
+  pick. `Live` sits at 56 bytes without spill, 80 with it. `wall_ms`,
+  `node` (the full 64-bit `NodeId`), and `logical` keep their full width:
+  `node` must stay bit-identical across independently computed replica
+  merges, and `logical` mints past `u32::MAX` on every merge-driven
+  compaction with no periodic reset. Every TTL keeps millisecond
+  precision, on both sides of the inline delta's own ~49.71-day ceiling,
+  and reads stay TTL-blind. No wire change: `wire::PROTOCOL_VERSION` and
+  `WireRecord` stay exactly as they are; only the in-RAM entry encoding
+  changes.
+- **Entry diet, phase B, a `Slab` replaces `Stripe::live`'s hash table**:
+  `Stripe::live` (`sundog/src/store/engine.rs`) is a `Slab<K, V>`, a dense
+  `Vec<Live<K, V>>` arena plus a `HashTable<u32>` index mapping each live
+  key's hash to its arena slot, in place of a `HashTable<Live<K, V>>`
+  holding entries directly. `Slab::remove` swap-removes an entry and fixes
+  the moved entry's index row in the same call, under the stripe's own
+  lock, so the arena stays dense with no holes and `entries.len()` is
+  always the exact live count; every full-stripe walker (digest XOR,
+  snapshot and state-transfer, sampled eviction, sweep's retain,
+  `release_buckets`' drain) iterates the arena directly with no liveness
+  check. An idle index bucket costs about 5 bytes against the roughly 73
+  bytes an idle `Live`-holding bucket costs at the same load factor, since
+  the index stores a 4-byte slot number instead of a 56-byte `Live`. On
+  the entry diet bench's profile (`Cache<String, String>`, 8-byte keys and
+  values, 4,000,000 entries, one node, `Mode::Local`, glibc, a 4-core
+  box), live heap drops to 69.4 bytes per entry (119.5 after phase A
+  alone) and the settled resident set drops to 0.305 GiB, about 81 bytes
+  per entry; read p50 stays at 0.24-0.28 microseconds, inside the
+  existing 0.616-microsecond ceiling, with no measurable cost from the
+  slab's extra index-then-arena dereference on this profile.
+  `entry_diet_rss_budget`'s `RSS_BUDGET_BYTES` tightens from 0.6 GiB to
+  0.35 GiB to match. No public API change, no wire change, no
+  `BUCKET_COUNT` change: this is an intra-stripe storage change the
+  mixed-version container test needs no new gate for.
+- **`CacheBuilder::capacity_hint`**: hints this shard's expected local
+  entry count so each of `BUCKET_COUNT` stripes' `Slab` (arena and index)
+  preallocates up front instead of growing one insert at a time. `None`,
+  the default, keeps today's zero-allocation-until-first-write behavior
+  exactly. `open()` clamps the hint to `max_capacity` unless a weigher is
+  configured, since a weigher turns `max_capacity` into a weight budget
+  rather than an entry count. An oversized hint costs memory rather than
+  correctness: `Engine::compact`'s existing paced pass reclaims a stripe
+  left far below its own reserved capacity, from an inflated hint or from
+  ownership rebalancing draining it, via a new `should_shrink_stripe`
+  check and a `Slab::shrink_to_fit` call. `demos/sundog-distributed-demo`
+  and `sundog-testnode` each pass `capacity_hint` the same per-node figure
+  they already pass `max_capacity`. The entry diet bench's
+  `entry_diet_rss_budget` runs a hinted 4,000,000-entry pass beside the
+  unhinted one (74.7 unhinted, 77.3 hinted bytes per entry on a 4-core
+  glibc box, both under the 90-byte target) and a 64,000,000-entry variant
+  of both (67.4 unhinted, 67.3 hinted, confirming the byte cost holds or
+  improves at scale rather than climbing), and a new
+  `entry_diet_rss_budget_heap_shape` measures a 16-byte-key/100-byte-value
+  shape at 209.6 bytes per entry, inside Redis 7's own 195-230
+  bytes/copy practical range for the same shape. The README's new Memory
+  per entry section lays out both shapes against Redis 7's computed and
+  practical figures, with the exact commands to reproduce either side.
+- **Converge-before-serving reconciliation for a warm spill reopen**:
+  `reconcile_warm_buckets` groups every warm-reloaded bucket by its live
+  co-owners and, per co-owner, loops a bucket-scoped anti-entropy round
+  (`anti_entropy::run_round_for_buckets`) over that peer's still-diverging
+  buckets until the peer's digest exchange itself reports no mismatch for
+  a bucket, up to three rounds that ran, `ClusterConfig::reconcile_byte_budget`
+  (default 32 MiB) wire bytes pushed and pulled, or
+  `ClusterConfig::state_transfer_budget` of wall time, whichever the
+  peer's loop hits first. A round the peer fails or answers stale, as every
+  co-owner does at a restart until its ownership view catches up to the
+  node rejoining, never counts as a round: the loop retries it after a
+  backoff from 200 ms doubling per consecutive failure up to `ae_interval`,
+  while the peer stays live and the wait ends inside the time budget.
+  On the 3-node 4M-key harness the restarted node's first round against each
+  co-owner comes back stale, and two rounds after a 200 ms backoff mark all
+  672 replayed buckets serving with none left unverified, the gate
+  satisfied.
+  Different peers' loops
+  run concurrently, so the step's worst case stays bounded by one peer's
+  budget however many live co-owners a node's warm buckets span. A bucket
+  clears cold and unverified via `ResidencySet::mark_serving` the instant
+  its digest matches a live co-owner's; a bucket whose loop exhausts the
+  budget against every live co-owner, or that has no live co-owner at all,
+  keeps both marks exactly as `attach_ownership` set them and falls through
+  to the ordinary cold-pull path, which alone decides whether to trust and
+  serve it, and a failed round never reports a bucket converged. A round
+  classifies its bucket and part-digest mismatches in chunks of 64 buckets,
+  so no round materializes more than one chunk's listings at once. The
+  warm-reopen cluster suite drives a mass overwrite across most buckets
+  while a node is down and reads back only current values after its
+  reopen.
+- **jemalloc in the demo and the test node**: `demos/sundog-distributed-demo`
+  and `sundog-testnode` both set `tikv_jemallocator::Jemalloc` as their
+  global allocator on every target but MSVC Windows; the `sundog` library
+  itself sets none, leaving the choice to whatever embeds it. glibc's
+  arenas keep the preload's and anti-entropy's transient buffers resident
+  past the point they're needed; jemalloc returns that memory. On the
+  3-node 4M-key harness the demo settles at 1.70 GiB against 3.24 GiB under
+  glibc, and preload throughput rises from 1.49M to 1.66M keys/s.
+- **Distributed demo sizing, metrics, report and gate flags**: `--value-bytes
+  <N>` pads every preload and load value out to N bytes. `--max-entries
+  <N>` caps live entries per node, and needs `--spill-dir <PATH>` (with
+  `--spill-capacity-mb`, `--spill-region-mb`, and `--spill-flush-queue-mb`,
+  all in mebibytes) to size the spill tier that catches what the cap
+  evicts; both need the demo built with `--features spill`. `--metrics`
+  (or `--metrics-interval-secs <N>`, which implies it) installs the
+  process-wide Prometheus recorder before any node opens and prints an
+  in-process `sundog_*` status line every interval during a `--headless`
+  run, needing `--features prometheus`. `--report-json <PATH>` writes a
+  JSON summary of a headless run (RSS, fetch latency, the sample check,
+  convergence, and the summed `sundog_*` totals) at the end of the run.
+  `--gate <PATH>` reads a JSON threshold file of the same shape, checks the
+  run's report against it, and exits nonzero listing every violated
+  threshold. Both need `--metrics`.
+- **Test node sizing knobs**: `sundog-testnode` reads
+  `SUNDOG_TESTNODE_MAX_ENTRIES` as an entry-count cap on `"it"`, alongside
+  the existing byte-denominated `SUNDOG_TESTNODE_MAX_CAPACITY_BYTES` (which
+  wins when both are set), and `SUNDOG_TESTNODE_SPILL_CAPACITY_MB`,
+  `SUNDOG_TESTNODE_SPILL_REGION_MB`, and
+  `SUNDOG_TESTNODE_SPILL_FLUSH_QUEUE_MB` as mebibyte-denominated
+  counterparts of the existing `_BYTES` spill sizing variables (each byte
+  variable still wins when both are set), mirroring the distributed demo's
+  own `--max-entries`/`--spill-capacity-mb`/`--spill-region-mb`/
+  `--spill-flush-queue-mb` flags.
+- `sundog_rebalance_pull_timeouts_total{cache}`: a `Mode::Distributed`
+  cache's seventh Prometheus metric, counting warm-ups that gave up on a
+  bucket pull timing out repeatedly and opened warm with whatever landed,
+  leaving the rest to anti-entropy.
+- **Spill flush-queue admission control**: a semaphore, sized from
+  `SpillConfig::flush_queue_bytes_value()`, tracks the flush queue's byte
+  budget in place of a plain counter. `Shard::insert_many`/`remove_many`
+  and `ShardOps::apply_remote_batch` (live replication, anti-entropy pull
+  repair, and every rebalance/state-transfer pull) reserve one batch's
+  worth of flush-queue room, once per call, before taking any stripe
+  lock, and wait up to `SpillConfig::spill_wait_timeout` (a new builder
+  method and accessor, `Duration::from_secs(2)` by default,
+  `Duration::ZERO` a documented opt-out) for room to free up instead of
+  refusing the eviction outright. That one reservation is sized only from
+  the call's own new bytes, so it can still run short against a real
+  backlog a lagging flusher left behind from earlier calls; when it does,
+  the call retries with a fresh reservation for exactly the shortfall,
+  against the same call's overall `spill_wait_timeout` budget. Every
+  entry this covers stays resident while the retry is still within
+  budget, never dropped for a shortfall the retry could still pay down;
+  once the budget runs out, the shortfall resolves through the same
+  ordinary, non-blocking refusal any unreserved write already uses, so
+  `SpillTier::set_keep_resident_when_refused`'s policy decides the
+  victim's fate exactly as it always has rather than leaving it resident
+  regardless of that policy. **This is a real behavior change for
+  every existing spill deployment**: `SpillConfig::new(...)` with no
+  override moves from always refusing an eviction instantly under
+  backpressure to waiting up to two seconds for room first; a cache
+  opened with no `SpillConfig` sees no change at all. The flush channel's
+  slot count scales with `flush_queue_bytes_value()` too (clamped to a
+  floor at the existing fixed 8192 slots and a ceiling that bounds a
+  pathological config), rather than staying fixed regardless of
+  configuration, since a fixed slot count fills, for small records, long
+  before the byte budget does. Three new metrics cover the wait itself:
+  `sundog_spill_wait_seconds_total{cache}` (a counter, whole seconds),
+  `sundog_spill_waiters{cache}` (a gauge), and
+  `sundog_spill_wait_timeouts_total{cache}` (a counter, incremented only
+  when the wait itself times out). `sundog_spill_dropped_total` gains a
+  `reason="disk_error"` value, incremented for every job in a segment
+  whose write fails; the victim stays resident on this path exactly as
+  every other refusal reason leaves it, so this counter is the only
+  visible sign of the failure.
+- **Fan-out backpressure, on both the send and the write side**: a live
+  peer's replicate frame is never dropped. `net::Mesh::send_frames_awaiting`
+  now waits for outbox room in `FAN_OUT_SEND_DEADLINE` (2s) slices for as
+  long as the target peer stays live in the mesh's peer table, logging each
+  timed-out slice at debug and counting it, in whole seconds, in the new
+  `sundog_fan_out_wait_seconds_total{peer}`, instead of giving up; only a
+  peer that has actually left the table (or whose outbox channel has
+  already closed) falls back to today's drop-and-count-and-warn path
+  against `sundog_backlog_dropped_total`. On the write side, `ClusterConfig`
+  gains `fan_out_backlog_capacity` (a new `usize` field, 262,144 keys
+  default, validated nonzero; `ClusterBuilder::build` rejects zero) and
+  `fan_out_wait_timeout` (a new `Duration` field, 30s default): every async
+  write (`insert`, `insert_with_ttl`, `insert_many`, `insert_many_with_ttl`,
+  `remove`, `remove_many`, and `merge`'s immediate-apply path) awaits room
+  in the shard's fan-out queue below that capacity, up to the timeout,
+  before pushing, so a stalled fan-out grows in memory instead of without
+  bound. The write always lands regardless: past the timeout it proceeds
+  anyway, over capacity, counted in the new
+  `sundog_fan_out_wait_timeouts_total{cache}`. A new gauge,
+  `sundog_fan_out_backlog{cache}`, exposes the queue's current length. The
+  synchronous write paths (`insert_sync`, `remove_sync`, `Shard::apply`)
+  keep pushing without waiting, as before; a default-configured caller who
+  never hits either new limit sees no behavior change. The distributed
+  demo's `--report-json` gains `backlog_dropped` (`sundog_backlog_dropped_total`
+  summed across peers) and `fan_out_wait_timeouts`
+  (`sundog_fan_out_wait_timeouts_total` summed across caches), and its
+  `--gate` file gains `max_backlog_dropped` (optional, an older gate file
+  with the field absent skips the check exactly as before);
+  `ops/scale-gate.json` sets it to 0.
+- **Scale workflow**: `.github/workflows/scale.yml` runs the distributed
+  demo headless overnight (and on demand via `workflow_dispatch`, with
+  `keys`, `duration_secs`, `max_entries`, and `runner` inputs) at 4M keys,
+  three nodes, two owners, 256-byte values, an 800k-entry RAM cap per node
+  over a spill tier, and checks the resulting report against
+  `ops/scale-gate.json`'s thresholds: steady RSS at most 4.5 GiB, peak RSS
+  at most 5.6 GiB, at most 100,000 deferred spill drops, zero pull
+  timeouts, fetch p99 at most 100 milliseconds, full convergence, and a
+  fully passing sample check. It uploads the run's `scale-report.json` and
+  log as workflow artifacts either way.
+- **Chunked bucket pull with independent per-bucket release**: a rebalance
+  donor sub-batches each bucket's key list by `rebalance_chunk_bytes` (a new
+  `ClusterConfig` field, 1 MiB default, clamped below `MAX_FRAME`) instead
+  of materializing a whole bucket's records at once, bounding donor RAM to
+  that budget times `rebalance_concurrency` regardless of bucket size.
+  `wire::PROTOCOL_VERSION` bumps to 4, adding `Msg::StBucketDone` and
+  `Msg::StBucketAck`, gated on `wire::PROTOCOL_ST_BUCKET_DONE_ACK`; a
+  protocol-3 peer on either side of a connection sees byte-for-byte today's
+  traffic. The donor signals a bucket's completion the instant its own last
+  chunk goes out, and the receiver clears that bucket's cold mark and
+  serves it immediately rather than waiting on the rest of its transfer
+  group. The receiver's `Msg::StBucketAck`, trusted for a new bounded
+  `rebalance_ack_window` (default `2 * ae_interval`), lets the donor skip a
+  redundant confirming anti-entropy round before release; `disown_grace`
+  stays the hard floor underneath either way, so a bucket is never
+  released before it.
+- **Fast spill reopen from a checkpoint snapshot**: with the new
+  `SpillConfig::warm_reopen(true)` (default `false`, so a default tier's
+  open and close cost are unaffected), a clean `SpillTier::close` first
+  writes every currently-resident live record into the region ring
+  alongside every already-spilled one, then writes a snapshot next to the
+  region files listing every live entry's key, version, expiry, and
+  on-disk location; tombstones and expired entries never appear in it, and
+  it is written to a temporary name and renamed into place, so a crash
+  mid-write leaves no snapshot. A restart against the same spill directory
+  replays only that snapshot (`SpillTier::reopen`), never scanning a
+  region file for records it does not already know to look for: it
+  validates the snapshot's magic, format version, and sizing against the
+  current `SpillConfig`, drops (and counts) an entry whose location fails
+  to decode, falling the whole reopen back cold if any entry is bad,
+  filters to buckets the fresh ownership view says this node still owns
+  (for `Mode::Distributed` on a cluster built with seeds, `CacheBuilder::open`
+  now waits briefly, bounded by `min(ClusterConfig::state_transfer_budget,
+  5s)`, for a first known peer before computing that view at all, so a
+  restart racing gossip convergence never treats a warm reopen's ownership
+  filter as "this node owns everything" for want of a peer having reported
+  in yet), drops anything already expired, and installs every survivor via the new
+  `SpillSink::install_new` with no value bytes read into RAM. A crash
+  before a clean close, or a close with `warm_reopen` off, leaves no
+  snapshot, so the next open is cold; a successful warm reopen deletes the
+  snapshot it just replayed, so a second open with no intervening clean
+  close is cold too. A node down longer than `tombstone_ttl` (10 minutes
+  by default) also always falls back to the ordinary cold path, since no
+  live peer is still guaranteed to hold the tombstones that would out-vote
+  a resurrected stale record. A `Mode::Distributed` cache never serves a
+  warm-reloaded bucket straight off replay: it starts both cold and
+  unverified, a marker distinct from cold precisely because a hit in a
+  warm-reloaded bucket is not automatically trustworthy the way a hit in
+  an ordinary cold bucket always was (pulled from a donor or replicated in
+  live), since a co-owner may have deleted the record during this node's
+  downtime; both `Cache::fetch` and a peer's request for the bucket treat
+  a local hit there the same as a miss while unverified is set. Clearing
+  unverified is always the same decision, and the same call
+  (`ResidencySet::mark_serving`/`mark_all_serving`), that clears cold for
+  the bucket, never a separate one: an eager anti-entropy round against
+  every live co-owner confirming the replayed data, or the ordinary
+  cold-pull machinery landing fresh data for the bucket, verifies it and
+  clears both together, the same events that already cleared cold for any
+  other reconciled or pulled bucket. When there is no co-owner left to
+  verify against instead -- a bucket found to have no co-owner at all, or
+  one whose only co-owners never answer before the warm-up's attempts run
+  out -- both marks clear on that decision too: the replayed data, already
+  bounded by the `tombstone_ttl` downtime gate above, is the best available
+  answer, and refusing local hits forever in a bucket whose local misses
+  are already trusted is incoherent, not extra safety.
+- `sundog_spill_reopen_total{cache, outcome, reason}` and
+  `sundog_spill_reopen_records_total{cache}`: a `spill` cache's two new
+  Prometheus metrics, the first incremented once per cache open naming
+  whether it reopened warm or fell back cold and why (`reason` one of
+  `disabled` for `SpillConfig::warm_reopen` off, `no_snapshot`,
+  `stale_snapshot`, `config_mismatch`, `downtime_exceeded`, or
+  `bad_region`; empty for `warm`), the second counting how many records a
+  warm reopen actually replayed.
+
+- `sundog_rebalance_buckets_total{cache, direction="served"}`: a donor
+  credits every bucket of a rebalance pull stream that runs to its end,
+  whatever the requester's protocol, so a node that serves no metrics of
+  its own still leaves its landed pull visible on the node that donated.
+
+### Changed
+
+- The distributed demo's restart reopens a node under the id it had, the
+  way a deployment persists its node id, so ownership stays where it was
+  and a warm spill reopen replays into buckets the node still owns. Its
+  report carries `backlog_dropped_other_peers`, the replicate frames
+  dropped toward any peer other than the node the run kills, and the scale
+  gate bounds that at zero through `max_backlog_dropped_other_peers`; the
+  frames the killed node's departure drops are counted in
+  `backlog_dropped` and left to its restart to pull or reconcile.
+- `sundog_rebalance_buckets_total{cache, direction="in"}` is now credited
+  per bucket, the moment its own pull lands (via the new
+  `Msg::StBucketDone`/`Msg::StBucketAck` signaling or, against an older
+  peer, its transfer group's completion), instead of once for a whole
+  multi-bucket transfer only after every bucket in it has landed.
+- `sundog-testnode` shuts its cluster down and exits 0 on SIGTERM, which is
+  what a container stop sends, so a spill tier opened with warm reopen on
+  writes its checkpoint before the process ends and a restart against a
+  preserved spill dir reopens warm. A shutdown that outlasts the container
+  stop's grace is killed, and the next open falls back cold. `quit` and
+  `crash` exit without leaving.
+
+### Fixed
+
+- A node whose `gossip_bind_addr` asks for port 0 probes a free port,
+  releases it and lets chitchat bind it; when another socket takes the
+  port in between, chitchat's address-in-use answer sends membership
+  back to probe a fresh port, up to five times, instead of failing the
+  join. A fixed port never moves: one another socket holds fails the
+  join with that address in the error.
+- `sundog_owned_buckets` is set for a distributed cache's first ownership
+  view, at open, not only when a later membership change republishes the
+  view. With the bounded membership wait at open, a node joining a settled
+  cluster computes its final view first and may never republish, which
+  left the gauge absent for that node.
+
 ## [0.6.1] – 2026-09-12
 
 ### Added

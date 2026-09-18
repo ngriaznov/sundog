@@ -2,8 +2,6 @@
 //! node slots, starts them, kicks off the preload, and starts the
 //! background write-load/fetch generator once the preload finishes.
 
-use std::net::SocketAddr;
-use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -13,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use crate::cli::Args;
 use crate::load::{self, LoadState};
-use crate::node::{self, NodeSlot};
+use crate::node::{self, NodeSlot, Topology};
 use crate::preload;
 
 /// Faster than the library default so convergence and rebalancing visibly
@@ -33,9 +31,7 @@ pub(crate) struct Demo {
     pub(crate) feed_rx: UnboundedReceiver<String>,
     pub(crate) feed_tx: UnboundedSender<String>,
     pub(crate) paused: Arc<AtomicBool>,
-    pub(crate) cluster_name: String,
-    pub(crate) seeds: Vec<SocketAddr>,
-    pub(crate) owners: NonZeroU8,
+    pub(crate) topology: Topology,
     pub(crate) keys: usize,
     pub(crate) state: Arc<LoadState>,
     pub(crate) preload_progress: Arc<AtomicU64>,
@@ -94,19 +90,18 @@ pub(crate) async fn bootstrap(args: &Args) -> anyhow::Result<Demo> {
         .gossip_base_port
         .unwrap_or_else(|| rand::random_range(20_000..60_000));
     let nodes = Arc::new(node::build_slots(args.nodes, base_port));
-    let seeds = node::seed_list(&nodes);
+    let topology = Topology {
+        cluster_name: args.cluster_name.clone(),
+        seeds: node::seed_list(&nodes),
+        ae_interval: AE_INTERVAL,
+        tombstone_ttl: TOMBSTONE_TTL,
+        owners: args.owners,
+        tuning: args.tuning.clone(),
+    };
     let (feed_tx, feed_rx) = mpsc::unbounded_channel();
 
     for slot in nodes.iter() {
-        slot.start(
-            &args.cluster_name,
-            &seeds,
-            AE_INTERVAL,
-            TOMBSTONE_TTL,
-            args.owners,
-            &feed_tx,
-        )
-        .await?;
+        slot.start(&topology, &feed_tx).await?;
     }
 
     let paused = Arc::new(AtomicBool::new(false));
@@ -156,9 +151,7 @@ pub(crate) async fn bootstrap(args: &Args) -> anyhow::Result<Demo> {
         feed_rx,
         feed_tx,
         paused,
-        cluster_name: args.cluster_name.clone(),
-        seeds,
-        owners: args.owners,
+        topology,
         keys: args.keys,
         state,
         preload_progress,

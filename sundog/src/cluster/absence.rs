@@ -504,6 +504,47 @@ mod tests {
         assert!(should_defer_gc(mode, &tracker, HOUR, Some(&view)));
     }
 
+    /// A surviving peer stops deferring GC for a departed node's tombstones
+    /// once its `OwnershipView` reassigns that node's buckets, on the
+    /// gossip failure-detection timescale that recomputes `eligible_owners`
+    /// and not on either tombstone TTL. Only the view moves between the two
+    /// assertions; the tracker keeps `departed` absent throughout.
+    #[test]
+    fn should_defer_gc_stops_protecting_a_departed_nodes_buckets_once_ownership_reassigns_them() {
+        let self_node = NodeId::from(1);
+        let departed = NodeId::from(2);
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(2, false)]));
+        tracker.observe(&live(&[]));
+        let mode = Mode::Distributed {
+            owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+        };
+
+        // Before reassignment: `departed` is still eligible and co-owns
+        // every bucket with `self_node`, so its absence defers GC.
+        let view_before = distributed_view(self_node, vec![self_node, departed]);
+        assert!(
+            should_defer_gc(mode, &tracker, HOUR, Some(&view_before)),
+            "departed still co-owns every bucket, so its absence defers GC"
+        );
+
+        // After reassignment: `departed` has dropped out of
+        // `eligible_owners` (the same live-set-driven recompute a real
+        // membership change drives), so it no longer co-owns anything
+        // `self_node` owns, even though the tracker itself still reports it
+        // absent -- unchanged from the assertion above.
+        let view_after = distributed_view(self_node, vec![self_node]);
+        assert!(
+            tracker.any_absent(HOUR),
+            "the tracker's own view of departed's absence is untouched by the ownership move"
+        );
+        assert!(
+            !should_defer_gc(mode, &tracker, HOUR, Some(&view_after)),
+            "once ownership reassigns departed's buckets away from it, its absence no longer \
+             defers GC for any bucket, regardless of how long it has actually been down"
+        );
+    }
+
     #[test]
     fn present_since_is_not_reset_by_jitter_that_never_reaches_the_detector() {
         let tracker = AbsenceTracker::default();

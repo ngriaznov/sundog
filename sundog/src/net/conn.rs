@@ -2,6 +2,7 @@
 //! mesh traffic and pooled request/response, and the per-peer dial-and-write
 //! loop over the broadcast outboxes.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
 use super::{
-    AeMismatch, AePartReply, AeRoundOutcome, FetchOutcome, InboundMsg, MeshInner, MeshStream,
-    OutFrame, RequestHandler, TlsCtx,
+    AeMismatch, AePartReply, AeRoundOutcome, BucketStreamItem, FetchOutcome, InboundMsg, MeshInner,
+    MeshStream, OutFrame, RequestHandler, TlsCtx,
 };
 use crate::error::CodecError;
 use crate::hlc::Hlc;
@@ -697,12 +698,37 @@ async fn dispatch_one(
             cache,
             buckets,
             view_hash,
-        } => serve_st_buckets(framed, cache, buckets, view_hash, handler, cancel).await,
+        } => {
+            serve_st_buckets(
+                framed,
+                cache,
+                buckets,
+                view_hash,
+                handler,
+                mesh,
+                from,
+                peer_protocol,
+                cancel,
+            )
+            .await
+        }
+        // The last bucket's `StBucketDone` is sent after `serve_st_buckets`
+        // returns, so its ack lands here instead; recording it catches that
+        // case. A mid-stream ack it already recorded just re-inserts.
+        Msg::StBucketAck {
+            cache,
+            bucket,
+            view_hash,
+        } => {
+            mesh.record_bucket_ack(cache, bucket, from, view_hash);
+            false
+        }
         // A duplicate `Hello`, or `StChunk`/`AeBucket`/`AeSketch`/
         // `AePartDigests`/`AePart`/`AePartSketch`/`StUnavailable`/
         // `FetchReply`/`StBucketChunk`/`StaleView`/`ReqDone` sent only as
         // replies on a connection this node initiated, never on one being
-        // served here.
+        // served here. `StBucketDone` is likewise never dispatched here:
+        // only `serve_st_buckets` sends it, to a requester.
         Msg::Hello { .. }
         | Msg::StChunk { .. }
         | Msg::AeBucket { .. }
@@ -715,6 +741,7 @@ async fn dispatch_one(
         | Msg::FetchDeclined { .. }
         | Msg::StBucketChunk { .. }
         | Msg::StaleView { .. }
+        | Msg::StBucketDone { .. }
         | Msg::ReqDone => false,
     }
 }
@@ -980,16 +1007,40 @@ async fn serve_ae_digest_scoped(
 /// otherwise (an unrecognized cache, one not open in distribution mode, or
 /// a view hash that has diverged from the requester's). Returns `true` when
 /// this connection is done.
+///
+/// Against a requester speaking at least
+/// [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`], sends [`Msg::StBucketDone`] once a
+/// bucket's chunks are exhausted, including buckets left empty locally, and
+/// folds any [`Msg::StBucketAck`] read meanwhile into `mesh` via
+/// [`MeshInner::record_bucket_ack`]. A missing ack or an older peer is not
+/// an error: release then falls back to the timer/AE-round path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bucket-done/ack wiring needs the serving peer's identity and protocol alongside every parameter serve_st_buckets already took"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one connection's whole chunk-send/ack-read loop plus its tail drain reads best kept together"
+)]
 async fn serve_st_buckets(
     framed: &mut PeerFramed,
     cache: SmolStr,
     buckets: Vec<u16>,
     view_hash: u64,
     handler: &dyn RequestHandler,
+    mesh: &MeshInner,
+    from: NodeId,
+    peer_protocol: u16,
     cancel: &CancellationToken,
 ) -> bool {
     if !handler.st_buckets_available(cache.clone(), view_hash).await {
         let responder_view_hash = handler.ownership_view_hash(cache.clone()).unwrap_or(0);
+        tracing::debug!(
+            cache = %cache,
+            requester_view_hash = view_hash,
+            responder_view_hash,
+            "st buckets pull declined: view hash mismatch"
+        );
         return send_or_cancelled(
             framed,
             &Msg::StaleView {
@@ -1006,25 +1057,148 @@ async fn serve_st_buckets(
     {
         // Owned but not yet pulled: not a source. The requester tries its
         // next donor.
+        tracing::debug!(
+            cache = %cache,
+            requested = buckets.len(),
+            "st buckets pull declined: requested buckets not yet warm locally"
+        );
         return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
     }
+    let signal_done = wire::peer_supports(peer_protocol, wire::PROTOCOL_ST_BUCKET_DONE_ACK);
+    let mut remaining: VecDeque<u16> = buckets.iter().copied().collect();
+    let buckets_requested = remaining.len();
     let mut chunks = handler.st_bucket_chunks(cache.clone(), buckets);
+    let mut chunks_sent: usize = 0;
+    let mut records_sent: usize = 0;
     loop {
         let next = tokio::select! {
             biased;
             () = cancel.cancelled() => return true,
+            ack = recv_msg(framed), if signal_done => {
+                match ack {
+                    Some(Ok(Msg::StBucketAck {
+                        cache: ack_cache,
+                        bucket,
+                        view_hash,
+                    })) => {
+                        if ack_cache == cache {
+                            mesh.record_bucket_ack(ack_cache, bucket, from, view_hash);
+                        }
+                        continue;
+                    }
+                    // An unrecognized message here is ignored, not fatal,
+                    // like the reply-only arms in `dispatch_one`.
+                    Some(Ok(_)) => continue,
+                    Some(Err(ref error)) => {
+                        tracing::debug!(
+                            cache = %cache,
+                            %error,
+                            chunks_sent,
+                            records_sent,
+                            remaining = remaining.len(),
+                            "st buckets pull ended early: requester sent an error"
+                        );
+                        return true;
+                    }
+                    None => {
+                        tracing::debug!(
+                            cache = %cache,
+                            chunks_sent,
+                            records_sent,
+                            remaining = remaining.len(),
+                            "st buckets pull ended early: connection closed"
+                        );
+                        return true;
+                    }
+                }
+            }
             next = chunks.next() => next,
         };
-        let Some(recs) = next else { break };
+        let Some((bucket, recs)) = next else {
+            break;
+        };
+        if signal_done {
+            while remaining.front().is_some_and(|&b| b != bucket) {
+                let done_bucket = remaining
+                    .pop_front()
+                    .expect("invariant: the while guard just checked front() is Some");
+                if send_or_cancelled(
+                    framed,
+                    &Msg::StBucketDone {
+                        cache: cache.clone(),
+                        bucket: done_bucket,
+                    },
+                    cancel,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        cache = %cache,
+                        chunks_sent,
+                        records_sent,
+                        remaining = remaining.len(),
+                        "st buckets pull ended early: connection closed sending StBucketDone"
+                    );
+                    return true;
+                }
+            }
+        }
+        chunks_sent += 1;
+        records_sent += recs.len();
         let msg = Msg::StBucketChunk {
             cache: cache.clone(),
             recs,
             done: false,
         };
         if send_or_cancelled(framed, &msg, cancel).await {
+            tracing::debug!(
+                cache = %cache,
+                chunks_sent,
+                records_sent,
+                remaining = remaining.len(),
+                "st buckets pull ended early: connection closed mid-stream"
+            );
             return true;
         }
     }
+    if signal_done {
+        while let Some(done_bucket) = remaining.pop_front() {
+            if send_or_cancelled(
+                framed,
+                &Msg::StBucketDone {
+                    cache: cache.clone(),
+                    bucket: done_bucket,
+                },
+                cancel,
+            )
+            .await
+            {
+                tracing::debug!(
+                    cache = %cache,
+                    chunks_sent,
+                    records_sent,
+                    remaining = remaining.len(),
+                    "st buckets pull ended early: connection closed draining StBucketDone"
+                );
+                return true;
+            }
+        }
+    }
+    // The donor-side counterpart of the requester's "in" direction.
+    metrics::counter!(
+        "sundog_rebalance_buckets_total",
+        "cache" => cache.to_string(),
+        "direction" => "served"
+    )
+    .increment(u64::try_from(buckets_requested).unwrap_or(u64::MAX));
+    tracing::debug!(
+        cache = %cache,
+        buckets_served = buckets_requested,
+        chunks_sent,
+        records_sent,
+        signal_done,
+        "st buckets pull stream ended"
+    );
     send_or_cancelled(
         framed,
         &Msg::StBucketChunk {
@@ -1396,20 +1570,47 @@ pub(super) fn state_stream(
     ))
 }
 
-/// Adapts a rebalance bucket-pull connection into a lazy stream of record
-/// chunks, the `StBucketChunk` counterpart of [`state_stream`]: identical
-/// shape, keyed on [`Msg::StBucketChunk`] instead of [`Msg::StChunk`].
+/// Adapts a rebalance bucket-pull connection into a lazy stream of
+/// [`BucketStreamItem`]s: a `Chunk` for every [`Msg::StBucketChunk`], plus,
+/// against a donor speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`],
+/// a `BucketDone` for every [`Msg::StBucketDone`]. An older donor never
+/// sends `BucketDone`, so this then yields only `Chunk`s, as before.
+///
+/// After yielding a `BucketDone`, the next poll sends `Msg::StBucketAck`
+/// back to the donor first (gated the same way), so the ack follows
+/// whatever the caller did with that item. A caller that stops polling
+/// instead just never sends the ack, which [`serve_st_buckets`] tolerates.
 pub(super) fn bucket_stream(
     framed: PeerFramed,
     pool: Arc<ReqPool>,
     first: Option<Result<Msg, CodecError>>,
-) -> futures::stream::BoxStream<'static, Result<Vec<WireRecord>, CodecError>> {
+    cache: SmolStr,
+    donor_protocol: u16,
+    view_hash: u64,
+) -> futures::stream::BoxStream<'static, Result<BucketStreamItem, CodecError>> {
+    let ack_gated = wire::peer_supports(donor_protocol, wire::PROTOCOL_ST_BUCKET_DONE_ACK);
     Box::pin(futures::stream::unfold(
-        Some((framed, first)),
+        Some((framed, first, None::<u16>)),
         move |state| {
             let pool = Arc::clone(&pool);
+            let cache = cache.clone();
             async move {
-                let (mut framed, mut pending) = state?;
+                let (mut framed, mut pending, pending_ack) = state?;
+                if ack_gated && let Some(bucket) = pending_ack {
+                    // Best-effort: a broken send surfaces on the read below.
+                    // `view_hash` is this node's view when it requested the
+                    // buckets; the donor drops the ack once its own view
+                    // has moved past it.
+                    let _ = send_msg(
+                        &mut framed,
+                        &Msg::StBucketAck {
+                            cache: cache.clone(),
+                            bucket,
+                            view_hash,
+                        },
+                    )
+                    .await;
+                }
                 loop {
                     let received = match pending.take() {
                         Some(first) => Some(first),
@@ -1426,9 +1627,18 @@ pub(super) fn bucket_stream(
                             }
                             if done {
                                 pool.checkin(framed);
-                                return Some((Ok(recs), None));
+                                return Some((Ok(BucketStreamItem::Chunk(recs)), None));
                             }
-                            return Some((Ok(recs), Some((framed, None))));
+                            return Some((
+                                Ok(BucketStreamItem::Chunk(recs)),
+                                Some((framed, None, None)),
+                            ));
+                        }
+                        Some(Ok(Msg::StBucketDone { bucket, .. })) => {
+                            return Some((
+                                Ok(BucketStreamItem::BucketDone(bucket)),
+                                Some((framed, None, Some(bucket))),
+                            ));
                         }
                         Some(Ok(_)) => {} // unexpected message on this stream; keep reading
                         Some(Err(err)) => return Some((Err(err), None)),
@@ -1527,7 +1737,7 @@ mod tests {
     use crate::error::CodecError;
     use crate::hlc::Hlc;
     #[cfg(not(feature = "sim"))]
-    use crate::net::{AeMismatch, AePartReply};
+    use crate::net::{AeMismatch, AePartReply, BucketStreamItem};
     use crate::node::NodeId;
     use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
@@ -2340,5 +2550,366 @@ mod tests {
                  out its reconnect backoff",
             )
             .expect("writer task did not panic");
+    }
+
+    /// A distinct `WireRecord` for the bucket-done/ack tests below.
+    #[cfg(not(feature = "sim"))]
+    fn bucket_wire_record(n: u8) -> WireRecord {
+        WireRecord {
+            key: Bytes::from(vec![n]),
+            value: Some(Bytes::from(vec![n, n])),
+            ver: Hlc {
+                wall_ms: u64::from(n),
+                logical: 0,
+                node: NodeId::from(1),
+            },
+            expires_at_ms: None,
+        }
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn bucket_stream_yields_bucket_done_between_and_after_chunks_when_the_peer_supports_it() {
+        let cache = SmolStr::new("users");
+        let rec1 = bucket_wire_record(1);
+        let rec2 = bucket_wire_record(2);
+        let framed = dial_fake_donor(vec![
+            Msg::StBucketChunk {
+                cache: cache.clone(),
+                recs: vec![rec1.clone()],
+                done: false,
+            },
+            Msg::StBucketDone {
+                cache: cache.clone(),
+                bucket: 0,
+            },
+            Msg::StBucketChunk {
+                cache: cache.clone(),
+                recs: vec![rec2.clone()],
+                done: false,
+            },
+            Msg::StBucketDone {
+                cache: cache.clone(),
+                bucket: 1,
+            },
+            Msg::StBucketChunk {
+                cache: cache.clone(),
+                recs: Vec::new(),
+                done: true,
+            },
+        ])
+        .await;
+
+        let mut stream = super::bucket_stream(
+            framed,
+            Arc::new(ReqPool::new()),
+            None,
+            cache,
+            wire::PROTOCOL_VERSION,
+            42,
+        );
+        let mut got = Vec::new();
+        while let Some(item) = stream.next().await {
+            got.push(item.expect("item decodes"));
+        }
+        assert_eq!(got.len(), 4, "two chunks and two bucket-done signals");
+        assert!(matches!(&got[0], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec1]));
+        assert!(matches!(got[1], BucketStreamItem::BucketDone(0)));
+        assert!(matches!(&got[2], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec2]));
+        assert!(matches!(got[3], BucketStreamItem::BucketDone(1)));
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn bucket_stream_yields_nothing_new_when_the_peer_does_not_support_bucket_done() {
+        // An older donor never sends StBucketDone, so only Chunks result.
+        let cache = SmolStr::new("users");
+        let rec1 = bucket_wire_record(1);
+        let rec2 = bucket_wire_record(2);
+        let framed = dial_fake_donor(vec![
+            Msg::StBucketChunk {
+                cache: cache.clone(),
+                recs: vec![rec1.clone()],
+                done: false,
+            },
+            Msg::StBucketChunk {
+                cache: cache.clone(),
+                recs: vec![rec2.clone()],
+                done: true,
+            },
+        ])
+        .await;
+
+        let mut stream = super::bucket_stream(
+            framed,
+            Arc::new(ReqPool::new()),
+            None,
+            cache,
+            wire::PROTOCOL_DISTRIBUTED,
+            42,
+        );
+        let mut got = Vec::new();
+        while let Some(item) = stream.next().await {
+            got.push(item.expect("item decodes"));
+        }
+        assert_eq!(got.len(), 2);
+        assert!(matches!(&got[0], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec1]));
+        assert!(matches!(&got[1], BucketStreamItem::Chunk(chunk) if chunk == &vec![rec2]));
+    }
+
+    /// Serves two one-chunk buckets, for the bucket-done/ack test below.
+    #[cfg(not(feature = "sim"))]
+    struct TwoBucketHandler;
+    #[cfg(not(feature = "sim"))]
+    impl super::RequestHandler for TwoBucketHandler {
+        fn snapshot_chunks(
+            &self,
+            _cache: SmolStr,
+        ) -> futures::stream::BoxStream<'static, Vec<WireRecord>> {
+            Box::pin(futures::stream::empty())
+        }
+        fn digests(
+            &self,
+            _cache: SmolStr,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketDigest>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn bucket_entries(
+            &self,
+            _cache: SmolStr,
+            _bucket: u16,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::KeyVersion>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn entries_for_buckets(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, crate::store::BucketEntries> {
+            Box::pin(async { Vec::new() })
+        }
+        fn records_for(
+            &self,
+            _cache: SmolStr,
+            _keys: Vec<Bytes>,
+        ) -> futures::future::BoxFuture<'_, Vec<WireRecord>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn bucket_lens(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketLen>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn part_digests(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::future::BoxFuture<'_, Vec<crate::store::BucketPartDigests>> {
+            Box::pin(async { Vec::new() })
+        }
+        fn entries_for_parts(
+            &self,
+            _cache: SmolStr,
+            _parts: Vec<crate::store::BucketPart>,
+        ) -> futures::future::BoxFuture<'_, crate::store::PartEntries> {
+            Box::pin(async { Vec::new() })
+        }
+        fn st_buckets_available(
+            &self,
+            _cache: SmolStr,
+            _view_hash: u64,
+        ) -> futures::future::BoxFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn st_bucket_chunks(
+            &self,
+            _cache: SmolStr,
+            _buckets: Vec<u16>,
+        ) -> futures::stream::BoxStream<'static, (u16, Vec<WireRecord>)> {
+            // Keeps the select loop polling for the ack instead of exiting
+            // as soon as the chunk stream ends.
+            let padding = futures::stream::once(tokio::time::sleep(Duration::from_millis(200)))
+                .filter_map(|()| async { None });
+            Box::pin(
+                futures::stream::iter(vec![
+                    (0u16, vec![bucket_wire_record(1)]),
+                    (1u16, vec![bucket_wire_record(2)]),
+                ])
+                .chain(padding),
+            )
+        }
+    }
+
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn serve_st_buckets_sends_bucket_done_after_the_last_chunk_and_reads_a_mid_stream_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let client_stream = TcpStream::connect(addr).await.expect("connect");
+        let server_stream = accept.await.expect("connection accepted");
+        let mut client_framed = super::new_framed(as_mesh_stream(client_stream));
+
+        let mesh = super::MeshInner::for_tests(no_tls(), CancellationToken::new());
+        let mesh_for_task = Arc::clone(&mesh);
+        let cache = SmolStr::new("users");
+        let cache_for_task = cache.clone();
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let served = tokio::spawn(async move {
+            let mut server_framed = super::new_framed(as_mesh_stream(server_stream));
+            super::serve_st_buckets(
+                &mut server_framed,
+                cache_for_task,
+                vec![0, 1],
+                42,
+                &TwoBucketHandler,
+                mesh_for_task.as_ref(),
+                NodeId::from(9),
+                wire::PROTOCOL_VERSION,
+                &cancel_for_task,
+            )
+            .await
+        });
+
+        let first = super::recv_msg(&mut client_framed)
+            .await
+            .expect("frame arrives")
+            .expect("decodes");
+        assert!(
+            matches!(&first, Msg::StBucketChunk{ recs, done: false, .. } if recs.len() == 1),
+            "bucket 0's chunk comes first: {first:?}"
+        );
+        let second = super::recv_msg(&mut client_framed)
+            .await
+            .expect("frame arrives")
+            .expect("decodes");
+        let Msg::StBucketDone {
+            cache: ack_cache,
+            bucket,
+        } = second
+        else {
+            panic!("expected Msg::StBucketDone for bucket 0, got {second:?}");
+        };
+        assert_eq!(bucket, 0);
+        // Ack it now, mid-stream, before bucket 1's own chunk/done arrive.
+        super::send_msg(
+            &mut client_framed,
+            &Msg::StBucketAck {
+                cache: ack_cache,
+                bucket,
+                view_hash: 42,
+            },
+        )
+        .await
+        .expect("send ack");
+
+        let third = super::recv_msg(&mut client_framed)
+            .await
+            .expect("frame arrives")
+            .expect("decodes");
+        assert!(
+            matches!(&third, Msg::StBucketChunk{ recs, done: false, .. } if recs.len() == 1),
+            "bucket 1's chunk follows: {third:?}"
+        );
+        let fourth = super::recv_msg(&mut client_framed)
+            .await
+            .expect("frame arrives")
+            .expect("decodes");
+        assert!(
+            matches!(fourth, Msg::StBucketDone { bucket: 1, .. }),
+            "bucket 1's done follows its chunk: {fourth:?}"
+        );
+        let fifth = super::recv_msg(&mut client_framed)
+            .await
+            .expect("frame arrives")
+            .expect("decodes");
+        assert!(
+            matches!(fifth, Msg::StBucketChunk { done: true, .. }),
+            "the group's own trailing marker chunk closes the reply: {fifth:?}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("serve_st_buckets ends once its reply is fully drained")
+            .expect("serve_st_buckets does not panic");
+        assert!(
+            mesh.acked_buckets
+                .read()
+                .expect("lock is never poisoned")
+                .contains_key(&(cache, 0, NodeId::from(9))),
+            "the mid-stream ack for bucket 0 is folded into the acked-owners table"
+        );
+    }
+
+    /// Pins that an ack arriving after `serve_st_buckets` has already
+    /// returned is still caught, by `handle_accepted`'s own `dispatch_one`
+    /// arm for `Msg::StBucketAck`.
+    #[cfg(not(feature = "sim"))]
+    #[tokio::test]
+    async fn handle_accepted_records_a_bucket_ack_that_arrives_after_any_serve_st_buckets_call_would_have_returned()
+     {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("listener has a local addr");
+        let accept = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let client_stream = TcpStream::connect(addr).await.expect("connect");
+        let server_stream = accept.await.expect("connection accepted");
+
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let handler: Arc<dyn super::RequestHandler> = Arc::new(EmptyHandler);
+        let mesh = super::MeshInner::for_tests(no_tls(), cancel.clone());
+        let accepted_task = tokio::spawn(super::handle_accepted(
+            server_stream,
+            inbound_tx,
+            handler,
+            Arc::clone(&mesh),
+        ));
+
+        let mut client = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME)
+            .new_framed(client_stream);
+        let from = NodeId::from(9);
+        let cache = SmolStr::new("users");
+        for msg in [
+            Msg::Hello {
+                node: from,
+                incarnation: 1,
+                protocol: wire::PROTOCOL_VERSION,
+            },
+            Msg::StBucketAck {
+                cache: cache.clone(),
+                bucket: 1,
+                view_hash: 42,
+            },
+        ] {
+            let encoded = wire::encode(&msg).expect("encodes");
+            client.send(encoded).await.expect("send");
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !mesh
+                .acked_buckets
+                .read()
+                .expect("lock is never poisoned")
+                .contains_key(&(cache.clone(), 1, from))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(
+            "an ack arriving as an ordinary frame, outside serve_st_buckets's own mid-stream \
+             read, is still recorded",
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), accepted_task).await;
     }
 }

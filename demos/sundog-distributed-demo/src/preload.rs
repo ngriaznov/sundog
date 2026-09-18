@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -69,11 +69,30 @@ pub(crate) fn key_for(i: usize) -> String {
     format!("k{i}")
 }
 
-/// The value string preload writes for index `i`: `v0`, `v1`, ... Kept short
-/// so millions of entries stay cheap in memory.
+/// Bytes every value is padded out to; `0`, the default, keeps the short
+/// `v{i}` values so millions of entries stay cheap in memory. Set once from
+/// the command line before any node opens.
+static VALUE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the padded value size for every later [`value_for`] call.
+pub(crate) fn set_value_bytes(bytes: usize) {
+    VALUE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The value string preload writes for index `i`: `v0`, `v1`, ..., padded
+/// out to the configured value size with `x`.
 #[must_use]
 pub(crate) fn value_for(i: usize) -> String {
-    format!("v{i}")
+    padded(format!("v{i}"), VALUE_BYTES.load(Ordering::Relaxed))
+}
+
+/// `value` extended with `x` to `bytes` bytes; unchanged when already that
+/// long.
+#[must_use]
+pub(crate) fn padded(mut value: String, bytes: usize) -> String {
+    let short = bytes.saturating_sub(value.len());
+    value.extend(std::iter::repeat_n('x', short));
+    value
 }
 
 /// Outcome of one preload run: how many keys landed and how long it took.
@@ -203,6 +222,13 @@ mod tests {
     #[test]
     fn keys_per_sec_is_zero_for_no_elapsed_time() {
         assert!(keys_per_sec(1000, Duration::ZERO).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn padding_extends_short_values_only() {
+        assert_eq!(padded("v7".to_owned(), 5), "v7xxx");
+        assert_eq!(padded("v7".to_owned(), 0), "v7");
+        assert_eq!(padded("v1234567".to_owned(), 4), "v1234567");
     }
 
     #[test]

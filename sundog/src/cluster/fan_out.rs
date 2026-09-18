@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -57,10 +56,6 @@ pub(crate) async fn fan_out_task<K, V>(
         fan_out_batch(&shard, &cluster, &cache_name, mode, items).await;
     }
 }
-
-/// How long one `Mode::Distributed` fan-out batch waits for outbox space
-/// across all its target peers before dropping what still does not fit.
-pub(super) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
 /// One [`group_by_owner_set`] group: `records`, all sharing `owners` as
 /// their bucket's exact target-peer set.
@@ -122,9 +117,12 @@ fn encode_frames(msgs: Vec<Msg>) -> Vec<OutFrame> {
 /// group as `ForwardBatch` frames stamped with `view`'s hash through the
 /// mesh's existing per-peer outboxes ([`Mesh::send_frames_awaiting`],
 /// waiting for space rather than dropping on overflow, since a forwarded
-/// write's only copy is the frame). The single function both an owner's
-/// normal fan-out and a non-owner's forwarded writes route through: "group
-/// by owner set instead of broadcast" has one implementation, not two.
+/// write's only copy is the frame -- indefinitely, in
+/// [`crate::net::FAN_OUT_SEND_DEADLINE`] slices, so long as the target peer
+/// stays live).
+/// The single function both an owner's normal fan-out and a non-owner's
+/// forwarded writes route through: "group by owner set instead of
+/// broadcast" has one implementation, not two.
 async fn fan_out_by_owner_set(
     mesh: &crate::net::Mesh,
     cache_name: &SmolStr,
@@ -132,15 +130,13 @@ async fn fan_out_by_owner_set(
     self_node: NodeId,
     records: Vec<WireRecord>,
 ) {
-    let deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
     for OwnerGroup { owners, records } in group_by_owner_set(view, self_node, records) {
         if owners.is_empty() {
             continue;
         }
         let frames = encode_frames(batch_forward(cache_name, view.view_hash(), 0, records));
         for peer in owners {
-            mesh.send_frames_awaiting(peer, frames.clone(), deadline)
-                .await;
+            mesh.send_frames_awaiting(peer, frames.clone()).await;
         }
     }
 }

@@ -308,9 +308,60 @@ a later eviction pass to retry instead, since every peer still holds the
 entry and a local delete would only have anti-entropy repair it back in. A
 `Local` or `Invalidation` cache evicts it as described above.
 
+With `SpillConfig::warm_reopen(true)` (default `false`, so a default tier's
+open and close cost stay exactly what they are without this setting), a
+clean close checkpoints the tier: every currently-resident live record is
+written to disk alongside every already-spilled one, and a snapshot next
+to the region files lists every live entry's key, version, expiry, and
+on-disk location. Tombstones and expired entries are never written into
+it. A restart against the same directory then replays only that snapshot,
+never scanning a region file for records it does not already know to look
+for, filters what it recovers to buckets this node currently owns, drops
+anything already expired, and folds every survivor straight into the
+shard's digests with no value bytes read into RAM. For `Mode::Distributed`
+on a cluster built with seeds, `CacheBuilder::open` waits briefly (bounded
+by `min(ClusterConfig::state_transfer_budget, 5s)`) for a first known peer
+before computing that owned-buckets filter at all, so a restart racing
+gossip convergence never treats this node as the sole owner of every
+bucket just because no peer has reported in yet. A crash, or a close
+with `warm_reopen` off, leaves no snapshot, so the next open is cold; a
+successful warm reopen deletes the snapshot it just replayed, so a second
+open with no intervening clean close is cold too. A node down longer than
+`tombstone_ttl` (10 minutes by default) also always falls back to the
+ordinary cold, wipe-and-recreate open, since no live peer is still
+guaranteed to hold the tombstones that would out-vote a resurrected stale
+record. Either way, a warm-reloaded bucket starts both cold and
+unverified: unlike an ordinary cold bucket, whose only possible content
+before a live pull lands is already trustworthy (pulled from a donor or
+replicated in live), a replayed bucket can hold a record a co-owner
+deleted during this node's downtime, so `Cache::fetch` and a peer's
+request for it both treat a local hit there the same as a miss, asking
+the other owners instead of answering short. A `Mode::Distributed` cache
+clears the unverified mark on the same decision, and at the same call,
+that clears cold. Verification is preferred whenever a live co-owner
+exists to check against: an eager anti-entropy round against every live
+co-owner confirming the replayed data, or the ordinary cold-pull machinery
+landing fresh data for the bucket, clears both marks together. When the
+code instead decides to serve a bucket with no donor to verify against --
+a bucket found to have no co-owner at all, or one whose only co-owners
+never answer before the warm-up's attempts run out -- the replayed data,
+already bounded by the `tombstone_ttl` downtime gate above, is the best
+available answer, and it clears both marks too rather than refusing local
+hits forever while already trusting local misses in the same bucket. A
+bucket this node does not own any more is never served short regardless.
+
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,
-`sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`,
+`sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`, frames
+dropped only once a peer is gone from the mesh -- a peer that is merely slow
+is never dropped for; `sundog_fan_out_wait_seconds_total{peer}`, whole
+seconds spent instead waiting out such a live peer's full outbox,
+`sundog_fan_out_wait_timeouts_total{cache}`, an async write (`insert`,
+`insert_many`, `remove`, `merge`, and their siblings) whose own wait for
+fan-out backlog room under `ClusterConfig::fan_out_backlog_capacity` ran out
+its `ClusterConfig::fan_out_wait_timeout` and proceeded over capacity anyway
+rather than ever dropping the write, and `sundog_fan_out_backlog{cache}`, a
+cache's current not-yet-fanned-out backlog length,
 `sundog_live_peers`, `sundog_open_caches`, `sundog_ae_sketch_total{cache,
 outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
 tags anti-entropy's IBLT-sketch reconciliation on large buckets, where
@@ -329,11 +380,26 @@ Install the recorder before opening a cache: a cache binds its per-cache
 handles when it opens. A ready-made Grafana dashboard lives at
 [`ops/grafana-dashboard.json`](ops/grafana-dashboard.json).
 
-A `Mode::Distributed` cache adds six more:
+With `spill`, every cache open also emits
+`sundog_spill_reopen_total{cache, outcome, reason}`, `outcome` `warm` for a
+fast reopen straight from a checkpoint snapshot or `cold_fallback` for the
+ordinary wipe-and-recreate path, with `reason` naming why for a fallback
+(`disabled` when `SpillConfig::warm_reopen` is off, `no_snapshot`,
+`stale_snapshot`, `config_mismatch`, `downtime_exceeded`, or `bad_region`;
+empty for `warm`), and `sundog_spill_reopen_records_total{cache}`, how many
+records a warm reopen actually replayed.
+
+A `Mode::Distributed` cache adds seven more:
 
 - `sundog_owned_buckets{cache}`, this node's current bucket count.
 - `sundog_rebalance_buckets_total{cache, direction}`, buckets rebalance
-  pulled in or released out.
+  pulled `in`, released `out`, or `served` to another node's pull, credited
+  per bucket the moment its own pull lands or its own release fires, not
+  batched behind the rest of a multi-bucket transfer, and per stream on the
+  donor once the stream runs to its end.
+- `sundog_rebalance_pull_timeouts_total{cache}`, warm-ups that gave up on a
+  bucket pull timing out repeatedly and opened warm with whatever landed,
+  leaving the rest to anti-entropy.
 - `sundog_fetch_total{cache, outcome}`, each `Cache::fetch` call's outcome
   (`local`, `remote`, `miss`, or `error`).
 - `sundog_forwarded_writes_total{cache}`, writes this node forwarded to a
@@ -469,6 +535,21 @@ SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
 `RUSTFLAGS="-D warnings"` and `RUSTDOCFLAGS="-D warnings"`: a compiler or
 rustdoc warning fails the build.
 
+`.github/workflows/scale.yml` runs nightly and on demand: it builds
+`sundog-distributed-demo` with `--features spill,prometheus` and runs it
+headless at 4M keys across three nodes with an 800k-entry RAM cap per node
+over a spill tier, checking the resulting `--report-json` output against
+[`ops/scale-gate.json`](ops/scale-gate.json)'s thresholds for steady and
+peak RSS, deferred spill drops, pull timeouts, dropped replicate backlog
+(`max_backlog_dropped_other_peers`, the `sundog_backlog_dropped_total`
+frames dropped toward any peer other than the node the run kills, whose
+departure drops the frames queued for it by design; `max_backlog_dropped`
+bounds the total across every peer instead), fetch p99 latency, warm spill
+reopens, convergence, and a fully passing sample check via `--gate`.
+`workflow_dispatch` reruns the same shape on demand with its own key count,
+duration, RAM cap, and runner inputs, for a one-off run at a different
+scale. Both the report and the run log upload as workflow artifacts.
+
 ## Chaos demo
 
 `demos/sundog-demo` spins up N in-process nodes on loopback and runs a background
@@ -506,7 +587,11 @@ batches spread round-robin across the live nodes via `Cache::insert_many`
 before the write load starts, printing preload throughput and this
 process's RSS when the preload finishes. Flags: `--owners <N>` (live owners per bucket,
 default 2), `--cluster <NAME>`, `--write-interval-ms <N>`,
-`--gossip-base-port <PORT>`; `--help` lists everything. The TUI shows a
+`--gossip-base-port <PORT>`, `--value-bytes <N>` to pad every value,
+`--max-entries <N>` with `--spill-dir <PATH>` for a per-node RAM cap over a
+spill tier (built with `--features spill`), and `--metrics` for an
+in-process `sundog_*` status line every interval during a headless run
+(built with `--features prometheus`); `--help` lists everything. The TUI shows a
 progress bar during preload, then per node: entry count, an estimated
 owned-bucket share, warmth, and restarts, plus cluster-wide fetch hit/miss/
 error counts and latency. Same keys as the chaos demo: arrow keys or `j`/`k`
@@ -518,13 +603,112 @@ node and watch the survivors' owned-bucket counts and entry counts climb as
 they pull its buckets; restart it and watch it take its share back.
 
 `--headless <SECS>` preloads, runs the load for `SECS` seconds (killing one
-node at the midpoint and restarting it three-quarters through, to exercise a
-real rebalance), then pauses it, polls the sum of live nodes' entry counts
-against `owners * surviving keys` under a bound wide enough for
+node at the midpoint and restarting it after a downtime of `min(SECS / 4,
+tombstone_ttl / 2)`, so the node comes back after half the tombstone TTL at
+most and a spill run exercises the warm reopen instead of always falling
+back cold, to exercise a real rebalance), then pauses it, polls the sum of
+live nodes' entry counts against `owners * surviving keys` under a bound
+wide enough for
 `distributed_disown_grace_rounds` to run out, verifies a random sample of
 surviving keys against their expected value, and prints one report line
 each for the preload, the fetch counters, the sample check, and
 convergence, exiting nonzero on either a divergence or a failed sample.
+`--report-json <PATH>` writes that same run as a JSON summary (RSS, fetch
+latency, the sample check, convergence, and the summed `sundog_*` totals)
+instead of only printing it, and `--gate <PATH>` reads a JSON threshold
+file of the same shape and checks the run against it, exiting nonzero and
+listing every violated threshold; both need `--metrics`, and the Scale
+workflow described in Testing runs with both set.
+
+Both the demo and the test node set jemalloc as their global allocator on
+every target but MSVC Windows. The library itself sets none, so a service
+embedding it chooses: on a 4M-key three-node run the demo settles at 1.7
+GiB under jemalloc against 3.2 GiB under glibc's default arenas, which
+keep the preload's and anti-entropy's transient buffers resident, and
+bulk ingest runs about twice as fast. Entries themselves cost 56 bytes
+(80 with `spill`) plus the slab's index slot and, for a key and value
+under 23 encoded bytes together, no allocation; see Memory per entry
+below for the full accounting against Redis.
+
+## Memory per entry
+
+`Live<K, V>` (`sundog/src/store/engine.rs`) packs a key and value under 23
+encoded bytes together, an absolute-millisecond HLC, the full 64-bit
+`NodeId` and logical counter a merge needs bit-identical, a packed expiry,
+and a packed last-access stamp into 56 bytes, no heap allocation, no
+separate typed copy of the key or value. `Stripe::live` is a `Slab`, a
+dense arena plus a `u32`-keyed hash index in place of a hash table holding
+entries directly, so an idle index slot costs about 5 bytes against the
+roughly 73 bytes an idle table slot holding a `Live` directly would cost
+at the same load factor. `CacheBuilder::capacity_hint` presizes a shard's
+stripes for its own expected local entry count up front, at `open()`,
+instead of growing one insert at a time.
+
+Measured with `SUNDOG_BENCH=1 cargo test --release -p sundog --test
+entry_diet_bench -- --nocapture` on a 4-core Linux box, glibc, one node,
+`Mode::Local`, settled resident set (`VmRSS`) divided by entry count:
+
+| Shape | Entries | sundog, no hint | sundog, hinted | Redis 7 computed | Redis 7 practical |
+|---|---:|---:|---:|---:|---:|
+| 7-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 74.7 B/entry | 77.3 B/entry | 80 B/copy | 85-100 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.4 B/entry | 67.3 B/entry | 80 B/copy | 85-100 B/copy |
+| 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 209.6 B/entry | not measured | 184 B/copy | 195-230 B/copy |
+
+The Redis 7 figures for the 7-byte-key/8-byte-value shape are its own `dictEntry` (24
+bytes) plus an `sdshdr8` key plus an `embstr`-encoded value sharing one
+allocation with its `robj` header plus one bucket-array slot, computed;
+for the 16/100-byte shape, past `embstr`'s threshold, the value takes its
+own `raw`-encoded allocation instead. `used_memory / DBSIZE` from public
+Redis benchmarks gives the practical range for both.
+
+For the 7-byte-key/8-byte-value shape, every one of sundog's four figures sits under 90
+bytes per entry and under Redis 7's own practical range, at both
+4,000,000 and 64,000,000 entries; the byte cost drops further as the
+entry count grows (fixed per-stripe overhead amortizing over more
+entries) rather than staying flat or climbing. `capacity_hint` costs a
+little more at 4,000,000 entries (77.3 against 74.7 bytes per entry):
+hinting the exact expected count means a stripe whose real share lands
+even one key over its reserved capacity still pays a full doubling
+growth from that reserved base, and about half of 1024 stripes do at
+this entry count under ordinary hash variance. At 64,000,000 entries the
+per-stripe hint is large enough that this variance rarely crosses it, so
+hinted and unhinted are effectively tied (67.3 against 67.4). The
+16-byte-key/100-byte-value shape takes one heap allocation on both
+engines, past sundog's 22-byte `Record::Inline` cap and Redis's `embstr`
+threshold alike; sundog's target there is parity with Redis, not another
+win, and it measures at 209.6 bytes per entry, inside Redis's 195-230
+practical range and a little above its 184 computed figure.
+
+Reproducing sundog's figures:
+
+```sh
+SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
+    entry_diet_rss_budget -- --exact entry_diet_rss_budget --test-threads=1 --nocapture
+SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
+    entry_diet_rss_budget_64m -- --exact entry_diet_rss_budget_64m --test-threads=1 --nocapture
+SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
+    entry_diet_rss_budget_heap_shape -- --exact entry_diet_rss_budget_heap_shape --test-threads=1 --nocapture
+```
+
+Reproducing Redis 7's figures at the same widths, 7-byte keys and 8-byte values:
+
+```sh
+redis-server --daemonize yes --save '' --appendonly no
+seq 1 4000000 | awk '{printf "SET %07d %08d\n", $1, $1}' | redis-cli --pipe
+redis-cli info memory | grep used_memory:
+redis-cli dbsize
+```
+
+And 16-byte keys, 100-byte values (`redis-cli flushall` first):
+
+```sh
+seq 1 4000000 | awk '{printf "SET %016d %0100d\n", $1, $1}' | redis-cli --pipe
+redis-cli info memory | grep used_memory:
+redis-cli dbsize
+```
+
+`used_memory` divided by `dbsize` is Redis's own bytes/copy in both
+cases. `redis-cli shutdown nosave` when done.
 
 ## MSRV
 

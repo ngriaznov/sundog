@@ -20,10 +20,12 @@ mod conn;
 pub(crate) use conn::{REPLICATE_BATCH_BUDGET, REPLICATE_BATCH_COUNT};
 mod outbox;
 mod tcp;
+#[cfg(all(test, not(feature = "sim")))]
+pub(crate) mod test_support;
 #[cfg(all(feature = "tls", not(feature = "sim")))]
 mod tls;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -130,6 +132,11 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 8_192;
 /// the writers' last frames to go out.
 const OUTBOX_FLUSH_DEADLINE: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TAIL: Duration = Duration::from_millis(20);
+
+/// How long [`Mesh::send_frames_awaiting`] waits for outbox space before
+/// rechecking peer liveness. Bounds the recheck interval, not the total
+/// time a live peer's send may take.
+pub(crate) const FAN_OUT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Process-wide wire-frame counters, incremented at [`conn::send_msg`], the
 /// single choke point every outbound frame passes through:
@@ -428,12 +435,24 @@ pub(crate) enum FetchOutcome {
 /// How a donor answered [`Mesh::request_buckets`].
 pub(crate) enum BucketPull {
     /// The donor is transferring: its chunk stream.
-    Stream(BoxStream<'static, Result<Vec<WireRecord>, CodecError>>),
+    Stream(BoxStream<'static, Result<BucketStreamItem, CodecError>>),
     /// The donor's own view hash differs from the request's.
     Stale,
     /// The donor owns a requested bucket but has not pulled it yet, so its
     /// copy is not a source; the requester tries its next donor.
     Cold,
+}
+
+/// One item off a [`BucketPull::Stream`]: a data chunk, or, against a donor
+/// speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`], a signal that
+/// the donor released one bucket ahead of the group's trailing `done: true`
+/// chunk. An older donor never sends `BucketDone`.
+pub(crate) enum BucketStreamItem {
+    /// Records for the bucket currently streaming.
+    Chunk(Vec<WireRecord>),
+    /// The donor released this bucket; triggers the caller's
+    /// `on_bucket_done` ahead of the stream's own end.
+    BucketDone(u16),
 }
 
 /// One reply to [`Mesh::ae_round_scoped`]: the scoped anti-entropy digest
@@ -632,11 +651,15 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// [`RequestHandler::st_buckets_available`] said yes. Default: an
     /// immediately-empty stream, never polled unless the caller ignores the
     /// availability check.
+    ///
+    /// Each item is tagged with its bucket, since a donor may split one
+    /// bucket's records into several chunks
+    /// ([`crate::config::ClusterConfig::rebalance_chunk_bytes`]).
     fn st_bucket_chunks(
         &self,
         cache: SmolStr,
         buckets: Vec<u16>,
-    ) -> BoxStream<'static, Vec<WireRecord>> {
+    ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
         let _ = (cache, buckets);
         Box::pin(futures::stream::empty())
     }
@@ -665,6 +688,13 @@ struct PeerHandle {
     protocol: AtomicU16,
 }
 
+/// [`MeshInner::acked_buckets`]'s key: the bucket a `Msg::StBucketAck`
+/// named and who sent it.
+type AckedBucketKey = (SmolStr, u16, NodeId);
+/// [`MeshInner::acked_buckets`]'s value: when the ack was recorded and the
+/// `view_hash` it carried.
+type AckedBucketEntry = (Instant, u64);
+
 struct MeshInner {
     node: NodeId,
     incarnation: u64,
@@ -672,6 +702,11 @@ struct MeshInner {
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
     tls: TlsCtx,
+    /// Bucket acks from `Msg::StBucketAck`, written by
+    /// `conn::serve_st_buckets` when a requester releases a bucket.
+    /// `rebalance_task` uses a fresh, current-view entry to skip a
+    /// redundant confirming AE round for that bucket.
+    acked_buckets: RwLock<HashMap<AckedBucketKey, AckedBucketEntry>>,
 }
 
 /// Digests from one peer answered empty in a row before the responder serves
@@ -684,6 +719,13 @@ const MAX_AE_DEFERRALS: u32 = 3;
 /// never more than [`MAX_AE_DEFERRALS`] times running.
 fn defer_ae_digest(queued: usize, deferred_so_far: u32) -> bool {
     queued > 0 && deferred_so_far < MAX_AE_DEFERRALS
+}
+
+/// Whether [`Mesh::send_frames_awaiting`] should wait again after a
+/// timed-out [`FAN_OUT_SEND_DEADLINE`] slice: yes while `peer_live`, so a
+/// live peer's frame is never dropped.
+const fn fan_out_keep_waiting(peer_live: bool) -> bool {
+    peer_live
 }
 
 impl MeshInner {
@@ -729,6 +771,58 @@ impl MeshInner {
         }
     }
 
+    /// Records that `from` acked `bucket` of `cache` via `Msg::StBucketAck`.
+    /// `view_hash` is the acker's own view hash at request time;
+    /// [`MeshInner::acked_owners`] checks it against this node's current one.
+    fn record_bucket_ack(&self, cache: SmolStr, bucket: u16, from: NodeId, view_hash: u64) {
+        self.acked_buckets
+            .write()
+            .expect("invariant: acked_buckets lock is never poisoned")
+            .insert((cache, bucket, from), (Instant::now(), view_hash));
+    }
+
+    /// Every acked owner of each of `due`'s buckets of `cache`, keyed by
+    /// bucket. An ack for one bucket says nothing about any other bucket the
+    /// same owner co-owns. An ack older than `window`, for a bucket not in
+    /// `due`, or carrying a `view_hash` other than this node's current one,
+    /// does not count.
+    fn acked_owners(
+        &self,
+        cache: &SmolStr,
+        due: &[u16],
+        window: Duration,
+        view_hash: u64,
+    ) -> HashMap<u16, HashSet<NodeId>> {
+        let now = Instant::now();
+        let mut acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
+        for ((c, bucket, owner), (acked_at, acked_view_hash)) in self
+            .acked_buckets
+            .read()
+            .expect("invariant: acked_buckets lock is never poisoned")
+            .iter()
+        {
+            if c == cache
+                && due.contains(bucket)
+                && now.saturating_duration_since(*acked_at) <= window
+                && *acked_view_hash == view_hash
+            {
+                acked.entry(*bucket).or_default().insert(*owner);
+            }
+        }
+        acked
+    }
+
+    /// `peer`'s last-known gossiped protocol, or `0` if unseen. Lets
+    /// `conn::bucket_stream` gate its `Msg::StBucketAck` send on what the
+    /// donor advertised.
+    fn peer_protocol(&self, peer: NodeId) -> u16 {
+        self.peers
+            .read()
+            .expect("invariant: peers lock is never poisoned")
+            .get(&peer)
+            .map_or(0, |handle| handle.protocol.load(Ordering::Relaxed))
+    }
+
     /// A mesh with no peers, for `conn`'s tests that drive
     /// `handle_accepted` over a raw accepted stream.
     #[cfg(all(test, not(feature = "sim")))]
@@ -740,6 +834,7 @@ impl MeshInner {
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,
+            acked_buckets: RwLock::new(HashMap::new()),
         })
     }
 }
@@ -799,6 +894,7 @@ impl Mesh {
             peers: RwLock::new(HashMap::new()),
             accept_cancel: CancellationToken::new(),
             tls,
+            acked_buckets: RwLock::new(HashMap::new()),
         });
         tokio::spawn(conn::accept_loop(
             listener,
@@ -973,21 +1069,18 @@ impl Mesh {
 
     /// [`Mesh::send_frames`] for records the sender keeps no copy of: a
     /// `Mode::Distributed` fan-out, where a forwarded write's only copy is
-    /// the frame itself. Waits for outbox space instead of dropping on
-    /// overflow, up to `deadline` for the whole batch; a frame that still
-    /// finds no space by then is dropped and counted in
-    /// `sundog_backlog_dropped_total`, and the peer marked dirty. A `peer`
-    /// the mesh doesn't know about is a silent no-op.
+    /// the frame itself, so a frame for a peer still live in the peer table
+    /// is never dropped. Waits for outbox space in
+    /// [`FAN_OUT_SEND_DEADLINE`] slices, logging and counting each timed-out
+    /// one in `sundog_fan_out_wait_seconds_total{peer}`. Once `peer` leaves
+    /// the table or its outbox closes, remaining frames are dropped,
+    /// counted in `sundog_backlog_dropped_total`, and the peer marked
+    /// dirty. An unknown `peer` is a silent no-op.
     ///
     /// # Panics
     ///
     /// Panics if the peer-table lock is poisoned.
-    pub(crate) async fn send_frames_awaiting(
-        &self,
-        peer: NodeId,
-        frames: Vec<OutFrame>,
-        deadline: tokio::time::Instant,
-    ) {
+    pub(crate) async fn send_frames_awaiting(&self, peer: NodeId, frames: Vec<OutFrame>) {
         let (tx, dirty, enqueued_stamp) = {
             let table = self
                 .inner
@@ -1003,11 +1096,35 @@ impl Mesh {
                 Arc::clone(&handle.last_replicate_enqueued),
             )
         };
+        let mut queue: VecDeque<OutFrame> = frames.into();
         let mut dropped = 0u64;
-        for frame in frames {
-            match tokio::time::timeout_at(deadline, tx.reserve()).await {
+        while let Some(frame) = queue.pop_front() {
+            let slice_deadline = tokio::time::Instant::now() + FAN_OUT_SEND_DEADLINE;
+            match tokio::time::timeout_at(slice_deadline, tx.reserve()).await {
                 Ok(Ok(permit)) => permit.send(frame),
-                Ok(Err(_)) | Err(_) => dropped += 1,
+                Ok(Err(_)) => {
+                    // The channel closed: this peer's writer already ended.
+                    dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                    queue.clear();
+                }
+                Err(_) => {
+                    if fan_out_keep_waiting(self.peer_is_live(peer)) {
+                        metrics::counter!(
+                            "sundog_fan_out_wait_seconds_total",
+                            "peer" => peer.to_string()
+                        )
+                        .increment(FAN_OUT_SEND_DEADLINE.as_secs());
+                        tracing::debug!(
+                            %peer,
+                            "outbox still full past one fan-out wait slice; peer is still \
+                             live, waiting again"
+                        );
+                        queue.push_front(frame);
+                    } else {
+                        dropped += 1 + u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                        queue.clear();
+                    }
+                }
             }
         }
         enqueued_stamp.store(mono_ms() + 1, Ordering::Relaxed);
@@ -1017,6 +1134,20 @@ impl Mesh {
                 .increment(dropped);
             tracing::warn!(%peer, dropped, "outbox stayed full past the fan-out deadline; frames dropped");
         }
+    }
+
+    /// Whether `peer` is still in the peer table:
+    /// [`Mesh::send_frames_awaiting`]'s liveness check between wait slices.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock is poisoned.
+    fn peer_is_live(&self, peer: NodeId) -> bool {
+        self.inner
+            .peers
+            .read()
+            .expect("invariant: peers lock is never poisoned")
+            .contains_key(&peer)
     }
 
     /// Waits, up to `deadline`, until every peer's replicate outbox has been
@@ -1406,6 +1537,7 @@ impl Mesh {
         // The caller's own transfer budget governs the full chunk stream,
         // exactly as `request_state` does; only the checkout-or-dial step
         // and the donor's first reply are bounded here.
+        let stream_cache = cache.clone();
         let msg = Msg::StBuckets {
             cache,
             buckets,
@@ -1422,7 +1554,30 @@ impl Mesh {
             pool.checkin(framed);
             return Ok(BucketPull::Cold);
         }
-        Ok(BucketPull::Stream(conn::bucket_stream(framed, pool, first)))
+        // The donor's gossiped protocol, so `bucket_stream` gates its ack
+        // send the same way `serve_st_buckets` gates `StBucketDone`.
+        let donor_protocol = self.inner.peer_protocol(donor);
+        Ok(BucketPull::Stream(conn::bucket_stream(
+            framed,
+            pool,
+            first,
+            stream_cache,
+            donor_protocol,
+            view_hash,
+        )))
+    }
+
+    /// See [`MeshInner::acked_owners`]. Lets `rebalance_task` skip a
+    /// redundant anti-entropy round against an owner that already acked a
+    /// bucket.
+    pub(crate) fn acked_owners(
+        &self,
+        cache: &SmolStr,
+        due: &[u16],
+        window: Duration,
+        view_hash: u64,
+    ) -> HashMap<u16, HashSet<NodeId>> {
+        self.inner.acked_owners(cache, due, window, view_hash)
     }
 
     /// Shuts down the mesh: stops accepting, cancels every per-peer writer.
@@ -1512,6 +1667,8 @@ mod tests {
         buckets_available: bool,
         buckets_cold: bool,
         bucket_chunks: Vec<Vec<WireRecord>>,
+        /// Per-`bucket_chunks` entry bucket tag; empty tags every chunk `0`.
+        bucket_chunk_tags: Vec<u16>,
     }
 
     impl Default for FixtureHandler {
@@ -1532,6 +1689,7 @@ mod tests {
                 buckets_available: false,
                 buckets_cold: false,
                 bucket_chunks: Vec::new(),
+                bucket_chunk_tags: Vec::new(),
             }
         }
     }
@@ -1701,8 +1859,17 @@ mod tests {
             &self,
             _cache: SmolStr,
             _buckets: Vec<u16>,
-        ) -> BoxStream<'static, Vec<WireRecord>> {
-            Box::pin(futures::stream::iter(self.bucket_chunks.clone()))
+        ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
+            // Empty tags default every chunk to bucket 0.
+            let tags = if self.bucket_chunk_tags.is_empty() {
+                vec![0u16; self.bucket_chunks.len()]
+            } else {
+                self.bucket_chunk_tags.clone()
+            };
+            Box::pin(
+                futures::stream::iter(self.bucket_chunks.clone().into_iter().zip(tags))
+                    .map(|(recs, bucket)| (bucket, recs)),
+            )
         }
     }
 
@@ -2341,6 +2508,106 @@ mod tests {
         assert!(
             !defer_ae_digest(5, MAX_AE_DEFERRALS),
             "the bound serves a round even with frames still queued"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    fn no_tls() -> super::TlsCtx {
+        None
+    }
+    #[cfg(not(feature = "tls"))]
+    fn no_tls() -> super::TlsCtx {
+        TlsCtx
+    }
+
+    #[test]
+    fn record_bucket_ack_is_readable_by_cache_bucket_and_requester() {
+        let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
+        mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+        assert!(
+            mesh.acked_buckets
+                .read()
+                .expect("lock is never poisoned")
+                .contains_key(&(SmolStr::new("prices"), 7, NodeId::from(3))),
+            "the ack lands under its (cache, bucket, requester) key"
+        );
+        assert!(
+            !mesh
+                .acked_buckets
+                .read()
+                .expect("lock is never poisoned")
+                .contains_key(&(SmolStr::new("prices"), 8, NodeId::from(3))),
+            "a different bucket is not recorded"
+        );
+    }
+
+    #[test]
+    fn acked_owners_only_counts_a_due_bucket_within_the_window() {
+        let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
+        mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+        mesh.record_bucket_ack(SmolStr::new("prices"), 9, NodeId::from(4), 42);
+        mesh.record_bucket_ack(SmolStr::new("other"), 7, NodeId::from(5), 42);
+        let owners = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 42);
+        assert_eq!(
+            owners,
+            HashMap::from([(7u16, HashSet::from([NodeId::from(3)]))]),
+            "only the acked owner of a bucket actually in `due`, for the right cache, counts, \
+             keyed by the bucket it acked"
+        );
+        // Sleeps briefly so the ack is reliably older than a zero window.
+        std::thread::sleep(Duration::from_millis(5));
+        let none = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::ZERO, 42);
+        assert!(
+            none.is_empty(),
+            "an ack older than the window does not count as reconciled"
+        );
+    }
+
+    #[test]
+    fn an_ack_carrying_a_stale_view_hash_does_not_count_as_reconciled() {
+        let mesh = MeshInner::for_tests(no_tls(), CancellationToken::new());
+        // Acked under view hash 1; this node's current view has moved to 2.
+        mesh.record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 1);
+        let stale = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 2);
+        assert!(
+            stale.is_empty(),
+            "an ack from before a view change does not count as reconciled"
+        );
+        let current = mesh.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 1);
+        assert_eq!(
+            current,
+            HashMap::from([(7u16, HashSet::from([NodeId::from(3)]))]),
+            "the same ack counts once the requested view hash matches the ack's own"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_protocol_is_zero_for_an_unknown_peer_and_otherwise_the_gossiped_value() {
+        let mesh_handle = Mesh {
+            local_addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            inner: MeshInner::for_tests(no_tls(), CancellationToken::new()),
+        };
+        assert_eq!(mesh_handle.inner.peer_protocol(NodeId::from(9)), 0);
+        mesh_handle.update_peers(vec![peer_at_protocol(
+            NodeId::from(9),
+            "127.0.0.1:1".parse().expect("valid loopback addr"),
+            3,
+        )]);
+        assert_eq!(mesh_handle.inner.peer_protocol(NodeId::from(9)), 3);
+    }
+
+    #[tokio::test]
+    async fn mesh_acked_owners_delegates_to_the_inner_table() {
+        let mesh_handle = Mesh {
+            local_addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+            inner: MeshInner::for_tests(no_tls(), CancellationToken::new()),
+        };
+        mesh_handle
+            .inner
+            .record_bucket_ack(SmolStr::new("prices"), 7, NodeId::from(3), 42);
+        assert_eq!(
+            mesh_handle.acked_owners(&SmolStr::new("prices"), &[7], Duration::from_secs(60), 42),
+            HashMap::from([(7u16, HashSet::from([NodeId::from(3)]))])
         );
     }
 
@@ -3012,13 +3279,7 @@ mod tests {
             .into_iter()
             .map(|msg| OutFrame::new(msg).expect("encodes"))
             .collect();
-        sender
-            .send_frames_awaiting(
-                NodeId::from(2),
-                frames,
-                tokio::time::Instant::now() + Duration::from_secs(5),
-            )
-            .await;
+        sender.send_frames_awaiting(NodeId::from(2), frames).await;
         sender.shutdown().await;
 
         let got = count_replicated(&mut inbound, Duration::from_secs(3)).await;
@@ -3027,6 +3288,136 @@ mod tests {
             "a four-slot outbox carries two hundred frames when the sender waits for space"
         );
         receiver.shutdown().await;
+    }
+
+    #[test]
+    fn fan_out_keep_waiting_only_for_a_live_peer() {
+        assert!(
+            fan_out_keep_waiting(true),
+            "a live peer's frame is never dropped: keep waiting"
+        );
+        assert!(
+            !fan_out_keep_waiting(false),
+            "a peer gone from the table falls back to today's drop-and-count path"
+        );
+    }
+
+    /// Pins that a live peer's stalled outbox keeps `send_frames_awaiting`
+    /// waiting past one `FAN_OUT_SEND_DEADLINE` instead of dropping frames.
+    #[tokio::test]
+    async fn send_frames_awaiting_waits_past_one_deadline_for_a_still_live_peer() {
+        let config = ClusterConfig {
+            outbox_capacity: 1,
+            ..ClusterConfig::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+        let (sender, _sender_inbound) =
+            Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+                .await
+                .expect("bind loopback");
+
+        // No listener behind this peer, so its outbox never drains.
+        let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+        sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+        // Fills the one-slot outbox so the call below has to wait.
+        sender.send(
+            NodeId::from(2),
+            MsgClass::Replicate,
+            Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: sample_record(0),
+            },
+        );
+
+        let frames: Vec<OutFrame> = replicate_msgs(3)
+            .into_iter()
+            .map(|msg| OutFrame::new(msg).expect("encodes"))
+            .collect();
+        let started = tokio::time::Instant::now();
+        // Bounded past one deadline slice; the call should still be waiting.
+        let outcome = tokio::time::timeout(
+            FAN_OUT_SEND_DEADLINE * 2,
+            sender.send_frames_awaiting(NodeId::from(2), frames),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a live peer's frames are never dropped, so the wait outlives one deadline slice"
+        );
+        assert!(
+            started.elapsed() >= FAN_OUT_SEND_DEADLINE,
+            "the call keeps waiting past at least one full slice"
+        );
+        assert!(
+            sender.take_dirty_peers().is_empty(),
+            "a live peer's stalled outbox is never marked dirty, so nothing was dropped"
+        );
+    }
+
+    /// Pins that removing the peer mid-wait drops its remaining frames
+    /// instead of waiting forever.
+    #[tokio::test]
+    async fn send_frames_awaiting_drops_once_the_peer_leaves_the_table_mid_wait() {
+        let config = ClusterConfig {
+            outbox_capacity: 1,
+            ..ClusterConfig::default()
+        };
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+        let (sender, _sender_inbound) =
+            Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+                .await
+                .expect("bind loopback");
+
+        let dead_peer: SocketAddr = "127.0.0.1:1".parse().expect("valid unroutable addr");
+        sender.update_peers(vec![peer_at(NodeId::from(2), dead_peer)]);
+
+        // take_dirty_peers only reports peers still in the table, so this
+        // reads the dirty flag directly off the handle instead.
+        let dirty_flag = {
+            let table = sender.inner.peers.read().expect("lock");
+            Arc::clone(&table.get(&NodeId::from(2)).expect("peer registered").dirty)
+        };
+
+        sender.send(
+            NodeId::from(2),
+            MsgClass::Replicate,
+            Msg::Replicate {
+                cache: SmolStr::new("users"),
+                rec: sample_record(0),
+            },
+        );
+
+        let frames: Vec<OutFrame> = replicate_msgs(3)
+            .into_iter()
+            .map(|msg| OutFrame::new(msg).expect("encodes"))
+            .collect();
+        let wait_fut = sender.send_frames_awaiting(NodeId::from(2), frames);
+        tokio::pin!(wait_fut);
+
+        // Confirms the call is still pending before the peer is removed.
+        let not_yet = tokio::time::timeout(Duration::from_millis(200), &mut wait_fut).await;
+        assert!(
+            not_yet.is_err(),
+            "the one-slot outbox is still full; the call must still be waiting"
+        );
+        assert!(
+            !dirty_flag.load(Ordering::Relaxed),
+            "nothing dropped yet while the peer is still live"
+        );
+
+        sender.update_peers(vec![]);
+
+        tokio::time::timeout(Duration::from_secs(3), &mut wait_fut)
+            .await
+            .expect("send_frames_awaiting returns once the peer is gone");
+
+        // `dirty` is set only alongside the drop counter, so this proves
+        // the remaining frames were dropped rather than waited on.
+        assert!(
+            dirty_flag.load(Ordering::Relaxed),
+            "a peer that leaves mid-wait drops its remaining frames and is marked dirty"
+        );
     }
 
     #[tokio::test]
@@ -3050,12 +3441,46 @@ mod tests {
             panic!("an available donor streams");
         };
         let mut got = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            got.extend(chunk.expect("chunk decodes"));
+        while let Some(item) = stream.next().await {
+            if let BucketStreamItem::Chunk(recs) = item.expect("item decodes") {
+                got.extend(recs);
+            }
         }
         let mut expected = chunk_a;
         expected.extend(chunk_b);
         assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn request_buckets_yields_bucket_done_once_per_bucket_before_the_stream_ends() {
+        let handler = Arc::new(FixtureHandler {
+            buckets_available: true,
+            bucket_chunks: vec![vec![sample_record(1)], vec![sample_record(2)]],
+            bucket_chunk_tags: vec![0, 1],
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (requester, _req_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        requester.update_peers(vec![peer_at(NodeId::from(1), donor.local_addr())]);
+
+        let BucketPull::Stream(mut stream) = requester
+            .request_buckets(NodeId::from(1), SmolStr::new("users"), vec![0, 1], 42)
+            .await
+            .expect("request accepted")
+        else {
+            panic!("an available donor streams");
+        };
+        let mut dones = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let BucketStreamItem::BucketDone(bucket) = item.expect("item decodes") {
+                dones.push(bucket);
+            }
+        }
+        assert_eq!(
+            dones,
+            vec![0, 1],
+            "each bucket's done arrives once, in request order, ahead of the stream's own end"
+        );
     }
 
     #[tokio::test]

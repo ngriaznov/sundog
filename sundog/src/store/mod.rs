@@ -5,7 +5,7 @@
 //! shard's fan-out queue and publishes an `Origin::Local` [`Event`]; the
 //! cluster layer turns those into wire traffic.
 
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
@@ -34,7 +34,7 @@ use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
-use engine::{ApplyOutcome, Engine, JoinOutcome};
+use engine::{ApplyOutcome, Engine, JoinOutcome, Reservation};
 
 /// Reference CRDT value types (a PN-Counter today) and the
 /// [`ConflictResolver`]s that merge them through [`ConflictResolver::merge`].
@@ -69,14 +69,30 @@ pub const PART_COUNT: usize = 64;
 /// [`Shard::with_weigher`] can store one before its closure type is nameable.
 pub(crate) type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
 
+/// [`Shard::with_weigher`]'s installed weigher, kept as an `Arc` outside the
+/// engine so a [`Shard::with_capacity_hint`] rebuild can carry it forward.
+pub(crate) type SharedWeigher<K, V> = Arc<dyn Fn(&K, &V) -> u32 + Send + Sync>;
+
+/// Boxes a remembered [`SharedWeigher`] into a fresh [`Weigher`] for
+/// `engine::Engine::new`, keeping the `Arc` alive for the next rebuild.
+fn boxed_weigher<K, V>(weigher: SharedWeigher<K, V>) -> Weigher<K, V>
+where
+    K: 'static,
+    V: 'static,
+{
+    Box::new(move |k: &K, v: &V| weigher(k, v))
+}
+
 /// Upper bound on records per [`WireRecord`] batch yielded by
 /// [`ShardOps::snapshot_chunks`], caps chunk size only for small-value caches:
 /// a chunk breaks sooner once its encoded size approaches [`MAX_FRAME`].
 const SNAPSHOT_CHUNK_SIZE: usize = 500;
 
 /// Headroom reserved below [`MAX_FRAME`] for the `Msg::StChunk` envelope around
-/// a snapshot chunk's records.
-const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
+/// a snapshot chunk's records. `pub(crate)` so
+/// [`crate::config::ClusterConfig::rebalance_chunk_bytes_value`] shares this
+/// headroom with `Msg::StBucketChunk`.
+pub(crate) const SNAPSHOT_CHUNK_ENVELOPE_HEADROOM: usize = 4 * 1024;
 
 /// Groups `records` into chunks that stay under [`MAX_FRAME`] once wrapped in a
 /// `Msg::StChunk`. Splits on cumulative wire-encoded size as well as
@@ -128,8 +144,13 @@ const EVENTS_CAPACITY: usize = 1024;
 /// `records_for_typed` re-fetches fresh wire bytes. A queue nothing drains, a
 /// `Mode::Local` shard's or a closed cache's, accepts nothing.
 pub(crate) struct FanOutQueue<K> {
+    /// This cache's name, used as the `cache` label on the fan-out metrics.
+    name: SmolStr,
     pending: StdMutex<Vec<K>>,
     notify: tokio::sync::Notify,
+    /// Notified when [`FanOutQueue::drain`] empties a non-empty backlog, so
+    /// [`FanOutQueue::wait_for_room`] waiters recheck instead of polling.
+    drained: tokio::sync::Notify,
     /// Whether a push lands in `pending` at all: `false` for a
     /// `Mode::Local` shard, whose writes never fan out and are not errors.
     accepting: AtomicBool,
@@ -143,13 +164,22 @@ pub(crate) struct FanOutQueue<K> {
 }
 
 impl<K> FanOutQueue<K> {
-    fn new(accepting: bool) -> Self {
+    fn new(name: SmolStr, accepting: bool) -> Self {
         Self {
+            name,
             pending: StdMutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
+            drained: tokio::sync::Notify::new(),
             accepting: AtomicBool::new(accepting),
             closed: StdMutex::new(false),
         }
+    }
+
+    /// Publishes `sundog_fan_out_backlog{cache}` as `len`, the one place
+    /// every mutation of `pending` reports its length through.
+    fn publish_backlog(&self, len: usize) {
+        metrics::gauge!("sundog_fan_out_backlog", "cache" => self.name.to_string())
+            .set(fan_out_backlog_gauge_value(len));
     }
 
     /// Stops accepting writes but keeps the backlog for the fan-out task's
@@ -168,6 +198,8 @@ impl<K> FanOutQueue<K> {
         let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
         pending.clear();
+        self.publish_backlog(0);
+        self.drained.notify_waiters();
     }
 
     /// Whether a write may still be accepted: `false` once sealed or
@@ -188,6 +220,7 @@ impl<K> FanOutQueue<K> {
             return true;
         }
         pending.push(key);
+        self.publish_backlog(pending.len());
         self.notify.notify_one();
         true
     }
@@ -203,13 +236,20 @@ impl<K> FanOutQueue<K> {
             return true;
         }
         pending.extend(keys);
+        self.publish_backlog(pending.len());
         self.notify.notify_one();
         true
     }
 
-    /// Takes every pending key, leaving the queue empty.
+    /// Takes every pending key and wakes [`FanOutQueue::wait_for_room`]'s waiters.
     pub(crate) fn drain(&self) -> Vec<K> {
-        std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner))
+        let items =
+            std::mem::take(&mut *self.pending.lock().unwrap_or_else(PoisonError::into_inner));
+        self.publish_backlog(0);
+        if !items.is_empty() {
+            self.drained.notify_waiters();
+        }
+        items
     }
 
     /// Resolves once the queue holds at least one key. A push that lands before
@@ -228,13 +268,58 @@ impl<K> FanOutQueue<K> {
         }
     }
 
-    #[cfg(test)]
+    /// Waits up to `timeout` for the backlog to fall under `capacity`, giving
+    /// an async write path a way to apply its own backpressure. The write
+    /// proceeds either way; on timeout,
+    /// `sundog_fan_out_wait_timeouts_total{cache}` counts it. The synchronous
+    /// write chain has no runtime to await on and never calls this.
+    pub(crate) async fn wait_for_room(&self, capacity: usize, timeout: Duration) {
+        if !fan_out_over_capacity(self.len(), capacity) {
+            return;
+        }
+        let waited = tokio::time::timeout(timeout, async {
+            loop {
+                // Armed before the recheck so a `drain` landing between the
+                // check and the `.await` is never missed.
+                let notified = self.drained.notified();
+                if !fan_out_over_capacity(self.len(), capacity) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        if waited.is_err() {
+            metrics::counter!(
+                "sundog_fan_out_wait_timeouts_total",
+                "cache" => self.name.to_string()
+            )
+            .increment(1);
+        }
+    }
+
     fn len(&self) -> usize {
         self.pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Whether [`FanOutQueue::wait_for_room`] keeps waiting: `true` while
+/// `pending_len` is at or above `capacity`.
+fn fan_out_over_capacity(pending_len: usize, capacity: usize) -> bool {
+    pending_len >= capacity
+}
+
+/// `len` as `sundog_fan_out_backlog`'s gauge value.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge only needs f64's exact-integer range, up to 2^53, which comfortably \
+              covers any realistic fan-out backlog"
+)]
+fn fan_out_backlog_gauge_value(len: usize) -> f64 {
+    len as f64
 }
 
 /// One entry in a shard's fan-out queue. `Applied` is every write this
@@ -523,10 +608,10 @@ pub struct CompactPassOutcome {
 }
 
 /// The type-erased surface the network layer drives a shard through, wire bytes
-/// in and out. This is the boundary where postcard (de)serialization happens;
-/// local reads never deserialize. Implemented by `Shard<K, V>` for any `K`, `V`
-/// meeting its bounds, and held as `Arc<dyn ShardOps>` in the cluster's cache
-/// registry.
+/// in and out: the boundary where postcard (de)serialization happens for the
+/// wire. A local read decodes its own stored record under the stripe's read
+/// lock. Implemented by `Shard<K, V>` for any `K`, `V` meeting its bounds, and
+/// held as `Arc<dyn ShardOps>` in the cluster's cache registry.
 ///
 /// Async methods return `BoxFuture` rather than `async fn` so `dyn ShardOps`
 /// stays usable from a `HashMap<SmolStr, Arc<dyn ShardOps>>`.
@@ -644,12 +729,22 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// Closes this shard's spill tier, if the `spill` feature is compiled in
-    /// and one is attached via `CacheBuilder::spill`: stops accepting
+    /// and one was attached via `CacheBuilder::spill`: stops accepting
     /// new spills and drops the flusher thread's channel sender. A no-op
-    /// otherwise. Called by `crate::cache::Cache::close` and by
-    /// `crate::cluster::Cluster::shutdown` for every cache still registered
-    /// when the cluster shuts down without an explicit `close`.
+    /// otherwise. This close writes no checkpoint, so the next open is cold
+    /// regardless of `SpillConfig::warm_reopen`; use
+    /// [`ShardOps::close_spill_checkpointed`] for a warm reopen.
     fn close_spill(&self) {}
+
+    /// [`ShardOps::close_spill`], plus, with `SpillConfig::warm_reopen` on, a
+    /// checkpoint of every live entry and a snapshot a later warm reopen
+    /// replays. The default just calls `close_spill`, so an implementor with
+    /// no spill tier keeps working, cold on the next open. Called by
+    /// `crate::cache::Cache::close` and cluster shutdown.
+    fn close_spill_checkpointed(&self) -> BoxFuture<'_, ()> {
+        self.close_spill();
+        Box::pin(async {})
+    }
 
     /// Stops accepting writes while keeping the fan-out backlog for the
     /// fan-out task's final drain: the first step of a cluster shutdown,
@@ -691,6 +786,15 @@ pub trait ShardOps: Send + Sync {
     /// yet pulled from a co-owner, so a local miss there is not an answer.
     /// `false` for every other mode.
     fn is_cold_bucket(&self, bucket: u16) -> bool {
+        let _ = bucket;
+        false
+    }
+
+    /// Whether `bucket` was warm-reloaded from spill and not yet verified
+    /// against a co-owner: a local hit there is not trustworthy, since a
+    /// co-owner may have deleted the record during this node's downtime.
+    /// `false` for every other mode and for a bucket never warm-reloaded.
+    fn is_unverified_bucket(&self, bucket: u16) -> bool {
         let _ = bucket;
         false
     }
@@ -1210,6 +1314,12 @@ where
     /// per pass.
     crdt_bounds: CompactionBounds,
     max_frame: usize,
+    /// [`Shard::with_fan_out_backlog_capacity`]'s cap: the threshold
+    /// [`Shard::wait_for_fan_out_room`] waits against, default from [`ClusterConfig::default`].
+    fan_out_backlog_capacity: usize,
+    /// [`Shard::with_fan_out_wait_timeout`]'s bound on
+    /// [`Shard::wait_for_fan_out_room`]'s wait, default from [`ClusterConfig::default`].
+    fan_out_wait_timeout: Duration,
     /// [`Shard::with_merge_coalesce_window`]'s configured window. Zero (the
     /// default) means every [`Shard::merge`] call applies at once;
     /// `crate::cache::CacheBuilder::merge_coalesce_window` is the validated
@@ -1229,11 +1339,18 @@ where
     /// sleep-until instead of parking past a deadline that did not exist
     /// yet when it last checked.
     merge_wake: Notify,
-    /// Remembered, with `tti` below, so [`Shard::with_weigher`] can rebuild
-    /// `engine::Engine` from scratch: a weigher installs only at
+    /// Remembered alongside `tti`/`capacity_hint`/`weigher` so
+    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`] can each
+    /// rebuild the engine without losing what the other already set.
     /// construction.
     max_capacity: u64,
     tti: Option<Duration>,
+    /// [`Shard::with_capacity_hint`]'s hint, `None` until set. Threaded into
+    /// every rebuild so it survives a later [`Shard::with_weigher`] call.
+    capacity_hint: Option<u64>,
+    /// [`Shard::with_weigher`]'s installed weigher, `None` until set.
+    /// Threaded into every rebuild so it survives a later capacity-hint call.
+    weigher: Option<SharedWeigher<K, V>>,
     /// Handle for `sundog_cache_hits_total{cache}`, created once here since
     /// label resolution costs more than the read path can afford per call.
     hits: metrics::Counter,
@@ -1281,6 +1398,39 @@ struct SpillRead {
     promotions: metrics::Counter,
 }
 
+/// [`Shard::attach_spill`]'s result: the buckets the reopen replayed at
+/// least one record for. Empty covers both a cold fallback and
+/// a clean reopen with nothing to replay.
+#[cfg(feature = "spill")]
+pub(crate) struct AttachSpillOutcome {
+    pub(crate) warm_buckets: HashSet<u16>,
+}
+
+/// Increments `sundog_spill_checkpoint_entries_total{cache,stage}` by
+/// `count` for one checkpoint phase, matching
+/// `Shard::close_spill_checkpointed`'s `info` logs.
+#[cfg(feature = "spill")]
+fn record_checkpoint_stage(cache: &str, stage: &'static str, count: u64) {
+    metrics::counter!(
+        "sundog_spill_checkpoint_entries_total",
+        "cache" => cache.to_string(),
+        "stage" => stage,
+    )
+    .increment(count);
+}
+
+/// Increments `sundog_spill_reopen_entries_total{cache,stage}` by `count`
+/// for one reopen phase, matching [`Shard::attach_spill`]'s `info` logs.
+#[cfg(feature = "spill")]
+fn record_reopen_stage(cache: &str, stage: &'static str, count: u64) {
+    metrics::counter!(
+        "sundog_spill_reopen_entries_total",
+        "cache" => cache.to_string(),
+        "stage" => stage,
+    )
+    .increment(count);
+}
+
 // Every method here is fully synchronous, with no `.await`, except
 // `Shard::get`/`Shard::get_or_load`'s spilled-key path under `feature =
 // "spill"`: a disk read runs behind `spawn_blocking` and a semaphore
@@ -1311,16 +1461,17 @@ where
         ttl: Option<Duration>,
         tti: Option<Duration>,
     ) -> Self {
-        let engine = Arc::new(Engine::new(max_capacity, tti, None));
+        let engine = Arc::new(Engine::new(max_capacity, tti, None, None));
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
+        let fan_out = Arc::new(FanOutQueue::new(name.clone(), !matches!(mode, Mode::Local)));
 
         Self {
             name,
             mode,
             engine,
             events: broadcast::channel(EVENTS_CAPACITY).0,
-            fan_out: Arc::new(FanOutQueue::new(!matches!(mode, Mode::Local))),
+            fan_out,
             clock: StdMutex::new(HlcClock::new(node)),
             clock_fn: Arc::new(now_ms),
             ttl,
@@ -1330,6 +1481,8 @@ where
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),
             max_frame: MAX_FRAME,
+            fan_out_backlog_capacity: ClusterConfig::default().fan_out_backlog_capacity,
+            fan_out_wait_timeout: ClusterConfig::default().fan_out_wait_timeout,
             merge_window: Duration::ZERO,
             pending_merges: (0..BUCKET_COUNT)
                 .map(|_| StdMutex::new(PendingMergeStripe::new()))
@@ -1338,6 +1491,8 @@ where
             merge_wake: Notify::new(),
             max_capacity,
             tti,
+            capacity_hint: None,
+            weigher: None,
             hits,
             misses,
             ownership: None,
@@ -1388,14 +1543,16 @@ where
     }
 
     /// Applies everything a live cluster's configuration decides for a
-    /// shard: both tombstone bounds, the CRDT compaction bounds, and the
-    /// frame cap.
+    /// shard: tombstone bounds, CRDT bounds, frame cap, fan-out capacity,
+    /// and its wait timeout.
     #[must_use]
     pub fn with_cluster_config(self, config: &ClusterConfig) -> Self {
         self.with_tombstone_ttl(config.tombstone_ttl)
             .with_tombstone_max_ttl(config.tombstone_max_ttl)
             .with_crdt_bounds(config.crdt_compaction_bounds())
             .with_max_frame(config.max_frame)
+            .with_fan_out_backlog_capacity(config.fan_out_backlog_capacity)
+            .with_fan_out_wait_timeout(config.fan_out_wait_timeout)
     }
 
     /// Rewraps `raw_resolver` with the current bound and clock. A
@@ -1419,6 +1576,22 @@ where
     #[must_use]
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
+        self
+    }
+
+    /// Overrides the fan-out backlog capacity an async write waits against
+    /// before queuing. Defaults to [`ClusterConfig::default`]'s.
+    #[must_use]
+    pub fn with_fan_out_backlog_capacity(mut self, capacity: usize) -> Self {
+        self.fan_out_backlog_capacity = capacity;
+        self
+    }
+
+    /// Overrides the bound on that fan-out backlog wait. Defaults to
+    /// [`ClusterConfig::default`]'s.
+    #[must_use]
+    pub fn with_fan_out_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.fan_out_wait_timeout = timeout;
         self
     }
 
@@ -1521,19 +1694,49 @@ where
 
     /// Installs a custom per-entry weigher for size-bounded eviction, in place
     /// of the default of one weight unit per entry. Rebuilds
-    /// `engine::Engine` from scratch, so call this immediately after
-    /// [`Shard::new`], before any reads or writes reach this shard.
+    /// `engine::Engine` from scratch, carrying forward any
+    /// [`Shard::with_capacity_hint`] already set. Call this right after
+    /// [`Shard::new`], before any reads or writes reach this shard; the two
+    /// builders can run in either order.
     #[must_use]
     pub fn with_weigher<W>(mut self, weigher: W) -> Self
     where
         W: Fn(&K, &V) -> u32 + Send + Sync + 'static,
     {
+        let weigher: SharedWeigher<K, V> = Arc::new(weigher);
+        self.weigher = Some(Arc::clone(&weigher));
         self.engine = Arc::new(Engine::new(
             self.max_capacity,
             self.tti,
-            Some(Box::new(weigher)),
+            Some(boxed_weigher(weigher)),
+            self.capacity_hint,
         ));
         self
+    }
+
+    /// Hints this shard's expected local entry count, presizing every
+    /// stripe up front; see [`crate::cache::CacheBuilder::capacity_hint`]
+    /// for the contract. Rebuilds the engine, carrying forward any
+    /// [`Shard::with_weigher`] already set, in either order. Call right
+    /// after [`Shard::new`], before any reads or writes reach this shard.
+    #[must_use]
+    pub fn with_capacity_hint(mut self, hint: u64) -> Self {
+        self.capacity_hint = Some(hint);
+        let weigher = self.weigher.clone().map(boxed_weigher);
+        self.engine = Arc::new(Engine::new(
+            self.max_capacity,
+            self.tti,
+            weigher,
+            self.capacity_hint,
+        ));
+        self
+    }
+
+    /// Per-stripe `live` arena capacities, in stripe order. `#[doc(hidden)]`
+    /// test/benchmark accessor for an integration-test binary outside this crate.
+    #[doc(hidden)]
+    pub fn stripe_capacities(&self) -> Vec<usize> {
+        self.engine.stripe_capacities()
     }
 
     /// Opens a local SSD/NVMe spill tier at `cfg` and attaches it to this
@@ -1576,6 +1779,14 @@ where
     /// builder-chain entry point for a caller that already owns an
     /// unshared `Shard`.
     ///
+    ///
+    /// Prefers `spill::SpillTier::reopen` over a cold open when
+    /// `SpillConfig::warm_reopen` is on and a checkpoint is still inside
+    /// `ClusterConfig::tombstone_ttl`, replaying it instead of wiping the
+    /// region files, filtered to [`Shard::with_ownership`]'s owned buckets.
+    /// Returns [`AttachSpillOutcome::warm_buckets`], the subset it replayed.
+    /// A warm-reloaded bucket still counts as cold per
+    /// [`ShardOps::is_cold_bucket`] until the caller clears it.
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if the tier's directory or
@@ -1585,14 +1796,76 @@ where
     ///
     /// Panics if called more than once on the same shard.
     #[cfg(feature = "spill")]
-    pub(crate) fn attach_spill(&self, cfg: &spill::SpillConfig) -> Result<(), std::io::Error> {
-        let tier = Arc::new(spill::SpillTier::open(cfg, &self.name)?);
+    pub(crate) fn attach_spill(
+        &self,
+        cfg: &spill::SpillConfig,
+    ) -> Result<AttachSpillOutcome, std::io::Error> {
+        let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
+        let view = self.ownership.as_ref().map(OwnershipTracker::current);
+        let owned = move |bucket: u16| view.as_ref().is_none_or(|v| v.owns(bucket));
+        let outcome = spill::SpillTier::reopen(
+            cfg,
+            &self.name,
+            sink.as_ref(),
+            now_ms(),
+            self.tombstone_ttl_ms,
+            owned,
+        )?;
+        if outcome.warm {
+            tracing::info!(
+                cache = %self.name,
+                records = outcome.records_installed,
+                "sundog spill: warm reopen replayed the tier from disk",
+            );
+            metrics::counter!(
+                "sundog_spill_reopen_total",
+                "cache" => self.name.to_string(),
+                "outcome" => "warm",
+                "reason" => "",
+            )
+            .increment(1);
+        } else {
+            let reason = outcome.reason.unwrap_or("unknown");
+            tracing::info!(
+                cache = %self.name,
+                reason,
+                "sundog spill: cold fallback",
+            );
+            metrics::counter!(
+                "sundog_spill_reopen_total",
+                "cache" => self.name.to_string(),
+                "outcome" => "cold_fallback",
+                "reason" => reason,
+            )
+            .increment(1);
+        }
+        metrics::counter!(
+            "sundog_spill_reopen_records_total",
+            "cache" => self.name.to_string(),
+        )
+        .increment(outcome.records_installed);
+        tracing::info!(
+            cache = %self.name,
+            read = outcome.entries_read,
+            dropped_unowned = outcome.dropped_unowned,
+            dropped_expired = outcome.dropped_expired,
+            dropped_bad = outcome.dropped_bad,
+            installed = outcome.records_installed,
+            refused_present = outcome.refused_present,
+            "sundog spill: reopen entry accounting",
+        );
+        record_reopen_stage(&self.name, "read", outcome.entries_read);
+        record_reopen_stage(&self.name, "dropped_unowned", outcome.dropped_unowned);
+        record_reopen_stage(&self.name, "dropped_expired", outcome.dropped_expired);
+        record_reopen_stage(&self.name, "dropped_bad", outcome.dropped_bad);
+        record_reopen_stage(&self.name, "installed", outcome.records_installed);
+        record_reopen_stage(&self.name, "refused_present", outcome.refused_present);
+        let tier = Arc::new(outcome.tier);
         tier.set_keep_resident_when_refused(matches!(
             self.mode,
             Mode::Replicated | Mode::Distributed { .. }
         ));
         self.engine.set_spill(Arc::clone(&tier));
-        let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
         tier.attach(Arc::downgrade(&sink));
         self.spill_read
             .set(SpillRead {
@@ -1615,7 +1888,9 @@ where
                 ),
             })
             .unwrap_or_else(|_| panic!("invariant: attach_spill runs at most once per shard"));
-        Ok(())
+        Ok(AttachSpillOutcome {
+            warm_buckets: outcome.warm_buckets,
+        })
     }
 
     /// Overrides the clock every timestamp this shard stamps reads from, in
@@ -2125,7 +2400,7 @@ where
         spill_read.reads_hit.increment(1);
         if self
             .engine
-            .promote_locked(key_bytes, hash, ver, value.clone(), bytes.encoded)
+            .promote_locked(key_bytes, hash, ver, &value, &bytes.encoded)
         {
             spill_read.promotions.increment(1);
         }
@@ -2315,6 +2590,7 @@ where
     /// replicate as exceeds the configured frame cap. See
     /// [`Shard::with_max_frame`], default [`MAX_FRAME`].
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.wait_for_fan_out_room().await;
         self.insert_sync(key, value)
     }
 
@@ -2334,6 +2610,7 @@ where
     ///
     /// As [`Shard::insert`].
     pub async fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) -> Result<(), CacheError> {
+        self.wait_for_fan_out_room().await;
         self.insert_expiring(key, value, Some(ttl))
     }
 
@@ -2356,6 +2633,15 @@ where
             encoded,
         };
         self.apply_or_forward(key, key_bytes, ver, incoming)
+    }
+
+    /// Waits for the fan-out backlog to fall under capacity via
+    /// [`FanOutQueue::wait_for_room`]. Every async write path calls this; the
+    /// synchronous chain never does.
+    async fn wait_for_fan_out_room(&self) {
+        self.fan_out
+            .wait_for_room(self.fan_out_backlog_capacity, self.fan_out_wait_timeout)
+            .await;
     }
 
     /// Applies a versioned write locally if this shard owns `key_bytes`'
@@ -2414,6 +2700,7 @@ where
         }
         let ver = self.stamp_local();
         if self.merge_window.is_zero() {
+            self.wait_for_fan_out_room().await;
             let expires_at_ms = self.expiry_for(None);
             return self.apply_or_forward(
                 key,
@@ -2437,56 +2724,7 @@ where
         } = &mut *stripe;
         match entries.entry(key) {
             Entry::Occupied(slot) => {
-                let (a, b) = {
-                    let existing = slot.get();
-                    (
-                        RecordView {
-                            value: Some(existing.encoded.as_ref()),
-                            ver: existing.ver,
-                            expires_at_ms: existing.expires_at_ms,
-                        },
-                        RecordView {
-                            value: Some(encoded.as_ref()),
-                            ver,
-                            expires_at_ms: self.expiry_for(None),
-                        },
-                    )
-                };
-                let merged = self
-                    .resolver
-                    .merges()
-                    .then(|| self.resolver.merge(key_bytes.as_ref(), a, b))
-                    .flatten();
-                match merged {
-                    Some(Merged {
-                        value: merged_bytes,
-                        expires_at_ms,
-                    }) => {
-                        let merged_value: V =
-                            postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
-                        let entry = slot.into_mut();
-                        entry.value = merged_value;
-                        entry.encoded = merged_bytes;
-                        entry.expires_at_ms = expires_at_ms;
-                        entry.ver = ver;
-                    }
-                    None => match self.resolver.winner(key_bytes.as_ref(), a, b) {
-                        Winner::B => {
-                            let entry = slot.into_mut();
-                            entry.value = value;
-                            entry.encoded = encoded;
-                            entry.expires_at_ms = self.expiry_for(None);
-                            entry.ver = ver;
-                        }
-                        Winner::A => {
-                            // The incoming call lost outright: nothing about the
-                            // pending entry changes, version included, mirroring
-                            // `resolve_and_rebind`'s `IncomingLoses => None` in
-                            // the engine: a losing write never advances the
-                            // version of the record it lost against.
-                        }
-                    },
-                }
+                self.fold_into_occupied_merge(slot, &key_bytes, encoded, value, ver)?;
             }
             Entry::Vacant(slot) => {
                 let deadline_ms = merge_deadline_ms(self.now_ms(), self.merge_window);
@@ -2503,6 +2741,66 @@ where
                 drop(stripe);
                 self.merge_wake.notify_one();
             }
+        }
+        Ok(())
+    }
+
+    /// [`Shard::merge`]'s occupied-slot branch: folds `value` into whatever
+    /// this stripe already holds pending, via the resolver's `merge` or `winner` call.
+    fn fold_into_occupied_merge(
+        &self,
+        slot: OccupiedEntry<'_, K, PendingMerge<V>>,
+        key_bytes: &Bytes,
+        encoded: Bytes,
+        value: V,
+        ver: Hlc,
+    ) -> Result<(), CacheError> {
+        let (a, b) = {
+            let existing = slot.get();
+            (
+                RecordView {
+                    value: Some(existing.encoded.as_ref()),
+                    ver: existing.ver,
+                    expires_at_ms: existing.expires_at_ms,
+                },
+                RecordView {
+                    value: Some(encoded.as_ref()),
+                    ver,
+                    expires_at_ms: self.expiry_for(None),
+                },
+            )
+        };
+        let merged = self
+            .resolver
+            .merges()
+            .then(|| self.resolver.merge(key_bytes.as_ref(), a, b))
+            .flatten();
+        match merged {
+            Some(Merged {
+                value: merged_bytes,
+                expires_at_ms,
+            }) => {
+                let merged_value: V =
+                    postcard::from_bytes(&merged_bytes).map_err(CodecError::from)?;
+                let entry = slot.into_mut();
+                entry.value = merged_value;
+                entry.encoded = merged_bytes;
+                entry.expires_at_ms = expires_at_ms;
+                entry.ver = ver;
+            }
+            None => match self.resolver.winner(key_bytes.as_ref(), a, b) {
+                Winner::B => {
+                    let entry = slot.into_mut();
+                    entry.value = value;
+                    entry.encoded = encoded;
+                    entry.expires_at_ms = self.expiry_for(None);
+                    entry.ver = ver;
+                }
+                Winner::A => {
+                    // The incoming call lost outright: nothing about the pending entry
+                    // changes, mirroring `resolve_and_rebind`'s `IncomingLoses => None`.
+                }
+            },
         }
         Ok(())
     }
@@ -2586,6 +2884,7 @@ where
         // by-stripe apply below: a forwarded entry never reaches `engine`,
         // matching `Shard::insert`'s single-write guard.
         let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
+        self.wait_for_fan_out_room().await;
         if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver, v, e, enc)| {
             (key, key_bytes, ver, put_incoming(v, e, enc))
         }) {
@@ -2594,38 +2893,179 @@ where
 
         self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver, v, e, enc)| {
             (hash, key, key_bytes, ver, put_incoming(v, e, enc))
-        });
+        })
+        .await;
         match failure {
             Some(err) => Err(err),
             None => Ok(()),
         }
     }
 
+    /// Reserves flush-queue admission for one whole
+    /// [`Shard::apply_grouped`]/[`ShardOps::apply_remote_batch`] call, before
+    /// any stripe lock: sums `spill::spill_record_len` over every
+    /// `Incoming::Put`, then makes one `SpillTier::reserve` call bounded by
+    /// the tier's `spill_wait_timeout`. Also returns that wait's deadline so
+    /// [`Shard::retry_reservation_deficit`] shares the same budget instead of
+    /// starting a fresh one. `None` for both when no spill tier is attached
+    /// or the reserve times out; the caller then falls back to
+    /// [`engine::Engine::apply_many_with_reservation`]'s non-blocking path.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_self,
+            reason = "the tier accessor and `reserve` only exist under feature = \"spill\""
+        )
+    )]
+    async fn reserve_for_batch<'e>(
+        &self,
+        entries: impl Iterator<Item = (&'e Bytes, &'e Incoming<V>)>,
+    ) -> (Option<Reservation<'_>>, Option<std::time::Instant>)
+    where
+        V: 'e,
+    {
+        #[cfg(feature = "spill")]
+        {
+            let Some(tier) = self.engine.spill() else {
+                return (None, None);
+            };
+            let reserved: u64 = entries
+                .map(|(key_bytes, incoming)| match incoming {
+                    Incoming::Put { encoded, .. } => {
+                        u64::from(spill::spill_record_len(key_bytes.len(), encoded.len()))
+                    }
+                    Incoming::Tombstone => 0,
+                })
+                .sum();
+            let reserved = u32::try_from(reserved).unwrap_or(u32::MAX);
+            let budget = tier.spill_wait_timeout_value();
+            let deadline = std::time::Instant::now() + budget;
+            let reservation = tier.reserve(reserved, budget).await.ok();
+            (reservation, Some(deadline))
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let _ = entries;
+            (None, None)
+        }
+    }
+
+    /// Pays down `deficit` bytes
+    /// [`engine::Engine::apply_many_with_reservation`]'s per-bucket loop left
+    /// resident (never dropped) when the call's one `Reservation` ran out.
+    /// Retries with a fresh [`SpillTier::reserve`] for the remainder, then
+    /// another `enforce_capacity_with_reservation` pass, until the deficit
+    /// clears or `deadline` passes. `deadline` is the same one
+    /// [`Shard::reserve_for_batch`] measured, not a fresh budget, so the
+    /// whole call stays bounded by one `spill_wait_timeout` rather than `2x`
+    /// it. A no-op when `deficit` is `0`. Once the budget runs out with a
+    /// deficit still outstanding, this makes one closing
+    /// [`engine::Engine::enforce_capacity`] call (`reservation: None`) so the
+    /// deficit is resolved before this call returns, not deferred to
+    /// whatever write happens to touch this shard next.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_self,
+            reason = "the tier accessor and `reserve` only exist under feature = \"spill\""
+        )
+    )]
+    async fn retry_reservation_deficit(
+        &self,
+        start_bucket: usize,
+        deficit: u64,
+        deadline: Option<std::time::Instant>,
+    ) {
+        #[cfg(feature = "spill")]
+        {
+            if deficit == 0 {
+                return;
+            }
+            let Some(tier) = self.engine.spill() else {
+                return;
+            };
+            let Some(deadline) = deadline else {
+                self.engine.enforce_capacity(start_bucket, self.now_ms());
+                return;
+            };
+            let mut deficit = deficit;
+            while deficit > 0 {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    // Budget already spent (initial wait or an earlier
+                    // iteration): skip straight to the closing fallback.
+                    break;
+                }
+                let bytes = u32::try_from(deficit).unwrap_or(u32::MAX);
+                match tier.reserve(bytes, remaining).await {
+                    Ok(mut reservation) => {
+                        deficit = self.engine.enforce_capacity_with_reservation(
+                            start_bucket,
+                            Some(&mut reservation),
+                            self.now_ms(),
+                        );
+                    }
+                    // `reserve` already recorded
+                    // `sundog_spill_wait_timeouts_total`; the fallback below resolves the rest.
+                    Err(_) => break,
+                }
+            }
+            if deficit > 0 {
+                self.engine.enforce_capacity(start_bucket, self.now_ms());
+            }
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let _ = (start_bucket, deficit, deadline);
+        }
+    }
+
     /// [`Shard::insert_many_expiring`]'s and [`Shard::remove_many`]'s shared apply step: groups by stripe, applies each under one lock.
-    fn apply_grouped<T>(
+    ///
+    /// Reserves flush-queue admission once for the whole call via
+    /// [`Shard::reserve_for_batch`], threading the `Reservation` through
+    /// every bucket's [`engine::Engine::apply_many_with_reservation`] call.
+    /// [`Shard::retry_reservation_deficit`] then pays down any deficit,
+    /// sharing the same deadline rather than a fresh budget.
+    async fn apply_grouped<T>(
         &self,
         prepared: Vec<T>,
         to_batch_entry: impl Fn(T) -> (u64, K, Bytes, Hlc, Incoming<V>),
     ) {
+        let batch_entries: Vec<(u64, K, Bytes, Hlc, Incoming<V>)> =
+            prepared.into_iter().map(to_batch_entry).collect();
+
+        let (mut reservation, deadline) = self
+            .reserve_for_batch(
+                batch_entries
+                    .iter()
+                    .map(|(_, _, key_bytes, _, incoming)| (key_bytes, incoming)),
+            )
+            .await;
+
         let mut by_stripe: Vec<Vec<_>> = (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
-        for entry in prepared {
-            let batch_entry = to_batch_entry(entry);
+        for batch_entry in batch_entries {
             by_stripe[engine::stripe_index_from_hash(batch_entry.0)].push(batch_entry);
         }
         let now = self.now_ms();
         let mut applied_keys: Vec<K> = Vec::new();
+        let mut deficit = 0u64;
         for (bucket, group) in by_stripe.into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
-            let outcomes = self.engine.apply_many(
+            let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
                 bucket,
                 group,
                 self.resolver.as_ref(),
                 self.tombstone_ttl_ms,
                 self.tombstone_max_ttl_ms,
                 now,
+                reservation.as_mut(),
             );
+            deficit += bucket_deficit;
             for outcome in outcomes {
                 applied_keys.extend(outcome.key().cloned());
                 self.handle_apply_outcome(outcome, Origin::Local, false);
@@ -2633,6 +3073,10 @@ where
             self.hand_off_bulk(&mut applied_keys, false);
         }
         self.hand_off_bulk(&mut applied_keys, true);
+        // Ends the reservation's borrow before requesting a fresh one; `let
+        // _ =` works on every build, including the placeholder without `spill`.
+        let _ = reservation;
+        self.retry_reservation_deficit(0, deficit, deadline).await;
     }
 
     /// Stamps and applies a local tombstone, then fans it out per [`Mode`], as
@@ -2642,6 +3086,7 @@ where
     ///
     /// Returns a [`CacheError`] if the key cannot be encoded for the wire.
     pub async fn remove(&self, key: &K) -> Result<(), CacheError> {
+        self.wait_for_fan_out_room().await;
         self.remove_sync(key)
     }
 
@@ -2691,6 +3136,7 @@ where
         // Same owner-vs-forward split as `Shard::insert_many_expiring`: a
         // forwarded tombstone never reaches `engine`.
         let (owned_prepared, forwarded_prepared) = self.partition_owned(prepared, |e| e.0);
+        self.wait_for_fan_out_room().await;
         if !self.forward_prepared(forwarded_prepared, |(_, key, key_bytes, ver)| {
             (key, key_bytes, ver, Incoming::Tombstone)
         }) {
@@ -2699,7 +3145,8 @@ where
 
         self.apply_grouped(owned_prepared, |(hash, key, key_bytes, ver)| {
             (hash, key, key_bytes, ver, Incoming::Tombstone)
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -2769,10 +3216,10 @@ where
     /// Closes this shard's attached spill tier, if `Shard::attach_spill`
     /// ever ran: stops accepting new spills and drops the flusher thread's
     /// channel sender, so its loop drains whatever is queued and exits on
-    /// its own. A no-op otherwise, and always a no-op in a non-`spill`
-    /// build. Called by `Cache::close` and, for a cache still registered at
-    /// cluster shutdown without an explicit `close`, by
-    /// `Cluster::shutdown`'s [`ShardOps::close_spill`] sweep.
+    /// its own, writing no checkpoint. The next `attach_spill` here opens
+    /// cold even with `SpillConfig::warm_reopen` on; see
+    /// [`Shard::close_spill_checkpointed`] for a warm reopen. A no-op
+    /// otherwise, and always a no-op in a non-`spill` build.
     #[cfg_attr(
         not(feature = "spill"),
         allow(
@@ -2792,12 +3239,186 @@ where
         }
     }
 
+    /// [`Shard::close_spill`], plus, with `SpillConfig::warm_reopen` on, a
+    /// checkpoint of every resident entry to disk before closing, each step a
+    /// separate blocking task. The disk write is unconditional, racy against
+    /// a concurrent `Cache` clone's remove/overwrite;
+    /// `Engine::finalize_checkpoint_writes` re-validates under the stripe
+    /// lock afterward and keeps only entries still live at the captured
+    /// version, so a losing key is dropped, never resurrected. Without
+    /// `warm_reopen`, this is [`Shard::close_spill`] alone: no checkpoint.
+    ///
+    /// A no-op otherwise, and always a no-op in a non-`spill` build. Called
+    /// by `Cache::close` and, for a cache still registered at cluster
+    /// shutdown, by `Cluster::shutdown`'s sweep.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_self,
+            clippy::unused_async,
+            reason = "the tier accessor, and everything this awaits, only exist under \
+                      feature = \"spill\""
+        )
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scripted checkpoint sequence, logging and metering each stage in order"
+    )]
+    pub(crate) async fn close_spill_checkpointed(&self) {
+        #[cfg(feature = "spill")]
+        if let Some(tier) = self.engine.spill().cloned() {
+            tracing::debug!(
+                cache = %self.name,
+                bytes_used = tier.bytes_used(),
+                "sundog spill: closing tier"
+            );
+            if tier.warm_reopen_value() {
+                let now = self.now_ms();
+                let engine = Arc::clone(&self.engine);
+                let resident =
+                    tokio::task::spawn_blocking(move || engine.checkpoint_resident_entries(now))
+                        .await
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                cache = %self.name,
+                                error = %err,
+                                "sundog spill: resident-entry scan task panicked; the \
+                                 checkpoint below covers only already-spilled entries",
+                            );
+                            Vec::new()
+                        });
+                tracing::info!(
+                    cache = %self.name,
+                    count = resident.len(),
+                    "sundog spill: checkpoint captured resident entries",
+                );
+                record_checkpoint_stage(&self.name, "captured", resident.len() as u64);
+
+                let sink = Arc::clone(&self.engine) as Arc<dyn spill::SpillSink>;
+                let checkpoint_tier = Arc::clone(&tier);
+                let flush_outcome = tokio::task::spawn_blocking(move || {
+                    checkpoint_tier.checkpoint_flush(sink.as_ref(), resident)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        cache = %self.name,
+                        error = %err,
+                        "sundog spill: checkpoint flush task panicked; the snapshot below \
+                         still covers every already-spilled entry",
+                    );
+                    spill::CheckpointFlushOutcome::default()
+                });
+                let newly_written = flush_outcome.written;
+                tracing::info!(
+                    cache = %self.name,
+                    count = newly_written.len(),
+                    "sundog spill: checkpoint wrote records",
+                );
+                record_checkpoint_stage(&self.name, "written", newly_written.len() as u64);
+                tracing::info!(
+                    cache = %self.name,
+                    jobs_drained = flush_outcome.jobs_drained,
+                    jobs_abandoned = flush_outcome.jobs_abandoned,
+                    "sundog spill: checkpoint drained the flush queue",
+                );
+                record_checkpoint_stage(&self.name, "drained", flush_outcome.jobs_drained);
+                record_checkpoint_stage(&self.name, "abandoned", flush_outcome.jobs_abandoned);
+
+                // Re-validates under the stripe lock: a concurrent write may have
+                // changed the key since capture, so a losing entry is dropped here.
+                let engine = Arc::clone(&self.engine);
+                let (_survivors, finalize_counts) = tokio::task::spawn_blocking(move || {
+                    engine.finalize_checkpoint_writes(newly_written, now)
+                })
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        cache = %self.name,
+                        error = %err,
+                        "sundog spill: checkpoint finalize task panicked; the snapshot below \
+                         drops every entry this checkpoint just wrote",
+                    );
+                    (Vec::new(), engine::CheckpointFinalizeCounts::default())
+                });
+                tracing::info!(
+                    cache = %self.name,
+                    kept = finalize_counts.kept,
+                    dropped_version_changed = finalize_counts.dropped_version_changed,
+                    dropped_tombstoned = finalize_counts.dropped_tombstoned,
+                    dropped_gone = finalize_counts.dropped_gone,
+                    dropped_expired = finalize_counts.dropped_expired,
+                    "sundog spill: checkpoint finalized writes",
+                );
+                record_checkpoint_stage(&self.name, "kept", finalize_counts.kept);
+                record_checkpoint_stage(
+                    &self.name,
+                    "dropped_version_changed",
+                    finalize_counts.dropped_version_changed,
+                );
+                record_checkpoint_stage(
+                    &self.name,
+                    "dropped_tombstoned",
+                    finalize_counts.dropped_tombstoned,
+                );
+                record_checkpoint_stage(&self.name, "dropped_gone", finalize_counts.dropped_gone);
+                record_checkpoint_stage(
+                    &self.name,
+                    "dropped_expired",
+                    finalize_counts.dropped_expired,
+                );
+
+                let engine = Arc::clone(&self.engine);
+                let entries = tokio::task::spawn_blocking(move || engine.snapshot_spilled(now))
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(
+                            cache = %self.name,
+                            error = %err,
+                            "sundog spill: spilled-pointer scan task panicked; the \
+                             checkpoint below covers only entries this checkpoint just wrote",
+                        );
+                        Vec::new()
+                    });
+                tracing::info!(
+                    cache = %self.name,
+                    count = entries.len(),
+                    "sundog spill: checkpoint listed already-spilled entries",
+                );
+                record_checkpoint_stage(&self.name, "listed", entries.len() as u64);
+
+                // `entries` already includes every survivor:
+                // `finalize_checkpoint_writes` flipped each to `Spilled` before this
+                // scan ran, so extending again would double-count.
+                tracing::info!(
+                    cache = %self.name,
+                    count = entries.len(),
+                    "sundog spill: checkpoint snapshot total",
+                );
+                record_checkpoint_stage(&self.name, "snapshot", entries.len() as u64);
+
+                let snapshot_tier = Arc::clone(&tier);
+                let closed = tokio::task::spawn_blocking(move || {
+                    snapshot_tier.write_checkpoint_snapshot(&entries, now);
+                    snapshot_tier.close();
+                })
+                .await;
+                if let Err(err) = closed {
+                    tracing::warn!(
+                        cache = %self.name,
+                        error = %err,
+                        "sundog spill: checkpoint snapshot task panicked",
+                    );
+                }
+            } else {
+                tier.close();
+            }
+        }
+    }
+
     /// Whether this shard's attached spill tier is closed by
-    /// [`Shard::close_spill`], or none is attached. `false` only while a
-    /// tier is attached and still open. Test-facing: lets a test observe
-    /// that [`Cache::close`] stopped the tier a surviving clone still
-    /// shares, without needing to drive an eviction and infer it
-    /// indirectly.
+    /// Whether this shard's spill tier is closed (by either close path) or
+    /// none is attached. Test-only: lets a test check closure directly.
     #[cfg(all(feature = "spill", test, not(feature = "sim")))]
     pub(crate) fn spill_tier_closed(&self) -> bool {
         self.engine.spill().is_none_or(|tier| tier.is_closed())
@@ -2823,6 +3444,10 @@ where
     /// freshly [`Shard::insert`]ed: a fresh version stamped now, so
     /// replication and events see the fold as one write happening at flush
     /// time, not backdated to whichever `merge` call opened the window.
+    /// Pushes onto the fan-out queue without awaiting room first, unlike
+    /// `Shard::merge`'s immediate-apply branch: this runs from the
+    /// merge-coalesce sweep and from `Drop`, where no async runtime may be
+    /// left to await on.
     fn flush_one_pending_merge(&self, key: K, pending: PendingMerge<V>) {
         let ver = self.stamp_local();
         let incoming = Incoming::Put {
@@ -3034,11 +3659,7 @@ where
             // never applied here and never dropped. A record for a bucket
             // this node never held is dropped and counted.
             let recs = self.guard_inbound(recs);
-            // Grouping by raw key bytes' stripe needs no decode. Each group
-            // keeps `recs`' relative order, so the same key always
-            // lands in the same stripe in arrival order.
-            let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
-                (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
+            let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
             for rec in recs {
                 self.observe_remote(rec.ver);
                 let hash = engine::hash_key_bytes(rec.key.as_ref());
@@ -3065,10 +3686,29 @@ where
                     }
                     None => Incoming::Tombstone,
                 };
-                by_stripe[engine::stripe_index_from_hash(hash)]
-                    .push((hash, key, rec.key, rec.ver, incoming, origin));
+                decoded.push((hash, key, rec.key, rec.ver, incoming, origin));
+            }
+
+            // One reservation for the whole decoded batch (see
+            // `Shard::reserve_for_batch`) throttles replication, anti-entropy
+            // repair, and state-transfer apply alike through this one method.
+            let (mut reservation, deadline) = self
+                .reserve_for_batch(
+                    decoded
+                        .iter()
+                        .map(|(_, _, key_bytes, _, incoming, _)| (key_bytes, incoming)),
+                )
+                .await;
+
+            // Groups by raw key-byte stripe, no decode needed; order within
+            // a stripe is preserved.
+            let mut by_stripe: Vec<Vec<RemoteEntry<K, V>>> =
+                (0..BUCKET_COUNT).map(|_| Vec::new()).collect();
+            for entry in decoded {
+                by_stripe[engine::stripe_index_from_hash(entry.0)].push(entry);
             }
             let now = self.now_ms();
+            let mut deficit = 0u64;
             for (bucket, group) in by_stripe.into_iter().enumerate() {
                 if group.is_empty() {
                     continue;
@@ -3081,18 +3721,24 @@ where
                         (hash, key, key_bytes, ver, incoming)
                     })
                     .collect();
-                let outcomes = self.engine.apply_many(
+                let (outcomes, bucket_deficit) = self.engine.apply_many_with_reservation(
                     bucket,
                     entries,
                     self.resolver.as_ref(),
                     self.tombstone_ttl_ms,
                     self.tombstone_max_ttl_ms,
                     now,
+                    reservation.as_mut(),
                 );
+                deficit += bucket_deficit;
                 for (outcome, origin) in outcomes.into_iter().zip(origins) {
                     self.handle_apply_outcome(outcome, origin, true);
                 }
             }
+            // See `Shard::apply_grouped`'s identical line: `let _ =` works
+            // on every build.
+            let _ = reservation;
+            self.retry_reservation_deficit(0, deficit, deadline).await;
         })
     }
 
@@ -3458,6 +4104,10 @@ where
         Shard::close_spill(self);
     }
 
+    fn close_spill_checkpointed(&self) -> BoxFuture<'_, ()> {
+        Box::pin(Shard::close_spill_checkpointed(self))
+    }
+
     fn seal_fan_out(&self) {
         self.fan_out.seal();
     }
@@ -3485,6 +4135,12 @@ where
         self.residency
             .as_ref()
             .is_some_and(|residency| residency.is_cold(bucket))
+    }
+
+    fn is_unverified_bucket(&self, bucket: u16) -> bool {
+        self.residency
+            .as_ref()
+            .is_some_and(|residency| residency.is_unverified(bucket))
     }
 
     fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
@@ -4850,6 +5506,765 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Pins that a warm reopen leaves a reloaded bucket cold until the
+    /// caller's own reconciliation clears it; the record stays readable meanwhile.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end two-life scenario: splitting it would only scatter state \
+                  (dir, cfg, view, key, bucket) across helper signatures"
+    )]
+    async fn attach_spill_via_a_warm_reopen_leaves_the_reloaded_buckets_cold_until_reconciliation()
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-warm-reopen-cold-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+
+        let self_node = NodeId::from(201u64);
+        let peer = NodeId::from(202u64);
+        let owners = NonZeroU8::new(2).expect("nonzero");
+        let view = Arc::new(OwnershipView::compute(
+            self_node,
+            vec![self_node, peer],
+            owners,
+        ));
+        let key = find_key_by_ownership(&view, true);
+        let bucket = bucket_of(&key_bytes(&key));
+
+        // First life: a tiny weight cap forces the entry to disk before the
+        // checkpointed close.
+        let (tracker1, tx1) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &HashMap::new(),
+            &SmolStr::new("warm-cold"),
+            owners,
+        );
+        tx1.send(Arc::clone(&view)).expect("receiver still alive");
+        let residency1 = Arc::new(ResidencySet::new());
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("warm-cold"),
+            Mode::Distributed { owners },
+            self_node,
+            1, // a tiny weight cap: the one entry spills
+            None,
+            None,
+        )
+        .with_ownership(tracker1, residency1);
+        let warm0 = shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        assert!(
+            warm0.warm_buckets.is_empty(),
+            "a brand-new directory has nothing to warm-reopen the first time"
+        );
+
+        shard1.insert(key, "v".to_string()).await.expect("insert");
+        // Eviction samples within one bucket at a time; filling `key`'s bucket
+        // with newer entries concentrates eviction onto `key`, the oldest one there.
+        let fillers: Vec<u32> = (0..1_000_000u32)
+            .filter(|&k| k != key && bucket_of(&key_bytes(&k)) == bucket)
+            .take(20)
+            .collect();
+        assert!(
+            fillers.len() >= 8,
+            "at least an eviction sample's worth of same-bucket fillers is found quickly"
+        );
+        for filler in fillers {
+            shard1
+                .insert(filler, "filler".to_string())
+                .await
+                .expect("insert filler");
+        }
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while shard1.get_sync(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the target key spills to disk once eviction runs past the tiny weight cap"
+        );
+        shard1.close_spill_checkpointed().await;
+
+        // Second life: same directory, fresh tracker/residency, bucket marked
+        // cold up front.
+        let (tracker2, tx2) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &HashMap::new(),
+            &SmolStr::new("warm-cold"),
+            owners,
+        );
+        tx2.send(Arc::clone(&view)).expect("receiver still alive");
+        let residency2 = Arc::new(ResidencySet::new());
+        residency2.mark_cold(&[bucket]);
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("warm-cold"),
+            Mode::Distributed { owners },
+            self_node,
+            1,
+            None,
+            None,
+        )
+        .with_ownership(tracker2, Arc::clone(&residency2));
+
+        let warm = shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert_eq!(
+            warm.warm_buckets,
+            HashSet::from([bucket]),
+            "the second life's attach_spill warm-reloads exactly the one bucket the \
+             replayed record belongs to"
+        );
+        assert!(
+            residency2.is_cold(bucket),
+            "attach_spill alone never clears cold: only the caller's eager reconciliation does"
+        );
+        assert_eq!(
+            shard2.get(&key).await,
+            Some("v".to_string()),
+            "the warm-reloaded record is still readable even while its bucket stays marked cold"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins that a checkpointed close recovers every live entry, resident or
+    /// already spilled, and never resurrects a key tombstoned before the close.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end three-key scenario (resident, spilled, tombstoned): splitting \
+                  it would only scatter state (dir, cfg, node, the three keys) across helper \
+                  signatures"
+    )]
+    async fn a_checkpointed_close_replays_every_live_entry_and_never_a_tombstoned_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-checkpoint-replay-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(301u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("checkpoint-replay"),
+            Mode::Local,
+            node,
+            2, // room for exactly two resident entries at once
+            None,
+            None,
+        );
+        let warm0 = shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        assert!(warm0.warm_buckets.is_empty());
+
+        let resident_key = 1_000_001u32;
+        let spilled_key = 1_000_002u32;
+        let tombstoned_key = 1_000_003u32;
+
+        shard1
+            .insert(resident_key, "resident-value".to_string())
+            .await
+            .expect("insert resident");
+        shard1
+            .insert(spilled_key, "spilled-value".to_string())
+            .await
+            .expect("insert spilled");
+
+        // Filling `spilled_key`'s bucket concentrates eviction there,
+        // leaving `resident_key`'s different bucket untouched.
+        let spilled_bucket = bucket_of(&key_bytes(&spilled_key));
+        let resident_bucket = bucket_of(&key_bytes(&resident_key));
+        assert_ne!(
+            spilled_bucket, resident_bucket,
+            "the two keys must land in different buckets for this test to isolate eviction \
+             pressure onto only one of them"
+        );
+        let fillers: Vec<u32> = (2_000_000..3_000_000u32)
+            .filter(|&k| bucket_of(&key_bytes(&k)) == spilled_bucket)
+            .take(20)
+            .collect();
+        assert!(
+            fillers.len() >= 8,
+            "at least an eviction sample's worth of same-bucket fillers is found quickly"
+        );
+        for filler in fillers {
+            shard1
+                .insert(filler, "filler".to_string())
+                .await
+                .expect("insert filler");
+        }
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while shard1.get_sync(&spilled_key).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the target key spills to disk once eviction runs past the weight cap"
+        );
+
+        shard1
+            .insert(tombstoned_key, "gone".to_string())
+            .await
+            .expect("insert tombstoned");
+        shard1
+            .remove(&tombstoned_key)
+            .await
+            .expect("remove tombstoned");
+
+        shard1.close_spill_checkpointed().await;
+
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("checkpoint-replay"),
+            Mode::Local,
+            node,
+            2,
+            None,
+            None,
+        );
+        let warm = shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert!(
+            warm.warm_buckets.contains(&resident_bucket),
+            "the still-resident key's bucket replayed too, not only the spilled one"
+        );
+        assert!(warm.warm_buckets.contains(&spilled_bucket));
+
+        assert_eq!(
+            shard2.get(&resident_key).await,
+            Some("resident-value".to_string()),
+            "a key never spilled during the first life still survives the checkpoint"
+        );
+        assert_eq!(
+            shard2.get(&spilled_key).await,
+            Some("spilled-value".to_string()),
+            "a key already spilled when the tier closed survives the checkpoint too"
+        );
+        assert_eq!(
+            shard2.get(&tombstoned_key).await,
+            None,
+            "a key tombstoned before the close never resurrects via checkpoint replay"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the simplest resurrection case: a spilled-then-deleted key must
+    /// never come back on a checkpointed reopen, with no peer or GC involved.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn a_deleted_spilled_key_never_resurrects_across_a_checkpointed_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-no-resurrection-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(302u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("no-resurrection"),
+            Mode::Local,
+            node,
+            1, // a tiny weight cap: the one entry spills
+            None,
+            None,
+        );
+        shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+
+        let key = 42u32;
+        shard1.insert(key, "v".to_string()).await.expect("insert");
+        let bucket = bucket_of(&key_bytes(&key));
+        let fillers: Vec<u32> = (0..1_000_000u32)
+            .filter(|&k| k != key && bucket_of(&key_bytes(&k)) == bucket)
+            .take(20)
+            .collect();
+        assert!(fillers.len() >= 8);
+        for filler in fillers {
+            shard1
+                .insert(filler, "filler".to_string())
+                .await
+                .expect("insert filler");
+        }
+        let spilled = tokio::time::timeout(Duration::from_secs(5), async {
+            while shard1.get_sync(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            spilled,
+            "the key spills to disk once eviction runs past the tiny weight cap"
+        );
+
+        // Deleted while still spilled: a delete never rewrites the on-disk
+        // region bytes (see `engine::apply_tombstone`), so a scan-based
+        // reopen would still find them.
+        shard1.remove(&key).await.expect("remove the spilled key");
+
+        shard1.close_spill_checkpointed().await;
+
+        // Reopens well inside the default ten-minute tombstone_ttl gate.
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("no-resurrection"),
+            Mode::Local,
+            node,
+            1,
+            None,
+            None,
+        );
+        // `bucket` still warm-reloads its live filler keys; only the deleted
+        // key is checked below.
+        let _warm = shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert_eq!(
+            shard2.get(&key).await,
+            None,
+            "the deleted key never resurrects: no peer, no anti-entropy round, no tombstone \
+             GC, just replay from the checkpoint snapshot alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the exact race `Engine::finalize_checkpoint_writes` closes: a
+    /// key deleted between resident-capture and disk-write must not survive
+    /// the checkpoint.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn close_spill_checkpoint_drops_a_key_deleted_between_capture_and_disk_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-close-spill-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(303u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("close-spill-race"),
+            Mode::Local,
+            node,
+            1 << 20, // generous cap: this test drives the checkpoint's own
+            // engine methods directly, not a real eviction
+            None,
+            None,
+        );
+        shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+
+        let key = 77u32;
+        shard1.insert(key, "v".to_string()).await.expect("insert");
+
+        let now = shard1.now_ms();
+        // Phase 1: capture every resident live entry before anything else changes.
+        let resident = shard1.engine.checkpoint_resident_entries(now);
+        assert_eq!(resident.len(), 1, "the one resident key is captured");
+
+        // The race: a second clone deletes the key between capture and the write below.
+        shard1
+            .remove(&key)
+            .await
+            .expect("remove races the checkpoint");
+
+        let tier = Arc::clone(shard1.engine.spill().expect("attach_spill attaches a tier"));
+        let sink = Arc::clone(&shard1.engine) as Arc<dyn spill::SpillSink>;
+        // Phase 2: writes the now-stale bytes to disk regardless of the race.
+        let flush_outcome = tier.checkpoint_flush(sink.as_ref(), resident);
+        let newly_written = flush_outcome.written;
+        assert_eq!(
+            newly_written.len(),
+            1,
+            "checkpoint_flush writes the captured entry to disk with no version check, \
+             exactly as its own docs describe -- this is the vulnerable write the next phase \
+             must correct for"
+        );
+
+        // Phase 3, the fix: re-validates against live state and drops the
+        // now-tombstoned entry.
+        let (survivors, finalize_counts) =
+            shard1.engine.finalize_checkpoint_writes(newly_written, now);
+        assert!(
+            survivors.is_empty(),
+            "a key deleted between the capture and the checkpoint write must never survive \
+             finalize_checkpoint_writes"
+        );
+        assert_eq!(
+            finalize_counts.dropped_tombstoned, 1,
+            "the race drops the entry under the tombstoned reason specifically"
+        );
+
+        let mut entries = shard1.engine.snapshot_spilled(now);
+        entries.extend(survivors);
+        assert!(
+            entries.is_empty(),
+            "the deleted key must be absent from the final checkpoint snapshot"
+        );
+
+        tier.write_checkpoint_snapshot(&entries, now);
+        tier.close();
+
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new("close-spill-race"),
+            Mode::Local,
+            node,
+            1 << 20,
+            None,
+            None,
+        );
+        shard2
+            .attach_spill(&cfg)
+            .expect("a checkpoint snapshot within tombstone_ttl reopens warm");
+        assert_eq!(
+            shard2.get(&key).await,
+            None,
+            "the key deleted mid-checkpoint never resurrects on reopen"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins that `finalize_checkpoint_writes` calls `note_spill_arrival`
+    /// itself, since it flips `Resident` to `Spilled` without going through
+    /// `SpillSink::install`.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn close_spill_checkpoint_counts_a_surviving_resident_entry_toward_the_spill_entries_metric()
+     {
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-checkpoint-gauge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+        let node = NodeId::from(304u64);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new("checkpoint-gauge"),
+            Mode::Local,
+            node,
+            1 << 20, // generous: nothing is ever evicted by ordinary means
+            None,
+            None,
+        );
+        shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        shard1.insert(1u32, "v".to_string()).await.expect("insert");
+        assert_eq!(
+            shard1.engine.debug_spill_entries_count(),
+            0,
+            "a resident entry never counts toward sundog_spill_entries before any checkpoint"
+        );
+
+        shard1.close_spill_checkpointed().await;
+
+        assert_eq!(
+            shard1.engine.debug_spill_entries_count(),
+            1,
+            "close_spill_checkpointed's checkpoint flips the one resident entry to Spilled via \
+             Engine::finalize_checkpoint_writes, which must call note_spill_arrival itself \
+             since it never goes through SpillSink::install"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Captures `sundog_spill_reopen_total{outcome,reason}` increments for one
+    /// cache name.
+    #[cfg(feature = "spill")]
+    #[derive(Clone, Default)]
+    struct ReopenCounts(Arc<StdMutex<HashMap<(String, String), u64>>>);
+
+    #[cfg(feature = "spill")]
+    impl ReopenCounts {
+        fn get(&self, outcome: &str, reason: &str) -> u64 {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(outcome.to_string(), reason.to_string()))
+                .unwrap_or(&0)
+        }
+    }
+
+    #[cfg(feature = "spill")]
+    struct ReopenOutcomeCounter {
+        outcome_reason: (String, String),
+        counts: ReopenCounts,
+    }
+
+    #[cfg(feature = "spill")]
+    impl metrics::CounterFn for ReopenOutcomeCounter {
+        fn increment(&self, value: u64) {
+            *self
+                .counts
+                .0
+                .lock()
+                .unwrap()
+                .entry(self.outcome_reason.clone())
+                .or_insert(0) += value;
+        }
+
+        fn absolute(&self, value: u64) {
+            *self
+                .counts
+                .0
+                .lock()
+                .unwrap()
+                .entry(self.outcome_reason.clone())
+                .or_insert(0) = value;
+        }
+    }
+
+    #[cfg(feature = "spill")]
+    struct ReopenRecorder {
+        cache: String,
+        counts: ReopenCounts,
+    }
+
+    #[cfg(feature = "spill")]
+    impl metrics::Recorder for ReopenRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let this_cache = key
+                .labels()
+                .any(|l| l.key() == "cache" && l.value() == self.cache);
+            if key.name() != "sundog_spill_reopen_total" || !this_cache {
+                return metrics::Counter::noop();
+            }
+            let outcome = key
+                .labels()
+                .find(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            let reason = key
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            metrics::Counter::from_arc(Arc::new(ReopenOutcomeCounter {
+                outcome_reason: (outcome, reason),
+                counts: self.counts.clone(),
+            }))
+        }
+
+        fn register_gauge(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// Pins that `attach_spill` records a `stale_snapshot` cold fallback
+    /// under `sundog_spill_reopen_total`, the one reopen reason the exporter
+    /// test cannot reach.
+    #[cfg(feature = "spill")]
+    #[test]
+    fn attach_spill_records_a_stale_snapshot_cold_fallback_under_its_metric() {
+        const CACHE: &str = "attach-spill-stale-snapshot-metric";
+        let counts = ReopenCounts::default();
+        // The global recorder slot is process-wide; if another test already
+        // won it, this one observes nothing and skips its assertions.
+        let installed = metrics::set_global_recorder(ReopenRecorder {
+            cache: CACHE.to_string(),
+            counts: counts.clone(),
+        })
+        .is_ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-stale-snapshot-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let region_bytes = 4096u64;
+        let capacity_bytes = 1u64 << 20;
+        let cfg = spill::SpillConfig::new(&dir, capacity_bytes)
+            .region_bytes(region_bytes)
+            .warm_reopen(true);
+        let cache_dir = dir.join(CACHE);
+        std::fs::create_dir_all(&cache_dir).expect("scratch tier directory creates");
+        let region_count = spill::region_count_for(capacity_bytes, region_bytes).max(2);
+        spill::write_stale_snapshot_for_test(&cache_dir, region_bytes, region_count, 1_000);
+
+        let s = Shard::<u32, String>::new(
+            SmolStr::new(CACHE),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        let warm = s
+            .attach_spill(&cfg)
+            .expect("the cold fallback still succeeds even against a stale snapshot");
+        assert!(
+            warm.warm_buckets.is_empty(),
+            "a stale snapshot never reopens warm, so nothing is in warm_buckets"
+        );
+
+        if installed {
+            assert_eq!(
+                counts.get("cold_fallback", "stale_snapshot"),
+                1,
+                "sundog_spill_reopen_total{{outcome=\"cold_fallback\", \
+                 reason=\"stale_snapshot\"}} records the stale-snapshot cold fallback"
+            );
+            assert_eq!(
+                counts.get("warm", ""),
+                0,
+                "a stale snapshot never records a warm reopen"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins that reattaching with no clean close in between (a crash) falls
+    /// back cold with reason `"no_snapshot"`.
+    #[cfg(feature = "spill")]
+    #[test]
+    fn attach_spill_twice_with_no_close_between_falls_back_cold_with_reason_no_snapshot() {
+        const CACHE: &str = "attach-spill-twice-no-close";
+        let counts = ReopenCounts::default();
+        // The global recorder slot is process-wide; if already won, this
+        // test skips its assertions.
+        let installed = metrics::set_global_recorder(ReopenRecorder {
+            cache: CACHE.to_string(),
+            counts: counts.clone(),
+        })
+        .is_ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "sundog-shard-twice-no-close-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = spill::SpillConfig::new(&dir, 1 << 20)
+            .region_bytes(4096)
+            .warm_reopen(true);
+
+        let shard1 = Shard::<u32, String>::new(
+            SmolStr::new(CACHE),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        let warm1 = shard1
+            .attach_spill(&cfg)
+            .expect("a brand-new directory opens cold");
+        assert!(warm1.warm_buckets.is_empty());
+        // Life 1 ends with no checkpointed close: the tier drops, writing no
+        // snapshot.
+        drop(shard1);
+
+        let shard2 = Shard::<u32, String>::new(
+            SmolStr::new(CACHE),
+            Mode::Local,
+            NodeId::from(1),
+            u64::MAX,
+            None,
+            None,
+        );
+        let warm2 = shard2
+            .attach_spill(&cfg)
+            .expect("the cold fallback still succeeds against a directory with no snapshot");
+        assert!(
+            warm2.warm_buckets.is_empty(),
+            "no snapshot exists to warm-reopen from"
+        );
+
+        if installed {
+            assert_eq!(
+                counts.get("cold_fallback", "no_snapshot"),
+                2,
+                "sundog_spill_reopen_total{{outcome=\"cold_fallback\", \
+                 reason=\"no_snapshot\"}} records both lives' cold fallback: the first life's \
+                 directory starts out with no snapshot exactly as much as the second life's \
+                 does after a close with no checkpoint"
+            );
+            assert_eq!(counts.get("warm", ""), 0, "no snapshot ever reopens warm");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A resolver where the longer value wins, `Hlc` breaking ties on equal
     /// length. `(len, ver)` compared lexicographically satisfies
     /// `ConflictResolver::winner`'s contract.
@@ -5568,7 +6983,6 @@ mod tests {
             // directly) must skip it regardless of what its bytes would
             // decode to.
             s.engine.debug_insert_spilled(
-                1,
                 &key_bytes(&1u32),
                 hlc(1, 1),
                 None,
@@ -6442,6 +7856,42 @@ mod tests {
     }
 
     #[test]
+    fn shard_with_capacity_hint_presizes_engine() {
+        let s = shard::<u32, u32>(1);
+        assert_eq!(
+            s.stripe_capacities(),
+            vec![0; BUCKET_COUNT],
+            "no hint yet: every stripe starts at zero allocation"
+        );
+
+        let hint = 3_000u64;
+        let expected =
+            usize::try_from(hint.div_ceil(BUCKET_COUNT as u64)).expect("hint fits usize");
+        let s = s.with_capacity_hint(hint);
+        assert_eq!(
+            s.stripe_capacities(),
+            vec![expected; BUCKET_COUNT],
+            "the hint reached the engine and presized every stripe"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_capacity_hint_after_with_weigher_keeps_the_weigher() {
+        let s = shard::<u32, Vec<u8>>(1)
+            .with_weigher(|_key: &u32, value: &Vec<u8>| {
+                u32::try_from(value.len()).unwrap_or(u32::MAX)
+            })
+            .with_capacity_hint(10);
+        s.insert(1, vec![0u8; 7]).await.expect("insert");
+        let (_, weight) = s.engine.debug_totals();
+        assert_eq!(
+            weight, 7,
+            "with_capacity_hint's rebuild must carry an already-installed weigher forward \
+             instead of reverting to the default of 1 per entry"
+        );
+    }
+
+    #[test]
     fn with_merge_coalesce_window_overrides_the_default() {
         let s = shard::<u32, u32>(1).with_merge_coalesce_window(Duration::from_millis(7));
         assert_eq!(s.merge_window(), Duration::from_millis(7));
@@ -6564,9 +8014,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fan_out_over_capacity_at_or_above_the_cap_only() {
+        assert!(!fan_out_over_capacity(4, 5), "under capacity: no wait");
+        assert!(fan_out_over_capacity(5, 5), "at capacity: wait");
+        assert!(fan_out_over_capacity(6, 5), "over capacity: wait");
+        assert!(
+            !fan_out_over_capacity(0, 1),
+            "an empty queue is always under a nonzero capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_many_awaits_fan_out_room_and_proceeds_once_the_backlog_drains() {
+        let s = shard::<u32, String>(1)
+            .with_fan_out_backlog_capacity(5)
+            .with_fan_out_wait_timeout(Duration::from_secs(10));
+        let queue = s.fan_out_queue();
+
+        // Fills the backlog to capacity; this call itself never waits.
+        s.insert_many((0..5u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("fills the backlog to capacity");
+        assert_eq!(queue.len(), 5);
+
+        // At capacity: the next insert_many must await room before pushing.
+        let insert_fut = s.insert_many((5..7u32).map(|k| (k, k.to_string())));
+        tokio::pin!(insert_fut);
+        let not_yet = tokio::time::timeout(Duration::from_millis(150), &mut insert_fut).await;
+        assert!(
+            not_yet.is_err(),
+            "insert_many must still be waiting for backlog room at capacity"
+        );
+
+        // The fan-out task's drain frees room and wakes the waiter.
+        let drained = queue.drain();
+        assert_eq!(
+            drained.len(),
+            5,
+            "drains exactly what was there before the wait"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), &mut insert_fut)
+            .await
+            .expect("insert_many proceeds once the backlog drains")
+            .expect("insert_many succeeds");
+        let mut keys = applied_keys(queue.drain());
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![5, 6],
+            "the write that waited still lands once room frees up"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_many_proceeds_once_its_fan_out_wait_times_out() {
+        let s = shard::<u32, String>(1)
+            .with_fan_out_backlog_capacity(1)
+            .with_fan_out_wait_timeout(Duration::from_millis(100));
+        let queue = s.fan_out_queue();
+
+        s.insert(0, "zero".into())
+            .await
+            .expect("fills the backlog to capacity");
+        assert_eq!(queue.len(), 1);
+
+        // Nothing drains the queue; the wait must time out and the write still land.
+        let started = tokio::time::Instant::now();
+        s.insert_many([(1u32, "one".to_string())])
+            .await
+            .expect("insert_many proceeds regardless once its wait times out");
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the call actually waited out its configured timeout"
+        );
+
+        let mut keys = applied_keys(queue.drain());
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![0, 1],
+            "the write is never dropped or refused: it lands over capacity instead"
+        );
+    }
+
     #[tokio::test]
     async fn fan_out_queue_wakes_a_waiter_for_a_push_before_or_after_the_wait() {
-        let queue = Arc::new(FanOutQueue::<u32>::new(true));
+        let queue = Arc::new(FanOutQueue::<u32>::new(SmolStr::new("test"), true));
         let _ = queue.push(7);
         tokio::time::timeout(Duration::from_secs(1), queue.wait_nonempty())
             .await
@@ -6800,6 +8335,23 @@ mod tests {
         let s = shard::<u32, String>(1);
         s.insert_sync(1, "a".into()).expect("insert_sync");
         assert_eq!(s.get_sync(&1), Some("a".to_string()));
+    }
+
+    /// Pins that a cache with no spill tier sees zero behavior change:
+    /// `reserve_for_batch` resolves immediately with `reservation: None`.
+    #[tokio::test]
+    async fn spill_less_cache_never_touches_reserve() {
+        let s = shard::<u32, String>(1);
+        s.insert_many((0..50u32).map(|k| (k, k.to_string())))
+            .await
+            .expect("insert_many");
+        for k in 0..50u32 {
+            assert_eq!(s.get(&k).await, Some(k.to_string()));
+        }
+        s.remove_many(0..50u32).await.expect("remove_many");
+        for k in 0..50u32 {
+            assert_eq!(s.get(&k).await, None);
+        }
     }
 
     #[test]
@@ -7316,7 +8868,7 @@ mod tests {
 
     #[test]
     fn fan_out_item_applied_and_forward_both_drain_through_one_queue() {
-        let queue = FanOutQueue::<FanOutItem<u32>>::new(true);
+        let queue = FanOutQueue::<FanOutItem<u32>>::new(SmolStr::new("test"), true);
         let rec = wire_record(7, "v", hlc(1, 1));
         let _ = queue.push(FanOutItem::Applied(1));
         let _ = queue.push(FanOutItem::Forward(rec.clone()));
@@ -7441,6 +8993,28 @@ mod tests {
         assert!(ShardOps::is_cold_bucket(&s, 7));
         residency.clear_cold(&[7]);
         assert!(!ShardOps::is_cold_bucket(&s, 7));
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn is_unverified_bucket_follows_the_residency_set_and_is_false_elsewhere() {
+        let plain = shard::<u32, String>(1);
+        assert!(!ShardOps::is_unverified_bucket(&plain, 7));
+
+        let residency = Arc::new(ResidencySet::new());
+        let (s, _view, _tx) = distributed_shard::<u32, String>(
+            NodeId::from(1),
+            (1..=3u64).map(NodeId::from).collect(),
+            2,
+            Arc::clone(&residency),
+        );
+        assert!(!ShardOps::is_unverified_bucket(&s, 7));
+        residency.mark_unverified(&[7]);
+        assert!(ShardOps::is_unverified_bucket(&s, 7));
+        // Distinct from cold: marking one leaves the other alone.
+        assert!(!ShardOps::is_cold_bucket(&s, 7));
+        residency.clear_unverified(&[7]);
+        assert!(!ShardOps::is_unverified_bucket(&s, 7));
     }
 
     #[test]
@@ -8006,6 +9580,436 @@ mod tests {
             assert_eq!(shard.get_sync(&resident_key), None);
             assert!(!shard.contains_key_sync(&resident_key));
 
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Pins that `reserve_for_batch` suspends `insert_many` while another
+        /// caller holds the tier's flush-queue budget, resuming
+        /// once it frees.
+        #[tokio::test]
+        async fn apply_grouped_suspends_under_a_saturated_queue_and_resumes_once_room_frees() {
+            let dir = temp_dir("suspend-apply-grouped");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("suspend-apply-grouped"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            // Another caller holds the entire flush-queue budget already.
+            let held = tier
+                .reserve(64, Duration::from_secs(5))
+                .await
+                .expect("the whole (tiny) queue is free before this call");
+
+            let insert_fut = shard.insert_many([(1u32, "a".to_string())]);
+            tokio::pin!(insert_fut);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut insert_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "insert_many's own apply_grouped call must still be waiting on reserve()"
+            );
+
+            drop(held);
+
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut insert_fut)
+                .await
+                .expect("insert_many resumes once the reservation frees room");
+            assert!(
+                result.is_ok(),
+                "the write itself still succeeds: {result:?}"
+            );
+            assert_eq!(shard.get(&1).await, Some("a".to_string()));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Pins that `apply_remote_batch` suspends and resumes identically to
+        /// `apply_grouped` under a saturated flush-queue.
+        #[tokio::test]
+        async fn apply_remote_batch_suspends_identically_under_a_saturated_queue() {
+            let dir = temp_dir("suspend-apply-remote-batch");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("suspend-apply-remote-batch"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            // Another caller holds the entire flush-queue budget already.
+            let held = tier
+                .reserve(64, Duration::from_secs(5))
+                .await
+                .expect("the whole (tiny) queue is free before this call");
+
+            let rec = WireRecord {
+                key: key_bytes(&1u32),
+                value: Some(Bytes::from(postcard::to_stdvec("a").expect("encode"))),
+                ver: hlc(1, 1),
+                expires_at_ms: None,
+            };
+            let mut batch_fut = ShardOps::apply_remote_batch(&shard, vec![rec]);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut batch_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "apply_remote_batch's own reserve_for_batch call must still be waiting on \
+                 reserve()"
+            );
+
+            drop(held);
+
+            tokio::time::timeout(Duration::from_secs(5), &mut batch_fut)
+                .await
+                .expect("apply_remote_batch resumes once the reservation frees room");
+            assert_eq!(shard.get(&1).await, Some("a".to_string()));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Pins that `apply_remote_batch` groups by stripe before its one
+        /// `reserve_for_batch` suspension point, so the suspension cannot
+        /// reorder a batch: two same-key, same-`Hlc` puts must apply first-wins.
+        #[tokio::test]
+        async fn apply_remote_batch_preserves_per_bucket_order_once_reserve_can_suspend() {
+            let dir = temp_dir("order-apply-remote-batch");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("order-apply-remote-batch"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            let held = tier
+                .reserve(64, Duration::from_secs(5))
+                .await
+                .expect("the whole (tiny) queue is free before this call");
+
+            let ver = hlc(1, 1);
+            let first = WireRecord {
+                key: key_bytes(&7u32),
+                value: Some(Bytes::from(postcard::to_stdvec("first").expect("encode"))),
+                ver,
+                expires_at_ms: None,
+            };
+            let second = WireRecord {
+                key: key_bytes(&7u32),
+                value: Some(Bytes::from(postcard::to_stdvec("second").expect("encode"))),
+                ver,
+                expires_at_ms: None,
+            };
+            let mut batch_fut = ShardOps::apply_remote_batch(&shard, vec![first, second]);
+            let not_yet = tokio::time::timeout(Duration::from_millis(100), &mut batch_fut).await;
+            assert!(
+                not_yet.is_err(),
+                "this batch's reserve_for_batch call must still be waiting on reserve()"
+            );
+
+            drop(held);
+
+            tokio::time::timeout(Duration::from_secs(5), &mut batch_fut)
+                .await
+                .expect("apply_remote_batch resumes once the reservation frees room");
+            assert_eq!(
+                shard.get(&7).await,
+                Some("first".to_string()),
+                "the batch's own arrival order survives the suspension: \"first\" applies before \
+                 \"second\", so the equal-Hlc \"second\" write loses to it, exactly as it would \
+                 with no suspension at all"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Pins `retry_reservation_deficit`'s closing fallback end to end:
+        /// once its retry budget is exhausted with a real deficit outstanding,
+        /// it must call `Engine::enforce_capacity` itself rather than leave
+        /// `max_capacity` exceeded. The four keys collide into stripe 0,
+        /// the `start_bucket` both call sites pass.
+        #[tokio::test]
+        async fn retry_reservation_deficit_deletes_the_leftover_victim_once_its_own_budget_is_exhausted()
+         {
+            let dir = temp_dir("retry-deficit-shard-fallback");
+            let value = "x".repeat(20);
+            let encoded_len = postcard::to_stdvec(&value)
+                .expect("test value encodes")
+                .len();
+
+            let mut keys = Vec::new();
+            for k in 1..200_000u32 {
+                let kb = key_bytes(&k);
+                if engine::stripe_index_from_hash(engine::hash_key_bytes(kb.as_ref())) != 0 {
+                    continue;
+                }
+                keys.push(k);
+                if keys.len() == 4 {
+                    break;
+                }
+            }
+            assert_eq!(
+                keys.len(),
+                4,
+                "1024 stripes; four keys landing in stripe 0 specifically are found quickly"
+            );
+
+            let record_len_0 = spill::spill_record_len(key_bytes(&keys[0]).len(), encoded_len);
+
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                // One record's worth: the reservation clamps down to this
+                // tiny tier total, covering at most one victim.
+                .flush_queue_bytes(u64::from(record_len_0))
+                .spill_wait_timeout(Duration::from_millis(150));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("retry-deficit-shard-fallback"),
+                Mode::Local,
+                NodeId::from(1u64),
+                30,
+                None,
+                None,
+            )
+            .with_weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+            // Paused before this call enqueues anything, so nothing ever
+            // frees a byte back.
+            tier.pause_flusher();
+
+            shard
+                .insert_many(keys.iter().map(|&k| (k, value.clone())))
+                .await
+                .expect(
+                    "insert_many completes even though most of its own evictions are refused \
+                     for the whole run",
+                );
+
+            let mut resident_or_spilled = 0;
+            for &k in &keys {
+                if shard.get(&k).await.is_some() {
+                    resident_or_spilled += 1;
+                }
+            }
+            assert!(
+                resident_or_spilled < keys.len(),
+                "keep_resident_when_refused defaults to false: retry_reservation_deficit's own \
+                 closing fallback must physically delete at least the victim a reservation \
+                 retry gave up on, not leave every key resident with max_capacity exceeded \
+                 forever because a background retry ran out of budget"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Pins that `retry_reservation_deficit` shares
+        /// `reserve_for_batch`'s deadline instead of opening a second, fresh
+        /// `spill_wait_timeout` window: the whole `apply_grouped` call stays
+        /// bounded by one timeout total. A background task holds the tier's
+        /// admission budget for `HOG_HOLD` first, so a shared deadline
+        /// (finishes near `SPILL_WAIT_TIMEOUT`) is distinguishable from a
+        /// fresh one (`HOG_HOLD` + `SPILL_WAIT_TIMEOUT`).
+        #[tokio::test]
+        async fn apply_grouped_bounds_its_whole_reservation_wait_to_one_spill_wait_timeout() {
+            const SPILL_WAIT_TIMEOUT: Duration = Duration::from_millis(300);
+            /// Half the budget, leaving a clear gap between the "shared" and
+            /// "fresh" deadline totals so scheduling jitter cannot blur them.
+            const HOG_HOLD: Duration = Duration::from_millis(150);
+
+            let dir = temp_dir("retry-deficit-shared-budget");
+            let value = "x".repeat(20);
+            let encoded_len = postcard::to_stdvec(&value)
+                .expect("test value encodes")
+                .len();
+
+            let mut keys = Vec::new();
+            for k in 1..200_000u32 {
+                let kb = key_bytes(&k);
+                if engine::stripe_index_from_hash(engine::hash_key_bytes(kb.as_ref())) != 0 {
+                    continue;
+                }
+                keys.push(k);
+                if keys.len() == 4 {
+                    break;
+                }
+            }
+            assert_eq!(
+                keys.len(),
+                4,
+                "1024 stripes; four keys landing in stripe 0 specifically are found quickly"
+            );
+
+            let record_len_0 = spill::spill_record_len(key_bytes(&keys[0]).len(), encoded_len);
+
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(u64::from(record_len_0))
+                .spill_wait_timeout(SPILL_WAIT_TIMEOUT);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("retry-deficit-shared-budget"),
+                Mode::Local,
+                NodeId::from(1u64),
+                30,
+                None,
+                None,
+            )
+            .with_weigher(|_k: &u32, v: &String| u32::try_from(v.len()).unwrap_or(u32::MAX))
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+            tier.pause_flusher();
+
+            // Holds the whole admission budget for `HOG_HOLD`, forcing
+            // `reserve_for_batch` below to wait a known slice of its timeout.
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let hog_tier = Arc::clone(&tier);
+            let hog = tokio::spawn(async move {
+                let reservation = hog_tier
+                    .reserve(record_len_0, Duration::from_secs(5))
+                    .await
+                    .expect("the whole (single-record) queue is free before this task ever runs");
+                let _ = ready_tx.send(());
+                tokio::time::sleep(HOG_HOLD).await;
+                drop(reservation);
+            });
+            ready_rx.await.expect(
+                "the hog task reserves the whole queue before insert_many starts racing it",
+            );
+
+            let started = std::time::Instant::now();
+            shard
+                .insert_many(keys.iter().map(|&k| (k, value.clone())))
+                .await
+                .expect(
+                    "insert_many completes even though most of its own evictions are refused \
+                     for the whole run",
+                );
+            let elapsed = started.elapsed();
+            hog.await.expect("the hog task never panics");
+
+            assert!(
+                elapsed < SPILL_WAIT_TIMEOUT + Duration::from_millis(100),
+                "reserve_for_batch's own wait ({HOG_HOLD:?}, out for the hog) plus \
+                 retry_reservation_deficit's own retry must share one \
+                 {SPILL_WAIT_TIMEOUT:?} budget, not a fresh one each: elapsed {elapsed:?} \
+                 should land around {SPILL_WAIT_TIMEOUT:?}, well short of \
+                 {HOG_HOLD:?} + {SPILL_WAIT_TIMEOUT:?}, which is what a second, independent \
+                 full-budget wait would cost"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Pins that `apply_grouped`'s batch-wide `Reservation` reaches a real
+        /// eviction pass: every write past `max_capacity` still lands, never a
+        /// plain delete.
+        #[tokio::test]
+        async fn apply_grouped_threads_a_real_reservation_through_a_real_eviction_pass() {
+            let dir = temp_dir("reservation-through-real-eviction");
+            // Generous budget: the point is that the reservation reaches
+            // real eviction, not byte-budget precision.
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(1 << 16)
+                .spill_wait_timeout(Duration::from_secs(5));
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("reservation-through-real-eviction"),
+                Mode::Local,
+                NodeId::from(1u64),
+                5, // weight 1 per entry with no custom weigher: caps at 5 live entries
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+
+            shard
+                .insert_many((0..10u32).map(|k| (k, "v".repeat(5))))
+                .await
+                .expect("insert_many");
+
+            // Every write landed, resident or spilled, never a plain delete.
+            for k in 0..10u32 {
+                assert!(
+                    shard.get(&k).await.is_some(),
+                    "key {k} is present, whether resident or spilled"
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Extends [`insert_sync_writes_a_value_with_no_async_runtime`]:
+        /// `insert_sync` completes with no runtime even while another task
+        /// holds the whole reservation.
+        #[test]
+        fn insert_sync_completes_synchronously_while_another_task_holds_the_whole_reservation() {
+            let dir = temp_dir("insert-sync-under-reservation");
+            let cfg = SpillConfig::new(&dir, 1 << 20)
+                .region_bytes(4096)
+                .flush_queue_bytes(64);
+            let shard = Shard::<u32, String>::new(
+                SmolStr::new("insert-sync-under-reservation"),
+                Mode::Local,
+                NodeId::from(1u64),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_spill(&cfg)
+            .expect("tier opens");
+            let tier = Arc::clone(shard.engine.spill().expect("with_spill attaches a tier"));
+
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("a fresh runtime builds");
+                rt.block_on(async move {
+                    let reservation = tier
+                        .reserve(64, Duration::from_secs(30))
+                        .await
+                        .expect("the whole queue is free before this call");
+                    ready_tx.send(()).expect("the main thread is listening");
+                    let _ = release_rx.recv();
+                    drop(reservation);
+                });
+            });
+            ready_rx
+                .recv()
+                .expect("the holder thread reports it holds the reservation");
+
+            // Runs with no async runtime here while the reservation stays
+            // live on another thread.
+            shard.insert_sync(1, "a".to_string()).expect("insert_sync");
+            assert_eq!(shard.get_sync(&1), Some("a".to_string()));
+
+            release_tx.send(()).expect("the holder thread is listening");
+            holder.join().expect("the holder thread does not panic");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
