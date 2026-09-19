@@ -321,6 +321,9 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- Every workflow checks out with `actions/checkout@v7` and uploads with
+  `actions/upload-artifact@v7`, the Node 24 majors, and `weekly-kani.yml`
+  and `weekly-fuzz.yml` deny warnings the way every other lane does.
 - The sim, fuzz, chaos and scale runs are weekly instead of nightly:
   `weekly-sim.yml`, `weekly-fuzz.yml`, `weekly-chaos.yml` and `scale.yml`
   run early Sunday UTC and on demand, and `release.yml` requires a green
