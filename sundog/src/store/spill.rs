@@ -4995,3 +4995,26 @@ mod tests {
         }
     }
 }
+
+/// Kani proofs over the spill tier's sizing arithmetic.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Any capacity and region size give at least one region without panicking.
+    #[kani::proof]
+    fn region_count_is_at_least_one_for_any_sizes() {
+        let capacity_bytes: u64 = kani::any();
+        let region_bytes: u64 = kani::any();
+        assert!(region_count_for(capacity_bytes, region_bytes) >= 1);
+    }
+
+    /// Any flush queue byte size lands between the slot floor and ceiling.
+    #[kani::proof]
+    fn flush_queue_slots_stay_within_the_clamp() {
+        let flush_queue_bytes: u64 = kani::any();
+        let slots = flush_queue_slots(flush_queue_bytes);
+        assert!(slots >= FLUSH_QUEUE_CAPACITY);
+        assert!(slots <= FLUSH_QUEUE_SLOTS_MAX);
+    }
+}

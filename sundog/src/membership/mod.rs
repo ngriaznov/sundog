@@ -1503,3 +1503,22 @@ mod tests {
         ));
     }
 }
+
+/// Kani proof over the gossip bind retry rule.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Only a port-0 request retries, only on address-in-use, and never past the attempt cap.
+    #[kani::proof]
+    fn gossip_bind_retries_only_a_port_zero_request_within_the_cap() {
+        let requested_port: u16 = kani::any();
+        let addr_in_use: bool = kani::any();
+        let attempt: u32 = kani::any();
+        let retry = should_retry_gossip_bind(requested_port, addr_in_use, attempt);
+        assert_eq!(
+            retry,
+            requested_port == 0 && addr_in_use && attempt < GOSSIP_BIND_ATTEMPTS
+        );
+    }
+}

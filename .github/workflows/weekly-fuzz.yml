@@ -1,4 +1,4 @@
-# Nightly fuzz smoke: five minutes per target. The two wire-decoder targets
+# Weekly fuzz smoke: five minutes per target. The two wire-decoder targets
 # start from a generated seed corpus; the two stateful apply-path targets
 # (`apply_model`, `apply_permutation`) have no hand-built seeds — their
 # input is an `Arbitrary`-decoded op/record sequence, not a wire frame, so
@@ -6,11 +6,11 @@
 # own coverage-guided mutation is what grows one. A crash uploads its
 # artifact for local reproduction with `cargo +nightly fuzz run <target>
 # <artifact>`.
-name: nightly-fuzz
+name: weekly-fuzz
 
 on:
   schedule:
-    - cron: "30 3 * * *"
+    - cron: "30 3 * * 0"
   workflow_dispatch:
 
 jobs:

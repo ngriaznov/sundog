@@ -1,13 +1,13 @@
-# Nightly ten-minute chaos run with a fresh seed: the chosen seed is printed
-# before the suite runs, so a red night is replayed locally with
+# Weekly ten-minute chaos run with a fresh seed: the chosen seed is printed
+# before the suite runs, so a red run is replayed locally with
 # `SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=600
 # RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test containers
 # -- --test-threads=1 chaos_`.
-name: nightly-chaos
+name: weekly-chaos
 
 on:
   schedule:
-    - cron: "0 4 * * *"
+    - cron: "0 4 * * 0"
   workflow_dispatch:
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Pick and log tonight's seed
+      - name: Pick and log this run's seed
         run: |
           SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
           echo "SUNDOG_CHAOS_SEED=$SEED" >> "$GITHUB_ENV"

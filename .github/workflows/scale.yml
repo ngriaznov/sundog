@@ -1,4 +1,4 @@
-# Nightly scale run: builds the distributed demo with the spill and
+# Weekly scale run: builds the distributed demo with the spill and
 # prometheus features, runs it headless at 4M keys across three nodes with
 # an 800k-entry RAM cap per node over a spill tier, and checks the
 # resulting report against ops/scale-gate.json's RSS, spill-drop,
@@ -9,7 +9,7 @@ name: Scale
 
 on:
   schedule:
-    - cron: "0 5 * * *"
+    - cron: "0 5 * * 0"
   workflow_dispatch:
     inputs:
       keys:

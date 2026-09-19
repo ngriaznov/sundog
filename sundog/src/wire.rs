@@ -1445,3 +1445,25 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests;
+
+/// Kani proof over the replicate frame length arithmetic.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// For lengths within a frame, the computed length never overflows and
+    /// covers the header and every byte of the name, key and value.
+    #[kani::proof]
+    fn replicate_frame_len_covers_every_byte_without_overflow() {
+        let cache_len: usize = kani::any();
+        let key_len: usize = kani::any();
+        let value_len: usize = kani::any();
+        kani::assume(cache_len <= MAX_FRAME && key_len <= MAX_FRAME && value_len <= MAX_FRAME);
+        let len = replicate_frame_len(cache_len, key_len, value_len);
+        assert_eq!(
+            len,
+            1 + size_of::<RawFrameHeader>() + cache_len + RECORD_HEADER_LEN + key_len + value_len
+        );
+        assert!(len > cache_len + key_len + value_len);
+    }
+}

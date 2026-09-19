@@ -5181,3 +5181,62 @@ mod tests {
         }
     }
 }
+
+/// Kani proofs over the reconciliation loop's bounds.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_duration() -> Duration {
+        let secs: u64 = kani::any();
+        let nanos: u32 = kani::any();
+        kani::assume(nanos < 1_000_000_000);
+        Duration::new(secs, nanos)
+    }
+
+    fn any_budget() -> ReconcileBudget {
+        ReconcileBudget {
+            max_rounds: kani::any(),
+            byte_budget: kani::any(),
+            time_budget: any_duration(),
+            backoff_cap: any_duration(),
+        }
+    }
+
+    /// A retry wait never exceeds the backoff cap, always ends inside the
+    /// time budget, and is refused once the budget is spent.
+    #[kani::proof]
+    fn retry_delay_never_outruns_the_cap_or_the_time_budget() {
+        let failures: u32 = kani::any();
+        let elapsed = any_duration();
+        let budget = any_budget();
+        match retry_delay(failures, elapsed, &budget) {
+            Some(delay) => {
+                assert!(delay <= budget.backoff_cap);
+                assert!(elapsed + delay < budget.time_budget);
+            }
+            None => {}
+        }
+        if elapsed >= budget.time_budget {
+            assert!(retry_delay(failures, elapsed, &budget).is_none());
+        }
+    }
+
+    /// The loop keeps going only with work left and every bound unspent,
+    /// and stops the moment any one of them is hit.
+    #[kani::proof]
+    fn keep_reconciling_stops_at_every_bound() {
+        let rounds_run: u32 = kani::any();
+        let bytes_moved: u64 = kani::any();
+        let still_diverging: usize = kani::any();
+        let elapsed = any_duration();
+        let budget = any_budget();
+        let keep =
+            should_keep_reconciling(rounds_run, bytes_moved, still_diverging, elapsed, &budget);
+        let any_bound_hit = still_diverging == 0
+            || rounds_run >= budget.max_rounds
+            || bytes_moved >= budget.byte_budget
+            || elapsed >= budget.time_budget;
+        assert_eq!(keep, !any_bound_hit);
+    }
+}
