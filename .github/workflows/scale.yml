@@ -44,7 +44,7 @@ jobs:
       SCALE_DURATION_SECS: ${{ inputs.duration_secs || '300' }}
       SCALE_MAX_ENTRIES: ${{ inputs.max_entries || '800000' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -76,7 +76,7 @@ jobs:
 
       - name: Upload scale report and log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scale-report
           path: |

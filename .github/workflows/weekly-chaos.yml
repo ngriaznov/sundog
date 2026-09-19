@@ -19,7 +19,7 @@ jobs:
       SUNDOG_CONTAINER_TESTS: "1"
       SUNDOG_CHAOS_SECS: "600"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
