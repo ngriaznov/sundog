@@ -1,0 +1,22 @@
+# Weekly bounded model checking with Kani over the crate's pure arithmetic
+# and decision rules: the `#[kani::proof]` harnesses under each module's
+# `kani_proofs` (expiry packing, the touch stamp, hash-to-bucket indexing,
+# the compaction shrink rule, the reconciliation retry bounds, the gossip
+# bind retry, the anti-entropy skip rule, the hybrid logical
+# clock, frame length arithmetic, spill sizing). Reproduce locally with
+# `cargo install --locked kani-verifier && cargo kani setup && cargo kani -p sundog --features spill`.
+name: weekly-kani
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v1.1
+        with:
+          args: -p sundog --features spill

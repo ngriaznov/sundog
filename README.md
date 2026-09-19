@@ -479,8 +479,8 @@ Five layers, cheapest and highest-signal first:
      `chaos_distributed_crashes_churn_and_drops_still_converge` runs the same
      mix against a `Mode::Distributed` cluster instead, checking that every
      bucket converges across its current owners alone. `SUNDOG_CHAOS_SEED`
-     pins a run for replay; `nightly-chaos.yml` runs it for ten minutes with a
-     fresh seed, logged so a red night replays with
+     pins a run for replay; `weekly-chaos.yml` runs it for ten minutes with a
+     fresh seed, logged so a red run replays with
      `SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=<secs>
      RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test containers
      -- --test-threads=1 chaos_`.
@@ -491,7 +491,7 @@ Five layers, cheapest and highest-signal first:
    two-node replication, invalidation, state-transfer, anti-entropy, and
    local-mode tests.
 4. **Coverage-guided fuzzing** runs via `sundog/fuzz`, a `cargo-fuzz` crate
-   outside the workspace, nightly-only via `.github/workflows/nightly-fuzz.yml`.
+   outside the workspace, weekly via `.github/workflows/weekly-fuzz.yml`.
    `decode_never_panics` and `decode_encode_roundtrip` throw arbitrary bytes at
    the wire decoder: it must never panic, and any frame it accepts must
    re-encode to a fixed point. `apply_model` and `apply_permutation` cover
@@ -502,7 +502,17 @@ Five layers, cheapest and highest-signal first:
    in-crate under libFuzzer instead of proptest. `apply_permutation` runs the
    same permutation-convergence property: a duplicated, twice-shuffled record
    set must converge two shards to identical digests and entry sets.
-5. **Chaos demo** runs `sundog-demo` in headless mode, described in the Chaos demo section.
+5. **Bounded model checking** runs `#[kani::proof]` harnesses under each
+   module's `kani_proofs` with [Kani](https://github.com/model-checking/kani),
+   which exhausts every input of a pure function where proptest samples and
+   proves the absence of panics and overflow on the way: expiry packing and
+   the touch stamp, hash-to-bucket indexing, the compaction shrink rule, the
+   reconciliation retry bounds, the gossip bind retry, the anti-entropy skip
+   rule, the hybrid logical clock, frame length arithmetic and
+   spill sizing. `.github/workflows/weekly-kani.yml` runs them weekly;
+   locally, `cargo install --locked kani-verifier && cargo kani setup &&
+   cargo kani -p sundog --features spill`.
+6. **Chaos demo** runs `sundog-demo` in headless mode, described in the Chaos demo section.
 
 Three benchmark suites sit outside these five layers, each gated on
 `SUNDOG_BENCH=1` so a plain `cargo test` never pays their wall-clock cost:
@@ -535,7 +545,7 @@ SUNDOG_CONTAINER_TESTS=1 RIGHTSIZE_BACKEND=docker \
 `RUSTFLAGS="-D warnings"` and `RUSTDOCFLAGS="-D warnings"`: a compiler or
 rustdoc warning fails the build.
 
-`.github/workflows/scale.yml` runs nightly and on demand: it builds
+`.github/workflows/scale.yml` runs weekly and on demand: it builds
 `sundog-distributed-demo` with `--features spill,prometheus` and runs it
 headless at 4M keys across three nodes with an 800k-entry RAM cap per node
 over a spill tier, checking the resulting `--report-json` output against

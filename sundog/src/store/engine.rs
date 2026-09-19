@@ -11011,3 +11011,82 @@ mod tests {
         }
     }
 }
+
+/// Kani proofs over the engine's pure arithmetic: every input, not a sample.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Every deadline encodes without panicking and reads back as itself:
+    /// `None` as never, a deadline inside the inline range as an exact
+    /// delta, anything else through the side table.
+    #[kani::proof]
+    fn expiry_encodes_and_decodes_every_deadline() {
+        let wall_ms: u64 = kani::any();
+        let expires_at_ms: Option<u64> = kani::any();
+        let (expiry, side) = encode_expiry(wall_ms, expires_at_ms);
+        match expires_at_ms {
+            None => {
+                assert_eq!(expiry, NEVER_EXPIRES);
+                assert!(side.is_none());
+            }
+            Some(exp) if exp >= wall_ms && exp - wall_ms <= MAX_INLINE_TTL_MS => {
+                assert_ne!(expiry, NEVER_EXPIRES);
+                assert_ne!(expiry, LONG_TTL);
+                assert!(side.is_none());
+                assert_eq!(wall_ms + u64::from(expiry), exp);
+            }
+            Some(exp) => {
+                assert_eq!(expiry, LONG_TTL);
+                assert_eq!(side, Some(exp));
+            }
+        }
+    }
+
+    /// The u32 touch stamp recovers any idle gap up to the clamped
+    /// time-to-idle ceiling, across a rollover of the stamp.
+    #[kani::proof]
+    fn idle_elapsed_recovers_any_gap_under_the_stamp_span() {
+        let earlier: u64 = kani::any();
+        let now: u64 = kani::any();
+        kani::assume(now >= earlier);
+        kani::assume(now - earlier <= MAX_INLINE_TTL_MS);
+        assert_eq!(idle_elapsed_ms(now, touch_stamp(earlier)), now - earlier);
+    }
+
+    /// A clamped time-to-idle never exceeds the stamp's span or the value asked for.
+    #[kani::proof]
+    fn clamped_tti_stays_within_the_stamp_span() {
+        let tti_ms: u64 = kani::any();
+        let clamped = clamp_tti_ms(tti_ms);
+        assert!(clamped <= MAX_INLINE_TTL_MS);
+        assert!(clamped <= tti_ms);
+    }
+
+    /// Any hash lands inside the bucket table, the part table and the flat digest table.
+    #[kani::proof]
+    fn hash_indexes_stay_within_the_bucket_and_part_tables() {
+        let hash: u64 = kani::any();
+        let bucket = stripe_index_from_hash(hash);
+        let part = part_index_from_hash(hash);
+        assert!(bucket < BUCKET_COUNT);
+        assert!(part < PART_COUNT);
+        assert!(digest_slot(bucket, part) < BUCKET_COUNT * PART_COUNT);
+    }
+
+    /// A stripe shrinks only at or under an eighth of its allocation, never
+    /// with nothing allocated and never while holding more than it has room for.
+    #[kani::proof]
+    fn shrink_fires_only_at_an_eighth_of_the_allocation() {
+        let len: usize = kani::any();
+        let capacity: usize = kani::any();
+        let shrink = should_shrink_stripe(len, capacity);
+        if shrink {
+            assert!(capacity > 0);
+            assert!(len.checked_mul(8).is_some_and(|eight| eight <= capacity));
+        }
+        if capacity == 0 || len > capacity / 8 {
+            assert!(!shrink);
+        }
+    }
+}

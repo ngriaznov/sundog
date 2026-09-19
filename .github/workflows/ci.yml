@@ -55,7 +55,7 @@ jobs:
         run: cargo clippy --package sundog --all-targets --features spill,prometheus -- -D warnings -W clippy::pedantic
 
       # The fuzz crate sits outside the workspace; a wire change that misses
-      # its seed generator or a target would otherwise surface only nightly.
+      # its seed generator or a target would otherwise surface only weekly.
       - name: cargo check (fuzz crate)
         run: cargo check --manifest-path sundog/fuzz/Cargo.toml --all-targets
 
@@ -138,7 +138,7 @@ jobs:
     env:
       RIGHTSIZE_BACKEND: docker
       SUNDOG_CONTAINER_TESTS: "1"
-      # A short chaos pass on every run; `nightly-chaos.yml` runs the same
+      # A short chaos pass on every run; `weekly-chaos.yml` runs the same
       # test for ten minutes with a fresh seed.
       SUNDOG_CHAOS_SECS: "45"
     steps:

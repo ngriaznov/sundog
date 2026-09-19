@@ -37,7 +37,8 @@
   bollard in the repo. The test node is the `sundog-testnode` binary.
 - Publishing goes through GitHub Actions (`release.yml`, `tag-release.yml`,
   `yank.yml`); the session git proxy cannot push tags. `release.yml` refuses
-  to publish unless CI, nightly-sim, nightly-fuzz, and nightly-chaos each
-  have a successful run on the exact release commit: dispatch all four on
-  that commit and wait for green before the release run. After a release
+  to publish unless CI, weekly-sim, weekly-fuzz, weekly-chaos and
+  weekly-kani each have a successful run on the exact release commit:
+  dispatch all five on that commit and wait for green before the release
+  run. After a release
   run, verify the run's conclusion, not only the crates.io max version.

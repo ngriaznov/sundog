@@ -1,11 +1,11 @@
-# Nightly turmoil run with a fresh seed: the chosen seed is printed before
-# the suite runs, so a red night is replayed locally
+# Weekly turmoil run with a fresh seed: the chosen seed is printed before
+# the suite runs, so a red run is replayed locally
 # with `SUNDOG_SIM_SEED=<seed> cargo test -p sundog --features sim --test sim`.
-name: nightly-sim
+name: weekly-sim
 
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * 0"
   workflow_dispatch:
 
 env:
@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Pick and log tonight's seed
+      - name: Pick and log this run's seed
         run: |
           SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
           echo "SUNDOG_SIM_SEED=$SEED" >> "$GITHUB_ENV"

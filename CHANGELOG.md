@@ -7,6 +7,17 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **Kani proofs**: `#[kani::proof]` harnesses under each module's
+  `kani_proofs` prove, over every input, that expiry packing and the
+  touch stamp round-trip, a hash lands inside the bucket and part tables,
+  the compaction shrink rule fires only at an eighth of an allocation, a
+  reconciliation retry never outruns its cap or time budget and the loop
+  stops at every bound, the gossip bind retry moves only a port-0
+  request within its cap, the anti-entropy skip rule keeps its bound, the
+  hybrid logical clock advances past both the last and
+  the observed stamp, a replicate frame length never overflows, and spill
+  sizing stays within its clamps. `weekly-kani.yml` runs them weekly and
+  the release gate requires a green run.
 - **Entry diet**: a live entry stores one encoded record (key length, key,
   and value in the postcard form the wire already uses) instead of a typed
   key and value plus a separate encoded copy, and that record is an enum,
@@ -310,6 +321,11 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- The sim, fuzz, chaos and scale runs are weekly instead of nightly:
+  `weekly-sim.yml`, `weekly-fuzz.yml`, `weekly-chaos.yml` and `scale.yml`
+  run early Sunday UTC and on demand, and `release.yml` requires a green
+  run of each weekly workflow and of `weekly-kani.yml` on the release
+  commit.
 - The distributed demo's restart reopens a node under the id it had, the
   way a deployment persists its node id, so ownership stays where it was
   and a warm spill reopen replays into buckets the node still owns. Its

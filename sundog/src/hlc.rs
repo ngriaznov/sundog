@@ -177,3 +177,51 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests;
+
+/// Kani proofs of the clock's ordering rules over every stamp.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_hlc() -> Hlc {
+        Hlc {
+            wall_ms: kani::any(),
+            logical: kani::any(),
+            node: NodeId::from(kani::any::<u64>()),
+        }
+    }
+
+    /// A local stamp is greater than the previous one and never behind the physical clock.
+    #[kani::proof]
+    fn now_advances_past_the_last_stamp() {
+        let last = any_hlc();
+        kani::assume(last.logical < u32::MAX);
+        let mut clock = HlcClock {
+            node: last.node,
+            last,
+        };
+        let physical_now_ms: u64 = kani::any();
+        let stamp = clock.now(physical_now_ms);
+        assert!(stamp > last);
+        assert!(stamp.wall_ms >= physical_now_ms);
+        assert_eq!(stamp.node, last.node);
+    }
+
+    /// An observed stamp is greater than both the previous local stamp and the remote one.
+    #[kani::proof]
+    fn observe_advances_past_the_last_and_the_remote_stamp() {
+        let last = any_hlc();
+        let remote = any_hlc();
+        kani::assume(last.logical < u32::MAX);
+        kani::assume(remote.logical < u32::MAX);
+        let mut clock = HlcClock {
+            node: last.node,
+            last,
+        };
+        let physical_now_ms: u64 = kani::any();
+        let stamp = clock.observe(physical_now_ms, remote);
+        assert!(stamp > last);
+        assert!(stamp > remote);
+        assert!(stamp.wall_ms >= physical_now_ms);
+    }
+}

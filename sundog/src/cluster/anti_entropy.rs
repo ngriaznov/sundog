@@ -2367,3 +2367,18 @@ mod tests {
         }
     }
 }
+
+/// Kani proof over the scheduler's skip rule.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// A streaming peer is skipped at most `MAX_STREAMING_SKIPS` rounds running; an idle peer never.
+    #[kani::proof]
+    fn streaming_skips_are_bounded() {
+        let streaming: bool = kani::any();
+        let skipped_so_far: u32 = kani::any();
+        let skip = should_skip_round(streaming, skipped_so_far);
+        assert_eq!(skip, streaming && skipped_so_far < MAX_STREAMING_SKIPS);
+    }
+}
