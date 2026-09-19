@@ -351,6 +351,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- A `Mode::Distributed` node releases every bucket it holds without
+  owning, not only the ones its last two observed ownership views
+  disagree on. A view published and superseded while `rebalance_task` was
+  pulling or running a hand-off round was never observed, so entries the
+  inbound guard applied under it stayed resident, outside every
+  anti-entropy round and every release; the weekly chaos run caught a
+  four-node cluster settling 136 entries over its expected sum after a
+  crash and respawn. `plan_view_change` now folds the shard's
+  `held_buckets` that the new view does not own into the lost set.
+
 - A node whose `gossip_bind_addr` asks for port 0 probes a free port,
   releases it and lets chitchat bind it; when another socket takes the
   port in between, chitchat's address-in-use answer sends membership

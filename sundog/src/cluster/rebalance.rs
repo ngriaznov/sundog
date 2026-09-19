@@ -462,9 +462,14 @@ pub(crate) async fn warm_up_task(
     }
 }
 
-/// What one published view change asks of [`rebalance_task`]: `lost` and
-/// `regained` are the difference from the previous view (`prev`); `to_pull`
-/// is the difference from the latest view whose pull is not superseded
+/// What one published view change asks of [`rebalance_task`]: `regained`
+/// is the difference from the previous view (`prev`); `lost` is that
+/// difference plus every bucket in `held` (the shard's
+/// [`ShardOps::held_buckets`]) that `new` does not own, since a bucket
+/// owned only under a view published and superseded while the task was
+/// busy is in neither `prev` nor `new`, and what the inbound guard applied
+/// there stays resident until this fold releases it; `to_pull` is the
+/// difference from the latest view whose pull is not superseded
 /// (`pulled`), so a bucket gained under a view that gets superseded
 /// mid-pull is pulled again under the current one instead of skipped.
 pub(crate) struct ViewChangePlan {
@@ -477,8 +482,15 @@ pub(crate) fn plan_view_change(
     prev: &OwnershipView,
     pulled: &OwnershipView,
     new: &OwnershipView,
+    held: &[u16],
 ) -> ViewChangePlan {
-    let (regained, lost) = ownership_diff(prev, new);
+    let (regained, mut lost) = ownership_diff(prev, new);
+    let mut seen: HashSet<u16> = lost.iter().copied().collect();
+    lost.extend(
+        held.iter()
+            .copied()
+            .filter(|&bucket| !new.owns(bucket) && seen.insert(bucket)),
+    );
     let (to_pull, _) = ownership_diff(pulled, new);
     ViewChangePlan {
         lost,
@@ -658,7 +670,8 @@ pub(crate) async fn rebalance_task(
                     return; // the tracker's sender dropped
                 }
                 let new_view = view_rx.borrow_and_update().clone();
-                let plan = plan_view_change(&prev_view, &pulled_view, &new_view);
+                let held = shard.held_buckets().await;
+                let plan = plan_view_change(&prev_view, &pulled_view, &new_view, &held);
                 prev_view = Arc::clone(&new_view);
                 tracing::debug!(
                     cache = %cache,
@@ -888,7 +901,7 @@ mod tests {
         let (o0, o1, o2) = (owned(&v0), owned(&v1), owned(&v2));
 
         // v0 -> v1 pulled cleanly: prev and pulled agree.
-        let plan = plan_view_change(&v0, &v0, &v1);
+        let plan = plan_view_change(&v0, &v0, &v1, &[]);
         assert_eq!(
             plan.to_pull.iter().copied().collect::<HashSet<_>>(),
             plan.regained.iter().copied().collect::<HashSet<_>>()
@@ -900,7 +913,7 @@ mod tests {
         // v1's pull gets superseded by v2: lost is measured from v1, so a
         // bucket gained under v1 and gone in v2 starts its grace, while
         // the pull covers everything v2 owns that v0 did not.
-        let plan = plan_view_change(&v1, &v0, &v2);
+        let plan = plan_view_change(&v1, &v0, &v2, &[]);
         let gained_then_lost: Vec<u16> = o1
             .iter()
             .copied()
@@ -983,6 +996,162 @@ mod tests {
              `rebalance_task`'s normal lost-bucket path (`plan_view_change`) reacting off \
              `OwnershipTracker::baseline`, not a live re-borrow of the channel a race could \
              already have moved past"
+        );
+
+        cancel.cancel();
+        cluster.shutdown().await;
+    }
+
+    #[test]
+    fn plan_view_change_marks_a_held_bucket_lost_when_the_view_that_owned_it_was_never_observed() {
+        let self_node = NodeId::from(1);
+        let k = 2;
+        // v0: three nodes. v1: node 3 died. v2: node 4 joined. The task
+        // observed v0 and v2 only: v1 came and went while it was busy.
+        let v0 = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
+        let v1 = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
+        let v2 = view(self_node, [1u64, 2, 4].map(NodeId::from).to_vec(), k);
+        let owned = |v: &OwnershipView| v.owned_buckets().collect::<HashSet<u16>>();
+        let (o0, o1, o2) = (owned(&v0), owned(&v1), owned(&v2));
+        let only_in_v1: Vec<u16> = o1
+            .iter()
+            .copied()
+            .filter(|b| !o0.contains(b) && !o2.contains(b))
+            .collect();
+        assert!(
+            !only_in_v1.is_empty(),
+            "the fixture has a bucket owned under v1 alone"
+        );
+        let kept = *o2
+            .iter()
+            .find(|b| o0.contains(b))
+            .expect("the fixture has a bucket owned throughout");
+
+        // Without the held fold, the unobserved view leaves no trace.
+        let blind = plan_view_change(&v0, &v0, &v2, &[]);
+        for b in &only_in_v1 {
+            assert!(
+                !blind.lost.contains(b),
+                "bucket {b} is in neither prev nor new, so the plain diff misses it"
+            );
+        }
+
+        // The inbound guard applied entries to those buckets under v1:
+        // the shard holds them, and the fold releases every one.
+        let mut held = only_in_v1.clone();
+        held.push(kept);
+        let plan = plan_view_change(&v0, &v0, &v2, &held);
+        for b in &only_in_v1 {
+            assert!(
+                plan.lost.contains(b),
+                "held bucket {b} starts its disown grace"
+            );
+        }
+        assert!(
+            !plan.lost.contains(&kept),
+            "a held bucket the new view owns is not lost"
+        );
+        let distinct: HashSet<u16> = plan.lost.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            plan.lost.len(),
+            "lost lists each bucket once"
+        );
+        for b in o0.iter().filter(|b| !o2.contains(b)) {
+            assert!(
+                plan.lost.contains(b),
+                "the plain prev-to-new loss {b} stays"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rebalance_task_releases_a_bucket_held_under_a_view_it_never_observed() {
+        let cluster = solo_cluster("rebalance-unit-test-held-release").await;
+        let name = SmolStr::new("prices");
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (tracker, tx) = OwnershipTracker::seed(
+            cluster.node_id(),
+            &cluster.peers(),
+            &cluster.advertised_cache_modes(),
+            &name,
+            k,
+        );
+        let other_a = NodeId::from(u64::MAX);
+        let other_b = NodeId::from(u64::MAX - 1);
+        let settled = Arc::new(view(
+            cluster.node_id(),
+            vec![cluster.node_id(), other_a, other_b],
+            2,
+        ));
+        let bucket = (0..crate::store::BUCKET_COUNT)
+            .map(|b| u16::try_from(b).expect("invariant: BUCKET_COUNT fits u16"))
+            .find(|&b| !settled.owns(b))
+            .expect("a three-node, k=2 split leaves some bucket unowned here");
+        let shard = empty_shard();
+        let residency = Arc::new(ResidencySet::new());
+        let cancel = CancellationToken::new();
+        let _task = tokio::spawn(rebalance_task(
+            cluster.clone(),
+            Arc::clone(&shard),
+            tracker,
+            Arc::clone(&residency),
+            name.clone(),
+            Duration::from_secs(3600),
+            4,
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The lone-node baseline owned everything, so the first observed
+        // view loses `bucket` through the plain diff; its release then
+        // completes, modelled by the same unmark the release path calls.
+        tx.send(Arc::clone(&settled))
+            .expect("the tracker's own receiver keeps the channel open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(residency.is_releasing(bucket), "lost from the baseline");
+        residency.unmark(&[bucket]);
+
+        // A change that moves nothing, with nothing held: no grace starts.
+        tx.send(Arc::clone(&settled))
+            .expect("the tracker's own receiver keeps the channel open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !residency.is_releasing(bucket),
+            "an empty unowned bucket has nothing to release"
+        );
+
+        // An entry lands in the bucket, as the inbound guard applies one
+        // under a view that owned it and was superseded before this task
+        // observed it. The next observed change, whose prev and new both
+        // disown the bucket, still starts its grace.
+        let key = (0..1_000_000u32)
+            .find(|key| {
+                crate::store::bucket_of(&postcard::to_stdvec(key).expect("encodes")) == bucket
+            })
+            .expect("some key hashes into the bucket");
+        shard
+            .apply_remote_batch(vec![crate::wire::WireRecord {
+                key: bytes::Bytes::from(postcard::to_stdvec(&key).expect("encodes")),
+                value: Some(bytes::Bytes::from(
+                    postcard::to_stdvec(&7u32).expect("encodes"),
+                )),
+                ver: crate::hlc::Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    node: NodeId::from(9),
+                },
+                expires_at_ms: None,
+            }])
+            .await;
+        assert_eq!(shard.held_buckets().await, vec![bucket]);
+        tx.send(Arc::clone(&settled))
+            .expect("the tracker's own receiver keeps the channel open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            residency.is_releasing(bucket),
+            "a bucket the shard holds without owning starts its disown grace on the next \
+             observed view change, whichever views the task saw in between"
         );
 
         cancel.cancel();

@@ -662,6 +662,17 @@ pub trait ShardOps: Send + Sync {
     /// answers `0`.
     fn bucket_lens(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketLen>>;
 
+    /// Every bucket this shard holds at least one live entry or un-GC'd
+    /// tombstone in, whether or not its current view owns the bucket:
+    /// unlike [`ShardOps::bucket_lens`], residency never gates this list.
+    /// `rebalance_task` folds the held buckets its new view does not own
+    /// into the ones it releases, so a bucket owned only under a view it
+    /// never observed still hands its data off. The default answers
+    /// nothing, for a stub with no store behind it.
+    fn held_buckets(&self) -> BoxFuture<'_, Vec<u16>> {
+        Box::pin(async { Vec::new() })
+    }
+
     /// This shard's part digests for each of `buckets`, the second-level
     /// reply for a bucket whose digest mismatched and whose entry count
     /// passed [`crate::config::ClusterConfig::ae_part_min_bucket`].
@@ -3831,6 +3842,14 @@ where
             .map(|(bucket, len)| BucketLen { bucket, len })
             .collect();
         Box::pin(async move { out })
+    }
+
+    fn held_buckets(&self) -> BoxFuture<'_, Vec<u16>> {
+        let held: Vec<u16> = (0..BUCKET_COUNT)
+            .map(|b| u16::try_from(b).expect("invariant: BUCKET_COUNT fits u16"))
+            .filter(|&b| self.engine.bucket_len(b) > 0)
+            .collect();
+        Box::pin(async move { held })
     }
 
     fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
@@ -8687,6 +8706,45 @@ mod tests {
         assert!(
             s.get(&unowned_key).await.is_none(),
             "a record for a bucket this node does not own is dropped, never applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn held_buckets_lists_a_bucket_with_an_entry_the_current_view_no_longer_owns() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+
+        let key = find_key_by_ownership(&view, true);
+        let bucket = bucket_of(&key_bytes(&key));
+        ShardOps::apply_remote_batch(&s, vec![wire_record(key, "held", hlc(1, 9))]).await;
+        assert_eq!(
+            ShardOps::held_buckets(&s).await,
+            vec![bucket],
+            "the one bucket with an entry is held; every empty bucket is not"
+        );
+
+        // A view that grew past this node's share of `bucket`, as a
+        // membership change publishes while rebalance_task is busy.
+        let moved = (6..=64u64)
+            .map(|extra| {
+                let eligible = (1..=extra).map(NodeId::from).collect::<Vec<_>>();
+                OwnershipView::compute(self_node, eligible, NonZeroU8::new(2).expect("nonzero"))
+            })
+            .find(|v| !v.owns(bucket))
+            .expect("some larger eligible set takes the bucket away from self");
+        tx.send(Arc::new(moved)).expect("receiver still alive");
+
+        assert_eq!(
+            ShardOps::held_buckets(&s).await,
+            vec![bucket],
+            "held_buckets is ungated: the entry is still resident under the new view"
+        );
+        assert_eq!(
+            ShardOps::bucket_lens(&s, vec![bucket]).await,
+            vec![BucketLen { bucket, len: 0 }],
+            "bucket_lens stays residency-gated: the same bucket reads as empty"
         );
     }
 
