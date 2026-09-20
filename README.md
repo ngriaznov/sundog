@@ -1,4 +1,6 @@
-[//]: # (Badges 404 until the crate's first publish; the URLs are the real post-publish targets.)
+<p align="center">
+  <img src="assets/social-card.png" alt="sundog: an embedded, replicated cache for Rust" width="720">
+</p>
 
 [![CI](https://github.com/ngriaznov/sundog/actions/workflows/ci.yml/badge.svg)](https://github.com/ngriaznov/sundog/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/sundog.svg)](https://crates.io/crates/sundog)
