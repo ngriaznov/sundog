@@ -317,6 +317,43 @@ another region routes too, but the failure detector is tuned for
 sub-5-second detection on a LAN: at tens of milliseconds of RTT raise
 `gossip_interval`, `phi_threshold` and `fetch_timeout` before trusting it.
 
+**On Kubernetes**, sundog runs inside your service's pod, and the same two
+settings apply. Discovery is `DnsSrv` against a headless Service that
+selects the same pods, with the gossip port as its fallback so plain A
+records are enough. Ports are the same fixed pair, declared as container
+ports next to the service's own:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: myservice-gossip
+spec:
+  clusterIP: None
+  selector:
+    app: myservice
+  ports:
+    - name: gossip
+      port: 7946
+      protocol: UDP
+```
+
+```rust
+use sundog::discovery::dns::DnsSrv;
+
+let cluster = Cluster::builder("prod")
+    .config(config) // the fixed ports above
+    .discovery(DnsSrv::new("myservice-gossip.my-ns.svc.cluster.local.", 7946))
+    .build()
+    .await?;
+```
+
+The pod IP is what the probe advertises, so nothing more to set. Wire the
+readiness probe to `/readyz` if you enable `prometheus_listen`, or fold
+`cluster.is_ready()` into the probe your service already serves, and call
+`cluster.shutdown()` from its SIGTERM handler so peers see a departure
+instead of a failure.
+
 ## Feature flags
 
 | Flag | Default | What it adds |
