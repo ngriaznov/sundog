@@ -19,8 +19,6 @@ with it, and nothing reports it. A `max_clock_skew` on `ClusterConfig`
 rejects a remote stamp whose skew exceeds it, counts the rejection, and logs
 a local clock jump once.
 
-**Cost:** two days, with a skewed-node simulation scenario.
-
 ### Memory ceilings that refuse rather than diverge
 
 `Replicated` mode bounds capacity only through the spill tier, since evicting
@@ -33,8 +31,6 @@ from the engine's existing weight total, and a soft ceiling that rejects
 writes with a typed error keep every replica identical under memory pressure
 without a disk behind it.
 
-**Cost:** about a week, most of it the accounting's property coverage.
-
 ### TTL surface
 
 Nothing on `Cache` changes an entry's lifetime after the write that set it
@@ -44,16 +40,12 @@ of the entry's stored value bytes under a fresh version and a new
 three, so no wire change. `ttl_of` is a read that returns a duration and
 takes none, which keeps reads TTL-blind.
 
-**Cost:** two days each, on the existing expiry field.
-
 ### Batch reads
 
 `insert_many`, `insert_many_with_ttl` and `remove_many` have no read
 counterpart. `get_many` takes one stripe lock per distinct bucket instead of
 one per key, and `fetch_many` groups keys by owner into one request per
 owner instead of one round trip per key.
-
-**Cost:** three days, `fetch_many` a wire change with the usual bump.
 
 ### Latency histograms and a resident-bytes gauge
 
@@ -63,16 +55,12 @@ timing at all for a hit, a miss, a fetch or a spill read. Histograms for
 those four, plus the byte gauge above, are what a dashboard needs to show a
 p99. The exporter test pins each one.
 
-**Cost:** three days.
-
 ### A span on the fetch path
 
 State transfer and anti-entropy rounds already carry `tracing` spans, and a
 user's own OpenTelemetry subscriber already receives every event the crate
 emits. `fetch` has no span, so an owner round trip is invisible in a trace.
 One span with the owner, the outcome and the attempt count closes that.
-
-**Cost:** half a day.
 
 ### Cluster health with ownership, backlog and spill
 
@@ -82,8 +70,6 @@ more. An operator asking which buckets this node owns, how deep the fan-out
 backlog is, or how much of the spill tier is used reads a metric or
 nothing. `Health` grows a per-cache ownership summary, the backlog depth and
 the spill tier's bytes and entries, from state the crate already tracks.
-
-**Cost:** two days.
 
 ### Drop the spill reverse index
 
@@ -95,8 +81,6 @@ sequentially instead, one 64 MB scan off the hot path. For a 16-byte key
 that is 157 bytes of RAM per spilled entry today against about 85 without
 the index. This is the first step of the on-disk key index below and stands
 on its own.
-
-**Cost:** three days, inside the spill property suite.
 
 ## Proof
 
@@ -112,8 +96,6 @@ The scale gate's 100 ms fetch p99 covers a 3-node, 4M-key run whose fetch
 crosses the network and the SSD, and stays. A separate in-RAM local bench
 carries the sub-millisecond gate.
 
-**Cost:** two weeks, most of it the competitor containers under `rightsize`.
-
 **Trigger:** any claim of a lead over another system. Without this harness
 no such claim has a number behind it.
 
@@ -127,8 +109,6 @@ replicated write fanning out to every peer, and gossip state growing as
 nodes times caches. A turmoil scenario at 100 nodes with a rolling restart
 proves or corrects the README's number, and the README says what it proves.
 
-**Cost:** one week, most of it turmoil's per-host memory at that count.
-
 ### A docs site
 
 The README carries everything, in 13 flat sections. Per-mode guarantees,
@@ -136,8 +116,6 @@ memory sizing and the testing stack exist there already and move. The
 operations runbook, a tuning page, and a cookbook with an axum middleware, a
 read-through over sqlx and a session store are new writing, as is a page
 that states the verification stack as the differentiator it is.
-
-**Cost:** one week of prose.
 
 ## Reach
 
@@ -149,9 +127,6 @@ RESP lets `redis-cli`, `memtier` and every client library talk to a cluster,
 and gives the benchmark harness the same driver for every system. MGET is
 `get_many` above. EXPIRE is `expire` above.
 
-**Cost:** three weeks, with a container test running `redis-cli` against
-it.
-
 ### An observer
 
 No CLI exists; `sundog-testnode` is a container test node driven by a line
@@ -159,8 +134,6 @@ protocol. A member that joins gossip and advertises no caches already owns
 nothing under every mode, which is the seam. An observer binary joins that
 way and dumps peers, ownership, digests and keys over the wire, through the
 state-transfer and anti-entropy requests a donor already answers.
-
-**Cost:** one week.
 
 ### Snapshot export and import
 
@@ -170,8 +143,6 @@ no donor leaves every node warm and empty. `Cache::export` streams the
 shard's snapshot chunks to a writer and `Cache::import` applies them as
 remote records, versions intact, so a restart from a file converges with a
 peer exactly as a join does.
-
-**Cost:** one week.
 
 ## Store
 
@@ -185,8 +156,6 @@ mode a non-owner's write already forwards to the owners, so an
 stripe lock: compare-and-set, insert-if-absent and increments without a
 resolver. A wire change with the usual bump.
 
-**Cost:** two weeks.
-
 ### Admission by frequency
 
 Capacity eviction is sampled LRU: the idlest of 8 sampled entries goes, or
@@ -195,9 +164,6 @@ one scan of cold keys evicts a hot set. A count-min sketch of 4-bit
 counters, sized as Caffeine sizes its own at about 8 bytes per entry of
 capacity, and a doorkeeper filter in front of eviction admit a new entry
 only when it is likelier to be read again than the victim.
-
-**Cost:** two weeks, with a hit-ratio bench over public cache traces that
-states the gain against the sampled baseline instead of assuming it.
 
 ### A byte arena for heap records
 
@@ -210,8 +176,6 @@ pages holds those records back to back and reclaims holes on the tombstone
 sweep, the tick that runs for every cache. Compaction runs only for a
 merging cache and is the wrong host.
 
-**Cost:** one week.
-
 **Trigger:** the entry-diet bench on that shape above Redis 7's computed
 184 bytes, which is where it sits today.
 
@@ -221,8 +185,6 @@ Nothing tracks per-key access frequency. A sampled hot-key list, fed from
 the admission sketch above once it exists, reports through `Health` and a
 gauge which keys a node serves most.
 
-**Cost:** two days on top of the admission sketch.
-
 ### Per-record compression
 
 No compression anywhere in the store. A replica caches a replicate frame's
@@ -231,8 +193,6 @@ before every send or ships compressed bytes, and the second is a wire
 change with a protocol bump and gated responders. Behind a feature, with a
 per-cache trained dictionary and a size floor under which a record stays
 raw.
-
-**Cost:** one week plus the interop test.
 
 **Trigger:** a deployment whose values are text or structured payloads and
 whose RAM is bound by them.
@@ -317,9 +277,6 @@ rendezvous scoring has no such input today. The same `zone` key would
 extend it to spread a bucket's owners across zones instead of scoring every
 eligible peer the same regardless of where it runs.
 
-**Cost:** a few hundred lines across membership, state transfer, and the
-scheduler's peer choice.
-
 **Trigger:** a multi-zone deployment measuring cross-zone egress from joins
 or repairs.
 
@@ -376,8 +333,6 @@ random-read rate at queue depths far above 16, so the spill bench first
 measures what raising the permit count alone recovers; only if the thread
 hop itself is the bound does an io_uring submission ring under a
 Linux-only feature pay for itself.
-
-**Cost:** two to three weeks, most of it the spill property suite.
 
 **Trigger:** a `spill`-configured deployment whose per-node RAM is bound by
 the number of spilled keys rather than by the resident values spilling was
