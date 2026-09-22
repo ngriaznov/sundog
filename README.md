@@ -282,6 +282,41 @@ peers should use. It covers both the gossip and data-plane addresses, and no
 probe runs. Under Kubernetes host networking, or any setup where the bind
 address is already correct, leave it unset.
 
+**In a cloud VPC**, AWS, GCP or Azure, unicast routes and multicast does
+not, so `Mdns` finds nobody. Two settings make a VPC work. First, discovery:
+`Static` seeds at a few stable private addresses, via `.seeds(..)` or
+`SUNDOG_SEEDS`, or `DnsSrv` against a name in a private zone. Seeds only
+bootstrap; every node learns the rest through gossip. Second, fixed ports:
+both bind addresses default to port `0`, a free port picked at startup, and a
+security group cannot allow a random port. Set the gossip port (UDP) and the
+data-plane port (TCP) and open both within the cluster's security group, a
+self-referencing rule, plus the Prometheus port if you use one:
+
+```rust
+use sundog::{Cluster, ClusterConfig};
+
+let config = ClusterConfig {
+    gossip_bind_addr: "0.0.0.0:7946".parse()?,
+    data_bind_addr: "0.0.0.0:7947".parse()?,
+    ..ClusterConfig::default()
+};
+let cluster = Cluster::builder("prod")
+    .config(config)
+    .seeds(["10.0.1.10:7946".parse()?, "10.0.2.10:7946".parse()?])
+    .build()
+    .await?;
+```
+
+Seeds name the gossip port only; peers learn the data-plane port from gossip.
+The advertised address needs nothing: the outbound-interface probe finds the
+instance's private IP, which is the address peers dial. Mutual TLS is
+optional and carries a fixed name in every certificate, so no per-node IP
+SANs and no reissue when an instance's address changes. Several availability
+zones behave as one LAN with a few milliseconds more latency. A peered VPC in
+another region routes too, but the failure detector is tuned for
+sub-5-second detection on a LAN: at tens of milliseconds of RTT raise
+`gossip_interval`, `phi_threshold` and `fetch_timeout` before trusting it.
+
 ## Feature flags
 
 | Flag | Default | What it adds |
