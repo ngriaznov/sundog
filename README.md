@@ -282,6 +282,78 @@ peers should use. It covers both the gossip and data-plane addresses, and no
 probe runs. Under Kubernetes host networking, or any setup where the bind
 address is already correct, leave it unset.
 
+**In a cloud VPC**, AWS, GCP or Azure, unicast routes and multicast does
+not, so `Mdns` finds nobody. Two settings make a VPC work. First, discovery:
+`Static` seeds at a few stable private addresses, via `.seeds(..)` or
+`SUNDOG_SEEDS`, or `DnsSrv` against a name in a private zone. Seeds only
+bootstrap; every node learns the rest through gossip. Second, fixed ports:
+both bind addresses default to port `0`, a free port picked at startup, and a
+security group cannot allow a random port. Set the gossip port (UDP) and the
+data-plane port (TCP) and open both within the cluster's security group, a
+self-referencing rule, plus the Prometheus port if you use one:
+
+```rust
+use sundog::{Cluster, ClusterConfig};
+
+let config = ClusterConfig {
+    gossip_bind_addr: "0.0.0.0:7946".parse()?,
+    data_bind_addr: "0.0.0.0:7947".parse()?,
+    ..ClusterConfig::default()
+};
+let cluster = Cluster::builder("prod")
+    .config(config)
+    .seeds(["10.0.1.10:7946".parse()?, "10.0.2.10:7946".parse()?])
+    .build()
+    .await?;
+```
+
+Seeds name the gossip port only; peers learn the data-plane port from gossip.
+The advertised address needs nothing: the outbound-interface probe finds the
+instance's private IP, which is the address peers dial. Mutual TLS is
+optional and carries a fixed name in every certificate, so no per-node IP
+SANs and no reissue when an instance's address changes. Several availability
+zones behave as one LAN with a few milliseconds more latency. A peered VPC in
+another region routes too, but the failure detector is tuned for
+sub-5-second detection on a LAN: at tens of milliseconds of RTT raise
+`gossip_interval`, `phi_threshold` and `fetch_timeout` before trusting it.
+
+**On Kubernetes**, sundog runs inside your service's pod, and the same two
+settings apply. Discovery is `DnsSrv` against a headless Service that
+selects the same pods, with the gossip port as its fallback so plain A
+records are enough. Ports are the same fixed pair, declared as container
+ports next to the service's own:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: myservice-gossip
+spec:
+  clusterIP: None
+  selector:
+    app: myservice
+  ports:
+    - name: gossip
+      port: 7946
+      protocol: UDP
+```
+
+```rust
+use sundog::discovery::dns::DnsSrv;
+
+let cluster = Cluster::builder("prod")
+    .config(config) // the fixed ports above
+    .discovery(DnsSrv::new("myservice-gossip.my-ns.svc.cluster.local.", 7946))
+    .build()
+    .await?;
+```
+
+The pod IP is what the probe advertises, so nothing more to set. Wire the
+readiness probe to `/readyz` if you enable `prometheus_listen`, or fold
+`cluster.is_ready()` into the probe your service already serves, and call
+`cluster.shutdown()` from its SIGTERM handler so peers see a departure
+instead of a failure.
+
 ## Feature flags
 
 | Flag | Default | What it adds |
