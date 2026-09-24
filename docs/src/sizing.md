@@ -28,9 +28,9 @@ memory divided by entry count:
 
 | Shape | Entries | Bytes per entry |
 |---|---:|---:|
-| 7-byte key, 8-byte value | 4,000,000 | 74.7 |
-| 7-byte key, 8-byte value | 64,000,000 | 67.4 |
-| 16-byte key, 100-byte value | 4,000,000 | 209.6 |
+| 7-byte key, 8-byte value | 4,000,000 | 76.3 |
+| 7-byte key, 8-byte value | 64,000,000 | 67.3 |
+| 16-byte key, 100-byte value | 4,000,000 | 212.2 |
 
 For comparison, Redis 7 uses 85 to 100 bytes per key for the first shape
 and 195 to 230 for the second, from `used_memory` over `DBSIZE`. The README
@@ -46,7 +46,7 @@ SUNDOG_BENCH=1 cargo test --release -p sundog --test entry_diet_bench \
 ```
 
 `CacheBuilder::capacity_hint` preallocates for an expected entry count at
-`open`, which avoids growing each table one doubling at a time. Pass this
+`open`, which avoids growing each table as it fills. Pass this
 node's own share, not the cluster total.
 
 ## Tombstones

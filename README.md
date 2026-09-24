@@ -788,9 +788,9 @@ entry_diet_bench -- --nocapture` on a 4-core Linux box, glibc, one node,
 
 | Shape | Entries | sundog, no hint | sundog, hinted | Redis 7 computed | Redis 7 practical |
 |---|---:|---:|---:|---:|---:|
-| 7-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 74.7 B/entry | 77.3 B/entry | 80 B/copy | 85-100 B/copy |
-| 7-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.4 B/entry | 67.3 B/entry | 80 B/copy | 85-100 B/copy |
-| 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 209.6 B/entry | not measured | 184 B/copy | 195-230 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 76.3 B/entry | 75.1 B/entry | 80 B/copy | 85-100 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.3 B/entry | 67.4 B/entry | 80 B/copy | 85-100 B/copy |
+| 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 212.2 B/entry | not measured | 184 B/copy | 195-230 B/copy |
 
 The Redis 7 figures for the 7-byte-key/8-byte-value shape are its own `dictEntry` (24
 bytes) plus an `sdshdr8` key plus an `embstr`-encoded value sharing one
@@ -803,18 +803,17 @@ For the 7-byte-key/8-byte-value shape, every one of sundog's four figures sits u
 bytes per entry and under Redis 7's own practical range, at both
 4,000,000 and 64,000,000 entries; the byte cost drops further as the
 entry count grows (fixed per-stripe overhead amortizing over more
-entries) rather than staying flat or climbing. `capacity_hint` costs a
-little more at 4,000,000 entries (77.3 against 74.7 bytes per entry):
-hinting the exact expected count means a stripe whose real share lands
-even one key over its reserved capacity still pays a full doubling
-growth from that reserved base, and about half of 1024 stripes do at
-this entry count under ordinary hash variance. At 64,000,000 entries the
-per-stripe hint is large enough that this variance rarely crosses it, so
-hinted and unhinted land within 0.1 bytes of each other (67.3 against 67.4). The
+entries) rather than staying flat or climbing. A stripe's entry array
+grows by a quarter when it fills, so it stays at least four fifths full
+whatever the entry count; `capacity_hint` saves a little at 4,000,000
+entries (75.1 against 76.3 bytes per entry), where about half of 1024
+stripes land a few keys over their hinted share and grow once by a
+quarter, and hinted and unhinted land within 0.1 bytes of each other at
+64,000,000 (67.4 against 67.3). The
 16-byte-key/100-byte-value shape takes one heap allocation on both
 engines, past sundog's 22-byte `Record::Inline` cap and Redis's `embstr`
 threshold alike; sundog's target there is parity with Redis, not another
-win, and it measures at 209.6 bytes per entry, inside Redis's 195-230
+win, and it measures at 212.2 bytes per entry, inside Redis's 195-230
 practical range and a little above its 184 computed figure.
 
 Reproducing sundog's figures:

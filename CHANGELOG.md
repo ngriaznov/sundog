@@ -319,6 +319,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- **A stripe's entry array grows by a quarter instead of doubling.** A
+  stripe that just outgrew a power of two no longer leaves close to half
+  its 56-byte entry slots empty; the array stays at least four fifths
+  full. With the jemalloc harness, 14-byte keys and 100-byte values, the
+  mean over 100,000 to 2,000,000 keys in all three modes drops from 207.5
+  to 204.9 bytes per copy, and the worst case, a `Distributed` cluster at
+  2,000,000 keys, from 210.7 to 200.5. Where doubling already lands
+  nearly full it costs up to 2.7 bytes: the README's 4,000,000-entry glibc
+  figures move from 74.7 to 76.3 bytes unhinted, 77.3 to 75.1 hinted, and
+  209.5 to 212.2 for the 100-byte shape.
 - Every workflow checks out with `actions/checkout@v7` and uploads with
   `actions/upload-artifact@v7`, the Node 24 majors, and `weekly-kani.yml`
   and `weekly-fuzz.yml` deny warnings the way every other lane does.
