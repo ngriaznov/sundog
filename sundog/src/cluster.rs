@@ -4081,6 +4081,180 @@ mod tests {
         cluster_c.shutdown().await;
     }
 
+    /// A node that owned every bucket alone, because its peers had not
+    /// opened the cache yet, hands the buckets it then loses to both new
+    /// owners as soon as its view changes. Anti-entropy and the disown
+    /// grace both run once an hour here, so only the push on the view
+    /// change can move the entries.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scripted lone-owner-then-three-node scenario"
+    )]
+    #[tokio::test]
+    async fn a_lone_owner_pushes_each_bucket_it_loses_to_the_new_owners_on_the_view_change() {
+        const TOTAL: u32 = 300;
+        let mut config = ClusterConfig {
+            ae_interval: Duration::from_secs(3600),
+            state_transfer_budget: Duration::from_secs(2),
+            ..loopback_config()
+        };
+        config.tombstone_ttl = config.bucket_release_window();
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let name = SmolStr::new("prices");
+        let cluster_name = "cluster-it-lone-owner-push";
+
+        let cluster_a = Cluster::builder(cluster_name)
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("a builds");
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder(cluster_name)
+            .seeds([gossip_a])
+            .config(config.clone())
+            .build()
+            .await
+            .expect("b builds");
+        let cluster_c = Cluster::builder(cluster_name)
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("c builds");
+        for cluster in [&cluster_a, &cluster_b, &cluster_c] {
+            wait_for_peer_count(cluster, 2).await;
+        }
+        let open = |cluster: &Cluster| {
+            cluster
+                .cache::<u32, String>(name.as_str())
+                .mode(Mode::Distributed { owners })
+                .open()
+        };
+        let (cache_b, cache_c) = tokio::join!(open(&cluster_b), open(&cluster_c));
+        let cache_b = cache_b.expect("b opens");
+        let cache_c = cache_c.expect("c opens");
+
+        // a's shard under the view it seeded before any peer advertised
+        // the cache: a owns every bucket alone and holds every entry.
+        let (tracker, tx) = crate::ownership::OwnershipTracker::seed(
+            cluster_a.node_id(),
+            &[],
+            &HashMap::new(),
+            &name,
+            owners,
+        );
+        let residency = Arc::new(crate::ownership::ResidencySet::new());
+        let shard_a: Arc<dyn ShardOps> = Arc::new(
+            Shard::<u32, String>::new(
+                name.clone(),
+                Mode::Distributed { owners },
+                cluster_a.node_id(),
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_ownership(tracker.clone(), Arc::clone(&residency)),
+        );
+        shard_a
+            .apply_remote_batch(
+                (0..TOTAL)
+                    .map(|key| WireRecord {
+                        key: Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
+                        value: Some(Bytes::from(
+                            postcard::to_stdvec(&format!("v{key}")).expect("value encodes"),
+                        )),
+                        ver: Hlc {
+                            wall_ms: 1,
+                            logical: 0,
+                            node: cluster_a.node_id(),
+                        },
+                        expires_at_ms: None,
+                    })
+                    .collect(),
+            )
+            .await;
+
+        // b and c take a into their views once it advertises the cache.
+        cluster_a.advertise_cache_mode(&name, Mode::Distributed { owners });
+        let three = Arc::new(OwnershipView::compute(
+            cluster_a.node_id(),
+            vec![
+                cluster_a.node_id(),
+                cluster_b.node_id(),
+                cluster_c.node_id(),
+            ],
+            owners,
+        ));
+        wait_until(
+            Duration::from_secs(10),
+            "b and c compute the same three-node view a is about to publish",
+            async || {
+                (0..TOTAL).all(|key| {
+                    let bucket = bucket_of_u32(key);
+                    let mut expected = three.owners_of(bucket).to_vec();
+                    expected.sort_unstable();
+                    [&cache_b, &cache_c].iter().all(|cache| {
+                        let mut seen = cache.owners_of(&key);
+                        seen.sort_unstable();
+                        seen == expected
+                    })
+                })
+            },
+        )
+        .await;
+        let lost: Vec<u32> = (0..TOTAL)
+            .filter(|&key| !three.owns(bucket_of_u32(key)))
+            .collect();
+        assert!(
+            !lost.is_empty(),
+            "a three-node, two-owner split leaves a some key it does not own"
+        );
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(crate::cluster::rebalance::rebalance_task(
+            cluster_a.clone(),
+            Arc::clone(&shard_a),
+            tracker,
+            Arc::clone(&residency),
+            name.clone(),
+            Duration::from_secs(3600),
+            4,
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send(Arc::clone(&three))
+            .expect("the tracker's own receiver keeps the channel open");
+
+        wait_until(
+            Duration::from_secs(10),
+            "every entry a lost reaches both of its new owners",
+            async || {
+                for &key in &lost {
+                    let expected = Some(format!("v{key}"));
+                    if cache_b.get(&key).await != expected || cache_c.get(&key).await != expected {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
+        for &key in &lost {
+            assert!(
+                residency.is_releasing(bucket_of_u32(key)),
+                "a keeps serving bucket {} through its disown grace",
+                bucket_of_u32(key)
+            );
+        }
+
+        cancel.cancel();
+        task.await.expect("rebalance_task exits on cancel");
+        cluster_c.shutdown().await;
+        cluster_b.shutdown().await;
+        cluster_a.shutdown().await;
+    }
+
     #[tokio::test]
     async fn records_for_hashes_answers_exactly_the_records_whose_hash_matches() {
         let cluster = solo_cluster("cluster-it-records-for-hashes").await;

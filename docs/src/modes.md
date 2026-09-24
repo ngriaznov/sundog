@@ -67,7 +67,10 @@ When a node joins or leaves, ownership follows gossip within a few gossip
 intervals. A node that gains a bucket pulls it from the previous owners. A
 node that loses one keeps serving it for `distributed_disown_grace_rounds`
 anti-entropy intervals, hands it to each new owner, and drops it once every
-owner confirms.
+owner confirms. A lost bucket that no other previous owner still owns, as
+when a node opened the cache before its peers and owned every bucket alone,
+goes to its new owners as soon as the views agree, not at the end of the
+grace.
 
 A finite `max_capacity` needs a spill tier here too, and `tti` is refused.
 Two nodes that disagree on `owners` for one cache name get
