@@ -10,6 +10,8 @@
 name: Weekly bench
 
 on:
+  push:
+    branches: [bench-rerun-probe]
   schedule:
     - cron: "0 7 * * 0"
   workflow_dispatch:
