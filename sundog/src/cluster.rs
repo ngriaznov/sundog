@@ -2809,6 +2809,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidation_fills_on_two_nodes_keep_both_copies() {
+        let (cluster_a, cluster_b) = two_node_cluster("cluster-it-invalidate-fill").await;
+
+        let cache_a = cluster_a
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("a opens");
+        let cache_b = cluster_b
+            .cache::<u32, String>("users")
+            .mode(Mode::Invalidation)
+            .open()
+            .await
+            .expect("b opens");
+
+        let load = async |_key: &u32| -> Result<String, std::convert::Infallible> {
+            Ok("row".to_string())
+        };
+        cache_b.get_or_load(&1, load).await.expect("b fills");
+        cache_b
+            .insert(2, "marker".into())
+            .await
+            .expect("b holds the marker");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // A fills the same key later, then writes the marker. The marker's
+        // invalidation reaches B behind anything the fill sent, over the
+        // same ordered link.
+        cache_a.get_or_load(&1, load).await.expect("a fills");
+        cache_a
+            .insert(2, "newer".into())
+            .await
+            .expect("a writes the marker");
+        wait_until(
+            Duration::from_secs(10),
+            "b receives the marker's invalidation",
+            async || cache_b.get(&2).await.is_none(),
+        )
+        .await;
+
+        assert_eq!(
+            cache_b.get(&1).await,
+            Some("row".to_string()),
+            "a's fill left b's copy in place"
+        );
+        assert_eq!(cache_a.get(&1).await, Some("row".to_string()));
+
+        cluster_a.shutdown().await;
+        cluster_b.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_lone_node_waits_the_first_peer_grace_and_then_opens_warm() {
         let name = SmolStr::new("users");
         let cluster = solo_cluster("cluster-it-origin-grace").await;

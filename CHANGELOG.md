@@ -349,6 +349,21 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A read-through fill no longer overwrites a write that lands during its
+  load.** `get_or_load` stamps its fill before the loader runs, and the fill
+  installs only when it is newer than whatever the key holds when the loader
+  returns. A local `remove` or `insert` while the query runs, or a peer's
+  write stamped after the fill, keeps its place, where the stale loaded
+  value used to replace it and bring a removed key back until its TTL. A
+  superseded fill
+  still answers the call that loaded it and emits no event and no fan-out;
+  the next read loads afresh.
+- **Fills in `Invalidation` mode no longer evict other nodes' copies.** A
+  `get_or_load` fill copies data from its source, so an `Invalidation`
+  cache now sends nothing for it. It used to send an invalidation stamped
+  newer than every peer's copy, and two nodes reading one key through
+  `get_or_load` dropped each other's copy on every fill. `Replicated` and
+  `Distributed` fills still go out, so a peer skips its own loader call.
 - A `Mode::Distributed` node releases every bucket it holds without
   owning, not only the ones its last two observed ownership views
   disagree on. A view published and superseded while `rebalance_task` was

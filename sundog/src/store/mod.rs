@@ -349,6 +349,16 @@ pub enum SimFanOut<K> {
     Forward(WireRecord),
 }
 
+/// Whether a [`Shard::get_or_load`] fill goes out to peers. A fill copies
+/// data from its source and changes nothing there. `Replicated` and
+/// `Distributed` send it so a peer holding the key skips its own loader
+/// call. `Invalidation` sends nothing: an invalidation would drop every
+/// peer's copy of the same data, and two nodes reading one key would evict
+/// each other on every fill. Pure; unit tested directly.
+const fn fill_fans_out(mode: Mode) -> bool {
+    !matches!(mode, Mode::Invalidation)
+}
+
 /// A named cache's clustering behavior: how writes fan out to other nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2518,14 +2528,17 @@ where
                         drop(guard);
                         return Ok(value);
                     }
+                    // Stamped before the loader runs, so a write or removal
+                    // that lands during the load is newer than the fill and
+                    // keeps its place.
+                    let ver = self.stamp_local();
                     return match loader(key).await {
                         Ok(value) => {
-                            let ver = self.stamp_local();
                             let encoded = Bytes::from(postcard::to_stdvec(&value).expect(
                                 "invariant: a value returned by the loader postcard-encodes",
                             ));
                             let expires_at_ms = self.expiry_for(None);
-                            self.engine.complete_fresh_load(
+                            let outcome = self.engine.complete_fresh_load(
                                 engine::FreshLoad {
                                     key,
                                     key_bytes: &key_bytes,
@@ -2539,9 +2552,15 @@ where
                                 &inflight,
                             );
                             guard.complete();
+                            self.misses.increment(1);
+                            if outcome == engine::FillOutcome::Superseded {
+                                return Ok(value);
+                            }
                             // A refusal means the cache is closing; the
                             // loaded value still answers this read.
-                            let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
+                            if fill_fans_out(self.mode) {
+                                let _ = self.fan_out.push(FanOutItem::Applied(key.clone()));
+                            }
                             if self.events.receiver_count() > 0 {
                                 let _ = self.events.send(Event::Created {
                                     key: key.clone(),
@@ -2549,7 +2568,6 @@ where
                                     origin: Origin::Local,
                                 });
                             }
-                            self.misses.increment(1);
                             Ok(value)
                         }
                         Err(err) => {
@@ -4510,6 +4528,126 @@ mod tests {
             } => {}
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fill_fans_out_everywhere_but_invalidation() {
+        assert!(fill_fans_out(Mode::Replicated));
+        assert!(fill_fans_out(Mode::distributed()));
+        assert!(
+            fill_fans_out(Mode::Local),
+            "the fan-out task sends nothing for Local"
+        );
+        assert!(!fill_fans_out(Mode::Invalidation));
+    }
+
+    #[tokio::test]
+    async fn an_invalidation_fill_queues_no_fan_out_and_a_replicated_fill_does() {
+        let invalidation = Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Invalidation,
+            NodeId::from(1),
+            10_000,
+            None,
+            None,
+        );
+        invalidation
+            .get_or_load(
+                &7,
+                async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                    Ok("loaded".to_string())
+                },
+            )
+            .await
+            .expect("load succeeds");
+        assert!(
+            invalidation.fan_out.drain().is_empty(),
+            "an Invalidation fill sends no invalidation to peers"
+        );
+
+        let replicated = shard::<u32, String>(1);
+        replicated
+            .get_or_load(
+                &7,
+                async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                    Ok("loaded".to_string())
+                },
+            )
+            .await
+            .expect("load succeeds");
+        assert_eq!(applied_keys(replicated.fan_out.drain()), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn get_or_load_keeps_a_remove_that_lands_while_the_loader_runs() {
+        let s = shard::<u32, String>(1);
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let load = s.get_or_load(
+            &7,
+            async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                started.notify_one();
+                release.notified().await;
+                Ok("stale".to_string())
+            },
+        );
+        let race = async {
+            started.notified().await;
+            s.remove(&7).await.expect("remove");
+            release.notify_one();
+        };
+        let (loaded, ()) = tokio::join!(load, race);
+        assert_eq!(
+            loaded.expect("load succeeds"),
+            "stale",
+            "the read that raced the removal answers with what it loaded"
+        );
+        assert_eq!(s.get(&7).await, None, "the removal stays removed");
+        let _ = s.fan_out.drain();
+        assert_eq!(
+            s.get_or_load(
+                &7,
+                async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                    Ok("reloaded".to_string())
+                }
+            )
+            .await
+            .expect("load succeeds"),
+            "reloaded",
+            "the next read loads afresh over the removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_load_keeps_an_insert_that_lands_while_the_loader_runs() {
+        let s = shard::<u32, String>(1);
+        let started = tokio::sync::Notify::new();
+        let release = tokio::sync::Notify::new();
+        let load = s.get_or_load(
+            &7,
+            async |_key: &u32| -> Result<String, std::convert::Infallible> {
+                started.notify_one();
+                release.notified().await;
+                Ok("stale".to_string())
+            },
+        );
+        let race = async {
+            started.notified().await;
+            s.insert(7, "fresh".to_string()).await.expect("insert");
+            release.notify_one();
+        };
+        let (loaded, ()) = tokio::join!(load, race);
+        assert_eq!(loaded.expect("load succeeds"), "stale");
+        assert_eq!(
+            s.get(&7).await,
+            Some("fresh".to_string()),
+            "the write that landed during the load keeps its place"
+        );
+        assert_eq!(
+            applied_keys(s.fan_out.drain()),
+            vec![7],
+            "only the insert fans out; the superseded fill sends nothing"
+        );
     }
 
     #[tokio::test]
