@@ -337,9 +337,6 @@ async fn reconcile_mismatches(
 
 /// How one [`run_round_for_buckets`] round ended, per bucket: which
 /// matched, which were mismatched, wire bytes moved, and whether it failed.
-// Only exercised by this file's own real-transport tests today;
-// `Cache::reconcile_warm_buckets` wires it in once that rewrite lands.
-#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BucketRoundOutcome {
     /// No mismatch this round: converged at this instant, not a claim of
@@ -348,6 +345,13 @@ pub(crate) struct BucketRoundOutcome {
     /// Named mismatched, or requested but dropped because this shard's
     /// fresh ownership read disagrees `peer` co-owns it; either way never
     /// compared this round, so never `matched`.
+    #[cfg_attr(
+        any(not(test), feature = "sim"),
+        allow(
+            dead_code,
+            reason = "only tests read which requested buckets stayed diverged"
+        )
+    )]
     pub(crate) still_diverged: HashSet<u16>,
     /// Wire bytes pushed plus pulled this round: `0` when nothing
     /// mismatched or the round failed.
@@ -359,7 +363,6 @@ pub(crate) struct BucketRoundOutcome {
 
 /// [`run_round_for_buckets`]'s outcome for a round that could not be
 /// scoped or answered at all: everything requested counts as `still_diverged`.
-#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
 fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
     BucketRoundOutcome {
         matched: HashSet::new(),
@@ -379,10 +382,8 @@ fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
 /// co-own is silently absent from `sent` and lands in `still_diverged`
 /// rather than `matched`. A shard with no ownership view, a `Stale`
 /// reply, or a failed exchange reports everything `still_diverged` with
-/// `failed: true`.
-// Only exercised by this file's own real-transport tests today;
-// `Cache::reconcile_warm_buckets` wires it in once that rewrite lands.
-#[cfg_attr(any(not(test), feature = "sim"), allow(dead_code))]
+/// `failed: true`. `rebalance_task` also calls it to push a lost bucket no
+/// co-owner can hand over to that bucket's new owners.
 pub(crate) async fn run_round_for_buckets(
     mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,

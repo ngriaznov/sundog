@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use smol_str::SmolStr;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::Cluster;
@@ -518,6 +519,102 @@ pub(crate) fn hand_off_owners(
     owners
 }
 
+/// The buckets in `lost` that no new owner can pull from a surviving
+/// co-owner: no node but `self_node` owns the bucket under both `prev` and
+/// `new`, so a new owner's pull asks only nodes that never held it. A node
+/// that owned every bucket alone, because its peers had not opened the
+/// cache yet, loses most of its buckets this way when a view with two or
+/// more of them lands. A bucket with a surviving co-owner is left to the
+/// new owner's pull.
+pub(crate) fn unpullable_losses(
+    prev: &OwnershipView,
+    new: &OwnershipView,
+    self_node: NodeId,
+    lost: &[u16],
+) -> Vec<u16> {
+    lost.iter()
+        .copied()
+        .filter(|&bucket| {
+            let prev_owners = prev.owners_of(bucket);
+            !new.owners_of(bucket)
+                .iter()
+                .any(|owner| *owner != self_node && prev_owners.contains(owner))
+        })
+        .collect()
+}
+
+/// Each live owner of `buckets` under `view` other than `self_node`, paired
+/// with the buckets among `buckets` it owns, so one scoped round per owner
+/// covers all of them.
+pub(crate) fn push_targets(
+    view: &OwnershipView,
+    self_node: NodeId,
+    buckets: &[u16],
+    live: &HashSet<NodeId>,
+) -> Vec<(NodeId, Vec<u16>)> {
+    let mut targets: Vec<(NodeId, Vec<u16>)> = Vec::new();
+    for &bucket in buckets {
+        for &owner in view.owners_of(bucket) {
+            if owner == self_node || !live.contains(&owner) {
+                continue;
+            }
+            match targets.iter_mut().find(|(node, _)| *node == owner) {
+                Some((_, owned)) => owned.push(bucket),
+                None => targets.push((owner, vec![bucket])),
+            }
+        }
+    }
+    targets
+}
+
+/// Pushes each target's buckets to it through a scoped anti-entropy round,
+/// which sends every entry the target lacks or holds at an older version.
+/// A round that fails, or meets a responder whose view has not caught up
+/// with this node's, is retried every `retry` until every target has
+/// answered, `deadline` passes, or `cancel` fires. The disown-grace
+/// hand-off still confirms each bucket before it is released; this push
+/// brings the data to the new owners when the view changes rather than
+/// when the grace ends.
+async fn push_unpullable(
+    cluster: Cluster,
+    shard: Arc<dyn ShardOps>,
+    cache: SmolStr,
+    mut targets: Vec<(NodeId, Vec<u16>)>,
+    retry: Duration,
+    deadline: Duration,
+    cancel: CancellationToken,
+) {
+    let give_up = tokio::time::Instant::now() + deadline;
+    loop {
+        let mut pending = Vec::with_capacity(targets.len());
+        for (owner, buckets) in targets {
+            let outcome = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                outcome = anti_entropy::run_round_for_buckets(cluster.mesh(), &shard, &cache, owner, &buckets) => outcome,
+            };
+            if outcome.failed {
+                pending.push((owner, buckets));
+            } else {
+                tracing::debug!(cache = %cache, %owner, buckets = buckets.len(), bytes = outcome.bytes_moved, "pushed buckets no co-owner could hand over");
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        if tokio::time::Instant::now() + retry > give_up {
+            tracing::debug!(cache = %cache, owners = pending.len(), "left buckets no co-owner could hand over to the disown-grace hand-off");
+            return;
+        }
+        targets = pending;
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(retry) => {}
+        }
+    }
+}
+
 /// How long a released bucket may stay resident before it is dropped
 /// without a hand-off: the tombstone retention less one interval for the
 /// round. A copy held longer can no longer be trusted not to resurrect a
@@ -615,7 +712,11 @@ fn owners_needing_confirmation(
 
 /// Reacts to every change in `ownership`'s view for as long as `cancel`
 /// stays live: marks newly lost buckets releasing, unmarks newly regained
-/// ones, and pulls newly gained ones from their current owners. On a tick
+/// ones, and pulls newly gained ones from their current owners. A lost
+/// bucket this node holds data in and no surviving co-owner can hand over
+/// ([`unpullable_losses`]) is pushed to its new owners at once
+/// ([`push_unpullable`]), so a write accepted while this node owned the
+/// bucket alone reaches them without waiting out the grace. On a tick
 /// piggybacked on `ae_interval`, hands off whichever buckets' disown grace
 /// has elapsed to their live current owners ([`hand_off_owners`]), then
 /// calls [`ShardOps::release_buckets`] for the buckets every owner answered
@@ -661,10 +762,15 @@ pub(crate) async fn rebalance_task(
     let mut pulled_view = Arc::clone(&prev_view);
     let mut ticker = tokio::time::interval(ae_interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Pushes of buckets lost with no surviving co-owner, one per view
+    // change that lost any. Each stops on `cancel` through its child
+    // token; dropping the set when this task returns aborts any left.
+    let mut pushes: JoinSet<()> = JoinSet::new();
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return,
+            Some(_) = pushes.join_next(), if !pushes.is_empty() => {}
             changed = view_rx.changed() => {
                 if changed.is_err() {
                     return; // the tracker's sender dropped
@@ -672,6 +778,15 @@ pub(crate) async fn rebalance_task(
                 let new_view = view_rx.borrow_and_update().clone();
                 let held = shard.held_buckets().await;
                 let plan = plan_view_change(&prev_view, &pulled_view, &new_view, &held);
+                let held_set: HashSet<u16> = held.iter().copied().collect();
+                let held_losses: Vec<u16> = plan
+                    .lost
+                    .iter()
+                    .copied()
+                    .filter(|bucket| held_set.contains(bucket))
+                    .collect();
+                let unpullable =
+                    unpullable_losses(&prev_view, &new_view, cluster.node_id(), &held_losses);
                 prev_view = Arc::clone(&new_view);
                 tracing::debug!(
                     cache = %cache,
@@ -691,6 +806,20 @@ pub(crate) async fn rebalance_task(
                 if !plan.lost.is_empty() {
                     residency.mark_releasing(&plan.lost);
                     tracing::debug!(cache = %cache, count = plan.lost.len(), "buckets lost; disown grace started");
+                }
+                let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
+                let targets = push_targets(&new_view, cluster.node_id(), &unpullable, &live);
+                if !targets.is_empty() {
+                    tracing::debug!(cache = %cache, buckets = unpullable.len(), owners = targets.len(), "buckets lost with no co-owner to hand them over; pushing to their new owners");
+                    pushes.spawn(push_unpullable(
+                        cluster.clone(),
+                        Arc::clone(&shard),
+                        cache.clone(),
+                        targets,
+                        cluster.config().gossip_interval.max(Duration::from_millis(1)),
+                        disown_grace,
+                        cancel.child_token(),
+                    ));
                 }
                 if !plan.regained.is_empty() {
                     residency.unmark(&plan.regained);
@@ -1156,6 +1285,91 @@ mod tests {
 
         cancel.cancel();
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn unpullable_losses_names_every_bucket_a_lone_owner_loses() {
+        let self_node = NodeId::from(1);
+        let alone = view(self_node, vec![self_node], 2);
+        let three = view(self_node, (1..=3u64).map(NodeId::from).collect(), 2);
+        let (_, lost) = ownership_diff(&alone, &three);
+        assert!(!lost.is_empty(), "a three-node split takes buckets away");
+        assert_eq!(
+            unpullable_losses(&alone, &three, self_node, &lost),
+            lost,
+            "no other node owned any bucket before, so none can hand one over"
+        );
+    }
+
+    #[test]
+    fn unpullable_losses_leaves_a_bucket_with_a_surviving_co_owner_to_the_pull() {
+        let self_node = NodeId::from(1);
+        let before = view(self_node, (1..=3u64).map(NodeId::from).collect(), 2);
+        let after = view(self_node, (1..=4u64).map(NodeId::from).collect(), 2);
+        let (_, lost) = ownership_diff(&before, &after);
+        assert!(!lost.is_empty(), "the joiner displaces this node somewhere");
+        assert!(
+            unpullable_losses(&before, &after, self_node, &lost).is_empty(),
+            "a joiner only displaces one owner per bucket, so the other still holds it"
+        );
+
+        // Both of a bucket's other owners change: nobody left holds it.
+        let swapped = view(self_node, [1u64, 5, 6].map(NodeId::from).to_vec(), 2);
+        let (_, lost) = ownership_diff(&before, &swapped);
+        let orphaned: Vec<u16> = lost
+            .iter()
+            .copied()
+            .filter(|&bucket| {
+                !swapped
+                    .owners_of(bucket)
+                    .iter()
+                    .any(|owner| before.owners_of(bucket).contains(owner))
+            })
+            .collect();
+        assert!(
+            !orphaned.is_empty(),
+            "the fixture has a bucket with no survivor"
+        );
+        assert_eq!(
+            unpullable_losses(&before, &swapped, self_node, &lost),
+            orphaned
+        );
+    }
+
+    #[test]
+    fn push_targets_groups_buckets_by_live_owner_and_skips_self_and_the_dead() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=4u64).map(NodeId::from).collect();
+        let view = view(self_node, eligible.clone(), 2);
+        let buckets: Vec<u16> = (0..64u16).collect();
+        let dead = NodeId::from(4);
+        let live: HashSet<NodeId> = [2u64, 3].map(NodeId::from).into_iter().collect();
+        let targets = push_targets(&view, self_node, &buckets, &live);
+        let owners: Vec<NodeId> = targets.iter().map(|(owner, _)| *owner).collect();
+        assert!(!owners.contains(&self_node), "self is never a push target");
+        assert!(
+            !owners.contains(&dead),
+            "a dead owner is never a push target"
+        );
+        let distinct: HashSet<NodeId> = owners.iter().copied().collect();
+        assert_eq!(distinct.len(), owners.len(), "each owner appears once");
+        for &bucket in &buckets {
+            for owner in view.owners_of(bucket) {
+                let listed = targets
+                    .iter()
+                    .any(|(node, owned)| node == owner && owned.contains(&bucket));
+                assert_eq!(
+                    listed,
+                    live.contains(owner),
+                    "bucket {bucket} goes to each live owner other than self"
+                );
+            }
+        }
+        for (owner, owned) in &targets {
+            for bucket in owned {
+                assert!(view.owners_of(*bucket).contains(owner));
+            }
+        }
     }
 
     #[test]
