@@ -23,6 +23,10 @@ Consistency is best-effort on purpose. Gossip membership and last-write-wins
 skip the cost of a consensus protocol for cache data, and anti-entropy repairs
 whatever gossip's fire-and-forget delivery drops.
 
+A read comes from the process's own memory in about half a microsecond,
+hundreds of times faster than a round trip to Redis on the same machine.
+[Speed](#speed) has the figures.
+
 The [sundog book](https://ngriaznov.github.io/sundog/) covers guarantees per
 mode, deployment on a LAN, a VPC or Kubernetes, sizing, tuning, an operations
 runbook, and tested recipes for axum, sqlx and sessions.
@@ -179,6 +183,53 @@ building the listing. A mismatched part then follows the same
 listing-or-sketch rule at part scale. That third tier is what keeps repairing
 one changed key in a 100M-entry cache cheap: a bucket-level listing there costs
 megabytes, a part digest exchange costs a few hundred bytes.
+
+## Speed
+
+sundog answers a read from the calling process's memory, where a cache
+server answers across a socket. On one machine, a `Local` or `Replicated`
+read is more than 500 times faster than a Redis, Valkey or Dragonfly read, a
+write more than 100 times faster, and throughput more than 60 times higher.
+
+The figures below come from one run on a 4-core GitHub Actions runner:
+
+- **Data**: 100,000 keys of 14 bytes, each with its own 100-byte value.
+- **Mix**: 90% reads, keys drawn from a zipf distribution with exponent
+  0.99.
+- **Load**: 16 concurrent workers, 200,000 measured operations after
+  20,000 warm-up ones.
+
+| Target | Read p50 | Read p99 | Write p50 | Write p99 | Throughput |
+|---|---:|---:|---:|---:|---:|
+| sundog, `Local` | 0.52 µs | 1.12 µs | 1.96 µs | 2.85 µs | 3.39M ops/s |
+| sundog, `Replicated`, 3 nodes | 0.55 µs | 1.23 µs | 2.27 µs | 4.27 µs | 2.96M ops/s |
+| sundog, `Distributed`, 3 nodes | 1.46 µs | 549 µs | 3.73 µs | 7.07 µs | 189K ops/s |
+| Redis 8 | 302 µs | 855 µs | 304 µs | 848 µs | 46.9K ops/s |
+| Valkey 8 | 312 µs | 925 µs | 313 µs | 939 µs | 44.8K ops/s |
+| Dragonfly | 460 µs | 1,837 µs | 463 µs | 1,789 µs | 30.7K ops/s |
+| Olric | 421 µs | 1,149 µs | 424 µs | 1,171 µs | 35.0K ops/s |
+| Hazelcast 5.5 | 632 µs | 1,622 µs | 644 µs | 1,702 µs | 23.4K ops/s |
+
+The comparison is an embedded cache against a networked one, measured the
+way a service sees each:
+
+- **sundog**: the benchmark calls it in-process through one node's
+  `Cache` handle. In a 3-node cluster, all three nodes run in the
+  benchmark's process and talk over loopback.
+- **The servers**: each runs in a container, reached over loopback TCP on
+  the container's published port. That round trip is most of their
+  latency. Across a real network it grows, while a sundog read stays in
+  memory.
+- **Replicated writes**: a `Replicated` write returns once the local copy
+  is applied and the write is queued for its peers, so its latency leaves
+  out the network.
+- **`Distributed` reads**: a node owns about two thirds of the keys (two
+  owners on three nodes). It reads those from memory, and each of the rest
+  costs one round trip to an owner. Those remote reads set the 549 µs p99.
+
+The servers hold each entry in less memory: Redis and Valkey used 166 to 168
+bytes per entry, Dragonfly 131, and sundog 204 to 218 bytes per copy.
+[Memory per entry](#memory-per-entry) breaks down sundog's layout.
 
 ## The four modes
 
@@ -751,9 +802,9 @@ entry_diet_bench -- --nocapture` on a 4-core Linux box, glibc, one node,
 
 | Shape | Entries | sundog, no hint | sundog, hinted | Redis 7 computed | Redis 7 practical |
 |---|---:|---:|---:|---:|---:|
-| 7-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 74.7 B/entry | 77.3 B/entry | 80 B/copy | 85-100 B/copy |
-| 7-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.4 B/entry | 67.3 B/entry | 80 B/copy | 85-100 B/copy |
-| 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 209.6 B/entry | not measured | 184 B/copy | 195-230 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 4,000,000 | 76.3 B/entry | 75.1 B/entry | 80 B/copy | 85-100 B/copy |
+| 7-byte key, 8-byte value (`Record::Inline`) | 64,000,000 | 67.3 B/entry | 67.4 B/entry | 80 B/copy | 85-100 B/copy |
+| 16-byte key, 100-byte value (`Record::Heap`) | 4,000,000 | 212.2 B/entry | not measured | 184 B/copy | 195-230 B/copy |
 
 The Redis 7 figures for the 7-byte-key/8-byte-value shape are its own `dictEntry` (24
 bytes) plus an `sdshdr8` key plus an `embstr`-encoded value sharing one
@@ -766,18 +817,17 @@ For the 7-byte-key/8-byte-value shape, every one of sundog's four figures sits u
 bytes per entry and under Redis 7's own practical range, at both
 4,000,000 and 64,000,000 entries; the byte cost drops further as the
 entry count grows (fixed per-stripe overhead amortizing over more
-entries) rather than staying flat or climbing. `capacity_hint` costs a
-little more at 4,000,000 entries (77.3 against 74.7 bytes per entry):
-hinting the exact expected count means a stripe whose real share lands
-even one key over its reserved capacity still pays a full doubling
-growth from that reserved base, and about half of 1024 stripes do at
-this entry count under ordinary hash variance. At 64,000,000 entries the
-per-stripe hint is large enough that this variance rarely crosses it, so
-hinted and unhinted land within 0.1 bytes of each other (67.3 against 67.4). The
+entries) rather than staying flat or climbing. A stripe's entry array
+grows by a quarter when it fills, so it stays at least four fifths full
+whatever the entry count; `capacity_hint` saves a little at 4,000,000
+entries (75.1 against 76.3 bytes per entry), where about half of 1024
+stripes land a few keys over their hinted share and grow once by a
+quarter, and hinted and unhinted land within 0.1 bytes of each other at
+64,000,000 (67.4 against 67.3). The
 16-byte-key/100-byte-value shape takes one heap allocation on both
 engines, past sundog's 22-byte `Record::Inline` cap and Redis's `embstr`
 threshold alike; sundog's target there is parity with Redis, not another
-win, and it measures at 209.6 bytes per entry, inside Redis's 195-230
+win, and it measures at 212.2 bytes per entry, inside Redis's 195-230
 practical range and a little above its 184 computed figure.
 
 Reproducing sundog's figures:

@@ -443,8 +443,8 @@ async fn measure_rss_run(
     }
 }
 
-/// Measured settled RSS at 4,000,000 entries, unhinted: about 0.278 GiB,
-/// 74.7 bytes/entry. This budget sits about 13% above that, so a
+/// Measured settled RSS at 4,000,000 entries, unhinted: about 0.284 GiB,
+/// 76.3 bytes/entry. This budget sits about 13% above that, so a
 /// regression of a few bytes/entry fails the bench while run-to-run noise
 /// does not.
 #[allow(
@@ -455,10 +455,9 @@ async fn measure_rss_run(
 const RSS_BUDGET_BYTES: u64 = (0.315 * 1024.0 * 1024.0 * 1024.0) as u64;
 
 /// [`RSS_BUDGET_BYTES`]'s counterpart with `capacity_hint` set to the
-/// exact entry count: measures a little higher, about 77.3 bytes/entry
-/// (0.288 GiB), since a stripe whose real share lands over its reserved
-/// capacity still pays a full doubling from that base rather than zero.
-/// Set with the same ~13% headroom.
+/// exact entry count: measures about 75.1 bytes/entry (0.280 GiB), since
+/// a stripe whose real share lands over its reserved capacity grows once
+/// by a quarter. Set with the same ~13% headroom as the unhinted budget.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -529,7 +528,7 @@ async fn entry_diet_rss_budget() {
 const ENTRIES_64M: u32 = 64_000_000;
 
 /// [`RSS_BUDGET_BYTES`]'s counterpart at [`ENTRIES_64M`], unhinted:
-/// measures ~67.4 bytes/entry, lower than the 4M run's 74.7 since fixed
+/// measures ~67.3 bytes/entry, lower than the 4M run's 76.3 since fixed
 /// per-stripe overhead amortizes over more entries. Set with ~13%
 /// headroom over the measured number.
 #[allow(
@@ -540,7 +539,7 @@ const ENTRIES_64M: u32 = 64_000_000;
 const RSS_BUDGET_BYTES_64M: u64 = (4.55 * 1024.0 * 1024.0 * 1024.0) as u64;
 
 /// [`RSS_BUDGET_BYTES_HINTED`]'s counterpart at [`ENTRIES_64M`], hinted:
-/// measures ~67.3 bytes/entry, essentially the same as unhinted at this
+/// measures ~67.4 bytes/entry, essentially the same as unhinted at this
 /// scale since the per-stripe hint is large enough that hash variance
 /// rarely overshoots reserved capacity.
 #[allow(
@@ -606,7 +605,7 @@ async fn entry_diet_rss_budget_64m() {
 const HEAP_SHAPE_RSS_BUDGET_ENTRIES: u32 = RSS_BUDGET_ENTRIES;
 
 /// Budget for [`entry_diet_rss_budget_heap_shape`]'s run: measures
-/// ~209.6 bytes/entry, inside Redis's 195-230 bytes/copy range for the
+/// ~212.2 bytes/entry, inside Redis's 195-230 bytes/copy range for the
 /// same shape. Set with ~13% headroom over the measured number.
 #[allow(
     clippy::cast_possible_truncation,

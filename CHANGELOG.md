@@ -328,6 +328,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- **A stripe's entry array grows by a quarter instead of doubling.** A
+  stripe that just outgrew a power of two no longer leaves close to half
+  its 56-byte entry slots empty; the array stays at least four fifths
+  full. With the jemalloc harness, 14-byte keys and 100-byte values, the
+  mean over 100,000 to 2,000,000 keys in all three modes drops from 207.5
+  to 204.9 bytes per copy, and the worst case, a `Distributed` cluster at
+  2,000,000 keys, from 210.7 to 200.5. Where doubling already lands
+  nearly full it costs up to 2.7 bytes: the README's 4,000,000-entry glibc
+  figures move from 74.7 to 76.3 bytes unhinted, 77.3 to 75.1 hinted, and
+  209.5 to 212.2 for the 100-byte shape.
 - Every workflow checks out with `actions/checkout@v7` and uploads with
   `actions/upload-artifact@v7`, the Node 24 majors, and `weekly-kani.yml`
   and `weekly-fuzz.yml` deny warnings the way every other lane does.
@@ -358,6 +368,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A `Mode::Distributed` write accepted before the cluster formed reaches
+  its owners at once.** A node that opens the cache before its peers do
+  owns every bucket alone and keeps what it is given. When a view with
+  its peers lands, some of those buckets go to owners that never held
+  them, and a new owner's pull asks only its co-owners, so `fetch` from
+  any other node missed those keys. They stayed missing until the old
+  owner handed each bucket over at the end of its disown grace, or until
+  an anti-entropy round happened to pair the two nodes. The old owner now
+  pushes each bucket it loses with no surviving previous owner to its
+  new owners on the view change, retrying every gossip interval until
+  their views agree. A bucket with a surviving co-owner is left to the new
+  owner's pull as before, so a node joining a settled cluster moves no
+  extra data.
 - **A read-through fill no longer overwrites a write that lands during its
   load.** `get_or_load` stamps its fill before the loader runs, and the fill
   installs only when it is newer than whatever the key holds when the loader

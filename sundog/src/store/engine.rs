@@ -610,6 +610,20 @@ impl<K, V> Stripe<K, V> {
     }
 }
 
+/// How many slots a full arena of `len` entries grows by: a quarter of
+/// `len`, and never fewer than [`ARENA_MIN_GROWTH`]. `Vec`'s own doubling
+/// leaves a stripe that just outgrew its arena half empty, and a
+/// [`Live`] slot is the largest per-entry cost after the record itself;
+/// growing by a quarter keeps the arena at least four fifths full while
+/// each entry is still copied only a bounded number of times on average.
+fn arena_growth(len: usize) -> usize {
+    (len / 4).max(ARENA_MIN_GROWTH)
+}
+
+/// The fewest slots [`arena_growth`] adds, so a small stripe does not
+/// reallocate on every insert.
+const ARENA_MIN_GROWTH: usize = 4;
+
 /// One stripe's live entries: a dense arena plus a hash index mapping each
 /// live key's hash to its arena slot. No holes, no free list:
 /// `entries.len()` is always the exact live count, so a full-stripe walker
@@ -713,6 +727,9 @@ impl<K, V> Slab<K, V> {
     ) -> u32 {
         let slot = u32::try_from(self.entries.len())
             .expect("a stripe never holds anywhere near u32::MAX live entries");
+        if self.entries.len() == self.entries.capacity() {
+            self.entries.reserve_exact(arena_growth(self.entries.len()));
+        }
         self.entries.push(value);
         let entries = &self.entries;
         self.index
@@ -932,6 +949,39 @@ mod slab_tests {
             .find(hash, eq_for(7))
             .expect("just-inserted key is findable");
         assert_eq!(record_value(&found.record), b"v7");
+    }
+
+    #[test]
+    fn arena_growth_adds_a_quarter_and_at_least_the_minimum() {
+        assert_eq!(arena_growth(0), ARENA_MIN_GROWTH);
+        assert_eq!(arena_growth(8), ARENA_MIN_GROWTH);
+        assert_eq!(arena_growth(16), 4);
+        assert_eq!(arena_growth(100), 25);
+        assert_eq!(arena_growth(1_000_000), 250_000);
+    }
+
+    #[test]
+    fn slab_arena_stays_four_fifths_full_as_it_grows() {
+        let mut slab: Slab<u32, Vec<u8>> = Slab::new();
+        for key in 0..5_000u32 {
+            slab.insert_unique(hash_of(key), live_for(key, b"v"), hasher_for);
+            let len = slab.len();
+            assert!(
+                slab.capacity() <= len + arena_growth(len.saturating_sub(1)),
+                "at {len} entries the arena holds {} slots",
+                slab.capacity()
+            );
+            if len >= 20 {
+                assert!(
+                    slab.capacity() * 4 <= len * 5,
+                    "at {len} entries the arena holds {} slots, more than a quarter spare",
+                    slab.capacity()
+                );
+            }
+        }
+        for key in 0..5_000u32 {
+            assert!(slab.find(hash_of(key), eq_for(key)).is_some());
+        }
     }
 
     #[test]
