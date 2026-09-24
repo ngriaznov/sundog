@@ -46,7 +46,7 @@ All notable changes to this project are documented in this file. Format follows
   compaction with no periodic reset. Every TTL keeps millisecond
   precision, on both sides of the inline delta's own ~49.71-day ceiling,
   and reads stay TTL-blind. No wire change: `wire::PROTOCOL_VERSION` and
-  `WireRecord` stay exactly as they are; only the in-RAM entry encoding
+  `WireRecord` stay as they are; only the in-RAM entry encoding
   changes.
 - **Entry diet, phase B, a `Slab` replaces `Stripe::live`'s hash table**:
   `Stripe::live` (`sundog/src/store/engine.rs`) is a `Slab<K, V>`, a dense
@@ -75,10 +75,10 @@ All notable changes to this project are documented in this file. Format follows
 - **`CacheBuilder::capacity_hint`**: hints this shard's expected local
   entry count so each of `BUCKET_COUNT` stripes' `Slab` (arena and index)
   preallocates up front instead of growing one insert at a time. `None`,
-  the default, keeps today's zero-allocation-until-first-write behavior
-  exactly. `open()` clamps the hint to `max_capacity` unless a weigher is
+  the default, keeps today's zero-allocation-until-first-write behavior.
+  `open()` clamps the hint to `max_capacity` unless a weigher is
   configured, since a weigher turns `max_capacity` into a weight budget
-  rather than an entry count. An oversized hint costs memory rather than
+  rather than an entry count. An oversized hint costs memory and never
   correctness: `Engine::compact`'s existing paced pass reclaims a stripe
   left far below its own reserved capacity, from an inflated hint or from
   ownership rebalancing draining it, via a new `should_shrink_stripe`
@@ -89,7 +89,7 @@ All notable changes to this project are documented in this file. Format follows
   unhinted one (74.7 unhinted, 77.3 hinted bytes per entry on a 4-core
   glibc box, both under the 90-byte target) and a 64,000,000-entry variant
   of both (67.4 unhinted, 67.3 hinted, confirming the byte cost holds or
-  improves at scale rather than climbing), and a new
+  improves at scale), and a new
   `entry_diet_rss_budget_heap_shape` measures a 16-byte-key/100-byte-value
   shape at 209.6 bytes per entry, inside Redis 7's own 195-230
   bytes/copy practical range for the same shape. The README's new Memory
@@ -118,7 +118,7 @@ All notable changes to this project are documented in this file. Format follows
   clears cold and unverified via `ResidencySet::mark_serving` the instant
   its digest matches a live co-owner's; a bucket whose loop exhausts the
   budget against every live co-owner, or that has no live co-owner at all,
-  keeps both marks exactly as `attach_ownership` set them and falls through
+  keeps both marks as `attach_ownership` set them and falls through
   to the ordinary cold-pull path, which alone decides whether to trust and
   serve it, and a failed round never reports a bucket converged. A round
   classifies its bucket and part-digest mismatches in chunks of 64 buckets,
@@ -145,7 +145,7 @@ All notable changes to this project are documented in this file. Format follows
   in-process `sundog_*` status line every interval during a `--headless`
   run, needing `--features prometheus`. `--report-json <PATH>` writes a
   JSON summary of a headless run (RSS, fetch latency, the sample check,
-  convergence, and the summed `sundog_*` totals) at the end of the run.
+  convergence, and the summed `sundog_*` totals) once the run ends.
   `--gate <PATH>` reads a JSON threshold file of the same shape, checks the
   run's report against it, and exits nonzero listing every violated
   threshold. Both need `--metrics`.
@@ -182,7 +182,7 @@ All notable changes to this project are documented in this file. Format follows
   once the budget runs out, the shortfall resolves through the same
   ordinary, non-blocking refusal any unreserved write already uses, so
   `SpillTier::set_keep_resident_when_refused`'s policy decides the
-  victim's fate exactly as it always has rather than leaving it resident
+  victim's fate as it always has rather than leaving it resident
   regardless of that policy. **This is a real behavior change for
   every existing spill deployment**: `SpillConfig::new(...)` with no
   override moves from always refusing an eviction instantly under
@@ -190,15 +190,14 @@ All notable changes to this project are documented in this file. Format follows
   opened with no `SpillConfig` sees no change at all. The flush channel's
   slot count scales with `flush_queue_bytes_value()` too (clamped to a
   floor at the existing fixed 8192 slots and a ceiling that bounds a
-  pathological config), rather than staying fixed regardless of
-  configuration, since a fixed slot count fills, for small records, long
+  pathological config). A fixed slot count fills, for small records, long
   before the byte budget does. Three new metrics cover the wait itself:
   `sundog_spill_wait_seconds_total{cache}` (a counter, whole seconds),
   `sundog_spill_waiters{cache}` (a gauge), and
   `sundog_spill_wait_timeouts_total{cache}` (a counter, incremented only
   when the wait itself times out). `sundog_spill_dropped_total` gains a
   `reason="disk_error"` value, incremented for every job in a segment
-  whose write fails; the victim stays resident on this path exactly as
+  whose write fails; the victim stays resident on this path as
   every other refusal reason leaves it, so this counter is the only
   visible sign of the failure.
 - **Fan-out backpressure, on both the send and the write side**: a live
@@ -207,7 +206,7 @@ All notable changes to this project are documented in this file. Format follows
   long as the target peer stays live in the mesh's peer table, logging each
   timed-out slice at debug and counting it, in whole seconds, in the new
   `sundog_fan_out_wait_seconds_total{peer}`, instead of giving up; only a
-  peer that has actually left the table (or whose outbox channel has
+  peer that has left the table (or whose outbox channel has
   already closed) falls back to today's drop-and-count-and-warn path
   against `sundog_backlog_dropped_total`. On the write side, `ClusterConfig`
   gains `fan_out_backlog_capacity` (a new `usize` field, 262,144 keys
@@ -228,7 +227,7 @@ All notable changes to this project are documented in this file. Format follows
   summed across peers) and `fan_out_wait_timeouts`
   (`sundog_fan_out_wait_timeouts_total` summed across caches), and its
   `--gate` file gains `max_backlog_dropped` (optional, an older gate file
-  with the field absent skips the check exactly as before);
+  with the field absent skips the check as before);
   `ops/scale-gate.json` sets it to 0.
 - **Scale workflow**: `.github/workflows/scale.yml` runs the distributed
   demo headless overnight (and on demand via `workflow_dispatch`, with
@@ -238,7 +237,7 @@ All notable changes to this project are documented in this file. Format follows
   `ops/scale-gate.json`'s thresholds: steady RSS at most 4.5 GiB, peak RSS
   at most 5.6 GiB, at most 100,000 deferred spill drops, zero pull
   timeouts, fetch p99 at most 100 milliseconds, full convergence, and a
-  fully passing sample check. It uploads the run's `scale-report.json` and
+  passing sample check. It uploads the run's `scale-report.json` and
   log as workflow artifacts either way.
 - **Chunked bucket pull with independent per-bucket release**: a rebalance
   donor sub-batches each bucket's key list by `rebalance_chunk_bytes` (a new
@@ -250,8 +249,7 @@ All notable changes to this project are documented in this file. Format follows
   protocol-3 peer on either side of a connection sees byte-for-byte today's
   traffic. The donor signals a bucket's completion the instant its own last
   chunk goes out, and the receiver clears that bucket's cold mark and
-  serves it immediately rather than waiting on the rest of its transfer
-  group. The receiver's `Msg::StBucketAck`, trusted for a new bounded
+  serves it immediately, before the rest of its transfer group lands. The receiver's `Msg::StBucketAck`, trusted for a new bounded
   `rebalance_ack_window` (default `2 * ae_interval`), lets the donor skip a
   redundant confirming anti-entropy round before release; `disown_grace`
   stays the hard floor underneath either way, so a bucket is never
@@ -304,7 +302,7 @@ All notable changes to this project are documented in this file. Format follows
   out -- both marks clear on that decision too: the replayed data, already
   bounded by the `tombstone_ttl` downtime gate above, is the best available
   answer, and refusing local hits forever in a bucket whose local misses
-  are already trusted is incoherent, not extra safety.
+  are already trusted adds no safety.
 - `sundog_spill_reopen_total{cache, outcome, reason}` and
   `sundog_spill_reopen_records_total{cache}`: a `spill` cache's two new
   Prometheus metrics, the first incremented once per cache open naming
@@ -312,7 +310,7 @@ All notable changes to this project are documented in this file. Format follows
   `disabled` for `SpillConfig::warm_reopen` off, `no_snapshot`,
   `stale_snapshot`, `config_mismatch`, `downtime_exceeded`, or
   `bad_region`; empty for `warm`), the second counting how many records a
-  warm reopen actually replayed.
+  warm reopen replayed.
 
 - `sundog_rebalance_buckets_total{cache, direction="served"}`: a donor
   credits every bucket of a rebalance pull stream that runs to its end,
@@ -469,7 +467,7 @@ All notable changes to this project are documented in this file. Format follows
   membership incarnation it wrote under, replacing the bare `NodeId`
   keys `PnCounter`'s `p`/`n` and `OrSet`'s tags used in 0.6.1's first
   `crdt` module: a restarted node's fresh incarnation gets its own slot
-  rather than resuming or corrupting its pre-restart one.
+  and never touches its pre-restart one.
   `PnCounter::compact`/`OrSetResolver::compact` (backing the new
   `ConflictResolver::compact`, defaulted to a no-op) retire a dead writer
   in two stages: moving its live state into a per-writer retired entry,
@@ -529,7 +527,7 @@ All notable changes to this project are documented in this file. Format follows
   the retirement window and the sweep's per-call record budget.
   `sundog_crdt_retired_writers_total{cache}` counts writers the sweep's
   scan found eligible for retirement, which can run ahead of
-  `sundog_crdt_compactions_total{cache}`'s count of records actually
+  `sundog_crdt_compactions_total{cache}`'s count of records
   rewritten: a writer counts the moment the scan judges it eligible, even
   for a record the pass skips without rewriting (an unowned bucket, or
   one that changed underneath the scan). The sweep runs at
@@ -546,8 +544,7 @@ All notable changes to this project are documented in this file. Format follows
   previously took a `NodeId`. Neither type nor these signatures had
   shipped in a release before this one, so this is not a breaking change.
   It exists so a restarted node's fresh membership incarnation gets a slot
-  of its own rather than resuming, or corrupting, the one its pre-restart
-  process wrote to.
+  of its own and never touches the one its pre-restart process wrote to.
 - **The retirement contract, stated plainly.** A writer is retirement-
   eligible on a node once it is confirmed dead there (gone longer than
   `ClusterConfig::crdt_retire_after`, whether it crashed or left through
@@ -582,7 +579,7 @@ All notable changes to this project are documented in this file. Format follows
   writer's contribution once it reconnects (an `OrSet` writer's
   already-removed elements resurrect the same way). That is the same
   trust boundary `tombstone_max_ttl` already accepts for a member gone
-  that long, not a new one.
+  that long.
 
 ### Fixed
 
@@ -764,7 +761,7 @@ All notable changes to this project are documented in this file. Format follows
   `.seeds()` ignored it and browsed mDNS.
 - A pooled request connection idle for more than 30 s is dropped instead of
   reused, and one the peer has already closed is retried on a fresh dial
-  rather than failing the anti-entropy round.
+  and the anti-entropy round continues.
 
 ### Changed
 
@@ -950,7 +947,7 @@ All notable changes to this project are documented in this file. Format follows
   empty `get`. Collapsed waiters count as hits. `contains_key` counts as
   neither. `sundog_cache_entries{cache}` is a gauge refreshed every five seconds
   per open cache. Counter handles are created once per shard, so the read path
-  pays an atomic increment, not label resolution. Two matching Grafana panels
+  pays one atomic increment and resolves no labels. Two matching Grafana panels
   track hit ratio and entries per cache.
 
 ### Removed
@@ -1181,7 +1178,7 @@ The first release: the full core library.
   value clone for replication or invalidation fan-out.
 - **Partition-aware tombstone retention**: `ClusterConfig::tombstone_max_ttl`,
   24 hours unless overridden, bounds a new deferral in the tombstone GC sweep: a
-  tombstone past `tombstone_ttl` is kept, not collected, while any member
+  tombstone past `tombstone_ttl` is kept while any member
   seen inside that window is currently absent, up to the hard cap. This closes the
   resurrection window where a member absent longer than `tombstone_ttl` could
   bring a manually deleted key back to life on the nodes that stayed up. A

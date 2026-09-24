@@ -1,0 +1,16 @@
+[book]
+title = "sundog"
+authors = ["sundog contributors"]
+language = "en"
+src = "src"
+
+[build]
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/ngriaznov/sundog"
+edit-url-template = "https://github.com/ngriaznov/sundog/edit/main/docs/{path}"
+site-url = "/sundog/"
+
+[output.html.playground]
+runnable = false

@@ -1,0 +1,85 @@
+# Builds the book in docs/ and publishes it to GitHub Pages from main.
+#
+# The book's Rust code lives in docs/cookbook, a workspace member, so the
+# CI workflow's workspace lanes compile it with clippy and run each recipe
+# as a test. This workflow checks the other half: every include in the book
+# names an anchor that exists, and the book builds with no missing page.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", ".github/workflows/docs.yml"]
+  pull_request:
+    paths: ["docs/**", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  MDBOOK_VERSION: 0.5.4
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install mdbook
+        run: cargo install mdbook --locked --version "$MDBOOK_VERSION" --no-default-features --features search
+
+      # mdbook renders an include whose anchor is missing as an empty code
+      # block and exits 0, so a renamed anchor would ship a blank snippet.
+      - name: Check every include names an existing anchor
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS=: read -r page inc; do
+            spec=${inc#'{{#include '}
+            spec=${spec%'}}'}
+            file=${spec%%:*}
+            anchor=${spec#*:}
+            src="$(dirname "$page")/$file"
+            if [ ! -f "$src" ] || ! grep -q "ANCHOR: ${anchor}\$" "$src"; then
+              echo "::error file=$page::$file has no ANCHOR: $anchor"
+              status=1
+            fi
+          done < <(grep -roE '\{\{#include [^}]+\}\}' docs/src)
+          exit $status
+
+      - name: Build the book
+        run: mdbook build docs
+
+      - uses: actions/configure-pages@v6
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+      - uses: actions/upload-pages-artifact@v5
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: docs/book
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

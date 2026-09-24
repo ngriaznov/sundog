@@ -15,9 +15,9 @@
   --workspace`, the sim suite, the tls+prometheus suite, the
   spill+prometheus suite, `cargo doc --workspace --no-deps` and `cargo doc -p
   sundog --no-deps --all-features`, and the rightsize container suite. Repeat timing-sensitive new tests ten times. CI
-  is the end gate; dispatch it on the branch and wait for green.
+  is the end gate. Dispatch it on the branch and wait for green.
 - Run `cargo semver-checks --baseline-version <last release> --release-type
-  minor` before a minor release; only intentional, changelog-listed breaks may
+  minor` before a minor release. Only intentional, changelog-listed breaks may
   remain.
 - Reads are TTL-blind: only writes take a per-entry TTL. No read method accepts
   a TTL.
@@ -25,18 +25,18 @@
 - Commits are authored by Nikita Griaznov
   (`17167893+ngriaznov@users.noreply.github.com`), unsigned, with no co-author
   trailers and no model identifiers in any pushed artifact.
-- Delegated work runs on Sonnet. Work on a feature branch; merges to `main`,
+- Delegated work runs on Sonnet. Work on a feature branch. Merges to `main`,
   releases, and yanks wait for an explicit go.
 - Prose is greenfield and describes the code as it is: present tense, no
   wind-ups or hedges.
 - Every wire change bumps `wire::PROTOCOL_VERSION`, and a responder gates the
   new message kinds on the peer's protocol from its hello. Release N
-  interoperates with N-1; the mixed-version container test runs the previous
+  interoperates with N-1. The mixed-version container test runs the previous
   release's node against the current one and must stay green.
-- Container tests use the `rightsize` crate only; no Docker CLI, compose, or
+- Container tests use the `rightsize` crate only: no Docker CLI, compose, or
   bollard in the repo. The test node is the `sundog-testnode` binary.
 - Publishing goes through GitHub Actions (`release.yml`, `tag-release.yml`,
-  `yank.yml`); the session git proxy cannot push tags. `release.yml` refuses
+  `yank.yml`). The session git proxy cannot push tags. `release.yml` refuses
   to publish unless CI, weekly-sim, weekly-fuzz, weekly-chaos and
   weekly-kani each have a successful run on the exact release commit:
   dispatch all five on that commit and wait for green before the release
