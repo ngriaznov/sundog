@@ -34,7 +34,6 @@
 //! let users = cluster
 //!     .cache::<UserId, Profile>("users")
 //!     .mode(Mode::Replicated) // or Mode::Invalidation (default), Mode::Local, Mode::distributed()
-//!     .max_capacity(200_000)
 //!     .ttl(Duration::from_secs(600))
 //!     .open()
 //!     .await?; // triggers state transfer if the cache exists cluster-wide

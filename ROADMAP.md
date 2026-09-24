@@ -96,8 +96,8 @@ The scale gate's 100 ms fetch p99 covers a 3-node, 4M-key run whose fetch
 crosses the network and the SSD, and stays. A separate in-RAM local bench
 carries the sub-millisecond gate.
 
-**Trigger:** any claim of a lead over another system. Without this harness
-no such claim has a number behind it.
+**Trigger:** any claim of a lead over another system. Without these
+benchmarks no such claim has a number behind it.
 
 ### A hundred nodes in simulation
 
@@ -109,14 +109,6 @@ replicated write fanning out to every peer, and gossip state growing as
 nodes times caches. A turmoil scenario at 100 nodes with a rolling restart
 proves or corrects the README's number, and the README says what it proves.
 
-### A docs site
-
-The README carries everything, in 13 flat sections. Per-mode guarantees,
-memory sizing and the testing stack exist there already and move. The
-operations runbook, a tuning page, and a cookbook with an axum middleware, a
-read-through over sqlx and a session store are new writing, as is a page
-that states the verification stack as the differentiator it is.
-
 ## Reach
 
 ### A RESP-speaking server
@@ -124,7 +116,7 @@ that states the verification stack as the differentiator it is.
 Every Redis client speaks RESP and none speaks sundog. A `sundog-server`
 binary that opens a cache and answers GET, SET, DEL, EXPIRE and MGET over
 RESP lets `redis-cli`, `memtier` and every client library talk to a cluster,
-and gives the benchmark harness the same driver for every system. MGET is
+and gives the competitor benchmarks one driver for every system. MGET is
 `get_many` above. EXPIRE is `expire` above.
 
 ### An observer
@@ -142,7 +134,7 @@ Persistence is the spill tier's checkpoint, behind the `spill` feature. A
 no donor leaves every node warm and empty. `Cache::export` streams the
 shard's snapshot chunks to a writer and `Cache::import` applies them as
 remote records, versions intact, so a restart from a file converges with a
-peer exactly as a join does.
+peer the way a join does.
 
 ## Store
 

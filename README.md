@@ -23,6 +23,10 @@ Consistency is best-effort on purpose. Gossip membership and last-write-wins
 skip the cost of a consensus protocol for cache data, and anti-entropy repairs
 whatever gossip's fire-and-forget delivery drops.
 
+The [sundog book](https://ngriaznov.github.io/sundog/) covers guarantees per
+mode, deployment on a LAN, a VPC or Kubernetes, sizing, tuning, an operations
+runbook, and tested recipes for axum, sqlx and sessions.
+
 ## Getting it
 
 ```sh
@@ -54,7 +58,6 @@ let cluster = Cluster::builder("demo")
 let users = cluster
     .cache::<UserId, Profile>("users")
     .mode(Mode::Replicated) // or Mode::Invalidation, the default, or Mode::Local
-    .max_capacity(200_000)
     .ttl(Duration::from_secs(600))
     .open()
     .await?; // triggers state transfer if the cache exists cluster-wide
@@ -81,7 +84,7 @@ cluster.shutdown().await; // graceful leave
 
 That's the whole API surface for the common case.
 `Cluster::builder(name).build()` with nothing else chained works on a LAN. The
-doctest in `sundog/src/lib.rs` runs it as the project's acceptance test. For
+doctest in `sundog/src/lib.rs` compiles it on every CI run. For
 bulk fills, `users.insert_many(entries).await?` gives every entry its own HLC
 stamp and event under one lock acquisition instead of one per entry. The rest of
 the surface:
@@ -295,11 +298,10 @@ self-referencing rule, plus the Prometheus port if you use one:
 ```rust
 use sundog::{Cluster, ClusterConfig};
 
-let config = ClusterConfig {
-    gossip_bind_addr: "0.0.0.0:7946".parse()?,
-    data_bind_addr: "0.0.0.0:7947".parse()?,
-    ..ClusterConfig::default()
-};
+let config = ClusterConfig::default().with(|c| {
+    c.gossip_bind_addr = "0.0.0.0:7946".parse().expect("a socket address");
+    c.data_bind_addr = "0.0.0.0:7947".parse().expect("a socket address");
+});
 let cluster = Cluster::builder("prod")
     .config(config)
     .seeds(["10.0.1.10:7946".parse()?, "10.0.2.10:7946".parse()?])
@@ -383,7 +385,7 @@ entry and a local delete would only have anti-entropy repair it back in. A
 `Local` or `Invalidation` cache evicts it as described above.
 
 With `SpillConfig::warm_reopen(true)` (default `false`, so a default tier's
-open and close cost stay exactly what they are without this setting), a
+open and close cost stay what they are without this setting), a
 clean close checkpoints the tier: every currently-resident live record is
 written to disk alongside every already-spilled one, and a snapshot next
 to the region files lists every live entry's key, version, expiry, and
@@ -444,7 +446,7 @@ per-part reconciliation, where `outcome` is `listing`, `sketch`, or
 `fallback`. A cache whose resolver merges (`sundog::crdt`'s `PnCounter` and
 `OrSet`) also emits `sundog_crdt_retired_writers_total{cache}`, writers the
 CRDT compaction sweep found eligible for retirement, and
-`sundog_crdt_compactions_total{cache}`, records it actually rewrote in
+`sundog_crdt_compactions_total{cache}`, records it rewrote in
 their compacted form. The first can exceed the second: a writer counts as
 retired the moment the sweep's scan judges it eligible, even for a record
 the pass skips without rewriting (an unowned bucket, or one that changed
@@ -461,7 +463,7 @@ ordinary wipe-and-recreate path, with `reason` naming why for a fallback
 (`disabled` when `SpillConfig::warm_reopen` is off, `no_snapshot`,
 `stale_snapshot`, `config_mismatch`, `downtime_exceeded`, or `bad_region`;
 empty for `warm`), and `sundog_spill_reopen_records_total{cache}`, how many
-records a warm reopen actually replayed.
+records a warm reopen replayed.
 
 A `Mode::Distributed` cache adds seven more:
 
@@ -494,7 +496,7 @@ orchestrator's readiness and liveness probes.
 
 ## Testing
 
-Five layers, cheapest and highest-signal first:
+Six layers, cheapest and highest-signal first:
 
 1. **Property tests** run via `proptest` in `hlc`, `wire`, and `store` under
    `sundog/src`. The one that matters most, `store`'s permutation-convergence
@@ -588,9 +590,10 @@ Five layers, cheapest and highest-signal first:
    cargo kani -p sundog --features spill`.
 6. **Chaos demo** runs `sundog-demo` in headless mode, described in the Chaos demo section.
 
-Three benchmark suites sit outside these five layers, each gated on
+Four benchmark suites sit outside these six layers, each gated on
 `SUNDOG_BENCH=1` so a plain `cargo test` never pays their wall-clock cost:
-`sundog/tests/replication_bench.rs` (bulk write and read latency across a live
+`sundog/tests/entry_diet_bench.rs` (memory per entry and local read
+latency, covered in Memory per entry below), `sundog/tests/replication_bench.rs` (bulk write and read latency across a live
 cluster), `sundog/tests/spill_bench.rs` (the optional SSD spill tier's
 write path, RAM-hit versus tier-hit read latency, concurrent tier reads,
 region reclaim, and its hit-ratio case against plain eviction), and
@@ -629,7 +632,7 @@ peak RSS, deferred spill drops, pull timeouts, dropped replicate backlog
 frames dropped toward any peer other than the node the run kills, whose
 departure drops the frames queued for it by design; `max_backlog_dropped`
 bounds the total across every peer instead), fetch p99 latency, warm spill
-reopens, convergence, and a fully passing sample check via `--gate`.
+reopens, convergence, and a passing sample check via `--gate`.
 `workflow_dispatch` reruns the same shape on demand with its own key count,
 duration, RAM cap, and runner inputs, for a one-off run at a different
 scale. Both the report and the run log upload as workflow artifacts.
@@ -756,7 +759,7 @@ even one key over its reserved capacity still pays a full doubling
 growth from that reserved base, and about half of 1024 stripes do at
 this entry count under ordinary hash variance. At 64,000,000 entries the
 per-stripe hint is large enough that this variance rarely crosses it, so
-hinted and unhinted are effectively tied (67.3 against 67.4). The
+hinted and unhinted land within 0.1 bytes of each other (67.3 against 67.4). The
 16-byte-key/100-byte-value shape takes one heap allocation on both
 engines, past sundog's 22-byte `Record::Inline` cap and Redis's `embstr`
 threshold alike; sundog's target there is parity with Redis, not another
