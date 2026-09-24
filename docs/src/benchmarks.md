@@ -54,8 +54,9 @@ its figures.
 Memory is read before the load and again after it, and the difference is
 divided by the key count times the copies held:
 
-- **sundog**: bytes in use and not yet freed, from jemalloc's own
-  counter. It is the same kind of figure Redis reports as `used_memory`.
+- **sundog**: bytes in use and not yet freed: jemalloc's allocated
+  count less the freed memory its thread caches keep for reuse. It is the
+  same kind of figure Redis reports as `used_memory`.
   A `sundog-replicated` cluster holds three copies of each entry and a
   `sundog-distributed` one holds two, so both report bytes per copy.
 - **Redis, Valkey and Dragonfly**: `used_memory` from `INFO memory`.

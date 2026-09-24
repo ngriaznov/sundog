@@ -265,17 +265,22 @@ async fn wait_until(
     Ok(())
 }
 
-/// Bytes this process holds from jemalloc and has not freed, from jemalloc's own
-/// counter: the figure Redis reports as `used_memory`, so the two compare
-/// like for like. `None` where jemalloc is not the allocator.
+/// Bytes this process holds from jemalloc and has not freed, the figure
+/// Redis reports as `used_memory`, so the two compare like for like.
+/// jemalloc's own `stats.allocated` also counts memory the process has
+/// freed but a thread cache still keeps for reuse; [`held_bytes`] takes
+/// that back out. `None` where jemalloc is not the allocator.
 #[must_use]
 pub fn allocated_bytes() -> Option<u64> {
     #[cfg(not(target_env = "msvc"))]
     {
         tikv_jemalloc_ctl::epoch::advance().ok()?;
-        tikv_jemalloc_ctl::stats::allocated::read()
-            .ok()
-            .and_then(|bytes| u64::try_from(bytes).ok())
+        let allocated = tikv_jemalloc_ctl::stats::allocated::read().ok()?;
+        // SAFETY: `stats.arenas.<MALLCTL_ARENAS_ALL>.tcache_bytes` is a
+        // `size_t` statistic, read as the `usize` it is.
+        let thread_cached: usize =
+            unsafe { tikv_jemalloc_ctl::raw::read(THREAD_CACHED_BYTES) }.ok()?;
+        u64::try_from(held_bytes(allocated, thread_cached)).ok()
     }
     #[cfg(target_env = "msvc")]
     {
@@ -283,9 +288,40 @@ pub fn allocated_bytes() -> Option<u64> {
     }
 }
 
+/// jemalloc's count of freed bytes its thread caches hold, summed over
+/// every arena (`4096` is `MALLCTL_ARENAS_ALL`).
+#[cfg(not(target_env = "msvc"))]
+const THREAD_CACHED_BYTES: &[u8] = b"stats.arenas.4096.tcache_bytes\0";
+
+/// `allocated` less what thread caches keep of it: freed memory the
+/// allocator holds for reuse is not the process's to account for, the same
+/// as Redis's `used_memory` leaves it out.
+#[must_use]
+pub fn held_bytes(allocated: usize, thread_cached: usize) -> usize {
+    allocated.saturating_sub(thread_cached)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_bytes_leaves_out_what_thread_caches_keep() {
+        assert_eq!(held_bytes(10_000, 1_500), 8_500);
+        assert_eq!(held_bytes(10_000, 0), 10_000);
+        assert_eq!(held_bytes(1_000, 5_000), 0);
+    }
+
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn the_thread_cache_statistic_is_readable() {
+        tikv_jemalloc_ctl::epoch::advance().expect("epoch advances");
+        // SAFETY: as in `allocated_bytes`.
+        let cached: usize = unsafe { tikv_jemalloc_ctl::raw::read(THREAD_CACHED_BYTES) }
+            .expect("jemalloc reports its thread-cached bytes");
+        let allocated = tikv_jemalloc_ctl::stats::allocated::read().expect("allocated reads");
+        assert!(cached <= allocated, "{cached} cached of {allocated}");
+    }
 
     #[cfg(not(target_env = "msvc"))]
     #[test]
