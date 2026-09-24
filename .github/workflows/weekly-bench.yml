@@ -1,0 +1,100 @@
+# Weekly competitor benchmark: builds sundog-bench in release mode and runs
+# one zipf workload against sundog in its three modes and against Redis,
+# Valkey, Dragonfly, Olric and Hazelcast, each server in its own container
+# through rightsize. It first runs the crate's tests with the container
+# test switched on, a small workload against every server. The Markdown report lands on the run's summary page,
+# and the JSON and Markdown reports are uploaded as artifacts. The run fails
+# if a target fails or the report breaks ops/bench-gate.json.
+# workflow_dispatch reruns it on demand with a different target list, key
+# count, operation count or runner.
+name: Weekly bench
+
+on:
+  schedule:
+    - cron: "0 7 * * 0"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Comma-separated targets, empty for all"
+        required: false
+        default: ""
+        type: string
+      keys:
+        description: "Distinct keys"
+        required: false
+        default: "100000"
+        type: string
+      ops:
+        description: "Measured operations per target"
+        required: false
+        default: "200000"
+        type: string
+      runner:
+        description: "Runner label"
+        required: false
+        default: "ubuntu-latest"
+        type: string
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  bench:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    env:
+      BENCH_TARGETS: ${{ inputs.targets }}
+      BENCH_KEYS: ${{ inputs.keys || '100000' }}
+      BENCH_OPS: ${{ inputs.ops || '200000' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test (every server in a container)
+        env:
+          RIGHTSIZE_BACKEND: docker
+          SUNDOG_BENCH_CONTAINERS: "1"
+        run: cargo test --release -p sundog-bench
+
+      - name: cargo build --release
+        run: cargo build --release -p sundog-bench
+
+      - name: Run the benchmark
+        env:
+          RIGHTSIZE_BACKEND: docker
+          RUST_LOG: warn
+        run: |
+          set -o pipefail
+          targets=()
+          if [ -n "$BENCH_TARGETS" ]; then
+            targets=(--targets "$BENCH_TARGETS")
+          fi
+          ./target/release/sundog-bench \
+            "${targets[@]}" \
+            --keys "$BENCH_KEYS" \
+            --ops "$BENCH_OPS" \
+            --report-json bench-report.json \
+            --report-md bench-report.md \
+            --gate ops/bench-gate.json \
+            2>&1 | tee bench-run.log
+
+      - name: Publish the report on the run summary
+        if: always()
+        run: |
+          if [ -f bench-report.md ]; then
+            cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload bench report and log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-report
+          path: |
+            bench-report.json
+            bench-report.md
+            bench-run.log
+          if-no-files-found: warn

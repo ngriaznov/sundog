@@ -7,6 +7,15 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **Competitor benchmark**: `sundog-bench`, the new `bench` crate, runs one
+  zipf workload against sundog in its three modes and against Redis,
+  Valkey, Dragonfly, Olric and Hazelcast, each server in a container
+  started through rightsize. It reports read and write p50 and p99,
+  throughput, and bytes per entry, with every target in a fresh child
+  process so allocator state never carries over. `ops/bench-gate.json`
+  holds `sundog-local` and `sundog-replicated` to a one-millisecond read
+  and write p99, and `weekly-bench.yml` runs the set weekly and posts the
+  report on the run's summary page.
 - **Kani proofs**: `#[kani::proof]` harnesses under each module's
   `kani_proofs` prove, over every input, that expiry packing and the
   touch stamp round-trip, a hash lands inside the bucket and part tables,

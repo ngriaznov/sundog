@@ -1,0 +1,29 @@
+[package]
+name = "sundog-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Drives sundog and other caches through one zipf workload and reports latency, throughput and memory"
+publish = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+anyhow = "1.0.104"
+hdrhistogram = { version = "7.6.0", default-features = false }
+rand = "0.10"
+redis = { version = "1.7.0", default-features = false, features = ["tokio-comp", "aio"] }
+rightsize = "0.7.10"
+rightsize-modules = { version = "0.7.10", default-features = false, features = ["backend-docker"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sundog = { version = "0.6.1", path = "../sundog" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
+tikv-jemallocator = "0.7.0"

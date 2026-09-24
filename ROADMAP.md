@@ -84,21 +84,6 @@ on its own.
 
 ## Proof
 
-### A benchmark harness with competitors
-
-The benches under `sundog/tests` measure sundog alone, and the README's only
-competitor figure is memory per entry against Redis 7. Nothing measures
-throughput or latency against anything else. A workload crate with a zipf
-key distribution drives sundog, Redis, Dragonfly, Olric and Hazelcast
-through the same operations, reports p50 and p99 for reads, writes and
-fetch plus bytes per entry, and runs weekly next to the Scale workflow.
-The scale gate's 100 ms fetch p99 covers a 3-node, 4M-key run whose fetch
-crosses the network and the SSD, and stays. A separate in-RAM local bench
-carries the sub-millisecond gate.
-
-**Trigger:** any claim of a lead over another system. Without these
-benchmarks no such claim has a number behind it.
-
 ### A hundred nodes in simulation
 
 The README targets 2 to 30 nodes on a LAN. The largest scenario anywhere in
@@ -116,7 +101,8 @@ proves or corrects the README's number, and the README says what it proves.
 Every Redis client speaks RESP and none speaks sundog. A `sundog-server`
 binary that opens a cache and answers GET, SET, DEL, EXPIRE and MGET over
 RESP lets `redis-cli`, `memtier` and every client library talk to a cluster,
-and gives the competitor benchmarks one driver for every system. MGET is
+and lets `sundog-bench` measure a networked sundog through the same RESP
+client it uses for Redis and Valkey. MGET is
 `get_many` above. EXPIRE is `expire` above.
 
 ### An observer
