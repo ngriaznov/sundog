@@ -1961,6 +1961,26 @@ pub(crate) struct ApplyCtx<'a, K, V> {
     now_ms: u64,
 }
 
+/// What [`Engine::complete_fresh_load`] did with a fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillOutcome {
+    /// The loaded value is installed; `had_live` says whether it replaced a
+    /// live entry.
+    Installed { had_live: bool },
+    /// A write or removal at least as new as the fill landed while the
+    /// loader ran, and stays in place of the loaded value.
+    Superseded,
+}
+
+/// Whether a fill stamped `fill` replaces what its key holds, `existing`
+/// being the version of the tombstone or live entry there, if any. A fill
+/// is stamped before its loader runs, so a write or removal that lands
+/// during the load is newer and wins, the same versioned-apply rule every
+/// other write follows. Pure; unit tested directly.
+fn fill_supersedes(existing: Option<Hlc>, fill: Hlc) -> bool {
+    existing.is_none_or(|current| current < fill)
+}
+
 /// A successful [`super::Shard::get_or_load`] fill's write, for [`Engine::complete_fresh_load`].
 pub(crate) struct FreshLoad<'a, K, V> {
     pub(crate) key: &'a K,
@@ -4237,18 +4257,19 @@ where
         stripe.inflight.remove(key_bytes.as_ref());
     }
 
-    /// Applies a successful [`super::Shard::get_or_load`] fill: removes any
-    /// prior tombstone or live entry for `write.key`, unconditionally
-    /// installs the loader's value, corrects `live_count` for the net
-    /// change, and removes the `inflight` entry, all under one stripe
-    /// write-lock acquisition. Returns whether a live entry already
-    /// existed.
+    /// Applies a successful [`super::Shard::get_or_load`] fill under one
+    /// stripe write-lock acquisition: removes the `inflight` entry, and,
+    /// when [`fill_supersedes`] allows it, replaces any prior tombstone or
+    /// live entry for `write.key` with the loader's value and corrects
+    /// `live_count` for the net change. A tombstone or live entry at least
+    /// as new as the fill, a removal or write that landed while the loader
+    /// ran, stays, and the fill is dropped.
     pub(crate) fn complete_fresh_load(
         &self,
         write: FreshLoad<'_, K, V>,
         now_ms: u64,
         inflight: &Inflight<V>,
-    ) -> bool {
+    ) -> FillOutcome {
         let FreshLoad {
             key,
             key_bytes,
@@ -4260,9 +4281,24 @@ where
         } = write;
         let bucket = stripe_index_from_hash(hash);
         let part = part_index_from_hash(hash);
-        let had_live = {
+        let outcome = {
             let mut stripe = self.stripes[bucket].write();
             stripe.inflight.remove(key_bytes.as_ref());
+            let existing = stripe
+                .tombstones
+                .get(key_bytes.as_ref())
+                .map(|t| t.ver)
+                .or_else(|| {
+                    stripe
+                        .live
+                        .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())
+                        .map(Live::ver)
+                });
+            if !fill_supersedes(existing, ver) {
+                drop(stripe);
+                inflight.finish();
+                return FillOutcome::Superseded;
+            }
             let mut had_live = false;
             if let Some(t) = stripe.tombstones.remove(key_bytes.as_ref()) {
                 self.digest[digest_slot(bucket, part)].fetch_xor(
@@ -4306,11 +4342,11 @@ where
             }
             self.total_weight
                 .fetch_add(u64::from(weight), Ordering::Relaxed);
-            had_live
+            FillOutcome::Installed { had_live }
         };
         inflight.finish();
         self.enforce_capacity(bucket, now_ms);
-        had_live
+        outcome
     }
 
     /// Records a failed loader run: removes the `inflight` entry and stores
@@ -6214,7 +6250,7 @@ mod tests {
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             let value = "loaded-once".to_string();
                             let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encode"));
-                            let had_live = engine.complete_fresh_load(
+                            let outcome = engine.complete_fresh_load(
                                 FreshLoad {
                                     key: &key,
                                     key_bytes: &kb,
@@ -6227,7 +6263,11 @@ mod tests {
                                 0,
                                 &inflight,
                             );
-                            assert!(!had_live, "a genuine miss sees no prior live entry");
+                            assert_eq!(
+                                outcome,
+                                FillOutcome::Installed { had_live: false },
+                                "a genuine miss sees no prior live entry"
+                            );
                             guard.complete();
                             return value;
                         }
@@ -6385,7 +6425,7 @@ mod tests {
             panic!("no live entry: this caller becomes the owner");
         };
         let encoded = Bytes::from(postcard::to_stdvec("fresh").expect("encode"));
-        let had_live = engine.complete_fresh_load(
+        let outcome = engine.complete_fresh_load(
             FreshLoad {
                 key: &key,
                 key_bytes: &kb,
@@ -6398,7 +6438,11 @@ mod tests {
             0,
             &inflight,
         );
-        assert!(!had_live, "a tombstone is not a live entry");
+        assert_eq!(
+            outcome,
+            FillOutcome::Installed { had_live: false },
+            "an older tombstone gives way, and it is not a live entry"
+        );
         assert_eq!(engine.get(&key, 0), Some("fresh".to_string()));
         assert_eq!(engine.digests(), engine.recompute_digests_paired());
         let (entries, weight) = engine.debug_totals();
@@ -6407,7 +6451,24 @@ mod tests {
     }
 
     #[test]
-    fn complete_fresh_load_replaces_a_live_entry_that_landed_during_the_load() {
+    fn fill_supersedes_only_an_absent_or_older_entry() {
+        assert!(fill_supersedes(None, hlc(1, 1)), "nothing to displace");
+        assert!(
+            fill_supersedes(Some(hlc(1, 1)), hlc(2, 1)),
+            "an older entry gives way"
+        );
+        assert!(
+            !fill_supersedes(Some(hlc(3, 1)), hlc(2, 1)),
+            "a newer entry that landed during the load stays"
+        );
+        assert!(
+            !fill_supersedes(Some(hlc(2, 1)), hlc(2, 1)),
+            "the same version is not newer"
+        );
+    }
+
+    #[test]
+    fn complete_fresh_load_keeps_a_newer_write_that_landed_during_the_load() {
         let engine = engine_u32_string(u64::MAX, None);
         let key = 22u32;
         let kb = key_bytes(key);
@@ -6419,7 +6480,7 @@ mod tests {
         };
 
         // A write lands on the same key while the load is in flight, e.g. a
-        // replicated write racing the local loader.
+        // replicated write racing the local loader, stamped after the fill.
         let _ = put(
             &engine,
             key,
@@ -6429,10 +6490,9 @@ mod tests {
             None,
             0,
         );
-        assert_eq!(engine.get(&key, 0), Some("raced-in".to_string()));
 
         let encoded = Bytes::from(postcard::to_stdvec("loaded").expect("encode"));
-        let had_live = engine.complete_fresh_load(
+        let outcome = engine.complete_fresh_load(
             FreshLoad {
                 key: &key,
                 key_bytes: &kb,
@@ -6445,16 +6505,59 @@ mod tests {
             0,
             &inflight,
         );
-        assert!(had_live, "the entry that landed during the load was live");
+        assert_eq!(outcome, FillOutcome::Superseded);
         assert_eq!(
             engine.get(&key, 0),
-            Some("loaded".to_string()),
-            "complete_fresh_load installs unconditionally, even over a racer with a newer Hlc"
+            Some("raced-in".to_string()),
+            "the newer write keeps its place over the older fill"
+        );
+        assert!(
+            matches!(engine.miss_or_join(&kb, hash, 0), JoinOutcome::Hit(_)),
+            "the superseded fill left no in-flight entry behind"
         );
         assert_eq!(engine.digests(), engine.recompute_digests_paired());
         let (entries, weight) = engine.debug_totals();
         assert_eq!(entries, 1);
         assert_eq!(weight, 1);
+    }
+
+    #[test]
+    fn complete_fresh_load_keeps_a_newer_tombstone_that_landed_during_the_load() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let key = 23u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+
+        let JoinOutcome::Owner(inflight) = engine.miss_or_join(&kb, hash, 0) else {
+            panic!("first caller becomes the owner");
+        };
+        // A removal lands while the loader still reads the old row.
+        tombstone(&engine, key, kb.clone(), hlc(4, 1), 0);
+
+        let encoded = Bytes::from(postcard::to_stdvec("stale").expect("encode"));
+        let outcome = engine.complete_fresh_load(
+            FreshLoad {
+                key: &key,
+                key_bytes: &kb,
+                hash,
+                ver: hlc(2, 1),
+                value: "stale".to_string(),
+                encoded,
+                expires_at_ms: None,
+            },
+            0,
+            &inflight,
+        );
+        assert_eq!(outcome, FillOutcome::Superseded);
+        assert_eq!(
+            engine.get(&key, 0),
+            None,
+            "the removal stays removed; the stale fill never resurrects the key"
+        );
+        assert_eq!(engine.digests(), engine.recompute_digests_paired());
+        let (entries, weight) = engine.debug_totals();
+        assert_eq!(entries, 0);
+        assert_eq!(weight, 0);
     }
 
     #[test]
@@ -8865,7 +8968,7 @@ mod tests {
             // this key, since a concurrent tombstone or newer write raced
             // its read, yet the entry, sampled independently right here,
             // is still `Spilled` when the loader's fill lands.
-            // `complete_fresh_load` unconditionally replaces it, and must
+            // `complete_fresh_load` replaces it, being newer, and must
             // still keep `sundog_spill_entries` correct.
             let engine = engine_u32_string(u64::MAX, None);
             let key = 1u32;
@@ -8876,7 +8979,7 @@ mod tests {
 
             let inflight = Arc::new(Inflight::<String>::new());
             let encoded = Bytes::from(postcard::to_stdvec(&"loaded".to_string()).unwrap());
-            let had_live = engine.complete_fresh_load(
+            let outcome = engine.complete_fresh_load(
                 FreshLoad {
                     key: &key,
                     key_bytes: &kb,
@@ -8889,8 +8992,9 @@ mod tests {
                 0,
                 &inflight,
             );
-            assert!(
-                had_live,
+            assert_eq!(
+                outcome,
+                FillOutcome::Installed { had_live: true },
                 "the spilled entry counted as already-live for complete_fresh_load's purposes"
             );
             assert_eq!(engine.get(&key, 0), Some("loaded".to_string()));
