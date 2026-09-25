@@ -23,7 +23,7 @@ Consistency is best-effort on purpose. Gossip membership and last-write-wins
 skip the cost of a consensus protocol for cache data, and anti-entropy repairs
 whatever gossip's fire-and-forget delivery drops.
 
-A read comes from the process's own memory in about half a microsecond,
+A read comes from the process's own memory in under a microsecond,
 hundreds of times faster than a round trip to Redis on the same machine.
 [Speed](#speed) has the figures.
 
@@ -189,7 +189,7 @@ megabytes, a part digest exchange costs a few hundred bytes.
 sundog answers a read from the calling process's memory, where a cache
 server answers across a socket. On one machine, a `Local` or `Replicated`
 read is more than 500 times faster than a Redis, Valkey or Dragonfly read, a
-write more than 100 times faster, and throughput more than 60 times higher.
+write more than 100 times faster, and throughput more than 50 times higher.
 
 The figures below come from one run on a 4-core GitHub Actions runner:
 
@@ -201,14 +201,14 @@ The figures below come from one run on a 4-core GitHub Actions runner:
 
 | Target | Read p50 | Read p99 | Write p50 | Write p99 | Throughput |
 |---|---:|---:|---:|---:|---:|
-| sundog, `Local` | 0.52 µs | 1.12 µs | 1.96 µs | 2.85 µs | 3.39M ops/s |
-| sundog, `Replicated`, 3 nodes | 0.55 µs | 1.23 µs | 2.27 µs | 4.27 µs | 2.96M ops/s |
-| sundog, `Distributed`, 3 nodes | 1.46 µs | 549 µs | 3.73 µs | 7.07 µs | 189K ops/s |
-| Redis 8 | 302 µs | 855 µs | 304 µs | 848 µs | 46.9K ops/s |
-| Valkey 8 | 312 µs | 925 µs | 313 µs | 939 µs | 44.8K ops/s |
-| Dragonfly | 460 µs | 1,837 µs | 463 µs | 1,789 µs | 30.7K ops/s |
-| Olric | 421 µs | 1,149 µs | 424 µs | 1,171 µs | 35.0K ops/s |
-| Hazelcast 5.5 | 632 µs | 1,622 µs | 644 µs | 1,702 µs | 23.4K ops/s |
+| sundog, `Local` | 0.25 µs | 0.80 µs | 1.02 µs | 1.76 µs | 6.52M ops/s |
+| sundog, `Replicated`, 3 nodes | 0.26 µs | 0.93 µs | 1.18 µs | 2.48 µs | 5.13M ops/s |
+| sundog, `Distributed`, 3 nodes | 0.58 µs | 257 µs | 1.23 µs | 2.38 µs | 415K ops/s |
+| Redis 8 | 143 µs | 527 µs | 144 µs | 539 µs | 96.5K ops/s |
+| Valkey 8 | 137 µs | 494 µs | 136 µs | 502 µs | 100K ops/s |
+| Dragonfly | 223 µs | 596 µs | 225 µs | 591 µs | 65.3K ops/s |
+| Olric | 208 µs | 717 µs | 209 µs | 744 µs | 67.6K ops/s |
+| Hazelcast 5.5 | 337 µs | 876 µs | 340 µs | 901 µs | 43.4K ops/s |
 
 The comparison is an embedded cache against a networked one, measured the
 way a service sees each:
@@ -225,10 +225,10 @@ way a service sees each:
   out the network.
 - **`Distributed` reads**: a node owns about two thirds of the keys (two
   owners on three nodes). It reads those from memory, and each of the rest
-  costs one round trip to an owner. Those remote reads set the 549 µs p99.
+  costs one round trip to an owner. Those remote reads set the 257 µs p99.
 
 The servers hold each entry in less memory: Redis and Valkey used 166 to 168
-bytes per entry, Dragonfly 131, and sundog 204 to 218 bytes per copy.
+bytes per entry, Dragonfly 131, and sundog 205 to 209 bytes per copy.
 [Memory per entry](#memory-per-entry) breaks down sundog's layout.
 
 ## The four modes
