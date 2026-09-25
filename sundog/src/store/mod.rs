@@ -133,6 +133,13 @@ pub(crate) fn bucket_of(key_bytes: &[u8]) -> u16 {
     bucket_of_hash(engine::hash_key_bytes(key_bytes))
 }
 
+/// Whether a clock whose last stamp runs `lead_ms` ahead of the system
+/// clock has fallen behind by more than `max_clock_skew_ms` allows. `None`
+/// never flags.
+fn clock_jumped(lead_ms: u64, max_clock_skew_ms: Option<u64>) -> bool {
+    max_clock_skew_ms.is_some_and(|max| lead_ms > max)
+}
+
 /// Capacity of each shard's [`Event`] broadcast channel. A subscriber that
 /// falls this far behind misses events (`broadcast::error::RecvError::Lagged`)
 /// instead of applying backpressure to writers.
@@ -1324,6 +1331,19 @@ where
     ttl: Option<Duration>,
     tombstone_ttl_ms: u64,
     tombstone_max_ttl_ms: u64,
+    /// [`ClusterConfig::max_clock_skew`] in milliseconds: how far ahead of
+    /// this node's clock a remote stamp may be before
+    /// [`Shard::observe_remote`] refuses it. `None` accepts any stamp.
+    max_clock_skew_ms: Option<u64>,
+    /// Handle for `sundog_clock_skew_rejected_total{cache}`, created once
+    /// here like `hits`.
+    skew_rejected: metrics::Counter,
+    /// Set once the first refused stamp has been logged at `warn`; later
+    /// refusals log at `debug` and only count.
+    skew_warned: AtomicBool,
+    /// Set once this node's clock has been logged as further behind its
+    /// own last stamp than `max_clock_skew_ms`.
+    clock_jump_warned: AtomicBool,
     /// The resolver every decision runs through: `raw_resolver` wrapped in
     /// a [`SettlingResolver`] carrying `crdt_retire_after_ms` and this
     /// shard's clock, rebuilt whenever any of the three changes.
@@ -1485,6 +1505,8 @@ where
         let engine = Arc::new(Engine::new(max_capacity, tti, None, None));
         let hits = metrics::counter!("sundog_cache_hits_total", "cache" => name.to_string());
         let misses = metrics::counter!("sundog_cache_misses_total", "cache" => name.to_string());
+        let skew_rejected =
+            metrics::counter!("sundog_clock_skew_rejected_total", "cache" => name.to_string());
         let fan_out = Arc::new(FanOutQueue::new(name.clone(), !matches!(mode, Mode::Local)));
 
         Self {
@@ -1498,6 +1520,10 @@ where
             ttl,
             tombstone_ttl_ms: duration_ms(ClusterConfig::default().tombstone_ttl),
             tombstone_max_ttl_ms: duration_ms(ClusterConfig::default().tombstone_max_ttl),
+            max_clock_skew_ms: ClusterConfig::default().max_clock_skew.map(duration_ms),
+            skew_rejected,
+            skew_warned: AtomicBool::new(false),
+            clock_jump_warned: AtomicBool::new(false),
             resolver: Arc::new(LwwResolver),
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),
@@ -1542,6 +1568,14 @@ where
         self
     }
 
+    /// Overrides how far ahead of this node's clock a remote stamp may be
+    /// ([`ClusterConfig::max_clock_skew`]); `None` accepts any stamp.
+    #[must_use]
+    pub fn with_max_clock_skew(mut self, max_clock_skew: Option<Duration>) -> Self {
+        self.max_clock_skew_ms = max_clock_skew.map(duration_ms);
+        self
+    }
+
     /// Overrides the [`ConflictResolver`] `Shard::apply` consults whenever an
     /// incoming record's version differs from what's stored. Defaults to
     /// [`LwwResolver`].
@@ -1564,12 +1598,13 @@ where
     }
 
     /// Applies everything a live cluster's configuration decides for a
-    /// shard: tombstone bounds, CRDT bounds, frame cap, fan-out capacity,
-    /// and its wait timeout.
+    /// shard: tombstone bounds, the clock-skew bound, CRDT bounds, frame
+    /// cap, fan-out capacity, and its wait timeout.
     #[must_use]
     pub fn with_cluster_config(self, config: &ClusterConfig) -> Self {
         self.with_tombstone_ttl(config.tombstone_ttl)
             .with_tombstone_max_ttl(config.tombstone_max_ttl)
+            .with_max_clock_skew(config.max_clock_skew)
             .with_crdt_bounds(config.crdt_compaction_bounds())
             .with_max_frame(config.max_frame)
             .with_fan_out_backlog_capacity(config.fan_out_backlog_capacity)
@@ -1953,17 +1988,68 @@ where
     }
 
     fn stamp_local(&self) -> Hlc {
-        self.clock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .now(self.now_ms())
+        let now = self.now_ms();
+        let (stamp, lead_ms) = {
+            let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+            let lead_ms = clock.lead_ms(now);
+            (clock.now(now), lead_ms)
+        };
+        if clock_jumped(lead_ms, self.max_clock_skew_ms)
+            && !self.clock_jump_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                cache = %self.name,
+                behind_ms = lead_ms,
+                "this node's clock is further behind its own last write stamp than max_clock_skew: \
+                 the system clock stepped back, or it was set ahead and corrected; writes stay \
+                 ordered at the last stamp until the clock catches up"
+            );
+        }
+        stamp
     }
 
-    fn observe_remote(&self, remote: Hlc) {
+    /// Merges `remote` into this shard's clock and returns `true`, or
+    /// refuses it and returns `false` when it is stamped more than
+    /// `max_clock_skew_ms` ahead of this node's clock: a refused record is
+    /// not applied, and counts in `sundog_clock_skew_rejected_total{cache}`.
+    fn observe_remote(&self, remote: Hlc) -> bool {
+        let now = self.now_ms();
+        let accepted = {
+            let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(max_skew_ms) = self.max_clock_skew_ms {
+                clock.observe_bounded(now, remote, max_skew_ms).is_some()
+            } else {
+                clock.observe(now, remote);
+                true
+            }
+        };
+        if !accepted {
+            self.skew_rejected.increment(1);
+            let ahead_ms = remote.wall_ms.saturating_sub(now);
+            if self.skew_warned.swap(true, Ordering::Relaxed) {
+                tracing::debug!(cache = %self.name, writer = %remote.node, ahead_ms, "refused a record stamped past max_clock_skew");
+            } else {
+                tracing::warn!(
+                    cache = %self.name,
+                    writer = %remote.node,
+                    ahead_ms,
+                    "refused a record stamped further ahead of this node's clock than \
+                     max_clock_skew; the writer's clock runs fast, or this one runs slow. \
+                     sundog_clock_skew_rejected_total counts every refusal"
+                );
+            }
+        }
+        accepted
+    }
+
+    /// Merges a stamp this shard derived from one it already holds, such
+    /// as a compacted record's, with no skew bound: the stamp it came from
+    /// passed [`Shard::observe_remote`] or was stamped here.
+    fn observe_derived(&self, derived: Hlc) {
         self.clock
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .observe(self.now_ms(), remote);
+            .observe(self.now_ms(), derived);
     }
 
     /// The absolute expiry a write stamped now carries: the per-write `ttl` if
@@ -3690,7 +3776,9 @@ where
             let recs = self.guard_inbound(recs);
             let mut decoded: Vec<RemoteEntry<K, V>> = Vec::with_capacity(recs.len());
             for rec in recs {
-                self.observe_remote(rec.ver);
+                if !self.observe_remote(rec.ver) {
+                    continue;
+                }
                 let hash = engine::hash_key_bytes(rec.key.as_ref());
                 let Ok(key) = postcard::from_bytes::<K>(&rec.key) else {
                     tracing::warn!(cache = %self.name, "apply_remote_batch: undecodable key bytes");
@@ -3773,7 +3861,9 @@ where
 
     fn invalidate(&self, key: Bytes, ver: Hlc) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.observe_remote(ver);
+            if !self.observe_remote(ver) {
+                return;
+            }
             let Ok(decoded_key) = postcard::from_bytes::<K>(&key) else {
                 tracing::warn!(cache = %self.name, "invalidate: undecodable key bytes");
                 return;
@@ -4107,7 +4197,7 @@ where
             // counted here.
             let hash = engine::hash_key_bytes(key_bytes.as_ref());
             let new_ver = compacted_version(stale_ver, new_encoded.as_ref());
-            self.observe_remote(new_ver);
+            self.observe_derived(new_ver);
             if self
                 .engine
                 .compact_replace_if_current(engine::CompactReplace {
@@ -4287,6 +4377,12 @@ mod tests {
         }
     }
 
+    /// A wall clock one second ahead of the real one: newer than anything a
+    /// test shard stamps, and well inside the default `max_clock_skew`.
+    fn ahead_ms() -> u64 {
+        now_ms() + 1_000
+    }
+
     fn key_bytes<K: Serialize>(key: &K) -> Bytes {
         Bytes::from(postcard::to_stdvec(key).expect("test key encodes"))
     }
@@ -4421,7 +4517,7 @@ mod tests {
         let rec = WireRecord {
             key: key_bytes(&1u32),
             value: None,
-            ver: hlc(u64::MAX / 2, 2),
+            ver: hlc(ahead_ms(), 2),
             expires_at_ms: None,
         };
         ShardOps::apply_remote(&s, rec).await;
@@ -4438,7 +4534,7 @@ mod tests {
         let rec = WireRecord {
             key: key_bytes(&1u32),
             value: Some(Bytes::from_static(b"\x01b")),
-            ver: hlc(u64::MAX / 2, 2),
+            ver: hlc(ahead_ms(), 2),
             expires_at_ms: None,
         };
         ShardOps::apply_remote(&s, rec).await;
@@ -4475,6 +4571,125 @@ mod tests {
         assert_eq!(s.get(&1).await, Some("x".into()));
     }
 
+    /// A shard on a fixed clock at `NOW_MS` with a one-minute skew bound.
+    fn skew_bounded_shard() -> Shard<u32, String> {
+        const NOW_MS: u64 = 1_700_000_000_000;
+        shard::<u32, String>(1)
+            .with_clock(Arc::new(|| NOW_MS))
+            .with_max_clock_skew(Some(Duration::from_mins(1)))
+    }
+
+    /// The version `shard` holds for `key`, read from its bucket listing.
+    async fn held_version(shard: &Shard<u32, String>, key: u32) -> Option<Hlc> {
+        let key_bytes = key_bytes(&key);
+        ShardOps::bucket_entries(shard, bucket_of(&key_bytes))
+            .await
+            .into_iter()
+            .find(|entry| entry.key == key_bytes)
+            .map(|entry| entry.version)
+    }
+
+    fn put(key: u32, value: &str, ver: Hlc) -> WireRecord {
+        WireRecord {
+            key: key_bytes(&key),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&value.to_string()).expect("value encodes"),
+            )),
+            ver,
+            expires_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_record_stamped_past_max_clock_skew_is_refused_and_moves_no_clock() {
+        let s = skew_bounded_shard();
+        let now = s.now_ms();
+        let within = now + 60_000;
+        let past = now + 60_001;
+        ShardOps::apply_remote_batch(
+            &s,
+            vec![
+                put(1, "within", hlc(within, 2)),
+                put(2, "past", hlc(past, 2)),
+            ],
+        )
+        .await;
+        assert_eq!(s.get(&1).await.as_deref(), Some("within"));
+        assert_eq!(s.get(&2).await, None, "a stamp past the bound is refused");
+
+        s.insert(3, "local".into()).await.expect("insert");
+        let local = held_version(&s, 3).await.expect("the local write is held");
+        assert_eq!(
+            local.wall_ms, within,
+            "the clock took the accepted stamp and never the refused one"
+        );
+
+        ShardOps::invalidate(&s, key_bytes(&1u32), hlc(past, 9)).await;
+        assert_eq!(
+            s.get(&1).await.as_deref(),
+            Some("within"),
+            "an invalidation stamped past the bound is refused too"
+        );
+        ShardOps::invalidate(&s, key_bytes(&1u32), hlc(within, 9)).await;
+        assert_eq!(s.get(&1).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_record_applies_once_the_clock_comes_within_the_bound() {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_700_000_000_000));
+        let clock = Arc::clone(&now);
+        let s = shard::<u32, String>(1)
+            .with_clock(Arc::new(move || clock.load(Ordering::Relaxed)))
+            .with_max_clock_skew(Some(Duration::from_mins(1)));
+        let stamp = hlc(now.load(Ordering::Relaxed) + 3_600_000, 2);
+        ShardOps::apply_remote(&s, put(1, "early", stamp)).await;
+        assert_eq!(s.get(&1).await, None);
+
+        now.fetch_add(3_600_000 - 60_000, Ordering::Relaxed);
+        ShardOps::apply_remote(&s, put(1, "early", stamp)).await;
+        assert_eq!(s.get(&1).await.as_deref(), Some("early"));
+    }
+
+    #[tokio::test]
+    async fn no_max_clock_skew_accepts_a_stamp_any_distance_ahead() {
+        let s = skew_bounded_shard().with_max_clock_skew(None);
+        let far = hlc(s.now_ms() + 365 * 24 * 3_600_000, 2);
+        ShardOps::apply_remote(&s, put(1, "far", far)).await;
+        assert_eq!(s.get(&1).await.as_deref(), Some("far"));
+        s.insert(2, "local".into()).await.expect("insert");
+        assert!(
+            held_version(&s, 2).await.expect("held") > far,
+            "an unbounded shard's clock follows the far stamp"
+        );
+    }
+
+    #[test]
+    fn clock_jumped_flags_a_lead_past_the_bound_only() {
+        assert!(!clock_jumped(60_000, Some(60_000)));
+        assert!(clock_jumped(60_001, Some(60_000)));
+        assert!(!clock_jumped(0, Some(0)));
+        assert!(!clock_jumped(u64::MAX, None), "no bound never flags");
+    }
+
+    #[test]
+    fn with_cluster_config_takes_the_configured_max_clock_skew() {
+        let config =
+            ClusterConfig::default().with(|c| c.max_clock_skew = Some(Duration::from_secs(5)));
+        assert_eq!(
+            shard::<u32, String>(1)
+                .with_cluster_config(&config)
+                .max_clock_skew_ms,
+            Some(5_000)
+        );
+        let config = ClusterConfig::default().with(|c| c.max_clock_skew = None);
+        assert_eq!(
+            shard::<u32, String>(1)
+                .with_cluster_config(&config)
+                .max_clock_skew_ms,
+            None
+        );
+    }
+
     #[tokio::test]
     async fn invalidate_respects_newer_local_write() {
         let s = shard::<u32, String>(1);
@@ -4486,7 +4701,7 @@ mod tests {
         assert_eq!(s.get(&1).await, Some("fresh".into()));
 
         // A newer invalidation does evict it, and writes no tombstone.
-        ShardOps::invalidate(&s, key_bytes(&1u32), hlc(u64::MAX / 2, 9)).await;
+        ShardOps::invalidate(&s, key_bytes(&1u32), hlc(ahead_ms(), 9)).await;
         assert_eq!(s.get(&1).await, None);
         assert!(
             ShardOps::records_for(&s, vec![key_bytes(&1u32)])
@@ -4999,7 +5214,7 @@ mod tests {
         let s = shard::<u32, String>(1);
         s.insert(1, "a".into()).await.expect("insert");
 
-        ShardOps::invalidate(&s, Bytes::new(), hlc(u64::MAX / 2, 2)).await;
+        ShardOps::invalidate(&s, Bytes::new(), hlc(ahead_ms(), 2)).await;
 
         assert_eq!(
             s.get(&1).await,
@@ -7485,7 +7700,7 @@ mod tests {
         let incoming = WireRecord {
             key: key_bytes(&1u32),
             value: Some(Bytes::from(postcard::to_stdvec(&42u32).expect("encode"))),
-            ver: hlc(u64::MAX, 2),
+            ver: hlc(ahead_ms(), 2),
             expires_at_ms: None,
         };
         ShardOps::apply_remote(&s, incoming).await;
@@ -7580,7 +7795,7 @@ mod tests {
         let incoming = WireRecord {
             key: key_bytes(&spilled_key),
             value: Some(Bytes::from(postcard::to_stdvec(&123u32).expect("encode"))),
-            ver: hlc(u64::MAX, 9),
+            ver: hlc(ahead_ms(), 9),
             expires_at_ms: None,
         };
         ShardOps::apply_remote(&s, incoming).await;
@@ -7610,7 +7825,7 @@ mod tests {
         let incoming = WireRecord {
             key: key_bytes(&1u32),
             value: Some(Bytes::from(postcard::to_stdvec(&5u32).expect("encode"))),
-            ver: hlc(u64::MAX, 2),
+            ver: hlc(ahead_ms(), 2),
             expires_at_ms: None,
         };
         ShardOps::apply_remote(&s, incoming).await;
@@ -7643,7 +7858,7 @@ mod tests {
         let incoming = WireRecord {
             key: key_bytes(&1u32),
             value: Some(Bytes::from(postcard::to_stdvec(&5u32).expect("encode"))),
-            ver: hlc(u64::MAX, 2),
+            ver: hlc(ahead_ms(), 2),
             expires_at_ms: None,
         };
         ShardOps::apply_remote(&s, incoming).await;

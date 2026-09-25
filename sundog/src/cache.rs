@@ -3061,6 +3061,92 @@ mod tests {
         ((a, cache_a), (b, cache_b), (c, cache_c), unowned_key)
     }
 
+    /// `b` accepts any stamp; `a` bounds skew at one second. A record
+    /// stamped an hour ahead that `b` holds never reaches `a` through
+    /// anti-entropy, `a`'s clock never moves toward it, and `b`, whose
+    /// clock absorbed it, has its later writes refused by `a` too.
+    #[tokio::test]
+    async fn a_record_stamped_past_max_clock_skew_never_reaches_a_bounded_node() {
+        let name = "cache-it-clock-skew";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config().with(|c| c.max_clock_skew = Some(Duration::from_secs(1))))
+            .build()
+            .await
+            .expect("a builds");
+        let b = Cluster::builder(name)
+            .seeds([a.local_gossip_addr()])
+            .config(loopback_config().with(|c| c.max_clock_skew = None))
+            .build()
+            .await
+            .expect("b builds");
+        wait_for_peer_count(&a, 1).await;
+        let open = |cluster: &Cluster| {
+            cluster
+                .cache::<u32, String>("prices")
+                .mode(Mode::Replicated)
+                .open()
+        };
+        let cache_a = open(&a).await.expect("a opens");
+        let cache_b = open(&b).await.expect("b opens");
+
+        cache_b.insert(2, "before".into()).await.expect("insert");
+        wait_until(
+            Duration::from_secs(10),
+            "b's write stamped by its own clock reaches a",
+            async || cache_a.get(&2).await.is_some(),
+        )
+        .await;
+
+        let ahead = crate::hlc::Hlc {
+            wall_ms: crate::store::now_ms() + 3_600_000,
+            logical: 0,
+            node: b.node_id(),
+        };
+        ShardOps::apply_remote(
+            cache_b.shard.as_ref(),
+            crate::wire::WireRecord {
+                key: bytes::Bytes::from(postcard::to_stdvec(&1u32).expect("key encodes")),
+                value: Some(bytes::Bytes::from(
+                    postcard::to_stdvec(&"ahead".to_string()).expect("value encodes"),
+                )),
+                ver: ahead,
+                expires_at_ms: None,
+            },
+        )
+        .await;
+        assert_eq!(cache_b.get(&1).await.as_deref(), Some("ahead"));
+        cache_b.insert(4, "after".into()).await.expect("insert");
+
+        // Ten anti-entropy intervals: every round offers a both keys.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            cache_a.get(&1).await,
+            None,
+            "a refuses the record stamped an hour ahead"
+        );
+        assert_eq!(
+            cache_a.get(&4).await,
+            None,
+            "b's clock absorbed the hour, so its next write is refused as well"
+        );
+
+        cache_a.insert(3, "local".into()).await.expect("insert");
+        let key = bytes::Bytes::from(postcard::to_stdvec(&3u32).expect("key encodes"));
+        let held = ShardOps::bucket_entries(cache_a.shard.as_ref(), crate::store::bucket_of(&key))
+            .await
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .expect("a holds its own write");
+        assert!(
+            held.version.wall_ms < ahead.wall_ms - 3_000_000,
+            "a's clock never took the refused stamp"
+        );
+
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
     #[tokio::test]
     async fn fetch_returns_local_value_without_a_network_request_when_this_node_owns_the_bucket() {
         let cluster = Cluster::builder("cache-it-fetch-local")

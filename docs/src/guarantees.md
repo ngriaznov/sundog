@@ -16,7 +16,13 @@ reaches it. No error reports the loser.
 
 Keep node clocks synchronized with NTP or your platform's time service. A
 node whose clock runs ahead stamps its writes later than its peers' and
-wins their conflicts.
+wins their conflicts. `ClusterConfig::max_clock_skew`, one minute by
+default, caps how far: a node refuses a record stamped further ahead of its
+own clock than that, whether it arrives by replication, anti-entropy or
+state transfer, and does not let the stamp pull its clock forward. The
+refused write stays on the node that made it and reaches the others through
+anti-entropy once their clocks catch up with its stamp.
+`sundog_clock_skew_rejected_total{cache}` counts refusals.
 
 ### Values that merge
 

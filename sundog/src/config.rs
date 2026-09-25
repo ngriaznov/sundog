@@ -67,6 +67,21 @@ pub struct ClusterConfig {
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a
     /// member that never comes back.
     pub tombstone_max_ttl: Duration,
+    /// How far ahead of this node's clock a remote write's version stamp
+    /// may be. A replicated write, invalidation, anti-entropy repair or
+    /// transferred record stamped further ahead is refused: not applied,
+    /// its stamp not merged into this node's clock, and counted in
+    /// `sundog_clock_skew_rejected_total{cache}`. Once this node's clock
+    /// comes within the bound, anti-entropy delivers the record like any
+    /// other. `None` accepts any stamp, and then one node whose clock runs
+    /// an hour fast wins every conflicting write and pulls every other
+    /// node's clock an hour forward.
+    ///
+    /// The same bound flags this node's own clock: a node whose system
+    /// clock falls further than this behind its own last stamp logs one
+    /// warning per cache. Its writes stay ordered, held at that last stamp
+    /// until the clock catches up.
+    pub max_clock_skew: Option<Duration>,
     /// How long a gone, non-local writer incarnation must stay gone,
     /// whether it crashed or left through `Cluster::shutdown` (or be
     /// superseded by a live incarnation of the same node), before its
@@ -319,6 +334,7 @@ impl Default for ClusterConfig {
             ae_interval: Duration::from_secs(30),
             tombstone_ttl: Duration::from_mins(10),
             tombstone_max_ttl: Duration::from_hours(24),
+            max_clock_skew: Some(Duration::from_mins(1)),
             crdt_retire_after: Duration::from_hours(24),
             crdt_compact_batch: 4_096,
             crdt_sweep_interval: None,
@@ -422,6 +438,14 @@ mod tests {
     #[test]
     fn default_advertise_ip_is_none() {
         assert_eq!(ClusterConfig::default().advertise_ip, None);
+    }
+
+    #[test]
+    fn default_max_clock_skew_is_one_minute() {
+        assert_eq!(
+            ClusterConfig::default().max_clock_skew,
+            Some(Duration::from_mins(1))
+        );
     }
 
     #[test]

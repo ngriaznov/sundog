@@ -11,14 +11,6 @@ already justified by the code as it stands.
 
 ## Next
 
-### Clock-skew guard
-
-`HlcClock::observe` absorbs any remote stamp. One node with a clock an hour
-ahead wins every write cluster-wide and drags every other node's clock forward
-with it, and nothing reports it. A `max_clock_skew` on `ClusterConfig`
-rejects a remote stamp whose skew exceeds it, counts the rejection, and logs
-a local clock jump once.
-
 ### Memory ceilings that refuse rather than diverge
 
 `Replicated` mode bounds capacity only through the spill tier, since evicting

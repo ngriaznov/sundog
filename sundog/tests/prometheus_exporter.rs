@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use smol_str::SmolStr;
 use sundog::crdt::{PnCounter, PnCounterResolver};
-use sundog::store::Shard;
+use sundog::store::{Shard, ShardOps};
 use sundog::{CacheError, Cluster, Mode, NodeId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -239,6 +239,46 @@ async fn fan_out_wait_timeout_pin_metrics() {
         .insert(1, "b".to_string())
         .await
         .expect("second insert proceeds once its wait times out, over capacity");
+}
+
+/// Drives `sundog_clock_skew_rejected_total{cache}` through a bare `Shard`
+/// bounding skew at one minute: one record stamped an hour ahead is
+/// refused, one stamped a second ahead is applied, so the counter reads
+/// exactly one.
+async fn clock_skew_pin_metrics() {
+    let shard = Shard::<u32, String>::new(
+        SmolStr::new("clock-skew-pin"),
+        Mode::Replicated,
+        NodeId::from(1),
+        10_000,
+        None,
+        None,
+    )
+    .with_max_clock_skew(Some(Duration::from_secs(60)));
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_millis(),
+    )
+    .expect("epoch milliseconds fit in u64");
+    let record = |key: u32, ahead_ms: u64| sundog::wire::WireRecord {
+        key: bytes::Bytes::from(postcard::to_stdvec(&key).expect("key encodes")),
+        value: Some(bytes::Bytes::from(
+            postcard::to_stdvec(&"v".to_string()).expect("value encodes"),
+        )),
+        ver: sundog::Hlc {
+            wall_ms: now_ms + ahead_ms,
+            logical: 0,
+            node: NodeId::from(2),
+        },
+        expires_at_ms: None,
+    };
+    shard
+        .apply_remote_batch(vec![record(1, 3_600_000), record(2, 1_000)])
+        .await;
+    assert_eq!(shard.get(&1).await, None);
+    assert_eq!(shard.get(&2).await.as_deref(), Some("v"));
 }
 
 /// Opens `users` on both `cluster` and `peer`, does one plain insert/remove
@@ -724,6 +764,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     seed_part_mismatch(&cluster, &peer).await;
     count_hits_and_misses(&cluster).await;
     fan_out_wait_timeout_pin_metrics().await;
+    clock_skew_pin_metrics().await;
     #[cfg(feature = "spill")]
     let mut spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
     #[cfg(feature = "spill")]
@@ -795,6 +836,17 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
     );
 
+    // sundog_clock_skew_rejected_total: pinned by the bare-Shard scenario
+    // above, one record an hour ahead refused and one a second ahead applied.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_clock_skew_rejected_total",
+            &[("cache", "clock-skew-pin")]
+        ),
+        Some(1.0),
+        "expected exactly one refused record on the 'clock-skew-pin' cache; got body:\n{body}"
+    );
     // sundog_fan_out_wait_timeouts_total / sundog_fan_out_backlog: pinned
     // by the bare-Shard scenario above; nothing drains it, so both keys
     // sit in the backlog against a capacity of one.

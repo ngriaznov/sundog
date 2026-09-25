@@ -1918,7 +1918,7 @@ mod tests {
                 postcard::to_stdvec(&vec![0u8; 3]).expect("value encodes"),
             )),
             ver: Hlc {
-                wall_ms: u64::MAX / 2,
+                wall_ms: crate::store::now_ms() + 1_000,
                 logical: 0,
                 node: NodeId::from(9),
             },
@@ -3778,7 +3778,7 @@ mod tests {
                     postcard::to_stdvec(&extra_value).expect("test value encodes"),
                 )),
                 ver: Hlc {
-                    wall_ms: u64::MAX / 2,
+                    wall_ms: crate::store::now_ms() + 1_000,
                     logical: 0,
                     node: cluster_b.node_id(),
                 },

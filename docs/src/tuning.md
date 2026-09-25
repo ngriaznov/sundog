@@ -36,6 +36,7 @@ Cache-level settings, `mode`, `max_capacity`, `ttl`, `tti`, `resolver`,
 | Field | Default | Change it when |
 |---|---|---|
 | `ae_interval` | 30 s | repairs after message loss must land faster; each round costs one digest exchange per open cache |
+| `max_clock_skew` | 1 min | node clocks drift further apart than this in normal running; `None` accepts any stamp, and one fast clock then wins every conflict and pulls every other clock forward |
 | `state_transfer_budget` | 20 s | a joining node's snapshot takes longer to pull; `open` waits this long before opening with a partial copy that anti-entropy completes |
 | `fan_out_backlog_capacity` | 262,144 keys | write bursts outrun the network for longer than the backlog absorbs |
 | `fan_out_wait_timeout` | 30 s | a writer waiting for backlog room should give up sooner and write over capacity |

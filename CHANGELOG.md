@@ -7,6 +7,18 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **Clock-skew guard**: `ClusterConfig::max_clock_skew`, one minute by
+  default, bounds how far ahead of a node's clock a remote record's
+  stamp may be. A record stamped further ahead, whether replicated,
+  invalidated, repaired by anti-entropy or transferred, is refused: not
+  applied, its stamp not merged into the clock, and counted in
+  `sundog_clock_skew_rejected_total{cache}`, with the first refusal per
+  cache logged at `warn`. It applies once the receiving clock comes within
+  the bound. A node whose own clock falls further than the bound behind
+  its last stamp logs that once per cache. `HlcClock::observe_bounded`
+  and `HlcClock::lead_ms` expose the rule. `None` restores accepting any
+  stamp. No wire change.
+
 - **Competitor benchmark**: `sundog-bench`, the new `bench` crate, runs one
   zipf workload against sundog in its three modes and against Redis,
   Valkey, Dragonfly, Olric and Hazelcast, each server in a container
