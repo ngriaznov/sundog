@@ -2224,7 +2224,7 @@ enum DistOp {
 /// `Mode::Replicated`, but fanning writes out to a key's current owners
 /// (via [`fan_out_owned`]) instead of broadcasting to every peer, gating
 /// anti-entropy's peer choice through `ShardOps::ae_peer_filter`, and
-/// releasing buckets whose disown grace has elapsed on its own tick,
+/// releasing parts whose disown grace has elapsed from [`release_loop`],
 /// mirroring `cluster::rebalance::rebalance_task`'s release half. The
 /// gained half is left to anti-entropy's self-healing backstop; see this
 /// section's own doc.
@@ -2236,8 +2236,8 @@ struct DistNodeParams {
     peers: Vec<(NodeId, &'static str, u16)>,
     /// May be empty: a scenario that drives every write itself, directly on
     /// a node's `Arc<TestShard>` from outside this loop, still needs the
-    /// loop running so its own `fan_out_tick`/`ae_tick`/`rebalance_tick`
-    /// pick the write up. Shared, not owned outright: `sim.host`'s closure
+    /// loop running so its own `fan_out_tick`/`ae_tick` pick the write
+    /// up. Shared, not owned outright: `sim.host`'s closure
     /// re-clones `DistNodeParams` on every restart (a bounce included), and
     /// an owned `Vec` would replay every already-issued op from scratch on
     /// each one, re-inserting an already-removed key with a fresh,
@@ -2265,6 +2265,28 @@ struct DistNodeParams {
 /// see [`fan_out_owned`]'s own doc for why a `Forward` item needs this and
 /// an `Applied` one does not.
 const FORWARD_RETRIES: u8 = 15;
+
+/// Releases every part whose disown grace has elapsed, once per `period`.
+/// Runs as its own task, as `cluster::rebalance::rebalance_task` does, so
+/// an anti-entropy round waiting out network timeouts in
+/// [`dist_node_loop`] never holds a release back.
+async fn release_loop(
+    shard: Arc<TestShard>,
+    residency: Arc<ResidencySet>,
+    period: Duration,
+    grace: Duration,
+) {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let due = residency.expired(grace);
+        if !due.is_empty() {
+            ShardOps::release_parts(shard.as_ref(), &due).await;
+            residency.unmark(&due);
+        }
+    }
+}
 
 async fn dist_node_loop(
     params: DistNodeParams,
@@ -2299,8 +2321,13 @@ async fn dist_node_loop(
     fan_out_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ae_tick = tokio::time::interval(params.ae_period);
     ae_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut rebalance_tick = tokio::time::interval(params.rebalance_period);
-    rebalance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Dropped with the host's runtime on a crash; a bounce spawns a fresh one.
+    tokio::spawn(release_loop(
+        Arc::clone(&shard),
+        residency,
+        params.rebalance_period,
+        params.disown_grace,
+    ));
 
     loop {
         tokio::select! {
@@ -2356,13 +2383,6 @@ async fn dist_node_loop(
                         *attempts_left -= 1;
                         *attempts_left > 0
                     });
-                }
-            }
-            _ = rebalance_tick.tick() => {
-                let due = residency.expired(params.disown_grace);
-                if !due.is_empty() {
-                    ShardOps::release_parts(shard.as_ref(), &due).await;
-                    residency.unmark(&due);
                 }
             }
         }
