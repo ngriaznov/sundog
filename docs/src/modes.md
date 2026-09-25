@@ -62,7 +62,9 @@ A write for a part this node does not own goes to that part's owners.
 the network-aware read: it answers locally when this node owns the part
 and otherwise asks the owners in order, returning `Ok(None)` for a real
 miss or `CacheError::FetchUnavailable` when no owner answers within
-`fetch_timeout`. `owners_of` reports a key's owners.
+`fetch_timeout`, or while the part is still cold on every owner that
+answers. A part is cold on its new owner until the owner has pulled it,
+a few seconds after a membership change. `owners_of` reports a key's owners.
 
 ```rust
 {{#include ../cookbook/src/deploy.rs:distributed}}

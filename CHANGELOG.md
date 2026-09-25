@@ -439,6 +439,14 @@ All notable changes to this project are documented in this file. Format follows
   the pull every `ae_interval` until a donor is warm, opening warm with
   what landed after three attempts as a timed-out pull does.
 
+- **`fetch` never answers a miss from a cold part.** A `Mode::Distributed`
+  node that owns a key's part but has not pulled it yet asks the part's
+  other owners on a local miss. When every one of them declined, `fetch`
+  returned the local miss, although the node that handed the part over
+  still holds the record through its disown grace. `fetch` now returns
+  `CacheError::FetchUnavailable` until the part is warm or another owner
+  answers from a warm copy.
+
 - **A `Mode::Distributed` write accepted before the cluster formed reaches
   its owners at once.** A node that opens the cache before its peers do
   owns every bucket alone and keeps what it is given. When a view with

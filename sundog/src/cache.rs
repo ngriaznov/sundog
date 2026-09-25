@@ -1255,19 +1255,21 @@ where
     /// Never promotes the fetched value into the local store; [`Cache::get`]
     /// for the same key immediately afterward is still a miss on this node.
     /// A part this node owns but has not yet pulled from a co-owner is
-    /// cold: a local miss there asks the other owners before answering
-    /// `Ok(None)`, and a cold owner whose every other owner is unreachable
-    /// returns [`CacheError::FetchUnavailable`] rather than a miss it
-    /// cannot vouch for. On a cache that isn't [`Mode::Distributed`] this
+    /// cold: a local miss there asks the other owners, and when none of
+    /// them answers from a warm copy it returns
+    /// [`CacheError::FetchUnavailable`] rather than a miss it cannot vouch
+    /// for, since the part's previous owner can still hold the record
+    /// through its disown grace. On a cache that isn't [`Mode::Distributed`] this
     /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
     /// unconditionally, so callers don't need to branch on mode.
     ///
     /// # Errors
     ///
     /// Returns [`CacheError::Codec`] if `key` fails to encode, and
-    /// [`CacheError::FetchUnavailable`] if every owner is unreachable or
+    /// [`CacheError::FetchUnavailable`] if every owner is unreachable,
     /// times out (`crate::config::ClusterConfig::fetch_timeout` per
-    /// attempt), distinct from a genuine miss, which returns `Ok(None)`.
+    /// attempt) or declines while this node's own copy is cold, distinct
+    /// from a genuine miss, which returns `Ok(None)`.
     /// An owner whose ownership view differs from this node's is retried
     /// with a short jittered backoff before the next owner is tried.
     pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
@@ -1280,11 +1282,11 @@ where
         let part = PartId::of_key(&key_bytes);
         // An unverified part (warm-reloaded, not yet checked against a live
         // co-owner) counts as not owned here: it can hold a record a co-owner deleted during downtime.
-        let mut owns = view.owns(part) && !self.shard.is_unverified_part(part);
-        if owns {
+        if view.owns(part) && !self.shard.is_unverified_part(part) {
             let value = self.shard.get(key).await;
             // A miss in a part not yet pulled from a co-owner is not an
-            // answer: the other owners are asked first.
+            // answer: its previous owner can still hold the record through
+            // the disown grace, so only another owner's warm copy answers.
             if value.is_some() || !self.shard.is_cold_part(part) {
                 record_fetch_outcome(self.shard.name(), "local");
                 return Ok(value);
@@ -1302,12 +1304,6 @@ where
         // When the current owner first answered `Stale` with this node's
         // view unchanged: its retry window runs from here.
         let mut stale_since: Option<tokio::time::Instant> = None;
-        // Whether any owner answered at all, a decline included, as opposed
-        // to every attempt ending in a transport error or timeout: the
-        // difference between a miss and `FetchUnavailable` for a part
-        // this node owns but has not pulled yet. With nobody else to ask,
-        // this node's own copy is all there is.
-        let mut any_answered = owners.is_empty();
 
         while owner_idx < owners.len() {
             let owner = owners[owner_idx];
@@ -1330,11 +1326,6 @@ where
                     );
                     return Ok(value);
                 }
-                Ok(Ok(FetchOutcome::Declined)) => {
-                    any_answered = true;
-                    owner_idx += 1;
-                    stale_since = None;
-                }
                 Ok(Ok(FetchOutcome::Stale { .. })) => {
                     if let Some(fresh) = self.shard.ownership_view()
                         && fresh.view_hash() != view.view_hash()
@@ -1347,11 +1338,9 @@ where
                                 return Ok(value);
                             }
                         }
-                        owns = view.owns(part) && !self.shard.is_unverified_part(part);
                         owners = other_owners(&view, part, self_node);
                         owner_idx = 0;
                         stale_since = None;
-                        any_answered = owners.is_empty();
                         continue;
                     }
                     let since = *stale_since.get_or_insert_with(tokio::time::Instant::now);
@@ -1362,17 +1351,13 @@ where
                     }
                     tokio::time::sleep(fetch_retry_backoff()).await;
                 }
-                Ok(Err(_)) | Err(_) => {
+                // A decline is as good as no answer: that owner holds no
+                // warm copy to vouch for the key.
+                Ok(Ok(FetchOutcome::Declined) | Err(_)) | Err(_) => {
                     owner_idx += 1;
                     stale_since = None;
                 }
             }
-        }
-        if owns && any_answered {
-            // Every other owner declined too, or there is none: this
-            // owner's own miss is the best answer there is.
-            record_fetch_outcome(&cache_name, "miss");
-            return Ok(None);
         }
         record_fetch_outcome(&cache_name, "error");
         Err(CacheError::FetchUnavailable { cache: cache_name })
@@ -3243,12 +3228,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_asks_the_other_owner_for_a_miss_in_a_cold_bucket_and_answers_a_miss_once_every_owner_is_cold()
+    async fn fetch_asks_the_other_owner_for_a_miss_in_a_cold_bucket_and_is_unavailable_while_every_owner_is_cold()
      {
         // Two nodes, two owners per bucket: both own every bucket. Once
         // both are warm, `a` drops its copy of a key and marks the bucket
         // cold again by hand, so a fetch on `a` has to ask `b`; then `b`
-        // does the same, and `a`'s fetch is a miss rather than an error.
+        // does the same, and `a`'s fetch is `FetchUnavailable`: no warm
+        // copy vouches for the miss.
         // Anti-entropy is effectively off: it would repair a dropped copy
         // from the co-owner and race every step below.
         let name = "distributed-cold-fetch";
@@ -3324,10 +3310,12 @@ mod tests {
 
         cache_b.invalidate_local(&7).await;
         residency_b.mark_cold(&[bucket]);
-        assert_eq!(
-            cache_a.fetch(&7).await.expect("a miss, not an error"),
-            None,
-            "every owner cold and empty is a miss"
+        assert!(
+            matches!(
+                cache_a.fetch(&7).await,
+                Err(CacheError::FetchUnavailable { .. })
+            ),
+            "every owner cold leaves no copy to vouch for a miss"
         );
 
         residency_a.clear_cold(&[bucket]);

@@ -269,7 +269,8 @@ current owner.
 `get` stays local-only everywhere, returning `None` off a non-owner. `fetch`
 is the network-aware read, trying live owners in rendezvous order and
 returning `Ok(None)` for a genuine miss or `CacheError::FetchUnavailable` once
-every owner has timed out inside `fetch_timeout`. `owners_of` reports a key's
+every owner has timed out inside `fetch_timeout`, or while the part is still
+cold on every owner that answered. `owners_of` reports a key's
 current owners in that same order. `owners` must be 2 or more
 (`CacheError::TooFewOwners` otherwise), a finite `max_capacity` needs a
 `spill` tier the same way `Replicated` does, `tti` is rejected outright, and

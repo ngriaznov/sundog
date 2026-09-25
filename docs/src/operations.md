@@ -139,7 +139,8 @@ in `sundog_live_peers`. Flapping under jitter calls for a higher
 
 `sundog_fetch_total{outcome="error"}` rises and callers see
 `CacheError::FetchUnavailable`: no owner of a key answered within
-`fetch_timeout`. Check whether owners are overloaded or unreachable, and
+`fetch_timeout`, or every owner that answered still had the key's part
+cold. A short burst right after a join or a leave is the second case. Check whether owners are overloaded or unreachable, and
 whether a node's `sundog_owned_parts` dropped to 0 after a restart.
 `sundog_stale_view_total` rising briefly during a membership change is
 normal; rising steadily means gossip is not converging.
