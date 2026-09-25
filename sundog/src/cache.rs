@@ -4289,10 +4289,13 @@ mod tests {
         // cache before anyone has gossiped to it: its first view is the
         // self-only one, owning every bucket with no co-owner to pull from.
         // Anti-entropy is effectively off, so only the warm-up pull can
-        // bring `a`'s entries over.
+        // bring `a`'s entries over. A timed-out pull retries only after
+        // `ae_interval`, so the budget covers a whole-space pull of all
+        // 65,536 parts, about 2 s in a debug build, on a slow runner.
         let name = "distributed-late-peer";
         let mut config = loopback_config();
         config.ae_interval = Duration::from_secs(3600);
+        config.state_transfer_budget = Duration::from_secs(15);
         config.tombstone_ttl = config.bucket_release_window();
         config.gossip_interval = Duration::from_millis(200);
         // The released port can be taken by a test running alongside before
@@ -4347,7 +4350,7 @@ mod tests {
             .await
             .expect("b opens before it knows a");
 
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let mut held = 0;
                 for key in 0..200u32 {
