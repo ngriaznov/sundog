@@ -71,8 +71,7 @@ rotating out can purge the keys still pointing into it. The on-disk record
 header already stores the key, so reclaim can read the region's headers
 sequentially instead, one 64 MB scan off the hot path. For a 16-byte key
 that is 157 bytes of RAM per spilled entry today against about 85 without
-the index. This is the first step of the on-disk key index below and stands
-on its own.
+the index.
 
 ## Proof
 
@@ -167,39 +166,6 @@ raw.
 **Trigger:** a deployment whose values are text or structured payloads and
 whose RAM is bound by them.
 
-## Distribution mode
-
-`Mode::Distributed { owners }` ships. What is still open:
-
-- **No quorum.** Gossip membership lets each side of a partition compute its
-  own owner set and accept writes; the two sides converge by version alone,
-  the same rule every other mode's conflicting writes settle by, once the
-  partition heals.
-- **Two owners is a narrow margin under back-to-back failures.** A bucket
-  pull the view moves past is planned again against the current view, and a
-  release hands a bucket to each new owner before dropping it, so two
-  membership changes in a row lose nothing on their own. Two owners of the
-  same bucket dying inside one rebalance window still take its last copy;
-  `owners` above 2 is the only answer, and a pull from a node outside the
-  current owner set is not attempted.
-- **Every node weighs the same.** Rendezvous scoring hashes the node id and
-  the bucket and nothing else, so a node with twice the RAM owns the same
-  share as one with half. A per-node weight in `ClusterConfig`, gossiped
-  beside the node's other keys and folded into `view_hash`, since that hash
-  rides in fetch and transfer frames as the epoch check, scales the score.
-  A protocol bump.
-- **A bucket is a coarse unit at a hundred nodes.** Ownership, pull and
-  release move whole buckets, 1,024 of them. At 30 nodes each holds about
-  34 with a 17 percent spread from hash variance alone; at 100 nodes about
-  10 with a 31 percent spread. The 64 anti-entropy parts under each bucket
-  give 65,536 units, about 655 per node at 100 with a 4 percent spread.
-  Stripes stay at 1,024, since a part lives inside its bucket's stripe and
-  part-scoped reads already exist. The bucket ids in every transfer and
-  fetch message change meaning, so a protocol bump.
-
-**Trigger** for the last two: a deployment past 30 nodes, or one with
-heterogeneous machines, measuring the owned-entry spread across nodes.
-
 ## Zone-aware donor and repair choice
 
 Every replicated node holds every entry, so a write crosses every zone once
@@ -238,45 +204,6 @@ and live broadcast traffic shows up as measured tail latency, not as a
 theoretical concern. The per-class outbox split and request-response traffic
 living outside the broadcast channel already remove the worst of this at the
 application layer; QUIC would only matter for what's left after that.
-
-## Tiered storage: an on-disk key index
-
-The `spill` feature ships. A spilled entry still keeps its full key resident:
-only the value moves to disk, so the fixed per-key bookkeeping stays in RAM
-regardless of how cold the entry is: an 80-byte entry holding the key,
-version, expiry, and disk pointer, plus its index slot. That is deliberate:
-it keeps a spilled entry a normal member of the live table, with no second
-index to keep in sync. RAM per spilled entry does not shrink below one key's
-worth, however small the value it replaced.
-
-A fingerprint index replaces that: a 64-bit hash of the key, the 16-byte
-disk location, and the version and expiry a wire record needs, 48 bytes per
-entry before table overhead, with the key itself confirmed against the
-on-disk record header on every read. A hash match must confirm against the
-record's stored key before trusting it, so an occasional false-positive
-disk read replaces a guaranteed-correct in-memory comparison.
-
-| Per spilled entry, 16-byte key | RAM |
-|---|---:|
-| Today | about 157 B |
-| Reverse index dropped (under Next) | about 85 B |
-| Fingerprint index | 48 B |
-| 4 billion entries at 48 B | 192 GB before table overhead |
-
-Reads stay bounded separately. A spilled read is one `spawn_blocking`
-positional read behind a semaphore, 16 permits by default, and
-`SpillConfig::read_concurrency` raises that with no cap. NVMe delivers its
-random-read rate at queue depths far above 16, so the spill bench first
-measures what raising the permit count alone recovers; only if the thread
-hop itself is the bound does an io_uring submission ring under a
-Linux-only feature pay for itself.
-
-**Trigger:** a `spill`-configured deployment whose per-node RAM is bound by
-the number of spilled keys rather than by the resident values spilling was
-built to move off-heap: many small values behind large keys, or a cold
-working set large enough that a fixed 85 bytes a key adds up. At a terabyte
-of 256-byte values on disk that is 4 billion keys and 340 GB of index,
-against 192 with fingerprints.
 
 ## Distributed locks and leader leases
 
