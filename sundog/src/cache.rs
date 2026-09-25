@@ -2765,14 +2765,15 @@ mod tests {
         c.shutdown().await;
     }
 
-    /// A bucket `0..total` never touches, so both sides' empty digests
-    /// match once b's view stops answering `Stale`, untouched by real data.
-    /// Every part of it: whichever of them a view assigns to both nodes.
+    /// Every part of a bucket keys `0..total` never touch, so both sides'
+    /// empty digests match once b's view stops answering `Stale`, untouched
+    /// by real data.
     fn unused_bucket(total: u32) -> Vec<PartId> {
         let used: HashSet<u16> = (0..total)
             .map(|key| bucket_of(&encode_key(&key).expect("u32 key encodes")))
             .collect();
-        let bucket = (0..u16::try_from(crate::store::BUCKET_COUNT).expect("BUCKET_COUNT fits u16"))
+        let bucket = (0..=u16::MAX)
+            .take(crate::store::BUCKET_COUNT)
             .find(|bucket| !used.contains(bucket))
             .expect("BUCKET_COUNT buckets is far more than a small test's `total` can fill");
         PartId::of_bucket(bucket).collect()

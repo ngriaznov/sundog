@@ -54,8 +54,8 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 ///   [`Msg::FetchDeclined`], [`Msg::AeDigestScoped`], [`Msg::StBuckets`],
 ///   [`Msg::StBucketChunk`], [`Msg::ForwardBatch`], and [`Msg::StaleView`].
 /// - 4: Adds [`Msg::StBucketDone`] and [`Msg::StBucketAck`].
-/// - 5: Part-level ownership for a `Mode::Distributed` cache: no new
-///   message kinds; see [`PROTOCOL_PART_OWNERSHIP`].
+/// - 5: Part-level ownership for `Mode::Distributed`. Adds
+///   [`Msg::AeDigestMasked`]. See [`PROTOCOL_PART_OWNERSHIP`].
 pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The oldest peer protocol this build still serves in full.
@@ -87,12 +87,13 @@ pub const PROTOCOL_DISTRIBUTED: u16 = 3;
 /// release timing for that pull, exactly as protocol 3 behaves now.
 pub const PROTOCOL_ST_BUCKET_DONE_ACK: u16 = 4;
 
-/// The protocol that introduced part-level ownership for a
-/// `Mode::Distributed` cache. A node computes a part-granular view only when
-/// it and every eligible peer speak it; under such a view the `u16` ids in
-/// [`Msg::AeDigestScoped`], [`Msg::StBuckets`] and the replies they draw name
-/// parts instead of buckets, and both sides have already agreed on the view
-/// by its hash before any id is read.
+/// The protocol that introduced part-level ownership for
+/// `Mode::Distributed`. A node computes a part-granular view only when
+/// every eligible peer speaks it; under it, the `u16` ids in
+/// [`Msg::StBuckets`] and its replies name parts instead of buckets,
+/// anti-entropy sends [`Msg::AeDigestMasked`] instead of
+/// [`Msg::AeDigestScoped`], and both sides agree on the view's hash before
+/// reading an id.
 pub const PROTOCOL_PART_OWNERSHIP: u16 = 5;
 
 /// Whether a peer speaking `peer_protocol` understands a message kind
@@ -350,6 +351,18 @@ pub enum Msg {
         cache: SmolStr,
         bucket: u16,
         view_hash: u64,
+    },
+    /// Anti-entropy round, step 1, under a part-granular view: per bucket,
+    /// a mask of the parts the round covers (bit `p` is part `p`) and the
+    /// XOR of their part digests, with the sender's `view_hash`. The
+    /// responder folds its own part digests over the same mask and answers
+    /// each bucket that differs with [`Msg::AePartDigests`]. Declared last,
+    /// so every earlier variant's postcard encoding stays unchanged.
+    /// Introduced in protocol 5.
+    AeDigestMasked {
+        cache: SmolStr,
+        view_hash: u64,
+        buckets: Vec<(u16, u64, u64)>,
     },
 }
 
@@ -1148,6 +1161,15 @@ mod tests {
         roundtrip(&Msg::StBucketDone {
             cache: SmolStr::new("users"),
             bucket: 42,
+        });
+    }
+
+    #[test]
+    fn ae_digest_masked_roundtrips() {
+        roundtrip(&Msg::AeDigestMasked {
+            cache: SmolStr::new("users"),
+            view_hash: 999,
+            buckets: vec![(0, u64::MAX, 111), (1023, 1 << 63 | 1, 222)],
         });
     }
 

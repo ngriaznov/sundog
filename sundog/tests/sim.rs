@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -3090,7 +3090,9 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         .max_message_latency(Duration::from_millis(20))
         .build();
 
-    let disown_grace = Duration::from_millis(400);
+    // Real time, like the grace clock: long enough that the probe phase's
+    // virtual seconds, run in a debug build, finish inside it.
+    let disown_grace = Duration::from_secs(2);
     spawn_dist_nodes(&mut sim, &nodes, {
         let roster = roster.clone();
         move |node| DistNodeParams {
@@ -3123,6 +3125,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     let mut eligible = node_ids.clone();
     eligible.push(phantom);
     republish_all(&nodes, &eligible, k);
+    let released_at = Instant::now() + disown_grace;
     assert!(
         nodes
             .iter()
@@ -3199,6 +3202,10 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     run_steps(&mut sim, steps_for(Duration::from_millis(100)));
 
     assert!(
+        Instant::now() < released_at,
+        "the probe phase finishes inside the real-time grace"
+    );
+    assert!(
         ae_mismatch_count.load(Ordering::Relaxed) > 0,
         "the releasing node still answers a digest mismatch with real entries"
     );
@@ -3221,8 +3228,8 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     // `ResidencySet`'s grace clock is stamped from real `Instant::now()`,
     // not turmoil's virtual clock, so real time must pass; see
     // `distributed_rebalance_under_churn`'s identical comment.
-    std::thread::sleep(disown_grace * 3);
-    run_steps(&mut sim, steps_for(disown_grace * 3));
+    std::thread::sleep(released_at.saturating_duration_since(Instant::now()) + disown_grace / 2);
+    run_steps(&mut sim, steps_for(disown_grace));
     for &key in bucket_keys {
         assert!(
             value_of(shard_of(&nodes, leaving), key).is_none(),

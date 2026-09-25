@@ -364,10 +364,6 @@ pub enum AeMismatch {
     /// against its own part digests and requests only the mismatched parts
     /// via [`Mesh::ae_parts`].
     PartDigests(u16, Vec<u64>),
-    /// One mismatched part's listing or sketch: a part-granular view's
-    /// scoped exchange compares single parts, so a responder answers each
-    /// mismatched part directly.
-    Part(AePartReply),
 }
 
 impl AeMismatch {
@@ -378,7 +374,6 @@ impl AeMismatch {
             Self::Bucket(bucket, _) | Self::Sketch(bucket, _) | Self::PartDigests(bucket, _) => {
                 *bucket
             }
-            Self::Part(reply) => reply.bucket(),
         }
     }
 }
@@ -485,17 +480,13 @@ pub(crate) enum FetchServe {
     Unavailable,
 }
 
-/// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::AeDigestScoped`]:
-/// either the responder's current per-bucket digests (for the caller to
-/// diff against the requester's, exactly as an ordinary digest exchange
-/// does), or a decline.
-pub(crate) enum AeServeOutcome {
-    /// The responder's own owned-bucket digests, view hashes matching.
-    Digests(Vec<BucketDigest>),
-    /// The matching view is part-granular: the requester's ids name parts,
-    /// and these are the responder's digests for the same parts, each
-    /// `bucket` field holding a raw [`crate::store::PartId`].
-    PartDigests(Vec<BucketDigest>),
+/// A [`RequestHandler`]'s answer to a scoped anti-entropy digest
+/// exchange, [`crate::wire::Msg::AeDigestScoped`] or
+/// [`crate::wire::Msg::AeDigestMasked`]: the responder's digests to
+/// compare, view hashes matching, or a decline.
+pub(crate) enum AeServeOutcome<T> {
+    /// The view hashes match: the responder's digests.
+    Digests(T),
     /// The responder's own view hash differs from the requester's.
     Stale { responder_view_hash: u64 },
     /// The named cache is not open here, or not a distribution-mode cache.
@@ -509,9 +500,9 @@ pub(crate) enum StServe {
     Stale { responder_view_hash: u64 },
     /// The responder owns a requested id but has not pulled it yet.
     Cold,
-    /// The responder is donating: each requested id's chunks, tagged with
-    /// the id, the order the stream finishes the ids in, and how many parts
-    /// the ids cover. An id with nothing to send yields no chunk.
+    /// The responder donates: each requested id's chunks tagged with the
+    /// id, the order the stream finishes ids in, and how many parts they
+    /// cover. An id with nothing to send yields no chunk.
     Stream {
         chunks: BoxStream<'static, (u16, Vec<WireRecord>)>,
         order: Vec<u16>,
@@ -651,7 +642,22 @@ pub trait RequestHandler: Send + Sync + 'static {
         cache: SmolStr,
         view_hash: u64,
         buckets: Vec<BucketDigest>,
-    ) -> BoxFuture<'_, AeServeOutcome> {
+    ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketDigest>>> {
+        let _ = (cache, view_hash, buckets);
+        Box::pin(async { AeServeOutcome::Unavailable })
+    }
+
+    /// Serves a [`crate::wire::Msg::AeDigestMasked`]: the part digests of
+    /// each `(bucket, mask, digest)` whose masked fold here differs.
+    /// Default: `AeServeOutcome::Unavailable`; see
+    /// [`RequestHandler::ae_digest_scoped`].
+    #[allow(private_interfaces, reason = "see RequestHandler::fetch's doc comment")]
+    fn ae_digest_masked(
+        &self,
+        cache: SmolStr,
+        view_hash: u64,
+        buckets: Vec<(u16, u64, u64)>,
+    ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketPartDigests>>> {
         let _ = (cache, view_hash, buckets);
         Box::pin(async { AeServeOutcome::Unavailable })
     }
@@ -674,11 +680,11 @@ pub trait RequestHandler: Send + Sync + 'static {
     }
 
     /// Decides a [`crate::wire::Msg::StBuckets`] pull in one step: the view
-    /// check, the cold check and the chunk stream all read the same view,
-    /// so the ids are read at the granularity the requester sent them at.
-    /// The default composes [`RequestHandler::st_buckets_available`],
-    /// [`RequestHandler::st_buckets_cold`] and
-    /// [`RequestHandler::st_bucket_chunks`], each id standing for a whole
+    /// check, cold check, and chunk stream all read the same view, so ids
+    /// are read at the granularity the requester sent them at. The default
+    /// composes [`RequestHandler::st_buckets_available`],
+    /// [`RequestHandler::st_buckets_cold`], and
+    /// [`RequestHandler::st_bucket_chunks`], treating each id as a whole
     /// bucket.
     #[allow(private_interfaces, reason = "see RequestHandler::fetch's doc comment")]
     fn st_serve(&self, cache: SmolStr, ids: Vec<u16>, view_hash: u64) -> BoxFuture<'_, StServe> {
@@ -1568,6 +1574,38 @@ impl Mesh {
         .await
     }
 
+    /// [`Mesh::ae_round_scoped`] under a part-granular view: each of
+    /// `local_buckets` is `(bucket, mask, digest)`, the digest folded over
+    /// the parts the mask names, and a mismatch answers with the bucket's
+    /// part digests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError`] if `peer` is unknown, speaks a protocol older
+    /// than [`wire::PROTOCOL_PART_OWNERSHIP`], or the exchange fails.
+    pub(crate) async fn ae_round_masked(
+        &self,
+        peer: NodeId,
+        cache: SmolStr,
+        view_hash: u64,
+        local_buckets: Vec<(u16, u64, u64)>,
+    ) -> Result<AeRoundOutcome, CodecError> {
+        self.require_peer_protocol(
+            peer,
+            wire::PROTOCOL_PART_OWNERSHIP,
+            "a masked anti-entropy digest exchange",
+        )?;
+        timed("masked anti-entropy digest exchange", async {
+            let msg = Msg::AeDigestMasked {
+                cache,
+                view_hash,
+                buckets: local_buckets,
+            };
+            conn::collect_ae_round_scoped(self.acquire_conn(peer, msg).await?).await
+        })
+        .await
+    }
+
     /// Rebalance: requests everything `donor` holds for `buckets`, the
     /// bucket-scoped counterpart of [`Mesh::request_state`], carrying this
     /// node's `view_hash` so a donor whose own view has since diverged can
@@ -1676,6 +1714,7 @@ mod tests {
 
     use super::*;
     use crate::node::NodeName;
+    use crate::store::PartMask;
     use crate::wire::{self, MAX_FRAME};
 
     /// `(key, version)` tuples to [`KeyVersion`]s, for a fixture written the
@@ -1889,10 +1928,42 @@ mod tests {
             _cache: SmolStr,
             _view_hash: u64,
             _buckets: Vec<BucketDigest>,
-        ) -> BoxFuture<'_, AeServeOutcome> {
+        ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketDigest>>> {
             Box::pin(async move {
                 match &self.ae_scoped_fixture {
                     AeScopedFixture::Digests(digests) => AeServeOutcome::Digests(digests.clone()),
+                    AeScopedFixture::Stale(responder_view_hash) => AeServeOutcome::Stale {
+                        responder_view_hash: *responder_view_hash,
+                    },
+                    AeScopedFixture::Unavailable => AeServeOutcome::Unavailable,
+                }
+            })
+        }
+
+        /// Answers from `part_digests`, folded over each requested mask.
+        fn ae_digest_masked(
+            &self,
+            _cache: SmolStr,
+            _view_hash: u64,
+            buckets: Vec<(u16, u64, u64)>,
+        ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketPartDigests>>> {
+            Box::pin(async move {
+                match &self.ae_scoped_fixture {
+                    AeScopedFixture::Digests(_) => AeServeOutcome::Digests(
+                        self.part_digests
+                            .iter()
+                            .filter(|(bucket, digests)| {
+                                buckets.iter().any(|&(b, mask, digest)| {
+                                    b == *bucket
+                                        && PartMask::from_bits(mask).fold(digests) != digest
+                                })
+                            })
+                            .map(|(bucket, digests)| BucketPartDigests {
+                                bucket: *bucket,
+                                digests: digests.clone(),
+                            })
+                            .collect(),
+                    ),
                     AeScopedFixture::Stale(responder_view_hash) => AeServeOutcome::Stale {
                         responder_view_hash: *responder_view_hash,
                     },
@@ -3243,6 +3314,88 @@ mod tests {
             result,
             AeRoundOutcome::Mismatches(Vec::new()),
             "the default RequestHandler::ae_digest_scoped body degrades to no mismatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_masked_answers_each_bucket_whose_masked_fold_differs_with_its_part_digests() {
+        let digests: Vec<u64> = (1..=64).collect();
+        let handler = Arc::new(FixtureHandler {
+            ae_scoped_fixture: AeScopedFixture::Digests(Vec::new()),
+            part_digests: vec![(0, digests.clone()), (1, digests.clone())],
+            ..Default::default()
+        });
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
+
+        let result = client
+            .ae_round_masked(
+                NodeId::from(1),
+                SmolStr::new("users"),
+                1,
+                vec![(0, 0b11, 1 ^ 2), (1, 0b1, 999)],
+            )
+            .await
+            .expect("masked ae round succeeds");
+        assert_eq!(
+            result,
+            AeRoundOutcome::Mismatches(vec![AeMismatch::PartDigests(1, digests)]),
+            "bucket 0's fold over parts 0 and 1 matches; bucket 1's does not"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_masked_reports_stale_and_degrades_against_the_default_handler_body() {
+        let handler = Arc::new(FixtureHandler {
+            ae_scoped_fixture: AeScopedFixture::Stale(777),
+            ..Default::default()
+        });
+        let (stale, _stale_inbound) = spawn_mesh(NodeId::from(1), handler).await;
+        let (plain, _plain_inbound) = spawn_mesh(NodeId::from(3), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![
+            peer_at(NodeId::from(1), stale.local_addr()),
+            peer_at(NodeId::from(3), plain.local_addr()),
+        ]);
+
+        let round = |peer| {
+            client.ae_round_masked(
+                NodeId::from(peer),
+                SmolStr::new("users"),
+                1,
+                vec![(0, 1, 5)],
+            )
+        };
+        assert_eq!(
+            round(1).await.expect("masked ae round succeeds"),
+            AeRoundOutcome::Stale {
+                responder_view_hash: 777
+            }
+        );
+        assert_eq!(
+            round(3).await.expect("masked ae round succeeds"),
+            AeRoundOutcome::Mismatches(Vec::new()),
+            "the default RequestHandler::ae_digest_masked body degrades to no mismatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn ae_round_masked_refuses_to_dial_a_peer_that_does_not_speak_part_ownership() {
+        let (server, _server_inbound) = spawn_mesh(NodeId::from(1), empty_handler()).await;
+        let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
+        client.update_peers(vec![peer_at_protocol(
+            NodeId::from(1),
+            server.local_addr(),
+            wire::PROTOCOL_PART_OWNERSHIP - 1,
+        )]);
+
+        let result = client
+            .ae_round_masked(NodeId::from(1), SmolStr::new("users"), 1, Vec::new())
+            .await;
+        assert!(
+            result.is_err(),
+            "a peer that does not speak PROTOCOL_PART_OWNERSHIP is never sent a masked round"
         );
     }
 

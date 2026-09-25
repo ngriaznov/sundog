@@ -53,7 +53,9 @@ A `Distributed` cache splits its keys into 65,536 parts, 64 in each of the
 rendezvous hashing. `Mode::distributed()` uses two owners, and `owners`
 must be at least 2. At 100 nodes and two owners the busiest node holds
 about 8% more than an even share, and a join moves only the parts the
-joiner takes.
+joiner takes. Anti-entropy between two owners compares one digest per
+bucket, folded over the parts they share, so an idle round costs the same
+at any cluster size.
 
 A write for a part this node does not own goes to that part's owners.
 `get` reads this node's copy and returns `None` off a non-owner. `fetch` is

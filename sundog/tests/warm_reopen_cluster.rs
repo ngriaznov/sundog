@@ -97,9 +97,10 @@ fn cluster_config(gossip: SocketAddr) -> ClusterConfig {
     common::fast_config().with(|c| {
         c.gossip_bind_addr = gossip;
         c.ae_interval = Duration::from_millis(100);
-        // Above bucket_release_window() and node0's downtime, so its
-        // restart lands inside the warm-reopen TTL gate.
-        c.tombstone_ttl = Duration::from_secs(4);
+        // Above bucket_release_window() and node0's downtime, a few
+        // seconds in a debug build, so its restart lands inside the
+        // warm-reopen TTL gate.
+        c.tombstone_ttl = Duration::from_secs(8);
         // Mirrors the demo's own DISOWN_GRACE_ROUNDS.
         c.distributed_disown_grace_rounds = 2;
     })
@@ -430,13 +431,14 @@ const NUM_KEYS_BULK: u32 = 5_000;
 const MAX_CAPACITY_BULK: u64 = 500;
 
 /// [`cluster_config`] with `ae_sketch_min_bucket`/`ae_sketch_cells` shrunk
-/// so a bucket's `AeSketch` reply fails to decode deterministically from a
-/// two-key divergence, forcing the `AeEntries` listing fallback this
-/// file's bulk-overwrite test exercises. `ae_sketch_cells: 3` gives an
-/// IBLT one cell wide per partition, so two or more differing keys always
-/// leave a cell over-counted or checksum-mismatched (`Undecodable`);
-/// `ae_sketch_min_bucket: 1` makes any bucket with more than one entry
-/// use that sketch instead of an exact listing.
+/// so a sketch reply, `AeSketch` over a bucket or `AePartSketch` over a
+/// part, fails to decode deterministically from a two-key divergence,
+/// forcing the `AeEntries` listing fallback this file's bulk-overwrite
+/// test exercises. `ae_sketch_cells: 3` gives an IBLT one cell wide per
+/// partition, so two or more differing keys always leave a cell
+/// over-counted or checksum-mismatched (`Undecodable`);
+/// `ae_sketch_min_bucket: 1` makes anything with more than one entry use
+/// that sketch instead of an exact listing.
 fn cluster_config_bulk_overwrite(gossip: SocketAddr) -> ClusterConfig {
     cluster_config(gossip).with(|c| {
         c.ae_sketch_min_bucket = 1;
@@ -454,19 +456,35 @@ fn cluster_config_bulk_overwrite(gossip: SocketAddr) -> ClusterConfig {
     })
 }
 
+/// Sketch-decode fallbacks for the bulk cache so far, whole-bucket and
+/// per-part: a bucket view repairs through `AeSketch`, a part view through
+/// `AePartSketch`.
+fn sketch_fallbacks(body: &str) -> f64 {
+    ["sundog_ae_sketch_total", "sundog_ae_parts_total"]
+        .into_iter()
+        .filter_map(|metric| {
+            scraped_metric_value(
+                body,
+                metric,
+                &[("cache", CACHE_NAME_BULK), ("outcome", "fallback")],
+            )
+        })
+        .sum()
+}
+
 /// Reproduces this file's scenario at the scale the converge-before-serving
 /// loop exists for: not a few hundred overwrites through one live
 /// co-owner, but every key of a several-thousand-key keyspace spanning
 /// virtually every bucket, overwritten while node0 is down.
 /// `cluster_config_bulk_overwrite` shrinks the sketch's decodable capacity
-/// so this divergence forces the fallback listing-repair path for close
-/// to every bucket node0 shares with its live co-owner, the case a
-/// single unchecked reconciliation round would have marked servable
-/// without ever re-checking.
+/// so this divergence forces the fallback listing-repair path wherever
+/// two or more diverged keys share a bucket or part node0 co-owns with its
+/// live peer, the case a single unchecked reconciliation round would have
+/// marked servable without ever re-checking.
 ///
 /// Asserts: every overwritten key reads the new value from node0 the
 /// instant `open()` returns, never the stale warm-replayed one; genuine
-/// per-bucket sketch-fallback repair activity happened; and, once
+/// sketch-fallback repair activity happened; and, once
 /// settled, every node's reads and node0's entry count agree with the
 /// current ownership view.
 #[tokio::test]
@@ -635,12 +653,7 @@ async fn warm_reopen_reconciles_a_mass_overwrite_across_most_buckets_without_ser
 
     // Baseline sketch-fallback count: expected zero, since nothing
     // before this point diverged a bucket by more than one key.
-    let fallback_before = scraped_metric_value(
-        &metrics.render(),
-        "sundog_ae_sketch_total",
-        &[("cache", CACHE_NAME_BULK), ("outcome", "fallback")],
-    )
-    .unwrap_or(0.0);
+    let fallback_before = sketch_fallbacks(&metrics.render());
 
     // ---- Restart node0, mirroring the demo: build, then open
     // immediately. ----
@@ -694,23 +707,18 @@ async fn warm_reopen_reconciles_a_mass_overwrite_across_most_buckets_without_ser
     })
     .await;
 
-    // Proves the loop repaired real per-bucket divergence rather than
-    // trusting a single round's outcome: the shrunk sketch forces most
-    // buckets through the fallback path, and a fallback-repaired bucket
-    // only reports matched on the round after the one that repaired it,
+    // Proves the loop repaired real divergence rather than trusting a
+    // single round's outcome: the shrunk sketch forces diverged buckets or
+    // parts through the fallback path, and a fallback-repaired one only
+    // reports matched on the round after the one that repaired it,
     // so converged data here is only reachable through a confirming
     // second round, which a single-round design could not produce.
-    let fallback_after = scraped_metric_value(
-        &metrics.render(),
-        "sundog_ae_sketch_total",
-        &[("cache", CACHE_NAME_BULK), ("outcome", "fallback")],
-    )
-    .unwrap_or(0.0);
+    let fallback_after = sketch_fallbacks(&metrics.render());
     assert!(
         fallback_after - fallback_before > 0.0,
-        "expected real per-bucket sketch-decode failures (and so a repair, then a confirming \
-         second round) for at least one of the {NUM_KEYS_BULK} overwritten keys' buckets; saw \
-         none (before={fallback_before}, after={fallback_after})"
+        "expected real sketch-decode failures (and so a repair, then a confirming second round) \
+         among the {NUM_KEYS_BULK} overwritten keys' buckets or parts; saw none \
+         (before={fallback_before}, after={fallback_after})"
     );
 
     // ---- Convergence polling. ----

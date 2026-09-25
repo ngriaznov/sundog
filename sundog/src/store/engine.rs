@@ -4252,10 +4252,10 @@ where
     }
 
     /// [`Engine::release_buckets`] for single parts: drops every live entry
-    /// and tombstone in `parts` and zeroes their part digests, leaving the
-    /// rest of each bucket where it is. A bucket named by all
+    /// and tombstone in `parts`, zeroes their part digests, and leaves the
+    /// rest of each bucket untouched. A bucket named by all
     /// [`PART_COUNT`] of its parts takes the whole-bucket path. Returns the
-    /// total number of entries removed, live and tombstoned together.
+    /// total entries removed, live and tombstoned together.
     pub(crate) fn release_parts(&self, parts: &[PartId]) -> u64 {
         let mut masks: HashMap<u16, u64> = HashMap::new();
         for part in parts {
@@ -6268,8 +6268,7 @@ mod tests {
         );
     }
 
-    /// Two keys in one bucket but different parts: the first two keys of
-    /// `0..limit` whose bucket matches and whose parts differ.
+    /// The first two keys of `0..limit` sharing a bucket but not a part.
     fn same_bucket_different_parts(limit: u32) -> (u32, u32) {
         let mut by_bucket: HashMap<usize, Vec<u32>> = HashMap::new();
         for k in 0..limit {

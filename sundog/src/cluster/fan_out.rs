@@ -3,7 +3,7 @@
 //! target-peer set for `Distributed`. `Shard` holds no handle to `net::Mesh`,
 //! so this is the one place a write's mode decides who hears about it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
 use tokio_util::sync::CancellationToken;
 
-use super::Cluster;
+use super::{Cluster, group_in_order};
 use crate::net::{MsgClass, OutFrame, batch_forward, batch_replicate};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
@@ -67,37 +67,27 @@ pub(super) struct OwnerGroup {
 
 /// Groups `records` by the exact target-peer set each replicates to: its
 /// part's live owners under `view`, self excluded. Pure and mesh-free, so
-/// [`fan_out_by_owner_set`] and its own unit tests both build on it
-/// directly. Two records whose parts share the same owner set land in the
-/// same group, so replicating them costs one round trip per group, not one
-/// per record.
+/// [`fan_out_by_owner_set`] and its unit tests build on it directly.
+/// Records whose parts share an owner set land in the same group, so
+/// replicating them costs one round trip per group, not one per record.
 pub(super) fn group_by_owner_set(
     view: &OwnershipView,
     self_node: NodeId,
     records: Vec<WireRecord>,
 ) -> Vec<OwnerGroup> {
-    let mut groups: Vec<OwnerGroup> = Vec::new();
-    let mut index: HashMap<Vec<NodeId>, usize> = HashMap::new();
-    for rec in records {
-        let part = PartId::of_key(rec.key.as_ref());
+    group_in_order(records.into_iter().map(|rec| {
         let mut owners: Vec<NodeId> = view
-            .owners_of(part)
+            .owners_of(PartId::of_key(&rec.key))
             .iter()
             .copied()
             .filter(|&n| n != self_node)
             .collect();
         owners.sort_unstable();
-        if let Some(&at) = index.get(&owners) {
-            groups[at].records.push(rec);
-        } else {
-            index.insert(owners.clone(), groups.len());
-            groups.push(OwnerGroup {
-                owners,
-                records: vec![rec],
-            });
-        }
-    }
-    groups
+        (owners, [rec])
+    }))
+    .into_iter()
+    .map(|(owners, records)| OwnerGroup { owners, records })
+    .collect()
 }
 
 /// Encodes each of `msgs` into an [`OutFrame`], dropping (and logging) any
@@ -195,10 +185,10 @@ async fn fan_out_batch<K, V>(
         let Some(view) = shard.ownership_view() else {
             return;
         };
-        // A write forwarded while this node did not own its part, whose
-        // part this node owns by the time the queue drains, lands here too:
-        // sending it only to the other owners, or to nobody when this node
-        // is the sole owner, would lose the one copy that exists.
+        // A write forwarded before this node owned its part, but owned by
+        // the time the queue drains, lands here too: sending it only to
+        // the other owners (or nobody, if this node is the sole owner)
+        // would lose the one copy that exists.
         let mine: Vec<WireRecord> = records
             .iter()
             .filter(|rec| {

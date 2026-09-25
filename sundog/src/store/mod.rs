@@ -66,6 +66,7 @@ pub const BUCKET_COUNT: usize = 1024;
 pub const PART_COUNT: usize = 64;
 
 pub use part::PartId;
+pub(crate) use part::PartMask;
 
 /// A custom per-entry weigher for size-bounded eviction: `(key, value) ->
 /// weight`. Boxed so [`crate::cache::CacheBuilder::weigher`] and
@@ -622,13 +623,52 @@ pub struct CompactPassOutcome {
     pub stripes_visited: usize,
 }
 
-/// [`ShardOps::ae_scoped_digests_for`]'s answer: one view's hash and
-/// granularity, and a digest per wire id at that granularity.
+/// [`ShardOps::ae_scoped_digests_for`]'s answer: one view's hash and what
+/// a round under it compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScopedDigests {
     pub(crate) view_hash: u64,
-    pub(crate) granularity: Granularity,
-    pub(crate) ids: Vec<(u16, u64)>,
+    pub(crate) scope: Scope,
+}
+
+/// What one scoped anti-entropy round compares, at its view's granularity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Under a bucket view: each bucket in scope and its digest.
+    Buckets(Vec<(u16, u64)>),
+    /// Under a part view: each bucket holding a part in scope, those parts,
+    /// and their folded digest.
+    Parts(Vec<MaskedDigest>),
+}
+
+/// One bucket of a [`Scope::Parts`]: the parts in scope and the XOR of
+/// their part digests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaskedDigest {
+    pub(crate) bucket: u16,
+    pub(crate) mask: PartMask,
+    pub(crate) digest: u64,
+}
+
+impl Scope {
+    /// Each bucket the round compares and the parts of it that count.
+    pub(crate) fn coverage(&self) -> Vec<(u16, PartMask)> {
+        match self {
+            Self::Buckets(ids) => ids
+                .iter()
+                .map(|&(bucket, _)| (bucket, PartMask::ALL))
+                .collect(),
+            Self::Parts(masked) => masked.iter().map(|m| (m.bucket, m.mask)).collect(),
+        }
+    }
+
+    /// Keeps the buckets whose parts in scope `keep` accepts.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(u16, PartMask) -> bool) {
+        match self {
+            Self::Buckets(ids) => ids.retain(|&(bucket, _)| keep(bucket, PartMask::ALL)),
+            Self::Parts(masked) => masked.retain(|m| keep(m.bucket, m.mask)),
+        }
+    }
 }
 
 /// The type-erased surface the network layer drives a shard through, wire bytes
@@ -671,11 +711,10 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// A `Mode::Distributed` shard's scoped anti-entropy digests for `peer`,
-    /// read under one ownership view: its hash, its granularity, and a
-    /// digest per wire id, the ids naming buckets or parts as the
-    /// granularity says. `None` for every other mode. The default reads
+    /// read under one ownership view: its hash and a `Scope` at its
+    /// granularity. `None` for every other mode. The default reads
     /// [`ShardOps::ownership_view_hash`] and [`ShardOps::ae_digests_for`]
-    /// as bucket ids.
+    /// as a bucket scope.
     #[allow(
         private_interfaces,
         reason = "ScopedDigests is only built and read inside this crate; see ShardOps::ownership_view"
@@ -691,8 +730,7 @@ pub trait ShardOps: Send + Sync {
                 .collect();
             Some(ScopedDigests {
                 view_hash,
-                granularity: Granularity::Bucket,
-                ids,
+                scope: Scope::Buckets(ids),
             })
         })
     }
@@ -858,8 +896,8 @@ pub trait ShardOps: Send + Sync {
     }
 
     /// [`ShardOps::release_buckets`] for single parts: removes every locally
-    /// held entry, live or tombstone, in each of `parts`, leaving the rest of
-    /// their buckets. A no-op returning `0` for a stub.
+    /// held entry, live or tombstone, in each of `parts`, leaving the rest
+    /// of each bucket untouched. A no-op returning `0` for a stub.
     fn release_parts(&self, parts: &[PartId]) -> BoxFuture<'_, u64> {
         let _ = parts;
         Box::pin(async { 0 })
@@ -2307,13 +2345,7 @@ where
     /// lookup per part.
     fn resident_bucket_mask(residency: &(Arc<OwnershipView>, Arc<ResidencySet>)) -> Vec<bool> {
         let (view, res) = residency;
-        let mut mask: Vec<bool> = (0..BUCKET_COUNT)
-            .map(|bucket| {
-                view.owns_any_in_bucket(
-                    u16::try_from(bucket).expect("invariant: BUCKET_COUNT fits u16"),
-                )
-            })
-            .collect();
+        let mut mask = view.owned_bucket_mask().to_vec();
         for part in res.releasing_parts() {
             mask[usize::from(part.bucket())] = true;
         }
@@ -2321,9 +2353,9 @@ where
     }
 
     /// The parts one anti-entropy round with `peer` covers: every part
-    /// both own under the current view, plus every part mid disown-grace
-    /// here that `peer` owns, the backstop for a lost rebalance pull.
-    /// Ascending, each part once.
+    /// both self and `peer` own under the current view, plus every part
+    /// mid disown-grace here that `peer` owns, the backstop for a lost
+    /// rebalance pull. Ascending, each part once.
     fn peer_scope(
         residency: &(Arc<OwnershipView>, Arc<ResidencySet>),
         peer: NodeId,
@@ -2359,22 +2391,21 @@ where
             .collect()
     }
 
-    /// Each of `parts`' own digest, keyed by its raw id: one engine read per
-    /// bucket the parts touch.
-    fn part_digests_of(&self, parts: &[PartId]) -> Vec<(u16, u64)> {
-        let mut by_bucket: BTreeMap<u16, Vec<PartId>> = BTreeMap::new();
-        for &part in parts {
-            by_bucket.entry(part.bucket()).or_default().push(part);
+    /// `parts` gathered by bucket, ascending, each bucket's parts as a mask
+    /// and their digests folded: one engine read per bucket.
+    fn masked_digests(&self, parts: &[PartId]) -> Vec<MaskedDigest> {
+        let mut masks: BTreeMap<u16, PartMask> = BTreeMap::new();
+        for part in parts {
+            masks.entry(part.bucket()).or_default().insert(part.part());
         }
-        let mut out = Vec::with_capacity(parts.len());
-        for (bucket, parts) in by_bucket {
-            let digests = self.engine.part_digests(bucket);
-            for part in parts {
-                let digest = digests.get(usize::from(part.part())).copied().unwrap_or(0);
-                out.push((part.raw(), digest));
-            }
-        }
-        out
+        masks
+            .into_iter()
+            .map(|(bucket, mask)| MaskedDigest {
+                bucket,
+                mask,
+                digest: mask.fold(&self.engine.part_digests(bucket)),
+            })
+            .collect()
     }
 
     /// Dedups and sorts a bulk request list, ascending.
@@ -2406,22 +2437,10 @@ where
         compute: impl Fn(u16) -> R,
         absent: R,
     ) -> Vec<(u16, R)> {
-        let buckets = Self::dedup_sorted(buckets);
-        // A short list checks each bucket; a long one builds the whole mask once.
-        let mask = self.residency_check().map(|residency| {
-            if buckets.len() < PART_COUNT {
-                let mut mask = vec![false; BUCKET_COUNT];
-                for &bucket in &buckets {
-                    if let Some(slot) = mask.get_mut(usize::from(bucket)) {
-                        *slot = Self::is_resident_bucket(&residency, bucket);
-                    }
-                }
-                mask
-            } else {
-                Self::resident_bucket_mask(&residency)
-            }
-        });
-        buckets
+        let mask = self
+            .residency_check()
+            .map(|residency| Self::resident_bucket_mask(&residency));
+        Self::dedup_sorted(buckets)
             .into_iter()
             .map(|b| Self::gated(mask.as_deref(), b, || compute(b), absent.clone()))
             .collect()
@@ -4076,19 +4095,20 @@ where
     #[allow(private_interfaces, reason = "see the trait method's own allow")]
     fn ae_scoped_digests_for(&self, peer: NodeId) -> BoxFuture<'_, Option<ScopedDigests>> {
         let scoped = self.residency_check().map(|residency| {
-            let view = &residency.0;
-            let ids = match view.granularity() {
-                Granularity::Bucket => self
-                    .bucket_digests_for(&residency, peer)
-                    .into_iter()
-                    .map(|bd| (bd.bucket, bd.digest))
-                    .collect(),
-                Granularity::Part => self.part_digests_of(&Self::peer_scope(&residency, peer)),
+            let scope = match residency.0.granularity() {
+                Granularity::Bucket => Scope::Buckets(
+                    self.bucket_digests_for(&residency, peer)
+                        .into_iter()
+                        .map(|bd| (bd.bucket, bd.digest))
+                        .collect(),
+                ),
+                Granularity::Part => {
+                    Scope::Parts(self.masked_digests(&Self::peer_scope(&residency, peer)))
+                }
             };
             ScopedDigests {
-                view_hash: view.view_hash(),
-                granularity: view.granularity(),
-                ids,
+                view_hash: residency.0.view_hash(),
+                scope,
             }
         });
         Box::pin(async move { scoped })
@@ -4634,15 +4654,15 @@ mod tests {
             .await
             .expect("a distributed shard has scoped digests");
         assert_eq!(scoped.view_hash, view.view_hash());
-        assert_eq!(scoped.granularity, Granularity::Bucket);
         let bucket_form: Vec<(u16, u64)> = ShardOps::ae_digests_for(&s, peer)
             .await
             .into_iter()
             .map(|bd| (bd.bucket, bd.digest))
             .collect();
         assert_eq!(
-            scoped.ids, bucket_form,
-            "the ids are ae_digests_for's buckets"
+            scoped.scope,
+            Scope::Buckets(bucket_form),
+            "the scope is ae_digests_for's buckets"
         );
         assert!(
             ShardOps::ae_scoped_digests_for(&shard::<u32, String>(1), peer)
@@ -4652,7 +4672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ae_scoped_digests_for_names_each_shared_part_under_a_part_view() {
+    async fn ae_scoped_digests_for_masks_each_shared_part_under_a_part_view() {
         let self_node = NodeId::from(1);
         let peer = NodeId::from(2);
         let residency = Arc::new(ResidencySet::new());
@@ -4676,27 +4696,57 @@ mod tests {
             .await
             .expect("a distributed shard has scoped digests");
         assert_eq!(scoped.view_hash, view.view_hash());
-        assert_eq!(scoped.granularity, Granularity::Part);
-        let ids: HashMap<u16, u64> = scoped.ids.iter().copied().collect();
-        assert_eq!(ids.len(), scoped.ids.len(), "each part once");
+        let Scope::Parts(masked) = &scoped.scope else {
+            panic!("a part view masks its scope");
+        };
+        assert!(
+            masked
+                .windows(2)
+                .all(|pair| pair[0].bucket < pair[1].bucket),
+            "one entry per bucket, ascending"
+        );
         let mut expected: Vec<PartId> = crate::ownership::shared_owned_parts(&view, peer);
         expected.push(releasing);
         expected.sort_unstable();
-        let mut named: Vec<PartId> = ids.keys().map(|&id| PartId::from_raw(id)).collect();
+        let mut named: Vec<PartId> = masked
+            .iter()
+            .flat_map(|m| m.mask.parts().map(|part| PartId::new(m.bucket, part)))
+            .collect();
         named.sort_unstable();
         assert_eq!(named, expected, "every shared part, plus the releasing one");
-        assert_ne!(
-            ids[&shared_part.raw()],
-            0,
-            "the part holding a record has its digest"
-        );
+        let entry = masked
+            .iter()
+            .find(|m| m.bucket == shared_part.bucket())
+            .expect("the shared part's bucket is in scope");
         let part_digests = ShardOps::part_digests(&s, vec![shared_part.bucket()]).await;
         assert_eq!(
-            ids[&shared_part.raw()],
-            part_digests[0].digests[usize::from(shared_part.part())],
-            "a part's scoped digest is its engine part digest"
+            entry.digest,
+            entry.mask.fold(&part_digests[0].digests),
+            "a bucket's scoped digest folds its engine part digests over its mask"
         );
-        assert_eq!(ids[&releasing.raw()], 0, "an empty part digests to zero");
+        assert_ne!(entry.digest, 0, "the bucket holding a record has a digest");
+    }
+
+    #[test]
+    fn a_scope_covers_whole_buckets_or_their_masks_and_retains_by_them() {
+        let mut buckets = Scope::Buckets(vec![(3, 30), (5, 50)]);
+        assert_eq!(
+            buckets.coverage(),
+            vec![(3, PartMask::ALL), (5, PartMask::ALL)]
+        );
+        buckets.retain(|bucket, _| bucket == 5);
+        assert_eq!(buckets, Scope::Buckets(vec![(5, 50)]));
+
+        let mask = |parts: &[u8]| parts.iter().copied().collect::<PartMask>();
+        let entry = |bucket, parts: &[u8]| MaskedDigest {
+            bucket,
+            mask: mask(parts),
+            digest: u64::from(bucket),
+        };
+        let mut parts = Scope::Parts(vec![entry(3, &[1]), entry(5, &[2, 9])]);
+        assert_eq!(parts.coverage(), vec![(3, mask(&[1])), (5, mask(&[2, 9]))]);
+        parts.retain(|_, mask| mask.contains(9));
+        assert_eq!(parts, Scope::Parts(vec![entry(5, &[2, 9])]));
     }
 
     /// Every part of `bucket`: what a bucket-granularity view owns or

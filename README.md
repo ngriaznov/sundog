@@ -310,11 +310,12 @@ current one in both roles. Distribution mode's message kinds (`Fetch`,
 peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
 own a part and never receives one of these messages at all.
 
-Protocol 5 ranks each of a distributed cache's 65,536 parts on its own. A
-protocol-4 node ranks whole buckets, so while any eligible node speaks
-protocol 4 every node keeps ranking whole buckets. When the last protocol-4
-node leaves, every node switches to part ranking within a few gossip
-intervals. Most parts change owners at that moment: the switch runs as one
+Protocol 5 ranks each of a distributed cache's 65,536 parts on its own and
+adds `AeDigestMasked`: anti-entropy under part ranking sends one digest per
+bucket, folded over the parts both nodes own. A protocol-4 node ranks whole
+buckets, so while any eligible node speaks protocol 4 every node keeps
+ranking whole buckets. When the last protocol-4 node leaves, every node
+switches to part ranking within a few gossip intervals. Most parts change owners at that moment: the switch runs as one
 large rebalance, with every lost part served through its disown grace and
 handed to its new owners before it is dropped. Upgrade outside peak load.
 

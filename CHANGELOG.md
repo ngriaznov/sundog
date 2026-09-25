@@ -35,16 +35,22 @@ All notable changes to this project are documented in this file. Format follows
   and write p99, and `weekly-bench.yml` runs the set weekly and posts the
   report on the run's summary page.
 - **Kani proofs**: `#[kani::proof]` harnesses under each module's
-  `kani_proofs` prove, over every input, that expiry packing and the
-  touch stamp round-trip, a hash lands inside the bucket and part tables,
-  the compaction shrink rule fires only at an eighth of an allocation, a
+  `kani_proofs` prove, over every input, that expiry packing and the touch
+  stamp round-trip, a hash lands inside the bucket and part tables, the
+  compaction shrink rule fires only at an eighth of an allocation, a
   reconciliation retry never outruns its cap or time budget and the loop
-  stops at every bound, the gossip bind retry moves only a port-0
-  request within its cap, the anti-entropy skip rule keeps its bound, the
-  hybrid logical clock advances past both the last and
-  the observed stamp, a replicate frame length never overflows, and spill
-  sizing stays within its clamps. `weekly-kani.yml` runs them weekly and
-  the release gate requires a green run.
+  stops at every bound, the gossip bind retry moves only a port-0 request
+  within its cap, the anti-entropy skip rule keeps its bound, the hybrid
+  logical clock advances past both the last and the observed stamp, a
+  replicate frame length never overflows, spill sizing stays within its
+  clamps, a part id round-trips through every representation, every part
+  owns its own bit of a part set, a part mask holds exactly its parts and
+  its digest fold splits over disjoint masks, the bounded top-`k` owner
+  selection keeps the first `k` in rank order, a wire id names its parts
+  back at either granularity, a view ranks parts only when every peer speaks
+  part ownership, the owned-bucket gauge is the part count over 64, and a
+  pull serves its ids in ascending single-bucket runs. `weekly-kani.yml`
+  runs them weekly and the release gate requires a green run.
 - **Entry diet**: a live entry stores one encoded record (key length, key,
   and value in the postcard form the wire already uses) instead of a typed
   key and value plus a separate encoded copy, and that record is an enum,
@@ -354,11 +360,13 @@ All notable changes to this project are documented in this file. Format follows
   60% over and the lightest about half; a join moves only the parts the
   joiner takes. Rebalance pulls, the disown-grace
   hand-off, release, warm reopen and scoped anti-entropy all work part by
-  part, and a part-granular scoped round answers each mismatched part with
-  its listing or sketch directly. The wire protocol is 5, with no new
-  message kinds: under a part-granular view the `u16` ids that
-  `AeDigestScoped` and `StBuckets` carry name parts, and the view hash
-  both sides already compare tells them apart. A node ranks whole buckets
+  part. The wire protocol is 5 and adds `Msg::AeDigestMasked`: scoped
+  anti-entropy under a part view sends, per bucket, a mask of the parts
+  both nodes own and the XOR of those parts' digests, so an idle round
+  costs one entry per bucket at any cluster size, and a bucket that
+  differs answers with its part digests. Under a part view the `u16` ids
+  that `StBuckets` carries name parts, and the view hash both sides
+  already compare tells them apart. A node ranks whole buckets
   while any eligible peer speaks protocol 4, so a mixed cluster keeps the
   ownership its older members compute. When the last protocol-4 node
   leaves, every node switches to ranking parts and most parts change

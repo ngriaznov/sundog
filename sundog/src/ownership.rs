@@ -1,12 +1,11 @@
 //! Ownership for a `Mode::Distributed` cache: which live nodes own each of a
 //! cache's 65,536 parts, computed by rendezvous (highest-random-weight)
 //! hashing over the cache's live, protocol-compatible peers. A view has a
-//! [`Granularity`]: at `Part` every part is ranked on its own, which keeps
-//! each node's share within a few percent of even at a hundred nodes; at
-//! `Bucket` every part of a bucket shares the bucket's owners, the ownership
-//! a peer on an older protocol computes. A node always owns its own view's
-//! computation regardless of what else is live: the degenerate one-node case
-//! is a valid, if under-replicated, cluster.
+//! [`Granularity`]: `Part` ranks every part on its own, keeping each node's
+//! share within a few percent even at a hundred nodes; `Bucket` gives every
+//! part of a bucket the bucket's owners, what a peer on an older protocol
+//! computes. A node always counts itself eligible, so a lone node owns every
+//! part: a valid, under-replicated cluster.
 //!
 //! [`OwnershipView`] is the immutable, point-in-time answer; [`OwnershipTracker`]
 //! is the live-updating handle every reader shares. [`ResidencySet`] is a
@@ -14,7 +13,7 @@
 //! keeps serving for a grace period, so a new owner's transfer has time to
 //! land.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU8;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,12 +41,16 @@ pub(crate) fn rendezvous_score(node: NodeId, bucket: u16) -> u64 {
     xxh3_64(&buf)
 }
 
-/// Ranks `scored` by descending score, ties broken by ascending [`NodeId`],
-/// and truncates to `k`. Factored out of [`owners_of_bucket`] so the
-/// tie-break and truncation logic is testable against synthetic scores
-/// without needing an actual rendezvous-score collision.
+/// Rendezvous rank order: higher score first, ties to the lower [`NodeId`].
+fn rank_order(a: &(u64, NodeId), b: &(u64, NodeId)) -> std::cmp::Ordering {
+    b.0.cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+/// The first `k` of `scored` in [`rank_order`], by a full sort: the
+/// reference for [`select_top`], on scores a test picks.
+#[cfg(test)]
 fn rank_by_score(mut scored: Vec<(u64, NodeId)>, k: u8) -> Vec<NodeId> {
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.sort_by(rank_order);
     scored
         .into_iter()
         .take(usize::from(k))
@@ -55,13 +58,10 @@ fn rank_by_score(mut scored: Vec<(u64, NodeId)>, k: u8) -> Vec<NodeId> {
         .collect()
 }
 
-/// The owners of `bucket` among `eligible`: the top `k` by descending
-/// [`rendezvous_score`], ties broken by ascending [`NodeId`].
-/// `eligible.len() <= k` degenerates to "every eligible node owns every
-/// bucket," returning every entry of `eligible`. Never inspects whether
-/// `eligible` contains any particular node; that a view always includes
-/// itself is [`OwnershipView::compute`]'s contract, not this function's.
-pub(crate) fn owners_of_bucket(eligible: &[NodeId], bucket: u16, k: u8) -> Vec<NodeId> {
+/// The owners of `bucket` among `eligible` by [`rank_by_score`]: the
+/// reference a view's rankings are tested against.
+#[cfg(test)]
+fn owners_of_bucket(eligible: &[NodeId], bucket: u16, k: u8) -> Vec<NodeId> {
     let scored = eligible
         .iter()
         .map(|&node| (rendezvous_score(node, bucket), node))
@@ -128,19 +128,29 @@ pub fn ownership_granularity(
     peers: &[Peer],
     eligible: &[NodeId],
 ) -> Granularity {
-    let everyone_speaks_parts = wire::PROTOCOL_VERSION >= wire::PROTOCOL_PART_OWNERSHIP
-        && eligible
+    Granularity::for_protocols(
+        eligible
             .iter()
             .filter(|&&node| node != self_node)
-            .all(|&node| {
+            .map(|&node| {
                 peers
                     .iter()
-                    .any(|peer| peer.node == node && peer.protocol >= wire::PROTOCOL_PART_OWNERSHIP)
-            });
-    if everyone_speaks_parts {
-        Granularity::Part
-    } else {
-        Granularity::Bucket
+                    .find(|peer| peer.node == node)
+                    .map_or(0, |peer| peer.protocol)
+            }),
+    )
+}
+
+impl Granularity {
+    /// `Part` when this build and every one of `peer_protocols` speak
+    /// [`wire::PROTOCOL_PART_OWNERSHIP`], `Bucket` otherwise.
+    fn for_protocols(peer_protocols: impl IntoIterator<Item = u16>) -> Self {
+        let speaks = |protocol| wire::peer_supports(protocol, wire::PROTOCOL_PART_OWNERSHIP);
+        if speaks(wire::PROTOCOL_VERSION) && peer_protocols.into_iter().all(speaks) {
+            Self::Part
+        } else {
+            Self::Bucket
+        }
     }
 }
 
@@ -226,76 +236,46 @@ impl OwnershipView {
         Self::compute_at(self_node, eligible, k, Granularity::Bucket)
     }
 
-    /// Builds the view for `self_node` from `eligible` (typically
-    /// [`eligible_owners`]'s output) at `granularity` (typically
-    /// [`ownership_granularity`]'s). Folds `self_node` into `eligible` and
-    /// dedups before ranking, so this is correct even when called directly
-    /// with `self_node` omitted from `eligible`, such as from a test.
-    ///
-    /// # Panics
-    ///
-    /// Panics only on the platform-impossible case of [`BUCKET_COUNT`] not
-    /// fitting a `u16`.
+    /// Builds the view for `self_node` from `eligible` at `granularity`, as
+    /// [`eligible_owners`] and [`ownership_granularity`] pick them. Folds
+    /// `self_node` into `eligible` and dedups first, so a caller may omit it.
     #[must_use]
     pub fn compute_at(
         self_node: NodeId,
-        eligible: Vec<NodeId>,
+        mut eligible: Vec<NodeId>,
         k: NonZeroU8,
         granularity: Granularity,
     ) -> Self {
-        let mut eligible = eligible;
-        if !eligible.contains(&self_node) {
-            eligible.push(self_node);
-        }
+        eligible.push(self_node);
         eligible.sort_unstable();
         eligible.dedup();
 
         let view_hash = view_hash_at(&eligible, granularity);
         let k = k.get();
         let stride = usize::from(k).min(eligible.len());
-        let mut owned = PartSet::new();
-        let owners = match granularity {
-            Granularity::Bucket => {
-                let mut owners = Vec::with_capacity(BUCKET_COUNT * stride);
-                for bucket in 0..BUCKET_COUNT {
-                    let bucket = u16::try_from(bucket).expect("invariant: BUCKET_COUNT fits u16");
-                    let set = owners_of_bucket(&eligible, bucket, k);
-                    if set.contains(&self_node) {
-                        owned.extend(PartId::of_bucket(bucket));
-                    }
-                    owners.extend(set);
-                }
-                owners
-            }
-            Granularity::Part => {
-                let mut owners = Vec::with_capacity(PART_SPACE * stride);
-                let mut top: Vec<(u64, NodeId)> = Vec::with_capacity(stride + 1);
-                for part in PartId::all() {
-                    top_by_score(&eligible, part.raw(), stride, &mut top);
-                    if top.iter().any(|&(_, node)| node == self_node) {
-                        owned.insert(part);
-                    }
-                    owners.extend(top.iter().map(|&(_, node)| node));
-                }
-                owners
-            }
+        // One ranking per unit: a bucket at `Bucket`, a part at `Part`,
+        // either way named by its wire id.
+        let units = match granularity {
+            Granularity::Bucket => BUCKET_COUNT,
+            Granularity::Part => PART_SPACE,
         };
+        let mut owners = Vec::with_capacity(units * stride);
+        let mut owned = PartSet::new();
         let mut owns_in_bucket = vec![false; BUCKET_COUNT];
-        let mut co_owner_set: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
-        for part in owned.iter() {
-            owns_in_bucket[usize::from(part.bucket())] = true;
-        }
-        for (unit, set) in owners.chunks(stride.max(1)).enumerate() {
-            let owned_here = match granularity {
-                Granularity::Bucket => owns_in_bucket[unit],
-                Granularity::Part => owned.contains(PartId::from_index(unit)),
-            };
-            if owned_here {
-                co_owner_set.extend(set.iter().copied().filter(|&node| node != self_node));
+        let mut co_owners = BTreeSet::new();
+        let mut top = Vec::with_capacity(stride + 1);
+        for unit in (0..=u16::MAX).take(units) {
+            top_by_score(&eligible, unit, stride, &mut top);
+            let ranked = top.iter().map(|&(_, node)| node);
+            if ranked.clone().any(|node| node == self_node) {
+                for part in parts_of_wire_id(granularity, unit) {
+                    owned.insert(part);
+                    owns_in_bucket[usize::from(part.bucket())] = true;
+                }
+                co_owners.extend(ranked.clone().filter(|&node| node != self_node));
             }
+            owners.extend(ranked);
         }
-        let mut co_owners: Vec<NodeId> = co_owner_set.into_iter().collect();
-        co_owners.sort_unstable();
         Self {
             view_hash,
             self_node,
@@ -304,7 +284,7 @@ impl OwnershipView {
             stride,
             owned,
             owns_in_bucket,
-            co_owners,
+            co_owners: co_owners.into_iter().collect(),
         }
     }
 
@@ -338,10 +318,15 @@ impl OwnershipView {
     /// Whether `self_node` owns any part of `bucket`.
     #[must_use]
     pub fn owns_any_in_bucket(&self, bucket: u16) -> bool {
-        self.owns_in_bucket
+        self.owned_bucket_mask()
             .get(usize::from(bucket))
-            .copied()
-            .unwrap_or(false)
+            .is_some_and(|&owns| owns)
+    }
+
+    /// Whether `self_node` owns any part of each bucket, indexed by bucket.
+    #[must_use]
+    pub(crate) fn owned_bucket_mask(&self) -> &[bool] {
+        &self.owns_in_bucket
     }
 
     /// `part`'s live owners, highest rendezvous score first.
@@ -406,22 +391,37 @@ pub(crate) fn parts_of_wire_id(
 }
 
 /// Fills `top` with the `k` highest-scoring nodes of `eligible` for the unit
-/// `raw`, highest first, ties broken by ascending [`NodeId`]: the same order
-/// [`rank_by_score`] gives, without sorting every node for each of 65,536
+/// `raw`, in [`rank_order`], without sorting every node for each of 65,536
 /// parts.
 fn top_by_score(eligible: &[NodeId], raw: u16, k: usize, top: &mut Vec<(u64, NodeId)>) {
-    top.clear();
-    let before = |a: &(u64, NodeId), b: &(u64, NodeId)| a.0 > b.0 || (a.0 == b.0 && a.1 < b.1);
-    for &node in eligible {
-        let entry = (rendezvous_score(node, raw), node);
-        if top.len() == k && !top.last().is_some_and(|last| before(&entry, last)) {
-            continue;
-        }
-        let at = top
+    select_top(
+        eligible
             .iter()
-            .position(|other| before(&entry, other))
-            .unwrap_or(top.len());
-        top.insert(at, entry);
+            .map(|&node| (rendezvous_score(node, raw), node)),
+        k,
+        top,
+        rank_order,
+    );
+}
+
+/// Leaves the first `k` of `items` in `top`, in `order`: a bounded
+/// insertion sort that sifts each item toward the front and never keeps
+/// more than `k`.
+fn select_top<T>(
+    items: impl IntoIterator<Item = T>,
+    k: usize,
+    top: &mut Vec<T>,
+    order: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    top.clear();
+    for item in items {
+        top.push(item);
+        for at in (1..top.len()).rev() {
+            if order(&top[at - 1], &top[at]).is_le() {
+                break;
+            }
+            top.swap(at - 1, at);
+        }
         top.truncate(k);
     }
 }
@@ -1657,5 +1657,89 @@ mod tests {
             !set.expired(Duration::from_millis(200)).contains(&p(5)),
             "a flap resets the release clock rather than letting it accumulate across the gap"
         );
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// The bounded selection is the first `k` of any strict order, for
+    /// every `k` through the input's length: `k` items, strictly ascending,
+    /// each drawn from the input, and every item left out ordered after
+    /// every one kept. It compares items and nothing else, so four distinct
+    /// bytes cover every shape of input.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn select_top_keeps_the_first_k_in_order() {
+        let items: [u8; 4] = kani::any();
+        for i in 0..items.len() {
+            for j in 0..i {
+                kani::assume(items[i] != items[j]);
+            }
+        }
+        let mut top = Vec::with_capacity(items.len() + 1);
+        for k in 0..=items.len() {
+            select_top(items, k, &mut top, u8::cmp);
+            let held = |item: &u8| top.iter().any(|kept| kept == item);
+            assert_eq!(top.len(), k);
+            assert!(top.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(top.iter().all(|kept| items.iter().any(|item| item == kept)));
+            assert!(
+                items
+                    .iter()
+                    .all(|item| held(item) || top.iter().all(|kept| kept < item))
+            );
+        }
+    }
+
+    /// A part's wire id names it back at either granularity, and every
+    /// part that id names lies where the id says.
+    #[kani::proof]
+    #[kani::unwind(66)]
+    fn a_part_s_wire_id_names_it_back() {
+        let part = PartId::from_raw(kani::any());
+        let granularity = if kani::any() {
+            Granularity::Part
+        } else {
+            Granularity::Bucket
+        };
+        let ids = wire_ids(granularity, &[part]);
+        assert_eq!(ids.len(), 1);
+        let id = ids[0];
+        assert!(parts_of_wire_id(granularity, id).any(|named| named == part));
+        match granularity {
+            Granularity::Bucket => {
+                assert_eq!(id, part.bucket());
+                assert!(parts_of_wire_id(granularity, id).all(|named| named.bucket() == id));
+            }
+            Granularity::Part => assert_eq!(id, part.raw()),
+        }
+    }
+
+    /// Parts only when this build and every peer speak part ownership.
+    #[kani::proof]
+    fn parts_only_when_every_peer_speaks_them() {
+        let protocols: [u16; 3] = kani::any();
+        let everyone = protocols
+            .iter()
+            .all(|&protocol| protocol >= wire::PROTOCOL_PART_OWNERSHIP);
+        let expected = if wire::PROTOCOL_VERSION >= wire::PROTOCOL_PART_OWNERSHIP && everyone {
+            Granularity::Part
+        } else {
+            Granularity::Bucket
+        };
+        assert_eq!(Granularity::for_protocols(protocols), expected);
+    }
+
+    /// The owned-buckets gauge is the part count over 64, exactly, for any
+    /// share a node can own.
+    #[kani::proof]
+    fn the_bucket_gauge_is_the_part_count_over_sixty_four() {
+        let owned: u32 = kani::any();
+        kani::assume(owned as usize <= PART_SPACE);
+        #[allow(clippy::cast_precision_loss, reason = "at most 65,536, exact in f64")]
+        let parts = f64::from(owned);
+        assert_eq!(owned_bucket_equivalent(owned as usize) * 64.0, parts);
     }
 }

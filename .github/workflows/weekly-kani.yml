@@ -2,8 +2,10 @@
 # and decision rules: the `#[kani::proof]` harnesses under each module's
 # `kani_proofs` (expiry packing, the touch stamp, hash-to-bucket indexing,
 # the compaction shrink rule, the reconciliation retry bounds, the gossip
-# bind retry, the anti-entropy skip rule, the hybrid logical
-# clock, frame length arithmetic, spill sizing). Reproduce locally with
+# bind retry, the anti-entropy skip rule, the hybrid logical clock, frame
+# length arithmetic, spill sizing, part ids, the part set and part masks,
+# top-k owner selection, wire ids, the granularity rule, the owned-bucket
+# gauge, serve order and bucket runs). Reproduce locally with
 # `cargo install --locked kani-verifier && cargo kani setup && cargo kani -p sundog --features spill`.
 #
 # Two notices in the log are Kani's own, not the crate's: rustc prints

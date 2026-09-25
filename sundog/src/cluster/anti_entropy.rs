@@ -27,12 +27,12 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::Cluster;
 use super::sketch::{Cell, Decoded, Iblt};
+use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
 use crate::node::NodeId;
-use crate::ownership::{Granularity, parts_of_wire_id};
 use crate::store::part::PartSet;
-use crate::store::{BucketPart, PartId, ShardOps};
+use crate::store::{BucketPart, PartId, PartMask, Scope, ScopedDigests, ShardOps};
 use crate::wire::{self, WireRecord};
 
 /// Runs anti-entropy for one shard while `cancel` stays live: every jittered
@@ -170,7 +170,8 @@ pub enum RoundOutcome {
 /// merge converge in this one round rather than needing a second.
 ///
 /// A `Mode::Distributed` shard exchanges digests through
-/// `Mesh::ae_round_scoped` instead of [`Mesh::ae_round`], carrying its
+/// `Mesh::ae_round_scoped`, or `Mesh::ae_round_masked` under a part view,
+/// instead of [`Mesh::ae_round`], carrying its
 /// [`ShardOps::ownership_view_hash`] for the epoch check; a `Stale` reply
 /// ends the round at once, counted in `sundog_stale_view_total`.
 ///
@@ -188,17 +189,15 @@ pub async fn run_round_against(
     // mismatched key instead of only the greater version pushing to the
     // lesser side. See `ShardOps::merges`.
     let merging = shard.merges();
-    let mismatched = match shard.ae_scoped_digests_for(peer).await {
+    let (mismatched, in_scope) = match shard.ae_scoped_digests_for(peer).await {
         Some(scoped) => {
-            // Only the ids `peer` co-owns, read under the same view as the
-            // hash they travel with: the whole resident list would have
-            // every other id reported as a mismatch and its entries pushed
-            // only to be dropped by the peer's inbound guard.
-            match mesh
-                .ae_round_scoped(peer, cache.clone(), scoped.view_hash, scoped.ids)
-                .await
-            {
-                Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
+            // Only what `peer` co-owns, read under the view whose hash it
+            // travels with: the whole resident list would have everything
+            // else reported as a mismatch and its entries pushed only to be
+            // dropped by the peer's inbound guard.
+            let in_scope = scoped.scope.coverage().into_iter().collect();
+            match scoped_exchange(mesh, cache, peer, scoped).await {
+                Ok(AeRoundOutcome::Mismatches(mismatched)) => (mismatched, Some(in_scope)),
                 Ok(AeRoundOutcome::Stale {
                     responder_view_hash,
                 }) => {
@@ -229,7 +228,7 @@ pub async fn run_round_against(
             )
             .await
         {
-            Ok(mismatched) => mismatched,
+            Ok(mismatched) => (mismatched, None),
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy digest exchange failed");
                 return RoundOutcome::Failed;
@@ -241,8 +240,33 @@ pub async fn run_round_against(
         return RoundOutcome::Reconciled;
     }
 
-    let _ = reconcile_mismatches(mesh, shard, cache, peer, mismatched, merging).await;
+    let _ = reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, merging).await;
     RoundOutcome::Reconciled
+}
+
+/// Sends `scoped`'s digests to `peer` in the exchange its scope calls for:
+/// bucket digests, or masked part digests under a part view.
+async fn scoped_exchange(
+    mesh: &Mesh,
+    cache: &SmolStr,
+    peer: NodeId,
+    scoped: ScopedDigests,
+) -> Result<AeRoundOutcome, CodecError> {
+    let ScopedDigests { view_hash, scope } = scoped;
+    match scope {
+        Scope::Buckets(ids) => {
+            mesh.ae_round_scoped(peer, cache.clone(), view_hash, ids)
+                .await
+        }
+        Scope::Parts(masked) => {
+            let buckets = masked
+                .iter()
+                .map(|m| (m.bucket, m.mask.bits(), m.digest))
+                .collect();
+            mesh.ae_round_masked(peer, cache.clone(), view_hash, buckets)
+                .await
+        }
+    }
 }
 
 /// The classify-through-repair pipeline shared by [`run_round_against`] and
@@ -253,32 +277,27 @@ pub async fn run_round_against(
 ///
 /// Buckets past `ae_part_min_bucket` answered with part digests never
 /// load their full entries here; only listing/sketch buckets go through
-/// `entries_for_buckets`.
+/// `entries_for_buckets`. A part-digest reply repairs only the parts
+/// `in_scope` names for its bucket; `None` repairs every part.
 async fn reconcile_mismatches(
     mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
     mismatched: Vec<AeMismatch>,
+    in_scope: Option<HashMap<u16, PartMask>>,
     merging: bool,
 ) -> u64 {
-    let (part_digest_mismatches, rest): (Vec<AeMismatch>, Vec<AeMismatch>) = mismatched
-        .into_iter()
-        .partition(|m| matches!(m, AeMismatch::PartDigests(..)));
-    let (part_replies, bucket_mismatches): (Vec<AeMismatch>, Vec<AeMismatch>) = rest
-        .into_iter()
-        .partition(|m| matches!(m, AeMismatch::Part(..)));
-    let part_replies: Vec<AePartReply> = part_replies
-        .into_iter()
-        .filter_map(|m| match m {
-            AeMismatch::Part(reply) => Some(reply),
-            _ => None,
-        })
-        .collect();
+    let (part_digest_mismatches, bucket_mismatches): (Vec<AeMismatch>, Vec<AeMismatch>) =
+        mismatched
+            .into_iter()
+            .partition(|m| matches!(m, AeMismatch::PartDigests(..)));
 
-    let mut plan = RepairPlan::default();
+    let mut plan = RepairPlan {
+        in_scope,
+        ..RepairPlan::default()
+    };
     classify_bucket_mismatches(shard, cache, bucket_mismatches, &mut plan, merging).await;
-    classify_part_replies(shard, cache, part_replies, &mut plan, merging).await;
     classify_part_digest_mismatches(
         mesh,
         shard,
@@ -379,28 +398,19 @@ fn every_part_diverged(requested: &HashSet<PartId>) -> PartRoundOutcome {
     }
 }
 
-/// The wire id a mismatch reply names at `granularity`: its bucket for a
-/// bucket-granular round, its part's raw id for a part reply.
-fn mismatch_id(mismatch: &AeMismatch) -> u16 {
-    match mismatch {
-        AeMismatch::Part(reply) => PartId::new(reply.bucket(), reply.part()).raw(),
-        other => other.bucket(),
-    }
-}
-
-/// Which of `requested` a round at `granularity` compared equal: every part
-/// of a `sent` id the reply did not name mismatched, narrowed to
-/// `requested`. A pure function of the round's ids, split out of
-/// [`run_round_for_parts`] for its unit test.
+/// Which of `requested` a round compared equal: every part in scope of a
+/// `covered` bucket the reply did not name mismatched. A pure function of
+/// the round's scope, split out of [`run_round_for_parts`] for its unit
+/// test.
 fn matched_parts(
-    granularity: Granularity,
     requested: &HashSet<PartId>,
-    sent: &[u16],
+    covered: &[(u16, PartMask)],
     named_mismatched: &HashSet<u16>,
 ) -> HashSet<PartId> {
-    sent.iter()
-        .filter(|id| !named_mismatched.contains(id))
-        .flat_map(|&id| parts_of_wire_id(granularity, id))
+    covered
+        .iter()
+        .filter(|(bucket, _)| !named_mismatched.contains(bucket))
+        .flat_map(|&(bucket, mask)| mask.parts().map(move |part| PartId::new(bucket, part)))
         .filter(|part| requested.contains(part))
         .collect()
 }
@@ -412,11 +422,11 @@ fn matched_parts(
 /// `rebalance_task` calls it to push a lost part no co-owner can hand over
 /// to that part's new owners.
 ///
-/// Reads the shard's scoped digests once, so the ids it sends and the
-/// view hash they travel with come from one view, then keeps the ids
-/// covering a requested part. A requested part the live view says `peer`
-/// does not co-own is absent from what is sent and lands in
-/// `still_diverged` rather than `matched`. A shard with no ownership view,
+/// Reads the shard's scoped digests once, so the scope it sends and the
+/// view hash it travels with come from one view, then keeps the buckets
+/// whose scope holds a requested part. A requested part the live view says
+/// `peer` does not co-own is out of scope and lands in `still_diverged`
+/// rather than `matched`. A shard with no ownership view,
 /// a `Stale` reply, or a failed exchange reports everything
 /// `still_diverged` with `failed: true`.
 pub(crate) async fn run_round_for_parts(
@@ -427,22 +437,17 @@ pub(crate) async fn run_round_for_parts(
     parts: &[PartId],
 ) -> PartRoundOutcome {
     let requested: HashSet<PartId> = parts.iter().copied().collect();
-    let Some(scoped) = shard.ae_scoped_digests_for(peer).await else {
+    let Some(mut scoped) = shard.ae_scoped_digests_for(peer).await else {
         return every_part_diverged(&requested);
     };
-    let granularity = scoped.granularity;
     let wanted: PartSet = parts.iter().copied().collect();
-    let local_ids: Vec<(u16, u64)> = scoped
-        .ids
-        .into_iter()
-        .filter(|&(id, _)| parts_of_wire_id(granularity, id).any(|part| wanted.contains(part)))
-        .collect();
-    let sent: Vec<u16> = local_ids.iter().map(|&(id, _)| id).collect();
+    scoped.scope.retain(|bucket, mask| {
+        mask.parts()
+            .any(|part| wanted.contains(PartId::new(bucket, part)))
+    });
+    let covered = scoped.scope.coverage();
     let merging = shard.merges();
-    let mismatched = match mesh
-        .ae_round_scoped(peer, cache.clone(), scoped.view_hash, local_ids)
-        .await
-    {
+    let mismatched = match scoped_exchange(mesh, cache, peer, scoped).await {
         Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
         Ok(AeRoundOutcome::Stale {
             responder_view_hash,
@@ -459,8 +464,8 @@ pub(crate) async fn run_round_for_parts(
             return every_part_diverged(&requested);
         }
     };
-    let named_mismatched: HashSet<u16> = mismatched.iter().map(mismatch_id).collect();
-    let matched = matched_parts(granularity, &requested, &sent, &named_mismatched);
+    let named_mismatched: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
+    let matched = matched_parts(&requested, &covered, &named_mismatched);
     let still_diverged: HashSet<PartId> = requested.difference(&matched).copied().collect();
     if mismatched.is_empty() {
         return PartRoundOutcome {
@@ -470,7 +475,17 @@ pub(crate) async fn run_round_for_parts(
             failed: false,
         };
     }
-    let bytes_moved = reconcile_mismatches(mesh, shard, cache, peer, mismatched, merging).await;
+    let in_scope = covered.into_iter().collect();
+    let bytes_moved = reconcile_mismatches(
+        mesh,
+        shard,
+        cache,
+        peer,
+        mismatched,
+        Some(in_scope),
+        merging,
+    )
+    .await;
     PartRoundOutcome {
         matched,
         still_diverged,
@@ -481,9 +496,9 @@ pub(crate) async fn run_round_for_parts(
 
 /// Drops every queued push of a key whose part `peer` does not own under a
 /// `Mode::Distributed` shard's current view: a whole-bucket fallback
-/// listing covers parts the peer never holds, and pushing them only has the
-/// peer's inbound guard forward or drop them. Identity for a shard with no
-/// ownership view.
+/// listing covers parts the peer never holds, and pushing them only reaches
+/// the peer's inbound guard to forward or drop. Identity for a shard with
+/// no ownership view.
 fn retain_peer_owned_pushes(shard: &Arc<dyn ShardOps>, peer: NodeId, push_keys: &mut Vec<Bytes>) {
     if let Some(view) = shard.ownership_view() {
         push_keys.retain(|key| view.owners_of(PartId::of_key(key)).contains(&peer));
@@ -511,9 +526,12 @@ fn retain_owned_pulls(
 }
 
 /// One round's push/pull/hash-pull/fallback classification, threaded as
-/// `&mut RepairPlan` instead of four separate out-parameters.
+/// `&mut RepairPlan` instead of four separate out-parameters, and the
+/// parts of each bucket it may repair: `in_scope`'s, or every part when
+/// `None`.
 #[derive(Default)]
 struct RepairPlan {
+    in_scope: Option<HashMap<u16, PartMask>>,
     push_keys: Vec<Bytes>,
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
@@ -521,6 +539,13 @@ struct RepairPlan {
 }
 
 impl RepairPlan {
+    /// The parts of `bucket` this round may repair.
+    fn repairable(&self, bucket: u16) -> PartMask {
+        self.in_scope.as_ref().map_or(PartMask::ALL, |scope| {
+            scope.get(&bucket).copied().unwrap_or_default()
+        })
+    }
+
     /// Queues `hashes` to pull from `bucket` by hash; a no-op if empty.
     fn pull_by_hash(&mut self, bucket: u16, hashes: Vec<u64>) {
         if !hashes.is_empty() {
@@ -604,8 +629,8 @@ async fn classify_bucket_mismatches(
                         local_by_bucket.get(&bucket).map_or(&[], Vec::as_slice);
                     handle_sketch_mismatch(cache, bucket, cells, entries, plan, merging);
                 }
-                AeMismatch::PartDigests(..) | AeMismatch::Part(..) => {
-                    unreachable!("invariant: reconcile_mismatches partitions these variants out")
+                AeMismatch::PartDigests(..) => {
+                    unreachable!("invariant: reconcile_mismatches partitions this variant out")
                 }
             }
         }
@@ -680,9 +705,11 @@ async fn classify_part_digest_mismatch_chunk(
         let local_parts = local_digests_by_bucket
             .get(&bucket)
             .map_or(&[][..], Vec::as_slice);
+        let mask = plan.repairable(bucket);
         wanted_parts.extend(
             mismatched_parts(local_parts, digests)
                 .into_iter()
+                .filter(|&part| mask.contains(part))
                 .map(|part| BucketPart { bucket, part }),
         );
     }
@@ -1924,54 +1951,45 @@ mod tests {
     }
 
     #[test]
-    fn matched_parts_is_every_requested_part_of_a_sent_id_the_reply_did_not_name() {
+    fn matched_parts_is_every_requested_part_in_scope_of_a_bucket_the_reply_did_not_name() {
         let requested: HashSet<PartId> = [PartId::new(4, 0), PartId::new(4, 5), PartId::new(9, 1)]
             .into_iter()
             .collect();
-        // Bucket ids: bucket 4 matched, bucket 9 named mismatched; only
-        // the requested parts of bucket 4 count.
-        let matched = matched_parts(
-            Granularity::Bucket,
-            &requested,
-            &[4, 9],
-            &HashSet::from([9]),
-        );
+        // Bucket 4 matched, bucket 9 named mismatched: only bucket 4's
+        // requested parts count.
+        let whole = [(4, PartMask::ALL), (9, PartMask::ALL)];
         assert_eq!(
-            matched,
+            matched_parts(&requested, &whole, &HashSet::from([9])),
             HashSet::from([PartId::new(4, 0), PartId::new(4, 5)])
         );
-        // Part ids: each id is its own part.
-        let matched = matched_parts(
-            Granularity::Part,
-            &requested,
-            &[PartId::new(4, 0).raw(), PartId::new(9, 1).raw()],
-            &HashSet::from([PartId::new(9, 1).raw()]),
+        // A mask narrows a matched bucket to the parts it names.
+        let masked = [(4, [5].into_iter().collect()), (9, PartMask::ALL)];
+        assert_eq!(
+            matched_parts(&requested, &masked, &HashSet::new()),
+            HashSet::from([PartId::new(4, 5), PartId::new(9, 1)])
         );
-        assert_eq!(matched, HashSet::from([PartId::new(4, 0)]));
-        // An id never sent never matches, even unnamed.
-        assert!(matched_parts(Granularity::Part, &requested, &[], &HashSet::new()).is_empty());
+        // A bucket never covered never matches, even unnamed.
+        assert!(matched_parts(&requested, &[], &HashSet::new()).is_empty());
     }
 
     #[test]
-    fn mismatch_id_is_the_bucket_or_the_part_a_reply_names() {
-        assert_eq!(mismatch_id(&AeMismatch::Bucket(12, Vec::new())), 12);
-        assert_eq!(mismatch_id(&AeMismatch::Sketch(13, Vec::new())), 13);
-        assert_eq!(mismatch_id(&AeMismatch::PartDigests(14, Vec::new())), 14);
-        let reply = AePartReply::Listing {
-            bucket: 15,
-            part: 3,
-            entries: Vec::new(),
+    fn a_repair_plan_repairs_every_part_unscoped_and_only_its_scope_otherwise() {
+        assert_eq!(RepairPlan::default().repairable(7), PartMask::ALL);
+        let plan = RepairPlan {
+            in_scope: Some(HashMap::from([(7, [1, 2].into_iter().collect())])),
+            ..RepairPlan::default()
         };
+        assert_eq!(plan.repairable(7).parts().collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(
-            mismatch_id(&AeMismatch::Part(reply.clone())),
-            PartId::new(15, 3).raw()
+            plan.repairable(8),
+            PartMask::default(),
+            "a bucket outside the scope repairs nothing"
         );
-        assert_eq!(AeMismatch::Part(reply).bucket(), 15);
     }
 
     #[test]
     fn retain_peer_owned_pushes_keeps_only_keys_whose_part_the_peer_owns() {
-        use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
+        use crate::ownership::{Granularity, OwnershipTracker, OwnershipView, ResidencySet};
         use crate::store::{Mode, Shard};
 
         let self_node = NodeId::from(1);
@@ -2443,6 +2461,7 @@ mod tests {
                 pull_keys: vec![Bytes::from_static(b"q3")],
                 pull_hashes: vec![(3, vec![33])],
                 undecodable_buckets: vec![3],
+                ..RepairPlan::default()
             },
         );
         gathered.insert(
@@ -2452,6 +2471,7 @@ mod tests {
                 pull_keys: Vec::new(),
                 pull_hashes: vec![(5, vec![55])],
                 undecodable_buckets: Vec::new(),
+                ..RepairPlan::default()
             },
         );
         let mut plan = RepairPlan::default();

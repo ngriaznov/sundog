@@ -53,8 +53,8 @@ use crate::net::{
 use crate::node::{NodeId, NodeName};
 use crate::ownership::{Granularity, OwnershipView, parts_of_wire_id};
 use crate::store::{
-    BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, PartId, Shard,
-    ShardOps, chunk_records_for_snapshot,
+    BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, PartId, PartMask,
+    Shard, ShardOps, chunk_records_for_snapshot,
 };
 use crate::wire::{self, Msg, WireRecord};
 
@@ -843,6 +843,24 @@ impl ClusterRequestHandler {
     fn lookup(&self, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
         self.shards.read_shards().get(cache).cloned()
     }
+
+    /// `cache`'s shard when its view's hash is `view_hash`, otherwise the
+    /// decline a scoped anti-entropy round answers with.
+    fn matching_view<T>(
+        &self,
+        cache: &SmolStr,
+        view_hash: u64,
+    ) -> Result<Arc<dyn ShardOps>, AeServeOutcome<T>> {
+        let shard = self.lookup(cache).ok_or(AeServeOutcome::Unavailable)?;
+        let view = shard.ownership_view().ok_or(AeServeOutcome::Unavailable)?;
+        if view.view_hash() == view_hash {
+            Ok(shard)
+        } else {
+            Err(AeServeOutcome::Stale {
+                responder_view_hash: view.view_hash(),
+            })
+        }
+    }
 }
 
 impl RequestHandler for ClusterRequestHandler {
@@ -992,44 +1010,53 @@ impl RequestHandler for ClusterRequestHandler {
         &self,
         cache: SmolStr,
         view_hash: u64,
-        buckets: Vec<BucketDigest>,
-    ) -> BoxFuture<'_, AeServeOutcome> {
-        // The requester's ids only matter once its epoch is confirmed
-        // current; the mismatch classification against them happens one
-        // layer up, in `conn::serve_ae_digest_scoped`. At a part-granular
-        // view they name parts, and only their own digests are read.
+        _buckets: Vec<BucketDigest>,
+    ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketDigest>>> {
+        // The requester's buckets only matter once its epoch is confirmed
+        // current; `conn::serve_ae_digest_scoped` classifies them.
         Box::pin(async move {
-            let Some(shard) = self.lookup(&cache) else {
-                return AeServeOutcome::Unavailable;
-            };
-            let Some(view) = shard.ownership_view() else {
-                return AeServeOutcome::Unavailable;
-            };
-            if view.view_hash() != view_hash {
-                return AeServeOutcome::Stale {
-                    responder_view_hash: view.view_hash(),
-                };
+            match self.matching_view(&cache, view_hash) {
+                Ok(shard) => AeServeOutcome::Digests(shard.digests().await),
+                Err(declined) => declined,
             }
-            match view.granularity() {
-                Granularity::Bucket => AeServeOutcome::Digests(shard.digests().await),
-                Granularity::Part => {
-                    let parts: Vec<PartId> = buckets
-                        .iter()
-                        .map(|bd| PartId::from_raw(bd.bucket))
-                        .collect();
-                    AeServeOutcome::PartDigests(part_digests_of(shard.as_ref(), &parts).await)
-                }
-            }
+        })
+    }
+
+    fn ae_digest_masked(
+        &self,
+        cache: SmolStr,
+        view_hash: u64,
+        buckets: Vec<(u16, u64, u64)>,
+    ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketPartDigests>>> {
+        Box::pin(async move {
+            let shard = match self.matching_view(&cache, view_hash) {
+                Ok(shard) => shard,
+                Err(declined) => return declined,
+            };
+            let remote: HashMap<u16, (PartMask, u64)> = buckets
+                .into_iter()
+                .map(|(bucket, mask, digest)| (bucket, (PartMask::from_bits(mask), digest)))
+                .collect();
+            let local = shard.part_digests(remote.keys().copied().collect()).await;
+            AeServeOutcome::Digests(
+                local
+                    .into_iter()
+                    .filter(|bpd| {
+                        remote
+                            .get(&bpd.bucket)
+                            .is_some_and(|&(mask, digest)| mask.fold(&bpd.digests) != digest)
+                    })
+                    .collect(),
+            )
         })
     }
 
     fn st_serve(&self, cache: SmolStr, ids: Vec<u16>, view_hash: u64) -> BoxFuture<'_, StServe> {
         Box::pin(async move {
-            let view = self.lookup(&cache).and_then(|shard| {
-                let view = shard.ownership_view()?;
-                Some((shard, view))
-            });
-            let Some((shard, view)) = view else {
+            let serving = self
+                .lookup(&cache)
+                .and_then(|shard| shard.ownership_view().map(|view| (shard, view)));
+            let Some((shard, view)) = serving else {
                 return StServe::Stale {
                     responder_view_hash: 0,
                 };
@@ -1040,25 +1067,18 @@ impl RequestHandler for ClusterRequestHandler {
                 };
             }
             let granularity = view.granularity();
-            if ids
-                .iter()
-                .flat_map(|&id| parts_of_wire_id(granularity, id))
-                .any(|part| shard.is_cold_part(part))
-            {
+            let order = serve_order(granularity, ids);
+            let parts = || {
+                order
+                    .iter()
+                    .flat_map(|&id| parts_of_wire_id(granularity, id))
+            };
+            if parts().any(|part| shard.is_cold_part(part)) {
                 return StServe::Cold;
             }
-            let parts = ids
-                .iter()
-                .map(|&id| parts_of_wire_id(granularity, id).count() as u64)
-                .sum();
-            let order = serve_order(granularity, ids);
+            let parts = parts().count() as u64;
             StServe::Stream {
-                chunks: id_chunks(
-                    shard,
-                    granularity,
-                    order.clone(),
-                    self.rebalance_chunk_bytes,
-                ),
+                chunks: id_chunks(shard, granularity, &order, self.rebalance_chunk_bytes),
                 order,
                 parts,
             }
@@ -1095,15 +1115,34 @@ impl RequestHandler for ClusterRequestHandler {
         };
         let granularity = current_granularity(shard.as_ref());
         let order = serve_order(granularity, buckets);
-        id_chunks(shard, granularity, order, self.rebalance_chunk_bytes)
+        id_chunks(shard, granularity, &order, self.rebalance_chunk_bytes)
     }
+}
+
+/// Groups `items` by key, keys in first-seen order, each group's values in
+/// input order.
+pub(crate) fn group_in_order<K, V>(
+    items: impl IntoIterator<Item = (K, impl IntoIterator<Item = V>)>,
+) -> Vec<(K, Vec<V>)>
+where
+    K: Eq + Hash + Clone,
+{
+    let mut index: HashMap<K, usize> = HashMap::new();
+    let mut groups: Vec<(K, Vec<V>)> = Vec::new();
+    for (key, values) in items {
+        let at = *index.entry(key.clone()).or_insert_with(|| {
+            groups.push((key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[at].1.extend(values);
+    }
+    groups
 }
 
 /// The order a donor streams `ids` in: bucket by bucket, each bucket's parts
 /// together, so one entries read per bucket serves every requested part of
 /// it. Bucket ids already are that order once sorted.
-fn serve_order(granularity: Granularity, ids: Vec<u16>) -> Vec<u16> {
-    let mut ids = ids;
+fn serve_order(granularity: Granularity, mut ids: Vec<u16>) -> Vec<u16> {
     match granularity {
         Granularity::Bucket => ids.sort_unstable(),
         Granularity::Part => ids.sort_unstable_by_key(|&id| {
@@ -1123,127 +1162,75 @@ fn current_granularity(shard: &dyn ShardOps) -> Granularity {
         .map_or(Granularity::Bucket, |view| view.granularity())
 }
 
-/// Each of `parts`' own digest from `shard`, keyed by its raw id: one
-/// residency-gated part-digest read per bucket the parts touch, so a part
-/// this shard does not hold reads as empty.
-async fn part_digests_of(shard: &dyn ShardOps, parts: &[PartId]) -> Vec<BucketDigest> {
-    let mut buckets: Vec<u16> = parts.iter().map(|part| part.bucket()).collect();
-    buckets.sort_unstable();
-    buckets.dedup();
-    let by_bucket: HashMap<u16, Vec<u64>> = shard
-        .part_digests(buckets)
-        .await
-        .into_iter()
-        .map(|bpd| (bpd.bucket, bpd.digests))
-        .collect();
-    parts
-        .iter()
-        .map(|part| BucketDigest {
-            bucket: part.raw(),
-            digest: by_bucket
-                .get(&part.bucket())
-                .and_then(|digests| digests.get(usize::from(part.part())))
-                .copied()
-                .unwrap_or(0),
-        })
-        .collect()
-}
-
-/// Groups `ids`, already in [`serve_order`], into one run per bucket: a
+/// Splits `ids`, already in [`serve_order`], into one run per bucket: a
 /// bucket id alone, or every requested part of one bucket.
-fn bucket_runs(granularity: Granularity, ids: Vec<u16>) -> Vec<Vec<u16>> {
-    let mut runs: Vec<Vec<u16>> = Vec::new();
-    for id in ids {
-        let bucket = match granularity {
-            Granularity::Bucket => id,
-            Granularity::Part => PartId::from_raw(id).bucket(),
-        };
-        match runs.last_mut() {
-            Some(run)
-                if granularity == Granularity::Part
-                    && run
-                        .first()
-                        .is_some_and(|&first| PartId::from_raw(first).bucket() == bucket) =>
-            {
-                run.push(id);
-            }
-            _ => runs.push(vec![id]),
-        }
-    }
-    runs
+fn bucket_runs(granularity: Granularity, ids: &[u16]) -> impl Iterator<Item = &[u16]> {
+    ids.chunk_by(move |&a, &b| {
+        granularity == Granularity::Part
+            && PartId::from_raw(a).bucket() == PartId::from_raw(b).bucket()
+    })
 }
 
-/// Streams each of `ids`' records in `rebalance_chunk_bytes` sub-batches,
-/// tagged with the id, the ids naming buckets or parts as `granularity`
-/// says and arriving in [`serve_order`]. One entries read per bucket
-/// serves every requested id in it, and an id with nothing to send yields
-/// no chunk. One sub-batch is resident at a time, not a whole bucket's
-/// records; `chunk_records_for_snapshot` still splits each sub-batch on the
-/// wire-frame cap, so `MAX_FRAME` stays the hard ceiling regardless of
-/// this setting.
+/// Streams the records of `ids`, in [`serve_order`], as frames tagged with
+/// their id: one entries read per bucket run, then `chunk_bytes`-sized key
+/// batches read one at a time, each split on the frame cap. An id holding
+/// nothing yields no frame.
 fn id_chunks(
     shard: Arc<dyn ShardOps>,
     granularity: Granularity,
-    ids: Vec<u16>,
+    ids: &[u16],
     chunk_bytes: u64,
 ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
-    Box::pin(
-        stream::iter(bucket_runs(granularity, ids)).flat_map(move |run| {
-            let keys_shard = Arc::clone(&shard);
-            let fetch_shard = Arc::clone(&shard);
-            let keys_fut = async move {
-                let keyed: Vec<(u16, Vec<Bytes>)> = match granularity {
-                    Granularity::Bucket => keys_shard
-                        .entries_for_buckets(run)
-                        .await
-                        .into_iter()
-                        .map(|(bucket, entries)| {
-                            (bucket, entries.into_iter().map(|kv| kv.key).collect())
-                        })
-                        .collect(),
-                    Granularity::Part => keys_shard
-                        .entries_for_parts(
-                            run.iter()
-                                .map(|&id| PartId::from_raw(id).bucket_part())
-                                .collect(),
-                        )
-                        .await
-                        .into_iter()
-                        .map(|(bp, entries)| {
-                            (
-                                PartId::from(bp).raw(),
-                                entries.into_iter().map(|kv| kv.key).collect(),
-                            )
-                        })
-                        .collect(),
-                };
-                keyed
+    let runs: Vec<Vec<u16>> = bucket_runs(granularity, ids).map(<[u16]>::to_vec).collect();
+    let keys_shard = Arc::clone(&shard);
+    stream::iter(runs)
+        .then(move |run| id_keys(Arc::clone(&keys_shard), granularity, run))
+        .flat_map(move |keyed| {
+            stream::iter(keyed.into_iter().flat_map(move |(id, keys)| {
+                st_bucket_key_sub_batches(keys, chunk_bytes)
                     .into_iter()
-                    .filter(|(_, keys)| !keys.is_empty())
-                    .flat_map(|(id, keys)| {
-                        st_bucket_key_sub_batches(keys, chunk_bytes)
-                            .into_iter()
-                            .map(move |batch| (id, batch))
-                    })
-                    .collect::<Vec<(u16, Vec<Bytes>)>>()
-            };
-            stream::once(keys_fut)
-                .flat_map(move |sub_batches| {
-                    let fetch_shard = Arc::clone(&fetch_shard);
-                    stream::iter(sub_batches).then(move |(id, sub_batch)| {
-                        let fetch_shard = Arc::clone(&fetch_shard);
-                        async move { (id, fetch_shard.records_for(sub_batch).await) }
-                    })
-                })
-                .flat_map(|(id, recs)| {
-                    stream::iter(
-                        chunk_records_for_snapshot(recs)
-                            .into_iter()
-                            .map(move |chunk| (id, chunk)),
-                    )
-                })
-        }),
-    )
+                    .map(move |batch| (id, batch))
+            }))
+        })
+        .then(move |(id, batch)| {
+            let shard = Arc::clone(&shard);
+            async move { (id, shard.records_for(batch).await) }
+        })
+        .flat_map(|(id, recs)| {
+            stream::iter(
+                chunk_records_for_snapshot(recs)
+                    .into_iter()
+                    .map(move |chunk| (id, chunk)),
+            )
+        })
+        .boxed()
+}
+
+/// The keys each id of one bucket run holds, in one entries read; an id
+/// holding nothing is left out.
+async fn id_keys(
+    shard: Arc<dyn ShardOps>,
+    granularity: Granularity,
+    run: Vec<u16>,
+) -> Vec<(u16, Vec<Bytes>)> {
+    let listed: Vec<(u16, Vec<KeyVersion>)> = match granularity {
+        Granularity::Bucket => shard.entries_for_buckets(run).await,
+        Granularity::Part => shard
+            .entries_for_parts(
+                run.iter()
+                    .map(|&id| PartId::from_raw(id).bucket_part())
+                    .collect(),
+            )
+            .await
+            .into_iter()
+            .map(|(bp, entries)| (PartId::from(bp).raw(), entries))
+            .collect(),
+    };
+    listed
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .map(|(id, entries)| (id, entries.into_iter().map(|kv| kv.key).collect()))
+        .collect()
 }
 
 fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
@@ -1560,6 +1547,7 @@ async fn inbound_loop(
                 | Msg::FetchReply { .. }
                 | Msg::FetchDeclined { .. }
                 | Msg::AeDigestScoped { .. }
+                | Msg::AeDigestMasked { .. }
                 | Msg::StBuckets { .. }
                 | Msg::StBucketChunk { .. }
                 | Msg::StaleView { .. }
@@ -1748,6 +1736,53 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
 /// Saturating `u64` -> `f64` conversion for gauge values.
 fn entry_count_f64(count: u64) -> f64 {
     f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Bucket runs split a serve order where the bucket changes: every run
+    /// is one bucket, runs ascend by bucket, and together the runs are the
+    /// order. Ids span four buckets of four parts, where raw id order and
+    /// bucket order disagree.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn bucket_runs_split_the_serve_order_at_each_bucket() {
+        let granularity = if kani::any() {
+            Granularity::Part
+        } else {
+            Granularity::Bucket
+        };
+        let key = |id: u16| match granularity {
+            Granularity::Bucket => (id, 0),
+            Granularity::Part => (PartId::from_raw(id).bucket(), PartId::from_raw(id).part()),
+        };
+        let order: [u16; 3] = std::array::from_fn(|_| {
+            let (bucket, part): (u8, u8) = (kani::any(), kani::any());
+            kani::assume(bucket < 4 && part < 4);
+            match granularity {
+                Granularity::Bucket => u16::from(bucket),
+                Granularity::Part => PartId::new(u16::from(bucket), part).raw(),
+            }
+        });
+        kani::assume(order.windows(2).all(|pair| key(pair[0]) < key(pair[1])));
+        let mut next = 0;
+        let mut last_bucket = None;
+        for run in bucket_runs(granularity, &order) {
+            let bucket = key(run[0]).0;
+            assert!(last_bucket < Some(bucket));
+            last_bucket = Some(bucket);
+            for &id in run {
+                assert_eq!((id, key(id).0), (order[next], bucket));
+                next += 1;
+            }
+            if granularity == Granularity::Bucket {
+                assert_eq!(run.len(), 1);
+            }
+        }
+        assert_eq!(next, order.len());
+    }
 }
 
 // Real-transport-only: these build a live `Cluster` with a real `Mesh` and
@@ -3322,14 +3357,15 @@ mod tests {
 
     // --- Sketch-based anti-entropy (`cluster::sketch`) ---
 
-    /// Mirrors `store::bucket_of`'s formula so a test can compute which
-    /// anti-entropy bucket a key lands in without that private function.
+    /// `key`'s part, from its postcard-encoded bytes.
     fn part_of_u32(key: u32) -> crate::store::PartId {
         crate::store::PartId::of_key(
             &postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes"),
         )
     }
 
+    /// Mirrors `store::bucket_of`'s formula so a test can compute which
+    /// anti-entropy bucket a key lands in without that private function.
     fn bucket_of_u32(key: u32) -> u16 {
         let bytes = postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes");
         let bucket = xxhash_rust::xxh3::xxh3_64(&bytes) & (crate::store::BUCKET_COUNT as u64 - 1);
@@ -4521,6 +4557,10 @@ mod tests {
             handler.ae_digest_scoped(name.clone(), 1, Vec::new()).await,
             AeServeOutcome::Unavailable
         ));
+        assert!(matches!(
+            handler.ae_digest_masked(name.clone(), 1, Vec::new()).await,
+            AeServeOutcome::Unavailable
+        ));
         assert!(!handler.st_buckets_available(name.clone(), 1).await);
         let mut chunks = handler.st_bucket_chunks(name, vec![0]);
         assert!(
@@ -4594,32 +4634,42 @@ mod tests {
         ));
 
         // Every eligible node speaks part ownership, so the view is
-        // part-granular and the requester's ids name parts.
-        let requested = vec![
-            BucketDigest {
-                bucket: part_one.raw(),
-                digest: 0,
-            },
-            BucketDigest {
-                bucket: part_other.raw(),
-                digest: 0,
-            },
-        ];
-        let AeServeOutcome::PartDigests(digests) = handler
-            .ae_digest_scoped(name.clone(), view_hash, requested)
+        // part-granular and rounds arrive masked.
+        let masked = |part: PartId, digest| {
+            let mask: PartMask = [part.part()].into_iter().collect();
+            (part.bucket(), mask.bits(), digest)
+        };
+        let AeServeOutcome::Digests(mismatched) = handler
+            .ae_digest_masked(
+                name.clone(),
+                view_hash,
+                vec![masked(part_one, 0), masked(part_other, 0)],
+            )
             .await
         else {
-            panic!("expected the sole owner's own part digests when the view hash matches");
+            panic!("expected the owner's part digests when the view hash matches");
         };
-        assert_eq!(
-            digests.iter().map(|bd| bd.bucket).collect::<Vec<_>>(),
-            vec![part_one.raw(), part_other.raw()],
-            "one digest per requested part, in request order"
-        );
-        assert!(
-            digests.iter().all(|bd| bd.digest != 0),
-            "each requested part holds a record, so its digest is nonzero"
-        );
+        let by_bucket: HashMap<u16, Vec<u64>> = mismatched
+            .into_iter()
+            .map(|bpd| (bpd.bucket, bpd.digests))
+            .collect();
+        for part in [part_one, part_other] {
+            let digest = by_bucket[&part.bucket()][usize::from(part.part())];
+            assert_ne!(digest, 0, "each requested part holds a record");
+            let AeServeOutcome::Digests(settled) = handler
+                .ae_digest_masked(name.clone(), view_hash, vec![masked(part, digest)])
+                .await
+            else {
+                panic!("the view hash still matches");
+            };
+            assert!(settled.is_empty(), "a matching fold draws no reply");
+        }
+        assert!(matches!(
+            handler
+                .ae_digest_masked(name.clone(), view_hash.wrapping_add(1), Vec::new())
+                .await,
+            AeServeOutcome::Stale { responder_view_hash } if responder_view_hash == view_hash
+        ));
         assert!(matches!(
             handler
                 .ae_digest_scoped(name.clone(), view_hash.wrapping_add(1), Vec::new())
@@ -4852,6 +4902,15 @@ mod tests {
     }
 
     #[test]
+    fn group_in_order_keeps_first_seen_key_order_and_input_value_order() {
+        let groups = group_in_order([('b', [1]), ('a', [2]), ('b', [3])]);
+        assert_eq!(groups, vec![('b', vec![1, 3]), ('a', vec![2])]);
+        let merged = group_in_order([("k", vec![1, 2]), ("k", vec![]), ("k", vec![3])]);
+        assert_eq!(merged, vec![("k", vec![1, 2, 3])]);
+        assert!(group_in_order(Vec::<(u8, [u8; 0])>::new()).is_empty());
+    }
+
+    #[test]
     fn serve_order_sorts_bucket_ids_and_groups_part_ids_by_bucket() {
         assert_eq!(serve_order(Granularity::Bucket, vec![9, 3, 9]), vec![3, 9]);
         let (a, b, c) = (PartId::new(5, 2), PartId::new(3, 9), PartId::new(5, 0));
@@ -4864,8 +4923,11 @@ mod tests {
 
     #[test]
     fn bucket_runs_groups_consecutive_part_ids_of_one_bucket() {
+        let runs = |granularity, ids: &[u16]| -> Vec<Vec<u16>> {
+            bucket_runs(granularity, ids).map(<[u16]>::to_vec).collect()
+        };
         assert_eq!(
-            bucket_runs(Granularity::Bucket, vec![3, 9]),
+            runs(Granularity::Bucket, &[3, 9]),
             vec![vec![3], vec![9]],
             "a bucket id is a run of its own"
         );
@@ -4878,13 +4940,13 @@ mod tests {
             ],
         );
         assert_eq!(
-            bucket_runs(Granularity::Part, ids),
+            runs(Granularity::Part, &ids),
             vec![
                 vec![PartId::new(3, 9).raw()],
                 vec![PartId::new(5, 0).raw(), PartId::new(5, 2).raw()],
             ]
         );
-        assert!(bucket_runs(Granularity::Part, Vec::new()).is_empty());
+        assert!(runs(Granularity::Part, &[]).is_empty());
     }
 
     #[test]

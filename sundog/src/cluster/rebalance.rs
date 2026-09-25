@@ -14,9 +14,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::Cluster;
 use super::anti_entropy::{self, RoundOutcome};
 use super::state_transfer::{self, DonorResult, Outcome};
+use super::{Cluster, group_in_order};
 use crate::net::{BucketPull, Mesh};
 use crate::node::NodeId;
 use crate::ownership::{
@@ -38,32 +38,15 @@ fn group_parts_by_donor_set(
     self_node: NodeId,
     parts: Vec<PartId>,
 ) -> Vec<DonorGroup> {
-    // First by the view's own owner slice, borrowed rather than rebuilt per
-    // part, then the few distinct slices merge by donor set: two rankings
-    // that differ only in where self sits name the same donors.
-    let mut by_owners: Vec<(&[NodeId], Vec<PartId>)> = Vec::new();
-    let mut slice_index: HashMap<&[NodeId], usize> = HashMap::new();
-    for part in parts {
-        let owners = view.owners_of(part);
-        if let Some(&at) = slice_index.get(owners) {
-            by_owners[at].1.push(part);
-        } else {
-            slice_index.insert(owners, by_owners.len());
-            by_owners.push((owners, vec![part]));
-        }
-    }
-    let mut groups: Vec<DonorGroup> = Vec::new();
-    let mut index: HashMap<Vec<NodeId>, usize> = HashMap::new();
-    for (owners, parts) in by_owners {
+    // Groups by the view's own owner slice first, borrowed rather than
+    // rebuilt per part; the few resulting slices then merge by donor set,
+    // since two rankings that differ only in where self sits name the
+    // same donors.
+    let by_owners = group_in_order(parts.into_iter().map(|part| (view.owners_of(part), [part])));
+    group_in_order(by_owners.into_iter().map(|(owners, parts)| {
         let donors: Vec<NodeId> = owners.iter().copied().filter(|&n| n != self_node).collect();
-        if let Some(&at) = index.get(&donors) {
-            groups[at].1.extend(parts);
-        } else {
-            index.insert(donors.clone(), groups.len());
-            groups.push((donors, parts));
-        }
-    }
-    groups
+        (donors, parts)
+    }))
 }
 
 /// [`state_transfer::try_donor`]'s part-scoped counterpart: pulls `parts`
@@ -603,13 +586,13 @@ pub(crate) fn push_targets(
 }
 
 /// Pushes each target's parts to it through a part-scoped anti-entropy
-/// round, which sends every entry the target
-/// lacks or holds at an older version. A round that fails, or meets a
-/// responder whose view has not caught up with this node's, is retried
-/// every `retry` until every target has answered, `deadline` passes, or
-/// `cancel` fires. The disown-grace hand-off still confirms each part before
-/// it is released; this push brings the data to the new owners when the
-/// view changes rather than when the grace ends.
+/// round, which sends every entry the target lacks or holds at an older
+/// version. A round that fails, or meets a responder whose view has not
+/// caught up with this node's, is retried every `retry` until every
+/// target has answered, `deadline` passes, or `cancel` fires. The
+/// disown-grace hand-off still confirms each part before it is released;
+/// this push brings the data to the new owners when the view changes
+/// rather than when the grace ends.
 async fn push_unpullable(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
