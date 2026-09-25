@@ -48,6 +48,10 @@ pub fn key_from_bytes(bytes: &[u8]) -> Option<u8> {
 pub const TOMBSTONE_TTL_MS: u64 = 200;
 /// Hard cap on tombstone retention for every [`new_shard_and_model`] pair.
 pub const TOMBSTONE_MAX_TTL_MS: u64 = 2_000;
+/// The clock-skew bound for every [`new_shard_and_model`] pair: inside the
+/// roughly 32-second reach of a remote op's `i16` wall-clock offset, so a
+/// fuzz run sends records both inside and past it.
+pub const MAX_CLOCK_SKEW_MS: u64 = 20_000;
 /// The manual clock's starting value, an arbitrary epoch-ms baseline.
 pub const START_CLOCK_MS: u64 = 1_000_000;
 
@@ -143,10 +147,14 @@ impl Model {
     }
 
     /// Mirrors the paired shard's `observe_remote`: folds a remote version
-    /// into [`Model::hlc_clock`] so a later stamp stays causally after it.
-    fn observe_remote(&mut self, remote: Hlc) {
+    /// into [`Model::hlc_clock`] so a later stamp stays causally after it,
+    /// or refuses one stamped more than [`MAX_CLOCK_SKEW_MS`] ahead and
+    /// returns `false`, leaving the clock alone, as the shard does.
+    fn observe_remote(&mut self, remote: Hlc) -> bool {
         let now = self.now_ms();
-        self.hlc_clock.observe(now, remote);
+        self.hlc_clock
+            .observe_bounded(now, remote, MAX_CLOCK_SKEW_MS)
+            .is_some()
     }
 
     /// The versioned-apply core: the newer [`Hlc`] wins, an equal version
@@ -381,6 +389,7 @@ pub fn new_shard_and_model(name: &str, node: u64) -> (Shard<u8, u8>, Model) {
     )
     .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
     .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS))
+    .with_max_clock_skew(Some(Duration::from_millis(MAX_CLOCK_SKEW_MS)))
     .with_clock(model.clock_fn());
     (shard, model)
 }
@@ -420,6 +429,7 @@ pub fn new_shard_and_model_with_ownership(
     )
     .with_tombstone_ttl(Duration::from_millis(TOMBSTONE_TTL_MS))
     .with_tombstone_max_ttl(Duration::from_millis(TOMBSTONE_MAX_TTL_MS))
+    .with_max_clock_skew(Some(Duration::from_millis(MAX_CLOCK_SKEW_MS)))
     .with_clock(model.clock_fn())
     .with_ownership(tracker, residency);
     (shard, model)
@@ -441,7 +451,9 @@ pub fn remote_wire_record(record: &RemoteRecord, now_ms: u64) -> WireRecord {
 /// it exactly as [`Shard::apply`]'s default resolver would.
 fn apply_remote_to_model(model: &mut Model, record: &RemoteRecord, now_ms: u64) {
     let ver = remote_hlc(now_ms, record.wall_ms_offset, record.logical, record.node);
-    model.observe_remote(ver);
+    if !model.observe_remote(ver) {
+        return;
+    }
     match record.value {
         Some(v) => model.apply(
             record.key,
@@ -515,8 +527,9 @@ fn apply_op(op: &Op, shard: &Shard<u8, u8>, model: &mut Model) {
             let now = model.now_ms();
             let ver = remote_hlc(now, *wall_ms_offset, *logical, *node);
             futures::executor::block_on(ShardOps::invalidate(shard, key_bytes(*key), ver));
-            model.observe_remote(ver);
-            model.invalidate(*key, ver);
+            if model.observe_remote(ver) {
+                model.invalidate(*key, ver);
+            }
         }
         Op::Gc { any_member_absent } => {
             futures::executor::block_on(ShardOps::gc_tombstones(shard, *any_member_absent));

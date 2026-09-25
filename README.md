@@ -489,6 +489,8 @@ fan-out backlog room under `ClusterConfig::fan_out_backlog_capacity` ran out
 its `ClusterConfig::fan_out_wait_timeout` and proceeded over capacity anyway
 rather than ever dropping the write, and `sundog_fan_out_backlog{cache}`, a
 cache's current not-yet-fanned-out backlog length,
+`sundog_clock_skew_rejected_total{cache}`, records refused for a stamp
+further ahead of this node's clock than `ClusterConfig::max_clock_skew`,
 `sundog_live_peers`, `sundog_open_caches`, `sundog_ae_sketch_total{cache,
 outcome}`, and `sundog_ae_parts_total{cache, outcome}`. The first of that pair
 tags anti-entropy's IBLT-sketch reconciliation on large buckets, where

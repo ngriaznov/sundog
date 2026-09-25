@@ -36,6 +36,7 @@ addresses once it forms, under `cluster formed`.
 | `sundog_ae_sketch_total{cache, outcome}` | sketch reconciliations of large buckets, `decoded` or `fallback` |
 | `sundog_ae_parts_total{cache, outcome}` | part-level reconciliations, `listing`, `sketch` or `fallback` |
 | `sundog_state_transfer_records_total{cache}` | records a joining node pulled from its donor |
+| `sundog_clock_skew_rejected_total{cache}` | records refused for a stamp further ahead of this node's clock than `max_clock_skew` |
 
 ### The cluster
 
@@ -141,6 +142,15 @@ in `sundog_live_peers`. Flapping under jitter calls for a higher
 whether a node's `sundog_owned_buckets` dropped to 0 after a restart.
 `sundog_stale_view_total` rising briefly during a membership change is
 normal; rising steadily means gossip is not converging.
+
+### Records are refused for clock skew
+
+`sundog_clock_skew_rejected_total` rises, and the node logs one warning
+naming the writer and how far ahead its stamp was. One node's clock runs
+fast, or this node's runs slow: compare each host's time against NTP. A
+refused write stays on the node that made it until the other clocks reach
+its stamp. A node that logs that its clock is behind its own last write
+stamp had its system clock stepped back; its writes keep their order.
 
 ### A spill tier drops evictions
 
