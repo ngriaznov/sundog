@@ -167,39 +167,6 @@ raw.
 **Trigger:** a deployment whose values are text or structured payloads and
 whose RAM is bound by them.
 
-## Merge resolvers
-
-`ConflictResolver::merge`, `Cache::merge`, the coalesce window, writer
-retirement and the `sundog::crdt` reference types ship. What is still open:
-
-- **Redundant pulls at a partial conflict fraction.** A key one side's pull
-  already converged can still mismatch the other side's sketch later in the
-  same repair, costing a second pull for content anti-entropy already
-  settled. At `conflict_fraction=0.5` and 20,000 keys this costs `merged`
-  more total bytes than `decomposed` despite an equal round count; the
-  per-key convergence argument bounds rounds for one divergent key, not
-  bytes for a whole partition's mix of converged and still-diverging keys.
-  Needs root-causing before the exchange's byte cost can be trusted at every
-  conflict mix. Separately, the partition-heal sim still runs at a longer,
-  race-free anti-entropy tick than production's 200ms default
-  (`HEAL_AE_INTERVAL_MS` in `sundog/tests/sim.rs`); a production-cadence
-  variant is still needed to confirm the round-count result holds there
-  too, not only under this harness's generous timing margin.
-- **No CRDT resolver ships for a map or a register**, only a counter and a
-  set; a user needing either writes their own `ConflictResolver` against the
-  same `Merged` contract, or a `MergeResolver<V, F>` generic adapter over an
-  arbitrary join-semilattice `V` would remove the boilerplate both reference
-  resolvers currently duplicate.
-- **A resolver's bytes that fail to decode are rejected silently.** There is
-  no dedicated counter for this path, so it is observable only as an absent
-  write.
-- **No metric for a coalesced fold.** `Cache::merge`'s pending-fold count and
-  flush cadence are observable today only through `Cache::events()` and
-  `entry_count`, not a dedicated counter.
-
-**Trigger:** none yet seen in a real deployment; each is a known limitation
-of the mechanism as it stands, not a scheduled fix.
-
 ## Distribution mode
 
 `Mode::Distributed { owners }` ships. What is still open:
@@ -321,4 +288,4 @@ different system. The stance is a refusal: anyone who needs a lease needs
 etcd or a database row, and sundog stays a cache.
 
 Coordinator-free rate limiting and counters are a different question: they
-are CRDTs, and the merge resolvers above cover them.
+are CRDTs, and `sundog::crdt`'s merge resolvers cover them.
