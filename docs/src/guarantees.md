@@ -89,8 +89,8 @@ TTL is its bound on staleness. Set one on every `Invalidation` cache.
 
 A `Distributed` cache has no quorum. During a partition each side computes
 its own owners and accepts writes, and the two sides settle by version
-when it heals. With two owners, both owners of one bucket failing inside
-one rebalance window lose that bucket; set `owners` to 3 or more where
+when it heals. With two owners, both owners of one part failing inside
+one rebalance window lose that part; set `owners` to 3 or more where
 that matters.
 
 ## What sundog does not promise

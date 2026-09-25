@@ -122,5 +122,5 @@ pub use cluster::sketch::{Decoded, Elem, Iblt, Undecodable};
 #[cfg(feature = "sim")]
 #[doc(hidden)]
 pub use ownership::{
-    OwnershipTracker, OwnershipView, ResidencySet, eligible_owners, ownership_diff,
+    Granularity, OwnershipTracker, OwnershipView, ResidencySet, eligible_owners, ownership_diff,
 };

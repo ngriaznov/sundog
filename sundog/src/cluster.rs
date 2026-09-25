@@ -48,13 +48,13 @@ use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
-    AeServeOutcome, FetchServe, InboundMsg, Mesh, OutFrame, RequestHandler, batch_forward,
+    AeServeOutcome, FetchServe, InboundMsg, Mesh, OutFrame, RequestHandler, StServe, batch_forward,
 };
 use crate::node::{NodeId, NodeName};
-use crate::ownership::OwnershipView;
+use crate::ownership::{Granularity, OwnershipView, parts_of_wire_id};
 use crate::store::{
-    BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, Shard, ShardOps,
-    bucket_of, chunk_records_for_snapshot,
+    BucketDigest, BucketLen, BucketPart, BucketPartDigests, KeyVersion, Mode, PartId, Shard,
+    ShardOps, chunk_records_for_snapshot,
 };
 use crate::wire::{self, Msg, WireRecord};
 
@@ -962,16 +962,16 @@ impl RequestHandler for ClusterRequestHandler {
             let Some(local_hash) = shard.ownership_view_hash() else {
                 return FetchServe::Unavailable;
             };
-            let bucket = bucket_of(&key);
-            // An unverified bucket (warm-reloaded, not yet checked against
+            let part = PartId::of_key(&key);
+            // An unverified part (warm-reloaded, not yet checked against
             // a live co-owner) answers Unavailable even on a hit: it may
             // hold a record a co-owner deleted during this node's downtime.
-            if shard.is_unverified_bucket(bucket) {
+            if shard.is_unverified_part(part) {
                 return FetchServe::Unavailable;
             }
             // A held record is an answer whatever the two views say: it is
             // what a local `get` here would return. Only a miss depends on
-            // this node being a current, warm owner of the bucket.
+            // this node being a current, warm owner of the part.
             if let Some(rec) = shard.records_for(vec![key]).await.into_iter().next() {
                 return FetchServe::Found(Some(rec));
             }
@@ -980,7 +980,7 @@ impl RequestHandler for ClusterRequestHandler {
                     responder_view_hash: local_hash,
                 };
             }
-            if shard.is_cold_bucket(bucket) {
+            if shard.is_cold_part(part) {
                 // Owned but not yet pulled: a miss here is not an answer.
                 return FetchServe::Unavailable;
             }
@@ -994,23 +994,74 @@ impl RequestHandler for ClusterRequestHandler {
         view_hash: u64,
         buckets: Vec<BucketDigest>,
     ) -> BoxFuture<'_, AeServeOutcome> {
-        // The requester's own bucket list only matters once its epoch is
-        // confirmed current; the mismatch classification against it happens
-        // one layer up, in `conn::serve_ae_digest_scoped`.
-        let _ = buckets;
+        // The requester's ids only matter once its epoch is confirmed
+        // current; the mismatch classification against them happens one
+        // layer up, in `conn::serve_ae_digest_scoped`. At a part-granular
+        // view they name parts, and only their own digests are read.
         Box::pin(async move {
             let Some(shard) = self.lookup(&cache) else {
                 return AeServeOutcome::Unavailable;
             };
-            let Some(local_hash) = shard.ownership_view_hash() else {
+            let Some(view) = shard.ownership_view() else {
                 return AeServeOutcome::Unavailable;
             };
-            if local_hash != view_hash {
+            if view.view_hash() != view_hash {
                 return AeServeOutcome::Stale {
-                    responder_view_hash: local_hash,
+                    responder_view_hash: view.view_hash(),
                 };
             }
-            AeServeOutcome::Digests(shard.digests().await)
+            match view.granularity() {
+                Granularity::Bucket => AeServeOutcome::Digests(shard.digests().await),
+                Granularity::Part => {
+                    let parts: Vec<PartId> = buckets
+                        .iter()
+                        .map(|bd| PartId::from_raw(bd.bucket))
+                        .collect();
+                    AeServeOutcome::PartDigests(part_digests_of(shard.as_ref(), &parts).await)
+                }
+            }
+        })
+    }
+
+    fn st_serve(&self, cache: SmolStr, ids: Vec<u16>, view_hash: u64) -> BoxFuture<'_, StServe> {
+        Box::pin(async move {
+            let view = self.lookup(&cache).and_then(|shard| {
+                let view = shard.ownership_view()?;
+                Some((shard, view))
+            });
+            let Some((shard, view)) = view else {
+                return StServe::Stale {
+                    responder_view_hash: 0,
+                };
+            };
+            if view.view_hash() != view_hash {
+                return StServe::Stale {
+                    responder_view_hash: view.view_hash(),
+                };
+            }
+            let granularity = view.granularity();
+            if ids
+                .iter()
+                .flat_map(|&id| parts_of_wire_id(granularity, id))
+                .any(|part| shard.is_cold_part(part))
+            {
+                return StServe::Cold;
+            }
+            let parts = ids
+                .iter()
+                .map(|&id| parts_of_wire_id(granularity, id).count() as u64)
+                .sum();
+            let order = serve_order(granularity, ids);
+            StServe::Stream {
+                chunks: id_chunks(
+                    shard,
+                    granularity,
+                    order.clone(),
+                    self.rebalance_chunk_bytes,
+                ),
+                order,
+                parts,
+            }
         })
     }
 
@@ -1024,8 +1075,13 @@ impl RequestHandler for ClusterRequestHandler {
 
     fn st_buckets_cold(&self, cache: SmolStr, buckets: Vec<u16>) -> BoxFuture<'_, bool> {
         Box::pin(async move {
-            self.lookup(&cache)
-                .is_some_and(|shard| buckets.iter().any(|&bucket| shard.is_cold_bucket(bucket)))
+            self.lookup(&cache).is_some_and(|shard| {
+                let granularity = current_granularity(shard.as_ref());
+                buckets
+                    .iter()
+                    .flat_map(|&id| parts_of_wire_id(granularity, id))
+                    .any(|part| shard.is_cold_part(part))
+            })
         })
     }
 
@@ -1037,34 +1093,157 @@ impl RequestHandler for ClusterRequestHandler {
         let Some(shard) = self.lookup(&cache) else {
             return stream::empty().boxed();
         };
-        let chunk_bytes = self.rebalance_chunk_bytes;
-        // One `rebalance_chunk_bytes` sub-batch resident at a time, not a
-        // whole bucket's records; `chunk_records_for_snapshot` still splits
-        // each sub-batch on the wire-frame cap, so `MAX_FRAME` stays the
-        // hard ceiling regardless of this setting.
-        Box::pin(stream::iter(buckets).flat_map(move |bucket| {
+        let granularity = current_granularity(shard.as_ref());
+        let order = serve_order(granularity, buckets);
+        id_chunks(shard, granularity, order, self.rebalance_chunk_bytes)
+    }
+}
+
+/// The order a donor streams `ids` in: bucket by bucket, each bucket's parts
+/// together, so one entries read per bucket serves every requested part of
+/// it. Bucket ids already are that order once sorted.
+fn serve_order(granularity: Granularity, ids: Vec<u16>) -> Vec<u16> {
+    let mut ids = ids;
+    match granularity {
+        Granularity::Bucket => ids.sort_unstable(),
+        Granularity::Part => ids.sort_unstable_by_key(|&id| {
+            let part = PartId::from_raw(id);
+            (part.bucket(), part.part())
+        }),
+    }
+    ids.dedup();
+    ids
+}
+
+/// The granularity `shard`'s current view reads wire ids at: `Bucket` for a
+/// shard with no view.
+fn current_granularity(shard: &dyn ShardOps) -> Granularity {
+    shard
+        .ownership_view()
+        .map_or(Granularity::Bucket, |view| view.granularity())
+}
+
+/// Each of `parts`' own digest from `shard`, keyed by its raw id: one
+/// residency-gated part-digest read per bucket the parts touch, so a part
+/// this shard does not hold reads as empty.
+async fn part_digests_of(shard: &dyn ShardOps, parts: &[PartId]) -> Vec<BucketDigest> {
+    let mut buckets: Vec<u16> = parts.iter().map(|part| part.bucket()).collect();
+    buckets.sort_unstable();
+    buckets.dedup();
+    let by_bucket: HashMap<u16, Vec<u64>> = shard
+        .part_digests(buckets)
+        .await
+        .into_iter()
+        .map(|bpd| (bpd.bucket, bpd.digests))
+        .collect();
+    parts
+        .iter()
+        .map(|part| BucketDigest {
+            bucket: part.raw(),
+            digest: by_bucket
+                .get(&part.bucket())
+                .and_then(|digests| digests.get(usize::from(part.part())))
+                .copied()
+                .unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Groups `ids`, already in [`serve_order`], into one run per bucket: a
+/// bucket id alone, or every requested part of one bucket.
+fn bucket_runs(granularity: Granularity, ids: Vec<u16>) -> Vec<Vec<u16>> {
+    let mut runs: Vec<Vec<u16>> = Vec::new();
+    for id in ids {
+        let bucket = match granularity {
+            Granularity::Bucket => id,
+            Granularity::Part => PartId::from_raw(id).bucket(),
+        };
+        match runs.last_mut() {
+            Some(run)
+                if granularity == Granularity::Part
+                    && run
+                        .first()
+                        .is_some_and(|&first| PartId::from_raw(first).bucket() == bucket) =>
+            {
+                run.push(id);
+            }
+            _ => runs.push(vec![id]),
+        }
+    }
+    runs
+}
+
+/// Streams each of `ids`' records in `rebalance_chunk_bytes` sub-batches,
+/// tagged with the id, the ids naming buckets or parts as `granularity`
+/// says and arriving in [`serve_order`]. One entries read per bucket
+/// serves every requested id in it, and an id with nothing to send yields
+/// no chunk. One sub-batch is resident at a time, not a whole bucket's
+/// records; `chunk_records_for_snapshot` still splits each sub-batch on the
+/// wire-frame cap, so `MAX_FRAME` stays the hard ceiling regardless of
+/// this setting.
+fn id_chunks(
+    shard: Arc<dyn ShardOps>,
+    granularity: Granularity,
+    ids: Vec<u16>,
+    chunk_bytes: u64,
+) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
+    Box::pin(
+        stream::iter(bucket_runs(granularity, ids)).flat_map(move |run| {
             let keys_shard = Arc::clone(&shard);
             let fetch_shard = Arc::clone(&shard);
             let keys_fut = async move {
-                let entries = keys_shard.entries_for_buckets(vec![bucket]).await;
-                let keys: Vec<Bytes> = entries
+                let keyed: Vec<(u16, Vec<Bytes>)> = match granularity {
+                    Granularity::Bucket => keys_shard
+                        .entries_for_buckets(run)
+                        .await
+                        .into_iter()
+                        .map(|(bucket, entries)| {
+                            (bucket, entries.into_iter().map(|kv| kv.key).collect())
+                        })
+                        .collect(),
+                    Granularity::Part => keys_shard
+                        .entries_for_parts(
+                            run.iter()
+                                .map(|&id| PartId::from_raw(id).bucket_part())
+                                .collect(),
+                        )
+                        .await
+                        .into_iter()
+                        .map(|(bp, entries)| {
+                            (
+                                PartId::from(bp).raw(),
+                                entries.into_iter().map(|kv| kv.key).collect(),
+                            )
+                        })
+                        .collect(),
+                };
+                keyed
                     .into_iter()
-                    .flat_map(|(_, entries)| entries.into_iter().map(|kv| kv.key))
-                    .collect();
-                st_bucket_key_sub_batches(keys, chunk_bytes)
+                    .filter(|(_, keys)| !keys.is_empty())
+                    .flat_map(|(id, keys)| {
+                        st_bucket_key_sub_batches(keys, chunk_bytes)
+                            .into_iter()
+                            .map(move |batch| (id, batch))
+                    })
+                    .collect::<Vec<(u16, Vec<Bytes>)>>()
             };
             stream::once(keys_fut)
                 .flat_map(move |sub_batches| {
                     let fetch_shard = Arc::clone(&fetch_shard);
-                    stream::iter(sub_batches).then(move |sub_batch| {
+                    stream::iter(sub_batches).then(move |(id, sub_batch)| {
                         let fetch_shard = Arc::clone(&fetch_shard);
-                        async move { fetch_shard.records_for(sub_batch).await }
+                        async move { (id, fetch_shard.records_for(sub_batch).await) }
                     })
                 })
-                .flat_map(|recs| stream::iter(chunk_records_for_snapshot(recs)))
-                .map(move |chunk| (bucket, chunk))
-        }))
-    }
+                .flat_map(|(id, recs)| {
+                    stream::iter(
+                        chunk_records_for_snapshot(recs)
+                            .into_iter()
+                            .map(move |chunk| (id, chunk)),
+                    )
+                })
+        }),
+    )
 }
 
 fn lookup_shard(shards: &ShardRegistry, cache: &SmolStr) -> Option<Arc<dyn ShardOps>> {
@@ -4187,7 +4366,7 @@ mod tests {
 
         // b and c take a into their views once it advertises the cache.
         cluster_a.advertise_cache_mode(&name, Mode::Distributed { owners });
-        let three = Arc::new(OwnershipView::compute(
+        let three = Arc::new(OwnershipView::compute_at(
             cluster_a.node_id(),
             vec![
                 cluster_a.node_id(),
@@ -4195,6 +4374,7 @@ mod tests {
                 cluster_c.node_id(),
             ],
             owners,
+            Granularity::Part,
         ));
         wait_until(
             Duration::from_secs(10),
@@ -4363,6 +4543,8 @@ mod tests {
         let other_key = (2..1_000u32)
             .find(|k| bucket_of_u32(*k) != bucket_of_u32(1))
             .expect("a key in another bucket is found within a generous scan range");
+        let part_one = part_of_u32(1);
+        let part_other = part_of_u32(other_key);
         cache
             .insert(other_key, "other".to_string())
             .await
@@ -4409,15 +4591,32 @@ mod tests {
             FetchServe::Found(None)
         ));
 
-        let AeServeOutcome::Digests(digests) = handler
-            .ae_digest_scoped(name.clone(), view_hash, Vec::new())
+        // Every eligible node speaks part ownership, so the view is
+        // part-granular and the requester's ids name parts.
+        let requested = vec![
+            BucketDigest {
+                bucket: part_one.raw(),
+                digest: 0,
+            },
+            BucketDigest {
+                bucket: part_other.raw(),
+                digest: 0,
+            },
+        ];
+        let AeServeOutcome::PartDigests(digests) = handler
+            .ae_digest_scoped(name.clone(), view_hash, requested)
             .await
         else {
-            panic!("expected the sole owner's own digests when the view hash matches");
+            panic!("expected the sole owner's own part digests when the view hash matches");
         };
+        assert_eq!(
+            digests.iter().map(|bd| bd.bucket).collect::<Vec<_>>(),
+            vec![part_one.raw(), part_other.raw()],
+            "one digest per requested part, in request order"
+        );
         assert!(
-            !digests.is_empty(),
-            "the sole owner reports digests for every bucket it owns"
+            digests.iter().all(|bd| bd.digest != 0),
+            "each requested part holds a record, so its digest is nonzero"
         );
         assert!(matches!(
             handler
@@ -4429,23 +4628,47 @@ mod tests {
         assert!(handler.st_buckets_available(name.clone(), view_hash).await);
         assert!(
             !handler
-                .st_buckets_cold(name.clone(), vec![bucket_of_u32(1)])
+                .st_buckets_cold(name.clone(), vec![part_one.raw()])
                 .await,
-            "a warm owner is a source for its bucket"
+            "a warm owner is a source for its part"
         );
+        assert!(matches!(
+            handler
+                .st_serve(name.clone(), vec![part_one.raw()], view_hash.wrapping_add(1))
+                .await,
+            StServe::Stale { responder_view_hash } if responder_view_hash == view_hash
+        ));
+        let StServe::Stream {
+            mut chunks, parts, ..
+        } = handler
+            .st_serve(
+                name.clone(),
+                vec![part_one.raw(), part_other.raw()],
+                view_hash,
+            )
+            .await
+        else {
+            panic!("a warm owner at the requester's view hash donates");
+        };
+        assert_eq!(parts, 2, "two part ids cover two parts");
+        let mut served: Vec<u16> = Vec::new();
+        while let Some((id, _)) = chunks.next().await {
+            served.push(id);
+        }
+        assert_eq!(served, vec![part_one.raw(), part_other.raw()]);
         assert!(
             !handler
                 .st_buckets_available(name.clone(), view_hash.wrapping_add(1))
                 .await
         );
 
-        let owned_bucket = bucket_of_u32(1);
-        let mut chunks = handler.st_bucket_chunks(name.clone(), vec![owned_bucket]);
+        let owned_part = part_one.raw();
+        let mut chunks = handler.st_bucket_chunks(name.clone(), vec![owned_part]);
         let mut got_key = false;
-        while let Some((bucket, chunk)) = chunks.next().await {
+        while let Some((id, chunk)) = chunks.next().await {
             assert_eq!(
-                bucket, owned_bucket,
-                "every chunk is tagged with the requested bucket"
+                id, owned_part,
+                "every chunk is tagged with the requested part"
             );
             if chunk.iter().any(|r| r.key == key_one) {
                 got_key = true;
@@ -4453,28 +4676,29 @@ mod tests {
         }
         assert!(
             got_key,
-            "bucket_chunks streams the requested owned bucket's contents"
+            "bucket_chunks streams the requested owned part's contents"
         );
 
-        // A multi-bucket pull streams one bucket at a time, in request
-        // order, each chunk tagged with its owning bucket.
+        // A multi-part pull streams one part at a time, bucket by bucket
+        // whatever the request order, each chunk tagged with its part.
         let key_other = Bytes::from(postcard::to_stdvec(&other_key).expect("test key encodes"));
-        let mut chunks =
-            handler.st_bucket_chunks(name, vec![bucket_of_u32(other_key), owned_bucket]);
+        let mut chunks = handler.st_bucket_chunks(name, vec![part_other.raw(), owned_part]);
         let mut order: Vec<Bytes> = Vec::new();
-        while let Some((bucket, chunk)) = chunks.next().await {
+        while let Some((id, chunk)) = chunks.next().await {
             assert!(
-                chunk
-                    .iter()
-                    .all(|r| crate::store::bucket_of(&r.key) == bucket),
-                "a chunk never spans two buckets, and its tag matches its records"
+                chunk.iter().all(|r| PartId::of_key(&r.key).raw() == id),
+                "a chunk never spans two parts, and its tag matches its records"
             );
             order.extend(chunk.into_iter().map(|r| r.key));
         }
+        let expected = if part_one.bucket() < part_other.bucket() {
+            vec![key_one, key_other]
+        } else {
+            vec![key_other, key_one]
+        };
         assert_eq!(
-            order,
-            vec![key_other, key_one],
-            "buckets stream in request order, one at a time"
+            order, expected,
+            "parts stream in bucket order, one at a time"
         );
 
         cluster.shutdown().await;
@@ -4536,9 +4760,9 @@ mod tests {
             .ownership_view_hash(name.clone())
             .expect("a registered distributed cache reports a view hash");
 
-        let bucket = bucket_of(&key_bytes);
-        residency.mark_cold(&[bucket]);
-        residency.mark_unverified(&[bucket]);
+        let part = PartId::of_key(&key_bytes);
+        residency.mark_cold(&[part]);
+        residency.mark_unverified(&[part]);
 
         assert!(
             matches!(
@@ -4550,8 +4774,8 @@ mod tests {
             "a hit in an unverified bucket answers Unavailable, never the record itself"
         );
 
-        residency.clear_cold(&[bucket]);
-        residency.clear_unverified(&[bucket]);
+        residency.clear_cold(&[part]);
+        residency.clear_unverified(&[part]);
         let FetchServe::Found(Some(rec)) = handler
             .fetch(name.clone(), key_bytes.clone(), view_hash)
             .await
@@ -4559,6 +4783,106 @@ mod tests {
             panic!("expected the record again once the bucket is no longer unverified");
         };
         assert_eq!(rec.key, key_bytes);
+    }
+
+    /// `st_serve` reads the requester's ids at the matching view's
+    /// granularity for the cold check too: a cold part declines the pull,
+    /// a warm one in the same bucket does not.
+    #[tokio::test]
+    async fn cluster_request_handler_st_serve_declines_a_pull_naming_a_cold_part() {
+        let name = SmolStr::new("prices");
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let node = NodeId::from(1u64);
+        let (tracker, _tx) =
+            crate::ownership::OwnershipTracker::seed(node, &[], &HashMap::new(), &name, owners);
+        let view = tracker.current();
+        assert_eq!(
+            view.granularity(),
+            Granularity::Part,
+            "a lone current node ranks parts"
+        );
+        let residency = Arc::new(crate::ownership::ResidencySet::new());
+        let shard_ops: Arc<dyn ShardOps> = Arc::new(
+            Shard::<u32, String>::new(
+                name.clone(),
+                Mode::Distributed { owners },
+                node,
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_ownership(tracker, Arc::clone(&residency)),
+        );
+        let shards: ShardRegistry =
+            Arc::new(RwLock::new(HashMap::from([(name.clone(), shard_ops)])));
+        let handler = ClusterRequestHandler {
+            shards,
+            warmth: Arc::new(Warmth::default()),
+            ae_part_min_bucket: ClusterConfig::default().ae_part_min_bucket,
+            ae_sketch_min_bucket: ClusterConfig::default().ae_sketch_min_bucket,
+            ae_sketch_cells: ClusterConfig::default().ae_sketch_cells,
+            rebalance_chunk_bytes: ClusterConfig::default().rebalance_chunk_bytes_value(),
+        };
+        let cold = PartId::new(9, 1);
+        let warm = PartId::new(9, 2);
+        residency.mark_cold(&[cold]);
+        assert!(matches!(
+            handler
+                .st_serve(name.clone(), vec![warm.raw(), cold.raw()], view.view_hash())
+                .await,
+            StServe::Cold
+        ));
+        let StServe::Stream { order, parts, .. } = handler
+            .st_serve(name.clone(), vec![warm.raw()], view.view_hash())
+            .await
+        else {
+            panic!("a warm part donates");
+        };
+        assert_eq!((order, parts), (vec![warm.raw()], 1));
+        assert!(matches!(
+            handler
+                .st_serve(SmolStr::new("unknown"), vec![warm.raw()], view.view_hash())
+                .await,
+            StServe::Stale {
+                responder_view_hash: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_order_sorts_bucket_ids_and_groups_part_ids_by_bucket() {
+        assert_eq!(serve_order(Granularity::Bucket, vec![9, 3, 9]), vec![3, 9]);
+        let (a, b, c) = (PartId::new(5, 2), PartId::new(3, 9), PartId::new(5, 0));
+        assert_eq!(
+            serve_order(Granularity::Part, vec![a.raw(), b.raw(), c.raw(), a.raw()]),
+            vec![b.raw(), c.raw(), a.raw()],
+            "bucket 3 first, then bucket 5's parts in part order, each once"
+        );
+    }
+
+    #[test]
+    fn bucket_runs_groups_consecutive_part_ids_of_one_bucket() {
+        assert_eq!(
+            bucket_runs(Granularity::Bucket, vec![3, 9]),
+            vec![vec![3], vec![9]],
+            "a bucket id is a run of its own"
+        );
+        let ids = serve_order(
+            Granularity::Part,
+            vec![
+                PartId::new(5, 2).raw(),
+                PartId::new(3, 9).raw(),
+                PartId::new(5, 0).raw(),
+            ],
+        );
+        assert_eq!(
+            bucket_runs(Granularity::Part, ids),
+            vec![
+                vec![PartId::new(3, 9).raw()],
+                vec![PartId::new(5, 0).raw(), PartId::new(5, 2).raw()],
+            ]
+        );
+        assert!(bucket_runs(Granularity::Part, Vec::new()).is_empty());
     }
 
     #[test]
@@ -4604,6 +4928,7 @@ mod tests {
     /// `close_spill` panics if called, since that would be a test bug.
     struct RecordingShard {
         entries: Vec<(u16, Vec<KeyVersion>)>,
+        held: Vec<u16>,
         records: HashMap<Bytes, WireRecord>,
         records_for_calls: Mutex<Vec<Vec<Bytes>>>,
         close_spill_calls: AtomicUsize,
@@ -4685,6 +5010,33 @@ mod tests {
         fn close_spill(&self) {
             self.close_spill_calls.fetch_add(1, Ordering::Relaxed);
         }
+
+        fn held_buckets(&self) -> BoxFuture<'_, Vec<u16>> {
+            let held = self.held.clone();
+            Box::pin(async move { held })
+        }
+    }
+
+    /// `ShardOps`' part-granular defaults, on a stub that implements only
+    /// the bucket forms: held parts are every part of each held bucket,
+    /// nothing releases or reads cold or unverified, and a stub with no
+    /// view has no scoped digests.
+    #[tokio::test]
+    async fn shard_ops_part_defaults_follow_the_bucket_forms() {
+        let stub = RecordingShard {
+            entries: Vec::new(),
+            held: vec![3, 900],
+            records: HashMap::new(),
+            records_for_calls: Mutex::new(Vec::new()),
+            close_spill_calls: AtomicUsize::new(0),
+        };
+        let held = stub.held_parts().await;
+        assert_eq!(held.len(), 2 * crate::store::PART_COUNT);
+        assert!(held.iter().all(|part| [3, 900].contains(&part.bucket())));
+        assert_eq!(stub.release_parts(&held).await, 0);
+        assert!(!stub.is_cold_part(held[0]));
+        assert!(!stub.is_unverified_part(held[0]));
+        assert!(stub.ae_scoped_digests_for(NodeId::from(2)).await.is_none());
     }
 
     #[tokio::test]
@@ -4727,6 +5079,7 @@ mod tests {
 
         let recording = Arc::new(RecordingShard {
             entries: vec![(bucket, entries)],
+            held: Vec::new(),
             records,
             records_for_calls: Mutex::new(Vec::new()),
             close_spill_calls: AtomicUsize::new(0),
@@ -4792,6 +5145,7 @@ mod tests {
     async fn close_spill_checkpointed_default_resolves_and_calls_the_sync_close() {
         let recording = Arc::new(RecordingShard {
             entries: Vec::new(),
+            held: Vec::new(),
             records: HashMap::new(),
             records_for_calls: Mutex::new(Vec::new()),
             close_spill_calls: AtomicUsize::new(0),

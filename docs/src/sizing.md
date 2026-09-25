@@ -12,7 +12,7 @@ How many entries a node holds depends on the mode:
 
 A `Distributed` cache of 30 million entries on six nodes with two owners
 holds about 10 million entries per node. After a node leaves, the
-survivors pull its buckets, so size each node for the share it holds with
+survivors pull its parts, so size each node for the share it holds with
 one node gone: 12 million in that example.
 
 ## Bytes per entry

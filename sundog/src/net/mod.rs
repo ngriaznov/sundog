@@ -364,6 +364,10 @@ pub enum AeMismatch {
     /// against its own part digests and requests only the mismatched parts
     /// via [`Mesh::ae_parts`].
     PartDigests(u16, Vec<u64>),
+    /// One mismatched part's listing or sketch: a part-granular view's
+    /// scoped exchange compares single parts, so a responder answers each
+    /// mismatched part directly.
+    Part(AePartReply),
 }
 
 impl AeMismatch {
@@ -374,6 +378,7 @@ impl AeMismatch {
             Self::Bucket(bucket, _) | Self::Sketch(bucket, _) | Self::PartDigests(bucket, _) => {
                 *bucket
             }
+            Self::Part(reply) => reply.bucket(),
         }
     }
 }
@@ -487,10 +492,31 @@ pub(crate) enum FetchServe {
 pub(crate) enum AeServeOutcome {
     /// The responder's own owned-bucket digests, view hashes matching.
     Digests(Vec<BucketDigest>),
+    /// The matching view is part-granular: the requester's ids name parts,
+    /// and these are the responder's digests for the same parts, each
+    /// `bucket` field holding a raw [`crate::store::PartId`].
+    PartDigests(Vec<BucketDigest>),
     /// The responder's own view hash differs from the requester's.
     Stale { responder_view_hash: u64 },
     /// The named cache is not open here, or not a distribution-mode cache.
     Unavailable,
+}
+
+/// A [`RequestHandler`]'s answer to a [`crate::wire::Msg::StBuckets`] pull,
+/// decided against one ownership view.
+pub(crate) enum StServe {
+    /// The responder's own view hash differs from the requester's.
+    Stale { responder_view_hash: u64 },
+    /// The responder owns a requested id but has not pulled it yet.
+    Cold,
+    /// The responder is donating: each requested id's chunks, tagged with
+    /// the id, the order the stream finishes the ids in, and how many parts
+    /// the ids cover. An id with nothing to send yields no chunk.
+    Stream {
+        chunks: BoxStream<'static, (u16, Vec<WireRecord>)>,
+        order: Vec<u16>,
+        parts: u64,
+    },
 }
 
 /// What the net layer needs from the local shard registry to answer
@@ -647,6 +673,33 @@ pub trait RequestHandler: Send + Sync + 'static {
         Box::pin(async { false })
     }
 
+    /// Decides a [`crate::wire::Msg::StBuckets`] pull in one step: the view
+    /// check, the cold check and the chunk stream all read the same view,
+    /// so the ids are read at the granularity the requester sent them at.
+    /// The default composes [`RequestHandler::st_buckets_available`],
+    /// [`RequestHandler::st_buckets_cold`] and
+    /// [`RequestHandler::st_bucket_chunks`], each id standing for a whole
+    /// bucket.
+    #[allow(private_interfaces, reason = "see RequestHandler::fetch's doc comment")]
+    fn st_serve(&self, cache: SmolStr, ids: Vec<u16>, view_hash: u64) -> BoxFuture<'_, StServe> {
+        Box::pin(async move {
+            if !self.st_buckets_available(cache.clone(), view_hash).await {
+                return StServe::Stale {
+                    responder_view_hash: self.ownership_view_hash(cache).unwrap_or(0),
+                };
+            }
+            if self.st_buckets_cold(cache.clone(), ids.clone()).await {
+                return StServe::Cold;
+            }
+            let parts = (ids.len() as u64).saturating_mul(crate::store::PART_COUNT as u64);
+            StServe::Stream {
+                chunks: self.st_bucket_chunks(cache, ids.clone()),
+                order: ids,
+                parts,
+            }
+        })
+    }
+
     /// Streams the reply chunks once
     /// [`RequestHandler::st_buckets_available`] said yes. Default: an
     /// immediately-empty stream, never polled unless the caller ignores the
@@ -794,6 +847,7 @@ impl MeshInner {
         view_hash: u64,
     ) -> HashMap<u16, HashSet<NodeId>> {
         let now = Instant::now();
+        let due: HashSet<u16> = due.iter().copied().collect();
         let mut acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
         for ((c, bucket, owner), (acked_at, acked_view_hash)) in self
             .acked_buckets

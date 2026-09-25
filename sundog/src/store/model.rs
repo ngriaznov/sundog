@@ -624,3 +624,17 @@ pub fn run(ops: &[Op], shard: &Shard<u8, u8>, model: &mut Model) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_of_is_the_part_a_model_key_hashes_into_inside_its_bucket() {
+        for key in [0u8, 1, 7, 200, 255] {
+            let part = part_of(key);
+            assert_eq!(part, PartId::of_key(key_bytes(key).as_ref()));
+            assert_eq!(part.bucket(), bucket_of(key));
+        }
+    }
+}

@@ -37,8 +37,8 @@ use sundog::store::{
 };
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
-    ConflictResolver, Merged, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
-    ownership_diff,
+    ConflictResolver, Granularity, Merged, OwnershipTracker, OwnershipView, RecordView,
+    ResidencySet, Winner, ownership_diff,
 };
 use tokio::sync::watch;
 use turmoil::{Builder, Sim};
@@ -2108,8 +2108,14 @@ fn republish_view(
     residency: &ResidencySet,
     eligible: Vec<NodeId>,
     k: NonZeroU8,
+    granularity: Granularity,
 ) {
-    let new_view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+    let new_view = Arc::new(OwnershipView::compute_at(
+        self_node,
+        eligible,
+        k,
+        granularity,
+    ));
     tx.send_if_modified(|current| {
         if current.view_hash() == new_view.view_hash() {
             return false;
@@ -2133,9 +2139,21 @@ fn republish_view(
 /// crashed, in which case nothing reads its tracker until it bounces back
 /// and this is called again with it included.
 fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
+    republish_all_at(nodes, live, k, Granularity::Bucket);
+}
+
+/// [`republish_all`] at `granularity`.
+fn republish_all_at(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8, granularity: Granularity) {
     for node in nodes {
         if live.contains(&node.node) {
-            republish_view(node.node, &node.tx, &node.residency, live.to_vec(), k);
+            republish_view(
+                node.node,
+                &node.tx,
+                &node.residency,
+                live.to_vec(),
+                k,
+                granularity,
+            );
         }
     }
 }
@@ -2444,11 +2462,23 @@ fn spawn_dist_nodes(
 /// every live node's content equals exactly the surviving set, and every
 /// live node holds only buckets it currently owns.
 #[test]
+fn distributed_rebalance_under_churn() {
+    rebalance_under_churn(Granularity::Bucket);
+}
+
+/// [`distributed_rebalance_under_churn`] with every view ranking parts:
+/// each node owns scattered parts of every bucket, so rebalance, release
+/// and repair all work below bucket level.
+#[test]
+fn distributed_rebalance_under_churn_at_part_granularity() {
+    rebalance_under_churn(Granularity::Part);
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one scenario's full setup, churn schedule, and assertions read best kept together"
 )]
-fn distributed_rebalance_under_churn() {
+fn rebalance_under_churn(granularity: Granularity) {
     const OWNERS: u8 = 2;
     let k = NonZeroU8::new(OWNERS).expect("nonzero");
     let port = 5100;
@@ -2464,7 +2494,7 @@ fn distributed_rebalance_under_churn() {
         .iter()
         .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
         .collect();
-    republish_all(&nodes, &node_ids, k);
+    republish_all_at(&nodes, &node_ids, k, granularity);
 
     // Message loss turns on only once the initial write/remove plans have
     // settled (below), so that churn, the thing this scenario tests, runs
@@ -2566,7 +2596,7 @@ fn distributed_rebalance_under_churn() {
     for &idx in &[2usize, 3usize] {
         let victim = node_ids[idx];
         live.retain(|&n| n != victim);
-        republish_all(&nodes, &live, k);
+        republish_all_at(&nodes, &live, k, granularity);
         sim.crash(nodes[idx].host);
         run_until(&mut sim, steps_for(settle), || {
             dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
@@ -2575,7 +2605,7 @@ fn distributed_rebalance_under_churn() {
 
         sim.bounce(nodes[idx].host);
         live.push(victim);
-        republish_all(&nodes, &live, k);
+        republish_all_at(&nodes, &live, k, granularity);
         run_until(&mut sim, steps_for(settle), || {
             dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
         })

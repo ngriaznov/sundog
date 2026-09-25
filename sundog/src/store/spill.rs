@@ -1348,7 +1348,7 @@ impl SpillTier {
     ///    entry falls the whole tier back cold.
     ///
     /// Past those checks, this replays only the snapshot. Each surviving
-    /// entry is dropped if `owned` disallows its bucket or `expires_at_ms`
+    /// entry is dropped if `owned` disallows its part or `expires_at_ms`
     /// is past `now_ms`, and otherwise installed via
     /// [`SpillSink::install_new`]. The snapshot is deleted on success, so
     /// a second open with no intervening clean close is cold.
@@ -1367,7 +1367,7 @@ impl SpillTier {
         sink: &dyn SpillSink,
         now_ms: u64,
         tombstone_ttl_ms: u64,
-        owned: impl Fn(u16) -> bool,
+        owned: impl Fn(crate::store::PartId) -> bool,
     ) -> io::Result<ReopenOutcome> {
         cfg.validate()
             .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
@@ -1437,7 +1437,7 @@ impl SpillTier {
             reverse_index_by_region,
             used_bytes_by_region,
             records_installed,
-            buckets_installed,
+            parts_installed,
             dropped_unowned,
             dropped_expired,
             refused_present,
@@ -1505,7 +1505,7 @@ impl SpillTier {
             warm: true,
             reason: None,
             records_installed,
-            warm_buckets: buckets_installed,
+            warm_parts: parts_installed,
             entries_read,
             dropped_unowned,
             dropped_expired,
@@ -1531,7 +1531,7 @@ impl SpillTier {
             warm: false,
             reason: Some(reason),
             records_installed: 0,
-            warm_buckets: HashSet::new(),
+            warm_parts: HashSet::new(),
             entries_read,
             dropped_unowned: 0,
             dropped_expired: 0,
@@ -1544,7 +1544,7 @@ impl SpillTier {
 /// [`SpillTier::reopen`]'s outcome: the tier itself, ready to use like
 /// [`SpillTier::open`]'s, alongside whether the warm path was taken and,
 /// when not, [`ReopenOutcome::reason`] naming why. Every count below is
-/// `0` (and `warm_buckets` empty) for a cold fallback.
+/// `0` (and `warm_parts` empty) for a cold fallback.
 pub(crate) struct ReopenOutcome {
     pub(crate) tier: SpillTier,
     /// `true` once every eligibility check passed and every snapshot
@@ -1555,13 +1555,13 @@ pub(crate) struct ReopenOutcome {
     pub(crate) reason: Option<&'static str>,
     /// Records [`SpillSink::install_new`] accepted during a warm replay.
     pub(crate) records_installed: u64,
-    /// Distinct buckets `records_installed` came from, so the caller can
-    /// narrow eager reconciliation to these buckets instead of every
-    /// owned bucket.
-    pub(crate) warm_buckets: HashSet<u16>,
+    /// Distinct parts `records_installed` came from, so the caller can
+    /// narrow eager reconciliation to these parts instead of every owned
+    /// part.
+    pub(crate) warm_parts: HashSet<crate::store::PartId>,
     /// Total entries the snapshot named, before any filter ran.
     pub(crate) entries_read: u64,
-    /// Entries dropped because `owned` no longer allows their bucket.
+    /// Entries dropped because `owned` no longer allows their part.
     pub(crate) dropped_unowned: u64,
     /// Entries dropped because their `expires_at_ms` was already past
     /// `now_ms`.
@@ -1678,14 +1678,14 @@ fn validate_snapshot_entries(
 }
 
 /// [`install_snapshot_entries`]'s result: each region's reverse index and
-/// used-byte total, the overall accepted count and the distinct buckets it
+/// used-byte total, the overall accepted count and the distinct parts it
 /// came from, plus a per-reason breakdown of everything dropped instead.
 struct InstalledRecords {
     reverse_index_by_region: Vec<Vec<(usize, Bytes)>>,
     used_bytes_by_region: Vec<u64>,
     records_installed: u64,
-    buckets_installed: HashSet<u16>,
-    /// Entries dropped because `owned` no longer allows their bucket.
+    parts_installed: HashSet<crate::store::PartId>,
+    /// Entries dropped because `owned` no longer allows their part.
     dropped_unowned: u64,
     /// Entries dropped because their `expires_at_ms` was already past
     /// `now_ms`.
@@ -1697,19 +1697,19 @@ struct InstalledRecords {
 
 /// Installs every validated snapshot entry via [`SpillSink::install_new`],
 /// first dropping one whose `expires_at_ms` is already past `now_ms` or
-/// whose bucket `owned` disallows.
+/// whose part `owned` disallows.
 fn install_snapshot_entries(
     entries: Vec<SnapshotEntry>,
     region_count: u32,
     sink: &dyn SpillSink,
     now_ms: u64,
-    owned: impl Fn(u16) -> bool,
+    owned: impl Fn(crate::store::PartId) -> bool,
 ) -> InstalledRecords {
     let mut reverse_index_by_region: Vec<Vec<(usize, Bytes)>> =
         (0..region_count).map(|_| Vec::new()).collect();
     let mut used_bytes_by_region = vec![0u64; region_count as usize];
     let mut records_installed = 0u64;
-    let mut buckets_installed: HashSet<u16> = HashSet::new();
+    let mut parts_installed: HashSet<crate::store::PartId> = HashSet::new();
     let mut dropped_unowned = 0u64;
     let mut dropped_expired = 0u64;
     let mut refused_present = 0u64;
@@ -1722,13 +1722,13 @@ fn install_snapshot_entries(
             dropped_expired += 1;
             continue;
         }
-        let bucket = crate::store::bucket_of(&entry.key);
-        if !owned(bucket) {
+        let hash = crate::store::engine::hash_key_bytes(&entry.key);
+        let part = crate::store::PartId::from_hash(hash);
+        if !owned(part) {
             dropped_unowned += 1;
             continue;
         }
-        let hash = crate::store::engine::hash_key_bytes(&entry.key);
-        let stripe_idx = usize::from(bucket);
+        let stripe_idx = usize::from(part.bucket());
         if sink.install_new(
             stripe_idx,
             &entry.key,
@@ -1739,7 +1739,7 @@ fn install_snapshot_entries(
             0,
         ) {
             records_installed += 1;
-            buckets_installed.insert(bucket);
+            parts_installed.insert(part);
             let region_idx = entry.loc.region as usize;
             used_bytes_by_region[region_idx] += u64::from(entry.loc.len);
             reverse_index_by_region[region_idx].push((stripe_idx, entry.key));
@@ -1752,7 +1752,7 @@ fn install_snapshot_entries(
         reverse_index_by_region,
         used_bytes_by_region,
         records_installed,
-        buckets_installed,
+        parts_installed,
         dropped_unowned,
         dropped_expired,
         refused_present,
@@ -4337,9 +4337,9 @@ mod tests {
             assert_eq!(outcome.reason, None);
             assert_eq!(outcome.records_installed, 1);
             assert_eq!(
-                outcome.warm_buckets,
-                HashSet::from([crate::store::bucket_of(b"hello")]),
-                "warm_buckets names exactly the one bucket a record was actually replayed for"
+                outcome.warm_parts,
+                HashSet::from([crate::store::PartId::of_key(b"hello")]),
+                "warm_parts names exactly the one part a record was actually replayed for"
             );
             assert_eq!(fresh_sink.install_new_count(), 1);
             let (recovered_ver, loc) = *fresh_sink
@@ -4665,8 +4665,8 @@ mod tests {
                 "every record is filtered out by an owned-bucket predicate that owns nothing"
             );
             assert!(
-                outcome.warm_buckets.is_empty(),
-                "no bucket was actually replayed into, so warm_buckets names none"
+                outcome.warm_parts.is_empty(),
+                "no bucket was actually replayed into, so warm_parts names none"
             );
             assert_eq!(fresh_sink.install_new_count(), 0);
 
@@ -4676,7 +4676,7 @@ mod tests {
         #[test]
         fn reopen_warm_buckets_names_only_the_buckets_a_record_survived_the_owned_filter_for() {
             // Two keys in different buckets; only one passes the owned
-            // predicate, so warm_buckets must name only that one.
+            // predicate, so warm_parts must name only that one.
             let dir = temp_dir("reopen-owned-filter-partial");
             let cfg = SpillConfig::new(&dir, 1 << 20)
                 .region_bytes(4096)
@@ -4693,18 +4693,18 @@ mod tests {
             let region_count = region_count_for(1 << 20, 4096);
             write_snapshot_for_test(&cache_dir, &sink, 4096, region_count, 1_000, None);
 
-            let kept_bucket = crate::store::bucket_of(b"k");
+            let kept_bucket = crate::store::PartId::of_key(b"k");
             let fresh_sink = RecordingSink::default();
-            let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |b| {
-                b == kept_bucket
+            let outcome = SpillTier::reopen(&cfg, "cache-a", &fresh_sink, 1_500, 600_000, |p| {
+                p == kept_bucket
             })
             .expect("reopen against a cleanly closed tier succeeds");
 
             assert!(outcome.warm);
             assert_eq!(
-                outcome.warm_buckets,
+                outcome.warm_parts,
                 HashSet::from([kept_bucket]),
-                "only the owned bucket's key survives the filter and lands in warm_buckets"
+                "only the owned part's key survives the filter and lands in warm_parts"
             );
 
             let _ = fs::remove_dir_all(&dir);

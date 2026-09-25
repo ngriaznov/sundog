@@ -133,8 +133,15 @@ replication and repair running throughout. A container test runs the
 previous release's node against the current one in both directions on
 every change.
 
+A `Distributed` cache ranks whole buckets while any eligible node runs a
+release before part ownership, and switches to ranking each part once the
+last such node leaves. Most parts change owners at that switch, so the
+last step of that upgrade runs one large rebalance: every lost part is
+served through its disown grace and handed to its new owners before it is
+dropped. Take that step outside peak load.
+
 Roll one node at a time. For a `Distributed` cache, wait until
 `Cluster::health()` on the restarted node reports the cache warm, meaning
-its owned buckets have landed, before stopping the next node, so no bucket
+its owned parts have landed, before stopping the next node, so no part
 loses two owners inside one rebalance window. Readiness alone does not
 cover this: it waits only on `Replicated` caches.

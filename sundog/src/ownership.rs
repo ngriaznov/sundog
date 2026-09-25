@@ -742,14 +742,29 @@ pub(crate) async fn refresh_task(
         }
         let peers_snapshot = peers.borrow_and_update().clone();
         let modes_snapshot = modes.borrow_and_update().clone();
-        let view = Arc::new(compute_view(
-            self_node,
-            &peers_snapshot,
-            &modes_snapshot,
-            &cache,
-            k,
-        ));
-        let new_hash = view.view_hash();
+        // The hash alone says whether anything changed; the view itself,
+        // 65,536 rankings at part granularity, is built only when it did,
+        // and off the async workers.
+        let eligible = eligible_owners(self_node, &peers_snapshot, &modes_snapshot, &cache, k);
+        let granularity = ownership_granularity(self_node, &peers_snapshot, &eligible);
+        let new_hash = view_hash_at(&eligible, granularity);
+        if tx.borrow().view_hash() == new_hash {
+            continue;
+        }
+        let view = match granularity {
+            Granularity::Bucket => OwnershipView::compute_at(self_node, eligible, k, granularity),
+            Granularity::Part => {
+                match tokio::task::spawn_blocking(move || {
+                    OwnershipView::compute_at(self_node, eligible, k, granularity)
+                })
+                .await
+                {
+                    Ok(view) => view,
+                    Err(_) => return, // the runtime is shutting down
+                }
+            }
+        };
+        let view = Arc::new(view);
         let published = tx.send_if_modified(|current| {
             if current.view_hash() == new_hash {
                 false
@@ -1107,6 +1122,50 @@ mod tests {
     }
 
     #[test]
+    fn owns_any_in_bucket_is_whether_any_owned_part_lies_in_the_bucket() {
+        let self_node = NodeId::from(1);
+        let eligible: Vec<NodeId> = (1..=6u64).map(NodeId::from).collect();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        for granularity in [Granularity::Bucket, Granularity::Part] {
+            let view = OwnershipView::compute_at(self_node, eligible.clone(), k, granularity);
+            for bucket in 0..u16::try_from(BUCKET_COUNT).expect("fits") {
+                assert_eq!(
+                    view.owns_any_in_bucket(bucket),
+                    PartId::of_bucket(bucket).any(|part| view.owns(part)),
+                    "bucket {bucket} at {granularity:?}"
+                );
+            }
+        }
+        let alone = OwnershipView::compute(self_node, vec![self_node], k);
+        assert!(alone.owns_any_in_bucket(0));
+        assert!(
+            !alone.owns_any_in_bucket(u16::MAX),
+            "a bucket past the space is never owned"
+        );
+    }
+
+    #[test]
+    fn co_owners_are_every_other_owner_of_an_owned_part() {
+        let self_node = NodeId::from(1);
+        let k = NonZeroU8::new(2).expect("nonzero");
+        for granularity in [Granularity::Bucket, Granularity::Part] {
+            let eligible: Vec<NodeId> = (1..=8u64).map(NodeId::from).collect();
+            let view = OwnershipView::compute_at(self_node, eligible, k, granularity);
+            let mut expected: Vec<NodeId> = view
+                .owned_parts()
+                .flat_map(|part| view.owners_of(part).to_vec())
+                .filter(|&node| node != self_node)
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(view.co_owners(), expected.as_slice(), "at {granularity:?}");
+            assert!(!view.co_owners().contains(&self_node));
+        }
+        let alone = OwnershipView::compute(self_node, vec![self_node], k);
+        assert!(alone.co_owners().is_empty(), "a lone node has no co-owner");
+    }
+
+    #[test]
     fn top_by_score_matches_a_full_sort() {
         let eligible: Vec<NodeId> = (1..=40u64).map(NodeId::from).collect();
         let mut top = Vec::new();
@@ -1172,6 +1231,33 @@ mod tests {
             expected_when_all,
             "a lone node has no older peer to wait for"
         );
+    }
+
+    /// `refresh_task` decides whether a view changed from
+    /// [`view_hash_at`] over [`eligible_owners`] at
+    /// [`ownership_granularity`], before building anything: that hash is
+    /// the built view's, at either granularity.
+    #[test]
+    fn a_view_hash_is_known_before_the_view_is_built() {
+        let self_node = NodeId::from(1);
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let cache = SmolStr::new("prices");
+        let mode = Mode::Distributed { owners: k };
+        let modes = modes_with(&[
+            (NodeId::from(2), "prices", mode.clone()),
+            (NodeId::from(3), "prices", mode),
+        ]);
+        let current = wire::PROTOCOL_VERSION;
+        for peers in [
+            vec![peer(2, current), peer(3, current)],
+            vec![peer(2, current), peer(3, wire::PROTOCOL_DISTRIBUTED)],
+        ] {
+            let eligible = eligible_owners(self_node, &peers, &modes, &cache, k);
+            let granularity = ownership_granularity(self_node, &peers, &eligible);
+            let built = compute_view(self_node, &peers, &modes, &cache, k);
+            assert_eq!(built.granularity(), granularity);
+            assert_eq!(view_hash_at(&eligible, granularity), built.view_hash());
+        }
     }
 
     #[test]
@@ -1514,6 +1600,30 @@ mod tests {
             set.is_releasing(p(9)),
             "mark_all_serving touches only the cold and unverified marks"
         );
+    }
+
+    #[test]
+    fn residency_set_releasing_parts_and_releasing_in_bucket_read_the_marks_in_bulk() {
+        let set = ResidencySet::new();
+        assert!(set.releasing_parts().is_empty());
+        assert!(!set.releasing_in_bucket(7));
+        set.mark_releasing(&[PartId::new(7, 3), PartId::new(9, 0)]);
+        let mut releasing = set.releasing_parts();
+        releasing.sort_unstable();
+        assert_eq!(releasing, {
+            let mut expected = vec![PartId::new(7, 3), PartId::new(9, 0)];
+            expected.sort_unstable();
+            expected
+        });
+        assert!(set.releasing_in_bucket(7));
+        assert!(set.releasing_in_bucket(9));
+        assert!(!set.releasing_in_bucket(8));
+        // Past `PART_COUNT` marks the per-bucket check reads the bucket's
+        // own parts instead of scanning every mark; same answers.
+        set.mark_releasing(&PartId::of_bucket(100).collect::<Vec<_>>());
+        assert!(set.releasing_in_bucket(7));
+        assert!(set.releasing_in_bucket(100));
+        assert!(!set.releasing_in_bucket(8));
     }
 
     #[test]

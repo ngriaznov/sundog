@@ -7,6 +7,12 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **`store::PartId`** names one of a distributed cache's 65,536 parts:
+  `PartId::of_key`, `bucket`, `part`, `raw`, and `PartId::all` and
+  `PartId::of_bucket` to walk them. `ShardOps` gains `held_parts`,
+  `release_parts`, `is_cold_part` and `is_unverified_part`, each with a
+  default, alongside the bucket forms it keeps.
+
 - **Clock-skew guard**: `ClusterConfig::max_clock_skew`, one minute by
   default, bounds how far ahead of a node's clock a remote record's
   stamp may be. A record stamped further ahead, whether replicated,
@@ -339,6 +345,36 @@ All notable changes to this project are documented in this file. Format follows
   its own still leaves its landed pull visible on the node that donated.
 
 ### Changed
+
+- **`Mode::Distributed` owns parts, not buckets.** A distributed cache's
+  65,536 parts, the 64 anti-entropy parts of each of the 1,024 buckets, are
+  each ranked on their own by rendezvous hashing. At 100 nodes and two
+  owners the busiest node holds about 8% more than an even share and the
+  lightest about 11% less, where whole buckets left the busiest node about
+  60% over and the lightest about half; a join moves only the parts the
+  joiner takes. Rebalance pulls, the disown-grace
+  hand-off, release, warm reopen and scoped anti-entropy all work part by
+  part, and a part-granular scoped round answers each mismatched part with
+  its listing or sketch directly. The wire protocol is 5, with no new
+  message kinds: under a part-granular view the `u16` ids that
+  `AeDigestScoped` and `StBuckets` carry name parts, and the view hash
+  both sides already compare tells them apart. A node ranks whole buckets
+  while any eligible peer speaks protocol 4, so a mixed cluster keeps the
+  ownership its older members compute. When the last protocol-4 node
+  leaves, every node switches to ranking parts and most parts change
+  owners at once: that switch runs as one large rebalance, every lost part
+  served through its disown grace before it is dropped.
+- **`sundog_rebalance_buckets_total` is now `sundog_rebalance_parts_total`**,
+  counting parts pulled `in`, released `out` or `served`, and
+  `sundog_owned_parts{cache}` reports the parts a node owns.
+  `sundog_owned_buckets{cache}` stays, as owned parts over 64: fractional
+  under part ranking, and still summing to `1024 × owners` across the
+  cluster.
+- **`StBucketDone` frames go out in batches.** A donor flushes a run of
+  finished ids at once and reads the requester's acks between batches, and
+  the requester flushes its acks every 256 or at the next chunk, so a pull
+  of thousands of mostly empty parts costs a few flushes, not one per part.
+  A retried pull asks only for the parts no earlier attempt finished.
 
 - **A stripe's entry array grows by a quarter instead of doubling.** A
   stripe that just outgrew a power of two no longer leaves close to half

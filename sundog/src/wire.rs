@@ -54,7 +54,9 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 ///   [`Msg::FetchDeclined`], [`Msg::AeDigestScoped`], [`Msg::StBuckets`],
 ///   [`Msg::StBucketChunk`], [`Msg::ForwardBatch`], and [`Msg::StaleView`].
 /// - 4: Adds [`Msg::StBucketDone`] and [`Msg::StBucketAck`].
-pub const PROTOCOL_VERSION: u16 = 4;
+/// - 5: Part-level ownership for a `Mode::Distributed` cache: no new
+///   message kinds; see [`PROTOCOL_PART_OWNERSHIP`].
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -1164,6 +1166,14 @@ mod tests {
         assert!(!peer_supports(2, PROTOCOL_ST_BUCKET_DONE_ACK));
         assert!(!peer_supports(1, PROTOCOL_ST_BUCKET_DONE_ACK));
         assert!(peer_supports(4, PROTOCOL_ST_BUCKET_DONE_ACK));
+    }
+
+    #[test]
+    fn part_ownership_needs_protocol_5() {
+        assert!(PROTOCOL_VERSION >= PROTOCOL_PART_OWNERSHIP);
+        assert!(peer_supports(5, PROTOCOL_PART_OWNERSHIP));
+        assert!(!peer_supports(4, PROTOCOL_PART_OWNERSHIP));
+        assert!(!peer_supports(3, PROTOCOL_PART_OWNERSHIP));
     }
 
     #[test]

@@ -38,20 +38,30 @@ fn group_parts_by_donor_set(
     self_node: NodeId,
     parts: Vec<PartId>,
 ) -> Vec<DonorGroup> {
+    // First by the view's own owner slice, borrowed rather than rebuilt per
+    // part, then the few distinct slices merge by donor set: two rankings
+    // that differ only in where self sits name the same donors.
+    let mut by_owners: Vec<(&[NodeId], Vec<PartId>)> = Vec::new();
+    let mut slice_index: HashMap<&[NodeId], usize> = HashMap::new();
+    for part in parts {
+        let owners = view.owners_of(part);
+        match slice_index.get(owners) {
+            Some(&at) => by_owners[at].1.push(part),
+            None => {
+                slice_index.insert(owners, by_owners.len());
+                by_owners.push((owners, vec![part]));
+            }
+        }
+    }
     let mut groups: Vec<DonorGroup> = Vec::new();
     let mut index: HashMap<Vec<NodeId>, usize> = HashMap::new();
-    for part in parts {
-        let donors: Vec<NodeId> = view
-            .owners_of(part)
-            .iter()
-            .copied()
-            .filter(|&n| n != self_node)
-            .collect();
+    for (owners, parts) in by_owners {
+        let donors: Vec<NodeId> = owners.iter().copied().filter(|&n| n != self_node).collect();
         match index.get(&donors) {
-            Some(&at) => groups[at].1.push(part),
+            Some(&at) => groups[at].1.extend(parts),
             None => {
                 index.insert(donors.clone(), groups.len());
-                groups.push((donors, vec![part]));
+                groups.push((donors, parts));
             }
         }
     }
@@ -91,6 +101,11 @@ async fn try_donor_parts(
         .await;
     let cold = matches!(pull, Ok(BucketPull::Cold));
     let requested: PartSet = parts.iter().copied().collect();
+    let parts_in = metrics::counter!(
+        "sundog_rebalance_parts_total",
+        "cache" => cache.to_string(),
+        "direction" => "in"
+    );
     let stream = pull.map(|answer| match answer {
         BucketPull::Stream(stream) => Some(stream),
         BucketPull::Stale | BucketPull::Cold => None,
@@ -113,12 +128,7 @@ async fn try_donor_parts(
                 .filter(|&part| requested.contains(part) && credited.insert(part))
                 .count();
             if fresh > 0 {
-                metrics::counter!(
-                    "sundog_rebalance_parts_total",
-                    "cache" => cache.to_string(),
-                    "direction" => "in"
-                )
-                .increment(u64::try_from(fresh).unwrap_or(u64::MAX));
+                parts_in.increment(u64::try_from(fresh).unwrap_or(u64::MAX));
             }
         })
         .await;
@@ -175,9 +185,14 @@ async fn pull_one_group(
     // Shared across every donor and retry pass, so a part a prior donor
     // already credited is never credited again on a re-send.
     let mut credited: HashSet<PartId> = HashSet::new();
+    let group_len = parts.len();
+    let mut parts = parts;
     loop {
         let mut every_donor_cold = !donors.is_empty();
         for &donor in &donors {
+            // A part an earlier attempt finished is serving already: the
+            // next attempt asks only for the rest.
+            parts.retain(|part| !credited.contains(part));
             let attempt = tokio::time::timeout(
                 per_donor,
                 try_donor_parts(
@@ -217,7 +232,7 @@ async fn pull_one_group(
             );
             if result == DonorResult::Done {
                 residency.mark_serving(&parts);
-                let pending = parts_pending_group_credit(parts.len(), &credited);
+                let pending = parts_pending_group_credit(group_len, &credited);
                 if pending > 0 {
                     metrics::counter!(
                         "sundog_rebalance_parts_total",
@@ -226,8 +241,8 @@ async fn pull_one_group(
                     )
                     .increment(u64::try_from(pending).unwrap_or(u64::MAX));
                 }
-                tracing::debug!(cache = %cache, %donor, parts = parts.len(), records = count, "part pull landed");
-                return Some(u64::try_from(parts.len()).unwrap_or(u64::MAX));
+                tracing::debug!(cache = %cache, %donor, parts = group_len, records = count, "part pull landed");
+                return Some(u64::try_from(group_len).unwrap_or(u64::MAX));
             }
             every_donor_cold &= cold;
         }
@@ -589,45 +604,37 @@ pub(crate) fn push_targets(
     targets
 }
 
-/// Pushes each target's parts to it through a scoped anti-entropy round
-/// over their wire ids at `granularity`, which sends every entry the target
+/// Pushes each target's parts to it through a part-scoped anti-entropy
+/// round, which sends every entry the target
 /// lacks or holds at an older version. A round that fails, or meets a
 /// responder whose view has not caught up with this node's, is retried
 /// every `retry` until every target has answered, `deadline` passes, or
 /// `cancel` fires. The disown-grace hand-off still confirms each part before
 /// it is released; this push brings the data to the new owners when the
 /// view changes rather than when the grace ends.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one spawned task's whole context; a struct would only rename the same eight values"
-)]
 async fn push_unpullable(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
     cache: SmolStr,
-    granularity: Granularity,
     targets: Vec<(NodeId, Vec<PartId>)>,
     retry: Duration,
     deadline: Duration,
     cancel: CancellationToken,
 ) {
     let give_up = tokio::time::Instant::now() + deadline;
-    let mut targets: Vec<(NodeId, Vec<u16>)> = targets
-        .into_iter()
-        .map(|(owner, parts)| (owner, wire_ids(granularity, &parts)))
-        .collect();
+    let mut targets = targets;
     loop {
         let mut pending = Vec::with_capacity(targets.len());
-        for (owner, ids) in targets {
+        for (owner, parts) in targets {
             let outcome = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
-                outcome = anti_entropy::run_round_for_buckets(cluster.mesh(), &shard, &cache, owner, &ids) => outcome,
+                outcome = anti_entropy::run_round_for_parts(cluster.mesh(), &shard, &cache, owner, &parts) => outcome,
             };
             if outcome.failed {
-                pending.push((owner, ids));
+                pending.push((owner, parts));
             } else {
-                tracing::debug!(cache = %cache, %owner, ids = ids.len(), bytes = outcome.bytes_moved, "pushed parts no co-owner could hand over");
+                tracing::debug!(cache = %cache, %owner, parts = parts.len(), bytes = outcome.bytes_moved, "pushed parts no co-owner could hand over");
             }
         }
         if pending.is_empty() {
@@ -862,7 +869,6 @@ pub(crate) async fn rebalance_task(
                         cluster.clone(),
                         Arc::clone(&shard),
                         cache.clone(),
-                        new_view.granularity(),
                         targets,
                         cluster.config().gossip_interval.max(Duration::from_millis(1)),
                         disown_grace,
@@ -1032,6 +1038,32 @@ mod tests {
                 assert_eq!(donors, &expected);
             }
         }
+    }
+
+    #[test]
+    fn group_parts_by_donor_set_merges_rankings_that_name_the_same_donors() {
+        // Two eligible nodes at k=2: every part's owners are self and the
+        // other node, in either order, so every part has one donor set.
+        let self_node = NodeId::from(1);
+        let other = NodeId::from(2);
+        let view = OwnershipView::compute_at(
+            self_node,
+            vec![self_node, other],
+            NonZeroU8::new(2).expect("nonzero"),
+            Granularity::Part,
+        );
+        let orders: HashSet<Vec<NodeId>> = PartId::all()
+            .map(|part| view.owners_of(part).to_vec())
+            .collect();
+        assert_eq!(
+            orders.len(),
+            2,
+            "the fixture ranks self first for some parts and second for others"
+        );
+        let groups = group_parts_by_donor_set(&view, self_node, PartId::all().collect());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, vec![other]);
+        assert_eq!(groups[0].1.len(), crate::store::part::PART_SPACE);
     }
 
     #[test]
@@ -1792,6 +1824,43 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    /// `RequestHandler::st_serve`'s default composes the three bucket
+    /// calls: a hash mismatch is `Stale`, and otherwise the ids stream in
+    /// request order, each standing for a whole bucket.
+    #[tokio::test]
+    async fn st_serve_default_composes_the_bucket_availability_cold_and_chunk_calls() {
+        use futures::StreamExt as _;
+
+        use crate::net::test_support::BucketPullHandler;
+        use crate::net::{RequestHandler, StServe};
+
+        let handler = BucketPullHandler {
+            view_hash: 42,
+            chunks: vec![(9u16, vec![sample_wire_record(1)])],
+            stall_after: false,
+            requested: Default::default(),
+        };
+        let cache = SmolStr::new("prices");
+        assert!(matches!(
+            handler.st_serve(cache.clone(), vec![9, 3], 41).await,
+            StServe::Stale {
+                responder_view_hash: 0
+            }
+        ));
+        let StServe::Stream {
+            mut chunks,
+            order,
+            parts,
+        } = handler.st_serve(cache, vec![9, 3], 42).await
+        else {
+            panic!("a matching view hash streams");
+        };
+        assert_eq!(order, vec![9, 3], "the default keeps request order");
+        assert_eq!(parts, 2 * crate::store::PART_COUNT as u64);
+        let (id, recs) = chunks.next().await.expect("the fixture's one chunk");
+        assert_eq!((id, recs.len()), (9, 1));
+    }
+
     #[tokio::test]
     async fn pull_buckets_reports_no_peers_when_every_bucket_has_no_other_owner() {
         let cluster = solo_cluster("rebalance-unit-test-solo").await;
@@ -2122,12 +2191,14 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
+            requested: Default::default(),
         });
         let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
         let requester_handler = Arc::new(BucketPullHandler {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
+            requested: Default::default(),
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
@@ -2172,6 +2243,186 @@ mod tests {
         requester.shutdown().await;
     }
 
+    #[test]
+    fn acked_by_part_rekeys_each_id_by_the_parts_it_names() {
+        let a = NodeId::from(1);
+        let b = NodeId::from(2);
+        let by_bucket = acked_by_part(
+            Granularity::Bucket,
+            HashMap::from([(3u16, HashSet::from([a]))]),
+        );
+        assert_eq!(by_bucket.len(), crate::store::PART_COUNT);
+        assert!(
+            by_bucket
+                .iter()
+                .all(|(part, owners)| part.bucket() == 3 && owners == &HashSet::from([a]))
+        );
+
+        let part = PartId::new(3, 5);
+        let by_part = acked_by_part(
+            Granularity::Part,
+            HashMap::from([(part.raw(), HashSet::from([a, b]))]),
+        );
+        assert_eq!(by_part, HashMap::from([(part, HashSet::from([a, b]))]));
+    }
+
+    /// A donor that stalls after finishing bucket 0 leaves bucket 1 for the
+    /// next donor, which is asked for bucket 1 alone.
+    #[tokio::test]
+    async fn pull_one_group_asks_a_later_donor_only_for_the_parts_no_earlier_attempt_finished() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        let cache = SmolStr::new("prices");
+        let view_hash = 42;
+        let (first_node, second_node, requester_node) =
+            (NodeId::from(301), NodeId::from(302), NodeId::from(303));
+        let first_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            chunks: vec![
+                (0u16, vec![sample_wire_record(1)]),
+                (1u16, vec![sample_wire_record(2)]),
+            ],
+            stall_after: true,
+            requested: Default::default(),
+        });
+        let second_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            chunks: vec![(1u16, vec![sample_wire_record(2)])],
+            stall_after: false,
+            requested: Default::default(),
+        });
+        let (first, _first_inbound) = spawn_mesh(first_node, Arc::clone(&first_handler) as _).await;
+        let (second, _second_inbound) =
+            spawn_mesh(second_node, Arc::clone(&second_handler) as _).await;
+        let (requester, _requester_inbound) = spawn_mesh(
+            requester_node,
+            Arc::new(BucketPullHandler {
+                view_hash: 0,
+                chunks: Vec::new(),
+                stall_after: false,
+                requested: Default::default(),
+            }),
+        )
+        .await;
+        requester.update_peers(vec![
+            peer_at(first_node, first.local_addr()),
+            peer_at(second_node, second.local_addr()),
+        ]);
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&two_buckets());
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+
+        let landed = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![first_node, second_node],
+            two_buckets(),
+            (Granularity::Bucket, view_hash),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(landed, Some(2 * crate::store::PART_COUNT as u64));
+        assert_eq!(
+            *second_handler.requested.lock().expect("fixture mutex"),
+            vec![vec![1u16]],
+            "the second donor is asked only for the bucket the first never finished"
+        );
+        assert!(
+            two_buckets()
+                .into_iter()
+                .all(|part| !residency.is_cold(part))
+        );
+
+        first.shutdown().await;
+        second.shutdown().await;
+        requester.shutdown().await;
+    }
+
+    /// A part-granular pull of thousands of parts, most of them empty,
+    /// finishes every part, and the donor records an ack for every one:
+    /// done frames and acks both cross their batch sizes.
+    #[tokio::test]
+    async fn a_pull_of_thousands_of_parts_finishes_and_acks_every_part() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        const PARTS: usize = 3_000;
+        let cache = SmolStr::new("prices");
+        let view_hash = 42;
+        let (donor_node, requester_node) = (NodeId::from(401), NodeId::from(402));
+        let parts: Vec<PartId> = PartId::all().step_by(7).take(PARTS).collect();
+        let first = parts[0];
+        let (donor, _donor_inbound) = spawn_mesh(
+            donor_node,
+            Arc::new(BucketPullHandler {
+                view_hash,
+                chunks: vec![(first.raw(), vec![sample_wire_record(1)])],
+                stall_after: false,
+                requested: Default::default(),
+            }),
+        )
+        .await;
+        let (requester, _requester_inbound) = spawn_mesh(
+            requester_node,
+            Arc::new(BucketPullHandler {
+                view_hash: 0,
+                chunks: Vec::new(),
+                stall_after: false,
+                requested: Default::default(),
+            }),
+        )
+        .await;
+        requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+        donor.update_peers(vec![peer_at(requester_node, requester.local_addr())]);
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&parts);
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+
+        let landed = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![donor_node],
+            parts.clone(),
+            (Granularity::Part, view_hash),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(landed, Some(PARTS as u64));
+        assert!(parts.iter().all(|&part| !residency.is_cold(part)));
+
+        let ids: Vec<u16> = parts.iter().map(|part| part.raw()).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let acked = donor.acked_owners(&cache, &ids, Duration::from_secs(60), view_hash);
+            if acked.len() == PARTS {
+                assert!(
+                    acked
+                        .values()
+                        .all(|owners| owners.contains(&requester_node))
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {PARTS} parts acked",
+                acked.len()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        donor.shutdown().await;
+        requester.shutdown().await;
+    }
+
     /// Pins that `credited`, threaded across two donor calls the way
     /// `pull_one_group` does, counts bucket 0 once even though the first
     /// donor stalls after landing it and the second donor re-sends it:
@@ -2193,6 +2444,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
+            requested: Default::default(),
         });
         let (first_donor, _first_donor_inbound) =
             spawn_mesh(first_donor_node, first_donor_handler).await;
@@ -2203,6 +2455,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: false,
+            requested: Default::default(),
         });
         let (second_donor, _second_donor_inbound) =
             spawn_mesh(second_donor_node, second_donor_handler).await;
@@ -2210,6 +2463,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
+            requested: Default::default(),
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![

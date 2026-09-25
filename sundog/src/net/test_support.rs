@@ -64,6 +64,8 @@ pub(crate) struct BucketPullHandler {
     /// instead of ending: a donor stalled mid-group, for a partial-group
     /// test.
     pub(crate) stall_after: bool,
+    /// Every id list `st_bucket_chunks` was asked for, in call order.
+    pub(crate) requested: std::sync::Mutex<Vec<Vec<u16>>>,
 }
 
 impl RequestHandler for BucketPullHandler {
@@ -119,8 +121,12 @@ impl RequestHandler for BucketPullHandler {
     fn st_bucket_chunks(
         &self,
         _cache: SmolStr,
-        _buckets: Vec<u16>,
+        buckets: Vec<u16>,
     ) -> BoxStream<'static, (u16, Vec<WireRecord>)> {
+        self.requested
+            .lock()
+            .expect("invariant: fixture mutex is never poisoned")
+            .push(buckets);
         let chunks = futures::stream::iter(self.chunks.clone());
         if self.stall_after {
             Box::pin(chunks.chain(futures::stream::pending()))
@@ -150,6 +156,7 @@ mod tests {
             view_hash: 7,
             chunks: vec![(0, vec![rec.clone()])],
             stall_after: true,
+            requested: Default::default(),
         };
         assert!(handler.st_buckets_available(SmolStr::new("c"), 7).await);
         assert!(!handler.st_buckets_available(SmolStr::new("c"), 8).await);
@@ -170,6 +177,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
+            requested: Default::default(),
         });
         let (mesh_a, _inbound_a) = spawn_mesh(NodeId::from(1), Arc::clone(&handler)).await;
         let (mesh_b, _inbound_b) = spawn_mesh(NodeId::from(2), handler).await;

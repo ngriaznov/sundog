@@ -1541,34 +1541,17 @@ async fn distributed_rebalance_interoperates_between_releases(new_is_donor: bool
     wait_for_peers(&nodes, 2).await;
 
     // The joiner's pull has landed. This checkout's joiner reports it via
-    // `sundog_rebalance_buckets_total{direction="in"}`; a previous-release
+    // `sundog_rebalance_parts_total{direction="in"}`; a previous-release
     // joiner serves no metrics, so the donors report `direction="served"`
     // instead. The settle wait and fetch check below assert both roles:
     // every key on exactly `OWNERS` nodes, fetchable everywhere.
     eventually_with_logs(REBALANCE_WAIT, &nodes, || async {
         if new_is_donor {
-            scrape_metric(
-                &n1,
-                "sundog_rebalance_buckets_total",
-                ("direction", "served"),
-            )
-            .await
-                > 0
-                && scrape_metric(
-                    &n2,
-                    "sundog_rebalance_buckets_total",
-                    ("direction", "served"),
-                )
-                .await
+            scrape_metric(&n1, "sundog_rebalance_parts_total", ("direction", "served")).await > 0
+                && scrape_metric(&n2, "sundog_rebalance_parts_total", ("direction", "served")).await
                     > 0
         } else {
-            scrape_metric(
-                &joiner,
-                "sundog_rebalance_buckets_total",
-                ("direction", "in"),
-            )
-            .await
-                > 0
+            scrape_metric(&joiner, "sundog_rebalance_parts_total", ("direction", "in")).await > 0
         }
     })
     .await;
@@ -2469,7 +2452,7 @@ async fn fetch_mismatches(nodes: &[&Node], entries: &[(String, String)]) -> Vec<
         .await
 }
 
-/// One line per node of `count`, `peers`, `sundog_owned_buckets`, and the
+/// One line per node of `count`, `peers`, `sundog_owned_parts`, and the
 /// rebalance in/out counters, for a convergence wait's progress report.
 async fn describe_distributed_state(nodes: &[&Node]) -> String {
     let mut parts = Vec::with_capacity(nodes.len());
@@ -2482,11 +2465,10 @@ async fn describe_distributed_state(nodes: &[&Node]) -> String {
             .peers()
             .await
             .map_or_else(|_| "?".to_string(), |c| c.to_string());
-        let owned = scrape_metric(node, "sundog_owned_buckets", ("cache", "it")).await;
-        let pulled =
-            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await;
+        let owned = scrape_metric(node, "sundog_owned_parts", ("cache", "it")).await;
+        let pulled = scrape_metric(node, "sundog_rebalance_parts_total", ("direction", "in")).await;
         let released =
-            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
+            scrape_metric(node, "sundog_rebalance_parts_total", ("direction", "out")).await;
         parts.push(format!(
             "{}: count={count} peers={peers} owned={owned} in={pulled} out={released}",
             node.name()
@@ -2530,12 +2512,13 @@ async fn sum_counts(nodes: &[&Node]) -> Option<usize> {
     Some(sum)
 }
 
-/// Every `sundog-testnode` opens `"it"`'s `Mode::Distributed` bucket space
-/// over `sundog::store::BUCKET_COUNT` buckets; with `owners` owners per
-/// bucket, the summed `sundog_owned_buckets` gauge across every live node
-/// settles at this many bucket-ownership assignments.
-fn expected_owned_buckets_sum(owners: u64) -> u64 {
-    sundog::store::BUCKET_COUNT as u64 * owners
+/// Every `sundog-testnode` opens `"it"`'s `Mode::Distributed` part space,
+/// `sundog::store::BUCKET_COUNT` buckets of `sundog::store::PART_COUNT`
+/// parts; with `owners` owners per part, the summed `sundog_owned_parts`
+/// gauge across every live node settles at this many part-ownership
+/// assignments.
+fn expected_owned_parts_sum(owners: u64) -> u64 {
+    (sundog::store::BUCKET_COUNT * sundog::store::PART_COUNT) as u64 * owners
 }
 
 /// Five distributed nodes fill a shared keyspace from one writer, and every
@@ -2543,7 +2526,7 @@ fn expected_owned_buckets_sum(owners: u64) -> u64 {
 /// exactly two ids, exactly those nodes' `get k` answers with the value and
 /// every other node answers `none`, every node's `fetch k` returns the
 /// value, the summed local `count` is `OWNERS * FILL_KEYS`, and the summed
-/// `sundog_owned_buckets` gauge is every bucket assigned exactly `OWNERS`
+/// `sundog_owned_parts` gauge is every part assigned exactly `OWNERS`
 /// times.
 #[tokio::test]
 async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_owners() {
@@ -2588,7 +2571,7 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
     let ids = collect_node_ids(&node_refs).await;
     let tagged: Vec<(&Node, u64)> = node_refs.iter().copied().zip(ids).collect();
     let sample = sample_kv_entries(0xd157_fe11, FILL_KEYS, SAMPLE_SIZE);
-    let expected_owned_sum = expected_owned_buckets_sum(u64::from(OWNERS));
+    let expected_owned_sum = expected_owned_parts_sum(u64::from(OWNERS));
 
     eventually_with_logs(CONVERGE_WAIT, &node_refs, || async {
         let Some(sum) = sum_counts(&node_refs).await else {
@@ -2602,7 +2585,7 @@ async fn distributed_five_node_fill_and_convergence_with_every_key_on_exactly_k_
         }
         let mut owned_sum = 0u64;
         for node in &node_refs {
-            owned_sum += scrape_metric(node, "sundog_owned_buckets", ("cache", "it")).await;
+            owned_sum += scrape_metric(node, "sundog_owned_parts", ("cache", "it")).await;
         }
         owned_sum == expected_owned_sum
     })
@@ -2678,7 +2661,7 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
     let mut in_before = Vec::with_capacity(nodes.len() - 1);
     for node in &nodes[1..] {
         in_before
-            .push(scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await);
+            .push(scrape_metric(node, "sundog_rebalance_parts_total", ("direction", "in")).await);
     }
 
     let victim = nodes.remove(0);
@@ -2718,15 +2701,14 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
 
     let mut in_moved = false;
     for (node, before) in live.iter().zip(in_before.iter()) {
-        let after =
-            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "in")).await;
+        let after = scrape_metric(node, "sundog_rebalance_parts_total", ("direction", "in")).await;
         if after > *before {
             in_moved = true;
         }
     }
     assert!(
         in_moved,
-        "at least one surviving node should have pulled rebalanced buckets in after the crash"
+        "at least one surviving node should have pulled rebalanced parts in after the crash"
     );
 
     let mismatches = fetch_mismatches(&live, &sample).await;
@@ -2742,8 +2724,8 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
 }
 
 /// A fourth node joins a filled three-node distributed cluster: it pulls
-/// roughly a quarter of the 1,024-bucket space (`sundog_owned_buckets` near
-/// `BUCKET_COUNT * OWNERS / 4`) and at least one original node's
+/// roughly a quarter of the part-ownership assignments (`sundog_owned_parts`
+/// near 65,536 × `OWNERS` / 4) and at least one original node's
 /// `direction="out"` counter moves to match. Once the disown grace period
 /// (`distributed_disown_grace_rounds` anti-entropy intervals) has passed, the
 /// donors have dropped every key outside their own ownership, and every key
@@ -2756,14 +2738,14 @@ async fn distributed_join_and_rebalance() {
     const ALIASES: [&str; 3] = ["n1", "n2", "n3"];
     const JOINER: &str = "n4";
     const CLUSTER: &str = "dist-join-cluster";
-    /// `BUCKET_COUNT * OWNERS / 4` nodes: the even split a fresh joiner
-    /// should land close to, rendezvous hashing balancing buckets roughly
-    /// uniformly rather than exactly.
-    const JOINER_BUCKETS_TOLERANCE: u64 = 200;
+    /// Parts either side of 65,536 × `OWNERS` / 4, the even split a fresh
+    /// joiner lands close to: rendezvous hashing balances parts closely
+    /// rather than exactly, within about 1% at four nodes.
+    const JOINER_PARTS_TOLERANCE: u64 = 1_000;
     const REBALANCE_WAIT: Duration = Duration::from_secs(240);
     // sundog-testnode sets ae_interval to 2s; distributed_disown_grace_
     // rounds defaults to 3, so a previous owner keeps serving for 6s past
-    // losing a bucket. Generous past that for the anti-entropy round itself.
+    // losing a part. Generous past that for the anti-entropy round itself.
     const DISOWN_GRACE_WAIT: Duration = Duration::from_secs(16);
     const SETTLE_WAIT: Duration = Duration::from_secs(180);
 
@@ -2798,9 +2780,8 @@ async fn distributed_join_and_rebalance() {
 
     let mut out_before = Vec::with_capacity(fleet.0.len());
     for node in &fleet.0 {
-        out_before.push(
-            scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await,
-        );
+        out_before
+            .push(scrape_metric(node, "sundog_rebalance_parts_total", ("direction", "out")).await);
     }
 
     let all_seeds: Vec<String> = ALIASES.iter().map(|a| seed(a)).collect();
@@ -2821,28 +2802,23 @@ async fn distributed_join_and_rebalance() {
         .last()
         .expect("nodes always has the joiner as its last element");
 
-    let expected_joiner_buckets = expected_owned_buckets_sum(u64::from(OWNERS)) / 4;
+    let expected_joiner_parts = expected_owned_parts_sum(u64::from(OWNERS)) / 4;
     eventually_with_logs(REBALANCE_WAIT, &node_refs, || async {
-        let owned = scrape_metric(joiner, "sundog_owned_buckets", ("cache", "it")).await;
-        let pulled_in = scrape_metric(
-            joiner,
-            "sundog_rebalance_buckets_total",
-            ("direction", "in"),
-        )
-        .await
-            > 0;
-        pulled_in && owned.abs_diff(expected_joiner_buckets) <= JOINER_BUCKETS_TOLERANCE
+        let owned = scrape_metric(joiner, "sundog_owned_parts", ("cache", "it")).await;
+        let pulled_in =
+            scrape_metric(joiner, "sundog_rebalance_parts_total", ("direction", "in")).await > 0;
+        pulled_in && owned.abs_diff(expected_joiner_parts) <= JOINER_PARTS_TOLERANCE
     })
     .await;
 
-    // A previous owner keeps a lost bucket for the disown grace, hands it
+    // A previous owner keeps a lost part for the disown grace, hands it
     // to the joiner, and only then drops it: `direction="out"` moves at
     // that point, not when the joiner's pull lands.
     tokio::time::sleep(DISOWN_GRACE_WAIT).await;
     eventually_with_logs(SETTLE_WAIT, &node_refs, || async {
         for (node, before) in node_refs[..ALIASES.len()].iter().zip(out_before.iter()) {
             let after =
-                scrape_metric(node, "sundog_rebalance_buckets_total", ("direction", "out")).await;
+                scrape_metric(node, "sundog_rebalance_parts_total", ("direction", "out")).await;
             if after > *before {
                 return true;
             }
