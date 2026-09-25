@@ -87,15 +87,14 @@ pub(super) fn group_by_owner_set(
             .filter(|&n| n != self_node)
             .collect();
         owners.sort_unstable();
-        match index.get(&owners) {
-            Some(&at) => groups[at].records.push(rec),
-            None => {
-                index.insert(owners.clone(), groups.len());
-                groups.push(OwnerGroup {
-                    owners,
-                    records: vec![rec],
-                });
-            }
+        if let Some(&at) = index.get(&owners) {
+            groups[at].records.push(rec);
+        } else {
+            index.insert(owners.clone(), groups.len());
+            groups.push(OwnerGroup {
+                owners,
+                records: vec![rec],
+            });
         }
     }
     groups

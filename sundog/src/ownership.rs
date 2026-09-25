@@ -1244,7 +1244,7 @@ mod tests {
         let cache = SmolStr::new("prices");
         let mode = Mode::Distributed { owners: k };
         let modes = modes_with(&[
-            (NodeId::from(2), "prices", mode.clone()),
+            (NodeId::from(2), "prices", mode),
             (NodeId::from(3), "prices", mode),
         ]);
         let current = wire::PROTOCOL_VERSION;

@@ -156,7 +156,7 @@ mod tests {
             view_hash: 7,
             chunks: vec![(0, vec![rec.clone()])],
             stall_after: true,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         };
         assert!(handler.st_buckets_available(SmolStr::new("c"), 7).await);
         assert!(!handler.st_buckets_available(SmolStr::new("c"), 8).await);
@@ -177,7 +177,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (mesh_a, _inbound_a) = spawn_mesh(NodeId::from(1), Arc::clone(&handler)).await;
         let (mesh_b, _inbound_b) = spawn_mesh(NodeId::from(2), handler).await;

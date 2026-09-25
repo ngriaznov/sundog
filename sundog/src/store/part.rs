@@ -38,9 +38,13 @@ impl PartId {
         Self((bucket & 0x3FF) | (((part & 0x3F) as u16) << 10))
     }
 
-    /// The part at `index` in `0..PART_SPACE`, the inverse of
-    /// [`PartId::index`]. `index` wraps modulo [`PART_SPACE`].
+    /// The part at `index` in `0..65_536`, the inverse of
+    /// [`PartId::index`]. `index` wraps modulo 65,536.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "masked to the 16 bits a part id has"
+    )]
     pub const fn from_index(index: usize) -> Self {
         Self((index & 0xFFFF) as u16)
     }
@@ -69,7 +73,7 @@ impl PartId {
         (self.0 >> 10) as u8
     }
 
-    /// A dense index in `0..PART_SPACE`, for bitsets and tables.
+    /// A dense index in `0..65_536`, for bitsets and tables.
     #[must_use]
     pub const fn index(self) -> usize {
         self.0 as usize
@@ -92,12 +96,9 @@ impl PartId {
 
     /// The [`PART_COUNT`] parts of `bucket`, in part order.
     pub fn of_bucket(bucket: u16) -> impl Iterator<Item = Self> {
-        (0..PART_COUNT).map(move |part| {
-            Self::new(
-                bucket,
-                u8::try_from(part).expect("invariant: PART_COUNT fits u8"),
-            )
-        })
+        (0u8..)
+            .take(PART_COUNT)
+            .map(move |part| Self::new(bucket, part))
     }
 }
 
@@ -123,7 +124,9 @@ pub(crate) struct PartSet {
 
 impl std::fmt::Debug for PartSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PartSet").field("len", &self.len).finish()
+        f.debug_struct("PartSet")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
     }
 }
 

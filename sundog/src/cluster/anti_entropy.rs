@@ -2003,10 +2003,10 @@ mod tests {
             .with_ownership(tracker, Arc::new(ResidencySet::new())),
         );
         let key_of = |key: u32| crate::store::encode_key(&key).expect("u32 key encodes");
-        let peers_key = (0u32..)
+        let peers_key = (0u32..1_000_000)
             .find(|&k| view.owners_of(part_of_u32_any(k)).contains(&peer))
             .expect("the peer owns some key");
-        let other_key = (0u32..)
+        let other_key = (0u32..1_000_000)
             .find(|&k| !view.owners_of(part_of_u32_any(k)).contains(&peer))
             .expect("the peer does not own some key");
         let mut pushes = vec![key_of(peers_key), key_of(other_key)];

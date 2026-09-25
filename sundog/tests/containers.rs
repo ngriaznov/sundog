@@ -1595,6 +1595,97 @@ async fn distributed_rebalance_interoperates_with_a_previous_release_donor_and_a
     distributed_rebalance_interoperates_between_releases(false).await;
 }
 
+/// The last step of a rolling upgrade: while a previous-release node is an
+/// eligible owner, every current node ranks whole buckets; once it leaves,
+/// the survivors rank parts instead and most parts change owners at once.
+/// Every key still ends on exactly `OWNERS` of the survivors, fetchable
+/// from each of them.
+#[tokio::test]
+async fn distributed_ownership_switches_to_parts_once_the_last_previous_release_node_leaves() {
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 1_500;
+    const SAMPLE_SIZE: usize = 100;
+    const CLUSTER: &str = "dist-switch-cluster";
+    const SWITCH_WAIT: Duration = Duration::from_secs(120);
+    const SETTLE_WAIT: Duration = Duration::from_secs(240);
+    let part_space = (sundog::store::BUCKET_COUNT * sundog::store::PART_COUNT) as u64;
+    let part_count = sundog::store::PART_COUNT as u64;
+
+    require_containers!();
+
+    let previous = build_previous_testnode();
+    let current = build_testnode();
+    let net = Arc::new(Network::new_network());
+    let env = [
+        ("SUNDOG_TESTNODE_MODE", "distributed"),
+        ("SUNDOG_TESTNODE_OWNERS", "2"),
+        ("RUST_LOG", DISTRIBUTED_RUST_LOG),
+    ];
+    let old = Node::spawn_binary(&net, CLUSTER, "n1", &[], &env, previous).await;
+    let n2 = Node::spawn_binary(&net, CLUSTER, "n2", &[&seed("n1")], &env, current).await;
+    let n3 = Node::spawn_binary(&net, CLUSTER, "n3", &[&seed("n1")], &env, current).await;
+    let n4 = Node::spawn_binary(&net, CLUSTER, "n4", &[&seed("n1")], &env, current).await;
+    let everyone = [&old, &n2, &n3, &n4];
+    wait_for_peers(&everyone, 3).await;
+
+    n2.fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    eventually_with_logs(SETTLE_WAIT, &everyone, || async {
+        sum_counts(&everyone).await == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+    // Ranking whole buckets: each current node owns whole buckets' worth
+    // of parts.
+    let survivors = [&n2, &n3, &n4];
+    for node in survivors {
+        let owned = scrape_metric(node, "sundog_owned_parts", ("cache", "it")).await;
+        assert_eq!(
+            owned % part_count,
+            0,
+            "{} owns whole buckets while a previous-release node is eligible",
+            node.name()
+        );
+    }
+
+    old.stop().await.expect("the previous-release node stops");
+    wait_for_peers(&survivors, 2).await;
+
+    // Ranking parts: the survivors' shares no longer fall on bucket
+    // boundaries, and together they still assign every part `OWNERS` times.
+    eventually_with_logs(SWITCH_WAIT, &survivors, || async {
+        let mut sum = 0;
+        let mut off_bucket_boundary = false;
+        for node in survivors {
+            let owned = scrape_metric(node, "sundog_owned_parts", ("cache", "it")).await;
+            sum += owned;
+            off_bucket_boundary |= owned % part_count != 0;
+        }
+        sum == part_space * u64::from(OWNERS) && off_bucket_boundary
+    })
+    .await;
+
+    let ids = collect_node_ids(&survivors).await;
+    let tagged: Vec<(&Node, u64)> = survivors.iter().copied().zip(ids).collect();
+    let sample = sample_kv_entries(0x5317_c400, FILL_KEYS, SAMPLE_SIZE);
+    eventually_with_logs(SETTLE_WAIT, &survivors, || async {
+        if sum_counts(&survivors).await != Some(usize::from(OWNERS) * FILL_KEYS as usize) {
+            return false;
+        }
+        ownership_snapshot_matches(tagged[0].0, &tagged, &sample, usize::from(OWNERS)).await
+    })
+    .await;
+    let all_entries = kv_range(FILL_KEYS);
+    let mismatches = fetch_mismatches(&survivors, &all_entries).await;
+    assert!(
+        mismatches.is_empty(),
+        "every key stays fetchable through the switch to part ownership: {mismatches:?}"
+    );
+
+    n2.stop().await.expect("n2 stops");
+    n3.stop().await.expect("n3 stops");
+    n4.stop().await.expect("n4 stops");
+    net.close().await.expect("network closes");
+}
+
 /// A merge on the current release's node stamps its version with a
 /// merge-derived node id rather than a real single writer's; this pins that
 /// the previous release's node, whose own resolver knows nothing of merges,

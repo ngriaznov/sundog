@@ -370,8 +370,14 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
         .await
         .expect("donor opens delayed as the sole owner, warm at once");
 
-    let victim_config = node_config(common::reserve_gossip_addr().await)
-        .with(|c| c.state_transfer_budget = Duration::from_millis(200));
+    // A failure detector slow enough that the victim's view keeps listing
+    // the donor for every timed-out warm-up attempt: each attempt costs its
+    // 200ms budget plus the retry interval, and the donor dropping out
+    // first would end the warm-up with no co-owner instead of a timeout.
+    let victim_config = node_config(common::reserve_gossip_addr().await).with(|c| {
+        c.state_transfer_budget = Duration::from_millis(200);
+        c.phi_threshold = 1_000.0;
+    });
     let victim = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
         .config(victim_config)

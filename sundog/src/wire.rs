@@ -1170,7 +1170,7 @@ mod tests {
 
     #[test]
     fn part_ownership_needs_protocol_5() {
-        assert!(PROTOCOL_VERSION >= PROTOCOL_PART_OWNERSHIP);
+        const { assert!(PROTOCOL_VERSION >= PROTOCOL_PART_OWNERSHIP) };
         assert!(peer_supports(5, PROTOCOL_PART_OWNERSHIP));
         assert!(!peer_supports(4, PROTOCOL_PART_OWNERSHIP));
         assert!(!peer_supports(3, PROTOCOL_PART_OWNERSHIP));

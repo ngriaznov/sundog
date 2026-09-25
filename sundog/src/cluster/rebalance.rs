@@ -45,24 +45,22 @@ fn group_parts_by_donor_set(
     let mut slice_index: HashMap<&[NodeId], usize> = HashMap::new();
     for part in parts {
         let owners = view.owners_of(part);
-        match slice_index.get(owners) {
-            Some(&at) => by_owners[at].1.push(part),
-            None => {
-                slice_index.insert(owners, by_owners.len());
-                by_owners.push((owners, vec![part]));
-            }
+        if let Some(&at) = slice_index.get(owners) {
+            by_owners[at].1.push(part);
+        } else {
+            slice_index.insert(owners, by_owners.len());
+            by_owners.push((owners, vec![part]));
         }
     }
     let mut groups: Vec<DonorGroup> = Vec::new();
     let mut index: HashMap<Vec<NodeId>, usize> = HashMap::new();
     for (owners, parts) in by_owners {
         let donors: Vec<NodeId> = owners.iter().copied().filter(|&n| n != self_node).collect();
-        match index.get(&donors) {
-            Some(&at) => groups[at].1.extend(parts),
-            None => {
-                index.insert(donors.clone(), groups.len());
-                groups.push((donors, parts));
-            }
+        if let Some(&at) = index.get(&donors) {
+            groups[at].1.extend(parts);
+        } else {
+            index.insert(donors.clone(), groups.len());
+            groups.push((donors, parts));
         }
     }
     groups
@@ -1838,7 +1836,7 @@ mod tests {
             view_hash: 42,
             chunks: vec![(9u16, vec![sample_wire_record(1)])],
             stall_after: false,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         };
         let cache = SmolStr::new("prices");
         assert!(matches!(
@@ -2191,14 +2189,14 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
         let requester_handler = Arc::new(BucketPullHandler {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
@@ -2283,13 +2281,13 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let second_handler = Arc::new(BucketPullHandler {
             view_hash,
             chunks: vec![(1u16, vec![sample_wire_record(2)])],
             stall_after: false,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (first, _first_inbound) = spawn_mesh(first_node, Arc::clone(&first_handler) as _).await;
         let (second, _second_inbound) =
@@ -2300,7 +2298,7 @@ mod tests {
                 view_hash: 0,
                 chunks: Vec::new(),
                 stall_after: false,
-                requested: Default::default(),
+                requested: std::sync::Mutex::default(),
             }),
         )
         .await;
@@ -2362,7 +2360,7 @@ mod tests {
                 view_hash,
                 chunks: vec![(first.raw(), vec![sample_wire_record(1)])],
                 stall_after: false,
-                requested: Default::default(),
+                requested: std::sync::Mutex::default(),
             }),
         )
         .await;
@@ -2372,7 +2370,7 @@ mod tests {
                 view_hash: 0,
                 chunks: Vec::new(),
                 stall_after: false,
-                requested: Default::default(),
+                requested: std::sync::Mutex::default(),
             }),
         )
         .await;
@@ -2444,7 +2442,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (first_donor, _first_donor_inbound) =
             spawn_mesh(first_donor_node, first_donor_handler).await;
@@ -2455,7 +2453,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: false,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (second_donor, _second_donor_inbound) =
             spawn_mesh(second_donor_node, second_donor_handler).await;
@@ -2463,7 +2461,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
-            requested: Default::default(),
+            requested: std::sync::Mutex::default(),
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![
