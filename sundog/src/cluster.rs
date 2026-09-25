@@ -3145,6 +3145,12 @@ mod tests {
 
     /// Mirrors `store::bucket_of`'s formula so a test can compute which
     /// anti-entropy bucket a key lands in without that private function.
+    fn part_of_u32(key: u32) -> crate::store::PartId {
+        crate::store::PartId::of_key(
+            &postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes"),
+        )
+    }
+
     fn bucket_of_u32(key: u32) -> u16 {
         let bytes = postcard::to_stdvec(&key).expect("a u32 key always postcard-encodes");
         let bucket = xxhash_rust::xxh3::xxh3_64(&bytes) & (crate::store::BUCKET_COUNT as u64 - 1);
@@ -3195,7 +3201,8 @@ mod tests {
             );
             for rec in &group.records {
                 assert!(
-                    view.owners_of(bucket_of(rec.key.as_ref())).contains(&third),
+                    view.owners_of(crate::store::PartId::of_key(rec.key.as_ref()))
+                        .contains(&third),
                     "a record only re-forwards to a node that owns its bucket"
                 );
             }
@@ -3203,7 +3210,10 @@ mod tests {
         let re_forwarded: usize = groups.iter().map(|g| g.records.len()).sum();
         let expected = records
             .iter()
-            .filter(|rec| view.owners_of(bucket_of(rec.key.as_ref())).contains(&third))
+            .filter(|rec| {
+                view.owners_of(crate::store::PartId::of_key(rec.key.as_ref()))
+                    .contains(&third)
+            })
             .count();
         assert_eq!(
             re_forwarded, expected,
@@ -4191,8 +4201,7 @@ mod tests {
             "b and c compute the same three-node view a is about to publish",
             async || {
                 (0..TOTAL).all(|key| {
-                    let bucket = bucket_of_u32(key);
-                    let mut expected = three.owners_of(bucket).to_vec();
+                    let mut expected = three.owners_of(part_of_u32(key)).to_vec();
                     expected.sort_unstable();
                     [&cache_b, &cache_c].iter().all(|cache| {
                         let mut seen = cache.owners_of(&key);
@@ -4204,7 +4213,7 @@ mod tests {
         )
         .await;
         let lost: Vec<u32> = (0..TOTAL)
-            .filter(|&key| !three.owns(bucket_of_u32(key)))
+            .filter(|&key| !three.owns(part_of_u32(key)))
             .collect();
         assert!(
             !lost.is_empty(),
@@ -4242,9 +4251,9 @@ mod tests {
         .await;
         for &key in &lost {
             assert!(
-                residency.is_releasing(bucket_of_u32(key)),
-                "a keeps serving bucket {} through its disown grace",
-                bucket_of_u32(key)
+                residency.is_releasing(part_of_u32(key)),
+                "a keeps serving part {} through its disown grace",
+                part_of_u32(key)
             );
         }
 

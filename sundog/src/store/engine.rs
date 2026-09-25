@@ -53,6 +53,7 @@ use crate::node::NodeId;
 use crate::wire::WireRecord;
 
 use super::crdt;
+use super::part::PartSet;
 #[cfg(feature = "spill")]
 pub(crate) use super::spill::Reservation;
 #[cfg(feature = "spill")]
@@ -61,7 +62,8 @@ use super::spill::{
 };
 use super::{
     BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
-    PART_COUNT, PartEntries, Quiescence, RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
+    PART_COUNT, PartEntries, PartId, Quiescence, RecordView, Tombstone, Weigher, Winner,
+    entry_fingerprint,
 };
 
 /// A never-constructed placeholder for
@@ -4247,6 +4249,93 @@ where
                 .saturating_add(u64::try_from(removed_tombstones).unwrap_or(u64::MAX));
         }
         removed_total
+    }
+
+    /// [`Engine::release_buckets`] for single parts: drops every live entry
+    /// and tombstone in `parts` and zeroes their part digests, leaving the
+    /// rest of each bucket where it is. A bucket named by all
+    /// [`PART_COUNT`] of its parts takes the whole-bucket path. Returns the
+    /// total number of entries removed, live and tombstoned together.
+    pub(crate) fn release_parts(&self, parts: &[PartId]) -> u64 {
+        let mut masks: HashMap<u16, u64> = HashMap::new();
+        for part in parts {
+            *masks.entry(part.bucket()).or_default() |= 1u64 << part.part();
+        }
+        let mut removed_total = 0u64;
+        for (bucket, mask) in masks {
+            if mask == u64::MAX {
+                removed_total = removed_total.saturating_add(self.release_buckets(&[bucket]));
+                continue;
+            }
+            let released =
+                |key: &[u8]| mask & (1u64 << part_index_from_hash(hash_key_bytes(key))) != 0;
+            let bucket_idx = usize::from(bucket);
+            let (removed_weight, removed_live, removed_tombstones, removed_spilled) = {
+                let mut stripe = self.stripes[bucket_idx].write();
+                let mut removed_weight = 0u64;
+                let mut removed_live = 0u64;
+                let mut removed_spilled = 0usize;
+                stripe.live.retain(hasher_for, |live| {
+                    if released(record_key(&live.record)) {
+                        removed_weight += u64::from(live.weight);
+                        removed_live += 1;
+                        if is_spilled(live) {
+                            removed_spilled += 1;
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let before = stripe.tombstones.len();
+                stripe.tombstones.retain(|key, _| !released(key));
+                let removed_tombstones = before - stripe.tombstones.len();
+                stripe.long_ttl.retain(|key, _| !released(key));
+                (
+                    removed_weight,
+                    removed_live,
+                    removed_tombstones,
+                    removed_spilled,
+                )
+            };
+            for part in 0..PART_COUNT {
+                if mask & (1u64 << part) != 0 {
+                    self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
+                }
+            }
+            if removed_weight > 0 {
+                self.total_weight
+                    .fetch_sub(removed_weight, Ordering::Relaxed);
+            }
+            if removed_live > 0 {
+                self.live_count.fetch_sub(removed_live, Ordering::Relaxed);
+            }
+            self.note_spill_departures(removed_spilled);
+            removed_total = removed_total
+                .saturating_add(removed_live)
+                .saturating_add(u64::try_from(removed_tombstones).unwrap_or(u64::MAX));
+        }
+        removed_total
+    }
+
+    /// Every part holding at least one live entry or un-GC'd tombstone,
+    /// ascending: one stripe read lock at a time, skipping empty stripes
+    /// without touching an entry.
+    pub(crate) fn held_parts(&self) -> Vec<PartId> {
+        let mut held = PartSet::new();
+        for stripe in &*self.stripes {
+            let stripe = stripe.read();
+            if stripe.live.len() == 0 && stripe.tombstones.is_empty() {
+                continue;
+            }
+            for live in stripe.live.iter() {
+                held.insert(PartId::from_hash(hash_key_bytes(record_key(&live.record))));
+            }
+            for key in stripe.tombstones.keys() {
+                held.insert(PartId::from_hash(hash_key_bytes(key)));
+            }
+        }
+        held.iter().collect()
     }
 
     /// The lock-protected first half of [`super::Shard::get_or_load`]: a

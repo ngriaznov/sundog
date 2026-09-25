@@ -30,7 +30,7 @@ use super::sketch::{Cell, Decoded, Iblt};
 use crate::hlc::Hlc;
 use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
 use crate::node::NodeId;
-use crate::store::{BucketPart, ShardOps, bucket_of};
+use crate::store::{BucketPart, PartId, ShardOps};
 use crate::wire::{self, WireRecord};
 
 /// Runs anti-entropy for one shard while `cancel` stays live: every jittered
@@ -448,19 +448,23 @@ pub(crate) async fn run_round_for_buckets(
     }
 }
 
-/// Drops every queued pull for a bucket a `Mode::Distributed` shard does
-/// not own: a round against a new owner of a bucket this node is releasing
-/// pushes what the owner lacks and leaves the owner's own entries where
-/// they are, instead of pulling them into the inbound guard. Identity for
-/// a shard with no ownership view.
+/// Drops every queued pull for a part a `Mode::Distributed` shard does not
+/// own: a round against a new owner of a part this node is releasing pushes
+/// what the owner lacks and leaves the owner's own entries where they are,
+/// instead of pulling them into the inbound guard. A hash pull names each
+/// entry by its full key hash, so its part is exact whatever the round's
+/// ids name. Identity for a shard with no ownership view.
 fn retain_owned_pulls(
     shard: &Arc<dyn ShardOps>,
     pull_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
 ) {
     if let Some(view) = shard.ownership_view() {
-        pull_keys.retain(|key| view.owns(bucket_of(key)));
-        pull_hashes.retain(|(bucket, _)| view.owns(*bucket));
+        pull_keys.retain(|key| view.owns(PartId::of_key(key)));
+        for (_, hashes) in pull_hashes.iter_mut() {
+            hashes.retain(|&hash| view.owns(PartId::from_hash(hash)));
+        }
+        pull_hashes.retain(|(_, hashes)| !hashes.is_empty());
     }
 }
 
@@ -1154,7 +1158,10 @@ mod tests {
         let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
         for key in 0..n {
             let bytes = crate::store::encode_key(&key).expect("u32 key encodes");
-            by_bucket.entry(bucket_of(&bytes)).or_default().push(key);
+            by_bucket
+                .entry(crate::store::bucket_of(&bytes))
+                .or_default()
+                .push(key);
         }
         let dense: Vec<Vec<u32>> = by_bucket
             .into_values()
@@ -1414,7 +1421,7 @@ mod tests {
         let mut seen = HashSet::new();
         for key in 0u32.. {
             let bytes = crate::store::encode_key(&key).expect("u32 key encodes");
-            let bucket = bucket_of(&bytes);
+            let bucket = crate::store::bucket_of(&bytes);
             if seen.insert(bucket) {
                 found.push((key, bucket));
                 if found.len() == n {
@@ -1697,10 +1704,13 @@ mod tests {
                 for bucket in
                     0..u16::try_from(crate::store::BUCKET_COUNT).expect("BUCKET_COUNT fits u16")
                 {
-                    if !view.owns(bucket) {
+                    let part = PartId::of_bucket(bucket)
+                        .next()
+                        .expect("a bucket has parts");
+                    if !view.owns(part) {
                         continue;
                     }
-                    if view.owners_of(bucket).contains(&node_b) {
+                    if view.owners_of(part).contains(&node_b) {
                         shared_with_b.get_or_insert(bucket);
                     } else {
                         dropped_by_b.get_or_insert(bucket);

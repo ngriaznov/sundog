@@ -85,6 +85,14 @@ pub const PROTOCOL_DISTRIBUTED: u16 = 3;
 /// release timing for that pull, exactly as protocol 3 behaves now.
 pub const PROTOCOL_ST_BUCKET_DONE_ACK: u16 = 4;
 
+/// The protocol that introduced part-level ownership for a
+/// `Mode::Distributed` cache. A node computes a part-granular view only when
+/// it and every eligible peer speak it; under such a view the `u16` ids in
+/// [`Msg::AeDigestScoped`], [`Msg::StBuckets`] and the replies they draw name
+/// parts instead of buckets, and both sides have already agreed on the view
+/// by its hash before any id is read.
+pub const PROTOCOL_PART_OWNERSHIP: u16 = 5;
+
 /// Whether a peer speaking `peer_protocol` understands a message kind
 /// introduced in protocol `since`.
 #[must_use]

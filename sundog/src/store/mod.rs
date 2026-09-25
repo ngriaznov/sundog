@@ -34,6 +34,7 @@ use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::wire::{self, MAX_FRAME, WireRecord};
 
 mod engine;
+pub(crate) mod part;
 use engine::{ApplyOutcome, Engine, JoinOutcome, Reservation};
 
 /// Reference CRDT value types (a PN-Counter today) and the
@@ -63,6 +64,8 @@ pub const BUCKET_COUNT: usize = 1024;
 /// [`crate::config::ClusterConfig::ae_part_min_bucket`] is compared at this
 /// finer grain before either side sends a listing or a sketch.
 pub const PART_COUNT: usize = 64;
+
+pub use part::PartId;
 
 /// A custom per-entry weigher for size-bounded eviction: `(key, value) ->
 /// weight`. Boxed so [`crate::cache::CacheBuilder::weigher`] and
@@ -690,6 +693,19 @@ pub trait ShardOps: Send + Sync {
         Box::pin(async { Vec::new() })
     }
 
+    /// [`ShardOps::held_buckets`] at part granularity: every part holding at
+    /// least one live entry or un-GC'd tombstone, whether or not the current
+    /// view owns it. The default names every part of each held bucket.
+    fn held_parts(&self) -> BoxFuture<'_, Vec<PartId>> {
+        Box::pin(async move {
+            self.held_buckets()
+                .await
+                .into_iter()
+                .flat_map(PartId::of_bucket)
+                .collect()
+        })
+    }
+
     /// This shard's part digests for each of `buckets`, the second-level
     /// reply for a bucket whose digest mismatched and whose entry count
     /// passed [`crate::config::ClusterConfig::ae_part_min_bucket`].
@@ -808,6 +824,28 @@ pub trait ShardOps: Send + Sync {
     fn release_buckets(&self, buckets: &[u16]) -> BoxFuture<'_, u64> {
         let _ = buckets;
         Box::pin(async { 0 })
+    }
+
+    /// [`ShardOps::release_buckets`] for single parts: removes every locally
+    /// held entry, live or tombstone, in each of `parts`, leaving the rest of
+    /// their buckets. A no-op returning `0` for a stub.
+    fn release_parts(&self, parts: &[PartId]) -> BoxFuture<'_, u64> {
+        let _ = parts;
+        Box::pin(async { 0 })
+    }
+
+    /// Whether `part` is owned here but not yet pulled from a co-owner; see
+    /// [`ShardOps::is_cold_bucket`]. `false` for a stub.
+    fn is_cold_part(&self, part: PartId) -> bool {
+        let _ = part;
+        false
+    }
+
+    /// Whether `part` was warm-reloaded and not yet verified; see
+    /// [`ShardOps::is_unverified_bucket`]. `false` for a stub.
+    fn is_unverified_part(&self, part: PartId) -> bool {
+        let _ = part;
+        false
     }
 
     /// Whether `bucket` is owned by this `Mode::Distributed` shard but not
@@ -2146,12 +2184,12 @@ where
             Some(view) => {
                 let (owned, unowned): (Vec<_>, Vec<_>) = recs
                     .into_iter()
-                    .partition(|rec| view.owns(bucket_of(rec.key.as_ref())));
+                    .partition(|rec| view.owns(PartId::of_key(rec.key.as_ref())));
                 let (redirected, dropped): (Vec<_>, Vec<_>) =
                     unowned.into_iter().partition(|rec| {
                         self.residency
                             .as_ref()
-                            .is_some_and(|r| r.is_releasing(bucket_of(rec.key.as_ref())))
+                            .is_some_and(|r| r.is_releasing(PartId::of_key(rec.key.as_ref())))
                     });
                 if !redirected.is_empty() {
                     metrics::counter!(
@@ -2190,14 +2228,14 @@ where
         }
     }
 
-    /// Whether this shard's own current bucket-ownership view owns
-    /// `key_bytes`' bucket. `true` unconditionally for every mode but
-    /// `Mode::Distributed`, which has no [`OwnershipTracker`] attached at
-    /// all: every other mode owns everything it holds.
+    /// Whether this shard's own current ownership view owns `key_bytes`'
+    /// part. `true` unconditionally for every mode but `Mode::Distributed`,
+    /// which has no [`OwnershipTracker`] attached at all: every other mode
+    /// owns everything it holds.
     fn owns_key(&self, key_bytes: &[u8]) -> bool {
         self.ownership
             .as_ref()
-            .is_none_or(|tracker| tracker.current().owns(bucket_of(key_bytes)))
+            .is_none_or(|tracker| tracker.current().owns(PartId::of_key(key_bytes)))
     }
 
     /// This shard's current ownership view and residency set together, for
@@ -2213,17 +2251,42 @@ where
         }
     }
 
-    /// Whether `bucket` is currently resident for outbound anti-entropy or
+    /// Whether `part` is currently resident for outbound anti-entropy or
     /// snapshot serving: owned, or mid disown-grace. `is_resident = owns ||
     /// residency.is_releasing`, used only by the outbound-serving guard and
     /// the donor-serving exception, never by the inbound-apply guard,
     /// which stays strict current-view ownership.
+    fn is_resident_part(residency: &(Arc<OwnershipView>, Arc<ResidencySet>), part: PartId) -> bool {
+        let (view, res) = residency;
+        view.owns(part) || res.is_releasing(part)
+    }
+
+    /// Whether any part of `bucket` is resident; see
+    /// [`Shard::is_resident_part`].
     fn is_resident_bucket(
         residency: &(Arc<OwnershipView>, Arc<ResidencySet>),
         bucket: u16,
     ) -> bool {
         let (view, res) = residency;
-        view.owns(bucket) || res.is_releasing(bucket)
+        view.owns_any_in_bucket(bucket) || res.releasing_in_bucket(bucket)
+    }
+
+    /// [`Shard::is_resident_bucket`] for every bucket at once, indexed by
+    /// bucket: one pass over the owned and releasing parts instead of one
+    /// lookup per part.
+    fn resident_bucket_mask(residency: &(Arc<OwnershipView>, Arc<ResidencySet>)) -> Vec<bool> {
+        let (view, res) = residency;
+        let mut mask: Vec<bool> = (0..BUCKET_COUNT)
+            .map(|bucket| {
+                view.owns_any_in_bucket(
+                    u16::try_from(bucket).expect("invariant: BUCKET_COUNT fits u16"),
+                )
+            })
+            .collect();
+        for part in res.releasing_parts() {
+            mask[usize::from(part.bucket())] = true;
+        }
+        mask
     }
 
     /// Dedups and sorts a bulk request list, ascending.
@@ -2233,17 +2296,18 @@ where
         items
     }
 
-    /// Runs `compute` for a resident `bucket`, else substitutes `absent` unrun.
+    /// Runs `compute` for a resident `bucket`, else substitutes `absent`
+    /// unrun. `mask` is [`Shard::resident_bucket_mask`]'s, `None` for a
+    /// shard with no residency guard.
     fn gated<R>(
-        residency: Option<&(Arc<OwnershipView>, Arc<ResidencySet>)>,
+        mask: Option<&[bool]>,
         bucket: u16,
         compute: impl FnOnce() -> R,
         absent: R,
     ) -> (u16, R) {
-        let value = match residency {
-            Some(residency) if !Self::is_resident_bucket(residency, bucket) => absent,
-            _ => compute(),
-        };
+        let resident =
+            mask.is_none_or(|mask| mask.get(usize::from(bucket)).copied().unwrap_or(false));
+        let value = if resident { compute() } else { absent };
         (bucket, value)
     }
 
@@ -2254,10 +2318,12 @@ where
         compute: impl Fn(u16) -> R,
         absent: R,
     ) -> Vec<(u16, R)> {
-        let residency = self.residency_check();
+        let mask = self
+            .residency_check()
+            .map(|residency| Self::resident_bucket_mask(&residency));
         Self::dedup_sorted(buckets)
             .into_iter()
-            .map(|b| Self::gated(residency.as_ref(), b, || compute(b), absent.clone()))
+            .map(|b| Self::gated(mask.as_deref(), b, || compute(b), absent.clone()))
             .collect()
     }
 
@@ -2271,9 +2337,10 @@ where
         let wanted = Self::dedup_sorted(wanted);
         match self.residency_check() {
             Some(residency) => {
+                let mask = Self::resident_bucket_mask(&residency);
                 let (resident, unresident): (Vec<T>, Vec<T>) = wanted
                     .into_iter()
-                    .partition(|&t| Self::is_resident_bucket(&residency, bucket_of(t)));
+                    .partition(|&t| mask[usize::from(bucket_of(t)) % BUCKET_COUNT]);
                 let mut entries = query(resident);
                 entries.extend(unresident.into_iter().map(|t| (t, Vec::new())));
                 entries.sort_unstable_by_key(|&(t, _)| t);
@@ -2341,14 +2408,14 @@ where
         }
     }
 
-    /// Splits prepared entries into owned and forwarded halves by current bucket ownership.
+    /// Splits prepared entries into owned and forwarded halves by current part ownership.
     fn partition_owned<T>(&self, prepared: Vec<T>, hash: impl Fn(&T) -> u64) -> (Vec<T>, Vec<T>) {
         match &self.ownership {
             Some(tracker) => {
                 let view = tracker.current();
                 prepared
                     .into_iter()
-                    .partition(|entry| view.owns(bucket_of_hash(hash(entry))))
+                    .partition(|entry| view.owns(PartId::from_hash(hash(entry))))
             }
             None => (prepared, Vec::new()),
         }
@@ -3883,10 +3950,13 @@ where
         // The outbound-serving guard: a `Mode::Distributed` shard never
         // reports a bucket it neither owns nor is releasing.
         let digests = match self.residency_check() {
-            Some(residency) => digests
-                .into_iter()
-                .filter(|&(bucket, _)| Self::is_resident_bucket(&residency, bucket))
-                .collect(),
+            Some(residency) => {
+                let mask = Self::resident_bucket_mask(&residency);
+                digests
+                    .into_iter()
+                    .filter(|&(bucket, _)| mask[usize::from(bucket) % BUCKET_COUNT])
+                    .collect()
+            }
             None => digests,
         };
         let digests = digests
@@ -3901,17 +3971,22 @@ where
             return self.digests();
         };
         let (view, releasing) = &residency;
-        let shared: HashSet<u16> = crate::ownership::shared_owned_buckets(view, peer)
+        let mut scope: HashSet<u16> = crate::ownership::shared_owned_parts(view, peer)
             .into_iter()
+            .map(PartId::bucket)
             .collect();
+        scope.extend(
+            releasing
+                .releasing_parts()
+                .into_iter()
+                .filter(|&part| view.owners_of(part).contains(&peer))
+                .map(PartId::bucket),
+        );
         let digests: Vec<BucketDigest> = self
             .engine
             .digests()
             .into_iter()
-            .filter(|&(bucket, _)| {
-                shared.contains(&bucket)
-                    || (releasing.is_releasing(bucket) && view.owners_of(bucket).contains(&peer))
-            })
+            .filter(|(bucket, _)| scope.contains(bucket))
             .map(|(bucket, digest)| BucketDigest { bucket, digest })
             .collect();
         Box::pin(async move { digests })
@@ -3960,6 +4035,11 @@ where
         Box::pin(async move { held })
     }
 
+    fn held_parts(&self) -> BoxFuture<'_, Vec<PartId>> {
+        let held = self.engine.held_parts();
+        Box::pin(async move { held })
+    }
+
     fn part_digests(&self, buckets: Vec<u16>) -> BoxFuture<'_, Vec<BucketPartDigests>> {
         let out = self.gated_map(buckets, |b| self.engine.part_digests(b), Vec::new());
         let out = out
@@ -3991,7 +4071,7 @@ where
         let keys = match self.residency_check() {
             Some(residency) => keys
                 .into_iter()
-                .filter(|k| Self::is_resident_bucket(&residency, bucket_of(k.as_ref())))
+                .filter(|k| Self::is_resident_part(&residency, PartId::of_key(k.as_ref())))
                 .collect(),
             None => keys,
         };
@@ -4052,7 +4132,9 @@ where
             let records = match residency {
                 Some(residency) => records
                     .into_iter()
-                    .filter(|rec| Self::is_resident_bucket(&residency, bucket_of(rec.key.as_ref())))
+                    .filter(|rec| {
+                        Self::is_resident_part(&residency, PartId::of_key(rec.key.as_ref()))
+                    })
                     .collect(),
                 None => records,
             };
@@ -4258,16 +4340,29 @@ where
         Box::pin(async move { removed })
     }
 
-    fn is_cold_bucket(&self, bucket: u16) -> bool {
+    fn release_parts(&self, parts: &[PartId]) -> BoxFuture<'_, u64> {
+        let removed = self.engine.release_parts(parts);
+        Box::pin(async move { removed })
+    }
+
+    fn is_cold_part(&self, part: PartId) -> bool {
         self.residency
             .as_ref()
-            .is_some_and(|residency| residency.is_cold(bucket))
+            .is_some_and(|residency| residency.is_cold(part))
+    }
+
+    fn is_unverified_part(&self, part: PartId) -> bool {
+        self.residency
+            .as_ref()
+            .is_some_and(|residency| residency.is_unverified(part))
+    }
+
+    fn is_cold_bucket(&self, bucket: u16) -> bool {
+        PartId::of_bucket(bucket).any(|part| self.is_cold_part(part))
     }
 
     fn is_unverified_bucket(&self, bucket: u16) -> bool {
-        self.residency
-            .as_ref()
-            .is_some_and(|residency| residency.is_unverified(bucket))
+        PartId::of_bucket(bucket).any(|part| self.is_unverified_part(part))
     }
 
     fn ae_peer_filter(&self, dirty: Vec<NodeId>, live: Vec<NodeId>) -> (Vec<NodeId>, Vec<NodeId>) {
@@ -4276,12 +4371,9 @@ where
             return (dirty, live);
         };
         let view = tracker.current();
-        let mut cohort: HashSet<NodeId> = HashSet::new();
-        for i in 0..BUCKET_COUNT {
-            let bucket = u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
-            if view.owns(bucket) || residency.is_releasing(bucket) {
-                cohort.extend(view.owners_of(bucket).iter().copied());
-            }
+        let mut cohort: HashSet<NodeId> = view.co_owners().iter().copied().collect();
+        for part in residency.releasing_parts() {
+            cohort.extend(view.owners_of(part).iter().copied());
         }
         let filter = |nodes: Vec<NodeId>| -> Vec<NodeId> {
             nodes.into_iter().filter(|n| cohort.contains(n)).collect()
@@ -4346,11 +4438,23 @@ mod tests {
         (shard, view, tx)
     }
 
-    /// The first `u32` key, scanning from `0`, whose bucket `view.owns`
+    /// Every part of `bucket`: what a bucket-granularity view owns or
+    /// releases together.
+    fn whole(bucket: u16) -> Vec<PartId> {
+        PartId::of_bucket(bucket).collect()
+    }
+
+    /// `bucket`'s first part, which a bucket-granularity view owns exactly
+    /// when it owns the bucket.
+    fn first_part(bucket: u16) -> PartId {
+        PartId::new(bucket, 0)
+    }
+
+    /// The first `u32` key, scanning from `0`, whose part `view.owns`
     /// matches `owns`.
     fn find_key_by_ownership(view: &OwnershipView, owns: bool) -> u32 {
         (0..1_000_000u32)
-            .find(|&key| view.owns(bucket_of(&key_bytes(&key))) == owns)
+            .find(|&key| view.owns(PartId::of_key(&key_bytes(&key))) == owns)
             .expect("a matching key is found within a generous scan range")
     }
 
@@ -7215,9 +7319,9 @@ mod tests {
                 NonZeroU8::new(1).expect("nonzero"),
             );
             let key = (0..1_000_000u32)
-                .find(|&k| !new_view.owns(bucket_of(&key_bytes(&k))))
+                .find(|&k| !new_view.owns(PartId::of_key(&key_bytes(&k))))
                 .expect("some bucket flips ownership once a second node joins");
-            let bucket = bucket_of(&key_bytes(&key));
+            let bucket = PartId::of_key(&key_bytes(&key));
             assert!(initial_view.owns(bucket));
 
             let dead = writer(11);
@@ -8915,7 +9019,7 @@ mod tests {
         let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
 
         let unowned_keys: Vec<u32> = (0..5_000u32)
-            .filter(|&key| !view.owns(bucket_of(&key_bytes(&key))))
+            .filter(|&key| !view.owns(PartId::of_key(&key_bytes(&key))))
             .take(200)
             .collect();
         assert!(
@@ -9085,7 +9189,7 @@ mod tests {
                 let eligible = (1..=extra).map(NodeId::from).collect::<Vec<_>>();
                 OwnershipView::compute(self_node, eligible, NonZeroU8::new(2).expect("nonzero"))
             })
-            .find(|v| !v.owns(bucket))
+            .find(|v| !v.owns(first_part(bucket)))
             .expect("some larger eligible set takes the bucket away from self");
         tx.send(Arc::new(moved)).expect("receiver still alive");
 
@@ -9116,7 +9220,7 @@ mod tests {
         // yes for this bucket, but the inbound-apply guard stays strict
         // current-view ownership: the record goes on to the current owners
         // through the fan-out queue and never lands here.
-        residency.mark_releasing(&[unowned_bucket]);
+        residency.mark_releasing(&whole(unowned_bucket));
 
         let rec = wire_record(unowned_key, "redirected", hlc(1, 9));
         ShardOps::apply_remote_batch(&s, vec![rec.clone()]).await;
@@ -9132,7 +9236,7 @@ mod tests {
         );
 
         // A bucket this node never held is still dropped outright.
-        residency.unmark(&[unowned_bucket]);
+        residency.unmark(&whole(unowned_bucket));
         let rec = wire_record(unowned_key, "dropped", hlc(2, 9));
         ShardOps::apply_remote_batch(&s, vec![rec]).await;
         assert!(s.get(&unowned_key).await.is_none());
@@ -9156,7 +9260,7 @@ mod tests {
             .collect();
         for &bucket in &reported {
             assert!(
-                view.owns(bucket),
+                view.owns(first_part(bucket)),
                 "digests reported unowned bucket {bucket}"
             );
         }
@@ -9237,10 +9341,10 @@ mod tests {
             NonZeroU8::new(1).expect("nonzero"),
         );
         let key = (0..1_000_000u32)
-            .find(|&k| !new_view.owns(bucket_of(&key_bytes(&k))))
+            .find(|&k| !new_view.owns(PartId::of_key(&key_bytes(&k))))
             .expect("some bucket flips ownership once a second node joins");
-        let bucket = bucket_of(&key_bytes(&key));
-        assert!(initial_view.owns(bucket));
+        let part = PartId::of_key(&key_bytes(&key));
+        assert!(initial_view.owns(part));
 
         s.insert(key, "still here".to_string())
             .await
@@ -9250,9 +9354,9 @@ mod tests {
         // exactly what `rebalance_task` reacts to by starting this bucket's
         // disown grace.
         tx.send(Arc::new(new_view)).expect("receiver still alive");
-        residency.mark_releasing(&[bucket]);
+        residency.mark_releasing(&[part]);
         assert!(
-            !ShardOps::ownership_view(&s).expect("attached").owns(bucket),
+            !ShardOps::ownership_view(&s).expect("attached").owns(part),
             "sanity: this node no longer owns the bucket under the new view"
         );
 
@@ -9262,11 +9366,11 @@ mod tests {
             .map(|bd| bd.bucket)
             .collect();
         assert!(
-            digests.contains(&bucket),
+            digests.contains(&part.bucket()),
             "a releasing bucket still answers digests"
         );
 
-        let entries = ShardOps::entries_for_buckets(&s, vec![bucket]).await;
+        let entries = ShardOps::entries_for_buckets(&s, vec![part.bucket()]).await;
         assert_eq!(entries.len(), 1);
         assert!(
             entries[0]
@@ -9400,9 +9504,9 @@ mod tests {
             Arc::clone(&residency),
         );
         assert!(!ShardOps::is_cold_bucket(&s, 7));
-        residency.mark_cold(&[7]);
+        residency.mark_cold(&whole(7));
         assert!(ShardOps::is_cold_bucket(&s, 7));
-        residency.clear_cold(&[7]);
+        residency.clear_cold(&whole(7));
         assert!(!ShardOps::is_cold_bucket(&s, 7));
     }
 
@@ -9458,23 +9562,23 @@ mod tests {
         let bucket_at = |i: usize| u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
         let shared_owned = (0..BUCKET_COUNT)
             .map(bucket_at)
-            .find(|&b| view.owns(b) && view.owners_of(b).contains(&peer))
+            .find(|&b| view.owns(first_part(b)) && view.owners_of(first_part(b)).contains(&peer))
             .expect("some bucket is owned by both self and the peer");
         let owned_not_shared = (0..BUCKET_COUNT)
             .map(bucket_at)
-            .find(|&b| view.owns(b) && !view.owners_of(b).contains(&peer))
+            .find(|&b| view.owns(first_part(b)) && !view.owners_of(first_part(b)).contains(&peer))
             .expect("some bucket is owned by self but not the peer");
         let peer_only = (0..BUCKET_COUNT)
             .map(bucket_at)
-            .find(|&b| !view.owns(b) && view.owners_of(b).contains(&peer))
+            .find(|&b| !view.owns(first_part(b)) && view.owners_of(first_part(b)).contains(&peer))
             .expect("some bucket is owned by the peer but not self");
         let neither = (0..BUCKET_COUNT)
             .map(bucket_at)
-            .find(|&b| !view.owns(b) && !view.owners_of(b).contains(&peer))
+            .find(|&b| !view.owns(first_part(b)) && !view.owners_of(first_part(b)).contains(&peer))
             .expect("some bucket is owned by neither self nor the peer");
         // A bucket mid disown-grace that the peer now owns stays in the
         // round: the anti-entropy backstop for a lost rebalance pull.
-        residency.mark_releasing(&[peer_only, neither]);
+        residency.mark_releasing(&[whole(peer_only), whole(neither)].concat());
 
         let listed: HashSet<u16> = ShardOps::ae_digests_for(&s, peer)
             .await
@@ -9499,11 +9603,11 @@ mod tests {
         );
         for bucket in &listed {
             assert!(
-                view.owners_of(*bucket).contains(&peer),
+                view.owners_of(first_part(*bucket)).contains(&peer),
                 "every listed bucket is owned by the peer: {bucket}"
             );
             assert!(
-                view.owns(*bucket) || residency.is_releasing(*bucket),
+                view.owns(first_part(*bucket)) || residency.is_releasing(first_part(*bucket)),
                 "every listed bucket is resident here: {bucket}"
             );
         }
@@ -9525,8 +9629,8 @@ mod tests {
         let mut cohort: HashSet<NodeId> = HashSet::new();
         for i in 0..BUCKET_COUNT {
             let bucket = u16::try_from(i).expect("invariant: BUCKET_COUNT fits u16");
-            if view.owns(bucket) {
-                cohort.extend(view.owners_of(bucket).iter().copied());
+            if view.owns(first_part(bucket)) {
+                cohort.extend(view.owners_of(first_part(bucket)).iter().copied());
             }
         }
         cohort.remove(&self_node);

@@ -33,7 +33,7 @@ use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHa
 use sundog::node::{NodeId, NodeName};
 use sundog::store::{
     BucketDigest, BucketLen, BucketPart, BucketPartDigests, CompactionBounds, KeyVersion, Mode,
-    Quiescence, Shard, ShardOps, SimFanOut,
+    PartId, Quiescence, Shard, ShardOps, SimFanOut,
 };
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
@@ -1736,6 +1736,11 @@ fn bucket_of_u32(key: u32) -> u16 {
     bucket_of_bytes(&key_bytes(key))
 }
 
+/// The ownership part `key` hashes into.
+fn part_of_u32(key: u32) -> PartId {
+    PartId::of_key(&key_bytes(key))
+}
+
 /// Among `0..n`, every key in a bucket holding more than `min_count` of
 /// them. Deterministic given a fixed key range.
 fn dense_bucket_keys(n: u32, min_count: usize) -> Vec<u32> {
@@ -2141,8 +2146,7 @@ fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
 /// grouping; [`fan_out_owned`] calls this once per `Applied` item, and
 /// retries a `Forward` item across ticks the same way.
 fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &WireRecord) {
-    let bucket = bucket_of_bytes(rec.key.as_ref());
-    for &owner in view.owners_of(bucket) {
+    for &owner in view.owners_of(PartId::of_key(rec.key.as_ref())) {
         if owner != self_node {
             mesh.send(
                 owner,
@@ -2339,7 +2343,7 @@ async fn dist_node_loop(
             _ = rebalance_tick.tick() => {
                 let due = residency.expired(params.disown_grace);
                 if !due.is_empty() {
-                    ShardOps::release_buckets(shard.as_ref(), &due).await;
+                    ShardOps::release_parts(shard.as_ref(), &due).await;
                     residency.unmark(&due);
                 }
             }
@@ -2362,13 +2366,13 @@ fn assert_holds_only_owned_or_releasing(
         };
         for key in 0..key_space {
             if value_of(&n.shard, key).is_some() {
-                let bucket = bucket_of_u32(key);
-                let ok = view.owns(bucket) || (allow_releasing && n.residency.is_releasing(bucket));
+                let part = part_of_u32(key);
+                let ok = view.owns(part) || (allow_releasing && n.residency.is_releasing(part));
                 assert!(
                     ok,
-                    "{label}: node {:?} holds key {key} (bucket {bucket}) it neither owns nor is releasing (is_releasing={})",
+                    "{label}: node {:?} holds key {key} (part {part}) it neither owns nor is releasing (is_releasing={})",
                     n.node,
-                    n.residency.is_releasing(bucket)
+                    n.residency.is_releasing(part)
                 );
             }
         }
@@ -2382,9 +2386,9 @@ fn assert_holds_only_owned_or_releasing(
 /// scenarios above use) does not apply.
 fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
     expected.iter().all(|&key| {
-        let bucket = bucket_of_u32(key);
+        let part = part_of_u32(key);
         nodes.iter().any(|n| {
-            ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(bucket))
+            ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(part))
                 && value_of(&n.shard, key).is_some()
         })
     })
@@ -2400,9 +2404,9 @@ fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
 /// second hop to land before treating the pre-churn baseline as settled.
 fn dist_removals_settled(nodes: &[DistNode], removed: &HashSet<u32>) -> bool {
     removed.iter().all(|&key| {
-        let bucket = bucket_of_u32(key);
+        let part = part_of_u32(key);
         nodes.iter().all(|n| {
-            !ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(bucket))
+            !ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(part))
                 || value_of(&n.shard, key).is_none()
         })
     })
@@ -2714,11 +2718,11 @@ fn distributed_partition_then_heal_reconciles_ownership() {
             let view =
                 ShardOps::ownership_view(n.shard.as_ref()).expect("distributed shard has a view");
             value_of(&n.shard, shared_key).as_deref() != Some("side1")
-                && (!view.owns(bucket_of_u32(shared_key))
+                && (!view.owns(part_of_u32(shared_key))
                     || value_of(&n.shard, shared_key).as_deref() == Some("side2"))
-                && (!view.owns(bucket_of_u32(111))
+                && (!view.owns(part_of_u32(111))
                     || value_of(&n.shard, 111).as_deref() == Some("only-side1"))
-                && (!view.owns(bucket_of_u32(222))
+                && (!view.owns(part_of_u32(222))
                     || value_of(&n.shard, 222).as_deref() == Some("only-side2"))
         })
     })
@@ -2765,10 +2769,10 @@ fn distributed_owner_loss_k_two_loses_nothing() {
         (NodeId::from(3004), "loss-node-d", port),
     ];
     let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
-    let target_bucket = 0u16;
+    let target_part = PartId::from_raw(0);
 
     let initial_owners = OwnershipView::compute(node_ids[0], node_ids.clone(), k)
-        .owners_of(target_bucket)
+        .owners_of(target_part)
         .to_vec();
     assert_eq!(
         initial_owners.len(),
@@ -2778,8 +2782,8 @@ fn distributed_owner_loss_k_two_loses_nothing() {
     let leaving = initial_owners[0];
     let staying = initial_owners[1];
 
-    let bucket_keys: Vec<u32> = (0..20_000)
-        .filter(|&key| bucket_of_u32(key) == target_bucket)
+    let bucket_keys: Vec<u32> = (0..5_000_000)
+        .filter(|&key| part_of_u32(key) == target_part)
         .take(5)
         .collect();
     assert!(
@@ -2832,7 +2836,7 @@ fn distributed_owner_loss_k_two_loses_nothing() {
     republish_all(&nodes, &live, k);
 
     let new_owners = OwnershipView::compute(staying, live, k)
-        .owners_of(target_bucket)
+        .owners_of(target_part)
         .to_vec();
     assert!(
         new_owners.contains(&staying),
@@ -3000,10 +3004,10 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         (NodeId::from(5003), "grace-node-c", port),
     ];
     let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
-    let target_bucket = 0u16;
+    let target_part = PartId::from_raw(0);
 
     let initial_owners = OwnershipView::compute(node_ids[0], node_ids.clone(), k)
-        .owners_of(target_bucket)
+        .owners_of(target_part)
         .to_vec();
     assert_eq!(initial_owners.len(), 2);
     // `owners_of` is ordered by descending rendezvous score: index 0 is the
@@ -3017,7 +3021,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     let leaving = initial_owners[1];
 
     // A phantom fourth node: never run as a real host, chosen purely so
-    // the rendezvous computation displaces `leaving` from `target_bucket`
+    // the rendezvous computation displaces `leaving` from `target_part`
     // without displacing `staying`.
     let phantom = (9_000_000u64..9_001_000)
         .map(NodeId::from)
@@ -3025,14 +3029,14 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
             let mut eligible = node_ids.clone();
             eligible.push(candidate);
             let owners = OwnershipView::compute(candidate, eligible, k)
-                .owners_of(target_bucket)
+                .owners_of(target_part)
                 .to_vec();
             owners.contains(&staying) && !owners.contains(&leaving)
         })
         .expect("some candidate id displaces the leaving owner alone");
 
-    let all_bucket_keys: Vec<u32> = (0..20_000)
-        .filter(|&key| bucket_of_u32(key) == target_bucket)
+    let all_bucket_keys: Vec<u32> = (0..5_000_000)
+        .filter(|&key| part_of_u32(key) == target_part)
         .take(4)
         .collect();
     assert_eq!(
@@ -3084,7 +3088,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     })
     .expect("both original owners hold the bucket's keys before the membership change");
 
-    // Advertise the phantom fourth node: `leaving` loses `target_bucket`
+    // Advertise the phantom fourth node: `leaving` loses `target_part`
     // and starts its disown-grace clock; `staying` keeps it.
     let mut eligible = node_ids.clone();
     eligible.push(phantom);
@@ -3095,7 +3099,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
             .find(|n| n.node == leaving)
             .unwrap()
             .residency
-            .is_releasing(target_bucket),
+            .is_releasing(target_part),
         "the departed owner marks the bucket releasing immediately on the view change"
     );
 
@@ -3131,13 +3135,13 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         // A deliberately wrong digest forces a mismatch reply carrying
         // real entries, proving the responder still answers.
         if let Ok(mismatched) = mesh
-            .ae_round(leaving, cache_name(), vec![(target_bucket, 0)])
+            .ae_round(leaving, cache_name(), vec![(target_part.bucket(), 0)])
             .await
         {
             ae_mismatch_count_probe.fetch_add(mismatched.len(), Ordering::Relaxed);
         }
         if let Ok(listing) = mesh
-            .ae_entries(leaving, cache_name(), vec![target_bucket])
+            .ae_entries(leaving, cache_name(), vec![target_part.bucket()])
             .await
         {
             let count: usize = listing.into_iter().map(|(_, entries)| entries.len()).sum();

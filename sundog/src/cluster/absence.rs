@@ -211,8 +211,8 @@ pub(crate) fn should_defer_gc(
                 return false;
             };
             tracker.absent_nodes(hard_cap).into_iter().any(|node| {
-                view.owned_buckets()
-                    .any(|b| view.owners_of(b).contains(&node))
+                view.owned_parts()
+                    .any(|part| view.owners_of(part).contains(&node))
             })
         }
         Mode::Local | Mode::Invalidation => false,

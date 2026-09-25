@@ -3,7 +3,7 @@
 //! target-peer set for `Distributed`. `Shard` holds no handle to `net::Mesh`,
 //! so this is the one place a write's mode decides who hears about it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use super::Cluster;
 use crate::net::{MsgClass, OutFrame, batch_forward, batch_replicate};
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
-use crate::store::{FanOutItem, FanOutQueue, Mode, Shard, ShardOps, bucket_of};
+use crate::store::{FanOutItem, FanOutQueue, Mode, PartId, Shard, ShardOps};
 use crate::wire::{Msg, WireRecord};
 
 /// Drains one opened cache's queue of locally written keys and fans them out
@@ -66,32 +66,36 @@ pub(super) struct OwnerGroup {
 }
 
 /// Groups `records` by the exact target-peer set each replicates to: its
-/// bucket's live owners under `view`, self excluded. Pure and mesh-free, so
+/// part's live owners under `view`, self excluded. Pure and mesh-free, so
 /// [`fan_out_by_owner_set`] and its own unit tests both build on it
-/// directly. Two records whose buckets share the same owner set land in
-/// the same group, so replicating them costs one round trip per group, not
-/// one per record.
+/// directly. Two records whose parts share the same owner set land in the
+/// same group, so replicating them costs one round trip per group, not one
+/// per record.
 pub(super) fn group_by_owner_set(
     view: &OwnershipView,
     self_node: NodeId,
     records: Vec<WireRecord>,
 ) -> Vec<OwnerGroup> {
     let mut groups: Vec<OwnerGroup> = Vec::new();
+    let mut index: HashMap<Vec<NodeId>, usize> = HashMap::new();
     for rec in records {
-        let bucket = bucket_of(rec.key.as_ref());
+        let part = PartId::of_key(rec.key.as_ref());
         let mut owners: Vec<NodeId> = view
-            .owners_of(bucket)
+            .owners_of(part)
             .iter()
             .copied()
             .filter(|&n| n != self_node)
             .collect();
         owners.sort_unstable();
-        match groups.iter_mut().find(|group| group.owners == owners) {
-            Some(group) => group.records.push(rec),
-            None => groups.push(OwnerGroup {
-                owners,
-                records: vec![rec],
-            }),
+        match index.get(&owners) {
+            Some(&at) => groups[at].records.push(rec),
+            None => {
+                index.insert(owners.clone(), groups.len());
+                groups.push(OwnerGroup {
+                    owners,
+                    records: vec![rec],
+                });
+            }
         }
     }
     groups
@@ -192,14 +196,14 @@ async fn fan_out_batch<K, V>(
         let Some(view) = shard.ownership_view() else {
             return;
         };
-        // A write forwarded while this node did not own its bucket, whose
-        // bucket this node owns by the time the queue drains, lands here
-        // too: sending it only to the other owners, or to nobody when this
-        // node is the sole owner, would lose the one copy that exists.
+        // A write forwarded while this node did not own its part, whose
+        // part this node owns by the time the queue drains, lands here too:
+        // sending it only to the other owners, or to nobody when this node
+        // is the sole owner, would lose the one copy that exists.
         let mine: Vec<WireRecord> = records
             .iter()
             .filter(|rec| {
-                view.owns(bucket_of(rec.key.as_ref()))
+                view.owns(PartId::of_key(rec.key.as_ref()))
                     && !applied_keys_bytes.contains(rec.key.as_ref())
             })
             .cloned()
@@ -325,10 +329,9 @@ mod tests {
                  owners: {owners:?}"
             );
             for rec in records {
-                let key: u32 = postcard::from_bytes(&rec.key).expect("test key decodes");
-                let bucket = bucket_of_u32(key);
+                let part = PartId::of_key(&rec.key);
                 let mut expected: Vec<NodeId> = view
-                    .owners_of(bucket)
+                    .owners_of(part)
                     .iter()
                     .copied()
                     .filter(|&n| n != self_node)
