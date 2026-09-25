@@ -210,13 +210,17 @@ pub fn ownership_diff(old: &OwnershipView, new: &OwnershipView) -> (Vec<PartId>,
 
 /// One cache's computed ownership, current as of the eligible-node set that
 /// built it. Immutable once built: a membership or cache-mode change produces
-/// a whole new view via [`OwnershipView::compute_at`], never a mutation, so a
-/// reader holding an `Arc<OwnershipView>` sees a consistent snapshot for the
-/// whole of one operation.
+/// a whole new view via [`OwnershipView::compute_at`] or
+/// [`OwnershipView::successor`], never a mutation, so a reader holding an
+/// `Arc<OwnershipView>` sees a consistent snapshot for the whole of one
+/// operation.
 #[derive(Debug)]
 pub struct OwnershipView {
     view_hash: u64,
     self_node: NodeId,
+    /// The ranked nodes, `self_node` among them, ascending.
+    eligible: Vec<NodeId>,
+    k: NonZeroU8,
     granularity: Granularity,
     /// Every unit's owners, highest rendezvous score first, `stride` apiece:
     /// one unit per bucket at `Bucket`, one per part at `Part`.
@@ -242,43 +246,98 @@ impl OwnershipView {
     #[must_use]
     pub fn compute_at(
         self_node: NodeId,
-        mut eligible: Vec<NodeId>,
+        eligible: Vec<NodeId>,
         k: NonZeroU8,
         granularity: Granularity,
     ) -> Self {
-        eligible.push(self_node);
-        eligible.sort_unstable();
-        eligible.dedup();
+        let eligible = with_self(self_node, eligible);
+        let stride = usize::from(k.get()).min(eligible.len());
+        let mut owners = Vec::with_capacity(unit_count(granularity) * stride);
+        let mut top = Vec::with_capacity(stride + 1);
+        for unit in units(granularity) {
+            top_by_score(&eligible, unit, stride, &mut top);
+            owners.extend(top.iter().map(|&(_, node)| node));
+        }
+        Self::from_owners(self_node, eligible, k, granularity, owners)
+    }
 
-        let view_hash = view_hash_at(&eligible, granularity);
-        let k = k.get();
-        let stride = usize::from(k).min(eligible.len());
-        // One ranking per unit: a bucket at `Bucket`, a part at `Part`,
-        // either way named by its wire id.
-        let units = match granularity {
-            Granularity::Bucket => BUCKET_COUNT,
-            Granularity::Part => PART_SPACE,
-        };
-        let mut owners = Vec::with_capacity(units * stride);
+    /// The view `self_node` moves to when the eligible set becomes
+    /// `eligible`: equal to [`OwnershipView::compute_at`]'s, built from this
+    /// view's ranking. A unit whose owners all stay eligible ranks only
+    /// them and the nodes that joined; a unit that lost an owner ranks
+    /// every node again. A change of granularity, `k` or owners per unit
+    /// builds from scratch.
+    #[must_use]
+    pub fn successor(&self, eligible: Vec<NodeId>, k: NonZeroU8, granularity: Granularity) -> Self {
+        let eligible = with_self(self.self_node, eligible);
+        let stride = usize::from(k.get()).min(eligible.len());
+        if (k, granularity, stride) != (self.k, self.granularity, self.stride) {
+            return Self::compute_at(self.self_node, eligible, k, granularity);
+        }
+        let joined: Vec<NodeId> = eligible
+            .iter()
+            .copied()
+            .filter(|node| self.eligible.binary_search(node).is_err())
+            .collect();
+        let stays = |node: NodeId| eligible.binary_search(&node).is_ok();
+        let mut owners = Vec::with_capacity(self.owners.len());
+        let mut candidates = Vec::with_capacity(stride + joined.len());
+        let mut top = Vec::with_capacity(stride + 1);
+        for (unit, previous) in units(granularity).zip(self.owners.chunks_exact(stride)) {
+            if joined.is_empty() && previous.iter().all(|&node| stays(node)) {
+                owners.extend_from_slice(previous);
+                continue;
+            }
+            candidates.clear();
+            candidates.extend(
+                previous
+                    .iter()
+                    .chain(&joined)
+                    .map(|&node| (rendezvous_score(node, unit), node)),
+            );
+            let (kept, newcomers) = candidates.split_at(stride);
+            if !carried_top(
+                kept,
+                newcomers,
+                |&(_, node)| stays(node),
+                stride,
+                &mut top,
+                rank_order,
+            ) {
+                top_by_score(&eligible, unit, stride, &mut top);
+            }
+            owners.extend(top.iter().map(|&(_, node)| node));
+        }
+        Self::from_owners(self.self_node, eligible, k, granularity, owners)
+    }
+
+    /// The view `owners` describes: every unit's owners, `min(k, eligible)`
+    /// apiece, in [`units`] order.
+    fn from_owners(
+        self_node: NodeId,
+        eligible: Vec<NodeId>,
+        k: NonZeroU8,
+        granularity: Granularity,
+        owners: Vec<NodeId>,
+    ) -> Self {
+        let stride = usize::from(k.get()).min(eligible.len());
         let mut owned = PartSet::new();
         let mut owns_in_bucket = vec![false; BUCKET_COUNT];
         let mut co_owners = BTreeSet::new();
-        let mut top = Vec::with_capacity(stride + 1);
-        for unit in (0..=u16::MAX).take(units) {
-            top_by_score(&eligible, unit, stride, &mut top);
-            let ranked = top.iter().map(|&(_, node)| node);
-            if ranked.clone().any(|node| node == self_node) {
+        for (unit, ranked) in units(granularity).zip(owners.chunks_exact(stride)) {
+            if ranked.contains(&self_node) {
                 for part in parts_of_wire_id(granularity, unit) {
                     owned.insert(part);
                     owns_in_bucket[usize::from(part.bucket())] = true;
                 }
-                co_owners.extend(ranked.clone().filter(|&node| node != self_node));
+                co_owners.extend(ranked.iter().copied().filter(|&node| node != self_node));
             }
-            owners.extend(ranked);
         }
         Self {
-            view_hash,
+            view_hash: view_hash_at(&eligible, granularity),
             self_node,
+            eligible,
+            k,
             granularity,
             owners,
             stride,
@@ -424,6 +483,49 @@ fn select_top<T>(
         }
         top.truncate(k);
     }
+}
+
+/// Refreshes one unit's first `k` when its candidates change: `kept` was the
+/// first `k` of the old candidates in `order`, `joined` are the new ones,
+/// and `stays` says which old ones remain. Fills `top` and returns `true`
+/// when every one of `kept` stays, since then no candidate outside `kept`
+/// can outrank them; returns `false`, leaving the unit to a full ranking,
+/// when one left, since a candidate `kept` crowded out may rise.
+fn carried_top<T: Copy>(
+    kept: &[T],
+    joined: &[T],
+    stays: impl Fn(&T) -> bool,
+    k: usize,
+    top: &mut Vec<T>,
+    order: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> bool {
+    let carried = kept.iter().all(stays);
+    if carried {
+        select_top(kept.iter().chain(joined).copied(), k, top, order);
+    }
+    carried
+}
+
+/// `eligible` with `self_node` in it, ascending and deduplicated.
+fn with_self(self_node: NodeId, mut eligible: Vec<NodeId>) -> Vec<NodeId> {
+    eligible.push(self_node);
+    eligible.sort_unstable();
+    eligible.dedup();
+    eligible
+}
+
+/// How many units a view at `granularity` ranks.
+const fn unit_count(granularity: Granularity) -> usize {
+    match granularity {
+        Granularity::Bucket => BUCKET_COUNT,
+        Granularity::Part => PART_SPACE,
+    }
+}
+
+/// Every unit a view at `granularity` ranks, by wire id: a bucket at
+/// `Bucket`, a part at `Part`.
+fn units(granularity: Granularity) -> impl Iterator<Item = u16> {
+    (0..=u16::MAX).take(unit_count(granularity))
 }
 
 /// A live-updating, cheap-to-clone handle onto one cache's current
@@ -743,20 +845,21 @@ pub(crate) async fn refresh_task(
         }
         let peers_snapshot = peers.borrow_and_update().clone();
         let modes_snapshot = modes.borrow_and_update().clone();
-        // The hash alone says whether anything changed; the view itself,
-        // 65,536 rankings at part granularity, is built only when it did,
-        // and off the async workers.
+        // The hash alone says whether anything changed; the view itself is
+        // built only when it did, from the current one, and at part
+        // granularity off the async workers.
         let eligible = eligible_owners(self_node, &peers_snapshot, &modes_snapshot, &cache, k);
         let granularity = ownership_granularity(self_node, &peers_snapshot, &eligible);
         let new_hash = view_hash_at(&eligible, granularity);
         if tx.borrow().view_hash() == new_hash {
             continue;
         }
+        let current = Arc::clone(&tx.borrow());
         let view = match granularity {
-            Granularity::Bucket => OwnershipView::compute_at(self_node, eligible, k, granularity),
+            Granularity::Bucket => current.successor(eligible, k, granularity),
             Granularity::Part => {
                 match tokio::task::spawn_blocking(move || {
-                    OwnershipView::compute_at(self_node, eligible, k, granularity)
+                    current.successor(eligible, k, granularity)
                 })
                 .await
                 {
@@ -861,7 +964,46 @@ mod tests {
         assert!(eligible.iter().all(|n| result.contains(n)));
     }
 
+    /// Holds `successor` equal to a fresh build of the same inputs, field by
+    /// field.
+    fn assert_same_view(successor: &OwnershipView, fresh: &OwnershipView) {
+        assert_eq!(successor.view_hash, fresh.view_hash);
+        assert_eq!(successor.eligible, fresh.eligible);
+        assert_eq!(successor.stride, fresh.stride);
+        assert_eq!(successor.owners, fresh.owners, "every unit's ranked owners");
+        assert!(successor.owned_parts().eq(fresh.owned_parts()));
+        assert_eq!(successor.owns_in_bucket, fresh.owns_in_bucket);
+        assert_eq!(successor.co_owners, fresh.co_owners);
+    }
+
+    /// The nodes `1..=n` minus `left`, plus `joined`.
+    fn moved(n: u64, left: &[u64], joined: &[u64]) -> Vec<NodeId> {
+        (1..=n)
+            .filter(|node| !left.contains(node))
+            .chain(joined.iter().copied())
+            .map(NodeId::from)
+            .collect()
+    }
+
     proptest! {
+        #[test]
+        fn a_successor_view_equals_a_fresh_build(
+            n in 1u64..24,
+            k in 1u8..4,
+            left in proptest::collection::vec(2u64..24, 0..4),
+            joined in proptest::collection::vec(100u64..110, 0..4),
+        ) {
+            let self_node = NodeId::from(1);
+            let k = NonZeroU8::new(k).expect("nonzero");
+            let before = OwnershipView::compute_at(self_node, moved(n, &[], &[]), k, Granularity::Bucket);
+            let eligible = moved(n, &left, &joined);
+            let successor = before.successor(eligible.clone(), k, Granularity::Bucket);
+            assert_same_view(
+                &successor,
+                &OwnershipView::compute_at(self_node, eligible, k, Granularity::Bucket),
+            );
+        }
+
         #[test]
         fn owners_of_bucket_is_invariant_to_input_order(seed in any::<u64>(), n in 1u64..30) {
             let mut nodes: Vec<NodeId> = (1..=n).map(NodeId::from).collect();
@@ -1164,6 +1306,85 @@ mod tests {
         }
         let alone = OwnershipView::compute(self_node, vec![self_node], k);
         assert!(alone.co_owners().is_empty(), "a lone node has no co-owner");
+    }
+
+    #[test]
+    fn a_part_view_successor_equals_a_fresh_build_across_joins_leaves_and_switches() {
+        let self_node = NodeId::from(1);
+        let two = NonZeroU8::new(2).expect("nonzero");
+        let before =
+            OwnershipView::compute_at(self_node, moved(20, &[], &[]), two, Granularity::Part);
+        let cases = [
+            ("a join", moved(20, &[], &[21]), two, Granularity::Part),
+            ("a leave", moved(20, &[7], &[]), two, Granularity::Part),
+            (
+                "a join and a leave",
+                moved(20, &[7, 9], &[21]),
+                two,
+                Granularity::Part,
+            ),
+            ("no change", moved(20, &[], &[]), two, Granularity::Part),
+            (
+                "another k",
+                moved(20, &[], &[]),
+                NonZeroU8::new(3).expect("nonzero"),
+                Granularity::Part,
+            ),
+            (
+                "bucket ranking",
+                moved(20, &[], &[]),
+                two,
+                Granularity::Bucket,
+            ),
+            ("a lone node", vec![self_node], two, Granularity::Part),
+        ];
+        for (what, eligible, k, granularity) in cases {
+            let successor = before.successor(eligible.clone(), k, granularity);
+            let fresh = OwnershipView::compute_at(self_node, eligible, k, granularity);
+            assert_eq!(successor.view_hash(), fresh.view_hash(), "{what}");
+            assert_same_view(&successor, &fresh);
+        }
+        let alone = OwnershipView::compute_at(self_node, vec![self_node], two, Granularity::Part);
+        assert_same_view(
+            &alone.successor(moved(20, &[], &[]), two, Granularity::Part),
+            &before,
+        );
+    }
+
+    #[test]
+    fn carried_top_ranks_kept_and_joined_or_hands_back_a_unit_that_lost_a_member() {
+        let mut top = Vec::new();
+        assert!(carried_top(
+            &[9, 7],
+            &[8, 3],
+            |_| true,
+            2,
+            &mut top,
+            |a: &u8, b| b.cmp(a)
+        ));
+        assert_eq!(top, vec![9, 8]);
+        assert!(!carried_top(
+            &[9, 7],
+            &[8],
+            |&x| x != 7,
+            2,
+            &mut top,
+            |a: &u8, b| b.cmp(a)
+        ));
+    }
+
+    #[test]
+    fn units_name_every_bucket_or_every_part() {
+        assert_eq!(units(Granularity::Bucket).count(), BUCKET_COUNT);
+        assert_eq!(units(Granularity::Part).count(), PART_SPACE);
+        assert_eq!(units(Granularity::Part).last(), Some(u16::MAX));
+        assert_eq!(
+            with_self(
+                NodeId::from(2),
+                vec![NodeId::from(3), NodeId::from(2), NodeId::from(3)]
+            ),
+            vec![NodeId::from(2), NodeId::from(3)]
+        );
     }
 
     #[test]
@@ -1691,6 +1912,57 @@ mod kani_proofs {
                     .all(|item| held(item) || top.iter().all(|kept| kept < item))
             );
         }
+    }
+
+    /// Four distinct candidates, in any order.
+    fn distinct_candidates() -> [u8; 4] {
+        let [a, b, c, d]: [u8; 4] = kani::any();
+        kani::assume(a != b && a != c && a != d && b != c && b != d && c != d);
+        [a, b, c, d]
+    }
+
+    /// Carrying the first `k` of `old` to `new`, where `joined` are the
+    /// newcomers, gives the first `k` of `new` whenever it does not hand
+    /// the unit back, for every `k` through four.
+    fn assert_carried_top_is_full(old: &[u8], new: &[u8], joined: &[u8]) {
+        let (mut kept, mut carried, mut full) = (
+            Vec::with_capacity(5),
+            Vec::with_capacity(5),
+            Vec::with_capacity(5),
+        );
+        for k in 0..=4 {
+            select_top(old.iter().copied(), k, &mut kept, u8::cmp);
+            select_top(new.iter().copied(), k, &mut full, u8::cmp);
+            let stays = |item: &u8| new.iter().any(|stayed| stayed == item);
+            if carried_top(&kept, joined, stays, k, &mut carried, u8::cmp) {
+                assert!(carried.iter().eq(full.iter()));
+            }
+        }
+    }
+
+    /// A leave carries a unit's first `k` whether the leaver was kept or
+    /// crowded out.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn a_carried_top_survives_a_leave() {
+        let [a, b, c, _] = distinct_candidates();
+        assert_carried_top_is_full(&[a, b, c], &[a, b], &[]);
+    }
+
+    /// A join carries a unit's first `k` wherever the newcomer ranks.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn a_carried_top_survives_a_join() {
+        let [a, b, c, d] = distinct_candidates();
+        assert_carried_top_is_full(&[a, b, c], &[a, b, c, d], &[d]);
+    }
+
+    /// A leave and a join at once carry a unit's first `k`.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn a_carried_top_survives_a_leave_and_a_join() {
+        let [a, b, c, d] = distinct_candidates();
+        assert_carried_top_is_full(&[a, b, c], &[a, b, d], &[d]);
     }
 
     /// A part's wire id names it back at either granularity, and every

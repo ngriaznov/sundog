@@ -46,11 +46,13 @@ All notable changes to this project are documented in this file. Format follows
   clamps, a part id round-trips through every representation, every part
   owns its own bit of a part set, a part mask holds exactly its parts and
   its digest fold splits over disjoint masks, the bounded top-`k` owner
-  selection keeps the first `k` in rank order, a wire id names its parts
-  back at either granularity, a view ranks parts only when every peer speaks
-  part ownership, the owned-bucket gauge is the part count over 64, and a
-  pull serves its ids in ascending single-bucket runs. `weekly-kani.yml`
-  runs them weekly and the release gate requires a green run.
+  selection keeps the first `k` in rank order, carrying a part's owners
+  across a membership change ranks them as a full ranking does, a wire id
+  names its parts back at either granularity, a view ranks parts only when
+  every peer speaks part ownership, the owned-bucket gauge is the part count
+  over 64, and a pull serves its ids in ascending single-bucket runs.
+  `weekly-kani.yml` runs them weekly and the release gate requires a green
+  run.
 - **Entry diet**: a live entry stores one encoded record (key length, key,
   and value in the postcard form the wire already uses) instead of a typed
   key and value plus a separate encoded copy, and that record is an enum,
@@ -358,7 +360,10 @@ All notable changes to this project are documented in this file. Format follows
   owners the busiest node holds about 8% more than an even share and the
   lightest about 11% less, where whole buckets left the busiest node about
   60% over and the lightest about half; a join moves only the parts the
-  joiner takes. Rebalance pulls, the disown-grace
+  joiner takes. A membership change builds each node's new view from its
+  last one: a join ranks only each part's owners and the newcomer, and a
+  leave re-ranks only the parts the leaver owned, so at 100 nodes a view
+  change takes about 4 ms where ranking every part afresh takes 100 ms. Rebalance pulls, the disown-grace
   hand-off, release, warm reopen and scoped anti-entropy all work part by
   part. The wire protocol is 5 and adds `Msg::AeDigestMasked`: scoped
   anti-entropy under a part view sends, per bucket, a mask of the parts
