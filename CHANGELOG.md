@@ -429,6 +429,16 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A warm-reopened part is never served unverified because its donors
+  were cold.** A `Mode::Distributed` node reopening a spill tier pulls
+  each part its replay covers from the part's co-owners. When every
+  co-owner declined as cold, still pulling the part itself, the pull
+  marked the replayed part servable, and a key missing from the replay
+  read as a miss until anti-entropy repaired it. Such a part now stays
+  unverified, so `fetch` asks its other owners, and the warm-up retries
+  the pull every `ae_interval` until a donor is warm, opening warm with
+  what landed after three attempts as a timed-out pull does.
+
 - **A `Mode::Distributed` write accepted before the cluster formed reaches
   its owners at once.** A node that opens the cache before its peers do
   owns every bucket alone and keeps what it is given. When a view with

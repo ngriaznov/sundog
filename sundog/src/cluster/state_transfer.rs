@@ -57,6 +57,11 @@ pub(crate) enum Outcome {
     /// the current view runs at once. Never answered by a whole-cache
     /// transfer, which has no view to move.
     Superseded,
+    /// Every donor of a part this node warm-reloaded and has not verified
+    /// stayed cold: nothing vouches for the replay yet, so the part stays
+    /// unverified and the pull retries as after a timeout. Never answered
+    /// by a whole-cache transfer, which replays nothing.
+    Unverified,
 }
 
 impl Outcome {
@@ -64,7 +69,10 @@ impl Outcome {
     /// cache to warm, or an origin that receives the cache should a peer
     /// with it appear.
     pub(crate) const fn needs_warm_up(self) -> bool {
-        matches!(self, Self::NoPeers | Self::TimedOut | Self::Superseded)
+        matches!(
+            self,
+            Self::NoPeers | Self::TimedOut | Self::Superseded | Self::Unverified
+        )
     }
 }
 
@@ -82,13 +90,14 @@ pub(crate) enum WarmUpStep {
     Done,
     /// Nobody to receive from yet; wait for a first peer, then run again.
     WaitForPeer,
-    /// The transfer timed out; wait one `ae_interval`, then run again.
+    /// The transfer timed out, or found nothing warm to verify a replay
+    /// against; wait one `ae_interval`, then run again.
     RetryLater,
     /// The ownership view moved mid-pull; run again at once against the
     /// current view.
     RetryNow,
-    /// Timed out [`MAX_WARM_UP_ATTEMPTS`] times running; mark the cache warm
-    /// with what landed and end.
+    /// Timed out or stayed unverified [`MAX_WARM_UP_ATTEMPTS`] times
+    /// running; mark the cache warm with what landed and end.
     WarmAnyway,
 }
 
@@ -97,8 +106,10 @@ pub(crate) fn next_warm_up_step(outcome: Outcome, attempt: u32) -> WarmUpStep {
         Outcome::Completed | Outcome::NoDonor | Outcome::Skipped => WarmUpStep::Done,
         Outcome::NoPeers => WarmUpStep::WaitForPeer,
         Outcome::Superseded => WarmUpStep::RetryNow,
-        Outcome::TimedOut if attempt >= MAX_WARM_UP_ATTEMPTS => WarmUpStep::WarmAnyway,
-        Outcome::TimedOut => WarmUpStep::RetryLater,
+        Outcome::TimedOut | Outcome::Unverified if attempt >= MAX_WARM_UP_ATTEMPTS => {
+            WarmUpStep::WarmAnyway
+        }
+        Outcome::TimedOut | Outcome::Unverified => WarmUpStep::RetryLater,
     }
 }
 
@@ -597,6 +608,15 @@ mod tests {
             next_warm_up_step(Outcome::TimedOut, MAX_WARM_UP_ATTEMPTS),
             WarmUpStep::WarmAnyway
         );
+        assert_eq!(
+            next_warm_up_step(Outcome::Unverified, 1),
+            WarmUpStep::RetryLater,
+            "an unverified replay waits for a warm donor, as a timeout does"
+        );
+        assert_eq!(
+            next_warm_up_step(Outcome::Unverified, MAX_WARM_UP_ATTEMPTS),
+            WarmUpStep::WarmAnyway
+        );
     }
 
     #[test]
@@ -604,6 +624,7 @@ mod tests {
         assert!(Outcome::NoPeers.needs_warm_up());
         assert!(Outcome::TimedOut.needs_warm_up());
         assert!(Outcome::Superseded.needs_warm_up());
+        assert!(Outcome::Unverified.needs_warm_up());
         assert!(!Outcome::Completed.needs_warm_up());
         assert!(!Outcome::NoDonor.needs_warm_up());
         assert!(!Outcome::Skipped.needs_warm_up());

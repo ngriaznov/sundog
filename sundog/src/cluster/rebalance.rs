@@ -137,15 +137,45 @@ const ALL_COLD_PASSES: u32 = 3;
 /// trying again.
 const GROUP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
+/// How one donor group's pull ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupPull {
+    /// Every part is served: this many landed from a donor, or none when
+    /// every donor stayed cold and what is here is all there is.
+    Landed(u64),
+    /// This node's view moved past the one the pull planned against.
+    Superseded,
+    /// Every donor stayed cold and some parts are still unverified: they
+    /// stay cold and unverified for the warm-up retries.
+    Unverified,
+}
+
+/// What a group whose donors all stayed cold settles to: the parts that
+/// serve what landed here, since nothing warm exists to pull, and whether
+/// any part still waits because nothing has verified its replay.
+fn settle_all_cold(
+    parts: &[PartId],
+    unverified: impl Fn(PartId) -> bool,
+) -> (Vec<PartId>, GroupPull) {
+    let (waiting, settled): (Vec<PartId>, Vec<PartId>) =
+        parts.iter().partition(|&&part| unverified(part));
+    let pull = if waiting.is_empty() {
+        GroupPull::Landed(0)
+    } else {
+        GroupPull::Unverified
+    };
+    (settled, pull)
+}
+
 /// Tries `donors` in order for one part group, applying the first that
 /// donates. A `StaleView` decline is expected while both sides'
 /// `refresh_task`s converge after a membership change (see
 /// [`crate::store::ShardOps::ae_peer_filter`]), so an all-declined pass
 /// retries after [`GROUP_RETRY_BACKOFF`] rather than giving up, unless this
 /// node's own view has moved past `view_hash`: then no donor ever agrees,
-/// and the pull answers `None` for the caller to replan against the
-/// current view. Returns the count of records landed once a donor
-/// succeeds.
+/// and the pull answers [`GroupPull::Superseded`] for the caller to
+/// replan against the current view. A group every donor keeps declining
+/// as cold settles by [`settle_all_cold`].
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is independent context one donor-group retry loop needs; grouping any subset into a struct would only rename the same eight pieces of state"
@@ -160,7 +190,7 @@ async fn pull_one_group(
     parts: Vec<PartId>,
     view: (Granularity, u64),
     per_donor: Duration,
-) -> Option<u64> {
+) -> GroupPull {
     let view_hash = view.1;
     let mut all_cold_passes = 0u32;
     // Shared across every donor and retry pass, so a part a prior donor
@@ -223,26 +253,28 @@ async fn pull_one_group(
                     .increment(u64::try_from(pending).unwrap_or(u64::MAX));
                 }
                 tracing::debug!(cache = %cache, %donor, parts = group_len, records = count, "part pull landed");
-                return Some(u64::try_from(group_len).unwrap_or(u64::MAX));
+                return GroupPull::Landed(u64::try_from(group_len).unwrap_or(u64::MAX));
             }
             every_donor_cold &= cold;
         }
         if every_donor_cold {
             all_cold_passes += 1;
             if all_cold_passes >= ALL_COLD_PASSES {
-                // No warm copy anywhere to pull; whatever landed here,
-                // warm-reloaded or not, is the best available answer with
-                // nobody left to verify it against.
+                // No warm copy anywhere to pull. A cold part serves what
+                // landed here; a warm-reloaded part nothing has verified
+                // keeps waiting, since its replay can lack a key an owner
+                // holds and a read would answer a wrong miss.
                 tracing::debug!(cache = %cache, parts = parts.len(), "every donor is cold for these parts; nothing warm to pull");
-                residency.mark_serving(&parts);
-                return Some(0);
+                let (settled, pull) = settle_all_cold(&parts, |part| residency.is_unverified(part));
+                residency.mark_serving(&settled);
+                return pull;
             }
         } else {
             all_cold_passes = 0;
         }
         if ownership.current().view_hash() != view_hash {
             tracing::debug!(cache = %cache, "ownership view moved mid-pull; this pull is superseded");
-            return None;
+            return GroupPull::Superseded;
         }
         tokio::time::sleep(GROUP_RETRY_BACKOFF).await;
     }
@@ -357,26 +389,27 @@ impl PullRequest<'_> {
             }
             // sundog_rebalance_parts_total{direction="in"} is already
             // credited per part inside pull_one_group/try_donor_parts;
-            // this loop only needs `superseded` for the overall Outcome.
-            let mut superseded = false;
+            // this loop only folds each group's end into the Outcome.
+            let (mut superseded, mut unverified) = (false, false);
             while let Some(result) = set.join_next().await {
-                if result.ok().flatten().is_none() {
-                    superseded = true;
+                match result {
+                    Ok(GroupPull::Landed(_)) => {}
+                    Ok(GroupPull::Unverified) => unverified = true,
+                    Ok(GroupPull::Superseded) | Err(_) => superseded = true,
                 }
             }
-            superseded
+            if superseded {
+                Outcome::Superseded
+            } else if unverified {
+                Outcome::Unverified
+            } else {
+                Outcome::Completed
+            }
         };
 
-        match tokio::time::timeout(budget, run_all).await {
-            Ok(superseded) => {
-                if superseded {
-                    Outcome::Superseded
-                } else {
-                    Outcome::Completed
-                }
-            }
-            Err(_) => Outcome::TimedOut,
-        }
+        tokio::time::timeout(budget, run_all)
+            .await
+            .unwrap_or(Outcome::TimedOut)
     }
 }
 
@@ -1819,7 +1852,7 @@ mod tests {
             view_hash: 42,
             chunks: vec![(9u16, vec![sample_wire_record(1)])],
             stall_after: false,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         };
         let cache = SmolStr::new("prices");
         assert!(matches!(
@@ -2153,6 +2186,77 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    #[test]
+    fn settle_all_cold_serves_cold_parts_and_holds_back_unverified_ones() {
+        let parts = [
+            PartId::from_raw(1),
+            PartId::from_raw(2),
+            PartId::from_raw(3),
+        ];
+        let (settled, pull) = settle_all_cold(&parts, |part| part == PartId::from_raw(2));
+        assert_eq!(settled, vec![PartId::from_raw(1), PartId::from_raw(3)]);
+        assert_eq!(pull, GroupPull::Unverified);
+        let (settled, pull) = settle_all_cold(&parts, |_| false);
+        assert_eq!(settled, parts.to_vec());
+        assert_eq!(pull, GroupPull::Landed(0));
+    }
+
+    /// The warm-reopen race: this node replayed part `a` from disk, the only
+    /// donor is still cold on it, and the part that donor could not give is
+    /// the one whose replay may lack keys. Serving it would answer a wrong
+    /// miss, so it stays cold and unverified while plain cold `b` serves.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn pull_one_group_keeps_an_unverified_part_waiting_when_every_donor_is_cold() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        let cache = SmolStr::new("prices");
+        let (donor_node, requester_node) = (NodeId::from(111), NodeId::from(112));
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+        let view_hash = ownership.current().view_hash();
+        let donor_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            cold: true,
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
+        let (requester, _requester_inbound) =
+            spawn_mesh(requester_node, Arc::new(BucketPullHandler::default())).await;
+        requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+
+        let (a, b) = (PartId::new(3, 0), PartId::new(3, 1));
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&[a, b]);
+        residency.mark_unverified(&[a]);
+
+        let pull = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![donor_node],
+            vec![a, b],
+            (Granularity::Part, view_hash),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(pull, GroupPull::Unverified);
+        assert!(
+            residency.is_cold(a) && residency.is_unverified(a),
+            "the unverified replay keeps both marks, so reads ask the other owners"
+        );
+        assert!(
+            !residency.is_cold(b),
+            "the plain cold part serves what landed"
+        );
+
+        donor.shutdown().await;
+        requester.shutdown().await;
+    }
+
     #[tokio::test]
     async fn pull_one_group_clears_cold_per_bucket_as_each_done_arrives_before_the_group_finishes()
     {
@@ -2172,14 +2276,14 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
         let requester_handler = Arc::new(BucketPullHandler {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
@@ -2264,13 +2368,13 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let second_handler = Arc::new(BucketPullHandler {
             view_hash,
             chunks: vec![(1u16, vec![sample_wire_record(2)])],
             stall_after: false,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (first, _first_inbound) = spawn_mesh(first_node, Arc::clone(&first_handler) as _).await;
         let (second, _second_inbound) =
@@ -2281,7 +2385,7 @@ mod tests {
                 view_hash: 0,
                 chunks: Vec::new(),
                 stall_after: false,
-                requested: std::sync::Mutex::default(),
+                ..Default::default()
             }),
         )
         .await;
@@ -2307,7 +2411,10 @@ mod tests {
             Duration::from_millis(300),
         )
         .await;
-        assert_eq!(landed, Some(2 * crate::store::PART_COUNT as u64));
+        assert_eq!(
+            landed,
+            GroupPull::Landed(2 * crate::store::PART_COUNT as u64)
+        );
         assert_eq!(
             *second_handler.requested.lock().expect("fixture mutex"),
             vec![vec![1u16]],
@@ -2343,7 +2450,7 @@ mod tests {
                 view_hash,
                 chunks: vec![(first.raw(), vec![sample_wire_record(1)])],
                 stall_after: false,
-                requested: std::sync::Mutex::default(),
+                ..Default::default()
             }),
         )
         .await;
@@ -2353,7 +2460,7 @@ mod tests {
                 view_hash: 0,
                 chunks: Vec::new(),
                 stall_after: false,
-                requested: std::sync::Mutex::default(),
+                ..Default::default()
             }),
         )
         .await;
@@ -2377,7 +2484,7 @@ mod tests {
             Duration::from_secs(10),
         )
         .await;
-        assert_eq!(landed, Some(PARTS as u64));
+        assert_eq!(landed, GroupPull::Landed(PARTS as u64));
         assert!(parts.iter().all(|&part| !residency.is_cold(part)));
 
         let ids: Vec<u16> = parts.iter().map(|part| part.raw()).collect();
@@ -2425,7 +2532,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (first_donor, _first_donor_inbound) =
             spawn_mesh(first_donor_node, first_donor_handler).await;
@@ -2436,7 +2543,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: false,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (second_donor, _second_donor_inbound) =
             spawn_mesh(second_donor_node, second_donor_handler).await;
@@ -2444,7 +2551,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![

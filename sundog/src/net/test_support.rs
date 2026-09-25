@@ -57,6 +57,7 @@ pub(crate) fn peer_at(node: NodeId, addr: SocketAddr) -> Peer {
 /// tests, which need to control exactly which bucket a chunk belongs to and
 /// whether a bucket's stream ever completes, without reimplementing the
 /// rest of `RequestHandler`'s surface at that call site.
+#[derive(Default)]
 pub(crate) struct BucketPullHandler {
     pub(crate) view_hash: u64,
     pub(crate) chunks: Vec<(u16, Vec<WireRecord>)>,
@@ -66,6 +67,9 @@ pub(crate) struct BucketPullHandler {
     pub(crate) stall_after: bool,
     /// Every id list `st_bucket_chunks` was asked for, in call order.
     pub(crate) requested: std::sync::Mutex<Vec<Vec<u16>>>,
+    /// When `true`, every requested id is owned here but not yet pulled: a
+    /// cold donor that declines every pull.
+    pub(crate) cold: bool,
 }
 
 impl RequestHandler for BucketPullHandler {
@@ -118,6 +122,11 @@ impl RequestHandler for BucketPullHandler {
         Box::pin(async move { available })
     }
 
+    fn st_buckets_cold(&self, _cache: SmolStr, _buckets: Vec<u16>) -> BoxFuture<'_, bool> {
+        let cold = self.cold;
+        Box::pin(async move { cold })
+    }
+
     fn st_bucket_chunks(
         &self,
         _cache: SmolStr,
@@ -156,7 +165,7 @@ mod tests {
             view_hash: 7,
             chunks: vec![(0, vec![rec.clone()])],
             stall_after: true,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         };
         assert!(handler.st_buckets_available(SmolStr::new("c"), 7).await);
         assert!(!handler.st_buckets_available(SmolStr::new("c"), 8).await);
@@ -177,7 +186,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
-            requested: std::sync::Mutex::default(),
+            ..Default::default()
         });
         let (mesh_a, _inbound_a) = spawn_mesh(NodeId::from(1), Arc::clone(&handler)).await;
         let (mesh_b, _inbound_b) = spawn_mesh(NodeId::from(2), handler).await;
