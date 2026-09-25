@@ -23,3 +23,4 @@
 # Project
 
 - [Verification](verification.md)
+- [Benchmarks](benchmarks.md)

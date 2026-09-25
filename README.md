@@ -688,6 +688,20 @@ reopens, convergence, and a passing sample check via `--gate`.
 duration, RAM cap, and runner inputs, for a one-off run at a different
 scale. Both the report and the run log upload as workflow artifacts.
 
+`bench`, the `sundog-bench` binary, runs one zipf workload against sundog in
+each of its three modes and against Redis, Valkey, Dragonfly, Olric and
+Hazelcast, each server in a container started through rightsize. It reports
+read and write p50 and p99, throughput, and bytes per entry, and
+[`ops/bench-gate.json`](ops/bench-gate.json) holds `sundog-local` and
+`sundog-replicated` to a one-millisecond read and write p99.
+`.github/workflows/weekly-bench.yml` runs it weekly and posts the report on
+the run's summary page. The book's Benchmarks page covers the method:
+
+```sh
+RIGHTSIZE_BACKEND=docker cargo run --release -p sundog-bench -- \
+    --report-md bench-report.md --gate ops/bench-gate.json
+```
+
 ## Chaos demo
 
 `demos/sundog-demo` spins up N in-process nodes on loopback and runs a background

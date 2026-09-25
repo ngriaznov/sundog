@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "sundog-local": {
+      "max_read_p99_us": 1000,
+      "max_write_p99_us": 1000,
+      "max_errors": 0
+    },
+    "sundog-replicated": {
+      "max_read_p99_us": 1000,
+      "max_write_p99_us": 1000,
+      "max_errors": 0
+    },
+    "sundog-distributed": {
+      "max_errors": 0
+    }
+  }
+}
