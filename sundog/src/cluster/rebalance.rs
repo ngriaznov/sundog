@@ -1,9 +1,9 @@
-//! Rebalance for a `Mode::Distributed` cache: pulls a bucket from its
+//! Rebalance for a `Mode::Distributed` cache: pulls a part from its
 //! current owners the moment this node's [`OwnershipView`] says it gained
-//! it, and releases a bucket's local data once this node has kept it
+//! it, and releases a part's local data once this node has kept it
 //! resident past the disown grace after losing it. The open()-time initial
 //! pull and this module's ongoing loop share one mechanism, [`PullRequest`],
-//! scoped to whichever bucket set is at hand.
+//! scoped to whichever part set is at hand.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -144,7 +144,7 @@ fn parts_pending_group_credit(total_parts: usize, already_credited: &HashSet<Par
 }
 
 /// Passes over a group's donors in which every one declined as cold before
-/// the pull gives the group up: nobody warm holds the buckets, so what has
+/// the pull gives the group up: nobody warm holds the parts, so what has
 /// landed here by other means is all there is.
 const ALL_COLD_PASSES: u32 = 3;
 

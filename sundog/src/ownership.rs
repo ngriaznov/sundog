@@ -144,7 +144,7 @@ pub fn ownership_granularity(
     }
 }
 
-/// The nodes eligible to own a bucket for `cache`: live peers speaking at
+/// The nodes eligible to own a part of `cache`: live peers speaking at
 /// least [`wire::PROTOCOL_DISTRIBUTED`] that currently advertise `cache` under
 /// `Mode::Distributed` with this same `k`, plus `self_node` unconditionally,
 /// since a node is always eligible for its own view regardless of what it
@@ -471,10 +471,10 @@ impl OwnershipTracker {
     }
 
     /// This tracker's original seeded view, pinned for its whole lifetime.
-    /// `rebalance_task` diffs its first lost-bucket check against this
+    /// `rebalance_task` diffs its first lost-part check against this
     /// instead of a live re-borrow of the view channel, which could already
     /// show a view `refresh_task` corrected before `rebalance_task` started
-    /// watching, missing a bucket only the seed view ever called owned.
+    /// watching, missing a part only the seed view ever called owned.
     #[must_use]
     pub fn baseline(&self) -> Arc<OwnershipView> {
         Arc::clone(&self.baseline)
@@ -713,8 +713,9 @@ fn publish_owned_parts(cache: &SmolStr, view: &OwnershipView, message: &'static 
 /// [`OwnershipTracker::seed`] publishes the first view's gauge itself.
 /// Publishes with [`watch::Sender::send_if_modified`], keyed on
 /// `view_hash`, so a peer's unrelated gossip key changing never ripples
-/// through this cache: the `sundog_owned_buckets` gauge only moves on a
-/// real ownership change.
+/// through this cache: the `sundog_owned_parts` and `sundog_owned_buckets`
+/// gauges only move on a real ownership change. The hash is known before
+/// the view is built, so an unchanged view costs no ranking at all.
 pub(crate) async fn refresh_task(
     cluster: Cluster,
     cache: SmolStr,

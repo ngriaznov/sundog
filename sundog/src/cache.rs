@@ -194,7 +194,7 @@ where
     /// `ClusterConfig::state_transfer_budget`; a cache too large to finish
     /// opens with a partial copy anti-entropy tops up. For
     /// [`Mode::Distributed`], the same open()-time transfer instead pulls
-    /// only this node's own buckets, per its freshly computed ownership
+    /// only this node's own parts, per its freshly computed ownership
     /// view; a transfer that lands, finds nothing to pull, or times out
     /// repeatedly all still open the cache warm.
     ///
@@ -304,7 +304,7 @@ where
         // for a cold open, since a view computed once a peer shows up beats
         // one computed alone. `membership_settled` records whether the wait
         // landed a peer; `distributed_warm_and_rebalance` uses it to gate the
-        // sole-owner shortcut for a bucket this open's spill tier replayed.
+        // sole-owner shortcut for a part this open's spill tier replayed.
         let membership_settled = if matches!(mode, Mode::Distributed { .. }) {
             await_initial_peers(&cluster).await
         } else {
@@ -337,7 +337,7 @@ where
         // the reservation back: nothing has advertised or scheduled tasks
         // for this name yet, so removing it is enough. A success threads
         // whether the tier landed a warm reopen into `distributed`, so
-        // `distributed_warm_and_rebalance` knows which owned buckets get
+        // `distributed_warm_and_rebalance` knows which owned parts get
         // eager reconciliation instead of an ordinary cold pull.
         #[cfg(feature = "spill")]
         let mut distributed = distributed;
@@ -594,7 +594,7 @@ async fn await_initial_peers(cluster: &Cluster) -> bool {
     settled
 }
 
-/// Attaches a freshly seeded bucket-ownership tracker and residency set to
+/// Attaches a freshly seeded ownership tracker and residency set to
 /// `shard`, for a `Mode::Distributed` cache; every other mode leaves both
 /// unset and returns `None`. Runs before `shard` is ever shared, so no
 /// reader can observe anything but a real, already-computed view.
@@ -643,7 +643,7 @@ where
 
 /// The background loops one opened cache runs: fan-out for a clustered
 /// mode, warm-up and anti-entropy for `Replicated`, the analogous
-/// bucket-scoped pull, refresh, and rebalance loops for `Distributed`,
+/// part-scoped pull, refresh, and rebalance loops for `Distributed`,
 /// tombstone GC, and the entry gauge, all under `cancel` and tracked by
 /// `tasks`. `membership_settled` is `open()`'s own [`await_initial_peers`]
 /// outcome, used only by [`distributed_warm_and_rebalance`]'s sole-owner shortcut.
@@ -772,8 +772,8 @@ where
 }
 
 /// The `Mode::Distributed`-only half of [`spawn_cache_tasks`]: pulls this
-/// node's initially owned buckets from their current owners before the
-/// cache is marked warm, the bucket-scoped analogue of
+/// node's initially owned parts from their current owners before the
+/// cache is marked warm, the part-scoped analogue of
 /// [`warm_and_repair`]'s whole-cache transfer, then starts the
 /// ownership-refresh and rebalance loops. An initial pull that times out,
 /// or finds no co-owner because gossip has not shown a peer yet, leaves
@@ -870,7 +870,7 @@ async fn distributed_warm_and_rebalance(
         concurrency,
         // See `trust_sole_owner_at_open`: a cold open trusts sole ownership
         // outright; a warm reopen trusts it only once membership_settled too,
-        // else the bucket stays cold for `warm_up_task`'s ordinary retries.
+        // else the part stays cold for `warm_up_task`'s ordinary retries.
         trust_sole_owner: trust_sole_owner_at_open(membership_settled, warm_reloaded_parts.len()),
     }
     .run()
@@ -905,7 +905,7 @@ async fn distributed_warm_and_rebalance(
 }
 
 /// Cap on rounds in [`reconcile_warm_buckets`]'s per-peer converge loop:
-/// chances for a bucket still moving under live writes to settle, not chunks
+/// chances for a part still moving under live writes to settle, not chunks
 /// of a fixed size. A failed or `Stale` round doesn't count; it retries.
 const RECONCILE_MAX_ROUNDS: u32 = 3;
 
@@ -915,7 +915,7 @@ const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(200);
 
 /// Per-peer bound on [`reconcile_warm_buckets`]'s converge loop: whichever
 /// of `max_rounds`, `byte_budget` or `time_budget` is hit first stops it,
-/// leaving that peer's still-diverging buckets cold for the ordinary pull.
+/// leaving that peer's still-diverging parts cold for the ordinary pull.
 #[derive(Debug, Clone, Copy)]
 struct ReconcileBudget {
     max_rounds: u32,
@@ -1249,12 +1249,12 @@ where
         self.shard.get_sync(key)
     }
 
-    /// Reads `key`: local if this node owns its bucket (no network,
+    /// Reads `key`: local if this node owns its part (no network,
     /// counted `sundog_fetch_total{outcome="local"}`), otherwise one request
     /// to a live owner, tried in rendezvous-score order until one answers.
     /// Never promotes the fetched value into the local store; [`Cache::get`]
     /// for the same key immediately afterward is still a miss on this node.
-    /// A bucket this node owns but has not yet pulled from a co-owner is
+    /// A part this node owns but has not yet pulled from a co-owner is
     /// cold: a local miss there asks the other owners before answering
     /// `Ok(None)`, and a cold owner whose every other owner is unreachable
     /// returns [`CacheError::FetchUnavailable`] rather than a miss it
@@ -1304,7 +1304,7 @@ where
         let mut stale_since: Option<tokio::time::Instant> = None;
         // Whether any owner answered at all, a decline included, as opposed
         // to every attempt ending in a transport error or timeout: the
-        // difference between a miss and `FetchUnavailable` for a bucket
+        // difference between a miss and `FetchUnavailable` for a part
         // this node owns but has not pulled yet. With nobody else to ask,
         // this node's own copy is all there is.
         let mut any_answered = owners.is_empty();
@@ -1378,7 +1378,7 @@ where
         Err(CacheError::FetchUnavailable { cache: cache_name })
     }
 
-    /// The live owners of `key`'s bucket, in rendezvous score order.
+    /// The live owners of `key`'s part, in rendezvous score order.
     /// `vec![self.cluster.node_id()]` on a cache that isn't
     /// [`Mode::Distributed`].
     #[must_use]

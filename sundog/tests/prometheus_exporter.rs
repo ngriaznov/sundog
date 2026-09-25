@@ -719,11 +719,15 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
         .find(|&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
         .expect("some key's bucket excludes cluster among four real nodes");
     let error_owners = cluster_prices.owners_of(&error_key);
-    for down in [peer.clone(), third.clone(), fourth.clone()] {
-        if error_owners.contains(&down.node_id()) {
-            down.shutdown().await;
-        }
-    }
+    // Both at once: one owner's departure reaching `cluster`'s view before
+    // the other has gone would hand the key to a live owner.
+    futures::future::join_all(
+        [peer.clone(), third.clone(), fourth.clone()]
+            .into_iter()
+            .filter(|down| error_owners.contains(&down.node_id()))
+            .map(Cluster::shutdown),
+    )
+    .await;
     assert!(
         matches!(
             cluster_prices.fetch(&error_key).await,
