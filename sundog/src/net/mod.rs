@@ -3036,7 +3036,6 @@ mod tests {
         let (client, _client_inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
         client.update_peers(vec![peer_at(NodeId::from(1), server.local_addr())]);
 
-        let frames_before = frames_sent_total();
         let bytes_before = bytes_sent_total();
         let got = client
             .ae_pull(
@@ -3046,9 +3045,12 @@ mod tests {
             )
             .await
             .expect("ae_pull succeeds");
-        let frames = frames_sent_total() - frames_before;
         let bytes = bytes_sent_total() - bytes_before;
         assert_eq!(got, records, "every pulled record arrives, in order");
+        // The reply is `batch_replicate`'s frames plus `ReqDone`, counted
+        // from the batching itself: the process-wide frame counter also
+        // takes every concurrently running test's frames.
+        let frames = batch_replicate(&SmolStr::new("users"), records).len() + 1;
         assert!(
             frames < 100,
             "a 3000-record pull reply travels as a few batch frames, not one per record: {frames}"
