@@ -618,6 +618,17 @@ pub(crate) fn push_targets(
     targets
 }
 
+/// Whether a retry `retry` after `now` would land past `give_up`. `None`
+/// never gives up; a retry too far out to represent lands past any
+/// deadline.
+fn out_of_time(
+    now: tokio::time::Instant,
+    retry: Duration,
+    give_up: Option<tokio::time::Instant>,
+) -> bool {
+    give_up.is_some_and(|give_up| now.checked_add(retry).is_none_or(|next| next > give_up))
+}
+
 /// Pushes each target's parts to it through a part-scoped anti-entropy
 /// round, which sends every entry the target lacks or holds at an older
 /// version. A round that fails, or meets a responder whose view has not
@@ -635,7 +646,8 @@ async fn push_unpullable(
     deadline: Duration,
     cancel: CancellationToken,
 ) {
-    let give_up = tokio::time::Instant::now() + deadline;
+    // `None` for a deadline too far out to represent: never give up.
+    let give_up = tokio::time::Instant::now().checked_add(deadline);
     let mut targets = targets;
     loop {
         let mut pending = Vec::with_capacity(targets.len());
@@ -654,7 +666,7 @@ async fn push_unpullable(
         if pending.is_empty() {
             return;
         }
-        if tokio::time::Instant::now() + retry > give_up {
+        if out_of_time(tokio::time::Instant::now(), retry, give_up) {
             tracing::debug!(cache = %cache, owners = pending.len(), "left parts no co-owner could hand over to the disown-grace hand-off");
             return;
         }
@@ -972,7 +984,7 @@ pub(crate) async fn rebalance_task(
                             RoundOutcome::Stale => {}
                         }
                     }
-                    let overdue: PartSet = residency.expired(disown_grace * 2).into_iter().collect();
+                    let overdue: PartSet = residency.expired(disown_grace.saturating_mul(2)).into_iter().collect();
                     let due = parts_to_release(
                         &view,
                         self_node,
@@ -1523,6 +1535,26 @@ mod tests {
             Duration::from_secs(3),
             "never shorter than one interval"
         );
+    }
+
+    #[test]
+    fn out_of_time_gives_up_only_on_a_retry_past_a_representable_deadline() {
+        let now = tokio::time::Instant::now();
+        let retry = Duration::from_secs(1);
+        assert!(!out_of_time(now, retry, None));
+        assert!(!out_of_time(now, Duration::MAX, None));
+        assert!(!out_of_time(now, retry, Some(now + Duration::from_secs(5))));
+        assert!(out_of_time(
+            now,
+            retry,
+            Some(now + Duration::from_millis(500))
+        ));
+        assert!(out_of_time(
+            now,
+            Duration::MAX,
+            Some(now + Duration::from_secs(5))
+        ));
+        assert!(now.checked_add(Duration::MAX).is_none());
     }
 
     #[test]

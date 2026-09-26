@@ -21,8 +21,11 @@ use crate::wire::WireRecord;
 /// Delay between retrying the same still-live donor after a transient failure.
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
 
+/// How long one donor gets out of `total`: two fifths of it, 8 s at the
+/// default. Saturating, so a `state_transfer_budget` of `Duration::MAX`
+/// reads as a very long budget instead of overflowing.
 pub(crate) fn per_donor_budget(total: Duration) -> Duration {
-    total * 2 / 5
+    total.saturating_mul(2) / 5
 }
 
 /// How long a node with no live peer in sight waits for gossip to show one
@@ -575,6 +578,13 @@ mod tests {
     }
 
     #[test]
+    fn per_donor_budget_saturates_instead_of_overflowing_on_a_huge_budget() {
+        assert_eq!(per_donor_budget(Duration::MAX), Duration::MAX / 5);
+        let half = Duration::MAX / 2;
+        assert_eq!(per_donor_budget(half), half * 2 / 5);
+    }
+
+    #[test]
     fn first_peer_grace_is_a_fifth_of_the_budget_and_zero_for_a_zero_budget() {
         assert_eq!(
             first_peer_grace(Duration::from_secs(20)),
@@ -787,5 +797,26 @@ mod tests {
         .await;
         assert_eq!(result, DonorResult::Failed);
         assert_eq!(applied, 0);
+    }
+}
+
+/// Kani proof over [`per_donor_budget`]: every budget, not a sample.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// No budget overflows, the share never exceeds the budget, and up to
+    /// half of `Duration::MAX` it is exactly two fifths.
+    #[kani::proof]
+    fn per_donor_budget_never_overflows_and_stays_within_the_budget() {
+        let secs: u64 = kani::any();
+        let nanos: u32 = kani::any();
+        kani::assume(nanos < 1_000_000_000);
+        let total = Duration::new(secs, nanos);
+        let share = per_donor_budget(total);
+        assert!(share <= total);
+        if let Some(doubled) = total.checked_mul(2) {
+            assert_eq!(share, doubled / 5);
+        }
     }
 }

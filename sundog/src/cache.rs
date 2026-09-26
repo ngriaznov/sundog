@@ -806,8 +806,7 @@ async fn distributed_warm_and_rebalance(
 
     let budget = cluster.config().state_transfer_budget;
     let concurrency = cluster.config().rebalance_concurrency;
-    let disown_grace =
-        cluster.config().ae_interval * cluster.config().distributed_disown_grace_rounds;
+    let disown_grace = cluster.config().disown_grace();
     // The refresh loop starts before the first pull, so a membership change
     // during it moves the view under the pull, which replans instead of stalling.
     cluster.spawn_tracked_in(
