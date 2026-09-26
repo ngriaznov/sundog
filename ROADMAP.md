@@ -73,18 +73,6 @@ sequentially instead, one 64 MB scan off the hot path. For a 16-byte key
 that is 157 bytes of RAM per spilled entry today against about 85 without
 the index.
 
-## Proof
-
-### A hundred nodes in simulation
-
-The README targets 2 to 30 nodes on a LAN. The largest scenario anywhere in
-the repository runs 5: 4 in the turmoil suite and the chaos run, 5 in the
-container suite. Nothing in gossip caps the count, but three things grow
-with it: one pair of bounded outboxes and a connection pool per peer, a
-replicated write fanning out to every peer, and gossip state growing as
-nodes times caches. A turmoil scenario at 100 nodes with a rolling restart
-proves or corrects the README's number, and the README says what it proves.
-
 ## Reach
 
 ### A RESP-speaking server
