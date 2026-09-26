@@ -27,10 +27,12 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::Cluster;
 use super::sketch::{Cell, Decoded, Iblt};
+use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::net::{AeMismatch, AePartReply, AeRoundOutcome, Mesh, MsgClass};
 use crate::node::NodeId;
-use crate::store::{BucketPart, ShardOps, bucket_of};
+use crate::store::part::PartSet;
+use crate::store::{BucketPart, PartId, PartMask, Scope, ScopedDigests, ShardOps};
 use crate::wire::{self, WireRecord};
 
 /// Runs anti-entropy for one shard while `cancel` stays live: every jittered
@@ -168,7 +170,8 @@ pub enum RoundOutcome {
 /// merge converge in this one round rather than needing a second.
 ///
 /// A `Mode::Distributed` shard exchanges digests through
-/// `Mesh::ae_round_scoped` instead of [`Mesh::ae_round`], carrying its
+/// `Mesh::ae_round_scoped`, or `Mesh::ae_round_masked` under a part view,
+/// instead of [`Mesh::ae_round`], carrying its
 /// [`ShardOps::ownership_view_hash`] for the epoch check; a `Stale` reply
 /// ends the round at once, counted in `sundog_stale_view_total`.
 ///
@@ -186,23 +189,15 @@ pub async fn run_round_against(
     // mismatched key instead of only the greater version pushing to the
     // lesser side. See `ShardOps::merges`.
     let merging = shard.merges();
-    let mismatched = match shard.ownership_view_hash() {
-        Some(view_hash) => {
-            // Only the buckets `peer` co-owns: the whole resident list
-            // would have every other bucket reported as a mismatch and
-            // its entries pushed only to be dropped by the peer's inbound
-            // guard.
-            let local_buckets: Vec<(u16, u64)> = shard
-                .ae_digests_for(peer)
-                .await
-                .into_iter()
-                .map(|bd| (bd.bucket, bd.digest))
-                .collect();
-            match mesh
-                .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
-                .await
-            {
-                Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
+    let (mismatched, in_scope) = match shard.ae_scoped_digests_for(peer).await {
+        Some(scoped) => {
+            // Only what `peer` co-owns, read under the view whose hash it
+            // travels with: the whole resident list would have everything
+            // else reported as a mismatch and its entries pushed only to be
+            // dropped by the peer's inbound guard.
+            let in_scope = scoped.scope.coverage().into_iter().collect();
+            match scoped_exchange(mesh, cache, peer, scoped).await {
+                Ok(AeRoundOutcome::Mismatches(mismatched)) => (mismatched, Some(in_scope)),
                 Ok(AeRoundOutcome::Stale {
                     responder_view_hash,
                 }) => {
@@ -233,7 +228,7 @@ pub async fn run_round_against(
             )
             .await
         {
-            Ok(mismatched) => mismatched,
+            Ok(mismatched) => (mismatched, None),
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy digest exchange failed");
                 return RoundOutcome::Failed;
@@ -245,8 +240,33 @@ pub async fn run_round_against(
         return RoundOutcome::Reconciled;
     }
 
-    let _ = reconcile_mismatches(mesh, shard, cache, peer, mismatched, merging).await;
+    let _ = reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, merging).await;
     RoundOutcome::Reconciled
+}
+
+/// Sends `scoped`'s digests to `peer` in the exchange its scope calls for:
+/// bucket digests, or masked part digests under a part view.
+async fn scoped_exchange(
+    mesh: &Mesh,
+    cache: &SmolStr,
+    peer: NodeId,
+    scoped: ScopedDigests,
+) -> Result<AeRoundOutcome, CodecError> {
+    let ScopedDigests { view_hash, scope } = scoped;
+    match scope {
+        Scope::Buckets(ids) => {
+            mesh.ae_round_scoped(peer, cache.clone(), view_hash, ids)
+                .await
+        }
+        Scope::Parts(masked) => {
+            let buckets = masked
+                .iter()
+                .map(|m| (m.bucket, m.mask.bits(), m.digest))
+                .collect();
+            mesh.ae_round_masked(peer, cache.clone(), view_hash, buckets)
+                .await
+        }
+    }
 }
 
 /// The classify-through-repair pipeline shared by [`run_round_against`] and
@@ -257,13 +277,15 @@ pub async fn run_round_against(
 ///
 /// Buckets past `ae_part_min_bucket` answered with part digests never
 /// load their full entries here; only listing/sketch buckets go through
-/// `entries_for_buckets`.
+/// `entries_for_buckets`. A part-digest reply repairs only the parts
+/// `in_scope` names for its bucket; `None` repairs every part.
 async fn reconcile_mismatches(
     mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
     mismatched: Vec<AeMismatch>,
+    in_scope: Option<HashMap<u16, PartMask>>,
     merging: bool,
 ) -> u64 {
     let (part_digest_mismatches, bucket_mismatches): (Vec<AeMismatch>, Vec<AeMismatch>) =
@@ -271,7 +293,10 @@ async fn reconcile_mismatches(
             .into_iter()
             .partition(|m| matches!(m, AeMismatch::PartDigests(..)));
 
-    let mut plan = RepairPlan::default();
+    let mut plan = RepairPlan {
+        in_scope,
+        ..RepairPlan::default()
+    };
     classify_bucket_mismatches(shard, cache, bucket_mismatches, &mut plan, merging).await;
     classify_part_digest_mismatches(
         mesh,
@@ -323,6 +348,7 @@ async fn reconcile_mismatches(
     }
 
     retain_owned_pulls(shard, &mut plan.pull_keys, &mut plan.pull_hashes);
+    retain_peer_owned_pushes(shard, peer, &mut plan.push_keys);
     apply_repairs(
         mesh,
         shard,
@@ -335,13 +361,13 @@ async fn reconcile_mismatches(
     .await
 }
 
-/// How one [`run_round_for_buckets`] round ended, per bucket: which
-/// matched, which were mismatched, wire bytes moved, and whether it failed.
+/// How one [`run_round_for_parts`] round ended, per part: which matched,
+/// which stayed diverged, wire bytes moved, and whether it failed.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BucketRoundOutcome {
+pub(crate) struct PartRoundOutcome {
     /// No mismatch this round: converged at this instant, not a claim of
     /// permanent equality.
-    pub(crate) matched: HashSet<u16>,
+    pub(crate) matched: HashSet<PartId>,
     /// Named mismatched, or requested but dropped because this shard's
     /// fresh ownership read disagrees `peer` co-owns it; either way never
     /// compared this round, so never `matched`.
@@ -349,10 +375,10 @@ pub(crate) struct BucketRoundOutcome {
         any(not(test), feature = "sim"),
         allow(
             dead_code,
-            reason = "only tests read which requested buckets stayed diverged"
+            reason = "only tests read which requested parts stayed diverged"
         )
     )]
-    pub(crate) still_diverged: HashSet<u16>,
+    pub(crate) still_diverged: HashSet<PartId>,
     /// Wire bytes pushed plus pulled this round: `0` when nothing
     /// mismatched or the round failed.
     pub(crate) bytes_moved: u64,
@@ -361,10 +387,10 @@ pub(crate) struct BucketRoundOutcome {
     pub(crate) failed: bool,
 }
 
-/// [`run_round_for_buckets`]'s outcome for a round that could not be
-/// scoped or answered at all: everything requested counts as `still_diverged`.
-fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
-    BucketRoundOutcome {
+/// [`run_round_for_parts`]'s outcome for a round that could not be scoped
+/// or answered at all: everything requested counts as `still_diverged`.
+fn every_part_diverged(requested: &HashSet<PartId>) -> PartRoundOutcome {
+    PartRoundOutcome {
         matched: HashSet::new(),
         still_diverged: requested.clone(),
         bytes_moved: 0,
@@ -372,44 +398,56 @@ fn every_bucket_diverged(requested: &HashSet<u16>) -> BucketRoundOutcome {
     }
 }
 
-/// Bucket-scoped sibling of [`run_round_against`]: scoped to `buckets`
-/// and reports which specifically matched instead of collapsing to one
+/// Which of `requested` a round compared equal: every part in scope of a
+/// `covered` bucket the reply did not name mismatched. A pure function of
+/// the round's scope, split out of [`run_round_for_parts`] for its unit
+/// test.
+fn matched_parts(
+    requested: &HashSet<PartId>,
+    covered: &[(u16, PartMask)],
+    named_mismatched: &HashSet<u16>,
+) -> HashSet<PartId> {
+    covered
+        .iter()
+        .filter(|(bucket, _)| !named_mismatched.contains(bucket))
+        .flat_map(|&(bucket, mask)| mask.parts().map(move |part| PartId::new(bucket, part)))
+        .filter(|part| requested.contains(part))
+        .collect()
+}
+
+/// Part-scoped sibling of [`run_round_against`]: scoped to `parts` and
+/// reports which specifically matched instead of collapsing to one
 /// [`RoundOutcome`]. `Cache::reconcile_warm_buckets`'s converge-before-
-/// serving loop calls this per live co-owner, per round.
+/// serving loop calls this per live co-owner, per round, and
+/// `rebalance_task` calls it to push a lost part no co-owner can hand over
+/// to that part's new owners.
 ///
-/// Filters local digests to `buckets` before the request goes out; a
-/// requested bucket the live ownership view says `peer` does not
-/// co-own is silently absent from `sent` and lands in `still_diverged`
-/// rather than `matched`. A shard with no ownership view, a `Stale`
-/// reply, or a failed exchange reports everything `still_diverged` with
-/// `failed: true`. `rebalance_task` also calls it to push a lost bucket no
-/// co-owner can hand over to that bucket's new owners.
-pub(crate) async fn run_round_for_buckets(
+/// Reads the shard's scoped digests once, so the scope it sends and the
+/// view hash it travels with come from one view, then keeps the buckets
+/// whose scope holds a requested part. A requested part the live view says
+/// `peer` does not co-own is out of scope and lands in `still_diverged`
+/// rather than `matched`. A shard with no ownership view,
+/// a `Stale` reply, or a failed exchange reports everything
+/// `still_diverged` with `failed: true`.
+pub(crate) async fn run_round_for_parts(
     mesh: &Mesh,
     shard: &Arc<dyn ShardOps>,
     cache: &SmolStr,
     peer: NodeId,
-    buckets: &[u16],
-) -> BucketRoundOutcome {
-    let requested: HashSet<u16> = buckets.iter().copied().collect();
-    let Some(view_hash) = shard.ownership_view_hash() else {
-        return every_bucket_diverged(&requested);
+    parts: &[PartId],
+) -> PartRoundOutcome {
+    let requested: HashSet<PartId> = parts.iter().copied().collect();
+    let Some(mut scoped) = shard.ae_scoped_digests_for(peer).await else {
+        return every_part_diverged(&requested);
     };
+    let wanted: PartSet = parts.iter().copied().collect();
+    scoped.scope.retain(|bucket, mask| {
+        mask.parts()
+            .any(|part| wanted.contains(PartId::new(bucket, part)))
+    });
+    let covered = scoped.scope.coverage();
     let merging = shard.merges();
-    let local_buckets: Vec<(u16, u64)> = shard
-        .ae_digests_for(peer)
-        .await
-        .into_iter()
-        .filter(|bd| requested.contains(&bd.bucket))
-        .map(|bd| (bd.bucket, bd.digest))
-        .collect();
-    // Every bucket this round sent, per the fresh ownership read
-    // above, not `requested`; only `sent` buckets get a real answer.
-    let sent: HashSet<u16> = local_buckets.iter().map(|&(bucket, _)| bucket).collect();
-    let mismatched = match mesh
-        .ae_round_scoped(peer, cache.clone(), view_hash, local_buckets)
-        .await
-    {
+    let mismatched = match scoped_exchange(mesh, cache, peer, scoped).await {
         Ok(AeRoundOutcome::Mismatches(mismatched)) => mismatched,
         Ok(AeRoundOutcome::Stale {
             responder_view_hash,
@@ -417,30 +455,38 @@ pub(crate) async fn run_round_for_buckets(
             metrics::counter!("sundog_stale_view_total", "cache" => cache.to_string()).increment(1);
             tracing::debug!(
                 responder_view_hash,
-                "anti-entropy bucket-scoped round ended: responder's view has diverged"
+                "anti-entropy part-scoped round ended: responder's view has diverged"
             );
-            return every_bucket_diverged(&requested);
+            return every_part_diverged(&requested);
         }
         Err(error) => {
-            tracing::debug!(%error, "anti-entropy bucket-scoped digest exchange failed");
-            return every_bucket_diverged(&requested);
+            tracing::debug!(%error, "anti-entropy part-scoped digest exchange failed");
+            return every_part_diverged(&requested);
         }
     };
     let named_mismatched: HashSet<u16> = mismatched.iter().map(AeMismatch::bucket).collect();
-    // matched: sent buckets that came back unnamed; a bucket dropped
-    // from sent was never digest-compared, so it folds into still_diverged.
-    let matched: HashSet<u16> = sent.difference(&named_mismatched).copied().collect();
-    let still_diverged: HashSet<u16> = requested.difference(&matched).copied().collect();
+    let matched = matched_parts(&requested, &covered, &named_mismatched);
+    let still_diverged: HashSet<PartId> = requested.difference(&matched).copied().collect();
     if mismatched.is_empty() {
-        return BucketRoundOutcome {
+        return PartRoundOutcome {
             matched,
             still_diverged,
             bytes_moved: 0,
             failed: false,
         };
     }
-    let bytes_moved = reconcile_mismatches(mesh, shard, cache, peer, mismatched, merging).await;
-    BucketRoundOutcome {
+    let in_scope = covered.into_iter().collect();
+    let bytes_moved = reconcile_mismatches(
+        mesh,
+        shard,
+        cache,
+        peer,
+        mismatched,
+        Some(in_scope),
+        merging,
+    )
+    .await;
+    PartRoundOutcome {
         matched,
         still_diverged,
         bytes_moved,
@@ -448,26 +494,44 @@ pub(crate) async fn run_round_for_buckets(
     }
 }
 
-/// Drops every queued pull for a bucket a `Mode::Distributed` shard does
-/// not own: a round against a new owner of a bucket this node is releasing
-/// pushes what the owner lacks and leaves the owner's own entries where
-/// they are, instead of pulling them into the inbound guard. Identity for
-/// a shard with no ownership view.
+/// Drops every queued push of a key whose part `peer` does not own under a
+/// `Mode::Distributed` shard's current view: a whole-bucket fallback
+/// listing covers parts the peer never holds, and pushing them only reaches
+/// the peer's inbound guard to forward or drop. Identity for a shard with
+/// no ownership view.
+fn retain_peer_owned_pushes(shard: &Arc<dyn ShardOps>, peer: NodeId, push_keys: &mut Vec<Bytes>) {
+    if let Some(view) = shard.ownership_view() {
+        push_keys.retain(|key| view.owners_of(PartId::of_key(key)).contains(&peer));
+    }
+}
+
+/// Drops every queued pull for a part a `Mode::Distributed` shard does not
+/// own: a round against a new owner of a part this node is releasing pushes
+/// what the owner lacks and leaves the owner's own entries where they are,
+/// instead of pulling them into the inbound guard. A hash pull names each
+/// entry by its full key hash, so its part is exact whatever the round's
+/// ids name. Identity for a shard with no ownership view.
 fn retain_owned_pulls(
     shard: &Arc<dyn ShardOps>,
     pull_keys: &mut Vec<Bytes>,
     pull_hashes: &mut Vec<(u16, Vec<u64>)>,
 ) {
     if let Some(view) = shard.ownership_view() {
-        pull_keys.retain(|key| view.owns(bucket_of(key)));
-        pull_hashes.retain(|(bucket, _)| view.owns(*bucket));
+        pull_keys.retain(|key| view.owns(PartId::of_key(key)));
+        for (_, hashes) in pull_hashes.iter_mut() {
+            hashes.retain(|&hash| view.owns(PartId::from_hash(hash)));
+        }
+        pull_hashes.retain(|(_, hashes)| !hashes.is_empty());
     }
 }
 
 /// One round's push/pull/hash-pull/fallback classification, threaded as
-/// `&mut RepairPlan` instead of four separate out-parameters.
+/// `&mut RepairPlan` instead of four separate out-parameters, and the
+/// parts of each bucket it may repair: `in_scope`'s, or every part when
+/// `None`.
 #[derive(Default)]
 struct RepairPlan {
+    in_scope: Option<HashMap<u16, PartMask>>,
     push_keys: Vec<Bytes>,
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
@@ -475,6 +539,13 @@ struct RepairPlan {
 }
 
 impl RepairPlan {
+    /// The parts of `bucket` this round may repair.
+    fn repairable(&self, bucket: u16) -> PartMask {
+        self.in_scope.as_ref().map_or(PartMask::ALL, |scope| {
+            scope.get(&bucket).copied().unwrap_or_default()
+        })
+    }
+
     /// Queues `hashes` to pull from `bucket` by hash; a no-op if empty.
     fn pull_by_hash(&mut self, bucket: u16, hashes: Vec<u64>) {
         if !hashes.is_empty() {
@@ -559,7 +630,7 @@ async fn classify_bucket_mismatches(
                     handle_sketch_mismatch(cache, bucket, cells, entries, plan, merging);
                 }
                 AeMismatch::PartDigests(..) => {
-                    unreachable!("invariant: run_round_against partitions this variant out")
+                    unreachable!("invariant: reconcile_mismatches partitions this variant out")
                 }
             }
         }
@@ -634,9 +705,11 @@ async fn classify_part_digest_mismatch_chunk(
         let local_parts = local_digests_by_bucket
             .get(&bucket)
             .map_or(&[][..], Vec::as_slice);
+        let mask = plan.repairable(bucket);
         wanted_parts.extend(
             mismatched_parts(local_parts, digests)
                 .into_iter()
+                .filter(|&part| mask.contains(part))
                 .map(|part| BucketPart { bucket, part }),
         );
     }
@@ -648,55 +721,7 @@ async fn classify_part_digest_mismatch_chunk(
         wanted_parts.iter().map(|p| (p.bucket, p.part)).collect();
     match mesh.ae_parts(peer, cache.clone(), wanted_parts_wire).await {
         Ok(replies) => {
-            let local_part_entries = shard.entries_for_parts(wanted_parts).await;
-            let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> = local_part_entries
-                .into_iter()
-                .map(|(bp, entries)| ((bp.bucket, bp.part), key_versions_to_tuples(entries)))
-                .collect();
-            let mut gathered: HashMap<u16, RepairPlan> = HashMap::new();
-            for reply in replies {
-                let slot = gathered.entry(reply.bucket()).or_default();
-                match reply {
-                    AePartReply::Listing {
-                        bucket,
-                        part,
-                        entries,
-                    } => {
-                        diff_bucket(
-                            local_by_part
-                                .get(&(bucket, part))
-                                .map_or(&[], Vec::as_slice),
-                            &key_versions_to_tuples(entries),
-                            &mut slot.push_keys,
-                            &mut slot.pull_keys,
-                            merging,
-                        );
-                        metrics::counter!(
-                            "sundog_ae_parts_total",
-                            "cache" => cache.to_string(),
-                            "outcome" => "listing"
-                        )
-                        .increment(1);
-                        tracing::debug!(
-                            outcome = "listing",
-                            bucket,
-                            part,
-                            "anti-entropy part listing"
-                        );
-                    }
-                    AePartReply::Sketch {
-                        bucket,
-                        part,
-                        cells,
-                    } => {
-                        let entries: &[(Bytes, Hlc)] = local_by_part
-                            .get(&(bucket, part))
-                            .map_or(&[], Vec::as_slice);
-                        handle_part_sketch_mismatch(cache, bucket, cells, entries, slot, merging);
-                    }
-                }
-            }
-            settle_bucket_parts(gathered, plan);
+            classify_part_replies(shard, cache, replies, plan, merging).await;
             true
         }
         Err(error) => {
@@ -704,6 +729,79 @@ async fn classify_part_digest_mismatch_chunk(
             false
         }
     }
+}
+
+/// Classifies part listings and sketches against this node's own entries
+/// for the same parts, the way [`classify_bucket_mismatches`] does for
+/// whole buckets: the second half of a part-digest exchange, and the
+/// whole of a part-granular scoped round's answer. A part sketch that
+/// fails to peel marks its bucket for the `Msg::AeEntries` fallback.
+async fn classify_part_replies(
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    replies: Vec<AePartReply>,
+    plan: &mut RepairPlan,
+    merging: bool,
+) {
+    if replies.is_empty() {
+        return;
+    }
+    let wanted_parts: Vec<BucketPart> = replies
+        .iter()
+        .map(|reply| BucketPart {
+            bucket: reply.bucket(),
+            part: reply.part(),
+        })
+        .collect();
+    let local_part_entries = shard.entries_for_parts(wanted_parts).await;
+    let local_by_part: HashMap<(u16, u8), Vec<(Bytes, Hlc)>> = local_part_entries
+        .into_iter()
+        .map(|(bp, entries)| ((bp.bucket, bp.part), key_versions_to_tuples(entries)))
+        .collect();
+    let mut gathered: HashMap<u16, RepairPlan> = HashMap::new();
+    for reply in replies {
+        let slot = gathered.entry(reply.bucket()).or_default();
+        match reply {
+            AePartReply::Listing {
+                bucket,
+                part,
+                entries,
+            } => {
+                diff_bucket(
+                    local_by_part
+                        .get(&(bucket, part))
+                        .map_or(&[], Vec::as_slice),
+                    &key_versions_to_tuples(entries),
+                    &mut slot.push_keys,
+                    &mut slot.pull_keys,
+                    merging,
+                );
+                metrics::counter!(
+                    "sundog_ae_parts_total",
+                    "cache" => cache.to_string(),
+                    "outcome" => "listing"
+                )
+                .increment(1);
+                tracing::debug!(
+                    outcome = "listing",
+                    bucket,
+                    part,
+                    "anti-entropy part listing"
+                );
+            }
+            AePartReply::Sketch {
+                bucket,
+                part,
+                cells,
+            } => {
+                let entries: &[(Bytes, Hlc)] = local_by_part
+                    .get(&(bucket, part))
+                    .map_or(&[], Vec::as_slice);
+                handle_part_sketch_mismatch(cache, bucket, cells, entries, slot, merging);
+            }
+        }
+    }
+    settle_bucket_parts(gathered, plan);
 }
 
 /// This record's wire size framed as a [`crate::wire::Msg::Replicate`]
@@ -1154,7 +1252,10 @@ mod tests {
         let mut by_bucket: HashMap<u16, Vec<u32>> = HashMap::new();
         for key in 0..n {
             let bytes = crate::store::encode_key(&key).expect("u32 key encodes");
-            by_bucket.entry(bucket_of(&bytes)).or_default().push(key);
+            by_bucket
+                .entry(crate::store::bucket_of(&bytes))
+                .or_default()
+                .push(key);
         }
         let dense: Vec<Vec<u32>> = by_bucket
             .into_values()
@@ -1406,6 +1507,12 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    /// The ownership part a u32 test key hashes into.
+    #[cfg(not(feature = "sim"))]
+    fn part_of_u32(key: u32) -> PartId {
+        PartId::of_key(&crate::store::encode_key(&key).expect("u32 key encodes"))
+    }
+
     /// `n` distinct u32 keys, each landing in a different bucket.
     /// Real-transport only.
     #[cfg(not(feature = "sim"))]
@@ -1414,7 +1521,7 @@ mod tests {
         let mut seen = HashSet::new();
         for key in 0u32.. {
             let bytes = crate::store::encode_key(&key).expect("u32 key encodes");
-            let bucket = bucket_of(&bytes);
+            let bucket = crate::store::bucket_of(&bytes);
             if seen.insert(bucket) {
                 found.push((key, bucket));
                 if found.len() == n {
@@ -1521,7 +1628,7 @@ mod tests {
     }
 
     /// Two real, joined `Mode::Distributed` nodes co-owning every bucket,
-    /// for `run_round_for_buckets`'s real-transport tests. Real-transport only.
+    /// for `run_round_for_parts`'s real-transport tests. Real-transport only.
     #[cfg(not(feature = "sim"))]
     async fn two_distributed_co_owners(
         test_id: &str,
@@ -1573,7 +1680,7 @@ mod tests {
     /// request is scoped to `buckets`.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
-    async fn run_round_for_buckets_reports_only_the_requested_buckets_still_diverged() {
+    async fn run_round_for_parts_reports_only_the_requested_buckets_still_diverged() {
         use super::super::test_support::wait_until;
 
         let name = SmolStr::new("scoped-round-diverged");
@@ -1581,22 +1688,23 @@ mod tests {
             two_distributed_co_owners("scoped-diverged", &name).await;
 
         let keys = keys_in_distinct_buckets(2);
-        let (requested_key, requested_bucket) = keys[0];
-        let (extra_key, extra_bucket) = keys[1];
+        let (requested_key, _) = keys[0];
+        let (extra_key, _) = keys[1];
+        let requested_part = part_of_u32(requested_key);
+        let extra_part = part_of_u32(extra_key);
 
         let (_, requested_rec) = encode_test_record(requested_key, "requested", node_b);
         shard_b.apply_remote(requested_rec).await;
         let (_, extra_rec) = encode_test_record(extra_key, "extra", node_b);
         shard_b.apply_remote(extra_rec).await;
 
-        let mut outcome = BucketRoundOutcome::default();
+        let mut outcome = PartRoundOutcome::default();
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c joining, so the round runs instead of reporting stale",
             async || {
                 outcome =
-                    run_round_for_buckets(c.mesh(), &shard_c, &name, node_b, &[requested_bucket])
-                        .await;
+                    run_round_for_parts(c.mesh(), &shard_c, &name, node_b, &[requested_part]).await;
                 !outcome.failed
             },
         )
@@ -1604,7 +1712,7 @@ mod tests {
 
         assert_eq!(
             outcome.still_diverged,
-            HashSet::from([requested_bucket]),
+            HashSet::from([requested_part]),
             "the requested bucket's real divergence is reported"
         );
         assert!(
@@ -1612,8 +1720,7 @@ mod tests {
             "the only requested bucket diverged, so nothing is reported matched"
         );
         assert!(
-            !outcome.still_diverged.contains(&extra_bucket)
-                && !outcome.matched.contains(&extra_bucket),
+            !outcome.still_diverged.contains(&extra_part) && !outcome.matched.contains(&extra_part),
             "the un-requested bucket's real divergence never surfaces in this scoped round's outcome"
         );
 
@@ -1632,7 +1739,7 @@ mod tests {
                   the request, run and assert the round): splitting it would only scatter state \
                   (b, c, d, node_b, shard_c, the split buckets) across helper signatures"
     )]
-    async fn run_round_for_buckets_never_reports_matched_for_a_bucket_the_peer_does_not_co_own() {
+    async fn run_round_for_parts_never_reports_matched_for_a_bucket_the_peer_does_not_co_own() {
         use super::super::test_support::{
             loopback_config, registered_shard, wait_for_peer_count, wait_until,
         };
@@ -1683,7 +1790,7 @@ mod tests {
 
         // c's ownership view catches up to d's cache mode on its own
         // cadence, so this polls rather than assuming the first view is settled.
-        let mut split: Option<(u16, u16)> = None;
+        let mut split: Option<(PartId, PartId)> = None;
         wait_until(
             Duration::from_secs(10),
             "c's own view catches up to d joining, splitting c's owned buckets across both b \
@@ -1694,16 +1801,11 @@ mod tests {
                 };
                 let mut shared_with_b = None;
                 let mut dropped_by_b = None;
-                for bucket in
-                    0..u16::try_from(crate::store::BUCKET_COUNT).expect("BUCKET_COUNT fits u16")
-                {
-                    if !view.owns(bucket) {
-                        continue;
-                    }
-                    if view.owners_of(bucket).contains(&node_b) {
-                        shared_with_b.get_or_insert(bucket);
+                for part in view.owned_parts() {
+                    if view.owners_of(part).contains(&node_b) {
+                        shared_with_b.get_or_insert(part);
                     } else {
-                        dropped_by_b.get_or_insert(bucket);
+                        dropped_by_b.get_or_insert(part);
                     }
                     if shared_with_b.is_some() && dropped_by_b.is_some() {
                         break;
@@ -1724,13 +1826,13 @@ mod tests {
 
         // b's own OwnershipTracker catches up to c/d joining on its own
         // cadence, so this polls rather than assuming a shared view hash.
-        let mut outcome = BucketRoundOutcome::default();
+        let mut outcome = PartRoundOutcome::default();
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c and d joining, so the round against it runs instead of \
              reporting stale",
             async || {
-                outcome = run_round_for_buckets(
+                outcome = run_round_for_parts(
                     c.mesh(),
                     &shard_c,
                     &name,
@@ -1766,7 +1868,7 @@ mod tests {
     /// divergence, no bytes moved.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
-    async fn run_round_for_buckets_marks_a_bucket_matched_once_its_digest_exchange_reports_no_mismatch()
+    async fn run_round_for_parts_marks_a_bucket_matched_once_its_digest_exchange_reports_no_mismatch()
      {
         use super::super::test_support::wait_until;
 
@@ -1774,16 +1876,15 @@ mod tests {
         let (b, c, node_b, _shard_b, shard_c) =
             two_distributed_co_owners("scoped-matched", &name).await;
 
-        let (_, matched_bucket) = keys_in_distinct_buckets(1)[0];
+        let matched_part = part_of_u32(keys_in_distinct_buckets(1)[0].0);
 
-        let mut outcome = BucketRoundOutcome::default();
+        let mut outcome = PartRoundOutcome::default();
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c joining, so the round runs instead of reporting stale",
             async || {
                 outcome =
-                    run_round_for_buckets(c.mesh(), &shard_c, &name, node_b, &[matched_bucket])
-                        .await;
+                    run_round_for_parts(c.mesh(), &shard_c, &name, node_b, &[matched_part]).await;
                 !outcome.failed
             },
         )
@@ -1791,7 +1892,7 @@ mod tests {
 
         assert_eq!(
             outcome.matched,
-            HashSet::from([matched_bucket]),
+            HashSet::from([matched_part]),
             "an untouched bucket's digests already agree, so it matches at once"
         );
         assert!(outcome.still_diverged.is_empty());
@@ -1808,7 +1909,7 @@ mod tests {
     /// lands in `still_diverged`.
     #[tokio::test]
     #[cfg(not(feature = "sim"))]
-    async fn run_round_for_buckets_treats_every_requested_bucket_as_still_diverged_when_the_peer_is_unreachable()
+    async fn run_round_for_parts_treats_every_requested_bucket_as_still_diverged_when_the_peer_is_unreachable()
      {
         use super::super::test_support::{loopback_config, registered_shard};
         use crate::store::Mode;
@@ -1829,10 +1930,10 @@ mod tests {
 
         let shard = registered_shard(&cluster, &name);
         let unknown_peer = NodeId::from(u64::MAX);
-        let requested = [1u16, 2, 3];
+        let requested = [1u16, 2, 3].map(PartId::from_raw);
 
         let outcome =
-            run_round_for_buckets(cluster.mesh(), &shard, &name, unknown_peer, &requested).await;
+            run_round_for_parts(cluster.mesh(), &shard, &name, unknown_peer, &requested).await;
 
         assert!(
             outcome.failed,
@@ -1840,13 +1941,113 @@ mod tests {
         );
         assert_eq!(
             outcome.still_diverged,
-            requested.iter().copied().collect::<HashSet<u16>>(),
+            requested.iter().copied().collect::<HashSet<PartId>>(),
             "every requested bucket is treated as still diverged when the round cannot run"
         );
         assert!(outcome.matched.is_empty());
         assert_eq!(outcome.bytes_moved, 0);
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn matched_parts_is_every_requested_part_in_scope_of_a_bucket_the_reply_did_not_name() {
+        let requested: HashSet<PartId> = [PartId::new(4, 0), PartId::new(4, 5), PartId::new(9, 1)]
+            .into_iter()
+            .collect();
+        // Bucket 4 matched, bucket 9 named mismatched: only bucket 4's
+        // requested parts count.
+        let whole = [(4, PartMask::ALL), (9, PartMask::ALL)];
+        assert_eq!(
+            matched_parts(&requested, &whole, &HashSet::from([9])),
+            HashSet::from([PartId::new(4, 0), PartId::new(4, 5)])
+        );
+        // A mask narrows a matched bucket to the parts it names.
+        let masked = [(4, [5].into_iter().collect()), (9, PartMask::ALL)];
+        assert_eq!(
+            matched_parts(&requested, &masked, &HashSet::new()),
+            HashSet::from([PartId::new(4, 5), PartId::new(9, 1)])
+        );
+        // A bucket never covered never matches, even unnamed.
+        assert!(matched_parts(&requested, &[], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_repair_plan_repairs_every_part_unscoped_and_only_its_scope_otherwise() {
+        assert_eq!(RepairPlan::default().repairable(7), PartMask::ALL);
+        let plan = RepairPlan {
+            in_scope: Some(HashMap::from([(7, [1, 2].into_iter().collect())])),
+            ..RepairPlan::default()
+        };
+        assert_eq!(plan.repairable(7).parts().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            plan.repairable(8),
+            PartMask::default(),
+            "a bucket outside the scope repairs nothing"
+        );
+    }
+
+    #[test]
+    fn retain_peer_owned_pushes_keeps_only_keys_whose_part_the_peer_owns() {
+        use crate::ownership::{Granularity, OwnershipTracker, OwnershipView, ResidencySet};
+        use crate::store::{Mode, Shard};
+
+        let self_node = NodeId::from(1);
+        let peer = NodeId::from(2);
+        let owners = std::num::NonZeroU8::new(2).expect("nonzero");
+        let (tracker, tx) = OwnershipTracker::seed(
+            self_node,
+            &[],
+            &HashMap::new(),
+            &SmolStr::new("prices"),
+            owners,
+        );
+        let view = Arc::new(OwnershipView::compute_at(
+            self_node,
+            (1..=5u64).map(NodeId::from).collect(),
+            owners,
+            Granularity::Part,
+        ));
+        tx.send(Arc::clone(&view)).expect("receiver alive");
+        let shard: Arc<dyn ShardOps> = Arc::new(
+            Shard::<u32, String>::new(
+                SmolStr::new("prices"),
+                Mode::Distributed { owners },
+                self_node,
+                u64::MAX,
+                None,
+                None,
+            )
+            .with_ownership(tracker, Arc::new(ResidencySet::new())),
+        );
+        let key_of = |key: u32| crate::store::encode_key(&key).expect("u32 key encodes");
+        let peers_key = (0u32..1_000_000)
+            .find(|&k| view.owners_of(part_of_u32_any(k)).contains(&peer))
+            .expect("the peer owns some key");
+        let other_key = (0u32..1_000_000)
+            .find(|&k| !view.owners_of(part_of_u32_any(k)).contains(&peer))
+            .expect("the peer does not own some key");
+        let mut pushes = vec![key_of(peers_key), key_of(other_key)];
+        retain_peer_owned_pushes(&shard, peer, &mut pushes);
+        assert_eq!(pushes, vec![key_of(peers_key)]);
+
+        // No view: identity.
+        let plain: Arc<dyn ShardOps> = Arc::new(Shard::<u32, String>::new(
+            SmolStr::new("plain"),
+            Mode::Replicated,
+            self_node,
+            u64::MAX,
+            None,
+            None,
+        ));
+        let mut pushes = vec![key_of(peers_key), key_of(other_key)];
+        retain_peer_owned_pushes(&plain, peer, &mut pushes);
+        assert_eq!(pushes.len(), 2);
+    }
+
+    /// The ownership part a u32 test key hashes into, under either transport.
+    fn part_of_u32_any(key: u32) -> PartId {
+        PartId::of_key(&crate::store::encode_key(&key).expect("u32 key encodes"))
     }
 
     #[test]
@@ -2260,6 +2461,7 @@ mod tests {
                 pull_keys: vec![Bytes::from_static(b"q3")],
                 pull_hashes: vec![(3, vec![33])],
                 undecodable_buckets: vec![3],
+                ..RepairPlan::default()
             },
         );
         gathered.insert(
@@ -2269,6 +2471,7 @@ mod tests {
                 pull_keys: Vec::new(),
                 pull_hashes: vec![(5, vec![55])],
                 undecodable_buckets: Vec::new(),
+                ..RepairPlan::default()
             },
         );
         let mut plan = RepairPlan::default();

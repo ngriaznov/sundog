@@ -37,9 +37,9 @@ pub(crate) struct Report {
     pub(crate) pull_timeouts: u64,
     pub(crate) spill_writes: u64,
     pub(crate) ae_repaired: u64,
-    /// `sundog_rebalance_buckets_total{direction="in"}`, summed across caches.
+    /// `sundog_rebalance_parts_total{direction="in"}`, summed across caches.
     pub(crate) rebalance_in: u64,
-    /// `sundog_rebalance_buckets_total{direction="out"}`, summed across caches.
+    /// `sundog_rebalance_parts_total{direction="out"}`, summed across caches.
     pub(crate) rebalance_out: u64,
     /// `sundog_backlog_dropped_total`, summed across peers.
     pub(crate) backlog_dropped: u64,

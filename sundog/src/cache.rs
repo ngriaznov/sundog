@@ -32,12 +32,13 @@ use crate::error::CacheError;
 use crate::net::FetchOutcome;
 use crate::node::NodeId;
 use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
+use crate::store::PartId;
 use crate::store::crdt::WriterId;
+use crate::store::part::PartSet;
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{
-    ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher, bucket_of, encode_key,
-    now_ms,
+    ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher, encode_key, now_ms,
 };
 use crate::wire::WireRecord;
 
@@ -193,7 +194,7 @@ where
     /// `ClusterConfig::state_transfer_budget`; a cache too large to finish
     /// opens with a partial copy anti-entropy tops up. For
     /// [`Mode::Distributed`], the same open()-time transfer instead pulls
-    /// only this node's own buckets, per its freshly computed ownership
+    /// only this node's own parts, per its freshly computed ownership
     /// view; a transfer that lands, finds nothing to pull, or times out
     /// repeatedly all still open the cache warm.
     ///
@@ -303,7 +304,7 @@ where
         // for a cold open, since a view computed once a peer shows up beats
         // one computed alone. `membership_settled` records whether the wait
         // landed a peer; `distributed_warm_and_rebalance` uses it to gate the
-        // sole-owner shortcut for a bucket this open's spill tier replayed.
+        // sole-owner shortcut for a part this open's spill tier replayed.
         let membership_settled = if matches!(mode, Mode::Distributed { .. }) {
             await_initial_peers(&cluster).await
         } else {
@@ -336,7 +337,7 @@ where
         // the reservation back: nothing has advertised or scheduled tasks
         // for this name yet, so removing it is enough. A success threads
         // whether the tier landed a warm reopen into `distributed`, so
-        // `distributed_warm_and_rebalance` knows which owned buckets get
+        // `distributed_warm_and_rebalance` knows which owned parts get
         // eager reconciliation instead of an ordinary cold pull.
         #[cfg(feature = "spill")]
         let mut distributed = distributed;
@@ -386,7 +387,7 @@ where
 
 /// [`CacheBuilder::open`]'s spill-attach step: a no-op when `spill` is
 /// `None`, otherwise [`Shard::attach_spill`], recording the warm-reloaded
-/// buckets into `distributed`'s [`DistributedContext::warm_reloaded_buckets`].
+/// parts into `distributed`'s [`DistributedContext::warm_reloaded_parts`].
 ///
 /// # Errors
 ///
@@ -406,11 +407,11 @@ where
     };
     let outcome = shard.attach_spill(cfg)?;
     if let Some(ctx) = distributed.as_mut() {
-        // Every bucket this warm reopen replayed is unverified until
+        // Every part this warm reopen replayed is unverified until
         // `reconcile_warm_buckets` or an ordinary cold pull lands fresh data.
-        let warm: Vec<u16> = outcome.warm_buckets.iter().copied().collect();
+        let warm: Vec<PartId> = outcome.warm_parts.iter().copied().collect();
         ctx.residency.mark_unverified(&warm);
-        ctx.warm_reloaded_buckets = outcome.warm_buckets;
+        ctx.warm_reloaded_parts = outcome.warm_parts;
     }
     Ok(())
 }
@@ -461,10 +462,10 @@ fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
     window.is_zero() || resolver_merges
 }
 
-/// `bucket`'s owners under `view` other than `self_node`: the candidates a
+/// `part`'s owners under `view` other than `self_node`: the candidates a
 /// [`Cache::fetch`] asks, in rendezvous order.
-fn other_owners(view: &OwnershipView, bucket: u16, self_node: NodeId) -> Vec<NodeId> {
-    view.owners_of(bucket)
+fn other_owners(view: &OwnershipView, part: PartId, self_node: NodeId) -> Vec<NodeId> {
+    view.owners_of(part)
         .iter()
         .copied()
         .filter(|owner| *owner != self_node)
@@ -517,13 +518,13 @@ struct DistributedContext {
     view_tx: watch::Sender<Arc<OwnershipView>>,
     residency: Arc<ResidencySet>,
     owners: NonZeroU8,
-    /// The buckets `Shard::attach_spill` warm-reloaded at least one record
+    /// The parts `Shard::attach_spill` warm-reloaded at least one record
     /// for. Empty here (the spill tier attaches only after the shard is
     /// shared); `CacheBuilder::open` fills it in before
     /// `spawn_cache_tasks` runs, for `distributed_warm_and_rebalance` to
-    /// intersect with the initially owned buckets and pick eager
+    /// intersect with the initially owned parts and pick eager
     /// reconciliation candidates over an ordinary cold pull.
-    warm_reloaded_buckets: HashSet<u16>,
+    warm_reloaded_parts: HashSet<PartId>,
 }
 
 /// The cap [`await_initial_peers`] never waits past: long enough for a
@@ -539,7 +540,7 @@ fn should_await_first_peer(has_seeds: bool, peers_known: bool) -> bool {
 
 /// The rule behind `trust_sole_owner` for
 /// [`distributed_warm_and_rebalance`]'s initial pull: trust sole ownership
-/// at open unless this open replayed buckets from a spill snapshot
+/// at open unless this open replayed parts from a spill snapshot
 /// (`replayed > 0`) and the membership wait timed out.
 fn trust_sole_owner_at_open(membership_settled: bool, replayed: usize) -> bool {
     membership_settled || replayed == 0
@@ -593,7 +594,7 @@ async fn await_initial_peers(cluster: &Cluster) -> bool {
     settled
 }
 
-/// Attaches a freshly seeded bucket-ownership tracker and residency set to
+/// Attaches a freshly seeded ownership tracker and residency set to
 /// `shard`, for a `Mode::Distributed` cache; every other mode leaves both
 /// unset and returns `None`. Runs before `shard` is ever shared, so no
 /// reader can observe anything but a real, already-computed view.
@@ -618,13 +619,13 @@ where
         owners,
     );
     let residency = Arc::new(ResidencySet::new());
-    // Cold until pulled: every initially owned bucket with a co-owner to
-    // pull from. A bucket owned alone has no other copy; a node that opens
-    // before gossip shows any peer holds nothing yet either way.
+    // Cold until pulled: every initially owned part with a co-owner to pull
+    // from. A part owned alone has no other copy; a node that opens before
+    // gossip shows any peer holds nothing yet either way.
     let seed = ownership.current();
-    let cold: Vec<u16> = seed
-        .owned_buckets()
-        .filter(|&bucket| seed.owners_of(bucket).len() > 1)
+    let cold: Vec<PartId> = seed
+        .owned_parts()
+        .filter(|&part| seed.owners_of(part).len() > 1)
         .collect();
     residency.mark_cold(&cold);
     shard = shard.with_ownership(ownership.clone(), Arc::clone(&residency));
@@ -635,14 +636,14 @@ where
             view_tx,
             residency,
             owners,
-            warm_reloaded_buckets: HashSet::new(),
+            warm_reloaded_parts: HashSet::new(),
         }),
     )
 }
 
 /// The background loops one opened cache runs: fan-out for a clustered
 /// mode, warm-up and anti-entropy for `Replicated`, the analogous
-/// bucket-scoped pull, refresh, and rebalance loops for `Distributed`,
+/// part-scoped pull, refresh, and rebalance loops for `Distributed`,
 /// tombstone GC, and the entry gauge, all under `cancel` and tracked by
 /// `tasks`. `membership_settled` is `open()`'s own [`await_initial_peers`]
 /// outcome, used only by [`distributed_warm_and_rebalance`]'s sole-owner shortcut.
@@ -771,8 +772,8 @@ where
 }
 
 /// The `Mode::Distributed`-only half of [`spawn_cache_tasks`]: pulls this
-/// node's initially owned buckets from their current owners before the
-/// cache is marked warm, the bucket-scoped analogue of
+/// node's initially owned parts from their current owners before the
+/// cache is marked warm, the part-scoped analogue of
 /// [`warm_and_repair`]'s whole-cache transfer, then starts the
 /// ownership-refresh and rebalance loops. An initial pull that times out,
 /// or finds no co-owner because gossip has not shown a peer yet, leaves
@@ -800,7 +801,7 @@ async fn distributed_warm_and_rebalance(
         view_tx,
         residency,
         owners,
-        warm_reloaded_buckets,
+        warm_reloaded_parts,
     } = distributed;
 
     let budget = cluster.config().state_transfer_budget;
@@ -820,15 +821,15 @@ async fn distributed_warm_and_rebalance(
         ),
     );
 
-    let initially_owned: Vec<u16> = ownership.current().owned_buckets().collect();
-    // A warm-reloaded bucket starts as cold as any other: this eager
-    // reconciliation round runs first, clearing cold only for a bucket whose
+    let initially_owned: Vec<PartId> = ownership.current().owned_parts().collect();
+    // A warm-reloaded part starts as cold as any other: this eager
+    // reconciliation round runs first, clearing cold only for a part whose
     // round against every live co-owner comes back reconciled. Everything
     // else falls to the ordinary cold-pull path below, same as with no spill tier.
-    let warm_candidates: Vec<u16> = initially_owned
+    let warm_candidates: Vec<PartId> = initially_owned
         .iter()
         .copied()
-        .filter(|bucket| warm_reloaded_buckets.contains(bucket))
+        .filter(|part| warm_reloaded_parts.contains(part))
         .collect();
     let reconciled = reconcile_warm_buckets(
         cluster,
@@ -854,9 +855,9 @@ async fn distributed_warm_and_rebalance(
         ),
     );
 
-    let pull_buckets: Vec<u16> = initially_owned
+    let pull_parts: Vec<PartId> = initially_owned
         .into_iter()
-        .filter(|bucket| !reconciled.contains(bucket))
+        .filter(|part| !reconciled.contains(part))
         .collect();
     let outcome = crate::cluster::rebalance::PullRequest {
         cluster,
@@ -864,13 +865,13 @@ async fn distributed_warm_and_rebalance(
         ownership: &ownership,
         residency: &residency,
         cache: name,
-        buckets: pull_buckets,
+        parts: pull_parts,
         budget,
         concurrency,
         // See `trust_sole_owner_at_open`: a cold open trusts sole ownership
         // outright; a warm reopen trusts it only once membership_settled too,
-        // else the bucket stays cold for `warm_up_task`'s ordinary retries.
-        trust_sole_owner: trust_sole_owner_at_open(membership_settled, warm_reloaded_buckets.len()),
+        // else the part stays cold for `warm_up_task`'s ordinary retries.
+        trust_sole_owner: trust_sole_owner_at_open(membership_settled, warm_reloaded_parts.len()),
     }
     .run()
     .await;
@@ -904,7 +905,7 @@ async fn distributed_warm_and_rebalance(
 }
 
 /// Cap on rounds in [`reconcile_warm_buckets`]'s per-peer converge loop:
-/// chances for a bucket still moving under live writes to settle, not chunks
+/// chances for a part still moving under live writes to settle, not chunks
 /// of a fixed size. A failed or `Stale` round doesn't count; it retries.
 const RECONCILE_MAX_ROUNDS: u32 = 3;
 
@@ -914,7 +915,7 @@ const RECONCILE_RETRY_BASE: Duration = Duration::from_millis(200);
 
 /// Per-peer bound on [`reconcile_warm_buckets`]'s converge loop: whichever
 /// of `max_rounds`, `byte_budget` or `time_budget` is hit first stops it,
-/// leaving that peer's still-diverging buckets cold for the ordinary pull.
+/// leaving that peer's still-diverging parts cold for the ordinary pull.
 #[derive(Debug, Clone, Copy)]
 struct ReconcileBudget {
     max_rounds: u32,
@@ -968,27 +969,27 @@ fn retry_delay(
 }
 
 /// Splits `requested` into (converged, still-diverging) from one round's
-/// outcome; a `failed` round reports every bucket as still diverging.
+/// outcome; a `failed` round reports every part as still diverging.
 fn split_round_result(
-    requested: &[u16],
-    outcome: &anti_entropy::BucketRoundOutcome,
-) -> (Vec<u16>, Vec<u16>) {
+    requested: &[PartId],
+    outcome: &anti_entropy::PartRoundOutcome,
+) -> (Vec<PartId>, Vec<PartId>) {
     if outcome.failed {
         return (Vec::new(), requested.to_vec());
     }
     requested
         .iter()
         .copied()
-        .partition(|bucket| outcome.matched.contains(bucket))
+        .partition(|part| outcome.matched.contains(part))
 }
 
 /// One live co-owner's converge loop: repeatedly
-/// [`anti_entropy::run_round_for_buckets`] against `peer` over its
-/// still-diverging subset of `buckets`, calling `mark_serving` as soon as a
-/// bucket's digest matches, until nothing is left diverging or
+/// [`anti_entropy::run_round_for_parts`] against `peer` over its
+/// still-diverging subset of `parts`, marking each part serving as soon as
+/// its digest matches, until nothing is left diverging or
 /// [`should_keep_reconciling`]'s `budget` stops it. A failed or `Stale`
 /// round retries via [`retry_delay`] without counting as a round. Returns
-/// every bucket marked serving this way.
+/// every part marked serving this way.
 ///
 /// Factored out so [`reconcile_warm_buckets`] can run one of these per live
 /// co-owner concurrently, bounding the wait by one peer's `budget` instead
@@ -999,16 +1000,16 @@ async fn reconcile_against_peer(
     cache: &SmolStr,
     residency: &Arc<ResidencySet>,
     peer: NodeId,
-    buckets: Vec<u16>,
+    parts: Vec<PartId>,
     budget: ReconcileBudget,
-) -> HashSet<u16> {
+) -> HashSet<PartId> {
     let mesh = cluster.mesh();
     let started = Instant::now();
-    let mut still_diverging = buckets;
+    let mut still_diverging = parts;
     let mut rounds_run: u32 = 0;
     let mut failed_in_a_row: u32 = 0;
     let mut bytes_moved: u64 = 0;
-    let mut reconciled: HashSet<u16> = HashSet::new();
+    let mut reconciled: HashSet<PartId> = HashSet::new();
     while should_keep_reconciling(
         rounds_run,
         bytes_moved,
@@ -1017,8 +1018,7 @@ async fn reconcile_against_peer(
         &budget,
     ) {
         let outcome =
-            anti_entropy::run_round_for_buckets(mesh, shard_ops, cache, peer, &still_diverging)
-                .await;
+            anti_entropy::run_round_for_parts(mesh, shard_ops, cache, peer, &still_diverging).await;
         if outcome.failed {
             failed_in_a_row += 1;
         } else {
@@ -1028,7 +1028,7 @@ async fn reconcile_against_peer(
         bytes_moved += outcome.bytes_moved;
         let (converged, diverging) = split_round_result(&still_diverging, &outcome);
         if !converged.is_empty() {
-            // Cleared per bucket once its digest matches, not held back for the rest.
+            // Cleared per part once its digest matches, not held back for the rest.
             residency.mark_serving(&converged);
             reconciled.extend(converged.iter().copied());
         }
@@ -1057,20 +1057,21 @@ async fn reconcile_against_peer(
             }
         }
     }
-    // Every bucket still in `still_diverging` here gets no `ResidencySet`
+    // Every part still in `still_diverging` here gets no `ResidencySet`
     // call: it stays cold and unverified, falling to the ordinary cold-pull path.
     reconciled
 }
 
-/// Converge-before-serving reconciliation: groups `warm_buckets` by live
+/// Converge-before-serving reconciliation: groups `warm_parts` by live
 /// co-owner, then runs [`reconcile_against_peer`]'s loop for each peer
-/// concurrently, returning the union of buckets marked serving.
+/// concurrently over its parts, returning the union of parts marked
+/// serving.
 ///
-/// A warm-reloaded bucket's local state came from replaying on-disk records
+/// A warm-reloaded part's local state came from replaying on-disk records
 /// that predate this restart and can include a value this node itself
 /// deleted before going down (deletes never persist to the spill tier), so
 /// it needs verification against a live co-owner rather than outright
-/// trust. A bucket with no live co-owner, or one whose loop against a peer
+/// trust. A part with no live co-owner, or one whose loop against a peer
 /// never closed the gap, gets no [`ResidencySet`] call and stays cold and
 /// unverified, falling to the caller's ordinary cold-pull path.
 async fn reconcile_warm_buckets(
@@ -1079,9 +1080,9 @@ async fn reconcile_warm_buckets(
     cache: &SmolStr,
     ownership: &OwnershipTracker,
     residency: &Arc<ResidencySet>,
-    warm_buckets: &[u16],
-) -> HashSet<u16> {
-    if warm_buckets.is_empty() {
+    warm_parts: &[PartId],
+) -> HashSet<PartId> {
+    if warm_parts.is_empty() {
         return HashSet::new();
     }
 
@@ -1089,12 +1090,12 @@ async fn reconcile_warm_buckets(
     let self_node = cluster.node_id();
     let live: HashSet<NodeId> = cluster.live_peer_ids().into_iter().collect();
 
-    // Grouped by live co-owner; a bucket with none is excluded, staying cold and unverified.
-    let mut peer_buckets: HashMap<NodeId, Vec<u16>> = HashMap::new();
+    // Grouped by live co-owner; a part with none is excluded, staying cold and unverified.
+    let mut peer_parts: HashMap<NodeId, Vec<PartId>> = HashMap::new();
     let mut cold_left: usize = 0;
-    for &bucket in warm_buckets {
+    for &part in warm_parts {
         let peers: Vec<NodeId> = view
-            .owners_of(bucket)
+            .owners_of(part)
             .iter()
             .copied()
             .filter(|&node| node != self_node && live.contains(&node))
@@ -1104,26 +1105,31 @@ async fn reconcile_warm_buckets(
             continue;
         }
         for peer in peers {
-            peer_buckets.entry(peer).or_default().push(bucket);
+            peer_parts.entry(peer).or_default().push(part);
         }
     }
 
     let budget = ReconcileBudget::from_config(cluster.config());
-    // Runs concurrently, not sequentially: warm buckets can split across
+    // Runs concurrently, not sequentially: warm parts can split across
     // several peers, and running loops one after another would multiply the
     // stall by peer count instead of bounding it by one `ReconcileBudget`.
-    let per_peer = peer_buckets.into_iter().map(|(peer, buckets)| {
-        reconcile_against_peer(cluster, shard_ops, cache, residency, peer, buckets, budget)
+    let per_peer = peer_parts.into_iter().map(|(peer, parts)| {
+        reconcile_against_peer(cluster, shard_ops, cache, residency, peer, parts, budget)
     });
-    let reconciled: HashSet<u16> = futures::future::join_all(per_peer)
+    let warm: PartSet = warm_parts.iter().copied().collect();
+    let reconciled: HashSet<PartId> = futures::future::join_all(per_peer)
         .await
         .into_iter()
         .flatten()
+        .filter(|&part| warm.contains(part))
         .collect();
 
-    // Every bucket not marked serving stays cold and unverified: either its
+    // Every part not marked serving stays cold and unverified: either its
     // loop never closed the gap (retried by `warm_up_task`), or it had no live co-owner.
-    let unverified_left = warm_buckets.len() - reconciled.len() - cold_left;
+    let unverified_left = warm_parts
+        .len()
+        .saturating_sub(reconciled.len())
+        .saturating_sub(cold_left);
     tracing::info!(
         cache = %cache,
         marked_serving = reconciled.len(),
@@ -1243,25 +1249,27 @@ where
         self.shard.get_sync(key)
     }
 
-    /// Reads `key`: local if this node owns its bucket (no network,
+    /// Reads `key`: local if this node owns its part (no network,
     /// counted `sundog_fetch_total{outcome="local"}`), otherwise one request
     /// to a live owner, tried in rendezvous-score order until one answers.
     /// Never promotes the fetched value into the local store; [`Cache::get`]
     /// for the same key immediately afterward is still a miss on this node.
-    /// A bucket this node owns but has not yet pulled from a co-owner is
-    /// cold: a local miss there asks the other owners before answering
-    /// `Ok(None)`, and a cold owner whose every other owner is unreachable
-    /// returns [`CacheError::FetchUnavailable`] rather than a miss it
-    /// cannot vouch for. On a cache that isn't [`Mode::Distributed`] this
+    /// A part this node owns but has not yet pulled from a co-owner is
+    /// cold: a local miss there asks the other owners, and when none of
+    /// them answers from a warm copy it returns
+    /// [`CacheError::FetchUnavailable`] rather than a miss it cannot vouch
+    /// for, since the part's previous owner can still hold the record
+    /// through its disown grace. On a cache that isn't [`Mode::Distributed`] this
     /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
     /// unconditionally, so callers don't need to branch on mode.
     ///
     /// # Errors
     ///
     /// Returns [`CacheError::Codec`] if `key` fails to encode, and
-    /// [`CacheError::FetchUnavailable`] if every owner is unreachable or
+    /// [`CacheError::FetchUnavailable`] if every owner is unreachable,
     /// times out (`crate::config::ClusterConfig::fetch_timeout` per
-    /// attempt), distinct from a genuine miss, which returns `Ok(None)`.
+    /// attempt) or declines while this node's own copy is cold, distinct
+    /// from a genuine miss, which returns `Ok(None)`.
     /// An owner whose ownership view differs from this node's is retried
     /// with a short jittered backoff before the next owner is tried.
     pub async fn fetch(&self, key: &K) -> Result<Option<V>, CacheError> {
@@ -1271,15 +1279,15 @@ where
             return Ok(value);
         };
         let key_bytes = encode_key(key)?;
-        let bucket = bucket_of(&key_bytes);
-        // An unverified bucket (warm-reloaded, not yet checked against a live
+        let part = PartId::of_key(&key_bytes);
+        // An unverified part (warm-reloaded, not yet checked against a live
         // co-owner) counts as not owned here: it can hold a record a co-owner deleted during downtime.
-        let mut owns = view.owns(bucket) && !self.shard.is_unverified_bucket(bucket);
-        if owns {
+        if view.owns(part) && !self.shard.is_unverified_part(part) {
             let value = self.shard.get(key).await;
-            // A miss in a bucket not yet pulled from a co-owner is not an
-            // answer: the other owners are asked first.
-            if value.is_some() || !self.shard.is_cold_bucket(bucket) {
+            // A miss in a part not yet pulled from a co-owner is not an
+            // answer: its previous owner can still hold the record through
+            // the disown grace, so only another owner's warm copy answers.
+            if value.is_some() || !self.shard.is_cold_part(part) {
                 record_fetch_outcome(self.shard.name(), "local");
                 return Ok(value);
             }
@@ -1291,17 +1299,11 @@ where
 
         let self_node = self.cluster.node_id();
         let mut view = view;
-        let mut owners = other_owners(&view, bucket, self_node);
+        let mut owners = other_owners(&view, part, self_node);
         let mut owner_idx = 0usize;
         // When the current owner first answered `Stale` with this node's
         // view unchanged: its retry window runs from here.
         let mut stale_since: Option<tokio::time::Instant> = None;
-        // Whether any owner answered at all, a decline included, as opposed
-        // to every attempt ending in a transport error or timeout: the
-        // difference between a miss and `FetchUnavailable` for a bucket
-        // this node owns but has not pulled yet. With nobody else to ask,
-        // this node's own copy is all there is.
-        let mut any_answered = owners.is_empty();
 
         while owner_idx < owners.len() {
             let owner = owners[owner_idx];
@@ -1324,28 +1326,21 @@ where
                     );
                     return Ok(value);
                 }
-                Ok(Ok(FetchOutcome::Declined)) => {
-                    any_answered = true;
-                    owner_idx += 1;
-                    stale_since = None;
-                }
                 Ok(Ok(FetchOutcome::Stale { .. })) => {
                     if let Some(fresh) = self.shard.ownership_view()
                         && fresh.view_hash() != view.view_hash()
                     {
                         view = fresh;
-                        if view.owns(bucket) && !self.shard.is_unverified_bucket(bucket) {
+                        if view.owns(part) && !self.shard.is_unverified_part(part) {
                             let value = self.shard.get(key).await;
-                            if value.is_some() || !self.shard.is_cold_bucket(bucket) {
+                            if value.is_some() || !self.shard.is_cold_part(part) {
                                 record_fetch_outcome(&cache_name, "local");
                                 return Ok(value);
                             }
                         }
-                        owns = view.owns(bucket) && !self.shard.is_unverified_bucket(bucket);
-                        owners = other_owners(&view, bucket, self_node);
+                        owners = other_owners(&view, part, self_node);
                         owner_idx = 0;
                         stale_since = None;
-                        any_answered = owners.is_empty();
                         continue;
                     }
                     let since = *stale_since.get_or_insert_with(tokio::time::Instant::now);
@@ -1356,23 +1351,19 @@ where
                     }
                     tokio::time::sleep(fetch_retry_backoff()).await;
                 }
-                Ok(Err(_)) | Err(_) => {
+                // A decline is as good as no answer: that owner holds no
+                // warm copy to vouch for the key.
+                Ok(Ok(FetchOutcome::Declined) | Err(_)) | Err(_) => {
                     owner_idx += 1;
                     stale_since = None;
                 }
             }
         }
-        if owns && any_answered {
-            // Every other owner declined too, or there is none: this
-            // owner's own miss is the best answer there is.
-            record_fetch_outcome(&cache_name, "miss");
-            return Ok(None);
-        }
         record_fetch_outcome(&cache_name, "error");
         Err(CacheError::FetchUnavailable { cache: cache_name })
     }
 
-    /// The live owners of `key`'s bucket, in rendezvous score order.
+    /// The live owners of `key`'s part, in rendezvous score order.
     /// `vec![self.cluster.node_id()]` on a cache that isn't
     /// [`Mode::Distributed`].
     #[must_use]
@@ -1383,7 +1374,7 @@ where
         let Ok(key_bytes) = encode_key(key) else {
             return Vec::new();
         };
-        view.owners_of(bucket_of(&key_bytes)).to_vec()
+        view.owners_of(PartId::of_key(&key_bytes)).to_vec()
     }
 
     /// Reads whether `key` has a live entry, honoring expiry, without cloning
@@ -1622,6 +1613,7 @@ mod tests {
     use super::*;
     use crate::cluster::Cluster;
     use crate::cluster::test_support::wait_until;
+    use crate::store::bucket_of;
     use crate::store::crdt::{PnCounter, PnCounterResolver};
 
     fn loopback_config() -> ClusterConfig {
@@ -2079,10 +2071,13 @@ mod tests {
     /// diverging regardless of `matched`, else splits by membership in it.
     #[test]
     fn split_round_result_folds_a_failed_round_and_otherwise_splits_by_matched() {
+        fn parts(raw: &[u16]) -> HashSet<PartId> {
+            raw.iter().map(|&r| PartId::from_raw(r)).collect()
+        }
         struct Case {
             name: &'static str,
             requested: &'static [u16],
-            outcome: anti_entropy::BucketRoundOutcome,
+            outcome: anti_entropy::PartRoundOutcome,
             expect_converged: &'static [u16],
             expect_diverging: &'static [u16],
         }
@@ -2091,8 +2086,8 @@ mod tests {
                 name: "a failed round leaves every requested bucket diverging, even one \
                        nominally in matched",
                 requested: &[1, 2, 3],
-                outcome: anti_entropy::BucketRoundOutcome {
-                    matched: HashSet::from([1]),
+                outcome: anti_entropy::PartRoundOutcome {
+                    matched: parts(&[1]),
                     still_diverged: HashSet::new(),
                     bytes_moved: 0,
                     failed: true,
@@ -2103,9 +2098,9 @@ mod tests {
             Case {
                 name: "a successful round splits matched from still-diverging",
                 requested: &[1, 2, 3],
-                outcome: anti_entropy::BucketRoundOutcome {
-                    matched: HashSet::from([1, 3]),
-                    still_diverged: HashSet::from([2]),
+                outcome: anti_entropy::PartRoundOutcome {
+                    matched: parts(&[1, 3]),
+                    still_diverged: parts(&[2]),
                     bytes_moved: 500,
                     failed: false,
                 },
@@ -2115,8 +2110,8 @@ mod tests {
             Case {
                 name: "everything requested matched: nothing left diverging",
                 requested: &[4, 5],
-                outcome: anti_entropy::BucketRoundOutcome {
-                    matched: HashSet::from([4, 5]),
+                outcome: anti_entropy::PartRoundOutcome {
+                    matched: parts(&[4, 5]),
                     still_diverged: HashSet::new(),
                     bytes_moved: 0,
                     failed: false,
@@ -2126,9 +2121,16 @@ mod tests {
             },
         ];
         for case in cases {
-            let (converged, diverging) = split_round_result(case.requested, &case.outcome);
-            assert_eq!(converged, case.expect_converged, "case: {}", case.name);
-            assert_eq!(diverging, case.expect_diverging, "case: {}", case.name);
+            let requested: Vec<PartId> = case
+                .requested
+                .iter()
+                .map(|&r| PartId::from_raw(r))
+                .collect();
+            let (converged, diverging) = split_round_result(&requested, &case.outcome);
+            let raw =
+                |parts: Vec<PartId>| -> Vec<u16> { parts.into_iter().map(PartId::raw).collect() };
+            assert_eq!(raw(converged), case.expect_converged, "case: {}", case.name);
+            assert_eq!(raw(diverging), case.expect_diverging, "case: {}", case.name);
         }
     }
 
@@ -2163,15 +2165,18 @@ mod tests {
         let name = SmolStr::new("scratch");
         let (shard_ops, distributed) = distributed_context_for_test(&cluster, &name);
 
-        let warm_buckets = [0u16, 500, 1023];
-        distributed.residency.mark_cold(&warm_buckets);
+        let warm_parts: Vec<PartId> = [0u16, 500, 1023]
+            .into_iter()
+            .flat_map(PartId::of_bucket)
+            .collect();
+        distributed.residency.mark_cold(&warm_parts);
         let reconciled = reconcile_warm_buckets(
             &cluster,
             &shard_ops,
             &name,
             &distributed.ownership,
             &distributed.residency,
-            &warm_buckets,
+            &warm_parts,
         )
         .await;
 
@@ -2182,10 +2187,10 @@ mod tests {
              as reconciled -- it falls through to PullRequest::run's own \"owned alone\" case \
              next, which is the site that actually decides a co-owner-less bucket is servable"
         );
-        for bucket in warm_buckets {
+        for part in warm_parts {
             assert!(
-                distributed.residency.is_cold(bucket),
-                "bucket {bucket} stays cold with nobody for reconcile_warm_buckets itself to \
+                distributed.residency.is_cold(part),
+                "part {part} stays cold with nobody for reconcile_warm_buckets itself to \
                  reconcile against, falling through to the ordinary cold-pull path"
             );
         }
@@ -2265,17 +2270,17 @@ mod tests {
 
         // c's shard for `name`, built directly rather than through a real `open()`.
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
-        let warm_buckets: Vec<u16> = distributed_c.ownership.current().owned_buckets().collect();
+        let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
         assert!(
-            !warm_buckets.is_empty(),
+            !warm_parts.is_empty(),
             "with only b and c eligible at owners=2, c owns every bucket"
         );
-        distributed_c.residency.mark_cold(&warm_buckets);
+        distributed_c.residency.mark_cold(&warm_parts);
 
         // b's tracker catches up to c joining on its own refresh cadence,
         // answering every round `Stale` until then, so this polls rather
         // than assuming one round suffices.
-        let mut reconciled: HashSet<u16> = HashSet::new();
+        let mut reconciled: HashSet<PartId> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c joining, so the round against it reconciles",
@@ -2286,22 +2291,22 @@ mod tests {
                     &name,
                     &distributed_c.ownership,
                     &distributed_c.residency,
-                    &warm_buckets,
+                    &warm_parts,
                 )
                 .await;
-                reconciled.len() == warm_buckets.len()
+                reconciled.len() == warm_parts.len()
             },
         )
         .await;
 
-        for &bucket in &warm_buckets {
+        for &bucket in &warm_parts {
             assert!(
                 !distributed_c.residency.is_cold(bucket),
                 "bucket {bucket} clears cold once its digest matches b's in a round against it"
             );
         }
         let recovered: usize = shard_ops_c
-            .entries_for_buckets(warm_buckets.clone())
+            .entries_for_buckets(buckets_of(&warm_parts))
             .await
             .into_iter()
             .map(|(_, entries)| entries.len())
@@ -2324,7 +2329,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one end-to-end three-node scenario (settle b/c/d, split c's warm buckets \
                   across b and d, reconcile, assert both peers' shares converge): splitting it \
-                  would only scatter state (b, c, d, shard_ops_c, distributed_c, warm_buckets) \
+                  would only scatter state (b, c, d, shard_ops_c, distributed_c, warm_parts) \
                   across helper signatures"
     )]
     async fn reconcile_warm_buckets_converges_buckets_split_across_two_live_co_owners() {
@@ -2382,25 +2387,25 @@ mod tests {
              across both b and d rather than naming b the only co-owner",
             async || {
                 let (shard_ops, distributed) = distributed_context_for_test(&c, &name);
-                let warm_buckets: Vec<u16> =
-                    distributed.ownership.current().owned_buckets().collect();
+                let warm_parts: Vec<PartId> =
+                    distributed.ownership.current().owned_parts().collect();
                 let view = distributed.ownership.current();
-                let with_b = warm_buckets
+                let with_b = warm_parts
                     .iter()
                     .copied()
                     .find(|&bucket| view.owners_of(bucket).contains(&node_b));
-                let with_d = warm_buckets
+                let with_d = warm_parts
                     .iter()
                     .copied()
                     .find(|&bucket| view.owners_of(bucket).contains(&node_d));
                 match (with_b, with_d) {
-                    (Some(bucket_with_b), Some(bucket_with_d)) => {
+                    (Some(part_with_b), Some(part_with_d)) => {
                         built = Some(SplitWarmContext {
                             shard_ops,
                             distributed,
-                            warm_buckets,
-                            bucket_with_b,
-                            bucket_with_d,
+                            warm_parts,
+                            part_with_b,
+                            part_with_d,
                         });
                         true
                     }
@@ -2412,16 +2417,16 @@ mod tests {
         let SplitWarmContext {
             shard_ops: shard_ops_c,
             distributed: distributed_c,
-            warm_buckets,
-            bucket_with_b,
-            bucket_with_d,
+            warm_parts,
+            part_with_b,
+            part_with_d,
         } = built.expect("wait_until only returns once the closure itself reported ready");
-        distributed_c.residency.mark_cold(&warm_buckets);
+        distributed_c.residency.mark_cold(&warm_parts);
 
         // One planted key per peer, applied straight to each donor's shard,
         // proves one call pulls data from both groups, not just whichever runs first.
-        let key_from_b = key_for_bucket(bucket_with_b);
-        let key_from_d = key_for_bucket(bucket_with_d);
+        let key_from_b = key_for_part(part_with_b);
+        let key_from_d = key_for_part(part_with_d);
         registered_shard(&b, &name)
             .apply_remote_batch(vec![test_record(key_from_b, "from-b", node_b)])
             .await;
@@ -2431,7 +2436,7 @@ mod tests {
 
         // b's and d's trackers catch up to c joining on their own refresh
         // cadence, the same real-time delay the single-peer test polls around.
-        let mut reconciled: HashSet<u16> = HashSet::new();
+        let mut reconciled: HashSet<PartId> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
             "b's and d's views catch up to c joining, so both peers' rounds reconcile",
@@ -2442,15 +2447,15 @@ mod tests {
                     &name,
                     &distributed_c.ownership,
                     &distributed_c.residency,
-                    &warm_buckets,
+                    &warm_parts,
                 )
                 .await;
-                reconciled.len() == warm_buckets.len()
+                reconciled.len() == warm_parts.len()
             },
         )
         .await;
 
-        for &bucket in &warm_buckets {
+        for &bucket in &warm_parts {
             assert!(
                 !distributed_c.residency.is_cold(bucket),
                 "bucket {bucket} clears cold once its digest matches its live co-owner's, \
@@ -2466,21 +2471,30 @@ mod tests {
     }
 
     /// Raw-shard test context, rebuilt on each `wait_until` retry, plus
-    /// which of `warm_buckets` landed with each of the two live co-owners.
+    /// which of `warm_parts` landed with each of the two live co-owners.
     struct SplitWarmContext {
         shard_ops: Arc<dyn ShardOps>,
         distributed: DistributedContext,
-        warm_buckets: Vec<u16>,
-        bucket_with_b: u16,
-        bucket_with_d: u16,
+        warm_parts: Vec<PartId>,
+        part_with_b: PartId,
+        part_with_d: PartId,
     }
 
-    /// The first `u32` key (bounded scan) whose bucket is `bucket`:
-    /// [`unused_bucket`]'s inverse, for planting a record at a known bucket.
-    fn key_for_bucket(bucket: u16) -> u32 {
-        (0u32..1_000_000)
-            .find(|key| bucket_of(&encode_key(key).expect("u32 key encodes")) == bucket)
-            .expect("some u32 key among the first million maps to every bucket")
+    /// The first `u32` key (bounded scan) whose part is `part`, for
+    /// planting a record at a known part.
+    fn key_for_part(part: PartId) -> u32 {
+        (0u32..10_000_000)
+            .find(|key| PartId::of_key(&encode_key(key).expect("u32 key encodes")) == part)
+            .expect("some u32 key among the first ten million maps to every part")
+    }
+
+    /// The distinct buckets `parts` fall in, for the bucket-keyed
+    /// [`ShardOps`] reads.
+    fn buckets_of(parts: &[PartId]) -> Vec<u16> {
+        let mut buckets: Vec<u16> = parts.iter().map(|part| part.bucket()).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        buckets
     }
 
     /// A [`WireRecord`] for `key`/`value`, versioned at `node`, for seeding a shard directly.
@@ -2570,9 +2584,9 @@ mod tests {
         c.advertise_cache_mode(&name, Mode::distributed());
 
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
-        let warm_buckets: Vec<u16> = distributed_c.ownership.current().owned_buckets().collect();
+        let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
         assert!(
-            !warm_buckets.is_empty(),
+            !warm_parts.is_empty(),
             "with only b and c eligible at owners=2, c owns every bucket"
         );
 
@@ -2592,10 +2606,10 @@ mod tests {
             expires_at_ms: None,
         };
         shard_ops_c.apply_remote_batch(vec![stale]).await;
-        distributed_c.residency.mark_cold(&warm_buckets);
+        distributed_c.residency.mark_cold(&warm_parts);
 
         // b's tracker catches up to c joining on its own refresh cadence, as above.
-        let mut reconciled: HashSet<u16> = HashSet::new();
+        let mut reconciled: HashSet<PartId> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c joining, so the round against it reconciles",
@@ -2606,15 +2620,15 @@ mod tests {
                     &name,
                     &distributed_c.ownership,
                     &distributed_c.residency,
-                    &warm_buckets,
+                    &warm_parts,
                 )
                 .await;
-                reconciled.len() == warm_buckets.len()
+                reconciled.len() == warm_parts.len()
             },
         )
         .await;
 
-        for &bucket in &warm_buckets {
+        for &bucket in &warm_parts {
             assert!(
                 !distributed_c.residency.is_cold(bucket),
                 "bucket {bucket} clears cold once its digest matches b's in a round against it"
@@ -2675,9 +2689,9 @@ mod tests {
         c.advertise_cache_mode(&name, Mode::distributed());
 
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
-        let warm_buckets: Vec<u16> = distributed_c.ownership.current().owned_buckets().collect();
-        assert!(!warm_buckets.is_empty());
-        distributed_c.residency.mark_cold(&warm_buckets);
+        let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
+        assert!(!warm_parts.is_empty());
+        distributed_c.residency.mark_cold(&warm_parts);
 
         // Warms up to a first converged round first, so the round below
         // fails on b's unreachability specifically, not an unsettled view.
@@ -2691,14 +2705,14 @@ mod tests {
                     &name,
                     &distributed_c.ownership,
                     &distributed_c.residency,
-                    &warm_buckets,
+                    &warm_parts,
                 )
                 .await
                 .is_empty()
             },
         )
         .await;
-        distributed_c.residency.mark_cold(&warm_buckets);
+        distributed_c.residency.mark_cold(&warm_parts);
 
         // c's gossip-derived live list still names b live briefly, so the
         // round below attempts and fails on the dial, not a no-co-owner skip.
@@ -2711,7 +2725,7 @@ mod tests {
             &name,
             &distributed_c.ownership,
             &distributed_c.residency,
-            &warm_buckets,
+            &warm_parts,
         )
         .await;
 
@@ -2725,7 +2739,7 @@ mod tests {
              running on to loopback_config's 5s: took {:?}",
             started.elapsed()
         );
-        for &bucket in &warm_buckets {
+        for &bucket in &warm_parts {
             assert!(
                 distributed_c.residency.is_cold(bucket),
                 "bucket {bucket} stays cold once its only co-owner's round fails, falling \
@@ -2736,15 +2750,18 @@ mod tests {
         c.shutdown().await;
     }
 
-    /// A bucket `0..total` never touches, so both sides' empty digests
-    /// match once b's view stops answering `Stale`, untouched by real data.
-    fn unused_bucket(total: u32) -> u16 {
+    /// Every part of a bucket keys `0..total` never touch, so both sides'
+    /// empty digests match once b's view stops answering `Stale`, untouched
+    /// by real data.
+    fn unused_bucket(total: u32) -> Vec<PartId> {
         let used: HashSet<u16> = (0..total)
             .map(|key| bucket_of(&encode_key(&key).expect("u32 key encodes")))
             .collect();
-        (0..u16::try_from(crate::store::BUCKET_COUNT).expect("BUCKET_COUNT fits u16"))
+        let bucket = (0..=u16::MAX)
+            .take(crate::store::BUCKET_COUNT)
             .find(|bucket| !used.contains(bucket))
-            .expect("BUCKET_COUNT buckets is far more than a small test's `total` can fill")
+            .expect("BUCKET_COUNT buckets is far more than a small test's `total` can fill");
+        PartId::of_bucket(bucket).collect()
     }
 
     /// Polls `probe_bucket` (an [`unused_bucket`]) until a round against it
@@ -2755,18 +2772,18 @@ mod tests {
         shard_ops_c: &Arc<dyn ShardOps>,
         name: &SmolStr,
         node_b: NodeId,
-        probe_bucket: u16,
+        probe_bucket: &[PartId],
     ) {
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to c joining, so a round against it stops answering Stale",
             async || {
-                !anti_entropy::run_round_for_buckets(
+                !anti_entropy::run_round_for_parts(
                     c.mesh(),
                     shard_ops_c,
                     name,
                     node_b,
-                    &[probe_bucket],
+                    probe_bucket,
                 )
                 .await
                 .failed
@@ -2809,8 +2826,8 @@ mod tests {
                 .expect("b owns every bucket while alone");
         }
         let probe_bucket = unused_bucket(TOTAL);
-        let divergent_buckets: HashSet<u16> = (0..TOTAL)
-            .map(|key| bucket_of(&encode_key(&key).expect("u32 key encodes")))
+        let divergent_parts: HashSet<PartId> = (0..TOTAL)
+            .map(|key| PartId::of_key(&encode_key(&key).expect("u32 key encodes")))
             .collect();
 
         let c = Cluster::builder("cache-it-reconcile-needs-two-rounds")
@@ -2824,14 +2841,14 @@ mod tests {
         c.advertise_cache_mode(&name, Mode::distributed());
 
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
-        let warm_buckets: Vec<u16> = distributed_c.ownership.current().owned_buckets().collect();
+        let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
         assert!(
-            !warm_buckets.is_empty(),
+            !warm_parts.is_empty(),
             "with only b and c eligible at owners=2, c owns every bucket"
         );
-        distributed_c.residency.mark_cold(&warm_buckets);
+        distributed_c.residency.mark_cold(&warm_parts);
 
-        wait_for_live_co_owner_view_to_settle(&c, &shard_ops_c, &name, node_b, probe_bucket).await;
+        wait_for_live_co_owner_view_to_settle(&c, &shard_ops_c, &name, node_b, &probe_bucket).await;
 
         // A single call: if it ran only one round, a repaired bucket would
         // still report `still_diverged`.
@@ -2841,25 +2858,25 @@ mod tests {
             &name,
             &distributed_c.ownership,
             &distributed_c.residency,
-            &warm_buckets,
+            &warm_parts,
         )
         .await;
 
         assert_eq!(
             reconciled.len(),
-            warm_buckets.len(),
+            warm_parts.len(),
             "a single call's own internal loop, not an external retry, closes the gap: round \
              one repairs the divergence but reports it still diverged, round two's fresh digest \
              exchange confirms the match"
         );
-        for &bucket in &divergent_buckets {
+        for &bucket in &divergent_parts {
             assert!(
                 !distributed_c.residency.is_cold(bucket),
                 "bucket {bucket} clears cold once the loop's confirming round finds no mismatch"
             );
         }
         let recovered: usize = shard_ops_c
-            .entries_for_buckets(warm_buckets.clone())
+            .entries_for_buckets(buckets_of(&warm_parts))
             .await
             .into_iter()
             .map(|(_, entries)| entries.len())
@@ -2904,8 +2921,8 @@ mod tests {
                 .expect("b owns every bucket while alone");
         }
         let probe_bucket = unused_bucket(TOTAL);
-        let divergent_buckets: HashSet<u16> = (0..TOTAL)
-            .map(|key| bucket_of(&encode_key(&key).expect("u32 key encodes")))
+        let divergent_parts: HashSet<PartId> = (0..TOTAL)
+            .map(|key| PartId::of_key(&encode_key(&key).expect("u32 key encodes")))
             .collect();
 
         // A budget so small the first repair byte exceeds it: one round only.
@@ -2924,14 +2941,14 @@ mod tests {
         c.advertise_cache_mode(&name, Mode::distributed());
 
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
-        let warm_buckets: Vec<u16> = distributed_c.ownership.current().owned_buckets().collect();
+        let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
         assert!(
-            !warm_buckets.is_empty(),
+            !warm_parts.is_empty(),
             "with only b and c eligible at owners=2, c owns every bucket"
         );
-        distributed_c.residency.mark_cold(&warm_buckets);
+        distributed_c.residency.mark_cold(&warm_parts);
 
-        wait_for_live_co_owner_view_to_settle(&c, &shard_ops_c, &name, node_b, probe_bucket).await;
+        wait_for_live_co_owner_view_to_settle(&c, &shard_ops_c, &name, node_b, &probe_bucket).await;
 
         let reconciled = reconcile_warm_buckets(
             &c,
@@ -2939,18 +2956,18 @@ mod tests {
             &name,
             &distributed_c.ownership,
             &distributed_c.residency,
-            &warm_buckets,
+            &warm_parts,
         )
         .await;
 
         assert!(
-            divergent_buckets
+            divergent_parts
                 .iter()
                 .all(|bucket| !reconciled.contains(bucket)),
             "the byte budget stops the loop after its one repairing round, before the \
              confirming round that would have reconciled the genuinely divergent buckets"
         );
-        for &bucket in &divergent_buckets {
+        for &bucket in &divergent_parts {
             assert!(
                 distributed_c.residency.is_cold(bucket),
                 "bucket {bucket} stays cold: the budget cut the loop off before a confirming \
@@ -2958,7 +2975,7 @@ mod tests {
             );
         }
         let recovered: usize = shard_ops_c
-            .entries_for_buckets(warm_buckets.clone())
+            .entries_for_buckets(buckets_of(&warm_parts))
             .await
             .into_iter()
             .map(|(_, entries)| entries.len())
@@ -3211,12 +3228,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_asks_the_other_owner_for_a_miss_in_a_cold_bucket_and_answers_a_miss_once_every_owner_is_cold()
+    async fn fetch_asks_the_other_owner_for_a_miss_in_a_cold_bucket_and_is_unavailable_while_every_owner_is_cold()
      {
         // Two nodes, two owners per bucket: both own every bucket. Once
         // both are warm, `a` drops its copy of a key and marks the bucket
         // cold again by hand, so a fetch on `a` has to ask `b`; then `b`
-        // does the same, and `a`'s fetch is a miss rather than an error.
+        // does the same, and `a`'s fetch is `FetchUnavailable`: no warm
+        // copy vouches for the miss.
         // Anti-entropy is effectively off: it would repair a dropped copy
         // from the co-owner and race every step below.
         let name = "distributed-cold-fetch";
@@ -3269,7 +3287,7 @@ mod tests {
         })
         .await
         .expect("both nodes finish warming up");
-        let bucket = bucket_of(&encode_key(&7u32).expect("u32 encodes"));
+        let bucket = PartId::of_key(&encode_key(&7u32).expect("u32 encodes"));
         let residency_a = cache_a.shard.residency().expect("a is distributed");
         let residency_b = cache_b.shard.residency().expect("b is distributed");
         // Both views list both nodes, or the fetch below ends `Stale`.
@@ -3292,10 +3310,12 @@ mod tests {
 
         cache_b.invalidate_local(&7).await;
         residency_b.mark_cold(&[bucket]);
-        assert_eq!(
-            cache_a.fetch(&7).await.expect("a miss, not an error"),
-            None,
-            "every owner cold and empty is a miss"
+        assert!(
+            matches!(
+                cache_a.fetch(&7).await,
+                Err(CacheError::FetchUnavailable { .. })
+            ),
+            "every owner cold leaves no copy to vouch for a miss"
         );
 
         residency_a.clear_cold(&[bucket]);
@@ -3383,15 +3403,15 @@ mod tests {
             tasks: TaskTracker::new(),
         };
 
-        let warm_buckets: Vec<u16> = distributed.ownership.current().owned_buckets().collect();
+        let warm_parts: Vec<PartId> = distributed.ownership.current().owned_parts().collect();
         assert!(
-            !warm_buckets.is_empty(),
+            !warm_parts.is_empty(),
             "with only b and a eligible at owners=2, a owns every bucket"
         );
-        let bucket = bucket_of(&encode_key(&key).expect("u32 encodes"));
+        let bucket = PartId::of_key(&encode_key(&key).expect("u32 encodes"));
         assert!(
-            warm_buckets.contains(&bucket),
-            "with owners=2 and exactly two real nodes, a owns key's bucket too"
+            warm_parts.contains(&bucket),
+            "with owners=2 and exactly two real nodes, a owns key's part too"
         );
 
         // Stands in for what a warm reopen's replay would install: a stale
@@ -3410,8 +3430,8 @@ mod tests {
             expires_at_ms: None,
         };
         shard_ops_a.apply_remote_batch(vec![stale]).await;
-        distributed.residency.mark_cold(&warm_buckets);
-        distributed.residency.mark_unverified(&warm_buckets);
+        distributed.residency.mark_cold(&warm_parts);
+        distributed.residency.mark_unverified(&warm_parts);
 
         assert_eq!(
             cache_a.fetch(&key).await.expect("b answers"),
@@ -3426,7 +3446,7 @@ mod tests {
              refuses to trust it while unverified"
         );
 
-        let mut reconciled: HashSet<u16> = HashSet::new();
+        let mut reconciled: HashSet<PartId> = HashSet::new();
         wait_until(
             Duration::from_secs(10),
             "b's view catches up to a joining, so the round against it reconciles",
@@ -3437,10 +3457,10 @@ mod tests {
                     &name,
                     &distributed.ownership,
                     &distributed.residency,
-                    &warm_buckets,
+                    &warm_parts,
                 )
                 .await;
-                reconciled.len() == warm_buckets.len()
+                reconciled.len() == warm_parts.len()
             },
         )
         .await;
@@ -3532,7 +3552,7 @@ mod tests {
         // the views say, so only a miss exercises the stale retry.
         let key = (2..1_000_000u32)
             .find(|key| {
-                let bucket = bucket_of(&encode_key(key).expect("u32 encodes"));
+                let bucket = PartId::of_key(&encode_key(key).expect("u32 encodes"));
                 !view.owns(bucket) && view.owners_of(bucket).contains(&peer_b.node)
             })
             .expect("a key owned by b and not by a");
@@ -3542,11 +3562,11 @@ mod tests {
         // own miss is the answer.
         let cold_key = (2..1_000_000u32)
             .find(|key| {
-                let bucket = bucket_of(&encode_key(key).expect("u32 encodes"));
+                let bucket = PartId::of_key(&encode_key(key).expect("u32 encodes"));
                 view.owns(bucket) && !view.owners_of(bucket).contains(&peer_b.node)
             })
             .expect("a key owned by a and the phantom");
-        let cold_bucket = bucket_of(&encode_key(&cold_key).expect("u32 encodes"));
+        let cold_bucket = PartId::of_key(&encode_key(&cold_key).expect("u32 encodes"));
         let residency = cache_a.shard.residency().expect("a is distributed");
         residency.mark_cold(&[cold_bucket]);
         assert!(
@@ -4269,10 +4289,13 @@ mod tests {
         // cache before anyone has gossiped to it: its first view is the
         // self-only one, owning every bucket with no co-owner to pull from.
         // Anti-entropy is effectively off, so only the warm-up pull can
-        // bring `a`'s entries over.
+        // bring `a`'s entries over. A timed-out pull retries only after
+        // `ae_interval`, so the budget covers a whole-space pull of all
+        // 65,536 parts, about 2 s in a debug build, on a slow runner.
         let name = "distributed-late-peer";
         let mut config = loopback_config();
         config.ae_interval = Duration::from_secs(3600);
+        config.state_transfer_budget = Duration::from_secs(15);
         config.tombstone_ttl = config.bucket_release_window();
         config.gossip_interval = Duration::from_millis(200);
         // The released port can be taken by a test running alongside before
@@ -4327,7 +4350,7 @@ mod tests {
             .await
             .expect("b opens before it knows a");
 
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let mut held = 0;
                 for key in 0..200u32 {

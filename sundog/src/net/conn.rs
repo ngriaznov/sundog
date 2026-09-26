@@ -17,13 +17,13 @@ use tokio_util::sync::CancellationToken;
 use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
 use super::{
-    AeMismatch, AePartReply, AeRoundOutcome, BucketStreamItem, FetchOutcome, InboundMsg, MeshInner,
-    MeshStream, OutFrame, RequestHandler, TlsCtx,
+    AeMismatch, AePartReply, AeRoundOutcome, AeServeOutcome, BucketStreamItem, FetchOutcome,
+    InboundMsg, MeshInner, MeshStream, OutFrame, RequestHandler, TlsCtx,
 };
 use crate::error::CodecError;
 use crate::hlc::Hlc;
 use crate::node::NodeId;
-use crate::store::{BucketDigest, BucketPart, KeyVersion};
+use crate::store::{BucketDigest, BucketPart, BucketPartDigests, KeyVersion};
 use crate::wire::{self, MAX_FRAME, Msg, WireRecord};
 
 pub(super) type PeerFramed = Framed<MeshStream, LengthDelimitedCodec>;
@@ -78,6 +78,16 @@ pub(super) async fn send_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), C
     let frame = wire::encode(msg)?;
     let len = frame.len();
     framed.send(frame).await.map_err(CodecError::Io)?;
+    super::record_frame_sent(len);
+    Ok(())
+}
+
+/// Writes `msg` into `framed`'s buffer without flushing it: the caller
+/// flushes once for a run of messages.
+async fn feed_msg(framed: &mut PeerFramed, msg: &Msg) -> Result<(), CodecError> {
+    let frame = wire::encode(msg)?;
+    let len = frame.len();
+    framed.feed(frame).await.map_err(CodecError::Io)?;
     super::record_frame_sent(len);
     Ok(())
 }
@@ -594,6 +604,7 @@ async fn handle_accepted(
                 | Msg::AeParts { .. }
                 | Msg::Fetch { .. }
                 | Msg::AeDigestScoped { .. }
+                | Msg::AeDigestMasked { .. }
                 | Msg::StBuckets { .. }
         );
         let stop = dispatch_one(
@@ -694,6 +705,11 @@ async fn dispatch_one(
             )
             .await
         }
+        Msg::AeDigestMasked {
+            cache,
+            view_hash,
+            buckets,
+        } => serve_ae_digest_masked(framed, cache, view_hash, buckets, handler, cancel).await,
         Msg::StBuckets {
             cache,
             buckets,
@@ -966,38 +982,118 @@ async fn serve_ae_digest_scoped(
         .iter()
         .map(|&(bucket, digest)| BucketDigest { bucket, digest })
         .collect();
-    match handler
+    let outcome = handler
         .ae_digest_scoped(cache.clone(), view_hash, remote_bucket_digests)
-        .await
-    {
-        super::AeServeOutcome::Unavailable => {
-            send_batch_or_cancelled(framed, &[Msg::ReqDone], cancel).await
-        }
-        super::AeServeOutcome::Stale {
-            responder_view_hash,
-        } => {
-            send_batch_or_cancelled(
-                framed,
-                &[
-                    Msg::StaleView {
-                        cache,
-                        responder_view_hash,
-                    },
-                    Msg::ReqDone,
-                ],
-                cancel,
-            )
-            .await
-        }
-        super::AeServeOutcome::Digests(local) => {
+        .await;
+    let mut replies = match outcome {
+        AeServeOutcome::Digests(local) => {
             let local: std::collections::HashMap<u16, u64> =
                 local.into_iter().map(|bd| (bd.bucket, bd.digest)).collect();
-            let mut replies =
-                ae_mismatch_replies(&cache, &local, remote_buckets, handler, peer_protocol).await;
-            replies.push(Msg::ReqDone);
-            send_batch_or_cancelled(framed, &replies, cancel).await
+            ae_mismatch_replies(&cache, &local, remote_buckets, handler, peer_protocol).await
+        }
+        declined => declined_replies(cache, &declined),
+    };
+    replies.push(Msg::ReqDone);
+    send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// Serves an `AeDigestMasked`: each bucket whose masked digest differs
+/// from this responder's own is answered with its part digests, for the
+/// requester to compare part by part within its mask.
+async fn serve_ae_digest_masked(
+    framed: &mut PeerFramed,
+    cache: SmolStr,
+    view_hash: u64,
+    remote_buckets: Vec<(u16, u64, u64)>,
+    handler: &dyn RequestHandler,
+    cancel: &CancellationToken,
+) -> bool {
+    let outcome = handler
+        .ae_digest_masked(cache.clone(), view_hash, remote_buckets)
+        .await;
+    let mut replies = match outcome {
+        AeServeOutcome::Digests(mismatched) => mismatched
+            .into_iter()
+            .map(|BucketPartDigests { bucket, digests }| Msg::AePartDigests {
+                cache: cache.clone(),
+                bucket,
+                digests,
+            })
+            .collect(),
+        declined => declined_replies(cache, &declined),
+    };
+    replies.push(Msg::ReqDone);
+    send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// What a scoped round the responder answered without digests replies
+/// ahead of `ReqDone`: a `StaleView` when the views differ, else nothing.
+fn declined_replies<T>(cache: SmolStr, outcome: &AeServeOutcome<T>) -> Vec<Msg> {
+    match *outcome {
+        AeServeOutcome::Stale {
+            responder_view_hash,
+        } => vec![Msg::StaleView {
+            cache,
+            responder_view_hash,
+        }],
+        AeServeOutcome::Digests(_) | AeServeOutcome::Unavailable => Vec::new(),
+    }
+}
+
+/// The most [`Msg::StBucketDone`] frames [`serve_st_buckets`] sends per
+/// flush.
+const DONE_BATCH: usize = 1024;
+
+/// Sends a [`Msg::StBucketDone`] per id in `ids`, [`DONE_BATCH`] at a
+/// time, draining acks via [`drain_ready_acks`] between batches: a donor
+/// that only writes fills both directions' socket buffers. Returns `true`
+/// when the connection is done.
+async fn send_done_run(
+    framed: &mut PeerFramed,
+    cache: &SmolStr,
+    ids: Vec<u16>,
+    mesh: &MeshInner,
+    from: NodeId,
+    cancel: &CancellationToken,
+) -> bool {
+    for batch in ids.chunks(DONE_BATCH) {
+        let dones: Vec<Msg> = batch
+            .iter()
+            .map(|&bucket| Msg::StBucketDone {
+                cache: cache.clone(),
+                bucket,
+            })
+            .collect();
+        if send_batch_or_cancelled(framed, &dones, cancel).await
+            || drain_ready_acks(framed, cache, mesh, from)
+        {
+            return true;
         }
     }
+    false
+}
+
+/// Records every [`Msg::StBucketAck`] for `cache` already readable on
+/// `framed`, without waiting for more. Returns `true` when the connection
+/// broke.
+fn drain_ready_acks(
+    framed: &mut PeerFramed,
+    cache: &SmolStr,
+    mesh: &MeshInner,
+    from: NodeId,
+) -> bool {
+    while let Some(Some(msg)) = recv_msg(framed).now_or_never() {
+        match msg {
+            Ok(Msg::StBucketAck {
+                cache: acked,
+                bucket,
+                view_hash,
+            }) if acked == *cache => mesh.record_bucket_ack(acked, bucket, from, view_hash),
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// Serves an `StBuckets` rebalance pull: streams every chunk
@@ -1033,41 +1129,45 @@ async fn serve_st_buckets(
     peer_protocol: u16,
     cancel: &CancellationToken,
 ) -> bool {
-    if !handler.st_buckets_available(cache.clone(), view_hash).await {
-        let responder_view_hash = handler.ownership_view_hash(cache.clone()).unwrap_or(0);
-        tracing::debug!(
-            cache = %cache,
-            requester_view_hash = view_hash,
-            responder_view_hash,
-            "st buckets pull declined: view hash mismatch"
-        );
-        return send_or_cancelled(
-            framed,
-            &Msg::StaleView {
-                cache,
+    let requested = buckets.len();
+    let (mut chunks, mut remaining, parts_requested) =
+        match handler.st_serve(cache.clone(), buckets, view_hash).await {
+            super::StServe::Stale {
                 responder_view_hash,
-            },
-            cancel,
-        )
-        .await;
-    }
-    if handler
-        .st_buckets_cold(cache.clone(), buckets.clone())
-        .await
-    {
-        // Owned but not yet pulled: not a source. The requester tries its
-        // next donor.
-        tracing::debug!(
-            cache = %cache,
-            requested = buckets.len(),
-            "st buckets pull declined: requested buckets not yet warm locally"
-        );
-        return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
-    }
+            } => {
+                tracing::debug!(
+                    cache = %cache,
+                    requester_view_hash = view_hash,
+                    responder_view_hash,
+                    "st buckets pull declined: view hash mismatch"
+                );
+                return send_or_cancelled(
+                    framed,
+                    &Msg::StaleView {
+                        cache,
+                        responder_view_hash,
+                    },
+                    cancel,
+                )
+                .await;
+            }
+            super::StServe::Cold => {
+                // Owned but not yet pulled: not a source. The requester tries
+                // its next donor.
+                tracing::debug!(
+                    cache = %cache,
+                    requested,
+                    "st buckets pull declined: requested buckets not yet warm locally"
+                );
+                return send_or_cancelled(framed, &Msg::StUnavailable { cache }, cancel).await;
+            }
+            super::StServe::Stream {
+                chunks,
+                order,
+                parts,
+            } => (chunks, VecDeque::from(order), parts),
+        };
     let signal_done = wire::peer_supports(peer_protocol, wire::PROTOCOL_ST_BUCKET_DONE_ACK);
-    let mut remaining: VecDeque<u16> = buckets.iter().copied().collect();
-    let buckets_requested = remaining.len();
-    let mut chunks = handler.st_bucket_chunks(cache.clone(), buckets);
     let mut chunks_sent: usize = 0;
     let mut records_sent: usize = 0;
     loop {
@@ -1118,29 +1218,26 @@ async fn serve_st_buckets(
             break;
         };
         if signal_done {
+            // Every id ahead of this chunk's is finished: one flush for the
+            // whole run, since a part-granular pull finishes thousands of
+            // empty ids back to back.
+            let mut done_run: Vec<u16> = Vec::new();
             while remaining.front().is_some_and(|&b| b != bucket) {
-                let done_bucket = remaining
-                    .pop_front()
-                    .expect("invariant: the while guard just checked front() is Some");
-                if send_or_cancelled(
-                    framed,
-                    &Msg::StBucketDone {
-                        cache: cache.clone(),
-                        bucket: done_bucket,
-                    },
-                    cancel,
-                )
-                .await
-                {
-                    tracing::debug!(
-                        cache = %cache,
-                        chunks_sent,
-                        records_sent,
-                        remaining = remaining.len(),
-                        "st buckets pull ended early: connection closed sending StBucketDone"
-                    );
-                    return true;
-                }
+                done_run.push(
+                    remaining
+                        .pop_front()
+                        .expect("invariant: the while guard just checked front() is Some"),
+                );
+            }
+            if send_done_run(framed, &cache, done_run, mesh, from, cancel).await {
+                tracing::debug!(
+                    cache = %cache,
+                    chunks_sent,
+                    records_sent,
+                    remaining = remaining.len(),
+                    "st buckets pull ended early: connection closed sending StBucketDone"
+                );
+                return true;
             }
         }
         chunks_sent += 1;
@@ -1162,38 +1259,30 @@ async fn serve_st_buckets(
         }
     }
     if signal_done {
-        while let Some(done_bucket) = remaining.pop_front() {
-            if send_or_cancelled(
-                framed,
-                &Msg::StBucketDone {
-                    cache: cache.clone(),
-                    bucket: done_bucket,
-                },
-                cancel,
-            )
-            .await
-            {
-                tracing::debug!(
-                    cache = %cache,
-                    chunks_sent,
-                    records_sent,
-                    remaining = remaining.len(),
-                    "st buckets pull ended early: connection closed draining StBucketDone"
-                );
-                return true;
-            }
+        let done_run: Vec<u16> = remaining.drain(..).collect();
+        let draining = done_run.len();
+        if send_done_run(framed, &cache, done_run, mesh, from, cancel).await {
+            tracing::debug!(
+                cache = %cache,
+                chunks_sent,
+                records_sent,
+                draining,
+                "st buckets pull ended early: connection closed draining StBucketDone"
+            );
+            return true;
         }
     }
     // The donor-side counterpart of the requester's "in" direction.
     metrics::counter!(
-        "sundog_rebalance_buckets_total",
+        "sundog_rebalance_parts_total",
         "cache" => cache.to_string(),
         "direction" => "served"
     )
-    .increment(u64::try_from(buckets_requested).unwrap_or(u64::MAX));
+    .increment(parts_requested);
     tracing::debug!(
         cache = %cache,
-        buckets_served = buckets_requested,
+        ids_served = requested,
+        parts_served = parts_requested,
         chunks_sent,
         records_sent,
         signal_done,
@@ -1225,39 +1314,48 @@ async fn serve_ae_parts(
     handler: &dyn RequestHandler,
     cancel: &CancellationToken,
 ) -> bool {
-    let mut replies: Vec<Msg> = if parts.is_empty() {
-        Vec::new()
-    } else {
-        let min_bucket = handler.ae_sketch_min_bucket();
-        let sketch_cells = handler.ae_sketch_cells();
-        let parts: Vec<BucketPart> = parts
-            .into_iter()
-            .map(|(bucket, part)| BucketPart { bucket, part })
-            .collect();
-        handler
-            .entries_for_parts(cache.clone(), parts)
-            .await
-            .into_iter()
-            .map(|(BucketPart { bucket, part }, entries)| {
-                match listing_or_sketch(entries, min_bucket, sketch_cells) {
-                    ListingOrSketch::Sketch(cells) => Msg::AePartSketch {
-                        cache: cache.clone(),
-                        bucket,
-                        part,
-                        cells,
-                    },
-                    ListingOrSketch::Listing(entries) => Msg::AePart {
-                        cache: cache.clone(),
-                        bucket,
-                        part,
-                        entries: key_versions_to_wire(entries),
-                    },
-                }
-            })
-            .collect()
-    };
+    let parts: Vec<BucketPart> = parts
+        .into_iter()
+        .map(|(bucket, part)| BucketPart { bucket, part })
+        .collect();
+    let mut replies = part_replies(&cache, parts, handler).await;
     replies.push(Msg::ReqDone);
     send_batch_or_cancelled(framed, &replies, cancel).await
+}
+
+/// Each of `parts`' [`Msg::AePart`] listing, or [`Msg::AePartSketch`] once
+/// the listing would outweigh one.
+async fn part_replies(
+    cache: &SmolStr,
+    parts: Vec<BucketPart>,
+    handler: &dyn RequestHandler,
+) -> Vec<Msg> {
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    let min_bucket = handler.ae_sketch_min_bucket();
+    let sketch_cells = handler.ae_sketch_cells();
+    handler
+        .entries_for_parts(cache.clone(), parts)
+        .await
+        .into_iter()
+        .map(|(BucketPart { bucket, part }, entries)| {
+            match listing_or_sketch(entries, min_bucket, sketch_cells) {
+                ListingOrSketch::Sketch(cells) => Msg::AePartSketch {
+                    cache: cache.clone(),
+                    bucket,
+                    part,
+                    cells,
+                },
+                ListingOrSketch::Listing(entries) => Msg::AePart {
+                    cache: cache.clone(),
+                    bucket,
+                    part,
+                    entries: key_versions_to_wire(entries),
+                },
+            }
+        })
+        .collect()
 }
 
 /// A responder's shape for one mismatched bucket or part: its listing, or
@@ -1570,16 +1668,20 @@ pub(super) fn state_stream(
     ))
 }
 
+/// How many [`Msg::StBucketAck`]s [`bucket_stream`] queues before a flush.
+const ACK_FLUSH: usize = 256;
+
 /// Adapts a rebalance bucket-pull connection into a lazy stream of
 /// [`BucketStreamItem`]s: a `Chunk` for every [`Msg::StBucketChunk`], plus,
 /// against a donor speaking at least [`wire::PROTOCOL_ST_BUCKET_DONE_ACK`],
 /// a `BucketDone` for every [`Msg::StBucketDone`]. An older donor never
 /// sends `BucketDone`, so this then yields only `Chunk`s, as before.
 ///
-/// After yielding a `BucketDone`, the next poll sends `Msg::StBucketAck`
-/// back to the donor first (gated the same way), so the ack follows
-/// whatever the caller did with that item. A caller that stops polling
-/// instead just never sends the ack, which [`serve_st_buckets`] tolerates.
+/// After yielding a `BucketDone`, the next poll queues a `Msg::StBucketAck`
+/// for it (gated the same way), so the ack follows whatever the caller did
+/// with that item. Queued acks flush every [`ACK_FLUSH`], before the next
+/// chunk, and at the end. A caller that stops polling never sends the rest,
+/// which [`serve_st_buckets`] tolerates.
 pub(super) fn bucket_stream(
     framed: PeerFramed,
     pool: Arc<ReqPool>,
@@ -1590,18 +1692,19 @@ pub(super) fn bucket_stream(
 ) -> futures::stream::BoxStream<'static, Result<BucketStreamItem, CodecError>> {
     let ack_gated = wire::peer_supports(donor_protocol, wire::PROTOCOL_ST_BUCKET_DONE_ACK);
     Box::pin(futures::stream::unfold(
-        Some((framed, first, None::<u16>)),
+        Some((framed, first, None::<u16>, 0usize)),
         move |state| {
             let pool = Arc::clone(&pool);
             let cache = cache.clone();
             async move {
-                let (mut framed, mut pending, pending_ack) = state?;
+                let (mut framed, mut pending, pending_ack, mut unflushed) = state?;
                 if ack_gated && let Some(bucket) = pending_ack {
                     // Best-effort: a broken send surfaces on the read below.
                     // `view_hash` is this node's view when it requested the
                     // buckets; the donor drops the ack once its own view
-                    // has moved past it.
-                    let _ = send_msg(
+                    // has moved past it. Buffered, and flushed every
+                    // `ACK_FLUSH` acks, at the next chunk, or at the end.
+                    let _ = feed_msg(
                         &mut framed,
                         &Msg::StBucketAck {
                             cache: cache.clone(),
@@ -1610,12 +1713,21 @@ pub(super) fn bucket_stream(
                         },
                     )
                     .await;
+                    unflushed += 1;
+                    if unflushed >= ACK_FLUSH {
+                        let _ = framed.flush().await;
+                        unflushed = 0;
+                    }
                 }
                 loop {
                     let received = match pending.take() {
                         Some(first) => Some(first),
                         None => recv_msg(&mut framed).await,
                     };
+                    if unflushed > 0 && !matches!(received, Some(Ok(Msg::StBucketDone { .. }))) {
+                        let _ = framed.flush().await;
+                        unflushed = 0;
+                    }
                     match received {
                         Some(Ok(Msg::StBucketChunk { recs, done, .. })) => {
                             if recs.is_empty() {
@@ -1631,13 +1743,13 @@ pub(super) fn bucket_stream(
                             }
                             return Some((
                                 Ok(BucketStreamItem::Chunk(recs)),
-                                Some((framed, None, None)),
+                                Some((framed, None, None, 0)),
                             ));
                         }
                         Some(Ok(Msg::StBucketDone { bucket, .. })) => {
                             return Some((
                                 Ok(BucketStreamItem::BucketDone(bucket)),
-                                Some((framed, None, Some(bucket))),
+                                Some((framed, None, Some(bucket), unflushed)),
                             ));
                         }
                         Some(Ok(_)) => {} // unexpected message on this stream; keep reading
@@ -2274,6 +2386,33 @@ mod tests {
             .await
             .expect("the stray Hello must be skipped, not break the reply");
         assert_eq!(got, vec![(3, super::wire_to_key_versions(entries))]);
+    }
+
+    #[test]
+    fn a_declined_scoped_round_replies_stale_view_or_nothing() {
+        let cache = SmolStr::new("users");
+        assert_eq!(
+            super::declined_replies(
+                cache.clone(),
+                &crate::net::AeServeOutcome::<()>::Stale {
+                    responder_view_hash: 7
+                }
+            ),
+            vec![Msg::StaleView {
+                cache: cache.clone(),
+                responder_view_hash: 7
+            }]
+        );
+        assert!(
+            super::declined_replies(
+                cache.clone(),
+                &crate::net::AeServeOutcome::<()>::Unavailable
+            )
+            .is_empty()
+        );
+        assert!(
+            super::declined_replies(cache, &crate::net::AeServeOutcome::Digests(())).is_empty()
+        );
     }
 
     #[cfg(not(feature = "sim"))]

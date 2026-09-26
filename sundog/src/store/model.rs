@@ -21,7 +21,7 @@ use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet};
 use crate::wire::WireRecord;
 
 use super::engine::{hash_key_bytes, stripe_index_from_hash};
-use super::{BUCKET_COUNT, Mode, Shard, ShardOps, entry_fingerprint};
+use super::{BUCKET_COUNT, Mode, PartId, Shard, ShardOps, entry_fingerprint};
 
 /// The anti-entropy bucket a model key hashes into, mirroring `Shard`'s own
 /// key encoding. `pub` so the out-of-workspace fuzz crate can group
@@ -32,6 +32,12 @@ pub fn bucket_of(key: u8) -> u16 {
         key_bytes(key).as_ref(),
     )))
     .expect("invariant: BUCKET_COUNT fits u16")
+}
+
+/// The ownership part a model key hashes into.
+#[must_use]
+pub fn part_of(key: u8) -> PartId {
+    PartId::from_hash(hash_key_bytes(key_bytes(key).as_ref()))
 }
 
 /// Decodes a model key back from the wire bytes [`ShardOps::entries_for_buckets`]
@@ -109,13 +115,13 @@ impl Model {
     }
 
     /// Whether this model's attached ownership view (if any) owns `key`'s
-    /// bucket. `true` unconditionally when no view is attached, the default
+    /// part. `true` unconditionally when no view is attached, the default
     /// for every constructor but [`new_shard_and_model_with_ownership`].
     #[must_use]
     pub fn owns(&self, key: u8) -> bool {
         self.ownership
             .as_ref()
-            .is_none_or(|view| view.owns(bucket_of(key)))
+            .is_none_or(|view| view.owns(part_of(key)))
     }
 
     /// The clock-reading closure to install via [`Shard::with_clock`], so
@@ -615,6 +621,20 @@ pub fn run(ops: &[Op], shard: &Shard<u8, u8>, model: &mut Model) {
         assert_reads_match_model(shard, model);
         if matches!(op, Op::Sweep) {
             assert_digest_and_entries_match_model(shard, model);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_of_is_the_part_a_model_key_hashes_into_inside_its_bucket() {
+        for key in [0u8, 1, 7, 200, 255] {
+            let part = part_of(key);
+            assert_eq!(part, PartId::of_key(key_bytes(key).as_ref()));
+            assert_eq!(part.bucket(), bucket_of(key));
         }
     }
 }

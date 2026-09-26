@@ -370,8 +370,14 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
         .await
         .expect("donor opens delayed as the sole owner, warm at once");
 
-    let victim_config = node_config(common::reserve_gossip_addr().await)
-        .with(|c| c.state_transfer_budget = Duration::from_millis(200));
+    // A failure detector slow enough that the victim's view keeps listing
+    // the donor for every timed-out warm-up attempt: each attempt costs its
+    // 200ms budget plus the retry interval, and the donor dropping out
+    // first would end the warm-up with no co-owner instead of a timeout.
+    let victim_config = node_config(common::reserve_gossip_addr().await).with(|c| {
+        c.state_transfer_budget = Duration::from_millis(200);
+        c.phi_threshold = 1_000.0;
+    });
     let victim = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
         .config(victim_config)
@@ -518,12 +524,12 @@ async fn seed_crdt_compaction_metrics(
 
 /// Opens `prices` across `cluster`, `peer`, and two more nodes joined
 /// for this scenario, driving every `sundog_fetch_total` outcome, a
-/// forwarded write, and all three `sundog_rebalance_buckets_total`
+/// forwarded write, and all three `sundog_rebalance_parts_total`
 /// directions on `cluster` itself, the only node whose metrics this test
 /// scrapes. Folded into the main test for the same process-global
 /// recorder reason `spill_writes_and_promotes_pin_metrics` is; the shared
-/// recorder also means `sundog_owned_buckets{cache="prices"}`'s pin stays
-/// a positivity check.
+/// recorder also means `sundog_owned_parts{cache="prices"}`'s pin stays
+/// a positivity check, and `sundog_owned_buckets` is pinned to it over 64.
 #[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
 async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: SocketAddr) {
     let owners = NonZeroU8::new(2).expect("nonzero");
@@ -533,7 +539,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
     // (both own everything with only two eligible nodes) before `cluster`
     // ever opens it, so `cluster`'s own open() pulls a real share of the
     // 1,024 buckets from a real donor: the open()-time initial pull is
-    // `sundog_rebalance_buckets_total{direction="in"}`'s natural trigger.
+    // `sundog_rebalance_parts_total{direction="in"}`'s natural trigger.
     let third = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
         .config(node_config(common::reserve_gossip_addr().await))
@@ -665,7 +671,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
         "a forwarded write never lands locally on cluster"
     );
 
-    // sundog_rebalance_buckets_total{direction="out"}: a fourth node joins
+    // sundog_rebalance_parts_total{direction="out"}: a fourth node joins
     // and, for at least one of cluster's owned buckets, displaces it;
     // cluster releases that bucket once the disown grace elapses.
     let owned_before: Vec<u32> = (0..500u32)
@@ -713,11 +719,15 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
         .find(|&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
         .expect("some key's bucket excludes cluster among four real nodes");
     let error_owners = cluster_prices.owners_of(&error_key);
-    for down in [peer.clone(), third.clone(), fourth.clone()] {
-        if error_owners.contains(&down.node_id()) {
-            down.shutdown().await;
-        }
-    }
+    // Both at once: one owner's departure reaching `cluster`'s view before
+    // the other has gone would hand the key to a live owner.
+    futures::future::join_all(
+        [peer.clone(), third.clone(), fourth.clone()]
+            .into_iter()
+            .filter(|down| error_owners.contains(&down.node_id()))
+            .map(Cluster::shutdown),
+    )
+    .await;
     assert!(
         matches!(
             cluster_prices.fetch(&error_key).await,
@@ -881,11 +891,16 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected at least one part listing on the 'parts' cache; got body:\n{body}"
     );
 
+    let owned_parts = scraped_metric_value(&body, "sundog_owned_parts", &[("cache", "prices")]);
     assert!(
-        scraped_metric_value(&body, "sundog_owned_buckets", &[("cache", "prices")])
-            .is_some_and(|owned| owned > 0.0),
-        "expected a positive sundog_owned_buckets for the distributed 'prices' cache; got \
+        owned_parts.is_some_and(|owned| owned > 0.0),
+        "expected a positive sundog_owned_parts for the distributed 'prices' cache; got \
          body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_owned_buckets", &[("cache", "prices")]),
+        owned_parts.map(|parts| parts / 64.0),
+        "sundog_owned_buckets is the owned part count over 64; got body:\n{body}"
     );
     for outcome in ["local", "remote", "miss", "error"] {
         assert!(
@@ -912,11 +927,11 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         assert!(
             scraped_metric_value(
                 &body,
-                "sundog_rebalance_buckets_total",
+                "sundog_rebalance_parts_total",
                 &[("cache", "prices"), ("direction", direction)]
             )
             .is_some_and(|count| count >= 1.0),
-            "expected sundog_rebalance_buckets_total{{cache=\"prices\",direction=\"{direction}\"}} \
+            "expected sundog_rebalance_parts_total{{cache=\"prices\",direction=\"{direction}\"}} \
              >= 1; got body:\n{body}"
         );
     }

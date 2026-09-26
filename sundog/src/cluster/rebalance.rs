@@ -1,9 +1,9 @@
-//! Rebalance for a `Mode::Distributed` cache: pulls a bucket from its
+//! Rebalance for a `Mode::Distributed` cache: pulls a part from its
 //! current owners the moment this node's [`OwnershipView`] says it gained
-//! it, and releases a bucket's local data once this node has kept it
+//! it, and releases a part's local data once this node has kept it
 //! resident past the disown grace after losing it. The open()-time initial
 //! pull and this module's ongoing loop share one mechanism, [`PullRequest`],
-//! scoped to whichever bucket set is at hand.
+//! scoped to whichever part set is at hand.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -14,47 +14,47 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::Cluster;
 use super::anti_entropy::{self, RoundOutcome};
 use super::state_transfer::{self, DonorResult, Outcome};
+use super::{Cluster, group_in_order};
 use crate::net::{BucketPull, Mesh};
 use crate::node::NodeId;
-use crate::ownership::{OwnershipTracker, OwnershipView, ResidencySet, ownership_diff};
-use crate::store::ShardOps;
+use crate::ownership::{
+    Granularity, OwnershipTracker, OwnershipView, ResidencySet, ownership_diff, parts_of_wire_id,
+    wire_ids,
+};
+use crate::store::part::PartSet;
+use crate::store::{PartId, ShardOps};
 
-/// One pull group: the donors to try, in rendezvous order, and the buckets
+/// One pull group: the donors to try, in rendezvous order, and the parts
 /// they all co-own.
-type DonorGroup = (Vec<NodeId>, Vec<u16>);
+type DonorGroup = (Vec<NodeId>, Vec<PartId>);
 
-/// Groups `buckets` by exact donor set (`view`'s live owners minus self, in
-/// rendezvous order), so buckets sharing a donor set land in one
-/// `StBuckets` round trip; the bucket-scoped analogue of
-/// `cluster::group_by_owner_set`.
-fn group_buckets_by_donor_set(
+/// Groups `parts` by exact donor set (`view`'s live owners minus self, in
+/// rendezvous order), so parts sharing a donor set land in one `StBuckets`
+/// round trip; the part-scoped analogue of `cluster::group_by_owner_set`.
+fn group_parts_by_donor_set(
     view: &OwnershipView,
     self_node: NodeId,
-    buckets: Vec<u16>,
+    parts: Vec<PartId>,
 ) -> Vec<DonorGroup> {
-    let mut groups: Vec<DonorGroup> = Vec::new();
-    for bucket in buckets {
-        let donors: Vec<NodeId> = view
-            .owners_of(bucket)
-            .iter()
-            .copied()
-            .filter(|&n| n != self_node)
-            .collect();
-        match groups.iter_mut().find(|(d, _)| *d == donors) {
-            Some((_, group_buckets)) => group_buckets.push(bucket),
-            None => groups.push((donors, vec![bucket])),
-        }
-    }
-    groups
+    // Groups by the view's own owner slice first, borrowed rather than
+    // rebuilt per part; the few resulting slices then merge by donor set,
+    // since two rankings that differ only in where self sits name the
+    // same donors.
+    let by_owners = group_in_order(parts.into_iter().map(|part| (view.owners_of(part), [part])));
+    group_in_order(by_owners.into_iter().map(|(owners, parts)| {
+        let donors: Vec<NodeId> = owners.iter().copied().filter(|&n| n != self_node).collect();
+        (donors, parts)
+    }))
 }
 
-/// [`state_transfer::try_donor`]'s bucket-scoped counterpart: pulls
-/// `buckets` from `donor` via [`Mesh::request_buckets`] instead of a
-/// whole-cache [`Mesh::request_state`], sharing the per-donor stream-pull-
-/// and-apply logic through [`state_transfer::pull_from_donor`].
+/// [`state_transfer::try_donor`]'s part-scoped counterpart: pulls `parts`
+/// from `donor` via [`Mesh::request_buckets`] instead of a whole-cache
+/// [`Mesh::request_state`], sharing the per-donor stream-pull-and-apply logic
+/// through [`state_transfer::pull_from_donor`]. The request names the parts
+/// by their wire ids at `granularity`, and each finished id marks the parts
+/// it names servable.
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is independent context one donor attempt needs; `credited` in \
@@ -62,61 +62,72 @@ fn group_buckets_by_donor_set(
               `pull_one_group` retries against, not something a struct could own instead \
               without losing that sharing"
 )]
-async fn try_donor_buckets(
+async fn try_donor_parts(
     shard: &Arc<dyn ShardOps>,
     mesh: &Mesh,
     cache: &SmolStr,
     residency: &ResidencySet,
     donor: NodeId,
-    buckets: Vec<u16>,
-    view_hash: u64,
-    credited: &mut HashSet<u16>,
+    parts: &[PartId],
+    (granularity, view_hash): (Granularity, u64),
+    credited: &mut HashSet<PartId>,
 ) -> (DonorResult, u64, bool) {
     let pull = mesh
-        .request_buckets(donor, cache.clone(), buckets, view_hash)
+        .request_buckets(
+            donor,
+            cache.clone(),
+            wire_ids(granularity, parts),
+            view_hash,
+        )
         .await;
     let cold = matches!(pull, Ok(BucketPull::Cold));
+    let requested: PartSet = parts.iter().copied().collect();
+    let parts_in = metrics::counter!(
+        "sundog_rebalance_parts_total",
+        "cache" => cache.to_string(),
+        "direction" => "in"
+    );
     let stream = pull.map(|answer| match answer {
         BucketPull::Stream(stream) => Some(stream),
         BucketPull::Stale | BucketPull::Cold => None,
     });
-    // Cold clears per bucket as its BucketDone lands, so a group that never
-    // finishes still leaves every finished bucket servable.
-    // sundog_rebalance_buckets_total{direction="in"} is credited here too,
-    // per bucket; `credited` is shared across every donor this group's
-    // pull_one_group retries against, so a bucket a prior donor already
+    // Cold clears per id as its BucketDone lands, so a group that never
+    // finishes still leaves every finished part servable.
+    // sundog_rebalance_parts_total{direction="in"} is credited here too,
+    // per part; `credited` is shared across every donor this group's
+    // pull_one_group retries against, so a part a prior donor already
     // credited is never credited twice on a later donor's re-send.
     let (result, count) =
-        state_transfer::pull_buckets_from_donor(shard, donor, async { stream }, |bucket| {
-            // A pulled bucket is authoritative regardless of any
+        state_transfer::pull_buckets_from_donor(shard, donor, async { stream }, |id| {
+            let done: Vec<PartId> = parts_of_wire_id(granularity, id).collect();
+            // A pulled part is authoritative regardless of any
             // warm-reloaded on-disk checkpoint; mark_serving clears both
             // the cold and unverified marks in one decision.
-            residency.mark_serving(&[bucket]);
-            if credited.insert(bucket) {
-                metrics::counter!(
-                    "sundog_rebalance_buckets_total",
-                    "cache" => cache.to_string(),
-                    "direction" => "in"
-                )
-                .increment(1);
+            residency.mark_serving(&done);
+            let fresh = done
+                .into_iter()
+                .filter(|&part| requested.contains(part) && credited.insert(part))
+                .count();
+            if fresh > 0 {
+                parts_in.increment(u64::try_from(fresh).unwrap_or(u64::MAX));
             }
         })
         .await;
     (result, count, cold)
 }
 
-/// How many of a group's `total_buckets` still need
-/// `sundog_rebalance_buckets_total{direction="in"}` credited once
-/// [`DonorResult::Done`] fires: buckets in `already_credited` were
-/// already counted live, so crediting them again here would double-count.
-/// A protocol-3 donor, which never sends per-bucket `BucketDone`, credits
-/// every bucket this way instead.
-fn buckets_pending_group_credit(total_buckets: usize, already_credited: &HashSet<u16>) -> usize {
-    total_buckets.saturating_sub(already_credited.len())
+/// How many of a group's `total_parts` still need
+/// `sundog_rebalance_parts_total{direction="in"}` credited once
+/// [`DonorResult::Done`] fires: parts in `already_credited` were already
+/// counted live, so crediting them again here would double-count. A
+/// protocol-3 donor, which never sends per-bucket `BucketDone`, credits every
+/// part this way instead.
+fn parts_pending_group_credit(total_parts: usize, already_credited: &HashSet<PartId>) -> usize {
+    total_parts.saturating_sub(already_credited.len())
 }
 
 /// Passes over a group's donors in which every one declined as cold before
-/// the pull gives the group up: nobody warm holds the buckets, so what has
+/// the pull gives the group up: nobody warm holds the parts, so what has
 /// landed here by other means is all there is.
 const ALL_COLD_PASSES: u32 = 3;
 
@@ -126,15 +137,45 @@ const ALL_COLD_PASSES: u32 = 3;
 /// trying again.
 const GROUP_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Tries `donors` in order for one bucket group, applying the first that
+/// How one donor group's pull ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupPull {
+    /// Every part is served: this many landed from a donor, or none when
+    /// every donor stayed cold and what is here is all there is.
+    Landed(u64),
+    /// This node's view moved past the one the pull planned against.
+    Superseded,
+    /// Every donor stayed cold and some parts are still unverified: they
+    /// stay cold and unverified for the warm-up retries.
+    Unverified,
+}
+
+/// What a group whose donors all stayed cold settles to: the parts that
+/// serve what landed here, since nothing warm exists to pull, and whether
+/// any part still waits because nothing has verified its replay.
+fn settle_all_cold(
+    parts: &[PartId],
+    unverified: impl Fn(PartId) -> bool,
+) -> (Vec<PartId>, GroupPull) {
+    let (waiting, settled): (Vec<PartId>, Vec<PartId>) =
+        parts.iter().partition(|&&part| unverified(part));
+    let pull = if waiting.is_empty() {
+        GroupPull::Landed(0)
+    } else {
+        GroupPull::Unverified
+    };
+    (settled, pull)
+}
+
+/// Tries `donors` in order for one part group, applying the first that
 /// donates. A `StaleView` decline is expected while both sides'
 /// `refresh_task`s converge after a membership change (see
 /// [`crate::store::ShardOps::ae_peer_filter`]), so an all-declined pass
 /// retries after [`GROUP_RETRY_BACKOFF`] rather than giving up, unless this
 /// node's own view has moved past `view_hash`: then no donor ever agrees,
-/// and the pull answers `None` for the caller to replan against the
-/// current view. Returns the count of records landed once a donor
-/// succeeds.
+/// and the pull answers [`GroupPull::Superseded`] for the caller to
+/// replan against the current view. A group every donor keeps declining
+/// as cold settles by [`settle_all_cold`].
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is independent context one donor-group retry loop needs; grouping any subset into a struct would only rename the same eight pieces of state"
@@ -146,27 +187,33 @@ async fn pull_one_group(
     ownership: &OwnershipTracker,
     residency: &ResidencySet,
     donors: Vec<NodeId>,
-    buckets: Vec<u16>,
-    view_hash: u64,
+    parts: Vec<PartId>,
+    view: (Granularity, u64),
     per_donor: Duration,
-) -> Option<u64> {
+) -> GroupPull {
+    let view_hash = view.1;
     let mut all_cold_passes = 0u32;
-    // Shared across every donor and retry pass, so a bucket a prior
-    // donor already credited is never credited again on a re-send.
-    let mut credited: HashSet<u16> = HashSet::new();
+    // Shared across every donor and retry pass, so a part a prior donor
+    // already credited is never credited again on a re-send.
+    let mut credited: HashSet<PartId> = HashSet::new();
+    let group_len = parts.len();
+    let mut parts = parts;
     loop {
         let mut every_donor_cold = !donors.is_empty();
         for &donor in &donors {
+            // A part an earlier attempt finished is serving already: the
+            // next attempt asks only for the rest.
+            parts.retain(|part| !credited.contains(part));
             let attempt = tokio::time::timeout(
                 per_donor,
-                try_donor_buckets(
+                try_donor_parts(
                     shard,
                     mesh,
                     cache,
                     residency,
                     donor,
-                    buckets.clone(),
-                    view_hash,
+                    &parts,
+                    view,
                     &mut credited,
                 ),
             )
@@ -177,7 +224,7 @@ async fn pull_one_group(
                     cache = %cache,
                     %donor,
                     per_donor_budget = ?per_donor,
-                    "rebalance bucket pull to donor timed out; trying the next"
+                    "rebalance part pull to donor timed out; trying the next"
                 );
                 (DonorResult::Failed, 0, false)
             });
@@ -185,64 +232,66 @@ async fn pull_one_group(
             tracing::debug!(
                 cache = %cache,
                 %donor,
-                buckets = buckets.len(),
+                parts = parts.len(),
                 per_donor_budget = ?per_donor,
                 result = ?result,
                 records = count,
                 cold,
                 stale,
                 timed_out,
-                "bucket pull attempt finished"
+                "part pull attempt finished"
             );
             if result == DonorResult::Done {
-                residency.mark_serving(&buckets);
-                let pending = buckets_pending_group_credit(buckets.len(), &credited);
+                residency.mark_serving(&parts);
+                let pending = parts_pending_group_credit(group_len, &credited);
                 if pending > 0 {
                     metrics::counter!(
-                        "sundog_rebalance_buckets_total",
+                        "sundog_rebalance_parts_total",
                         "cache" => cache.to_string(),
                         "direction" => "in"
                     )
                     .increment(u64::try_from(pending).unwrap_or(u64::MAX));
                 }
-                tracing::debug!(cache = %cache, %donor, buckets = buckets.len(), records = count, "bucket pull landed");
-                return Some(u64::try_from(buckets.len()).unwrap_or(u64::MAX));
+                tracing::debug!(cache = %cache, %donor, parts = group_len, records = count, "part pull landed");
+                return GroupPull::Landed(u64::try_from(group_len).unwrap_or(u64::MAX));
             }
             every_donor_cold &= cold;
         }
         if every_donor_cold {
             all_cold_passes += 1;
             if all_cold_passes >= ALL_COLD_PASSES {
-                // No warm copy anywhere to pull; whatever landed here,
-                // warm-reloaded or not, is the best available answer with
-                // nobody left to verify it against.
-                tracing::debug!(cache = %cache, buckets = buckets.len(), "every donor is cold for these buckets; nothing warm to pull");
-                residency.mark_serving(&buckets);
-                return Some(0);
+                // No warm copy anywhere to pull. A cold part serves what
+                // landed here; a warm-reloaded part nothing has verified
+                // keeps waiting, since its replay can lack a key an owner
+                // holds and a read would answer a wrong miss.
+                tracing::debug!(cache = %cache, parts = parts.len(), "every donor is cold for these parts; nothing warm to pull");
+                let (settled, pull) = settle_all_cold(&parts, |part| residency.is_unverified(part));
+                residency.mark_serving(&settled);
+                return pull;
             }
         } else {
             all_cold_passes = 0;
         }
         if ownership.current().view_hash() != view_hash {
             tracing::debug!(cache = %cache, "ownership view moved mid-pull; this pull is superseded");
-            return None;
+            return GroupPull::Superseded;
         }
         tokio::time::sleep(GROUP_RETRY_BACKOFF).await;
     }
 }
 
-/// One bucket pull's eight fields, gathered so every caller builds and runs
-/// one value instead of repeating an eight-argument call.
+/// One part pull's fields, gathered so every caller builds and runs one
+/// value instead of repeating a nine-argument call.
 pub(crate) struct PullRequest<'a> {
     pub(crate) cluster: &'a Cluster,
     pub(crate) shard: &'a Arc<dyn ShardOps>,
     pub(crate) ownership: &'a OwnershipTracker,
     pub(crate) residency: &'a Arc<ResidencySet>,
     pub(crate) cache: &'a SmolStr,
-    pub(crate) buckets: Vec<u16>,
+    pub(crate) parts: Vec<PartId>,
     pub(crate) budget: Duration,
     pub(crate) concurrency: usize,
-    /// Whether a bucket found owned alone (no live co-owner) may be
+    /// Whether a part found owned alone (no live co-owner) may be
     /// trusted as sole-owned and marked servable outright,
     /// rather than left cold/unverified for ordinary warm-up retries.
     /// `true` for every routine call, where the ownership view is the
@@ -250,7 +299,7 @@ pub(crate) struct PullRequest<'a> {
     ///
     /// For `Cache::open`'s initial pull, `crate::cache::trust_sole_owner_at_open`
     /// computes this: a cold open passes `true` regardless, since a
-    /// sole-owned bucket there is this node's own data. A warm
+    /// sole-owned part there is this node's own data. A warm
     /// reopen whose membership wait timed out passes `false`, since "no
     /// live co-owner" there can be the transient view a lone-looking node
     /// computes before gossip shows it any peer, not genuine single
@@ -259,11 +308,11 @@ pub(crate) struct PullRequest<'a> {
 }
 
 impl PullRequest<'_> {
-    /// Pulls `buckets` from any current owner, grouped by donor set so two
-    /// buckets sharing an owner-set-minus-self go in one `StBuckets` round
+    /// Pulls `parts` from any current owner, grouped by donor set so two
+    /// parts sharing an owner-set-minus-self go in one `StBuckets` round
     /// trip, bounded to `concurrency` simultaneous donor streams. Answers
     /// [`Outcome::Completed`]/[`Outcome::Skipped`]/[`Outcome::NoPeers`] for
-    /// an empty bucket set, a zero budget, or no live co-owner anywhere;
+    /// an empty part set, a zero budget, or no live co-owner anywhere;
     /// otherwise races `budget`, answering [`Outcome::TimedOut`] or
     /// [`Outcome::Superseded`] if it runs out or the view moves on first.
     pub(crate) async fn run(self) -> Outcome {
@@ -273,36 +322,36 @@ impl PullRequest<'_> {
             ownership,
             residency,
             cache,
-            buckets,
+            parts,
             budget,
             concurrency,
             trust_sole_owner,
         } = self;
-        if buckets.is_empty() {
+        if parts.is_empty() {
             return Outcome::Completed;
         }
         if budget.is_zero() {
-            tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained buckets to anti-entropy");
+            tracing::debug!(cache = %cache, "rebalance transfer budget is zero; leaving gained parts to anti-entropy");
             return Outcome::Skipped;
         }
 
         let view = ownership.current();
-        let view_hash = view.view_hash();
+        let view_key = (view.granularity(), view.view_hash());
         let (groups, no_donor): (Vec<DonorGroup>, Vec<DonorGroup>) =
-            group_buckets_by_donor_set(&view, cluster.node_id(), buckets)
+            group_parts_by_donor_set(&view, cluster.node_id(), parts)
                 .into_iter()
                 .partition(|(donors, _)| !donors.is_empty());
-        // A bucket this node owns alone has nobody to pull from or verify
-        // a warm-reloaded record against, so it is neither cold nor
+        // A part this node owns alone has nobody to pull from or verify a
+        // warm-reloaded record against, so it is neither cold nor
         // unverified, but only when `trust_sole_owner` says this view's
         // "alone" answer is real. Left untrusted, it falls to
         // warm_up_task's ordinary retries via Outcome::NoPeers.
-        let alone: Vec<u16> = no_donor.into_iter().flat_map(|(_, b)| b).collect();
+        let alone: Vec<PartId> = no_donor.into_iter().flat_map(|(_, p)| p).collect();
         if !alone.is_empty() && trust_sole_owner {
             residency.mark_serving(&alone);
         }
         if groups.is_empty() {
-            tracing::debug!(cache = %cache, "no live co-owner for any gained bucket; nothing to pull");
+            tracing::debug!(cache = %cache, "no live co-owner for any gained part; nothing to pull");
             return Outcome::NoPeers;
         }
 
@@ -312,7 +361,7 @@ impl PullRequest<'_> {
 
         let run_all = async {
             let mut set = tokio::task::JoinSet::new();
-            for (donors, group_buckets) in groups {
+            for (donors, group_parts) in groups {
                 let semaphore = Arc::clone(&semaphore);
                 let shard = Arc::clone(shard);
                 let mesh = mesh.clone();
@@ -331,35 +380,36 @@ impl PullRequest<'_> {
                         &ownership,
                         &residency,
                         donors,
-                        group_buckets,
-                        view_hash,
+                        group_parts,
+                        view_key,
                         per_donor,
                     )
                     .await
                 });
             }
-            // sundog_rebalance_buckets_total{direction="in"} is already
-            // credited per bucket inside pull_one_group/try_donor_buckets;
-            // this loop only needs `superseded` for the overall Outcome.
-            let mut superseded = false;
+            // sundog_rebalance_parts_total{direction="in"} is already
+            // credited per part inside pull_one_group/try_donor_parts;
+            // this loop only folds each group's end into the Outcome.
+            let (mut superseded, mut unverified) = (false, false);
             while let Some(result) = set.join_next().await {
-                if result.ok().flatten().is_none() {
-                    superseded = true;
+                match result {
+                    Ok(GroupPull::Landed(_)) => {}
+                    Ok(GroupPull::Unverified) => unverified = true,
+                    Ok(GroupPull::Superseded) | Err(_) => superseded = true,
                 }
             }
-            superseded
+            if superseded {
+                Outcome::Superseded
+            } else if unverified {
+                Outcome::Unverified
+            } else {
+                Outcome::Completed
+            }
         };
 
-        match tokio::time::timeout(budget, run_all).await {
-            Ok(superseded) => {
-                if superseded {
-                    Outcome::Superseded
-                } else {
-                    Outcome::Completed
-                }
-            }
-            Err(_) => Outcome::TimedOut,
-        }
+        tokio::time::timeout(budget, run_all)
+            .await
+            .unwrap_or(Outcome::TimedOut)
     }
 }
 
@@ -390,14 +440,14 @@ pub(crate) async fn warm_up_task(
     let mut attempt: u32 = 0;
     let mut view_rx = ownership.subscribe();
     loop {
-        let buckets: Vec<u16> = view_rx.borrow_and_update().owned_buckets().collect();
+        let parts: Vec<PartId> = view_rx.borrow_and_update().owned_parts().collect();
         let pull = PullRequest {
             cluster: &cluster,
             shard: &shard,
             ownership: &ownership,
             residency: &residency,
             cache: &cache,
-            buckets,
+            parts,
             budget,
             concurrency,
             // The library's normal, live-updating view by the time this retry loop runs.
@@ -423,7 +473,7 @@ pub(crate) async fn warm_up_task(
                 return;
             }
             state_transfer::WarmUpStep::WaitForPeer => {
-                tracing::debug!(cache = %cache, "no co-owner for any owned bucket yet; waiting for the ownership view to change");
+                tracing::debug!(cache = %cache, "no co-owner for any owned part yet; waiting for the ownership view to change");
                 tokio::select! {
                     biased;
                     () = cancel.cancelled() => return,
@@ -465,32 +515,32 @@ pub(crate) async fn warm_up_task(
 
 /// What one published view change asks of [`rebalance_task`]: `regained`
 /// is the difference from the previous view (`prev`); `lost` is that
-/// difference plus every bucket in `held` (the shard's
-/// [`ShardOps::held_buckets`]) that `new` does not own, since a bucket
-/// owned only under a view published and superseded while the task was
-/// busy is in neither `prev` nor `new`, and what the inbound guard applied
-/// there stays resident until this fold releases it; `to_pull` is the
-/// difference from the latest view whose pull is not superseded
-/// (`pulled`), so a bucket gained under a view that gets superseded
-/// mid-pull is pulled again under the current one instead of skipped.
+/// difference plus every part in `held` (the shard's
+/// [`ShardOps::held_parts`]) that `new` does not own, since a part owned only
+/// under a view published and superseded while the task was busy is in
+/// neither `prev` nor `new`, and what the inbound guard applied there stays
+/// resident until this fold releases it; `to_pull` is the difference from the
+/// latest view whose pull is not superseded (`pulled`), so a part gained
+/// under a view that gets superseded mid-pull is pulled again under the
+/// current one instead of skipped.
 pub(crate) struct ViewChangePlan {
-    pub(crate) lost: Vec<u16>,
-    pub(crate) regained: Vec<u16>,
-    pub(crate) to_pull: Vec<u16>,
+    pub(crate) lost: Vec<PartId>,
+    pub(crate) regained: Vec<PartId>,
+    pub(crate) to_pull: Vec<PartId>,
 }
 
 pub(crate) fn plan_view_change(
     prev: &OwnershipView,
     pulled: &OwnershipView,
     new: &OwnershipView,
-    held: &[u16],
+    held: &[PartId],
 ) -> ViewChangePlan {
     let (regained, mut lost) = ownership_diff(prev, new);
-    let mut seen: HashSet<u16> = lost.iter().copied().collect();
+    let mut seen: PartSet = lost.iter().copied().collect();
     lost.extend(
         held.iter()
             .copied()
-            .filter(|&bucket| !new.owns(bucket) && seen.insert(bucket)),
+            .filter(|&part| !new.owns(part) && seen.insert(part)),
     );
     let (to_pull, _) = ownership_diff(pulled, new);
     ViewChangePlan {
@@ -500,17 +550,17 @@ pub(crate) fn plan_view_change(
     }
 }
 
-/// The distinct live current owners, other than `self_node`, of the
-/// buckets in `due`: the peers a release hands each bucket to first.
+/// The distinct live current owners, other than `self_node`, of the parts
+/// in `due`: the peers a release hands each part to first.
 pub(crate) fn hand_off_owners(
     view: &OwnershipView,
     self_node: NodeId,
-    due: &[u16],
+    due: &[PartId],
     live: &HashSet<NodeId>,
 ) -> Vec<NodeId> {
     let mut owners: Vec<NodeId> = Vec::new();
-    for &bucket in due {
-        for &owner in view.owners_of(bucket) {
+    for &part in due {
+        for &owner in view.owners_of(part) {
             if owner != self_node && live.contains(&owner) && !owners.contains(&owner) {
                 owners.push(owner);
             }
@@ -519,91 +569,93 @@ pub(crate) fn hand_off_owners(
     owners
 }
 
-/// The buckets in `lost` that no new owner can pull from a surviving
-/// co-owner: no node but `self_node` owns the bucket under both `prev` and
+/// The parts in `lost` that no new owner can pull from a surviving
+/// co-owner: no node but `self_node` owns the part under both `prev` and
 /// `new`, so a new owner's pull asks only nodes that never held it. A node
-/// that owned every bucket alone, because its peers had not opened the
-/// cache yet, loses most of its buckets this way when a view with two or
-/// more of them lands. A bucket with a surviving co-owner is left to the
-/// new owner's pull.
+/// that owned every part alone, because its peers had not opened the cache
+/// yet, loses most of its parts this way when a view with two or more of
+/// them lands, and so does every node when a cluster's view switches from
+/// bucket to part granularity. A part with a surviving co-owner is left to
+/// the new owner's pull.
 pub(crate) fn unpullable_losses(
     prev: &OwnershipView,
     new: &OwnershipView,
     self_node: NodeId,
-    lost: &[u16],
-) -> Vec<u16> {
+    lost: &[PartId],
+) -> Vec<PartId> {
     lost.iter()
         .copied()
-        .filter(|&bucket| {
-            let prev_owners = prev.owners_of(bucket);
-            !new.owners_of(bucket)
+        .filter(|&part| {
+            let prev_owners = prev.owners_of(part);
+            !new.owners_of(part)
                 .iter()
                 .any(|owner| *owner != self_node && prev_owners.contains(owner))
         })
         .collect()
 }
 
-/// Each live owner of `buckets` under `view` other than `self_node`, paired
-/// with the buckets among `buckets` it owns, so one scoped round per owner
+/// Each live owner of `parts` under `view` other than `self_node`, paired
+/// with the parts among `parts` it owns, so one scoped round per owner
 /// covers all of them.
 pub(crate) fn push_targets(
     view: &OwnershipView,
     self_node: NodeId,
-    buckets: &[u16],
+    parts: &[PartId],
     live: &HashSet<NodeId>,
-) -> Vec<(NodeId, Vec<u16>)> {
-    let mut targets: Vec<(NodeId, Vec<u16>)> = Vec::new();
-    for &bucket in buckets {
-        for &owner in view.owners_of(bucket) {
+) -> Vec<(NodeId, Vec<PartId>)> {
+    let mut targets: Vec<(NodeId, Vec<PartId>)> = Vec::new();
+    for &part in parts {
+        for &owner in view.owners_of(part) {
             if owner == self_node || !live.contains(&owner) {
                 continue;
             }
             match targets.iter_mut().find(|(node, _)| *node == owner) {
-                Some((_, owned)) => owned.push(bucket),
-                None => targets.push((owner, vec![bucket])),
+                Some((_, owned)) => owned.push(part),
+                None => targets.push((owner, vec![part])),
             }
         }
     }
     targets
 }
 
-/// Pushes each target's buckets to it through a scoped anti-entropy round,
-/// which sends every entry the target lacks or holds at an older version.
-/// A round that fails, or meets a responder whose view has not caught up
-/// with this node's, is retried every `retry` until every target has
-/// answered, `deadline` passes, or `cancel` fires. The disown-grace
-/// hand-off still confirms each bucket before it is released; this push
-/// brings the data to the new owners when the view changes rather than
-/// when the grace ends.
+/// Pushes each target's parts to it through a part-scoped anti-entropy
+/// round, which sends every entry the target lacks or holds at an older
+/// version. A round that fails, or meets a responder whose view has not
+/// caught up with this node's, is retried every `retry` until every
+/// target has answered, `deadline` passes, or `cancel` fires. The
+/// disown-grace hand-off still confirms each part before it is released;
+/// this push brings the data to the new owners when the view changes
+/// rather than when the grace ends.
 async fn push_unpullable(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
     cache: SmolStr,
-    mut targets: Vec<(NodeId, Vec<u16>)>,
+    targets: Vec<(NodeId, Vec<PartId>)>,
     retry: Duration,
     deadline: Duration,
     cancel: CancellationToken,
 ) {
     let give_up = tokio::time::Instant::now() + deadline;
+    let mut targets = targets;
     loop {
         let mut pending = Vec::with_capacity(targets.len());
-        for (owner, buckets) in targets {
+        for (owner, parts) in targets {
             let outcome = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
-                outcome = anti_entropy::run_round_for_buckets(cluster.mesh(), &shard, &cache, owner, &buckets) => outcome,
+                outcome = anti_entropy::run_round_for_parts(cluster.mesh(), &shard, &cache, owner, &parts) => outcome,
             };
             if outcome.failed {
-                pending.push((owner, buckets));
+                pending.push((owner, parts));
             } else {
-                tracing::debug!(cache = %cache, %owner, buckets = buckets.len(), bytes = outcome.bytes_moved, "pushed buckets no co-owner could hand over");
+                tracing::debug!(cache = %cache, %owner, parts = parts.len(), bytes = outcome.bytes_moved, "pushed parts no co-owner could hand over");
             }
         }
         if pending.is_empty() {
             return;
         }
         if tokio::time::Instant::now() + retry > give_up {
-            tracing::debug!(cache = %cache, owners = pending.len(), "left buckets no co-owner could hand over to the disown-grace hand-off");
+            tracing::debug!(cache = %cache, owners = pending.len(), "left parts no co-owner could hand over to the disown-grace hand-off");
             return;
         }
         targets = pending;
@@ -615,7 +667,7 @@ async fn push_unpullable(
     }
 }
 
-/// How long a released bucket may stay resident before it is dropped
+/// How long a released part may stay resident before it is dropped
 /// without a hand-off: the tombstone retention less one interval for the
 /// round. A copy held longer can no longer be trusted not to resurrect a
 /// key the owners removed and whose tombstone they have since collected;
@@ -625,54 +677,69 @@ pub(crate) fn hand_off_cutoff(tombstone_ttl: Duration, ae_interval: Duration) ->
     tombstone_ttl.saturating_sub(ae_interval).max(ae_interval)
 }
 
-/// Drops `buckets` held past [`hand_off_cutoff`] at once, counted under
-/// `sundog_rebalance_buckets_total{direction="out"}` like any release.
+/// Drops `parts` held past [`hand_off_cutoff`] at once, counted under
+/// `sundog_rebalance_parts_total{direction="out"}` like any release.
 async fn release_without_hand_off(
     shard: &dyn ShardOps,
     residency: &ResidencySet,
     cache: &SmolStr,
-    buckets: &[u16],
+    parts: &[PartId],
 ) {
-    if buckets.is_empty() {
+    if parts.is_empty() {
         return;
     }
-    let removed = shard.release_buckets(buckets).await;
-    residency.unmark(buckets);
+    let removed = shard.release_parts(parts).await;
+    residency.unmark(parts);
     metrics::counter!(
-        "sundog_rebalance_buckets_total",
+        "sundog_rebalance_parts_total",
         "cache" => cache.to_string(),
         "direction" => "out"
     )
-    .increment(u64::try_from(buckets.len()).unwrap_or(u64::MAX));
-    tracing::warn!(cache = %cache, buckets = buckets.len(), removed, "released buckets held past the tombstone retention without a hand-off");
+    .increment(u64::try_from(parts.len()).unwrap_or(u64::MAX));
+    tracing::warn!(cache = %cache, parts = parts.len(), removed, "released parts held past the tombstone retention without a hand-off");
 }
 
-/// The buckets in `due` a release may drop now: those whose every other
-/// current owner is in `reconciled` (its round completed since the
-/// bucket came due), has acked that specific bucket per `acked` (keyed
-/// by bucket, never treated as reconciling any other bucket that owner
-/// holds), or, once `overdue`, is in `unreachable`. An owner whose view
-/// still differs from this node's is none of these, so the bucket stays
-/// resident until the views converge.
-pub(crate) fn buckets_to_release(
+/// Acks recorded against wire ids, re-keyed by the parts each id names at
+/// `granularity`.
+fn acked_by_part(
+    granularity: Granularity,
+    acked: HashMap<u16, HashSet<NodeId>>,
+) -> HashMap<PartId, HashSet<NodeId>> {
+    let mut out: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
+    for (id, owners) in acked {
+        for part in parts_of_wire_id(granularity, id) {
+            out.entry(part).or_default().extend(owners.iter().copied());
+        }
+    }
+    out
+}
+
+/// The parts in `due` a release may drop now: those whose every other
+/// current owner is in `reconciled` (its round completed since the part came
+/// due), has acked that specific part per `acked` (keyed by part, never
+/// treated as reconciling any other part that owner holds), or, once
+/// `overdue`, is in `unreachable`. An owner whose view still differs from
+/// this node's is none of these, so the part stays resident until the views
+/// converge.
+pub(crate) fn parts_to_release(
     view: &OwnershipView,
     self_node: NodeId,
-    due: &[u16],
-    overdue: &[u16],
+    due: &[PartId],
+    overdue: &PartSet,
     reconciled: &HashSet<NodeId>,
-    acked: &HashMap<u16, HashSet<NodeId>>,
+    acked: &HashMap<PartId, HashSet<NodeId>>,
     unreachable: &HashSet<NodeId>,
-) -> Vec<u16> {
+) -> Vec<PartId> {
     due.iter()
         .copied()
-        .filter(|&bucket| {
-            view.owners_of(bucket).iter().all(|owner| {
+        .filter(|&part| {
+            view.owners_of(part).iter().all(|owner| {
                 *owner == self_node
                     || reconciled.contains(owner)
                     || acked
-                        .get(&bucket)
+                        .get(&part)
                         .is_some_and(|owners| owners.contains(owner))
-                    || (overdue.contains(&bucket) && unreachable.contains(owner))
+                    || (overdue.contains(part) && unreachable.contains(owner))
             })
         })
         .collect()
@@ -681,14 +748,14 @@ pub(crate) fn buckets_to_release(
 /// Which of `hand_off_owners`'s `owners` still need a confirming
 /// anti-entropy round: an owner already in `reconciled` needs none;
 /// otherwise an owner is skipped only once [`crate::net::Mesh::acked_owners`]
-/// covers every bucket in `due` that owner co-owns, never on a single
-/// acked bucket among several.
+/// covers every part in `due` that owner co-owns, never on a single acked
+/// part among several.
 fn owners_needing_confirmation(
     view: &OwnershipView,
     owners: &[NodeId],
-    due: &[u16],
+    due: &[PartId],
     reconciled: &HashSet<NodeId>,
-    acked: &HashMap<u16, HashSet<NodeId>>,
+    acked: &HashMap<PartId, HashSet<NodeId>>,
 ) -> Vec<NodeId> {
     owners
         .iter()
@@ -699,10 +766,10 @@ fn owners_needing_confirmation(
             }
             let fully_acked = due
                 .iter()
-                .filter(|&&bucket| view.owners_of(bucket).contains(owner))
-                .all(|&bucket| {
+                .filter(|&&part| view.owners_of(part).contains(owner))
+                .all(|&part| {
                     acked
-                        .get(&bucket)
+                        .get(&part)
                         .is_some_and(|owners| owners.contains(owner))
                 });
             !fully_acked
@@ -711,24 +778,24 @@ fn owners_needing_confirmation(
 }
 
 /// Reacts to every change in `ownership`'s view for as long as `cancel`
-/// stays live: marks newly lost buckets releasing, unmarks newly regained
-/// ones, and pulls newly gained ones from their current owners. A lost
-/// bucket this node holds data in and no surviving co-owner can hand over
+/// stays live: marks newly lost parts releasing, unmarks newly regained
+/// ones, and pulls newly gained ones from their current owners. A lost part
+/// this node holds data in and no surviving co-owner can hand over
 /// ([`unpullable_losses`]) is pushed to its new owners at once
-/// ([`push_unpullable`]), so a write accepted while this node owned the
-/// bucket alone reaches them without waiting out the grace. On a tick
-/// piggybacked on `ae_interval`, hands off whichever buckets' disown grace
-/// has elapsed to their live current owners ([`hand_off_owners`]), then
-/// calls [`ShardOps::release_buckets`] for the buckets every owner answered
-/// ([`buckets_to_release`]); an owner that never answers keeps the bucket
-/// resident until it is reachable again or its view converges. An owner
-/// that acked a specific due bucket, within the ack window and current
-/// view hash, counts as reconciled for that bucket without a redundant
-/// confirming round; an ack is scoped to the one bucket it names, so
-/// [`owners_needing_confirmation`] still runs a round unless every due
-/// bucket that owner co-owns was acked. `disown_grace` still gates which
-/// buckets reach this hand-off, so an ack only accelerates confirmation,
-/// never the release timing floor.
+/// ([`push_unpullable`]), so a write accepted while this node owned the part
+/// alone reaches them without waiting out the grace. On a tick piggybacked
+/// on `ae_interval`, hands off whichever parts' disown grace has elapsed to
+/// their live current owners ([`hand_off_owners`]), then calls
+/// [`ShardOps::release_parts`] for the parts every owner answered
+/// ([`parts_to_release`]); an owner that never answers keeps the part
+/// resident until it is reachable again or its view converges. An owner that
+/// acked a specific due part, within the ack window and current view hash,
+/// counts as reconciled for that part without a redundant confirming round;
+/// an ack is scoped to the parts its wire id names, so
+/// [`owners_needing_confirmation`] still runs a round unless every due part
+/// that owner co-owns was acked. `disown_grace` still gates which parts
+/// reach this hand-off, so an ack only accelerates confirmation, never the
+/// release timing floor.
 #[expect(
     clippy::too_many_arguments,
     reason = "a long-running per-cache background task carries this cache's full context for its whole lifetime; a struct would only rename these same eight fields"
@@ -754,17 +821,17 @@ pub(crate) async fn rebalance_task(
     // `prev_view` starts from `ownership.baseline()`, the tracker's
     // original seeded view, never a live re-borrow that could already
     // show a raced-ahead publish (see `OwnershipTracker::baseline`): a
-    // bucket only the seed view ever called owned must still be
-    // recognized as lost on the first view change this task observes.
-    // `pulled_view` is the latest view without a superseded pull; see
-    // `plan_view_change` for why the two differ.
+    // part only the seed view ever called owned must still be recognized
+    // as lost on the first view change this task observes. `pulled_view`
+    // is the latest view without a superseded pull; see `plan_view_change`
+    // for why the two differ.
     let mut prev_view = ownership.baseline();
     let mut pulled_view = Arc::clone(&prev_view);
     let mut ticker = tokio::time::interval(ae_interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Pushes of buckets lost with no surviving co-owner, one per view
-    // change that lost any. Each stops on `cancel` through its child
-    // token; dropping the set when this task returns aborts any left.
+    // Pushes of parts lost with no surviving co-owner, one per view change
+    // that lost any. Each stops on `cancel` through its child token;
+    // dropping the set when this task returns aborts any left.
     let mut pushes: JoinSet<()> = JoinSet::new();
     loop {
         tokio::select! {
@@ -776,14 +843,14 @@ pub(crate) async fn rebalance_task(
                     return; // the tracker's sender dropped
                 }
                 let new_view = view_rx.borrow_and_update().clone();
-                let held = shard.held_buckets().await;
+                let held = shard.held_parts().await;
                 let plan = plan_view_change(&prev_view, &pulled_view, &new_view, &held);
-                let held_set: HashSet<u16> = held.iter().copied().collect();
-                let held_losses: Vec<u16> = plan
+                let held_set: PartSet = held.iter().copied().collect();
+                let held_losses: Vec<PartId> = plan
                     .lost
                     .iter()
                     .copied()
-                    .filter(|bucket| held_set.contains(bucket))
+                    .filter(|&part| held_set.contains(part))
                     .collect();
                 let unpullable =
                     unpullable_losses(&prev_view, &new_view, cluster.node_id(), &held_losses);
@@ -792,25 +859,26 @@ pub(crate) async fn rebalance_task(
                     cache = %cache,
                     gained = plan.to_pull.len(),
                     lost = plan.lost.len(),
+                    granularity = ?new_view.granularity(),
                     "ownership view changed"
                 );
-                // A bucket owned alone has nobody to pull from or verify
-                // a record against, so it is neither cold nor unverified.
-                let alone: Vec<u16> = new_view
-                    .owned_buckets()
-                    .filter(|&bucket| new_view.owners_of(bucket).len() == 1)
+                // A part owned alone has nobody to pull from or verify a
+                // record against, so it is neither cold nor unverified.
+                let alone: Vec<PartId> = new_view
+                    .owned_parts()
+                    .filter(|&part| new_view.owners_of(part).len() == 1)
                     .collect();
                 if !alone.is_empty() {
                     residency.mark_serving(&alone);
                 }
                 if !plan.lost.is_empty() {
                     residency.mark_releasing(&plan.lost);
-                    tracing::debug!(cache = %cache, count = plan.lost.len(), "buckets lost; disown grace started");
+                    tracing::debug!(cache = %cache, count = plan.lost.len(), "parts lost; disown grace started");
                 }
                 let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
                 let targets = push_targets(&new_view, cluster.node_id(), &unpullable, &live);
                 if !targets.is_empty() {
-                    tracing::debug!(cache = %cache, buckets = unpullable.len(), owners = targets.len(), "buckets lost with no co-owner to hand them over; pushing to their new owners");
+                    tracing::debug!(cache = %cache, parts = unpullable.len(), owners = targets.len(), "parts lost with no co-owner to hand them over; pushing to their new owners");
                     pushes.spawn(push_unpullable(
                         cluster.clone(),
                         Arc::clone(&shard),
@@ -829,14 +897,14 @@ pub(crate) async fn rebalance_task(
                 } else {
                     // Gained from a co-owner: cold until the pull lands.
                     residency.mark_cold(&plan.to_pull);
-                    tracing::debug!(cache = %cache, count = plan.to_pull.len(), "buckets gained; pulling from current owners");
+                    tracing::debug!(cache = %cache, count = plan.to_pull.len(), "parts gained; pulling from current owners");
                     PullRequest {
                         cluster: &cluster,
                         shard: &shard,
                         ownership: &ownership,
                         residency: &residency,
                         cache: &cache,
-                        buckets: plan.to_pull,
+                        parts: plan.to_pull,
                         budget,
                         concurrency,
                         // The ongoing rebalance loop, well past open()'s membership wait.
@@ -855,32 +923,36 @@ pub(crate) async fn rebalance_task(
             _ = ticker.tick() => {
                 let past_cutoff = residency.expired(cutoff);
                 release_without_hand_off(shard.as_ref(), &residency, &cache, &past_cutoff).await;
-                let due: Vec<u16> = residency
+                let past_cutoff: PartSet = past_cutoff.into_iter().collect();
+                let due: Vec<PartId> = residency
                     .expired(disown_grace)
                     .into_iter()
-                    .filter(|bucket| !past_cutoff.contains(bucket))
+                    .filter(|&part| !past_cutoff.contains(part))
                     .collect();
                 if !due.is_empty() {
                     let view = ownership.current();
                     let self_node = cluster.node_id();
                     let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
-                    // An owner that already acked a due bucket counts as
-                    // reconciled for that bucket without a redundant
-                    // round; kept separate from `reconciled` (AE-round
-                    // derived, owner-global) since an ack names one
-                    // bucket, never every bucket the owner co-owns.
-                    let acked: HashMap<u16, HashSet<NodeId>> = cluster.mesh().acked_owners(
-                        &cache,
-                        &due,
-                        cluster.config().rebalance_ack_window_value(),
-                        view.view_hash(),
+                    // An owner that already acked a due part counts as
+                    // reconciled for that part without a redundant round;
+                    // kept separate from `reconciled` (AE-round derived,
+                    // owner-global) since an ack names one wire id, never
+                    // every part the owner co-owns.
+                    let acked = acked_by_part(
+                        view.granularity(),
+                        cluster.mesh().acked_owners(
+                            &cache,
+                            &view.wire_ids(&due),
+                            cluster.config().rebalance_ack_window_value(),
+                            view.view_hash(),
+                        ),
                     );
                     let mut reconciled: HashSet<NodeId> = HashSet::new();
                     // An owner missing from gossip is unreachable by
                     // definition; the view drops it on its next refresh.
                     let mut unreachable: HashSet<NodeId> = due
                         .iter()
-                        .flat_map(|&bucket| view.owners_of(bucket).iter().copied())
+                        .flat_map(|&part| view.owners_of(part).iter().copied())
                         .filter(|owner| *owner != self_node && !live.contains(owner))
                         .collect();
                     let hand_off = hand_off_owners(&view, self_node, &due, &live);
@@ -900,8 +972,8 @@ pub(crate) async fn rebalance_task(
                             RoundOutcome::Stale => {}
                         }
                     }
-                    let overdue = residency.expired(disown_grace * 2);
-                    let due = buckets_to_release(
+                    let overdue: PartSet = residency.expired(disown_grace * 2).into_iter().collect();
+                    let due = parts_to_release(
                         &view,
                         self_node,
                         &due,
@@ -915,25 +987,25 @@ pub(crate) async fn rebalance_task(
                             cache = %cache,
                             reconciled = reconciled.len(),
                             acked = acked.len(),
-                            "no released bucket's owners all answered its hand-off; holding until the next tick"
+                            "no released part's owners all answered its hand-off; holding until the next tick"
                         );
                         continue;
                     }
-                    let removed = shard.release_buckets(&due).await;
+                    let removed = shard.release_parts(&due).await;
                     residency.unmark(&due);
                     metrics::counter!(
-                        "sundog_rebalance_buckets_total",
+                        "sundog_rebalance_parts_total",
                         "cache" => cache.to_string(),
                         "direction" => "out"
                     )
                     .increment(u64::try_from(due.len()).unwrap_or(u64::MAX));
                     tracing::debug!(
                         cache = %cache,
-                        buckets = due.len(),
+                        parts = due.len(),
                         removed,
                         reconciled = reconciled.len(),
                         acked = acked.len(),
-                        "released buckets past their disown grace"
+                        "released parts past their disown grace"
                     );
                 }
             }
@@ -956,23 +1028,23 @@ mod tests {
     }
 
     #[test]
-    fn group_buckets_by_donor_set_groups_buckets_sharing_the_same_donors() {
+    fn group_parts_by_donor_set_groups_parts_sharing_the_same_donors() {
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
-        let buckets: Vec<u16> = (0..64).collect();
+        let parts: Vec<PartId> = PartId::all().step_by(97).take(64).collect();
 
-        let groups = group_buckets_by_donor_set(&view, self_node, buckets.clone());
+        let groups = group_parts_by_donor_set(&view, self_node, parts.clone());
 
-        // Every bucket appears in exactly one group, and each group's donor
-        // set is precisely that bucket's owners minus self.
-        let mut regrouped: Vec<u16> = groups.iter().flat_map(|(_, bs)| bs.clone()).collect();
+        // Every part appears in exactly one group, and each group's donor
+        // set is precisely that part's owners minus self.
+        let mut regrouped: Vec<PartId> = groups.iter().flat_map(|(_, ps)| ps.clone()).collect();
         regrouped.sort_unstable();
-        assert_eq!(regrouped, buckets);
-        for (donors, group_buckets) in &groups {
-            for &bucket in group_buckets {
+        assert_eq!(regrouped, parts);
+        for (donors, group_parts) in &groups {
+            for &part in group_parts {
                 let expected: Vec<NodeId> = view
-                    .owners_of(bucket)
+                    .owners_of(part)
                     .iter()
                     .copied()
                     .filter(|&n| n != self_node)
@@ -983,35 +1055,61 @@ mod tests {
     }
 
     #[test]
-    fn group_buckets_by_donor_set_excludes_self_from_every_donor_list() {
+    fn group_parts_by_donor_set_merges_rankings_that_name_the_same_donors() {
+        // Two eligible nodes at k=2: every part's owners are self and the
+        // other node, in either order, so every part has one donor set.
         let self_node = NodeId::from(1);
-        // Solo eligible set: self is every bucket's only owner, so every
+        let other = NodeId::from(2);
+        let view = OwnershipView::compute_at(
+            self_node,
+            vec![self_node, other],
+            NonZeroU8::new(2).expect("nonzero"),
+            Granularity::Part,
+        );
+        let orders: HashSet<Vec<NodeId>> = PartId::all()
+            .map(|part| view.owners_of(part).to_vec())
+            .collect();
+        assert_eq!(
+            orders.len(),
+            2,
+            "the fixture ranks self first for some parts and second for others"
+        );
+        let groups = group_parts_by_donor_set(&view, self_node, PartId::all().collect());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, vec![other]);
+        assert_eq!(groups[0].1.len(), crate::store::part::PART_SPACE);
+    }
+
+    #[test]
+    fn group_parts_by_donor_set_excludes_self_from_every_donor_list() {
+        let self_node = NodeId::from(1);
+        // Solo eligible set: self is every part's only owner, so every
         // donor list is empty once self is excluded.
         let view = view(self_node, vec![self_node], 2);
-        let groups = group_buckets_by_donor_set(&view, self_node, vec![0, 1, 2]);
+        let groups = group_parts_by_donor_set(&view, self_node, PartId::all().take(3).collect());
 
         assert_eq!(groups.len(), 1);
         assert!(groups[0].0.is_empty());
     }
 
     #[test]
-    fn buckets_pending_group_credit_excludes_buckets_already_credited_live() {
+    fn parts_pending_group_credit_excludes_parts_already_credited_live() {
         let mut already_credited = HashSet::new();
-        already_credited.insert(3u16);
-        already_credited.insert(7u16);
+        already_credited.insert(PartId::from_raw(3));
+        already_credited.insert(PartId::from_raw(7));
         assert_eq!(
-            buckets_pending_group_credit(5, &already_credited),
+            parts_pending_group_credit(5, &already_credited),
             3,
-            "5 buckets minus the 2 already credited live leaves 3 for the group-level fallback"
+            "5 parts minus the 2 already credited live leaves 3 for the group-level fallback"
         );
     }
 
     #[test]
-    fn buckets_pending_group_credit_is_the_full_group_when_nothing_landed_live() {
+    fn parts_pending_group_credit_is_the_full_group_when_nothing_landed_live() {
         assert_eq!(
-            buckets_pending_group_credit(4, &HashSet::new()),
+            parts_pending_group_credit(4, &HashSet::new()),
             4,
-            "a protocol-3 donor never fires a live BucketDone, so every bucket in the group is \
+            "a protocol-3 donor never fires a live BucketDone, so every part in the group is \
              credited at group completion instead"
         );
     }
@@ -1026,7 +1124,7 @@ mod tests {
         let v0 = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
         let v1 = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
         let v2 = view(self_node, [1u64, 2, 4].map(NodeId::from).to_vec(), k);
-        let owned = |v: &OwnershipView| v.owned_buckets().collect::<HashSet<u16>>();
+        let owned = |v: &OwnershipView| v.owned_parts().collect::<HashSet<PartId>>();
         let (o0, o1, o2) = (owned(&v0), owned(&v1), owned(&v2));
 
         // v0 -> v1 pulled cleanly: prev and pulled agree.
@@ -1043,7 +1141,7 @@ mod tests {
         // bucket gained under v1 and gone in v2 starts its grace, while
         // the pull covers everything v2 owns that v0 did not.
         let plan = plan_view_change(&v1, &v0, &v2, &[]);
-        let gained_then_lost: Vec<u16> = o1
+        let gained_then_lost: Vec<PartId> = o1
             .iter()
             .copied()
             .filter(|b| !o0.contains(b) && !o2.contains(b))
@@ -1077,7 +1175,7 @@ mod tests {
         );
         // The seeded, lone-node view: the transient "owns everything" state.
         let baseline = tracker.baseline();
-        assert_eq!(baseline.owned_buckets().count(), crate::store::BUCKET_COUNT);
+        assert_eq!(baseline.owned_part_count(), crate::store::part::PART_SPACE);
 
         // Published before rebalance_task is spawned: as if refresh_task
         // had already raced ahead, the very race baseline() exists to
@@ -1090,7 +1188,7 @@ mod tests {
             2,
         ));
         let bucket_only_in_baseline = baseline
-            .owned_buckets()
+            .owned_parts()
             .find(|&b| !corrected.owns(b))
             .expect("a lone-node view owns strictly more than a three-node, k=2 split");
         tx.send(Arc::clone(&corrected))
@@ -1140,9 +1238,9 @@ mod tests {
         let v0 = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
         let v1 = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
         let v2 = view(self_node, [1u64, 2, 4].map(NodeId::from).to_vec(), k);
-        let owned = |v: &OwnershipView| v.owned_buckets().collect::<HashSet<u16>>();
+        let owned = |v: &OwnershipView| v.owned_parts().collect::<HashSet<PartId>>();
         let (o0, o1, o2) = (owned(&v0), owned(&v1), owned(&v2));
-        let only_in_v1: Vec<u16> = o1
+        let only_in_v1: Vec<PartId> = o1
             .iter()
             .copied()
             .filter(|b| !o0.contains(b) && !o2.contains(b))
@@ -1180,7 +1278,7 @@ mod tests {
             !plan.lost.contains(&kept),
             "a held bucket the new view owns is not lost"
         );
-        let distinct: HashSet<u16> = plan.lost.iter().copied().collect();
+        let distinct: HashSet<PartId> = plan.lost.iter().copied().collect();
         assert_eq!(
             distinct.len(),
             plan.lost.len(),
@@ -1213,9 +1311,8 @@ mod tests {
             vec![cluster.node_id(), other_a, other_b],
             2,
         ));
-        let bucket = (0..crate::store::BUCKET_COUNT)
-            .map(|b| u16::try_from(b).expect("invariant: BUCKET_COUNT fits u16"))
-            .find(|&b| !settled.owns(b))
+        let bucket = PartId::all()
+            .find(|&p| !settled.owns(p))
             .expect("a three-node, k=2 split leaves some bucket unowned here");
         let shard = empty_shard();
         let residency = Arc::new(ResidencySet::new());
@@ -1255,9 +1352,7 @@ mod tests {
         // observed it. The next observed change, whose prev and new both
         // disown the bucket, still starts its grace.
         let key = (0..1_000_000u32)
-            .find(|key| {
-                crate::store::bucket_of(&postcard::to_stdvec(key).expect("encodes")) == bucket
-            })
+            .find(|key| PartId::of_key(&postcard::to_stdvec(key).expect("encodes")) == bucket)
             .expect("some key hashes into the bucket");
         shard
             .apply_remote_batch(vec![crate::wire::WireRecord {
@@ -1273,7 +1368,7 @@ mod tests {
                 expires_at_ms: None,
             }])
             .await;
-        assert_eq!(shard.held_buckets().await, vec![bucket]);
+        assert_eq!(shard.held_parts().await, vec![bucket]);
         tx.send(Arc::clone(&settled))
             .expect("the tracker's own receiver keeps the channel open");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1316,7 +1411,7 @@ mod tests {
         // Both of a bucket's other owners change: nobody left holds it.
         let swapped = view(self_node, [1u64, 5, 6].map(NodeId::from).to_vec(), 2);
         let (_, lost) = ownership_diff(&before, &swapped);
-        let orphaned: Vec<u16> = lost
+        let orphaned: Vec<PartId> = lost
             .iter()
             .copied()
             .filter(|&bucket| {
@@ -1341,7 +1436,7 @@ mod tests {
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=4u64).map(NodeId::from).collect();
         let view = view(self_node, eligible.clone(), 2);
-        let buckets: Vec<u16> = (0..64u16).collect();
+        let buckets: Vec<PartId> = PartId::all().take(64).collect();
         let dead = NodeId::from(4);
         let live: HashSet<NodeId> = [2u64, 3].map(NodeId::from).into_iter().collect();
         let targets = push_targets(&view, self_node, &buckets, &live);
@@ -1377,7 +1472,7 @@ mod tests {
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
         let view = view(self_node, eligible.clone(), 2);
-        let due: Vec<u16> = (0..256).collect();
+        let due: Vec<PartId> = PartId::all().take(256).collect();
         let live: HashSet<NodeId> = eligible
             .iter()
             .copied()
@@ -1431,15 +1526,23 @@ mod tests {
     }
 
     #[test]
-    fn buckets_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue() {
+    fn parts_to_release_holds_a_bucket_until_every_owner_answered_or_it_is_overdue() {
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=5u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
-        let due: Vec<u16> = (0..256).collect();
+        let due: Vec<PartId> = PartId::all().take(256).collect();
 
         let none: HashSet<NodeId> = HashSet::new();
-        let no_acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
-        let held = buckets_to_release(&view, self_node, &due, &[], &none, &no_acked, &none);
+        let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
+        let held = parts_to_release(
+            &view,
+            self_node,
+            &due,
+            &PartSet::new(),
+            &none,
+            &no_acked,
+            &none,
+        );
         for &bucket in &held {
             assert!(
                 view.owners_of(bucket).iter().all(|o| *o == self_node),
@@ -1448,7 +1551,15 @@ mod tests {
         }
 
         let answered: HashSet<NodeId> = [NodeId::from(2)].into_iter().collect();
-        let released = buckets_to_release(&view, self_node, &due, &[], &answered, &no_acked, &none);
+        let released = parts_to_release(
+            &view,
+            self_node,
+            &due,
+            &PartSet::new(),
+            &answered,
+            &no_acked,
+            &none,
+        );
         for &bucket in &due {
             let all_answered = view
                 .owners_of(bucket)
@@ -1467,22 +1578,22 @@ mod tests {
 
         // Overdue: a stale owner still holds the bucket, an unreachable
         // one does not.
-        let overdue: Vec<u16> = due.clone();
+        let overdue: PartSet = due.iter().copied().collect();
         let still_held =
-            buckets_to_release(&view, self_node, &due, &overdue, &none, &no_acked, &none);
+            parts_to_release(&view, self_node, &due, &overdue, &none, &no_acked, &none);
         assert_eq!(
             still_held, held,
             "an overdue bucket whose owners are merely stale stays resident"
         );
         let everyone: HashSet<NodeId> = (2..=5u64).map(NodeId::from).collect();
-        let dropped = buckets_to_release(
+        let dropped = parts_to_release(
             &view, self_node, &due, &overdue, &none, &no_acked, &everyone,
         );
         assert_eq!(
             dropped, due,
             "an overdue bucket whose owners are all unreachable is released"
         );
-        let mixed = buckets_to_release(
+        let mixed = parts_to_release(
             &view, self_node, &due, &overdue, &answered, &no_acked, &everyone,
         );
         assert_eq!(
@@ -1492,13 +1603,13 @@ mod tests {
     }
 
     #[test]
-    fn buckets_to_release_accepts_an_acked_owner_without_a_confirming_ae_round() {
+    fn parts_to_release_accepts_an_acked_owner_without_a_confirming_ae_round() {
         // An acked owner releases like a reconciled one; other current
         // owners must still be covered.
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
-        let due: Vec<u16> = (0..256).collect();
+        let due: Vec<PartId> = PartId::all().take(256).collect();
         let bucket = due
             .iter()
             .copied()
@@ -1511,31 +1622,48 @@ mod tests {
             .expect("a co-owned bucket has another owner");
 
         let none: HashSet<NodeId> = HashSet::new();
-        let no_acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
+        let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
         assert!(
-            !buckets_to_release(&view, self_node, &[bucket], &[], &none, &no_acked, &none)
-                .contains(&bucket),
+            !parts_to_release(
+                &view,
+                self_node,
+                &[bucket],
+                &PartSet::new(),
+                &none,
+                &no_acked,
+                &none
+            )
+            .contains(&bucket),
             "with no ack and no round, the bucket stays resident"
         );
 
-        let acked: HashMap<u16, HashSet<NodeId>> =
+        let acked: HashMap<PartId, HashSet<NodeId>> =
             HashMap::from([(bucket, HashSet::from([other]))]);
         assert!(
-            buckets_to_release(&view, self_node, &[bucket], &[], &none, &acked, &none)
-                .contains(&bucket),
+            parts_to_release(
+                &view,
+                self_node,
+                &[bucket],
+                &PartSet::new(),
+                &none,
+                &acked,
+                &none
+            )
+            .contains(&bucket),
             "an owner who acked this bucket releases it without a confirming AE round against it"
         );
     }
 
     #[test]
-    fn buckets_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_different_bucket()
-     {
+    fn parts_to_release_never_releases_a_co_owned_bucket_whose_owner_only_acked_a_different_bucket()
+    {
         // Regression: two due buckets share an owner who acked only one;
         // the un-acked bucket must stay resident.
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
-        let due: Vec<u16> = (0..256)
+        let due: Vec<PartId> = PartId::all()
+            .take(256)
             .filter(|&b| view.owners_of(b).contains(&self_node) && view.owners_of(b).len() == 2)
             .collect();
         let other = *view
@@ -1544,7 +1672,7 @@ mod tests {
             .find(|&&o| o != self_node)
             .expect("a co-owned bucket has another owner");
         // Two distinct due buckets `other` co-owns alongside self.
-        let owner_due: Vec<u16> = due
+        let owner_due: Vec<PartId> = due
             .iter()
             .copied()
             .filter(|&b| view.owners_of(b).contains(&other))
@@ -1559,13 +1687,13 @@ mod tests {
 
         let none: HashSet<NodeId> = HashSet::new();
         // `other` acked `bucket_acked` only.
-        let acked: HashMap<u16, HashSet<NodeId>> =
+        let acked: HashMap<PartId, HashSet<NodeId>> =
             HashMap::from([(bucket_acked, HashSet::from([other]))]);
-        let released = buckets_to_release(
+        let released = parts_to_release(
             &view,
             self_node,
             &[bucket_acked, bucket_unacked],
-            &[],
+            &PartSet::new(),
             &none,
             &acked,
             &none,
@@ -1590,9 +1718,9 @@ mod tests {
         // The full bucket range: every real caller's owners co-own at
         // least one bucket in `due`, so an empty range here would
         // vacuously look reconciled.
-        let due: Vec<u16> = (0..256).collect();
+        let due: Vec<PartId> = PartId::all().take(256).collect();
         let reconciled: HashSet<NodeId> = [NodeId::from(2)].into_iter().collect();
-        let no_acked: HashMap<u16, HashSet<NodeId>> = HashMap::new();
+        let no_acked: HashMap<PartId, HashSet<NodeId>> = HashMap::new();
         assert_eq!(
             owners_needing_confirmation(&view, &owners, &due, &reconciled, &no_acked),
             vec![NodeId::from(3)],
@@ -1613,7 +1741,8 @@ mod tests {
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=3u64).map(NodeId::from).collect();
         let view = view(self_node, eligible, 2);
-        let due: Vec<u16> = (0..256)
+        let due: Vec<PartId> = PartId::all()
+            .take(256)
             .filter(|&b| view.owners_of(b).contains(&self_node) && view.owners_of(b).len() == 2)
             .collect();
         let other = *view
@@ -1621,7 +1750,7 @@ mod tests {
             .iter()
             .find(|&&o| o != self_node)
             .expect("a co-owned bucket has another owner");
-        let owner_due: Vec<u16> = due
+        let owner_due: Vec<PartId> = due
             .iter()
             .copied()
             .filter(|&b| view.owners_of(b).contains(&other))
@@ -1633,7 +1762,7 @@ mod tests {
 
         let reconciled: HashSet<NodeId> = HashSet::new();
         // Acked only the first of the buckets `other` co-owns.
-        let acked: HashMap<u16, HashSet<NodeId>> =
+        let acked: HashMap<PartId, HashSet<NodeId>> =
             HashMap::from([(owner_due[0], HashSet::from([other]))]);
         assert_eq!(
             owners_needing_confirmation(&view, &[other], &due, &reconciled, &acked),
@@ -1642,7 +1771,7 @@ mod tests {
         );
 
         // Acking every due bucket `other` co-owns does let it skip.
-        let full_acked: HashMap<u16, HashSet<NodeId>> = owner_due
+        let full_acked: HashMap<PartId, HashSet<NodeId>> = owner_due
             .iter()
             .map(|&b| (b, HashSet::from([other])))
             .collect();
@@ -1697,7 +1826,7 @@ mod tests {
             ownership: &tracker,
             residency: &Arc::new(ResidencySet::new()),
             cache: &name,
-            buckets: Vec::new(),
+            parts: Vec::new(),
             budget: Duration::from_secs(1),
             concurrency: 4,
             trust_sole_owner: true,
@@ -1707,6 +1836,43 @@ mod tests {
         assert_eq!(outcome, Outcome::Completed);
 
         cluster.shutdown().await;
+    }
+
+    /// `RequestHandler::st_serve`'s default composes the three bucket
+    /// calls: a hash mismatch is `Stale`, and otherwise the ids stream in
+    /// request order, each standing for a whole bucket.
+    #[tokio::test]
+    async fn st_serve_default_composes_the_bucket_availability_cold_and_chunk_calls() {
+        use futures::StreamExt as _;
+
+        use crate::net::test_support::BucketPullHandler;
+        use crate::net::{RequestHandler, StServe};
+
+        let handler = BucketPullHandler {
+            view_hash: 42,
+            chunks: vec![(9u16, vec![sample_wire_record(1)])],
+            stall_after: false,
+            ..Default::default()
+        };
+        let cache = SmolStr::new("prices");
+        assert!(matches!(
+            handler.st_serve(cache.clone(), vec![9, 3], 41).await,
+            StServe::Stale {
+                responder_view_hash: 0
+            }
+        ));
+        let StServe::Stream {
+            mut chunks,
+            order,
+            parts,
+        } = handler.st_serve(cache, vec![9, 3], 42).await
+        else {
+            panic!("a matching view hash streams");
+        };
+        assert_eq!(order, vec![9, 3], "the default keeps request order");
+        assert_eq!(parts, 2 * crate::store::PART_COUNT as u64);
+        let (id, recs) = chunks.next().await.expect("the fixture's one chunk");
+        assert_eq!((id, recs.len()), (9, 1));
     }
 
     #[tokio::test]
@@ -1728,7 +1894,7 @@ mod tests {
             ownership: &tracker,
             residency: &Arc::new(ResidencySet::new()),
             cache: &name,
-            buckets: vec![0, 1, 2],
+            parts: PartId::all().take(3).collect(),
             budget: Duration::from_secs(1),
             concurrency: 4,
             trust_sole_owner: true,
@@ -1816,7 +1982,7 @@ mod tests {
         // Self-only view: no co-owner ever joined the cluster.
         let bucket = tracker
             .current()
-            .owned_buckets()
+            .owned_parts()
             .next()
             .expect("self owns at least one bucket alone");
         let residency = Arc::new(ResidencySet::new());
@@ -1830,7 +1996,7 @@ mod tests {
             ownership: &tracker,
             residency: &residency,
             cache: &name,
-            buckets: vec![bucket],
+            parts: vec![bucket],
             budget: Duration::from_secs(1),
             concurrency: 4,
             trust_sole_owner: true,
@@ -1876,7 +2042,7 @@ mod tests {
 
         let bucket = tracker
             .current()
-            .owned_buckets()
+            .owned_parts()
             .next()
             .expect("self owns at least one bucket alone");
         let residency = Arc::new(ResidencySet::new());
@@ -1889,7 +2055,7 @@ mod tests {
             ownership: &tracker,
             residency: &residency,
             cache: &name,
-            buckets: vec![bucket],
+            parts: vec![bucket],
             budget: Duration::from_secs(1),
             concurrency: 4,
             trust_sole_owner: false,
@@ -1949,7 +2115,7 @@ mod tests {
             .expect("receiver still alive");
 
         let bucket = phantom_view
-            .owned_buckets()
+            .owned_parts()
             .next()
             .expect("self owns at least one bucket");
         let residency = Arc::new(ResidencySet::new());
@@ -2008,7 +2174,7 @@ mod tests {
             ownership: &tracker,
             residency: &Arc::new(ResidencySet::new()),
             cache: &name,
-            buckets: vec![0],
+            parts: vec![PartId::from_raw(0)],
             budget: Duration::ZERO,
             concurrency: 4,
             trust_sole_owner: true,
@@ -2018,6 +2184,77 @@ mod tests {
         assert_eq!(outcome, Outcome::Skipped);
 
         cluster.shutdown().await;
+    }
+
+    #[test]
+    fn settle_all_cold_serves_cold_parts_and_holds_back_unverified_ones() {
+        let parts = [
+            PartId::from_raw(1),
+            PartId::from_raw(2),
+            PartId::from_raw(3),
+        ];
+        let (settled, pull) = settle_all_cold(&parts, |part| part == PartId::from_raw(2));
+        assert_eq!(settled, vec![PartId::from_raw(1), PartId::from_raw(3)]);
+        assert_eq!(pull, GroupPull::Unverified);
+        let (settled, pull) = settle_all_cold(&parts, |_| false);
+        assert_eq!(settled, parts.to_vec());
+        assert_eq!(pull, GroupPull::Landed(0));
+    }
+
+    /// The warm-reopen race: this node replayed part `a` from disk, the only
+    /// donor is still cold on it, and the part that donor could not give is
+    /// the one whose replay may lack keys. Serving it would answer a wrong
+    /// miss, so it stays cold and unverified while plain cold `b` serves.
+    #[cfg(feature = "spill")]
+    #[tokio::test]
+    async fn pull_one_group_keeps_an_unverified_part_waiting_when_every_donor_is_cold() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        let cache = SmolStr::new("prices");
+        let (donor_node, requester_node) = (NodeId::from(111), NodeId::from(112));
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+        let view_hash = ownership.current().view_hash();
+        let donor_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            cold: true,
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
+        let (requester, _requester_inbound) =
+            spawn_mesh(requester_node, Arc::new(BucketPullHandler::default())).await;
+        requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+
+        let (a, b) = (PartId::new(3, 0), PartId::new(3, 1));
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&[a, b]);
+        residency.mark_unverified(&[a]);
+
+        let pull = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![donor_node],
+            vec![a, b],
+            (Granularity::Part, view_hash),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(pull, GroupPull::Unverified);
+        assert!(
+            residency.is_cold(a) && residency.is_unverified(a),
+            "the unverified replay keeps both marks, so reads ask the other owners"
+        );
+        assert!(
+            !residency.is_cold(b),
+            "the plain cold part serves what landed"
+        );
+
+        donor.shutdown().await;
+        requester.shutdown().await;
     }
 
     #[tokio::test]
@@ -2039,18 +2276,20 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
+            ..Default::default()
         });
         let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
         let requester_handler = Arc::new(BucketPullHandler {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
+            ..Default::default()
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
 
         let residency = Arc::new(ResidencySet::new());
-        residency.mark_cold(&[0, 1]);
+        residency.mark_cold(&two_buckets());
         let shard = empty_shard();
         let modes: crate::membership::CacheModes = std::collections::HashMap::new();
         let k = NonZeroU8::new(2).expect("nonzero");
@@ -2065,8 +2304,8 @@ mod tests {
                 &ownership,
                 &residency,
                 vec![donor_node],
-                vec![0, 1],
-                view_hash,
+                two_buckets(),
+                (Granularity::Bucket, view_hash),
                 Duration::from_secs(5),
             ),
         )
@@ -2077,13 +2316,196 @@ mod tests {
              test's patience"
         );
         assert!(
-            !residency.is_cold(0),
+            PartId::of_bucket(0).all(|p| !residency.is_cold(p)),
             "bucket 0's BucketDone landed and cleared its cold mark before the group finished"
         );
         assert!(
-            residency.is_cold(1),
+            PartId::of_bucket(1).all(|p| residency.is_cold(p)),
             "bucket 1's BucketDone never arrived, so it stays cold"
         );
+
+        donor.shutdown().await;
+        requester.shutdown().await;
+    }
+
+    #[test]
+    fn acked_by_part_rekeys_each_id_by_the_parts_it_names() {
+        let a = NodeId::from(1);
+        let b = NodeId::from(2);
+        let by_bucket = acked_by_part(
+            Granularity::Bucket,
+            HashMap::from([(3u16, HashSet::from([a]))]),
+        );
+        assert_eq!(by_bucket.len(), crate::store::PART_COUNT);
+        assert!(
+            by_bucket
+                .iter()
+                .all(|(part, owners)| part.bucket() == 3 && owners == &HashSet::from([a]))
+        );
+
+        let part = PartId::new(3, 5);
+        let by_part = acked_by_part(
+            Granularity::Part,
+            HashMap::from([(part.raw(), HashSet::from([a, b]))]),
+        );
+        assert_eq!(by_part, HashMap::from([(part, HashSet::from([a, b]))]));
+    }
+
+    /// A donor that stalls after finishing bucket 0 leaves bucket 1 for the
+    /// next donor, which is asked for bucket 1 alone.
+    #[tokio::test]
+    async fn pull_one_group_asks_a_later_donor_only_for_the_parts_no_earlier_attempt_finished() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        let cache = SmolStr::new("prices");
+        let view_hash = 42;
+        let (first_node, second_node, requester_node) =
+            (NodeId::from(301), NodeId::from(302), NodeId::from(303));
+        let first_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            chunks: vec![
+                (0u16, vec![sample_wire_record(1)]),
+                (1u16, vec![sample_wire_record(2)]),
+            ],
+            stall_after: true,
+            ..Default::default()
+        });
+        let second_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            chunks: vec![(1u16, vec![sample_wire_record(2)])],
+            stall_after: false,
+            ..Default::default()
+        });
+        let (first, _first_inbound) = spawn_mesh(first_node, Arc::clone(&first_handler) as _).await;
+        let (second, _second_inbound) =
+            spawn_mesh(second_node, Arc::clone(&second_handler) as _).await;
+        let (requester, _requester_inbound) = spawn_mesh(
+            requester_node,
+            Arc::new(BucketPullHandler {
+                view_hash: 0,
+                chunks: Vec::new(),
+                stall_after: false,
+                ..Default::default()
+            }),
+        )
+        .await;
+        requester.update_peers(vec![
+            peer_at(first_node, first.local_addr()),
+            peer_at(second_node, second.local_addr()),
+        ]);
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&two_buckets());
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+
+        let landed = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![first_node, second_node],
+            two_buckets(),
+            (Granularity::Bucket, view_hash),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(
+            landed,
+            GroupPull::Landed(2 * crate::store::PART_COUNT as u64)
+        );
+        assert_eq!(
+            *second_handler.requested.lock().expect("fixture mutex"),
+            vec![vec![1u16]],
+            "the second donor is asked only for the bucket the first never finished"
+        );
+        assert!(
+            two_buckets()
+                .into_iter()
+                .all(|part| !residency.is_cold(part))
+        );
+
+        first.shutdown().await;
+        second.shutdown().await;
+        requester.shutdown().await;
+    }
+
+    /// A part-granular pull of thousands of parts, most of them empty,
+    /// finishes every part, and the donor records an ack for every one:
+    /// done frames and acks both cross their batch sizes.
+    #[tokio::test]
+    async fn a_pull_of_thousands_of_parts_finishes_and_acks_every_part() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        const PARTS: usize = 3_000;
+        let cache = SmolStr::new("prices");
+        let view_hash = 42;
+        let (donor_node, requester_node) = (NodeId::from(401), NodeId::from(402));
+        let parts: Vec<PartId> = PartId::all().step_by(7).take(PARTS).collect();
+        let first = parts[0];
+        let (donor, _donor_inbound) = spawn_mesh(
+            donor_node,
+            Arc::new(BucketPullHandler {
+                view_hash,
+                chunks: vec![(first.raw(), vec![sample_wire_record(1)])],
+                stall_after: false,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let (requester, _requester_inbound) = spawn_mesh(
+            requester_node,
+            Arc::new(BucketPullHandler {
+                view_hash: 0,
+                chunks: Vec::new(),
+                stall_after: false,
+                ..Default::default()
+            }),
+        )
+        .await;
+        requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+        donor.update_peers(vec![peer_at(requester_node, requester.local_addr())]);
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&parts);
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+
+        let landed = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![donor_node],
+            parts.clone(),
+            (Granularity::Part, view_hash),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(landed, GroupPull::Landed(PARTS as u64));
+        assert!(parts.iter().all(|&part| !residency.is_cold(part)));
+
+        let ids: Vec<u16> = parts.iter().map(|part| part.raw()).collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let acked = donor.acked_owners(&cache, &ids, Duration::from_secs(60), view_hash);
+            if acked.len() == PARTS {
+                assert!(
+                    acked
+                        .values()
+                        .all(|owners| owners.contains(&requester_node))
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of {PARTS} parts acked",
+                acked.len()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         donor.shutdown().await;
         requester.shutdown().await;
@@ -2094,7 +2516,7 @@ mod tests {
     /// donor stalls after landing it and the second donor re-sends it:
     /// guards the regression where a donor retry double-counted a bucket.
     #[tokio::test]
-    async fn try_donor_buckets_shares_credited_buckets_across_repeated_calls_for_one_group() {
+    async fn try_donor_parts_shares_credited_parts_across_repeated_calls_for_one_group() {
         use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
 
         let cache = SmolStr::new("prices");
@@ -2110,6 +2532,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: true,
+            ..Default::default()
         });
         let (first_donor, _first_donor_inbound) =
             spawn_mesh(first_donor_node, first_donor_handler).await;
@@ -2120,6 +2543,7 @@ mod tests {
                 (1u16, vec![sample_wire_record(2)]),
             ],
             stall_after: false,
+            ..Default::default()
         });
         let (second_donor, _second_donor_inbound) =
             spawn_mesh(second_donor_node, second_donor_handler).await;
@@ -2127,6 +2551,7 @@ mod tests {
             view_hash: 0,
             chunks: Vec::new(),
             stall_after: false,
+            ..Default::default()
         });
         let (requester, _requester_inbound) = spawn_mesh(requester_node, requester_handler).await;
         requester.update_peers(vec![
@@ -2135,22 +2560,22 @@ mod tests {
         ]);
 
         let residency = ResidencySet::new();
-        residency.mark_cold(&[0, 1]);
+        residency.mark_cold(&two_buckets());
         let shard = empty_shard();
-        let mut credited: HashSet<u16> = HashSet::new();
+        let mut credited: HashSet<PartId> = HashSet::new();
 
         // Mirrors pull_one_group's per-donor timeout; the first donor
         // stalls after bucket 1's chunk.
         let first_call = tokio::time::timeout(
             Duration::from_millis(200),
-            try_donor_buckets(
+            try_donor_parts(
                 &shard,
                 &requester,
                 &cache,
                 &residency,
                 first_donor_node,
-                vec![0, 1],
-                view_hash,
+                &two_buckets(),
+                (Granularity::Bucket, view_hash),
                 &mut credited,
             ),
         )
@@ -2162,20 +2587,20 @@ mod tests {
         );
         assert_eq!(
             credited,
-            HashSet::from([0]),
+            PartId::of_bucket(0).collect::<HashSet<_>>(),
             "bucket 0's BucketDone landed (flushed once bucket 1's chunk proved bucket 0 is \
              behind it) and was credited before the stall; bucket 1's own BucketDone never \
              arrived"
         );
 
-        let (result_second, count_second, cold_second) = try_donor_buckets(
+        let (result_second, count_second, cold_second) = try_donor_parts(
             &shard,
             &requester,
             &cache,
             &residency,
             second_donor_node,
-            vec![0, 1],
-            view_hash,
+            &two_buckets(),
+            (Granularity::Bucket, view_hash),
             &mut credited,
         )
         .await;
@@ -2191,7 +2616,7 @@ mod tests {
         assert!(!cold_second);
         assert_eq!(
             credited,
-            HashSet::from([0, 1]),
+            two_buckets().into_iter().collect::<HashSet<_>>(),
             "bucket 0 stays credited exactly once even though the second donor redelivered its \
              BucketDone; only bucket 1 is newly credited"
         );
@@ -2199,6 +2624,12 @@ mod tests {
         first_donor.shutdown().await;
         second_donor.shutdown().await;
         requester.shutdown().await;
+    }
+
+    /// Every part of buckets 0 and 1: what a bucket-mode view's pull of
+    /// those two buckets covers.
+    fn two_buckets() -> Vec<PartId> {
+        PartId::of_bucket(0).chain(PartId::of_bucket(1)).collect()
     }
 
     fn sample_wire_record(n: u8) -> crate::wire::WireRecord {

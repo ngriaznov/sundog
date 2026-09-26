@@ -238,7 +238,7 @@ bytes per entry, Dragonfly 131, and sundog 205 to 209 bytes per copy.
 | `Local` | its own data, nothing shared | nothing sent | local only | you want a fast in-process cache with TTL and bounded size, and no cluster traffic at all |
 | `Invalidation` (default) | its own working set | broadcasts "this key changed" | local, may be momentarily stale | the dataset is big or expensive to hold everywhere, and each node mostly cares about its own hot keys |
 | `Replicated` | a full copy of everything | broadcasts the value | always local, never waits on the network | the dataset is small enough to duplicate, and you want reads to never touch the network |
-| `Distributed` | the buckets it owns, `k` live owners per key (2 by default, via `Mode::distributed()`) | forwarded to the key's owners, applied only there | `get` is local-only; `fetch` asks an owner | the dataset is too big to hold on every node, but must survive a node loss |
+| `Distributed` | the parts it owns, `k` live owners per key (2 by default, via `Mode::distributed()`) | forwarded to the key's owners, applied only there | `get` is local-only; `fetch` asks an owner | the dataset is too big to hold on every node, but must survive a node loss |
 
 `Invalidation` never sends values between nodes: a write on A tells B "your copy
 of this key is stale," and B drops it or reloads it on next access. `Replicated`
@@ -247,18 +247,20 @@ existing peer that has finished its own, then reconciling with every other
 peer once. It also keeps a background anti-entropy loop running while the
 cache is open.
 
-`Distributed` splits a cache into 1,024 anti-entropy buckets
-(`xxh3(key) & 1023`), each assigned to its `k` live owners by rendezvous
-hashing over the peers that advertise the same cache under the same mode and
-owner count. The view recomputes from gossip membership, so ownership
-converges a few gossip intervals after a join or leave, not instantly. A node
-that gains a bucket pulls it from the previous owners. One that loses a bucket
-keeps serving it for `distributed_disown_grace_rounds` anti-entropy intervals,
-then hands it to each new owner in one anti-entropy round and drops it only
-once every owner has answered. Until a gained bucket's pull lands, a `fetch`
-that misses it locally asks the other owners first. A write for a
-bucket this node doesn't own is forwarded to that bucket's owners and never
-applied locally, so nothing external needs to route it, though a local `get`
+`Distributed` splits a cache into 65,536 parts (`xxh3(key) & 0xFFFF`: the
+1,024 anti-entropy buckets, 64 parts each), each assigned to its `k` live
+owners by rendezvous hashing over the peers that advertise the same cache
+under the same mode and owner count. At 100 nodes and two owners the busiest
+node holds about 8% more than an even share and the lightest about 11% less,
+and a join moves only the parts the joiner takes. The view recomputes from gossip
+membership, so ownership converges a few gossip intervals after a join or
+leave, not instantly. A node that gains a part pulls it from the previous
+owners. One that loses a part keeps serving it for
+`distributed_disown_grace_rounds` anti-entropy intervals, then hands it to
+each new owner in one anti-entropy round and drops it only once every owner
+has answered. Until a gained part's pull lands, a `fetch` that misses it
+locally asks the other owners first. A write for a part this node doesn't
+own is forwarded to that part's owners and never applied locally, so nothing external needs to route it, though a local `get`
 right after a forwarded write still misses, since only the owners hold it.
 Every forwarded batch carries the writer's view hash. An owner whose own
 view differs passes the batch on once more to the owners it knows, so a
@@ -267,7 +269,8 @@ current owner.
 `get` stays local-only everywhere, returning `None` off a non-owner. `fetch`
 is the network-aware read, trying live owners in rendezvous order and
 returning `Ok(None)` for a genuine miss or `CacheError::FetchUnavailable` once
-every owner has timed out inside `fetch_timeout`. `owners_of` reports a key's
+every owner has timed out inside `fetch_timeout`, or while the part is still
+cold on every owner that answered. `owners_of` reports a key's
 current owners in that same order. `owners` must be 2 or more
 (`CacheError::TooFewOwners` otherwise), a finite `max_capacity` needs a
 `spill` tier the same way `Replicated` does, `tti` is rejected outright, and
@@ -277,7 +280,7 @@ two peers disagreeing on `owners` for the same cache name hit
 ```rust
 let prices = cluster
     .cache::<Sku, Price>("prices")
-    .mode(Mode::distributed()) // k = 2 owners per bucket
+    .mode(Mode::distributed()) // k = 2 owners per part
     .open()
     .await?;
 
@@ -300,13 +303,22 @@ answers a peer only with what that peer's version understands: an older peer
 never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
-The current release speaks protocol 3 and serves protocol 2, the release
+The current release speaks protocol 5 and serves protocol 4, the release
 before it. A container test runs the previous release's node against the
 current one in both roles. Distribution mode's message kinds (`Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
 `StBucketChunk`, `ForwardBatch`, and `StaleView`) are gated on protocol 3: a distributed cache forms only among protocol-3
 peers advertising it, and a protocol-2 peer mid-rollout is never eligible to
-own a bucket and never receives one of these messages at all.
+own a part and never receives one of these messages at all.
+
+Protocol 5 ranks each of a distributed cache's 65,536 parts on its own and
+adds `AeDigestMasked`: anti-entropy under part ranking sends one digest per
+bucket, folded over the parts both nodes own. A protocol-4 node ranks whole
+buckets, so while any eligible node speaks protocol 4 every node keeps
+ranking whole buckets. When the last protocol-4 node leaves, every node
+switches to part ranking within a few gossip intervals. Most parts change owners at that moment: the switch runs as one
+large rebalance, with every lost part served through its disown grace and
+handed to its new owners before it is dropped. Upgrade outside peak load.
 
 ## How nodes find each other
 
@@ -518,26 +530,28 @@ ordinary wipe-and-recreate path, with `reason` naming why for a fallback
 empty for `warm`), and `sundog_spill_reopen_records_total{cache}`, how many
 records a warm reopen replayed.
 
-A `Mode::Distributed` cache adds seven more:
+A `Mode::Distributed` cache adds eight more:
 
-- `sundog_owned_buckets{cache}`, this node's current bucket count.
-- `sundog_rebalance_buckets_total{cache, direction}`, buckets rebalance
-  pulled `in`, released `out`, or `served` to another node's pull, credited
-  per bucket the moment its own pull lands or its own release fires, not
-  batched behind the rest of a multi-bucket transfer, and per stream on the
-  donor once the stream runs to its end.
+- `sundog_owned_parts{cache}`, this node's current part count.
+- `sundog_owned_buckets{cache}`, the same share in buckets: owned parts over
+  64, fractional once parts are ranked on their own.
+- `sundog_rebalance_parts_total{cache, direction}`, parts rebalance pulled
+  `in`, released `out`, or `served` to another node's pull, credited per
+  part the moment its own pull lands or its own release fires, not batched
+  behind the rest of a multi-part transfer, and per stream on the donor once
+  the stream runs to its end.
 - `sundog_rebalance_pull_timeouts_total{cache}`, warm-ups that gave up on a
-  bucket pull timing out repeatedly and opened warm with whatever landed,
+  part pull timing out repeatedly and opened warm with whatever landed,
   leaving the rest to anti-entropy.
 - `sundog_fetch_total{cache, outcome}`, each `Cache::fetch` call's outcome
   (`local`, `remote`, `miss`, or `error`).
 - `sundog_forwarded_writes_total{cache}`, writes this node forwarded to a
-  bucket's owners instead of applying, or passed on because they arrived
+  part's owners instead of applying, or passed on because they arrived
   under another node's view.
 - `sundog_stale_view_total{cache}`, anti-entropy rounds a peer declined over
   a mismatched ownership view.
 - `sundog_unowned_inbound_dropped_total{cache}`, inbound records dropped for
-  a bucket this node neither owns nor is mid disown-grace on.
+  a part this node neither owns nor is mid disown-grace on.
 
 `Cluster::is_ready()` and `Cluster::health()` report whether every open
 `Mode::Replicated` cache has finished its state transfer. A `Local` or

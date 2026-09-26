@@ -53,6 +53,7 @@ use crate::node::NodeId;
 use crate::wire::WireRecord;
 
 use super::crdt;
+use super::part::PartSet;
 #[cfg(feature = "spill")]
 pub(crate) use super::spill::Reservation;
 #[cfg(feature = "spill")]
@@ -61,7 +62,8 @@ use super::spill::{
 };
 use super::{
     BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
-    PART_COUNT, PartEntries, Quiescence, RecordView, Tombstone, Weigher, Winner, entry_fingerprint,
+    PART_COUNT, PartEntries, PartId, Quiescence, RecordView, Tombstone, Weigher, Winner,
+    entry_fingerprint,
 };
 
 /// A never-constructed placeholder for
@@ -4249,6 +4251,93 @@ where
         removed_total
     }
 
+    /// [`Engine::release_buckets`] for single parts: drops every live entry
+    /// and tombstone in `parts`, zeroes their part digests, and leaves the
+    /// rest of each bucket untouched. A bucket named by all
+    /// [`PART_COUNT`] of its parts takes the whole-bucket path. Returns the
+    /// total entries removed, live and tombstoned together.
+    pub(crate) fn release_parts(&self, parts: &[PartId]) -> u64 {
+        let mut masks: HashMap<u16, u64> = HashMap::new();
+        for part in parts {
+            *masks.entry(part.bucket()).or_default() |= 1u64 << part.part();
+        }
+        let mut removed_total = 0u64;
+        for (bucket, mask) in masks {
+            if mask == u64::MAX {
+                removed_total = removed_total.saturating_add(self.release_buckets(&[bucket]));
+                continue;
+            }
+            let released =
+                |key: &[u8]| mask & (1u64 << part_index_from_hash(hash_key_bytes(key))) != 0;
+            let bucket_idx = usize::from(bucket);
+            let (removed_weight, removed_live, removed_tombstones, removed_spilled) = {
+                let mut stripe = self.stripes[bucket_idx].write();
+                let mut removed_weight = 0u64;
+                let mut removed_live = 0u64;
+                let mut removed_spilled = 0usize;
+                stripe.live.retain(hasher_for, |live| {
+                    if released(record_key(&live.record)) {
+                        removed_weight += u64::from(live.weight);
+                        removed_live += 1;
+                        if is_spilled(live) {
+                            removed_spilled += 1;
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let before = stripe.tombstones.len();
+                stripe.tombstones.retain(|key, _| !released(key));
+                let removed_tombstones = before - stripe.tombstones.len();
+                stripe.long_ttl.retain(|key, _| !released(key));
+                (
+                    removed_weight,
+                    removed_live,
+                    removed_tombstones,
+                    removed_spilled,
+                )
+            };
+            for part in 0..PART_COUNT {
+                if mask & (1u64 << part) != 0 {
+                    self.digest[digest_slot(bucket_idx, part)].store(0, Ordering::Relaxed);
+                }
+            }
+            if removed_weight > 0 {
+                self.total_weight
+                    .fetch_sub(removed_weight, Ordering::Relaxed);
+            }
+            if removed_live > 0 {
+                self.live_count.fetch_sub(removed_live, Ordering::Relaxed);
+            }
+            self.note_spill_departures(removed_spilled);
+            removed_total = removed_total
+                .saturating_add(removed_live)
+                .saturating_add(u64::try_from(removed_tombstones).unwrap_or(u64::MAX));
+        }
+        removed_total
+    }
+
+    /// Every part holding at least one live entry or un-GC'd tombstone,
+    /// ascending: one stripe read lock at a time, skipping empty stripes
+    /// without touching an entry.
+    pub(crate) fn held_parts(&self) -> Vec<PartId> {
+        let mut held = PartSet::new();
+        for stripe in &*self.stripes {
+            let stripe = stripe.read();
+            if stripe.live.len() == 0 && stripe.tombstones.is_empty() {
+                continue;
+            }
+            for live in stripe.live.iter() {
+                held.insert(PartId::from_hash(hash_key_bytes(record_key(&live.record))));
+            }
+            for key in stripe.tombstones.keys() {
+                held.insert(PartId::from_hash(hash_key_bytes(key)));
+            }
+        }
+        held.iter().collect()
+    }
+
     /// The lock-protected first half of [`super::Shard::get_or_load`]: a
     /// fast-path re-check, then either joining an already in-flight load or
     /// registering as the new owner.
@@ -6177,6 +6266,128 @@ mod tests {
             Some("untouched".to_string()),
             "a different bucket's entry survives release"
         );
+    }
+
+    /// The first two keys of `0..limit` sharing a bucket but not a part.
+    fn same_bucket_different_parts(limit: u32) -> (u32, u32) {
+        let mut by_bucket: HashMap<usize, Vec<u32>> = HashMap::new();
+        for k in 0..limit {
+            let hash = hash_key_bytes(key_bytes(k).as_ref());
+            let keys = by_bucket.entry(stripe_index_from_hash(hash)).or_default();
+            if let Some(&first) = keys.iter().find(|&&other| {
+                part_index_from_hash(hash_key_bytes(key_bytes(other).as_ref()))
+                    != part_index_from_hash(hash)
+            }) {
+                return (first, k);
+            }
+            keys.push(k);
+        }
+        panic!("no same-bucket, different-part pair within the first {limit} keys");
+    }
+
+    #[test]
+    fn release_parts_drops_only_the_named_part_and_resets_only_its_digest() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let (released_key, kept_key) = same_bucket_different_parts(100_000);
+        let released = PartId::from_hash(hash_key_bytes(key_bytes(released_key).as_ref()));
+        let kept = PartId::from_hash(hash_key_bytes(key_bytes(kept_key).as_ref()));
+        assert_eq!(released.bucket(), kept.bucket());
+        let bucket = usize::from(released.bucket());
+
+        let _ = put(
+            &engine,
+            released_key,
+            key_bytes(released_key),
+            "released".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        let _ = put(
+            &engine,
+            kept_key,
+            key_bytes(kept_key),
+            "kept".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        let kept_digest =
+            engine.digest[digest_slot(bucket, usize::from(kept.part()))].load(Ordering::Relaxed);
+        assert_ne!(kept_digest, 0);
+
+        let removed = engine.release_parts(&[released]);
+
+        assert_eq!(removed, 1, "only the released part's entry goes");
+        assert_eq!(engine.get(&released_key, 0), None);
+        assert_eq!(engine.get(&kept_key, 0), Some("kept".to_string()));
+        assert_eq!(
+            engine.digest[digest_slot(bucket, usize::from(released.part()))]
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            engine.digest[digest_slot(bucket, usize::from(kept.part()))].load(Ordering::Relaxed),
+            kept_digest,
+            "the bucket's other part keeps its digest"
+        );
+        assert_eq!(engine.held_parts(), vec![kept]);
+    }
+
+    #[test]
+    fn release_parts_drops_a_released_part_s_tombstone_too() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let (released_key, kept_key) = same_bucket_different_parts(100_000);
+        let released = PartId::from_hash(hash_key_bytes(key_bytes(released_key).as_ref()));
+        tombstone(&engine, released_key, key_bytes(released_key), hlc(1, 1), 0);
+        tombstone(&engine, kept_key, key_bytes(kept_key), hlc(1, 1), 0);
+        assert_eq!(engine.held_parts().len(), 2, "a tombstone holds its part");
+
+        assert_eq!(engine.release_parts(&[released]), 1);
+        assert_eq!(
+            engine.held_parts(),
+            vec![PartId::from_hash(hash_key_bytes(
+                key_bytes(kept_key).as_ref()
+            ))]
+        );
+    }
+
+    #[test]
+    fn release_parts_of_every_part_of_a_bucket_is_releasing_the_bucket() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let (live_key, tomb_key, bucket) = same_bucket_pair(100_000);
+        let _ = put(
+            &engine,
+            live_key,
+            key_bytes(live_key),
+            "live".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        tombstone(&engine, tomb_key, key_bytes(tomb_key), hlc(1, 1), 0);
+        let whole: Vec<PartId> = PartId::of_bucket(u16::try_from(bucket).expect("fits")).collect();
+
+        assert_eq!(engine.release_parts(&whole), 2);
+        assert_eq!(engine.debug_totals(), (0, 0));
+        assert!(engine.held_parts().is_empty());
+    }
+
+    #[test]
+    fn held_parts_names_each_part_holding_an_entry_once() {
+        let engine = engine_u32_string(u64::MAX, None);
+        assert!(engine.held_parts().is_empty());
+        let keys = [1u32, 2, 3, 1];
+        for key in keys {
+            let _ = put(&engine, key, key_bytes(key), "v".into(), hlc(1, 1), None, 0);
+        }
+        let mut expected: Vec<PartId> = keys
+            .iter()
+            .map(|&key| PartId::from_hash(hash_key_bytes(key_bytes(key).as_ref())))
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(engine.held_parts(), expected);
     }
 
     #[test]

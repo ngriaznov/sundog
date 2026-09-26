@@ -25,7 +25,7 @@
 
 use std::env;
 use std::io::Write as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -187,6 +187,29 @@ fn bool_env(name: &str) -> bool {
 /// `Mode::distributed()` when `owners` is absent, or `Mode::Distributed`
 /// with that count when present and at least 2. Any other `mode` string, or
 /// an `owners` under 2, is an `Err` naming the problem.
+/// The IP every listener binds, `SUNDOG_TESTNODE_BIND_IP`: all interfaces
+/// by default, as a container wants, or one loopback address apiece when
+/// many test nodes share a host.
+fn bind_ip_from_env(raw: Option<&str>) -> Result<IpAddr, String> {
+    raw.map_or(Ok(IpAddr::from([0, 0, 0, 0])), |raw| {
+        raw.parse()
+            .map_err(|error| format!("SUNDOG_TESTNODE_BIND_IP must be an IP address: {error}"))
+    })
+}
+
+/// Whether the replicated side caches the `churn`, `pn*` and `os*` commands
+/// drive open, `SUNDOG_TESTNODE_SIDE_CACHES`: on unless it reads `off`, so
+/// a scale run exercises `"it"` alone.
+fn side_caches_from_env(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(other) => Err(format!(
+            "SUNDOG_TESTNODE_SIDE_CACHES must be \"on\" or \"off\", got {other:?}"
+        )),
+    }
+}
+
 fn mode_from_env(mode: Option<&str>, owners: Option<u8>) -> Result<Mode, String> {
     match mode {
         None | Some("replicated") => Ok(Mode::Replicated),
@@ -446,8 +469,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let it_mode = mode_from_env(env::var("SUNDOG_TESTNODE_MODE").ok().as_deref(), owners)?;
     let it_resolver = resolver_kind_from_env(env::var("SUNDOG_TESTNODE_RESOLVER").ok().as_deref())?;
 
+    let bind_ip = bind_ip_from_env(env::var("SUNDOG_TESTNODE_BIND_IP").ok().as_deref())?;
+    let side_caches =
+        side_caches_from_env(env::var("SUNDOG_TESTNODE_SIDE_CACHES").ok().as_deref())?;
     let config = ClusterConfig::default().with(|c| {
-        c.gossip_bind_addr = SocketAddr::from(([0, 0, 0, 0], GOSSIP_PORT));
+        c.gossip_bind_addr = SocketAddr::new(bind_ip, GOSSIP_PORT);
+        c.data_bind_addr = SocketAddr::new(bind_ip, 0);
         // Faster than the default so container tests converge in seconds.
         c.ae_interval = Duration::from_secs(2);
         // Covers the 16 s bucket release window a distributed cache needs.
@@ -467,44 +494,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Cluster::builder(cluster_name).seeds(seeds).config(config);
     #[cfg(feature = "prometheus")]
     {
-        builder = builder.prometheus_listen(SocketAddr::from(([0, 0, 0, 0], METRICS_PORT)));
+        builder = builder.prometheus_listen(SocketAddr::new(bind_ip, METRICS_PORT));
     }
     let cluster = builder.build().await?;
 
     let cache = open_it_cache(&cluster, it_mode, it_resolver).await?;
-    let churn = cluster
-        .cache::<String, String>(CHURN_CACHE_NAME)
-        .mode(Mode::Replicated)
-        .ttl(CHURN_TTL)
-        .open()
-        .await?;
-    let pn = cluster
-        .cache::<String, PnCounter>(PN_CACHE_NAME)
-        .mode(Mode::Replicated)
-        .resolver(Arc::new(PnCounterResolver))
-        .open()
-        .await?;
-    let os = cluster
-        .cache::<String, OrSet<String>>(OS_CACHE_NAME)
-        .mode(Mode::Replicated)
-        .resolver(Arc::new(OrSetResolver::<String>::new()))
-        .open()
-        .await?;
-    // This process's next `OrSet::add` sequence number: shared across every
-    // control connection and every key, since it only has to be unique per
-    // writer incarnation, not per key. Starts at zero every process start,
-    // matching a fresh incarnation's fresh tag space.
-    let os_seq = Arc::new(AtomicU64::new(0));
+    let side = if side_caches {
+        Some(SideCaches::open(&cluster).await?)
+    } else {
+        None
+    };
     let node = TestNode {
         cache,
-        churn,
-        pn,
-        os,
-        os_seq,
+        side,
         cluster,
     };
 
-    let listener = TcpListener::bind(("0.0.0.0", CONTROL_PORT)).await?;
+    let listener = TcpListener::bind((bind_ip, CONTROL_PORT)).await?;
     // A container stop sends SIGTERM: leave the cluster and checkpoint a
     // warm-reopen spill tier; `quit`/`crash` exit with no leave.
     let stop = stop_requested();
@@ -585,11 +591,92 @@ fn ok_reply(result: Result<(), impl std::fmt::Display>) -> String {
 #[derive(Clone)]
 struct TestNode {
     cache: Cache<String, String>,
+    side: Option<SideCaches>,
+    cluster: Cluster,
+}
+
+/// The replicated caches beside `"it"`, absent under
+/// `SUNDOG_TESTNODE_SIDE_CACHES=off`.
+#[derive(Clone)]
+struct SideCaches {
     churn: Cache<String, String>,
     pn: Cache<String, PnCounter>,
     os: Cache<String, OrSet<String>>,
     os_seq: Arc<AtomicU64>,
-    cluster: Cluster,
+}
+
+impl SideCaches {
+    async fn open(cluster: &Cluster) -> Result<Self, Box<dyn std::error::Error>> {
+        let churn = cluster
+            .cache::<String, String>(CHURN_CACHE_NAME)
+            .mode(Mode::Replicated)
+            .ttl(CHURN_TTL)
+            .open()
+            .await?;
+        let pn = cluster
+            .cache::<String, PnCounter>(PN_CACHE_NAME)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await?;
+        let os = cluster
+            .cache::<String, OrSet<String>>(OS_CACHE_NAME)
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(OrSetResolver::<String>::new()))
+            .open()
+            .await?;
+        // This process's next `OrSet::add` sequence number: shared across
+        // every control connection and every key, since it only has to be
+        // unique per writer incarnation, not per key. Starts at zero every
+        // process start, matching a fresh incarnation's fresh tag space.
+        let os_seq = Arc::new(AtomicU64::new(0));
+        Ok(Self {
+            churn,
+            pn,
+            os,
+            os_seq,
+        })
+    }
+
+    /// Runs one side-cache command: `churn`, `ccount`, `pn*` or `os*`.
+    async fn dispatch(&self, command: &str, parts: &mut std::str::SplitN<'_, char>) -> Reply {
+        match command {
+            // churn n -> ok | err <e>, running n ops (3:1 insert:remove) over CHURN_KEYSPACE keys.
+            "churn" => {
+                let Some(ops) = parse_arg::<u32>(parts.next()) else {
+                    return Reply::Line("err churn needs a u32 op count".to_string());
+                };
+                for i in 0..ops {
+                    let key = format!("c{}", i % CHURN_KEYSPACE);
+                    let result = if i % 4 == 3 {
+                        self.churn.remove(&key).await
+                    } else {
+                        self.churn.insert(key, format!("v{i}")).await
+                    };
+                    if let Err(error) = result {
+                        return Reply::Line(format!("err {error}"));
+                    }
+                }
+                Reply::Line("ok".to_string())
+            }
+            // ccount -> <n>, "churn"'s live-entry count.
+            "ccount" => Reply::Line(self.churn.entry_count().await.to_string()),
+            "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
+                pn_command(&self.pn, self.pn.writer_id(), command, parts.next()).await
+            }
+            _ => {
+                os_command(
+                    &self.os,
+                    self.os.writer_id(),
+                    &self.os_seq,
+                    command,
+                    parts.next(),
+                    parts.next(),
+                )
+                .await
+            }
+        }
+    }
 }
 
 impl TestNode {
@@ -634,42 +721,16 @@ impl TestNode {
                 let entries = (0..count).map(|i| (format!("k{i}"), format!("v{i}")));
                 Reply::Line(ok_reply(self.cache.insert_many(entries).await))
             }
-            // churn n -> ok | err <e>, running n ops (3:1 insert:remove) over CHURN_KEYSPACE keys.
-            "churn" => {
-                let Some(ops) = parse_arg::<u32>(parts.next()) else {
-                    return Reply::Line("err churn needs a u32 op count".to_string());
+            // The replicated side caches' commands; see `SideCaches::dispatch`.
+            "churn" | "ccount" | "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump"
+            | "osadd" | "osremove" | "osmembers" => {
+                let Some(side) = &self.side else {
+                    return Reply::Line("err side caches are off".to_string());
                 };
-                for i in 0..ops {
-                    let key = format!("c{}", i % CHURN_KEYSPACE);
-                    let result = if i % 4 == 3 {
-                        self.churn.remove(&key).await
-                    } else {
-                        self.churn.insert(key, format!("v{i}")).await
-                    };
-                    if let Err(error) = result {
-                        return Reply::Line(format!("err {error}"));
-                    }
-                }
-                Reply::Line("ok".to_string())
+                side.dispatch(command, &mut parts).await
             }
-            // ccount -> <n>, "churn"'s live-entry count.
-            "ccount" => Reply::Line(self.churn.entry_count().await.to_string()),
             "bigfill" | "bigcheck" | "bigput" | "bigverify" => {
                 big_command(&self.cache, command, &mut parts).await
-            }
-            "pnfill" | "pncount" | "pnget" | "pnbytes" | "pndump" => {
-                pn_command(&self.pn, self.pn.writer_id(), command, parts.next()).await
-            }
-            "osadd" | "osremove" | "osmembers" => {
-                os_command(
-                    &self.os,
-                    self.os.writer_id(),
-                    &self.os_seq,
-                    command,
-                    parts.next(),
-                    parts.next(),
-                )
-                .await
             }
             // drop k -> ok, dropping k's local copy with no tombstone.
             "drop" => {
@@ -1102,6 +1163,24 @@ mod tests {
     }
 
     #[test]
+    fn bind_ip_from_env_defaults_to_every_interface_and_reads_an_address() {
+        assert_eq!(bind_ip_from_env(None), Ok(IpAddr::from([0, 0, 0, 0])));
+        assert_eq!(
+            bind_ip_from_env(Some("127.0.0.42")),
+            Ok(IpAddr::from([127, 0, 0, 42]))
+        );
+        assert!(bind_ip_from_env(Some("n42")).is_err());
+    }
+
+    #[test]
+    fn side_caches_from_env_is_on_unless_off() {
+        assert_eq!(side_caches_from_env(None), Ok(true));
+        assert_eq!(side_caches_from_env(Some("on")), Ok(true));
+        assert_eq!(side_caches_from_env(Some("off")), Ok(false));
+        assert!(side_caches_from_env(Some("no")).is_err());
+    }
+
+    #[test]
     fn mode_from_env_defaults_to_replicated() {
         assert_eq!(mode_from_env(None, None), Ok(Mode::Replicated));
     }
@@ -1507,33 +1586,12 @@ mod tests {
             .open()
             .await
             .expect("\"it\" opens");
-        let churn = cluster
-            .cache::<String, String>(CHURN_CACHE_NAME)
-            .mode(Mode::Replicated)
-            .ttl(CHURN_TTL)
-            .open()
+        let side = SideCaches::open(&cluster)
             .await
-            .expect("\"churn\" opens");
-        let pn = cluster
-            .cache::<String, PnCounter>(PN_CACHE_NAME)
-            .mode(Mode::Replicated)
-            .resolver(Arc::new(PnCounterResolver))
-            .open()
-            .await
-            .expect("\"pn\" opens");
-        let os = cluster
-            .cache::<String, OrSet<String>>(OS_CACHE_NAME)
-            .mode(Mode::Replicated)
-            .resolver(Arc::new(OrSetResolver::<String>::new()))
-            .open()
-            .await
-            .expect("\"os\" opens");
+            .expect("the side caches open");
         TestNode {
             cache,
-            churn,
-            pn,
-            os,
-            os_seq: Arc::new(AtomicU64::new(0)),
+            side: Some(side),
             cluster,
         }
     }
@@ -1553,6 +1611,26 @@ mod tests {
         assert_eq!(reply_line(node.dispatch("get k").await), "val v");
         assert_eq!(reply_line(node.dispatch("count").await), "1");
         assert_eq!(reply_line(node.dispatch("get missing").await), "none");
+        node.cluster.clone().shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_through_test_node_declines_side_cache_commands_with_the_side_caches_off() {
+        let mut node = test_node("testnode-dispatch-side-off").await;
+        assert_eq!(reply_line(node.dispatch("ccount").await), "0");
+        node.side = None;
+        for line in ["churn 4", "ccount", "pncount", "osmembers k"] {
+            assert_eq!(
+                reply_line(node.dispatch(line).await),
+                "err side caches are off",
+                "{line}"
+            );
+        }
+        assert_eq!(
+            reply_line(node.dispatch("count").await),
+            "0",
+            "\"it\" still answers"
+        );
         node.cluster.clone().shutdown().await;
     }
 

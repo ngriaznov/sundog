@@ -7,6 +7,12 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **`store::PartId`** names one of a distributed cache's 65,536 parts:
+  `PartId::of_key`, `bucket`, `part`, `raw`, and `PartId::all` and
+  `PartId::of_bucket` to walk them. `ShardOps` gains `held_parts`,
+  `release_parts`, `is_cold_part` and `is_unverified_part`, each with a
+  default, alongside the bucket forms it keeps.
+
 - **Clock-skew guard**: `ClusterConfig::max_clock_skew`, one minute by
   default, bounds how far ahead of a node's clock a remote record's
   stamp may be. A record stamped further ahead, whether replicated,
@@ -29,16 +35,24 @@ All notable changes to this project are documented in this file. Format follows
   and write p99, and `weekly-bench.yml` runs the set weekly and posts the
   report on the run's summary page.
 - **Kani proofs**: `#[kani::proof]` harnesses under each module's
-  `kani_proofs` prove, over every input, that expiry packing and the
-  touch stamp round-trip, a hash lands inside the bucket and part tables,
-  the compaction shrink rule fires only at an eighth of an allocation, a
+  `kani_proofs` prove, over every input, that expiry packing and the touch
+  stamp round-trip, a hash lands inside the bucket and part tables, the
+  compaction shrink rule fires only at an eighth of an allocation, a
   reconciliation retry never outruns its cap or time budget and the loop
-  stops at every bound, the gossip bind retry moves only a port-0
-  request within its cap, the anti-entropy skip rule keeps its bound, the
-  hybrid logical clock advances past both the last and
-  the observed stamp, a replicate frame length never overflows, and spill
-  sizing stays within its clamps. `weekly-kani.yml` runs them weekly and
-  the release gate requires a green run.
+  stops at every bound, the gossip bind retry moves only a port-0 request
+  within its cap, the anti-entropy skip rule keeps its bound, the hybrid
+  logical clock advances past both the last and the observed stamp, a
+  replicate frame length never overflows, spill sizing stays within its
+  clamps, a part id round-trips through every representation, every part
+  owns its own bit of a part set, a part mask holds exactly its parts and
+  its digest fold splits over disjoint masks, the bounded top-`k` owner
+  selection keeps the first `k` in rank order, carrying a part's owners
+  across a membership change ranks them as a full ranking does, a wire id
+  names its parts back at either granularity, a view ranks parts only when
+  every peer speaks part ownership, the owned-bucket gauge is the part count
+  over 64, and a pull serves its ids in ascending single-bucket runs.
+  `weekly-kani.yml` runs them weekly and the release gate requires a green
+  run.
 - **Entry diet**: a live entry stores one encoded record (key length, key,
   and value in the postcard form the wire already uses) instead of a typed
   key and value plus a separate encoded copy, and that record is an enum,
@@ -340,6 +354,41 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- **`Mode::Distributed` owns parts, not buckets.** A distributed cache's
+  65,536 parts, the 64 anti-entropy parts of each of the 1,024 buckets, are
+  each ranked on their own by rendezvous hashing. At 100 nodes and two
+  owners the busiest node holds about 8% more than an even share and the
+  lightest about 11% less, where whole buckets left the busiest node about
+  60% over and the lightest about half; a join moves only the parts the
+  joiner takes. A membership change builds each node's new view from its
+  last one: a join ranks only each part's owners and the newcomer, and a
+  leave re-ranks only the parts the leaver owned, so at 100 nodes a view
+  change takes about 4 ms where ranking every part afresh takes 100 ms. Rebalance pulls, the disown-grace
+  hand-off, release, warm reopen and scoped anti-entropy all work part by
+  part. The wire protocol is 5 and adds `Msg::AeDigestMasked`: scoped
+  anti-entropy under a part view sends, per bucket, a mask of the parts
+  both nodes own and the XOR of those parts' digests, so an idle round
+  costs one entry per bucket at any cluster size, and a bucket that
+  differs answers with its part digests. Under a part view the `u16` ids
+  that `StBuckets` carries name parts, and the view hash both sides
+  already compare tells them apart. A node ranks whole buckets
+  while any eligible peer speaks protocol 4, so a mixed cluster keeps the
+  ownership its older members compute. When the last protocol-4 node
+  leaves, every node switches to ranking parts and most parts change
+  owners at once: that switch runs as one large rebalance, every lost part
+  served through its disown grace before it is dropped.
+- **`sundog_rebalance_buckets_total` is now `sundog_rebalance_parts_total`**,
+  counting parts pulled `in`, released `out` or `served`, and
+  `sundog_owned_parts{cache}` reports the parts a node owns.
+  `sundog_owned_buckets{cache}` stays, as owned parts over 64: fractional
+  under part ranking, and still summing to `1024 × owners` across the
+  cluster.
+- **`StBucketDone` frames go out in batches.** A donor flushes a run of
+  finished ids at once and reads the requester's acks between batches, and
+  the requester flushes its acks every 256 or at the next chunk, so a pull
+  of thousands of mostly empty parts costs a few flushes, not one per part.
+  A retried pull asks only for the parts no earlier attempt finished.
+
 - **A stripe's entry array grows by a quarter instead of doubling.** A
   stripe that just outgrew a power of two no longer leaves close to half
   its 56-byte entry slots empty; the array stays at least four fifths
@@ -379,6 +428,24 @@ All notable changes to this project are documented in this file. Format follows
   `crash` exit without leaving.
 
 ### Fixed
+
+- **A warm-reopened part is never served unverified because its donors
+  were cold.** A `Mode::Distributed` node reopening a spill tier pulls
+  each part its replay covers from the part's co-owners. When every
+  co-owner declined as cold, still pulling the part itself, the pull
+  marked the replayed part servable, and a key missing from the replay
+  read as a miss until anti-entropy repaired it. Such a part now stays
+  unverified, so `fetch` asks its other owners, and the warm-up retries
+  the pull every `ae_interval` until a donor is warm, opening warm with
+  what landed after three attempts as a timed-out pull does.
+
+- **`fetch` never answers a miss from a cold part.** A `Mode::Distributed`
+  node that owns a key's part but has not pulled it yet asks the part's
+  other owners on a local miss. When every one of them declined, `fetch`
+  returned the local miss, although the node that handed the part over
+  still holds the record through its disown grace. `fetch` now returns
+  `CacheError::FetchUnavailable` until the part is warm or another owner
+  answers from a warm copy.
 
 - **A `Mode::Distributed` write accepted before the cluster formed reaches
   its owners at once.** A node that opens the cache before its peers do

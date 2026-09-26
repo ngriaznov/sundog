@@ -5,7 +5,7 @@
 | `Local` | its own entries | stays on this node | local | you want an in-process cache with TTL and a size bound, and no cluster traffic |
 | `Invalidation` (default) | its own working set | drops the key on every other node | local | the dataset is too large to hold everywhere and each node serves mostly its own hot keys |
 | `Replicated` | every entry | sends the value to every node | local, never waits on the network | the dataset fits on one node and reads must never touch the network |
-| `Distributed` | the buckets it owns | goes to the key's owners | `get` is local; `fetch` asks an owner | the dataset is too large for one node and must survive a node loss |
+| `Distributed` | the parts it owns | goes to the key's owners | `get` is local; `fetch` asks an owner | the dataset is too large for one node and must survive a node loss |
 
 Every node gossips the mode of each cache it has open. Opening a name
 under a mode that conflicts with a live peer's fails with
@@ -48,27 +48,34 @@ to move cold entries to disk. `open` returns
 
 ## Distributed
 
-A `Distributed` cache splits its keys into 1,024 buckets and assigns each
-bucket to `owners` live nodes by rendezvous hashing. `Mode::distributed()`
-uses two owners, and `owners` must be at least 2.
+A `Distributed` cache splits its keys into 65,536 parts, 64 in each of the
+1,024 anti-entropy buckets, and assigns each part to `owners` live nodes by
+rendezvous hashing. `Mode::distributed()` uses two owners, and `owners`
+must be at least 2. At 100 nodes and two owners the busiest node holds
+about 8% more than an even share, and a join moves only the parts the
+joiner takes. Anti-entropy between two owners compares one digest per
+bucket, folded over the parts they share, so an idle round costs the same
+at any cluster size.
 
-A write for a bucket this node does not own goes to that bucket's owners.
+A write for a part this node does not own goes to that part's owners.
 `get` reads this node's copy and returns `None` off a non-owner. `fetch` is
-the network-aware read: it answers locally when this node owns the bucket
+the network-aware read: it answers locally when this node owns the part
 and otherwise asks the owners in order, returning `Ok(None)` for a real
 miss or `CacheError::FetchUnavailable` when no owner answers within
-`fetch_timeout`. `owners_of` reports a key's owners.
+`fetch_timeout`, or while the part is still cold on every owner that
+answers. A part is cold on its new owner until the owner has pulled it,
+a few seconds after a membership change. `owners_of` reports a key's owners.
 
 ```rust
 {{#include ../cookbook/src/deploy.rs:distributed}}
 ```
 
 When a node joins or leaves, ownership follows gossip within a few gossip
-intervals. A node that gains a bucket pulls it from the previous owners. A
+intervals. A node that gains a part pulls it from the previous owners. A
 node that loses one keeps serving it for `distributed_disown_grace_rounds`
 anti-entropy intervals, hands it to each new owner, and drops it once every
-owner confirms. A lost bucket that no other previous owner still owns, as
-when a node opened the cache before its peers and owned every bucket alone,
+owner confirms. A lost part that no other previous owner still owns, as
+when a node opened the cache before its peers and owned every part alone,
 goes to its new owners as soon as the views agree, not at the end of the
 grace.
 

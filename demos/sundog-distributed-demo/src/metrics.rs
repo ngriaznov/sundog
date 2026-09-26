@@ -110,7 +110,7 @@ const SUMMARY: &[(&str, &str)] = &[
     ("sundog_spill_dropped_total", "spill_dropped"),
     ("sundog_spill_region_reclaims_total", "reclaims"),
     ("sundog_state_transfer_records_total", "st_records"),
-    ("sundog_rebalance_buckets_total", "rebalance"),
+    ("sundog_rebalance_parts_total", "rebalance"),
     ("sundog_ae_repaired_total", "ae_repaired"),
     ("sundog_forwarded_writes_total", "forwarded"),
     ("sundog_cache_hits_total", "hits"),
@@ -196,16 +196,16 @@ mod tests {
         assert_eq!(sums.len(), 3);
     }
 
-    const DIRECTION_BODY: &str = "sundog_rebalance_buckets_total{cache=\"a\",direction=\"in\"} 4\n\
-        sundog_rebalance_buckets_total{cache=\"b\",direction=\"in\"} 6\n\
-        sundog_rebalance_buckets_total{cache=\"a\",direction=\"out\"} 1\n";
+    const DIRECTION_BODY: &str = "sundog_rebalance_parts_total{cache=\"a\",direction=\"in\"} 4\n\
+        sundog_rebalance_parts_total{cache=\"b\",direction=\"in\"} 6\n\
+        sundog_rebalance_parts_total{cache=\"a\",direction=\"out\"} 1\n";
 
     #[test]
     fn labeled_total_sums_only_the_matching_label_value_across_other_labels() {
         assert!(
             (labeled_total(
                 DIRECTION_BODY,
-                "sundog_rebalance_buckets_total",
+                "sundog_rebalance_parts_total",
                 "direction",
                 "in"
             ) - 10.0)
@@ -215,7 +215,7 @@ mod tests {
         assert!(
             (labeled_total(
                 DIRECTION_BODY,
-                "sundog_rebalance_buckets_total",
+                "sundog_rebalance_parts_total",
                 "direction",
                 "out"
             ) - 1.0)
@@ -229,7 +229,7 @@ mod tests {
         assert!(
             labeled_total(
                 DIRECTION_BODY,
-                "sundog_rebalance_buckets_total",
+                "sundog_rebalance_parts_total",
                 "direction",
                 "gone"
             )

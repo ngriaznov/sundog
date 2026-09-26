@@ -53,13 +53,14 @@ addresses once it forms, under `cluster formed`.
 
 | Metric | Meaning |
 |---|---|
-| `sundog_owned_buckets{cache}` | buckets this node owns |
-| `sundog_rebalance_buckets_total{cache, direction}` | buckets pulled `in`, released `out`, or `served` to another node's pull |
-| `sundog_rebalance_pull_timeouts_total{cache}` | bucket pulls that timed out repeatedly and left the rest to anti-entropy |
+| `sundog_owned_parts{cache}` | parts this node owns, of 65,536 |
+| `sundog_owned_buckets{cache}` | the same share in buckets: owned parts over 64 |
+| `sundog_rebalance_parts_total{cache, direction}` | parts pulled `in`, released `out`, or `served` to another node's pull |
+| `sundog_rebalance_pull_timeouts_total{cache}` | part pulls that timed out repeatedly and left the rest to anti-entropy |
 | `sundog_fetch_total{cache, outcome}` | `fetch` calls by outcome: `local`, `remote`, `miss` or `error` |
-| `sundog_forwarded_writes_total{cache}` | writes sent on to a bucket's owners |
+| `sundog_forwarded_writes_total{cache}` | writes sent on to a part's owners |
 | `sundog_stale_view_total{cache}` | anti-entropy rounds a peer declined over a different ownership view |
-| `sundog_unowned_inbound_dropped_total{cache}` | inbound records dropped for a bucket this node does not own |
+| `sundog_unowned_inbound_dropped_total{cache}` | inbound records dropped for a part this node does not own |
 
 ### Merge resolvers
 
@@ -138,8 +139,9 @@ in `sundog_live_peers`. Flapping under jitter calls for a higher
 
 `sundog_fetch_total{outcome="error"}` rises and callers see
 `CacheError::FetchUnavailable`: no owner of a key answered within
-`fetch_timeout`. Check whether owners are overloaded or unreachable, and
-whether a node's `sundog_owned_buckets` dropped to 0 after a restart.
+`fetch_timeout`, or every owner that answered still had the key's part
+cold. A short burst right after a join or a leave is the second case. Check whether owners are overloaded or unreachable, and
+whether a node's `sundog_owned_parts` dropped to 0 after a restart.
 `sundog_stale_view_total` rising briefly during a membership change is
 normal; rising steadily means gossip is not converging.
 

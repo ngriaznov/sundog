@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -33,12 +33,12 @@ use sundog::net::{AeMismatch, AePartReply, InboundMsg, Mesh, MsgClass, RequestHa
 use sundog::node::{NodeId, NodeName};
 use sundog::store::{
     BucketDigest, BucketLen, BucketPart, BucketPartDigests, CompactionBounds, KeyVersion, Mode,
-    Quiescence, Shard, ShardOps, SimFanOut,
+    PartId, Quiescence, Shard, ShardOps, SimFanOut,
 };
 use sundog::wire::{Msg, WireRecord};
 use sundog::{
-    ConflictResolver, Merged, OwnershipTracker, OwnershipView, RecordView, ResidencySet, Winner,
-    ownership_diff,
+    ConflictResolver, Granularity, Merged, OwnershipTracker, OwnershipView, RecordView,
+    ResidencySet, Winner, ownership_diff,
 };
 use tokio::sync::watch;
 use turmoil::{Builder, Sim};
@@ -1736,6 +1736,11 @@ fn bucket_of_u32(key: u32) -> u16 {
     bucket_of_bytes(&key_bytes(key))
 }
 
+/// The ownership part `key` hashes into.
+fn part_of_u32(key: u32) -> PartId {
+    PartId::of_key(&key_bytes(key))
+}
+
 /// Among `0..n`, every key in a bucket holding more than `min_count` of
 /// them. Deterministic given a fixed key range.
 fn dense_bucket_keys(n: u32, min_count: usize) -> Vec<u32> {
@@ -2103,8 +2108,14 @@ fn republish_view(
     residency: &ResidencySet,
     eligible: Vec<NodeId>,
     k: NonZeroU8,
+    granularity: Granularity,
 ) {
-    let new_view = Arc::new(OwnershipView::compute(self_node, eligible, k));
+    let new_view = Arc::new(OwnershipView::compute_at(
+        self_node,
+        eligible,
+        k,
+        granularity,
+    ));
     tx.send_if_modified(|current| {
         if current.view_hash() == new_view.view_hash() {
             return false;
@@ -2128,9 +2139,21 @@ fn republish_view(
 /// crashed, in which case nothing reads its tracker until it bounces back
 /// and this is called again with it included.
 fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
+    republish_all_at(nodes, live, k, Granularity::Bucket);
+}
+
+/// [`republish_all`] at `granularity`.
+fn republish_all_at(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8, granularity: Granularity) {
     for node in nodes {
         if live.contains(&node.node) {
-            republish_view(node.node, &node.tx, &node.residency, live.to_vec(), k);
+            republish_view(
+                node.node,
+                &node.tx,
+                &node.residency,
+                live.to_vec(),
+                k,
+                granularity,
+            );
         }
     }
 }
@@ -2141,8 +2164,7 @@ fn republish_all(nodes: &[DistNode], live: &[NodeId], k: NonZeroU8) {
 /// grouping; [`fan_out_owned`] calls this once per `Applied` item, and
 /// retries a `Forward` item across ticks the same way.
 fn send_to_owners(mesh: &Mesh, view: &OwnershipView, self_node: NodeId, rec: &WireRecord) {
-    let bucket = bucket_of_bytes(rec.key.as_ref());
-    for &owner in view.owners_of(bucket) {
+    for &owner in view.owners_of(PartId::of_key(rec.key.as_ref())) {
         if owner != self_node {
             mesh.send(
                 owner,
@@ -2202,7 +2224,7 @@ enum DistOp {
 /// `Mode::Replicated`, but fanning writes out to a key's current owners
 /// (via [`fan_out_owned`]) instead of broadcasting to every peer, gating
 /// anti-entropy's peer choice through `ShardOps::ae_peer_filter`, and
-/// releasing buckets whose disown grace has elapsed on its own tick,
+/// releasing parts whose disown grace has elapsed from [`release_loop`],
 /// mirroring `cluster::rebalance::rebalance_task`'s release half. The
 /// gained half is left to anti-entropy's self-healing backstop; see this
 /// section's own doc.
@@ -2214,8 +2236,8 @@ struct DistNodeParams {
     peers: Vec<(NodeId, &'static str, u16)>,
     /// May be empty: a scenario that drives every write itself, directly on
     /// a node's `Arc<TestShard>` from outside this loop, still needs the
-    /// loop running so its own `fan_out_tick`/`ae_tick`/`rebalance_tick`
-    /// pick the write up. Shared, not owned outright: `sim.host`'s closure
+    /// loop running so its own `fan_out_tick`/`ae_tick` pick the write
+    /// up. Shared, not owned outright: `sim.host`'s closure
     /// re-clones `DistNodeParams` on every restart (a bounce included), and
     /// an owned `Vec` would replay every already-issued op from scratch on
     /// each one, re-inserting an already-removed key with a fresh,
@@ -2243,6 +2265,28 @@ struct DistNodeParams {
 /// see [`fan_out_owned`]'s own doc for why a `Forward` item needs this and
 /// an `Applied` one does not.
 const FORWARD_RETRIES: u8 = 15;
+
+/// Releases every part whose disown grace has elapsed, once per `period`.
+/// Runs as its own task, as `cluster::rebalance::rebalance_task` does, so
+/// an anti-entropy round waiting out network timeouts in
+/// [`dist_node_loop`] never holds a release back.
+async fn release_loop(
+    shard: Arc<TestShard>,
+    residency: Arc<ResidencySet>,
+    period: Duration,
+    grace: Duration,
+) {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let due = residency.expired(grace);
+        if !due.is_empty() {
+            ShardOps::release_parts(shard.as_ref(), &due).await;
+            residency.unmark(&due);
+        }
+    }
+}
 
 async fn dist_node_loop(
     params: DistNodeParams,
@@ -2277,8 +2321,13 @@ async fn dist_node_loop(
     fan_out_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ae_tick = tokio::time::interval(params.ae_period);
     ae_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut rebalance_tick = tokio::time::interval(params.rebalance_period);
-    rebalance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Dropped with the host's runtime on a crash; a bounce spawns a fresh one.
+    tokio::spawn(release_loop(
+        Arc::clone(&shard),
+        residency,
+        params.rebalance_period,
+        params.disown_grace,
+    ));
 
     loop {
         tokio::select! {
@@ -2336,13 +2385,6 @@ async fn dist_node_loop(
                     });
                 }
             }
-            _ = rebalance_tick.tick() => {
-                let due = residency.expired(params.disown_grace);
-                if !due.is_empty() {
-                    ShardOps::release_buckets(shard.as_ref(), &due).await;
-                    residency.unmark(&due);
-                }
-            }
         }
     }
 }
@@ -2362,13 +2404,13 @@ fn assert_holds_only_owned_or_releasing(
         };
         for key in 0..key_space {
             if value_of(&n.shard, key).is_some() {
-                let bucket = bucket_of_u32(key);
-                let ok = view.owns(bucket) || (allow_releasing && n.residency.is_releasing(bucket));
+                let part = part_of_u32(key);
+                let ok = view.owns(part) || (allow_releasing && n.residency.is_releasing(part));
                 assert!(
                     ok,
-                    "{label}: node {:?} holds key {key} (bucket {bucket}) it neither owns nor is releasing (is_releasing={})",
+                    "{label}: node {:?} holds key {key} (part {part}) it neither owns nor is releasing (is_releasing={})",
                     n.node,
-                    n.residency.is_releasing(bucket)
+                    n.residency.is_releasing(part)
                 );
             }
         }
@@ -2382,9 +2424,9 @@ fn assert_holds_only_owned_or_releasing(
 /// scenarios above use) does not apply.
 fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
     expected.iter().all(|&key| {
-        let bucket = bucket_of_u32(key);
+        let part = part_of_u32(key);
         nodes.iter().any(|n| {
-            ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(bucket))
+            ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(part))
                 && value_of(&n.shard, key).is_some()
         })
     })
@@ -2400,9 +2442,9 @@ fn dist_data_settled(nodes: &[DistNode], expected: &HashSet<u32>) -> bool {
 /// second hop to land before treating the pre-churn baseline as settled.
 fn dist_removals_settled(nodes: &[DistNode], removed: &HashSet<u32>) -> bool {
     removed.iter().all(|&key| {
-        let bucket = bucket_of_u32(key);
+        let part = part_of_u32(key);
         nodes.iter().all(|n| {
-            !ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(bucket))
+            !ShardOps::ownership_view(n.shard.as_ref()).is_some_and(|view| view.owns(part))
                 || value_of(&n.shard, key).is_none()
         })
     })
@@ -2440,11 +2482,23 @@ fn spawn_dist_nodes(
 /// every live node's content equals exactly the surviving set, and every
 /// live node holds only buckets it currently owns.
 #[test]
+fn distributed_rebalance_under_churn() {
+    rebalance_under_churn(Granularity::Bucket);
+}
+
+/// [`distributed_rebalance_under_churn`] with every view ranking parts:
+/// each node owns scattered parts of every bucket, so rebalance, release
+/// and repair all work below bucket level.
+#[test]
+fn distributed_rebalance_under_churn_at_part_granularity() {
+    rebalance_under_churn(Granularity::Part);
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one scenario's full setup, churn schedule, and assertions read best kept together"
 )]
-fn distributed_rebalance_under_churn() {
+fn rebalance_under_churn(granularity: Granularity) {
     const OWNERS: u8 = 2;
     let k = NonZeroU8::new(OWNERS).expect("nonzero");
     let port = 5100;
@@ -2460,7 +2514,7 @@ fn distributed_rebalance_under_churn() {
         .iter()
         .map(|&(id, host, port)| new_dist_node(id, host, port, OWNERS))
         .collect();
-    republish_all(&nodes, &node_ids, k);
+    republish_all_at(&nodes, &node_ids, k, granularity);
 
     // Message loss turns on only once the initial write/remove plans have
     // settled (below), so that churn, the thing this scenario tests, runs
@@ -2562,7 +2616,7 @@ fn distributed_rebalance_under_churn() {
     for &idx in &[2usize, 3usize] {
         let victim = node_ids[idx];
         live.retain(|&n| n != victim);
-        republish_all(&nodes, &live, k);
+        republish_all_at(&nodes, &live, k, granularity);
         sim.crash(nodes[idx].host);
         run_until(&mut sim, steps_for(settle), || {
             dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
@@ -2571,7 +2625,7 @@ fn distributed_rebalance_under_churn() {
 
         sim.bounce(nodes[idx].host);
         live.push(victim);
-        republish_all(&nodes, &live, k);
+        republish_all_at(&nodes, &live, k, granularity);
         run_until(&mut sim, steps_for(settle), || {
             dist_data_settled(&nodes, &expected) && dist_removals_settled(&nodes, &removed_keys)
         })
@@ -2714,11 +2768,11 @@ fn distributed_partition_then_heal_reconciles_ownership() {
             let view =
                 ShardOps::ownership_view(n.shard.as_ref()).expect("distributed shard has a view");
             value_of(&n.shard, shared_key).as_deref() != Some("side1")
-                && (!view.owns(bucket_of_u32(shared_key))
+                && (!view.owns(part_of_u32(shared_key))
                     || value_of(&n.shard, shared_key).as_deref() == Some("side2"))
-                && (!view.owns(bucket_of_u32(111))
+                && (!view.owns(part_of_u32(111))
                     || value_of(&n.shard, 111).as_deref() == Some("only-side1"))
-                && (!view.owns(bucket_of_u32(222))
+                && (!view.owns(part_of_u32(222))
                     || value_of(&n.shard, 222).as_deref() == Some("only-side2"))
         })
     })
@@ -2765,10 +2819,10 @@ fn distributed_owner_loss_k_two_loses_nothing() {
         (NodeId::from(3004), "loss-node-d", port),
     ];
     let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
-    let target_bucket = 0u16;
+    let target_part = PartId::from_raw(0);
 
     let initial_owners = OwnershipView::compute(node_ids[0], node_ids.clone(), k)
-        .owners_of(target_bucket)
+        .owners_of(target_part)
         .to_vec();
     assert_eq!(
         initial_owners.len(),
@@ -2778,8 +2832,8 @@ fn distributed_owner_loss_k_two_loses_nothing() {
     let leaving = initial_owners[0];
     let staying = initial_owners[1];
 
-    let bucket_keys: Vec<u32> = (0..20_000)
-        .filter(|&key| bucket_of_u32(key) == target_bucket)
+    let bucket_keys: Vec<u32> = (0..5_000_000)
+        .filter(|&key| part_of_u32(key) == target_part)
         .take(5)
         .collect();
     assert!(
@@ -2832,7 +2886,7 @@ fn distributed_owner_loss_k_two_loses_nothing() {
     republish_all(&nodes, &live, k);
 
     let new_owners = OwnershipView::compute(staying, live, k)
-        .owners_of(target_bucket)
+        .owners_of(target_part)
         .to_vec();
     assert!(
         new_owners.contains(&staying),
@@ -3000,10 +3054,10 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         (NodeId::from(5003), "grace-node-c", port),
     ];
     let node_ids: Vec<NodeId> = roster.iter().map(|&(id, _, _)| id).collect();
-    let target_bucket = 0u16;
+    let target_part = PartId::from_raw(0);
 
     let initial_owners = OwnershipView::compute(node_ids[0], node_ids.clone(), k)
-        .owners_of(target_bucket)
+        .owners_of(target_part)
         .to_vec();
     assert_eq!(initial_owners.len(), 2);
     // `owners_of` is ordered by descending rendezvous score: index 0 is the
@@ -3017,7 +3071,7 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     let leaving = initial_owners[1];
 
     // A phantom fourth node: never run as a real host, chosen purely so
-    // the rendezvous computation displaces `leaving` from `target_bucket`
+    // the rendezvous computation displaces `leaving` from `target_part`
     // without displacing `staying`.
     let phantom = (9_000_000u64..9_001_000)
         .map(NodeId::from)
@@ -3025,14 +3079,14 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
             let mut eligible = node_ids.clone();
             eligible.push(candidate);
             let owners = OwnershipView::compute(candidate, eligible, k)
-                .owners_of(target_bucket)
+                .owners_of(target_part)
                 .to_vec();
             owners.contains(&staying) && !owners.contains(&leaving)
         })
         .expect("some candidate id displaces the leaving owner alone");
 
-    let all_bucket_keys: Vec<u32> = (0..20_000)
-        .filter(|&key| bucket_of_u32(key) == target_bucket)
+    let all_bucket_keys: Vec<u32> = (0..5_000_000)
+        .filter(|&key| part_of_u32(key) == target_part)
         .take(4)
         .collect();
     assert_eq!(
@@ -3056,7 +3110,9 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         .max_message_latency(Duration::from_millis(20))
         .build();
 
-    let disown_grace = Duration::from_millis(400);
+    // Real time, like the grace clock: long enough that the probe phase's
+    // virtual seconds, run in a debug build, finish inside it.
+    let disown_grace = Duration::from_secs(2);
     spawn_dist_nodes(&mut sim, &nodes, {
         let roster = roster.clone();
         move |node| DistNodeParams {
@@ -3084,18 +3140,19 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     })
     .expect("both original owners hold the bucket's keys before the membership change");
 
-    // Advertise the phantom fourth node: `leaving` loses `target_bucket`
+    // Advertise the phantom fourth node: `leaving` loses `target_part`
     // and starts its disown-grace clock; `staying` keeps it.
     let mut eligible = node_ids.clone();
     eligible.push(phantom);
     republish_all(&nodes, &eligible, k);
+    let released_at = Instant::now() + disown_grace;
     assert!(
         nodes
             .iter()
             .find(|n| n.node == leaving)
             .unwrap()
             .residency
-            .is_releasing(target_bucket),
+            .is_releasing(target_part),
         "the departed owner marks the bucket releasing immediately on the view change"
     );
 
@@ -3131,13 +3188,13 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
         // A deliberately wrong digest forces a mismatch reply carrying
         // real entries, proving the responder still answers.
         if let Ok(mismatched) = mesh
-            .ae_round(leaving, cache_name(), vec![(target_bucket, 0)])
+            .ae_round(leaving, cache_name(), vec![(target_part.bucket(), 0)])
             .await
         {
             ae_mismatch_count_probe.fetch_add(mismatched.len(), Ordering::Relaxed);
         }
         if let Ok(listing) = mesh
-            .ae_entries(leaving, cache_name(), vec![target_bucket])
+            .ae_entries(leaving, cache_name(), vec![target_part.bucket()])
             .await
         {
             let count: usize = listing.into_iter().map(|(_, entries)| entries.len()).sum();
@@ -3165,6 +3222,10 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     run_steps(&mut sim, steps_for(Duration::from_millis(100)));
 
     assert!(
+        Instant::now() < released_at,
+        "the probe phase finishes inside the real-time grace"
+    );
+    assert!(
         ae_mismatch_count.load(Ordering::Relaxed) > 0,
         "the releasing node still answers a digest mismatch with real entries"
     );
@@ -3187,8 +3248,8 @@ fn distributed_releasing_bucket_still_answers_anti_entropy_but_never_accepts_a_f
     // `ResidencySet`'s grace clock is stamped from real `Instant::now()`,
     // not turmoil's virtual clock, so real time must pass; see
     // `distributed_rebalance_under_churn`'s identical comment.
-    std::thread::sleep(disown_grace * 3);
-    run_steps(&mut sim, steps_for(disown_grace * 3));
+    std::thread::sleep(released_at.saturating_duration_since(Instant::now()) + disown_grace / 2);
+    run_steps(&mut sim, steps_for(disown_grace));
     for &key in bucket_keys {
         assert!(
             value_of(shard_of(&nodes, leaving), key).is_none(),

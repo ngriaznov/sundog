@@ -262,13 +262,13 @@ fn build_report(
         ae_repaired: as_u64(total_of("sundog_ae_repaired_total")),
         rebalance_in: as_u64(metrics::labeled_total(
             metrics_body,
-            "sundog_rebalance_buckets_total",
+            "sundog_rebalance_parts_total",
             "direction",
             "in",
         )),
         rebalance_out: as_u64(metrics::labeled_total(
             metrics_body,
-            "sundog_rebalance_buckets_total",
+            "sundog_rebalance_parts_total",
             "direction",
             "out",
         )),
@@ -528,8 +528,8 @@ mod tests {
         sundog_ae_repaired_total 4\n\
         sundog_spill_dropped_total{reason=\"deferred\"} 9\n\
         sundog_spill_dropped_total{reason=\"other\"} 100\n\
-        sundog_rebalance_buckets_total{direction=\"in\"} 6\n\
-        sundog_rebalance_buckets_total{direction=\"out\"} 2\n\
+        sundog_rebalance_parts_total{direction=\"in\"} 6\n\
+        sundog_rebalance_parts_total{direction=\"out\"} 2\n\
         sundog_backlog_dropped_total{peer=\"0000000000000001\"} 5\n\
         sundog_backlog_dropped_total{peer=\"0000000000000002\"} 3\n\
         sundog_fan_out_wait_timeouts_total{cache=\"demo\"} 8\n\
