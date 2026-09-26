@@ -157,28 +157,6 @@ eligible peer the same regardless of where it runs.
 **Trigger:** a multi-zone deployment measuring cross-zone egress from joins
 or repairs.
 
-## QUIC data plane
-
-The data plane is one `LengthDelimitedCodec`-framed TCP connection per peer,
-carrying every message class, `Invalidate`/`Replicate` broadcast traffic,
-state-transfer chunk streams, and anti-entropy digest/pull round-trips, over the
-same stream, ordered by TCP's own head-of-line blocking. A `quinn`-based QUIC
-transport would give each message class its own stream, keeping a large
-state-transfer snapshot to a joining node from stalling a latency-sensitive
-invalidation behind it.
-
-**Cost:** a second transport implementation behind the existing `net::tcp` seam,
-already the `sim`-feature swap point, so the shape exists; a TLS identity for
-QUIC's mandatory encryption, sharing the mutual-TLS material the `tls` feature
-wires into the TCP path; and connection-migration semantics that a same-LAN
-deployment never needs.
-
-**Trigger:** head-of-line blocking between state-transfer/anti-entropy traffic
-and live broadcast traffic shows up as measured tail latency, not as a
-theoretical concern. The per-class outbox split and request-response traffic
-living outside the broadcast channel already remove the worst of this at the
-application layer; QUIC would only matter for what's left after that.
-
 ## Distributed locks and leader leases
 
 A lock or a lease is a promise that at most one holder exists. sundog's
