@@ -1393,7 +1393,8 @@ enum MergedVersion {
 /// is; a merge reducing to `incoming` with `ver > sv` stores its `(ver,
 /// merged)` pair verbatim; one reducing to `stored` with `sv > ver` is a
 /// no-op; otherwise mints a version, [`NodeId::merge_derived`] from the
-/// merged bytes, that strictly dominates both inputs under `Hlc`'s `Ord`.
+/// merged bytes, that strictly dominates both inputs under `Hlc`'s `Ord`
+/// short of the maximum stamp [`mint_stamp`] describes.
 /// `permutation_convergence` and
 /// `pn_counter_bidirectional_gossip_converges_in_one_round` in
 /// `store::prop_tests` prove this converges, including the one-round case
@@ -1405,32 +1406,54 @@ fn merge_version(
     incoming: &[u8],
     merged: &[u8],
 ) -> MergedVersion {
-    if merged == stored && merged == incoming {
+    merge_decision(sv, ver, merged == stored, merged == incoming, || {
+        NodeId::merge_derived(xxh3_64(merged))
+    })
+}
+
+/// [`merge_version`] over which inputs the merged bytes equal:
+/// `is_stored` for `stored`, `is_incoming` for `incoming`. `mint_node`
+/// names the minted version's node and runs only on the mint arm.
+fn merge_decision(
+    sv: Hlc,
+    ver: Hlc,
+    is_stored: bool,
+    is_incoming: bool,
+    mint_node: impl FnOnce() -> NodeId,
+) -> MergedVersion {
+    if is_stored && is_incoming {
         let v = sv.max(ver);
         if v == sv {
             MergedVersion::NoOp
         } else {
             MergedVersion::Store(v)
         }
-    } else if merged == incoming && ver > sv {
+    } else if is_incoming && ver > sv {
         MergedVersion::Store(ver)
-    } else if merged == stored && sv > ver {
+    } else if is_stored && sv > ver {
         MergedVersion::NoOp
     } else {
-        let base_wall = sv.wall_ms.max(ver.wall_ms);
-        let base_logical = sv.logical.max(ver.logical);
-        let (wall_ms, logical) = match base_logical.checked_add(1) {
-            Some(logical) => (base_wall, logical),
-            // `logical` has no room left to grow within this `wall_ms`: carry
-            // into `wall_ms` instead so the minted stamp still strictly
-            // dominates both inputs (see this function's doc).
-            None => (base_wall.saturating_add(1), 0),
-        };
-        MergedVersion::Store(Hlc {
-            wall_ms,
-            logical,
-            node: NodeId::merge_derived(xxh3_64(merged)),
-        })
+        MergedVersion::Store(mint_stamp(sv, ver, mint_node()))
+    }
+}
+
+/// A version above both `sv` and `ver`: the larger `wall_ms` with one past
+/// the larger `logical`, carrying into `wall_ms` when `logical` has no room
+/// left. Where both are already at their maximum no stamp can be larger,
+/// and the mint ties both inputs on `wall_ms` and `logical`; the clock-skew
+/// guard keeps a real stamp nowhere near that.
+fn mint_stamp(sv: Hlc, ver: Hlc, node: NodeId) -> Hlc {
+    let base_wall = sv.wall_ms.max(ver.wall_ms);
+    let base_logical = sv.logical.max(ver.logical);
+    let (wall_ms, logical) = match (base_logical.checked_add(1), base_wall.checked_add(1)) {
+        (Some(logical), _) => (base_wall, logical),
+        (None, Some(wall_ms)) => (wall_ms, 0),
+        (None, None) => (u64::MAX, u32::MAX),
+    };
+    Hlc {
+        wall_ms,
+        logical,
+        node,
     }
 }
 
@@ -11081,6 +11104,31 @@ mod tests {
             assert_eq!(minted.logical, 0, "logical resets once it carries");
             assert!(minted.node.is_merge_derived());
         }
+
+        /// With `logical` and `wall_ms` both at their maximum there is no
+        /// larger stamp to mint: the mint holds the maximum instead of
+        /// wrapping below its inputs, and only the node can differ.
+        #[test]
+        fn mint_stamp_holds_the_maximum_instead_of_wrapping_below_its_inputs() {
+            let node = NodeId::merge_derived(7);
+            let top = |n: u64| Hlc {
+                wall_ms: u64::MAX,
+                logical: u32::MAX,
+                node: NodeId::from(n),
+            };
+            let minted = mint_stamp(top(1), top(2), node);
+            assert_eq!((minted.wall_ms, minted.logical), (u64::MAX, u32::MAX));
+            assert_eq!(minted.node, node);
+
+            let below = Hlc {
+                wall_ms: u64::MAX - 1,
+                logical: u32::MAX,
+                node: NodeId::from(3u64),
+            };
+            let carried = mint_stamp(below, below, node);
+            assert_eq!((carried.wall_ms, carried.logical), (u64::MAX, 0));
+            assert!(carried > below);
+        }
     }
 
     /// Coverage for [`Engine::apply_many`]'s pre-fold: that a non-merging
@@ -11381,6 +11429,78 @@ mod tests {
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
+
+    fn any_hlc() -> Hlc {
+        Hlc {
+            wall_ms: kani::any(),
+            logical: kani::any(),
+            node: NodeId::from(kani::any::<u64>()),
+        }
+    }
+
+    /// A minted stamp is at least both inputs on `wall_ms` and `logical`,
+    /// and strictly above both everywhere short of the maximum stamp.
+    #[kani::proof]
+    fn a_minted_stamp_dominates_both_inputs() {
+        let (sv, ver) = (any_hlc(), any_hlc());
+        let node = NodeId::from(kani::any::<u64>());
+        let minted = mint_stamp(sv, ver, node);
+        assert_eq!(minted.node, node);
+        for input in [sv, ver] {
+            assert!((minted.wall_ms, minted.logical) >= (input.wall_ms, input.logical));
+        }
+        let at_max =
+            sv.wall_ms.max(ver.wall_ms) == u64::MAX && sv.logical.max(ver.logical) == u32::MAX;
+        if !at_max {
+            assert!(minted > sv && minted > ver);
+        }
+    }
+
+    /// A merge never stores a version below the stored one, stores a new
+    /// version strictly above it off the mint arm, and no-ops only when the
+    /// merged bytes are what is already stored.
+    #[kani::proof]
+    fn a_merge_never_moves_the_stored_version_back() {
+        let (sv, ver) = (any_hlc(), any_hlc());
+        let (is_stored, is_incoming): (bool, bool) = (kani::any(), kani::any());
+        let node = NodeId::from(kani::any::<u64>());
+        let minted = mint_stamp(sv, ver, node);
+        match merge_decision(sv, ver, is_stored, is_incoming, || node) {
+            MergedVersion::NoOp => assert!(is_stored),
+            MergedVersion::Store(v) if v == minted => {
+                assert!((v.wall_ms, v.logical) >= (sv.wall_ms, sv.logical));
+            }
+            MergedVersion::Store(v) => assert!(v > sv),
+        }
+    }
+
+    /// Both nodes of a collision, each holding the other's write as
+    /// incoming, end at the same version: the one node keeps or stores what
+    /// the other does. `stored_eq` says the two sides' bytes match, which
+    /// the merged bytes can only equal both of when it holds.
+    #[kani::proof]
+    fn a_collision_converges_in_either_order() {
+        let (sv, ver) = (any_hlc(), any_hlc());
+        let (is_stored, is_incoming, stored_eq): (bool, bool, bool) =
+            (kani::any(), kani::any(), kani::any());
+        kani::assume(!(is_stored && is_incoming) || stored_eq);
+        kani::assume(!stored_eq || is_stored == is_incoming);
+        let node = NodeId::from(kani::any::<u64>());
+        let settle = |own: Hlc, other: Hlc, is_own: bool, is_other: bool| match merge_decision(
+            own,
+            other,
+            is_own,
+            is_other,
+            || node,
+        ) {
+            MergedVersion::NoOp => own,
+            MergedVersion::Store(v) => v,
+        };
+        assert_eq!(
+            settle(sv, ver, is_stored, is_incoming),
+            settle(ver, sv, is_incoming, is_stored)
+        );
+    }
 
     /// Every deadline encodes without panicking and reads back as itself:
     /// `None` as never, a deadline inside the inline range as an exact
