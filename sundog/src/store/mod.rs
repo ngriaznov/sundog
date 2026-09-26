@@ -951,8 +951,9 @@ pub trait ShardOps: Send + Sync {
     /// pull instead of only pushing the greater side to the lesser one, so
     /// two replicas each holding half of a merge exchange records in the
     /// same round rather than needing a second round to carry the minted
-    /// result back. `false` for every shard without a resolver set, since
-    /// [`LwwResolver::merges`] is `false`.
+    /// result back. The pulls run first, and a key that lands at exactly the
+    /// peer's version is not pushed back. `false` for every shard without a
+    /// resolver set, since [`LwwResolver::merges`] is `false`.
     fn merges(&self) -> bool {
         false
     }

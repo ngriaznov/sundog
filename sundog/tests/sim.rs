@@ -3333,9 +3333,9 @@ const HEAL_PARTITION_MS: u64 = 500;
 /// for an extra push/pull pair per divergent key, a real slowdown at
 /// production's actual 200ms cadence. This generous margin only shows
 /// that nothing here gets slower still; it does not bound how much slower
-/// the bidirectional exchange itself is at that cadence. A
-/// production-cadence variant, run at (or near) 200ms and tolerant of the
-/// resulting scheduling noise, would be needed to measure that directly.
+/// the bidirectional exchange itself is at that cadence;
+/// [`partition_heal_at_the_default_ae_interval`] runs the same grid at
+/// 200ms to measure that directly.
 const HEAL_AE_INTERVAL_MS: u64 = 1000;
 /// Every anti-entropy round in this family runs against at most two peers
 /// on a 1s tick; a generous multiple of the handful of rounds convergence
@@ -4218,6 +4218,80 @@ fn partition_heal_comparison() {
                         metrics.ae_rounds <= HEAL_MAX_AE_ROUNDS,
                         "{}: keys={keys} conflict_fraction={conflict_fraction} seed={seed:#x} \
                          spent {} anti-entropy rounds, over the {HEAL_MAX_AE_ROUNDS} sanity bound",
+                        metrics.variant,
+                        metrics.ae_rounds
+                    );
+                }
+                print_heal_comparison(&decomposed, &merged);
+            }
+        }
+    }
+}
+
+/// `ClusterConfig::default`'s `ae_interval`: the tick
+/// [`partition_heal_at_the_default_ae_interval`] runs at.
+const HEAL_DEFAULT_AE_INTERVAL_MS: u64 = 200;
+
+/// [`partition_heal_comparison`] at production's default 200 ms
+/// anti-entropy tick instead of [`HEAL_AE_INTERVAL_MS`]'s race-free one
+/// second. At this cadence a node's next round can start while a peer's
+/// multi-batch repair is still landing, so the rounds interleave differently
+/// from run to run; the test asserts only what holds under any
+/// interleaving: both variants converge to the exact total within
+/// [`HEAL_MAX_AE_ROUNDS`]. It prints the same `SIM` lines as
+/// [`partition_heal_comparison`] for reading the round and byte ratios at
+/// this cadence, and `SUNDOG_SIM_FULL=1` widens the grid the same way.
+#[test]
+fn partition_heal_at_the_default_ae_interval() {
+    let full = heal_sim_full();
+    let keys_grid: &[u32] = if full {
+        &HEAL_FULL_KEYS
+    } else {
+        &[HEAL_DEFAULT_KEYS]
+    };
+    let fractions: &[f64] = if full {
+        &HEAL_FULL_CONFLICT_FRACTIONS
+    } else {
+        &HEAL_DEFAULT_CONFLICT_FRACTIONS
+    };
+    let default_seed = [sim_seed(0xC0DE_7400)];
+    let seeds: &[u64] = if full {
+        &HEAL_FULL_SEEDS
+    } else {
+        &default_seed
+    };
+    let at_default_tick = |seed, variant, keys, conflict_fraction| HealConfig {
+        ae_interval_ms: HEAL_DEFAULT_AE_INTERVAL_MS,
+        ..HealConfig::new(seed, variant, keys, conflict_fraction)
+    };
+
+    for &keys in keys_grid {
+        for &conflict_fraction in fractions {
+            for &seed in seeds {
+                let decomposed = run_partition_heal(at_default_tick(
+                    seed,
+                    Variant::Decomposed,
+                    keys,
+                    conflict_fraction,
+                ));
+                let merged = run_partition_heal(at_default_tick(
+                    seed,
+                    Variant::Merged,
+                    keys,
+                    conflict_fraction,
+                ));
+                for metrics in [&decomposed, &merged] {
+                    assert_eq!(
+                        metrics.lost_updates, 0,
+                        "{}: keys={keys} conflict_fraction={conflict_fraction} seed={seed:#x} \
+                         did not converge to the exact total at a {HEAL_DEFAULT_AE_INTERVAL_MS} ms tick",
+                        metrics.variant
+                    );
+                    assert!(
+                        metrics.ae_rounds <= HEAL_MAX_AE_ROUNDS,
+                        "{}: keys={keys} conflict_fraction={conflict_fraction} seed={seed:#x} \
+                         spent {} anti-entropy rounds at a {HEAL_DEFAULT_AE_INTERVAL_MS} ms tick, \
+                         over the {HEAL_MAX_AE_ROUNDS} sanity bound",
                         metrics.variant,
                         metrics.ae_rounds
                     );
