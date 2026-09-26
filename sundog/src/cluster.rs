@@ -4173,12 +4173,14 @@ mod tests {
     }
 
     /// A short-`ae_interval`, short-disown-grace config for the rebalance
-    /// test below: a real grace elapses in two seconds, not the default 30,
-    /// and still outlasts a joiner's pull of its share of the 65,536 parts.
+    /// test below: a real grace elapses in ten seconds, not the default 30.
+    /// A joiner's pull of its share of the 65,536 parts lands about two
+    /// seconds after it starts in a debug build, so the grace outlasts it
+    /// on a runner several times slower.
     fn rebalance_config() -> ClusterConfig {
         let mut config = ClusterConfig {
             ae_interval: Duration::from_millis(50),
-            distributed_disown_grace_rounds: 40,
+            distributed_disown_grace_rounds: 200,
             ..loopback_config()
         };
         config.tombstone_ttl = config.bucket_release_window();
@@ -4286,7 +4288,7 @@ mod tests {
         .await;
 
         // A brief, deliberate quiescence window: right after the pull lands
-        // (inside the two-second disown grace, since the pull is triggered
+        // (inside the ten-second disown grace, since the pull is triggered
         // immediately on the ownership change while the grace only starts
         // counting down from the same moment), the displaced node has not
         // released anything yet.
@@ -4297,7 +4299,7 @@ mod tests {
         );
 
         wait_until(
-            Duration::from_secs(10),
+            Duration::from_secs(30),
             "the displaced owner releases the key once the disown grace elapses",
             async || displaced_cache.get(&moved_key).await.is_none(),
         )
