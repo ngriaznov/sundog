@@ -1615,6 +1615,18 @@ struct RegionReplayState {
     write_cursor: u32,
 }
 
+/// Where a snapshot entry at `loc` ends in its region, or `None` when its
+/// region is not one of `region_count` or its bytes run past
+/// `region_bytes`.
+fn snapshot_loc_end(loc: SpillLoc, region_bytes: u32, region_count: u32) -> Option<u32> {
+    if loc.region >= region_count {
+        return None;
+    }
+    loc.offset
+        .checked_add(loc.len)
+        .filter(|&end| end <= region_bytes)
+}
+
 /// Validates each `entries` item: `region` must be real, `offset + len`
 /// must fit `region_bytes`, [`decode_record_with_key`] at that offset must
 /// match the entry's key/version, and every entry naming a region must
@@ -1634,13 +1646,7 @@ fn validate_snapshot_entries(
     for entry in entries {
         let valid = (|| -> Option<()> {
             let region_idx = entry.loc.region;
-            if region_idx >= region_count {
-                return None;
-            }
-            let end = entry.loc.offset.checked_add(entry.loc.len)?;
-            if end > region_bytes {
-                return None;
-            }
+            let end = snapshot_loc_end(entry.loc, region_bytes, region_count)?;
             let file = region_files.get(region_idx as usize)?;
             let mut buf = vec![0u8; entry.loc.len as usize];
             pread_exact(file, &mut buf, u64::from(entry.loc.offset)).ok()?;
@@ -2162,16 +2168,7 @@ fn build_header(job: &SpillJob, key_len: u32, value_len: u32) -> SpillRecordHead
 /// [`SpillTier::read_at`]'s caller, which already knows the key; reopen's
 /// region scan does not.
 fn decode_record_with_key(buf: &[u8]) -> Option<(Bytes, SpilledBytes)> {
-    let (header, rest) = SpillRecordHeader::read_from_prefix(buf).ok()?;
-    if header.magic != SPILL_MAGIC {
-        return None;
-    }
-    let key_len = header.key_len as usize;
-    let value_len = header.value_len as usize;
-    if rest.len() != key_len + value_len {
-        return None;
-    }
-    let (key_bytes, value_bytes) = rest.split_at(key_len);
+    let (header, key_bytes, value_bytes) = split_record(buf)?;
     if record_checksum(key_bytes, value_bytes) != header.checksum {
         return None;
     }
@@ -2188,6 +2185,23 @@ fn decode_record_with_key(buf: &[u8]) -> Option<(Bytes, SpilledBytes)> {
             encoded: Bytes::copy_from_slice(value_bytes),
         },
     ))
+}
+
+/// Splits `buf` into its header, key and value, or `None` for a short
+/// buffer, a bad magic, or lengths that don't add up to exactly the bytes
+/// after the header. Checks no checksum.
+fn split_record(buf: &[u8]) -> Option<(SpillRecordHeader, &[u8], &[u8])> {
+    let (header, rest) = SpillRecordHeader::read_from_prefix(buf).ok()?;
+    if header.magic != SPILL_MAGIC {
+        return None;
+    }
+    let key_len = usize::try_from(header.key_len).ok()?;
+    let value_len = usize::try_from(header.value_len).ok()?;
+    if key_len.checked_add(value_len)? != rest.len() {
+        return None;
+    }
+    let (key_bytes, value_bytes) = rest.split_at(key_len);
+    Some((header, key_bytes, value_bytes))
 }
 
 /// Parses `buf`, one record's bytes as read off disk, into
@@ -2711,6 +2725,34 @@ mod tests {
         let last = buf.len() - 1;
         buf[last] ^= 0x01;
         assert!(decode_record_with_key(&buf).is_none());
+    }
+
+    #[test]
+    fn split_record_accounts_for_every_byte_and_refuses_a_bad_length() {
+        let buf = raw_record(b"key", b"value", hlc(1, 0), None);
+        let (header, key, value) = split_record(&buf).expect("a well-formed record splits");
+        assert_eq!((key, value), (&b"key"[..], &b"value"[..]));
+        assert_eq!(header.magic, SPILL_MAGIC);
+        assert!(split_record(&buf[..buf.len() - 1]).is_none());
+        assert!(split_record(&buf[..HEADER_LEN - 1]).is_none());
+        let mut longer = buf.clone();
+        longer.push(0);
+        assert!(split_record(&longer).is_none());
+    }
+
+    #[test]
+    fn snapshot_loc_end_accepts_only_a_location_inside_a_real_region() {
+        let loc = |region, offset, len| SpillLoc {
+            region,
+            offset,
+            len,
+            generation: 0,
+        };
+        assert_eq!(snapshot_loc_end(loc(0, 10, 20), 100, 2), Some(30));
+        assert_eq!(snapshot_loc_end(loc(1, 80, 20), 100, 2), Some(100));
+        assert_eq!(snapshot_loc_end(loc(2, 0, 1), 100, 2), None);
+        assert_eq!(snapshot_loc_end(loc(0, 90, 20), 100, 2), None);
+        assert_eq!(snapshot_loc_end(loc(0, u32::MAX, 1), u32::MAX, 2), None);
     }
 
     #[test]
@@ -5016,5 +5058,59 @@ mod kani_proofs {
         let slots = flush_queue_slots(flush_queue_bytes);
         assert!(slots >= FLUSH_QUEUE_CAPACITY);
         assert!(slots <= FLUSH_QUEUE_SLOTS_MAX);
+    }
+
+    /// A record fits exactly when its end, taken without wrapping, is
+    /// inside the region.
+    #[kani::proof]
+    fn a_record_fits_exactly_when_it_ends_inside_the_region() {
+        let (write_cursor, region_bytes, record_len): (u32, u32, u32) =
+            (kani::any(), kani::any(), kani::any());
+        let end = u64::from(write_cursor) + u64::from(record_len);
+        assert_eq!(
+            record_fits(write_cursor, region_bytes, record_len),
+            end <= u64::from(region_bytes)
+        );
+    }
+
+    /// A snapshot location is accepted only inside a real region, and its
+    /// end is exactly `offset + len`, taken without wrapping.
+    #[kani::proof]
+    fn a_snapshot_location_is_accepted_only_inside_a_real_region() {
+        let loc = SpillLoc {
+            region: kani::any(),
+            offset: kani::any(),
+            len: kani::any(),
+            generation: kani::any(),
+        };
+        let (region_bytes, region_count): (u32, u32) = (kani::any(), kani::any());
+        let end = u64::from(loc.offset) + u64::from(loc.len);
+        match snapshot_loc_end(loc, region_bytes, region_count) {
+            Some(accepted) => {
+                assert!(loc.region < region_count);
+                assert_eq!(u64::from(accepted), end);
+                assert!(accepted <= region_bytes);
+            }
+            None => {
+                assert!(loc.region >= region_count || end > u64::from(region_bytes));
+            }
+        }
+    }
+
+    /// Any buffer off disk up to three bytes past a header splits without
+    /// panicking, and a split accounts for every byte.
+    #[kani::proof]
+    fn any_buffer_off_disk_splits_without_panicking() {
+        const MAX: usize = HEADER_LEN + 3;
+        let bytes: [u8; MAX] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX);
+        let buf = &bytes[..len];
+        if let Some((header, key, value)) = split_record(buf) {
+            assert_eq!(header.magic, SPILL_MAGIC);
+            assert_eq!(key.len(), header.key_len as usize);
+            assert_eq!(value.len(), header.value_len as usize);
+            assert_eq!(HEADER_LEN + key.len() + value.len(), buf.len());
+        }
     }
 }

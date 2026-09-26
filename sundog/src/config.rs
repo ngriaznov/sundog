@@ -302,12 +302,19 @@ impl ClusterConfig {
         self.rebalance_chunk_bytes.min(cap)
     }
 
+    /// How long a `Mode::Distributed` node keeps serving a part it no longer
+    /// owns: `distributed_disown_grace_rounds * ae_interval`, saturating.
+    #[must_use]
+    pub(crate) fn disown_grace(&self) -> Duration {
+        self.ae_interval
+            .saturating_mul(self.distributed_disown_grace_rounds)
+    }
+
     /// Upper bound for [`rebalance_ack_window`](Self::rebalance_ack_window):
     /// `distributed_disown_grace_rounds * ae_interval`.
     #[must_use]
     pub fn rebalance_ack_window_max(&self) -> Duration {
-        self.ae_interval
-            .saturating_mul(self.distributed_disown_grace_rounds)
+        self.disown_grace()
     }
 
     /// [`rebalance_ack_window`](Self::rebalance_ack_window) clamped to
@@ -446,6 +453,18 @@ mod tests {
             ClusterConfig::default().max_clock_skew,
             Some(Duration::from_mins(1))
         );
+    }
+
+    #[test]
+    fn disown_grace_is_rounds_times_the_interval_and_saturates() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.disown_grace(), config.ae_interval * 3);
+        assert_eq!(config.rebalance_ack_window_max(), config.disown_grace());
+        let huge = ClusterConfig {
+            ae_interval: Duration::MAX,
+            ..ClusterConfig::default()
+        };
+        assert_eq!(huge.disown_grace(), Duration::MAX);
     }
 
     #[test]

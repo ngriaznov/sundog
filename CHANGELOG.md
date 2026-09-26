@@ -50,7 +50,14 @@ All notable changes to this project are documented in this file. Format follows
   across a membership change ranks them as a full ranking does, a wire id
   names its parts back at either granularity, a view ranks parts only when
   every peer speaks part ownership, the owned-bucket gauge is the part count
-  over 64, and a pull serves its ids in ascending single-bucket runs.
+  over 64, a pull serves its ids in ascending single-bucket runs, a
+  donor's share of the transfer budget never overflows, a minted merge
+  version is at least both inputs and strictly above them short of the
+  maximum stamp, a merge never moves the stored version back, both sides
+  of a collision settle on the same version, an IBLT cell index stays
+  inside its partition and subtracting any remote cells never overflows,
+  and a spill record or snapshot location read off disk parses without
+  panicking and only inside its region.
   `weekly-kani.yml` runs them weekly and the release gate requires a green
   run.
 - **Entry diet**: a live entry stores one encoded record (key length, key,
@@ -428,6 +435,23 @@ All notable changes to this project are documented in this file. Format follows
   `crash` exit without leaving.
 
 ### Fixed
+
+- **A huge `state_transfer_budget` or disown grace no longer crashes a
+  rebalance.** `Duration`'s multiply panics on overflow, and a
+  `state_transfer_budget` of `Duration::MAX` overflowed the per-donor
+  share, while a large `ae_interval` or `distributed_disown_grace_rounds`
+  overflowed the disown grace and its deadline. All three saturate.
+
+- **A merged version minted at the maximum stamp stays at or above its
+  inputs.** With both inputs at `wall_ms` `u64::MAX` and `logical`
+  `u32::MAX`, the minted version wrapped to a `logical` of 0, below both.
+  It now holds the maximum stamp.
+
+- **An IBLT sketch off the wire can no longer overflow a count or index
+  past its cells.** A peer's cell count of `i32::MIN` or `i32::MAX`
+  overflowed on subtract and peel, and a one- or two-cell sketch indexed
+  past its end on peel. Counts wrap, and a cell count `Iblt::new` cannot
+  produce makes a sketch that subtract and peel refuse.
 
 - **A warm-reopened part is never served unverified because its donors
   were cold.** A `Mode::Distributed` node reopening a spill tier pulls
