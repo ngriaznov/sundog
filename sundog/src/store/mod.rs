@@ -1409,6 +1409,31 @@ where
     Ok(Bytes::from(bytes))
 }
 
+/// A capped shard's `sundog_ceiling_refusals_total{cache, kind}` handles,
+/// created once like `hits`.
+struct CeilingRefusals {
+    /// `kind="write"`: a local write refused at the ceiling.
+    writes: metrics::Counter,
+    /// `kind="fill"`: a read-through fill returned without being stored.
+    fills: metrics::Counter,
+}
+
+impl CeilingRefusals {
+    fn new(cache: &str) -> Self {
+        let counter = |kind: &'static str| {
+            metrics::counter!(
+                "sundog_ceiling_refusals_total",
+                "cache" => cache.to_string(),
+                "kind" => kind
+            )
+        };
+        Self {
+            writes: counter("write"),
+            fills: counter("fill"),
+        }
+    }
+}
+
 /// A typed named cache: an `engine::Engine` of `K -> V` plus the
 /// version-and-conflict machinery that backs [`ShardOps`]. The typed `Cache<K,
 /// V>` handle users hold (`crate::cache`) wraps `Arc<Shard<K, V>>`.
@@ -1463,6 +1488,14 @@ where
     /// per pass.
     crdt_bounds: CompactionBounds,
     max_frame: usize,
+    /// [`Shard::with_max_resident_bytes`]'s ceiling: a local write that
+    /// finds [`Shard::resident_bytes`] at or over it fails with
+    /// [`CacheError::OverMemoryCeiling`]. `u64::MAX` means no ceiling.
+    max_resident_bytes: u64,
+    /// `sundog_ceiling_refusals_total` handles, registered by
+    /// [`Shard::with_max_resident_bytes`] only, so an uncapped cache
+    /// exports no refusal series.
+    ceiling_refusals: Option<CeilingRefusals>,
     /// [`Shard::with_fan_out_backlog_capacity`]'s cap: the threshold
     /// [`Shard::wait_for_fan_out_room`] waits against, default from [`ClusterConfig::default`].
     fan_out_backlog_capacity: usize,
@@ -1636,6 +1669,8 @@ where
             raw_resolver: Arc::new(LwwResolver),
             crdt_bounds: ClusterConfig::default().crdt_compaction_bounds(),
             max_frame: MAX_FRAME,
+            max_resident_bytes: u64::MAX,
+            ceiling_refusals: None,
             fan_out_backlog_capacity: ClusterConfig::default().fan_out_backlog_capacity,
             fan_out_wait_timeout: ClusterConfig::default().fan_out_wait_timeout,
             merge_window: Duration::ZERO,
@@ -1741,6 +1776,87 @@ where
     pub fn with_max_frame(mut self, max_frame: usize) -> Self {
         self.max_frame = max_frame;
         self
+    }
+
+    /// Sets a soft ceiling on [`Shard::resident_bytes`]. A local write
+    /// ([`Shard::insert`], [`Shard::insert_with_ttl`], [`Shard::merge`],
+    /// [`Shard::insert_many`]) that finds the ceiling reached fails with
+    /// [`CacheError::OverMemoryCeiling`], and a read-through fill returns its
+    /// value without storing it. Removals and writes arriving from peers are
+    /// always accepted, so every replica keeps the same entries and resident
+    /// bytes can pass the ceiling by what peers send. Defaults to `u64::MAX`,
+    /// no ceiling.
+    ///
+    /// A shard with no ceiling counts no bytes: [`Shard::resident_bytes`]
+    /// is `None` and the write paths skip the check. Setting one rebuilds
+    /// the engine with counting on, carrying forward any
+    /// [`Shard::with_weigher`] and [`Shard::with_capacity_hint`], so call it
+    /// right after [`Shard::new`], before any reads or writes reach this
+    /// shard. `u64::MAX` removes the ceiling.
+    #[must_use]
+    pub fn with_max_resident_bytes(mut self, ceiling: u64) -> Self {
+        self.max_resident_bytes = ceiling;
+        self.ceiling_refusals = (ceiling != u64::MAX).then(|| CeilingRefusals::new(&self.name));
+        if self.ceiling_refusals.is_some() != self.engine.resident_bytes().is_some() {
+            self.engine = self.build_engine();
+        }
+        self
+    }
+
+    /// Bytes this shard's live entries hold in memory, counted only under
+    /// a [`Shard::with_max_resident_bytes`] ceiling and `None` without one:
+    /// a fixed per-entry overhead for the entry slot and its index row,
+    /// plus each record's heap-held key and value bytes. A spilled entry
+    /// counts only its key. A lower bound on the process memory the entries
+    /// occupy, since allocator rounding and spare arena capacity are not
+    /// counted.
+    #[must_use]
+    pub fn resident_bytes(&self) -> Option<u64> {
+        self.engine.resident_bytes()
+    }
+
+    /// [`Shard::resident_bytes`] once it has reached the ceiling set by
+    /// [`Shard::with_max_resident_bytes`], `None` below it or with no
+    /// ceiling.
+    fn at_ceiling(&self) -> Option<u64> {
+        let resident_bytes = self.engine.resident_bytes()?;
+        (resident_bytes >= self.max_resident_bytes).then_some(resident_bytes)
+    }
+
+    /// Ends a [`Shard::get_or_load`] fill that finished at the ceiling:
+    /// hands `value` to every joined waiter without storing it, and counts
+    /// the loader run as a miss and an uncached fill.
+    fn finish_uncached_fill(
+        &self,
+        key_bytes: &Bytes,
+        hash: u64,
+        inflight: &engine::Inflight<V>,
+        value: V,
+    ) {
+        self.engine
+            .finish_uncached(key_bytes, hash, inflight, value);
+        self.misses.increment(1);
+        if let Some(refusals) = &self.ceiling_refusals {
+            refusals.fills.increment(1);
+        }
+    }
+
+    /// `Err(CacheError::OverMemoryCeiling)`, counted, when this shard is at
+    /// its ceiling: the gate every local write passes first.
+    fn check_ceiling(&self) -> Result<(), CacheError> {
+        match self.at_ceiling() {
+            None => Ok(()),
+            Some(resident_bytes) => {
+                if let Some(refusals) = &self.ceiling_refusals {
+                    refusals.writes.increment(1);
+                }
+                Err(CacheError::OverMemoryCeiling {
+                    cache: self.name.clone(),
+                    resident_bytes,
+                    ceiling: self.max_resident_bytes,
+                })
+            }
+        }
     }
 
     /// Overrides the fan-out backlog capacity an async write waits against
@@ -1867,14 +1983,8 @@ where
     where
         W: Fn(&K, &V) -> u32 + Send + Sync + 'static,
     {
-        let weigher: SharedWeigher<K, V> = Arc::new(weigher);
-        self.weigher = Some(Arc::clone(&weigher));
-        self.engine = Arc::new(Engine::new(
-            self.max_capacity,
-            self.tti,
-            Some(boxed_weigher(weigher)),
-            self.capacity_hint,
-        ));
+        self.weigher = Some(Arc::new(weigher));
+        self.engine = self.build_engine();
         self
     }
 
@@ -1886,14 +1996,27 @@ where
     #[must_use]
     pub fn with_capacity_hint(mut self, hint: u64) -> Self {
         self.capacity_hint = Some(hint);
-        let weigher = self.weigher.clone().map(boxed_weigher);
-        self.engine = Arc::new(Engine::new(
+        self.engine = self.build_engine();
+        self
+    }
+
+    /// A fresh engine from this shard's capacity, TTI, weigher, capacity
+    /// hint, ceiling and the current engine's pre-fold flag: the rebuild
+    /// every engine-shaping builder shares, so each carries the others'
+    /// settings forward. Counts resident bytes only under a ceiling.
+    fn build_engine(&self) -> Arc<Engine<K, V>> {
+        let engine = Engine::new(
             self.max_capacity,
             self.tti,
-            weigher,
+            self.weigher.clone().map(boxed_weigher),
             self.capacity_hint,
-        ));
-        self
+        );
+        engine.set_prefold_enabled(self.engine.prefold_enabled());
+        Arc::new(if self.max_resident_bytes == u64::MAX {
+            engine
+        } else {
+            engine.count_resident_bytes()
+        })
     }
 
     /// Per-stripe `live` arena capacities, in stripe order. `#[doc(hidden)]`
@@ -2740,6 +2863,11 @@ where
     /// so a burst of concurrent misses on one spilled key reads it off
     /// disk once.
     ///
+    /// A fill that finishes with the shard at the ceiling set by
+    /// [`Shard::with_max_resident_bytes`] returns its value to the caller
+    /// and every joined waiter without storing it, and counts
+    /// `sundog_ceiling_refusals_total{cache, kind="fill"}`.
+    ///
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails.
@@ -2778,6 +2906,10 @@ where
                             Arc::clone(err),
                         ))));
                     }
+                    if let Some(value) = inflight.value.get() {
+                        self.hits.increment(1);
+                        return Ok(value.clone());
+                    }
                     // The fast-path read above picks up the fresh value, or its
                     // absence.
                 }
@@ -2805,6 +2937,11 @@ where
                     // keeps its place.
                     let ver = self.stamp_local();
                     return match loader(key).await {
+                        Ok(value) if self.at_ceiling().is_some() => {
+                            self.finish_uncached_fill(&key_bytes, hash, &inflight, value.clone());
+                            guard.complete();
+                            Ok(value)
+                        }
                         Ok(value) => {
                             let encoded = Bytes::from(postcard::to_stdvec(&value).expect(
                                 "invariant: a value returned by the loader postcard-encodes",
@@ -2889,7 +3026,9 @@ where
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the wire frame this write would
     /// replicate as exceeds the configured frame cap. See
-    /// [`Shard::with_max_frame`], default [`MAX_FRAME`].
+    /// [`Shard::with_max_frame`], default [`MAX_FRAME`]. Returns
+    /// [`CacheError::OverMemoryCeiling`] if this shard is at the ceiling set
+    /// by [`Shard::with_max_resident_bytes`].
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.wait_for_fan_out_room().await;
         self.insert_sync(key, value)
@@ -2916,6 +3055,7 @@ where
     }
 
     fn insert_expiring(&self, key: K, value: V, ttl: Option<Duration>) -> Result<(), CacheError> {
+        self.check_ceiling()?;
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let ver = self.stamp_local();
@@ -2987,8 +3127,12 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if `value`'s wire frame exceeds
-    /// the configured frame cap. See [`Shard::with_max_frame`].
+    /// the configured frame cap. See [`Shard::with_max_frame`]. Returns
+    /// [`CacheError::OverMemoryCeiling`] as [`Shard::insert`] does; a call
+    /// folded into a pending value within the window is checked when it is
+    /// made, not when the fold flushes.
     pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
+        self.check_ceiling()?;
         let key_bytes = encode_key(&key)?;
         let encoded = Bytes::from(postcard::to_stdvec(&value).map_err(CodecError::from)?);
         let wire_size = wire::replicate_frame_len(self.name.len(), key_bytes.len(), encoded.len());
@@ -3115,7 +3259,10 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if any entry's wire frame exceeds
-    /// the configured frame cap (see [`Shard::insert`]).
+    /// the configured frame cap (see [`Shard::insert`]). Returns
+    /// [`CacheError::OverMemoryCeiling`], applying nothing, if this shard is
+    /// at its ceiling when the call begins; a batch that begins under the
+    /// ceiling applies whole.
     pub async fn insert_many(
         &self,
         entries: impl IntoIterator<Item = (K, V)>,
@@ -3143,6 +3290,7 @@ where
         entries: impl IntoIterator<Item = (K, V)>,
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
+        self.check_ceiling()?;
         // Stops preparing entries at the first one that fails to encode or
         // exceeds `max_frame`, but keeps everything prepared before it so
         // the apply loop below still applies those, per this method's
@@ -5495,6 +5643,214 @@ mod tests {
         assert!(matches!(err, CacheError::ValueTooLarge { .. }));
     }
 
+    /// A Replicated shard whose memory ceiling is one byte: empty, it takes
+    /// one write, then refuses every local write after it.
+    fn one_byte_ceiling_shard() -> Shard<u32, String> {
+        shard::<u32, String>(1).with_max_resident_bytes(1)
+    }
+
+    #[tokio::test]
+    async fn resident_bytes_rises_on_insert_and_falls_to_zero_on_remove() {
+        let s = shard::<u32, String>(1).with_max_resident_bytes(1 << 40);
+        assert_eq!(s.resident_bytes(), Some(0));
+        s.insert(1, "v".repeat(100)).await.expect("insert");
+        let one = s.resident_bytes().expect("a capped shard counts");
+        assert!(
+            one > 100,
+            "an entry counts at least its value bytes, got {one}"
+        );
+        s.insert(2, "v".repeat(100)).await.expect("insert");
+        assert_eq!(
+            s.resident_bytes(),
+            Some(2 * one),
+            "a same-shaped entry costs the same"
+        );
+        s.remove(&1).await.expect("remove");
+        s.remove(&2).await.expect("remove");
+        assert_eq!(s.resident_bytes(), Some(0));
+    }
+
+    #[test]
+    fn engine_rebuilds_carry_the_prefold_flag_and_the_ceiling_forward() {
+        let s = shard::<u32, String>(1)
+            .with_prefold_enabled(false)
+            .with_max_resident_bytes(1 << 40)
+            .with_capacity_hint(64)
+            .with_weigher(|_k: &u32, _v: &String| 1)
+            .with_max_resident_bytes(1 << 30);
+        assert!(!s.prefold_enabled(), "every rebuild keeps pre-fold off");
+        assert_eq!(
+            s.resident_bytes(),
+            Some(0),
+            "every rebuild keeps counting on"
+        );
+        let uncapped = shard::<u32, String>(1)
+            .with_prefold_enabled(false)
+            .with_max_resident_bytes(u64::MAX);
+        assert!(
+            !uncapped.prefold_enabled(),
+            "no ceiling leaves the engine as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncapped_shard_counts_no_bytes_and_refuses_nothing() {
+        let s = shard::<u32, String>(1);
+        s.insert(1, "v".repeat(100)).await.expect("insert");
+        assert_eq!(s.resident_bytes(), None);
+        assert_eq!(s.engine.resident_bytes(), None);
+        let capped_then_lifted = shard::<u32, String>(1)
+            .with_max_resident_bytes(1)
+            .with_max_resident_bytes(u64::MAX);
+        capped_then_lifted
+            .insert_many((0..8).map(|k| (k, "v".to_string())))
+            .await
+            .expect("u64::MAX removes the ceiling");
+        assert_eq!(capped_then_lifted.resident_bytes(), None);
+    }
+
+    #[tokio::test]
+    async fn insert_at_the_memory_ceiling_is_refused_until_a_remove_frees_room() {
+        let s = one_byte_ceiling_shard();
+        s.insert(1, "a".to_string())
+            .await
+            .expect("an empty shard is under its ceiling");
+        let resident_bytes = s.resident_bytes();
+        let err = s
+            .insert(2, "b".to_string())
+            .await
+            .expect_err("the shard is at its ceiling");
+        assert!(
+            matches!(
+                &err,
+                CacheError::OverMemoryCeiling { cache, resident_bytes: found, ceiling: 1 }
+                    if cache == "test" && Some(*found) == resident_bytes
+            ),
+            "got {err:?}"
+        );
+        assert!(matches!(
+            s.insert_sync(2, "b".to_string()),
+            Err(CacheError::OverMemoryCeiling { .. })
+        ));
+        assert!(matches!(
+            s.insert_with_ttl(2, "b".to_string(), Duration::from_secs(60))
+                .await,
+            Err(CacheError::OverMemoryCeiling { .. })
+        ));
+        assert_eq!(s.get(&2).await, None, "no refused write landed");
+
+        s.remove(&1).await.expect("a removal is never refused");
+        s.insert(2, "b".to_string())
+            .await
+            .expect("the removal brought the shard back under its ceiling");
+        assert_eq!(s.get(&2).await.as_deref(), Some("b"));
+    }
+
+    #[tokio::test]
+    async fn merge_and_insert_many_at_the_memory_ceiling_apply_nothing() {
+        let s = one_byte_ceiling_shard();
+        s.insert_many([(1, "a".to_string()), (2, "b".to_string())])
+            .await
+            .expect("a batch that starts under the ceiling applies whole");
+        assert_eq!(s.entry_count().await, 2);
+        assert!(matches!(
+            s.insert_many([(3, "c".to_string()), (4, "d".to_string())])
+                .await,
+            Err(CacheError::OverMemoryCeiling { .. })
+        ));
+        assert!(matches!(
+            s.insert_many_with_ttl([(3, "c".to_string())], Duration::from_secs(60))
+                .await,
+            Err(CacheError::OverMemoryCeiling { .. })
+        ));
+        assert!(matches!(
+            s.merge(5, "e".to_string()).await,
+            Err(CacheError::OverMemoryCeiling { .. })
+        ));
+        assert_eq!(s.entry_count().await, 2, "no refused entry landed");
+    }
+
+    #[tokio::test]
+    async fn writes_from_peers_apply_past_the_memory_ceiling() {
+        let s = one_byte_ceiling_shard();
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let record = |key: u32| WireRecord {
+            key: key_bytes(&key),
+            value: Some(Bytes::from(postcard::to_stdvec("peer").expect("encode"))),
+            ver: hlc(10, 2),
+            expires_at_ms: None,
+        };
+        ShardOps::apply_remote_batch(&s, vec![record(2), record(3)]).await;
+        ShardOps::apply_remote(&s, record(4)).await;
+        for key in 2..=4 {
+            assert_eq!(
+                s.get(&key).await.as_deref(),
+                Some("peer"),
+                "key {key}: a replica never refuses what a peer applied"
+            );
+        }
+        assert_eq!(s.resident_bytes(), Some(s.engine.recount_resident_bytes()));
+    }
+
+    #[tokio::test]
+    async fn get_or_load_at_the_memory_ceiling_returns_the_value_uncached() {
+        let s = one_byte_ceiling_shard();
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let before = s.resident_bytes();
+        for round in 0..2 {
+            let value = s
+                .get_or_load(&2, async |_key: &u32| -> Result<String, BoomError> {
+                    Ok("loaded".to_string())
+                })
+                .await
+                .expect("the loader succeeds");
+            assert_eq!(value, "loaded", "round {round}");
+            assert_eq!(
+                s.get(&2).await,
+                None,
+                "round {round}: the fill is not stored"
+            );
+        }
+        assert_eq!(s.resident_bytes(), before);
+        let made = s
+            .get_or_insert_with(&3, async |_key: &u32| "made".to_string())
+            .await
+            .expect("an infallible fill");
+        assert_eq!(made, "made");
+        assert_eq!(s.get(&3).await, None);
+    }
+
+    #[tokio::test]
+    async fn get_or_load_stampede_at_the_memory_ceiling_shares_one_uncached_value() {
+        const CONCURRENCY: usize = 32;
+        let s = Arc::new(one_byte_ceiling_shard());
+        s.insert(1, "a".to_string()).await.expect("insert");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENCY {
+            let s = Arc::clone(&s);
+            let calls = Arc::clone(&calls);
+            tasks.spawn(async move {
+                s.get_or_load(&42, async move |_key: &u32| -> Result<String, BoomError> {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok("loaded-once".to_string())
+                })
+                .await
+                .expect("loader succeeds")
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.expect("caller does not panic"), "loaded-once");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "every joined waiter takes the owner's uncached value instead of loading again"
+        );
+        assert_eq!(s.get(&42).await, None);
+    }
+
     #[tokio::test]
     async fn insert_many_applies_entries_before_an_oversized_one_then_fails() {
         let s = shard::<u32, Vec<u8>>(1);
@@ -6779,18 +7135,28 @@ mod tests {
             1 << 20, // generous: nothing is ever evicted by ordinary means
             None,
             None,
-        );
+        )
+        .with_max_resident_bytes(1 << 40);
         shard1
             .attach_spill(&cfg)
             .expect("a brand-new directory opens cold");
-        shard1.insert(1u32, "v".to_string()).await.expect("insert");
+        shard1.insert(1u32, "v".repeat(40)).await.expect("insert");
         assert_eq!(
             shard1.engine.debug_spill_entries_count(),
             0,
             "a resident entry never counts toward sundog_spill_entries before any checkpoint"
         );
+        let resident_before = shard1.resident_bytes().expect("a capped shard counts");
 
         shard1.close_spill_checkpointed().await;
+        assert!(
+            shard1.resident_bytes() < Some(resident_before),
+            "the checkpoint's flip to Spilled drops the value's heap bytes"
+        );
+        assert_eq!(
+            shard1.resident_bytes(),
+            Some(shard1.engine.recount_resident_bytes())
+        );
 
         assert_eq!(
             shard1.engine.debug_spill_entries_count(),

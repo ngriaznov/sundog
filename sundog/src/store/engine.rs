@@ -272,6 +272,15 @@ impl Record {
         }
     }
 
+    /// Bytes this record holds on the heap: `0` inline, its whole length
+    /// boxed.
+    fn heap_len(&self) -> usize {
+        match self {
+            Record::Inline { .. } => 0,
+            Record::Heap(boxed) => boxed.len(),
+        }
+    }
+
     /// The record's bytes, from whichever variant holds them.
     fn as_slice(&self) -> &[u8] {
         match self {
@@ -402,6 +411,33 @@ fn decode_key<K: DeserializeOwned>(key_bytes: &[u8]) -> K {
 /// Decodes `value_bytes` back into `V`, mirroring [`decode_key`].
 fn decode_value<V: DeserializeOwned>(value_bytes: &[u8]) -> V {
     postcard::from_bytes(value_bytes).expect("value_bytes is this engine's own postcard output")
+}
+
+/// Resident bytes every live entry costs besides its record's heap bytes:
+/// its [`Live`] slot and its `u32` row plus control byte in the stripe's
+/// hash index.
+const ENTRY_OVERHEAD_BYTES: u64 = (size_of::<Live<(), ()>>() + size_of::<u32>() + 1) as u64;
+
+/// The resident bytes `live` accounts for: [`ENTRY_OVERHEAD_BYTES`] plus
+/// whatever its record holds on the heap. Allocator rounding and a stripe's
+/// spare arena capacity are not counted.
+fn entry_bytes<K, V>(live: &Live<K, V>) -> u64 {
+    ENTRY_OVERHEAD_BYTES + live.record.heap_len() as u64
+}
+
+/// Replaces `live`'s record with `record` and, when the engine counts
+/// resident bytes, moves the total by the difference in heap bytes: every
+/// in-place record swap goes through here, so the total stays exact.
+fn set_record<K, V>(live: &mut Live<K, V>, record: Record, resident_bytes: Option<&AtomicU64>) {
+    if let Some(total) = resident_bytes {
+        let (old, new) = (live.record.heap_len() as u64, record.heap_len() as u64);
+        if new >= old {
+            total.fetch_add(new - old, Ordering::Relaxed);
+        } else {
+            total.fetch_sub(old - new, Ordering::Relaxed);
+        }
+    }
+    live.record = record;
 }
 
 /// One live entry. Stores only `record`'s raw postcard bytes, never a
@@ -553,7 +589,10 @@ pub(crate) struct Inflight<V> {
     /// being woken returns the same [`crate::error::CacheError::Loader`]
     /// the owner did.
     pub(crate) error: OnceLock<Arc<dyn std::error::Error + Send + Sync>>,
-    _marker: PhantomData<fn() -> V>,
+    /// Set iff the fill finished without storing its value, because the
+    /// shard sat at its memory ceiling: a joined waiter returns this value
+    /// instead of loading again.
+    pub(crate) value: OnceLock<V>,
 }
 
 impl<V> Inflight<V> {
@@ -561,7 +600,7 @@ impl<V> Inflight<V> {
         Self {
             done: watch::channel(false).0,
             error: OnceLock::new(),
-            _marker: PhantomData,
+            value: OnceLock::new(),
         }
     }
 
@@ -637,6 +676,11 @@ struct Slab<K, V> {
     /// `u32` slot indices, hashed and compared through [`hasher_for`]/
     /// [`record_key`] on the slot's own record.
     index: HashTable<u32>,
+    /// The engine's resident byte total, shared by every stripe's slab when
+    /// [`Engine::count_resident_bytes`] turns counting on: every entry this
+    /// slab gains or loses moves it by [`entry_bytes`]. `None` counts
+    /// nothing.
+    resident_bytes: Option<Arc<AtomicU64>>,
 }
 
 impl<K, V> Slab<K, V> {
@@ -646,6 +690,7 @@ impl<K, V> Slab<K, V> {
         Self {
             entries: Vec::new(),
             index: HashTable::new(),
+            resident_bytes: None,
         }
     }
 
@@ -655,6 +700,7 @@ impl<K, V> Slab<K, V> {
         Self {
             entries: Vec::with_capacity(capacity),
             index: HashTable::with_capacity(capacity),
+            resident_bytes: None,
         }
     }
 
@@ -732,6 +778,9 @@ impl<K, V> Slab<K, V> {
         if self.entries.len() == self.entries.capacity() {
             self.entries.reserve_exact(arena_growth(self.entries.len()));
         }
+        if let Some(total) = &self.resident_bytes {
+            total.fetch_add(entry_bytes(&value), Ordering::Relaxed);
+        }
         self.entries.push(value);
         let entries = &self.entries;
         self.index
@@ -775,6 +824,9 @@ impl<K, V> Slab<K, V> {
         index_row.remove();
         let last = self.entries.len() - 1;
         let removed = self.entries.swap_remove(slot);
+        if let Some(total) = &self.resident_bytes {
+            total.fetch_sub(entry_bytes(&removed), Ordering::Relaxed);
+        }
         if slot != last {
             let moved_hash = hasher(&self.entries[slot]);
             let last_u32 =
@@ -814,6 +866,10 @@ impl<K, V> Slab<K, V> {
     /// Drains and returns every live entry, emptying both the arena and the
     /// index.
     fn drain(&mut self) -> std::vec::Drain<'_, Live<K, V>> {
+        if let Some(total) = &self.resident_bytes {
+            let drained: u64 = self.entries.iter().map(entry_bytes).sum();
+            total.fetch_sub(drained, Ordering::Relaxed);
+        }
         self.index.clear();
         self.entries.drain(..)
     }
@@ -2392,6 +2448,12 @@ pub(crate) struct Engine<K, V> {
     digest: Box<[AtomicU64]>,
     total_weight: AtomicU64,
     live_count: AtomicU64,
+    /// Resident bytes across every stripe's live entries, per
+    /// [`entry_bytes`], once [`Engine::count_resident_bytes`] turns counting
+    /// on: shared with each stripe's [`Slab`], which moves it on every
+    /// insert and removal, and moved by [`set_record`] on every in-place
+    /// record swap. `None`, the default, counts nothing.
+    resident_bytes: Option<Arc<AtomicU64>>,
     max_capacity: u64,
     /// The configured time-to-idle, clamped by [`clamp_tti_ms`].
     tti_ms: Option<u64>,
@@ -2526,6 +2588,7 @@ where
                 .into_boxed_slice(),
             total_weight: AtomicU64::new(0),
             live_count: AtomicU64::new(0),
+            resident_bytes: None,
             max_capacity,
             tti_ms: tti.map(|d| clamp_tti_ms(super::duration_ms(d))),
             weigher,
@@ -3111,7 +3174,8 @@ where
                         FinalizeWriteOutcome::DroppedExpired
                     } else {
                         let weight = live.weight;
-                        live.record = build_key_only_record(record_key(&live.record));
+                        let key_only = build_key_only_record(record_key(&live.record));
+                        set_record(live, key_only, self.resident_bytes.as_deref());
                         live.state = EntryState::Spilled(loc);
                         live.weight = 0;
                         FinalizeWriteOutcome::Kept(weight)
@@ -3416,7 +3480,8 @@ where
             let old_weight = live.weight;
             let old_wall_ms = live.wall_ms;
             let old_expiry = live.expiry;
-            live.record = build_resident_record(record_key(&live.record), encoded.as_ref());
+            let record = build_resident_record(record_key(&live.record), encoded.as_ref());
+            set_record(live, record, self.resident_bytes.as_deref());
             live.weight = new_weight;
             live.set_ver(new_ver);
             // new_ver carries a new wall_ms; re-deriving expiry from the
@@ -3457,6 +3522,43 @@ where
     /// The number of live entries across every stripe.
     pub(crate) fn live_entry_count(&self) -> u64 {
         self.live_count.load(Ordering::Relaxed)
+    }
+
+    /// Turns resident byte counting on, for an engine that holds no
+    /// entries yet: from here every insert, removal and in-place record
+    /// swap moves [`Engine::resident_bytes`]. Off by default, so an engine
+    /// nobody caps pays nothing for it.
+    #[must_use]
+    pub(crate) fn count_resident_bytes(mut self) -> Self {
+        let total = Arc::new(AtomicU64::new(0));
+        for stripe in &mut self.stripes {
+            let live = &mut stripe.get_mut().live;
+            debug_assert_eq!(live.len(), 0, "counting starts on an empty engine");
+            live.resident_bytes = Some(Arc::clone(&total));
+        }
+        self.resident_bytes = Some(total);
+        self
+    }
+
+    /// Resident bytes across every stripe's live entries, `None` unless
+    /// [`Engine::count_resident_bytes`] turned counting on: each entry's
+    /// fixed overhead plus its record's heap bytes. A lower bound on the
+    /// process memory the entries occupy, since allocator rounding and spare
+    /// arena capacity are not counted.
+    pub(crate) fn resident_bytes(&self) -> Option<u64> {
+        self.resident_bytes
+            .as_ref()
+            .map(|total| total.load(Ordering::Relaxed))
+    }
+
+    /// [`Engine::resident_bytes`] recomputed from scratch by walking every
+    /// stripe: the reference the maintained counter must equal.
+    #[cfg(test)]
+    pub(crate) fn recount_resident_bytes(&self) -> u64 {
+        self.stripes
+            .iter()
+            .map(|stripe| stripe.read().live.iter().map(entry_bytes).sum::<u64>())
+            .sum()
     }
 
     /// xorshift64: fast and allocation-free for choosing which stripe to look
@@ -4005,10 +4107,8 @@ where
         self.prefold_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// The current value of [`Engine::set_prefold_enabled`]'s flag. Only a
-    /// test reads it back; the write path only ever needs the flag itself,
-    /// via [`Self::apply_many`].
-    #[cfg(test)]
+    /// The current value of [`Engine::set_prefold_enabled`]'s flag, which a
+    /// shard's engine rebuild carries forward onto the new engine.
     pub(crate) fn prefold_enabled(&self) -> bool {
         self.prefold_enabled.load(Ordering::Relaxed)
     }
@@ -4526,6 +4626,20 @@ where
         inflight.finish();
     }
 
+    /// Records a loader run whose value is not stored: removes the
+    /// `inflight` entry and hands `value` to every joined waiter.
+    pub(crate) fn finish_uncached(
+        &self,
+        key_bytes: &Bytes,
+        hash: u64,
+        inflight: &Inflight<V>,
+        value: V,
+    ) {
+        let _ = inflight.value.set(value);
+        self.finish_inflight(key_bytes, hash);
+        inflight.finish();
+    }
+
     /// Snapshots a currently-[`EntryState::Spilled`] entry's pointer under the
     /// stripe read lock: `None` for a resident entry, an absent key, or one
     /// a read at `now_ms` would see as expired. Touches `last_access_ms`.
@@ -4602,7 +4716,11 @@ where
         }
         let key: K = decode_key(key_bytes);
         let weight = self.weigher.as_ref().map_or(1, |w| w(&key, value));
-        live.record = build_resident_record(key_bytes, encoded.as_ref());
+        set_record(
+            live,
+            build_resident_record(key_bytes, encoded.as_ref()),
+            self.resident_bytes.as_deref(),
+        );
         live.state = EntryState::Resident;
         live.weight = weight;
         drop(stripe);
@@ -4651,7 +4769,8 @@ where
                 {
                     // A fresh copy of the key half, never a slice of the
                     // record (which would keep its value bytes resident).
-                    live.record = build_key_only_record(record_key(&live.record));
+                    let key_only = build_key_only_record(record_key(&live.record));
+                    set_record(live, key_only, self.resident_bytes.as_deref());
                     live.state = EntryState::Spilled(loc);
                     true
                 }
@@ -5903,7 +6022,7 @@ mod tests {
         // compact_replace_if_current's path: a wall_ms jump alone can make
         // a stored LONG_TTL row stale by making the deadline inline again.
         {
-            let engine = engine_u32_string(u64::MAX, None);
+            let engine = engine_u32_string(u64::MAX, None).count_resident_bytes();
             let key = 3u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -5935,6 +6054,11 @@ mod tests {
                 encoded: Bytes::from(postcard::to_stdvec("compacted").expect("encode")),
             });
             assert!(replaced);
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(engine.recount_resident_bytes()),
+                "an in-place compaction moves the resident byte total by its heap delta"
+            );
             assert!(
                 !engine
                     .stripe_lock(bucket)
@@ -7344,6 +7468,190 @@ mod tests {
         assert_eq!(engine.digests(), engine.recompute_digests_paired());
     }
 
+    #[test]
+    fn resident_bytes_is_none_and_slabs_count_nothing_until_counting_is_turned_on() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let _ = put(
+            &engine,
+            1,
+            key_bytes(1),
+            "v".repeat(100),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        assert_eq!(engine.resident_bytes(), None);
+        assert!(
+            engine
+                .stripes
+                .iter()
+                .all(|stripe| stripe.read().live.resident_bytes.is_none()),
+            "an uncapped engine's slabs carry no counter to move"
+        );
+        let counted = engine_u32_string(u64::MAX, None).count_resident_bytes();
+        assert_eq!(counted.resident_bytes(), Some(0));
+        assert!(
+            counted
+                .stripes
+                .iter()
+                .all(|stripe| stripe.read().live.resident_bytes.is_some())
+        );
+    }
+
+    #[test]
+    fn resident_bytes_counts_each_entry_overhead_plus_its_heap_record() {
+        let engine = engine_u32_string(u64::MAX, None).count_resident_bytes();
+        let (short, long) = (1u32, 2u32);
+        let _ = put(
+            &engine,
+            short,
+            key_bytes(short),
+            "s".to_string(),
+            hlc(1, 1),
+            None,
+            0,
+        );
+        assert_eq!(
+            engine.resident_bytes(),
+            Some(ENTRY_OVERHEAD_BYTES),
+            "an inline record adds only the entry overhead"
+        );
+        let long_value = "v".repeat(100);
+        let _ = put(
+            &engine,
+            long,
+            key_bytes(long),
+            long_value.clone(),
+            hlc(2, 1),
+            None,
+            0,
+        );
+        // One LEN prefix byte, then the key and value bytes.
+        let long_record =
+            1 + key_bytes(long).len() + postcard::to_stdvec(&long_value).expect("encode").len();
+        assert_eq!(
+            engine.resident_bytes(),
+            Some(2 * ENTRY_OVERHEAD_BYTES + long_record as u64),
+            "a heap record adds its whole length on top of the overhead"
+        );
+        let _ = put(
+            &engine,
+            long,
+            key_bytes(long),
+            "t".to_string(),
+            hlc(3, 1),
+            None,
+            0,
+        );
+        assert_eq!(
+            engine.resident_bytes(),
+            Some(2 * ENTRY_OVERHEAD_BYTES),
+            "overwriting with an inline value releases the old heap bytes"
+        );
+        for (key, wall_ms) in [(short, 4), (long, 5)] {
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            apply_direct(
+                &engine,
+                stripe_index_from_hash(hash),
+                EntryKey {
+                    hash,
+                    key,
+                    key_bytes: kb,
+                },
+                hlc(wall_ms, 1),
+                Incoming::Tombstone,
+                wall_ms,
+            );
+        }
+        assert_eq!(
+            engine.resident_bytes(),
+            Some(0),
+            "removals release every byte"
+        );
+        assert_eq!(
+            engine.resident_bytes(),
+            Some(engine.recount_resident_bytes())
+        );
+    }
+
+    #[test]
+    fn resident_bytes_matches_a_full_recount_after_random_ops_including_sweeps_and_evictions() {
+        use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
+
+        let engine = engine_u32_string(12, None).count_resident_bytes();
+        let mut rng = StdRng::seed_from_u64(0xB17E5);
+        let mut clock = HlcClock::new(NodeId::from(1));
+
+        for i in 0..400u64 {
+            let key = rng.random_range(0..24u32);
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            let now = i * 10;
+            let entry = EntryKey {
+                hash,
+                key,
+                key_bytes: kb,
+            };
+            match rng.random_range(0..4u32) {
+                0 => {
+                    // Lengths on both sides of INLINE_CAP, so records move
+                    // between the inline and heap variants.
+                    let value = "x".repeat(rng.random_range(0..64usize));
+                    let encoded = Bytes::from(postcard::to_stdvec(&value).expect("encode"));
+                    let incoming = Incoming::Put {
+                        value,
+                        expires_at_ms: Some(now + 500),
+                        encoded,
+                    };
+                    apply_direct(&engine, bucket, entry, clock.now(now), incoming, now);
+                    engine.enforce_capacity(bucket, now);
+                }
+                1 => {
+                    let ver = clock.now(now);
+                    apply_direct(&engine, bucket, entry, ver, Incoming::Tombstone, now);
+                }
+                2 => engine.sweep(now),
+                _ => engine.gc_tombstones(false, now),
+            }
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(engine.recount_resident_bytes()),
+                "iteration {i}: the maintained resident byte total diverged from a full recount"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_replace_moves_resident_bytes_by_the_heap_delta() {
+        let engine = engine_u32_string(u64::MAX, None).count_resident_bytes();
+        let key = 7u32;
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+        let _ = put(&engine, key, kb.clone(), "a".repeat(80), hlc(1, 1), None, 0);
+        let before = engine.resident_bytes().expect("counting is on");
+        let compacted = "a".repeat(30);
+        assert!(engine.compact_replace_if_current(CompactReplace {
+            key: &key,
+            key_bytes: kb.as_ref(),
+            hash,
+            expected_ver: hlc(1, 1),
+            new_ver: hlc(2, 1),
+            value: compacted.clone(),
+            encoded: Bytes::from(postcard::to_stdvec(&compacted).expect("encode")),
+        }));
+        assert_eq!(
+            before - engine.resident_bytes().expect("counting is on"),
+            50,
+            "the record shrinks by exactly the 50 value bytes compaction dropped"
+        );
+        assert_eq!(
+            engine.resident_bytes(),
+            Some(engine.recount_resident_bytes())
+        );
+    }
+
     trait PairedDigests {
         fn recompute_digests_paired(&self) -> Vec<(u16, u64)>;
     }
@@ -8410,7 +8718,7 @@ mod tests {
 
         #[test]
         fn promote_locked_restores_residency_without_touching_the_digest_or_live_count() {
-            let engine = engine_u32_string(u64::MAX, None);
+            let engine = engine_u32_string(u64::MAX, None).count_resident_bytes();
             let key = 1u32;
             let kb = key_bytes(key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8432,6 +8740,11 @@ mod tests {
                 promoted,
                 "the version matches and nothing displaced it: promotion succeeds"
             );
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(engine.recount_resident_bytes()),
+                "promotion adds the restored value's heap bytes to the resident total"
+            );
 
             assert_eq!(engine.get(&key, 0), Some("restored".to_string()));
             assert_eq!(
@@ -8447,6 +8760,33 @@ mod tests {
             assert_eq!(
                 weight_after, 1,
                 "promotion adds the freshly weighed entry's weight back to total_weight"
+            );
+        }
+
+        #[test]
+        fn promote_locked_adds_the_restored_value_heap_bytes_to_resident_bytes() {
+            let engine = engine_u32_string(u64::MAX, None).count_resident_bytes();
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let ver = hlc(5, 1);
+            engine.debug_insert_spilled(&kb, ver, None, loc(0, 0, 10, 0), 0);
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(ENTRY_OVERHEAD_BYTES),
+                "a spilled entry keeps only its inline key-only record resident"
+            );
+            let restored = "r".repeat(100);
+            let encoded = Bytes::from(postcard::to_stdvec(&restored).expect("string encodes"));
+            assert!(engine.promote_locked(kb.as_ref(), hash, ver, &restored, &encoded));
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(ENTRY_OVERHEAD_BYTES + (1 + kb.len() + encoded.len()) as u64),
+                "promotion brings the whole record back onto the heap"
+            );
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(engine.recount_resident_bytes())
             );
         }
 
@@ -8855,7 +9195,8 @@ mod tests {
         fn install_copies_the_key_into_a_fresh_allocation_instead_of_slicing() {
             // A key over INLINE_CAP forces the heap path, where a
             // pointer-identity check is meaningful.
-            let engine = Engine::<String, String>::new(u64::MAX, None, None, None);
+            let engine =
+                Engine::<String, String>::new(u64::MAX, None, None, None).count_resident_bytes();
             let key = "k".repeat(40);
             let kb = string_key_bytes(&key);
             let hash = hash_key_bytes(kb.as_ref());
@@ -8887,6 +9228,11 @@ mod tests {
                 live.record.as_ref().as_ptr()
             };
 
+            assert_eq!(
+                engine.resident_bytes(),
+                Some(engine.recount_resident_bytes()),
+                "install drops the value's heap bytes from the resident total"
+            );
             assert_ne!(
                 record_ptr_before, record_ptr_after,
                 "install builds a fresh key-only allocation rather than slicing the old \

@@ -7,6 +7,23 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Added
 
+- **Memory ceiling**: `CacheBuilder::max_resident_bytes` sets a soft cap
+  on a cache's memory on each node, in every mode and without a spill tier.
+  A local write (`insert`, `insert_sync`, `insert_with_ttl`, `insert_many`,
+  `insert_many_with_ttl`, `merge`) that finds the cache at or over it fails
+  with the new `CacheError::OverMemoryCeiling`, and a `get_or_load` or
+  `get_or_insert_with` fill returns its value to the caller and every
+  joined waiter without storing it. Removals and writes arriving from peers
+  always apply, so replicas stay identical. `Cache::resident_bytes` and
+  `Shard::resident_bytes` report the figure the ceiling checks: each live
+  entry's slot and index bytes plus its record's heap bytes, a spilled
+  entry counting only its key. Only a capped cache counts: without a
+  ceiling both return `None`, writes skip the check, and no byte or
+  refusal series is exported. `Shard::with_max_resident_bytes` sets the
+  ceiling on a bare shard. New metrics, for capped caches:
+  `sundog_cache_bytes{cache}` and `sundog_ceiling_refusals_total{cache,
+  kind}`. No wire change.
+
 - **`store::PartId`** names one of a distributed cache's 65,536 parts:
   `PartId::of_key`, `bucket`, `part`, `raw`, and `PartId::all` and
   `PartId::of_bucket` to walk them. `ShardOps` gains `held_parts`,
@@ -448,6 +465,10 @@ All notable changes to this project are documented in this file. Format follows
   `crash` exit without leaving.
 
 ### Fixed
+
+- **`CacheBuilder::prefold_enabled(false)` survives a capacity hint or a
+  weigher.** Each rebuilds the shard's engine, and the rebuild reset the
+  flag to its default; it now carries the flag forward.
 
 - **A huge `state_transfer_budget` or disown grace no longer crashes a
   rebalance.** `Duration`'s multiply panics on overflow, and a

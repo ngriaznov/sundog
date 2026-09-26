@@ -71,6 +71,22 @@ pub enum CacheError {
         /// The configured cap it exceeded.
         limit: usize,
     },
+    /// A local write found the cache's resident bytes at or over its
+    /// configured memory ceiling and was refused rather than stored.
+    /// Removals and writes arriving from peers are still accepted, so the
+    /// write is safe to retry once entries expire, are removed, or are
+    /// evicted.
+    #[error(
+        "cache {cache:?} holds {resident_bytes} resident bytes, at or over its {ceiling}-byte memory ceiling"
+    )]
+    OverMemoryCeiling {
+        /// The cache the refused write targeted.
+        cache: SmolStr,
+        /// The resident bytes the write found.
+        resident_bytes: u64,
+        /// The configured ceiling.
+        ceiling: u64,
+    },
     /// The named cache is opened locally with a [`crate::store::Mode`] that
     /// conflicts with how another live node already has it configured. This
     /// check is best-effort: two nodes opening the same name at nearly the

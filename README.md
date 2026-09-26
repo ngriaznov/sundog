@@ -276,6 +276,15 @@ current owners in that same order. `owners` must be 2 or more
 two peers disagreeing on `owners` for the same cache name hit
 `CacheError::ModeMismatch` like any other mode conflict.
 
+Every mode takes a soft memory ceiling, spill tier or not:
+`CacheBuilder::max_resident_bytes(n)` makes a local write that finds this
+node's `Cache::resident_bytes()` at `n` or over fail with
+`CacheError::OverMemoryCeiling`, and a `get_or_load` fill return its value
+without storing it. Nothing is evicted, and removals and writes arriving from
+peers are always applied, so replicas keep identical contents and a node can
+pass its ceiling by what its peers send. A cache without a ceiling counts no
+bytes and checks nothing: `resident_bytes()` returns `None`.
+
 ```rust
 let prices = cluster
     .cache::<Sku, Price>("prices")
@@ -490,7 +499,11 @@ bucket this node does not own any more is never served short regardless.
 
 sundog emits these metrics regardless of features:
 `sundog_cache_hits_total{cache}`, `sundog_cache_misses_total{cache}`,
-`sundog_cache_entries{cache}`, `sundog_backlog_dropped_total{peer}`, frames
+`sundog_cache_entries{cache}`, `sundog_cache_bytes{cache}`, a capped cache's
+resident bytes as `Cache::resident_bytes` counts them,
+`sundog_ceiling_refusals_total{cache, kind}`, local writes (`kind="write"`)
+refused and fills (`kind="fill"`) returned uncached at the
+`max_resident_bytes` ceiling (both only for a cache with a ceiling), `sundog_backlog_dropped_total{peer}`, frames
 dropped only once a peer is gone from the mesh -- a peer that is merely slow
 is never dropped for; `sundog_fan_out_wait_seconds_total{peer}`, whole
 seconds spent instead waiting out such a live peer's full outbox,
@@ -810,6 +823,12 @@ roughly 73 bytes an idle table slot holding a `Live` directly would cost
 at the same load factor. `CacheBuilder::capacity_hint` presizes a shard's
 stripes for its own expected local entry count up front, at `open()`,
 instead of growing one insert at a time.
+
+Under a `max_resident_bytes` ceiling, `Cache::resident_bytes` counts each
+entry's slot, its 5 index bytes and its
+record's heap allocation, not allocator rounding or spare arena capacity,
+so it reads below the resident set: about 180 bytes per entry for the
+16-byte-key, 100-byte-value shape below, measured at 212.
 
 Measured with `SUNDOG_BENCH=1 cargo test --release -p sundog --test
 entry_diet_bench -- --nocapture` on a 4-core Linux box, glibc, one node,

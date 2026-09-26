@@ -213,6 +213,38 @@ async fn count_hits_and_misses(cluster: &Cluster) {
     assert!(loads.iter().all(|value| value == "joined"));
 }
 
+/// Drives `sundog_ceiling_refusals_total{cache, kind}` and
+/// `sundog_cache_bytes{cache}` on a `Mode::Local` cache whose memory ceiling
+/// is one byte: one accepted insert, two refused writes (`kind="write"`),
+/// and one fill returned uncached (`kind="fill"`). Returns the cache's
+/// resident bytes, the value its gauge settles on.
+async fn memory_ceiling_pin_metrics(cluster: &Cluster) -> u64 {
+    let capped = cluster
+        .cache::<u32, String>("ceiling-pin")
+        .mode(Mode::Local)
+        .max_resident_bytes(1)
+        .open()
+        .await
+        .expect("cache opens");
+    capped
+        .insert(1, "a".into())
+        .await
+        .expect("under the ceiling");
+    assert!(capped.insert(2, "b".into()).await.is_err());
+    assert!(capped.insert_many([(3, "c".into())]).await.is_err());
+    let loaded = capped
+        .get_or_load(&4, async |_key| {
+            Ok::<_, std::convert::Infallible>("uncached".to_string())
+        })
+        .await
+        .expect("loader succeeds");
+    assert_eq!(loaded, "uncached");
+    assert_eq!(capped.get(&4).await, None);
+    capped
+        .resident_bytes()
+        .expect("a capped cache counts its bytes")
+}
+
 /// Drives a genuine `sundog_fan_out_wait_timeouts_total{cache}` increment
 /// and pins `sundog_fan_out_backlog{cache}` nonzero through a bare
 /// `Shard`, with no `Cluster`/mesh to drain the fan-out queue. A
@@ -775,6 +807,10 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     count_hits_and_misses(&cluster).await;
     fan_out_wait_timeout_pin_metrics().await;
     clock_skew_pin_metrics().await;
+    let ceiling_pin_bytes = f64::from(
+        u32::try_from(memory_ceiling_pin_metrics(&cluster).await).expect("one entry's bytes fit"),
+    );
+    assert!(ceiling_pin_bytes > 0.0);
     #[cfg(feature = "spill")]
     let mut spill_dirs = spill_writes_and_promotes_pin_metrics(&cluster).await;
     #[cfg(feature = "spill")]
@@ -810,6 +846,9 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
             && scraped_metric_value(&body, "sundog_ae_parts_total", &[("outcome", "listing")])
                 .is_some()
             && body.contains("sundog_cache_entries")
+            // Refreshed every 5 seconds, so it may first read the open-time 0.
+            && scraped_metric_value(&body, "sundog_cache_bytes", &[("cache", "ceiling-pin")])
+                == Some(ceiling_pin_bytes)
             && scraped_metric_value(&body, "sundog_ae_sketch_total", &[("outcome", "decoded")])
                 .is_some()
             && (cfg!(not(feature = "spill"))
@@ -825,7 +864,7 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "metrics endpoint never served sundog_open_caches, sundog_live_peers, \
-             sundog_cache_entries, a decoded sundog_ae_sketch_total, and (feature = \"spill\") \
+             sundog_cache_entries, sundog_cache_bytes, a decoded sundog_ae_sketch_total, and (feature = \"spill\") \
              sundog_spill_writes_total within the bound"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -846,6 +885,37 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
         "expected a sundog_cache_entries line for the 'counted' cache; got body:\n{body}"
     );
 
+    // An uncapped cache counts no bytes, so it exports neither series.
+    assert_eq!(
+        scraped_metric_value(&body, "sundog_cache_bytes", &[("cache", "counted")]),
+        None,
+        "an uncapped cache publishes no byte gauge; got body:\n{body}"
+    );
+    assert!(
+        !body.contains("sundog_ceiling_refusals_total{cache=\"counted\""),
+        "an uncapped cache registers no refusal counters; got body:\n{body}"
+    );
+    // sundog_ceiling_refusals_total: pinned by memory_ceiling_pin_metrics,
+    // two refused writes and one uncached fill. sundog_cache_bytes is
+    // pinned to Cache::resident_bytes by the wait above.
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_ceiling_refusals_total",
+            &[("cache", "ceiling-pin"), ("kind", "write")]
+        ),
+        Some(2.0),
+        "expected two refused writes on the 'ceiling-pin' cache; got body:\n{body}"
+    );
+    assert_eq!(
+        scraped_metric_value(
+            &body,
+            "sundog_ceiling_refusals_total",
+            &[("cache", "ceiling-pin"), ("kind", "fill")]
+        ),
+        Some(1.0),
+        "expected one uncached fill on the 'ceiling-pin' cache; got body:\n{body}"
+    );
     // sundog_clock_skew_rejected_total: pinned by the bare-Shard scenario
     // above, one record an hour ahead refused and one a second ahead applied.
     assert_eq!(

@@ -45,6 +45,8 @@ evicting an entry on one node would only have anti-entropy pull it back
 from the others. Bound it with TTLs, or attach the [spill tier](features.md#spill)
 to move cold entries to disk. `open` returns
 `CacheError::ReplicatedWithLocalEviction` for a capacity without a tier.
+A [memory ceiling](sizing.md#memory-ceiling) evicts nothing, so it needs no
+tier.
 
 ## Distributed
 
@@ -80,5 +82,6 @@ goes to its new owners as soon as the views agree, not at the end of the
 grace.
 
 A finite `max_capacity` needs a spill tier here too, and `tti` is refused.
+A [memory ceiling](sizing.md#memory-ceiling) needs no tier.
 Two nodes that disagree on `owners` for one cache name get
 `CacheError::ModeMismatch`.

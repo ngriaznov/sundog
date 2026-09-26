@@ -49,6 +49,7 @@ pub struct CacheBuilder<K, V> {
     name: SmolStr,
     mode: Mode,
     max_capacity: u64,
+    max_resident_bytes: u64,
     ttl: Option<Duration>,
     tti: Option<Duration>,
     capacity_hint: Option<u64>,
@@ -72,6 +73,7 @@ where
             name,
             mode: Mode::Invalidation,
             max_capacity: u64::MAX,
+            max_resident_bytes: u64::MAX,
             ttl: None,
             tti: None,
             capacity_hint: None,
@@ -94,6 +96,22 @@ where
     /// Bounds local entry count. Default: unbounded.
     pub fn max_capacity(mut self, max_capacity: u64) -> Self {
         self.max_capacity = max_capacity;
+        self
+    }
+
+    /// Sets a soft memory ceiling on this node's copy of the cache, in the
+    /// bytes [`Cache::resident_bytes`] reports. A local write that finds the
+    /// ceiling reached fails with [`CacheError::OverMemoryCeiling`] instead
+    /// of growing memory, and a [`Cache::get_or_load`] fill returns its
+    /// value without storing it. Removals and writes arriving from peers
+    /// are always accepted, so replicas keep identical contents in every
+    /// mode, and resident bytes can pass the ceiling by what peers send.
+    /// Unlike [`CacheBuilder::max_capacity`], nothing is evicted, so this is
+    /// allowed in [`Mode::Replicated`] and [`Mode::Distributed`] without a
+    /// spill tier. Default: no ceiling, and then no byte counting either:
+    /// [`Cache::resident_bytes`] is `None` and writes skip the check.
+    pub fn max_resident_bytes(mut self, bytes: u64) -> Self {
+        self.max_resident_bytes = bytes;
         self
     }
 
@@ -227,6 +245,7 @@ where
             name,
             mode,
             max_capacity,
+            max_resident_bytes,
             ttl,
             tti,
             capacity_hint,
@@ -284,7 +303,8 @@ where
         .with_cluster_config(cluster.config())
         .with_resolver(resolver)
         .with_merge_coalesce_window(merge_coalesce_window)
-        .with_prefold_enabled(prefold_enabled);
+        .with_prefold_enabled(prefold_enabled)
+        .with_max_resident_bytes(max_resident_bytes);
         // `with_capacity_hint`/`with_weigher` each carry the other's setting
         // forward, so order is free. Skips the clamp when a weigher is set.
         if let Some(hint) = capacity_hint {
@@ -1394,6 +1414,17 @@ where
         self.shard.entry_count().await
     }
 
+    /// Bytes this node's live entries hold in memory, counted only when
+    /// [`CacheBuilder::max_resident_bytes`] sets a ceiling and `None`
+    /// without one: a fixed per-entry overhead plus each entry's heap-held
+    /// key and value bytes, a spilled entry counting only its key. The
+    /// figure the ceiling is checked against, and a lower bound on the
+    /// process memory the entries occupy.
+    #[must_use]
+    pub fn resident_bytes(&self) -> Option<u64> {
+        self.shard.resident_bytes()
+    }
+
     /// A weakly consistent snapshot of this node's local live keys, not a
     /// cluster view. O(entries).
     #[must_use]
@@ -1413,7 +1444,9 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::Loader`] if `loader` fails, or
-    /// [`CacheError::Codec`] if `key` fails to postcard-encode.
+    /// [`CacheError::Codec`] if `key` fails to postcard-encode. A fill that
+    /// finishes at the [`CacheBuilder::max_resident_bytes`] ceiling returns
+    /// its value without storing it.
     pub async fn get_or_load<F, E>(&self, key: &K, loader: F) -> Result<V, CacheError>
     where
         F: AsyncFnOnce(&K) -> Result<V, E>,
@@ -1442,7 +1475,9 @@ where
     /// # Errors
     ///
     /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds
-    /// the frame cap, or [`CacheError::Codec`] if `key` fails to encode.
+    /// the frame cap, [`CacheError::OverMemoryCeiling`] if this node is at
+    /// its [`CacheBuilder::max_resident_bytes`] ceiling, or
+    /// [`CacheError::Codec`] if `key` fails to encode.
     pub async fn insert(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.insert(key, value).await
     }
@@ -1473,7 +1508,9 @@ where
     ///
     /// # Errors
     ///
-    /// As [`Cache::insert`], for any entry.
+    /// As [`Cache::insert`], for any entry. A batch that starts at the
+    /// memory ceiling applies nothing; one that starts under it applies
+    /// whole.
     pub async fn insert_many(
         &self,
         entries: impl IntoIterator<Item = (K, V)>,
@@ -1499,8 +1536,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError::ValueTooLarge`] if the encoded value exceeds
-    /// the frame cap, or [`CacheError::Codec`] if `key` fails to encode.
+    /// As [`Cache::insert`].
     pub async fn merge(&self, key: K, value: V) -> Result<(), CacheError> {
         self.shard.merge(key, value).await
     }
@@ -4835,6 +4871,115 @@ mod tests {
             "expected ReplicatedWithLocalEviction, got {err:?}"
         );
 
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replicated_node_at_its_memory_ceiling_refuses_local_writes_and_takes_its_peers() {
+        let name = "cache-it-memory-ceiling";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("a builds");
+        let b = Cluster::builder(name)
+            .seeds([a.local_gossip_addr()])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        wait_for_peer_count(&a, 1).await;
+        let cache_a = a
+            .cache::<u32, String>("sessions")
+            .mode(Mode::Replicated)
+            .max_resident_bytes(1)
+            .open()
+            .await
+            .expect("a ceiling needs no spill tier in Replicated mode");
+        let cache_b = b
+            .cache::<u32, String>("sessions")
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("b opens");
+
+        assert_eq!(cache_a.resident_bytes(), Some(0));
+        assert_eq!(
+            cache_b.resident_bytes(),
+            None,
+            "an uncapped cache counts nothing"
+        );
+        cache_a
+            .insert(1, "a".into())
+            .await
+            .expect("under the ceiling");
+        assert!(cache_a.resident_bytes() > Some(0));
+        assert!(matches!(
+            cache_a.insert(2, "a".into()).await,
+            Err(CacheError::OverMemoryCeiling { ceiling: 1, .. })
+        ));
+        let loaded = cache_a
+            .get_or_load(&9, async |_key: &u32| -> Result<String, std::io::Error> {
+                Ok("loaded".into())
+            })
+            .await
+            .expect("the loader succeeds");
+        assert_eq!(loaded, "loaded");
+        assert_eq!(
+            cache_a.get(&9).await,
+            None,
+            "a fill at the ceiling is not stored"
+        );
+
+        cache_b.insert(3, "from b".into()).await.expect("insert");
+        wait_until(
+            Duration::from_secs(10),
+            "b's write lands on a past a's ceiling",
+            async || cache_a.get(&3).await.is_some(),
+        )
+        .await;
+        wait_until(
+            Duration::from_secs(10),
+            "a's accepted write reaches b",
+            async || cache_b.get(&1).await.is_some(),
+        )
+        .await;
+        assert_eq!(
+            cache_b.get(&2).await,
+            None,
+            "a refused write never replicates"
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn distributed_cache_opens_with_a_memory_ceiling_and_no_spill() {
+        let cluster = Cluster::builder("cache-it-distributed-memory-ceiling")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("build succeeds");
+        let cache = cluster
+            .cache::<u32, String>("scratch")
+            .mode(Mode::Distributed {
+                owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+            })
+            .max_resident_bytes(1)
+            .open()
+            .await
+            .expect("a ceiling evicts nothing, so Distributed accepts it without spill");
+        cache
+            .insert(1, "a".into())
+            .await
+            .expect("under the ceiling");
+        assert!(matches!(
+            cache.insert(2, "b".into()).await,
+            Err(CacheError::OverMemoryCeiling { .. })
+        ));
         cluster.shutdown().await;
     }
 

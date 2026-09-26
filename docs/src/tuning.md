@@ -8,8 +8,8 @@ fields through `with`:
 {{#include ../cookbook/src/deploy.rs:fixed_ports}}
 ```
 
-Cache-level settings, `mode`, `max_capacity`, `ttl`, `tti`, `resolver`,
-`weigher` and `spill`, live on the cache builder instead.
+Cache-level settings, `mode`, `max_capacity`, `max_resident_bytes`, `ttl`,
+`tti`, `resolver`, `weigher` and `spill`, live on the cache builder instead.
 
 ## Network
 

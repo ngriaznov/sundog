@@ -30,6 +30,8 @@ addresses once it forms, under `cluster formed`.
 | `sundog_cache_hits_total{cache}` | reads answered from this node's copy |
 | `sundog_cache_misses_total{cache}` | reads that found no entry on this node, one per loader run for `get_or_load` |
 | `sundog_cache_entries{cache}` | live entries on this node |
+| `sundog_cache_bytes{cache}` | a cache with a `max_resident_bytes` ceiling: resident bytes of this node's live entries, as `Cache::resident_bytes` counts them |
+| `sundog_ceiling_refusals_total{cache, kind}` | a cache with a `max_resident_bytes` ceiling: local writes refused (`write`) and fills returned uncached (`fill`) |
 | `sundog_fan_out_backlog{cache}` | written keys not yet sent to peers |
 | `sundog_fan_out_wait_timeouts_total{cache}` | writes that waited out `fan_out_wait_timeout` for backlog room and proceeded over capacity |
 | `sundog_ae_repaired_total{cache}` | entries anti-entropy repaired |

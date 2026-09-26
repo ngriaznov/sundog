@@ -11,18 +11,6 @@ already justified by the code as it stands.
 
 ## Next
 
-### Memory ceilings that refuse rather than diverge
-
-`Replicated` mode bounds capacity only through the spill tier, since evicting
-locally without one makes replicas differ. `max_capacity` counts entries, or
-a `Weigher`'s value, and a weigher sees the decoded key and value, not their
-encoded length, and counts payload alone: never the 56-byte entry, its index
-slot, or the allocator's rounding. A built-in byte weigher over the encoded
-record plus that per-entry overhead, a `sundog_cache_bytes{cache}` gauge fed
-from the engine's existing weight total, and a soft ceiling that rejects
-writes with a typed error keep every replica identical under memory pressure
-without a disk behind it.
-
 ### TTL surface
 
 Nothing on `Cache` changes an entry's lifetime after the write that set it
@@ -39,13 +27,13 @@ counterpart. `get_many` takes one stripe lock per distinct bucket instead of
 one per key, and `fetch_many` groups keys by owner into one request per
 owner instead of one round trip per key.
 
-### Latency histograms and a resident-bytes gauge
+### Latency histograms
 
 Every `sundog_*` metric is a counter or a gauge. Latency exists only as two
 accumulating sums, the fan-out and spill wait totals, with no buckets and no
 timing at all for a hit, a miss, a fetch or a spill read. Histograms for
-those four, plus the byte gauge above, are what a dashboard needs to show a
-p99. The exporter test pins each one.
+those four are what a dashboard needs to show a p99. The exporter test pins
+each one.
 
 ### A span on the fetch path
 

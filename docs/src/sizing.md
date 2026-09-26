@@ -64,6 +64,32 @@ resident. The demos and the test node use jemalloc, and on a three-node
 run of 4 million keys the demo settles at 1.7 GiB under jemalloc against
 3.2 GiB under glibc, with bulk ingest about twice as fast.
 
+## Memory ceiling
+
+`CacheBuilder::max_resident_bytes(n)` caps a cache's memory on each node,
+in every mode and without a spill tier. A local write, `insert`,
+`insert_with_ttl`, `insert_many` or `merge`, that finds
+`Cache::resident_bytes()` at `n` or over fails with
+`CacheError::OverMemoryCeiling`, and a `get_or_load` fill returns its value
+to every waiting caller without storing it. A batch that starts under the
+ceiling applies whole.
+
+The ceiling is soft. Nothing is evicted, and removals and writes arriving
+from peers always apply, so every replica keeps the same entries and a
+node passes its ceiling by what its peers send. Expiry, removals and
+`max_capacity` eviction bring it back under. Refusals count in
+`sundog_ceiling_refusals_total{cache, kind}`, and `sundog_cache_bytes{cache}`
+tracks the figure the ceiling checks.
+
+Only a cache with a ceiling counts bytes. Without one, writes skip the
+check, `resident_bytes()` returns `None`, and neither metric is exported.
+
+`resident_bytes` counts each entry's slot and index bytes and its record's
+heap allocation. Allocator rounding, spare arena capacity, tombstones and
+in-flight buffers are not counted, so set the ceiling below the memory you
+can give the cache: the counter reads about 180 bytes per entry where the
+resident set measures 212, for a 16-byte key and a 100-byte value.
+
 ## The spill tier
 
 With the `spill` feature, a cache's `max_capacity` bounds RAM and entries

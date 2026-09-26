@@ -1708,10 +1708,11 @@ pub(crate) async fn tombstone_gc_task(
     }
 }
 
-/// Publishes `sundog_cache_entries{cache}` for one opened cache: set
+/// Publishes `sundog_cache_entries{cache}` for one opened cache, and
+/// `sundog_cache_bytes{cache}` for one with a memory ceiling: set
 /// immediately, then refreshed every 5 seconds from [`Shard::entry_count`]
-/// for as long as the cache stays open. The count is only advisory until
-/// pending housekeeping flushes.
+/// and [`Shard::resident_bytes`] for as long as the cache stays open. The
+/// count is only advisory until pending housekeeping flushes.
 pub(crate) async fn cache_entries_gauge_task<K, V>(
     shard: Arc<Shard<K, V>>,
     name: SmolStr,
@@ -1721,7 +1722,17 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
     V: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     let gauge = metrics::gauge!("sundog_cache_entries", "cache" => name.to_string());
+    let bytes_gauge = shard
+        .resident_bytes()
+        .is_some()
+        .then(|| metrics::gauge!("sundog_cache_bytes", "cache" => name.to_string()));
+    let publish_bytes = || {
+        if let (Some(gauge), Some(bytes)) = (&bytes_gauge, shard.resident_bytes()) {
+            gauge.set(resident_bytes_f64(bytes));
+        }
+    };
     gauge.set(entry_count_f64(shard.entry_count().await));
+    publish_bytes();
 
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1730,12 +1741,22 @@ pub(crate) async fn cache_entries_gauge_task<K, V>(
             return;
         }
         gauge.set(entry_count_f64(shard.entry_count().await));
+        publish_bytes();
     }
 }
 
 /// Saturating `u64` -> `f64` conversion for gauge values.
 fn entry_count_f64(count: u64) -> f64 {
     f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a gauge only needs f64's exact-integer range, up to 2^53 bytes, \
+              far past any node's memory"
+)]
+fn resident_bytes_f64(bytes: u64) -> f64 {
+    bytes as f64
 }
 
 #[cfg(kani)]
