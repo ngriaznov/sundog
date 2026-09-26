@@ -4079,6 +4079,7 @@ mod tests {
             name.clone(),
             k,
             tx,
+            Arc::new(crate::ownership::ResidencySet::new()),
             cancel.clone(),
         ));
 

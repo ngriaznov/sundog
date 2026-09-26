@@ -522,7 +522,9 @@ pub(crate) async fn warm_up_task(
 /// resident until this fold releases it; `to_pull` is the difference from the
 /// latest view whose pull is not superseded (`pulled`), so a part gained
 /// under a view that gets superseded mid-pull is pulled again under the
-/// current one instead of skipped.
+/// current one instead of skipped, plus every part `new` owns that was
+/// regained since `prev` or dropped by a published view since the last
+/// change (`lost_since`), since writes to it went elsewhere meanwhile.
 pub(crate) struct ViewChangePlan {
     pub(crate) lost: Vec<PartId>,
     pub(crate) regained: Vec<PartId>,
@@ -534,6 +536,7 @@ pub(crate) fn plan_view_change(
     pulled: &OwnershipView,
     new: &OwnershipView,
     held: &[PartId],
+    lost_since: &PartSet,
 ) -> ViewChangePlan {
     let (regained, mut lost) = ownership_diff(prev, new);
     let mut seen: PartSet = lost.iter().copied().collect();
@@ -542,7 +545,19 @@ pub(crate) fn plan_view_change(
             .copied()
             .filter(|&part| !new.owns(part) && seen.insert(part)),
     );
-    let (to_pull, _) = ownership_diff(pulled, new);
+    // A part regained since `prev`, or dropped by a published view since the
+    // last change (`lost_since`, which covers a view this task never saw),
+    // missed the writes made while another node owned it, even when
+    // `pulled` still owned it.
+    let (mut to_pull, _) = ownership_diff(pulled, new);
+    let mut planned: PartSet = to_pull.iter().copied().collect();
+    to_pull.extend(
+        regained
+            .iter()
+            .copied()
+            .chain(lost_since.iter().filter(|&part| new.owns(part)))
+            .filter(|&part| planned.insert(part)),
+    );
     ViewChangePlan {
         lost,
         regained,
@@ -855,8 +870,10 @@ pub(crate) async fn rebalance_task(
                     return; // the tracker's sender dropped
                 }
                 let new_view = view_rx.borrow_and_update().clone();
+                let lost_since = residency.take_lost();
                 let held = shard.held_parts().await;
-                let plan = plan_view_change(&prev_view, &pulled_view, &new_view, &held);
+                let plan =
+                    plan_view_change(&prev_view, &pulled_view, &new_view, &held, &lost_since);
                 let held_set: PartSet = held.iter().copied().collect();
                 let held_losses: Vec<PartId> = plan
                     .lost
@@ -929,7 +946,7 @@ pub(crate) async fn rebalance_task(
                 // starting point on the next change, which is already
                 // published, so nothing gained is skipped.
                 if outcome != Outcome::Superseded {
-                    residency.settle(Arc::clone(&new_view));
+                    residency.settle(&new_view);
                     pulled_view = new_view;
                 }
             }
@@ -1128,6 +1145,54 @@ mod tests {
     }
 
     #[test]
+    fn plan_view_change_pulls_a_part_regained_after_a_loss_its_last_completed_pull_never_saw() {
+        let self_node = NodeId::from(1);
+        let k = 2;
+        // Pulled under two nodes (self owns everything), then a third node
+        // joined and took some parts while that change's pull was
+        // superseded, then it left again and self regained them.
+        let pulled = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
+        let prev = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
+        let new = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
+        let regained: Vec<PartId> = new.owned_parts().filter(|&p| !prev.owns(p)).collect();
+        assert!(!regained.is_empty(), "the fixture regains parts");
+
+        let plan = plan_view_change(&prev, &pulled, &new, &[], &PartSet::new());
+        let to_pull: HashSet<PartId> = plan.to_pull.iter().copied().collect();
+        for part in &regained {
+            assert!(
+                to_pull.contains(part),
+                "part {part} missed writes while node 3 owned it, so it is pulled again"
+            );
+        }
+        assert_eq!(
+            to_pull.len(),
+            plan.to_pull.len(),
+            "each part is planned once"
+        );
+    }
+
+    #[test]
+    fn plan_view_change_pulls_a_part_a_view_it_never_saw_dropped() {
+        let self_node = NodeId::from(1);
+        let k = 2;
+        // Two nodes, then a third joined and left again before this task
+        // looked: it sees the same view twice, but the tracker recorded the
+        // parts the intermediate view dropped.
+        let two = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
+        let three = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
+        let dropped: PartSet = two.owned_parts().filter(|&p| !three.owns(p)).collect();
+        assert!(dropped.len() > 0, "the fixture drops parts");
+
+        let blind = plan_view_change(&two, &two, &two, &[], &PartSet::new());
+        assert!(blind.to_pull.is_empty(), "the views alone show no change");
+        let plan = plan_view_change(&two, &two, &two, &[], &dropped);
+        let to_pull: PartSet = plan.to_pull.iter().copied().collect();
+        assert_eq!(to_pull.len(), dropped.len());
+        assert!(dropped.iter().all(|part| to_pull.contains(part)));
+    }
+
+    #[test]
     fn plan_view_change_marks_a_bucket_lost_since_the_previous_view_even_when_its_pull_was_superseded()
      {
         let self_node = NodeId::from(1);
@@ -1141,7 +1206,7 @@ mod tests {
         let (o0, o1, o2) = (owned(&v0), owned(&v1), owned(&v2));
 
         // v0 -> v1 pulled cleanly: prev and pulled agree.
-        let plan = plan_view_change(&v0, &v0, &v1, &[]);
+        let plan = plan_view_change(&v0, &v0, &v1, &[], &PartSet::new());
         assert_eq!(
             plan.to_pull.iter().copied().collect::<HashSet<_>>(),
             plan.regained.iter().copied().collect::<HashSet<_>>()
@@ -1153,7 +1218,7 @@ mod tests {
         // v1's pull gets superseded by v2: lost is measured from v1, so a
         // bucket gained under v1 and gone in v2 starts its grace, while
         // the pull covers everything v2 owns that v0 did not.
-        let plan = plan_view_change(&v1, &v0, &v2, &[]);
+        let plan = plan_view_change(&v1, &v0, &v2, &[], &PartSet::new());
         let gained_then_lost: Vec<PartId> = o1
             .iter()
             .copied()
@@ -1268,7 +1333,7 @@ mod tests {
             .expect("the fixture has a bucket owned throughout");
 
         // Without the held fold, the unobserved view leaves no trace.
-        let blind = plan_view_change(&v0, &v0, &v2, &[]);
+        let blind = plan_view_change(&v0, &v0, &v2, &[], &PartSet::new());
         for b in &only_in_v1 {
             assert!(
                 !blind.lost.contains(b),
@@ -1280,7 +1345,7 @@ mod tests {
         // the shard holds them, and the fold releases every one.
         let mut held = only_in_v1.clone();
         held.push(kept);
-        let plan = plan_view_change(&v0, &v0, &v2, &held);
+        let plan = plan_view_change(&v0, &v0, &v2, &held, &PartSet::new());
         for b in &only_in_v1 {
             assert!(
                 plan.lost.contains(b),

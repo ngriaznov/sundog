@@ -648,7 +648,7 @@ where
         .filter(|&part| seed.owners_of(part).len() > 1)
         .collect();
     residency.mark_cold(&cold);
-    residency.settle(seed);
+    residency.settle(&seed);
     shard = shard.with_ownership(ownership.clone(), Arc::clone(&residency));
     (
         shard,
@@ -837,6 +837,7 @@ async fn distributed_warm_and_rebalance(
             name.clone(),
             owners,
             view_tx,
+            Arc::clone(&residency),
             cancel.clone(),
         ),
     );

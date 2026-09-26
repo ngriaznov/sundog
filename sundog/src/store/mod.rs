@@ -4811,7 +4811,7 @@ mod tests {
             2,
             Arc::clone(&residency),
         );
-        residency.settle(Arc::clone(&before));
+        residency.settle(&before);
 
         let after = Arc::new(OwnershipView::compute(
             me,

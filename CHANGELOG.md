@@ -474,6 +474,14 @@ All notable changes to this project are documented in this file. Format follows
   rebalance task finished did not now counts as cold until its own pull
   lands.
 
+- **A Distributed node pulls a part it owns again after losing it.** The
+  rebalance task planned pulls from the last view whose pull completed, so
+  a part lost under a superseded pull, or under a view that coalesced away
+  before the task looked, and then owned again was never pulled, and the
+  writes made while another node owned it were missing here. The tracker
+  now records every part a published view drops, the part reads as cold at
+  once, and the next rebalance pulls it.
+
 - **`CacheBuilder::prefold_enabled(false)` survives a capacity hint or a
   weigher.** Each rebuilds the shard's engine, and the rebuild reset the
   flag to its default; it now carries the flag forward.
