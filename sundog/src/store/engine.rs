@@ -11466,11 +11466,15 @@ mod kani_proofs {
         let node = NodeId::from(kani::any::<u64>());
         let minted = mint_stamp(sv, ver, node);
         match merge_decision(sv, ver, is_stored, is_incoming, || node) {
-            MergedVersion::NoOp => assert!(is_stored),
+            MergedVersion::NoOp => {
+                assert!(is_stored);
+            }
             MergedVersion::Store(v) if v == minted => {
                 assert!((v.wall_ms, v.logical) >= (sv.wall_ms, sv.logical));
             }
-            MergedVersion::Store(v) => assert!(v > sv),
+            MergedVersion::Store(v) => {
+                assert!(v > sv);
+            }
         }
     }
 
