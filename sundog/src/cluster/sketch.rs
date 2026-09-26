@@ -68,6 +68,17 @@ fn check(key_hash: u64, wall_ms: u64, logical: u32, node: u64) -> u64 {
     xxh3_64(&buf)
 }
 
+/// The cell `mixed` lands on in partition `partition` of a sketch whose
+/// partitions are `partition_len` cells long: always inside that
+/// partition's own slice.
+fn cell_index(partition: usize, mixed: u64, partition_len: usize) -> usize {
+    let partition_len_u64 =
+        u64::try_from(partition_len).expect("invariant: partition_len fits in u64");
+    let offset = usize::try_from(mixed % partition_len_u64)
+        .expect("invariant: a value taken mod partition_len always fits in usize");
+    partition * partition_len + offset
+}
+
 /// One IBLT cell: `count`, XOR sums of every accumulated element's
 /// `key_hash` and version fields, and `check_sum`, the fingerprint that
 /// verifies a "pure" cell holds exactly one element. `Default` is the empty
@@ -182,15 +193,24 @@ impl Iblt {
         }
     }
 
-    /// Rebuilds a sketch from cells received off the wire; `partition_len`
-    /// is re-derived the same way [`Iblt::new`] derives it.
+    /// Rebuilds a sketch from cells received off the wire. A cell count
+    /// [`Iblt::new`] cannot produce, zero or not a multiple of
+    /// [`IBLT_PARTITIONS`], makes a malformed sketch that [`Iblt::subtract`]
+    /// and [`Iblt::peel`] refuse.
     #[must_use]
     pub fn from_cells(cells: Vec<Cell>) -> Self {
-        let partition_len = (cells.len() / IBLT_PARTITIONS).max(1);
+        let partition_len = cells.len() / IBLT_PARTITIONS;
         Self {
             cells,
             partition_len,
         }
+    }
+
+    /// Whether every partition is `partition_len` cells long and not
+    /// empty, the shape [`Iblt::new`] always builds and every cell index
+    /// relies on.
+    fn is_well_formed(&self) -> bool {
+        self.partition_len > 0 && self.cells.len() == self.partition_len * IBLT_PARTITIONS
     }
 
     /// Unwraps this sketch's cells for the wire.
@@ -202,23 +222,19 @@ impl Iblt {
     /// The three cell indices a `placement_hash` maps to, one per
     /// partition; always distinct, since partitions own disjoint slices.
     fn locations(&self, placement_hash: u64) -> [usize; IBLT_PARTITIONS] {
-        let partition_len_u64 =
-            u64::try_from(self.partition_len).expect("invariant: partition_len fits in u64");
-        std::array::from_fn(|p| {
-            let offset = mix(placement_hash, p) % partition_len_u64;
-            let offset = usize::try_from(offset)
-                .expect("invariant: a value taken mod partition_len always fits in usize");
-            p * self.partition_len + offset
-        })
+        std::array::from_fn(|p| cell_index(p, mix(placement_hash, p), self.partition_len))
     }
 
     /// Folds `(key_hash, ver)` into this sketch with `sign` (`1` to insert,
     /// `-1` to remove), placed by the whole element's hash.
     fn apply(&mut self, key_hash: u64, ver: Hlc, sign: i32) {
+        if !self.is_well_formed() {
+            return;
+        }
         let c = check(key_hash, ver.wall_ms, ver.logical, ver.node.as_u64());
         for idx in self.locations(c) {
             let cell = &mut self.cells[idx];
-            cell.count += sign;
+            cell.count = cell.count.wrapping_add(sign);
             cell.key_sum ^= key_hash;
             cell.wall_sum ^= ver.wall_ms;
             cell.logical_sum ^= ver.logical;
@@ -239,11 +255,12 @@ impl Iblt {
     ///
     /// # Errors
     ///
-    /// Returns [`Undecodable`] if `other` has a different cell count: a
-    /// sketch off the wire whose shape this node cannot rebuild, which the
-    /// caller treats like any other failed decode.
+    /// Returns [`Undecodable`] if either sketch is malformed or `other`
+    /// has a different cell count: a sketch off the wire whose shape this
+    /// node cannot rebuild, which the caller treats like any other failed
+    /// decode.
     pub fn subtract(&self, other: &Self) -> Result<Self, Undecodable> {
-        if self.cells.len() != other.cells.len() {
+        if !self.is_well_formed() || self.cells.len() != other.cells.len() {
             return Err(Undecodable);
         }
         let cells = self
@@ -251,7 +268,7 @@ impl Iblt {
             .iter()
             .zip(&other.cells)
             .map(|(a, b)| Cell {
-                count: a.count - b.count,
+                count: a.count.wrapping_sub(b.count),
                 key_sum: a.key_sum ^ b.key_sum,
                 wall_sum: a.wall_sum ^ b.wall_sum,
                 logical_sum: a.logical_sum ^ b.logical_sum,
@@ -281,6 +298,9 @@ impl Iblt {
     /// for every cell to peel back to zero; the caller falls back to a full
     /// listing.
     pub fn peel(mut self) -> Result<Decoded, Undecodable> {
+        if !self.is_well_formed() {
+            return Err(Undecodable);
+        }
         let mut only_left = Vec::new();
         let mut only_right = Vec::new();
         let mut queue: std::collections::VecDeque<usize> = (0..self.cells.len())
@@ -299,7 +319,7 @@ impl Iblt {
             let placement_hash = cell.check_sum;
             for target in self.locations(placement_hash) {
                 let c = &mut self.cells[target];
-                c.count -= sign;
+                c.count = c.count.wrapping_sub(sign);
                 c.key_sum ^= elem.key_hash;
                 c.wall_sum ^= elem.ver.wall_ms;
                 c.logical_sum ^= elem.ver.logical;
@@ -525,6 +545,32 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_sketch_off_the_wire_is_refused_without_panicking() {
+        for len in [0usize, 1, 2, 4, 5] {
+            let remote = Iblt::from_cells(vec![Cell::default(); len]);
+            assert_eq!(remote.clone().peel(), Err(Undecodable), "len = {len}");
+            assert!(remote.subtract(&Iblt::new(len)).is_err(), "len = {len}");
+        }
+    }
+
+    #[test]
+    fn extreme_remote_counts_wrap_instead_of_overflowing() {
+        let mut local = Iblt::new(6);
+        local.insert(1, ver(1));
+        for count in [i32::MIN, i32::MAX] {
+            let remote = Iblt::from_cells(vec![
+                Cell {
+                    count,
+                    ..Cell::default()
+                };
+                6
+            ]);
+            let diff = local.subtract(&remote).expect("same shape");
+            assert!(diff.peel().is_err(), "count = {count}");
+        }
+    }
+
+    #[test]
     fn from_cells_round_trips_through_into_cells() {
         let mut iblt = Iblt::new(240);
         iblt.insert(5, ver(1));
@@ -566,3 +612,50 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests;
+
+/// Kani proofs over the sketch's index and count arithmetic: every input,
+/// not a sample.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// In a well-formed sketch every placement lands inside its own
+    /// partition's slice, so inside the cells.
+    #[kani::proof]
+    fn a_cell_index_stays_inside_its_partition() {
+        let partition: usize = kani::any();
+        let partition_len: usize = kani::any();
+        let mixed: u64 = kani::any();
+        kani::assume(partition < IBLT_PARTITIONS);
+        kani::assume(partition_len > 0);
+        kani::assume(partition_len.checked_mul(IBLT_PARTITIONS).is_some());
+        let idx = cell_index(partition, mixed, partition_len);
+        assert!(idx >= partition * partition_len);
+        assert!(idx < (partition + 1) * partition_len);
+        assert!(idx < partition_len * IBLT_PARTITIONS);
+    }
+
+    /// Subtracting any cells off the wire never overflows: each count
+    /// wraps, and every other field is a plain XOR.
+    #[kani::proof]
+    fn subtracting_any_remote_cells_never_overflows() {
+        let any_cell = || Cell {
+            count: kani::any(),
+            key_sum: kani::any(),
+            wall_sum: kani::any(),
+            logical_sum: kani::any(),
+            node_sum: kani::any(),
+            check_sum: kani::any(),
+        };
+        let local = Iblt::from_cells(vec![any_cell(), any_cell(), any_cell()]);
+        let remote = Iblt::from_cells(vec![any_cell(), any_cell(), any_cell()]);
+        let diff = local
+            .subtract(&remote)
+            .expect("both are well formed at 3 cells");
+        for ((d, a), b) in diff.cells.iter().zip(&local.cells).zip(&remote.cells) {
+            assert_eq!(d.count, a.count.wrapping_sub(b.count));
+            assert_eq!(d.key_sum, a.key_sum ^ b.key_sum);
+            assert_eq!(d.check_sum, a.check_sum ^ b.check_sum);
+        }
+    }
+}
