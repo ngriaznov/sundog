@@ -357,6 +357,7 @@ async fn reconcile_mismatches(
         plan.push_keys,
         plan.pull_keys,
         plan.pull_hashes,
+        merging,
     )
     .await
 }
@@ -818,6 +819,16 @@ fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
 /// [`REPAIR_BATCH`] chunks, emits `sundog_ae_repaired_total{cache}`, and
 /// returns the total wire bytes moved (pushed plus pulled).
+///
+/// Without `merging`, pushes go out first: the two sets are disjoint. With
+/// `merging`, a key both sides hold sits in both sets, so pulls run first
+/// and fold the peer's record in, and a key whose stored version is then
+/// exactly the version the peer sent is not pushed back: the peer already
+/// holds it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one round's classified sets plus the peer and resolver they repair against"
+)]
 async fn apply_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -826,71 +837,130 @@ async fn apply_repairs(
     push_keys: Vec<Bytes>,
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
+    merging: bool,
 ) -> u64 {
-    let mut repaired: u64 = 0;
-    let mut bytes_moved: u64 = 0;
+    let mut tally = RepairTally::default();
+    if merging {
+        let pulled =
+            pull_repairs(mesh, shard, cache, peer, pull_keys, pull_hashes, &mut tally).await;
+        push_repairs(mesh, shard, cache, peer, &push_keys, &pulled, &mut tally).await;
+    } else {
+        push_repairs(
+            mesh,
+            shard,
+            cache,
+            peer,
+            &push_keys,
+            &HashMap::new(),
+            &mut tally,
+        )
+        .await;
+        pull_repairs(mesh, shard, cache, peer, pull_keys, pull_hashes, &mut tally).await;
+    }
+
+    if tally.repaired > 0 {
+        metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
+            .increment(tally.repaired);
+    }
+    tracing::debug!(
+        repaired = tally.repaired,
+        bytes_moved = tally.bytes_moved,
+        "anti-entropy round complete"
+    );
+    tally.bytes_moved
+}
+
+/// Records and wire bytes one round's repairs moved, both directions.
+#[derive(Default)]
+struct RepairTally {
+    repaired: u64,
+    bytes_moved: u64,
+}
+
+impl RepairTally {
+    fn add(&mut self, cache: &SmolStr, records: &[WireRecord]) {
+        self.repaired += records.len() as u64;
+        self.bytes_moved += records
+            .iter()
+            .map(|rec| wire_record_len(cache.len(), rec))
+            .sum::<u64>();
+    }
+}
+
+/// Whether a record stored at `local` still needs pushing to a peer whose
+/// record for the key this round pulled at `pulled`: always, unless the
+/// peer sent exactly that version.
+fn push_needed(local: Hlc, pulled: Option<Hlc>) -> bool {
+    pulled != Some(local)
+}
+
+/// Pushes `push_keys`' current records to `peer`, skipping any whose stored
+/// version `pulled` shows the peer already holds.
+async fn push_repairs(
+    mesh: &crate::net::Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    push_keys: &[Bytes],
+    pulled: &HashMap<Bytes, Hlc>,
+    tally: &mut RepairTally,
+) {
     // Batched so a large divergence makes durable incremental progress:
     // each landed batch shrinks the next round's diff, instead of one
     // all-or-nothing exchange racing a request timeout.
     for batch in push_keys.chunks(REPAIR_BATCH) {
-        let records = shard.records_for(batch.to_vec()).await;
-        repaired += records.len() as u64;
-        bytes_moved += records
-            .iter()
-            .map(|rec| wire_record_len(cache.len(), rec))
-            .sum::<u64>();
+        let mut records = shard.records_for(batch.to_vec()).await;
+        records.retain(|rec| push_needed(rec.ver, pulled.get(&rec.key).copied()));
+        tally.add(cache, &records);
         // `net::batch_replicate` chunks this into a handful of full frames, not
         // one `Msg::Replicate` per record.
         let msgs = crate::net::batch_replicate(cache, records);
         mesh.send_many(peer, MsgClass::Replicate, msgs);
     }
+}
+
+/// Pulls `pull_keys` and `pull_hashes` from `peer` and applies them,
+/// stopping at the first failed request. Returns the version of every
+/// record the peer sent, by key.
+async fn pull_repairs(
+    mesh: &crate::net::Mesh,
+    shard: &Arc<dyn ShardOps>,
+    cache: &SmolStr,
+    peer: NodeId,
+    pull_keys: Vec<Bytes>,
+    pull_hashes: Vec<(u16, Vec<u64>)>,
+    tally: &mut RepairTally,
+) -> HashMap<Bytes, Hlc> {
+    let mut pulled = HashMap::new();
+    let mut land = async |records: Vec<WireRecord>, pulled: &mut HashMap<Bytes, Hlc>| {
+        tally.add(cache, &records);
+        pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
+        shard.apply_remote_batch(records).await;
+    };
     for batch in pull_keys.chunks(REPAIR_BATCH) {
         match mesh.ae_pull(peer, cache.clone(), batch.to_vec()).await {
-            Ok(records) => {
-                repaired += records.len() as u64;
-                bytes_moved += records
-                    .iter()
-                    .map(|rec| wire_record_len(cache.len(), rec))
-                    .sum::<u64>();
-                shard.apply_remote_batch(records).await;
-            }
+            Ok(records) => land(records, &mut pulled).await,
             Err(error) => {
-                tracing::debug!(%error, repaired, "anti-entropy pull failed; keeping progress");
-                break;
+                tracing::debug!(%error, "anti-entropy pull failed; keeping progress");
+                return pulled;
             }
         }
     }
-    'buckets: for (bucket, hashes) in pull_hashes {
+    for (bucket, hashes) in pull_hashes {
         for batch in hashes.chunks(REPAIR_BATCH) {
             match mesh
                 .ae_pull_hashes(peer, cache.clone(), bucket, batch.to_vec())
                 .await
             {
-                Ok(records) => {
-                    repaired += records.len() as u64;
-                    bytes_moved += records
-                        .iter()
-                        .map(|rec| wire_record_len(cache.len(), rec))
-                        .sum::<u64>();
-                    shard.apply_remote_batch(records).await;
-                }
+                Ok(records) => land(records, &mut pulled).await,
                 Err(error) => {
-                    tracing::debug!(
-                        %error, repaired,
-                        "anti-entropy hash pull failed; keeping progress"
-                    );
-                    break 'buckets;
+                    tracing::debug!(%error, "anti-entropy hash pull failed; keeping progress");
+                    return pulled;
                 }
             }
         }
     }
-
-    if repaired > 0 {
-        metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
-            .increment(repaired);
-    }
-    tracing::debug!(repaired, bytes_moved, "anti-entropy round complete");
-    bytes_moved
+    pulled
 }
 
 /// Classifies one `AeMismatch::Sketch(bucket, cells)` reply through
@@ -1164,6 +1234,133 @@ mod tests {
         (key_bytes, rec)
     }
 
+    #[test]
+    fn push_needed_skips_only_the_exact_version_the_peer_sent() {
+        let ver = |wall_ms, node: u64| Hlc {
+            wall_ms,
+            logical: 0,
+            node: NodeId::from(node),
+        };
+        assert!(push_needed(ver(5, 1), None));
+        assert!(!push_needed(ver(5, 1), Some(ver(5, 1))));
+        assert!(push_needed(ver(5, 1), Some(ver(4, 1))));
+        assert!(push_needed(ver(5, 1), Some(ver(5, 2))));
+    }
+
+    /// A merging round pulls before it pushes. A key whose pulled record
+    /// already contains the local one lands at exactly the peer's version and
+    /// is not pushed back; a key whose merge mints a new version still is.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn a_merging_round_does_not_push_back_a_key_it_adopted_from_the_peer() {
+        use super::super::test_support::{loopback_config, registered_shard, wait_for_peer_count};
+        use crate::store::Mode;
+        use crate::store::crdt::{PnCounter, PnCounterResolver, WriterId};
+
+        let config = loopback_config();
+        let cluster_a = Cluster::builder("cluster-it-apply-repairs-merging")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("node a builds");
+        let node_a = cluster_a.node_id();
+        cluster_a
+            .cache::<u32, PnCounter>("counters")
+            .mode(Mode::Replicated)
+            .resolver(Arc::new(PnCounterResolver))
+            .open()
+            .await
+            .expect("a opens");
+        let gossip_a = cluster_a.inner.membership.local_peer().gossip_addr;
+        let cluster_b = Cluster::builder("cluster-it-apply-repairs-merging")
+            .seeds([gossip_a])
+            .config(config)
+            .build()
+            .await
+            .expect("node b builds");
+        wait_for_peer_count(&cluster_b, 1).await;
+        let node_b = cluster_b.node_id();
+        let cache_b = tokio::time::timeout(
+            Duration::from_secs(20),
+            cluster_b
+                .cache::<u32, PnCounter>("counters")
+                .mode(Mode::Replicated)
+                .resolver(Arc::new(PnCounterResolver))
+                .open(),
+        )
+        .await
+        .expect("open completes within the state-transfer budget")
+        .expect("b opens");
+
+        let name = SmolStr::new("counters");
+        let shard_a = registered_shard(&cluster_a, &name);
+        let shard_b = registered_shard(&cluster_b, &name);
+        let record = |key: u32, counter: &PnCounter, wall_ms, node| {
+            let key_bytes = Bytes::from(postcard::to_stdvec(&key).expect("key encodes"));
+            let rec = WireRecord {
+                key: key_bytes.clone(),
+                value: Some(Bytes::from(
+                    postcard::to_stdvec(counter).expect("counter encodes"),
+                )),
+                ver: Hlc {
+                    wall_ms,
+                    logical: 0,
+                    node,
+                },
+                expires_at_ms: None,
+            };
+            (key_bytes, rec)
+        };
+        let one = |writer: u64| PnCounter::local_delta(WriterId::new(NodeId::from(writer), 1), 1);
+
+        // Key 1: a's counter already holds b's increment.
+        let (adopted_key, b_adopted) = record(1, &one(1), 1, node_b);
+        let (_, a_adopted) = record(1, &one(1).merge(&one(2)), 2, node_a);
+        // Key 2: each side holds only its own increment.
+        let (minted_key, b_minted) = record(2, &one(3), 1, node_b);
+        let (_, a_minted) = record(2, &one(4), 2, node_a);
+        shard_b.apply_remote_batch(vec![b_adopted, b_minted]).await;
+        shard_a
+            .apply_remote_batch(vec![a_adopted.clone(), a_minted.clone()])
+            .await;
+
+        let bytes_moved = apply_repairs(
+            cluster_b.mesh(),
+            &shard_b,
+            &name,
+            node_a,
+            vec![adopted_key.clone(), minted_key.clone()],
+            vec![adopted_key.clone(), minted_key.clone()],
+            Vec::new(),
+            true,
+        )
+        .await;
+
+        let stored = shard_b.records_for(vec![adopted_key, minted_key]).await;
+        let (adopted, minted) = (&stored[0], &stored[1]);
+        assert_eq!(
+            adopted.ver, a_adopted.ver,
+            "b adopts a's record for key 1 as is"
+        );
+        assert!(
+            minted.ver.node.is_merge_derived(),
+            "key 2 merges to a minted version"
+        );
+        let pulled =
+            wire_record_len(name.len(), &a_adopted) + wire_record_len(name.len(), &a_minted);
+        assert_eq!(
+            bytes_moved,
+            pulled + wire_record_len(name.len(), minted),
+            "both keys are pulled and only the minted one is pushed back"
+        );
+        assert_eq!(
+            cache_b.get(&1u32).await.map(|c| c.value()),
+            Some(2),
+            "b's counter for key 1 holds both increments"
+        );
+    }
+
     /// Pins that `apply_repairs`'s pushed/pulled byte count matches
     /// `wire_record_len` computed independently for one pushed and one
     /// pulled record between two real nodes.
@@ -1227,6 +1424,7 @@ mod tests {
             vec![push_key_bytes],
             vec![pull_key_bytes],
             Vec::new(),
+            false,
         )
         .await;
 

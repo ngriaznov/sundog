@@ -361,6 +361,19 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- **A merging cache's anti-entropy round pulls before it pushes.** A key
+  both replicas hold under different versions is exchanged both ways in
+  one round. The pulls now land first, and a key whose stored version is
+  then exactly the version the peer sent is not pushed back, since the
+  peer already holds it. In the three-node partition-heal simulation at
+  20,000 keys and half the counters in conflict, the merged exchange had
+  moved 11% more bytes than per-writer keys under last-write-wins; it now
+  moves within about 1% of them, and fewer at every other mix, in the
+  same number of rounds or fewer. A new simulation runs the same grid at
+  the default 200 ms anti-entropy tick, where the merged exchange moves
+  within 4% of the per-writer bytes at every mix and never takes more
+  rounds or more time.
+
 - **`Mode::Distributed` owns parts, not buckets.** A distributed cache's
   65,536 parts, the 64 anti-entropy parts of each of the 1,024 buckets, are
   each ranked on their own by rendezvous hashing. At 100 nodes and two
