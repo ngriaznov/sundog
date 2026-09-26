@@ -131,6 +131,47 @@ fn parts_pending_group_credit(total_parts: usize, already_credited: &HashSet<Par
 /// landed here by other means is all there is.
 const ALL_COLD_PASSES: u32 = 3;
 
+/// Anti-entropy rounds [`converge_with_cold_donors`] runs against each cold
+/// donor before a group every donor declined settles.
+const COLD_DONOR_ROUNDS: u32 = 3;
+
+/// Converges `parts` with each of `donors` by anti-entropy, which a donor
+/// answers whether or not it is cold: a donor still pulling these parts
+/// itself can hold writes that reached it meanwhile, and a group every
+/// donor declines as cold otherwise settles without them. Up to
+/// [`COLD_DONOR_ROUNDS`] rounds per donor, each bounded by `per_donor`,
+/// until every part matches or a round fails.
+async fn converge_with_cold_donors(
+    shard: &Arc<dyn ShardOps>,
+    mesh: &Mesh,
+    cache: &SmolStr,
+    donors: &[NodeId],
+    parts: &[PartId],
+    per_donor: Duration,
+) {
+    for &donor in donors {
+        let mut diverging = parts.to_vec();
+        for _ in 0..COLD_DONOR_ROUNDS {
+            let Ok(outcome) = tokio::time::timeout(
+                per_donor,
+                anti_entropy::run_round_for_parts(mesh, shard, cache, donor, &diverging),
+            )
+            .await
+            else {
+                break;
+            };
+            if outcome.failed {
+                break;
+            }
+            diverging.retain(|part| !outcome.matched.contains(part));
+            if diverging.is_empty() {
+                break;
+            }
+        }
+        tracing::debug!(cache = %cache, %donor, parts = parts.len(), diverging = diverging.len(), "converged with a cold donor by anti-entropy");
+    }
+}
+
 /// Delay between retry passes over a group's whole donor list once every
 /// candidate has declined or failed once: long enough for both sides'
 /// `refresh_task`s to have a real chance at converging their views before
@@ -260,11 +301,14 @@ async fn pull_one_group(
         if every_donor_cold {
             all_cold_passes += 1;
             if all_cold_passes >= ALL_COLD_PASSES {
-                // No warm copy anywhere to pull. A cold part serves what
-                // landed here; a warm-reloaded part nothing has verified
-                // keeps waiting, since its replay can lack a key an owner
-                // holds and a read would answer a wrong miss.
+                // No warm copy anywhere to pull. A cold donor can still
+                // hold writes that reached it while its own pull ran, so
+                // converge with each first; a cold part then serves what
+                // landed here, while a warm-reloaded part nothing has
+                // verified keeps waiting, since its replay can lack a key
+                // an owner holds and a read would answer a wrong miss.
                 tracing::debug!(cache = %cache, parts = parts.len(), "every donor is cold for these parts; nothing warm to pull");
+                converge_with_cold_donors(shard, mesh, cache, &donors, &parts, per_donor).await;
                 let (settled, pull) = settle_all_cold(&parts, |part| residency.is_unverified(part));
                 residency.mark_serving(&settled);
                 return pull;

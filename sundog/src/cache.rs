@@ -2235,6 +2235,81 @@ mod tests {
         cluster.shutdown().await;
     }
 
+    /// A donor still pulling a part itself declines every pull as cold, yet
+    /// can hold writes that reached it meanwhile. A joiner whose only donor
+    /// stays cold converges with it by anti-entropy before serving, rather
+    /// than answering a miss for a key the donor holds. `ae_interval` is an
+    /// hour, so no periodic round repairs it instead.
+    #[tokio::test]
+    async fn a_joiner_whose_only_donor_stays_cold_converges_with_it_before_serving() {
+        const TOTAL: u32 = 50;
+        let name = SmolStr::new("cold-donor");
+        let config = ClusterConfig {
+            ae_interval: Duration::from_hours(1),
+            tombstone_ttl: Duration::from_hours(720),
+            ..loopback_config()
+        };
+
+        let b = Cluster::builder("cache-it-cold-donor")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("b builds");
+        let cache_b = b
+            .cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone, owning every part");
+        for key in 0..TOTAL {
+            cache_b
+                .insert(key, format!("v{key}"))
+                .await
+                .expect("b owns every part while alone");
+        }
+        let c = Cluster::builder("cache-it-cold-donor")
+            .seeds([b.local_gossip_addr()])
+            .config(config)
+            .build()
+            .await
+            .expect("c builds");
+        wait_for_peer_count(&b, 1).await;
+        wait_for_peer_count(&c, 1).await;
+        // Marked once b sees c: while b owns every part alone, a republished
+        // view marks what it owns alone servable.
+        cache_b
+            .shard
+            .residency()
+            .expect("b is distributed")
+            .mark_cold(&PartId::all().collect::<Vec<_>>());
+        let cache_c = c
+            .cache::<u32, String>(name)
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("c opens, co-owning every part with b");
+
+        wait_until(
+            Duration::from_secs(10),
+            "c's pull settles against its cold donor",
+            async || cache_c.entry_count().await == u64::from(TOTAL),
+        )
+        .await;
+        for key in 0..TOTAL {
+            assert_eq!(
+                cache_c.get(&key).await,
+                Some(format!("v{key}")),
+                "key {key} converged from the cold donor"
+            );
+        }
+
+        cache_c.close().await;
+        cache_b.close().await;
+        c.shutdown().await;
+        b.shutdown().await;
+    }
+
     #[tokio::test]
     async fn reconcile_warm_buckets_never_runs_a_round_for_an_empty_bucket_list() {
         let cluster = Cluster::builder("cache-it-reconcile-empty")

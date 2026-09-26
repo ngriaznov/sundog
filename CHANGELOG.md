@@ -482,6 +482,14 @@ All notable changes to this project are documented in this file. Format follows
   now records every part a published view drops, the part reads as cold at
   once, and the next rebalance pulls it.
 
+- **A part whose every donor is still catching up converges with them
+  before it serves.** A donor still pulling a part declines to hand it over,
+  yet holds the writes that reached it meanwhile. When every donor declined
+  that way, the new owner served its own copy without them: after an owner
+  crashed mid-pull, a read of that part answered a miss for keys its
+  surviving co-owner held. The new owner now runs anti-entropy rounds
+  against each such donor before serving the part.
+
 - **`CacheBuilder::prefold_enabled(false)` survives a capacity hint or a
   weigher.** Each rebuilds the shard's engine, and the rebuild reset the
   flag to its default; it now carries the flag forward.
