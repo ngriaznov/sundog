@@ -157,9 +157,8 @@ one, raise `tombstone_max_ttl` or treat sundog as the wrong layer.
 
 Good fits: read-through caching in front of a slower store, session or profile
 data that's fine being eventually consistent, or any per-instance cache whose
-instances agree without standing up Redis. It targets small clusters of 2-30
-nodes on a LAN, with no consistent-hashing or partitioning. Every replicated
-node holds every entry.
+instances agree without standing up Redis. In `Replicated` mode every node
+holds every entry.
 
 The store is an in-crate engine with 1,024 lock-striped tables, one per
 anti-entropy bucket. A read takes one read lock and one lookup with no

@@ -29,8 +29,6 @@ entries never come back.
 - Any per-instance cache whose instances should agree without standing up
   Redis.
 
-It targets clusters of 2 to 30 nodes on a LAN or a cloud VPC.
-
 ## What it is not
 
 sundog is a cache, not a database. Nothing reaches disk unless you
