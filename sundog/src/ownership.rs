@@ -611,6 +611,16 @@ pub struct ResidencySet {
     /// local hit isn't trusted until verification lands or every donor
     /// turns out cold or unreachable, at which point this clears anyway.
     unverified: RwLock<PartSet>,
+    /// The last view `rebalance_task` finished with, or `None` before one
+    /// is recorded. A part the current view owns and this one doesn't
+    /// counts as cold until its pull lands: the tracker publishes a view
+    /// before `rebalance_task` marks the parts it gains cold, and a local
+    /// miss in between says nothing about the key.
+    settled: RwLock<Option<Arc<OwnershipView>>>,
+    /// Parts that turned servable since [`ResidencySet::settled`] was last
+    /// recorded, so a part gained after it serves as soon as its own pull
+    /// lands rather than when the whole pull does.
+    served_since_settled: RwLock<PartSet>,
 }
 
 impl Default for ResidencySet {
@@ -626,7 +636,26 @@ impl ResidencySet {
             releasing: RwLock::new(HashMap::new()),
             cold: RwLock::new(PartSet::new()),
             unverified: RwLock::new(PartSet::new()),
+            settled: RwLock::new(None),
+            served_since_settled: RwLock::new(PartSet::new()),
         }
+    }
+
+    /// Records `view` as the last view `rebalance_task` finished with: every
+    /// part it owns is now either pulled or marked cold on its own.
+    pub(crate) fn settle(&self, view: Arc<OwnershipView>) {
+        let mut settled = self.settled.write();
+        self.served_since_settled.write().clear();
+        *settled = Some(view);
+    }
+
+    /// Whether `part`, owned under the current view, is not yet settled:
+    /// the last settled view did not own it and no pull or verification
+    /// has served it since. `false` before any view is settled.
+    pub(crate) fn is_unsettled(&self, part: PartId) -> bool {
+        let settled = self.settled.read();
+        settled.as_ref().is_some_and(|view| !view.owns(part))
+            && !self.served_since_settled.read().contains(part)
     }
 
     /// Marks each of `parts` cold: owned here, not yet pulled.
@@ -660,6 +689,9 @@ impl ResidencySet {
     pub(crate) fn mark_serving(&self, parts: &[PartId]) {
         self.clear_cold(parts);
         self.clear_unverified(parts);
+        self.served_since_settled
+            .write()
+            .extend(parts.iter().copied());
     }
 
     /// Wholesale analogue of [`ResidencySet::mark_serving`]: after
@@ -668,6 +700,11 @@ impl ResidencySet {
     pub(crate) fn mark_all_serving(&self) {
         self.clear_all_cold();
         self.unverified.write().clear();
+        if let Some(view) = self.settled.read().as_ref() {
+            self.served_since_settled
+                .write()
+                .extend(PartId::all().filter(|&part| !view.owns(part)));
+        }
     }
 
     /// Whether `part` is owned here but not yet pulled.
@@ -1804,6 +1841,54 @@ mod tests {
         // mark_serving clears whichever marks a part carries.
         set.mark_serving(&[p(1), p(2)]);
         assert!(!set.is_cold(p(1)) && !set.is_cold(p(2)) && !set.is_unverified(p(1)));
+    }
+
+    #[test]
+    fn residency_set_a_part_the_settled_view_misses_stays_unsettled_until_it_serves() {
+        let set = ResidencySet::new();
+        let alone = NonZeroU8::new(1).expect("nonzero");
+        let (me, other) = (NodeId::from(1), NodeId::from(2));
+        let settled = Arc::new(OwnershipView::compute(me, vec![me, other], alone));
+        let gained = PartId::all()
+            .find(|&part| !settled.owns(part))
+            .expect("two nodes split the parts");
+        let kept = PartId::all()
+            .find(|&part| settled.owns(part))
+            .expect("two nodes split the parts");
+
+        assert!(
+            !set.is_unsettled(gained),
+            "nothing is unsettled before a view settles"
+        );
+        set.settle(Arc::clone(&settled));
+        assert!(set.is_unsettled(gained));
+        assert!(
+            !set.is_unsettled(kept),
+            "a part the settled view owns is settled"
+        );
+
+        set.mark_serving(&[gained]);
+        assert!(
+            !set.is_unsettled(gained),
+            "its own pull landing settles the part"
+        );
+
+        set.settle(Arc::clone(&settled));
+        assert!(
+            set.is_unsettled(gained),
+            "settling again forgets what served under the previous settled view"
+        );
+        set.mark_all_serving();
+        assert!(
+            !set.is_unsettled(gained),
+            "giving up the warm-up settles every part"
+        );
+
+        set.settle(Arc::new(OwnershipView::compute(me, vec![me], alone)));
+        assert!(
+            !set.is_unsettled(gained),
+            "a settled view that owns the part settles it"
+        );
     }
 
     #[cfg(feature = "spill")]

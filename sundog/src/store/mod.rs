@@ -4617,9 +4617,14 @@ where
     }
 
     fn is_cold_part(&self, part: PartId) -> bool {
-        self.residency
-            .as_ref()
-            .is_some_and(|residency| residency.is_cold(part))
+        self.residency.as_ref().is_some_and(|residency| {
+            residency.is_cold(part)
+                || (residency.is_unsettled(part)
+                    && self
+                        .ownership
+                        .as_ref()
+                        .is_some_and(|tracker| tracker.current().owns(part)))
+        })
     }
 
     fn is_unverified_part(&self, part: PartId) -> bool {
@@ -4786,6 +4791,56 @@ mod tests {
         );
         residency.mark_serving(&[cold]);
         assert!(!ShardOps::is_cold_part(&s, cold));
+    }
+
+    /// The tracker publishes a view before `rebalance_task` marks what it
+    /// gains cold: a part gained in between still reads as cold, so a local
+    /// miss there is never taken as an answer.
+    #[test]
+    fn a_part_gained_under_a_view_not_yet_settled_is_cold_until_it_serves() {
+        let (me, peer, other, victim) = (
+            NodeId::from(1),
+            NodeId::from(2),
+            NodeId::from(3),
+            NodeId::from(4),
+        );
+        let residency = Arc::new(ResidencySet::new());
+        let (s, before, tx) = distributed_shard::<u32, String>(
+            me,
+            vec![me, peer, other, victim],
+            2,
+            Arc::clone(&residency),
+        );
+        residency.settle(Arc::clone(&before));
+
+        let after = Arc::new(OwnershipView::compute(
+            me,
+            vec![me, peer, other],
+            NonZeroU8::new(2).expect("nonzero"),
+        ));
+        tx.send(Arc::clone(&after)).expect("receiver still alive");
+        let gained = PartId::all()
+            .find(|&part| after.owns(part) && !before.owns(part))
+            .expect("losing a node hands some of its parts to this one");
+        let kept = PartId::all()
+            .find(|&part| after.owns(part) && before.owns(part))
+            .expect("this node keeps some parts");
+        let not_owned = PartId::all()
+            .find(|&part| !after.owns(part))
+            .expect("with two owners among three nodes, some parts are elsewhere");
+
+        assert!(
+            ShardOps::is_cold_part(&s, gained),
+            "gained under a published view, no mark_cold yet: still cold"
+        );
+        assert!(!ShardOps::is_cold_part(&s, kept));
+        assert!(
+            !ShardOps::is_cold_part(&s, not_owned),
+            "a part this node does not own is never cold here"
+        );
+
+        residency.mark_serving(&[gained]);
+        assert!(!ShardOps::is_cold_part(&s, gained), "its pull landed");
     }
 
     #[tokio::test]

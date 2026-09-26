@@ -648,6 +648,7 @@ where
         .filter(|&part| seed.owners_of(part).len() > 1)
         .collect();
     residency.mark_cold(&cold);
+    residency.settle(seed);
     shard = shard.with_ownership(ownership.clone(), Arc::clone(&residency));
     (
         shard,

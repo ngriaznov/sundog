@@ -929,6 +929,7 @@ pub(crate) async fn rebalance_task(
                 // starting point on the next change, which is already
                 // published, so nothing gained is skipped.
                 if outcome != Outcome::Superseded {
+                    residency.settle(Arc::clone(&new_view));
                     pulled_view = new_view;
                 }
             }

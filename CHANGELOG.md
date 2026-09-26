@@ -466,6 +466,14 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A Distributed read never takes a freshly gained part's empty store for
+  a miss.** The ownership view is published before the rebalance task marks
+  the parts it gains cold, and a `fetch` in that window answered `Ok(None)`
+  from the new owner's store, locally or to a peer, for keys the surviving
+  owner still held. A part the current view owns but the last view the
+  rebalance task finished did not now counts as cold until its own pull
+  lands.
+
 - **`CacheBuilder::prefold_enabled(false)` survives a capacity hint or a
   weigher.** Each rebuilds the shard's engine, and the rebuild reset the
   flag to its default; it now carries the flag forward.
