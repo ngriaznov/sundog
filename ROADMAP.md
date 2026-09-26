@@ -134,20 +134,6 @@ counters, sized as Caffeine sizes its own at about 8 bytes per entry of
 capacity, and a doorkeeper filter in front of eviction admit a new entry
 only when it is likelier to be read again than the victim.
 
-### A byte arena for heap records
-
-A record over 22 encoded bytes takes its own `Box<[u8]>`. On the 16-byte
-key, 100-byte value shape the record is 119 bytes and lands in a 128-byte
-allocator chunk; with the 56-byte entry and about 5 bytes of index that
-accounts for 189 bytes, and the measured 209.6 leaves about 21 bytes of
-fragmentation and slack per entry. A per-stripe arena of bump-allocated
-pages holds those records back to back and reclaims holes on the tombstone
-sweep, the tick that runs for every cache. Compaction runs only for a
-merging cache and is the wrong host.
-
-**Trigger:** the entry-diet bench on that shape above Redis 7's computed
-184 bytes, which is where it sits today.
-
 ### Hot keys
 
 Nothing tracks per-key access frequency. A sampled hot-key list, fed from
