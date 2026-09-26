@@ -919,9 +919,9 @@ async fn push_repairs(
     }
 }
 
-/// Pulls `pull_keys` and `pull_hashes` from `peer` and applies them,
-/// stopping at the first failed request. Returns the version of every
-/// record the peer sent, by key.
+/// Pulls `pull_keys` and then `pull_hashes` from `peer` and applies them.
+/// A failed request ends its own list, keeping what earlier batches
+/// landed. Returns the version of every record the peer sent, by key.
 async fn pull_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -942,7 +942,7 @@ async fn pull_repairs(
             Ok(records) => land(records, &mut pulled).await,
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy pull failed; keeping progress");
-                return pulled;
+                break;
             }
         }
     }
