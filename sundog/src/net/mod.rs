@@ -899,6 +899,44 @@ impl MeshInner {
     }
 }
 
+/// The data-plane TCP listener, bound and holding its port until
+/// [`Mesh::spawn_on`] takes it over. Binding port `0` here and handing the
+/// listener on keeps the port from being released in between, where
+/// another socket could take it.
+pub(crate) struct BoundListener {
+    listener: TcpListener,
+    local_addr: SocketAddr,
+}
+
+impl BoundListener {
+    /// Binds `bind_addr`, resolving port `0` to the port the OS assigns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JoinError::Bind`] if `bind_addr` cannot be bound.
+    pub(crate) async fn bind(bind_addr: SocketAddr) -> Result<Self, JoinError> {
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|source| JoinError::Bind {
+                addr: bind_addr,
+                source,
+            })?;
+        let local_addr = listener.local_addr().map_err(|source| JoinError::Bind {
+            addr: bind_addr,
+            source,
+        })?;
+        Ok(Self {
+            listener,
+            local_addr,
+        })
+    }
+
+    /// The bound address, with port `0` resolved.
+    pub(crate) const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+}
+
 /// A cheap-to-clone handle onto the running data-plane mesh.
 #[derive(Clone)]
 pub struct Mesh {
@@ -926,18 +964,33 @@ impl Mesh {
         config: &ClusterConfig,
         handler: Arc<dyn RequestHandler>,
     ) -> Result<(Self, mpsc::Receiver<InboundMsg>), JoinError> {
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .map_err(|source| JoinError::Bind {
-                addr: bind_addr,
-                source,
-            })?;
-        let local_addr = listener.local_addr().map_err(|source| JoinError::Bind {
-            addr: bind_addr,
-            source,
-        })?;
+        let listener = BoundListener::bind(bind_addr).await?;
+        Self::spawn_on(listener, node, incarnation, config, handler)
+    }
+
+    /// [`Mesh::spawn`] over a listener already bound by
+    /// [`BoundListener::bind`], so the port a caller advertised before
+    /// spawning is the one the mesh accepts on.
+    #[cfg_attr(
+        not(all(feature = "tls", not(feature = "sim"))),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only building the TLS context can fail"
+        )
+    )]
+    pub(crate) fn spawn_on(
+        listener: BoundListener,
+        node: NodeId,
+        incarnation: u64,
+        config: &ClusterConfig,
+        handler: Arc<dyn RequestHandler>,
+    ) -> Result<(Self, mpsc::Receiver<InboundMsg>), JoinError> {
+        let BoundListener {
+            listener,
+            local_addr,
+        } = listener;
         #[cfg(all(feature = "tls", not(feature = "sim")))]
-        let tls = build_tls_ctx(config, bind_addr)?;
+        let tls = build_tls_ctx(config, local_addr)?;
         #[cfg(not(all(feature = "tls", not(feature = "sim"))))]
         let tls = build_tls_ctx(config);
 
@@ -2019,6 +2072,31 @@ mod tests {
         Mesh::spawn(addr, node, 1, &ClusterConfig::default(), handler)
             .await
             .expect("bind loopback")
+    }
+
+    #[tokio::test]
+    async fn a_bound_listener_holds_its_port_and_spawn_on_accepts_on_it() {
+        let bound = BoundListener::bind("127.0.0.1:0".parse().expect("valid loopback addr"))
+            .await
+            .expect("bind loopback");
+        let addr = bound.local_addr();
+        assert_ne!(addr.port(), 0, "port 0 resolves to the assigned port");
+        let err = std::net::TcpListener::bind(addr)
+            .expect_err("the bound listener keeps its port from any other socket");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+
+        let (mesh, _inbound) = Mesh::spawn_on(
+            bound,
+            NodeId::from(1),
+            1,
+            &ClusterConfig::default(),
+            empty_handler(),
+        )
+        .expect("spawn on the bound listener");
+        assert_eq!(mesh.local_addr(), addr);
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the mesh accepts on the port the listener held");
     }
 
     fn empty_handler() -> Arc<dyn RequestHandler> {

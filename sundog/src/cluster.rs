@@ -33,7 +33,6 @@ use futures::stream::{self, BoxStream, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use smol_str::SmolStr;
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -48,7 +47,8 @@ use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
-    AeServeOutcome, FetchServe, InboundMsg, Mesh, OutFrame, RequestHandler, StServe, batch_forward,
+    AeServeOutcome, BoundListener, FetchServe, InboundMsg, Mesh, OutFrame, RequestHandler, StServe,
+    batch_forward,
 };
 use crate::node::{NodeId, NodeName};
 use crate::ownership::{Granularity, OwnershipView, parts_of_wire_id};
@@ -709,7 +709,8 @@ impl ClusterBuilder {
         let discovery = resolve_discovery(discovery, &name, &node_name);
         let has_seeds = discovery.has_seeds();
 
-        let data_bind_addr = reserve_data_bind_addr(config.data_bind_addr).await?;
+        let data_listener = BoundListener::bind(config.data_bind_addr).await?;
+        let data_bind_addr = data_listener.local_addr();
         let advertise_ip = crate::membership::advertise_ip_for(&config, data_bind_addr.ip());
         let advertise_data_addr = SocketAddr::new(advertise_ip, data_bind_addr.port());
 
@@ -739,7 +740,7 @@ impl ClusterBuilder {
             rebalance_chunk_bytes: config.rebalance_chunk_bytes_value(),
         });
         let (mesh, inbound_rx) =
-            Mesh::spawn(data_bind_addr, node, incarnation, &config, handler).await?;
+            Mesh::spawn_on(data_listener, node, incarnation, &config, handler)?;
 
         let cluster = Cluster {
             inner: Arc::new(ClusterInner {
@@ -891,26 +892,6 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
         cluster.shards(),
         cluster.cancel_token(),
     ));
-}
-
-/// Resolves the address `Mesh::spawn` binds to and `Membership::spawn`
-/// advertises. A non-zero configured port is used as-is; the zeroconf port
-/// `0` is claimed here and released for `Mesh::spawn` to reclaim, so
-/// `Membership::spawn` has a real port to gossip.
-async fn reserve_data_bind_addr(configured: SocketAddr) -> Result<SocketAddr, JoinError> {
-    if configured.port() != 0 {
-        return Ok(configured);
-    }
-    let probe = TcpListener::bind(configured)
-        .await
-        .map_err(|source| JoinError::Bind {
-            addr: configured,
-            source,
-        })?;
-    probe.local_addr().map_err(|source| JoinError::Bind {
-        addr: configured,
-        source,
-    })
 }
 
 fn local_hostname() -> String {
@@ -5402,6 +5383,26 @@ mod tests {
             .expect("open succeeds");
         cache.insert(1, "a".into()).await.expect("insert");
         assert_eq!(cache.get(&1).await, Some("a".to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn build_advertises_the_data_port_its_mesh_accepts_on() {
+        let cluster = Cluster::builder("cluster-it-data-port-advertised")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+
+        let accepting = cluster.inner.mesh.local_addr();
+        assert_ne!(accepting.port(), 0);
+        assert_eq!(
+            cluster.inner.membership.local_peer().data_addr,
+            accepting,
+            "membership gossips the port the mesh's listener holds"
+        );
 
         cluster.shutdown().await;
     }
