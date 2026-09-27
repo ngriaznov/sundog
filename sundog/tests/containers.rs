@@ -2814,6 +2814,109 @@ async fn distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned(
     net.close().await.expect("network closes");
 }
 
+/// Like [`fetch_mismatches`], but an honest "no reachable owner" is not a
+/// mismatch: only a miss, a wrong value, or another error is.
+async fn fetch_violations(nodes: &[&Node], entries: &[(String, String)]) -> Vec<String> {
+    fetch_mismatches(nodes, entries)
+        .await
+        .into_iter()
+        .filter(|line| !line.contains("found no reachable owner"))
+        .collect()
+}
+
+/// An owner crashes while a newly joined node is still pulling its share.
+/// The joiner's parts stay cold rather than answering from an empty store,
+/// the surviving holders keep answering, and no read of a written key comes
+/// back a miss or a wrong value, at worst "no reachable owner" for a moment;
+/// every key is then readable again. The crash lands a random 0 to 1.5 s
+/// after the joiner is ready, printed so a failure replays with
+/// `SUNDOG_CRASH_DELAY_MS`.
+#[tokio::test]
+async fn distributed_owner_crash_during_a_joiners_pull_keeps_every_key_fetchable() {
+    const OWNERS: u8 = 2;
+    const FILL_KEYS: u32 = 3_000;
+    const SAMPLE_SIZE: usize = 200;
+    const ALIASES: [&str; 4] = ["j1", "j2", "j3", "j4"];
+    const CLUSTER: &str = "dist-join-crash-cluster";
+    const CHECK_WINDOW: Duration = Duration::from_secs(15);
+    const READABLE_WAIT: Duration = Duration::from_secs(120);
+
+    require_containers!();
+
+    let delay_ms: u64 = std::env::var("SUNDOG_CRASH_DELAY_MS").map_or_else(
+        |_| rand::rng().random_range(0..=1_500),
+        |raw| raw.parse().expect("SUNDOG_CRASH_DELAY_MS is a u64"),
+    );
+    eprintln!("crash delay: replay with SUNDOG_CRASH_DELAY_MS={delay_ms}");
+
+    let net = Arc::new(Network::new_network());
+    let log_env = [("RUST_LOG", DISTRIBUTED_RUST_LOG)];
+    let mut nodes = Vec::with_capacity(ALIASES.len() + 1);
+    for (i, alias) in ALIASES.iter().enumerate() {
+        let seeds: Vec<String> = ALIASES[..i].iter().map(|a| seed(a)).collect();
+        let seed_refs: Vec<&str> = seeds.iter().map(String::as_str).collect();
+        nodes.push(
+            Node::spawn_distributed_with_env(
+                &net,
+                CLUSTER,
+                alias,
+                &seed_refs,
+                Some(OWNERS),
+                &log_env,
+            )
+            .await,
+        );
+    }
+    wait_for_peers(&nodes.iter().collect::<Vec<_>>(), ALIASES.len() - 1).await;
+    nodes[0].fill(FILL_KEYS).await.expect("bulk fill succeeds");
+    eventually(Duration::from_secs(60), || async {
+        sum_counts(&nodes.iter().collect::<Vec<_>>()).await
+            == Some(usize::from(OWNERS) * FILL_KEYS as usize)
+    })
+    .await;
+    let sample = sample_kv_entries(0x0101_c0de, FILL_KEYS, SAMPLE_SIZE);
+
+    let joiner_seeds: Vec<String> = ALIASES.iter().map(|a| seed(a)).collect();
+    let joiner_seed_refs: Vec<&str> = joiner_seeds.iter().map(String::as_str).collect();
+    let joiner = Node::spawn_distributed_with_env(
+        &net,
+        CLUSTER,
+        "j5",
+        &joiner_seed_refs,
+        Some(OWNERS),
+        &log_env,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    let victim = nodes.remove(0);
+    victim
+        .crash()
+        .await
+        .expect("crashed node dies and is removed cleanly");
+    nodes.push(joiner);
+    let live: Vec<&Node> = nodes.iter().collect();
+
+    let check_deadline = tokio::time::Instant::now() + CHECK_WINDOW;
+    while tokio::time::Instant::now() < check_deadline {
+        let violations = fetch_violations(&live, &sample).await;
+        assert!(
+            violations.is_empty(),
+            "a read answered a miss or a wrong value {delay_ms} ms into the joiner's pull: \
+             {violations:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    eventually(READABLE_WAIT, || async {
+        fetch_mismatches(&live, &sample).await.is_empty()
+    })
+    .await;
+
+    for node in nodes {
+        node.stop().await.expect("node stops");
+    }
+    net.close().await.expect("network closes");
+}
+
 /// A fourth node joins a filled three-node distributed cluster: it pulls
 /// roughly a quarter of the part-ownership assignments (`sundog_owned_parts`
 /// near 65,536 × `OWNERS` / 4) and at least one original node's

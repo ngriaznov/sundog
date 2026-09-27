@@ -1,5 +1,6 @@
-# Weekly ten-minute chaos run with a fresh seed: the chosen seed is printed
-# before the suite runs, so a red run is replayed locally with
+# Weekly ten-minute chaos run with a fresh seed, then fifteen rounds of the
+# owner-crash scenarios. The chosen seed is printed before the suite runs,
+# so a red run is replayed locally with
 # `SUNDOG_CONTAINER_TESTS=1 SUNDOG_CHAOS_SEED=<seed> SUNDOG_CHAOS_SECS=600
 # RIGHTSIZE_BACKEND=docker cargo test --release -p sundog --test containers
 # -- --test-threads=1 chaos_`.
@@ -39,6 +40,20 @@ jobs:
 
       - name: Run the chaos scenario
         run: cargo test --release --package sundog --test containers -- --test-threads=1 chaos_
+
+      # The owner-crash tests hit a race only at some timings, so they run
+      # fifteen times, the joiner test with a fresh random crash delay each
+      # time; a failure prints the delay to replay with
+      # SUNDOG_CRASH_DELAY_MS.
+      - name: Repeat the owner-crash scenarios
+        run: |
+          for run in $(seq 15); do
+            echo "::group::owner-crash round $run"
+            cargo test --release --package sundog --test containers -- --test-threads=1 \
+              distributed_kill_one_owner_and_every_key_still_fetchable_then_re_owned \
+              distributed_owner_crash_during_a_joiners_pull_keeps_every_key_fetchable
+            echo "::endgroup::"
+          done
 
       - name: Upload container node logs
         if: failure()

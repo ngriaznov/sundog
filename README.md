@@ -425,7 +425,8 @@ The pod IP is what the probe advertises, so nothing more to set. Wire the
 readiness probe to `/readyz` if you enable `prometheus_listen`, or fold
 `cluster.is_ready()` into the probe your service already serves, and call
 `cluster.shutdown()` from its SIGTERM handler so peers see a departure
-instead of a failure.
+instead of a failure: a leaving node reconciles its parts with their other
+owners before it announces, and ownership moves at the announcement.
 
 ## Feature flags
 
@@ -577,11 +578,14 @@ orchestrator's readiness and liveness probes.
 
 Six layers, cheapest and highest-signal first:
 
-1. **Property tests** run via `proptest` in `hlc`, `wire`, and `store` under
-   `sundog/src`. The one that matters most, `store`'s permutation-convergence
-   property, applies a random batch of writes and removes in every sampled
-   order, with drops and duplicates. Every run lands on the same final state,
-   the property this loss-tolerant design rests on.
+1. **Property tests** run via `proptest` in `hlc`, `wire`, `store` and the
+   rebalance planner under `sundog/src`. The one that matters most,
+   `store`'s permutation-convergence property, applies a random batch of
+   writes and removes in every sampled order, with drops and duplicates.
+   Every run lands on the same final state, the property this loss-tolerant
+   design rests on. The rebalance planner's drives random ownership views,
+   coalesced and superseded, against a model of which parts hold every
+   write.
 2. **Deterministic simulation** runs via `turmoil` in `sundog/tests/sim.rs`,
    behind the `sim` feature. It drives the real net layer and store against a
    scripted membership feed with no sockets involved. Scenarios:
@@ -594,7 +598,12 @@ Six layers, cheapest and highest-signal first:
      path, both under the same loss and reordering.
    - A `Mode::Distributed` cluster churning membership under loss and
      reordering, checking that every bucket's data converges across its
-     current owners with no non-owner ever holding one.
+     current owners with no non-owner ever holding one. These scenarios
+     script ownership by hand and move data by anti-entropy; the rebalance
+     and pull path runs in the churn oracle, `sundog/tests/churn_oracle.rs`,
+     which takes real in-process clusters through joins, graceful leaves and
+     crashes mid-pull while reading every key from every node, and fails on
+     any miss for a key a live owner holds, deleted value or wrong value.
 3. **Container integration** runs via
    [`rightsize`](https://crates.io/crates/rightsize) in
    `sundog/tests/containers.rs`, no Docker CLI, no `bollard`. Multi-node
@@ -608,8 +617,9 @@ Six layers, cheapest and highest-signal first:
    duplicating it, high-churn add/remove/TTL workloads draining to zero, and
    64 KiB values verified byte-for-byte, and, for `Mode::Distributed`, a
    five-node fill landing every key on two owners, one owner crashing
-   with every key still fetchable and then re-owned, and a fourth node
-   joining a filled cluster and taking its share. Each node is
+   with every key still fetchable and then re-owned, one owner crashing
+   while a new node is still pulling its share, and a fourth node joining
+   a filled cluster and taking its share. Each node is
    `sundog-testnode`, a tiny
    static/musl binary driven over a line-based control protocol, and reads
    `SUNDOG_TESTNODE_MODE=distributed` (with `SUNDOG_TESTNODE_OWNERS` to pick

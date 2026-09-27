@@ -73,7 +73,12 @@ a few seconds after a membership change. `owners_of` reports a key's owners.
 ```
 
 When a node joins or leaves, ownership follows gossip within a few gossip
-intervals. A node that gains a part pulls it from the previous owners. A
+intervals. A node that gains a part pulls it from the previous owners, and
+a node that regains a part it lost pulls it again, since writes went to
+other owners meanwhile. A node that shuts down gracefully first reconciles
+its parts with their other owners, then announces its departure, and
+ownership moves at the announcement; a crashed node keeps its parts until
+the failure detector drops it. A
 node that loses one keeps serving it for `distributed_disown_grace_rounds`
 anti-entropy intervals, hands it to each new owner, and drops it once every
 owner confirms. A lost part that no other previous owner still owns, as

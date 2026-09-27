@@ -91,7 +91,28 @@ A `Distributed` cache has no quorum. During a partition each side computes
 its own owners and accepts writes, and the two sides settle by version
 when it heals. With two owners, both owners of one part failing inside
 one rebalance window lose that part; set `owners` to 3 or more where
-that matters.
+that matters. A crash counts as a failure until the failure detector drops
+the node from the live set. A graceful shutdown does not: the leaving node
+first reconciles every part it owns with each live co-owner, within
+`state_transfer_budget`, then announces its departure, and ownership moves
+at the announcement.
+
+### Reads while ownership moves
+
+While `Distributed` nodes join, leave or crash, `fetch` answers one of
+three things for a key:
+
+- its current value, from an owner that holds it;
+- `Ok(None)`, only when the key is absent or deleted;
+- `CacheError::FetchUnavailable`, when no reachable owner can vouch for the
+  key yet, for example while every owner is still pulling its part.
+
+A read never returns a miss for a key a live owner holds, and never a
+deleted value. A part a node has just gained, or regained after losing it,
+counts as cold until its pull lands, so the node asks the other owners
+rather than answering from an incomplete copy. `get` reads only this node's
+copy and makes none of these promises off an owner that is still pulling.
+The [churn oracle](verification.md) checks exactly this list.
 
 ## What sundog does not promise
 

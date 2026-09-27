@@ -1,6 +1,8 @@
-# Weekly turmoil run with a fresh seed: the chosen seed is printed before
-# the suite runs, so a red run is replayed locally
-# with `SUNDOG_SIM_SEED=<seed> cargo test -p sundog --features sim --test sim`.
+# Weekly sweep of fresh seeds: the turmoil suite under five seeds, and the
+# churn read oracle under thirty. Every seed is printed before it runs, so
+# a red run is replayed locally with
+# `SUNDOG_SIM_SEED=<seed> cargo test -p sundog --features sim --test sim` or
+# `SUNDOG_ORACLE_SEED=<seed> cargo test -p sundog --test churn_oracle`.
 name: weekly-sim
 
 on:
@@ -18,10 +20,26 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Pick and log this run's seed
+      - name: Run the simulation suite under five fresh seeds
+        run: |
+          for run in 1 2 3 4 5; do
+            SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
+            echo "::notice title=sim seed ${run}::replay with SUNDOG_SIM_SEED=$SEED"
+            SUNDOG_SIM_SEED=$SEED cargo test --package sundog --features sim --test sim
+          done
+
+  churn-oracle-fresh-seeds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick and log the first seed
         run: |
           SEED=$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')
-          echo "SUNDOG_SIM_SEED=$SEED" >> "$GITHUB_ENV"
-          echo "::notice title=sim seed::replay with SUNDOG_SIM_SEED=$SEED"
-      - name: Run the simulation suite
-        run: cargo test --package sundog --features sim --test sim
+          echo "SUNDOG_ORACLE_SEED=$SEED" >> "$GITHUB_ENV"
+          echo "::notice title=oracle seeds::seeds $SEED onward, 30 runs; a failure names the seed to replay with SUNDOG_ORACLE_SEED"
+      - name: Run the churn read oracle
+        env:
+          SUNDOG_ORACLE_RUNS: "30"
+        run: cargo test --release --package sundog --test churn_oracle -- --nocapture
