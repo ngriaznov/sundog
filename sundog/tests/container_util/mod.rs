@@ -80,7 +80,7 @@ pub fn build_testnode() -> &'static Path {
 
 /// The release whose test node [`build_previous_testnode`] builds: the one
 /// this checkout must interoperate with across a rolling upgrade.
-pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.0";
+pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.1";
 
 /// Env var a container test passes via [`Node::spawn_with_env`] to override
 /// `ClusterConfig::crdt_retire_after` (`u64` seconds) down from its 24h

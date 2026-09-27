@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.2] – 2026-09-27
 
 ### Added
 
@@ -388,8 +388,10 @@ All notable changes to this project are documented in this file. Format follows
 
 - **Protocol 6: the data-plane hello names the cluster.** `Msg::Hello`
   gains `cluster`, the sender's `wire::cluster_id`, and
-  `wire::PROTOCOL_VERSION` bumps to 6. Code that builds a `Msg::Hello`
-  sets the new field; `wire::UNNAMED_CLUSTER` names none. A protocol 2 to
+  `wire::PROTOCOL_VERSION` bumps to 6. **Breaking** for code that builds
+  or exhaustively destructures `Msg::Hello`: it sets or matches the new
+  field, and `wire::UNNAMED_CLUSTER` names none. This is the release's only
+  API break. A protocol 2 to
   5 hello decodes with `cluster` unnamed, and a protocol-4 node ignores the
   new trailing field, so the release still serves the one before it.
   `wire::cluster_id`, `wire::same_cluster` and `wire::PROTOCOL_CLUSTER_ID`
