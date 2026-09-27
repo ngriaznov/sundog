@@ -3731,16 +3731,52 @@ mod tests {
         )
         .await;
 
-        // Both of the key's real owners go down; `a` never owned it and
-        // gossip has not yet had time to recompute `a`'s view around their
-        // departure, so every dial fails outright.
-        b.shutdown().await;
-        c.shutdown().await;
+        // Both of the key's real owners crash; `a` never owned it and its
+        // failure detector has not yet dropped them, so its view still names
+        // them and every dial fails outright.
+        b.crash().await;
+        c.crash().await;
 
         assert!(matches!(
             cache_a.fetch(&unowned_key).await,
             Err(CacheError::FetchUnavailable { cache }) if cache == "prices"
         ));
+
+        a.shutdown().await;
+    }
+
+    /// Unlike a crash, a graceful leave hands a key on: when both of its
+    /// owners shut down one after the other, the remaining node inherits
+    /// the key and still reads it.
+    #[tokio::test]
+    async fn both_owners_leaving_gracefully_hand_the_key_to_the_remaining_node() {
+        let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) =
+            three_node_distributed("cache-it-graceful-hand-off", "prices").await;
+        cache_b
+            .insert(unowned_key, "value".to_string())
+            .await
+            .expect("insert");
+        wait_until(
+            Duration::from_secs(10),
+            "the value reaches its owners",
+            async || matches!(cache_a.fetch(&unowned_key).await, Ok(Some(value)) if value == "value"),
+        )
+        .await;
+
+        b.shutdown().await;
+        c.shutdown().await;
+
+        wait_until(
+            Duration::from_secs(10),
+            "a owns the key alone and holds it",
+            async || cache_a.owners_of(&unowned_key) == vec![a.node_id()],
+        )
+        .await;
+        assert_eq!(
+            cache_a.get(&unowned_key).await,
+            Some("value".to_string()),
+            "the hand-off put the value on a before its last owner left"
+        );
 
         a.shutdown().await;
     }
