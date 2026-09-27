@@ -747,18 +747,18 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster) {
     .expect("cluster releases the displaced bucket once the disown grace elapses");
 
     // outcome="error": every real owner of some key cluster never owned
-    // goes down; both dials fail before gossip has time to react.
+    // crashes; both dials fail before the failure detector reacts. A
+    // graceful leave would announce the departure and hand the key to a
+    // live owner instead.
     let error_key = (20_000..30_000u32)
         .find(|&k| !cluster_prices.owners_of(&k).contains(&cluster.node_id()))
         .expect("some key's bucket excludes cluster among four real nodes");
     let error_owners = cluster_prices.owners_of(&error_key);
-    // Both at once: one owner's departure reaching `cluster`'s view before
-    // the other has gone would hand the key to a live owner.
     futures::future::join_all(
         [peer.clone(), third.clone(), fourth.clone()]
             .into_iter()
             .filter(|down| error_owners.contains(&down.node_id()))
-            .map(Cluster::shutdown),
+            .map(Cluster::crash),
     )
     .await;
     assert!(
