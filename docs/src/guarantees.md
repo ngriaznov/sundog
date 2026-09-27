@@ -53,10 +53,16 @@ one `tombstone_max_ttl` sets for deletes, below.
 
 `remove` writes a tombstone that replicates like a value and outvotes
 every older copy of the key. Tombstones stay for `tombstone_ttl`, 10
-minutes by default. While any member that gossip remembers is absent, a
-`Replicated` cache keeps its tombstones longer, up to `tombstone_max_ttl`,
-24 hours by default, so a node returning from a partition cannot bring a
-deleted key back.
+minutes by default. While a member that gossip remembers is absent, a
+cache keeps its tombstones longer, up to `tombstone_max_ttl`, 24 hours by
+default, and for another `tombstone_ttl` once that member is back, so a
+node returning from a partition cannot bring a deleted key back. A
+`Replicated` cache counts every absent member. A `Distributed` cache
+counts an absent member that shares a part with this node once it is
+eligible again: its ownership view drops the member, yet the member keeps
+its copy of every part it owned, and a delete made meanwhile reaches only
+this side. A graceful leave is not an absence: the leaver hands its parts
+off and keeps nothing.
 
 A member gone longer than `tombstone_max_ttl` returns after the tombstone
 is collected, and its stale copy can come back, limited by that copy's own

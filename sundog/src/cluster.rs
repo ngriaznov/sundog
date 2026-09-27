@@ -1766,8 +1766,9 @@ async fn reforward_stale_view(mesh: &Mesh, batch: ReforwardBatch<'_>) {
 /// `mode` and `absence` decide each tick whether collection past
 /// `tombstone_ttl` defers via [`absence::should_defer_gc`]: a
 /// `Mode::Replicated` tombstone survives up to `tombstone_max_ttl` while any
-/// recently known member is absent; `Mode::Distributed` narrows that to an
-/// absent co-owner of a bucket this node also owns.
+/// recently known member is absent, and for another `tombstone_ttl` once it
+/// is back; `Mode::Distributed` narrows that to a member that co-owns a
+/// part with this node when it is eligible again.
 pub(crate) async fn tombstone_gc_task(
     shard: Arc<dyn ShardOps>,
     mode: Mode,
@@ -1785,7 +1786,13 @@ pub(crate) async fn tombstone_gc_task(
         }
         shard.run_pending_tasks().await;
         let view = shard.ownership_view();
-        let defer = absence::should_defer_gc(mode, &absence, tombstone_max_ttl, view.as_deref());
+        let defer = absence::should_defer_gc(
+            mode,
+            &absence,
+            tombstone_max_ttl,
+            tombstone_ttl,
+            view.as_deref(),
+        );
         shard.gc_tombstones(defer).await;
     }
 }

@@ -401,6 +401,22 @@ impl OwnershipView {
             .unwrap_or_default()
     }
 
+    /// The co-owners `self_node` has once every node in `returning` is
+    /// eligible again alongside this view's own: a node this view dropped
+    /// shares a part with `self_node` there when it ranks among that part's
+    /// owners with everyone back. Nodes already eligible change nothing.
+    #[must_use]
+    pub(crate) fn co_owners_with(&self, returning: &[NodeId]) -> Vec<NodeId> {
+        let mut eligible = self.eligible.clone();
+        eligible.extend_from_slice(returning);
+        eligible.sort_unstable();
+        eligible.dedup();
+        if eligible.len() == self.eligible.len() {
+            return self.co_owners.clone();
+        }
+        self.successor(eligible, self.k, self.granularity).co_owners
+    }
+
     /// Every part `self_node` owns, ascending by [`PartId::index`].
     pub fn owned_parts(&self) -> impl Iterator<Item = PartId> + '_ {
         self.owned.iter()
@@ -1419,6 +1435,44 @@ mod tests {
         }
         let alone = OwnershipView::compute(self_node, vec![self_node], k);
         assert!(alone.co_owners().is_empty(), "a lone node has no co-owner");
+    }
+
+    #[test]
+    fn co_owners_with_returning_nodes_match_a_view_built_with_them_eligible() {
+        let self_node = NodeId::from(1);
+        let k = NonZeroU8::new(2).expect("nonzero");
+        for granularity in [Granularity::Bucket, Granularity::Part] {
+            let everyone: Vec<NodeId> = (1..=12u64).map(NodeId::from).collect();
+            let full = OwnershipView::compute_at(self_node, everyone.clone(), k, granularity);
+            let returning = [NodeId::from(4), NodeId::from(9)];
+            let remaining: Vec<NodeId> = everyone
+                .iter()
+                .copied()
+                .filter(|node| !returning.contains(node))
+                .collect();
+            let view = OwnershipView::compute_at(self_node, remaining, k, granularity);
+            assert_eq!(
+                view.co_owners_with(&returning),
+                full.co_owners(),
+                "at {granularity:?}"
+            );
+            assert_eq!(
+                view.co_owners_with(&[]),
+                view.co_owners(),
+                "no returning node leaves the co-owners as they are"
+            );
+            assert_eq!(
+                view.co_owners_with(&[self_node, NodeId::from(2)]),
+                view.co_owners(),
+                "nodes already eligible change nothing"
+            );
+        }
+        let alone = OwnershipView::compute(self_node, vec![self_node], k);
+        assert_eq!(
+            alone.co_owners_with(&[NodeId::from(2)]),
+            vec![NodeId::from(2)],
+            "with two owners per part, a lone node's one returning peer co-owns every part"
+        );
     }
 
     #[test]

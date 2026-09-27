@@ -29,6 +29,10 @@ struct MemberRecord {
     known_since: Option<Instant>,
     /// Continuous-presence start; cleared only when the member goes absent.
     present_since: Option<Instant>,
+    /// Set when an absent member comes back live: tombstone collection
+    /// keeps deferring for a settle bound after it, until anti-entropy has
+    /// had time to hand the member the deletes made while it was away.
+    returned_since: Option<Instant>,
 }
 
 impl MemberRecord {
@@ -38,6 +42,7 @@ impl MemberRecord {
             && self.gone_since.is_none()
             && self.known_since.is_none()
             && self.present_since.is_none()
+            && self.returned_since.is_none()
     }
 }
 
@@ -84,7 +89,9 @@ impl AbsenceTracker {
         }
         for (&node, &flags) in live {
             let record = state.members.entry(node).or_default();
-            record.absent_since = None;
+            if record.absent_since.take().is_some() {
+                record.returned_since = Some(Instant::now());
+            }
             record.gone_since = None;
             record.present_since.get_or_insert_with(Instant::now);
             record.known_since.get_or_insert_with(Instant::now);
@@ -112,6 +119,7 @@ impl AbsenceTracker {
 
     /// Whether any recently known member is absent and not yet aged past
     /// `hard_cap`. Prunes older entries as a side effect.
+    #[cfg(test)]
     pub(crate) fn any_absent(&self, hard_cap: Duration) -> bool {
         let mut state = self.state();
         let now = Instant::now();
@@ -130,25 +138,28 @@ impl AbsenceTracker {
             .any(|record| record.absent_since.is_some())
     }
 
-    /// Every recently known member absent and not yet aged past `hard_cap`,
-    /// for [`should_defer_gc`]'s `Mode::Distributed` rule. Prunes older
-    /// entries as a side effect, same as [`AbsenceTracker::any_absent`].
-    pub(crate) fn absent_nodes(&self, hard_cap: Duration) -> Vec<NodeId> {
+    /// Every member that holds tombstone collection back: absent and not yet
+    /// aged past `hard_cap`, or back from an absence for less than `settle`.
+    /// Prunes aged entries as a side effect.
+    pub(crate) fn holding_gc(&self, hard_cap: Duration, settle: Duration) -> Vec<NodeId> {
         let mut state = self.state();
         let now = Instant::now();
+        let aged = |since: Option<Instant>, bound: Duration| {
+            since.is_some_and(|since| now.saturating_duration_since(since) >= bound)
+        };
         for record in state.members.values_mut() {
-            if record
-                .absent_since
-                .is_some_and(|since| now.saturating_duration_since(since) >= hard_cap)
-            {
+            if aged(record.absent_since, hard_cap) {
                 record.absent_since = None;
+            }
+            if aged(record.returned_since, settle) {
+                record.returned_since = None;
             }
         }
         state.members.retain(|_, record| !record.is_empty());
         state
             .members
             .iter()
-            .filter(|(_, record)| record.absent_since.is_some())
+            .filter(|(_, record)| record.absent_since.is_some() || record.returned_since.is_some())
             .map(|(&node, _)| node)
             .collect()
     }
@@ -156,8 +167,7 @@ impl AbsenceTracker {
     /// Every member gone at least `retire_after`, crashed or graceful: the
     /// members whose writer incarnations the CRDT sweep may retire. Reads
     /// the never-pruned `gone_since` field, so unlike
-    /// [`AbsenceTracker::any_absent`]/[`AbsenceTracker::absent_nodes`] it
-    /// never ages an absence out.
+    /// [`AbsenceTracker::holding_gc`] it never ages an absence out.
     pub(crate) fn gone_longer_than(&self, retire_after: Duration) -> Vec<NodeId> {
         let state = self.state();
         let now = Instant::now();
@@ -195,25 +205,37 @@ impl AbsenceTracker {
 }
 
 /// Whether `tombstone_gc_task` defers a tombstone past `tombstone_ttl` this
-/// tick. `Mode::Replicated` defers on any absence at all; `Mode::Distributed`
-/// narrows this to an absent member that currently co-owns a bucket this
-/// node also owns. `Mode::Local`/`Mode::Invalidation` never defer.
+/// tick: [`defers_for`] over the members [`AbsenceTracker::holding_gc`]
+/// names, absent up to `hard_cap` or back for less than `settle`.
 pub(crate) fn should_defer_gc(
     mode: Mode,
     tracker: &AbsenceTracker,
     hard_cap: Duration,
+    settle: Duration,
     ownership: Option<&OwnershipView>,
 ) -> bool {
+    defers_for(mode, &tracker.holding_gc(hard_cap, settle), ownership)
+}
+
+/// Whether `holders`, members absent or only just back, defer tombstone
+/// collection. `Mode::Replicated` defers for any of them. `Mode::Distributed`
+/// defers for one that co-owns a part with this node once it is eligible
+/// again: the current view drops an absent member, yet a member alive on
+/// the far side of a false partition still holds its copy of every part it
+/// owned, and a delete made here meanwhile never reached it.
+/// `Mode::Local`/`Mode::Invalidation` never defer.
+fn defers_for(mode: Mode, holders: &[NodeId], ownership: Option<&OwnershipView>) -> bool {
     match mode {
-        Mode::Replicated => tracker.any_absent(hard_cap),
+        Mode::Replicated => !holders.is_empty(),
         Mode::Distributed { .. } => {
             let Some(view) = ownership else {
                 return false;
             };
-            tracker.absent_nodes(hard_cap).into_iter().any(|node| {
-                view.owned_parts()
-                    .any(|part| view.owners_of(part).contains(&node))
-            })
+            if holders.is_empty() {
+                return false;
+            }
+            let co_owners = view.co_owners_with(holders);
+            holders.iter().any(|node| co_owners.contains(node))
         }
         Mode::Local | Mode::Invalidation => false,
     }
@@ -442,15 +464,33 @@ mod tests {
         tracker.observe(&live(&[(1, false)]));
         tracker.observe(&live(&[]));
 
-        assert!(should_defer_gc(Mode::Replicated, &tracker, HOUR, None));
-        assert!(!should_defer_gc(Mode::Local, &tracker, HOUR, None));
-        assert!(!should_defer_gc(Mode::Invalidation, &tracker, HOUR, None));
+        assert!(should_defer_gc(
+            Mode::Replicated,
+            &tracker,
+            HOUR,
+            HOUR,
+            None
+        ));
+        assert!(!should_defer_gc(Mode::Local, &tracker, HOUR, HOUR, None));
+        assert!(!should_defer_gc(
+            Mode::Invalidation,
+            &tracker,
+            HOUR,
+            HOUR,
+            None
+        ));
     }
 
     #[test]
     fn should_defer_gc_is_false_for_replicated_mode_with_no_absence() {
         let tracker = AbsenceTracker::default();
-        assert!(!should_defer_gc(Mode::Replicated, &tracker, HOUR, None));
+        assert!(!should_defer_gc(
+            Mode::Replicated,
+            &tracker,
+            HOUR,
+            HOUR,
+            None
+        ));
     }
 
     fn distributed_view(self_node: NodeId, eligible: Vec<NodeId>) -> OwnershipView {
@@ -470,22 +510,31 @@ mod tests {
             owners: std::num::NonZeroU8::new(2).expect("nonzero"),
         };
 
-        assert!(!should_defer_gc(mode, &tracker, HOUR, None));
+        assert!(!should_defer_gc(mode, &tracker, HOUR, HOUR, None));
     }
 
     #[test]
     fn should_defer_gc_ignores_an_absent_member_sharing_no_owned_bucket() {
         let self_node = NodeId::from(1);
-        // Self is the only eligible node, so the absent stranger (node 99) owns nothing.
-        let view = distributed_view(self_node, vec![self_node]);
+        let everyone: Vec<NodeId> = (1..=200).map(NodeId::from).collect();
+        let full = distributed_view(self_node, everyone.clone());
+        let stranger_id = (2..=200u64)
+            .find(|&id| !full.co_owners().contains(&NodeId::from(id)))
+            .expect("some node shares no bucket with self");
+        let stranger = NodeId::from(stranger_id);
+        // The current view already dropped the absent stranger.
+        let view = distributed_view(
+            self_node,
+            everyone.into_iter().filter(|&n| n != stranger).collect(),
+        );
         let tracker = AbsenceTracker::default();
-        tracker.observe(&live(&[(99, false)]));
+        tracker.observe(&live(&[(stranger_id, false)]));
         tracker.observe(&live(&[]));
         let mode = Mode::Distributed {
             owners: std::num::NonZeroU8::new(2).expect("nonzero"),
         };
 
-        assert!(!should_defer_gc(mode, &tracker, HOUR, Some(&view)));
+        assert!(!should_defer_gc(mode, &tracker, HOUR, HOUR, Some(&view)));
     }
 
     #[test]
@@ -501,18 +550,19 @@ mod tests {
             owners: std::num::NonZeroU8::new(2).expect("nonzero"),
         };
 
-        assert!(should_defer_gc(mode, &tracker, HOUR, Some(&view)));
+        assert!(should_defer_gc(mode, &tracker, HOUR, HOUR, Some(&view)));
     }
 
-    /// A surviving peer stops deferring GC for a departed node's tombstones
-    /// once its `OwnershipView` reassigns that node's buckets, on the
-    /// gossip failure-detection timescale that recomputes `eligible_owners`
-    /// and not on either tombstone TTL. Only the view moves between the two
-    /// assertions; the tracker keeps `departed` absent throughout.
+    /// A survivor keeps deferring GC for an absent co-owner after its view
+    /// reassigns that co-owner's parts. The view drops an absent member on
+    /// the failure detector's timescale, yet a member alive on the far side
+    /// of a false partition still holds every part it owned and missed the
+    /// deletes made here meanwhile. Only the absence aging past the hard
+    /// cap ends the deferral.
     #[test]
-    fn should_defer_gc_stops_protecting_a_departed_nodes_buckets_once_ownership_reassigns_them() {
+    fn should_defer_gc_keeps_protecting_an_absent_co_owner_after_ownership_reassigns_its_parts() {
         let self_node = NodeId::from(1);
-        let departed = NodeId::from(2);
+        let absent = NodeId::from(2);
         let tracker = AbsenceTracker::default();
         tracker.observe(&live(&[(2, false)]));
         tracker.observe(&live(&[]));
@@ -520,29 +570,124 @@ mod tests {
             owners: std::num::NonZeroU8::new(2).expect("nonzero"),
         };
 
-        // Before reassignment: `departed` is still eligible and co-owns
-        // every bucket with `self_node`, so its absence defers GC.
-        let view_before = distributed_view(self_node, vec![self_node, departed]);
+        let view_before = distributed_view(self_node, vec![self_node, absent]);
         assert!(
-            should_defer_gc(mode, &tracker, HOUR, Some(&view_before)),
-            "departed still co-owns every bucket, so its absence defers GC"
+            should_defer_gc(mode, &tracker, HOUR, HOUR, Some(&view_before)),
+            "absent still co-owns every bucket, so its absence defers GC"
         );
 
-        // After reassignment: `departed` has dropped out of
-        // `eligible_owners` (the same live-set-driven recompute a real
-        // membership change drives), so it no longer co-owns anything
-        // `self_node` owns, even though the tracker itself still reports it
-        // absent -- unchanged from the assertion above.
+        // The failure detector's recompute drops `absent`: this node now
+        // owns every part alone.
         let view_after = distributed_view(self_node, vec![self_node]);
         assert!(
-            tracker.any_absent(HOUR),
-            "the tracker's own view of departed's absence is untouched by the ownership move"
+            should_defer_gc(mode, &tracker, HOUR, HOUR, Some(&view_after)),
+            "absent co-owns every part once it is eligible again, so GC still defers"
         );
+
+        let tiny_cap = Duration::from_millis(1);
+        std::thread::sleep(Duration::from_millis(5));
         assert!(
-            !should_defer_gc(mode, &tracker, HOUR, Some(&view_after)),
-            "once ownership reassigns departed's buckets away from it, its absence no longer \
-             defers GC for any bucket, regardless of how long it has actually been down"
+            !should_defer_gc(mode, &tracker, tiny_cap, HOUR, Some(&view_after)),
+            "an absence past the hard cap no longer defers"
         );
+    }
+
+    #[test]
+    fn defers_for_a_distributed_holder_only_when_it_co_owns_a_part_once_eligible_again() {
+        let mode = Mode::Distributed {
+            owners: std::num::NonZeroU8::new(2).expect("nonzero"),
+        };
+        let self_node = NodeId::from(1);
+        // Two hundred nodes, two owners per bucket: self owns about ten
+        // buckets, so most nodes share none with it.
+        let others: Vec<NodeId> = (2..=200).map(NodeId::from).collect();
+        let mut eligible = others.clone();
+        eligible.push(self_node);
+        let full = distributed_view(self_node, eligible);
+        let sharing = *full
+            .co_owners()
+            .first()
+            .expect("self shares some bucket with another node");
+        let stranger = *others
+            .iter()
+            .find(|node| !full.co_owners().contains(node))
+            .expect("some node shares no bucket with self");
+
+        // The current view dropped both: they are absent.
+        let remaining: Vec<NodeId> = std::iter::once(self_node)
+            .chain(
+                others
+                    .iter()
+                    .copied()
+                    .filter(|&n| n != sharing && n != stranger),
+            )
+            .collect();
+        let view = distributed_view(self_node, remaining);
+
+        assert!(defers_for(mode, &[sharing], Some(&view)));
+        assert!(!defers_for(mode, &[stranger], Some(&view)));
+        assert!(defers_for(mode, &[stranger, sharing], Some(&view)));
+        assert!(!defers_for(mode, &[], Some(&view)));
+        assert!(!defers_for(mode, &[sharing], None), "no view attached yet");
+        assert!(defers_for(Mode::Replicated, &[stranger], None));
+        assert!(!defers_for(Mode::Replicated, &[], None));
+        assert!(!defers_for(Mode::Local, &[sharing], Some(&view)));
+    }
+
+    #[test]
+    fn holding_gc_names_an_absent_member_until_the_hard_cap() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false), (2, true)]));
+        tracker.observe(&live(&[]));
+
+        assert_eq!(
+            tracker.holding_gc(HOUR, HOUR),
+            vec![NodeId::from(1)],
+            "the crashed member holds GC; the graceful leaver does not"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            tracker
+                .holding_gc(Duration::from_millis(1), HOUR)
+                .is_empty(),
+            "an absence past the hard cap no longer holds GC"
+        );
+    }
+
+    #[test]
+    fn holding_gc_names_a_returned_member_until_it_settles() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[]));
+        tracker.observe(&live(&[(1, false)]));
+
+        assert!(!tracker.any_absent(HOUR), "the member is back");
+        assert_eq!(
+            tracker.holding_gc(HOUR, HOUR),
+            vec![NodeId::from(1)],
+            "a member just back from an absence still holds GC"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            tracker
+                .holding_gc(HOUR, Duration::from_millis(1))
+                .is_empty(),
+            "once settled it no longer does"
+        );
+    }
+
+    #[test]
+    fn holding_gc_ignores_a_member_that_was_never_absent() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false)]));
+        tracker.observe(&live(&[(1, false)]));
+        assert!(tracker.holding_gc(HOUR, HOUR).is_empty());
+
+        // A graceful leave and return is never an absence either.
+        tracker.observe(&live(&[(1, true)]));
+        tracker.observe(&live(&[]));
+        tracker.observe(&live(&[(1, false)]));
+        assert!(tracker.holding_gc(HOUR, HOUR).is_empty());
     }
 
     #[test]

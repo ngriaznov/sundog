@@ -483,6 +483,21 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A `Distributed` delete made while a co-owner seems gone stays
+  deleted.** A `Distributed` cache deferred tombstone collection only for
+  an absent member its current ownership view still named as a co-owner,
+  and the view drops an absent member once the failure detector does. A
+  co-owner wrongly detected as gone, alive on the far side of a partition
+  or stalled past the detector's threshold, kept its copy of every key, and
+  a delete made meanwhile reached only the survivor. Once the partition
+  outlasted `tombstone_ttl`, the survivor collected the tombstone and
+  anti-entropy brought the old value back. Collection now defers for an
+  absent member that co-owns a part with this node once it is eligible
+  again, up to `tombstone_max_ttl`. In both `Replicated` and `Distributed`
+  caches, a member back from an absence holds collection for another
+  `tombstone_ttl`, so anti-entropy hands it the deletes before their
+  tombstones go. No wire change.
+
 - **One cluster's writes no longer land in another cluster's caches.** A
   node accepted a data-plane connection from any node and applied what it
   sent. When an address one cluster's node held moved to another

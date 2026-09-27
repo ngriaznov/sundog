@@ -59,9 +59,12 @@ pub struct ClusterConfig {
     /// key comes back. Opening a `Mode::Distributed` cache rejects a shorter
     /// retention with `CacheError::TombstoneTtlInsideReleaseWindow`.
     ///
-    /// While a member is absent, a `Replicated`-mode cache defers collection
-    /// past this point, up to [`tombstone_max_ttl`](Self::tombstone_max_ttl),
-    /// so that member can't resurrect the entry via anti-entropy on return.
+    /// While a member is absent, a cache defers collection past this point,
+    /// up to [`tombstone_max_ttl`](Self::tombstone_max_ttl), and for another
+    /// `tombstone_ttl` once the member is back, so that member can't
+    /// resurrect the entry via anti-entropy on return. A `Mode::Distributed`
+    /// cache counts only a member that shares a part with this node once it
+    /// is eligible again.
     pub tombstone_ttl: Duration,
     /// Hard cap on tombstone retention regardless of any member's absence.
     /// Bounds [`tombstone_ttl`](Self::tombstone_ttl)'s deferral against a

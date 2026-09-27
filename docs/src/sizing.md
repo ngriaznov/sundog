@@ -52,8 +52,8 @@ node's own share, not the cluster total.
 ## Tombstones
 
 A removed key keeps a tombstone for `tombstone_ttl`, 10 minutes by default,
-and in a `Replicated` cache for up to `tombstone_max_ttl` while a member is
-absent. A workload that removes many keys holds their tombstones for that
+and for up to `tombstone_max_ttl` while a member is absent, in a
+`Distributed` cache a member that shares a part with this node. A workload that removes many keys holds their tombstones for that
 long. Budget for the removal rate times the retention.
 
 ## Allocator
