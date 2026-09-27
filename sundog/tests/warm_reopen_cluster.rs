@@ -165,7 +165,13 @@ fn current_owner_indices(owners_of: &[NodeId], node_ids: [NodeId; 3]) -> Vec<usi
 /// run, node0's warm reopen converges cleanly, with no orphaned local
 /// data and every overwrite/delete made during its downtime reading
 /// correctly everywhere.
-#[tokio::test]
+// Multi-threaded: in a deployment the three nodes are three processes. On
+// one shared thread, a burst of work on one node (a reconciliation round,
+// a part pull, spilled reads) stalls every node's gossip until all three
+// failure detectors drop their peers in the same tick; a node that then
+// sees itself alone owns every part and keeps its writes and deletes from
+// its co-owners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[expect(
     clippy::too_many_lines,
     reason = "one end-to-end scenario (form a three-node cluster, preload, kill node0, mutate \
@@ -488,7 +494,8 @@ fn sketch_fallbacks(body: &str) -> f64 {
 /// sketch-fallback repair activity happened; and, once
 /// settled, every node's reads and node0's entry count agree with the
 /// current ownership view.
-#[tokio::test]
+// Multi-threaded, as `warm_reopen_converges_without_orphaning_or_serving_stale_entries`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[expect(
     clippy::too_many_lines,
     reason = "one end-to-end scenario (form a three-node cluster, preload thousands of keys, \
