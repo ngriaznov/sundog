@@ -18,7 +18,7 @@ use super::outbox::DropOldestQueue;
 use super::tcp::{TcpListener, TcpStream};
 use super::{
     AeMismatch, AePartReply, AeRoundOutcome, AeServeOutcome, BucketStreamItem, FetchOutcome,
-    InboundMsg, MeshInner, MeshStream, OutFrame, RequestHandler, TlsCtx,
+    Greeting, InboundMsg, MeshInner, MeshStream, OutFrame, RequestHandler, TlsCtx,
 };
 use crate::error::CodecError;
 use crate::hlc::Hlc;
@@ -382,23 +382,14 @@ pub(super) fn probe_reused(framed: &mut PeerFramed) -> ReusedProbe {
 /// [`dial_with_hello_and`] instead.
 pub(super) async fn dial_with_hello(
     addr: SocketAddr,
-    node: NodeId,
-    incarnation: u64,
+    greeting: Greeting,
     tls: &TlsCtx,
 ) -> Result<PeerFramed, CodecError> {
     let stream = TcpStream::connect(addr).await?;
     disable_nagle(&stream);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
-    send_msg(
-        &mut framed,
-        &Msg::Hello {
-            node,
-            incarnation,
-            protocol: wire::PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    send_msg(&mut framed, &greeting.hello()).await?;
     Ok(framed)
 }
 
@@ -406,8 +397,7 @@ pub(super) async fn dial_with_hello(
 /// alongside `Hello` and flushes once for both, one syscall instead of two.
 pub(super) async fn dial_with_hello_and(
     addr: SocketAddr,
-    node: NodeId,
-    incarnation: u64,
+    greeting: Greeting,
     tls: &TlsCtx,
     first: Msg,
 ) -> Result<PeerFramed, CodecError> {
@@ -415,18 +405,7 @@ pub(super) async fn dial_with_hello_and(
     disable_nagle(&stream);
     let stream = establish_dial(stream, tls).await?;
     let mut framed = new_framed(stream);
-    send_batch(
-        &mut framed,
-        &[
-            Msg::Hello {
-                node,
-                incarnation,
-                protocol: wire::PROTOCOL_VERSION,
-            },
-            first,
-        ],
-    )
-    .await?;
+    send_batch(&mut framed, &[greeting.hello(), first]).await?;
     Ok(framed)
 }
 
@@ -435,8 +414,7 @@ pub(super) async fn dial_with_hello_and(
 /// or the connection breaks, in which case it reconnects. Never reads from
 /// the connection; two connections per pair of peers is normal.
 pub(super) async fn run_peer_writer(
-    local_node: NodeId,
-    incarnation: u64,
+    greeting: Greeting,
     addr: SocketAddr,
     invalidate: Arc<DropOldestQueue<OutFrame>>,
     mut replicate_rx: mpsc::Receiver<OutFrame>,
@@ -447,7 +425,7 @@ pub(super) async fn run_peer_writer(
         let mut framed = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            connected = connect_with_hello(addr, local_node, incarnation, &tls, &cancel) => match connected {
+            connected = connect_with_hello(addr, greeting, &tls, &cancel) => match connected {
                 Some(framed) => framed,
                 None => return, // cancelled while retrying
             },
@@ -486,14 +464,13 @@ pub(super) async fn run_peer_writer(
 /// or `cancel` fires. Returns `None` only when cancelled mid-retry.
 async fn connect_with_hello(
     addr: SocketAddr,
-    node: NodeId,
-    incarnation: u64,
+    greeting: Greeting,
     tls: &TlsCtx,
     cancel: &CancellationToken,
 ) -> Option<PeerFramed> {
     const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
     loop {
-        if let Ok(framed) = dial_with_hello(addr, node, incarnation, tls).await {
+        if let Ok(framed) = dial_with_hello(addr, greeting, tls).await {
             return Some(framed);
         }
         tokio::select! {
@@ -568,11 +545,22 @@ async fn handle_accepted(
     let Some(Ok(Msg::Hello {
         node: from,
         protocol: peer_protocol,
+        cluster: peer_cluster,
         ..
     })) = hello
     else {
         return;
     };
+    // A peer of another cluster dialed an address this node now holds,
+    // left over from a node of its own that held it before: nothing it
+    // sends belongs in this cluster's caches.
+    if !wire::same_cluster(mesh.cluster, peer_cluster) {
+        tracing::warn!(
+            peer = %from,
+            "dropping a data-plane connection from another cluster's node"
+        );
+        return;
+    }
     if peer_protocol > wire::PROTOCOL_VERSION {
         tracing::debug!(
             peer = %from,
@@ -2039,6 +2027,7 @@ mod tests {
             node: NodeId::from(7),
             incarnation: 3,
             protocol: wire::PROTOCOL_VERSION,
+            cluster: wire::UNNAMED_CLUSTER,
         };
         let encoded = wire::encode(&sent).expect("encodes");
         client.send(encoded).await.expect("send");
@@ -2373,6 +2362,7 @@ mod tests {
                 node: NodeId::from(9),
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             },
             Msg::AeBucket {
                 cache: SmolStr::new("users"),
@@ -2423,6 +2413,7 @@ mod tests {
                 node: NodeId::from(9),
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             },
             Msg::AeSketch {
                 cache: SmolStr::new("users"),
@@ -2456,6 +2447,7 @@ mod tests {
                 node: NodeId::from(9),
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             },
             Msg::Replicate {
                 cache: SmolStr::new("users"),
@@ -2515,6 +2507,7 @@ mod tests {
                 node: NodeId::from(9),
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             },
             Msg::AePart {
                 cache: SmolStr::new("users"),
@@ -2588,6 +2581,7 @@ mod tests {
                 node: from,
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             },
             Msg::ReqDone,
             Msg::AeBucket {
@@ -2669,9 +2663,13 @@ mod tests {
         let invalidate = Arc::new(super::DropOldestQueue::new(4));
         let (_replicate_tx, replicate_rx) = mpsc::channel(4);
         let cancel = CancellationToken::new();
+        let greeting = super::Greeting {
+            node: NodeId::from(1),
+            incarnation: 1,
+            cluster: wire::UNNAMED_CLUSTER,
+        };
         let handle = tokio::spawn(super::run_peer_writer(
-            NodeId::from(1),
-            1,
+            greeting,
             unreachable,
             invalidate,
             replicate_rx,
@@ -3021,6 +3019,7 @@ mod tests {
                 node: from,
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             },
             Msg::StBucketAck {
                 cache: cache.clone(),

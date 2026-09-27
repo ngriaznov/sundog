@@ -47,8 +47,8 @@ use crate::error::JoinError;
 use crate::hlc::Hlc;
 use crate::membership::{CacheModes, Membership, Peer};
 use crate::net::{
-    AeServeOutcome, BoundListener, FetchServe, InboundMsg, Mesh, OutFrame, RequestHandler, StServe,
-    batch_forward,
+    AeServeOutcome, BoundListener, FetchServe, Greeting, InboundMsg, Mesh, OutFrame,
+    RequestHandler, StServe, batch_forward,
 };
 use crate::node::{NodeId, NodeName};
 use crate::ownership::{Granularity, OwnershipView, parts_of_wire_id};
@@ -739,8 +739,12 @@ impl ClusterBuilder {
             ae_sketch_cells: config.ae_sketch_cells,
             rebalance_chunk_bytes: config.rebalance_chunk_bytes_value(),
         });
-        let (mesh, inbound_rx) =
-            Mesh::spawn_on(data_listener, node, incarnation, &config, handler)?;
+        let greeting = Greeting {
+            node,
+            incarnation,
+            cluster: wire::cluster_id(&name),
+        };
+        let (mesh, inbound_rx) = Mesh::spawn_on(data_listener, greeting, &config, handler)?;
 
         let cluster = Cluster {
             inner: Arc::new(ClusterInner {
@@ -4206,15 +4210,16 @@ mod tests {
 
     #[tokio::test]
     async fn run_round_against_ends_on_stale_without_pushing_or_pulling() {
-        // Two solo `Mode::Distributed` clusters, never gossip-joined to each
-        // other, so each independently computes its own view over only
-        // itself: genuinely different view hashes, since their `NodeId`s
-        // differ. `Mesh::update_peers` (a real, public mesh API) registers
+        // Two solo `Mode::Distributed` nodes of one cluster, with no seeds so
+        // never gossip-joined to each other, so each independently computes
+        // its own view over only itself: genuinely different view hashes,
+        // since their `NodeId`s differ. One cluster name, so the data plane
+        // accepts the pair. `Mesh::update_peers` (a real, public mesh API) registers
         // `b` on `a`'s mesh directly, the deterministic way to drive a real
         // `AeDigestScoped` exchange to a real `StaleView` reply without
         // racing gossip's own convergence timing.
-        let cluster_a = solo_cluster("cluster-it-ae-stale-a").await;
-        let cluster_b = solo_cluster("cluster-it-ae-stale-b").await;
+        let cluster_a = solo_cluster("cluster-it-ae-stale").await;
+        let cluster_b = solo_cluster("cluster-it-ae-stale").await;
         let name = SmolStr::new("prices");
         let owners = std::num::NonZeroU8::new(2).expect("nonzero");
         let cache_a = cluster_a
@@ -5404,6 +5409,24 @@ mod tests {
             accepting,
             "membership gossips the port the mesh's listener holds"
         );
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn build_names_its_cluster_in_every_data_plane_hello() {
+        let cluster = Cluster::builder("cluster-it-data-plane-name")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+
+        let Msg::Hello { cluster: named, .. } = cluster.inner.mesh.greeting().hello() else {
+            unreachable!("a greeting always says hello");
+        };
+        assert_eq!(named, wire::cluster_id("cluster-it-data-plane-name"));
+        assert_ne!(named, wire::UNNAMED_CLUSTER);
 
         cluster.shutdown().await;
     }

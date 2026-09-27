@@ -757,6 +757,10 @@ type AckedBucketEntry = (Instant, u64);
 struct MeshInner {
     node: NodeId,
     incarnation: u64,
+    /// This node's [`wire::cluster_id`], or [`wire::UNNAMED_CLUSTER`] for a
+    /// bare mesh: sent in every `Hello`, and checked against every
+    /// accepted one.
+    cluster: u64,
     outbox_capacity: usize,
     peers: RwLock<HashMap<NodeId, PeerHandle>>,
     accept_cancel: CancellationToken,
@@ -883,6 +887,15 @@ impl MeshInner {
             .map_or(0, |handle| handle.protocol.load(Ordering::Relaxed))
     }
 
+    /// What this mesh says in every `Hello` it sends.
+    const fn greeting(&self) -> Greeting {
+        Greeting {
+            node: self.node,
+            incarnation: self.incarnation,
+            cluster: self.cluster,
+        }
+    }
+
     /// A mesh with no peers, for `conn`'s tests that drive
     /// `handle_accepted` over a raw accepted stream.
     #[cfg(all(test, not(feature = "sim")))]
@@ -890,12 +903,34 @@ impl MeshInner {
         Arc::new(Self {
             node: NodeId::from(1),
             incarnation: 1,
+            cluster: wire::UNNAMED_CLUSTER,
             outbox_capacity: DEFAULT_CHANNEL_CAPACITY,
             peers: RwLock::new(HashMap::new()),
             accept_cancel,
             tls,
             acked_buckets: RwLock::new(HashMap::new()),
         })
+    }
+}
+
+/// Who a mesh says it is in the `Hello` that opens each connection it dials.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Greeting {
+    pub(crate) node: NodeId,
+    pub(crate) incarnation: u64,
+    /// The node's [`wire::cluster_id`], or [`wire::UNNAMED_CLUSTER`].
+    pub(crate) cluster: u64,
+}
+
+impl Greeting {
+    /// The `Hello` this greeting sends.
+    pub(crate) const fn hello(self) -> Msg {
+        Msg::Hello {
+            node: self.node,
+            incarnation: self.incarnation,
+            protocol: wire::PROTOCOL_VERSION,
+            cluster: self.cluster,
+        }
     }
 }
 
@@ -965,12 +1000,19 @@ impl Mesh {
         handler: Arc<dyn RequestHandler>,
     ) -> Result<(Self, mpsc::Receiver<InboundMsg>), JoinError> {
         let listener = BoundListener::bind(bind_addr).await?;
-        Self::spawn_on(listener, node, incarnation, config, handler)
+        let greeting = Greeting {
+            node,
+            incarnation,
+            cluster: wire::UNNAMED_CLUSTER,
+        };
+        Self::spawn_on(listener, greeting, config, handler)
     }
 
     /// [`Mesh::spawn`] over a listener already bound by
     /// [`BoundListener::bind`], so the port a caller advertised before
-    /// spawning is the one the mesh accepts on.
+    /// spawning is the one the mesh accepts on, and naming the cluster in
+    /// `greeting`: the mesh drops an accepted connection whose `Hello`
+    /// names another.
     #[cfg_attr(
         not(all(feature = "tls", not(feature = "sim"))),
         expect(
@@ -980,8 +1022,7 @@ impl Mesh {
     )]
     pub(crate) fn spawn_on(
         listener: BoundListener,
-        node: NodeId,
-        incarnation: u64,
+        greeting: Greeting,
         config: &ClusterConfig,
         handler: Arc<dyn RequestHandler>,
     ) -> Result<(Self, mpsc::Receiver<InboundMsg>), JoinError> {
@@ -1001,8 +1042,9 @@ impl Mesh {
         };
         let (inbound_tx, inbound_rx) = mpsc::channel(outbox_capacity);
         let inner = Arc::new(MeshInner {
-            node,
-            incarnation,
+            node: greeting.node,
+            incarnation: greeting.incarnation,
+            cluster: greeting.cluster,
             outbox_capacity,
             peers: RwLock::new(HashMap::new()),
             accept_cancel: CancellationToken::new(),
@@ -1023,6 +1065,13 @@ impl Mesh {
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The greeting this mesh opens every connection with, for the tests
+    /// that check what `Cluster::build` named in it.
+    #[cfg(all(test, not(feature = "sim")))]
+    pub(crate) fn greeting(&self) -> Greeting {
+        self.inner.greeting()
     }
 
     /// Refreshes the set of peers the mesh dials and fans traffic out to:
@@ -1082,8 +1131,7 @@ impl Mesh {
         let (replicate_tx, replicate_rx) = mpsc::channel(self.inner.outbox_capacity);
         let cancel = CancellationToken::new();
         tokio::spawn(conn::run_peer_writer(
-            self.inner.node,
-            self.inner.incarnation,
+            self.inner.greeting(),
             data_addr,
             Arc::clone(&invalidate),
             replicate_rx,
@@ -1416,8 +1464,8 @@ impl Mesh {
                 conn::ReusedProbe::Stale => {}
             }
         }
-        let (node, incarnation, tls) = (self.inner.node, self.inner.incarnation, &self.inner.tls);
-        let framed = conn::dial_with_hello_and(addr, node, incarnation, tls, first).await?;
+        let framed =
+            conn::dial_with_hello_and(addr, self.inner.greeting(), &self.inner.tls, first).await?;
         Ok((framed, pool, None))
     }
 
@@ -2085,14 +2133,14 @@ mod tests {
             .expect_err("the bound listener keeps its port from any other socket");
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
 
-        let (mesh, _inbound) = Mesh::spawn_on(
-            bound,
-            NodeId::from(1),
-            1,
-            &ClusterConfig::default(),
-            empty_handler(),
-        )
-        .expect("spawn on the bound listener");
+        let greeting = Greeting {
+            node: NodeId::from(1),
+            incarnation: 1,
+            cluster: wire::UNNAMED_CLUSTER,
+        };
+        let (mesh, _inbound) =
+            Mesh::spawn_on(bound, greeting, &ClusterConfig::default(), empty_handler())
+                .expect("spawn on the bound listener");
         assert_eq!(mesh.local_addr(), addr);
         tokio::net::TcpStream::connect(addr)
             .await
@@ -2146,6 +2194,7 @@ mod tests {
                 node: NodeId::from(1),
                 incarnation: 1,
                 protocol: wire::PROTOCOL_VERSION,
+                cluster: wire::UNNAMED_CLUSTER,
             }
         );
     }
@@ -2513,16 +2562,18 @@ mod tests {
         framed
     }
 
-    /// A protocol-1 hello: the protocol-2 encoding minus its trailing
-    /// `protocol` byte, checked to decode back as protocol 1.
+    /// A protocol-1 hello: an unnamed protocol-2 encoding minus its
+    /// trailing `protocol` and `cluster` bytes, one each, checked to decode
+    /// back as protocol 1.
     fn legacy_hello(node: NodeId) -> Bytes {
         let full = wire::encode(&Msg::Hello {
             node,
             incarnation: 1,
             protocol: 2,
+            cluster: wire::UNNAMED_CLUSTER,
         })
         .expect("encodes");
-        let legacy = full.slice(..full.len() - 1);
+        let legacy = full.slice(..full.len() - 2);
         assert!(matches!(
             wire::decode(&legacy),
             Ok(Msg::Hello { protocol: 1, .. })
@@ -2584,6 +2635,7 @@ mod tests {
             node: NodeId::from(3),
             incarnation: 1,
             protocol: wire::PROTOCOL_VERSION,
+            cluster: wire::UNNAMED_CLUSTER,
         })
         .expect("encodes");
         let mut new_peer = raw_request_conn(server.local_addr(), hello).await;
@@ -2627,6 +2679,7 @@ mod tests {
             node: NodeId::from(3),
             incarnation: 1,
             protocol: wire::PROTOCOL_VERSION,
+            cluster: wire::UNNAMED_CLUSTER,
         })
         .expect("encodes");
         let mut new_peer = raw_request_conn(server.local_addr(), hello).await;
@@ -3548,6 +3601,62 @@ mod tests {
         receiver.shutdown().await;
     }
 
+    /// A mesh that names `cluster` in its `Hello` and checks every accepted
+    /// one against it, as `Cluster::build` spawns it.
+    async fn spawn_named_mesh(node: NodeId, cluster: &str) -> (Mesh, mpsc::Receiver<InboundMsg>) {
+        let bound = BoundListener::bind("127.0.0.1:0".parse().expect("valid loopback addr"))
+            .await
+            .expect("bind loopback");
+        let greeting = Greeting {
+            node,
+            incarnation: 1,
+            cluster: wire::cluster_id(cluster),
+        };
+        Mesh::spawn_on(bound, greeting, &ClusterConfig::default(), empty_handler())
+            .expect("spawn on the bound listener")
+    }
+
+    /// A node of another cluster that dials this node's address, left over
+    /// from a node of its own that held it before, gets nothing through:
+    /// its replication never reaches this cluster's inbound. A node of the
+    /// same cluster, and an unnamed peer standing in for one older than
+    /// protocol 6, still do.
+    #[tokio::test]
+    async fn an_accepted_connection_from_another_cluster_delivers_nothing() {
+        let (receiver, mut inbound) = spawn_named_mesh(NodeId::from(2), "prices").await;
+        let receiver_peer = peer_at(NodeId::from(2), receiver.local_addr());
+
+        let (stranger, _) = spawn_named_mesh(NodeId::from(3), "sessions").await;
+        stranger.update_peers(vec![receiver_peer.clone()]);
+        stranger.send_many(NodeId::from(2), MsgClass::Replicate, replicate_msgs(10));
+        assert_eq!(
+            count_replicated(&mut inbound, Duration::from_secs(1)).await,
+            0,
+            "another cluster's replication is dropped at the handshake"
+        );
+
+        let (sibling, _) = spawn_named_mesh(NodeId::from(4), "prices").await;
+        sibling.update_peers(vec![receiver_peer.clone()]);
+        sibling.send_many(NodeId::from(2), MsgClass::Replicate, replicate_msgs(10));
+        assert_eq!(
+            count_replicated(&mut inbound, Duration::from_secs(3)).await,
+            10
+        );
+
+        let (unnamed, _) = spawn_mesh(NodeId::from(5), empty_handler()).await;
+        unnamed.update_peers(vec![receiver_peer]);
+        unnamed.send_many(NodeId::from(2), MsgClass::Replicate, replicate_msgs(10));
+        assert_eq!(
+            count_replicated(&mut inbound, Duration::from_secs(3)).await,
+            10,
+            "a peer that names no cluster is accepted, as an older release is"
+        );
+
+        for mesh in [stranger, sibling, unnamed, receiver] {
+            mesh.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn send_frames_awaiting_waits_for_outbox_space_instead_of_dropping() {
         let (receiver, mut inbound) = spawn_mesh(NodeId::from(2), empty_handler()).await;
@@ -3960,6 +4069,7 @@ mod tests {
             node: NodeId::from(2),
             incarnation: 1,
             protocol: wire::PROTOCOL_VERSION,
+            cluster: wire::UNNAMED_CLUSTER,
         })
         .expect("encodes");
         futures::SinkExt::send(&mut framed, hello)

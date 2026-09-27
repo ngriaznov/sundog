@@ -378,6 +378,15 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- **Protocol 6: the data-plane hello names the cluster.** `Msg::Hello`
+  gains `cluster`, the sender's `wire::cluster_id`, and
+  `wire::PROTOCOL_VERSION` bumps to 6. Code that builds a `Msg::Hello`
+  sets the new field; `wire::UNNAMED_CLUSTER` names none. A protocol 2 to
+  5 hello decodes with `cluster` unnamed, and a protocol-4 node ignores the
+  new trailing field, so the release still serves the one before it.
+  `wire::cluster_id`, `wire::same_cluster` and `wire::PROTOCOL_CLUSTER_ID`
+  are new. `Mesh::spawn` keeps its signature and names no cluster.
+
 - **A merging cache's anti-entropy round pulls before it pushes.** A key
   both replicas hold under different versions is exchanged both ways in
   one round. The pulls now land first, and a key whose stored version is
@@ -465,6 +474,17 @@ All notable changes to this project are documented in this file. Format follows
   `crash` exit without leaving.
 
 ### Fixed
+
+- **One cluster's writes no longer land in another cluster's caches.** A
+  node accepted a data-plane connection from any node and applied what it
+  sent. When an address one cluster's node held moved to another
+  cluster's node, as pod IPs do in Kubernetes and ephemeral ports do on
+  one host, a peer still dialing the old address replicated into the new
+  holder, and a same-named cache there merged the foreign records in: a
+  `PnCounter` test read 41 where its own writers summed to 30, the extra
+  11 from a neighboring test's cluster. A node now drops a connection
+  whose hello names another cluster. A node of an earlier release names
+  none and is accepted unchecked.
 
 - **A node that owns a part again no longer serves its stale copy.** In
   `Mode::Distributed`, a node that loses a part keeps its copy through the

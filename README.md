@@ -311,7 +311,7 @@ answers a peer only with what that peer's version understands: an older peer
 never receives a message kind its release cannot decode, and a newer peer
 limits itself the same way. One release step interoperates, so a cluster
 upgrades one node at a time with replication and repair running throughout.
-The current release speaks protocol 5 and serves protocol 4, the release
+The current release speaks protocol 6 and serves protocol 4, the release
 before it. A container test runs the previous release's node against the
 current one in both roles. Distribution mode's message kinds (`Fetch`,
 `FetchReply`, `FetchDeclined`, `AeDigestScoped`, `StBuckets`,
@@ -327,6 +327,12 @@ ranking whole buckets. When the last protocol-4 node leaves, every node
 switches to part ranking within a few gossip intervals. Most parts change owners at that moment: the switch runs as one
 large rebalance, with every lost part served through its disown grace and
 handed to its new owners before it is dropped. Upgrade outside peak load.
+
+Protocol 6 names the cluster in the hello. A node drops a connection whose
+hello names another cluster, as when a node dials an address its own
+cluster's departed node held and another cluster's node holds now, so one
+cluster's writes never land in another's caches. A hello from an older
+release names no cluster and is accepted.
 
 ## How nodes find each other
 

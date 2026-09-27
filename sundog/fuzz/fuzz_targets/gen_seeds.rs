@@ -26,6 +26,7 @@ fn main() {
             node,
             incarnation: 42,
             protocol: sundog::wire::PROTOCOL_VERSION,
+            cluster: sundog::wire::cluster_id("users"),
         },
         Msg::Invalidate {
             cache: "users".into(),

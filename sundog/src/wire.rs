@@ -56,7 +56,9 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// - 4: Adds [`Msg::StBucketDone`] and [`Msg::StBucketAck`].
 /// - 5: Part-level ownership for `Mode::Distributed`. Adds
 ///   [`Msg::AeDigestMasked`]. See [`PROTOCOL_PART_OWNERSHIP`].
-pub const PROTOCOL_VERSION: u16 = 5;
+/// - 6: [`Msg::Hello`] names the sender's cluster. See
+///   [`PROTOCOL_CLUSTER_ID`].
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// The oldest peer protocol this build still serves in full.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -95,6 +97,35 @@ pub const PROTOCOL_ST_BUCKET_DONE_ACK: u16 = 4;
 /// [`Msg::AeDigestScoped`], and both sides agree on the view's hash before
 /// reading an id.
 pub const PROTOCOL_PART_OWNERSHIP: u16 = 5;
+
+/// The protocol whose [`Msg::Hello`] carries `cluster`, the sender's
+/// [`cluster_id`]. An accepting node drops a connection whose `Hello` names
+/// a different cluster, so a peer still dialing an address another
+/// cluster's node now holds never writes into it. A `Hello` from an older
+/// peer decodes with `cluster` [`UNNAMED_CLUSTER`] and is accepted.
+pub const PROTOCOL_CLUSTER_ID: u16 = 6;
+
+/// The `cluster` a [`Msg::Hello`] carries when its sender names none: a
+/// peer older than [`PROTOCOL_CLUSTER_ID`], or a bare [`crate::net::Mesh`]
+/// spawned outside a cluster. Matches every cluster.
+pub const UNNAMED_CLUSTER: u64 = 0;
+
+/// The `cluster` a [`Msg::Hello`] carries for the cluster named `name`:
+/// its xxh3 hash, never [`UNNAMED_CLUSTER`].
+#[must_use]
+pub fn cluster_id(name: &str) -> u64 {
+    match xxhash_rust::xxh3::xxh3_64(name.as_bytes()) {
+        UNNAMED_CLUSTER => 1,
+        id => id,
+    }
+}
+
+/// Whether a connection whose `Hello` names cluster `peer` may talk to a
+/// node of cluster `local`: they match, or either names none.
+#[must_use]
+pub const fn same_cluster(local: u64, peer: u64) -> bool {
+    local == UNNAMED_CLUSTER || peer == UNNAMED_CLUSTER || local == peer
+}
 
 /// Whether a peer speaking `peer_protocol` understands a message kind
 /// introduced in protocol `since`.
@@ -136,10 +167,14 @@ pub enum Msg {
         node: NodeId,
         /// The sender's membership incarnation number.
         incarnation: u64,
-        /// The sender's [`PROTOCOL_VERSION`]. Last on purpose: a protocol-1
-        /// sender omits it and decodes here as protocol 1, and a newer
-        /// sender's further trailing fields are ignored.
+        /// The sender's [`PROTOCOL_VERSION`]. A protocol-1 sender omits it
+        /// and decodes here as protocol 1.
         protocol: u16,
+        /// The sender's [`cluster_id`], or [`UNNAMED_CLUSTER`]. Last on
+        /// purpose: a sender older than [`PROTOCOL_CLUSTER_ID`] omits it
+        /// and decodes here as [`UNNAMED_CLUSTER`], and a newer sender's
+        /// further trailing fields are ignored.
+        cluster: u64,
     },
     /// Invalidation-mode fan-out: "the entry at `key` changed, drop your
     /// copy." `key` is postcard-encoded; `ver` is the write's version.
@@ -744,28 +779,56 @@ pub fn decode(frame: &Bytes) -> Result<Msg, CodecError> {
     match kind {
         FRAME_KIND_POSTCARD => match postcard::from_bytes(&body) {
             Ok(msg) => Ok(msg),
-            Err(err) => decode_legacy_hello(&body).ok_or_else(|| CodecError::from(err)),
+            Err(err) => decode_older_hello(&body).ok_or_else(|| CodecError::from(err)),
         },
         FRAME_KIND_RAW_RECORD => decode_raw_frame(&body),
         _ => Err(CodecError::MalformedFrame("unknown frame discriminant")),
     }
 }
 
+/// [`Msg::Hello`] as protocols 2 to 5 encode it: the same variant index,
+/// no `cluster` field.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+enum UnnamedHello {
+    Hello {
+        node: NodeId,
+        incarnation: u64,
+        protocol: u16,
+    },
+}
+
 /// [`Msg::Hello`] as protocol 1 encodes it: the same variant index, no
-/// `protocol` field. Only shape a protocol-2 decode can fail on that still
-/// means something, so [`decode`] falls back to it.
+/// `protocol` field either.
 #[derive(Deserialize)]
 #[cfg_attr(test, derive(Serialize))]
 enum LegacyMsg {
     Hello { node: NodeId, incarnation: u64 },
 }
 
-fn decode_legacy_hello(body: &[u8]) -> Option<Msg> {
+/// The only shapes a current decode can fail on that still mean something:
+/// an older peer's [`Msg::Hello`], so [`decode`] falls back to them, newest
+/// first.
+fn decode_older_hello(body: &[u8]) -> Option<Msg> {
+    if let Ok(UnnamedHello::Hello {
+        node,
+        incarnation,
+        protocol,
+    }) = postcard::from_bytes(body)
+    {
+        return Some(Msg::Hello {
+            node,
+            incarnation,
+            protocol,
+            cluster: UNNAMED_CLUSTER,
+        });
+    }
     let LegacyMsg::Hello { node, incarnation } = postcard::from_bytes(body).ok()?;
     Some(Msg::Hello {
         node,
         incarnation,
         protocol: 1,
+        cluster: UNNAMED_CLUSTER,
     })
 }
 
@@ -808,7 +871,49 @@ mod tests {
             node: NodeId::from(1),
             incarnation: 3,
             protocol: PROTOCOL_VERSION,
+            cluster: cluster_id("prices"),
         });
+    }
+
+    #[test]
+    fn a_hello_without_a_cluster_field_decodes_as_unnamed() {
+        let unnamed = UnnamedHello::Hello {
+            node: NodeId::from(1),
+            incarnation: 3,
+            protocol: PROTOCOL_PART_OWNERSHIP,
+        };
+        let mut frame = vec![FRAME_KIND_POSTCARD];
+        frame.extend(postcard::to_stdvec(&unnamed).expect("encodes"));
+        assert_eq!(
+            decode(&Bytes::from(frame)).expect("a protocol-5 hello decodes"),
+            Msg::Hello {
+                node: NodeId::from(1),
+                incarnation: 3,
+                protocol: PROTOCOL_PART_OWNERSHIP,
+                cluster: UNNAMED_CLUSTER,
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_ids_match_only_the_same_name_or_an_unnamed_side() {
+        let (a, b) = (cluster_id("prices"), cluster_id("sessions"));
+        assert_ne!(a, UNNAMED_CLUSTER);
+        assert_eq!(
+            a,
+            cluster_id("prices"),
+            "the id is a stable hash of the name"
+        );
+        assert!(same_cluster(a, a));
+        assert!(!same_cluster(a, b), "two named clusters never talk");
+        assert!(
+            same_cluster(a, UNNAMED_CLUSTER),
+            "an older peer is accepted"
+        );
+        assert!(
+            same_cluster(UNNAMED_CLUSTER, b),
+            "a bare mesh accepts anyone"
+        );
     }
 
     #[test]
@@ -825,6 +930,7 @@ mod tests {
                 node: NodeId::from(1),
                 incarnation: 3,
                 protocol: 1,
+                cluster: UNNAMED_CLUSTER,
             }
         );
     }
@@ -835,6 +941,7 @@ mod tests {
             node: NodeId::from(1),
             incarnation: 3,
             protocol: PROTOCOL_VERSION + 1,
+            cluster: cluster_id("prices"),
         })
         .expect("encodes")
         .to_vec();
@@ -845,6 +952,7 @@ mod tests {
                 node: NodeId::from(1),
                 incarnation: 3,
                 protocol: PROTOCOL_VERSION + 1,
+                cluster: cluster_id("prices"),
             }
         );
     }

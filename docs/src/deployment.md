@@ -133,6 +133,13 @@ replication and repair running throughout. A container test runs the
 previous release's node against the current one in both directions on
 every change.
 
+The hello also names the cluster, and a node drops a connection from
+another cluster's node. Addresses move between clusters sharing a network,
+as pod IPs do in Kubernetes: a node still dialing a departed peer's address
+reaches whatever holds it now, and the check keeps its writes out of that
+node's caches. A node of a release before the check names no cluster and
+is accepted.
+
 A `Distributed` cache ranks whole buckets while any eligible node runs a
 release before part ownership, and switches to ranking each part once the
 last such node leaves. Most parts change owners at that switch, so the

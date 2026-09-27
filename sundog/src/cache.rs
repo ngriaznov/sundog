@@ -3719,20 +3719,21 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_retries_a_stale_owner_for_one_fetch_timeout_before_giving_up() {
-        // Two solo clusters that never gossip, `b` injected into `a`'s mesh
-        // by hand, so `b`'s view hash never matches the one `a` sends: every
+        // Two solo nodes of one cluster with no seeds, so they never gossip,
+        // `b` injected into `a`'s mesh by hand, so `b`'s view hash never
+        // matches the one `a` sends: every
         // fetch to `b` is answered `Stale`. `a`'s own view lists `b` and a
         // phantom third node, so it has buckets it does not own to fetch.
         let name = "distributed-fetch-stale";
         let mut config = loopback_config();
         config.fetch_timeout = Duration::from_millis(300);
-        let a = Cluster::builder("distributed-fetch-stale-a")
+        let a = Cluster::builder("distributed-fetch-stale")
             .seeds(std::iter::empty())
             .config(config)
             .build()
             .await
             .expect("node a builds");
-        let b = Cluster::builder("distributed-fetch-stale-b")
+        let b = Cluster::builder("distributed-fetch-stale")
             .seeds(std::iter::empty())
             .config(loopback_config())
             .build()
