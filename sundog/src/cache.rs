@@ -1301,8 +1301,9 @@ where
         };
         let key_bytes = encode_key(key)?;
         let part = PartId::of_key(&key_bytes);
-        // An unverified part (warm-reloaded, not yet checked against a live
-        // co-owner) counts as not owned here: it can hold a record a co-owner deleted during downtime.
+        // An unverified part (warm-reloaded or regained, not yet checked
+        // against a live co-owner) counts as not owned here: it can hold a
+        // record a co-owner deleted while this node was down or not an owner.
         if view.owns(part) && !self.shard.is_unverified_part(part) {
             let value = self.shard.get(key).await;
             // A miss in a part not yet pulled from a co-owner is not an
@@ -3435,6 +3436,123 @@ mod tests {
             cache_a.fetch(&7).await.expect("local"),
             None,
             "a warm bucket answers its own miss without asking anyone"
+        );
+
+        cache_b.close().await;
+        cache_a.close().await;
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// A part this node owns again after losing it holds whatever it kept
+    /// from before, which misses every write and delete made while another
+    /// node owned it. `a` holds such a stale copy of `key`, which `b`
+    /// deleted, and regains the part through the rebalance planner: while
+    /// the pull runs, `fetch` must answer from `b`, never the stale hit.
+    #[tokio::test]
+    async fn fetch_never_serves_a_stale_hit_from_a_regained_part_while_its_pull_runs() {
+        let name = SmolStr::new("fetch-regained-stale");
+        let (id_a, id_b) = (NodeId::from(0xa), NodeId::from(0xb));
+        // The view a gave the part up under: two nodes since gone outranked
+        // a for key's part.
+        let without_a = OwnershipView::compute_at(
+            id_a,
+            vec![id_b, NodeId::from(0xc), NodeId::from(0xd)],
+            std::num::NonZeroU8::new(2).expect("nonzero"),
+            crate::ownership::Granularity::Part,
+        );
+        let key = (0..64u32)
+            .find(|key| !without_a.owns(PartId::of_key(&encode_key(key).expect("u32 encodes"))))
+            .expect("a owns about half the parts in a four-node view");
+        let config = ClusterConfig {
+            tombstone_ttl: Duration::from_secs(300),
+            ..loopback_config()
+        };
+
+        let b = Cluster::builder("cache-it-fetch-regained")
+            .node_id(id_b)
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("b builds");
+        let cache_b = b
+            .cache::<u32, String>(name.clone())
+            .mode(Mode::distributed())
+            .open()
+            .await
+            .expect("b opens alone, owning every part");
+        cache_b
+            .insert(key, "v1".to_string())
+            .await
+            .expect("b owns every part while alone");
+        cache_b
+            .remove(&key)
+            .await
+            .expect("b deletes the key while a does not own its part");
+
+        let a = Cluster::builder("cache-it-fetch-regained")
+            .node_id(id_a)
+            .seeds([b.local_gossip_addr()])
+            .config(config)
+            .build()
+            .await
+            .expect("a builds");
+        wait_for_peer_count(&b, 1).await;
+        wait_for_peer_count(&a, 1).await;
+        a.advertise_cache_mode(&name, Mode::distributed());
+
+        let shard = Shard::<u32, String>::new(
+            name.clone(),
+            Mode::distributed(),
+            a.node_id(),
+            u64::MAX,
+            None,
+            None,
+        );
+        let (shard, distributed) = attach_ownership(shard, &a, &name, Mode::distributed());
+        let distributed = distributed.expect("Mode::distributed always attaches a context");
+        let cache_a = Cache {
+            shard: Arc::new(shard),
+            cluster: a.clone(),
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        };
+        let part = PartId::of_key(&encode_key(&key).expect("u32 encodes"));
+        let new = distributed.ownership.current();
+
+        // What a kept from owning the part before: the write, not the delete.
+        let shard_ops_a = Arc::clone(&cache_a.shard) as Arc<dyn ShardOps>;
+        let stale = WireRecord {
+            key: encode_key(&key).expect("u32 encodes"),
+            value: Some(bytes::Bytes::from(
+                postcard::to_stdvec(&"v1".to_string()).expect("string encodes"),
+            )),
+            ver: crate::hlc::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                node: b.node_id(),
+            },
+            expires_at_ms: None,
+        };
+        shard_ops_a.apply_remote_batch(vec![stale]).await;
+        assert_eq!(cache_a.get(&key).await, Some("v1".to_string()));
+
+        let held = shard_ops_a.held_parts().await;
+        let plan = crate::cluster::rebalance::plan_view_change(
+            &without_a,
+            &without_a,
+            &new,
+            &held,
+            &PartSet::new(),
+        );
+        assert!(plan.to_pull.contains(&part), "a owns key's part again");
+        crate::cluster::rebalance::mark_pulling(&distributed.residency, &plan);
+
+        assert_eq!(
+            cache_a.fetch(&key).await.expect("b answers"),
+            None,
+            "a's copy of the regained part predates b's delete: only b's tombstone answers"
         );
 
         cache_b.close().await;

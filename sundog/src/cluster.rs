@@ -1058,9 +1058,10 @@ impl RequestHandler for ClusterRequestHandler {
                 return FetchServe::Unavailable;
             };
             let part = PartId::of_key(&key);
-            // An unverified part (warm-reloaded, not yet checked against
-            // a live co-owner) answers Unavailable even on a hit: it may
-            // hold a record a co-owner deleted during this node's downtime.
+            // An unverified part (warm-reloaded or regained, not yet
+            // checked against a live co-owner) answers Unavailable even on
+            // a hit: it may hold a record a co-owner deleted while this
+            // node was down or not an owner.
             if shard.is_unverified_part(part) {
                 return FetchServe::Unavailable;
             }

@@ -110,7 +110,9 @@ three things for a key:
 A read never returns a miss for a key a live owner holds, and never a
 deleted value. A part a node has just gained, or regained after losing it,
 counts as cold until its pull lands, so the node asks the other owners
-rather than answering from an incomplete copy. `get` reads only this node's
+rather than answering a miss from an incomplete copy. A regained part whose
+old copy is still here does not answer a hit locally either, since writes
+and deletes went to the other owners while the node did not own it. `get` reads only this node's
 copy and makes none of these promises off an owner that is still pulling.
 The [churn oracle](verification.md) checks exactly this list.
 

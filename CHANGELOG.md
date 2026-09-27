@@ -466,6 +466,24 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A node that owns a part again no longer serves its stale copy.** In
+  `Mode::Distributed`, a node that loses a part keeps its copy through the
+  disown grace, and writes and deletes then go to the new owners only. When
+  it regained the part, `fetch` answered a local hit from that copy while
+  the part's pull ran, so a key deleted in between read back its old value
+  until the pull landed. A regained part the node still holds records in is
+  now marked stale until its pull lands: `fetch` asks the other owners, and
+  the node declines to answer other nodes' fetches for it, as for a
+  warm-reopened part. When every other owner is cold too, the part serves
+  once they have converged, since no copy anywhere is more complete.
+
+- **A node no longer fails to start when another socket takes its data
+  port.** With `data_bind_addr` on port `0`, `Cluster::build` bound a port
+  to learn its number, released it, gossiped it, and bound it again when
+  the data plane started. Anything that took the port in between, an
+  outbound connection's ephemeral port included, failed the build with
+  `JoinError::Bind`. The listener now stays bound from the first bind on.
+
 - **A graceful leave no longer loses the last copy of a key.** A node that
   announced its departure stayed an owner of every `Mode::Distributed`
   cache until the failure detector dropped it from the live set, so its

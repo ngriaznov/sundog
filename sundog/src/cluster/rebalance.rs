@@ -309,7 +309,7 @@ async fn pull_one_group(
                 // an owner holds and a read would answer a wrong miss.
                 tracing::debug!(cache = %cache, parts = parts.len(), "every donor is cold for these parts; nothing warm to pull");
                 converge_with_cold_donors(shard, mesh, cache, &donors, &parts, per_donor).await;
-                let (settled, pull) = settle_all_cold(&parts, |part| residency.is_unverified(part));
+                let (settled, pull) = settle_all_cold(&parts, |part| residency.is_replayed(part));
                 residency.mark_serving(&settled);
                 return pull;
             }
@@ -569,11 +569,23 @@ pub(crate) async fn warm_up_task(
 /// current one instead of skipped, plus every part `new` owns that was
 /// regained since `prev` or in `repull`: dropped by a published view since
 /// the last change, or planned by a pull that did not land, since writes to
-/// it went elsewhere meanwhile or it still lacks them.
+/// it went elsewhere meanwhile or it still lacks them. `stale` is every
+/// part in `to_pull` that `held` already has records in: a copy kept from
+/// an earlier stint of owning it can lack a write or delete another owner
+/// took meanwhile, so it is not trusted until the pull lands.
 pub(crate) struct ViewChangePlan {
     pub(crate) lost: Vec<PartId>,
     pub(crate) regained: Vec<PartId>,
     pub(crate) to_pull: Vec<PartId>,
+    pub(crate) stale: Vec<PartId>,
+}
+
+/// Marks the parts `plan` pulls cold, and its `stale` parts stale as well:
+/// a local hit there is not an answer until the pull lands and
+/// [`ResidencySet::mark_serving`] clears both marks.
+pub(crate) fn mark_pulling(residency: &ResidencySet, plan: &ViewChangePlan) {
+    residency.mark_cold(&plan.to_pull);
+    residency.mark_stale(&plan.stale);
 }
 
 pub(crate) fn plan_view_change(
@@ -602,10 +614,17 @@ pub(crate) fn plan_view_change(
             .chain(repull.iter().filter(|&part| new.owns(part)))
             .filter(|&part| planned.insert(part)),
     );
+    let held: PartSet = held.iter().copied().collect();
+    let stale = to_pull
+        .iter()
+        .copied()
+        .filter(|&part| held.contains(part))
+        .collect();
     ViewChangePlan {
         lost,
         regained,
         to_pull,
+        stale,
     }
 }
 
@@ -971,8 +990,9 @@ pub(crate) async fn rebalance_task(
                 let outcome = if plan.to_pull.is_empty() {
                     Outcome::Completed
                 } else {
-                    // Gained from a co-owner: cold until the pull lands.
-                    residency.mark_cold(&plan.to_pull);
+                    // Gained from a co-owner: cold until the pull lands,
+                    // and unverified where a stale copy is already here.
+                    mark_pulling(&residency, &plan);
                     tracing::debug!(cache = %cache, count = plan.to_pull.len(), "parts gained; pulling from current owners");
                     PullRequest {
                         cluster: &cluster,
@@ -1222,6 +1242,39 @@ mod tests {
             plan.to_pull.len(),
             "each part is planned once"
         );
+    }
+
+    #[test]
+    fn plan_view_change_marks_a_pulled_part_stale_only_where_a_copy_is_already_held() {
+        let self_node = NodeId::from(1);
+        let k = 2;
+        // Two nodes (self owns everything), a third joins and takes some
+        // parts, then leaves: self owns them again, and still holds its
+        // copy of one of them from before.
+        let two = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
+        let three = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
+        let regained: Vec<PartId> = two.owned_parts().filter(|&p| !three.owns(p)).collect();
+        assert!(regained.len() >= 2, "the fixture regains parts");
+        let kept = regained[0];
+        let steady = two
+            .owned_parts()
+            .find(|&p| three.owns(p))
+            .expect("some part stays owned throughout");
+
+        let plan = plan_view_change(&three, &three, &two, &[kept, steady], &PartSet::new());
+
+        assert!(plan.to_pull.contains(&kept) && plan.to_pull.contains(&regained[1]));
+        assert_eq!(
+            plan.stale,
+            vec![kept],
+            "only the regained part with a copy already here can hold a record another \
+             owner overwrote or deleted meanwhile; the steady part is not pulled at all"
+        );
+
+        let residency = ResidencySet::new();
+        mark_pulling(&residency, &plan);
+        assert!(residency.is_cold(kept) && residency.is_unverified(kept));
+        assert!(residency.is_cold(regained[1]) && !residency.is_unverified(regained[1]));
     }
 
     #[test]
@@ -2401,6 +2454,57 @@ mod tests {
         assert!(
             !residency.is_cold(b),
             "the plain cold part serves what landed"
+        );
+
+        donor.shutdown().await;
+        requester.shutdown().await;
+    }
+
+    /// Two owners that both regained a part hold only stale copies, and
+    /// each is the other's cold donor. Once they converge, no copy anywhere
+    /// is more complete, so the stale part serves like a plain cold one
+    /// instead of waiting for a warm donor that never comes.
+    #[tokio::test]
+    async fn pull_one_group_serves_a_stale_part_once_every_donor_is_cold() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        let cache = SmolStr::new("prices");
+        let (donor_node, requester_node) = (NodeId::from(121), NodeId::from(122));
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+        let view_hash = ownership.current().view_hash();
+        let donor_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            cold: true,
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
+        let (requester, _requester_inbound) =
+            spawn_mesh(requester_node, Arc::new(BucketPullHandler::default())).await;
+        requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+
+        let part = PartId::new(3, 0);
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&[part]);
+        residency.mark_stale(&[part]);
+
+        let pull = pull_one_group(
+            &empty_shard(),
+            &requester,
+            &cache,
+            &ownership,
+            &residency,
+            vec![donor_node],
+            vec![part],
+            (Granularity::Part, view_hash),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(pull, GroupPull::Landed(0));
+        assert!(
+            !residency.is_cold(part) && !residency.is_unverified(part),
+            "the stale part serves once converged with every cold donor"
         );
 
         donor.shutdown().await;

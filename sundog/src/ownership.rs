@@ -611,6 +611,13 @@ pub struct ResidencySet {
     /// local hit isn't trusted until verification lands or every donor
     /// turns out cold or unreachable, at which point this clears anyway.
     unverified: RwLock<PartSet>,
+    /// Parts this node owns again while it still holds its copy from
+    /// owning them before, which lacks every write and delete made while
+    /// it was not an owner. A local hit isn't trusted until the pull lands;
+    /// unlike `unverified`, a part here serves once every donor turns out
+    /// cold and has converged with this node, since no copy anywhere is
+    /// more complete.
+    stale: RwLock<PartSet>,
     /// Which owned parts hold everything written to them; see
     /// [`Settlement`].
     settlement: RwLock<Settlement>,
@@ -650,6 +657,7 @@ impl ResidencySet {
             releasing: RwLock::new(HashMap::new()),
             cold: RwLock::new(PartSet::new()),
             unverified: RwLock::new(PartSet::new()),
+            stale: RwLock::new(PartSet::new()),
             settlement: RwLock::new(Settlement::default()),
         }
     }
@@ -745,6 +753,7 @@ impl ResidencySet {
     pub(crate) fn mark_all_serving(&self) {
         self.clear_all_cold();
         self.unverified.write().clear();
+        self.stale.write().clear();
         let mut settlement = self.settlement.write();
         let Settlement {
             settled, served, ..
@@ -769,19 +778,35 @@ impl ResidencySet {
         self.unverified.write().extend(parts.iter().copied());
     }
 
-    /// Clears the unverified mark from `parts`: either an eager
+    /// Marks each of `parts` stale: `rebalance_task` is pulling a part it
+    /// already holds a copy of from owning it before; see
+    /// [`ResidencySet::stale`].
+    pub(crate) fn mark_stale(&self, parts: &[PartId]) {
+        self.stale.write().extend(parts.iter().copied());
+    }
+
+    /// Clears the unverified and stale marks from `parts`: either an eager
     /// `reconcile_warm_buckets` round vouched for them, or the cold-pull
     /// path landed fresh data.
     pub(crate) fn clear_unverified(&self, parts: &[PartId]) {
         let mut unverified = self.unverified.write();
+        let mut stale = self.stale.write();
         for &part in parts {
             unverified.remove(part);
+            stale.remove(part);
         }
     }
 
-    /// Whether `part` was warm-reloaded and not yet verified against a live
-    /// co-owner; see [`ResidencySet::unverified`].
+    /// Whether a local hit in `part` is not yet trusted: warm-reloaded or
+    /// stale, and not yet verified against a live co-owner; see
+    /// [`ResidencySet::unverified`] and [`ResidencySet::stale`].
     pub(crate) fn is_unverified(&self, part: PartId) -> bool {
+        self.unverified.read().contains(part) || self.stale.read().contains(part)
+    }
+
+    /// Whether `part` was warm-reloaded and not yet verified: the one mark
+    /// that holds a part back even once every donor turns out cold.
+    pub(crate) fn is_replayed(&self, part: PartId) -> bool {
         self.unverified.read().contains(part)
     }
 
@@ -1861,6 +1886,25 @@ mod tests {
 
         set.clear_unverified(&[p(2)]);
         assert!(set.is_unverified(p(1)) && !set.is_unverified(p(2)) && set.is_unverified(p(3)));
+    }
+
+    #[test]
+    fn residency_set_stale_marks_distrust_a_hit_without_holding_the_part_back() {
+        let set = ResidencySet::new();
+        set.mark_stale(&[p(1), p(2)]);
+        assert!(
+            set.is_unverified(p(1)) && !set.is_replayed(p(1)),
+            "a stale copy's hit is not trusted, but it is not a replay waiting on a warm donor"
+        );
+        assert!(!set.is_cold(p(1)), "stale and cold are separate marks");
+
+        set.clear_unverified(&[p(1)]);
+        assert!(!set.is_unverified(p(1)) && set.is_unverified(p(2)));
+        set.mark_serving(&[p(2)]);
+        assert!(!set.is_unverified(p(2)));
+        set.mark_stale(&[p(3)]);
+        set.mark_all_serving();
+        assert!(!set.is_unverified(p(3)));
     }
 
     #[cfg(feature = "spill")]
