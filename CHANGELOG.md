@@ -504,6 +504,13 @@ All notable changes to this project are documented in this file. Format follows
   outbound connection's ephemeral port included, failed the build with
   `JoinError::Bind`. The listener now stays bound from the first bind on.
 
+- **`Cluster::shutdown` no longer waits out a rebalance pull.** A
+  `Mode::Distributed` pull started on a view change kept retrying its
+  donors until `state_transfer_budget` ran out, and shutdown waited for it:
+  with a donor that had crashed before the failure detector noticed, a
+  graceful leave took up to 20 s by default. The pull now stops the moment
+  shutdown begins.
+
 - **A graceful leave no longer loses the last copy of a key.** A node that
   announced its departure stayed an owner of every `Mode::Distributed`
   cache until the failure detector dropped it from the live set, so its

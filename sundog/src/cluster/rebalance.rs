@@ -994,7 +994,7 @@ pub(crate) async fn rebalance_task(
                     // and unverified where a stale copy is already here.
                     mark_pulling(&residency, &plan);
                     tracing::debug!(cache = %cache, count = plan.to_pull.len(), "parts gained; pulling from current owners");
-                    PullRequest {
+                    let pull = PullRequest {
                         cluster: &cluster,
                         shard: &shard,
                         ownership: &ownership,
@@ -1005,9 +1005,15 @@ pub(crate) async fn rebalance_task(
                         concurrency,
                         // The ongoing rebalance loop, well past open()'s membership wait.
                         trust_sole_owner: true,
+                    };
+                    // A pull retrying against donors that died before the
+                    // failure detector noticed runs until `budget`; shutdown
+                    // must not wait that out.
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return,
+                        outcome = pull.run() => outcome,
                     }
-                    .run()
-                    .await
                 };
                 // What the pull planned and did not land is pulled again on
                 // the next change; a pull the view moves past is also planned
@@ -2355,6 +2361,111 @@ mod tests {
         );
 
         cancel.cancel();
+        cluster.shutdown().await;
+    }
+
+    /// A pull whose only donor never answers usefully runs until the
+    /// transfer budget; cancelling the task (what `Cluster::shutdown` does)
+    /// ends it at once instead of waiting that out. The donor is live in
+    /// gossip but never opened the cache, so every attempt is declined and
+    /// the pull keeps retrying, as it does against a donor that crashed
+    /// before the failure detector noticed.
+    #[tokio::test]
+    async fn rebalance_task_stops_mid_pull_when_cancelled() {
+        let config = crate::config::ClusterConfig {
+            gossip_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            data_bind_addr: std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+            state_transfer_budget: Duration::from_secs(120),
+            ..crate::config::ClusterConfig::default()
+        };
+        let cluster = crate::cluster::Cluster::builder("rebalance-unit-test-cancel-mid-pull")
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("a builds");
+        let donor = crate::cluster::Cluster::builder("rebalance-unit-test-cancel-mid-pull")
+            .seeds([cluster.local_gossip_addr()])
+            .config(config)
+            .build()
+            .await
+            .expect("the donor builds");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !cluster
+                .peers()
+                .iter()
+                .any(|peer| peer.node == donor.node_id())
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the donor is live in gossip");
+
+        let name = SmolStr::new("prices");
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (tracker, tx) = OwnershipTracker::seed(
+            cluster.node_id(),
+            &cluster.peers(),
+            &cluster.advertised_cache_modes(),
+            &name,
+            k,
+        );
+        let residency = Arc::new(ResidencySet::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(rebalance_task(
+            cluster.clone(),
+            empty_shard(),
+            tracker,
+            Arc::clone(&residency),
+            name,
+            Duration::from_secs(3600),
+            4,
+            cancel.clone(),
+        ));
+
+        // Half the parts go to a phantom node, then come back co-owned
+        // with the donor: the second view gains them and pulls from it.
+        let phantom = NodeId::from(u64::MAX);
+        let half = view(cluster.node_id(), vec![cluster.node_id(), phantom], 1);
+        tx.send(Arc::new(half)).expect("receiver still alive");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while residency.expired(Duration::ZERO).is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first view change is handled");
+        let full = view(
+            cluster.node_id(),
+            vec![cluster.node_id(), donor.node_id()],
+            2,
+        );
+        let gained = full
+            .owned_parts()
+            .find(|&part| residency.is_releasing(part))
+            .expect("a part the phantom took");
+        tx.send(Arc::new(full)).expect("receiver still alive");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !residency.is_cold(gained) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pull starts");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            residency.is_cold(gained),
+            "the declined pull is still retrying"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the task ends within two seconds of cancel, not at the transfer budget")
+            .expect("the task does not panic");
+
+        donor.shutdown().await;
         cluster.shutdown().await;
     }
 
