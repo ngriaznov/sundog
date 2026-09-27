@@ -378,6 +378,14 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Changed
 
+- **Reads during a `Distributed` ownership change can be stale.** The
+  read guarantees now say what `fetch` does: while nodes' views of a key's
+  owners disagree, a node that gave the key's part up can still answer
+  from its copy, which lacks the writes and deletes made since, so a
+  deleted key can read back its old value until the views agree. Nothing
+  stale is written back. The churn oracle counts such a read as allowed
+  staleness and fails one made while every live view agrees.
+
 - **Protocol 6: the data-plane hello names the cluster.** `Msg::Hello`
   gains `cluster`, the sender's `wire::cluster_id`, and
   `wire::PROTOCOL_VERSION` bumps to 6. Code that builds a `Msg::Hello`

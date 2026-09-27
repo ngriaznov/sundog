@@ -30,8 +30,10 @@ runs have each passed on that exact commit.
    process through a join while an owner crashes mid-pull, a join and leave
    inside the disown grace, a graceful leave, and a join followed by a
    crash. A reader fetches every key from every live node throughout, and
-   any miss for a key a live owner holds, any deleted value and any wrong
-   value fails the run; between steps every owner must hold its copies. CI
+   any miss for a key a live owner holds and any wrong value fails the
+   run, as does a deleted value while every live view agrees on the key's
+   owners; one while the views disagree is counted as allowed staleness.
+   Between steps every owner must hold its copies. CI
    runs one seed, the weekly run thirty fresh ones.
 3. **Container integration** through [`rightsize`](https://crates.io/crates/rightsize).
    Separate processes run on a real virtual network: three-node

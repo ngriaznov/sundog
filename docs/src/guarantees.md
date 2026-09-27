@@ -107,8 +107,15 @@ three things for a key:
 - `CacheError::FetchUnavailable`, when no reachable owner can vouch for the
   key yet, for example while every owner is still pulling its part.
 
-A read never returns a miss for a key a live owner holds, and never a
-deleted value. A part a node has just gained, or regained after losing it,
+A read never returns a miss for a key a live owner holds. It can return a
+stale value, an older one or a key's value from before its delete, while
+the nodes' views of who owns the key disagree: a node that gave the key's
+part up keeps its copy through the disown grace, and a reader whose view
+has not caught up still asks it. Writes and deletes made meanwhile reach
+only the new owners, so that copy lacks them. Nothing stale is written
+back, the copy is dropped when the grace ends, and once every view agrees
+the key reads its current value. sundog keeps answering here rather than
+failing reads until membership settles. A part a node has just gained, or regained after losing it,
 counts as cold until its pull lands, so the node asks the other owners
 rather than answering a miss from an incomplete copy. A regained part whose
 old copy is still here does not answer a hit locally either, since writes

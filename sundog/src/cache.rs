@@ -1280,7 +1280,11 @@ where
     /// them answers from a warm copy it returns
     /// [`CacheError::FetchUnavailable`] rather than a miss it cannot vouch
     /// for, since the part's previous owner can still hold the record
-    /// through its disown grace. On a cache that isn't [`Mode::Distributed`] this
+    /// through its disown grace. While ownership moves, a hit can be stale:
+    /// a node this node's view still lists as an owner may already have
+    /// given the part up, and its copy lacks the writes and deletes made
+    /// since. Once the views agree the key reads its current value. On a
+    /// cache that isn't [`Mode::Distributed`] this
     /// is [`Cache::get`] wrapped in `Ok`, counted `outcome="local"`
     /// unconditionally, so callers don't need to branch on mode.
     ///

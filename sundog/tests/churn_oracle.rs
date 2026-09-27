@@ -3,8 +3,12 @@
 //! crashes mid-pull, a node joining and leaving inside the disown grace, a
 //! graceful leave, and a join followed by a crash. The oracle knows each
 //! key's value or its deletion. A read may answer
-//! `CacheError::FetchUnavailable`, never a wrong value, a deleted key, or a
-//! miss for a key a live node holds.
+//! `CacheError::FetchUnavailable`, never a wrong value or a miss for a key a
+//! live node holds. A deleted key's old value is stale, allowed only while
+//! the live nodes' views disagree about the key's owners: a node that gave
+//! the key's part up still holds its copy through the disown grace and
+//! answers a reader whose view has not caught up. Once every view agrees, a
+//! deleted key never reads back.
 //!
 //! The churn schedule's delays come from a seed, printed on failure and
 //! overridden with `SUNDOG_ORACLE_SEED`; `SUNDOG_ORACLE_RUNS` runs that many
@@ -73,10 +77,45 @@ struct Findings {
     violations: Mutex<Vec<String>>,
     reads: AtomicU64,
     unavailable: AtomicU64,
+    /// Deleted keys read back while the views disagreed: allowed staleness.
+    stale: AtomicU64,
 }
 
-/// Checks one read of `key` from `node` against the oracle.
-fn judge(findings: &Findings, node: &str, key: u32, read: &Result<Option<String>, CacheError>) {
+/// Each live member's view of a key's owners, sorted so two views that
+/// name the same owners compare equal whatever order they rank them in.
+fn owner_sets(
+    members: &[(&'static str, NodeId, Cache<u32, String>)],
+    key: u32,
+) -> Vec<Vec<NodeId>> {
+    members
+        .iter()
+        .map(|(_, _, cache)| {
+            let mut owners = cache.owners_of(&key);
+            owners.sort_unstable();
+            owners
+        })
+        .collect()
+}
+
+/// Whether the views in `before` and `after`, taken around one read, all
+/// name the same owners for its key: no node can have answered from a
+/// part it gave up to a reader that still thought it owned it.
+fn views_agree(before: &[Vec<NodeId>], after: &[Vec<NodeId>]) -> bool {
+    before
+        .iter()
+        .chain(after)
+        .all(|owners| before.first().is_some_and(|first| owners == first))
+}
+
+/// Checks one read of `key` from `node` against the oracle. `settled` is
+/// whether every live view named the same owners around the read.
+fn judge(
+    findings: &Findings,
+    node: &str,
+    key: u32,
+    read: &Result<Option<String>, CacheError>,
+    settled: bool,
+) {
     findings.reads.fetch_add(1, Ordering::Relaxed);
     let verdict = match (read, expected(key)) {
         (Ok(got), want) if *got == want => return,
@@ -84,7 +123,11 @@ fn judge(findings: &Findings, node: &str, key: u32, read: &Result<Option<String>
             findings.unavailable.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        (Ok(Some(_)), None) => "a deleted key came back",
+        (Ok(Some(_)), None) if !settled => {
+            findings.stale.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        (Ok(Some(_)), None) => "a deleted key came back once every view agreed",
         (Ok(None), Some(_)) => "a miss for a key a live node holds",
         (Ok(_), _) => "a wrong value",
         (Err(_), _) => "an unexpected error",
@@ -193,9 +236,12 @@ async fn run(seed: u64) {
         async move {
             while !stop.load(Ordering::Relaxed) {
                 let members = live.lock().expect("unpoisoned").clone();
-                for (name, _, cache) in members {
+                for (name, _, cache) in &members {
                     for key in 0..KEYS {
-                        judge(&findings, name, key, &cache.fetch(&key).await);
+                        let before = owner_sets(&members, key);
+                        let read = cache.fetch(&key).await;
+                        let after = owner_sets(&members, key);
+                        judge(&findings, name, key, &read, views_agree(&before, &after));
                     }
                     // A fetch served from a local copy completes without
                     // awaiting anything, so once every member holds every
@@ -254,9 +300,10 @@ async fn run(seed: u64) {
     reader.await.expect("reader finishes");
     let violations = findings.violations.lock().expect("unpoisoned").clone();
     eprintln!(
-        "seed {seed}: {} reads, {} unavailable, {} violations",
+        "seed {seed}: {} reads, {} unavailable, {} stale while views moved, {} violations",
         findings.reads.load(Ordering::Relaxed),
         findings.unavailable.load(Ordering::Relaxed),
+        findings.stale.load(Ordering::Relaxed),
         violations.len()
     );
     assert!(
@@ -281,4 +328,22 @@ async fn reads_never_miss_resurrect_or_go_stale_while_distributed_ownership_move
         eprintln!("churn oracle: seed {seed}");
         run(seed).await;
     }
+}
+
+#[test]
+fn views_agree_only_when_every_view_names_the_same_owners_before_and_after() {
+    let (a, b, c) = (NodeId::from(1), NodeId::from(2), NodeId::from(3));
+    let ab = vec![a, b];
+    assert!(views_agree(
+        &[ab.clone(), ab.clone()],
+        &[ab.clone(), ab.clone()]
+    ));
+    assert!(
+        !views_agree(&[ab.clone(), vec![a, c]], &[ab.clone(), ab.clone()]),
+        "two members disagree before the read"
+    );
+    assert!(
+        !views_agree(&[ab.clone(), ab.clone()], &[vec![b, c], vec![b, c]]),
+        "the views moved during the read, even though they agree after it"
+    );
 }

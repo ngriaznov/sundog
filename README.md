@@ -609,7 +609,8 @@ Six layers, cheapest and highest-signal first:
      and pull path runs in the churn oracle, `sundog/tests/churn_oracle.rs`,
      which takes real in-process clusters through joins, graceful leaves and
      crashes mid-pull while reading every key from every node, and fails on
-     any miss for a key a live owner holds, deleted value or wrong value.
+     any miss for a key a live owner holds, any wrong value, and any deleted
+     value read while every node's view agrees on the key's owners.
 3. **Container integration** runs via
    [`rightsize`](https://crates.io/crates/rightsize) in
    `sundog/tests/containers.rs`, no Docker CLI, no `bollard`. Multi-node
