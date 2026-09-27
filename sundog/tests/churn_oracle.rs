@@ -197,6 +197,10 @@ async fn run(seed: u64) {
                     for key in 0..KEYS {
                         judge(&findings, name, key, &cache.fetch(&key).await);
                     }
+                    // A fetch served from a local copy completes without
+                    // awaiting anything, so once every member holds every
+                    // key this loop would never hand its worker back.
+                    tokio::task::yield_now().await;
                 }
             }
         }
