@@ -420,8 +420,11 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
     // Gossip quiescence, so the victim's view lists the donor before it opens.
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Closes the donor's listeners while the victim's view still lists it live.
-    donor.shutdown().await;
+    // A crash, not a graceful leave: a leaving node announces itself and
+    // drops out of every view at once, while a crashed one stays listed
+    // live until the failure detector notices, so every pull dials a closed
+    // listener.
+    donor.crash().await;
 
     let _victim_cache = victim
         .cache::<u32, String>(name)
