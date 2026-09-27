@@ -390,7 +390,7 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
 
     let donor = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
-        .config(node_config(common::reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("donor builds");
@@ -406,7 +406,7 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
     // the donor for every timed-out warm-up attempt: each attempt costs its
     // 200ms budget plus the retry interval, and the donor dropping out
     // first would end the warm-up with no co-owner instead of a timeout.
-    let victim_config = node_config(common::reserve_gossip_addr().await).with(|c| {
+    let victim_config = node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).with(|c| {
         c.state_transfer_budget = Duration::from_millis(200);
         c.phi_threshold = 1_000.0;
     });
@@ -456,13 +456,10 @@ async fn seed_pull_timeout_metric(gossip_a: SocketAddr, metrics_addr: SocketAddr
 /// `sundog_crdt_compactions_total` reads `1` or `2` depending on whether
 /// stage two's later record rewrite has landed by the time the caller
 /// scrapes.
-async fn seed_crdt_compaction_metrics(
-    cluster: &Cluster,
-    gossip_a: SocketAddr,
-    metrics_addr: SocketAddr,
-) {
+async fn seed_crdt_compaction_metrics(cluster: &Cluster, metrics_addr: SocketAddr) {
     let name = "counters";
     let restart_id = NodeId::random();
+    let gossip_a = cluster.local_gossip_addr();
 
     let cluster_counters = cluster
         .cache::<u32, PnCounter>(name)
@@ -474,7 +471,7 @@ async fn seed_crdt_compaction_metrics(
 
     let first_life = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
-        .config(node_config(common::reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .node_id(restart_id)
         .build()
         .await
@@ -508,7 +505,7 @@ async fn seed_crdt_compaction_metrics(
 
     let second_life = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
-        .config(node_config(common::reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .node_id(restart_id)
         .build()
         .await
@@ -563,9 +560,10 @@ async fn seed_crdt_compaction_metrics(
 /// recorder also means `sundog_owned_parts{cache="prices"}`'s pin stays
 /// a positivity check, and `sundog_owned_buckets` is pinned to it over 64.
 #[allow(clippy::too_many_lines, reason = "one scripted end-to-end scenario")]
-async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: SocketAddr) {
+async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster) {
     let owners = NonZeroU8::new(2).expect("nonzero");
     let name = "prices";
+    let gossip_a = cluster.local_gossip_addr();
 
     // `peer` and a fresh third node stabilize a two-way distributed cache
     // (both own everything with only two eligible nodes) before `cluster`
@@ -574,7 +572,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
     // `sundog_rebalance_parts_total{direction="in"}`'s natural trigger.
     let third = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
-        .config(node_config(common::reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("third node builds");
@@ -711,7 +709,7 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
         .collect();
     let fourth = Cluster::builder("it-prometheus-exporter")
         .seeds([gossip_a])
-        .config(node_config(common::reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("fourth node builds");
@@ -781,12 +779,10 @@ async fn seed_distributed_metrics(cluster: &Cluster, peer: &Cluster, gossip_a: S
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     let metrics_addr = reserve_tcp_addr().await;
-    let gossip_a = common::reserve_gossip_addr().await;
-    let gossip_b = common::reserve_gossip_addr().await;
 
     let cluster = Cluster::builder("it-prometheus-exporter")
-        .seeds([gossip_b])
-        .config(node_config(gossip_a))
+        .seeds(std::iter::empty())
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .prometheus_listen(metrics_addr)
         .build()
         .await
@@ -794,8 +790,8 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     // A peer for `users` to replicate to and reconcile against; only the
     // first node serves metrics, since the recorder is process-global.
     let peer = Cluster::builder("it-prometheus-exporter")
-        .seeds([gossip_a])
-        .config(node_config(gossip_b))
+        .seeds([cluster.local_gossip_addr()])
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("peer builds");
@@ -828,12 +824,12 @@ async fn metrics_endpoint_serves_sundog_metrics_after_cache_ops() {
     spill_dirs.extend(spill_reopen_pins_metrics(&cluster).await);
     // Independent of `peer`/`third`/`fourth`: fully retires its own
     // scenario-local nodes before returning.
-    seed_crdt_compaction_metrics(&cluster, gossip_a, metrics_addr).await;
+    seed_crdt_compaction_metrics(&cluster, metrics_addr).await;
     // Also independent: donor and victim are both shut down before it returns.
-    seed_pull_timeout_metric(gossip_a, metrics_addr).await;
+    seed_pull_timeout_metric(cluster.local_gossip_addr(), metrics_addr).await;
     // Runs last: it shuts down two of its own scenario-local nodes once it
     // is done with them, and `peer` isn't touched by anything after it.
-    seed_distributed_metrics(&cluster, &peer, gossip_a).await;
+    seed_distributed_metrics(&cluster, &peer).await;
 
     // `sundog_open_caches` comes from a periodic background routine and the
     // sketch/parts counters from an anti-entropy round, so poll until every
@@ -1833,10 +1829,9 @@ async fn reserve_timeout_pin_metric() -> std::path::PathBuf {
     let cache_name = "reserve-timeout-pin";
     let cluster_name = "it-prometheus-exporter-reserve-timeout";
 
-    let gossip_a = common::reserve_gossip_addr().await;
     let donor = Cluster::builder(cluster_name)
         .seeds(std::iter::empty())
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_a))
+        .config(common::fast_config())
         .build()
         .await
         .expect("donor builds");
@@ -1863,10 +1858,9 @@ async fn reserve_timeout_pin_metric() -> std::path::PathBuf {
         .flush_queue_bytes(FLUSH_QUEUE_BYTES)
         .spill_wait_timeout(TOO_SHORT_TIMEOUT);
 
-    let gossip_b = common::reserve_gossip_addr().await;
     let joiner = Cluster::builder(cluster_name)
-        .seeds([gossip_a])
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_b))
+        .seeds([donor.local_gossip_addr()])
+        .config(common::fast_config())
         .build()
         .await
         .expect("joiner builds");

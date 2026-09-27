@@ -126,10 +126,9 @@ async fn bulk_insert_over_a_saturated_flush_queue_drops_nothing() {
 
     let handle = metrics_handle();
 
-    let gossip = common::reserve_gossip_addr().await;
     let cluster = Cluster::builder("it-spill-backpressure-bulk")
         .seeds(std::iter::empty())
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip))
+        .config(common::fast_config())
         .build()
         .await
         .expect("solo node builds");
@@ -273,10 +272,9 @@ async fn bulk_insert_in_one_call_over_a_flush_queue_too_small_for_the_first_rese
 
     let handle = metrics_handle();
 
-    let gossip = common::reserve_gossip_addr().await;
     let cluster = Cluster::builder("it-spill-backpressure-bulk-one-call")
         .seeds(std::iter::empty())
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip))
+        .config(common::fast_config())
         .build()
         .await
         .expect("solo node builds");

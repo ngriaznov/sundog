@@ -1,7 +1,7 @@
 //! Shared harness for `tests/tls.rs` and `tests/prometheus_exporter.rs`: a
-//! fast-cycling [`ClusterConfig`], a bounded-wait polling helper, and the
-//! small [`Node`] bookkeeping struct both files build their own real,
-//! loopback-`Static`-discovery [`Cluster`]s around.
+//! fast-cycling [`ClusterConfig`] and a bounded-wait polling helper, both
+//! files build their own real, loopback-`Static`-discovery [`Cluster`]s
+//! around.
 #![allow(dead_code)]
 
 use std::future::Future;
@@ -48,24 +48,6 @@ where
     }
 }
 
-/// Reserves a loopback UDP port for a node's gossip bind address: probe-bind,
-/// read back, then drop it.
-pub async fn reserve_gossip_addr() -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind an ephemeral loopback udp port to reserve a gossip address");
-    socket
-        .local_addr()
-        .expect("a freshly bound udp socket reports a local address")
-}
-
-/// A running node plus the loopback gossip address it builds from,
-/// tracked here since the public API has no accessor for it.
-pub struct Node {
-    pub cluster: Cluster,
-    pub gossip_addr: SocketAddr,
-}
-
 /// Waits until `cluster` reports at least `expected` live peers.
 /// # Panics
 ///
@@ -74,10 +56,10 @@ pub async fn wait_for_peer_count(cluster: &Cluster, expected: usize, timeout: Du
     eventually(timeout, || async { cluster.peers().len() >= expected }).await;
 }
 
-/// Shuts every node in `nodes` down gracefully, sequentially, keeping
+/// Shuts every cluster in `clusters` down gracefully, sequentially, keeping
 /// failures attributable to a specific node.
-pub async fn shutdown_all(nodes: Vec<Node>) {
-    for node in nodes {
-        node.cluster.shutdown().await;
+pub async fn shutdown_all(clusters: Vec<Cluster>) {
+    for cluster in clusters {
+        cluster.shutdown().await;
     }
 }

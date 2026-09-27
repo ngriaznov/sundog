@@ -466,6 +466,27 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A graceful leave no longer loses the last copy of a key.** A node that
+  announced its departure stayed an owner of every `Mode::Distributed`
+  cache until the failure detector dropped it from the live set, so its
+  parts kept a single live holder the whole time, and a second node leaving
+  in that window took the only copy with it. A departing node now
+  advertises no cache modes, so ownership moves the moment the departure is
+  gossiped, while every other holder is still up. Before it announces, a
+  leaving node also runs anti-entropy rounds with each live co-owner, within
+  `state_transfer_budget`, so a co-owner still receiving its copy after a
+  recent membership change has all of it before this node goes.
+
+- **A part a superseded pull left behind is pulled on the next change.** A
+  part planned for a pull that the view moved past before it landed, when it
+  came from a dropped-and-regained ownership rather than the view difference,
+  was never planned again: it stayed cold, so reads always went to other
+  owners and it declined every donor request. The rebalance task now carries
+  every planned part that has not landed into the next plan. A property test
+  drives the planner and residency bookkeeping through random view sequences,
+  with coalesced views and superseded pulls, against a model of which parts
+  hold every write.
+
 - **A Distributed read never takes a freshly gained part's empty store for
   a miss.** The ownership view is published before the rebalance task marks
   the parts it gains cold, and a `fetch` in that window answered `Ok(None)`

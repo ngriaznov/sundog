@@ -404,10 +404,13 @@ impl Cluster {
         self.inner.warmth.is_warm(cache)
     }
 
-    /// This node's own gossip address, for a test harness that seeds a
-    /// second node against a running one.
-    #[cfg(all(test, not(feature = "sim")))]
-    pub(crate) fn local_gossip_addr(&self) -> SocketAddr {
+    /// The gossip address this node bound, so a test harness binds port 0
+    /// and seeds the next node against the real address rather than
+    /// reserving a port up front, which another process can take before
+    /// the node binds it. `#[doc(hidden)]`: not part of the supported API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn local_gossip_addr(&self) -> SocketAddr {
         self.inner.membership.local_peer().gossip_addr
     }
 
@@ -500,6 +503,7 @@ impl Cluster {
         for shard in self.inner.shards.read_shards().values() {
             shard.seal_fan_out();
         }
+        self.hand_off_before_leaving().await;
         self.inner.cancel.cancel();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
@@ -513,6 +517,98 @@ impl Cluster {
         self.inner.mesh.clone().shutdown().await;
         tracing::info!(node = %self.inner.node, cluster = %self.inner.name, "cluster shut down");
     }
+
+    /// Converges every part this node owns with each live co-owner before
+    /// it leaves, for every `Mode::Distributed` cache. After a membership
+    /// change a co-owner can still be receiving its copy, and once this node
+    /// departs the survivors pull only from each other, so a copy only this
+    /// node held would be lost. Both sides still share the view that makes
+    /// them co-owners, so every part is in anti-entropy scope. Up to
+    /// [`LEAVE_HAND_OFF_ROUNDS`] rounds per co-owner, all within
+    /// `state_transfer_budget`.
+    async fn hand_off_before_leaving(&self) {
+        let deadline = tokio::time::Instant::now() + self.config().state_transfer_budget;
+        let live: HashSet<NodeId> = self.live_peer_ids().into_iter().collect();
+        let shards: Vec<(SmolStr, Arc<dyn ShardOps>)> = self
+            .inner
+            .shards
+            .read_shards()
+            .iter()
+            .map(|(name, shard)| (name.clone(), Arc::clone(shard)))
+            .collect();
+        for (name, shard) in shards {
+            let Some(view) = shard.ownership_view() else {
+                continue;
+            };
+            for (peer, parts) in hand_off_groups(&view, self.node_id(), &live) {
+                let mut diverging = parts;
+                for _ in 0..LEAVE_HAND_OFF_ROUNDS {
+                    let Ok(outcome) = tokio::time::timeout_at(
+                        deadline,
+                        anti_entropy::run_round_for_parts(
+                            self.mesh(),
+                            &shard,
+                            &name,
+                            peer,
+                            &diverging,
+                        ),
+                    )
+                    .await
+                    else {
+                        tracing::warn!(cache = %name, %peer, "leave hand-off ran out of state_transfer_budget");
+                        return;
+                    };
+                    if outcome.failed {
+                        break;
+                    }
+                    diverging.retain(|part| !outcome.matched.contains(part));
+                    if diverging.is_empty() {
+                        break;
+                    }
+                }
+                tracing::debug!(cache = %name, %peer, diverging = diverging.len(), "leave hand-off with co-owner done");
+            }
+        }
+    }
+
+    /// Stops this node as a killed process would: background loops are
+    /// cancelled mid-flight, nothing queued for fan-out is flushed, gossip
+    /// stops with no departure, and the data plane drops its connections.
+    /// Peers learn of it only through the failure detector. A test seam for
+    /// crash scenarios run in-process; `#[doc(hidden)]`: not part of the
+    /// supported API.
+    #[doc(hidden)]
+    pub async fn crash(self) {
+        self.inner.cancel.cancel();
+        self.inner.tracker.close();
+        self.inner.tracker.wait().await;
+        self.inner.membership.clone().crash().await;
+        self.inner.mesh.clone().shutdown().await;
+        tracing::info!(node = %self.inner.node, cluster = %self.inner.name, "cluster crashed");
+    }
+}
+
+/// Anti-entropy rounds [`Cluster::hand_off_before_leaving`] runs against
+/// each co-owner.
+const LEAVE_HAND_OFF_ROUNDS: u32 = 3;
+
+/// The parts `view` owns, grouped by each co-owner in `live`, in node order:
+/// what a leaving node converges with whom before it goes.
+fn hand_off_groups(
+    view: &OwnershipView,
+    self_node: NodeId,
+    live: &HashSet<NodeId>,
+) -> Vec<(NodeId, Vec<PartId>)> {
+    let mut groups: std::collections::BTreeMap<NodeId, Vec<PartId>> =
+        std::collections::BTreeMap::new();
+    for part in view.owned_parts() {
+        for &owner in view.owners_of(part) {
+            if owner != self_node && live.contains(&owner) {
+                groups.entry(owner).or_default().push(part);
+            }
+        }
+    }
+    groups.into_iter().collect()
 }
 
 impl ClusterBuilder {
@@ -4202,11 +4298,37 @@ mod tests {
     fn rebalance_config() -> ClusterConfig {
         let mut config = ClusterConfig {
             ae_interval: Duration::from_millis(50),
-            distributed_disown_grace_rounds: 200,
+            // A 30 s grace: long enough that the mid-grace check below
+            // still lands inside it on a loaded runner.
+            distributed_disown_grace_rounds: 600,
             ..loopback_config()
         };
         config.tombstone_ttl = config.bucket_release_window();
         config
+    }
+
+    #[test]
+    fn hand_off_groups_pair_each_owned_part_with_its_live_co_owners_only() {
+        let (me, live_peer, dead_peer) = (NodeId::from(1), NodeId::from(2), NodeId::from(3));
+        let view = OwnershipView::compute(
+            me,
+            vec![me, live_peer, dead_peer],
+            std::num::NonZeroU8::new(2).expect("nonzero"),
+        );
+        let live: HashSet<NodeId> = [live_peer].into_iter().collect();
+        let groups = hand_off_groups(&view, me, &live);
+        assert_eq!(groups.len(), 1, "a co-owner that is not live gets nothing");
+        let (peer, parts) = &groups[0];
+        assert_eq!(*peer, live_peer);
+        let expected: Vec<PartId> = view
+            .owned_parts()
+            .filter(|&part| view.owners_of(part).contains(&live_peer))
+            .collect();
+        assert_eq!(
+            parts, &expected,
+            "every part this node co-owns with the live peer"
+        );
+        assert!(!parts.is_empty());
     }
 
     #[allow(
@@ -4264,6 +4386,9 @@ mod tests {
         )
         .await;
 
+        let grace = config.disown_grace();
+        // No displaced owner's grace starts before c exists.
+        let before_c = tokio::time::Instant::now();
         let cluster_c = Cluster::builder("cluster-it-rebalance-join")
             .seeds([gossip_a])
             .config(config)
@@ -4309,23 +4434,30 @@ mod tests {
         )
         .await;
 
-        // A brief, deliberate quiescence window: right after the pull lands
-        // (inside the ten-second disown grace, since the pull is triggered
-        // immediately on the ownership change while the grace only starts
-        // counting down from the same moment), the displaced node has not
-        // released anything yet.
+        // Right after the pull lands, still inside the disown grace, the
+        // displaced node has not released anything yet.
+        let elapsed = before_c.elapsed();
+        assert!(
+            elapsed < grace,
+            "setup ran {elapsed:?}, past the {grace:?} grace, so the check below cannot land mid-grace"
+        );
         assert_eq!(
             displaced_cache.get(&moved_key).await,
             Some(moved_key.to_string()),
-            "the displaced owner still resides the key mid disown-grace"
+            "the displaced owner still resides the key {elapsed:?} into a {grace:?} grace"
         );
 
         wait_until(
-            Duration::from_secs(30),
+            grace * 2,
             "the displaced owner releases the key once the disown grace elapses",
             async || displaced_cache.get(&moved_key).await.is_none(),
         )
         .await;
+        assert!(
+            before_c.elapsed() >= grace,
+            "the displaced owner released the key {:?} after c joined, before the {grace:?} grace",
+            before_c.elapsed()
+        );
 
         cluster_a.shutdown().await;
         cluster_b.shutdown().await;

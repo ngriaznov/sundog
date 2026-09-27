@@ -120,17 +120,15 @@ fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
 async fn replicated_two_node_spill_converges_and_settles_to_zero_repairs() {
     let handle = metrics_handle();
 
-    let gossip_a = common::reserve_gossip_addr().await;
-    let gossip_b = common::reserve_gossip_addr().await;
     let cluster_a = Cluster::builder("it-spill-repl")
-        .seeds([gossip_b])
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_a))
+        .seeds(std::iter::empty())
+        .config(common::fast_config())
         .build()
         .await
         .expect("node a builds");
     let cluster_b = Cluster::builder("it-spill-repl")
-        .seeds([gossip_a])
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_b))
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(common::fast_config())
         .build()
         .await
         .expect("node b builds");
@@ -256,10 +254,9 @@ async fn join_after_bulk_insert(
     Cache<u32, String>,
     Duration,
 ) {
-    let gossip_a = common::reserve_gossip_addr().await;
     let cluster_a = Cluster::builder(cluster_name)
         .seeds(std::iter::empty())
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_a))
+        .config(common::fast_config())
         .build()
         .await
         .expect("node a builds");
@@ -280,10 +277,9 @@ async fn join_after_bulk_insert(
         start = end;
     }
 
-    let gossip_b = common::reserve_gossip_addr().await;
     let cluster_b = Cluster::builder(cluster_name)
-        .seeds([gossip_a])
-        .config(common::fast_config().with(|c| c.gossip_bind_addr = gossip_b))
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(common::fast_config())
         .build()
         .await
         .expect("node b builds");

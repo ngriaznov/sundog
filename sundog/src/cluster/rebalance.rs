@@ -567,8 +567,9 @@ pub(crate) async fn warm_up_task(
 /// latest view whose pull is not superseded (`pulled`), so a part gained
 /// under a view that gets superseded mid-pull is pulled again under the
 /// current one instead of skipped, plus every part `new` owns that was
-/// regained since `prev` or dropped by a published view since the last
-/// change (`lost_since`), since writes to it went elsewhere meanwhile.
+/// regained since `prev` or in `repull`: dropped by a published view since
+/// the last change, or planned by a pull that did not land, since writes to
+/// it went elsewhere meanwhile or it still lacks them.
 pub(crate) struct ViewChangePlan {
     pub(crate) lost: Vec<PartId>,
     pub(crate) regained: Vec<PartId>,
@@ -580,7 +581,7 @@ pub(crate) fn plan_view_change(
     pulled: &OwnershipView,
     new: &OwnershipView,
     held: &[PartId],
-    lost_since: &PartSet,
+    repull: &PartSet,
 ) -> ViewChangePlan {
     let (regained, mut lost) = ownership_diff(prev, new);
     let mut seen: PartSet = lost.iter().copied().collect();
@@ -589,17 +590,16 @@ pub(crate) fn plan_view_change(
             .copied()
             .filter(|&part| !new.owns(part) && seen.insert(part)),
     );
-    // A part regained since `prev`, or dropped by a published view since the
-    // last change (`lost_since`, which covers a view this task never saw),
-    // missed the writes made while another node owned it, even when
-    // `pulled` still owned it.
+    // A part regained since `prev`, or in `repull` (which covers a view this
+    // task never saw, and a pull the view moved past), lacks writes another
+    // node took meanwhile, even when `pulled` still owned it.
     let (mut to_pull, _) = ownership_diff(pulled, new);
     let mut planned: PartSet = to_pull.iter().copied().collect();
     to_pull.extend(
         regained
             .iter()
             .copied()
-            .chain(lost_since.iter().filter(|&part| new.owns(part)))
+            .chain(repull.iter().filter(|&part| new.owns(part)))
             .filter(|&part| planned.insert(part)),
     );
     ViewChangePlan {
@@ -904,6 +904,8 @@ pub(crate) async fn rebalance_task(
     // that lost any. Each stops on `cancel` through its child token;
     // dropping the set when this task returns aborts any left.
     let mut pushes: JoinSet<()> = JoinSet::new();
+    // Parts the last pull planned that never landed.
+    let mut unfinished = PartSet::new();
     loop {
         tokio::select! {
             biased;
@@ -914,10 +916,10 @@ pub(crate) async fn rebalance_task(
                     return; // the tracker's sender dropped
                 }
                 let new_view = view_rx.borrow_and_update().clone();
-                let lost_since = residency.take_lost();
+                let mut repull = residency.take_lost();
+                repull.extend(unfinished.iter());
                 let held = shard.held_parts().await;
-                let plan =
-                    plan_view_change(&prev_view, &pulled_view, &new_view, &held, &lost_since);
+                let plan = plan_view_change(&prev_view, &pulled_view, &new_view, &held, &repull);
                 let held_set: PartSet = held.iter().copied().collect();
                 let held_losses: Vec<PartId> = plan
                     .lost
@@ -965,6 +967,7 @@ pub(crate) async fn rebalance_task(
                 if !plan.regained.is_empty() {
                     residency.unmark(&plan.regained);
                 }
+                let planned = plan.to_pull.clone();
                 let outcome = if plan.to_pull.is_empty() {
                     Outcome::Completed
                 } else {
@@ -986,9 +989,14 @@ pub(crate) async fn rebalance_task(
                     .run()
                     .await
                 };
-                // A pull the view moves past is planned again from the same
-                // starting point on the next change, which is already
+                // What the pull planned and did not land is pulled again on
+                // the next change; a pull the view moves past is also planned
+                // again from the same starting point, which is already
                 // published, so nothing gained is skipped.
+                unfinished = planned
+                    .into_iter()
+                    .filter(|&part| residency.is_cold(part))
+                    .collect();
                 if outcome != Outcome::Superseded {
                     residency.settle(&new_view);
                     pulled_view = new_view;
@@ -2784,6 +2792,160 @@ mod tests {
                 node: NodeId::from(1),
             },
             expires_at_ms: None,
+        }
+    }
+
+    /// A reference model of which parts this node holds every write for,
+    /// driven against the real `refresh_task` bookkeeping
+    /// ([`ResidencySet::record_published`]), [`plan_view_change`] and
+    /// [`ResidencySet::settle`] under the orderings the watch channel
+    /// allows: views published faster than the rebalance task looks
+    /// coalesce, and a pull can be superseded partway.
+    mod model {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::ownership::Granularity;
+        use crate::store::part::PART_SPACE;
+
+        /// One published view, or one rebalance step over the latest one.
+        #[derive(Debug, Clone)]
+        enum Step {
+            /// Publish the view over `self` plus these others (bit i set
+            /// means node `i + 2` is eligible).
+            Publish(u8),
+            /// Rebalance the latest published view. `superseded` pulls
+            /// only the parts `landed` selects and does not settle.
+            Rebalance { superseded: bool, landed: u64 },
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                (1u8..16).prop_map(Step::Publish),
+                (any::<bool>(), any::<u64>())
+                    .prop_map(|(superseded, landed)| Step::Rebalance { superseded, landed }),
+            ]
+        }
+
+        fn view_for(mask: u8, granularity: Granularity) -> Arc<OwnershipView> {
+            let me = NodeId::from(1);
+            let mut eligible = vec![me];
+            eligible.extend(
+                (0..4u64)
+                    .filter(|i| mask & (1 << i) != 0)
+                    .map(|i| NodeId::from(i + 2)),
+            );
+            Arc::new(OwnershipView::compute_at(
+                me,
+                eligible,
+                NonZeroU8::new(2).expect("nonzero"),
+                granularity,
+            ))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// Every part this node owns is either complete (it holds
+            /// every write made to it) or reads as cold, so a local miss
+            /// there is never taken as an answer; and once a view's pull
+            /// completes with nothing published after it, every owned part
+            /// serves.
+            #[test]
+            fn a_part_owned_but_missing_writes_always_reads_as_cold(
+                start in 1u8..16,
+                steps in proptest::collection::vec(step(), 1..14),
+                part_granularity in any::<bool>(),
+            ) {
+                let granularity = if part_granularity { Granularity::Part } else { Granularity::Bucket };
+                let residency = ResidencySet::new();
+                let mut published = view_for(start, granularity);
+                residency.settle(&published);
+                // Every part the starting view owns is complete; every other
+                // part holds nothing, so it is complete only while unowned.
+                let mut complete: Vec<bool> = vec![true; PART_SPACE];
+                let mut prev = Arc::clone(&published);
+                let mut pulled = Arc::clone(&published);
+                let mut unfinished = PartSet::new();
+
+                let check = |published: &OwnershipView, complete: &[bool]| {
+                    for part in published.owned_parts() {
+                        if !complete[part.index()] {
+                            prop_assert!(
+                                residency.is_cold(part) || residency.is_unsettled(part),
+                                "part {part} is owned and misses writes, yet reads as servable"
+                            );
+                        }
+                    }
+                    Ok(())
+                };
+
+                for step in steps {
+                    match step {
+                        Step::Publish(mask) => {
+                            let next = view_for(mask, granularity);
+                            residency.record_published(&published, &next);
+                            // Writes to a part this view does not own go to
+                            // its other owners, not here.
+                            for part in PartId::all().filter(|&p| !next.owns(p)) {
+                                complete[part.index()] = false;
+                            }
+                            published = next;
+                        }
+                        Step::Rebalance { superseded, landed } => {
+                            let new = Arc::clone(&published);
+                            let mut repull = residency.take_lost();
+                            repull.extend(unfinished.iter());
+                            let plan = plan_view_change(&prev, &pulled, &new, &[], &repull);
+                            residency.mark_cold(&plan.to_pull);
+                            let landing: Vec<PartId> = if superseded {
+                                plan.to_pull
+                                    .iter()
+                                    .copied()
+                                    .filter(|part| landed & (1 << (part.index() % 64)) != 0)
+                                    .collect()
+                            } else {
+                                plan.to_pull.clone()
+                            };
+                            residency.mark_serving(&landing);
+                            for part in &landing {
+                                complete[part.index()] = true;
+                            }
+                            unfinished = plan
+                                .to_pull
+                                .iter()
+                                .copied()
+                                .filter(|&part| residency.is_cold(part))
+                                .collect();
+                            if !superseded {
+                                residency.settle(&new);
+                                pulled = Arc::clone(&new);
+                            }
+                            prev = new;
+                        }
+                    }
+                    check(&published, &complete)?;
+                }
+
+                // Liveness: one completed rebalance of the latest view leaves
+                // every owned part complete and serving.
+                let mut repull = residency.take_lost();
+                repull.extend(unfinished.iter());
+                let plan = plan_view_change(&prev, &pulled, &published, &[], &repull);
+                residency.mark_cold(&plan.to_pull);
+                residency.mark_serving(&plan.to_pull);
+                for part in &plan.to_pull {
+                    complete[part.index()] = true;
+                }
+                residency.settle(&published);
+                for part in published.owned_parts() {
+                    prop_assert!(complete[part.index()], "part {part} still misses writes after a completed pull");
+                    prop_assert!(
+                        !residency.is_cold(part) && !residency.is_unsettled(part),
+                        "part {part} still reads as cold after a completed pull"
+                    );
+                }
+            }
         }
     }
 }

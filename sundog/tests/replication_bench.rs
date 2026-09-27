@@ -24,41 +24,23 @@ fn bench_enabled() -> bool {
     std::env::var("SUNDOG_BENCH").as_deref() == Ok("1")
 }
 
-/// Mirrors `tests/tls.rs`'s own copy: the only way, from outside the crate,
-/// to learn a gossip address before the node that binds it exists.
-async fn reserve_gossip_addr() -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind an ephemeral loopback udp port to reserve a gossip address");
-    socket
-        .local_addr()
-        .expect("a freshly bound udp socket reports a local address")
-}
-
 fn node_config(gossip_bind_addr: SocketAddr) -> ClusterConfig {
     common::fast_config().with(|c| {
         c.gossip_bind_addr = gossip_bind_addr;
     })
 }
 
-/// Builds `n` real, loopback-`Static`-discovery clusters that all seed each
-/// other, and waits until every one reports `n - 1` live peers.
+/// Builds `n` real, loopback-`Static`-discovery clusters, each seeding every
+/// node already built (gossip is bidirectional, so this converges to the
+/// same full mesh mutual seeding would), and waits until every one reports
+/// `n - 1` live peers.
 async fn peer_group(cluster_name: &str, n: usize) -> Vec<Cluster> {
-    let mut gossip_addrs = Vec::with_capacity(n);
-    for _ in 0..n {
-        gossip_addrs.push(reserve_gossip_addr().await);
-    }
-
-    let mut clusters = Vec::with_capacity(n);
-    for (i, &addr) in gossip_addrs.iter().enumerate() {
-        let seeds = gossip_addrs
-            .iter()
-            .enumerate()
-            .filter(|&(j, _)| j != i)
-            .map(|(_, &seed)| seed);
+    let mut clusters: Vec<Cluster> = Vec::with_capacity(n);
+    for i in 0..n {
+        let seeds: Vec<SocketAddr> = clusters.iter().map(Cluster::local_gossip_addr).collect();
         let cluster = Cluster::builder(cluster_name)
             .seeds(seeds)
-            .config(node_config(addr))
+            .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
             .build()
             .await
             .unwrap_or_else(|error| panic!("node {i} builds: {error}"));

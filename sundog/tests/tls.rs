@@ -11,7 +11,6 @@
 
 mod common;
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,51 +49,26 @@ fn generate_node_tls(ca: &Ca) -> TlsConfig {
     }
 }
 
-/// Mirrors `common`'s own `reserve_gossip_addr`: the only way, from outside
-/// the crate, to learn a gossip address before a node exists.
-async fn reserve_gossip_addr() -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind an ephemeral loopback udp port to reserve a gossip address");
-    socket
-        .local_addr()
-        .expect("a freshly bound udp socket reports a local address")
-}
-
-fn tls_node_config(gossip_bind_addr: SocketAddr, tls: TlsConfig) -> ClusterConfig {
-    common::fast_config().with(|c| {
-        c.gossip_bind_addr = gossip_bind_addr;
-        c.tls = Some(tls);
-    })
-}
-
-/// Like [`tls_node_config`], minus the `tls` field: for the case below that
-/// enables TLS through [`sundog::Cluster::builder`]'s `.tls()` setter
-/// instead of the config field directly.
-fn node_config(gossip_bind_addr: SocketAddr) -> ClusterConfig {
-    common::fast_config().with(|c| {
-        c.gossip_bind_addr = gossip_bind_addr;
-    })
+fn tls_node_config(tls: TlsConfig) -> ClusterConfig {
+    common::fast_config().with(|c| c.tls = Some(tls))
 }
 
 #[tokio::test]
 async fn nodes_sharing_a_ca_replicate_a_put_over_tls() {
     let ca = generate_ca();
-    let gossip_a = reserve_gossip_addr().await;
-    let gossip_b = reserve_gossip_addr().await;
 
     // Enabled via `ClusterBuilder::tls`, not `ClusterConfig::tls` directly,
     // so this test covers both entry points to the same setting.
     let cluster_a = Cluster::builder("it-tls-shared-ca")
-        .seeds([gossip_b])
-        .config(node_config(gossip_a))
+        .seeds(std::iter::empty())
+        .config(common::fast_config())
         .tls(generate_node_tls(&ca))
         .build()
         .await
         .expect("node a builds with tls");
     let cluster_b = Cluster::builder("it-tls-shared-ca")
-        .seeds([gossip_a])
-        .config(node_config(gossip_b))
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(common::fast_config())
         .tls(generate_node_tls(&ca))
         .build()
         .await
@@ -126,25 +100,13 @@ async fn nodes_sharing_a_ca_replicate_a_put_over_tls() {
     })
     .await;
 
-    common::shutdown_all(vec![
-        common::Node {
-            cluster: cluster_a,
-            gossip_addr: gossip_a,
-        },
-        common::Node {
-            cluster: cluster_b,
-            gossip_addr: gossip_b,
-        },
-    ])
-    .await;
+    common::shutdown_all(vec![cluster_a, cluster_b]).await;
 }
 
 #[tokio::test]
 async fn nodes_with_certs_from_different_cas_never_replicate() {
     let ca_a = generate_ca();
     let ca_b = generate_ca();
-    let gossip_a = reserve_gossip_addr().await;
-    let gossip_b = reserve_gossip_addr().await;
 
     // Every state-transfer attempt here is doomed, so shrink the budget
     // each `open()` burns failing TLS handshakes from the 20s default.
@@ -152,20 +114,14 @@ async fn nodes_with_certs_from_different_cas_never_replicate() {
         config.with(|c| c.state_transfer_budget = Duration::from_secs(2))
     };
     let cluster_a = Cluster::builder("it-tls-mismatched-ca")
-        .seeds([gossip_b])
-        .config(doomed_transfer(tls_node_config(
-            gossip_a,
-            generate_node_tls(&ca_a),
-        )))
+        .seeds(std::iter::empty())
+        .config(doomed_transfer(tls_node_config(generate_node_tls(&ca_a))))
         .build()
         .await
         .expect("node a builds with tls");
     let cluster_b = Cluster::builder("it-tls-mismatched-ca")
-        .seeds([gossip_a])
-        .config(doomed_transfer(tls_node_config(
-            gossip_b,
-            generate_node_tls(&ca_b),
-        )))
+        .seeds([cluster_a.local_gossip_addr()])
+        .config(doomed_transfer(tls_node_config(generate_node_tls(&ca_b))))
         .build()
         .await
         .expect("node b builds with tls");
@@ -203,15 +159,5 @@ async fn nodes_with_certs_from_different_cas_never_replicate() {
         "a write never crosses a TLS mesh between nodes with unrelated root CAs"
     );
 
-    common::shutdown_all(vec![
-        common::Node {
-            cluster: cluster_a,
-            gossip_addr: gossip_a,
-        },
-        common::Node {
-            cluster: cluster_b,
-            gossip_addr: gossip_b,
-        },
-    ])
-    .await;
+    common::shutdown_all(vec![cluster_a, cluster_b]).await;
 }

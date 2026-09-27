@@ -39,3 +39,11 @@ jobs:
 
       - name: Run the chaos scenario
         run: cargo test --release --package sundog --test containers -- --test-threads=1 chaos_
+
+      - name: Upload container node logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chaos-node-logs
+          path: target/container-logs/
+          if-no-files-found: warn

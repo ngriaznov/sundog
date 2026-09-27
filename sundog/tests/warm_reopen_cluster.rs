@@ -25,7 +25,7 @@
 mod common;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -179,31 +179,32 @@ async fn warm_reopen_converges_without_orphaning_or_serving_stale_entries() {
     // Fixed across the restart, as a real deployment would.
     let node0_id = NodeId::random();
 
-    let g0 = common::reserve_gossip_addr().await;
-    let g1 = common::reserve_gossip_addr().await;
-    let g2 = common::reserve_gossip_addr().await;
-
     // Initial three-node formation, waiting for peers before opening
     // any cache; the fix under test is specific to the restart below.
+    // node0's address is read back off the running cluster (rather than
+    // reserved up front) so it can rebind to it exactly on restart below.
     let cluster0 = Cluster::builder(CLUSTER_NAME)
-        .seeds([g1, g2])
-        .config(cluster_config(g0))
+        .seeds(std::iter::empty())
+        .config(cluster_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .node_id(node0_id)
         .build()
         .await
         .expect("node0 builds");
+    let g0 = cluster0.local_gossip_addr();
     let cluster1 = Cluster::builder(CLUSTER_NAME)
-        .seeds([g0, g2])
-        .config(cluster_config(g1))
+        .seeds([g0])
+        .config(cluster_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("node1 builds");
+    let g1 = cluster1.local_gossip_addr();
     let cluster2 = Cluster::builder(CLUSTER_NAME)
         .seeds([g0, g1])
-        .config(cluster_config(g2))
+        .config(cluster_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("node2 builds");
+    let g2 = cluster2.local_gossip_addr();
 
     common::wait_for_peer_count(&cluster0, 2, Duration::from_secs(15)).await;
     common::wait_for_peer_count(&cluster1, 2, Duration::from_secs(15)).await;
@@ -502,30 +503,40 @@ async fn warm_reopen_reconciles_a_mass_overwrite_across_most_buckets_without_ser
     // Fixed across the restart, same reasoning as this file's other test.
     let node0_id = NodeId::random();
 
-    let g0 = common::reserve_gossip_addr().await;
-    let g1 = common::reserve_gossip_addr().await;
-    let g2 = common::reserve_gossip_addr().await;
-
-    // ---- Initial three-node formation. ----
+    // ---- Initial three-node formation. node0's address is read back off
+    // the running cluster (rather than reserved up front) so it can rebind
+    // to it exactly on restart below. ----
     let cluster0 = Cluster::builder(CLUSTER_NAME_BULK)
-        .seeds([g1, g2])
-        .config(cluster_config_bulk_overwrite(g0))
+        .seeds(std::iter::empty())
+        .config(cluster_config_bulk_overwrite(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            0,
+        ))))
         .node_id(node0_id)
         .build()
         .await
         .expect("node0 builds");
+    let g0 = cluster0.local_gossip_addr();
     let cluster1 = Cluster::builder(CLUSTER_NAME_BULK)
-        .seeds([g0, g2])
-        .config(cluster_config_bulk_overwrite(g1))
+        .seeds([g0])
+        .config(cluster_config_bulk_overwrite(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            0,
+        ))))
         .build()
         .await
         .expect("node1 builds");
+    let g1 = cluster1.local_gossip_addr();
     let cluster2 = Cluster::builder(CLUSTER_NAME_BULK)
         .seeds([g0, g1])
-        .config(cluster_config_bulk_overwrite(g2))
+        .config(cluster_config_bulk_overwrite(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            0,
+        ))))
         .build()
         .await
         .expect("node2 builds");
+    let g2 = cluster2.local_gossip_addr();
 
     common::wait_for_peer_count(&cluster0, 2, Duration::from_secs(15)).await;
     common::wait_for_peer_count(&cluster1, 2, Duration::from_secs(15)).await;

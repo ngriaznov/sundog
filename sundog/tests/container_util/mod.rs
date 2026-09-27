@@ -13,7 +13,9 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rightsize::{Container, ContainerGuard, MountableFile, Network, Wait, WaitStrategy};
+use rightsize::{
+    Container, ContainerGuard, FollowHandle, MountableFile, Network, Wait, WaitStrategy,
+};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::TcpStream;
 
@@ -198,6 +200,55 @@ pub struct Node {
     guard: ContainerGuard,
     control_port: u16,
     metrics_port: u16,
+    /// Streams this node's output into its file under [`log_dir`] for as
+    /// long as the node lives; dropping it stops the stream.
+    _log: Option<FollowHandle>,
+}
+
+/// Where every container node's output lands, one file per node:
+/// `SUNDOG_CONTAINER_LOG_DIR`, or `target/container-logs` under the
+/// workspace. Written as the node runs, so a failed or crashed test leaves
+/// its nodes' full logs behind; CI uploads the directory when the container
+/// job fails.
+fn log_dir() -> PathBuf {
+    std::env::var_os("SUNDOG_CONTAINER_LOG_DIR").map_or_else(
+        || workspace_root().join("target/container-logs"),
+        PathBuf::from,
+    )
+}
+
+/// Follows `guard`'s output into `<log_dir>/<cluster_name>/<alias>-<n>.log`,
+/// `n` counting nodes this process has started, so a restarted alias gets
+/// a fresh file. Best effort: a node whose output cannot be followed still
+/// runs, and the reason goes to stderr.
+async fn follow_into_file(
+    guard: &ContainerGuard,
+    cluster_name: &str,
+    alias: &str,
+) -> Option<FollowHandle> {
+    static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = log_dir().join(cluster_name);
+    let path = dir.join(format!("{alias}-{n}.log"));
+    let file = std::fs::create_dir_all(&dir).and_then(|()| std::fs::File::create(&path));
+    let file = match file {
+        Ok(file) => std::sync::Mutex::new(std::io::LineWriter::new(file)),
+        Err(error) => {
+            eprintln!("cannot write {}: {error}", path.display());
+            return None;
+        }
+    };
+    let follow = guard
+        .follow_output(move |line| {
+            use std::io::Write as _;
+            if let Ok(mut file) = file.lock() {
+                let _ = writeln!(file, "{}", line.trim_end_matches('\n'));
+            }
+        })
+        .await;
+    follow
+        .map_err(|error| eprintln!("cannot follow {alias}'s output: {error}"))
+        .ok()
 }
 
 impl Node {
@@ -446,10 +497,12 @@ impl Node {
         let metrics_port = guard
             .get_mapped_port(METRICS_PORT)
             .expect("invariant: metrics port was declared via with_exposed_ports");
+        let log = follow_into_file(&guard, cluster_name, alias).await;
         Node {
             guard,
             control_port,
             metrics_port,
+            _log: log,
         }
     }
 

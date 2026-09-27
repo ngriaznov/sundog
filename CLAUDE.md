@@ -16,6 +16,12 @@
   spill+prometheus suite, `cargo doc --workspace --no-deps` and `cargo doc -p
   sundog --no-deps --all-features`, and the rightsize container suite. Repeat timing-sensitive new tests ten times. CI
   is the end gate. Dispatch it on the branch and wait for green.
+- A red `main` stops merges. Before merging or pushing to `main`, check CI on
+  `main`'s current head; if it is red, root-cause and fix that first. An
+  intermittent failure is a bug until its cause is found: never re-run it
+  away, never call it a flake without one. Container tests write every node's
+  output to `target/container-logs/`, which CI uploads when the job fails; read
+  those logs first.
 - Run `cargo semver-checks --baseline-version <last release> --release-type
   minor` before a minor release. Only intentional, changelog-listed breaks may
   remain.

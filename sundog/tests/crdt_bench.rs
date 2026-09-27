@@ -159,41 +159,23 @@ fn micro_ops() -> u32 {
 // test binaries share nothing beyond `mod common`).
 // ---------------------------------------------------------------------
 
-/// Mirrors `replication_bench.rs`'s own copy: the only way, from outside the
-/// crate, to learn a gossip address before the node that binds it exists.
-async fn reserve_gossip_addr() -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind an ephemeral loopback udp port to reserve a gossip address");
-    socket
-        .local_addr()
-        .expect("a freshly bound udp socket reports a local address")
-}
-
 fn node_config(gossip_bind_addr: SocketAddr) -> ClusterConfig {
     common::fast_config().with(|c| {
         c.gossip_bind_addr = gossip_bind_addr;
     })
 }
 
-/// Builds `n` real, loopback-`Static`-discovery clusters that all seed each
-/// other, and waits until every one reports `n - 1` live peers.
+/// Builds `n` real, loopback-`Static`-discovery clusters, each seeding every
+/// node already built (gossip is bidirectional, so this converges to the
+/// same full mesh mutual seeding would), and waits until every one reports
+/// `n - 1` live peers.
 async fn peer_group(cluster_name: &str, n: usize) -> Vec<Cluster> {
-    let mut gossip_addrs = Vec::with_capacity(n);
-    for _ in 0..n {
-        gossip_addrs.push(reserve_gossip_addr().await);
-    }
-
-    let mut clusters = Vec::with_capacity(n);
-    for (i, &addr) in gossip_addrs.iter().enumerate() {
-        let seeds = gossip_addrs
-            .iter()
-            .enumerate()
-            .filter(|&(j, _)| j != i)
-            .map(|(_, &seed)| seed);
+    let mut clusters: Vec<Cluster> = Vec::with_capacity(n);
+    for i in 0..n {
+        let seeds: Vec<SocketAddr> = clusters.iter().map(Cluster::local_gossip_addr).collect();
         let cluster = Cluster::builder(cluster_name)
             .seeds(seeds)
-            .config(node_config(addr))
+            .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
             .build()
             .await
             .unwrap_or_else(|error| panic!("node {i} builds: {error}"));
@@ -1553,7 +1535,7 @@ async fn run_cold_join_decomposed_rep(keys: u32) -> ColdJoinRepMetrics {
     let started = Instant::now();
     let fourth = Cluster::builder(cluster_label)
         .seeds([seed_addr])
-        .config(node_config(reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("fourth node builds");
@@ -1640,7 +1622,7 @@ async fn run_cold_join_merged_rep(keys: u32) -> ColdJoinRepMetrics {
     let started = Instant::now();
     let fourth = Cluster::builder(cluster_label)
         .seeds([seed_addr])
-        .config(node_config(reserve_gossip_addr().await))
+        .config(node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
         .build()
         .await
         .expect("fourth node builds");
@@ -2743,21 +2725,15 @@ fn sketch_node_config(gossip_bind_addr: SocketAddr, min_bucket: usize) -> Cluste
 /// scenario's cluster answers a mismatch with an IBLT sketch rather than a
 /// listing once a bucket clears `min_bucket`.
 async fn sketch_peer_group(cluster_name: &str, n: usize, min_bucket: usize) -> Vec<Cluster> {
-    let mut gossip_addrs = Vec::with_capacity(n);
-    for _ in 0..n {
-        gossip_addrs.push(reserve_gossip_addr().await);
-    }
-
-    let mut clusters = Vec::with_capacity(n);
-    for (i, &addr) in gossip_addrs.iter().enumerate() {
-        let seeds = gossip_addrs
-            .iter()
-            .enumerate()
-            .filter(|&(j, _)| j != i)
-            .map(|(_, &seed)| seed);
+    let mut clusters: Vec<Cluster> = Vec::with_capacity(n);
+    for i in 0..n {
+        let seeds: Vec<SocketAddr> = clusters.iter().map(Cluster::local_gossip_addr).collect();
         let cluster = Cluster::builder(cluster_name)
             .seeds(seeds)
-            .config(sketch_node_config(addr, min_bucket))
+            .config(sketch_node_config(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                min_bucket,
+            ))
             .build()
             .await
             .unwrap_or_else(|error| panic!("node {i} builds: {error}"));
@@ -3145,13 +3121,14 @@ async fn run_churn_writer_round(
     round: u32,
     counters: u32,
 ) -> Cluster {
-    let writer_addr = reserve_gossip_addr().await;
     let writer_cluster = Cluster::builder(cluster_label)
         .node_id(writer_node_id)
         .seeds([observer_addr])
-        .config(node_config(writer_addr).with(|c| {
-            c.crdt_retire_after = CHURN_RETIRE_AFTER;
-        }))
+        .config(
+            node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).with(|c| {
+                c.crdt_retire_after = CHURN_RETIRE_AFTER;
+            }),
+        )
         .build()
         .await
         .unwrap_or_else(|error| panic!("writer round {round} builds: {error}"));
@@ -3221,15 +3198,17 @@ async fn run_crdt_compaction_churn() -> ChurnRepMetrics {
     let cluster_label = "bench-crdt-churn";
     let cache_name = "crdt-churn";
 
-    let observer_addr = reserve_gossip_addr().await;
     let observer = Cluster::builder(cluster_label)
         .seeds(std::iter::empty())
-        .config(node_config(observer_addr).with(|c| {
-            c.crdt_retire_after = CHURN_RETIRE_AFTER;
-        }))
+        .config(
+            node_config(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).with(|c| {
+                c.crdt_retire_after = CHURN_RETIRE_AFTER;
+            }),
+        )
         .build()
         .await
         .expect("observer node builds");
+    let observer_addr = observer.local_gossip_addr();
     let observer_cache = observer
         .cache::<u32, PnCounter>(cache_name)
         .mode(Mode::Replicated)

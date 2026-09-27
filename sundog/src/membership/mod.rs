@@ -91,6 +91,7 @@ enum Command {
     SetCacheMode(SmolStr, Mode),
     ClearCacheMode(SmolStr),
     Shutdown(oneshot::Sender<()>),
+    Crash(oneshot::Sender<()>),
 }
 
 /// A cheap-to-clone handle onto a running membership session. Cloning
@@ -255,6 +256,15 @@ impl Membership {
     pub async fn shutdown(self) {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.commands.send(Command::Shutdown(reply_tx)).is_ok() {
+            let _ = reply_rx.await;
+        }
+    }
+
+    /// Stops gossiping at once with no departure: peers find out through
+    /// the failure detector alone, as they would from a killed process.
+    pub async fn crash(self) {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.commands.send(Command::Crash(reply_tx)).is_ok() {
             let _ = reply_rx.await;
         }
     }
@@ -516,6 +526,18 @@ fn protocol_notice(peer_protocol: u16) -> Option<&'static str> {
     }
 }
 
+/// The cache modes `node_state` advertises, or none once it gossips a
+/// departure: a gracefully leaving node stops being eligible to own any
+/// `Mode::Distributed` cache the moment it announces, so ownership moves
+/// while the rest of the cluster still holds everything it did, instead of
+/// waiting for the failure detector to drop the node from the live set.
+fn advertised_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
+    if is_departing(node_state) {
+        return HashMap::new();
+    }
+    parse_cache_modes(node_state)
+}
+
 /// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
 /// map, logging and skipping any value that isn't a recognized [`Mode`] token.
 fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
@@ -656,7 +678,7 @@ async fn run(
                     {
                         tracing::warn!(peer = %peer.node, peer_protocol = peer.protocol, "{notice}");
                     }
-                    cache_modes.insert(peer.node, parse_cache_modes(state));
+                    cache_modes.insert(peer.node, advertised_cache_modes(state));
                     departing.insert(
                         peer.node,
                         LiveFlags {
@@ -702,6 +724,11 @@ async fn run(
                             tracing::warn!(%error, "chitchat shutdown reported an error");
                         }
                         tracing::info!("membership stopped");
+                        let _ = reply.send(());
+                        return;
+                    }
+                    Some(Command::Crash(reply)) => {
+                        handle.abort();
                         let _ = reply.send(());
                         return;
                     }
@@ -893,6 +920,21 @@ mod tests {
         let state = state_with(&[(DEPARTING_KEY, "1")]);
         assert!(is_departing(&state));
         assert!(!is_departing(&NodeState::for_test()));
+    }
+
+    #[test]
+    fn a_departing_node_advertises_no_cache_modes() {
+        let token = Mode::distributed().as_token();
+        let staying = state_with(&[(&cache_key("users"), token.as_ref())]);
+        assert_eq!(
+            advertised_cache_modes(&staying).get("users"),
+            Some(&Mode::distributed())
+        );
+        let leaving = state_with(&[(&cache_key("users"), token.as_ref()), (DEPARTING_KEY, "1")]);
+        assert!(
+            advertised_cache_modes(&leaving).is_empty(),
+            "a node that announced its departure owns nothing from then on"
+        );
     }
 
     #[tokio::test]
