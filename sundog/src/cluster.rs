@@ -4335,7 +4335,11 @@ mod tests {
         clippy::too_many_lines,
         reason = "one scripted three-node join-then-release scenario"
     )]
-    #[tokio::test]
+    // Multi-threaded: every node's grace expires in the same tick, and on
+    // one shared thread their hand-off rounds, each over about 22k parts,
+    // stall the others' gossip long enough for the failure detector to flap
+    // the view, which restarts the grace.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rebalance_moves_a_bucket_to_a_joiner_and_the_old_owner_releases_it_after_the_grace() {
         let config = rebalance_config();
         let owners = std::num::NonZeroU8::new(2).expect("nonzero");
