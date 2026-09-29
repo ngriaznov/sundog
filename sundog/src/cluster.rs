@@ -330,6 +330,16 @@ impl Cluster {
         self.inner.absence.clone()
     }
 
+    /// Every member absent for less than `bound`, current as of this call:
+    /// the tracker first takes membership's latest live set, so a caller
+    /// acting on an ownership view never reads the tracker behind the
+    /// absence that changed the view, whenever the tracking task runs.
+    pub(crate) fn absent_within(&self, bound: Duration) -> Vec<NodeId> {
+        let absence = self.absence_tracker();
+        absence.observe(&self.inner.membership.departing_flags().borrow());
+        absence.absent_within(bound)
+    }
+
     pub(crate) fn mesh(&self) -> &Mesh {
         &self.inner.mesh
     }
@@ -5645,11 +5655,16 @@ mod tests {
             .expect("node b builds");
         wait_for_peer_count(&cluster_a, 1).await;
 
+        let node_b = cluster_b.node_id();
         cluster_b.shutdown().await;
         wait_for_no_peers(&cluster_a).await;
         assert!(
             !cluster_a.absence_tracker().any_absent(hard_cap),
             "a graceful departure is never counted absent"
+        );
+        assert!(
+            !cluster_a.absent_within(hard_cap).contains(&node_b),
+            "absent_within never names a graceful leaver"
         );
 
         // Crash case: c's background tasks are cancelled and it is dropped
@@ -5664,9 +5679,18 @@ mod tests {
             .expect("node c builds");
         wait_for_peer_count(&cluster_a, 1).await;
 
+        let node_c = cluster_c.node_id();
         cluster_c.inner.cancel.cancel();
         drop(cluster_c);
         wait_for_no_peers(&cluster_a).await;
+        // The peers watch is published after the departing flags, so the
+        // moment `peers()` drops c, absent_within names it, however far
+        // behind the tracking task is.
+        assert_eq!(
+            cluster_a.absent_within(hard_cap),
+            vec![node_c],
+            "absent_within names the crashed node as soon as the peer list drops it"
+        );
         assert!(
             cluster_a.absence_tracker().any_absent(hard_cap),
             "a crash, with no graceful departure gossiped, is counted absent"

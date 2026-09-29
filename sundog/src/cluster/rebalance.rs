@@ -418,7 +418,7 @@ impl PullRequest<'_> {
         // warm_up_task's ordinary retries via Outcome::NoPeers.
         let alone: Vec<PartId> = no_donor.into_iter().flat_map(|(_, p)| p).collect();
         if !alone.is_empty() && trust_sole_owner {
-            let absent = cluster.absence_tracker().absent_within(budget);
+            let absent = cluster.absent_within(budget);
             residency.mark_serving(&sole_owned(&view, alone, &absent));
         }
         if groups.is_empty() {
@@ -992,7 +992,7 @@ pub(crate) async fn rebalance_task(
                     new_view
                         .owned_parts()
                         .filter(|&part| new_view.owners_of(part).len() == 1),
-                    &cluster.absence_tracker().absent_within(budget),
+                    &cluster.absent_within(budget),
                 );
                 if !alone.is_empty() {
                     residency.mark_serving(&alone);
@@ -1074,7 +1074,7 @@ pub(crate) async fn rebalance_task(
                         let serving = sole_owned(
                             &view,
                             held,
-                            &cluster.absence_tracker().absent_within(budget),
+                            &cluster.absent_within(budget),
                         );
                         if !serving.is_empty() {
                             residency.mark_serving(&serving);

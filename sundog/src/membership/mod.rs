@@ -225,7 +225,8 @@ impl Membership {
 
     /// The live peers, each with its [`LiveFlags`]; the absence tracker's
     /// only input, so a peer's last flags and its disappearance arrive
-    /// together.
+    /// together. Published before the peers and cache modes of the same
+    /// membership change.
     pub(crate) fn departing_flags(&self) -> watch::Receiver<HashMap<NodeId, LiveFlags>> {
         self.departing.clone()
     }
@@ -688,8 +689,11 @@ async fn run(
                     peers.push(peer);
                 }
                 tracing::debug!(count = peers.len(), "membership view updated");
-                let _ = cache_modes_tx.send(cache_modes);
+                // Departing flags first: an ownership view built from the
+                // new peers or modes then never runs ahead of the live set
+                // `Cluster::absent_within` reads.
                 let _ = departing_tx.send(departing);
+                let _ = cache_modes_tx.send(cache_modes);
                 let _ = peers_tx.send(peers);
             }
             command = commands_rx.recv() => {
