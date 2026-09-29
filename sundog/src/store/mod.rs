@@ -1351,17 +1351,30 @@ fn drain_due_deadlines<K>(by_deadline: &mut BTreeMap<(u64, u64), K>, now_ms: u64
 /// rounded up from 25 for headroom.
 const HLC_ENCODED_MAX: usize = 32;
 
+/// Bytes of [`entry_fingerprint`]'s stack buffer, which holds a key and its
+/// encoded version up to this length together.
+const FINGERPRINT_STACK_BYTES: usize = 128;
+
 /// `xxh3(key_bytes ‖ postcard(ver))`, the digest contribution of one live entry
-/// or tombstone. Encodes `ver` into a stack buffer, not a heap `Vec`, since
-/// this runs on every apply.
+/// or tombstone. Runs on every apply, so the key and the encoded `ver` join in
+/// a stack buffer; only a key too long for it joins in a heap `Vec`. Both
+/// paths hash the same bytes.
 fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
+    let mut buf = [0u8; FINGERPRINT_STACK_BYTES];
+    if let Some(key_slot) = buf.get_mut(..key_bytes.len()) {
+        key_slot.copy_from_slice(key_bytes);
+        if let Ok(ver_bytes) = postcard::to_slice(&ver, &mut buf[key_bytes.len()..]) {
+            let len = key_bytes.len() + ver_bytes.len();
+            return xxh3_64(&buf[..len]);
+        }
+    }
     let mut ver_buf = [0u8; HLC_ENCODED_MAX];
     let ver_bytes = postcard::to_slice(&ver, &mut ver_buf)
         .expect("invariant: Hlc always postcard-encodes within HLC_ENCODED_MAX bytes");
-    let mut buf = Vec::with_capacity(key_bytes.len() + ver_bytes.len());
-    buf.extend_from_slice(key_bytes);
-    buf.extend_from_slice(ver_bytes);
-    xxh3_64(&buf)
+    let mut joined = Vec::with_capacity(key_bytes.len() + ver_bytes.len());
+    joined.extend_from_slice(key_bytes);
+    joined.extend_from_slice(ver_bytes);
+    xxh3_64(&joined)
 }
 
 /// The version a compacted record takes: the stale version's own successor
@@ -4994,6 +5007,56 @@ mod tests {
             logical: 0,
             node: NodeId::from(node),
         }
+    }
+
+    /// `xxh3(key_bytes ‖ postcard(ver))` spelled out, the definition
+    /// [`entry_fingerprint`] computes.
+    fn fingerprint_by_definition(key_bytes: &[u8], ver: Hlc) -> u64 {
+        let mut joined = key_bytes.to_vec();
+        joined.extend_from_slice(&postcard::to_stdvec(&ver).expect("an Hlc encodes"));
+        xxh3_64(&joined)
+    }
+
+    #[test]
+    fn entry_fingerprint_hashes_key_and_version_on_either_side_of_the_stack_buffer() {
+        let widest = Hlc {
+            wall_ms: u64::MAX,
+            logical: u32::MAX,
+            node: NodeId::from(u64::MAX),
+        };
+        let widest_len = postcard::to_stdvec(&widest).expect("an Hlc encodes").len();
+        let edge = FINGERPRINT_STACK_BYTES - widest_len;
+        for ver in [hlc(0, 0), hlc(1_727_000_000_000, 7), widest] {
+            for len in [
+                0,
+                1,
+                16,
+                edge - 1,
+                edge,
+                edge + 1,
+                FINGERPRINT_STACK_BYTES,
+                300,
+            ] {
+                let key: Vec<u8> = (0..len)
+                    .map(|i| u8::try_from(i % 251).expect("below 251"))
+                    .collect();
+                assert_eq!(
+                    entry_fingerprint(&key, ver),
+                    fingerprint_by_definition(&key, ver),
+                    "a {len}-byte key at {ver:?}"
+                );
+            }
+        }
+    }
+
+    /// Nodes compare digests built from these fingerprints, so the value is
+    /// part of the protocol: pinned against the one release N-1 computes.
+    #[test]
+    fn entry_fingerprint_keeps_its_value_across_releases() {
+        assert_eq!(
+            entry_fingerprint(b"key-000000000042", hlc(1_727_000_000_000, 7)),
+            16_473_212_977_212_482_666
+        );
     }
 
     /// A wall clock one second ahead of the real one: newer than anything a

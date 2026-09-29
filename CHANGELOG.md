@@ -15,6 +15,12 @@ All notable changes to this project are documented in this file. Format follows
   points at that region, generation and offset. Rotation stays in RAM and
   cannot fail. Measured live heap per spilled entry, 16-byte key, 1M
   entries: 186 bytes before, 131 after. No wire or on-disk change.
+- **A write's digest update no longer allocates.** The fingerprint each
+  apply folds into its part's digest joins the key and the encoded version
+  in a 128-byte stack buffer; only a longer pair joins on the heap. The
+  hashed bytes, and so every digest, are unchanged: 12 ns per fingerprint
+  for a 16-byte key where the heap join took 19, and an overwrite takes
+  two.
 
 ### Fixed
 
