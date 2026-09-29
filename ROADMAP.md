@@ -51,16 +51,6 @@ backlog is, or how much of the spill tier is used reads a metric or
 nothing. `Health` grows a per-cache ownership summary, the backlog depth and
 the spill tier's bytes and entries, from state the crate already tracks.
 
-### Drop the spill reverse index
-
-Every spilled entry keeps its key twice in RAM: the key half of its record on
-the entry, and a second copy in the region's reverse index, held so a region
-rotating out can purge the keys still pointing into it. The on-disk record
-header already stores the key, so reclaim can read the region's headers
-sequentially instead, one 64 MB scan off the hot path. For a 16-byte key
-that is 157 bytes of RAM per spilled entry today against about 85 without
-the index.
-
 ## Reach
 
 ### A RESP-speaking server

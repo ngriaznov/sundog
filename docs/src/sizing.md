@@ -94,10 +94,10 @@ resident set measures 212, for a 16-byte key and a 100-byte value.
 
 With the `spill` feature, a cache's `max_capacity` bounds RAM and entries
 past it move to a ring of region files on local disk. Only the value moves.
-A spilled entry keeps its slot and index entry in RAM, and its key twice:
-once in the slot and once in the index of the region that holds its
-value. A read of a spilled entry reads the value back and promotes the
-entry into RAM.
+A spilled entry keeps its slot, its index entry and its key in RAM, plus
+a 16-byte row in the reverse index of the region that holds its value. A
+read of a spilled entry reads the value back and promotes the entry into
+RAM.
 
 `SpillConfig::new(dir, capacity_bytes)` bounds the disk, and
 `capacity_bytes` must hold at least two regions of `region_bytes`, 64 MiB

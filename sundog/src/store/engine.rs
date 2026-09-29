@@ -58,7 +58,8 @@ use super::part::PartSet;
 pub(crate) use super::spill::Reservation;
 #[cfg(feature = "spill")]
 use super::spill::{
-    Admission, SpillJob, SpillLoc, SpillSink, SpillTier, spill_record_len, spilled_is_current,
+    Admission, ReclaimRef, SpillJob, SpillLoc, SpillSink, SpillTier, spill_record_len,
+    spilled_is_current,
 };
 use super::{
     BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
@@ -903,7 +904,14 @@ where
     F: Fn(&Live<K, V>) -> u64,
 {
     /// A reference to this slot's entry.
-    #[cfg_attr(not(any(test, feature = "spill")), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "every production read site goes through Slab::find; kept for symmetry \
+                      with SlabOccupiedEntry::get_mut and hashbrown's own OccupiedEntry API"
+        )
+    )]
     fn get(&self) -> &Live<K, V> {
         &self.slab.entries[self.slot]
     }
@@ -4882,32 +4890,36 @@ where
         }
     }
 
-    fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize {
+    fn reclaim(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> usize {
         let mut removed = 0usize;
-        for (stripe_idx, key_bytes) in keys {
-            let hash = hash_key_bytes(key_bytes.as_ref());
-            let bucket = *stripe_idx;
+        for row in rows {
+            let bucket = usize::from(row.stripe);
             let removed_this = {
                 let mut stripe = self.stripes[bucket].write();
+                // Location identifies the entry: one record occupies one
+                // offset of one region generation, so no key compare is
+                // needed, and an entry since overwritten, promoted or
+                // spilled again elsewhere no longer matches.
                 let SlabEntry::Occupied(occ) = stripe.live.entry(
-                    hash,
-                    |l| record_key(&l.record) == key_bytes.as_ref(),
+                    row.hash,
+                    |l| {
+                        matches!(
+                            &l.state,
+                            EntryState::Spilled(loc) if loc.region == region
+                                && loc.generation == generation
+                                && loc.offset == row.offset
+                        )
+                    },
                     hasher_for,
                 ) else {
                     continue;
                 };
-                let still_points_here = matches!(
-                    &occ.get().state,
-                    EntryState::Spilled(loc) if loc.region == region && loc.generation == generation
-                );
-                if !still_points_here {
-                    continue;
-                }
                 let (removed_entry, _vacant) = occ.remove();
-                stripe.long_ttl.remove(key_bytes.as_ref());
-                let part = part_index_from_hash(hash);
+                let key_bytes = record_key(&removed_entry.record);
+                stripe.long_ttl.remove(key_bytes);
+                let part = part_index_from_hash(row.hash);
                 self.digest[digest_slot(bucket, part)].fetch_xor(
-                    entry_fingerprint(record_key(&removed_entry.record), removed_entry.ver()),
+                    entry_fingerprint(key_bytes, removed_entry.ver()),
                     Ordering::Relaxed,
                 );
                 true
@@ -8502,7 +8514,7 @@ mod tests {
     #[cfg(feature = "spill")]
     mod spill_payload {
         use super::*;
-        use crate::store::spill::SpillSink;
+        use crate::store::spill::{ReclaimRef, SpillSink};
         #[cfg(not(feature = "sim"))]
         use crate::store::spill::{SpillConfig, SpillTier};
 
@@ -8927,7 +8939,7 @@ mod tests {
             let bucket = stripe_index_from_hash(hash);
             engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(3, 0, 10, 0), 0);
 
-            let removed = SpillSink::reclaim(&engine, 3, 0, &[(bucket, kb.clone())]);
+            let removed = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(bucket, hash, 0)]);
             assert_eq!(
                 removed, 1,
                 "the key's pointer still names this exact region and generation"
@@ -8955,7 +8967,7 @@ mod tests {
                 "a long TTL spilled entry leaves its absolute deadline in the side table"
             );
 
-            let removed = SpillSink::reclaim(&engine, 3, 0, &[(bucket, kb.clone())]);
+            let removed = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(bucket, hash, 0)]);
             assert_eq!(
                 removed, 1,
                 "the key's pointer still names this exact region and generation"
@@ -8988,13 +9000,46 @@ mod tests {
             ));
 
             let digest_before = engine.digests();
-            let removed = SpillSink::reclaim(&engine, 3, 0, &[(bucket, kb.clone())]);
+            let removed = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(bucket, hash, 0)]);
             assert_eq!(
                 removed, 0,
                 "a key promoted back to resident survives its old region's reclaim"
             );
             assert_eq!(engine.get(&key, 0), Some("restored".to_string()));
             assert_eq!(engine.digests(), digest_before);
+        }
+
+        /// Location, not the key hash, decides what a reclaim removes: a row
+        /// naming another offset of the same region and generation leaves
+        /// the entry alone, and a row naming another stripe removes
+        /// nothing.
+        #[test]
+        fn region_reclaim_removes_only_the_entry_at_the_listed_offset() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let key = 1u32;
+            let kb = key_bytes(key);
+            let hash = hash_key_bytes(kb.as_ref());
+            let bucket = stripe_index_from_hash(hash);
+            engine.debug_insert_spilled(&kb, hlc(1, 1), None, loc(3, 40, 10, 0), 0);
+
+            let elsewhere = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(bucket, hash, 0)]);
+            assert_eq!(
+                elsewhere, 0,
+                "a row for offset 0 leaves the entry that now sits at offset 40"
+            );
+            let other_stripe = (bucket + 1) % crate::store::BUCKET_COUNT;
+            let unknown =
+                SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(other_stripe, hash, 40)]);
+            assert_eq!(unknown, 0, "a row naming another stripe removes nothing");
+            assert_eq!(
+                engine.spilled_loc(kb.as_ref(), hash, 0).map(|(_, at)| at),
+                Some(loc(3, 40, 10, 0)),
+                "the entry still points at offset 40"
+            );
+
+            let here = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(bucket, hash, 40)]);
+            assert_eq!(here, 1, "the row naming the entry's own offset removes it");
+            assert_eq!(engine.get(&key, 0), None);
         }
 
         #[test]
@@ -9015,7 +9060,7 @@ mod tests {
                 0,
             );
 
-            let removed = SpillSink::reclaim(&engine, 3, 0, &[(bucket, kb.clone())]);
+            let removed = SpillSink::reclaim(&engine, 3, 0, &[ReclaimRef::new(bucket, hash, 0)]);
             assert_eq!(
                 removed, 0,
                 "an overwritten key's stale reverse-index row is left alone"

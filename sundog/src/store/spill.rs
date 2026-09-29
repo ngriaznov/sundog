@@ -307,6 +307,40 @@ pub(crate) struct SpillLoc {
     pub(crate) generation: u32,
 }
 
+/// One row of a region's reverse index: an entry written into the region,
+/// which the region's reclaim purges if the entry still points there. The
+/// entry is found by `hash` in stripe `stripe` and confirmed by its
+/// location, the region and generation being reclaimed plus `offset`, so
+/// the row carries no copy of the key: 16 bytes, where a `(usize, Bytes)`
+/// row is 40 bytes plus a heap allocation holding the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReclaimRef {
+    /// The entry's key hash, as its stripe's index hashes it.
+    pub(crate) hash: u64,
+    /// The record's offset within its region.
+    pub(crate) offset: u32,
+    /// The entry's stripe.
+    pub(crate) stripe: u16,
+}
+
+impl ReclaimRef {
+    /// The row for an entry of stripe `stripe_idx`, hashed `hash`, whose
+    /// record sits at `offset`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stripe_idx` does not fit in `u16`: a stripe index is
+    /// always below [`BUCKET_COUNT`](crate::store::BUCKET_COUNT).
+    pub(crate) fn new(stripe_idx: usize, hash: u64, offset: u32) -> Self {
+        Self {
+            hash,
+            offset,
+            stripe: u16::try_from(stripe_idx)
+                .expect("invariant: a stripe index is below BUCKET_COUNT and fits in u16"),
+        }
+    }
+}
+
 /// What `Engine::evict_*_sampled` hands the flusher: everything needed to
 /// write the record and, later, to install it back into the right stripe.
 pub(crate) struct SpillJob {
@@ -381,11 +415,11 @@ pub(crate) trait SpillSink: Send + Sync + 'static {
     ) -> bool;
 
     /// `region` at `generation` is about to be reused. Under each stripe
-    /// write lock, remove every listed key whose payload is still
+    /// write lock, remove every listed entry whose payload is still
     /// `Spilled(loc)` with `loc.region == region && loc.generation ==
-    /// generation`, XOR its fingerprint out of the digest, and decrement
-    /// `live_count`. Returns the count removed.
-    fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize;
+    /// generation && loc.offset == row.offset`, XOR its fingerprint out of
+    /// the digest, and decrement `live_count`. Returns the count removed.
+    fn reclaim(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> usize;
 
     /// A queued job for `key_bytes` is never installed: its region write
     /// fails, or the tier stops accepting jobs while this one is still
@@ -579,9 +613,9 @@ pub(crate) fn spilled_is_current(
 
 /// Per-region mutable state: the pre-opened file handle, one syscall per
 /// read/write with no `open()` on the hot path, the write cursor, the
-/// generation, and the reverse index of keys currently pointing into this
-/// region. That index is populated on every install that returns `true`,
-/// and drained whenever this region is reclaimed.
+/// generation, and the reverse index of entries written into this region.
+/// That index is populated on every install that returns `true`, and
+/// drained whenever this region is reclaimed.
 struct RegionState {
     file: File,
     write_cursor: AtomicU32,
@@ -589,7 +623,7 @@ struct RegionState {
     /// Bytes this region currently contributes to `Inner::bytes_used`.
     /// Reset to 0, and subtracted from the tier total, on reclaim.
     used_bytes: AtomicU64,
-    reverse_index: Mutex<Vec<(usize, Bytes)>>,
+    reverse_index: Mutex<Vec<ReclaimRef>>,
 }
 
 /// State shared between [`SpillTier`] and its flusher thread via `Arc`.
@@ -1687,7 +1721,7 @@ fn validate_snapshot_entries(
 /// used-byte total, the overall accepted count and the distinct parts it
 /// came from, plus a per-reason breakdown of everything dropped instead.
 struct InstalledRecords {
-    reverse_index_by_region: Vec<Vec<(usize, Bytes)>>,
+    reverse_index_by_region: Vec<Vec<ReclaimRef>>,
     used_bytes_by_region: Vec<u64>,
     records_installed: u64,
     parts_installed: HashSet<crate::store::PartId>,
@@ -1711,7 +1745,7 @@ fn install_snapshot_entries(
     now_ms: u64,
     owned: impl Fn(crate::store::PartId) -> bool,
 ) -> InstalledRecords {
-    let mut reverse_index_by_region: Vec<Vec<(usize, Bytes)>> =
+    let mut reverse_index_by_region: Vec<Vec<ReclaimRef>> =
         (0..region_count).map(|_| Vec::new()).collect();
     let mut used_bytes_by_region = vec![0u64; region_count as usize];
     let mut records_installed = 0u64;
@@ -1748,7 +1782,11 @@ fn install_snapshot_entries(
             parts_installed.insert(part);
             let region_idx = entry.loc.region as usize;
             used_bytes_by_region[region_idx] += u64::from(entry.loc.len);
-            reverse_index_by_region[region_idx].push((stripe_idx, entry.key));
+            reverse_index_by_region[region_idx].push(ReclaimRef::new(
+                stripe_idx,
+                hash,
+                entry.loc.offset,
+            ));
         } else {
             refused_present += 1;
         }
@@ -2429,7 +2467,7 @@ fn write_segment(
         if sink.install(stripe_idx, &key_bytes, hash, ver, loc, weight) {
             installed_count += 1;
             installed_bytes += u64::from(loc.len);
-            newly_indexed.push((stripe_idx, key_bytes));
+            newly_indexed.push(ReclaimRef::new(stripe_idx, hash, loc.offset));
         } else {
             inner.record_dropped("obsolete");
         }
@@ -2444,7 +2482,7 @@ fn write_segment(
 }
 
 /// Reclaims `next_region_index(current, region_count)`, the next region due
-/// for reuse: walks its reverse index, hands every listed key to
+/// for reuse: walks its reverse index, hands every listed entry to
 /// `sink.reclaim` *before* bumping the generation or resetting the cursor.
 /// Only a key whose pointer, at that moment, still names this
 /// region/generation is gone. Then makes it the new active region.
@@ -2456,8 +2494,8 @@ fn rotate(inner: &Inner, sink: &dyn SpillSink, current: u32) -> u32 {
     let region = &inner.regions[next as usize];
 
     let generation = region.generation.load(Ordering::Acquire);
-    let keys = std::mem::take(&mut *region.reverse_index.lock());
-    let _purged = sink.reclaim(next, generation, &keys);
+    let rows = std::mem::take(&mut *region.reverse_index.lock());
+    let _purged = sink.reclaim(next, generation, &rows);
 
     let freed = region.used_bytes.swap(0, Ordering::AcqRel);
     inner.bytes_used.fetch_sub(freed, Ordering::AcqRel);
@@ -2515,6 +2553,14 @@ mod tests {
     use super::*;
 
     // --- Pure functions: no I/O, no tokio, safe under every feature combo. ---
+
+    #[test]
+    fn a_reclaim_row_is_sixteen_bytes_and_keeps_its_stripe() {
+        assert_eq!(size_of::<ReclaimRef>(), 16);
+        let row = ReclaimRef::new(crate::store::BUCKET_COUNT - 1, 0xDEAD_BEEF, 4096);
+        assert_eq!(usize::from(row.stripe), crate::store::BUCKET_COUNT - 1);
+        assert_eq!((row.hash, row.offset), (0xDEAD_BEEF, 4096));
+    }
 
     #[test]
     fn region_count_for_returns_at_least_one_region() {
@@ -2903,8 +2949,8 @@ mod tests {
         const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
         /// One `reclaim` call: the region and generation being reused, and
-        /// the `(stripe_idx, key_bytes)` pairs to purge.
-        type ReclaimCall = (u32, u32, Vec<(usize, Bytes)>);
+        /// the reverse-index rows to purge.
+        type ReclaimCall = (u32, u32, Vec<ReclaimRef>);
 
         /// One `install_new` call: `install`'s fields plus `expires_at_ms`.
         type InstallNewCall = (usize, Bytes, Hlc, Option<u64>, SpillLoc);
@@ -2929,6 +2975,25 @@ mod tests {
 
             fn abandon_count(&self) -> usize {
                 self.abandons.lock().unwrap().len()
+            }
+
+            /// The keys this sink installed at the locations `rows` name in
+            /// `region` at `generation`, sorted.
+            fn keys_at(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> Vec<String> {
+                let installed = self.installs.lock().unwrap();
+                let mut keys: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        installed.iter().find(|(_, _, _, loc)| {
+                            loc.region == region
+                                && loc.generation == generation
+                                && loc.offset == row.offset
+                        })
+                    })
+                    .map(|(_, key, _, _)| String::from_utf8(key.to_vec()).unwrap())
+                    .collect();
+                keys.sort();
+                keys
             }
         }
 
@@ -2980,23 +3045,19 @@ mod tests {
                 true
             }
 
-            fn reclaim(&self, region: u32, generation: u32, keys: &[(usize, Bytes)]) -> usize {
+            fn reclaim(&self, region: u32, generation: u32, rows: &[ReclaimRef]) -> usize {
                 self.reclaims
                     .lock()
                     .unwrap()
-                    .push((region, generation, keys.to_vec()));
+                    .push((region, generation, rows.to_vec()));
                 let mut live = self.live.lock().unwrap();
-                let mut removed = 0;
-                for (_, key) in keys {
-                    if let Some((_, loc)) = live.get(key)
-                        && loc.region == region
+                let before = live.len();
+                live.retain(|_, (_, loc)| {
+                    !(loc.region == region
                         && loc.generation == generation
-                    {
-                        live.remove(key);
-                        removed += 1;
-                    }
-                }
-                removed
+                        && rows.iter().any(|row| row.offset == loc.offset))
+                });
+                before - live.len()
             }
 
             fn abandon(
@@ -3155,15 +3216,13 @@ mod tests {
                 == 2));
 
             let reclaims = sink.reclaims.lock().unwrap();
-            let (region, generation, keys) = &reclaims[1];
+            let (region, generation, rows) = &reclaims[1];
             assert_eq!(*region, 0);
             assert_eq!(*generation, 0);
-            let mut key_strings: Vec<String> = keys
-                .iter()
-                .map(|(_, k)| String::from_utf8(k.to_vec()).unwrap())
-                .collect();
-            key_strings.sort();
-            assert_eq!(key_strings, vec!["key-00", "key-01"]);
+            assert_eq!(
+                sink.keys_at(*region, *generation, rows),
+                vec!["key-00", "key-01"]
+            );
 
             let _ = fs::remove_dir_all(&dir);
         }
@@ -3262,10 +3321,13 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|(region, generation, keys)| {
+                    .any(|(region, generation, rows)| {
                         *region == 0
                             && *generation == 0
-                            && keys.iter().any(|(_, k)| k.as_ref() == b"old-0")
+                            && sink
+                                .keys_at(*region, *generation, rows)
+                                .iter()
+                                .any(|key| key == "old-0")
                     });
             assert!(
                 reclaimed_old,
@@ -4805,7 +4867,7 @@ mod tests {
                 false
             }
 
-            fn reclaim(&self, _: u32, _: u32, _: &[(usize, Bytes)]) -> usize {
+            fn reclaim(&self, _: u32, _: u32, _: &[ReclaimRef]) -> usize {
                 0
             }
 

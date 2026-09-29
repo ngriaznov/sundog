@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A spilled entry holds 55 bytes less RAM.** A spill region's reverse
+  index, which lists the entries whose values the region holds so its
+  reclaim can drop them, keeps a 16-byte row per entry: the key's hash, its
+  stripe and the record's offset. It no longer keeps a copy of the key.
+  Reclaim finds each entry by hash and removes it only while it still
+  points at that region, generation and offset. Rotation stays in RAM and
+  cannot fail. Measured live heap per spilled entry, 16-byte key, 1M
+  entries: 186 bytes before, 131 after. No wire or on-disk change.
+
 ### Fixed
 
 - **A `Distributed` node that only seems alone no longer answers a miss
