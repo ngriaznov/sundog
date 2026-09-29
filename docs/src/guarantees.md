@@ -123,7 +123,13 @@ back, the copy is dropped when the grace ends, and once every view agrees
 the key reads its current value. sundog keeps answering here rather than
 failing reads until membership settles. A part a node has just gained, or regained after losing it,
 counts as cold until its pull lands, so the node asks the other owners
-rather than answering a miss from an incomplete copy. A regained part whose
+rather than answering a miss from an incomplete copy. The same holds when
+the failure detector drops a key's other owners and leaves a node owning its
+part alone: an owner dropped that way can be stalled or across a partition
+and still hold the key, so the part stays cold and the node answers
+`FetchUnavailable` for up to `state_transfer_budget`, 20 seconds by default.
+An owner back within that bound hands the part over as a join does; past
+it, the node treats the owners as gone and serves what it holds. A regained part whose
 old copy is still here does not answer a hit locally either, since writes
 and deletes went to the other owners while the node did not own it. `get` reads only this node's
 copy and makes none of these promises off an owner that is still pulling.

@@ -1280,7 +1280,11 @@ where
     /// them answers from a warm copy it returns
     /// [`CacheError::FetchUnavailable`] rather than a miss it cannot vouch
     /// for, since the part's previous owner can still hold the record
-    /// through its disown grace. While ownership moves, a hit can be stale:
+    /// through its disown grace. A part this node owns alone because the
+    /// failure detector dropped its other owners stays cold the same way,
+    /// for up to [`ClusterConfig::state_transfer_budget`], since an owner
+    /// dropped that way can be stalled or across a partition and still hold
+    /// the key. While ownership moves, a hit can be stale:
     /// a node this node's view still lists as an owner may already have
     /// given the part up, and its copy lacks the writes and deletes made
     /// since. Once the views agree the key reads its current value. On a

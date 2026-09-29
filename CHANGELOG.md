@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A `Distributed` node that only seems alone no longer answers a miss
+  for a key its co-owners hold.** When the failure detector dropped every
+  other owner of a part, the node owned it alone, found nobody to pull
+  from and served it at once, so `fetch` answered `Ok(None)` for every key
+  those owners held. A node is dropped that way when it stalls past the
+  detector's threshold or sits across a partition, not only when it
+  crashes. A part owned alone now stays cold while a member the detector
+  dropped, without a graceful departure, would co-own it once eligible
+  again: `fetch` answers `FetchUnavailable` there, the returning owner
+  hands the part over as a join does, and after
+  `ClusterConfig::state_transfer_budget`, the bound a pull already waits
+  for a donor, the part serves what the node holds. No wire change.
+
 ## [0.6.2] – 2026-09-27
 
 ### Added

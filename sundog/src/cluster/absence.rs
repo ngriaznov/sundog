@@ -164,6 +164,25 @@ impl AbsenceTracker {
             .collect()
     }
 
+    /// Every member absent for less than `bound`: dropped out of the live set
+    /// without a graceful departure and not back since. A read only: unlike
+    /// [`AbsenceTracker::holding_gc`] it ages nothing out, so a shorter
+    /// `bound` here never shortens tombstone retention.
+    pub(crate) fn absent_within(&self, bound: Duration) -> Vec<NodeId> {
+        let state = self.state();
+        let now = Instant::now();
+        state
+            .members
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .absent_since
+                    .is_some_and(|since| now.saturating_duration_since(since) < bound)
+            })
+            .map(|(&node, _)| node)
+            .collect()
+    }
+
     /// Every member gone at least `retire_after`, crashed or graceful: the
     /// members whose writer incarnations the CRDT sweep may retire. Reads
     /// the never-pruned `gone_since` field, so unlike
@@ -673,6 +692,35 @@ mod tests {
                 .holding_gc(HOUR, Duration::from_millis(1))
                 .is_empty(),
             "once settled it no longer does"
+        );
+    }
+
+    #[test]
+    fn absent_within_names_a_crashed_member_until_the_bound_and_prunes_nothing() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false), (2, true), (3, false)]));
+        tracker.observe(&live(&[(3, false)]));
+
+        assert_eq!(
+            tracker.absent_within(HOUR),
+            vec![NodeId::from(1)],
+            "the crashed member is absent; the graceful leaver and the live one are not"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            tracker.absent_within(Duration::from_millis(1)).is_empty(),
+            "past the bound it is no longer named"
+        );
+        assert_eq!(
+            tracker.holding_gc(HOUR, HOUR),
+            vec![NodeId::from(1)],
+            "a short bound here leaves tombstone retention untouched"
+        );
+
+        tracker.observe(&live(&[(1, false), (3, false)]));
+        assert!(
+            tracker.absent_within(HOUR).is_empty(),
+            "a member back in the live set is not absent"
         );
     }
 

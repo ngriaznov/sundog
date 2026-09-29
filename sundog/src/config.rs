@@ -154,9 +154,13 @@ pub struct ClusterConfig {
     /// warm with what landed. Zero is honored: `open()` skips the transfer
     /// entirely and the cache is warm with what it has. A warm reopen's
     /// reconciliation loop (see [`reconcile_byte_budget`](Self::reconcile_byte_budget))
-    /// also runs on this bound.
+    /// also runs on this bound, and so does the wait of a
+    /// [`Mode::Distributed`] part this node owns alone because the failure
+    /// detector dropped its other owners: the part stays cold until they
+    /// return or this long has passed, then serves what this node holds.
     ///
     /// [`Mode::Replicated`]: crate::Mode::Replicated
+    /// [`Mode::Distributed`]: crate::Mode::Distributed
     pub state_transfer_budget: Duration,
     /// Bucket size past which an anti-entropy responder answers a mismatch
     /// with its 64 part digests instead of a listing or sketch, narrowing

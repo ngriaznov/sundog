@@ -407,14 +407,20 @@ impl OwnershipView {
     /// owners with everyone back. Nodes already eligible change nothing.
     #[must_use]
     pub(crate) fn co_owners_with(&self, returning: &[NodeId]) -> Vec<NodeId> {
+        self.widened(returning)
+            .map_or_else(|| self.co_owners.clone(), |view| view.co_owners)
+    }
+
+    /// This view with every node in `returning` eligible again alongside its
+    /// own, or `None` when each of them already is.
+    #[must_use]
+    pub(crate) fn widened(&self, returning: &[NodeId]) -> Option<Self> {
         let mut eligible = self.eligible.clone();
         eligible.extend_from_slice(returning);
         eligible.sort_unstable();
         eligible.dedup();
-        if eligible.len() == self.eligible.len() {
-            return self.co_owners.clone();
-        }
-        self.successor(eligible, self.k, self.granularity).co_owners
+        (eligible.len() != self.eligible.len())
+            .then(|| self.successor(eligible, self.k, self.granularity))
     }
 
     /// Every part `self_node` owns, ascending by [`PartId::index`].

@@ -186,6 +186,12 @@ impl PartSet {
         self.len
     }
 
+    /// Whether the set holds no part.
+    #[must_use]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Removes every part.
     pub(crate) fn clear(&mut self) {
         self.bits.fill(0);
@@ -365,12 +371,14 @@ mod tests {
     fn part_set_tracks_membership_length_and_order() {
         let mut set = PartSet::new();
         assert_eq!(set.len(), 0);
+        assert!(set.is_empty());
         let a = PartId::new(3, 1);
         let b = PartId::new(1000, 63);
         assert!(set.insert(b));
         assert!(set.insert(a));
         assert!(!set.insert(a), "a second insert is not fresh");
         assert_eq!(set.len(), 2);
+        assert!(!set.is_empty());
         assert!(set.contains(a) && set.contains(b));
         assert!(!set.contains(PartId::new(3, 2)));
         let order: Vec<PartId> = set.iter().collect();
@@ -384,6 +392,7 @@ mod tests {
         assert_eq!(set.len(), 1);
         set.clear();
         assert_eq!(set.len(), 0);
+        assert!(set.is_empty());
         assert_eq!(set.iter().count(), 0);
     }
 

@@ -30,6 +30,32 @@ use crate::store::{PartId, ShardOps};
 /// they all co-own.
 type DonorGroup = (Vec<NodeId>, Vec<PartId>);
 
+/// The parts of `alone`, each owned by this node alone under `view`, that no
+/// member of `absent` would co-own once eligible again: nobody else holds a
+/// copy, so each serves as it stands. A part an absent member would co-own
+/// stays cold. The failure detector drops a node that is stalled or on the
+/// far side of a partition as readily as one that crashed, and such a node
+/// still holds every key of the part, so a local miss here would answer
+/// `None` for a key it holds.
+pub(crate) fn sole_owned(
+    view: &OwnershipView,
+    alone: impl IntoIterator<Item = PartId>,
+    absent: &[NodeId],
+) -> Vec<PartId> {
+    let Some(widened) = view.widened(absent) else {
+        return alone.into_iter().collect();
+    };
+    alone
+        .into_iter()
+        .filter(|&part| {
+            !widened
+                .owners_of(part)
+                .iter()
+                .any(|owner| absent.contains(owner))
+        })
+        .collect()
+}
+
 /// Groups `parts` by exact donor set (`view`'s live owners minus self, in
 /// rendezvous order), so parts sharing a donor set land in one `StBuckets`
 /// round trip; the part-scoped analogue of `cluster::group_by_owner_set`.
@@ -392,7 +418,8 @@ impl PullRequest<'_> {
         // warm_up_task's ordinary retries via Outcome::NoPeers.
         let alone: Vec<PartId> = no_donor.into_iter().flat_map(|(_, p)| p).collect();
         if !alone.is_empty() && trust_sole_owner {
-            residency.mark_serving(&alone);
+            let absent = cluster.absence_tracker().absent_within(budget);
+            residency.mark_serving(&sole_owned(&view, alone, &absent));
         }
         if groups.is_empty() {
             tracing::debug!(cache = %cache, "no live co-owner for any gained part; nothing to pull");
@@ -957,11 +984,16 @@ pub(crate) async fn rebalance_task(
                     "ownership view changed"
                 );
                 // A part owned alone has nobody to pull from or verify a
-                // record against, so it is neither cold nor unverified.
-                let alone: Vec<PartId> = new_view
-                    .owned_parts()
-                    .filter(|&part| new_view.owners_of(part).len() == 1)
-                    .collect();
+                // record against, so it is neither cold nor unverified,
+                // unless a member the failure detector dropped would co-own
+                // it: see `sole_owned`.
+                let alone = sole_owned(
+                    &new_view,
+                    new_view
+                        .owned_parts()
+                        .filter(|&part| new_view.owners_of(part).len() == 1),
+                    &cluster.absence_tracker().absent_within(budget),
+                );
                 if !alone.is_empty() {
                     residency.mark_serving(&alone);
                 }
@@ -1029,6 +1061,29 @@ pub(crate) async fn rebalance_task(
                 }
             }
             _ = ticker.tick() => {
+                // A part held cold for an absent co-owner serves once that
+                // absence outlasts `budget`, the same bound a pull waits for
+                // a donor, or is pulled on the view change its return brings.
+                if !unfinished.is_empty() {
+                    let view = ownership.current();
+                    let held: Vec<PartId> = unfinished
+                        .iter()
+                        .filter(|&part| view.owners_of(part).len() == 1 && view.owns(part))
+                        .collect();
+                    if !held.is_empty() {
+                        let serving = sole_owned(
+                            &view,
+                            held,
+                            &cluster.absence_tracker().absent_within(budget),
+                        );
+                        if !serving.is_empty() {
+                            residency.mark_serving(&serving);
+                            for part in serving {
+                                unfinished.remove(part);
+                            }
+                        }
+                    }
+                }
                 let past_cutoff = residency.expired(cutoff);
                 release_without_hand_off(shard.as_ref(), &residency, &cache, &past_cutoff).await;
                 let past_cutoff: PartSet = past_cutoff.into_iter().collect();
@@ -1251,6 +1306,41 @@ mod tests {
     }
 
     #[test]
+    fn sole_owned_keeps_a_part_alone_only_when_no_absent_member_would_co_own_it() {
+        let me = NodeId::from(1);
+        let absent = NodeId::from(2);
+        let one = NonZeroU8::new(1).expect("nonzero");
+        let two = NonZeroU8::new(2).expect("nonzero");
+        let alone = OwnershipView::compute_at(me, vec![me], one, Granularity::Part);
+        let all = || alone.owned_parts();
+
+        assert_eq!(
+            sole_owned(&alone, all(), &[]),
+            all().collect::<Vec<_>>(),
+            "with nobody absent, every part owned alone serves"
+        );
+
+        // One owner per part: once `absent` is eligible again, each part
+        // goes to exactly one of the two, and only this node's stay.
+        let widened = OwnershipView::compute_at(me, vec![me, absent], one, Granularity::Part);
+        let kept = sole_owned(&alone, all(), &[absent]);
+        assert_eq!(kept, widened.owned_parts().collect::<Vec<_>>());
+        assert!(!kept.is_empty() && kept.len() < alone.owned_part_count());
+
+        // Two owners per part: `absent` would co-own every one of them.
+        let alone_two = OwnershipView::compute_at(me, vec![me], two, Granularity::Part);
+        assert!(
+            sole_owned(&alone_two, alone_two.owned_parts(), &[absent]).is_empty(),
+            "a part an absent member would co-own stays cold"
+        );
+        assert!(
+            sole_owned(&alone_two, alone_two.owned_parts(), &[me]).len()
+                == alone_two.owned_part_count(),
+            "this node itself is never absent from its own view"
+        );
+    }
+
+    #[test]
     fn plan_view_change_marks_a_pulled_part_stale_only_where_a_copy_is_already_held() {
         let self_node = NodeId::from(1);
         let k = 2;
@@ -1293,7 +1383,7 @@ mod tests {
         let two = view(self_node, (1..=2u64).map(NodeId::from).collect(), k);
         let three = view(self_node, (1..=3u64).map(NodeId::from).collect(), k);
         let dropped: PartSet = two.owned_parts().filter(|&p| !three.owns(p)).collect();
-        assert!(dropped.len() > 0, "the fixture drops parts");
+        assert!(!dropped.is_empty(), "the fixture drops parts");
 
         let blind = plan_view_change(&two, &two, &two, &[], &PartSet::new());
         assert!(blind.to_pull.is_empty(), "the views alone show no change");
