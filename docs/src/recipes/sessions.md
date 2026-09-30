@@ -15,20 +15,26 @@ session everywhere.
 ```
 
 - **Each session gets its lifetime at login** through `insert_with_ttl`,
-  and it expires at the same instant on every node.
+  and it expires at the same instant on every node. `refresh` restarts it.
 - **A logout is a tombstone.** It outvotes the login on every node, and a
   node that was partitioned away during the logout cannot bring the
   session back when it returns.
 - **Memory is bounded by the login rate times the lifetime**, since a
   `Replicated` cache takes no `max_capacity` without a spill tier.
 
-## A fixed lifetime
+## Sliding sessions
 
-The store never extends a session. Rewriting a session with a fresh TTL
-would stamp it with a newer version than a logout on another node that
-has not reached this one yet, and the rewrite would win. To keep a user
-signed in longer, issue a new session id at a refresh point and log the
-old one out.
+`refresh` keeps an active user signed in: `expire` restarts the session's
+lifetime without rewriting the session. It writes the stored session back
+stamped as the successor of the login it read, so a logout stamped after
+that login, on any node, still outranks it. A refresh racing a logout never
+signs the user back in, and a refresh after the logout arrives returns
+`false`.
+
+Rewriting the session with `insert_with_ttl` instead stamps it with a
+fresh version, newer than a logout on another node that has not reached
+this one yet, and the rewrite wins. Extend a session with `expire`, never
+with a second insert.
 
 ## Wiring it into a service
 

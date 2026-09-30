@@ -48,7 +48,8 @@
 //!     .mode(Mode::Replicated)
 //!     .open()
 //!     .await?;
-//! sessions.insert_with_ttl(token, Session, Duration::from_secs(30)).await?; // this entry's own TTL
+//! sessions.insert_with_ttl(token.clone(), Session, Duration::from_secs(30)).await?; // this entry's own TTL
+//! sessions.expire(&token, Duration::from_secs(60)).await?; // a new lifetime for the same session
 //!
 //! let mut events = users.events();
 //! while let Ok(ev) = events.recv().await {
