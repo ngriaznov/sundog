@@ -431,6 +431,15 @@ impl Mode {
     }
 }
 
+/// A live entry's remaining lifetime, as [`Shard::ttl_of`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ttl {
+    /// The entry has no expiry.
+    Never,
+    /// The entry expires after this long.
+    Remaining(Duration),
+}
+
 /// Who caused a cache [`Event`]: this node's own API call, or a message
 /// received from a remote peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1218,6 +1227,32 @@ enum Incoming<V> {
     Tombstone,
 }
 
+/// The lifespan a re-arm gives an entry, from now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifetime {
+    /// Expires after this long.
+    For(Duration),
+    /// The shard's default TTL, or no expiry on a shard without one.
+    Default,
+    /// Never expires.
+    Unbounded,
+}
+
+/// What [`Shard::rearm_local`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalRearm {
+    /// A live entry was here and took the new lifetime, or a write stamped
+    /// after it superseded the re-arm.
+    Rearmed,
+    /// No live entry, and this shard holds the key's part warm: the key is
+    /// absent.
+    Absent,
+    /// A `Mode::Distributed` shard that does not own the key's part, or
+    /// owns it but has not yet pulled or verified it: only an owner's
+    /// copy answers.
+    NotHeld,
+}
+
 /// Builds an [`Incoming::Put`], for the bulk-insert closures that reassemble one from a prepared tuple.
 fn put_incoming<V>(value: V, expires_at_ms: Option<u64>, encoded: Bytes) -> Incoming<V> {
     Incoming::Put {
@@ -1391,6 +1426,34 @@ fn entry_fingerprint(key_bytes: &[u8], ver: Hlc) -> u64 {
 /// minted version into its own clock right after, so a local write in the
 /// same millisecond still stamps strictly later.
 fn compacted_version(stale: Hlc, compacted: &[u8]) -> Hlc {
+    derived_successor(stale, xxh3_64(compacted))
+}
+
+/// The version a re-armed record carries: `base`'s successor, keyed by
+/// `base` and the new deadline the way [`compacted_version`] keys by
+/// content. It outranks the record it re-arms and every older one, and
+/// loses to any write stamped after `base` in a later millisecond, so a
+/// re-arm never overrides a write or delete made after the value it read.
+/// Two re-arms of one record to different deadlines mint different
+/// versions, since two contents never share one; the same re-arm made
+/// twice mints the same version.
+fn rearmed_version(base: Hlc, expires_at_ms: Option<u64>) -> Hlc {
+    let mut buf = [0u8; 30];
+    buf[0] = b'r';
+    buf[1..9].copy_from_slice(&base.wall_ms.to_le_bytes());
+    buf[9..13].copy_from_slice(&base.logical.to_le_bytes());
+    buf[13..21].copy_from_slice(&base.node.as_u64().to_le_bytes());
+    if let Some(deadline) = expires_at_ms {
+        buf[21] = 1;
+        buf[22..30].copy_from_slice(&deadline.to_le_bytes());
+    }
+    derived_successor(base, xxh3_64(&buf))
+}
+
+/// `stale`'s successor in `wall_ms`/`logical`, carrying into the next
+/// millisecond on a logical overflow, stamped with a node id derived from
+/// `content_hash`.
+fn derived_successor(stale: Hlc, content_hash: u64) -> Hlc {
     let (wall_ms, logical) = match stale.logical.checked_add(1) {
         Some(logical) => (stale.wall_ms, logical),
         None => (stale.wall_ms.saturating_add(1), 0),
@@ -1398,7 +1461,7 @@ fn compacted_version(stale: Hlc, compacted: &[u8]) -> Hlc {
     Hlc {
         wall_ms,
         logical,
-        node: NodeId::merge_derived(xxh3_64(compacted)),
+        node: NodeId::merge_derived(content_hash),
     }
 }
 
@@ -2790,6 +2853,23 @@ where
     /// its hash, such as [`Shard::get_or_load`]'s owner arm.
     #[cfg(feature = "spill")]
     async fn get_spilled_by_bytes(&self, key_bytes: &[u8], hash: u64) -> Option<V> {
+        let (ver, value, encoded) = self.read_spilled_by_bytes(key_bytes, hash).await?;
+        if self
+            .engine
+            .promote_locked(key_bytes, hash, ver, &value, &encoded)
+            && let Some(spill_read) = self.spill_read.get()
+        {
+            spill_read.promotions.increment(1);
+        }
+        Some(value)
+    }
+
+    /// Reads the key's currently spilled value off disk, without promoting
+    /// it: the version it was spilled at, the value, and its encoded bytes.
+    /// `None` for a key not spilled here, and for a read that fails or finds
+    /// the record rotated out, each counted in the spill read metrics.
+    #[cfg(feature = "spill")]
+    async fn read_spilled_by_bytes(&self, key_bytes: &[u8], hash: u64) -> Option<(Hlc, V, Bytes)> {
         let spill_read = self.spill_read.get()?;
         let tier = Arc::clone(self.engine.spill()?);
         let (ver, loc) = self.engine.spilled_loc(key_bytes, hash, self.now_ms())?;
@@ -2827,13 +2907,7 @@ where
             return None;
         };
         spill_read.reads_hit.increment(1);
-        if self
-            .engine
-            .promote_locked(key_bytes, hash, ver, &value, &bytes.encoded)
-        {
-            spill_read.promotions.increment(1);
-        }
-        Some(value)
+        Some((ver, value, bytes.encoded))
     }
 
     /// The number of live entries this node currently holds. Runs the engine's
@@ -3087,6 +3161,198 @@ where
             encoded,
         };
         self.apply_or_forward(key, key_bytes, ver, incoming)
+    }
+
+    /// Gives `key`'s live entry a lifespan of `ttl` from now and keeps its
+    /// value. The write re-puts the value this shard holds, stamped as its
+    /// successor: a write or remove stamped in a later millisecond than that
+    /// value supersedes it. A spilled entry's value is read back from disk
+    /// first. Returns whether a live entry was here. A `Mode::Distributed`
+    /// shard answers `false` for a key in a part it does not hold warm, as
+    /// [`Shard::get`] misses there; `Cache::expire` asks the owners instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to encode or the stored
+    /// value fails to decode.
+    pub async fn expire(&self, key: &K, ttl: Duration) -> Result<bool, CacheError> {
+        let rearmed = self.rearm_local(key, Lifetime::For(ttl)).await?;
+        Ok(rearmed == LocalRearm::Rearmed)
+    }
+
+    /// [`Shard::expire`] with the shard's default TTL: the entry's lifespan
+    /// restarts from now, and on a shard with no default it stops expiring.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::expire`].
+    pub async fn touch(&self, key: &K) -> Result<bool, CacheError> {
+        let rearmed = self.rearm_local(key, Lifetime::Default).await?;
+        Ok(rearmed == LocalRearm::Rearmed)
+    }
+
+    /// [`Shard::expire`] with no lifespan: the entry stops expiring.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::expire`].
+    pub async fn persist(&self, key: &K) -> Result<bool, CacheError> {
+        let rearmed = self.rearm_local(key, Lifetime::Unbounded).await?;
+        Ok(rearmed == LocalRearm::Rearmed)
+    }
+
+    /// The remaining lifetime of `key`'s live entry in this shard, resident
+    /// or spilled, with no disk read and no recency touch. `None` when no
+    /// live entry is here. Reads the TTL only: a `tti` idle timeout is not
+    /// reflected.
+    #[must_use]
+    pub fn ttl_of(&self, key: &K) -> Option<Ttl> {
+        let key_bytes = encode_key(key).ok()?;
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        self.engine.ttl_of(key_bytes.as_ref(), hash, self.now_ms())
+    }
+
+    /// The absolute expiry `lifetime` stamps now.
+    fn deadline_for(&self, lifetime: Lifetime) -> Option<u64> {
+        match lifetime {
+            Lifetime::For(ttl) => self.expiry_for(Some(ttl)),
+            Lifetime::Default => self.expiry_for(None),
+            Lifetime::Unbounded => None,
+        }
+    }
+
+    /// Re-arms `key`'s entry from this shard's own copy: reads the live
+    /// value, resident or spilled, and applies it back with `lifetime`'s
+    /// deadline at [`rearmed_version`], only while the entry is still at
+    /// the version read. An entry that moves on in between has taken a
+    /// write stamped after the read, which supersedes the re-arm anyway, so
+    /// that still counts as [`LocalRearm::Rearmed`].
+    pub(crate) async fn rearm_local(
+        &self,
+        key: &K,
+        lifetime: Lifetime,
+    ) -> Result<LocalRearm, CacheError> {
+        let key_bytes = encode_key(key)?;
+        let hash = engine::hash_key_bytes(key_bytes.as_ref());
+        let part = PartId::of_key(key_bytes.as_ref());
+        if self
+            .ownership
+            .as_ref()
+            .is_some_and(|tracker| !tracker.current().owns(part))
+            || ShardOps::is_unverified_part(self, part)
+        {
+            return Ok(LocalRearm::NotHeld);
+        }
+        self.wait_for_fan_out_room().await;
+        let resident = self
+            .engine
+            .record_for(key_bytes.as_ref(), self.now_ms())
+            .and_then(|rec| rec.value.map(|encoded| (rec.ver, encoded)));
+        let base = match resident {
+            Some((ver, encoded)) => {
+                let value: V = postcard::from_bytes(&encoded).map_err(CodecError::from)?;
+                Some((ver, value, encoded))
+            }
+            None => self.read_spilled_for_rearm(key_bytes.as_ref(), hash).await,
+        };
+        let Some((base_ver, value, encoded)) = base else {
+            return Ok(if ShardOps::is_cold_part(self, part) {
+                LocalRearm::NotHeld
+            } else {
+                LocalRearm::Absent
+            });
+        };
+        let expires_at_ms = self.deadline_for(lifetime);
+        let ver = rearmed_version(base_ver, expires_at_ms);
+        let applied = self.engine.apply_if_current(
+            (
+                hash,
+                key.clone(),
+                key_bytes,
+                ver,
+                Incoming::Put {
+                    value,
+                    expires_at_ms,
+                    encoded,
+                },
+            ),
+            base_ver,
+            self.resolver.as_ref(),
+            self.tombstone_ttl_ms,
+            self.tombstone_max_ttl_ms,
+            self.now_ms(),
+        );
+        if let Some(outcome) = applied {
+            self.observe_derived(ver);
+            self.handle_apply_outcome(outcome, Origin::Local, true);
+        }
+        Ok(LocalRearm::Rearmed)
+    }
+
+    /// The key's spilled value, read back for a re-arm. Always `None`
+    /// without the `spill` feature.
+    #[cfg_attr(
+        not(feature = "spill"),
+        allow(
+            clippy::unused_async,
+            clippy::unused_self,
+            reason = "the spill build reads the value off disk here"
+        )
+    )]
+    async fn read_spilled_for_rearm(&self, key_bytes: &[u8], hash: u64) -> Option<(Hlc, V, Bytes)> {
+        #[cfg(feature = "spill")]
+        {
+            self.read_spilled_by_bytes(key_bytes, hash).await
+        }
+        #[cfg(not(feature = "spill"))]
+        {
+            let _ = (key_bytes, hash);
+            None
+        }
+    }
+
+    /// Re-arms `key` from `base`, a record an owner answered with, when
+    /// this shard holds no warm copy of its own: the same write
+    /// [`Shard::rearm_local`] makes, applied here if this shard owns the
+    /// key's part and forwarded to the owners otherwise. Returns `false`
+    /// for a tombstone or an expired record, which has nothing to re-arm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to encode or `base`'s
+    /// value fails to decode, and [`CacheError::Closed`] if the shard can no
+    /// longer forward.
+    pub(crate) async fn forward_rearm(
+        &self,
+        key: K,
+        base: WireRecord,
+        lifetime: Lifetime,
+    ) -> Result<bool, CacheError> {
+        let Some(encoded) = base.value else {
+            return Ok(false);
+        };
+        if base
+            .expires_at_ms
+            .is_some_and(|deadline| deadline <= self.now_ms())
+        {
+            return Ok(false);
+        }
+        let key_bytes = encode_key(&key)?;
+        let value: V = postcard::from_bytes(&encoded).map_err(CodecError::from)?;
+        let expires_at_ms = self.deadline_for(lifetime);
+        let ver = rearmed_version(base.ver, expires_at_ms);
+        self.wait_for_fan_out_room().await;
+        self.apply_or_forward(
+            key,
+            key_bytes,
+            ver,
+            Incoming::Put {
+                value,
+                expires_at_ms,
+                encoded,
+            },
+        )?;
+        Ok(true)
     }
 
     /// Waits for the fan-out backlog to fall under capacity via
@@ -6285,6 +6551,370 @@ mod tests {
                 "{name}: a read-through fill takes the default, never an override"
             );
         }
+    }
+
+    #[test]
+    fn rearmed_version_is_the_bases_successor_keyed_by_the_new_deadline() {
+        let base = hlc(5_000, 1);
+        let minted = rearmed_version(base, Some(9_000));
+        assert!(minted > base);
+        assert_eq!((minted.wall_ms, minted.logical), (5_000, base.logical + 1));
+        assert!(minted.node.is_merge_derived());
+        assert_eq!(
+            rearmed_version(base, Some(9_000)),
+            minted,
+            "the same re-arm of the same record mints the same version on any node"
+        );
+        assert_ne!(rearmed_version(base, Some(9_001)), minted);
+        assert_ne!(rearmed_version(base, None), minted);
+        assert_ne!(
+            rearmed_version(hlc(5_000, 2), Some(9_000)).node,
+            minted.node,
+            "another base record mints another node id"
+        );
+        assert!(
+            minted < hlc(5_001, 1),
+            "a write stamped a millisecond after the base outranks the re-arm"
+        );
+    }
+
+    /// A `Mode::Replicated` shard for `node` on a clock the test sets.
+    fn clocked_shard(
+        node: u64,
+        default_ttl: Option<Duration>,
+        clock: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> Shard<u32, String> {
+        let reader = Arc::clone(clock);
+        Shard::<u32, String>::new(
+            SmolStr::new("test"),
+            Mode::Replicated,
+            NodeId::from(node),
+            10_000,
+            default_ttl,
+            None,
+        )
+        .with_clock(Arc::new(move || {
+            reader.load(std::sync::atomic::Ordering::SeqCst)
+        }))
+    }
+
+    #[tokio::test]
+    async fn expire_gives_a_live_entry_a_new_lifespan_and_keeps_its_value() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let s = clocked_shard(1, None, &clock);
+        s.insert(1, "a".into()).await.expect("insert");
+        let before = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+        let _ = s.fan_out_queue().drain();
+        let mut events = s.events();
+
+        assert!(s.expire(&1, Duration::from_secs(30)).await.expect("expire"));
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(Duration::from_secs(30))));
+        assert_eq!(s.get(&1).await, Some("a".to_string()));
+        let after = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+        assert_eq!(after[0].expires_at_ms, Some(1_030_000));
+        assert_eq!(
+            after[0].ver,
+            rearmed_version(before[0].ver, Some(1_030_000)),
+            "the re-arm is stamped as the value's successor"
+        );
+        assert!(
+            matches!(
+                s.fan_out_queue().drain().as_slice(),
+                [FanOutItem::Applied(1)]
+            ),
+            "the re-arm fans out like any local write"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Updated { key: 1, ref value, origin: Origin::Local }) if value == "a"
+        ));
+
+        clock.store(1_030_000, Ordering::SeqCst);
+        assert_eq!(s.get(&1).await, None, "it expires at the new deadline");
+        assert_eq!(s.ttl_of(&1), None);
+    }
+
+    #[tokio::test]
+    async fn expire_touch_and_persist_answer_false_for_a_key_that_is_not_live() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let s = clocked_shard(1, None, &clock);
+        assert!(!s.expire(&1, Duration::from_secs(5)).await.expect("expire"));
+        assert!(!s.touch(&1).await.expect("touch"));
+        assert!(!s.persist(&1).await.expect("persist"));
+
+        s.insert(2, "removed".into()).await.expect("insert");
+        s.remove(&2).await.expect("remove");
+        assert!(!s.expire(&2, Duration::from_secs(5)).await.expect("expire"));
+        assert_eq!(s.get(&2).await, None, "a removed key stays removed");
+
+        s.insert_with_ttl(3, "expired".into(), Duration::from_secs(1))
+            .await
+            .expect("insert");
+        clock.store(1_002_000, Ordering::SeqCst);
+        assert!(!s.persist(&3).await.expect("persist"));
+        assert_eq!(s.get(&3).await, None, "an expired key stays expired");
+        let _ = s.fan_out_queue().drain();
+        assert!(!s.touch(&4).await.expect("touch"));
+        assert!(
+            s.fan_out_queue().drain().is_empty(),
+            "nothing to re-arm, nothing to fan out"
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_restarts_the_default_ttl_and_persist_makes_the_entry_never_expire() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let s = clocked_shard(1, Some(Duration::from_secs(10)), &clock);
+        s.insert(1, "a".into()).await.expect("insert");
+        clock.store(1_004_000, Ordering::SeqCst);
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(Duration::from_secs(6))));
+
+        assert!(s.touch(&1).await.expect("touch"));
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(Duration::from_secs(10))));
+        assert!(s.expire(&1, Duration::from_secs(1)).await.expect("expire"));
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Remaining(Duration::from_secs(1))));
+        assert!(s.persist(&1).await.expect("persist"));
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Never));
+
+        clock.store(9_000_000, Ordering::SeqCst);
+        assert_eq!(
+            s.get(&1).await,
+            Some("a".to_string()),
+            "a persisted entry never expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_without_a_default_ttl_makes_the_entry_never_expire() {
+        use std::sync::atomic::AtomicU64;
+
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let s = clocked_shard(1, None, &clock);
+        s.insert_with_ttl(1, "a".into(), Duration::from_secs(5))
+            .await
+            .expect("insert");
+        assert!(s.touch(&1).await.expect("touch"));
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Never));
+    }
+
+    #[tokio::test]
+    async fn expire_with_a_zero_ttl_expires_the_entry_here_and_on_a_replica() {
+        use std::sync::atomic::AtomicU64;
+
+        let clock = Arc::new(AtomicU64::new(1_000_000));
+        let a = clocked_shard(1, None, &clock);
+        let b = clocked_shard(2, None, &clock);
+        a.insert(1, "a".into()).await.expect("insert");
+        let original = ShardOps::records_for(&a, vec![key_bytes(&1u32)]).await;
+        ShardOps::apply_remote_batch(&b, original).await;
+
+        assert!(a.expire(&1, Duration::ZERO).await.expect("expire"));
+        assert_eq!(a.get(&1).await, None);
+        let rearmed = WireRecord {
+            key: key_bytes(&1u32),
+            ver: rearmed_version(
+                ShardOps::records_for(&b, vec![key_bytes(&1u32)]).await[0].ver,
+                Some(1_000_000),
+            ),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&"a".to_string()).expect("encodes"),
+            )),
+            expires_at_ms: Some(1_000_000),
+        };
+        ShardOps::apply_remote_batch(&b, vec![rearmed]).await;
+        assert_eq!(
+            b.get(&1).await,
+            None,
+            "a re-arm that arrives already expired still replaces the older copy"
+        );
+    }
+
+    /// Under a merging resolver the re-arm applies through the resolver
+    /// like any write, and the `crdt` resolvers give a merged record no
+    /// expiry: the value stays and the entry does not expire.
+    #[tokio::test]
+    async fn expire_under_a_crdt_resolver_keeps_the_value_and_the_resolvers_expiry() {
+        use crate::store::crdt::{PnCounter, PnCounterResolver};
+
+        let s = Shard::<u32, PnCounter>::new(
+            SmolStr::new("test-crdt-expire"),
+            Mode::Replicated,
+            NodeId::from(1),
+            10_000,
+            None,
+            None,
+        )
+        .with_resolver(Arc::new(PnCounterResolver));
+        let writer = crdt::WriterId::new(NodeId::from(11), 1);
+        s.merge(1, PnCounter::local_delta(writer, 3))
+            .await
+            .expect("merge");
+
+        assert!(s.expire(&1, Duration::from_secs(60)).await.expect("expire"));
+        assert_eq!(s.get(&1).await.map(|c| c.value()), Some(3));
+        assert_eq!(s.ttl_of(&1), Some(Ttl::Never));
+    }
+
+    /// The re-arm's successor stamp outranks the value it read and nothing
+    /// written after it: a remove a peer stamped later survives the
+    /// re-arm in either delivery order, and a peer still holding the value
+    /// takes the new lifetime.
+    #[tokio::test]
+    async fn a_rearm_never_outvotes_a_remove_stamped_after_the_value_it_read() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let clock_a = Arc::new(AtomicU64::new(1_000_000));
+        let clock_b = Arc::new(AtomicU64::new(1_000_000));
+        let clock_c = Arc::new(AtomicU64::new(1_000_000));
+        let a = clocked_shard(1, None, &clock_a);
+        let b = clocked_shard(2, None, &clock_b);
+        let c = clocked_shard(3, None, &clock_c);
+        a.insert(1, "v".into()).await.expect("insert");
+        let original = ShardOps::records_for(&a, vec![key_bytes(&1u32)]).await;
+        ShardOps::apply_remote_batch(&b, original.clone()).await;
+        ShardOps::apply_remote_batch(&c, original).await;
+
+        clock_b.store(1_000_500, Ordering::SeqCst);
+        b.remove(&1).await.expect("remove");
+        clock_a.store(1_001_000, Ordering::SeqCst);
+        assert!(a.expire(&1, Duration::from_secs(60)).await.expect("expire"));
+
+        let rearm = ShardOps::records_for(&a, vec![key_bytes(&1u32)]).await;
+        let tombstone = ShardOps::records_for(&b, vec![key_bytes(&1u32)]).await;
+        ShardOps::apply_remote_batch(&b, rearm.clone()).await;
+        ShardOps::apply_remote_batch(&a, tombstone).await;
+        assert_eq!(
+            b.get(&1).await,
+            None,
+            "the later remove survives the re-arm"
+        );
+        assert_eq!(
+            a.get(&1).await,
+            None,
+            "and replaces it where it arrives second"
+        );
+
+        ShardOps::apply_remote_batch(&c, rearm).await;
+        clock_c.store(1_001_000, Ordering::SeqCst);
+        assert_eq!(
+            c.ttl_of(&1),
+            Some(Ttl::Remaining(Duration::from_secs(60))),
+            "a replica still holding the value takes the new lifetime"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_distributed_shard_leaves_a_key_it_does_not_own_to_the_owners() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) = distributed_shard::<u32, String>(self_node, eligible, 2, residency);
+        let owned = find_key_by_ownership(&view, true);
+        let unowned = find_key_by_ownership(&view, false);
+        s.insert(owned, "owned".to_string()).await.expect("insert");
+        let _ = s.fan_out_queue().drain();
+
+        assert!(
+            s.expire(&owned, Duration::from_secs(9))
+                .await
+                .expect("expire")
+        );
+        assert_eq!(
+            s.rearm_local(&unowned, Lifetime::Unbounded)
+                .await
+                .expect("rearm"),
+            LocalRearm::NotHeld
+        );
+        assert!(
+            !s.persist(&unowned).await.expect("persist"),
+            "this shard holds no copy of a key it does not own"
+        );
+
+        let base = WireRecord {
+            key: key_bytes(&unowned),
+            ver: hlc(now_ms(), 7),
+            value: Some(Bytes::from(
+                postcard::to_stdvec(&"theirs".to_string()).expect("encodes"),
+            )),
+            expires_at_ms: None,
+        };
+        let _ = s.fan_out_queue().drain();
+        assert!(
+            s.forward_rearm(
+                unowned,
+                base.clone(),
+                Lifetime::For(Duration::from_secs(60))
+            )
+            .await
+            .expect("forward")
+        );
+        let forwarded = s.fan_out_queue().drain();
+        assert!(
+            matches!(
+                forwarded.as_slice(),
+                [FanOutItem::Forward(rec)] if rec.ver > base.ver
+                    && rec.ver.wall_ms == base.ver.wall_ms
+                    && rec.value == base.value
+                    && rec.expires_at_ms.is_some()
+            ),
+            "the owner's record goes back to the owners re-armed: {forwarded:?}"
+        );
+        assert_eq!(s.get(&unowned).await, None, "and never lands here");
+
+        let tomb = WireRecord {
+            value: None,
+            ..base
+        };
+        assert!(
+            !s.forward_rearm(unowned, tomb, Lifetime::Unbounded)
+                .await
+                .expect("forward"),
+            "a tombstone has nothing to re-arm"
+        );
+        assert!(s.fan_out_queue().drain().is_empty());
+    }
+
+    /// An owned part not yet pulled cannot vouch for a miss, so a re-arm
+    /// that finds nothing there leaves the key to the other owners, while
+    /// a copy it does hold re-arms here.
+    #[tokio::test]
+    async fn a_rearm_in_a_cold_owned_part_answers_only_from_a_copy_it_holds() {
+        let self_node = NodeId::from(1);
+        let eligible = (1..=5u64).map(NodeId::from).collect::<Vec<_>>();
+        let residency = Arc::new(ResidencySet::new());
+        let (s, view, _tx) =
+            distributed_shard::<u32, String>(self_node, eligible, 2, Arc::clone(&residency));
+        let held = find_key_by_ownership(&view, true);
+        let missing = (held + 1..u32::MAX)
+            .find(|k| view.owns(PartId::of_key(&key_bytes(k))))
+            .expect("another owned key");
+        s.insert(held, "held".to_string()).await.expect("insert");
+        residency.mark_cold(&[
+            PartId::of_key(&key_bytes(&held)),
+            PartId::of_key(&key_bytes(&missing)),
+        ]);
+
+        assert_eq!(
+            s.rearm_local(&missing, Lifetime::Unbounded)
+                .await
+                .expect("rearm"),
+            LocalRearm::NotHeld,
+            "a cold part's miss is no answer"
+        );
+        assert_eq!(
+            s.rearm_local(&held, Lifetime::For(Duration::from_secs(5)))
+                .await
+                .expect("rearm"),
+            LocalRearm::Rearmed,
+            "a copy held in a cold part still re-arms"
+        );
+        assert!(matches!(s.ttl_of(&held), Some(Ttl::Remaining(_))));
     }
 
     /// Covers both [`ShardOps::apply_remote`] and
@@ -10686,6 +11316,37 @@ mod tests {
                 shard.get_sync(&spilled_key),
                 Some(spilled_value),
                 "the disk read promoted the key back to residency"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn expire_reads_a_spilled_value_back_and_ttl_of_needs_no_disk_read() {
+            let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
+                shard_with_one_spilled_entry("expire-spilled").await;
+
+            assert_eq!(shard.ttl_of(&spilled_key), Some(Ttl::Never));
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                None,
+                "reading the lifetime left the entry spilled"
+            );
+            assert!(
+                shard
+                    .expire(&spilled_key, Duration::from_secs(60))
+                    .await
+                    .expect("expire")
+            );
+            assert!(matches!(
+                shard.ttl_of(&spilled_key),
+                Some(Ttl::Remaining(left)) if left <= Duration::from_secs(60)
+                    && left > Duration::from_secs(50)
+            ));
+            assert_eq!(
+                shard.get_sync(&spilled_key),
+                Some(spilled_value),
+                "the re-arm wrote the value back resident"
             );
 
             let _ = std::fs::remove_dir_all(&dir);

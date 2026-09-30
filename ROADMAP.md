@@ -11,15 +11,6 @@ already justified by the code as it stands.
 
 ## Next
 
-### TTL surface
-
-Nothing on `Cache` changes an entry's lifetime after the write that set it
-or reads how much of it remains. `expire` and `touch` are writes: a re-put
-of the entry's stored value bytes under a fresh version and a new
-`expires_at_ms`, riding the `Replicate` record that already carries all
-three, so no wire change. `ttl_of` is a read that returns a duration and
-takes none, which keeps reads TTL-blind.
-
 ### Batch reads
 
 `insert_many`, `insert_many_with_ttl` and `remove_many` have no read
@@ -60,7 +51,8 @@ binary that opens a cache and answers GET, SET, DEL, EXPIRE and MGET over
 RESP lets `redis-cli`, `memtier` and every client library talk to a cluster,
 and lets `sundog-bench` measure a networked sundog through the same RESP
 client it uses for Redis and Valkey. MGET is
-`get_many` above. EXPIRE is `expire` above.
+`get_many` above. EXPIRE, PERSIST and TTL are `Cache::expire`,
+`Cache::persist` and `Cache::ttl_of`.
 
 ### An observer
 

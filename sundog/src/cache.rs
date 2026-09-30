@@ -38,7 +38,8 @@ use crate::store::part::PartSet;
 #[cfg(feature = "spill")]
 use crate::store::spill::SpillConfig;
 use crate::store::{
-    ConflictResolver, Event, LwwResolver, Mode, Shard, ShardOps, Weigher, encode_key, now_ms,
+    ConflictResolver, Event, Lifetime, LocalRearm, LwwResolver, Mode, Shard, ShardOps, Ttl,
+    Weigher, encode_key, now_ms,
 };
 use crate::wire::WireRecord;
 
@@ -480,6 +481,15 @@ fn validate_mode(
 /// the resolver can fold two values rather than only pick a side.
 fn validate_merge_window(window: Duration, resolver_merges: bool) -> bool {
     window.is_zero() || resolver_merges
+}
+
+/// Where a `Mode::Distributed` read's answer came from.
+enum OwnerAnswer<V> {
+    /// This node owns the key's part warm: its own copy.
+    Local(Option<V>),
+    /// An owner's record, a tombstone or expired record included, or
+    /// `None` for a key the owner never held.
+    Remote(Option<WireRecord>),
 }
 
 /// `part`'s owners under `view` other than `self_node`: the candidates a
@@ -1308,7 +1318,41 @@ where
             return Ok(value);
         };
         let key_bytes = encode_key(key)?;
-        let part = PartId::of_key(&key_bytes);
+        match self.owner_answer(key, &key_bytes, view).await {
+            Ok(OwnerAnswer::Local(value)) => {
+                record_fetch_outcome(self.shard.name(), "local");
+                Ok(value)
+            }
+            Ok(OwnerAnswer::Remote(rec)) => {
+                let value = rec.and_then(|rec| decode_live_value::<V>(&rec));
+                record_fetch_outcome(
+                    self.shard.name(),
+                    if value.is_some() { "remote" } else { "miss" },
+                );
+                Ok(value)
+            }
+            Err(err) => {
+                record_fetch_outcome(self.shard.name(), "error");
+                Err(err)
+            }
+        }
+    }
+
+    /// [`Cache::fetch`]'s answer for a `Mode::Distributed` key under
+    /// `view`: this node's own copy when it owns the key's part warm, or
+    /// else the record the first owner to answer holds, tried in rendezvous
+    /// order with the stale-view retry `fetch` documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::FetchUnavailable`] when no owner answers.
+    async fn owner_answer(
+        &self,
+        key: &K,
+        key_bytes: &bytes::Bytes,
+        view: Arc<OwnershipView>,
+    ) -> Result<OwnerAnswer<V>, CacheError> {
+        let part = PartId::of_key(key_bytes);
         // An unverified part (warm-reloaded or regained, not yet checked
         // against a live co-owner) counts as not owned here: it can hold a
         // record a co-owner deleted while this node was down or not an owner.
@@ -1318,8 +1362,7 @@ where
             // answer: its previous owner can still hold the record through
             // the disown grace, so only another owner's warm copy answers.
             if value.is_some() || !self.shard.is_cold_part(part) {
-                record_fetch_outcome(self.shard.name(), "local");
-                return Ok(value);
+                return Ok(OwnerAnswer::Local(value));
             }
         }
 
@@ -1348,14 +1391,7 @@ where
             )
             .await;
             match outcome {
-                Ok(Ok(FetchOutcome::Found(rec))) => {
-                    let value = rec.and_then(|rec| decode_live_value::<V>(&rec));
-                    record_fetch_outcome(
-                        &cache_name,
-                        if value.is_some() { "remote" } else { "miss" },
-                    );
-                    return Ok(value);
-                }
+                Ok(Ok(FetchOutcome::Found(rec))) => return Ok(OwnerAnswer::Remote(rec)),
                 Ok(Ok(FetchOutcome::Stale { .. })) => {
                     if let Some(fresh) = self.shard.ownership_view()
                         && fresh.view_hash() != view.view_hash()
@@ -1364,8 +1400,7 @@ where
                         if view.owns(part) && !self.shard.is_unverified_part(part) {
                             let value = self.shard.get(key).await;
                             if value.is_some() || !self.shard.is_cold_part(part) {
-                                record_fetch_outcome(&cache_name, "local");
-                                return Ok(value);
+                                return Ok(OwnerAnswer::Local(value));
                             }
                         }
                         owners = other_owners(&view, part, self_node);
@@ -1389,7 +1424,6 @@ where
                 }
             }
         }
-        record_fetch_outcome(&cache_name, "error");
         Err(CacheError::FetchUnavailable { cache: cache_name })
     }
 
@@ -1564,6 +1598,80 @@ where
         ttl: Duration,
     ) -> Result<(), CacheError> {
         self.shard.insert_many_with_ttl(entries, ttl).await
+    }
+
+    /// Gives `key`'s live entry a lifespan of `ttl` from now and keeps its
+    /// value, replicating like [`Cache::insert_with_ttl`]. Returns whether
+    /// the key was live.
+    ///
+    /// The write re-puts the value this node reads, stamped as that value's
+    /// successor. A write or remove stamped after the value supersedes it,
+    /// so `expire` never brings back a key removed, or a value replaced, in
+    /// a later millisecond on any node. In `Mode::Distributed`, a node that
+    /// does not own the key's part warm asks an owner for the record, as
+    /// [`Cache::fetch`] does, and forwards the write to the owners. Under a
+    /// merging [`CacheBuilder::resolver`], the resolver sets the merged
+    /// record's expiry, and the `crate::crdt` resolvers keep none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Codec`] if `key` fails to encode, and
+    /// [`CacheError::FetchUnavailable`] if this node needs an owner's copy
+    /// and no owner answers.
+    pub async fn expire(&self, key: &K, ttl: Duration) -> Result<bool, CacheError> {
+        self.rearm(key, Lifetime::For(ttl)).await
+    }
+
+    /// [`Cache::expire`] with the cache's default TTL: the entry's lifespan
+    /// restarts from now, and on a cache with no [`CacheBuilder::ttl`] it
+    /// stops expiring.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::expire`].
+    pub async fn touch(&self, key: &K) -> Result<bool, CacheError> {
+        self.rearm(key, Lifetime::Default).await
+    }
+
+    /// [`Cache::expire`] with no lifespan: the entry stops expiring.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cache::expire`].
+    pub async fn persist(&self, key: &K) -> Result<bool, CacheError> {
+        self.rearm(key, Lifetime::Unbounded).await
+    }
+
+    /// The remaining lifetime of `key`'s live entry in this node's copy,
+    /// read like [`Cache::get_sync`]: `None` when this node holds no live
+    /// entry, and never a disk read. Takes no TTL and extends none.
+    #[must_use]
+    pub fn ttl_of(&self, key: &K) -> Option<Ttl> {
+        self.shard.ttl_of(key)
+    }
+
+    /// [`Cache::expire`]'s body for any `lifetime`: this node's own copy
+    /// when it holds the key's part warm, an owner's record otherwise.
+    async fn rearm(&self, key: &K, lifetime: Lifetime) -> Result<bool, CacheError> {
+        match self.shard.rearm_local(key, lifetime).await? {
+            LocalRearm::Rearmed => return Ok(true),
+            LocalRearm::Absent => return Ok(false),
+            LocalRearm::NotHeld => {}
+        }
+        let Some(view) = self.shard.ownership_view() else {
+            return Ok(false);
+        };
+        let key_bytes = encode_key(key)?;
+        match self.owner_answer(key, &key_bytes, view).await? {
+            // The view moved to one that owns the part warm meanwhile.
+            OwnerAnswer::Local(_) => {
+                Ok(self.shard.rearm_local(key, lifetime).await? == LocalRearm::Rearmed)
+            }
+            OwnerAnswer::Remote(None) => Ok(false),
+            OwnerAnswer::Remote(Some(base)) => {
+                self.shard.forward_rearm(key.clone(), base, lifetime).await
+            }
+        }
     }
 
     /// Removes `key`: writes a tombstone and fans it out per [`Mode`].
@@ -3894,6 +4002,172 @@ mod tests {
             cache_a.get_sync(&unowned_key).is_some()
         );
 
+        a.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expire_touch_persist_and_ttl_of_on_one_node() {
+        let cluster = Cluster::builder("cache-it-ttl-surface")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("node builds");
+        let cache = cluster
+            .cache::<u32, String>("sessions")
+            .mode(Mode::Local)
+            .ttl(Duration::from_secs(600))
+            .open()
+            .await
+            .expect("opens");
+        cache.insert(1, "a".into()).await.expect("insert");
+        let left = |cache: &Cache<u32, String>| match cache.ttl_of(&1) {
+            Some(Ttl::Remaining(left)) => left,
+            other => panic!("a remaining lifetime, got {other:?}"),
+        };
+        assert!(left(&cache) > Duration::from_secs(590));
+
+        assert!(
+            cache
+                .expire(&1, Duration::from_secs(30))
+                .await
+                .expect("expire")
+        );
+        assert!(left(&cache) <= Duration::from_secs(30));
+        assert!(cache.touch(&1).await.expect("touch"));
+        assert!(
+            left(&cache) > Duration::from_secs(590),
+            "touch restarts the default"
+        );
+        assert!(cache.persist(&1).await.expect("persist"));
+        assert_eq!(cache.ttl_of(&1), Some(Ttl::Never));
+        assert_eq!(cache.get(&1).await, Some("a".to_string()));
+
+        assert!(
+            !cache
+                .expire(&2, Duration::from_secs(1))
+                .await
+                .expect("expire")
+        );
+        assert_eq!(cache.ttl_of(&2), None);
+        assert!(cache.expire(&1, Duration::ZERO).await.expect("expire"));
+        assert_eq!(cache.get(&1).await, None);
+
+        cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_new_lifetime_replicates_to_every_replica() {
+        let name = "cache-it-ttl-replicated";
+        let a = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("a builds");
+        let b = Cluster::builder(name)
+            .seeds([a.local_gossip_addr()])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        wait_for_peer_count(&a, 1).await;
+        wait_for_peer_count(&b, 1).await;
+        let open = |cluster: &Cluster| {
+            cluster
+                .cache::<u32, String>("sessions")
+                .mode(Mode::Replicated)
+                .open()
+        };
+        let cache_a = open(&a).await.expect("a opens");
+        let cache_b = open(&b).await.expect("b opens");
+
+        cache_a.insert(1, "a".into()).await.expect("insert");
+        wait_until(Duration::from_secs(10), "b holds the entry", async || {
+            cache_b.ttl_of(&1) == Some(Ttl::Never)
+        })
+        .await;
+
+        assert!(
+            cache_a
+                .expire(&1, Duration::from_secs(60))
+                .await
+                .expect("expire")
+        );
+        wait_until(
+            Duration::from_secs(10),
+            "b takes the new lifetime",
+            async || {
+                matches!(cache_b.ttl_of(&1), Some(Ttl::Remaining(left))
+                    if left <= Duration::from_secs(60) && left > Duration::from_secs(50))
+            },
+        )
+        .await;
+        assert!(cache_b.persist(&1).await.expect("persist"));
+        wait_until(
+            Duration::from_secs(10),
+            "a takes b's persist back",
+            async || cache_a.ttl_of(&1) == Some(Ttl::Never),
+        )
+        .await;
+        assert_eq!(cache_a.get(&1).await, Some("a".to_string()));
+
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    /// `a` owns none of the key's part, so it asks an owner for the record
+    /// and forwards the re-arm: both owners take the lifetime and `a` still
+    /// holds nothing. A key no owner holds answers `false`.
+    #[tokio::test]
+    async fn expire_from_a_node_that_does_not_own_the_key_reaches_its_owners() {
+        let ((a, cache_a), (b, cache_b), (c, cache_c), unowned_key) =
+            three_node_distributed("cache-it-ttl-forward", "prices").await;
+        cache_b
+            .insert(unowned_key, "value".to_string())
+            .await
+            .expect("insert");
+        wait_until(
+            Duration::from_secs(10),
+            "both owners hold the value",
+            async || {
+                cache_b.ttl_of(&unowned_key).is_some() && cache_c.ttl_of(&unowned_key).is_some()
+            },
+        )
+        .await;
+
+        assert!(
+            cache_a
+                .expire(&unowned_key, Duration::from_secs(60))
+                .await
+                .expect("expire")
+        );
+        let rearmed = |cache: &Cache<u32, String>| {
+            matches!(cache.ttl_of(&unowned_key), Some(Ttl::Remaining(left))
+                if left <= Duration::from_secs(60) && left > Duration::from_secs(50))
+        };
+        wait_until(
+            Duration::from_secs(10),
+            "both owners take the new lifetime",
+            async || rearmed(&cache_b) && rearmed(&cache_c),
+        )
+        .await;
+        assert_eq!(cache_a.ttl_of(&unowned_key), None, "a still holds no copy");
+        assert_eq!(
+            cache_a.fetch(&unowned_key).await.expect("fetch"),
+            Some("value".to_string())
+        );
+
+        let absent = (unowned_key + 1..u32::MAX)
+            .find(|k| !cache_a.owners_of(k).contains(&a.node_id()))
+            .expect("another key a does not own");
+        assert!(
+            !cache_a.persist(&absent).await.expect("the owners answer"),
+            "no owner holds the key"
+        );
+
+        c.shutdown().await;
+        b.shutdown().await;
         a.shutdown().await;
     }
 

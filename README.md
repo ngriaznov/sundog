@@ -144,7 +144,10 @@ Deletes and expiries differ. A TTL-expired entry never returns. Every record
 carries its own absolute `expires_at_ms`, and once a key is past it no peer
 accepts a stale copy back, partition or not. `.ttl(..)` sets a cache's default
 lifespan. `insert_with_ttl` and `insert_many_with_ttl` override it per entry or
-batch, and the override replicates like the default. Reads never touch expiry.
+batch, and the override replicates like the default. `expire`, `touch` and
+`persist` change a live entry's lifespan and keep its value, and `ttl_of` reads
+what is left. Reads never touch expiry. Shortening a lifespan is not a delete:
+a node partitioned away meanwhile keeps its copy until the old deadline.
 
 A manually removed key becomes a tombstone that skips the `tombstone_ttl` GC
 schedule while any member gossip still remembers is absent. A partitioned node can't

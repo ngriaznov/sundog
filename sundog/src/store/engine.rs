@@ -63,7 +63,7 @@ use super::spill::{
 };
 use super::{
     BUCKET_COUNT, BucketEntries, BucketPart, ConflictResolver, Incoming, KeyVersion, Merged,
-    PART_COUNT, PartEntries, PartId, Quiescence, RecordView, Tombstone, Weigher, Winner,
+    PART_COUNT, PartEntries, PartId, Quiescence, RecordView, Tombstone, Ttl, Weigher, Winner,
     entry_fingerprint,
 };
 
@@ -4259,6 +4259,95 @@ where
         (outcomes, deficit)
     }
 
+    /// [`Engine::apply_many`] for one entry, applied only while the key's
+    /// live entry is still at exactly `expected`, resident or spilled:
+    /// `None`, changing nothing, once it has moved on to another version, a
+    /// tombstone, or expiry. The check and the apply share one stripe write
+    /// lock, so no write lands between them.
+    pub(crate) fn apply_if_current(
+        &self,
+        entry: BatchEntry<K, V>,
+        expected: Hlc,
+        resolver: &dyn ConflictResolver,
+        tombstone_ttl_ms: u64,
+        tombstone_max_ttl_ms: u64,
+        now_ms: u64,
+    ) -> Option<ApplyOutcome<K, V>> {
+        let (hash, key, key_bytes, ver, incoming) = entry;
+        let bucket = stripe_index_from_hash(hash);
+        #[cfg(feature = "spill")]
+        let prefetched_spilled = prefetch_spilled_conflict_bytes(
+            &self.stripes[bucket],
+            [(hash, &key_bytes)],
+            resolver,
+            self.spill().map(Arc::as_ref),
+        );
+        let outcome = {
+            let mut stripe = self.stripes[bucket].write();
+            let live = stripe
+                .live
+                .find(hash, |l| record_key(&l.record) == key_bytes.as_ref())?;
+            if live.ver() != expected
+                || self.is_absent(live, key_bytes.as_ref(), &stripe.long_ttl, now_ms)
+            {
+                return None;
+            }
+            let ctx = ApplyCtx {
+                digest_bucket: &self.digest[digest_slot(bucket, part_index_from_hash(hash))],
+                total_weight: &self.total_weight,
+                live_count: &self.live_count,
+                weigher: self.weigher.as_ref(),
+                tti_ms: self.tti_ms,
+                resolver,
+                #[cfg(feature = "spill")]
+                prefetched_spilled: &prefetched_spilled,
+                #[cfg(feature = "spill")]
+                spill: self.spill().map(Arc::as_ref),
+                tombstone_ttl_ms,
+                tombstone_max_ttl_ms,
+                now_ms,
+            };
+            let (outcome, displaced_spilled) = apply_locked(
+                &mut stripe,
+                &ctx,
+                EntryKey {
+                    hash,
+                    key,
+                    key_bytes,
+                },
+                ver,
+                incoming,
+            );
+            self.note_spill_departure(displaced_spilled);
+            outcome
+        };
+        if matches!(outcome, ApplyOutcome::Put { .. }) {
+            self.enforce_capacity(bucket, now_ms);
+        }
+        Some(outcome)
+    }
+
+    /// The lifetime left at `now_ms` on the key's live entry, resident or
+    /// spilled, and `None` with no live entry. Not an access: the recency
+    /// stamp stays as it was.
+    pub(crate) fn ttl_of(&self, key_bytes: &[u8], hash: u64, now_ms: u64) -> Option<Ttl> {
+        let stripe = self.stripes[stripe_index_from_hash(hash)].read();
+        let live = stripe
+            .live
+            .find(hash, |l| record_key(&l.record) == key_bytes)?;
+        if self.is_absent(live, key_bytes, &stripe.long_ttl, now_ms) {
+            return None;
+        }
+        Some(
+            match decode_expiry(live.wall_ms, live.expiry, key_bytes, &stripe.long_ttl) {
+                None => Ttl::Never,
+                Some(deadline) => {
+                    Ttl::Remaining(Duration::from_millis(deadline.saturating_sub(now_ms)))
+                }
+            },
+        )
+    }
+
     /// Folds a [`RemovedLive`]'s departure into digest, weight, count, and spill bookkeeping; `keep_count` skips the live-count decrement for a caller about to insert a replacement.
     fn account_removed(
         &self,
@@ -5397,6 +5486,196 @@ mod tests {
                 expires_at_ms: None,
             })
         }
+    }
+
+    /// A one-entry [`BatchEntry`] putting `value` at `ver`, expiring at
+    /// `expires_at_ms`.
+    fn put_entry(
+        key: u32,
+        value: &str,
+        ver: Hlc,
+        expires_at_ms: Option<u64>,
+    ) -> BatchEntry<u32, String> {
+        let kb = key_bytes(key);
+        let hash = hash_key_bytes(kb.as_ref());
+        let encoded = Bytes::from(postcard::to_stdvec(value).expect("test value encodes"));
+        (
+            hash,
+            key,
+            kb,
+            ver,
+            Incoming::Put {
+                value: value.to_string(),
+                expires_at_ms,
+                encoded,
+            },
+        )
+    }
+
+    #[test]
+    fn apply_if_current_applies_only_while_the_entry_is_at_the_expected_version() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let now = 2_000;
+        let base = hlc(1_000, 1);
+        put(
+            &engine,
+            1u32,
+            key_bytes(1),
+            "a".to_string(),
+            base,
+            Some(5_000),
+            now,
+        );
+        let hash = hash_key_bytes(key_bytes(1).as_ref());
+
+        let stale = engine.apply_if_current(
+            put_entry(1, "a", hlc(1_000, 2), Some(9_000)),
+            hlc(999, 1),
+            &LwwResolver,
+            60_000,
+            600_000,
+            now,
+        );
+        assert!(
+            stale.is_none(),
+            "an expected version the entry is not at applies nothing"
+        );
+        assert_eq!(
+            engine.ttl_of(key_bytes(1).as_ref(), hash, now),
+            Some(remaining(3_000))
+        );
+
+        let rearmed = engine.apply_if_current(
+            put_entry(1, "a", hlc(1_000, 2), Some(9_000)),
+            base,
+            &LwwResolver,
+            60_000,
+            600_000,
+            now,
+        );
+        assert!(matches!(
+            rearmed,
+            Some(ApplyOutcome::Put { created: false, .. })
+        ));
+        assert_eq!(
+            engine.ttl_of(key_bytes(1).as_ref(), hash, now),
+            Some(remaining(7_000))
+        );
+        assert_eq!(engine.get(&1, now), Some("a".to_string()));
+        assert_eq!(engine.digests(), engine.recompute_digests_paired());
+        assert_eq!(engine.live_entry_count(), 1);
+
+        tombstone::<u32, String>(&engine, 1, key_bytes(1), hlc(1_500, 1), now);
+        let over_tombstone = engine.apply_if_current(
+            put_entry(1, "a", hlc(1_600, 1), None),
+            hlc(1_000, 2),
+            &LwwResolver,
+            60_000,
+            600_000,
+            now,
+        );
+        assert!(
+            over_tombstone.is_none(),
+            "a tombstoned key never takes a gated put"
+        );
+        assert_eq!(engine.get(&1, now), None);
+    }
+
+    #[test]
+    fn apply_if_current_refuses_an_entry_past_its_expiry() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let base = hlc(1_000, 1);
+        put(
+            &engine,
+            1u32,
+            key_bytes(1),
+            "a".to_string(),
+            base,
+            Some(1_500),
+            1_200,
+        );
+        let applied = engine.apply_if_current(
+            put_entry(1, "a", hlc(1_000, 2), Some(9_000)),
+            base,
+            &LwwResolver,
+            60_000,
+            600_000,
+            2_000,
+        );
+        assert!(
+            applied.is_none(),
+            "an expired entry is absent, whatever its version"
+        );
+        assert_eq!(engine.get(&1, 2_000), None);
+    }
+
+    fn remaining(ms: u64) -> Ttl {
+        Ttl::Remaining(Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn ttl_of_reads_each_kind_of_deadline_and_nothing_for_an_absent_key() {
+        let engine = engine_u32_string(u64::MAX, None);
+        let now = 2_000;
+        let deadline = |key: u32| {
+            let kb = key_bytes(key);
+            engine.ttl_of(kb.as_ref(), hash_key_bytes(kb.as_ref()), now)
+        };
+        put(
+            &engine,
+            1u32,
+            key_bytes(1),
+            "never".to_string(),
+            hlc(1_000, 1),
+            None,
+            now,
+        );
+        put(
+            &engine,
+            2u32,
+            key_bytes(2),
+            "soon".to_string(),
+            hlc(1_000, 1),
+            Some(7_000),
+            now,
+        );
+        let far = 1_000 + u64::from(u32::MAX) * 2;
+        put(
+            &engine,
+            3u32,
+            key_bytes(3),
+            "far".to_string(),
+            hlc(1_000, 1),
+            Some(far),
+            now,
+        );
+        put(
+            &engine,
+            4u32,
+            key_bytes(4),
+            "gone".to_string(),
+            hlc(1_000, 1),
+            Some(1_500),
+            now,
+        );
+
+        assert_eq!(
+            deadline(1),
+            Some(Ttl::Never),
+            "an entry with no TTL never expires"
+        );
+        assert_eq!(deadline(2), Some(remaining(5_000)));
+        assert_eq!(
+            deadline(3),
+            Some(remaining(far - now)),
+            "a deadline past the inline range"
+        );
+        assert_eq!(
+            deadline(4),
+            None,
+            "an expired entry has no deadline to read"
+        );
+        assert_eq!(deadline(5), None, "nor does a key never written");
     }
 
     #[test]
@@ -9007,6 +9286,49 @@ mod tests {
             );
             assert_eq!(engine.get(&key, 0), Some("restored".to_string()));
             assert_eq!(engine.digests(), digest_before);
+        }
+
+        /// A spilled entry at the expected version takes a gated put like a
+        /// resident one, and comes back resident with the put's expiry; its
+        /// lifetime reads from RAM before and after, with no disk read.
+        #[test]
+        fn apply_if_current_takes_a_spilled_entry_at_the_expected_version() {
+            let engine = engine_u32_string(u64::MAX, None);
+            let kb = key_bytes(7);
+            let hash = hash_key_bytes(kb.as_ref());
+            let base = hlc(1_000, 1);
+            engine.debug_insert_spilled(&kb, base, Some(5_000), loc(0, 0, 10, 0), 0);
+            assert_eq!(
+                engine.ttl_of(kb.as_ref(), hash, 2_000),
+                Some(remaining(3_000))
+            );
+
+            let encoded = Bytes::from(postcard::to_stdvec("v").expect("encodes"));
+            let outcome = engine.apply_if_current(
+                (
+                    hash,
+                    7,
+                    kb.clone(),
+                    hlc(1_000, 2),
+                    Incoming::Put {
+                        value: "v".to_string(),
+                        expires_at_ms: Some(9_000),
+                        encoded,
+                    },
+                ),
+                base,
+                &LwwResolver,
+                60_000,
+                600_000,
+                2_000,
+            );
+            assert!(matches!(outcome, Some(ApplyOutcome::Put { .. })));
+            assert_eq!(
+                engine.ttl_of(kb.as_ref(), hash, 2_000),
+                Some(remaining(7_000))
+            );
+            assert_eq!(engine.get(&7, 2_000), Some("v".to_string()), "now resident");
+            assert_eq!(engine.debug_spill_entries_count(), 0);
         }
 
         /// Location, not the key hash, decides what a reclaim removes: a row

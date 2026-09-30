@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Changing a live entry's lifetime.** `Cache::expire(&key, ttl)` gives
+  an entry a new TTL from now, `Cache::touch` restarts the cache's default,
+  and `Cache::persist` removes the expiry. Each keeps the value and returns
+  whether the key was live. `Cache::ttl_of` reads the lifetime left on this
+  node's copy as a `Ttl`, `Never` or `Remaining(Duration)`, without a disk
+  read. The new lifetime is a write of the value the node reads, stamped as
+  that value's successor, so a write or remove stamped in a later
+  millisecond on any node supersedes it and a removed key never comes back.
+  A `Distributed` node that does not hold the key asks an owner, as `fetch`
+  does, and forwards the write to the owners. `Shard` gains the same four
+  methods for its local copy. No wire change.
+
 ### Changed
 
 - **A spilled entry holds 55 bytes less RAM.** A spill region's reverse

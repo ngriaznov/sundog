@@ -50,6 +50,8 @@ node.
   one key run the loader once.
 - `insert_with_ttl` sets one entry's lifetime; `ttl` on the builder sets
   the default.
+- `expire`, `touch` and `persist` change a live entry's lifetime and keep
+  its value, and `ttl_of` reads what is left.
 - `insert_many` and `remove_many` apply a batch under one lock per stripe.
 - `contains_key`, `keys` and `for_each_key` inspect this node's copy.
 - `events` streams every `Created`, `Updated` and `Removed` change, tagged

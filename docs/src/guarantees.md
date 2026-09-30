@@ -78,6 +78,21 @@ accepts a copy past its expiry from a peer. `CacheBuilder::ttl` sets a
 cache's default lifetime, and `insert_with_ttl` and `insert_many_with_ttl`
 set one entry's or one batch's. Reads never extend or accept a TTL.
 
+`expire`, `touch` and `persist` give a live entry a new lifetime and keep
+its value: a given duration, the cache's default again, or none. Each
+writes back the value this node reads, stamped as that value's successor,
+so a write or remove stamped in a later millisecond on any node supersedes
+it. A new lifetime never brings back a removed key or an overwritten value;
+only a write made in the same millisecond as the value, which counts as
+concurrent with it, can lose to one. A `Distributed` node that does not
+hold the key asks an owner for it, as `fetch` does. `ttl_of` reads the
+lifetime left on this node's copy.
+
+Shortening a lifetime is not a delete. A node cut off for the whole
+lifetime keeps its copy's old deadline and can bring the entry back until
+that deadline passes; `remove` is the delete. Under a merging resolver the
+resolver sets a merged record's expiry, and the `crdt` resolvers set none.
+
 `CacheBuilder::tti`, an idle timeout, is local to one node and applies only
 to `Local` and `Invalidation` caches.
 
