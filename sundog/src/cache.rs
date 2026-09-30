@@ -3154,9 +3154,23 @@ mod tests {
         (Cluster, Cache<u32, String>),
         u32,
     ) {
+        three_node_distributed_with_a(cluster_name, cache_name, loopback_config()).await
+    }
+
+    /// [`three_node_distributed`] with the first node built on `a_config`.
+    async fn three_node_distributed_with_a(
+        cluster_name: &'static str,
+        cache_name: &'static str,
+        a_config: ClusterConfig,
+    ) -> (
+        (Cluster, Cache<u32, String>),
+        (Cluster, Cache<u32, String>),
+        (Cluster, Cache<u32, String>),
+        u32,
+    ) {
         let a = Cluster::builder(cluster_name)
             .seeds(std::iter::empty())
-            .config(loopback_config())
+            .config(a_config)
             .build()
             .await
             .expect("node a builds");
@@ -3845,8 +3859,16 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_returns_fetch_unavailable_when_every_owner_is_down() {
+        // `a`'s failure detector never drops `b` or `c` here. Once it drops
+        // one while the other still runs, `a` co-owns the key's part with
+        // the survivor and pulls the value from it, so a fetch after the
+        // second crash reads `a`'s own copy.
+        let a_config = ClusterConfig {
+            phi_threshold: 1_000.0,
+            ..loopback_config()
+        };
         let ((a, cache_a), (b, cache_b), (c, _cache_c), unowned_key) =
-            three_node_distributed("cache-it-fetch-unavailable", "prices").await;
+            three_node_distributed_with_a("cache-it-fetch-unavailable", "prices", a_config).await;
         cache_b
             .insert(unowned_key, "value".to_string())
             .await
@@ -3859,15 +3881,18 @@ mod tests {
         .await;
 
         // Both of the key's real owners crash; `a` never owned it and its
-        // failure detector has not yet dropped them, so its view still names
-        // them and every dial fails outright.
+        // failure detector never drops them, so its view still names them
+        // and every dial fails outright.
         b.crash().await;
         c.crash().await;
 
-        assert!(matches!(
-            cache_a.fetch(&unowned_key).await,
-            Err(CacheError::FetchUnavailable { cache }) if cache == "prices"
-        ));
+        let result = cache_a.fetch(&unowned_key).await;
+        assert!(
+            matches!(&result, Err(CacheError::FetchUnavailable { cache }) if cache == "prices"),
+            "a fetch with every owner down answers FetchUnavailable, got {result:?}; \
+             a holds a local copy: {}",
+            cache_a.get_sync(&unowned_key).is_some()
+        );
 
         a.shutdown().await;
     }
