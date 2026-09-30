@@ -7,9 +7,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-
 use crate::membership::LiveFlags;
 use crate::node::NodeId;
 use crate::ownership::OwnershipView;
@@ -33,6 +30,10 @@ struct MemberRecord {
     /// keeps deferring for a settle bound after it, until anti-entropy has
     /// had time to hand the member the deletes made while it was away.
     returned_since: Option<Instant>,
+    /// Set when an absent member comes back live, and never aged by
+    /// tombstone collection: an ownership view built while it was away can
+    /// still be the one a caller acts on.
+    back_since: Option<Instant>,
 }
 
 impl MemberRecord {
@@ -43,6 +44,7 @@ impl MemberRecord {
             && self.known_since.is_none()
             && self.present_since.is_none()
             && self.returned_since.is_none()
+            && self.back_since.is_none()
     }
 }
 
@@ -51,8 +53,9 @@ struct AbsenceState {
     members: HashMap<NodeId, MemberRecord>,
 }
 
-/// Cheap-to-clone view of which recently known members are absent, fed by
-/// [`tracking_task`] and read by `tombstone_gc_task` via [`should_defer_gc`].
+/// Cheap-to-clone view of which recently known members are absent, fed
+/// every live set membership publishes, before its peers and cache modes,
+/// and read by `tombstone_gc_task` via [`should_defer_gc`].
 #[derive(Clone, Default)]
 pub(crate) struct AbsenceTracker {
     state: Arc<StdMutex<AbsenceState>>,
@@ -90,7 +93,9 @@ impl AbsenceTracker {
         for (&node, &flags) in live {
             let record = state.members.entry(node).or_default();
             if record.absent_since.take().is_some() {
-                record.returned_since = Some(Instant::now());
+                let now = Instant::now();
+                record.returned_since = Some(now);
+                record.back_since = Some(now);
             }
             record.gone_since = None;
             record.present_since.get_or_insert_with(Instant::now);
@@ -164,21 +169,23 @@ impl AbsenceTracker {
             .collect()
     }
 
-    /// Every member absent for less than `bound`: dropped out of the live set
-    /// without a graceful departure and not back since. A read only: unlike
-    /// [`AbsenceTracker::holding_gc`] it ages nothing out, so a shorter
-    /// `bound` here never shortens tombstone retention.
-    pub(crate) fn absent_within(&self, bound: Duration) -> Vec<NodeId> {
+    /// Every member away less than `bound` ago: dropped out of the live set
+    /// without a graceful departure and either not back since, or back for
+    /// less than `bound`. A member that returned still counts, since an
+    /// ownership view built while it was gone can still be the one the
+    /// caller acts on. A read only: unlike [`AbsenceTracker::holding_gc`]
+    /// it ages nothing out, so a shorter `bound` here never shortens
+    /// tombstone retention.
+    pub(crate) fn away_within(&self, bound: Duration) -> Vec<NodeId> {
         let state = self.state();
         let now = Instant::now();
+        let recent = |since: Option<Instant>| {
+            since.is_some_and(|since| now.saturating_duration_since(since) < bound)
+        };
         state
             .members
             .iter()
-            .filter(|(_, record)| {
-                record
-                    .absent_since
-                    .is_some_and(|since| now.saturating_duration_since(since) < bound)
-            })
+            .filter(|(_, record)| recent(record.absent_since) || recent(record.back_since))
             .map(|(&node, _)| node)
             .collect()
     }
@@ -264,25 +271,6 @@ fn defers_for(mode: Mode, holders: &[NodeId], ownership: Option<&OwnershipView>)
 /// unless `departed_gracefully` shows it gossiped a departure first.
 fn counts_as_absent(departed_gracefully: bool) -> bool {
     !departed_gracefully
-}
-
-/// Republishes [`crate::membership::Membership::departing_flags`] changes
-/// into `tracker`, keeping [`AbsenceTracker`] current.
-pub(crate) async fn tracking_task(
-    mut live: watch::Receiver<HashMap<NodeId, LiveFlags>>,
-    tracker: AbsenceTracker,
-    cancel: CancellationToken,
-) {
-    tracker.observe(&live.borrow_and_update());
-    loop {
-        let Some(changed) = cancel.run_until_cancelled(live.changed()).await else {
-            return;
-        };
-        if changed.is_err() {
-            return; // membership shut down
-        }
-        tracker.observe(&live.borrow_and_update());
-    }
 }
 
 #[cfg(test)]
@@ -696,19 +684,19 @@ mod tests {
     }
 
     #[test]
-    fn absent_within_names_a_crashed_member_until_the_bound_and_prunes_nothing() {
+    fn away_within_names_a_crashed_member_until_the_bound_and_prunes_nothing() {
         let tracker = AbsenceTracker::default();
         tracker.observe(&live(&[(1, false), (2, true), (3, false)]));
         tracker.observe(&live(&[(3, false)]));
 
         assert_eq!(
-            tracker.absent_within(HOUR),
+            tracker.away_within(HOUR),
             vec![NodeId::from(1)],
-            "the crashed member is absent; the graceful leaver and the live one are not"
+            "the crashed member is away; the graceful leaver and the live one are not"
         );
         std::thread::sleep(Duration::from_millis(5));
         assert!(
-            tracker.absent_within(Duration::from_millis(1)).is_empty(),
+            tracker.away_within(Duration::from_millis(1)).is_empty(),
             "past the bound it is no longer named"
         );
         assert_eq!(
@@ -716,11 +704,35 @@ mod tests {
             vec![NodeId::from(1)],
             "a short bound here leaves tombstone retention untouched"
         );
+    }
 
-        tracker.observe(&live(&[(1, false), (3, false)]));
+    #[test]
+    fn away_within_keeps_naming_a_member_that_came_back_until_the_bound() {
+        let tracker = AbsenceTracker::default();
+        tracker.observe(&live(&[(1, false), (2, false)]));
+        tracker.observe(&live(&[(2, false)]));
+        tracker.observe(&live(&[(1, false), (2, false)]));
+
+        assert_eq!(
+            tracker.away_within(HOUR),
+            vec![NodeId::from(1)],
+            "a view built while it was gone can still be the one acted on"
+        );
         assert!(
-            tracker.absent_within(HOUR).is_empty(),
-            "a member back in the live set is not absent"
+            tracker
+                .holding_gc(Duration::ZERO, Duration::ZERO)
+                .is_empty(),
+            "tombstone collection ages its own marks out"
+        );
+        assert_eq!(
+            tracker.away_within(HOUR),
+            vec![NodeId::from(1)],
+            "and never the return this bound reads"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            tracker.away_within(Duration::from_millis(1)).is_empty(),
+            "past the bound it is no longer named"
         );
     }
 

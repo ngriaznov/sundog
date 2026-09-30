@@ -14,7 +14,7 @@ use futures::stream::BoxStream;
 use smol_str::SmolStr;
 use tokio::sync::mpsc;
 
-use super::{InboundMsg, Mesh, RequestHandler};
+use super::{AeServeOutcome, InboundMsg, Mesh, RequestHandler};
 use crate::config::ClusterConfig;
 use crate::membership::Peer;
 use crate::node::{NodeId, NodeName};
@@ -52,8 +52,10 @@ pub(crate) fn peer_at(node: NodeId, addr: SocketAddr) -> Peer {
 /// A [`RequestHandler`] that serves an `StBuckets` pull deterministically:
 /// `st_buckets_available` answers `view_hash == self.view_hash`, and
 /// `st_bucket_chunks` replays `chunks` (already bucket-tagged) verbatim,
-/// optionally stalling forever afterward. Every other lookup answers empty,
-/// never exercised by a bucket-pull test. Used by `cluster::rebalance`'s
+/// optionally stalling forever afterward. A part-scoped anti-entropy
+/// digest exchange at `view_hash` finds nothing differing, as a donor with
+/// nothing more to give answers, unless `ae_stale` declines it. Every
+/// other lookup answers empty, never exercised by a bucket-pull test. Used by `cluster::rebalance`'s
 /// tests, which need to control exactly which bucket a chunk belongs to and
 /// whether a bucket's stream ever completes, without reimplementing the
 /// rest of `RequestHandler`'s surface at that call site.
@@ -70,6 +72,23 @@ pub(crate) struct BucketPullHandler {
     /// When `true`, every requested id is owned here but not yet pulled: a
     /// cold donor that declines every pull.
     pub(crate) cold: bool,
+    /// When `true`, every anti-entropy digest exchange answers `Stale`, as
+    /// a donor whose view has moved on since it declined the pull does.
+    pub(crate) ae_stale: bool,
+}
+
+impl BucketPullHandler {
+    /// `Digests(empty)` at this donor's view hash, `Stale` at another one
+    /// or whenever `ae_stale` is set.
+    fn ae_answer<T: Default>(&self, view_hash: u64) -> AeServeOutcome<T> {
+        if view_hash == self.view_hash && !self.ae_stale {
+            AeServeOutcome::Digests(T::default())
+        } else {
+            AeServeOutcome::Stale {
+                responder_view_hash: self.view_hash ^ 1,
+            }
+        }
+    }
 }
 
 impl RequestHandler for BucketPullHandler {
@@ -115,6 +134,26 @@ impl RequestHandler for BucketPullHandler {
         _parts: Vec<BucketPart>,
     ) -> BoxFuture<'_, PartEntries> {
         Box::pin(async { Vec::new() })
+    }
+
+    fn ae_digest_scoped(
+        &self,
+        _cache: SmolStr,
+        view_hash: u64,
+        _buckets: Vec<BucketDigest>,
+    ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketDigest>>> {
+        let answer = self.ae_answer(view_hash);
+        Box::pin(async move { answer })
+    }
+
+    fn ae_digest_masked(
+        &self,
+        _cache: SmolStr,
+        view_hash: u64,
+        _buckets: Vec<(u16, u64, u64)>,
+    ) -> BoxFuture<'_, AeServeOutcome<Vec<BucketPartDigests>>> {
+        let answer = self.ae_answer(view_hash);
+        Box::pin(async move { answer })
     }
 
     fn st_buckets_available(&self, _cache: SmolStr, view_hash: u64) -> BoxFuture<'_, bool> {

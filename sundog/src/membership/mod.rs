@@ -85,6 +85,10 @@ pub(crate) struct LiveFlags {
     pub(crate) departing: bool,
 }
 
+/// Receives every live set [`Membership::spawn_observed`] publishes; see
+/// there.
+pub(crate) type LiveObserver = Box<dyn Fn(&HashMap<NodeId, LiveFlags>) + Send>;
+
 /// A request to the background gossip loop, the sole owner of the chitchat
 /// handle.
 enum Command {
@@ -102,10 +106,6 @@ enum Command {
 pub struct Membership {
     peers: watch::Receiver<Vec<Peer>>,
     cache_modes: watch::Receiver<CacheModes>,
-    /// Each live peer's [`LiveFlags`], published in lockstep with `peers`;
-    /// `pub(crate)`: only `cluster::absence` consumes it, via
-    /// [`Membership::departing_flags`].
-    departing: watch::Receiver<HashMap<NodeId, LiveFlags>>,
     local: Peer,
     commands: mpsc::UnboundedSender<Command>,
 }
@@ -128,7 +128,28 @@ impl Membership {
         hostname: &str,
         data_addr: SocketAddr,
         config: &ClusterConfig,
+        seeds: BoxStream<'static, SocketAddr>,
+    ) -> Result<Self, JoinError> {
+        Self::spawn_observed(cluster_name, node, hostname, data_addr, config, seeds, None).await
+    }
+
+    /// [`Membership::spawn`] with `observer` handed every live set, each
+    /// peer with its [`LiveFlags`], before the peers and cache modes of the
+    /// same membership change publish: a peer's last flags and its
+    /// disappearance arrive together, and an observer never misses a peer
+    /// that drops out and returns between two reads of a watch.
+    ///
+    /// # Errors
+    ///
+    /// As [`Membership::spawn`].
+    pub(crate) async fn spawn_observed(
+        cluster_name: SmolStr,
+        node: NodeId,
+        hostname: &str,
+        data_addr: SocketAddr,
+        config: &ClusterConfig,
         mut seeds: BoxStream<'static, SocketAddr>,
+        observer: Option<LiveObserver>,
     ) -> Result<Self, JoinError> {
         let incarnation = now_incarnation_ms();
         let name = NodeName::new(hostname, node);
@@ -172,7 +193,6 @@ impl Membership {
 
         let (peers_tx, peers_rx) = watch::channel(Vec::new());
         let (cache_modes_tx, cache_modes_rx) = watch::channel(HashMap::new());
-        let (departing_tx, departing_rx) = watch::channel(HashMap::new());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
 
         // A departing node's `DEPARTING_KEY` write needs at least one full
@@ -183,7 +203,7 @@ impl Membership {
         let publishers = Publishers {
             peers: peers_tx,
             cache_modes: cache_modes_tx,
-            departing: departing_tx,
+            observer,
         };
         tokio::spawn(run(
             handle,
@@ -197,7 +217,6 @@ impl Membership {
         Ok(Self {
             peers: peers_rx,
             cache_modes: cache_modes_rx,
-            departing: departing_rx,
             local,
             commands: commands_tx,
         })
@@ -221,14 +240,6 @@ impl Membership {
     /// in lockstep with [`Membership::peers`].
     pub(crate) fn cache_modes(&self) -> watch::Receiver<CacheModes> {
         self.cache_modes.clone()
-    }
-
-    /// The live peers, each with its [`LiveFlags`]; the absence tracker's
-    /// only input, so a peer's last flags and its disappearance arrive
-    /// together. Published before the peers and cache modes of the same
-    /// membership change.
-    pub(crate) fn departing_flags(&self) -> watch::Receiver<HashMap<NodeId, LiveFlags>> {
-        self.departing.clone()
     }
 
     /// Advertises `mode` as this node's [`Mode`] for cache `name`, under
@@ -633,12 +644,13 @@ pub(crate) fn incarnation_is_dead(
 /// addresses into gossip, republishes live-set changes as `Vec<Peer>`, and
 /// performs shutdown on request. Spawned once, so `ChitchatHandle::shutdown`
 /// has exactly one owner regardless of how many [`Membership`] clones exist.
-/// The three watch channels [`run`] republishes membership state on, bundled
-/// to keep its argument count down.
+/// Where [`run`] republishes membership state, bundled to keep its argument
+/// count down: two watch channels, and the observer that sees every live
+/// set first.
 struct Publishers {
     peers: watch::Sender<Vec<Peer>>,
     cache_modes: watch::Sender<CacheModes>,
-    departing: watch::Sender<HashMap<NodeId, LiveFlags>>,
+    observer: Option<LiveObserver>,
 }
 
 async fn run(
@@ -652,7 +664,7 @@ async fn run(
     let Publishers {
         peers: peers_tx,
         cache_modes: cache_modes_tx,
-        departing: departing_tx,
+        observer,
     } = publishers;
     let mut seeds = seeds.fuse();
     let chitchat = handle.chitchat();
@@ -671,7 +683,7 @@ async fn run(
             live = live_nodes.select_next_some() => {
                 let mut peers: Vec<Peer> = Vec::new();
                 let mut cache_modes: CacheModes = HashMap::new();
-                let mut departing: HashMap<NodeId, LiveFlags> = HashMap::new();
+                let mut live_flags: HashMap<NodeId, LiveFlags> = HashMap::new();
                 for (id, state) in live.iter().filter(|(id, _)| *id != &self_chitchat_id) {
                     let Some(peer) = parse_peer(id, state) else { continue };
                     if let Some(notice) = protocol_notice(peer.protocol)
@@ -680,7 +692,7 @@ async fn run(
                         tracing::warn!(peer = %peer.node, peer_protocol = peer.protocol, "{notice}");
                     }
                     cache_modes.insert(peer.node, advertised_cache_modes(state));
-                    departing.insert(
+                    live_flags.insert(
                         peer.node,
                         LiveFlags {
                             departing: is_departing(state),
@@ -689,10 +701,12 @@ async fn run(
                     peers.push(peer);
                 }
                 tracing::debug!(count = peers.len(), "membership view updated");
-                // Departing flags first: an ownership view built from the
-                // new peers or modes then never runs ahead of the live set
-                // `Cluster::absent_within` reads.
-                let _ = departing_tx.send(departing);
+                // The observer first: an ownership view built from the new
+                // peers or modes then never runs ahead of the live set
+                // `Cluster::away_within` reads.
+                if let Some(observer) = &observer {
+                    observer(&live_flags);
+                }
                 let _ = cache_modes_tx.send(cache_modes);
                 let _ = peers_tx.send(peers);
             }
@@ -754,6 +768,7 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
     use chitchat::NodeState;
@@ -1368,6 +1383,79 @@ mod tests {
         .await;
         assert!(departed.is_ok(), "dead peer did not disappear in time");
         assert!(peers1.borrow().is_empty());
+
+        membership1.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_observed_hands_the_observer_each_live_set_before_the_peers_watch() {
+        let cluster_name: SmolStr = "membership-test-observer".into();
+        let config = ClusterConfig {
+            gossip_bind_addr: addr(0),
+            ..ClusterConfig::default()
+        };
+        let seen: Arc<StdMutex<Vec<HashMap<NodeId, LiveFlags>>>> = Arc::default();
+        let log = Arc::clone(&seen);
+        let membership1 = Membership::spawn_observed(
+            cluster_name.clone(),
+            NodeId::random(),
+            "node1",
+            addr(9301),
+            &config,
+            stream::pending().boxed(),
+            Some(Box::new(move |live| {
+                log.lock().expect("unpoisoned").push(live.clone());
+            })),
+        )
+        .await
+        .expect("node1 starts");
+        let gossip1 = membership1.local_peer().gossip_addr;
+
+        let node2 = NodeId::random();
+        let membership2 = Membership::spawn(
+            cluster_name,
+            node2,
+            "node2",
+            addr(9302),
+            &config,
+            repeating_stream(gossip1),
+        )
+        .await
+        .expect("node2 starts");
+
+        let observed_live = |node: NodeId| {
+            seen.lock()
+                .expect("unpoisoned")
+                .iter()
+                .any(|live| live.contains_key(&node))
+        };
+        let mut peers1 = membership1.peers();
+        wait_for_peer_count(membership1.peers(), 1, Duration::from_secs(15)).await;
+        assert!(
+            observed_live(node2),
+            "the observer saw node2 before the peers watch did"
+        );
+
+        membership2.shutdown().await;
+        let departed = tokio::time::timeout(Duration::from_secs(20), async {
+            while !peers1.borrow_and_update().is_empty() {
+                if peers1.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(departed.is_ok(), "node2 did not leave the live set in time");
+        let seen = seen.lock().expect("unpoisoned").clone();
+        assert!(
+            seen.last().is_some_and(HashMap::is_empty),
+            "the observer saw node2 leave no later than the peers watch"
+        );
+        assert!(
+            seen.iter()
+                .any(|live| live.get(&node2).is_some_and(|flags| flags.departing)),
+            "node2's graceful departure reached the observer before node2 left"
+        );
 
         membership1.shutdown().await;
     }

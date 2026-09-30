@@ -664,6 +664,56 @@ struct Settlement {
     /// means pulling it again, even when `rebalance_task` never saw the
     /// view that dropped it.
     lost: PartSet,
+    /// Parts the latest published view owns, or `None` before `refresh_task`
+    /// publishes one. A pull planned under an earlier view can finish after
+    /// a newer one drops its parts: the inbound guard forwards those records
+    /// instead of applying them, so the part is marked nothing.
+    owned: Option<PartSet>,
+    /// Each open [`PullTicket`]'s held parts: those every published view
+    /// has owned since the ticket opened. A pull that ran while its part
+    /// was not owned here, from the start or for a stretch in between,
+    /// had the records for it forwarded to the other owners, so it never
+    /// vouches for that part.
+    pulls: HashMap<u64, PartSet>,
+    /// The id the next [`PullTicket`] takes.
+    next_pull: u64,
+}
+
+impl Settlement {
+    /// Whether the latest published view owns `part`; `true` before any
+    /// view is published.
+    fn owns(&self, part: PartId) -> bool {
+        self.owned.as_ref().is_none_or(|owned| owned.contains(part))
+    }
+}
+
+/// One in-flight pull's hold on a [`ResidencySet`], from
+/// [`ResidencySet::open_pull`]: its [`PullTicket::mark_serving`] vouches
+/// only for parts every published view has owned since the ticket opened.
+/// Dropping the ticket, including when its pull is cancelled, releases the
+/// hold.
+pub(crate) struct PullTicket {
+    residency: Arc<ResidencySet>,
+    id: u64,
+}
+
+impl PullTicket {
+    /// The residency set this ticket marks.
+    pub(crate) fn residency(&self) -> &ResidencySet {
+        &self.residency
+    }
+
+    /// [`ResidencySet::mark_serving`] for the parts of `parts` every
+    /// published view has owned since this ticket opened.
+    pub(crate) fn mark_serving(&self, parts: &[PartId]) {
+        self.residency.mark_serving_for(Some(self.id), parts);
+    }
+}
+
+impl Drop for PullTicket {
+    fn drop(&mut self) {
+        self.residency.settlement.write().pulls.remove(&self.id);
+    }
 }
 
 impl Default for ResidencySet {
@@ -706,6 +756,9 @@ impl ResidencySet {
             settled,
             served,
             lost,
+            owned,
+            pulls,
+            ..
         } = &mut *settlement;
         for part in old.owned_parts().filter(|&part| !new.owns(part)) {
             if let Some(settled) = settled.as_mut() {
@@ -713,6 +766,26 @@ impl ResidencySet {
             }
             served.remove(part);
             lost.insert(part);
+            for held in pulls.values_mut() {
+                held.remove(part);
+            }
+        }
+        *owned = Some(new.owned_parts().collect());
+    }
+
+    /// Opens a [`PullTicket`] for a pull about to start.
+    pub(crate) fn open_pull(self: &Arc<Self>) -> PullTicket {
+        let mut settlement = self.settlement.write();
+        let id = settlement.next_pull;
+        settlement.next_pull += 1;
+        let held = settlement
+            .owned
+            .clone()
+            .unwrap_or_else(|| PartId::all().collect());
+        settlement.pulls.insert(id, held);
+        PullTicket {
+            residency: Arc::clone(self),
+            id,
         }
     }
 
@@ -751,37 +824,49 @@ impl ResidencySet {
         }
     }
 
-    /// Clears every cold mark: the warm-up gave up, so what is here is what
-    /// there is. [`ResidencySet::mark_all_serving`] clears this and every
-    /// unverified mark together in production.
-    pub(crate) fn clear_all_cold(&self) {
-        self.cold.write().clear();
-    }
-
     /// Clears the cold and unverified marks from `parts` together: the
     /// single point where this node starts trusting both a local miss and a
     /// local hit in these parts. Called from every site that decides a part
     /// is ready to serve -- a donor pull landing, an eager verification
-    /// round, or every donor turning out cold or unreachable.
+    /// round, or every donor turning out cold or unreachable. A part the
+    /// latest published view does not own keeps its marks: whatever landed
+    /// for it went through the inbound guard to its current owners, and a
+    /// view that owns it again pulls it again.
     pub(crate) fn mark_serving(&self, parts: &[PartId]) {
-        self.clear_cold(parts);
-        self.clear_unverified(parts);
-        self.settlement.write().served.extend(parts.iter().copied());
+        self.mark_serving_for(None, parts);
+    }
+
+    /// [`ResidencySet::mark_serving`], restricted as well to the parts
+    /// `pull`'s ticket still holds.
+    fn mark_serving_for(&self, pull: Option<u64>, parts: &[PartId]) {
+        let mut settlement = self.settlement.write();
+        let held = pull.and_then(|id| settlement.pulls.get(&id));
+        let owned: Vec<PartId> = parts
+            .iter()
+            .copied()
+            .filter(|&part| settlement.owns(part) && held.is_none_or(|held| held.contains(part)))
+            .collect();
+        self.clear_cold(&owned);
+        self.clear_unverified(&owned);
+        settlement.served.extend(owned);
     }
 
     /// Wholesale analogue of [`ResidencySet::mark_serving`]: after
-    /// `warm_up_task`'s `WarmAnyway` give-up, every part still marked cold
-    /// or unverified is declared servable at once.
+    /// `warm_up_task`'s `WarmAnyway` give-up, every part the latest
+    /// published view owns and still marks cold or unverified is declared
+    /// servable at once.
     pub(crate) fn mark_all_serving(&self) {
-        self.clear_all_cold();
-        self.unverified.write().clear();
-        self.stale.write().clear();
         let mut settlement = self.settlement.write();
+        let owned: Vec<PartId> = PartId::all()
+            .filter(|&part| settlement.owns(part))
+            .collect();
+        self.clear_cold(&owned);
+        self.clear_unverified(&owned);
         let Settlement {
             settled, served, ..
         } = &mut *settlement;
         if let Some(settled) = settled.as_ref() {
-            served.extend(PartId::all().filter(|&part| !settled.contains(part)));
+            served.extend(owned.into_iter().filter(|&part| !settled.contains(part)));
         }
     }
 
@@ -1927,7 +2012,7 @@ mod tests {
         );
         set.clear_cold(&[p(2)]);
         assert!(set.is_cold(p(1)) && !set.is_cold(p(2)) && set.is_cold(p(3)));
-        set.clear_all_cold();
+        set.mark_all_serving();
         assert!(!set.is_cold(p(1)) && !set.is_cold(p(3)));
     }
 
@@ -2093,6 +2178,113 @@ mod tests {
             !set.is_unsettled(dropped),
             "once taken and pulled, a later settle vouches for it"
         );
+    }
+
+    #[test]
+    fn residency_set_a_pull_landing_after_its_part_is_dropped_serves_nothing() {
+        let set = ResidencySet::new();
+        let alone = NonZeroU8::new(1).expect("nonzero");
+        let (me, other) = (NodeId::from(1), NodeId::from(2));
+        let whole = OwnershipView::compute(me, vec![me], alone);
+        let split = OwnershipView::compute(me, vec![me, other], alone);
+        let dropped = PartId::all()
+            .find(|&part| !split.owns(part))
+            .expect("two nodes split the parts");
+        let kept = PartId::all()
+            .find(|&part| split.owns(part))
+            .expect("two nodes split the parts");
+
+        set.record_published(&split, &whole);
+        set.settle(&split);
+        set.mark_cold(&[dropped, kept]);
+        set.record_published(&whole, &split);
+        set.mark_serving(&[dropped, kept]);
+        assert!(
+            set.is_cold(dropped),
+            "a pull the view moved past forwarded its records away, so its part stays cold"
+        );
+        assert!(
+            !set.is_cold(kept),
+            "a part still owned serves once its pull lands"
+        );
+
+        set.record_published(&split, &whole);
+        assert!(
+            set.is_unsettled(dropped),
+            "owned again, the part waits for its own pull instead of the one that landed while dropped"
+        );
+    }
+
+    #[test]
+    fn a_pull_ticket_never_vouches_for_a_part_dropped_and_owned_again_while_it_ran() {
+        let set = Arc::new(ResidencySet::new());
+        let alone = NonZeroU8::new(1).expect("nonzero");
+        let (me, other) = (NodeId::from(1), NodeId::from(2));
+        let whole = OwnershipView::compute(me, vec![me], alone);
+        let split = OwnershipView::compute(me, vec![me, other], alone);
+        let flapped = PartId::all()
+            .find(|&part| !split.owns(part))
+            .expect("two nodes split the parts");
+        let kept = PartId::all()
+            .find(|&part| split.owns(part))
+            .expect("two nodes split the parts");
+
+        set.record_published(&split, &whole);
+        set.settle(&whole);
+        set.mark_cold(&[flapped, kept]);
+        let ticket = set.open_pull();
+        set.record_published(&whole, &split);
+        let stale = set.open_pull();
+        set.record_published(&split, &whole);
+        let later = set.open_pull();
+
+        ticket.mark_serving(&[flapped, kept]);
+        assert!(
+            set.is_cold(flapped),
+            "records for the part went to its other owners while it was dropped"
+        );
+        assert!(!set.is_cold(kept), "a part owned throughout serves");
+        stale.mark_serving(&[flapped]);
+        assert!(
+            set.is_cold(flapped),
+            "a pull planned from a view the published one had moved past started without the part"
+        );
+
+        later.mark_serving(&[flapped]);
+        assert!(
+            !set.is_cold(flapped),
+            "a pull that started after the part came back saw every record"
+        );
+
+        drop((ticket, stale, later));
+        assert!(
+            set.settlement.read().pulls.is_empty(),
+            "a dropped ticket releases its hold"
+        );
+    }
+
+    #[test]
+    fn residency_set_mark_all_serving_leaves_a_part_the_published_view_does_not_own() {
+        let set = ResidencySet::new();
+        let alone = NonZeroU8::new(1).expect("nonzero");
+        let (me, other) = (NodeId::from(1), NodeId::from(2));
+        let whole = OwnershipView::compute(me, vec![me], alone);
+        let split = OwnershipView::compute(me, vec![me, other], alone);
+        let dropped = PartId::all()
+            .find(|&part| !split.owns(part))
+            .expect("two nodes split the parts");
+        let kept = PartId::all()
+            .find(|&part| split.owns(part))
+            .expect("two nodes split the parts");
+
+        set.settle(&whole);
+        set.mark_cold(&[dropped, kept]);
+        set.record_published(&whole, &split);
+        set.mark_all_serving();
+        assert!(set.is_cold(dropped) && !set.is_cold(kept));
+
+        set.record_published(&split, &whole);
+        assert!(set.is_unsettled(dropped));
     }
 
     #[cfg(feature = "spill")]

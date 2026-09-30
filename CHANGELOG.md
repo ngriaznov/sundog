@@ -50,6 +50,32 @@ All notable changes to this project are documented in this file. Format follows
   hands the part over as a join does, and after
   `ClusterConfig::state_transfer_budget`, the bound a pull already waits
   for a donor, the part serves what the node holds. No wire change.
+- **A `Distributed` owner that flaps out of the live set and back no
+  longer leaves a node serving its parts alone.** The absence tracker read
+  membership through a watch, which keeps only the latest live set, so a
+  failure-detector flap that dropped every peer and brought them back
+  between two reads went unrecorded, and a node acting on the view built
+  while they were gone served every part as sole owner. Membership now
+  hands the tracker every live set before publishing its peers, and a
+  member back from an absence still counts for
+  `ClusterConfig::state_transfer_budget`, so the view built without it
+  keeps its parts cold. No wire change.
+- **A pull vouches only for parts owned for its whole run.** A rebalance
+  pull runs against whichever view was current when it started, and the
+  views move on meanwhile. While a part is not owned here, the inbound
+  guard forwards its records to the current owners, yet the pull's finish
+  still marked the part pulled, so a node that owned the part again
+  answered a miss from the copy the pull never filled. Each pull now holds
+  the parts the published view owns as it starts and loses any a later
+  view drops; it marks only the parts it still holds, and a part it lost
+  is pulled again. No wire change.
+- **A part group every donor declines as cold settles only once it has
+  converged with each donor.** A donor declines a whole group as cold when
+  any one part of it is cold, while still holding the rest. The group then
+  converges with each donor by anti-entropy and serves what landed, and it
+  served even when a round failed or timed out, answering a miss for keys
+  the donor held. It now keeps its parts cold and retries, within the
+  pull's `state_transfer_budget`. No wire change.
 
 ## [0.6.2] – 2026-09-27
 

@@ -20,8 +20,8 @@ use super::{Cluster, group_in_order};
 use crate::net::{BucketPull, Mesh};
 use crate::node::NodeId;
 use crate::ownership::{
-    Granularity, OwnershipTracker, OwnershipView, ResidencySet, ownership_diff, parts_of_wire_id,
-    wire_ids,
+    Granularity, OwnershipTracker, OwnershipView, PullTicket, ResidencySet, ownership_diff,
+    parts_of_wire_id, wire_ids,
 };
 use crate::store::part::PartSet;
 use crate::store::{PartId, ShardOps};
@@ -92,7 +92,7 @@ async fn try_donor_parts(
     shard: &Arc<dyn ShardOps>,
     mesh: &Mesh,
     cache: &SmolStr,
-    residency: &ResidencySet,
+    ticket: &PullTicket,
     donor: NodeId,
     parts: &[PartId],
     (granularity, view_hash): (Granularity, u64),
@@ -129,7 +129,7 @@ async fn try_donor_parts(
             // A pulled part is authoritative regardless of any
             // warm-reloaded on-disk checkpoint; mark_serving clears both
             // the cold and unverified marks in one decision.
-            residency.mark_serving(&done);
+            ticket.mark_serving(&done);
             let fresh = done
                 .into_iter()
                 .filter(|&part| requested.contains(part) && credited.insert(part))
@@ -163,10 +163,12 @@ const COLD_DONOR_ROUNDS: u32 = 3;
 
 /// Converges `parts` with each of `donors` by anti-entropy, which a donor
 /// answers whether or not it is cold: a donor still pulling these parts
-/// itself can hold writes that reached it meanwhile, and a group every
-/// donor declines as cold otherwise settles without them. Up to
-/// [`COLD_DONOR_ROUNDS`] rounds per donor, each bounded by `per_donor`,
-/// until every part matches or a round fails.
+/// itself can hold writes that reached it meanwhile, and a donor that
+/// declines a whole group as cold for one cold part still holds the rest.
+/// Up to [`COLD_DONOR_ROUNDS`] rounds per donor, each bounded by
+/// `per_donor`, until every part matches or a round fails. Answers whether
+/// every donor was reached: a failed or timed-out round leaves that donor's
+/// copy unmerged, so the group must not settle on what landed here.
 async fn converge_with_cold_donors(
     shard: &Arc<dyn ShardOps>,
     mesh: &Mesh,
@@ -174,27 +176,59 @@ async fn converge_with_cold_donors(
     donors: &[NodeId],
     parts: &[PartId],
     per_donor: Duration,
-) {
+) -> bool {
+    let mut reached_all = true;
     for &donor in donors {
         let mut diverging = parts.to_vec();
+        let mut reached = true;
         for _ in 0..COLD_DONOR_ROUNDS {
-            let Ok(outcome) = tokio::time::timeout(
+            let outcome = tokio::time::timeout(
                 per_donor,
                 anti_entropy::run_round_for_parts(mesh, shard, cache, donor, &diverging),
             )
             .await
-            else {
-                break;
-            };
-            if outcome.failed {
-                break;
-            }
-            diverging.retain(|part| !outcome.matched.contains(part));
-            if diverging.is_empty() {
-                break;
+            .ok();
+            match cold_round(outcome, &mut diverging) {
+                ColdRound::Unreached => {
+                    reached = false;
+                    break;
+                }
+                ColdRound::Matched => break,
+                ColdRound::Diverging => {}
             }
         }
-        tracing::debug!(cache = %cache, %donor, parts = parts.len(), diverging = diverging.len(), "converged with a cold donor by anti-entropy");
+        tracing::debug!(cache = %cache, %donor, parts = parts.len(), diverging = diverging.len(), reached, "converged with a cold donor by anti-entropy");
+        reached_all &= reached;
+    }
+    reached_all
+}
+
+/// Where one anti-entropy round against a cold donor leaves
+/// [`converge_with_cold_donors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdRound {
+    /// The round failed or ran out of time: nothing says what the donor holds.
+    Unreached,
+    /// Every part still diverging compared equal.
+    Matched,
+    /// The round reconciled what it found, and some parts still differ.
+    Diverging,
+}
+
+/// Folds one round's `outcome` (`None` for a round that ran out of time)
+/// into `diverging`, the parts not yet seen equal on the donor.
+fn cold_round(
+    outcome: Option<anti_entropy::PartRoundOutcome>,
+    diverging: &mut Vec<PartId>,
+) -> ColdRound {
+    let Some(outcome) = outcome.filter(|outcome| !outcome.failed) else {
+        return ColdRound::Unreached;
+    };
+    diverging.retain(|part| !outcome.matched.contains(part));
+    if diverging.is_empty() {
+        ColdRound::Matched
+    } else {
+        ColdRound::Diverging
     }
 }
 
@@ -242,7 +276,8 @@ fn settle_all_cold(
 /// node's own view has moved past `view_hash`: then no donor ever agrees,
 /// and the pull answers [`GroupPull::Superseded`] for the caller to
 /// replan against the current view. A group every donor keeps declining
-/// as cold settles by [`settle_all_cold`].
+/// as cold settles by [`settle_all_cold`] once
+/// [`converge_with_cold_donors`] reaches every donor.
 #[expect(
     clippy::too_many_arguments,
     reason = "each parameter is independent context one donor-group retry loop needs; grouping any subset into a struct would only rename the same eight pieces of state"
@@ -252,7 +287,7 @@ async fn pull_one_group(
     mesh: &Mesh,
     cache: &SmolStr,
     ownership: &OwnershipTracker,
-    residency: &ResidencySet,
+    ticket: &PullTicket,
     donors: Vec<NodeId>,
     parts: Vec<PartId>,
     view: (Granularity, u64),
@@ -277,7 +312,7 @@ async fn pull_one_group(
                     shard,
                     mesh,
                     cache,
-                    residency,
+                    ticket,
                     donor,
                     &parts,
                     view,
@@ -309,7 +344,7 @@ async fn pull_one_group(
                 "part pull attempt finished"
             );
             if result == DonorResult::Done {
-                residency.mark_serving(&parts);
+                ticket.mark_serving(&parts);
                 let pending = parts_pending_group_credit(group_len, &credited);
                 if pending > 0 {
                     metrics::counter!(
@@ -334,10 +369,15 @@ async fn pull_one_group(
                 // verified keeps waiting, since its replay can lack a key
                 // an owner holds and a read would answer a wrong miss.
                 tracing::debug!(cache = %cache, parts = parts.len(), "every donor is cold for these parts; nothing warm to pull");
-                converge_with_cold_donors(shard, mesh, cache, &donors, &parts, per_donor).await;
-                let (settled, pull) = settle_all_cold(&parts, |part| residency.is_replayed(part));
-                residency.mark_serving(&settled);
-                return pull;
+                if converge_with_cold_donors(shard, mesh, cache, &donors, &parts, per_donor).await {
+                    let (settled, pull) =
+                        settle_all_cold(&parts, |part| ticket.residency().is_replayed(part));
+                    ticket.mark_serving(&settled);
+                    return pull;
+                }
+                // A donor this node never reached can hold the only copy of
+                // a key, so the group stays cold and starts its passes over.
+                all_cold_passes = 0;
             }
         } else {
             all_cold_passes = 0;
@@ -405,6 +445,9 @@ impl PullRequest<'_> {
             return Outcome::Skipped;
         }
 
+        // Opened before the view is read, so any view published after the
+        // one this pull plans against counts against the ticket.
+        let ticket = Arc::new(residency.open_pull());
         let view = ownership.current();
         let view_key = (view.granularity(), view.view_hash());
         let (groups, no_donor): (Vec<DonorGroup>, Vec<DonorGroup>) =
@@ -418,8 +461,8 @@ impl PullRequest<'_> {
         // warm_up_task's ordinary retries via Outcome::NoPeers.
         let alone: Vec<PartId> = no_donor.into_iter().flat_map(|(_, p)| p).collect();
         if !alone.is_empty() && trust_sole_owner {
-            let absent = cluster.absent_within(budget);
-            residency.mark_serving(&sole_owned(&view, alone, &absent));
+            let absent = cluster.away_within(budget);
+            ticket.mark_serving(&sole_owned(&view, alone, &absent));
         }
         if groups.is_empty() {
             tracing::debug!(cache = %cache, "no live co-owner for any gained part; nothing to pull");
@@ -438,7 +481,7 @@ impl PullRequest<'_> {
                 let mesh = mesh.clone();
                 let cache = cache.clone();
                 let ownership = ownership.clone();
-                let residency = Arc::clone(residency);
+                let ticket = Arc::clone(&ticket);
                 set.spawn(async move {
                     let _permit = semaphore
                         .acquire_owned()
@@ -449,7 +492,7 @@ impl PullRequest<'_> {
                         &mesh,
                         &cache,
                         &ownership,
-                        &residency,
+                        &ticket,
                         donors,
                         group_parts,
                         view_key,
@@ -992,7 +1035,7 @@ pub(crate) async fn rebalance_task(
                     new_view
                         .owned_parts()
                         .filter(|&part| new_view.owners_of(part).len() == 1),
-                    &cluster.absent_within(budget),
+                    &cluster.away_within(budget),
                 );
                 if !alone.is_empty() {
                     residency.mark_serving(&alone);
@@ -1074,7 +1117,7 @@ pub(crate) async fn rebalance_task(
                         let serving = sole_owned(
                             &view,
                             held,
-                            &cluster.absent_within(budget),
+                            &cluster.away_within(budget),
                         );
                         if !serving.is_empty() {
                             residency.mark_serving(&serving);
@@ -2093,6 +2136,27 @@ mod tests {
         )) as Arc<dyn ShardOps>
     }
 
+    /// [`empty_shard`] planning against `ownership`, so a part-scoped
+    /// anti-entropy round has a view to send.
+    fn owned_shard(
+        ownership: &OwnershipTracker,
+        residency: &Arc<ResidencySet>,
+    ) -> Arc<dyn ShardOps> {
+        Arc::new(
+            crate::store::Shard::<u32, u32>::new(
+                SmolStr::new("prices"),
+                crate::store::Mode::Distributed {
+                    owners: NonZeroU8::new(2).expect("nonzero"),
+                },
+                crate::node::NodeId::random(),
+                1024,
+                None,
+                None,
+            )
+            .with_ownership(ownership.clone(), Arc::clone(residency)),
+        ) as Arc<dyn ShardOps>
+    }
+
     async fn solo_cluster(name: &str) -> crate::cluster::Cluster {
         crate::cluster::Cluster::builder(name)
             .seeds(std::iter::empty())
@@ -2591,6 +2655,41 @@ mod tests {
     }
 
     #[test]
+    fn cold_round_settles_nothing_on_a_round_that_never_reached_the_donor() {
+        let (a, b) = (PartId::from_raw(1), PartId::from_raw(2));
+        let round = |failed: bool, matched: &[PartId]| anti_entropy::PartRoundOutcome {
+            matched: matched.iter().copied().collect(),
+            still_diverged: HashSet::new(),
+            bytes_moved: 0,
+            failed,
+        };
+
+        let mut diverging = vec![a, b];
+        assert_eq!(
+            cold_round(None, &mut diverging),
+            ColdRound::Unreached,
+            "a round that ran out of time"
+        );
+        assert_eq!(
+            cold_round(Some(round(true, &[])), &mut diverging),
+            ColdRound::Unreached,
+            "a failed or stale round"
+        );
+        assert_eq!(diverging, vec![a, b], "an unreached round compares nothing");
+
+        assert_eq!(
+            cold_round(Some(round(false, &[a])), &mut diverging),
+            ColdRound::Diverging
+        );
+        assert_eq!(diverging, vec![b]);
+        assert_eq!(
+            cold_round(Some(round(false, &[b])), &mut diverging),
+            ColdRound::Matched
+        );
+        assert!(diverging.is_empty());
+    }
+
+    #[test]
     fn settle_all_cold_serves_cold_parts_and_holds_back_unverified_ones() {
         let parts = [
             PartId::from_raw(1),
@@ -2636,11 +2735,11 @@ mod tests {
         residency.mark_unverified(&[a]);
 
         let pull = pull_one_group(
-            &empty_shard(),
+            &owned_shard(&ownership, &residency),
             &requester,
             &cache,
             &ownership,
-            &residency,
+            &residency.open_pull(),
             vec![donor_node],
             vec![a, b],
             (Granularity::Part, view_hash),
@@ -2691,11 +2790,11 @@ mod tests {
         residency.mark_stale(&[part]);
 
         let pull = pull_one_group(
-            &empty_shard(),
+            &owned_shard(&ownership, &residency),
             &requester,
             &cache,
             &ownership,
-            &residency,
+            &residency.open_pull(),
             vec![donor_node],
             vec![part],
             (Granularity::Part, view_hash),
@@ -2706,6 +2805,62 @@ mod tests {
         assert!(
             !residency.is_cold(part) && !residency.is_unverified(part),
             "the stale part serves once converged with every cold donor"
+        );
+
+        donor.shutdown().await;
+        requester.shutdown().await;
+    }
+
+    /// A donor that declines a group as cold can still hold the group's
+    /// keys, so a group whose converge never reaches it keeps its parts
+    /// cold rather than serving what landed here.
+    #[tokio::test]
+    async fn pull_one_group_keeps_a_cold_group_cold_while_its_donor_answers_anti_entropy_stale() {
+        use crate::net::test_support::{BucketPullHandler, peer_at, spawn_mesh};
+
+        let cache = SmolStr::new("prices");
+        let (donor_node, requester_node) = (NodeId::from(131), NodeId::from(132));
+        let modes: crate::membership::CacheModes = std::collections::HashMap::new();
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let (ownership, _tx) = OwnershipTracker::seed(requester_node, &[], &modes, &cache, k);
+        let view_hash = ownership.current().view_hash();
+        let donor_handler = Arc::new(BucketPullHandler {
+            view_hash,
+            cold: true,
+            ae_stale: true,
+            ..Default::default()
+        });
+        let (donor, _donor_inbound) = spawn_mesh(donor_node, donor_handler).await;
+        let (requester, _requester_inbound) =
+            spawn_mesh(requester_node, Arc::new(BucketPullHandler::default())).await;
+        requester.update_peers(vec![peer_at(donor_node, donor.local_addr())]);
+
+        let part = PartId::new(3, 0);
+        let residency = Arc::new(ResidencySet::new());
+        residency.mark_cold(&[part]);
+
+        let pull = tokio::time::timeout(
+            Duration::from_secs(2),
+            pull_one_group(
+                &owned_shard(&ownership, &residency),
+                &requester,
+                &cache,
+                &ownership,
+                &residency.open_pull(),
+                vec![donor_node],
+                vec![part],
+                (Granularity::Part, view_hash),
+                Duration::from_millis(500),
+            ),
+        )
+        .await;
+        assert!(
+            pull.is_err(),
+            "the group keeps retrying instead of settling: {pull:?}"
+        );
+        assert!(
+            residency.is_cold(part),
+            "reads keep asking the other owners"
         );
 
         donor.shutdown().await;
@@ -2757,7 +2912,7 @@ mod tests {
                 &requester,
                 &cache,
                 &ownership,
-                &residency,
+                &residency.open_pull(),
                 vec![donor_node],
                 two_buckets(),
                 (Granularity::Bucket, view_hash),
@@ -2859,7 +3014,7 @@ mod tests {
             &requester,
             &cache,
             &ownership,
-            &residency,
+            &residency.open_pull(),
             vec![first_node, second_node],
             two_buckets(),
             (Granularity::Bucket, view_hash),
@@ -2932,7 +3087,7 @@ mod tests {
             &requester,
             &cache,
             &ownership,
-            &residency,
+            &residency.open_pull(),
             vec![donor_node],
             parts.clone(),
             (Granularity::Part, view_hash),
@@ -3014,7 +3169,7 @@ mod tests {
             peer_at(second_donor_node, second_donor.local_addr()),
         ]);
 
-        let residency = ResidencySet::new();
+        let residency = Arc::new(ResidencySet::new());
         residency.mark_cold(&two_buckets());
         let shard = empty_shard();
         let mut credited: HashSet<PartId> = HashSet::new();
@@ -3027,7 +3182,7 @@ mod tests {
                 &shard,
                 &requester,
                 &cache,
-                &residency,
+                &residency.open_pull(),
                 first_donor_node,
                 &two_buckets(),
                 (Granularity::Bucket, view_hash),
@@ -3052,7 +3207,7 @@ mod tests {
             &shard,
             &requester,
             &cache,
-            &residency,
+            &residency.open_pull(),
             second_donor_node,
             &two_buckets(),
             (Granularity::Bucket, view_hash),
