@@ -11321,6 +11321,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// The re-arm is a write over the capacity of one entry, so the
+        /// eviction it triggers can spill the entry straight back: the value
+        /// stays readable either way and keeps the new lifetime.
         #[tokio::test]
         async fn expire_reads_a_spilled_value_back_and_ttl_of_needs_no_disk_read() {
             let (shard, spilled_key, spilled_value, _resident_key, _resident_value, dir) =
@@ -11344,10 +11347,15 @@ mod tests {
                     && left > Duration::from_secs(50)
             ));
             assert_eq!(
-                shard.get_sync(&spilled_key),
+                shard.get(&spilled_key).await,
                 Some(spilled_value),
-                "the re-arm wrote the value back resident"
+                "the value survives the re-arm, resident or spilled again"
             );
+            assert!(matches!(
+                shard.ttl_of(&spilled_key),
+                Some(Ttl::Remaining(left)) if left <= Duration::from_secs(60)
+                    && left > Duration::from_secs(50)
+            ));
 
             let _ = std::fs::remove_dir_all(&dir);
         }
