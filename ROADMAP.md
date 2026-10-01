@@ -62,6 +62,28 @@ nothing under every mode, which is the seam. An observer binary joins that
 way and dumps peers, ownership, digests and keys over the wire, through the
 state-transfer and anti-entropy requests a donor already answers.
 
+### Explaining a read
+
+When a read answers a miss or `FetchUnavailable`, nothing says why. The
+answer depends on which nodes this node's view names as owners, whether its
+copy of the key's part is cold, unverified, stale or releasing, which pull
+or anti-entropy round last touched that part, and which owner answered.
+`Cache::explain(&key)` returns that record. A bounded per-part ring of
+residency events (gained, dropped, marked cold, pulled from a donor,
+settled) feeds it, off by default or sampled, and one request asks each
+owner for its own side. The observer above reads the same request.
+
+**Trigger:** an operator asking why a read missed, with nothing to read but
+counters.
+
+### A live cluster view
+
+The observer above dumps state once. `sundog-lens` is a terminal UI over the
+same requests that redraws it continuously: members joining and leaving,
+part ownership moving between them, pulls and repairs in flight, and the
+parts whose fetches are slowest or most frequent. It is the demo a README
+animation shows, and the view an operator watches during a rolling deploy.
+
 ### Snapshot export and import
 
 Persistence is the spill tier's checkpoint, behind the `spill` feature. A
@@ -98,6 +120,34 @@ Nothing tracks per-key access frequency. A sampled hot-key list, fed from
 the admission sketch above once it exists, reports through `Health` and a
 gauge which keys a node serves most.
 
+### Hot-key read replicas
+
+In `Distributed` mode every read of a key a node does not own is a round
+trip to an owner, however often the key is read. A key the hot-key list
+above names gets a short-lived copy on each node that reads it, under a
+read lease from its owners: a write to the key invalidates every leased
+copy before it lands, and a copy past its lease reads through to the owners
+again. Owners stay the source of truth, so a sharded cache serves its
+hottest keys at `Replicated` read latency. A wire change with the usual
+bump.
+
+**Trigger:** a `Distributed` deployment whose fetch rate is concentrated on
+a few keys.
+
+### Changing a cache's mode in place
+
+A cache's mode is fixed at `open()`, and moving from `Replicated` to
+`Distributed` when a cache outgrows one node's memory means closing it on
+every node and refilling it. Rebalance already moves parts between owners.
+A mode change advertised through gossip runs it from a view where every
+node owns every part to a sharded one, with each node releasing the parts
+it no longer owns through the disown grace, and back the other way by
+pulling every part. Reads keep answering throughout, as they do during
+ordinary churn.
+
+**Trigger:** a deployment that needs to change a cache's mode without
+taking it down.
+
 ### Per-record compression
 
 No compression anywhere in the store. A replica caches a replicate frame's
@@ -109,6 +159,38 @@ raw.
 
 **Trigger:** a deployment whose values are text or structured payloads and
 whose RAM is bound by them.
+
+## Reads
+
+### Cluster-wide load coalescing
+
+`get_or_load` collapses concurrent misses into one loader call on one node.
+When a popular key expires, every node that misses it still runs its own
+loader, so the backing store takes one query per node. A cluster-wide load
+picks one node per key, the key's first owner in `Distributed` mode and its
+rendezvous winner otherwise, to run the loader, and every other node that
+misses asks that node to load and waits for the result to arrive as an
+ordinary replicated write. A load request carries a deadline: a waiter
+whose loader node dies or stays silent past it runs the loader itself.
+
+This is deduplication, not mutual exclusion. Under a partition each side
+picks its own loader, two loads run, and last-write-wins settles their
+results like any two writes, so nothing here is the lease "Distributed
+locks and leader leases" refuses. A wire change with the usual bump.
+
+**Trigger:** a deployment whose backing store sees a burst of identical
+queries each time a popular key expires.
+
+### Hedged fetches
+
+A fetch asks one owner and waits for it. An owner that is slow but alive
+holds the read for the whole round trip, so a fetch's tail latency is its
+slowest owner's. A hedged fetch sends to a second owner once the first has
+taken longer than the fetch latency's p95 and takes whichever answer
+arrives first. The threshold comes from the fetch histogram under "Next".
+
+**Trigger:** a fetch p99 well above its p50 on a cluster whose owners are
+all healthy.
 
 ## Zone-aware donor and repair choice
 
