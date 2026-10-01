@@ -1,12 +1,13 @@
 //! The model: everything the interface shows, folded from [`Update`]s.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use smol_str::SmolStr;
-use sundog::observe::ClusterSnapshot;
+use sundog::observe::{ClusterSnapshot, MemberStatus};
+use sundog::store::Mode;
 
 use crate::source::{ScrapeReport, Update};
 
@@ -21,7 +22,8 @@ pub mod slots;
 pub mod testkit;
 
 pub use digest::{ModelDigest, digest};
-pub use events::{Event, EventKind};
+pub use events::{Event, EventKind, EventLog, Filter, diff_snapshots};
+pub use lifelines::Lifelines;
 pub use ownership::OwnershipDigest;
 pub use slots::{Slot, Slots};
 
@@ -37,7 +39,11 @@ pub struct Model {
     snapshot: Option<Arc<ClusterSnapshot>>,
     ownership: BTreeMap<SmolStr, OwnershipDigest>,
     view_since: BTreeMap<SmolStr, Instant>,
+    settle_pending: BTreeSet<SmolStr>,
     scrapes: BTreeMap<SocketAddr, ScrapeReport>,
+    last_ok: BTreeMap<SocketAddr, Instant>,
+    log: EventLog,
+    lifelines: Lifelines,
     now: Option<Instant>,
     wall: Option<SystemTime>,
 }
@@ -50,43 +56,42 @@ impl Model {
     }
 
     /// Folds `update` in at monotonic time `now` and wall-clock time `wall`
-    /// and returns the events it raises.
+    /// and returns the events it raises. The events also join the
+    /// [`events`](Self::events) log and mark the [`lifelines`](Self::lifelines).
     ///
-    /// A snapshot replaces the member view and gives every gossip address a
-    /// slot. An ownership digest replaces its cache's digest and restarts the
-    /// cache's settling clock when the view hash changed. A scrape replaces
-    /// the node's last report. It returns an empty event list.
+    /// A snapshot replaces the member view, gives every gossip address a slot,
+    /// raises the events [`diff_snapshots`] finds and drops the ownership of a
+    /// cache no live member advertises as `Distributed`. A `DOWN` carries the
+    /// time since the node's exporter last answered when its latest scrape
+    /// failed. An ownership digest replaces its cache's digest; a changed view
+    /// hash raises `VIEW` and restarts the cache's settling clock. A scrape
+    /// replaces the node's last report, marks the node suspect on a failure
+    /// and live again on a success. Any update raises `SETTLED` for a cache
+    /// whose view has held long enough.
     pub fn apply(&mut self, update: Update, now: Instant, wall: SystemTime) -> Vec<Event> {
         self.now = Some(now);
         self.wall = Some(wall);
-        match update {
-            Update::Snapshot(snapshot, _) => {
-                for member in &snapshot.members {
-                    self.slots.assign(member.peer.gossip_addr);
-                }
-                self.snapshot = Some(snapshot);
-            }
-            Update::Ownership(digest) => {
-                let moved = self
-                    .ownership
-                    .get(&digest.cache)
-                    .is_none_or(|held| held.view_hash != digest.view_hash);
-                if moved {
-                    self.view_since.insert(digest.cache.clone(), now);
-                }
-                self.ownership.insert(digest.cache.clone(), digest);
-            }
+        let mut kinds = match update {
+            Update::Snapshot(snapshot, _) => self.apply_snapshot(snapshot, now),
+            Update::Ownership(digest) => self.apply_ownership(digest, now),
             Update::Scrape(report) => {
-                self.scrapes.insert(report.addr, report);
+                self.apply_scrape(report, now);
+                Vec::new()
             }
-        }
-        Vec::new()
+        };
+        kinds.extend(self.settled_events(now));
+        self.finish(kinds, now, wall)
     }
 
-    /// Advances the model's clock to `now` and returns an empty event list.
+    /// Advances the model's clocks to `now` and returns the events the passing
+    /// time raises: `SETTLED` for a cache whose view has now held long enough.
+    /// A tick before the first update leaves the wall clock unset.
     pub fn tick(&mut self, now: Instant) -> Vec<Event> {
+        let wall = self.wall_at(now);
         self.now = Some(now);
-        Vec::new()
+        self.wall = self.wall.map(|_| wall);
+        let kinds = self.settled_events(now);
+        self.finish(kinds, now, wall)
     }
 
     /// Names the node at gossip address `addr` as `label`, for the slot that
@@ -124,25 +129,177 @@ impl Model {
         self.scrapes.get(&addr)
     }
 
+    /// The event log, oldest first.
+    #[must_use]
+    pub const fn events(&self) -> &EventLog {
+        &self.log
+    }
+
+    /// The node and cache lifelines.
+    #[must_use]
+    pub const fn lifelines(&self) -> &Lifelines {
+        &self.lifelines
+    }
+
     /// The monotonic time of the last update or tick.
     #[must_use]
     pub const fn now(&self) -> Option<Instant> {
         self.now
     }
 
-    /// The wall-clock time of the last update.
+    /// The wall-clock time of the last update or tick. A tick advances it by
+    /// the monotonic time that passed.
     #[must_use]
     pub const fn wall(&self) -> Option<SystemTime> {
         self.wall
     }
 
-    /// Whether `cache`'s view has held for [`GOSSIP_SETTLE`], judged from
-    /// gossip alone; `None` for a cache with no ownership digest.
+    /// The settling verdict for `cache`, judged from gossip alone: settled
+    /// once its view has held for [`GOSSIP_SETTLE`]. `None` for a cache with
+    /// no ownership digest.
     #[must_use]
-    pub fn settled(&self, cache: &str) -> Option<bool> {
+    pub fn settle(&self, cache: &str) -> Option<derive::Settle> {
         let since = self.view_since.get(cache)?;
         let now = self.now?;
-        Some(now.saturating_duration_since(*since) >= GOSSIP_SETTLE)
+        Some(derive::settled(now.saturating_duration_since(*since), &[]))
+    }
+
+    /// Whether `cache` has settled; see [`settle`](Self::settle).
+    #[must_use]
+    pub fn settled(&self, cache: &str) -> Option<bool> {
+        self.settle(cache).map(|verdict| verdict.settled)
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Arc<ClusterSnapshot>, now: Instant) -> Vec<EventKind> {
+        let mut kinds = diff_snapshots(self.snapshot.as_deref(), &snapshot);
+        for kind in &mut kinds {
+            if let EventKind::Down {
+                addr,
+                exporter_silent,
+                ..
+            } = kind
+            {
+                *exporter_silent = self.exporter_silence(*addr, now);
+            }
+        }
+        for member in &snapshot.members {
+            self.slots.assign(member.peer.gossip_addr);
+        }
+        self.snapshot = Some(snapshot);
+        self.prune_ownership();
+        kinds
+    }
+
+    fn apply_ownership(&mut self, digest: OwnershipDigest, now: Instant) -> Vec<EventKind> {
+        let held = self.ownership.get(&digest.cache);
+        let mut kinds = Vec::new();
+        if held.is_none_or(|held| held.view_hash != digest.view_hash) {
+            let deltas = held.map_or_else(
+                || {
+                    digest
+                        .counts
+                        .iter()
+                        .map(|&(node, count)| (node, i64::try_from(count).unwrap_or(i64::MAX)))
+                        .collect()
+                },
+                |held| ownership::share_deltas(&held.shares, &digest.shares),
+            );
+            kinds.push(EventKind::View {
+                cache: digest.cache.clone(),
+                from: held.map(|held| held.view_hash),
+                to: digest.view_hash,
+                moved: digest.moved,
+                deltas,
+            });
+            self.view_since.insert(digest.cache.clone(), now);
+            self.settle_pending.insert(digest.cache.clone());
+        }
+        self.ownership.insert(digest.cache.clone(), digest);
+        kinds
+    }
+
+    fn apply_scrape(&mut self, report: ScrapeReport, now: Instant) {
+        let addr = report.addr;
+        if report.outcome.is_ok() {
+            self.last_ok.insert(addr, report.at);
+            self.lifelines.recovered(addr, now);
+        } else {
+            self.lifelines.suspect(addr, now);
+        }
+        self.scrapes.insert(addr, report);
+    }
+
+    /// Drops the ownership of every cache that no live member advertises as
+    /// `Distributed`.
+    fn prune_ownership(&mut self) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let advertised: BTreeSet<&SmolStr> = snapshot
+            .members
+            .iter()
+            .filter(|member| member.status == MemberStatus::Live)
+            .flat_map(|member| &member.caches)
+            .filter(|(_, mode)| matches!(mode, Mode::Distributed { .. }))
+            .map(|(cache, _)| cache)
+            .collect();
+        self.ownership.retain(|cache, _| advertised.contains(cache));
+        self.view_since
+            .retain(|cache, _| advertised.contains(cache));
+        self.settle_pending
+            .retain(|cache| advertised.contains(cache));
+    }
+
+    /// How long before `now` the exporter of the node at `addr` last answered,
+    /// when its latest scrape failed.
+    fn exporter_silence(&self, addr: SocketAddr, now: Instant) -> Option<Duration> {
+        let failing = self
+            .scrapes
+            .get(&addr)
+            .is_some_and(|report| report.outcome.is_err());
+        let last_ok = self.last_ok.get(&addr)?;
+        failing.then(|| now.saturating_duration_since(*last_ok))
+    }
+
+    /// `SETTLED` for each cache that has a view change to settle and has now
+    /// settled.
+    fn settled_events(&mut self, now: Instant) -> Vec<EventKind> {
+        let ready: Vec<SmolStr> = self
+            .settle_pending
+            .iter()
+            .filter(|cache| self.settled(cache) == Some(true))
+            .cloned()
+            .collect();
+        ready
+            .into_iter()
+            .map(|cache| {
+                self.settle_pending.remove(&cache);
+                let since = self.view_since.get(&cache).copied().unwrap_or(now);
+                EventKind::Settled {
+                    took: now.saturating_duration_since(since),
+                    cache,
+                }
+            })
+            .collect()
+    }
+
+    fn wall_at(&self, now: Instant) -> SystemTime {
+        let (Some(wall), Some(then)) = (self.wall, self.now) else {
+            return SystemTime::UNIX_EPOCH;
+        };
+        wall + now.saturating_duration_since(then)
+    }
+
+    fn finish(&mut self, kinds: Vec<EventKind>, now: Instant, wall: SystemTime) -> Vec<Event> {
+        kinds
+            .into_iter()
+            .map(|kind| {
+                self.lifelines.record(&kind, now);
+                let event = Event { at: wall, kind };
+                self.log.push(event.clone());
+                event
+            })
+            .collect()
     }
 }
 
@@ -180,7 +337,13 @@ mod tests {
             now,
             SystemTime::UNIX_EPOCH,
         );
-        assert!(events.is_empty());
+        let tags: Vec<_> = events.iter().map(|event| event.kind.tag()).collect();
+        assert_eq!(tags, ["JOIN", "JOIN", "JOIN"]);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.at == SystemTime::UNIX_EPOCH)
+        );
         assert_eq!(model.snapshot().unwrap().members.len(), 3);
         assert_eq!(model.slots().len(), 3);
         assert_eq!(
@@ -318,6 +481,13 @@ mod tests {
         let now = Instant::now();
         assert!(model.tick(now).is_empty());
         assert_eq!(model.now(), Some(now));
+        assert_eq!(model.wall(), None, "no update has given a wall clock yet");
+        model.apply(ownership_update(1), now, SystemTime::UNIX_EPOCH);
+        model.tick(now + Duration::from_secs(2));
+        assert_eq!(
+            model.wall(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
+        );
     }
 
     #[test]
@@ -337,5 +507,397 @@ mod tests {
         );
         assert_eq!(frozen.snapshot().unwrap().members.len(), 2);
         assert_eq!(model.snapshot().unwrap().members.len(), 3);
+    }
+
+    fn tags(events: &[Event]) -> Vec<&'static str> {
+        events.iter().map(|event| event.kind.tag()).collect()
+    }
+
+    fn with_status(live: u8, index: u8, status: MemberStatus) -> ClusterSnapshot {
+        let mut members = testkit::snapshot(live).members;
+        members[usize::from(index - 1)].status = status;
+        ClusterSnapshot::new("fixture", members, 0)
+    }
+
+    #[test]
+    fn a_status_change_raises_its_event_and_the_log_keeps_it() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(5);
+        model.apply(snapshot_update(testkit::snapshot(3), t), t, wall);
+        let events = model.apply(
+            snapshot_update(with_status(3, 2, MemberStatus::Departing), t),
+            t,
+            wall,
+        );
+        assert_eq!(tags(&events), ["LEAVE"]);
+        assert_eq!(events[0].at, wall);
+        let events = model.apply(
+            snapshot_update(with_status(3, 2, MemberStatus::Left), t),
+            t,
+            wall,
+        );
+        assert_eq!(tags(&events), ["LEFT"]);
+        let logged: Vec<_> = model.events().iter().map(|e| e.kind.tag()).collect();
+        assert_eq!(logged, ["JOIN", "JOIN", "JOIN", "LEAVE", "LEFT"]);
+    }
+
+    #[test]
+    fn events_mark_the_lifeline_of_the_node_they_concern() {
+        use lifelines::{MarkKind, PhaseKind};
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(
+            snapshot_update(testkit::snapshot(2), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        model.apply(
+            snapshot_update(
+                with_status(2, 1, MemberStatus::Down),
+                t + Duration::from_secs(1),
+            ),
+            t + Duration::from_secs(1),
+            SystemTime::UNIX_EPOCH,
+        );
+        let first = model.lifelines().node(testkit::gossip_addr(1)).unwrap();
+        let kinds: Vec<_> = first.marks().iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, [MarkKind::Join, MarkKind::Down]);
+        assert_eq!(first.current(), None);
+        let second = model.lifelines().node(testkit::gossip_addr(2)).unwrap();
+        assert_eq!(second.current(), Some(PhaseKind::Live));
+    }
+
+    #[test]
+    fn a_down_carries_how_long_the_exporter_had_been_silent() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        let addr = testkit::gossip_addr(1);
+        let node = testkit::node_id(1, 0);
+        let report = |at, outcome| ScrapeReport {
+            addr,
+            node,
+            at,
+            outcome,
+            ready: None,
+        };
+        model.apply(
+            snapshot_update(testkit::snapshot(2), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        model.apply(
+            Update::Scrape(report(t + Duration::from_secs(1), Ok(Vec::new()))),
+            t + Duration::from_secs(1),
+            SystemTime::UNIX_EPOCH,
+        );
+        let failure = Err(crate::source::scrape::ScrapeError::Timeout);
+        model.apply(
+            Update::Scrape(report(t + Duration::from_secs(2), failure)),
+            t + Duration::from_secs(2),
+            SystemTime::UNIX_EPOCH,
+        );
+        let down_at = t + Duration::from_millis(4_900);
+        let events = model.apply(
+            snapshot_update(with_status(2, 1, MemberStatus::Down), down_at),
+            down_at,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            events[0].kind,
+            EventKind::Down {
+                node,
+                addr,
+                exporter_silent: Some(Duration::from_millis(3_900)),
+            }
+        );
+        // The lifeline turned suspect at the first failure and ended at Down.
+        let line = model.lifelines().node(addr).unwrap();
+        let kinds: Vec<_> = line.marks().iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                lifelines::MarkKind::Join,
+                lifelines::MarkKind::Suspect,
+                lifelines::MarkKind::Down
+            ]
+        );
+    }
+
+    #[test]
+    fn a_down_with_an_answering_or_absent_exporter_carries_no_silence() {
+        let t = Instant::now();
+        let addr = testkit::gossip_addr(1);
+        let silent = |model: &Model| {
+            let event = &model
+                .events()
+                .newest_first(Filter::Membership)
+                .find(|e| matches!(e.kind, EventKind::Down { .. }))
+                .unwrap()
+                .kind;
+            let EventKind::Down {
+                exporter_silent, ..
+            } = event
+            else {
+                unreachable!()
+            };
+            *exporter_silent
+        };
+
+        // No scrape at all.
+        let mut model = Model::new();
+        model.apply(
+            snapshot_update(testkit::snapshot(2), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        model.apply(
+            snapshot_update(with_status(2, 1, MemberStatus::Down), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(silent(&model), None);
+
+        // The exporter still answers: gossip and the exporter disagree.
+        let mut model = Model::new();
+        model.apply(
+            snapshot_update(testkit::snapshot(2), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        model.apply(
+            Update::Scrape(ScrapeReport {
+                addr,
+                node: testkit::node_id(1, 0),
+                at: t,
+                outcome: Ok(Vec::new()),
+                ready: None,
+            }),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        model.apply(
+            snapshot_update(with_status(2, 1, MemberStatus::Down), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(silent(&model), None);
+    }
+
+    #[test]
+    fn a_scrape_that_succeeds_again_lifts_the_suspicion() {
+        use lifelines::PhaseKind;
+        let mut model = Model::new();
+        let t = Instant::now();
+        let addr = testkit::gossip_addr(1);
+        model.apply(
+            snapshot_update(testkit::snapshot(1), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        let report = |outcome| ScrapeReport {
+            addr,
+            node: testkit::node_id(1, 0),
+            at: t,
+            outcome,
+            ready: None,
+        };
+        model.apply(
+            Update::Scrape(report(Err(crate::source::scrape::ScrapeError::Timeout))),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            model.lifelines().node(addr).unwrap().current(),
+            Some(PhaseKind::Suspect)
+        );
+        model.apply(
+            Update::Scrape(report(Ok(Vec::new()))),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(
+            model.lifelines().node(addr).unwrap().current(),
+            Some(PhaseKind::Live)
+        );
+    }
+
+    #[test]
+    fn the_first_digest_raises_a_view_with_each_nodes_share() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        let events = model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        assert_eq!(tags(&events), ["VIEW"]);
+        let digest = model.ownership("it").unwrap();
+        let EventKind::View {
+            cache,
+            from,
+            to,
+            moved,
+            deltas,
+        } = &events[0].kind
+        else {
+            panic!("a view event");
+        };
+        assert_eq!(cache, "it");
+        assert_eq!(*from, None);
+        assert_eq!(*to, digest.view_hash);
+        assert_eq!(*moved, 0);
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas.iter().map(|&(_, d)| d).sum::<i64>(), 2 * 65_536);
+        assert!(deltas.iter().all(|&(_, d)| d > 0));
+    }
+
+    #[test]
+    fn a_changed_view_raises_a_view_with_the_parts_moved_and_each_nodes_change() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        let three = testkit::snapshot(3);
+        let four = testkit::snapshot(4);
+        let first = testkit::ownership_digest(&three, "it").unwrap();
+        let second = testkit::ownership_digest_after(&four, "it", Some(&first)).unwrap();
+        let (first_hash, second_hash, moved) = (first.view_hash, second.view_hash, second.moved);
+        model.apply(Update::Ownership(first), t, SystemTime::UNIX_EPOCH);
+        let events = model.apply(Update::Ownership(second), t, SystemTime::UNIX_EPOCH);
+        let EventKind::View {
+            from,
+            to,
+            moved: reported,
+            deltas,
+            ..
+        } = &events[0].kind
+        else {
+            panic!("a view event");
+        };
+        assert_eq!((*from, *to), (Some(first_hash), second_hash));
+        assert_eq!(*reported, moved);
+        assert!(moved > 0);
+        assert_eq!(deltas.len(), 4);
+        assert_eq!(deltas.iter().map(|&(_, d)| d).sum::<i64>(), 0);
+    }
+
+    #[test]
+    fn an_unchanged_view_raises_nothing() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        let events = model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_view_settles_once_with_the_time_it_took() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(
+            ownership_update(3),
+            t,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        );
+        assert!(model.tick(t + Duration::from_millis(2_999)).is_empty());
+        let events = model.tick(t + Duration::from_secs(4));
+        assert_eq!(tags(&events), ["SETTLED"]);
+        assert_eq!(
+            events[0].kind,
+            EventKind::Settled {
+                cache: "it".into(),
+                took: Duration::from_secs(4),
+            }
+        );
+        assert_eq!(
+            events[0].at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(14)
+        );
+        assert!(
+            model.tick(t + Duration::from_secs(9)).is_empty(),
+            "settles once"
+        );
+    }
+
+    #[test]
+    fn an_update_after_the_hold_raises_the_settled_event_too() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        let events = model.apply(
+            snapshot_update(testkit::snapshot(3), t + Duration::from_secs(5)),
+            t + Duration::from_secs(5),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(tags(&events).contains(&"SETTLED"));
+    }
+
+    #[test]
+    fn a_new_view_before_the_settle_restarts_it() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        model.apply(
+            ownership_update(4),
+            t + Duration::from_secs(2),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(model.tick(t + Duration::from_secs(4)).is_empty());
+        let events = model.tick(t + Duration::from_secs(5));
+        assert_eq!(tags(&events), ["SETTLED"]);
+        assert_eq!(
+            events[0].kind,
+            EventKind::Settled {
+                cache: "it".into(),
+                took: Duration::from_secs(3),
+            }
+        );
+    }
+
+    #[test]
+    fn the_settle_verdict_says_it_rests_on_gossip_alone() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        assert_eq!(model.settle("it"), None);
+        model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        let waiting = model.settle("it").unwrap();
+        assert!(waiting.gossip_only && !waiting.settled);
+        model.tick(t + GOSSIP_SETTLE);
+        assert!(model.settle("it").unwrap().settled);
+    }
+
+    #[test]
+    fn ownership_is_dropped_once_no_live_member_advertises_the_cache() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(
+            snapshot_update(testkit::snapshot(2), t),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        model.apply(ownership_update(2), t, SystemTime::UNIX_EPOCH);
+        assert!(model.ownership("it").is_some());
+
+        let down = ClusterSnapshot::new(
+            "fixture",
+            vec![
+                testkit::member(1, MemberStatus::Down),
+                testkit::member(2, MemberStatus::Left),
+            ],
+            0,
+        );
+        model.apply(snapshot_update(down, t), t, SystemTime::UNIX_EPOCH);
+        assert!(model.ownership("it").is_none());
+        assert_eq!(model.settled("it"), None);
+        assert!(
+            model.tick(t + Duration::from_secs(10)).is_empty(),
+            "nothing left to settle"
+        );
+    }
+
+    #[test]
+    fn the_fixture_model_orders_departure_view_and_left() {
+        let model = testkit::fixture_model(Instant::now());
+        let tags: Vec<_> = model.events().iter().map(|e| e.kind.tag()).collect();
+        let last = |tag| tags.iter().rposition(|t| *t == tag).unwrap();
+        assert!(last("LEAVE") < last("LEFT"));
+        assert!(last("DOWN") > last("JOIN"));
+        assert_eq!(model.events().len(), tags.len());
+        assert!(model.lifelines().cache("it").is_some());
     }
 }
