@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smol_str::SmolStr;
 use sundog::NodeId;
 use sundog::observe::{ClusterSnapshot, Member};
 use tokio::sync::{mpsc, watch};
@@ -89,7 +88,7 @@ pub struct ScrapeReport {
     pub addr: SocketAddr,
     /// The node id of that member when the scrape started.
     pub node: NodeId,
-    /// When the round finished.
+    /// When `/metrics` answered or failed: the instant of the counter samples.
     pub at: Instant,
     /// The `sundog_*` samples of `/metrics`, or why there are none.
     pub outcome: Result<Vec<Sample>, ScrapeError>,
@@ -111,8 +110,6 @@ pub struct ScrapeConfig {
     pub timeout: Duration,
     /// The time between `/readyz` probes of one target.
     pub ready_every: Duration,
-    /// Slot labels for gossip addresses, as the model is given them.
-    pub hints: Vec<(SocketAddr, SmolStr)>,
 }
 
 impl ScrapeConfig {
@@ -126,7 +123,6 @@ impl ScrapeConfig {
             interval: Duration::from_secs(1),
             timeout: REQUEST_TIMEOUT,
             ready_every: READY_EVERY,
-            hints: Vec::new(),
         }
     }
 
@@ -148,13 +144,6 @@ impl ScrapeConfig {
         let mut config = Self::new(templates, args.scrape.clone());
         config.interval = args.interval;
         Ok(Some(config))
-    }
-
-    /// Names the node at gossip address `addr` as `label` for `--scrape`
-    /// pins, as [`Model::set_label_hint`](crate::model::Model::set_label_hint)
-    /// does for the display.
-    pub fn hint(&mut self, addr: SocketAddr, label: impl Into<SmolStr>) {
-        self.hints.push((addr, label.into()));
     }
 }
 
@@ -342,9 +331,13 @@ pub async fn probe_ready(url: &str, timeout: Duration) -> Option<bool> {
 }
 
 /// One scrape round of `target`: `/metrics` and, when `probe` is set,
-/// `/readyz` at the same time.
+/// `/readyz` at the same time. The report's `at` is the moment `/metrics`
+/// answered, however long `/readyz` takes.
 pub async fn scrape_round(target: &Target, timeout: Duration, probe: bool) -> ScrapeReport {
-    let metrics = fetch_samples(&target.url, timeout);
+    let metrics = async {
+        let outcome = fetch_samples(&target.url, timeout).await;
+        (outcome, Instant::now())
+    };
     let ready = async {
         if probe {
             probe_ready(&target.url, timeout).await
@@ -352,11 +345,11 @@ pub async fn scrape_round(target: &Target, timeout: Duration, probe: bool) -> Sc
             None
         }
     };
-    let (outcome, ready) = tokio::join!(metrics, ready);
+    let ((outcome, at), ready) = tokio::join!(metrics, ready);
     ScrapeReport {
         addr: target.addr,
         node: target.node,
-        at: Instant::now(),
+        at,
         outcome,
         ready,
     }
@@ -401,27 +394,22 @@ async fn scrape_target(
 /// the member's node id or URL changes. A member with a mapping error gets one
 /// report carrying it, and another whenever the error changes.
 ///
-/// Slot labels for `--scrape` pins follow the first-seen order of the
-/// snapshots this task receives, starting from the config's hints, as the
-/// model's do.
+/// `labels` carries the slot labels `--scrape` pins name nodes by. They are
+/// the labels of the model, and the sender publishes them before the snapshot
+/// that gives them, as [`observer::Relay`](super::observer::Relay) does.
 pub async fn run(
     config: ScrapeConfig,
     mut snapshots: watch::Receiver<Arc<ClusterSnapshot>>,
+    labels: watch::Receiver<Arc<Slots>>,
     updates: mpsc::Sender<Update>,
 ) {
-    let mut slots = Slots::new();
-    for (addr, label) in &config.hints {
-        slots.hint(*addr, label.clone());
-    }
     let mut tasks = JoinSet::new();
     let mut running: Vec<(Target, AbortHandle)> = Vec::new();
     let mut told: BTreeMap<SocketAddr, (NodeId, ScrapeError)> = BTreeMap::new();
     loop {
         while tasks.try_join_next().is_some() {}
         let snapshot = Arc::clone(&snapshots.borrow_and_update());
-        for member in &snapshot.members {
-            slots.assign(member.peer.gossip_addr);
-        }
+        let slots = Arc::clone(&labels.borrow());
         let plan = plan_targets(&snapshot.members, &config, &slots);
         let held: Vec<Target> = running.iter().map(|(target, _)| target.clone()).collect();
         let (start, stop) = diff_targets(&held, &plan.targets);
@@ -460,8 +448,13 @@ pub async fn run(
                 return;
             }
         }
-        if snapshots.changed().await.is_err() {
-            return;
+        tokio::select! {
+            changed = snapshots.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = updates.closed() => return,
         }
     }
 }
@@ -568,7 +561,6 @@ mod tests {
         assert_eq!(config.interval, Duration::from_millis(250));
         assert_eq!(config.timeout, REQUEST_TIMEOUT);
         assert_eq!(config.ready_every, READY_EVERY);
-        assert!(config.hints.is_empty());
     }
 
     #[test]
@@ -589,16 +581,6 @@ mod tests {
         assert_eq!(
             ScrapeConfig::from_args(&args),
             Err(TemplateError::UnknownPlaceholder("host".into()))
-        );
-    }
-
-    #[test]
-    fn a_hint_is_kept_for_the_pin_labels() {
-        let mut config = config(&[], Vec::new());
-        config.hint(testkit::gossip_addr(2), "alpha");
-        assert_eq!(
-            config.hints,
-            [(testkit::gossip_addr(2), SmolStr::new("alpha"))]
         );
     }
 

@@ -1,5 +1,7 @@
-//! Every `sundog_*` metric name the lens reads. A test checks each against
-//! `docs/src/operations.md`, so a renamed metric fails the build.
+//! Every `sundog_*` metric name the lens reads. Tests check each name against
+//! `docs/src/operations.md`, against the registrations in `sundog/src` and
+//! against the captured `fixtures/metrics.prom`, so a renamed or dropped metric
+//! fails `cargo test`.
 
 /// Gauge: live peers a node counts.
 pub const LIVE_PEERS: &str = "sundog_live_peers";

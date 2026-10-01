@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -15,9 +15,10 @@ use sundog::observe::{ClusterSnapshot, MemberStatus};
 use sundog::{Cluster, ClusterConfig};
 use sundog_lens::cli::{ScrapePin, Seed};
 use sundog_lens::model::testkit;
-use sundog_lens::model::{EventKind, ExporterState, Model};
+use sundog_lens::model::{EventKind, ExporterState, Model, NodeMetrics, Slots};
 use sundog_lens::source::expo::{self, Sample};
 use sundog_lens::source::names;
+use sundog_lens::source::observer::{self, Relay};
 use sundog_lens::source::scrape::{
     self, REQUEST_TIMEOUT, ScrapeConfig, ScrapeError, ScrapeReport, Target,
 };
@@ -47,6 +48,8 @@ struct State {
     ready: Mutex<VecDeque<u16>>,
     last_ready: AtomicU16,
     metrics_requests: AtomicUsize,
+    /// How long `/readyz` waits before it answers, in milliseconds.
+    ready_delay_ms: AtomicU64,
 }
 
 /// An HTTP/1.1 server that closes every connection after one answer.
@@ -74,6 +77,7 @@ impl Exporter {
             ready: Mutex::new(ready.iter().copied().collect()),
             last_ready: AtomicU16::new(ready.last().copied().unwrap_or(200)),
             metrics_requests: AtomicUsize::new(0),
+            ready_delay_ms: AtomicU64::new(0),
         });
         let served = Arc::clone(&state);
         let task = tokio::spawn(async move {
@@ -98,6 +102,10 @@ impl Exporter {
                     }
                     let line = String::from_utf8_lossy(&request);
                     let path = line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    if path == "/readyz" {
+                        let delay = state.ready_delay_ms.load(Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
                     let (status, body) = state.answer(&path);
                     let reason = match status {
                         200 => "OK",
@@ -128,6 +136,11 @@ impl Exporter {
 
     fn set_metrics(&self, body: String) {
         *self.state.metrics.lock().unwrap() = body;
+    }
+
+    fn set_ready_delay(&self, delay: Duration) {
+        let millis = u64::try_from(delay.as_millis()).unwrap();
+        self.state.ready_delay_ms.store(millis, Ordering::SeqCst);
     }
 
     fn set_metrics_status(&self, status: u16) {
@@ -287,13 +300,48 @@ async fn a_refused_connection_is_a_connect_error() {
         node: testkit::node_id(1, 0),
         url: format!("http://{addr}/metrics"),
     };
-    let report = scrape::scrape_round(&target, REQUEST_TIMEOUT, true).await;
+    // A refused loopback connection fails at once on Linux and macOS but only
+    // after the SYN retries (about 2 s) on Windows, so the deadline is
+    // generous.
+    let report = scrape::scrape_round(&target, Duration::from_secs(5), true).await;
     assert!(
         matches!(&report.outcome, Err(ScrapeError::Connect(message)) if message.contains("connect")),
         "{:?}",
         report.outcome
     );
     assert_eq!(report.ready, None);
+}
+
+#[tokio::test]
+async fn a_slow_readiness_probe_does_not_stretch_the_counter_interval() {
+    let exporter = Exporter::start(&[200]).await;
+    exporter.set_ready_delay(Duration::from_millis(600));
+    let target = target(&exporter);
+
+    let before_first = Instant::now();
+    let first = scrape::scrape_round(&target, REQUEST_TIMEOUT, true).await;
+    assert!(
+        first.at.duration_since(before_first) < Duration::from_millis(400),
+        "the metrics are stamped when they answer, not when /readyz does: {:?}",
+        first.at.duration_since(before_first)
+    );
+    assert_eq!(first.ready, Some(true));
+    exporter.set_metrics(capture_with_frames_up(130));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let before_second = Instant::now();
+    let second = scrape::scrape_round(&target, REQUEST_TIMEOUT, false).await;
+
+    // The counters were read about `real` apart, however long /readyz took.
+    let real = before_second.duration_since(before_first).as_secs_f64();
+    let mut metrics = NodeMetrics::new(target.node);
+    metrics.fold(first.at, samples(&first));
+    metrics.fold(second.at, samples(&second));
+    let rate = metrics.rate_sum(names::FRAMES_SENT).unwrap();
+    let truth = 130.0 / real;
+    assert!(
+        (rate / truth - 1.0).abs() < 0.1,
+        "{rate} frames/s against {truth} over {real} s"
+    );
 }
 
 #[tokio::test]
@@ -323,6 +371,11 @@ async fn fetching_samples_and_probing_readiness_work_on_their_own() {
         scrape::probe_ready("https://not-http/metrics", REQUEST_TIMEOUT).await,
         None
     );
+}
+
+/// Slot labels that never change, for a supervisor whose pins name addresses.
+fn unlabeled() -> watch::Receiver<Arc<Slots>> {
+    watch::channel(Arc::new(Slots::new())).1
 }
 
 fn pin(addr: SocketAddr, url: &str) -> ScrapePin {
@@ -390,7 +443,7 @@ async fn the_supervisor_scrapes_each_live_member_and_stops_when_one_goes_down() 
     ));
     let (snapshots, watched) = watch::channel(two_members(MemberStatus::Live));
     let (tx, mut updates) = mpsc::channel(256);
-    let task = tokio::spawn(scrape::run(config, watched, tx));
+    let task = tokio::spawn(scrape::run(config, watched, unlabeled(), tx));
 
     reports_from(&mut updates, &[addr1, addr2]).await;
     snapshots
@@ -417,6 +470,27 @@ async fn the_supervisor_scrapes_each_live_member_and_stops_when_one_goes_down() 
 }
 
 #[tokio::test]
+async fn the_supervisor_ends_when_the_update_stream_closes() {
+    let exporter = Exporter::start(&[200]).await;
+    let addr = testkit::gossip_addr(1);
+    let config = fast(ScrapeConfig::new(
+        Vec::new(),
+        vec![pin(addr, &exporter.url())],
+    ));
+    let (snapshots, watched) = watch::channel(Arc::new(testkit::snapshot(1)));
+    let (tx, mut updates) = mpsc::channel(256);
+    let task = tokio::spawn(scrape::run(config, watched, unlabeled(), tx));
+    reports_from(&mut updates, &[addr]).await;
+
+    drop(updates);
+    tokio::time::timeout(BOUND, task)
+        .await
+        .expect("the supervisor ends with the update stream, snapshots or not")
+        .expect("it does not panic");
+    drop(snapshots);
+}
+
+#[tokio::test]
 async fn readiness_is_probed_once_per_period_not_once_per_round() {
     let exporter = Exporter::start(&[200]).await;
     let addr = testkit::gossip_addr(1);
@@ -427,7 +501,7 @@ async fn readiness_is_probed_once_per_period_not_once_per_round() {
     config.ready_every = Duration::from_millis(400);
     let (snapshots, watched) = watch::channel(Arc::new(testkit::snapshot(1)));
     let (tx, mut updates) = mpsc::channel(256);
-    let task = tokio::spawn(scrape::run(config, watched, tx));
+    let task = tokio::spawn(scrape::run(config, watched, unlabeled(), tx));
 
     let reports = reports_within(&mut updates, Duration::from_millis(1500)).await;
     let probed = reports
@@ -460,7 +534,7 @@ async fn members_sharing_a_url_get_one_collision_report_each_and_no_scrape() {
     ));
     let (snapshots, watched) = watch::channel(two_members(MemberStatus::Live));
     let (tx, mut updates) = mpsc::channel(256);
-    let task = tokio::spawn(scrape::run(config, watched, tx));
+    let task = tokio::spawn(scrape::run(config, watched, unlabeled(), tx));
 
     let reports = reports_within(&mut updates, Duration::from_millis(600)).await;
     assert_eq!(reports.len(), 2, "one report per member, not one per round");
@@ -498,7 +572,7 @@ async fn a_template_that_does_not_expand_is_reported_once_for_the_member() {
     ));
     let (snapshots, watched) = watch::channel(Arc::new(testkit::snapshot(1)));
     let (tx, mut updates) = mpsc::channel(64);
-    let task = tokio::spawn(scrape::run(config, watched, tx));
+    let task = tokio::spawn(scrape::run(config, watched, unlabeled(), tx));
     let reports = reports_within(&mut updates, Duration::from_millis(400)).await;
     let [report] = reports.as_slice() else {
         panic!("one report, got {}", reports.len());
@@ -506,6 +580,74 @@ async fn a_template_that_does_not_expand_is_reported_once_for_the_member() {
     assert!(matches!(&report.outcome, Err(ScrapeError::Template(_))));
     drop(snapshots);
     tokio::time::timeout(BOUND, task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_slot_pin_scrapes_the_node_the_model_calls_by_that_label() {
+    // The model sees m2 alone, then m1 and m2 together: n1 is m2. The
+    // supervisor starts after both snapshots, so it would number the members
+    // by node id (m1 first) if it assigned labels itself.
+    let (m1, m2) = (testkit::gossip_addr(1), testkit::gossip_addr(2));
+    let both = |members: &[u8]| {
+        Arc::new(ClusterSnapshot::new(
+            "fixture",
+            members
+                .iter()
+                .map(|&index| testkit::member(index, MemberStatus::Live))
+                .collect(),
+            0,
+        ))
+    };
+    let (source, snapshots) = watch::channel(both(&[2]));
+    let (relay_tx, mut relayed) = watch::channel(both(&[]));
+    let (labels_tx, labels) = watch::channel(Arc::new(Slots::new()));
+    let (updates_tx, mut updates) = mpsc::channel(16);
+    let relay = Relay::new(relay_tx, labels_tx, &[]);
+    let forwarder = tokio::spawn(observer::forward(snapshots, updates_tx, Some(relay)));
+
+    let mut model = Model::new();
+    for members in [2usize, 3] {
+        if members == 3 {
+            source.send(both(&[1, 2])).unwrap();
+        }
+        let update = tokio::time::timeout(BOUND, updates.recv())
+            .await
+            .expect("an update arrives")
+            .expect("the stream is open");
+        let now = Instant::now();
+        model.apply(update, now, SystemTime::now());
+        tokio::time::timeout(BOUND, relayed.changed())
+            .await
+            .expect("the relay publishes")
+            .unwrap();
+    }
+    assert_eq!(model.slots().by_label("n1").unwrap().addr, m2);
+
+    let exporter = Exporter::start(&[200]).await;
+    let pinned = fast(ScrapeConfig::new(
+        Vec::new(),
+        vec![ScrapePin {
+            node: "n1".to_owned(),
+            url: exporter.url(),
+        }],
+    ));
+    let (tx, mut scraped) = mpsc::channel(64);
+    let task = tokio::spawn(scrape::run(pinned, relayed, labels, tx));
+    let report = loop {
+        let update = tokio::time::timeout(BOUND, scraped.recv())
+            .await
+            .expect("a report arrives")
+            .expect("the scraper stays open");
+        if let Update::Scrape(report) = update {
+            break report;
+        }
+    };
+    assert_eq!(report.addr, model.slots().by_label("n1").unwrap().addr);
+    assert_ne!(report.addr, m1);
+
+    drop(source);
+    tokio::time::timeout(BOUND, task).await.unwrap().unwrap();
+    forwarder.abort();
 }
 
 fn loopback_config() -> ClusterConfig {

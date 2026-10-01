@@ -2,13 +2,13 @@
 //! every series, the rate of every counter, and the rate histories the charts
 //! draw.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use smol_str::SmolStr;
 use sundog::NodeId;
 
-use super::derive::{self, FetchMix};
+use super::derive::{self, FetchMix, QUIET_SCRAPES};
 use super::series::{CounterTrack, RING_LEN, Ring};
 use crate::source::expo::Sample;
 use crate::source::names;
@@ -83,21 +83,50 @@ pub struct Folded {
     pub xfer_started: bool,
 }
 
+/// The run of quiet folds one cache is on: the folds in which the node pulled
+/// no part of it in.
+#[derive(Debug, Clone, Default)]
+struct Quiet {
+    /// The folds in the run.
+    count: u32,
+    /// Where the rate window of each of the newest [`QUIET_SCRAPES`] quiet
+    /// folds began: the instant of the fold before it.
+    windows: VecDeque<Instant>,
+}
+
+impl Quiet {
+    fn reset(&mut self) {
+        self.count = 0;
+        self.windows.clear();
+    }
+
+    fn extend(&mut self, window_start: Option<Instant>) {
+        self.count += 1;
+        let Some(start) = window_start else { return };
+        if self.windows.len() >= QUIET_SCRAPES as usize {
+            self.windows.pop_front();
+        }
+        self.windows.push_back(start);
+    }
+}
+
 /// One node's metrics over time.
 ///
-/// A fold takes the `sundog_*` samples of one successful scrape. The latest
-/// value of each series stays until the next fold replaces it; a counter's
-/// rate needs two folds and is absent after a counter reset.
+/// A fold takes the `sundog_*` samples of one successful scrape. Each fold
+/// replaces the latest value of every series, so a series absent from a scrape
+/// has no value until it reappears. A counter's rate needs two folds and is
+/// absent after a counter reset.
 #[derive(Debug, Clone)]
 pub struct NodeMetrics {
     node: NodeId,
     folds: u32,
+    last_at: Option<Instant>,
     values: BTreeMap<SeriesKey, f64>,
     rates: BTreeMap<SeriesKey, f64>,
     tracks: BTreeMap<SeriesKey, CounterTrack>,
     dropped_seen: BTreeMap<SmolStr, f64>,
     xfer_active: bool,
-    quiet: BTreeMap<SmolStr, u32>,
+    quiet: BTreeMap<SmolStr, Quiet>,
     ops: Ring<RING_LEN>,
     tx_bytes: Ring<RING_LEN>,
     tx_frames: Ring<RING_LEN>,
@@ -112,6 +141,7 @@ impl NodeMetrics {
         Self {
             node,
             folds: 0,
+            last_at: None,
             values: BTreeMap::new(),
             rates: BTreeMap::new(),
             tracks: BTreeMap::new(),
@@ -141,28 +171,42 @@ impl NodeMetrics {
     /// Folds one scrape taken at `at` into the metrics and returns what it
     /// reveals.
     ///
-    /// A series that is absent from the scrape leaves the latest values. A
+    /// Each fold replaces the latest values and rates: a series absent from
+    /// the scrape has no value until it reappears; its counter track is kept,
+    /// so its next rate spans back to its last sample. A
     /// `backlog_dropped_total` series that is new after the first fold counts
     /// all its frames as dropped, because the exporter creates the series at
     /// the first drop; one that rose counts the rise; one that fell is a
     /// counter reset and counts nothing. Each cache the node reports owning
     /// parts of gets a quiet-scrape count: the consecutive folds in which no
-    /// part was pulled in.
+    /// part was pulled in. The exporter creates the
+    /// `rebalance_parts_total{direction="in"}` series at the first pull, so a
+    /// fold that adds it with a positive value is a pull, at the rate of that
+    /// value over the time since the previous fold.
+    ///
+    /// The reads history counts the cache hits and misses and the fetches that
+    /// bypass the local read. A local fetch is a hit or a miss already; a miss
+    /// in a cold owned part that goes on to a remote owner counts as a miss
+    /// and as a fetch.
     pub fn fold(&mut self, at: Instant, samples: &[Sample]) -> Folded {
         let first = self.folds == 0;
         self.values.clear();
         self.rates.clear();
+        let mut created = Vec::new();
         for sample in samples {
             let key = SeriesKey::of(sample);
-            if is_counter(&sample.name)
-                && sample.value.is_finite()
-                && let Some(rate) = self
+            if is_counter(&sample.name) && sample.value.is_finite() {
+                if !self.tracks.contains_key(&key) {
+                    created.push(key.clone());
+                }
+                if let Some(rate) = self
                     .tracks
                     .entry(key.clone())
                     .or_default()
                     .observe(at, sample.value)
-            {
-                self.rates.insert(key.clone(), rate);
+                {
+                    self.rates.insert(key.clone(), rate);
+                }
             }
             self.values.insert(key, sample.value);
         }
@@ -171,11 +215,15 @@ impl NodeMetrics {
         let active = xfer.is_some_and(|rate| rate > 0.0);
         let xfer_started = active && !self.xfer_active;
         self.xfer_active = active;
-        self.fold_caches(first);
+        self.fold_caches(at, first, &created);
         if !first {
+            let bypassing: f64 = ["remote", "miss", "error"]
+                .iter()
+                .filter_map(|outcome| self.rate_sum_where(names::FETCH, &[("outcome", outcome)]))
+                .sum();
             let reads = self.rate_sum(names::CACHE_HITS).unwrap_or(0.0)
                 + self.rate_sum(names::CACHE_MISSES).unwrap_or(0.0)
-                + self.rate_sum(names::FETCH).unwrap_or(0.0);
+                + bypassing;
             self.ops.push(reads);
             self.tx_bytes
                 .push(self.rate_sum(names::BYTES_SENT).unwrap_or(0.0));
@@ -183,6 +231,7 @@ impl NodeMetrics {
                 .push(self.rate_sum(names::FRAMES_SENT).unwrap_or(0.0));
         }
         self.folds += 1;
+        self.last_at = Some(at);
         Folded {
             drops,
             xfer_started,
@@ -213,25 +262,39 @@ impl NodeMetrics {
         edges
     }
 
-    fn fold_caches(&mut self, first: bool) {
+    fn fold_caches(&mut self, at: Instant, first: bool, created: &[SeriesKey]) {
         let caches: Vec<SmolStr> = self
             .values
             .keys()
             .filter(|key| key.name() == names::OWNED_PARTS)
             .filter_map(|key| key.label("cache").map(SmolStr::new))
             .collect();
+        let window_start = self.last_at;
+        let span =
+            window_start.map_or(0.0, |last| at.saturating_duration_since(last).as_secs_f64());
         for cache in caches {
             let into = [("cache", cache.as_str()), ("direction", "in")];
             let out = [("cache", cache.as_str()), ("direction", "out")];
-            let in_rate = self.rate(names::REBALANCE_PARTS, &into);
-            let present = self.value(names::REBALANCE_PARTS, &into).is_some();
-            let quiet = self.quiet.entry(cache.clone()).or_insert(0);
+            let present = self.value(names::REBALANCE_PARTS, &into);
+            let appeared = !first
+                && created
+                    .iter()
+                    .any(|key| key.matches(names::REBALANCE_PARTS, &into));
+            let in_rate = match self.rate(names::REBALANCE_PARTS, &into) {
+                Some(rate) => Some(rate),
+                // The exporter creates the series at the first pull: the
+                // parts it holds arrived since the previous fold.
+                None if appeared => {
+                    present.map(|value| if span > 0.0 { value / span } else { value })
+                }
+                // Until then nothing has been pulled in.
+                None if present.is_none() && !first => Some(0.0),
+                None => None,
+            };
+            let quiet = self.quiet.entry(cache.clone()).or_default();
             match in_rate {
-                Some(rate) if rate > 0.0 => *quiet = 0,
-                Some(_) => *quiet += 1,
-                // The exporter creates the series at the first pull: until
-                // then nothing has been pulled in.
-                None if !present && !first => *quiet += 1,
+                Some(rate) if rate > 0.0 => quiet.reset(),
+                Some(_) => quiet.extend(window_start),
                 None => {}
             }
             if !first {
@@ -345,7 +408,22 @@ impl NodeMetrics {
     /// Consecutive folds in which the node pulled no part of `cache` in.
     #[must_use]
     pub fn quiet_scrapes(&self, cache: &str) -> u32 {
-        self.quiet.get(cache).copied().unwrap_or(0)
+        self.quiet.get(cache).map_or(0, |quiet| quiet.count)
+    }
+
+    /// The quiet folds of the current run, newest first, whose rate window
+    /// began at or after `since`: scrapes taken wholly inside a view that
+    /// began at `since`. Counts at most [`QUIET_SCRAPES`].
+    #[must_use]
+    pub fn quiet_scrapes_since(&self, cache: &str, since: Instant) -> u32 {
+        self.quiet.get(cache).map_or(0, |quiet| {
+            let inside = quiet
+                .windows
+                .iter()
+                .filter(|start| **start >= since)
+                .count();
+            u32::try_from(inside).unwrap_or(u32::MAX)
+        })
     }
 
     /// Reads and fetches per second, one sample per fold after the first.
@@ -464,6 +542,12 @@ mod tests {
         assert_eq!(metrics.live_peers(), Some(2.0));
         assert_eq!(metrics.entries("it"), Some(2040.0));
         assert_eq!(metrics.entries("nope"), None);
+        assert_eq!(
+            metrics.cache_value(names::CACHE_ENTRIES, "it"),
+            Some(2040.0)
+        );
+        assert_eq!(metrics.cache_value(names::CACHE_ENTRIES, "nope"), None);
+        assert_eq!(metrics.cache_value(names::LIVE_PEERS, "it"), None);
         assert_eq!(metrics.rate_sum(names::CACHE_HITS), None);
         assert!(metrics.ops().is_empty());
         assert_eq!(metrics.hit_ratio("it"), None);
@@ -482,6 +566,9 @@ mod tests {
                 sample(names::BYTES_SENT, &[], 1000.0),
                 sample(names::FRAMES_SENT, &[], 10.0),
                 sample(names::OWNED_PARTS, &[("cache", "it")], 100.0),
+                sample(names::FETCH, &[("cache", "it"), ("outcome", "local")], 0.0),
+                sample(names::FETCH, &[("cache", "it"), ("outcome", "remote")], 0.0),
+                sample(names::FETCH, &[("cache", "it"), ("outcome", "miss")], 0.0),
             ],
         );
         metrics.fold(
@@ -492,6 +579,17 @@ mod tests {
                 sample(names::BYTES_SENT, &[], 5000.0),
                 sample(names::FRAMES_SENT, &[], 30.0),
                 sample(names::OWNED_PARTS, &[("cache", "it")], 100.0),
+                sample(
+                    names::FETCH,
+                    &[("cache", "it"), ("outcome", "local")],
+                    200.0,
+                ),
+                sample(
+                    names::FETCH,
+                    &[("cache", "it"), ("outcome", "remote")],
+                    10.0,
+                ),
+                sample(names::FETCH, &[("cache", "it"), ("outcome", "miss")], 4.0),
             ],
         );
         let rate = |name| metrics.rate(name, &[("cache", "it")]).unwrap();
@@ -499,7 +597,10 @@ mod tests {
         assert!((rate(names::CACHE_MISSES) - 10.0).abs() < 1e-9);
         assert!((metrics.hit_ratio("it").unwrap() - 0.75).abs() < 1e-9);
         assert!((metrics.rate_sum(names::BYTES_SENT).unwrap() - 2000.0).abs() < 1e-9);
-        assert_eq!(metrics.ops().to_vec(), [40.0]);
+        // 30 hits and 10 misses a second, and 5 remote and 2 missed fetches a
+        // second; the 100 local fetches a second are the hits and misses
+        // already.
+        assert_eq!(metrics.ops().to_vec(), [47.0]);
         assert_eq!(metrics.tx_bytes().to_vec(), [2000.0]);
         assert_eq!(metrics.tx_frames().to_vec(), [10.0]);
         assert_eq!(
@@ -560,6 +661,20 @@ mod tests {
         assert!((mix.local - 0.75).abs() < 1e-9);
         assert!((mix.remote - 0.25).abs() < 1e-9);
         assert!(mix.miss.abs() < 1e-9 && mix.error.abs() < 1e-9);
+        let local_filter = [("cache", "it"), ("outcome", "local")];
+        assert!((metrics.rate_sum_where(names::FETCH, &local_filter).unwrap() - 30.0).abs() < 1e-9);
+        assert!(
+            (metrics
+                .rate_sum_where(names::FETCH, &[("cache", "it")])
+                .unwrap()
+                - 40.0)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(
+            metrics.rate_sum_where(names::FETCH, &[("cache", "other")]),
+            None
+        );
         metrics.fold(at(base, 2), &fetch(30.0, 10.0));
         assert_eq!(metrics.fetch_mix("it"), None, "zero traffic has no mix");
         assert_eq!(metrics.fetch_mix("other"), None);
@@ -676,6 +791,104 @@ mod tests {
         assert_eq!(metrics.quiet_scrapes("it"), 1);
         metrics.fold(at(base, 2), &owned);
         assert_eq!(metrics.quiet_scrapes("it"), 2);
+    }
+
+    #[test]
+    fn a_pull_series_that_appears_with_parts_is_a_pull() {
+        let base = Instant::now();
+        let mut metrics = NodeMetrics::new(node());
+        let owned = sample(names::OWNED_PARTS, &[("cache", "it")], 100.0);
+        for secs in 0..3 {
+            metrics.fold(at(base, secs), std::slice::from_ref(&owned));
+        }
+        assert_eq!(metrics.quiet_scrapes("it"), 2);
+        // The exporter creates the series at the first pull: 5000 parts came
+        // in during the last second.
+        let pulled = sample(
+            names::REBALANCE_PARTS,
+            &[("cache", "it"), ("direction", "in")],
+            5000.0,
+        );
+        metrics.fold(at(base, 3), &[owned.clone(), pulled.clone()]);
+        assert_eq!(
+            metrics.quiet_scrapes("it"),
+            0,
+            "a node that pulled is not quiet"
+        );
+        assert_eq!(
+            metrics.rebalance_in("it").unwrap().to_vec(),
+            [0.0, 0.0, 5000.0]
+        );
+        // No more parts: the series holds still and the quiet run starts over.
+        metrics.fold(at(base, 4), &[owned.clone(), pulled.clone()]);
+        assert_eq!(metrics.quiet_scrapes("it"), 1);
+        assert_eq!(
+            metrics.rebalance_in("it").unwrap().to_vec(),
+            [0.0, 0.0, 5000.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn a_pull_series_that_appears_empty_is_quiet_and_one_in_the_first_fold_is_a_baseline() {
+        let base = Instant::now();
+        let owned = sample(names::OWNED_PARTS, &[("cache", "it")], 100.0);
+        let pulled = |value| {
+            sample(
+                names::REBALANCE_PARTS,
+                &[("cache", "it"), ("direction", "in")],
+                value,
+            )
+        };
+        let mut metrics = NodeMetrics::new(node());
+        metrics.fold(base, std::slice::from_ref(&owned));
+        metrics.fold(at(base, 1), &[owned.clone(), pulled(0.0)]);
+        assert_eq!(metrics.quiet_scrapes("it"), 1);
+        let mut baseline = NodeMetrics::new(node());
+        baseline.fold(base, &[owned.clone(), pulled(9000.0)]);
+        baseline.fold(at(base, 1), &[owned, pulled(9000.0)]);
+        assert_eq!(
+            baseline.quiet_scrapes("it"),
+            1,
+            "the first fold sets the baseline"
+        );
+    }
+
+    #[test]
+    fn quiet_scrapes_since_counts_only_folds_taken_inside_the_view() {
+        let base = Instant::now();
+        let mut metrics = NodeMetrics::new(node());
+        let owned = [sample(names::OWNED_PARTS, &[("cache", "it")], 100.0)];
+        for secs in 0..=5 {
+            metrics.fold(at(base, secs), &owned);
+        }
+        assert_eq!(metrics.quiet_scrapes("it"), 5);
+        // A view that began at 4.5 s: the fold at 5 s, whose rate window
+        // began at 4 s, is not inside it.
+        let since = at(base, 4) + Duration::from_millis(500);
+        assert_eq!(metrics.quiet_scrapes_since("it", since), 0);
+        metrics.fold(at(base, 6), &owned);
+        assert_eq!(metrics.quiet_scrapes_since("it", since), 1);
+        metrics.fold(at(base, 7), &owned);
+        assert_eq!(metrics.quiet_scrapes_since("it", since), 2);
+        metrics.fold(at(base, 8), &owned);
+        assert_eq!(
+            metrics.quiet_scrapes_since("it", since),
+            QUIET_SCRAPES,
+            "it counts no more than the scrapes settling needs"
+        );
+        assert_eq!(
+            metrics.quiet_scrapes_since("it", at(base, 0)),
+            QUIET_SCRAPES
+        );
+        assert_eq!(metrics.quiet_scrapes_since("other", since), 0);
+        // A pull ends the run.
+        let pulled = sample(
+            names::REBALANCE_PARTS,
+            &[("cache", "it"), ("direction", "in")],
+            50.0,
+        );
+        metrics.fold(at(base, 9), &[owned[0].clone(), pulled]);
+        assert_eq!(metrics.quiet_scrapes_since("it", since), 0);
     }
 
     #[test]

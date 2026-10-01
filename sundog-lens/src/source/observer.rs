@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
+use smol_str::SmolStr;
 use sundog::ClusterConfig;
 use sundog::observe::{ClusterSnapshot, Observer};
 use tokio::sync::{mpsc, watch};
 
 use super::Update;
 use crate::cli::Seed;
+use crate::model::Slots;
 
 /// The gossip settings of the observer: where it binds and which address it
 /// advertises. Every other setting keeps the cluster default, so the observer
@@ -69,6 +71,52 @@ pub async fn start(
         .with_context(|| format!("joining cluster {cluster:?} as an observer"))
 }
 
+/// Where [`forward`] republishes the snapshots it sends the model, with the
+/// node slots those snapshots give.
+///
+/// The slots follow the snapshots in the order the model receives them, from
+/// the relay's label hints, so a consumer that reads its labels here names
+/// every node as the model does.
+#[derive(Debug)]
+pub struct Relay {
+    snapshots: watch::Sender<Arc<ClusterSnapshot>>,
+    labels: watch::Sender<Arc<Slots>>,
+    slots: Slots,
+}
+
+impl Relay {
+    /// A relay that publishes snapshots on `snapshots` and the slots they give
+    /// on `labels`. `hints` name gossip addresses as
+    /// [`Model::set_label_hint`](crate::model::Model::set_label_hint) does.
+    #[must_use]
+    pub fn new(
+        snapshots: watch::Sender<Arc<ClusterSnapshot>>,
+        labels: watch::Sender<Arc<Slots>>,
+        hints: &[(SocketAddr, SmolStr)],
+    ) -> Self {
+        let mut slots = Slots::new();
+        for (addr, label) in hints {
+            slots.hint(*addr, label.clone());
+        }
+        Self {
+            snapshots,
+            labels,
+            slots,
+        }
+    }
+
+    /// Assigns the slots of `snapshot`'s members, publishes the slots and
+    /// then the snapshot, so a reader of a snapshot finds its slots already
+    /// published.
+    fn publish(&mut self, snapshot: Arc<ClusterSnapshot>) {
+        for member in &snapshot.members {
+            self.slots.assign(member.peer.gossip_addr);
+        }
+        self.labels.send_replace(Arc::new(self.slots.clone()));
+        self.snapshots.send_replace(snapshot);
+    }
+}
+
 /// Sends the current snapshot, then every later one, as
 /// [`Update::Snapshot`]. Returns when the observer stops or `updates` closes.
 ///
@@ -78,7 +126,7 @@ pub async fn start(
 pub async fn forward(
     mut snapshots: watch::Receiver<Arc<ClusterSnapshot>>,
     updates: mpsc::Sender<Update>,
-    relay: Option<watch::Sender<Arc<ClusterSnapshot>>>,
+    mut relay: Option<Relay>,
 ) {
     loop {
         let snapshot = Arc::clone(&snapshots.borrow_and_update());
@@ -89,8 +137,8 @@ pub async fn forward(
         {
             return;
         }
-        if let Some(relay) = &relay {
-            relay.send_replace(snapshot);
+        if let Some(relay) = &mut relay {
+            relay.publish(snapshot);
         }
         if snapshots.changed().await.is_err() {
             return;
@@ -172,8 +220,10 @@ mod tests {
     async fn forward_relays_a_snapshot_only_after_its_update_is_queued() {
         let (tx, rx) = watch::channel(Arc::new(testkit::snapshot(1)));
         let (relay_tx, mut relay) = watch::channel(Arc::new(testkit::snapshot(0)));
+        let (labels_tx, labels) = watch::channel(Arc::new(Slots::new()));
         let (updates_tx, mut updates) = mpsc::channel(8);
-        let task = tokio::spawn(forward(rx, updates_tx, Some(relay_tx)));
+        let relayer = Relay::new(relay_tx, labels_tx, &[]);
+        let task = tokio::spawn(forward(rx, updates_tx, Some(relayer)));
 
         for members in [1usize, 2, 3] {
             if members > 1 {
@@ -185,9 +235,56 @@ mod tests {
                 .expect("the relay publishes")
                 .unwrap();
             assert_eq!(relay.borrow_and_update().members.len(), members);
+            assert_eq!(
+                labels.borrow().len(),
+                members,
+                "the slots are published before the snapshot"
+            );
             let queued = updates.try_recv().expect("the update was queued first");
             assert!(matches!(&queued, Update::Snapshot(s, _) if s.members.len() == members));
         }
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_relay_labels_slots_in_arrival_order_with_its_hints() {
+        let (tx, rx) = watch::channel(Arc::new(testkit::snapshot(0)));
+        let (relay_tx, relay) = watch::channel(Arc::new(testkit::snapshot(0)));
+        let (labels_tx, labels) = watch::channel(Arc::new(Slots::new()));
+        let (updates_tx, updates) = mpsc::channel(8);
+        let hinted = testkit::gossip_addr(2);
+        let relayer = Relay::new(relay_tx, labels_tx, &[(hinted, SmolStr::new("alpha"))]);
+        let task = tokio::spawn(forward(rx, updates_tx, Some(relayer)));
+        let mut relay = relay;
+        let mut updates = updates;
+
+        // Members come sorted by node id, so m2 is first seen alone and m1
+        // joins it: m2 takes the first slot.
+        for members in [&[2u8][..], &[1, 2]] {
+            tx.send(Arc::new(ClusterSnapshot::new(
+                "fixture",
+                members
+                    .iter()
+                    .map(|&index| testkit::member(index, sundog::observe::MemberStatus::Live))
+                    .collect(),
+                0,
+            )))
+            .unwrap();
+            let want = members.len();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                relay.wait_for(|snapshot| snapshot.members.len() == want),
+            )
+            .await
+            .expect("the relay publishes")
+            .unwrap();
+            while updates.try_recv().is_ok() {}
+        }
+        let slots = Arc::clone(&labels.borrow());
+        assert_eq!(slots.get(hinted).unwrap().label, "alpha");
+        assert_eq!(slots.get(hinted).unwrap().index, 0);
+        assert_eq!(slots.get(testkit::gossip_addr(1)).unwrap().label, "n2");
         drop(tx);
         task.await.unwrap();
     }

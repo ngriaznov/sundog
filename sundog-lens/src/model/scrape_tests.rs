@@ -422,6 +422,57 @@ fn metrics_settle_a_view_only_when_every_reporting_node_agrees_and_is_quiet() {
 }
 
 #[test]
+fn quiet_scrapes_from_before_a_view_change_do_not_settle_the_new_view() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(3), base);
+    let round = |model: &mut Model, at: Instant, nodes: u8| {
+        let mut events = Vec::new();
+        for index in 1..=nodes {
+            let sample = owned(model, index);
+            events.extend(model.apply(answer(index, at, vec![sample]), at, WALL));
+        }
+        events
+    };
+    for secs in 1..=5 {
+        round(&mut model, after(base, secs * 1000), 3);
+    }
+    assert_eq!(
+        model.settled("it"),
+        Some(true),
+        "a long quiet view is settled"
+    );
+
+    // n3 leaves: the view changes at 10 s. sundog sets `owned_parts` as soon
+    // as it recomputes the view, before any part is pulled, so the first
+    // scrape after the change already agrees and pulled nothing.
+    let view_at = after(base, 10_000);
+    let two = testkit::snapshot(2);
+    let digest = testkit::ownership_digest(&two, "it").unwrap();
+    model.apply(Update::Snapshot(Arc::new(two), view_at), view_at, WALL);
+    let events = model.apply(Update::Ownership(digest), view_at, WALL);
+    assert_eq!(tags(&events), ["VIEW"]);
+    assert_eq!(model.settled("it"), Some(false));
+
+    let settled_in = |events: &[Event]| events.iter().any(|event| event.kind.tag() == "SETTLED");
+    let first = round(&mut model, after(view_at, 100), 2);
+    assert!(!settled_in(&first));
+    assert_eq!(
+        model.settled("it"),
+        Some(false),
+        "the quiet scrapes of the old view say nothing about the new one"
+    );
+    let second = round(&mut model, after(view_at, 200), 2);
+    assert!(
+        !settled_in(&second),
+        "one scrape inside the view is not enough"
+    );
+    assert_eq!(model.settled("it"), Some(false));
+    let third = round(&mut model, after(view_at, 300), 2);
+    assert!(settled_in(&third), "two scrapes inside the view settle it");
+    assert_eq!(model.settled("it"), Some(true));
+}
+
+#[test]
 fn parts_pulled_in_keep_a_view_unsettled_until_they_stop() {
     let base = Instant::now();
     let mut model = watching(testkit::snapshot(2), base);

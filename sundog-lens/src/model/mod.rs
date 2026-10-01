@@ -207,7 +207,7 @@ impl Model {
     /// The settling verdict for `cache`. Nodes whose exporter answered since
     /// the view changed vote: the cache is settled once each of them reports
     /// the parts the observer computes for it and has pulled none in for
-    /// [`derive::QUIET_SCRAPES`] scrapes. With no such node the verdict rests
+    /// [`derive::QUIET_SCRAPES`] scrapes taken since the view changed. With no such node the verdict rests
     /// on gossip alone, and the cache is settled once its view has held for
     /// [`GOSSIP_SETTLE`]. `None` for a cache with no ownership digest.
     #[must_use]
@@ -338,7 +338,7 @@ impl Model {
                 derive::agreement(Some(reported), digest.parts_owned_by(node))
                     == derive::Agreement::Match,
             ),
-            quiet_scrapes: metrics.quiet_scrapes(&digest.cache),
+            quiet_scrapes: metrics.quiet_scrapes_since(&digest.cache, since),
         }
     }
 

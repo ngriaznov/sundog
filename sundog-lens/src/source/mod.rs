@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::cli::{Seed, WatchArgs};
+use crate::model::Slots;
 use crate::model::ownership::OwnershipDigest;
 use targets::TemplateError;
 
@@ -55,6 +56,10 @@ pub struct FeedConfig {
     pub advertise: Option<IpAddr>,
     /// How to find and poll each node's exporter; `None` scrapes nothing.
     pub scrape: Option<ScrapeConfig>,
+    /// Slot labels for gossip addresses: the one place they are configured.
+    /// The scraper names `--scrape` pins by them, and the model must be given
+    /// the same through [`Feed::hints`] so that it draws the same labels.
+    pub hints: Vec<(SocketAddr, SmolStr)>,
 }
 
 impl FeedConfig {
@@ -68,7 +73,13 @@ impl FeedConfig {
             bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             advertise: None,
             scrape: None,
+            hints: Vec::new(),
         }
+    }
+
+    /// Names the node at gossip address `addr` as `label`.
+    pub fn hint(&mut self, addr: SocketAddr, label: impl Into<SmolStr>) {
+        self.hints.push((addr, label.into()));
     }
 }
 
@@ -88,6 +99,7 @@ impl TryFrom<&WatchArgs> for FeedConfig {
             bind: args.bind,
             advertise: args.advertise,
             scrape: ScrapeConfig::from_args(args)?,
+            hints: Vec::new(),
         })
     }
 }
@@ -99,6 +111,7 @@ pub struct Feed {
     observer: Observer,
     updates: mpsc::Receiver<Update>,
     tasks: Vec<JoinHandle<()>>,
+    hints: Vec<(SocketAddr, SmolStr)>,
 }
 
 impl Feed {
@@ -125,6 +138,8 @@ impl Feed {
             Vec::new(),
             0,
         )));
+        let (labels, labeled) = watch::channel(Arc::new(Slots::new()));
+        let relay = observer::Relay::new(relay, labels, &config.hints);
         let mut tasks = vec![tokio::spawn(observer::forward(
             observer.subscribe(),
             tx.clone(),
@@ -134,6 +149,7 @@ impl Feed {
             tasks.push(tokio::spawn(scrape::run(
                 scrape,
                 relayed.clone(),
+                labeled,
                 tx.clone(),
             )));
         }
@@ -142,7 +158,16 @@ impl Feed {
             observer,
             updates,
             tasks,
+            hints: config.hints,
         })
+    }
+
+    /// The slot label hints the feed was configured with. Give each to the
+    /// model with [`Model::set_label_hint`](crate::model::Model::set_label_hint)
+    /// so that the model and the scraper name every node alike.
+    #[must_use]
+    pub fn hints(&self) -> &[(SocketAddr, SmolStr)] {
+        &self.hints
     }
 
     /// The next update; `None` once every source has stopped and the stream is
@@ -194,6 +219,15 @@ mod tests {
         assert_eq!(config.bind, SocketAddr::from(([0, 0, 0, 0], 0)));
         assert_eq!(config.advertise, None);
         assert_eq!(config.scrape, None);
+        assert!(config.hints.is_empty());
+    }
+
+    #[test]
+    fn a_hint_is_kept_for_the_slot_labels() {
+        let mut config = FeedConfig::new("c");
+        let addr: SocketAddr = "127.0.0.12:7946".parse().unwrap();
+        config.hint(addr, "alpha");
+        assert_eq!(config.hints, [(addr, SmolStr::new("alpha"))]);
     }
 
     #[test]
@@ -251,7 +285,10 @@ mod tests {
         let mut config = FeedConfig::new("lens-feed-unit");
         config.bind = "127.0.0.1:0".parse().unwrap();
         config.seeds = vec![Seed::Addr("127.0.0.1:9".parse().unwrap())];
+        let hinted: SocketAddr = "127.0.0.12:7946".parse().unwrap();
+        config.hint(hinted, "alpha");
         let mut feed = Feed::spawn(config).await.expect("the feed starts");
+        assert_eq!(feed.hints(), [(hinted, SmolStr::new("alpha"))]);
         assert!(feed.observer_addr().ip().is_loopback());
         assert_eq!(feed.observer().local_gossip_addr(), feed.observer_addr());
         let first = tokio::time::timeout(Duration::from_secs(10), feed.recv())
