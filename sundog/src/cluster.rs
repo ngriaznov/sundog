@@ -848,7 +848,7 @@ fn validate_config(config: &ClusterConfig) -> Result<(), JoinError> {
 /// Resolves the discovery mechanism `build()` uses: the caller's explicit
 /// choice, else [`use_static_from_env`]'s pick between `Static::from_env()`
 /// and the zeroconf `Mdns` default.
-fn resolve_discovery(
+pub(crate) fn resolve_discovery(
     discovery: Option<DiscoveryKind>,
     name: &SmolStr,
     node_name: &NodeName,
@@ -905,7 +905,7 @@ fn spawn_cluster_background_tasks(cluster: &Cluster, inbound_rx: mpsc::Receiver<
     ));
 }
 
-fn local_hostname() -> String {
+pub(crate) fn local_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())
@@ -1911,7 +1911,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::test_support::{
-        loopback_config, registered_shard, wait_for_no_peers, wait_for_peer_count, wait_until,
+        EndingDiscovery, loopback_config, registered_shard, wait_for_no_peers, wait_for_peer_count,
+        wait_until,
     };
     use super::*;
     use crate::error::CacheError;
@@ -5405,6 +5406,35 @@ mod tests {
         assert_eq!(cache.get(&1).await, Some("a".to_string()));
 
         cluster.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cluster_keeps_gossiping_after_its_seed_stream_ends() {
+        let name = "cluster-it-ending-seeds";
+        let a = Cluster::builder(name)
+            .discovery(EndingDiscovery {
+                addrs: Vec::new(),
+                // Past the initial seed window, so the membership loop
+                // itself sees the stream end.
+                lag: Duration::from_millis(1_500),
+            })
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("a builds");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let b = Cluster::builder(name)
+            .seeds([a.local_gossip_addr()])
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("b builds");
+        wait_for_peer_count(&a, 1).await;
+        wait_for_peer_count(&b, 1).await;
+
+        a.shutdown().await;
+        b.shutdown().await;
     }
 
     #[tokio::test]

@@ -18,6 +18,16 @@ All notable changes to this project are documented in this file. Format follows
   A `Distributed` node that does not hold the key asks an owner, as `fetch`
   does, and forwards the write to the owners. `Shard` gains the same four
   methods for its local copy. No wire change.
+- **Watching a cluster from outside.** `observe::Observer::builder(name).build()`
+  joins a cluster's gossip without a data plane or caches, and
+  `Observer::snapshot` returns a `ClusterSnapshot`: every member's `Peer`
+  record, its `MemberStatus` (`Live`, `Departing`, `Left` or `Down`, which
+  tells a graceful leave from a crash) and the caches it advertises with their
+  modes. `ClusterSnapshot::ownership(cache, owners)` ranks a `Distributed`
+  cache's parts the way its members do and returns `OwnershipShares`. An
+  observer's gossip state carries no node id or data address, so no member
+  counts it as a peer: it is never dialed, sent writes, asked for state or
+  made an owner. No wire change.
 
 ### Changed
 
@@ -38,6 +48,13 @@ All notable changes to this project are documented in this file. Format follows
 
 ### Fixed
 
+- **A discovery stream that ends no longer panics the membership loop.**
+  A custom `Discovery` whose candidate stream ends, and `Mdns` or `DnsSrv`
+  when the daemon or resolver fails to start, panicked the loop that feeds
+  gossip, which left the node gossiping with nothing able to stop it.
+  The loop now retires the seed arm when the stream ends, and a source that
+  cannot run returns a stream that stays pending, as the `Discovery`
+  contract requires.
 - **A `Distributed` node that only seems alone no longer answers a miss
   for a key its co-owners hold.** When the failure detector dropped every
   other owner of a part, the node owned it alone, found nobody to pull

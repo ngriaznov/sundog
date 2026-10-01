@@ -49,14 +49,14 @@ impl Mdns {
 impl Discovery for Mdns {
     fn candidates(&self) -> BoxStream<'static, SocketAddr> {
         let Some(daemon) = self.daemon.clone() else {
-            return stream::empty().boxed();
+            return stream::pending().boxed();
         };
         let cluster_name = self.cluster_name.clone();
         let events = match daemon.browse(SERVICE_TYPE) {
             Ok(events) => events,
             Err(error) => {
                 tracing::warn!(%error, "mDNS browse failed to start");
-                return stream::empty().boxed();
+                return stream::pending().boxed();
             }
         };
         events
@@ -169,6 +169,22 @@ mod tests {
     fn constructing_never_panics_even_without_multicast() {
         // `new` must not panic regardless of the sandbox's multicast support.
         let _discovery = Mdns::new("test-cluster", "test-node");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_source_yields_a_stream_that_never_ends() {
+        use futures::FutureExt as _;
+
+        let discovery = Mdns {
+            cluster_name: "test-cluster".into(),
+            instance_name: "test-node".to_owned(),
+            daemon: None,
+        };
+        let mut candidates = discovery.candidates();
+        assert!(
+            candidates.next().now_or_never().is_none(),
+            "a source with no daemon stays pending, never ends"
+        );
     }
 
     #[tokio::test]

@@ -5,10 +5,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use smol_str::SmolStr;
 
 use super::{Cluster, ShardRegistryExt};
 use crate::config::ClusterConfig;
+use crate::discovery::Discovery;
 use crate::store::ShardOps;
 
 /// Loopback-only config: skips the outbound-interface probe and keeps
@@ -85,4 +89,28 @@ pub(crate) async fn wait_until(budget: Duration, msg: &str, mut cond: impl Async
     })
     .await
     .expect(msg);
+}
+
+/// A discovery whose candidate stream yields its addresses, waits `lag` and
+/// then ends. The [`Discovery`] contract forbids that, and a custom source
+/// can still do it.
+pub(crate) struct EndingDiscovery {
+    pub(crate) addrs: Vec<SocketAddr>,
+    pub(crate) lag: Duration,
+}
+
+impl Discovery for EndingDiscovery {
+    fn candidates(&self) -> BoxStream<'static, SocketAddr> {
+        let lag = self.lag;
+        futures::stream::iter(self.addrs.clone())
+            .chain(
+                futures::stream::once(async move { tokio::time::sleep(lag).await })
+                    .filter_map(|()| async { None }),
+            )
+            .boxed()
+    }
+
+    fn announce(&self, _gossip_addr: SocketAddr) -> BoxFuture<'_, std::io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }

@@ -145,8 +145,24 @@ impl Granularity {
     /// `Part` when this build and every one of `peer_protocols` speak
     /// [`wire::PROTOCOL_PART_OWNERSHIP`], `Bucket` otherwise.
     fn for_protocols(peer_protocols: impl IntoIterator<Item = u16>) -> Self {
-        let speaks = |protocol| wire::peer_supports(protocol, wire::PROTOCOL_PART_OWNERSHIP);
-        if speaks(wire::PROTOCOL_VERSION) && peer_protocols.into_iter().all(speaks) {
+        if wire::peer_supports(wire::PROTOCOL_VERSION, wire::PROTOCOL_PART_OWNERSHIP) {
+            Self::for_members(peer_protocols)
+        } else {
+            Self::Bucket
+        }
+    }
+
+    /// `Part` when every one of `protocols` speaks
+    /// [`wire::PROTOCOL_PART_OWNERSHIP`], `Bucket` otherwise, with no term
+    /// for this build. A member's own granularity combines its build with
+    /// its peers' protocols, which equals this over every eligible member's
+    /// protocol, so a caller built from another release computes the
+    /// members' granularity.
+    pub(crate) fn for_members(protocols: impl IntoIterator<Item = u16>) -> Self {
+        if protocols
+            .into_iter()
+            .all(|protocol| wire::peer_supports(protocol, wire::PROTOCOL_PART_OWNERSHIP))
+        {
             Self::Part
         } else {
             Self::Bucket
@@ -170,7 +186,24 @@ pub fn eligible_owners(
     cache: &SmolStr,
     k: NonZeroU8,
 ) -> Vec<NodeId> {
-    let mut eligible: Vec<NodeId> = peers
+    let mut eligible = eligible_peers(peers, modes, cache, k);
+    if !eligible.contains(&self_node) {
+        eligible.push(self_node);
+    }
+    eligible
+}
+
+/// The members of `peers` eligible to own a part of `cache`: those speaking
+/// at least [`wire::PROTOCOL_DISTRIBUTED`] that advertise `cache` under
+/// `Mode::Distributed` with this same `k`. [`eligible_owners`] adds the
+/// calling node's own seat to this; a caller outside the cluster adds none.
+pub(crate) fn eligible_peers(
+    peers: &[Peer],
+    modes: &CacheModes,
+    cache: &SmolStr,
+    k: NonZeroU8,
+) -> Vec<NodeId> {
+    peers
         .iter()
         .filter(|peer| peer.protocol >= wire::PROTOCOL_DISTRIBUTED)
         .filter(|peer| {
@@ -180,11 +213,7 @@ pub fn eligible_owners(
                 .is_some_and(|mode| matches!(mode, Mode::Distributed { owners } if *owners == k))
         })
         .map(|peer| peer.node)
-        .collect();
-    if !eligible.contains(&self_node) {
-        eligible.push(self_node);
-    }
-    eligible
+        .collect()
 }
 
 /// The parts `view` owns that `peer` also owns: strict-ownership input for
@@ -353,6 +382,12 @@ impl OwnershipView {
     #[must_use]
     pub const fn view_hash(&self) -> u64 {
         self.view_hash
+    }
+
+    /// The ranked nodes, `self_node` among them, ascending.
+    #[must_use]
+    pub(crate) fn eligible(&self) -> &[NodeId] {
+        &self.eligible
     }
 
     /// Whether this view ranks whole buckets or single parts.
@@ -1318,6 +1353,34 @@ mod tests {
     }
 
     #[test]
+    fn eligible_peers_never_adds_a_seat_of_its_own() {
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let cache = SmolStr::new("cache");
+        let distributed = Mode::Distributed { owners: k };
+        let peers = vec![peer(2, 3), peer(3, 3), peer(4, 2), peer(5, 3), peer(6, 3)];
+        let modes = modes_with(&[
+            (NodeId::from(2), "cache", distributed),
+            (NodeId::from(3), "cache", distributed),
+            (NodeId::from(4), "cache", distributed),
+            (NodeId::from(5), "cache", Mode::Replicated),
+        ]);
+
+        assert_eq!(
+            eligible_peers(&peers, &modes, &cache, k),
+            vec![NodeId::from(2), NodeId::from(3)],
+            "a protocol-two peer, another mode and a silent peer are out"
+        );
+        assert!(
+            eligible_peers(&[], &HashMap::new(), &cache, k).is_empty(),
+            "no peer yields no seat, where eligible_owners yields the caller's"
+        );
+        assert_eq!(
+            eligible_owners(NodeId::from(1), &[], &HashMap::new(), &cache, k),
+            vec![NodeId::from(1)]
+        );
+    }
+
+    #[test]
     fn shared_owned_parts_is_empty_for_a_peer_owning_nothing_in_common() {
         let self_node = NodeId::from(1);
         let k = NonZeroU8::new(1).expect("nonzero");
@@ -1713,6 +1776,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn for_members_is_part_only_when_every_protocol_speaks_part_ownership() {
+        let current = wire::PROTOCOL_PART_OWNERSHIP;
+        assert_eq!(
+            Granularity::for_members([current, current + 1]),
+            Granularity::Part
+        );
+        assert_eq!(
+            Granularity::for_members([current, current - 1]),
+            Granularity::Bucket,
+            "one member on an older protocol keeps the cluster on buckets"
+        );
+        assert_eq!(
+            Granularity::for_members([1]),
+            Granularity::Bucket,
+            "a protocol-one member has no part ownership"
+        );
+        assert_eq!(
+            Granularity::for_members([]),
+            Granularity::Part,
+            "no member holds the cluster back, and this build adds no term"
+        );
+        assert_eq!(
+            Granularity::for_members([current]),
+            Granularity::for_protocols([current]),
+            "the members' answer is a build's own when the build speaks part ownership"
+        );
+    }
+
     /// `refresh_task` decides whether a view changed from
     /// [`view_hash_at`] over [`eligible_owners`] at
     /// [`ownership_granularity`], before building anything: that hash is
@@ -1761,6 +1853,22 @@ mod tests {
         assert!((owned_bucket_equivalent(64) - 1.0).abs() < f64::EPSILON);
         assert!((owned_bucket_equivalent(PART_SPACE) - 1024.0).abs() < f64::EPSILON);
         assert!((owned_bucket_equivalent(96) - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn eligible_lists_the_ranked_nodes_with_self() {
+        let k = NonZeroU8::new(2).expect("nonzero");
+        let view = OwnershipView::compute_at(
+            NodeId::from(9),
+            vec![NodeId::from(5), NodeId::from(3), NodeId::from(5)],
+            k,
+            Granularity::Bucket,
+        );
+        assert_eq!(
+            view.eligible(),
+            [NodeId::from(3), NodeId::from(5), NodeId::from(9)],
+            "ascending and deduplicated, with the caller's own seat folded in"
+        );
     }
 
     #[test]

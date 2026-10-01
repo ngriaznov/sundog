@@ -15,7 +15,7 @@ use chitchat::{
     spawn_chitchat,
 };
 use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, FusedStream};
 use smol_str::SmolStr;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time;
@@ -285,7 +285,9 @@ impl Membership {
 /// Samples `seeds` for up to [`INITIAL_SEED_WINDOW`] to build chitchat's
 /// static seed list, deduplicating and capping at [`MAX_INITIAL_SEEDS`].
 /// Does not exhaust the stream; the caller keeps consuming it afterward.
-async fn collect_initial_seeds(seeds: &mut BoxStream<'static, SocketAddr>) -> Vec<String> {
+pub(crate) async fn collect_initial_seeds(
+    seeds: &mut BoxStream<'static, SocketAddr>,
+) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut seed_nodes = Vec::new();
     let deadline = time::Instant::now() + INITIAL_SEED_WINDOW;
@@ -343,7 +345,7 @@ fn resolve_advertise_ip(bind_ip: IpAddr) -> IpAddr {
 /// another node in the same test binary, taking it in between: chitchat's
 /// address-in-use answer sends the loop back to probe a fresh port, up to
 /// [`GOSSIP_BIND_ATTEMPTS`] times. A fixed port never moves.
-async fn start_gossip(
+pub(crate) async fn start_gossip(
     cluster_name: &SmolStr,
     name: &NodeName,
     incarnation: u64,
@@ -482,11 +484,11 @@ fn is_link_local(ip: &IpAddr) -> bool {
 
 /// Whether `state` carries [`DEPARTING_KEY`], i.e. its owner gossiped a
 /// graceful departure before leaving.
-fn is_departing(state: &NodeState) -> bool {
+pub(crate) fn is_departing(state: &NodeState) -> bool {
     state.get(DEPARTING_KEY).is_some()
 }
 
-fn now_incarnation_ms() -> u64 {
+pub(crate) fn now_incarnation_ms() -> u64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
@@ -496,7 +498,7 @@ fn now_incarnation_ms() -> u64 {
 /// Reconstructs a [`Peer`] from a live chitchat member, or `None` if its
 /// gossiped state is missing or malformed. Such peers are excluded rather
 /// than surfaced as an error; they appear once their state catches up.
-fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> {
+pub(crate) fn parse_peer(chitchat_id: &ChitchatId, node_state: &NodeState) -> Option<Peer> {
     let node_id_value = u64::from_str_radix(node_state.get(NODE_ID_KEY)?, 16).ok()?;
     let node = NodeId::from(node_id_value);
 
@@ -552,7 +554,7 @@ fn advertised_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
 
 /// Reads every `cache:<name>` key off `node_state` into a `name -> Mode`
 /// map, logging and skipping any value that isn't a recognized [`Mode`] token.
-fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
+pub(crate) fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
     node_state
         .iter_prefix(CACHE_KEY_PREFIX)
         .filter_map(|(key, versioned_value)| {
@@ -570,6 +572,31 @@ fn parse_cache_modes(node_state: &NodeState) -> HashMap<SmolStr, Mode> {
             mode.map(|mode| (SmolStr::new(name), mode))
         })
         .collect()
+}
+
+/// A chitchat id and node state shaped as [`Membership::spawn`] publishes
+/// them for `peer`, with a `cache:<name>` key per entry of `caches` and the
+/// departure key when `departing`: what [`parse_peer`] and
+/// [`parse_cache_modes`] read back.
+#[cfg(test)]
+pub(crate) fn published_state_for_test(
+    peer: &Peer,
+    caches: &[(&str, Mode)],
+    departing: bool,
+) -> (ChitchatId, NodeState) {
+    let id = ChitchatId::new(peer.name.to_string(), peer.incarnation, peer.gossip_addr);
+    let mut state = NodeState::for_test();
+    state.set(NODE_ID_KEY, peer.node.to_string());
+    state.set(DATA_ADDR_KEY, peer.data_addr.to_string());
+    state.set(INCARNATION_KEY, peer.incarnation.to_string());
+    state.set(PROTOCOL_KEY, peer.protocol.to_string());
+    for (name, mode) in caches {
+        state.set(cache_key(name), mode.as_token().as_str());
+    }
+    if departing {
+        state.set(DEPARTING_KEY, "1");
+    }
+    (id, state)
 }
 
 /// One other member's state, as this node currently sees it, for the CRDT
@@ -675,7 +702,10 @@ async fn run(
 
     loop {
         tokio::select! {
-            addr = seeds.select_next_some() => {
+            // The arm retires when the discovery stream ends. The contract
+            // forbids that and a custom source can still do it;
+            // `select_next_some` would panic on the poll after the end.
+            Some(addr) = seeds.next(), if !seeds.is_terminated() => {
                 if let Err(error) = handle.gossip(addr) {
                     tracing::debug!(%error, %addr, "failed to queue gossip with discovered peer");
                 }

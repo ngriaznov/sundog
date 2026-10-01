@@ -149,7 +149,7 @@ fn candidate_ticks<L: SrvLookup>(
 impl Discovery for DnsSrv {
     fn candidates(&self) -> BoxStream<'static, SocketAddr> {
         let Some(resolver) = self.resolver.clone() else {
-            return stream::empty().boxed();
+            return stream::pending().boxed();
         };
         candidate_ticks(
             resolver,
@@ -170,6 +170,23 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_source_without_a_resolver_yields_a_stream_that_never_ends() {
+        use futures::FutureExt as _;
+
+        let discovery = DnsSrv {
+            resolver: None,
+            service_name: "_sundog._tcp.svc.cluster.local.".to_owned(),
+            fallback_port: 7946,
+            interval: DEFAULT_INTERVAL,
+        };
+        let mut candidates = discovery.candidates();
+        assert!(
+            candidates.next().now_or_never().is_none(),
+            "a source with no resolver stays pending, never ends"
+        );
+    }
 
     #[test]
     fn construction_carries_the_configured_service_name_and_port() {
