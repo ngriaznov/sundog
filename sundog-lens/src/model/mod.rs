@@ -69,7 +69,8 @@ impl Model {
     /// and raises the events [`diff_snapshots`] finds. A `DOWN` carries the
     /// time since the node's exporter last answered when its latest scrape
     /// failed. An ownership digest replaces its cache's digest; a changed view
-    /// hash raises `VIEW` and restarts the cache's settling clock. The
+    /// hash or owner count raises `VIEW` and restarts the cache's settling
+    /// clock. The
     /// ownership worker alone decides what ownership the model holds:
     /// [`Update::OwnershipGone`] drops a cache's digest, settling clock and
     /// lifeline, and a snapshot never does. A scrape
@@ -204,7 +205,7 @@ impl Model {
     fn apply_ownership(&mut self, digest: OwnershipDigest, now: Instant) -> Vec<EventKind> {
         let held = self.ownership.get(&digest.cache);
         let mut kinds = Vec::new();
-        if held.is_none_or(|held| held.view_hash != digest.view_hash) {
+        if held.is_none_or(|held| (held.view_hash, held.k) != (digest.view_hash, digest.k)) {
             let deltas = held.map_or_else(
                 || {
                     digest
@@ -433,6 +434,38 @@ mod tests {
     }
 
     #[test]
+    fn a_new_owner_count_over_the_same_members_raises_a_view_and_restarts_the_clock() {
+        let mut model = Model::new();
+        let start = Instant::now();
+        let two = testkit::ownership_digest_with_owners(
+            &testkit::snapshot_with_owners(3, 2),
+            "it",
+            owners(2),
+            None,
+        )
+        .unwrap();
+        let three = testkit::ownership_digest_with_owners(
+            &testkit::snapshot_with_owners(3, 3),
+            "it",
+            owners(3),
+            Some(&two),
+        )
+        .unwrap();
+        assert_eq!(two.view_hash, three.view_hash);
+        model.apply(Update::Ownership(two), start, SystemTime::UNIX_EPOCH);
+        let later = start + Duration::from_secs(4);
+        assert_eq!(model.settled("it"), Some(false));
+        model.tick(later);
+        assert_eq!(model.settled("it"), Some(true));
+        let events = model.apply(Update::Ownership(three), later, SystemTime::UNIX_EPOCH);
+        assert_eq!(tags(&events), ["VIEW"]);
+        assert_eq!(model.ownership("it").unwrap().k, owners(3));
+        assert_eq!(model.settled("it"), Some(false));
+        model.tick(later + Duration::from_secs(3));
+        assert_eq!(model.settled("it"), Some(true));
+    }
+
+    #[test]
     fn a_changed_view_restarts_the_settling_clock() {
         let mut model = Model::new();
         let start = Instant::now();
@@ -506,6 +539,10 @@ mod tests {
         );
         assert_eq!(frozen.snapshot().unwrap().members.len(), 2);
         assert_eq!(model.snapshot().unwrap().members.len(), 3);
+    }
+
+    fn owners(count: u8) -> std::num::NonZeroU8 {
+        std::num::NonZeroU8::new(count).expect("owners is nonzero")
     }
 
     fn tags(events: &[Event]) -> Vec<&'static str> {

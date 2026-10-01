@@ -122,7 +122,8 @@ pub enum EventKind {
         /// Its protocol.
         protocol: u16,
     },
-    /// `VIEW`: a cache's ownership view changed.
+    /// `VIEW`: a cache's ownership view changed. The hashes are equal when only
+    /// the owner count changed.
     View {
         /// The cache name.
         cache: SmolStr,

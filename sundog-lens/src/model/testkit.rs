@@ -100,6 +100,27 @@ pub fn snapshot(live: u8) -> ClusterSnapshot {
     )
 }
 
+/// A snapshot of `live` live members, `1..=live`, each advertising `it` as
+/// `Distributed` with `owners` owners.
+#[must_use]
+pub fn snapshot_with_owners(live: u8, owners: u8) -> ClusterSnapshot {
+    ClusterSnapshot::new(
+        "fixture",
+        (1..=live)
+            .map(|index| {
+                member_with(
+                    index,
+                    0,
+                    1,
+                    MemberStatus::Live,
+                    &[("it", distributed(owners))],
+                )
+            })
+            .collect(),
+        0,
+    )
+}
+
 /// The ownership digest of `cache` in `snapshot` with two owners, or `None`
 /// when no member is eligible.
 #[must_use]
@@ -114,7 +135,18 @@ pub fn ownership_digest_after(
     cache: &str,
     previous: Option<&OwnershipDigest>,
 ) -> Option<OwnershipDigest> {
-    let shares = snapshot.ownership(cache, Mode::DEFAULT_OWNERS)?;
+    ownership_digest_with_owners(snapshot, cache, Mode::DEFAULT_OWNERS, previous)
+}
+
+/// As [`ownership_digest_after`], ranking with `owners` owners per part.
+#[must_use]
+pub fn ownership_digest_with_owners(
+    snapshot: &ClusterSnapshot,
+    cache: &str,
+    owners: NonZeroU8,
+    previous: Option<&OwnershipDigest>,
+) -> Option<OwnershipDigest> {
+    let shares = snapshot.ownership(cache, owners)?;
     Some(OwnershipDigest::from_shares(Arc::new(shares), previous))
 }
 

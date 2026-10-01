@@ -171,9 +171,11 @@ enum Step {
 /// The step to take and the digest to keep after ranking a cache whose model
 /// holds `previous` and whose new ranking is `computed`.
 ///
-/// A ranking whose view hash equals the held one sends nothing and keeps the
-/// held digest, so its `moved` and `previous_view` stay those of the change
-/// that produced it. A ranking with no eligible member retracts a held digest.
+/// A ranking whose view hash and owner count equal the held ones sends nothing
+/// and keeps the held digest, so its `moved` and `previous_view` stay those of
+/// the change that produced it. The view hash covers the eligible set and the
+/// ranking granularity but not the owner count, so a new owner count over the
+/// same members is a new ranking and is sent. A ranking with no eligible member retracts a held digest.
 fn outcome(
     previous: Option<OwnershipDigest>,
     computed: Option<OwnershipDigest>,
@@ -181,7 +183,9 @@ fn outcome(
     match (previous, computed) {
         (None, None) => (Step::Skip, None),
         (Some(_), None) => (Step::Withdraw, None),
-        (Some(old), Some(new)) if old.view_hash == new.view_hash => (Step::Skip, Some(old)),
+        (Some(old), Some(new)) if (old.view_hash, old.k) == (new.view_hash, new.k) => {
+            (Step::Skip, Some(old))
+        }
         (_, Some(new)) => (Step::Publish(new.clone()), Some(new)),
     }
 }
@@ -197,7 +201,8 @@ fn departed(held: &BTreeMap<SmolStr, MemoKey>, wanted: &[MemoKey]) -> Vec<SmolSt
 /// Computes the ownership of every `Distributed` cache in each snapshot the
 /// receiver shows and sends a changed one as [`Update::Ownership`]. A cache
 /// whose members and owner count did not change is not computed again, and a
-/// computed ranking with the view hash already published is not sent again. A
+/// computed ranking with the view hash and owner count already published is not
+/// sent again. A
 /// cache that stops being wanted, or has no eligible member, is retracted with
 /// [`Update::OwnershipGone`] if the model holds a digest for it. Returns when
 /// the observer stops or `updates` closes.
@@ -534,6 +539,32 @@ mod tests {
         let kept = kept.expect("the held digest is kept");
         assert_eq!(kept.view_hash, held_hash);
         assert_eq!(kept.eligible, held_eligible);
+    }
+
+    #[test]
+    fn a_new_owner_count_over_the_same_members_is_published_and_kept() {
+        let at = |owners: u8, previous: Option<&OwnershipDigest>| {
+            let snapshot = testkit::snapshot_with_owners(3, owners);
+            let key = targets(&snapshot).remove(0);
+            assert_eq!(key.k, k(owners));
+            compute(&snapshot, &key, previous).expect("three eligible members")
+        };
+        let two = at(2, None);
+        let three = at(3, Some(&two));
+        assert_eq!(
+            two.view_hash, three.view_hash,
+            "the hash omits the owner count"
+        );
+        let (step, kept) = outcome(Some(two), Some(three));
+        let Step::Publish(sent) = step else {
+            panic!("a new owner count is published, not {step:?}");
+        };
+        assert_eq!(sent.k, k(3));
+        assert_eq!(
+            sent.counts.iter().map(|&(_, n)| n).sum::<usize>(),
+            3 * 65_536
+        );
+        assert_eq!(kept.unwrap().k, k(3));
     }
 
     #[test]
