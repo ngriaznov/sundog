@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
+use smol_str::SmolStr;
 use sundog::observe::{ClusterSnapshot, Observer};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -30,6 +31,9 @@ pub enum Update {
     /// The ownership worker computed a cache's ownership. The digest carries
     /// the owner slots moved since the previous digest of that cache.
     Ownership(OwnershipDigest),
+    /// No cache of this name has ownership any more: the ownership worker
+    /// holds none for it, so the model drops what it holds.
+    OwnershipGone(SmolStr),
     /// One scrape of one node's exporter finished.
     Scrape(ScrapeReport),
 }

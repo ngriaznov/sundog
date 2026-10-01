@@ -43,6 +43,9 @@ pub enum EventKind {
         node: NodeId,
         /// Its gossip address.
         addr: SocketAddr,
+        /// Whether a later incarnation holds the address: the departure
+        /// concerns an older process, not the node now at the address.
+        superseded: bool,
     },
     /// `LEFT`: a departing member is gone.
     Left {
@@ -50,6 +53,8 @@ pub enum EventKind {
         node: NodeId,
         /// Its gossip address.
         addr: SocketAddr,
+        /// Whether a later incarnation holds the address.
+        superseded: bool,
     },
     /// `DOWN`: a live member dropped with no departure.
     Down {
@@ -59,6 +64,16 @@ pub enum EventKind {
         addr: SocketAddr,
         /// How long its exporter had been silent, when known.
         exporter_silent: Option<Duration>,
+        /// Whether a later incarnation holds the address.
+        superseded: bool,
+    },
+    /// `UP`: a member that was down is live again, as when chitchat revives a
+    /// node whose heartbeat resumes after a stall or a partition.
+    Up {
+        /// The member.
+        node: NodeId,
+        /// Its gossip address.
+        addr: SocketAddr,
     },
     /// `REJOIN`: a new node id at a known gossip address.
     Rejoin {
@@ -187,6 +202,7 @@ impl EventKind {
             Self::Leave { .. } => "LEAVE",
             Self::Left { .. } => "LEFT",
             Self::Down { .. } => "DOWN",
+            Self::Up { .. } => "UP",
             Self::Rejoin { .. } => "REJOIN",
             Self::Restart { .. } => "RESTART",
             Self::CacheAdded { .. } => "CACHE+",
@@ -212,6 +228,7 @@ impl EventKind {
             | Self::Leave { .. }
             | Self::Left { .. }
             | Self::Down { .. }
+            | Self::Up { .. }
             | Self::Rejoin { .. }
             | Self::Restart { .. }
             | Self::CacheAdded { .. }
@@ -235,6 +252,7 @@ impl EventKind {
             | Self::Leave { node, .. }
             | Self::Left { node, .. }
             | Self::Down { node, .. }
+            | Self::Up { node, .. }
             | Self::Rejoin { node, .. }
             | Self::Restart { node, .. }
             | Self::CacheAdded { node, .. }
@@ -363,13 +381,15 @@ impl EventLog {
 /// node id held its gossip address, followed by `PROTO` when its protocol is
 /// not the lens's and `LEAVE` when it arrives departing. A member that was
 /// already in `prev` raises `LEAVE` on `Live` to `Departing`, `LEFT` on
-/// `Departing` to `Left`, both on `Live` straight to `Left`, and `DOWN` on a
-/// live status to `Down`. Between two `Live` snapshots of one member a cache
+/// `Departing` to `Left`, both on `Live` straight to `Left`, `DOWN` on a
+/// live status to `Down`, and `UP` on `Down` to `Live` (followed by `LEAVE`
+/// when it turns `Departing`). A `LEAVE`, `LEFT` or `DOWN` is `superseded`
+/// when `next` holds a later incarnation at the member's gossip address: the
+/// older process is going while the node at the address lives. Between two `Live` snapshots of one member a cache
 /// that appears raises `CACHE+` and a cache that disappears `CACHE-`. A cache
 /// whose live members advertise different modes raises `CONFLICT` when the
 /// disagreement is new or changes. A member that appears already `Left` or
-/// `Down`, a member that leaves `prev`, and a `Down` member that turns live
-/// again raise nothing. A `DOWN` carries no exporter silence: the model adds
+/// `Down` and a member that leaves `prev` raise nothing. A `DOWN` carries no exporter silence: the model adds
 /// it from the scrapes.
 #[must_use]
 pub fn diff_snapshots(prev: Option<&ClusterSnapshot>, next: &ClusterSnapshot) -> Vec<EventKind> {
@@ -381,9 +401,9 @@ pub fn diff_snapshots(prev: Option<&ClusterSnapshot>, next: &ClusterSnapshot) ->
             .iter()
             .find(|old| old.peer.node == peer.node && old.peer.incarnation == peer.incarnation);
         match old {
-            None => arrival(before, member, &mut events),
+            None => arrival(before, member, next, &mut events),
             Some(old) => {
-                transition(old, member, &mut events);
+                transition(old, member, next, &mut events);
                 cache_changes(old, member, &mut events);
             }
         }
@@ -397,7 +417,12 @@ pub fn diff_snapshots(prev: Option<&ClusterSnapshot>, next: &ClusterSnapshot) ->
     events
 }
 
-fn arrival(before: &[Member], member: &Member, events: &mut Vec<EventKind>) {
+fn arrival(
+    before: &[Member],
+    member: &Member,
+    next: &ClusterSnapshot,
+    events: &mut Vec<EventKind>,
+) {
     if !member.status.is_live() {
         return;
     }
@@ -434,32 +459,74 @@ fn arrival(before: &[Member], member: &Member, events: &mut Vec<EventKind>) {
         });
     }
     if member.status == MemberStatus::Departing {
-        events.push(EventKind::Leave { node, addr });
+        events.push(EventKind::Leave {
+            node,
+            addr,
+            superseded: superseded(next, member),
+        });
     }
 }
 
-fn transition(old: &Member, member: &Member, events: &mut Vec<EventKind>) {
+fn transition(old: &Member, member: &Member, next: &ClusterSnapshot, events: &mut Vec<EventKind>) {
     let (node, addr) = (member.peer.node, member.peer.gossip_addr);
+    let superseded = superseded(next, member);
     match (old.status, member.status) {
         (MemberStatus::Live, MemberStatus::Departing) => {
-            events.push(EventKind::Leave { node, addr });
+            events.push(EventKind::Leave {
+                node,
+                addr,
+                superseded,
+            });
         }
         (MemberStatus::Departing, MemberStatus::Left) => {
-            events.push(EventKind::Left { node, addr });
+            events.push(EventKind::Left {
+                node,
+                addr,
+                superseded,
+            });
         }
         (MemberStatus::Live, MemberStatus::Left) => {
-            events.push(EventKind::Leave { node, addr });
-            events.push(EventKind::Left { node, addr });
+            events.push(EventKind::Leave {
+                node,
+                addr,
+                superseded,
+            });
+            events.push(EventKind::Left {
+                node,
+                addr,
+                superseded,
+            });
         }
         (MemberStatus::Live | MemberStatus::Departing, MemberStatus::Down) => {
             events.push(EventKind::Down {
                 node,
                 addr,
                 exporter_silent: None,
+                superseded,
+            });
+        }
+        (MemberStatus::Down, MemberStatus::Live) => events.push(EventKind::Up { node, addr }),
+        (MemberStatus::Down, MemberStatus::Departing) => {
+            events.push(EventKind::Up { node, addr });
+            events.push(EventKind::Leave {
+                node,
+                addr,
+                superseded,
             });
         }
         _ => {}
     }
+}
+
+/// Whether `next` holds a later record than `member` at its gossip address:
+/// the greater (incarnation, node id), the order in which the newest record
+/// stands for the address.
+fn superseded(next: &ClusterSnapshot, member: &Member) -> bool {
+    let peer = &member.peer;
+    next.members.iter().any(|other| {
+        other.peer.gossip_addr == peer.gossip_addr
+            && (other.peer.incarnation, other.peer.node) > (peer.incarnation, peer.node)
+    })
 }
 
 fn cache_changes(old: &Member, member: &Member, events: &mut Vec<EventKind>) {
@@ -592,14 +659,16 @@ mod tests {
             diff_snapshots(Some(&live_one), &departing),
             vec![EventKind::Leave {
                 node: node(1),
-                addr: addr(1)
+                addr: addr(1),
+                superseded: false
             }]
         );
         assert_eq!(
             diff_snapshots(Some(&departing), &left),
             vec![EventKind::Left {
                 node: node(1),
-                addr: addr(1)
+                addr: addr(1),
+                superseded: false
             }]
         );
     }
@@ -624,7 +693,8 @@ mod tests {
             vec![EventKind::Down {
                 node: node(1),
                 addr: addr(1),
-                exporter_silent: None
+                exporter_silent: None,
+                superseded: false
             }]
         );
     }
@@ -641,11 +711,115 @@ mod tests {
     }
 
     #[test]
-    fn a_down_member_that_turns_live_or_a_gone_member_that_vanishes_raises_nothing() {
+    fn a_down_member_that_turns_live_comes_up() {
         let down = snapshot(vec![testkit::member(1, MemberStatus::Down)]);
-        let up = snapshot(vec![live(1)]);
-        assert!(diff_snapshots(Some(&down), &up).is_empty());
+        assert_eq!(
+            diff_snapshots(Some(&down), &snapshot(vec![live(1)])),
+            vec![EventKind::Up {
+                node: node(1),
+                addr: addr(1)
+            }]
+        );
+    }
+
+    #[test]
+    fn a_down_member_that_turns_departing_comes_up_and_leaves() {
+        let down = snapshot(vec![testkit::member(1, MemberStatus::Down)]);
+        let departing = snapshot(vec![testkit::member(1, MemberStatus::Departing)]);
+        assert_eq!(
+            diff_snapshots(Some(&down), &departing),
+            vec![
+                EventKind::Up {
+                    node: node(1),
+                    addr: addr(1)
+                },
+                EventKind::Leave {
+                    node: node(1),
+                    addr: addr(1),
+                    superseded: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gone_member_that_vanishes_or_a_down_member_that_turns_left_raises_nothing() {
+        let down = snapshot(vec![testkit::member(1, MemberStatus::Down)]);
         assert!(diff_snapshots(Some(&down), &snapshot(Vec::new())).is_empty());
+        let left = snapshot(vec![testkit::member(1, MemberStatus::Left)]);
+        assert!(diff_snapshots(Some(&down), &left).is_empty());
+    }
+
+    #[test]
+    fn an_older_incarnation_going_while_a_newer_one_holds_the_address_is_superseded() {
+        let old = |status| testkit::member_at(1, 0, 1, status);
+        let new = || testkit::member_at(1, 0, 2, MemberStatus::Live);
+        let before = snapshot(vec![old(MemberStatus::Live), new()]);
+        let flags = |events: Vec<EventKind>| -> Vec<(&'static str, bool)> {
+            events
+                .into_iter()
+                .map(|event| match event {
+                    EventKind::Leave { superseded, .. }
+                    | EventKind::Left { superseded, .. }
+                    | EventKind::Down { superseded, .. } => (event.tag(), superseded),
+                    other => (other.tag(), false),
+                })
+                .collect()
+        };
+        assert_eq!(
+            flags(diff_snapshots(
+                Some(&before),
+                &snapshot(vec![old(MemberStatus::Down), new()])
+            )),
+            [("DOWN", true)]
+        );
+        assert_eq!(
+            flags(diff_snapshots(
+                Some(&before),
+                &snapshot(vec![old(MemberStatus::Left), new()])
+            )),
+            [("LEAVE", true), ("LEFT", true)]
+        );
+        // A different node id at the address is superseded the same way.
+        let rejoined = testkit::member_at(1, 1, 5, MemberStatus::Live);
+        let before = snapshot(vec![old(MemberStatus::Live), rejoined.clone()]);
+        assert_eq!(
+            flags(diff_snapshots(
+                Some(&before),
+                &snapshot(vec![old(MemberStatus::Down), rejoined])
+            )),
+            [("DOWN", true)]
+        );
+        // The newest record at the address is not.
+        let before = snapshot(vec![old(MemberStatus::Live), new()]);
+        let after = snapshot(vec![
+            old(MemberStatus::Live),
+            testkit::member_at(1, 0, 2, MemberStatus::Down),
+        ]);
+        assert_eq!(
+            flags(diff_snapshots(Some(&before), &after)),
+            [("DOWN", false)]
+        );
+    }
+
+    #[test]
+    fn an_older_incarnation_arriving_departing_leaves_superseded() {
+        let new = testkit::member_at(1, 0, 2, MemberStatus::Live);
+        let old = testkit::member_at(1, 0, 1, MemberStatus::Departing);
+        let events = diff_snapshots(
+            Some(&snapshot(vec![new.clone()])),
+            &snapshot(vec![old, new]),
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EventKind::Leave {
+                    superseded: true,
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -858,13 +1032,21 @@ mod tests {
                 Some(n),
             ),
             (
-                EventKind::Leave { node: n, addr: a },
+                EventKind::Leave {
+                    node: n,
+                    addr: a,
+                    superseded: false,
+                },
                 "LEAVE",
                 Category::Membership,
                 Some(n),
             ),
             (
-                EventKind::Left { node: n, addr: a },
+                EventKind::Left {
+                    node: n,
+                    addr: a,
+                    superseded: false,
+                },
                 "LEFT",
                 Category::Membership,
                 Some(n),
@@ -874,8 +1056,15 @@ mod tests {
                     node: n,
                     addr: a,
                     exporter_silent: None,
+                    superseded: false,
                 },
                 "DOWN",
+                Category::Membership,
+                Some(n),
+            ),
+            (
+                EventKind::Up { node: n, addr: a },
+                "UP",
                 Category::Membership,
                 Some(n),
             ),
@@ -997,7 +1186,7 @@ mod tests {
             assert_eq!(kind.node(), who, "{tag}");
             assert!(tags.insert(tag), "{tag} twice");
         }
-        assert_eq!(tags.len(), 18);
+        assert_eq!(tags.len(), 19);
     }
 
     #[test]

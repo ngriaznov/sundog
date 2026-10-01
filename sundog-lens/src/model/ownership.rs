@@ -103,37 +103,39 @@ impl OwnershipDigest {
 #[must_use]
 pub fn lead_owners(shares: &OwnershipShares) -> [u8; BUCKETS] {
     let mut lead = [NO_LEAD; BUCKETS];
-    lead.copy_from_slice(&lead_owners_by(shares, usize::from(PARTS_PER_BUCKET)));
+    lead.copy_from_slice(&lead_over_buckets(shares, 1));
     lead
 }
 
 /// For each of the 512 pairs of adjacent buckets, the lead over the pair's 128
-/// parts, as [`lead_owners_by`] with 128 parts per pixel computes it.
+/// parts, as [`lead_over_buckets`] with 2 buckets per pixel computes it.
 #[must_use]
 pub fn lead_owners_compact(shares: &OwnershipShares) -> [u8; COMPACT_PIXELS] {
     let mut lead = [NO_LEAD; COMPACT_PIXELS];
-    lead.copy_from_slice(&lead_owners_by(shares, 2 * usize::from(PARTS_PER_BUCKET)));
+    lead.copy_from_slice(&lead_over_buckets(shares, 2));
     lead
 }
 
-/// For each run of `parts_per_pixel` consecutive parts, in part order, the
-/// index into `shares.eligible()` of the node that is first owner of the most
-/// parts of the run, the lower index winning a tie. An index of 255 or more,
-/// and a run no eligible node leads, is [`NO_LEAD`]. `parts_per_pixel` of 0 is
-/// 1; a final short run counts as a pixel.
+/// For each run of `buckets_per_pixel` consecutive buckets, the index into
+/// `shares.eligible()` of the node that is first owner of the most parts of the
+/// run's buckets, the lower index winning a tie. An index of 255 or more, and a
+/// run no eligible node leads, is [`NO_LEAD`]. `buckets_per_pixel` of 0 is 1; a
+/// final short run counts as a pixel.
 #[must_use]
-pub fn lead_owners_by(shares: &OwnershipShares, parts_per_pixel: usize) -> Vec<u8> {
+pub fn lead_over_buckets(shares: &OwnershipShares, buckets_per_pixel: usize) -> Vec<u8> {
     let eligible = shares.eligible();
-    let run = parts_per_pixel.max(1);
+    let run = buckets_per_pixel.max(1);
     let mut tally = vec![0usize; eligible.len()];
-    (0..PART_SPACE)
+    (0..BUCKETS)
         .step_by(run)
         .map(|start| {
             tally.fill(0);
-            for index in start..(start + run).min(PART_SPACE) {
-                let first = shares.owners_of(PartId::from_index(index)).first();
-                if let Some(slot) = first.and_then(|node| eligible.binary_search(node).ok()) {
-                    tally[slot] += 1;
+            for bucket in start..(start + run).min(BUCKETS) {
+                for part in PartId::of_bucket(bucket_id(bucket)) {
+                    let first = shares.owners_of(part).first();
+                    if let Some(slot) = first.and_then(|node| eligible.binary_search(node).ok()) {
+                        tally[slot] += 1;
+                    }
                 }
             }
             tally
@@ -146,6 +148,11 @@ pub fn lead_owners_by(shares: &OwnershipShares, parts_per_pixel: usize) -> Vec<u
                 .unwrap_or(NO_LEAD)
         })
         .collect()
+}
+
+/// The bucket id of bucket number `bucket`, which is below [`BUCKETS`].
+fn bucket_id(bucket: usize) -> u16 {
+    u16::try_from(bucket).unwrap_or(u16::MAX)
 }
 
 /// How many owner slots change hands from `a` to `b`: the number of
@@ -185,7 +192,9 @@ pub fn share_deltas(a: &OwnershipShares, b: &OwnershipShares) -> Vec<(NodeId, i6
 
 #[cfg(test)]
 mod tests {
-    use crate::model::testkit;
+    use sundog::observe::{ClusterSnapshot, MemberStatus};
+
+    use crate::model::{count_to_f64, testkit};
 
     use super::*;
 
@@ -227,13 +236,15 @@ mod tests {
         );
     }
 
-    /// The first-owner tallies of parts `start..start + len`, per eligible index.
-    fn tally(shares: &OwnershipShares, start: usize, len: usize) -> Vec<usize> {
+    /// The first-owner tallies of `buckets`, per eligible index.
+    fn tally(shares: &OwnershipShares, buckets: std::ops::Range<u16>) -> Vec<usize> {
         let mut counts = vec![0usize; shares.eligible().len()];
-        for index in start..start + len {
-            let owners = shares.owners_of(PartId::from_index(index));
-            let at = shares.eligible().binary_search(&owners[0]).unwrap();
-            counts[at] += 1;
+        for bucket in buckets {
+            for part in 0..PARTS_PER_BUCKET {
+                let owners = shares.owners_of(PartId::new(bucket, part));
+                let at = shares.eligible().binary_search(&owners[0]).unwrap();
+                counts[at] += 1;
+            }
         }
         counts
     }
@@ -242,10 +253,11 @@ mod tests {
     fn a_bucket_lead_is_the_plurality_of_its_64_parts() {
         let five = shares(5);
         let lead = lead_owners(&five);
-        for bucket in [0usize, 1, 2, 511, 512, 1023] {
-            let counts = tally(&five, bucket * 64, 64);
+        for bucket in [0u16, 1, 2, 17, 511, 512, 1023] {
+            let counts = tally(&five, bucket..bucket + 1);
             let most = *counts.iter().max().unwrap();
-            assert_eq!(counts[usize::from(lead[bucket])], most, "bucket {bucket}");
+            let at = usize::from(bucket);
+            assert_eq!(counts[usize::from(lead[at])], most, "bucket {bucket}");
         }
     }
 
@@ -255,7 +267,8 @@ mod tests {
         let compact = lead_owners_compact(&five);
         let lead = lead_owners(&five);
         for pair in 0..COMPACT_PIXELS {
-            let counts = tally(&five, pair * 128, 128);
+            let first = u16::try_from(2 * pair).unwrap();
+            let counts = tally(&five, first..first + 2);
             let most = *counts.iter().max().unwrap();
             assert_eq!(counts[usize::from(compact[pair])], most, "pair {pair}");
         }
@@ -267,25 +280,47 @@ mod tests {
     }
 
     #[test]
-    fn lead_owners_by_counts_runs_of_the_given_length() {
-        let three = shares(3);
-        assert_eq!(lead_owners_by(&three, 64).len(), BUCKETS);
-        assert_eq!(lead_owners_by(&three, 128).len(), COMPACT_PIXELS);
-        assert_eq!(lead_owners_by(&three, 0).len(), PART_SPACE);
-        assert_eq!(
-            lead_owners_by(&three, PART_SPACE),
-            lead_owners_by(&three, PART_SPACE + 1)
-        );
-        assert_eq!(lead_owners_by(&three, PART_SPACE).len(), 1);
-        // A run of one part is that part's first owner.
-        let single = lead_owners_by(&three, 1);
-        for index in [0usize, 1, 777, PART_SPACE - 1] {
-            let owner = three.owners_of(PartId::from_index(index))[0];
-            assert_eq!(
-                usize::from(single[index]),
-                three.eligible().binary_search(&owner).unwrap()
+    fn a_bucket_view_leads_each_bucket_with_the_first_owner_of_that_bucket() {
+        let old = sundog::wire::PROTOCOL_PART_OWNERSHIP - 1;
+        let mut members: Vec<_> = (1..=3)
+            .map(|index| testkit::member(index, MemberStatus::Live))
+            .collect();
+        members[0].peer.protocol = old;
+        let snapshot = ClusterSnapshot::new("c", members, 0);
+        let shares = snapshot
+            .ownership("it", NonZeroU8::new(2).unwrap())
+            .unwrap();
+        assert!(!shares.ranks_parts());
+        let lead = lead_owners(&shares);
+        let compact = lead_owners_compact(&shares);
+        for (bucket, &led) in lead.iter().enumerate() {
+            let first = shares.owners_of(PartId::new(u16::try_from(bucket).unwrap(), 0))[0];
+            let index = shares.eligible().binary_search(&first).unwrap();
+            assert_eq!(usize::from(led), index, "bucket {bucket}");
+        }
+        for (pair, &lead_of_pair) in compact.iter().enumerate() {
+            assert!(
+                [lead[2 * pair], lead[2 * pair + 1]].contains(&lead_of_pair),
+                "pair {pair}"
             );
         }
+    }
+
+    #[test]
+    fn lead_over_buckets_counts_runs_of_the_given_length() {
+        let three = shares(3);
+        assert_eq!(lead_over_buckets(&three, 1).len(), BUCKETS);
+        assert_eq!(lead_over_buckets(&three, 2).len(), COMPACT_PIXELS);
+        assert_eq!(lead_over_buckets(&three, 0).len(), BUCKETS);
+        assert_eq!(lead_over_buckets(&three, 1023).len(), 2);
+        assert_eq!(
+            lead_over_buckets(&three, BUCKETS),
+            lead_over_buckets(&three, BUCKETS + 1)
+        );
+        assert_eq!(lead_over_buckets(&three, BUCKETS).len(), 1);
+        // A run of one bucket is that bucket's lead.
+        assert_eq!(lead_over_buckets(&three, 1), lead_owners(&three));
+        assert_eq!(lead_over_buckets(&three, 2), lead_owners_compact(&three));
     }
 
     #[test]
@@ -304,8 +339,7 @@ mod tests {
     fn adding_a_fourth_node_moves_about_a_quarter_of_the_owner_slots() {
         let (three, four) = (shares(3), shares(4));
         let slots = 2 * PART_SPACE;
-        #[expect(clippy::cast_precision_loss, reason = "slot counts are small")]
-        let fraction = moved_parts(&three, &four) as f64 / slots as f64;
+        let fraction = count_to_f64(moved_parts(&three, &four)) / count_to_f64(slots);
         assert!((fraction - 0.25).abs() < 0.03, "{fraction}");
     }
 

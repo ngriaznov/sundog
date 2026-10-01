@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use smol_str::SmolStr;
 
+use super::count_to_f64;
 use super::events::EventKind;
 
 /// How many phases and how many marks a lifeline keeps; the oldest go first.
@@ -194,21 +195,35 @@ impl Lifelines {
     }
 
     /// Draws `kind`, which happened at `at`, onto the lifelines it concerns:
-    /// `JOIN` marks `▲` and goes live; `REJOIN` and `RESTART` mark `↻` and go
-    /// live; `LEAVE` marks `◐` and goes departing; `LEFT` and `DOWN` mark and
-    /// end the line; `VIEW` and `SETTLED` mark the cache's line. The other
-    /// kinds draw nothing.
+    /// `JOIN` marks `▲` and goes live; `REJOIN`, `RESTART` and `UP` mark `↻`
+    /// and go live; `LEAVE` marks `◐` and goes departing; `LEFT` and `DOWN`
+    /// mark and end the line; `VIEW` and `SETTLED` mark the cache's line. A
+    /// `LEAVE`, `LEFT` or `DOWN` of a superseded incarnation marks the line
+    /// and leaves its phase alone, because the node now at the address lives.
+    /// The other kinds draw nothing.
     pub fn record(&mut self, kind: &EventKind, at: Instant) {
         match kind {
             EventKind::Join { addr, .. } => self.begin(*addr, MarkKind::Join, PhaseKind::Live, at),
-            EventKind::Rejoin { addr, .. } | EventKind::Restart { addr, .. } => {
+            EventKind::Rejoin { addr, .. }
+            | EventKind::Restart { addr, .. }
+            | EventKind::Up { addr, .. } => {
                 self.begin(*addr, MarkKind::Rejoin, PhaseKind::Live, at);
             }
-            EventKind::Leave { addr, .. } => {
-                self.begin(*addr, MarkKind::Leave, PhaseKind::Departing, at);
+            EventKind::Leave {
+                addr, superseded, ..
+            } => {
+                if *superseded {
+                    self.mark_only(*addr, MarkKind::Leave, at);
+                } else {
+                    self.begin(*addr, MarkKind::Leave, PhaseKind::Departing, at);
+                }
             }
-            EventKind::Left { addr, .. } => self.finish(*addr, MarkKind::Left, at),
-            EventKind::Down { addr, .. } => self.finish(*addr, MarkKind::Down, at),
+            EventKind::Left {
+                addr, superseded, ..
+            } => self.finish(*addr, MarkKind::Left, *superseded, at),
+            EventKind::Down {
+                addr, superseded, ..
+            } => self.finish(*addr, MarkKind::Down, *superseded, at),
             EventKind::View { cache, .. } => {
                 self.caches
                     .entry(cache.clone())
@@ -270,10 +285,18 @@ impl Lifelines {
         line.begin(phase, at);
     }
 
-    fn finish(&mut self, addr: SocketAddr, mark: MarkKind, at: Instant) {
+    fn finish(&mut self, addr: SocketAddr, mark: MarkKind, superseded: bool, at: Instant) {
+        if superseded {
+            self.mark_only(addr, mark, at);
+            return;
+        }
         let line = self.nodes.entry(addr).or_default();
         line.mark(mark, at);
         line.end(at);
+    }
+
+    fn mark_only(&mut self, addr: SocketAddr, mark: MarkKind, at: Instant) {
+        self.nodes.entry(addr).or_default().mark(mark, at);
     }
 }
 
@@ -324,7 +347,7 @@ pub fn lifeline_cells(line: &Lifeline, window: Duration, width: usize, now: Inst
         return cells;
     }
     for (index, cell) in cells.iter_mut().enumerate() {
-        let mid_age = window.mul_f64(1.0 - (ratio(index) + 0.5) / ratio(width));
+        let mid_age = window.mul_f64(1.0 - (count_to_f64(index) + 0.5) / count_to_f64(width));
         let Some(mid) = now.checked_sub(mid_age) else {
             continue;
         };
@@ -376,17 +399,14 @@ pub fn lifeline_cells(line: &Lifeline, window: Duration, width: usize, now: Inst
     reason = "the fraction is clamped to 0..=1 and the width is a screen width"
 )]
 fn column_of(fraction_from_left: f64, width: usize) -> usize {
-    let column = (fraction_from_left.clamp(0.0, 1.0) * ratio(width)).floor() as usize;
+    let column = (fraction_from_left.clamp(0.0, 1.0) * count_to_f64(width)).floor() as usize;
     column.min(width - 1)
-}
-
-#[expect(clippy::cast_precision_loss, reason = "a screen width is tiny")]
-const fn ratio(count: usize) -> f64 {
-    count as f64
 }
 
 #[cfg(test)]
 mod tests {
+    use sundog::NodeId;
+
     use crate::model::testkit;
 
     use super::*;
@@ -403,6 +423,31 @@ mod tests {
             addr,
             protocol: 6,
             caches: BTreeMap::new(),
+        }
+    }
+
+    fn leave(node: NodeId, superseded: bool) -> EventKind {
+        EventKind::Leave {
+            node,
+            addr: addr(),
+            superseded,
+        }
+    }
+
+    fn left(node: NodeId, superseded: bool) -> EventKind {
+        EventKind::Left {
+            node,
+            addr: addr(),
+            superseded,
+        }
+    }
+
+    fn down(node: NodeId, superseded: bool) -> EventKind {
+        EventKind::Down {
+            node,
+            addr: addr(),
+            exporter_silent: None,
+            superseded,
         }
     }
 
@@ -442,8 +487,8 @@ mod tests {
         let mut lifelines = Lifelines::new();
         let node = testkit::node_id(1, 0);
         lifelines.record(&join(addr()), ago(now, 39_500));
-        lifelines.record(&EventKind::Leave { node, addr: addr() }, ago(now, 20_500));
-        lifelines.record(&EventKind::Left { node, addr: addr() }, ago(now, 14_500));
+        lifelines.record(&leave(node, false), ago(now, 20_500));
+        lifelines.record(&left(node, false), ago(now, 14_500));
         let expected = format!("▲{}◐{}○{}", "━".repeat(18), "┄".repeat(5), " ".repeat(14));
         assert_eq!(render(&lifelines, now), expected);
     }
@@ -455,14 +500,7 @@ mod tests {
         let node = testkit::node_id(1, 0);
         lifelines.record(&join(addr()), ago(now, 39_500));
         lifelines.suspect(addr(), ago(now, 20_500));
-        lifelines.record(
-            &EventKind::Down {
-                node,
-                addr: addr(),
-                exporter_silent: None,
-            },
-            ago(now, 14_500),
-        );
+        lifelines.record(&down(node, false), ago(now, 14_500));
         let crashed = format!("▲{}⚠{}✖{}", "━".repeat(18), "┄".repeat(5), " ".repeat(14));
         assert_eq!(render(&lifelines, now), crashed);
 
@@ -544,13 +582,7 @@ mod tests {
         let now = Instant::now() + Duration::from_secs(100);
         let mut lifelines = Lifelines::new();
         lifelines.record(&join(addr()), ago(now, 30_000));
-        lifelines.record(
-            &EventKind::Leave {
-                node: testkit::node_id(1, 0),
-                addr: addr(),
-            },
-            ago(now, 20_000),
-        );
+        lifelines.record(&leave(testkit::node_id(1, 0), false), ago(now, 20_000));
         lifelines.suspect(addr(), ago(now, 10_000));
         assert_eq!(
             lifelines.node(addr()).unwrap().current(),
@@ -702,5 +734,61 @@ mod tests {
         assert_eq!(MarkKind::Rejoin.tone(), Tone::Info);
         assert_eq!(MarkKind::Join.tone(), Tone::Node);
         assert_eq!(MarkKind::Leave.tone(), Tone::Warn);
+    }
+
+    #[test]
+    fn a_member_that_comes_up_again_reopens_its_line() {
+        let now = Instant::now() + Duration::from_secs(100);
+        let mut lifelines = Lifelines::new();
+        let node = testkit::node_id(1, 0);
+        lifelines.record(&join(addr()), ago(now, 39_500));
+        lifelines.record(&down(node, false), ago(now, 20_500));
+        assert_eq!(lifelines.node(addr()).unwrap().current(), None);
+        lifelines.record(&EventKind::Up { node, addr: addr() }, ago(now, 10_500));
+        let line = lifelines.node(addr()).unwrap();
+        assert_eq!(line.current(), Some(PhaseKind::Live));
+        let kinds: Vec<_> = line.marks().iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, [MarkKind::Join, MarkKind::Down, MarkKind::Rejoin]);
+    }
+
+    #[test]
+    fn a_superseded_departure_or_crash_marks_the_line_and_leaves_its_phase() {
+        let now = Instant::now() + Duration::from_secs(100);
+        let node = testkit::node_id(1, 0);
+        let restart = EventKind::Restart { node, addr: addr() };
+        for (kind, mark) in [
+            (down(node, true), MarkKind::Down),
+            (left(node, true), MarkKind::Left),
+            (leave(node, true), MarkKind::Leave),
+        ] {
+            let mut lifelines = Lifelines::new();
+            lifelines.record(&join(addr()), ago(now, 30_500));
+            lifelines.record(&restart, ago(now, 20_500));
+            lifelines.record(&kind, ago(now, 10_500));
+            let line = lifelines.node(addr()).unwrap();
+            assert_eq!(line.current(), Some(PhaseKind::Live), "{mark:?}");
+            assert_eq!(line.marks().last().map(|m| m.kind), Some(mark));
+        }
+    }
+
+    #[test]
+    fn a_superseded_event_for_an_unseen_address_still_marks_it() {
+        let node = testkit::node_id(1, 0);
+        let mut lifelines = Lifelines::new();
+        lifelines.record(&down(node, true), Instant::now());
+        let line = lifelines.node(addr()).unwrap();
+        assert_eq!(line.current(), None);
+        assert_eq!(line.marks().len(), 1);
+    }
+
+    #[test]
+    fn column_of_clamps_a_fraction_to_a_column() {
+        assert_eq!(column_of(0.0, 40), 0);
+        assert_eq!(column_of(0.5, 40), 20);
+        assert_eq!(column_of(0.999, 40), 39);
+        assert_eq!(column_of(1.0, 40), 39, "the right edge is the last column");
+        assert_eq!(column_of(-3.0, 40), 0);
+        assert_eq!(column_of(7.5, 40), 39);
+        assert_eq!(column_of(0.9, 1), 0);
     }
 }

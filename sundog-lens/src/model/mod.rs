@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use smol_str::SmolStr;
-use sundog::observe::{ClusterSnapshot, MemberStatus};
-use sundog::store::Mode;
+use sundog::observe::ClusterSnapshot;
 
 use crate::source::{ScrapeReport, Update};
 
@@ -26,6 +25,13 @@ pub use events::{Event, EventKind, EventLog, Filter, diff_snapshots};
 pub use lifelines::Lifelines;
 pub use ownership::OwnershipDigest;
 pub use slots::{Slot, Slots};
+
+/// `count` as a float: counts here (parts, screen columns, members) are far
+/// below 2^52, so the conversion is exact.
+#[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^52")]
+pub(crate) const fn count_to_f64(count: usize) -> f64 {
+    count as f64
+}
 
 /// With no metrics, a cache counts as settled once its view has held this
 /// long.
@@ -59,12 +65,14 @@ impl Model {
     /// and returns the events it raises. The events also join the
     /// [`events`](Self::events) log and mark the [`lifelines`](Self::lifelines).
     ///
-    /// A snapshot replaces the member view, gives every gossip address a slot,
-    /// raises the events [`diff_snapshots`] finds and drops the ownership of a
-    /// cache no live member advertises as `Distributed`. A `DOWN` carries the
+    /// A snapshot replaces the member view, gives every gossip address a slot
+    /// and raises the events [`diff_snapshots`] finds. A `DOWN` carries the
     /// time since the node's exporter last answered when its latest scrape
     /// failed. An ownership digest replaces its cache's digest; a changed view
-    /// hash raises `VIEW` and restarts the cache's settling clock. A scrape
+    /// hash raises `VIEW` and restarts the cache's settling clock. The
+    /// ownership worker alone decides what ownership the model holds:
+    /// [`Update::OwnershipGone`] drops a cache's digest, settling clock and
+    /// lifeline, and a snapshot never does. A scrape
     /// replaces the node's last report, marks the node suspect on a failure
     /// and live again on a success. Any update raises `SETTLED` for a cache
     /// whose view has held long enough.
@@ -74,6 +82,10 @@ impl Model {
         let mut kinds = match update {
             Update::Snapshot(snapshot, _) => self.apply_snapshot(snapshot, now),
             Update::Ownership(digest) => self.apply_ownership(digest, now),
+            Update::OwnershipGone(cache) => {
+                self.forget_cache(&cache);
+                Vec::new()
+            }
             Update::Scrape(report) => {
                 self.apply_scrape(report, now);
                 Vec::new()
@@ -186,7 +198,6 @@ impl Model {
             self.slots.assign(member.peer.gossip_addr);
         }
         self.snapshot = Some(snapshot);
-        self.prune_ownership();
         kinds
     }
 
@@ -229,25 +240,13 @@ impl Model {
         self.scrapes.insert(addr, report);
     }
 
-    /// Drops the ownership of every cache that no live member advertises as
-    /// `Distributed`.
-    fn prune_ownership(&mut self) {
-        let Some(snapshot) = &self.snapshot else {
-            return;
-        };
-        let advertised: BTreeSet<&SmolStr> = snapshot
-            .members
-            .iter()
-            .filter(|member| member.status == MemberStatus::Live)
-            .flat_map(|member| &member.caches)
-            .filter(|(_, mode)| matches!(mode, Mode::Distributed { .. }))
-            .map(|(cache, _)| cache)
-            .collect();
-        self.ownership.retain(|cache, _| advertised.contains(cache));
-        self.view_since
-            .retain(|cache, _| advertised.contains(cache));
-        self.settle_pending
-            .retain(|cache| advertised.contains(cache));
+    /// Drops everything the model holds for `cache`: its ownership, its
+    /// settling clock and its lifeline.
+    fn forget_cache(&mut self, cache: &str) {
+        self.ownership.remove(cache);
+        self.view_since.remove(cache);
+        self.settle_pending.remove(cache);
+        self.lifelines.forget_cache(cache);
     }
 
     /// How long before `now` the exporter of the node at `addr` last answered,
@@ -609,6 +608,7 @@ mod tests {
                 node,
                 addr,
                 exporter_silent: Some(Duration::from_millis(3_900)),
+                superseded: false,
             }
         );
         // The lifeline turned suspect at the first failure and ended at Down.
@@ -862,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn ownership_is_dropped_once_no_live_member_advertises_the_cache() {
+    fn ownership_gone_drops_the_cache_and_a_snapshot_does_not() {
         let mut model = Model::new();
         let t = Instant::now();
         model.apply(
@@ -872,7 +872,9 @@ mod tests {
         );
         model.apply(ownership_update(2), t, SystemTime::UNIX_EPOCH);
         assert!(model.ownership("it").is_some());
+        assert!(model.lifelines().cache("it").is_some());
 
+        // No snapshot drops ownership: the worker alone decides.
         let down = ClusterSnapshot::new(
             "fixture",
             vec![
@@ -882,12 +884,127 @@ mod tests {
             0,
         );
         model.apply(snapshot_update(down, t), t, SystemTime::UNIX_EPOCH);
+        assert!(model.ownership("it").is_some());
+
+        let events = model.apply(
+            Update::OwnershipGone("it".into()),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(events.is_empty());
         assert!(model.ownership("it").is_none());
+        assert_eq!(model.ownership_digests().count(), 0);
         assert_eq!(model.settled("it"), None);
+        assert!(model.lifelines().cache("it").is_none());
         assert!(
             model.tick(t + Duration::from_secs(10)).is_empty(),
             "nothing left to settle"
         );
+    }
+
+    #[test]
+    fn ownership_gone_for_an_unknown_cache_changes_nothing() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(ownership_update(2), t, SystemTime::UNIX_EPOCH);
+        model.apply(
+            Update::OwnershipGone("other".into()),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        assert!(model.ownership("it").is_some());
+    }
+
+    #[test]
+    fn a_digest_after_ownership_gone_is_a_first_view() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        model.apply(
+            Update::OwnershipGone("it".into()),
+            t,
+            SystemTime::UNIX_EPOCH,
+        );
+        let events = model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
+        assert_eq!(tags(&events), ["VIEW"]);
+        assert!(matches!(events[0].kind, EventKind::View { from: None, .. }));
+    }
+
+    #[test]
+    fn a_restart_then_the_old_incarnation_going_down_keeps_the_line_live() {
+        use lifelines::PhaseKind;
+        let mut model = Model::new();
+        let t = Instant::now();
+        let addr = testkit::gossip_addr(1);
+        let inc = |incarnation, status| testkit::member_at(1, 0, incarnation, status);
+        let step = |model: &mut Model, members: Vec<sundog::observe::Member>| {
+            model.apply(
+                snapshot_update(ClusterSnapshot::new("c", members, 0), t),
+                t,
+                SystemTime::UNIX_EPOCH,
+            )
+        };
+        step(&mut model, vec![inc(1, MemberStatus::Live)]);
+        let events = step(
+            &mut model,
+            vec![inc(1, MemberStatus::Live), inc(2, MemberStatus::Live)],
+        );
+        assert_eq!(tags(&events), ["RESTART"]);
+        let events = step(
+            &mut model,
+            vec![inc(1, MemberStatus::Down), inc(2, MemberStatus::Live)],
+        );
+        assert_eq!(tags(&events), ["DOWN"]);
+        assert_eq!(
+            model.lifelines().node(addr).unwrap().current(),
+            Some(PhaseKind::Live)
+        );
+
+        // The same for a new node id at the address.
+        let mut model = Model::new();
+        step(&mut model, vec![inc(1, MemberStatus::Live)]);
+        let rejoined = testkit::member_at(1, 1, 5, MemberStatus::Live);
+        let events = step(
+            &mut model,
+            vec![inc(1, MemberStatus::Live), rejoined.clone()],
+        );
+        assert_eq!(tags(&events), ["REJOIN"]);
+        step(&mut model, vec![inc(1, MemberStatus::Left), rejoined]);
+        assert_eq!(
+            model.lifelines().node(addr).unwrap().current(),
+            Some(PhaseKind::Live)
+        );
+    }
+
+    #[test]
+    fn a_member_that_comes_back_from_down_is_live_on_its_line_again() {
+        use lifelines::PhaseKind;
+        let mut model = Model::new();
+        let t = Instant::now();
+        let addr = testkit::gossip_addr(1);
+        let step = |model: &mut Model, status| {
+            model.apply(
+                snapshot_update(with_status(1, 1, status), t),
+                t,
+                SystemTime::UNIX_EPOCH,
+            )
+        };
+        step(&mut model, MemberStatus::Live);
+        step(&mut model, MemberStatus::Down);
+        assert_eq!(model.lifelines().node(addr).unwrap().current(), None);
+        let events = step(&mut model, MemberStatus::Live);
+        assert_eq!(tags(&events), ["UP"]);
+        assert_eq!(
+            model.lifelines().node(addr).unwrap().current(),
+            Some(PhaseKind::Live)
+        );
+    }
+
+    #[test]
+    fn count_to_f64_is_exact_for_the_counts_the_lens_holds() {
+        assert!(count_to_f64(0).abs() < f64::EPSILON);
+        assert!((count_to_f64(65_536) - 65_536.0).abs() < f64::EPSILON);
+        assert!((count_to_f64(2 * 65_536) - 131_072.0).abs() < f64::EPSILON);
     }
 
     #[test]

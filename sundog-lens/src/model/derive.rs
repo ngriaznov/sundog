@@ -3,8 +3,8 @@
 use std::num::NonZeroU8;
 use std::time::Duration;
 
-use super::GOSSIP_SETTLE;
 use super::ownership::{BUCKETS, PARTS_PER_BUCKET};
+use super::{GOSSIP_SETTLE, count_to_f64};
 
 /// Parts in the key space.
 pub const PART_SPACE: usize = BUCKETS * PARTS_PER_BUCKET as usize;
@@ -48,7 +48,7 @@ pub enum Agreement {
 pub fn agreement(reported: Option<f64>, computed: usize) -> Agreement {
     match reported {
         None => Agreement::Unknown,
-        Some(value) if (value - ratio_to_f64(computed)).abs() < 0.5 => Agreement::Match,
+        Some(value) if (value - count_to_f64(computed)).abs() < 0.5 => Agreement::Match,
         Some(_) => Agreement::Differs,
     }
 }
@@ -99,7 +99,7 @@ pub fn settled(view_held: Duration, nodes: &[NodeProgress]) -> Settle {
 #[must_use]
 pub fn coverage(reported_sum: f64, k: NonZeroU8, eligible: usize) -> Option<f64> {
     let owners = usize::from(k.get()).min(eligible);
-    (owners > 0).then(|| reported_sum / ratio_to_f64(owners * PART_SPACE))
+    (owners > 0).then(|| reported_sum / count_to_f64(owners * PART_SPACE))
 }
 
 /// The spread of a Replicated cache's entry counts across its advertisers:
@@ -150,17 +150,12 @@ pub fn fetch_mix(local: f64, remote: f64, miss: f64, error: f64) -> Option<Fetch
 /// of live members (which includes the node itself); `None` without metrics.
 #[must_use]
 pub fn peers_agree(reported: Option<f64>, live_members: usize) -> Option<bool> {
-    let expected = ratio_to_f64(live_members.saturating_sub(1));
+    let expected = count_to_f64(live_members.saturating_sub(1));
     reported.map(|value| (value - expected).abs() < 0.5)
 }
 
-#[expect(clippy::cast_precision_loss, reason = "counts here are far below 2^52")]
-const fn ratio_to_f64(count: usize) -> f64 {
-    count as f64
-}
-
 fn ratio(numerator: usize, denominator: usize) -> f64 {
-    ratio_to_f64(numerator) / ratio_to_f64(denominator)
+    count_to_f64(numerator) / count_to_f64(denominator)
 }
 
 #[cfg(test)]
