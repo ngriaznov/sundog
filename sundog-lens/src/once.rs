@@ -77,8 +77,10 @@ pub struct OnceMember {
     pub data: String,
     /// `live`, `departing`, `left` or `down`.
     pub status: &'static str,
-    /// Seconds since the observer first saw the node in this status.
-    pub up_secs: f64,
+    /// Seconds the process has run for a live node (from its incarnation),
+    /// or since a departing node announced its departure; `null` for a node
+    /// that is down or has left.
+    pub up_secs: Option<f64>,
     /// The wire protocol.
     pub protocol: u16,
     /// Each advertised cache and its mode: `distributed:2`.
@@ -177,7 +179,12 @@ fn member_entry(model: &Model, row: &NodeRow<'_>, wall: SystemTime) -> OnceMembe
         gossip: row.member.peer.gossip_addr.to_string(),
         data: row.member.peer.data_addr.to_string(),
         status: status_name(row.status()),
-        up_secs: row.status_age(wall).as_secs_f64(),
+        up_secs: match row.status() {
+            MemberStatus::Live => row.uptime(wall),
+            MemberStatus::Departing => Some(row.status_age(wall)),
+            _ => None,
+        }
+        .map(|up| up.as_secs_f64()),
         protocol: row.member.peer.protocol,
         caches: row
             .member
@@ -361,7 +368,10 @@ fn members_table(report: &OnceReport) -> Vec<String> {
             member.node.clone(),
             member.gossip.clone(),
             member.status.to_owned(),
-            text::uptime(Duration::from_secs_f64(member.up_secs.max(0.0))),
+            member.up_secs.map_or_else(
+                || "—".to_owned(),
+                |secs| text::uptime(Duration::from_secs_f64(secs.max(0.0))),
+            ),
             member.protocol.to_string(),
             caches,
         ]);
@@ -603,7 +613,14 @@ mod tests {
         assert_eq!(first.gossip, "127.0.0.11:7946");
         assert_eq!(first.caches["it"], "distributed:2");
         assert_eq!(first.caches["churn"], "replicated");
-        assert!((first.up_secs - 20.0).abs() < 1e-9);
+        // The fixture's incarnation is 1 ms past the epoch; its wall is 20 s.
+        assert!((first.up_secs.unwrap() - 19.999).abs() < 1e-9);
+        let ups: Vec<_> = report.members.iter().map(|m| m.up_secs.is_some()).collect();
+        assert_eq!(
+            ups,
+            [true, true, true, true, true, true, false, false],
+            "down and left nodes have no uptime"
+        );
         assert!(first.exporter.is_none(), "no metrics in the fixture");
         let statuses: Vec<_> = report.members.iter().map(|m| m.status).collect();
         assert_eq!(
@@ -661,7 +678,12 @@ mod tests {
             "{}",
             lines[2]
         );
-        assert!(lines[2].contains("00:20"), "{}", lines[2]);
+        assert!(lines[2].contains("00:19"), "{}", lines[2]);
+        for (slot, status) in [("n7", "down"), ("n8", "left")] {
+            let gone = lines.iter().find(|l| l.starts_with(slot)).unwrap();
+            let fields: Vec<_> = gone.split_whitespace().collect();
+            assert_eq!(fields[3..5], [status, "—"], "{gone}");
+        }
         let cache_header = lines.iter().position(|l| l.starts_with("CACHE")).unwrap();
         assert!(lines[cache_header].contains("Σ PARTS"));
         let it = lines[cache_header + 1];

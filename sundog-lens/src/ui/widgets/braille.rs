@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::widgets::Widget;
 
 use super::count_f64;
-use crate::ui::theme::{self, ColorMode};
+use crate::ui::theme::{self, ColorMode, Rgb};
 
 /// The first braille code point, the blank cell.
 const BASE: u32 = 0x2800;
@@ -126,13 +126,27 @@ pub struct BrailleArea<'a> {
     values: &'a [f64],
     max: f64,
     mode: ColorMode,
+    tint: Option<Rgb>,
 }
 
 impl<'a> BrailleArea<'a> {
     /// An area chart of `values` against `max`.
     #[must_use]
     pub const fn new(values: &'a [f64], max: f64, mode: ColorMode) -> Self {
-        Self { values, max, mode }
+        Self {
+            values,
+            max,
+            mode,
+            tint: None,
+        }
+    }
+
+    /// Shades the chart in `color`, a node's color, instead of the amber
+    /// gradient.
+    #[must_use]
+    pub const fn tinted(mut self, color: Rgb) -> Self {
+        self.tint = Some(color);
+        self
     }
 }
 
@@ -150,7 +164,10 @@ impl Widget for BrailleArea<'_> {
             } else {
                 count_f64(rows - 1 - row) / count_f64(rows - 1)
             };
-            let color = theme::gradient_at(height).color(self.mode);
+            let color = match self.tint {
+                Some(base) => theme::tinted_at(base, height).color(self.mode),
+                None => theme::gradient_color(height, self.mode),
+            };
             for (column, &bits) in line.iter().enumerate() {
                 if bits == 0 {
                     continue;
@@ -281,6 +298,30 @@ mod tests {
     #[test]
     fn rasterize_with_a_zero_max_draws_nothing() {
         assert_eq!(rasterize(&[5.0, 5.0], 1, 1, 0.0), [0]);
+    }
+
+    #[test]
+    fn a_tinted_braille_area_shades_in_the_nodes_color() {
+        let color = theme::NODE_COLORS[1];
+        let values = [1.0, 1.0, 1.0, 1.0];
+        let area = Rect::new(0, 0, 2, 3);
+        let mut buf = Buffer::empty(area);
+        BrailleArea::new(&values, 1.0, ColorMode::Truecolor)
+            .tinted(color)
+            .render(area, &mut buf);
+        let top = buf.cell((0, 0)).unwrap().fg;
+        let middle = buf.cell((0, 1)).unwrap().fg;
+        let bottom = buf.cell((0, 2)).unwrap().fg;
+        assert_eq!(
+            top,
+            theme::tinted_at(color, 1.0).color(ColorMode::Truecolor)
+        );
+        assert_eq!(middle, color.color(ColorMode::Truecolor));
+        assert_eq!(
+            bottom,
+            theme::tinted_at(color, 0.0).color(ColorMode::Truecolor)
+        );
+        assert_ne!(top, theme::gradient_at(1.0).color(ColorMode::Truecolor));
     }
 
     #[test]

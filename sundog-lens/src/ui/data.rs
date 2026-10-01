@@ -79,12 +79,29 @@ impl NodeRow<'_> {
     pub fn status_age(&self, wall: SystemTime) -> Duration {
         wall.duration_since(self.member.since).unwrap_or_default()
     }
+
+    /// When the process behind a live member started: its incarnation is the
+    /// wall clock in milliseconds at the start. `None` for a member that is
+    /// not live.
+    #[must_use]
+    pub fn started(&self) -> Option<SystemTime> {
+        (self.status() == MemberStatus::Live)
+            .then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(self.member.peer.incarnation))
+    }
+
+    /// How long the process behind a live member has run at `wall`; `None`
+    /// for a member that is not live.
+    #[must_use]
+    pub fn uptime(&self, wall: SystemTime) -> Option<Duration> {
+        self.started()
+            .map(|started| wall.duration_since(started).unwrap_or_default())
+    }
 }
 
 /// How a node is named in the event log: its label, short id and color.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeTag {
-    /// The slot label, or `??` for a node the model has not seen.
+    /// The slot label, or [`UNKNOWN_LABEL`] for a node the model has not seen.
     pub label: SmolStr,
     /// The first four hex digits of the node id.
     pub short: String,
@@ -162,6 +179,9 @@ pub fn row_labeled<'a>(model: &'a Model, label: &str) -> Option<NodeRow<'a>> {
         .find(|row| row.slot.label == label)
 }
 
+/// The label of a node the model has not seen.
+pub const UNKNOWN_LABEL: &str = "??";
+
 /// How `node` is named: by the slot of the address it was last seen at.
 #[must_use]
 pub fn tag_of(model: &Model, node: NodeId) -> NodeTag {
@@ -181,29 +201,11 @@ pub fn tag_of(model: &Model, node: NodeId) -> NodeTag {
             color: theme::node_color(slot.index),
         },
         None => NodeTag {
-            label: SmolStr::new_static("??"),
+            label: SmolStr::new_static(UNKNOWN_LABEL),
             short,
             color: theme::MUTED,
         },
     }
-}
-
-/// How the node at gossip address `addr` is named, when it has a slot.
-#[must_use]
-pub fn tag_at(model: &Model, addr: SocketAddr) -> Option<NodeTag> {
-    let slot = model.slots().get(addr)?;
-    let newest = model
-        .snapshot()?
-        .members
-        .iter()
-        .filter(|member| member.peer.gossip_addr == addr)
-        .max_by_key(|member| member.peer.incarnation)?;
-    let full = newest.peer.node.to_string();
-    Some(NodeTag {
-        label: slot.label.clone(),
-        short: text::short_id(&full).to_owned(),
-        color: theme::node_color(slot.index),
-    })
 }
 
 /// The tag of the node whose id the exporter labels as `peer` (16 hex
@@ -378,6 +380,21 @@ pub fn metrics_of<'a>(model: &'a Model, row: &NodeRow<'_>) -> Option<&'a NodeMet
         .filter(|metrics| metrics.node() == row.member.peer.node && metrics.folds() > 0)
 }
 
+/// Whether the last scrape of the exporter mapped to `row` answered.
+#[must_use]
+pub fn scrape_answered(model: &Model, row: &NodeRow<'_>) -> bool {
+    model
+        .scrape(row.member.peer.gossip_addr)
+        .is_some_and(|report| report.node == row.member.peer.node && report.outcome.is_ok())
+}
+
+/// [`metrics_of`] for a node whose exporter answered its last scrape: the
+/// source of every figure that reads "now".
+#[must_use]
+pub fn fresh_metrics_of<'a>(model: &'a Model, row: &NodeRow<'_>) -> Option<&'a NodeMetrics> {
+    metrics_of(model, row).filter(|_| scrape_answered(model, row))
+}
+
 /// Cluster-wide traffic: the sum of every live node's metrics.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Throughput {
@@ -426,7 +443,7 @@ fn live_metrics(model: &Model) -> impl Iterator<Item = &NodeMetrics> {
     all_node_rows(model)
         .into_iter()
         .filter(|row| row.status().is_live())
-        .filter_map(|row| metrics_of(model, &row))
+        .filter_map(|row| fresh_metrics_of(model, &row))
 }
 
 /// The traffic totals of the live nodes with metrics.
@@ -710,10 +727,8 @@ mod tests {
         assert_eq!(tag.color, theme::NODE_COLORS[1]);
         assert_eq!(tag.short.len(), 4);
         let unknown = tag_of(&model, NodeId::from(7));
-        assert_eq!(unknown.label, "??");
+        assert_eq!(unknown.label, UNKNOWN_LABEL);
         assert_eq!(unknown.color, theme::MUTED);
-        assert_eq!(tag_at(&model, testkit::gossip_addr(3)).unwrap().label, "n3");
-        assert!(tag_at(&model, testkit::gossip_addr(30)).is_none());
         let hex = testkit::node_id(4, 0).to_string();
         assert_eq!(tag_of_hex(&model, &hex).unwrap().label, "n4");
         assert!(tag_of_hex(&model, "zz").is_none());
@@ -832,6 +847,36 @@ mod tests {
     }
 
     #[test]
+    fn a_node_whose_exporter_stopped_answering_leaves_the_traffic_totals() {
+        let base = Instant::now();
+        let mut model = testkit::fixture_model_with_metrics(base);
+        let before = throughput(&model);
+        assert!(before.nodes >= 2 && before.reads.is_some(), "{before:?}");
+        let row = &all_node_rows(&model)[0];
+        let (addr, node) = (row.member.peer.gossip_addr, row.member.peer.node);
+        assert!(fresh_metrics_of(&model, row).is_some());
+        let at = model.now().unwrap() + Duration::from_secs(1);
+        model.apply(
+            Update::Scrape(crate::source::ScrapeReport {
+                addr,
+                node,
+                at,
+                outcome: Err(crate::source::scrape::ScrapeError::Timeout),
+                ready: None,
+            }),
+            at,
+            model.wall().unwrap(),
+        );
+        let row = &all_node_rows(&model)[0];
+        assert!(metrics_of(&model, row).is_some(), "the history stays");
+        assert!(!scrape_answered(&model, row));
+        assert!(fresh_metrics_of(&model, row).is_none());
+        let after = throughput(&model);
+        assert_eq!(after.nodes, before.nodes - 1);
+        assert!(after.ops.last() < before.ops.last(), "{after:?} {before:?}");
+    }
+
+    #[test]
     fn windows_hold_two_samples_per_column_up_to_a_full_ring() {
         assert_eq!(window_seconds(10), 20);
         assert_eq!(window_seconds(56), 112);
@@ -845,6 +890,39 @@ mod tests {
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
         assert_eq!(rows[0].status_age(wall), Duration::from_secs(30));
         assert_eq!(rows[0].status_age(SystemTime::UNIX_EPOCH), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_live_node_runs_from_its_incarnation_and_the_others_have_no_uptime() {
+        let at = |millis: u64| SystemTime::UNIX_EPOCH + Duration::from_millis(millis);
+        let nodes = [
+            (MemberStatus::Live, Some(Duration::from_secs(35))),
+            (MemberStatus::Departing, None),
+            (MemberStatus::Down, None),
+            (MemberStatus::Left, None),
+        ];
+        for (index, (status, expected)) in (1u8..).zip(nodes) {
+            let snapshot = ClusterSnapshot::new(
+                "c",
+                vec![testkit::member_at(index, 0, 1_790_000_000_000, status)],
+                0,
+            );
+            let mut model = Model::new();
+            let now = Instant::now();
+            model.apply(
+                Update::Snapshot(std::sync::Arc::new(snapshot), now),
+                now,
+                at(1_790_000_040_000),
+            );
+            let rows = all_node_rows(&model);
+            let wall = at(1_790_000_035_000);
+            assert_eq!(rows[0].uptime(wall), expected, "{status:?}");
+            assert_eq!(rows[0].started().is_some(), expected.is_some());
+            if let Some(started) = rows[0].started() {
+                assert_eq!(started, at(1_790_000_000_000));
+                assert_eq!(rows[0].uptime(at(1_000)), Some(Duration::ZERO));
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::widgets::Widget;
 
 use super::count_f64;
-use crate::ui::theme::{self, ColorMode};
+use crate::ui::theme::{self, ColorMode, Rgb};
 
 /// Vertical levels 1 to 8, bottom up.
 const VERTICAL: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -126,13 +126,27 @@ pub struct BlockArea<'a> {
     values: &'a [f64],
     max: f64,
     mode: ColorMode,
+    tint: Option<Rgb>,
 }
 
 impl<'a> BlockArea<'a> {
     /// A chart of `values` scaled against `max`.
     #[must_use]
     pub const fn new(values: &'a [f64], max: f64, mode: ColorMode) -> Self {
-        Self { values, max, mode }
+        Self {
+            values,
+            max,
+            mode,
+            tint: None,
+        }
+    }
+
+    /// Shades the chart in `color`, a node's color, instead of the amber
+    /// gradient.
+    #[must_use]
+    pub const fn tinted(mut self, color: Rgb) -> Self {
+        self.tint = Some(color);
+        self
     }
 }
 
@@ -148,7 +162,11 @@ impl Widget for BlockArea<'_> {
             } else {
                 count_f64(h - 1 - row) / count_f64(h - 1)
             };
-            let style = Style::new().fg(theme::gradient_at(height).color(self.mode));
+            let color = match self.tint {
+                Some(base) => theme::tinted_at(base, height).color(self.mode),
+                None => theme::gradient_color(height, self.mode),
+            };
+            let style = Style::new().fg(color);
             for (column, &glyph) in line.iter().enumerate() {
                 if glyph == ' ' {
                     continue;
@@ -246,6 +264,25 @@ mod tests {
         assert_eq!(block_area(&[], 3, 2, 1.0).len(), 2);
         // The newest `w` samples win.
         assert_eq!(block_area(&[9.0, 9.0, 9.0, 1.0], 2, 1, 9.0)[0], ['█', '▁']);
+    }
+
+    #[test]
+    fn a_tinted_block_area_shades_in_the_nodes_color() {
+        let color = theme::NODE_COLORS[2];
+        let area = Rect::new(0, 0, 2, 3);
+        let mut buf = Buffer::empty(area);
+        BlockArea::new(&[3.0, 3.0], 3.0, ColorMode::Truecolor)
+            .tinted(color)
+            .render(area, &mut buf);
+        assert_eq!(
+            buf[(1, 1)].fg,
+            color.color(ColorMode::Truecolor),
+            "the middle row is the node's own color"
+        );
+        assert_eq!(
+            buf[(1, 0)].fg,
+            theme::tinted_at(color, 1.0).color(ColorMode::Truecolor)
+        );
     }
 
     #[test]

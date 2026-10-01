@@ -267,6 +267,24 @@ pub fn fixture_model(base: Instant) -> Model {
     model
 }
 
+/// A model that has seen one live member at `base` and held still for
+/// [`DISCOVERY_QUIET`](crate::model::DISCOVERY_QUIET), so it no longer
+/// treats ownership digests as the discovery baseline, and the instant it
+/// stands at.
+#[must_use]
+pub fn past_discovery(base: Instant) -> (Model, Instant) {
+    let mut model = Model::new();
+    model.apply(
+        Update::Snapshot(Arc::new(snapshot(1)), base),
+        base,
+        SystemTime::UNIX_EPOCH,
+    );
+    let now = base + crate::model::DISCOVERY_QUIET;
+    model.tick(now);
+    assert!(!model.discovering());
+    (model, now)
+}
+
 /// The exporter body the metrics fixtures are cut from.
 const EXPORTER_BODY: &str = include_str!("../../tests/fixtures/metrics.prom");
 

@@ -7,19 +7,22 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
 use sundog::store::Mode;
 
 use super::data::{self, CacheRow, NodeRow};
 use super::look::Token;
 use super::panel::{self, gap};
 use super::table::{self, Col};
-use super::widgets::blocks::bar_eighths;
+use super::widgets::blocks::{BlockArea, bar_eighths};
+use super::widgets::braille::BrailleArea;
 use super::widgets::sharebar::{bar_spans, segments};
 use super::widgets::spark;
 use super::{LayoutKind, Scene, overview, text};
 use crate::model::derive::{self, Agreement, PART_SPACE};
 use crate::model::metrics::NodeMetrics;
 use crate::model::ownership::OwnershipDigest;
+use crate::model::series::Ring;
 use crate::source::names;
 
 /// Draws the Caches view into `area`.
@@ -28,7 +31,7 @@ pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     let list_width = if scene.kind == LayoutKind::Narrow {
         22
     } else {
-        28
+        30
     };
     let columns =
         Layout::horizontal([Constraint::Length(list_width), Constraint::Min(30)]).split(area);
@@ -36,8 +39,13 @@ pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     let modes_height =
         (u16::try_from(data::live_count(scene.model) + conflicts).unwrap_or(u16::MAX) + 2)
             .clamp(4, 10);
-    let left =
-        Layout::vertical([Constraint::Min(4), Constraint::Length(modes_height)]).split(columns[0]);
+    let list_height = (u16::try_from(rows.len()).unwrap_or(u16::MAX) + 2).max(4);
+    let left = Layout::vertical([
+        Constraint::Length(list_height),
+        Constraint::Length(modes_height),
+        Constraint::Min(0),
+    ])
+    .split(columns[0]);
     list(scene, &rows, left[0], buf);
     modes(scene, &rows, left[1], buf);
     let selected = scene.app.selected_cache(scene.model);
@@ -154,7 +162,7 @@ fn modes(scene: &Scene<'_>, rows: &[CacheRow], area: Rect, buf: &mut Buffer) {
     if !conflicts.is_empty() {
         block = block.border_style(look.style(Token::Bad));
     }
-    let inner = panel::draw(block, area, buf);
+    let inner = panel::padded(panel::draw(block, area, buf));
     let width = usize::from(inner.width);
     let mut lines = Vec::new();
     for node in scene.rows().iter().filter(|row| row.status().is_live()) {
@@ -277,7 +285,8 @@ fn detail_title(
         .unwrap_or(plain)
 }
 
-/// Draws the detail panel of `row`.
+/// Draws the detail panel of `row`. The panel ends where its content ends:
+/// the table sections, then the history charts in the rows that remain.
 fn detail(scene: &Scene<'_>, row: &CacheRow, area: Rect, buf: &mut Buffer) {
     let look = scene.look;
     let nodes = advertisers(scene, row);
@@ -292,17 +301,18 @@ fn detail(scene: &Scene<'_>, row: &CacheRow, area: Rect, buf: &mut Buffer) {
     } else {
         block
     };
-    let inner = panel::draw(block, area, buf);
-    if inner.width < 20 || inner.height < 3 {
+    let frame = block.inner(area);
+    if frame.width < 20 || frame.height < 3 {
+        panel::draw(block, area, buf);
         return;
     }
-    let inner = Rect::new(inner.x + 1, inner.y, inner.width - 2, inner.height);
+    let content = Rect::new(frame.x + 1, frame.y, frame.width - 2, frame.height);
     let mut lines = match row.mode {
         Some(Mode::Distributed { .. }) => scene.model.ownership(&row.name).map_or_else(
             || vec![Line::from(look.span("computing ownership", Token::Muted))],
-            |digest| distributed_lines(scene, row, digest, &nodes, inner),
+            |digest| distributed_lines(scene, row, digest, &nodes, content),
         ),
-        Some(_) => replicated_lines(scene, row, &nodes, inner),
+        Some(_) => replicated_lines(scene, row, &nodes, content),
         None => conflict_lines(scene, row),
     };
     if data::throughput(scene.model).nodes == 0 && !row.is_conflicted() {
@@ -312,7 +322,216 @@ fn detail(scene: &Scene<'_>, row: &CacheRow, area: Rect, buf: &mut Buffer) {
             Token::Faint,
         )));
     }
-    panel::lines(lines, inner, buf);
+    let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let history = (!row.is_conflicted())
+        .then(|| History::plan(scene, row, &nodes, content.height.saturating_sub(used + 1)))
+        .flatten();
+    let rows_used = used + history.as_ref().map_or(0, |plan| plan.rows() + 1);
+    let height = (rows_used + 2).min(area.height);
+    let area = Rect::new(area.x, area.y, area.width, height);
+    panel::draw(block, area, buf);
+    let content = Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        height.saturating_sub(2),
+    );
+    panel::lines(lines, content, buf);
+    if let Some(plan) = history {
+        // One blank row separates the tables from the charts.
+        let top = content.y + used + 1;
+        let section = Rect::new(content.x, top, content.width, plan.rows());
+        plan.draw(scene, row, &nodes, section, buf);
+    }
+}
+
+/// One chart column of the history section: a title and one series per node.
+#[derive(Debug, Clone)]
+struct HistoryCol {
+    title: &'static str,
+    series: Vec<Vec<f64>>,
+    max: f64,
+    unit: HistoryUnit,
+}
+
+/// How the latest sample of a history column reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryUnit {
+    Count,
+    Percent,
+}
+
+/// The history charts under a cache's tables: for each node, entries and hit
+/// percentage, and the fan-out backlog of a cache that keeps one.
+#[derive(Debug, Clone)]
+struct History {
+    cols: Vec<HistoryCol>,
+    chart_rows: u16,
+    nodes: usize,
+}
+
+/// The most rows a node's chart takes.
+const HISTORY_CHART_ROWS: u16 = 4;
+
+impl History {
+    /// The history that fits in `rows` rows under the tables, or `None` when
+    /// no node has history yet or the rows cannot hold a title and a chart
+    /// row for every node.
+    fn plan(scene: &Scene<'_>, row: &CacheRow, nodes: &[NodeRow<'_>], rows: u16) -> Option<Self> {
+        let metrics: Vec<Option<&NodeMetrics>> = nodes
+            .iter()
+            .map(|node| data::metrics_of(scene.model, node))
+            .collect();
+        let series = |pick: fn(&NodeMetrics, &str) -> Option<Vec<f64>>| -> Vec<Vec<f64>> {
+            metrics
+                .iter()
+                .map(|m| m.and_then(|m| pick(m, &row.name)).unwrap_or_default())
+                .collect()
+        };
+        let largest = |series: &[Vec<f64>]| {
+            series
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(1.0, f64::max)
+        };
+        let entries = series(|m, cache| m.entries_history(cache).map(Ring::to_vec));
+        let hit = series(|m, cache| m.hit_history(cache).map(Ring::to_vec));
+        // Only a cache that fans writes out has a backlog worth charting.
+        let backlog = if row.is_distributed() {
+            vec![Vec::new(); nodes.len()]
+        } else {
+            series(|m, cache| m.backlog_history(cache).map(Ring::to_vec))
+        };
+        let mut cols = Vec::new();
+        for (title, series, max, unit) in [
+            (
+                "entries",
+                entries.clone(),
+                largest(&entries),
+                HistoryUnit::Count,
+            ),
+            ("hit", hit, 100.0, HistoryUnit::Percent),
+            (
+                "backlog",
+                backlog.clone(),
+                largest(&backlog),
+                HistoryUnit::Count,
+            ),
+        ] {
+            if series.iter().any(|s| !s.is_empty()) {
+                cols.push(HistoryCol {
+                    title,
+                    series,
+                    max,
+                    unit,
+                });
+            }
+        }
+        let count = u16::try_from(nodes.len()).ok().filter(|count| *count > 0)?;
+        // The rule takes a row; each node takes a title row and its chart.
+        let per_node = rows.checked_sub(1)? / count;
+        let chart_rows = per_node.checked_sub(1)?.min(HISTORY_CHART_ROWS);
+        (!cols.is_empty() && chart_rows >= 1).then_some(Self {
+            cols,
+            chart_rows,
+            nodes: nodes.len(),
+        })
+    }
+
+    /// The rows the section takes, the rule included.
+    fn rows(&self) -> u16 {
+        1 + u16::try_from(self.nodes).unwrap_or(u16::MAX) * (self.chart_rows + 1)
+    }
+
+    fn draw(
+        &self,
+        scene: &Scene<'_>,
+        row: &CacheRow,
+        nodes: &[NodeRow<'_>],
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let look = scene.look;
+        let title = if row.is_distributed() {
+            "history · metrics · entries and hit %"
+        } else {
+            "history · metrics · entries, hit % and backlog"
+        };
+        panel::lines(
+            vec![rule(scene, title, usize::from(area.width))],
+            Rect::new(area.x, area.y, area.width, 1),
+            buf,
+        );
+        let label = 5;
+        let columns = u16::try_from(self.cols.len()).unwrap_or(1);
+        let gaps = 2 * columns.saturating_sub(1);
+        let col_width = area.width.saturating_sub(label + gaps) / columns;
+        if col_width < 6 {
+            return;
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            let top = area.y + 1 + u16::try_from(index).unwrap_or(0) * (self.chart_rows + 1);
+            panel::lines(
+                vec![Line::from(
+                    look.node_span(node.label().to_owned(), node.color()),
+                )],
+                Rect::new(area.x, top, label, 1),
+                buf,
+            );
+            for (position, col) in self.cols.iter().enumerate() {
+                let x = area.x + label + u16::try_from(position).unwrap_or(0) * (col_width + 2);
+                let samples = &col.series[index];
+                // The title sits at the left and the latest value at the
+                // right, above the newest end of the chart.
+                let latest = samples
+                    .last()
+                    .map_or_else(|| "—".to_owned(), |value| col.unit.format(*value));
+                let room = usize::from(col_width)
+                    .saturating_sub(col.title.chars().count() + latest.chars().count());
+                panel::lines(
+                    vec![Line::from(vec![
+                        look.span(col.title, Token::Muted),
+                        gap(room.max(1)),
+                        look.span(
+                            latest,
+                            if samples.is_empty() {
+                                Token::Faint
+                            } else {
+                                Token::Text
+                            },
+                        ),
+                    ])],
+                    Rect::new(x, top, col_width, 1),
+                    buf,
+                );
+                let chart = Rect::new(x, top + 1, col_width, self.chart_rows);
+                if look.braille {
+                    Widget::render(
+                        BrailleArea::new(samples, col.max * 1.1, look.mode).tinted(node.color()),
+                        chart,
+                        buf,
+                    );
+                } else {
+                    Widget::render(
+                        BlockArea::new(samples, col.max * 1.1, look.mode).tinted(node.color()),
+                        chart,
+                        buf,
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl HistoryUnit {
+    fn format(self, value: f64) -> String {
+        match self {
+            Self::Count => text::count(value),
+            Self::Percent => format!("{}%", text::whole(value.round())),
+        }
+    }
 }
 
 fn conflict_lines(scene: &Scene<'_>, row: &CacheRow) -> Vec<Line<'static>> {
@@ -367,14 +586,14 @@ fn last_of(
 fn distributed_columns() -> Vec<Col> {
     vec![
         Col::new("NODE", 6, 9),
-        Col::new("OWNED", 13, 8),
+        Col::new("OWNED", 12, 8),
         Col::right("SHARE", 8, 7),
-        Col::right("REPORTED", 12, 8),
+        Col::right("REPORTED", 10, 8),
         Col::right("IN/s", 7, 4),
         Col::right("OUT/s", 7, 4),
         Col::right("ENTRIES", 9, 5),
         Col::right("HIT%", 6, 3),
-        Col::new("FETCH l/r/m/e", 15, 2),
+        Col::new("FETCH l/r/m/e", 14, 2),
         Col::right("FWD/s", 7, 2),
         Col::right("STALE/s", 9, 1),
     ]
@@ -620,11 +839,34 @@ fn distributed_footer(
     Line::from(spans)
 }
 
+/// The BACKLOG cell: a spark of the fan-out backlog in the node's color and
+/// the frames waiting now.
+fn backlog_cell(
+    scene: &Scene<'_>,
+    node: &NodeRow<'_>,
+    metrics: Option<&NodeMetrics>,
+    cache: &str,
+) -> Vec<Span<'static>> {
+    let look = scene.look;
+    let Some(now) = metrics.and_then(|m| m.cache_value(names::FAN_OUT_BACKLOG, cache)) else {
+        return vec![look.span("—", Token::Faint)];
+    };
+    let history = metrics
+        .and_then(|m| m.backlog_history(cache))
+        .map(crate::model::series::Ring::to_vec)
+        .unwrap_or_default();
+    vec![
+        look.node_span(spark(&history, 6, look.braille), node.color()),
+        gap(1),
+        look.span(text::pad_left(&text::whole(now), 5), Token::Text),
+    ]
+}
+
 fn replicated_columns() -> Vec<Col> {
     vec![
         Col::new("NODE", 6, 9),
         Col::new("ENTRIES", 26, 8),
-        Col::right("BACKLOG", 9, 6),
+        Col::new("BACKLOG", 13, 6),
         Col::right("AE rep/s", 10, 5),
         Col::right("XFER/s", 8, 4),
         Col::right("HIT%", 6, 3),
@@ -684,12 +926,7 @@ fn replicated_lines(
         let cells = vec![
             node_cell(scene, node),
             entries_cell,
-            number(
-                scene,
-                metrics.and_then(|m| m.cache_value(names::FAN_OUT_BACKLOG, &row.name)),
-                8,
-                text::whole,
-            ),
+            backlog_cell(scene, node, metrics, &row.name),
             number(
                 scene,
                 metrics.and_then(|m| m.rate(names::AE_REPAIRED, &[("cache", &row.name)])),
@@ -830,10 +1067,124 @@ mod tests {
         assert!(!text.contains("coverage"), "{text}");
     }
 
+    fn draw_cache(model: &Model, cache: &str, kind: LayoutKind, w: u16, h: u16) -> Vec<String> {
+        let mut app = App::new(AppConfig::default());
+        app.apply_director(UiCommand::Cache(cache.into()), model);
+        app.observe(model, Instant::now());
+        app.snap();
+        draw_with(&app, model, kind, w, h)
+    }
+
+    fn live() -> Model {
+        testkit::fixture_model_with_metrics(Instant::now())
+    }
+
+    /// The index of the last row that has any text.
+    fn last_row(rows: &[String]) -> usize {
+        rows.iter().rposition(|row| !row.is_empty()).unwrap()
+    }
+
+    #[test]
+    fn the_list_and_the_detail_end_where_their_content_ends() {
+        let rows = draw(&fixture(), LayoutKind::Full, 140, 37);
+        // The list holds four caches and its border: six rows, not the column.
+        assert!(rows[5].starts_with("╰"), "{}", rows[5]);
+        assert!(rows[6].starts_with("╭ Modes"), "{}", rows[6]);
+        // Without metrics the detail has no history, so it ends with its
+        // text: a short panel, not the whole screen.
+        let end = last_row(&rows);
+        assert!(end < 27, "the view ends at row {end}:\n{}", rows.join("\n"));
+        assert!(rows[end].contains('╰'), "{}", rows[end]);
+        assert!(!rows.join("\n").contains("history · metrics"));
+    }
+
+    #[test]
+    fn with_metrics_the_detail_charts_each_nodes_history_in_the_rows_that_remain() {
+        let model = live();
+        let rows = draw(&model, LayoutKind::Full, 140, 37);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("── history · metrics · entries and hit %"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("history · metrics · entries, hit %"),
+            "{text}"
+        );
+        for node in ["n1", "n2", "n3", "n4", "n5", "n6"] {
+            let title = rows
+                .iter()
+                .find(|r| r.contains(&format!("│ {node}   entries")))
+                .unwrap_or_else(|| panic!("a {node} history row in\n{text}"));
+            assert!(title.contains("hit "), "{title}");
+            assert!(
+                !title.contains("backlog"),
+                "a Distributed cache has none: {title}"
+            );
+        }
+        // The charts are braille below the titles and the panel runs on to
+        // the rows that hold them.
+        let first = rows
+            .iter()
+            .position(|r| r.contains("│ n1   entries"))
+            .unwrap();
+        assert!(
+            rows[first + 1]
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+        );
+        let end = last_row(&rows);
+        assert!(end >= 30 && rows[end].contains('╰'), "{end}:\n{text}");
+    }
+
+    #[test]
+    fn a_replicated_cache_charts_the_backlog_and_shows_it_as_a_spark_in_the_table() {
+        let model = live();
+        let rows = draw_cache(&model, "churn", LayoutKind::Full, 140, 37);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("── history · metrics · entries, hit % and backlog"),
+            "{text}"
+        );
+        let title = rows.iter().find(|r| r.contains("│ n1   entries")).unwrap();
+        assert!(
+            title.contains("hit ") && title.contains("backlog"),
+            "{title}"
+        );
+        let table = rows.iter().position(|r| r.contains("BACKLOG")).unwrap();
+        let n1 = &rows[table + 1];
+        assert!(
+            n1.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "the backlog spark: {n1}"
+        );
+    }
+
+    #[test]
+    fn a_short_panel_drops_the_history_rather_than_squeeze_it() {
+        let model = live();
+        let rows = draw(&model, LayoutKind::Full, 140, 24);
+        assert!(!rows.join("\n").contains("history · metrics"));
+        let rows = draw(&model, LayoutKind::Full, 140, 30);
+        assert!(!rows.join("\n").contains("history · metrics"));
+    }
+
+    #[test]
+    fn the_tables_keep_two_cells_between_a_right_aligned_column_and_the_next() {
+        let rows = draw(&live(), LayoutKind::Full, 140, 37);
+        let header = rows.iter().find(|r| r.contains("REPORTED")).unwrap();
+        assert!(header.contains("HIT%  FETCH l/r/m/e"), "{header}");
+        let n1 = rows.iter().find(|r| r.contains("│ n1    ━")).unwrap();
+        assert!(n1.contains("%  64/29/"), "{n1}");
+        let rows = draw_cache(&live(), "churn", LayoutKind::Full, 140, 37);
+        let header = rows.iter().find(|r| r.contains("BACKLOG")).unwrap();
+        assert!(header.contains("AE rep/s"), "{header}");
+    }
+
     #[test]
     fn the_modes_box_lists_each_live_node_and_distributed_caches_first() {
         let text = draw(&fixture(), LayoutKind::Full, 140, 37).join("\n");
-        assert!(text.contains("n1 it D2 churn R os R pn R"), "{text}");
+        assert!(text.contains("│ n1 it D2 churn R os R pn R"), "{text}");
+        assert!(text.contains("pn R │"), "padded on both sides: {text}");
     }
 
     #[test]

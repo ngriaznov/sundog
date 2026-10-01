@@ -141,7 +141,7 @@ fn the_full_overview_with_metrics_shows_throughput_and_agreement() {
         "hit ",
         "reads ",
         "metrics 6/6 · 1 s",
-        "reported ✓ 4/5",
+        "reported ↻ 4/5",
         "↻",
         "✓",
     ] {
@@ -457,7 +457,8 @@ fn assert_golden(name: &str, shown: &str) {
         return;
     }
     let golden = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("tests/golden/{name}.txt is unreadable: {error}"));
+        .unwrap_or_else(|error| panic!("tests/golden/{name}.txt is unreadable: {error}"))
+        .replace("\r\n", "\n");
     if golden != shown {
         let mismatch = golden
             .lines()

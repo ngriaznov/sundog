@@ -13,7 +13,6 @@ use super::widgets::blocks::BlockArea;
 use super::widgets::braille::BrailleArea;
 use super::widgets::spark;
 use super::{LayoutKind, Scene, allocate, eventlog, members, ownership, text};
-use crate::model::derive::fair_share;
 
 /// The height the Ownership panel needs at the screen class `kind`.
 fn ownership_height(scene: &Scene<'_>) -> u16 {
@@ -236,7 +235,7 @@ fn cache_status(scene: &Scene<'_>, row: &CacheRow) -> Vec<Span<'static>> {
 pub fn caches(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     let look = scene.look;
     let block = panel::block(look, "Caches", "gossip+metrics", Vec::new(), false);
-    let inner = panel::draw(block, area, buf);
+    let inner = panel::padded(panel::draw(block, area, buf));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -345,13 +344,6 @@ fn rebalance_line(scene: &Scene<'_>, cache: &str, width: usize) -> Line<'static>
     ])
 }
 
-/// The fair share the Overview's ownership panel marks, for tests.
-#[must_use]
-pub fn fair_for(scene: &Scene<'_>, cache: &str) -> Option<f64> {
-    let digest = scene.model.ownership(cache)?;
-    Some(fair_share(digest.k, digest.eligible.len()))
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
@@ -444,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn the_caches_and_events_panels_keep_a_cell_of_padding_inside_their_borders() {
+        let rows = draw(&fixture(), LayoutKind::Full, 140, 40);
+        let marked = rows.iter().find(|r| r.contains("▸ it")).unwrap();
+        assert!(marked.contains("│ ▸ it "), "{marked}");
+        let event = rows.iter().find(|r| r.contains("SETTLED")).unwrap();
+        assert!(event.starts_with("│ 00:00:"), "{event}");
+        let other = rows.iter().find(|r| r.contains("churn")).unwrap();
+        assert!(other.contains("│   churn"), "{other}");
+    }
+
+    #[test]
     fn compact_and_narrow_overviews_leave_out_throughput_and_caches() {
         for (kind, w, h) in [(LayoutKind::Compact, 120, 33), (LayoutKind::Narrow, 80, 21)] {
             let rows = draw(&fixture(), kind, w, h).join("\n");
@@ -453,26 +456,6 @@ mod tests {
             assert!(!rows.contains("Throughput"), "{kind:?}");
             assert!(!rows.contains("Caches · gossip"), "{kind:?}");
         }
-    }
-
-    #[test]
-    fn the_fair_share_helper_reads_the_digest() {
-        let model = fixture();
-        let app = App::new(AppConfig::default());
-        let ctx = Ctx {
-            now: model.now().unwrap(),
-            wall: model.wall().unwrap(),
-            elapsed: Duration::ZERO,
-        };
-        let scene = Scene {
-            app: &app,
-            model: &model,
-            ctx: &ctx,
-            look: app.look(),
-            kind: LayoutKind::Full,
-        };
-        assert!((fair_for(&scene, "it").unwrap() - 0.4).abs() < 1e-9);
-        assert!(fair_for(&scene, "nope").is_none());
     }
 
     #[test]

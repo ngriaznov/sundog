@@ -174,6 +174,9 @@ pub enum EventKind {
     },
     /// `EXPORTER`: an exporter came or went, or its mapping is wrong.
     Exporter {
+        /// The node the exporter is mapped to, as it was when the event
+        /// happened.
+        node: NodeId,
         /// The gossip address of the mapped member.
         addr: SocketAddr,
         /// What happened.
@@ -263,11 +266,9 @@ impl EventKind {
             | Self::Drop { node, .. }
             | Self::Ready { node }
             | Self::Unready { node }
-            | Self::Unreachable { node } => Some(*node),
-            Self::Conflict { .. }
-            | Self::View { .. }
-            | Self::Settled { .. }
-            | Self::Exporter { .. } => None,
+            | Self::Unreachable { node }
+            | Self::Exporter { node, .. } => Some(*node),
+            Self::Conflict { .. } | Self::View { .. } | Self::Settled { .. } => None,
         }
     }
 }
@@ -1168,12 +1169,13 @@ mod tests {
             ),
             (
                 EventKind::Exporter {
+                    node: n,
                     addr: a,
                     detail: "up".into(),
                 },
                 "EXPORTER",
                 Category::Exporter,
-                None,
+                Some(n),
             ),
         ]
     }

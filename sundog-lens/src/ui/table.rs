@@ -43,13 +43,42 @@ impl Col {
     }
 }
 
+/// The cells added after a right-aligned column that another column follows:
+/// its numbers end at the edge of the column, so the extra cell keeps two
+/// cells between them and the next column's text.
+const AFTER_RIGHT: usize = 1;
+
+/// The cells that follow a cell wider than its column.
+const MIN_GAP: usize = 2;
+
+/// The cells that follow the column at `position` among `visible`.
+fn trailing(cols: &[Col], visible: &[usize], position: usize) -> usize {
+    if position + 1 < visible.len() && cols[visible[position]].right {
+        AFTER_RIGHT
+    } else {
+        0
+    }
+}
+
+/// The width of the visible columns with the gaps after right-aligned ones.
+#[must_use]
+pub fn total_width(cols: &[Col], visible: &[usize]) -> usize {
+    visible
+        .iter()
+        .enumerate()
+        .map(|(position, &i)| cols[i].width + trailing(cols, visible, position))
+        .sum()
+}
+
 /// The indices of the columns that fit in `width` cells, in their order:
 /// columns go in ascending `keep` order until the rest fit. A column with the
-/// highest `keep` always stays.
+/// highest `keep` always stays. The width of a column counts the gap after
+/// it, and a right-aligned column that another follows gets one more cell
+/// (see [`total_width`]).
 #[must_use]
 pub fn visible(cols: &[Col], width: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..cols.len()).collect();
-    let total = |kept: &[usize]| kept.iter().map(|&i| cols[i].width).sum::<usize>();
+    let total = |kept: &[usize]| total_width(cols, kept);
     while kept.len() > 1 && total(&kept) > width {
         let drop = kept
             .iter()
@@ -69,18 +98,17 @@ pub fn visible(cols: &[Col], width: usize) -> Vec<usize> {
 /// The header line of the visible columns.
 #[must_use]
 pub fn header(look: Look, cols: &[Col], visible: &[usize]) -> Line<'static> {
-    let spans: Vec<Span<'static>> = visible
-        .iter()
-        .map(|&i| {
-            let col = &cols[i];
-            let cell = if col.right {
-                text::pad_left(&format!("{} ", col.title), col.width)
-            } else {
-                text::pad_right(&col.title, col.width)
-            };
-            look.span(cell, Token::Muted)
-        })
-        .collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (position, &i) in visible.iter().enumerate() {
+        let col = &cols[i];
+        let cell = if col.right {
+            text::pad_left(&format!("{} ", col.title), col.width)
+        } else {
+            text::pad_right(&col.title, col.width)
+        };
+        spans.push(look.span(cell, Token::Muted));
+        spans.push(gap(trailing(cols, visible, position)));
+    }
     Line::from(spans)
 }
 
@@ -89,14 +117,15 @@ pub fn header(look: Look, cols: &[Col], visible: &[usize]) -> Line<'static> {
 #[must_use]
 pub fn row(cols: &[Col], visible: &[usize], mut cells: Vec<Vec<Span<'static>>>) -> Line<'static> {
     let mut spans = Vec::new();
-    for &i in visible {
+    for (position, &i) in visible.iter().enumerate() {
         let cell = std::mem::take(&mut cells[i]);
         if width_of(&cell) > cols[i].width {
             spans.extend(cell);
-            spans.push(gap(0));
+            spans.push(gap(MIN_GAP));
         } else {
             spans.extend(pad_spans(cell, cols[i].width));
         }
+        spans.push(gap(trailing(cols, visible, position)));
     }
     Line::from(spans)
 }
@@ -120,14 +149,14 @@ mod tests {
 
     #[test]
     fn every_column_shows_when_there_is_room() {
-        assert_eq!(visible(&cols(), 29), [0, 1, 2, 3]);
+        assert_eq!(visible(&cols(), 31), [0, 1, 2, 3]);
         assert_eq!(visible(&cols(), 200), [0, 1, 2, 3]);
     }
 
     #[test]
     fn the_lowest_keep_goes_first_and_the_widest_priority_always_stays() {
-        assert_eq!(visible(&cols(), 28), [0, 1, 2]);
-        assert_eq!(visible(&cols(), 18), [0, 1]);
+        assert_eq!(visible(&cols(), 30), [0, 1, 2]);
+        assert_eq!(visible(&cols(), 19), [0, 1]);
         assert_eq!(visible(&cols(), 12), [0]);
         assert_eq!(visible(&cols(), 0), [0]);
         assert!(visible(&[], 10).is_empty());
@@ -147,8 +176,8 @@ mod tests {
     fn headers_align_with_their_columns() {
         let cols = cols();
         let line = header(Look::default(), &cols, &[0, 1, 2, 3]);
-        assert_eq!(text_of(&line), "NODE    IN/s  HIT% FETCH     ");
-        assert_eq!(text_of(&line).chars().count(), 29);
+        assert_eq!(text_of(&line), "NODE    IN/s   HIT%  FETCH     ");
+        assert_eq!(text_of(&line).chars().count(), 31);
     }
 
     #[test]
@@ -161,13 +190,29 @@ mod tests {
             vec![Span::raw("61/30")],
         ];
         let line = row(&cols, &[0, 1, 3], cells);
-        assert_eq!(text_of(&line), "n1       12  61/30     ");
+        assert_eq!(text_of(&line), "n1       12   61/30     ");
     }
 
     #[test]
     fn a_cell_wider_than_its_column_is_kept_whole() {
         let cols = vec![Col::new("A", 3, 1)];
         let line = row(&cols, &[0], vec![vec![Span::raw("wide")]]);
-        assert_eq!(text_of(&line), "wide");
+        assert_eq!(text_of(&line), "wide  ");
+    }
+
+    #[test]
+    fn two_cells_part_a_right_aligned_column_from_the_next_and_none_trail_the_last() {
+        let cols = vec![Col::right("HIT%", 7, 1), Col::new("OWNED", 7, 1)];
+        let cells = vec![vec![Span::raw(" 77.5%")], vec![Span::raw("65,536")]];
+        let both = [0, 1];
+        let row_text = text_of(&row(&cols, &both, cells));
+        assert_eq!(row_text, " 77.5%  65,536 ");
+        assert!(row_text.contains("%  6"), "{row_text}");
+        assert_eq!(total_width(&cols, &both), 15);
+        assert_eq!(total_width(&cols, &[0]), 7, "a lone column has no neighbor");
+        assert_eq!(total_width(&cols, &[1]), 7);
+        // A trailing right-aligned column keeps its own width only.
+        let rev = vec![Col::new("A", 3, 1), Col::right("B", 4, 1)];
+        assert_eq!(total_width(&rev, &[0, 1]), 7);
     }
 }

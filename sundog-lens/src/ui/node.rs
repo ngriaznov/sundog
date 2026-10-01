@@ -16,7 +16,7 @@ use super::widgets::blocks::BlockArea;
 use super::widgets::braille::BrailleArea;
 use super::{LayoutKind, Scene, eventlog, overview, text};
 use crate::model::derive::{self, Agreement};
-use crate::model::events::{EventKind, Filter};
+use crate::model::events::Filter;
 use crate::model::metrics::NodeMetrics;
 use crate::source::names;
 
@@ -104,7 +104,10 @@ fn status_phrase(status: MemberStatus) -> &'static str {
 /// not fit in `width` cells.
 fn info_title(scene: &Scene<'_>, row: &NodeRow<'_>, width: usize) -> Vec<Span<'static>> {
     let look = scene.look;
-    let age = row.status_age(scene.ctx.wall);
+    let age = row
+        .uptime(scene.ctx.wall)
+        .unwrap_or_else(|| row.status_age(scene.ctx.wall));
+    let since = row.started().unwrap_or(row.member.since);
     let glyph = match row.status() {
         MemberStatus::Live => "●",
         MemberStatus::Departing => "◐",
@@ -125,7 +128,7 @@ fn info_title(scene: &Scene<'_>, row: &NodeRow<'_>, width: usize) -> Vec<Span<'s
             format!(
                 " · {} {} ({})",
                 status_phrase(row.status()),
-                text::clock(row.member.since),
+                text::clock(since),
                 text::age(age)
             ),
             Token::Muted,
@@ -347,6 +350,14 @@ fn chart(
         }
         return;
     };
+    if !data::scrape_answered(scene.model, row) {
+        panel::centered(
+            vec![Line::from(look.span("exporter not answering", Token::Warn))],
+            inner,
+            buf,
+        );
+        return;
+    }
     let ops = metrics.ops().to_vec();
     let max = ops.iter().copied().fold(0.0, f64::max).max(1.0) * 1.1;
     let plot = Rect::new(
@@ -356,9 +367,17 @@ fn chart(
         inner.height - 1,
     );
     if look.braille {
-        ratatui::widgets::Widget::render(BrailleArea::new(&ops, max, look.mode), plot, buf);
+        ratatui::widgets::Widget::render(
+            BrailleArea::new(&ops, max, look.mode).tinted(row.color()),
+            plot,
+            buf,
+        );
     } else {
-        ratatui::widgets::Widget::render(BlockArea::new(&ops, max, look.mode), plot, buf);
+        ratatui::widgets::Widget::render(
+            BlockArea::new(&ops, max, look.mode).tinted(row.color()),
+            plot,
+            buf,
+        );
     }
     let mut spans = vec![
         look.span(
@@ -655,15 +674,11 @@ fn cache_table(
 fn events(scene: &Scene<'_>, row: &NodeRow<'_>, area: Rect, buf: &mut Buffer) {
     let look = scene.look;
     let node = row.member.peer.node;
-    let addr = row.member.peer.gossip_addr;
     let mine: Vec<_> = scene
         .model
         .events()
         .newest_first(Filter::All)
-        .filter(|event| match &event.kind {
-            EventKind::Exporter { addr: at, .. } => *at == addr,
-            kind => kind.node() == Some(node),
-        })
+        .filter(|event| event.kind.node() == Some(node))
         .collect();
     let mut title = vec![gap(1), panel::title_span(look, "events for"), gap(1)];
     title.push(look.node_span(row.label().to_owned(), row.color()));
@@ -782,6 +797,25 @@ mod tests {
         (0..h).map(|y| row_text(&buf, y)).collect()
     }
 
+    fn buffer_with(app: &App, model: &Model, w: u16, h: u16) -> Buffer {
+        let ctx = Ctx {
+            now: model.now().unwrap(),
+            wall: model.wall().unwrap(),
+            elapsed: Duration::ZERO,
+        };
+        let scene = Scene {
+            app,
+            model,
+            ctx: &ctx,
+            look: app.look(),
+            kind: LayoutKind::Full,
+        };
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        render(&scene, area, &mut buf);
+        buf
+    }
+
     fn app_on(label: &str, model: &Model) -> App {
         let mut app = App::new(AppConfig::default());
         app.apply_director(UiCommand::Select(label.into()), model);
@@ -800,7 +834,7 @@ mod tests {
         let rows = draw_with(&app_on("n2", &model), &model, LayoutKind::Full, 140, 37);
         let text = rows.join("\n");
         assert!(rows[0].starts_with("╭ ● n2 "), "{}", rows[0]);
-        assert!(rows[0].contains("live since 00:00:00 (20s)"), "{}", rows[0]);
+        assert!(rows[0].contains("live since 00:00:00 (19s)"), "{}", rows[0]);
         assert!(text.contains("host         host"), "{text}");
         assert!(text.contains("gossip       127.0.0.12:7946"), "{text}");
         assert!(text.contains("data 127.0.0.12:39211"), "{text}");
@@ -815,6 +849,63 @@ mod tests {
             text.contains("caches       it D·2 · churn R · os R · pn R"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_ops_chart_is_shaded_in_the_nodes_own_color() {
+        let model = testkit::fixture_model_with_metrics(Instant::now());
+        let buf = buffer_with(&app_on("n2", &model), &model, 140, 37);
+        let color = data::row_labeled(&model, "n2").unwrap().color();
+        assert_eq!(color, crate::ui::theme::NODE_COLORS[1]);
+        let shades: Vec<_> = (0..=12)
+            .map(|step| {
+                crate::ui::theme::tinted_at(color, f64::from(step) / 12.0)
+                    .color(crate::ui::theme::ColorMode::Truecolor)
+            })
+            .collect();
+        let (mut tinted, mut amber) = (0, 0);
+        for y in 1..10 {
+            for x in 66..138 {
+                let cell = &buf[(x, y)];
+                if !cell
+                    .symbol()
+                    .chars()
+                    .all(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+                {
+                    continue;
+                }
+                if shades.contains(&cell.fg) {
+                    tinted += 1;
+                } else if cell.fg
+                    == crate::ui::theme::GRADIENT[1].color(crate::ui::theme::ColorMode::Truecolor)
+                {
+                    amber += 1;
+                }
+            }
+        }
+        assert!(tinted > 20, "{tinted} tinted cells");
+        assert_eq!(amber, 0, "no cell takes the amber throughput gradient");
+    }
+
+    #[test]
+    fn a_node_whose_exporter_stopped_answering_says_so_in_place_of_the_chart() {
+        let mut model = testkit::fixture_model_with_metrics(Instant::now());
+        let row = data::row_labeled(&model, "n2").unwrap();
+        let report = crate::source::ScrapeReport {
+            addr: row.member.peer.gossip_addr,
+            node: row.member.peer.node,
+            at: model.now().unwrap(),
+            outcome: Err(crate::source::scrape::ScrapeError::Timeout),
+            ready: None,
+        };
+        let (now, wall) = (model.now().unwrap(), model.wall().unwrap());
+        model.apply(crate::source::Update::Scrape(report), now, wall);
+        let text = draw_with(&app_on("n2", &model), &model, LayoutKind::Full, 140, 37).join("\n");
+        assert!(text.contains("exporter not answering"), "{text}");
+        let healthy = testkit::fixture_model_with_metrics(Instant::now());
+        let text =
+            draw_with(&app_on("n2", &healthy), &healthy, LayoutKind::Full, 140, 37).join("\n");
+        assert!(!text.contains("exporter not answering"), "{text}");
     }
 
     #[test]

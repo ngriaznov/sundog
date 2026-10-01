@@ -75,22 +75,62 @@ pub const GRADIENT: [Rgb; 3] = [
     Rgb(0xFF, 0xE2, 0xA0),
 ];
 
+/// The xterm-256 cube entries the gradient uses in 256-color mode: `#875f00`,
+/// `#ffaf00` and `#ffd7af`. Quantizing the truecolor stops instead turns the
+/// dark bottom stop olive green.
+pub const GRADIENT_256: [u8; 3] = [94, 214, 223];
+
 /// The node color for slot `index`.
 #[must_use]
 pub fn node_color(index: usize) -> Rgb {
     NODE_COLORS[index % NODE_COLORS.len()]
 }
 
+/// The color at height `t` along the three-stop ramp `stops`, where 0 is the
+/// first stop and 1 the last. `t` outside 0 to 1 clamps.
+fn ramp(stops: [Rgb; 3], t: f64) -> Rgb {
+    let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+    if t < 0.5 {
+        crate::ui::anim::blend(stops[0], stops[1], t * 2.0)
+    } else {
+        crate::ui::anim::blend(stops[1], stops[2], (t - 0.5) * 2.0)
+    }
+}
+
 /// The gradient color at height `t`, where 0 is the bottom stop and 1 the top
 /// stop. `t` outside 0 to 1 clamps.
 #[must_use]
 pub fn gradient_at(t: f64) -> Rgb {
-    let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
-    if t < 0.5 {
-        crate::ui::anim::blend(GRADIENT[0], GRADIENT[1], t * 2.0)
-    } else {
-        crate::ui::anim::blend(GRADIENT[1], GRADIENT[2], (t - 0.5) * 2.0)
+    ramp(GRADIENT, t)
+}
+
+/// The gradient color at height `t` as the terminal shows it under `mode`. In
+/// 256-color mode the ramp runs between [`GRADIENT_256`] entries, so no step
+/// drifts toward green.
+#[must_use]
+pub fn gradient_color(t: f64, mode: ColorMode) -> Color {
+    match mode {
+        ColorMode::Ansi256 => ramp(GRADIENT_256.map(cube_rgb), t).color(mode),
+        _ => gradient_at(t).color(mode),
     }
+}
+
+/// A ramp in one node's color at height `t`: a dim tint of it at the bottom,
+/// the color itself in the middle and a lighter shade at the top.
+#[must_use]
+pub fn tinted_at(base: Rgb, t: f64) -> Rgb {
+    let anim = crate::ui::anim::blend;
+    ramp([anim(BG, base, 0.35), base, anim(base, WHITE, 0.4)], t)
+}
+
+/// The color of xterm-256 cube entry `index` (16 to 231); other indices give
+/// black.
+fn cube_rgb(index: u8) -> Rgb {
+    let Some(offset) = index.checked_sub(16).filter(|offset| *offset < 216) else {
+        return Rgb(0, 0, 0);
+    };
+    let level = |step: u8| CUBE_LEVELS[usize::from(step % 6)];
+    Rgb(level(offset / 36), level(offset / 6), level(offset))
 }
 
 /// How colors reach the terminal.
@@ -341,6 +381,46 @@ mod tests {
         assert_eq!(gradient_at(-3.0), GRADIENT[0]);
         assert_eq!(gradient_at(9.0), GRADIENT[2]);
         assert_eq!(gradient_at(f64::NAN), GRADIENT[0]);
+    }
+
+    #[test]
+    fn the_256_gradient_runs_between_pinned_entries_and_never_drifts_to_green() {
+        let at = |t: f64| gradient_color(t, ColorMode::Ansi256);
+        assert_eq!(at(0.0), Color::Indexed(94));
+        assert_eq!(at(0.5), Color::Indexed(214));
+        assert_eq!(at(1.0), Color::Indexed(223));
+        assert_eq!(cube_rgb(94), Rgb(0x87, 0x5f, 0x00));
+        assert_eq!(cube_rgb(214), Rgb(0xff, 0xaf, 0x00));
+        assert_eq!(cube_rgb(223), Rgb(0xff, 0xd7, 0xaf));
+        assert_eq!(cube_rgb(5), Rgb(0, 0, 0));
+        for step in 0..=100 {
+            let Color::Indexed(index) = at(f64::from(step) / 100.0) else {
+                panic!("an indexed color");
+            };
+            if index >= 232 {
+                continue;
+            }
+            let Rgb(r, g, b) = cube_rgb(index);
+            assert!(r >= g && r >= b, "step {step} is green-dominant: {index}");
+        }
+        // The old quantized bottom stop was the olive (95, 95, 0).
+        assert_eq!(to_256(GRADIENT[0]), 16 + 36 + 6);
+        assert_eq!(gradient_color(0.3, ColorMode::Mono), Color::Reset);
+        assert_eq!(
+            gradient_color(1.0, ColorMode::Truecolor),
+            GRADIENT[2].color(ColorMode::Truecolor)
+        );
+    }
+
+    #[test]
+    fn a_tinted_ramp_rises_from_a_dim_shade_through_the_color_to_a_light_one() {
+        let base = NODE_COLORS[1];
+        assert_eq!(tinted_at(base, 0.5), base);
+        let bottom = tinted_at(base, 0.0);
+        let top = tinted_at(base, 1.0);
+        assert!(bottom.0 < base.0 && bottom.1 < base.1 && bottom.2 < base.2);
+        assert!(top.0 >= base.0 && top.1 > base.1 && top.2 > base.2);
+        assert_eq!(tinted_at(base, f64::NAN), bottom);
     }
 
     #[test]

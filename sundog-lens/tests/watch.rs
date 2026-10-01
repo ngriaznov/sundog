@@ -101,7 +101,7 @@ async fn the_loop_draws_the_cluster_follows_keys_and_commands_and_quits() {
     };
     let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("the test terminal");
     let driver = tokio::spawn(async move {
-        let outcome = drive(&mut terminal, session, input_rx).await;
+        let outcome = drive(&mut terminal, session, input_rx, std::future::pending()).await;
         (outcome, terminal)
     });
 
@@ -165,7 +165,7 @@ async fn the_loop_ends_at_exit_after_and_shows_the_splash_before_a_member_appear
     let started = std::time::Instant::now();
     tokio::time::timeout(
         Duration::from_secs(20),
-        drive(&mut terminal, session, input_rx),
+        drive(&mut terminal, session, input_rx, std::future::pending()),
     )
     .await
     .expect("the loop ends at exit-after")
@@ -180,4 +180,34 @@ async fn the_loop_ends_at_exit_after_and_shows_the_splash_before_a_member_appear
         last.contains("the observer opens no cache and is never a peer"),
         "{last}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_loop_shuts_the_feed_down_and_returns_when_the_process_is_asked_to_stop() {
+    let feed = feed_for(
+        "lens-watch-stop",
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+    )
+    .await;
+    let app = App::new(AppConfig {
+        cluster: "lens-watch-stop".to_owned(),
+        ..AppConfig::default()
+    });
+    let (_input_tx, input_rx) = mpsc::unbounded_channel();
+    let session = Session {
+        feed,
+        model: Model::new(),
+        app,
+        commands: None,
+        fleet: None,
+        exit_after: None,
+    };
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("the test terminal");
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        drive(&mut terminal, session, input_rx, std::future::ready(())),
+    )
+    .await
+    .expect("a resolved stop future ends the loop")
+    .expect("the loop ends cleanly");
 }

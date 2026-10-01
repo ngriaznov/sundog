@@ -243,7 +243,7 @@ impl App {
     }
 
     /// How many events from the newest the log view starts at, given that the
-    /// log now holds `len` events. 0 while the log follows the live end.
+    /// log now shows `len` events (those that pass the filter). 0 while the log follows the live end.
     #[must_use]
     pub fn log_offset(&self, len: usize) -> usize {
         if !self.pinned {
@@ -327,7 +327,7 @@ impl App {
     }
 
     fn scroll_log(&mut self, live: &Model, step: Step) {
-        let len = self.shown(live).events().len();
+        let len = self.shown(live).events().newest_first(self.filter).count();
         if !self.pinned {
             self.pinned = true;
             self.pin_len = len;
@@ -413,7 +413,12 @@ impl App {
             KeyCode::Esc => return self.escape(),
             KeyCode::Char('c') => self.cycle_ownership_cache(live, true),
             KeyCode::Char('C') => self.cycle_ownership_cache(live, false),
-            KeyCode::Char('f') => self.filter = self.filter.next(),
+            KeyCode::Char('f') => {
+                self.filter = self.filter.next();
+                // A scroll offset in one filter means nothing in another.
+                self.pinned = false;
+                self.scroll = 0;
+            }
             KeyCode::Char('t') => self.show_gone = !self.show_gone,
             KeyCode::Char('r') if self.view == View::Node => self.raw = !self.raw,
             KeyCode::Char('p') => {
@@ -506,6 +511,9 @@ impl App {
             return;
         }
         let animate = self.anim;
+        // Digests found while the observer is still discovering the cluster
+        // are the baseline: no bucket moved.
+        let flash = animate && !model.discovering();
         for digest in model.ownership_digests() {
             let changed = self
                 .motion
@@ -514,7 +522,7 @@ impl App {
                 .is_none_or(|prev| (prev.view_hash, prev.k) != (digest.view_hash, digest.k));
             if changed {
                 if let Some(prev) = self.motion.previous.get(&digest.cache)
-                    && animate
+                    && flash
                 {
                     self.motion.flashes.insert(
                         digest.cache.clone(),
@@ -1006,6 +1014,33 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_counts_the_events_the_filter_shows() {
+        let model = model();
+        let total = model.events().len();
+        let filtered = model.events().newest_first(Filter::Ownership).count();
+        assert!(filtered >= 2 && filtered < total, "{filtered} of {total}");
+        let mut app = app();
+        app.handle_key(ch('4'), &model);
+        while app.filter != Filter::Ownership {
+            app.handle_key(ch('f'), &model);
+        }
+        app.handle_key(ch('g'), &model);
+        assert_eq!(app.log_offset(filtered), filtered - 1);
+        app.handle_key(ch('j'), &model);
+        assert_eq!(
+            app.log_offset(filtered),
+            filtered - 2,
+            "one press moves the view one row"
+        );
+        // A matching event arriving while pinned holds the view in place.
+        let before = app.log_offset(filtered);
+        assert_eq!(app.log_offset(filtered + 1), before + 1);
+        app.handle_key(ch('f'), &model);
+        assert!(!app.is_pinned(), "a new filter unpins the log");
+        assert_eq!(app.log_offset(filtered), 0);
+    }
+
+    #[test]
     fn demo_keys_act_only_in_demo_mode() {
         let model = model();
         for letter in ['S', 'K', 'L', 'R'] {
@@ -1132,9 +1167,8 @@ mod tests {
 
     #[test]
     fn a_view_change_flashes_the_moved_buckets_for_1200_ms() {
-        let mut model = Model::new();
         let mut app = app();
-        let start = Instant::now();
+        let (mut model, start) = testkit::past_discovery(Instant::now());
         apply_digest(&mut model, digest_of(3), start);
         app.observe(&model, start);
         assert!(
@@ -1154,6 +1188,32 @@ mod tests {
         assert!((mid - 0.5).abs() < 1e-6);
         assert!(app.flash("it", start + MOSAIC_FLASH).is_none());
         assert!(app.flash("none", start).is_none());
+    }
+
+    #[test]
+    fn a_view_found_while_discovering_the_cluster_does_not_flash() {
+        let mut model = Model::new();
+        let mut app = app();
+        let start = Instant::now();
+        let snapshot = |count| {
+            crate::source::Update::Snapshot(std::sync::Arc::new(testkit::snapshot(count)), start)
+        };
+        model.apply(snapshot(1), start, SystemTime::UNIX_EPOCH);
+        apply_digest(&mut model, digest_of(1), start);
+        app.observe(&model, start);
+        model.apply(snapshot(3), start, SystemTime::UNIX_EPOCH);
+        apply_digest(&mut model, digest_of(3), start);
+        assert!(model.discovering());
+        app.observe(&model, start);
+        assert!(
+            app.flash("it", start).is_none(),
+            "the observer finding members moves no bucket"
+        );
+        let later = start + crate::model::DISCOVERY_QUIET;
+        model.tick(later);
+        apply_digest(&mut model, digest_of(4), later);
+        app.observe(&model, later);
+        assert!(app.flash("it", later).is_some(), "a real change flashes");
     }
 
     #[test]

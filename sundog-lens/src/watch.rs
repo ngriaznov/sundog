@@ -21,6 +21,7 @@ use crate::app::{Action, App, AppConfig, FleetCmd, UiCommand};
 use crate::cli::WatchArgs;
 use crate::model::Model;
 use crate::source::{Feed, FeedConfig, Update};
+use crate::ui::anim;
 use crate::ui::look::Look;
 use crate::ui::{self, Ctx};
 
@@ -209,8 +210,8 @@ fn frame_ctx(app: &App, model: &Model, start: Instant) -> Ctx {
 }
 
 /// Runs the interface on the real terminal until the user quits,
-/// `exit_after` passes or the sources stop. The terminal is restored on every
-/// path out.
+/// `exit_after` passes or the process is asked to stop. The terminal is
+/// restored on every path out.
 ///
 /// # Errors
 ///
@@ -220,10 +221,7 @@ pub async fn run_session(session: Session) -> anyhow::Result<()> {
     let _restore = Restore;
     let stop = Arc::new(AtomicBool::new(false));
     let input = spawn_input(Arc::clone(&stop));
-    let result = tokio::select! {
-        result = drive(&mut terminal, session, input) => result,
-        () = termination() => Ok(()),
-    };
+    let result = drive(&mut terminal, session, input, termination()).await;
     stop.store(true, Ordering::Relaxed);
     result
 }
@@ -255,10 +253,24 @@ pub async fn termination() {
     }
 }
 
+/// Whether the header spinner has moved to a new frame at `elapsed` since the
+/// frame in `last`, which then holds the new one. Motion off or a frozen
+/// display keeps the spinner still.
+fn spinner_moved(app: &App, elapsed: Duration, last: &mut char) -> bool {
+    if !app.anim || app.is_frozen() {
+        return false;
+    }
+    let frame = anim::spinner_frame(elapsed);
+    let moved = frame != *last;
+    *last = frame;
+    moved
+}
+
 /// The loop itself, over any backend and any source of terminal events: folds
 /// updates into the model, handles events, advances motion and draws, until a
-/// quit event, `exit_after` or the end of the sources. It shuts the feed down
-/// before it returns.
+/// quit event, `exit_after` or `stop` resolves. Once the sources end it runs
+/// on with the last model until one of those. It shuts the feed down before
+/// it returns, whichever way it ends.
 ///
 /// # Errors
 ///
@@ -267,12 +279,15 @@ pub async fn drive<B>(
     terminal: &mut Terminal<B>,
     mut session: Session,
     mut input: mpsc::UnboundedReceiver<Event>,
+    stop: impl Future<Output = ()>,
 ) -> anyhow::Result<()>
 where
     B: Backend,
     B::Error: Send + Sync + 'static,
 {
+    tokio::pin!(stop);
     let start = Instant::now();
+    let mut spinner = anim::spinner_frame(Duration::ZERO);
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dirty = true;
@@ -281,6 +296,7 @@ where
     let mut sources_open = true;
     let result: anyhow::Result<()> = loop {
         tokio::select! {
+            () = &mut stop => break Ok(()),
             Some(event) = input.recv() => {
                 let pass = handle_event(
                     &event,
@@ -326,6 +342,9 @@ where
                     dirty = true;
                 }
                 if session.app.animating(&session.model, now, SystemTime::now()) {
+                    dirty = true;
+                }
+                if spinner_moved(&session.app, start.elapsed(), &mut spinner) {
                     dirty = true;
                 }
                 if session.app.anim && session.model.snapshot().is_none_or(|s| s.members.is_empty()) {
@@ -375,6 +394,52 @@ mod tests {
 
     fn key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn a_tick_that_advances_the_spinner_step_marks_the_frame_dirty() {
+        let app = App::new(AppConfig::default());
+        let mut last = anim::spinner_frame(Duration::ZERO);
+        assert!(!spinner_moved(&app, Duration::from_millis(60), &mut last));
+        assert!(spinner_moved(&app, Duration::from_millis(110), &mut last));
+        assert_eq!(last, anim::SPINNER[1]);
+        assert!(!spinner_moved(&app, Duration::from_millis(160), &mut last));
+        assert!(spinner_moved(&app, Duration::from_millis(210), &mut last));
+        assert_eq!(last, anim::SPINNER[2]);
+        // A whole turn later it is the first frame again, which is a move.
+        assert!(spinner_moved(&app, Duration::from_millis(1000), &mut last));
+        assert_eq!(last, anim::SPINNER[0]);
+    }
+
+    #[test]
+    fn the_spinner_stands_still_without_motion_or_while_frozen() {
+        let model = Model::new();
+        let mut still = App::new(AppConfig {
+            anim: false,
+            ..AppConfig::default()
+        });
+        let mut last = anim::SPINNER[0];
+        assert!(!spinner_moved(
+            &still,
+            Duration::from_millis(150),
+            &mut last
+        ));
+        assert_eq!(last, anim::SPINNER[0]);
+        still.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &model,
+        );
+        assert!(still.anim);
+        still.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            &model,
+        );
+        assert!(still.is_frozen());
+        assert!(!spinner_moved(
+            &still,
+            Duration::from_millis(150),
+            &mut last
+        ));
     }
 
     #[test]

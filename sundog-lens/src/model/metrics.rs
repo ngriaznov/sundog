@@ -138,6 +138,9 @@ pub struct NodeMetrics {
     tx_frames: Ring<RING_LEN>,
     rebalance_in: BTreeMap<SmolStr, Ring<RING_LEN>>,
     rebalance_out: BTreeMap<SmolStr, Ring<RING_LEN>>,
+    entries_history: BTreeMap<SmolStr, Ring<RING_LEN>>,
+    hit_history: BTreeMap<SmolStr, Ring<RING_LEN>>,
+    backlog_history: BTreeMap<SmolStr, Ring<RING_LEN>>,
 }
 
 impl NodeMetrics {
@@ -159,6 +162,9 @@ impl NodeMetrics {
             tx_frames: Ring::new(),
             rebalance_in: BTreeMap::new(),
             rebalance_out: BTreeMap::new(),
+            entries_history: BTreeMap::new(),
+            hit_history: BTreeMap::new(),
+            backlog_history: BTreeMap::new(),
         }
     }
 
@@ -172,6 +178,14 @@ impl NodeMetrics {
     #[must_use]
     pub const fn folds(&self) -> u32 {
         self.folds
+    }
+
+    /// Withdraws the rates after a failed scrape: a rate describes the span
+    /// between two answers, so a node that stopped answering has none. The
+    /// latest values, the counter tracks and the quiet counts stay, so the
+    /// settle vote and the next rate span are unchanged.
+    pub fn mark_stale(&mut self) {
+        self.rates.clear();
     }
 
     /// Folds one scrape taken at `at` into the metrics and returns what it
@@ -222,6 +236,7 @@ impl NodeMetrics {
         let xfer_started = active && !self.xfer_active;
         self.xfer_active = active;
         self.fold_caches(at, first, &created);
+        self.fold_cache_histories(first);
         if !first {
             let bypassing: f64 = ["remote", "miss", "error"]
                 .iter()
@@ -266,6 +281,35 @@ impl NodeMetrics {
             self.dropped_seen.insert(peer, value);
         }
         edges
+    }
+
+    /// Pushes one sample per cache the node reports entries for: the entries
+    /// and the fan-out backlog at every fold, and the hit percentage from the
+    /// second fold on (0 at zero traffic).
+    fn fold_cache_histories(&mut self, first: bool) {
+        let caches: Vec<SmolStr> = self
+            .values
+            .keys()
+            .filter(|key| key.name() == names::CACHE_ENTRIES)
+            .filter_map(|key| key.label("cache").map(SmolStr::new))
+            .collect();
+        for cache in caches {
+            let entries = self.cache_value(names::CACHE_ENTRIES, &cache);
+            self.entries_history
+                .entry(cache.clone())
+                .or_default()
+                .push(entries.unwrap_or(0.0));
+            if let Some(backlog) = self.cache_value(names::FAN_OUT_BACKLOG, &cache) {
+                self.backlog_history
+                    .entry(cache.clone())
+                    .or_default()
+                    .push(backlog);
+            }
+            if !first {
+                let hit = self.hit_ratio(&cache).map_or(0.0, |ratio| ratio * 100.0);
+                self.hit_history.entry(cache).or_default().push(hit);
+            }
+        }
     }
 
     fn fold_caches(&mut self, at: Instant, first: bool, created: &[SeriesKey]) {
@@ -462,6 +506,26 @@ impl NodeMetrics {
     #[must_use]
     pub fn rebalance_out(&self, cache: &str) -> Option<&Ring<RING_LEN>> {
         self.rebalance_out.get(cache)
+    }
+
+    /// The entries the node held in `cache`, one sample per fold.
+    #[must_use]
+    pub fn entries_history(&self, cache: &str) -> Option<&Ring<RING_LEN>> {
+        self.entries_history.get(cache)
+    }
+
+    /// The percentage of `cache` reads that hit, one sample per fold after
+    /// the first; 0 at zero traffic.
+    #[must_use]
+    pub fn hit_history(&self, cache: &str) -> Option<&Ring<RING_LEN>> {
+        self.hit_history.get(cache)
+    }
+
+    /// The frames waiting in the fan-out backlog of `cache`, one sample per
+    /// fold. A cache that has no backlog series has no history.
+    #[must_use]
+    pub fn backlog_history(&self, cache: &str) -> Option<&Ring<RING_LEN>> {
+        self.backlog_history.get(cache)
     }
 }
 
@@ -929,6 +993,41 @@ mod tests {
         assert_eq!(metrics.rebalance_in("it").unwrap().to_vec(), [200.0]);
         assert_eq!(metrics.rebalance_out("it").unwrap().to_vec(), [50.0]);
         assert!(metrics.rebalance_in("other").is_none());
+    }
+
+    #[test]
+    fn cache_histories_hold_entries_backlog_and_hit_percentage() {
+        let base = Instant::now();
+        let mut metrics = NodeMetrics::new(node());
+        let round = |entries: f64, hits: f64, misses: f64, backlog: f64| {
+            vec![
+                sample(names::CACHE_ENTRIES, &[("cache", "side")], entries),
+                sample(names::CACHE_HITS, &[("cache", "side")], hits),
+                sample(names::CACHE_MISSES, &[("cache", "side")], misses),
+                sample(names::FAN_OUT_BACKLOG, &[("cache", "side")], backlog),
+                sample(names::CACHE_ENTRIES, &[("cache", "bare")], 7.0),
+            ]
+        };
+        metrics.fold(base, &round(100.0, 0.0, 0.0, 4.0));
+        assert_eq!(metrics.entries_history("side").unwrap().to_vec(), [100.0]);
+        assert_eq!(metrics.backlog_history("side").unwrap().to_vec(), [4.0]);
+        assert!(metrics.hit_history("side").is_none(), "needs two folds");
+        metrics.fold(at(base, 1), &round(150.0, 90.0, 10.0, 2.0));
+        metrics.fold(at(base, 2), &round(160.0, 90.0, 10.0, 0.0));
+        assert_eq!(
+            metrics.entries_history("side").unwrap().to_vec(),
+            [100.0, 150.0, 160.0]
+        );
+        assert_eq!(
+            metrics.backlog_history("side").unwrap().to_vec(),
+            [4.0, 2.0, 0.0]
+        );
+        // 90 hits and 10 misses in the second round, nothing in the third.
+        assert_eq!(metrics.hit_history("side").unwrap().to_vec(), [90.0, 0.0]);
+        assert_eq!(metrics.entries_history("bare").unwrap().len(), 3);
+        assert!(metrics.backlog_history("bare").is_none());
+        assert!(metrics.entries_history("nothing").is_none());
+        assert!(metrics.hit_history("nothing").is_none());
     }
 
     #[test]

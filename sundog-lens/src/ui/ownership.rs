@@ -27,6 +27,9 @@ const FULL_COLUMNS: u16 = 64;
 /// The width of the compact mosaic.
 const COMPACT_COLUMNS: u16 = 32;
 
+/// The widest share bar of a node line.
+const MAX_BAR: usize = 44;
+
 /// The rows the panel wants inside its border at the screen class `kind`
 /// when `nodes` nodes are eligible.
 #[must_use]
@@ -131,8 +134,11 @@ fn stats(
         } else {
             Token::Move
         };
+        // The check mark says every node agrees; while some differ the
+        // settling mark takes its place, as on the node rows.
+        let mark = if agree == entries.len() { '✓' } else { '↻' };
         full.push(look.span("reported ", Token::Muted));
-        full.push(look.span(format!("✓ {agree}/{}", entries.len()), token));
+        full.push(look.span(format!("{mark} {agree}/{}", entries.len()), token));
     }
     let short = vec![look.span(
         format!(
@@ -287,7 +293,7 @@ fn column(
         .unwrap_or(2)
         .clamp(2, 8);
     let fixed = label_width + 32;
-    let bar = width.saturating_sub(fixed).clamp(4, 28);
+    let bar = width.saturating_sub(fixed).clamp(4, MAX_BAR);
     let tail = 1 + usize::from(state.is_some() && height >= 6);
     let spare = height.saturating_sub(tail);
     let (listed, more) = if entries.len() <= spare {
@@ -493,6 +499,57 @@ mod tests {
         assert_eq!(total, 2 * PART_SPACE);
         let rows = draw(&model, LayoutKind::Full, 140, 10);
         assert!(rows[1..9].iter().any(|r| r.contains('%')));
+    }
+
+    #[test]
+    fn the_title_checks_only_when_every_node_agrees_and_otherwise_shows_settling() {
+        let model = testkit::fixture_model_with_metrics(Instant::now());
+        let rows = draw(&model, LayoutKind::Full, 140, 10);
+        assert!(rows[0].contains("reported ↻ 4/5"), "{}", rows[0]);
+        assert!(!rows[0].contains("✓ 4/5"), "{}", rows[0]);
+        // Every node reports what the observer computes.
+        let app = App::new(AppConfig::default());
+        let ctx = Ctx {
+            now: model.now().unwrap(),
+            wall: model.wall().unwrap(),
+            elapsed: Duration::ZERO,
+        };
+        let scene = Scene {
+            app: &app,
+            model: &model,
+            ctx: &ctx,
+            look: app.look(),
+            kind: LayoutKind::Full,
+        };
+        let digest = model.ownership("it").unwrap();
+        let mut listed = entries(&scene, digest);
+        for entry in &mut listed {
+            entry.reported = Some(crate::model::count_to_f64(entry.owned));
+        }
+        let text = |spans: Vec<Span<'static>>| -> String {
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        assert!(text(stats(&scene, digest, &listed, 200)).ends_with("reported ✓ 5/5"));
+        listed[0].reported = Some(0.0);
+        listed[1].reported = Some(0.0);
+        assert!(text(stats(&scene, digest, &listed, 200)).ends_with("reported ↻ 3/5"));
+        listed[2].reported = Some(0.0);
+        listed[3].reported = Some(0.0);
+        listed[4].reported = Some(0.0);
+        assert!(text(stats(&scene, digest, &listed, 200)).ends_with("reported ↻ 0/5"));
+    }
+
+    #[test]
+    fn a_compact_panel_stretches_its_share_bars_across_the_room_beside_the_mosaic() {
+        let rows = draw(&fixture(), LayoutKind::Compact, 120, 10);
+        let line = rows[1..9].iter().find(|r| r.contains("● n1")).unwrap();
+        let bar = line
+            .chars()
+            .filter(|c| matches!(c, '━' | '╸' | '─'))
+            .count();
+        assert!(bar > 28 && bar <= MAX_BAR, "{bar}: {line}");
+        let used = line.trim_end_matches('│').trim_end().chars().count();
+        assert!(used > 100, "the line ends at {used}: {line}");
     }
 
     #[test]

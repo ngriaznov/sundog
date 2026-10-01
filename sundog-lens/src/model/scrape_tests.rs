@@ -69,6 +69,17 @@ fn watching(snapshot: ClusterSnapshot, now: Instant) -> Model {
     model
 }
 
+/// As [`watching`], on a model that has finished discovering the cluster, so
+/// the first view settles with a `SETTLED` event. Returns the model and the
+/// instant the view began at.
+fn watching_past_discovery(snapshot: ClusterSnapshot, base: Instant) -> (Model, Instant) {
+    let (mut model, now) = testkit::past_discovery(base);
+    let digest = testkit::ownership_digest(&snapshot, "it").expect("a live advertiser");
+    model.apply(Update::Snapshot(Arc::new(snapshot), now), now, WALL);
+    model.apply(Update::Ownership(digest), now, WALL);
+    (model, now)
+}
+
 /// A model that has seen `snapshot` at `now` and no ownership.
 fn observing(snapshot: ClusterSnapshot, now: Instant) -> Model {
     let mut model = Model::new();
@@ -204,6 +215,39 @@ fn readiness_flips_raise_ready_and_unready() {
     assert_eq!(
         model.exporter(testkit::gossip_addr(1)).unwrap().ready(),
         Some(false)
+    );
+}
+
+#[test]
+fn a_failed_scrape_withdraws_the_rates_and_keeps_the_values() {
+    let base = Instant::now();
+    let mut model = observing(testkit::snapshot(1), base);
+    let addr = testkit::gossip_addr(1);
+    for secs in 0..2 {
+        let at = after(base, secs * 1000);
+        model.apply(answer(1, at, expo::parse(FIXTURE)), at, WALL);
+    }
+    let metrics = model.metrics(addr).unwrap();
+    assert!(metrics.rate_sum(names::CACHE_HITS).is_some());
+    let owned_before = metrics.owned_parts("it");
+    model.apply(fail(1, after(base, 2000)), after(base, 2000), WALL);
+    let metrics = model.metrics(addr).unwrap();
+    assert_eq!(metrics.rate_sum(names::CACHE_HITS), None);
+    assert_eq!(metrics.rate(names::CACHE_HITS, &[]), None);
+    assert_eq!(metrics.owned_parts("it"), owned_before);
+    assert_eq!(metrics.folds(), 2);
+    model.apply(
+        answer(1, after(base, 3000), expo::parse(FIXTURE)),
+        after(base, 3000),
+        WALL,
+    );
+    assert!(
+        model
+            .metrics(addr)
+            .unwrap()
+            .rate_sum(names::CACHE_HITS)
+            .is_some(),
+        "the next answer spans back to the last good sample"
     );
 }
 
@@ -402,8 +446,7 @@ fn a_snapshot_that_changes_the_live_count_starts_the_peer_alert_clock() {
 
 #[test]
 fn metrics_settle_a_view_only_when_every_reporting_node_agrees_and_is_quiet() {
-    let base = Instant::now();
-    let mut model = watching(testkit::snapshot(3), base);
+    let (mut model, base) = watching_past_discovery(testkit::snapshot(3), Instant::now());
     let round = |model: &mut Model, secs: u64, skew: usize| {
         let at = after(base, secs * 1000);
         let mut events = Vec::new();

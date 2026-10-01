@@ -44,6 +44,12 @@ pub(crate) const fn count_to_f64(count: usize) -> f64 {
 /// long.
 pub const GOSSIP_SETTLE: Duration = Duration::from_secs(3);
 
+/// How long the live member set has to hold still before the lens stops
+/// discovering the cluster. The observer finds members one at a time, so the
+/// ownership it computes while the set grows is the baseline, not a view
+/// change of the cluster.
+pub const DISCOVERY_QUIET: Duration = Duration::from_secs(2);
+
 /// How long a node's `sundog_live_peers` has to disagree with the observer's
 /// count before the PEERS column turns amber.
 pub const PEERS_GRACE: Duration = Duration::from_secs(3);
@@ -86,6 +92,9 @@ pub struct Model {
     lifelines: Lifelines,
     now: Option<Instant>,
     wall: Option<SystemTime>,
+    live_set: Vec<NodeId>,
+    live_set_changed: Option<Instant>,
+    discovered: bool,
 }
 
 impl Model {
@@ -104,7 +113,8 @@ impl Model {
     /// time since the node's exporter last answered when its latest scrape
     /// failed. An ownership digest replaces its cache's digest; a changed view
     /// hash or owner count raises `VIEW` and restarts the cache's settling
-    /// clock. The
+    /// clock, except while the lens is still [discovering](Self::discovering)
+    /// the cluster: those digests only replace the held one. The
     /// ownership worker alone decides what ownership the model holds:
     /// [`Update::OwnershipGone`] drops a cache's digest, settling clock and
     /// lifeline, and a snapshot never does.
@@ -119,6 +129,7 @@ impl Model {
     pub fn apply(&mut self, update: Update, now: Instant, wall: SystemTime) -> Vec<Event> {
         self.now = Some(now);
         self.wall = Some(wall);
+        self.refresh_discovery(now);
         let mut kinds = match update {
             Update::Snapshot(snapshot, _) => self.apply_snapshot(snapshot, now),
             Update::Ownership(digest) => self.apply_ownership(digest, now),
@@ -140,8 +151,30 @@ impl Model {
         let wall = self.wall_at(now);
         self.now = Some(now);
         self.wall = self.wall.map(|_| wall);
+        self.refresh_discovery(now);
         let kinds = self.settled_events(now);
         self.finish(kinds, now, wall)
+    }
+
+    /// Whether the lens is still discovering the cluster: no member has been
+    /// seen yet, or the live member set changed less than
+    /// [`DISCOVERY_QUIET`] ago. Once the set has held still that long, the
+    /// phase is over for good.
+    #[must_use]
+    pub const fn discovering(&self) -> bool {
+        !self.discovered
+    }
+
+    /// Ends discovery once the live member set has held still for
+    /// [`DISCOVERY_QUIET`].
+    fn refresh_discovery(&mut self, now: Instant) {
+        if !self.discovered
+            && self
+                .live_set_changed
+                .is_some_and(|at| now.saturating_duration_since(at) >= DISCOVERY_QUIET)
+        {
+            self.discovered = true;
+        }
     }
 
     /// Names the node at gossip address `addr` as `label`, for the slot that
@@ -410,6 +443,18 @@ impl Model {
         for member in &snapshot.members {
             self.slots.assign(member.peer.gossip_addr);
         }
+        let live_set: Vec<NodeId> = snapshot
+            .members
+            .iter()
+            .filter(|member| member.status.is_live())
+            .map(|member| member.peer.node)
+            .collect();
+        if live_set != self.live_set {
+            if !live_set.is_empty() {
+                self.live_set_changed = Some(now);
+            }
+            self.live_set = live_set;
+        }
         self.snapshot = Some(snapshot);
         kinds
     }
@@ -417,6 +462,15 @@ impl Model {
     fn apply_ownership(&mut self, digest: OwnershipDigest, now: Instant) -> Vec<EventKind> {
         let held = self.ownership.get(&digest.cache);
         let mut kinds = Vec::new();
+        if !self.discovered {
+            // The baseline: the view the observer has found so far, which
+            // grows as it finds members. Nothing moved in the cluster.
+            if held.is_none_or(|held| (held.view_hash, held.k) != (digest.view_hash, digest.k)) {
+                self.view_since.insert(digest.cache.clone(), now);
+            }
+            self.ownership.insert(digest.cache.clone(), digest);
+            return kinds;
+        }
         if held.is_none_or(|held| (held.view_hash, held.k) != (digest.view_hash, digest.k)) {
             let deltas = held.map_or_else(
                 || {
@@ -482,7 +536,12 @@ impl Model {
                     frames: edge.frames,
                 }));
             }
-            Err(error) if !error.is_mapping() => self.lifelines.suspect(addr, now),
+            Err(error) if !error.is_mapping() => {
+                self.lifelines.suspect(addr, now);
+                if let Some(metrics) = self.metrics.get_mut(&addr) {
+                    metrics.mark_stale();
+                }
+            }
             Err(_) => {}
         }
         self.scrapes.insert(addr, report);
@@ -561,6 +620,8 @@ mod tests {
     use sundog::observe::MemberStatus;
 
     use super::*;
+
+    const WALL0: SystemTime = SystemTime::UNIX_EPOCH;
 
     fn snapshot_update(snapshot: ClusterSnapshot, now: Instant) -> Update {
         Update::Snapshot(Arc::new(snapshot), now)
@@ -688,8 +749,7 @@ mod tests {
 
     #[test]
     fn a_new_owner_count_over_the_same_members_raises_a_view_and_restarts_the_clock() {
-        let mut model = Model::new();
-        let start = Instant::now();
+        let (mut model, start) = testkit::past_discovery(Instant::now());
         let two = testkit::ownership_digest_with_owners(
             &testkit::snapshot_with_owners(3, 2),
             "it",
@@ -1013,9 +1073,61 @@ mod tests {
     }
 
     #[test]
-    fn the_first_digest_raises_a_view_with_each_nodes_share() {
+    fn digests_found_while_the_observer_discovers_members_raise_no_view() {
         let mut model = Model::new();
         let t = Instant::now();
+        let mut events = model.apply(snapshot_update(testkit::snapshot(1), t), t, WALL0);
+        events.extend(model.apply(ownership_update(1), t, WALL0));
+        let t = t + Duration::from_millis(500);
+        events.extend(model.apply(snapshot_update(testkit::snapshot(2), t), t, WALL0));
+        events.extend(model.apply(ownership_update(2), t, WALL0));
+        assert_eq!(tags(&events), ["JOIN", "JOIN"], "no VIEW in {events:?}");
+        assert!(model.discovering());
+        assert_eq!(
+            model.ownership("it").unwrap().eligible.len(),
+            2,
+            "the latest digest is held as the baseline"
+        );
+        // The set held still for the quiet span: the baseline view settles
+        // quietly on the gossip hold, with no SETTLED event for it.
+        let end = t + DISCOVERY_QUIET;
+        assert!(model.tick(end).is_empty());
+        assert!(!model.discovering());
+        assert_eq!(model.settled("it"), Some(false));
+        let settled = t + GOSSIP_SETTLE;
+        assert!(
+            model.tick(settled).is_empty(),
+            "no SETTLED for the baseline"
+        );
+        assert_eq!(model.settled("it"), Some(true));
+        // A real change after discovery is a view.
+        let events = model.apply(ownership_update(3), settled, WALL0);
+        assert_eq!(tags(&events), ["VIEW"]);
+    }
+
+    #[test]
+    fn a_member_set_that_keeps_changing_keeps_the_observer_discovering() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        assert!(model.discovering());
+        for count in 1u8..=4 {
+            let at = t + Duration::from_millis(1500) * u32::from(count);
+            model.apply(snapshot_update(testkit::snapshot(count), at), at, WALL0);
+            model.tick(at + Duration::from_millis(1400));
+            assert!(model.discovering(), "member {count} arrived 1.5 s ago");
+        }
+        let last = t + Duration::from_millis(6000);
+        model.tick(last + DISCOVERY_QUIET);
+        assert!(!model.discovering());
+        // The phase is over for good, even when the set changes again.
+        let again = last + DISCOVERY_QUIET + Duration::from_secs(1);
+        model.apply(snapshot_update(testkit::snapshot(2), again), again, WALL0);
+        assert!(!model.discovering());
+    }
+
+    #[test]
+    fn the_first_digest_raises_a_view_with_each_nodes_share() {
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         let events = model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
         assert_eq!(tags(&events), ["VIEW"]);
         let digest = model.ownership("it").unwrap();
@@ -1040,8 +1152,7 @@ mod tests {
 
     #[test]
     fn a_changed_view_raises_a_view_with_the_parts_moved_and_each_nodes_change() {
-        let mut model = Model::new();
-        let t = Instant::now();
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         let three = testkit::snapshot(3);
         let four = testkit::snapshot(4);
         let first = testkit::ownership_digest(&three, "it").unwrap();
@@ -1077,8 +1188,7 @@ mod tests {
 
     #[test]
     fn a_view_settles_once_with_the_time_it_took() {
-        let mut model = Model::new();
-        let t = Instant::now();
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         model.apply(
             ownership_update(3),
             t,
@@ -1106,8 +1216,7 @@ mod tests {
 
     #[test]
     fn an_update_after_the_hold_raises_the_settled_event_too() {
-        let mut model = Model::new();
-        let t = Instant::now();
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
         let events = model.apply(
             snapshot_update(testkit::snapshot(3), t + Duration::from_secs(5)),
@@ -1119,8 +1228,7 @@ mod tests {
 
     #[test]
     fn a_new_view_before_the_settle_restarts_it() {
-        let mut model = Model::new();
-        let t = Instant::now();
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
         model.apply(
             ownership_update(4),
@@ -1153,8 +1261,7 @@ mod tests {
 
     #[test]
     fn ownership_gone_drops_the_cache_and_a_snapshot_does_not() {
-        let mut model = Model::new();
-        let t = Instant::now();
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         model.apply(
             snapshot_update(testkit::snapshot(2), t),
             t,
@@ -1207,8 +1314,7 @@ mod tests {
 
     #[test]
     fn a_digest_after_ownership_gone_is_a_first_view() {
-        let mut model = Model::new();
-        let t = Instant::now();
+        let (mut model, t) = testkit::past_discovery(Instant::now());
         model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
         model.apply(
             Update::OwnershipGone("it".into()),

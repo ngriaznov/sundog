@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 
 use super::look::{Look, Token};
-use super::theme::Rgb;
 
 /// A panel's frame: a rounded border, a bold title with a provenance tag and
 /// right-aligned stats. The focused panel's border is amber.
@@ -103,6 +102,15 @@ pub fn centered(lines_in: Vec<Line<'static>>, area: Rect, buf: &mut Buffer) {
         .render(target, buf);
 }
 
+/// `area` with a cell of padding on its left and right.
+#[must_use]
+pub const fn padded(area: Rect) -> Rect {
+    if area.width < 2 {
+        return area;
+    }
+    Rect::new(area.x + 1, area.y, area.width - 2, area.height)
+}
+
 /// A line of `spans`.
 #[must_use]
 pub fn line(spans: Vec<Span<'static>>) -> Line<'static> {
@@ -113,12 +121,6 @@ pub fn line(spans: Vec<Span<'static>>) -> Line<'static> {
 #[must_use]
 pub fn gap(width: usize) -> Span<'static> {
     Span::raw(" ".repeat(width))
-}
-
-/// A colored glyph in a node's color.
-#[must_use]
-pub fn node_glyph(look: Look, glyph: char, color: Rgb) -> Span<'static> {
-    look.node_span(glyph.to_string(), color)
 }
 
 /// The width of a line in cells.
@@ -164,8 +166,9 @@ pub fn clip(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 }
 
 /// The text of a buffer row, trailing spaces trimmed.
+#[cfg(test)]
 #[must_use]
-pub fn row_text(buf: &Buffer, y: u16) -> String {
+pub(crate) fn row_text(buf: &Buffer, y: u16) -> String {
     let area = buf.area;
     let mut row = String::new();
     for x in area.x..area.x + area.width {
@@ -292,9 +295,6 @@ mod tests {
         assert_eq!(width_of(&pad_spans(spans, 1)), 2);
         assert_eq!(width_of(&[gap(3)]), 3);
         assert_eq!(line(vec![Span::raw("x")]).width(), 1);
-        let glyph = node_glyph(look(), '●', Rgb(1, 2, 3));
-        assert_eq!(glyph.content, "●");
-        assert_eq!(glyph.style.fg, Some(Color::Rgb(1, 2, 3)));
     }
 
     #[test]

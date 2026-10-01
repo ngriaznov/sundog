@@ -40,8 +40,16 @@ pub enum Col {
     Ops,
 }
 
-/// The width of the bar in the SHARE column.
+/// The width of the bar in the SHARE column at its narrowest.
 const BAR: usize = 8;
+
+/// The width of the sparkline in the OPS/S column at its narrowest.
+const SPARK: usize = 3;
+
+/// The most cells the SHARE bar and the OPS/S sparkline each take from the
+/// width the other columns leave over.
+const BAR_GROWTH: usize = 30;
+const SPARK_GROWTH: usize = 24;
 
 /// The width of the `▌● ` prefix: selection bar, status glyph, space.
 const PREFIX: usize = 3;
@@ -55,6 +63,10 @@ pub struct Cols {
     pub label: usize,
     /// The width of the GOSSIP column, with its gap.
     pub gossip: usize,
+    /// The width of the bar in the SHARE column.
+    pub bar: usize,
+    /// The width of the sparkline in the OPS/S column.
+    pub spark: usize,
 }
 
 impl Cols {
@@ -62,7 +74,8 @@ impl Cols {
     /// rows whose labels are up to `label` wide and whose gossip addresses
     /// are up to `gossip` characters. A narrow screen keeps NAME, SHARE and
     /// OPS; wider ones drop GOSSIP, CACHES, P, UP and PEERS, in that order,
-    /// until the table fits.
+    /// until the table fits. Width the columns leave over goes to the SHARE
+    /// bar and the OPS/S sparkline.
     #[must_use]
     pub fn for_width(kind: LayoutKind, width: usize, label: usize, gossip: usize) -> Self {
         let mut cols = Self {
@@ -78,19 +91,28 @@ impl Cols {
             ],
             label: label.clamp(2, 8),
             gossip: gossip.max(15) + 1,
+            bar: BAR,
+            spark: SPARK,
         };
         if kind == LayoutKind::Narrow {
             cols.list = vec![Col::Name, Col::Share, Col::Ops];
-            return cols;
-        }
-        if kind == LayoutKind::Compact {
-            cols.list.retain(|col| *col != Col::Gossip);
-        }
-        for dropped in [Col::Gossip, Col::Caches, Col::Proto, Col::Up, Col::Peers] {
-            if cols.total() <= width {
-                break;
+        } else {
+            for dropped in [Col::Gossip, Col::Caches, Col::Proto, Col::Up, Col::Peers] {
+                if cols.total() <= width {
+                    break;
+                }
+                cols.list.retain(|col| *col != dropped);
             }
-            cols.list.retain(|col| *col != dropped);
+        }
+        // One cell stays free at the right edge.
+        let spare = width.saturating_sub(cols.total() + 1);
+        if cols.has(Col::Share) {
+            let take = (spare * 3 / 5).min(BAR_GROWTH);
+            cols.bar += take;
+        }
+        if cols.has(Col::Ops) {
+            let take = spare.saturating_sub(cols.bar - BAR).min(SPARK_GROWTH);
+            cols.spark += take;
         }
         cols
     }
@@ -99,12 +121,13 @@ impl Cols {
     #[must_use]
     pub const fn width_of(&self, col: Col) -> usize {
         match col {
-            Col::Name => self.label + 7,
+            Col::Name => self.label + 8,
             Col::Gossip => self.gossip,
             Col::Up | Col::Peers => 6,
             Col::Proto => 3,
-            Col::Caches | Col::Ops => 9,
-            Col::Share => BAR + 10,
+            Col::Caches => 9,
+            Col::Ops => self.spark + 6,
+            Col::Share => self.bar + 10,
         }
     }
 
@@ -196,9 +219,10 @@ fn share_cell(
     scene: &Scene<'_>,
     row: &NodeRow<'_>,
     digest: Option<&OwnershipDigest>,
+    bar: usize,
 ) -> Vec<Span<'static>> {
     let look = scene.look;
-    let blank = || vec![gap(BAR + 10)];
+    let blank = || vec![gap(bar + 10)];
     let Some(digest) = digest else { return blank() };
     let node = row.member.peer.node;
     let eligible = digest.position(node).is_some();
@@ -214,7 +238,7 @@ fn share_cell(
         scene.app.share(&digest.cache, node, target)
     };
     let fair = derive::fair_share(digest.k, digest.eligible.len());
-    let mut spans = sharebar::bar_spans(frac, Some(fair), BAR, row.color(), look);
+    let mut spans = sharebar::bar_spans(frac, Some(fair), bar, row.color(), look);
     spans.push(gap(1));
     spans.push(look.span(text::pad_left(&text::percent(target, 1), 6), Token::Text));
     spans.push(gap(1));
@@ -257,15 +281,15 @@ fn peers_cell(scene: &Scene<'_>, row: &NodeRow<'_>) -> Span<'static> {
 }
 
 /// The OPS/S cell: a short sparkline and the rate.
-fn ops_cell(scene: &Scene<'_>, row: &NodeRow<'_>) -> Vec<Span<'static>> {
+fn ops_cell(scene: &Scene<'_>, row: &NodeRow<'_>, width: usize) -> Vec<Span<'static>> {
     let look = scene.look;
-    let Some(metrics) = data::metrics_of(scene.model, row) else {
-        return vec![look.span(text::pad_left("—", 9), Token::Faint)];
+    let Some(metrics) = data::fresh_metrics_of(scene.model, row) else {
+        return vec![look.span(text::pad_left("—", width + 6), Token::Faint)];
     };
     let samples = metrics.ops().to_vec();
     let rate = samples.last().copied().unwrap_or(0.0);
     vec![
-        Span::styled(spark(&samples, 3, look.braille), look.node(row.color())),
+        Span::styled(spark(&samples, width, look.braille), look.node(row.color())),
         gap(1),
         look.span(text::pad_left(&text::count(rate), 5), Token::Text),
     ]
@@ -358,17 +382,18 @@ fn row_line(
                     Token::Muted,
                 )),
                 Col::Up => {
-                    // A departing node's clock runs from the departure, not
-                    // from the join: it reads in the warning color.
+                    // A live node's clock runs from its process start (its
+                    // incarnation); a departing node's runs from the
+                    // departure and reads in the warning color.
                     let token = if row.status() == MemberStatus::Departing {
                         Token::Warn
                     } else {
                         text_token
                     };
-                    spans.push(look.span(
-                        text::pad_right(&text::uptime(row.status_age(scene.ctx.wall)), 6),
-                        token,
-                    ));
+                    let up = row
+                        .uptime(scene.ctx.wall)
+                        .unwrap_or_else(|| row.status_age(scene.ctx.wall));
+                    spans.push(look.span(text::pad_right(&text::uptime(up), 6), token));
                 }
                 Col::Proto => {
                     let token = if row.member.peer.protocol == sundog::wire::PROTOCOL_VERSION {
@@ -385,9 +410,9 @@ fn row_line(
                     let pills = cache_pills(scene, row);
                     spans.extend(panel::pad_spans(pills, 9));
                 }
-                Col::Share => spans.extend(share_cell(scene, row, digest)),
+                Col::Share => spans.extend(share_cell(scene, row, digest, cols.bar)),
                 Col::Peers => spans.push(peers_cell(scene, row)),
-                Col::Ops => spans.extend(ops_cell(scene, row)),
+                Col::Ops => spans.extend(ops_cell(scene, row, cols.spark)),
             }
         }
     }
@@ -581,10 +606,61 @@ mod tests {
     }
 
     #[test]
-    fn a_compact_table_drops_the_gossip_column() {
+    fn a_compact_table_keeps_the_gossip_column_while_it_fits() {
         let rows = draw(&fixture(), LayoutKind::Compact, 98, 13);
+        assert!(rows[1].contains("GOSSIP"), "{}", rows[1]);
+        assert!(rows[1].contains("CACHES"), "{}", rows[1]);
+        let rows = draw(&fixture(), LayoutKind::Compact, 72, 13);
         assert!(!rows[1].contains("GOSSIP"), "{}", rows[1]);
         assert!(rows[1].contains("CACHES"), "{}", rows[1]);
+    }
+
+    #[test]
+    fn a_compact_table_fills_its_panel_with_a_wider_bar_and_spark() {
+        let model = testkit::fixture_model_with_metrics(Instant::now());
+        for (width, height) in [(138, 32), (118, 34)] {
+            let rows = draw(&model, LayoutKind::Compact, width, height);
+            assert!(rows[1].contains("GOSSIP"), "{width}: {}", rows[1]);
+            let inner = usize::from(width) - 2;
+            let before = rows[1].split("OPS/S").next().unwrap();
+            let used = before.chars().count() + "OPS/S".len() - 1;
+            assert!(
+                inner - used <= 4,
+                "{width}: the table ends {} cells short:\n{}",
+                inner - used,
+                rows[1]
+            );
+            let n1 = rows.iter().find(|r| r.contains("n1")).unwrap();
+            let bar = n1.chars().filter(|c| matches!(c, '━' | '╸' | '─')).count();
+            assert!(bar > BAR + 6, "{width}: the bar grew to {bar}:\n{n1}");
+        }
+    }
+
+    #[test]
+    fn a_rejoined_row_keeps_a_space_between_its_badge_and_the_address() {
+        let mut model = Model::new();
+        let now = Instant::now();
+        let snapshot = sundog::observe::ClusterSnapshot::new(
+            "c",
+            vec![
+                testkit::member_at(1, 0, 1, MemberStatus::Down),
+                testkit::member_at(1, 1, 2, MemberStatus::Live),
+                testkit::member_at(2, 0, 1, MemberStatus::Live),
+            ],
+            0,
+        );
+        model.apply(
+            crate::source::Update::Snapshot(std::sync::Arc::new(snapshot), now),
+            now,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        for width in [84, 100] {
+            let rows = draw(&model, LayoutKind::Full, width, 8);
+            let rejoined = rows.iter().find(|r| r.contains("n1")).unwrap();
+            assert!(rejoined.contains("↻ 127.0.0.11"), "{rejoined}");
+            let steady = rows.iter().find(|r| r.contains("n2")).unwrap();
+            assert!(steady.contains("  127.0.0.12"), "{steady}");
+        }
     }
 
     #[test]
@@ -618,7 +694,12 @@ mod tests {
         let cols = Cols::for_width(LayoutKind::Full, 200, 2, 15);
         let sum: usize = cols.list.iter().map(|&c| cols.width_of(c)).sum();
         assert_eq!(cols.total(), PREFIX + sum);
-        assert!(cols.total() <= 82, "{}", cols.total());
+        assert!(cols.total() <= 200, "{}", cols.total());
+        assert_eq!(cols.bar, BAR + BAR_GROWTH, "the bar takes its share");
+        assert_eq!(cols.spark, SPARK + SPARK_GROWTH);
+        let snug = Cols::for_width(LayoutKind::Full, 82, 2, 15);
+        assert!(snug.total() <= 82, "{}", snug.total());
+        assert_eq!((snug.bar, snug.spark), (BAR, SPARK + 1));
         let long = Cols::for_width(LayoutKind::Full, 200, 20, 40);
         assert_eq!(long.label, 8);
         assert_eq!(long.gossip, 41);

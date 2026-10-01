@@ -93,6 +93,7 @@ impl ExporterState {
                 let message = error.to_string();
                 if self.mapping.as_deref() != Some(message.as_str()) {
                     kinds.push(EventKind::Exporter {
+                        node,
                         addr,
                         detail: format!("not scraped: {message}"),
                     });
@@ -108,6 +109,7 @@ impl ExporterState {
                         EventKind::Unreachable { node }
                     } else {
                         EventKind::Exporter {
+                            node,
                             addr,
                             detail: format!("not answering: {error}"),
                         }
@@ -120,6 +122,7 @@ impl ExporterState {
                 self.failures = 0;
                 if !self.ever_answered || again {
                     kinds.push(EventKind::Exporter {
+                        node,
                         addr,
                         detail: if again {
                             "answering again".to_owned()
@@ -135,6 +138,7 @@ impl ExporterState {
                     .any(|sample| sample.label("peer") == Some(own.as_str()));
                 if mismatch && !self.mismatch {
                     kinds.push(EventKind::Exporter {
+                        node,
                         addr,
                         detail: format!(
                             "reports {own} as a peer, which is the node it is mapped to: \

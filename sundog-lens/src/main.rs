@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use sundog_lens::cli::{self, Command};
 use sundog_lens::{once, watch};
 
-/// What `cluster` and `demo` say until the fleet commands are built.
+/// What `cluster` and `demo` print: this build starts no local fleet.
 const NO_FLEET: &str = "this build does not start a local fleet";
 
 fn main() -> ExitCode {
