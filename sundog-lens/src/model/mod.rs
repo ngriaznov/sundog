@@ -204,13 +204,16 @@ impl Model {
         self.wall
     }
 
-    /// The settling verdict for `cache`. Nodes whose exporter answered since
-    /// the view changed vote, and a later failed scrape does not withdraw the
-    /// vote: the cache is settled once each of them reports the parts the
+    /// The settling verdict for `cache`. Every eligible node that reports the
+    /// cache votes. A node whose exporter has not answered since the view
+    /// changed holds the verdict open until it answers or its exporter is
+    /// unreachable, and a later failed scrape does not withdraw an answered
+    /// vote. The cache is settled once each voter reports the parts the
     /// observer computes for it and has pulled none in for
     /// [`derive::QUIET_SCRAPES`] scrapes taken since the view changed. With no
-    /// such node the verdict rests on gossip alone, and the cache is settled once its view has held for
-    /// [`GOSSIP_SETTLE`]. `None` for a cache with no ownership digest.
+    /// voter the verdict rests on gossip alone, and the cache is settled once
+    /// its view has held for [`GOSSIP_SETTLE`]. `None` for a cache with no
+    /// ownership digest.
     #[must_use]
     pub fn settle(&self, cache: &str) -> Option<derive::Settle> {
         let since = *self.view_since.get(cache)?;
@@ -324,9 +327,11 @@ impl Model {
     }
 
     /// What the settling test knows about `node` for the view that began at
-    /// `since`: nothing, unless the node's exporter last answered at or after
-    /// `since` and reports `digest.cache`. A failed scrape leaves the vote as
-    /// the last answer cast it.
+    /// `since`. A node that reports nothing for `digest.cache`, or whose
+    /// exporter is unreachable and has not answered since `since`, has no
+    /// vote. A node that reports the cache but has not answered since `since`
+    /// holds the verdict open with a pending vote. A failed scrape leaves the
+    /// vote as the last answer cast it.
     fn progress(&self, digest: &OwnershipDigest, node: NodeId, since: Instant) -> NodeProgress {
         let silent = NodeProgress {
             agrees: None,
@@ -335,13 +340,25 @@ impl Model {
         let Some((member, metrics)) = self.live_member_metrics(node) else {
             return silent;
         };
-        let fresh = self
-            .last_ok
-            .get(&member.peer.gossip_addr)
-            .is_some_and(|at| *at >= since);
-        let Some(reported) = metrics.owned_parts(&digest.cache).filter(|_| fresh) else {
+        let Some(reported) = metrics.owned_parts(&digest.cache) else {
             return silent;
         };
+        let addr = member.peer.gossip_addr;
+        let fresh = self.last_ok.get(&addr).is_some_and(|at| *at >= since);
+        if !fresh {
+            let unreachable = self
+                .exporters
+                .get(&addr)
+                .is_some_and(ExporterState::unreachable);
+            return if unreachable {
+                silent
+            } else {
+                NodeProgress {
+                    agrees: Some(false),
+                    quiet_scrapes: 0,
+                }
+            };
+        }
         NodeProgress {
             agrees: Some(
                 derive::agreement(Some(reported), digest.parts_owned_by(node))

@@ -68,8 +68,9 @@ pub struct NodeProgress {
 pub struct Settle {
     /// Whether the cache has settled.
     pub settled: bool,
-    /// Whether the verdict rests on gossip alone: no eligible node reports
-    /// metrics, so the view only has to hold for [`GOSSIP_SETTLE`].
+    /// Whether the verdict rests on gossip alone: no eligible node with a
+    /// reachable exporter reports the cache, so the view only has to hold for
+    /// [`GOSSIP_SETTLE`].
     pub gossip_only: bool,
 }
 

@@ -581,15 +581,121 @@ fn a_scrape_older_than_the_view_does_not_vote() {
     }
     let verdict = model.settle("it").unwrap();
     assert!(
-        verdict.gossip_only,
+        !verdict.gossip_only && !verdict.settled,
         "reports from before the view are not evidence"
     );
-    assert!(!verdict.settled);
     model.tick(after(view_at, 3000));
+    let verdict = model.settle("it").unwrap();
+    assert!(
+        !verdict.gossip_only && !verdict.settled,
+        "nodes that report metrics are waited for, not settled by the gossip hold"
+    );
+}
+
+#[test]
+fn a_slow_scrape_interval_does_not_let_the_gossip_hold_settle_a_view() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(3), base);
+    let round = |model: &mut Model, secs: u64, nodes: u8| {
+        let at = after(base, secs * 1000);
+        for index in 1..=nodes {
+            let sample = owned(model, index);
+            model.apply(answer(index, at, vec![sample]), at, WALL);
+        }
+    };
+    for secs in [1, 5, 10] {
+        round(&mut model, secs, 3);
+    }
+    assert_eq!(model.settled("it"), Some(true), "two quiet rounds settle");
+
+    // n3 leaves at 11 s. The next round is not due for 4 s.
+    let view_at = after(base, 11_000);
+    let two = testkit::snapshot(2);
+    let digest = testkit::ownership_digest(&two, "it").unwrap();
+    model.apply(Update::Snapshot(Arc::new(two), view_at), view_at, WALL);
+    model.apply(Update::Ownership(digest), view_at, WALL);
+    let events = model.tick(after(base, 14_000));
+    assert!(
+        !events.iter().any(|event| event.kind.tag() == "SETTLED"),
+        "the gossip hold does not settle nodes that have metrics"
+    );
+    let verdict = model.settle("it").unwrap();
+    assert!(!verdict.settled && !verdict.gossip_only);
+
+    round(&mut model, 15, 2);
+    round(&mut model, 20, 2);
+    assert_eq!(
+        model.settled("it"),
+        Some(false),
+        "two rounds, one is a baseline"
+    );
+    round(&mut model, 25, 2);
+    let verdict = model.settle("it").unwrap();
+    assert!(verdict.settled && !verdict.gossip_only);
+}
+
+#[test]
+fn a_node_whose_exporter_failed_once_since_the_view_still_holds_it_open() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(3), base);
+    for secs in [1u64, 5, 10] {
+        let at = after(base, secs * 1000);
+        for index in 1..=3u8 {
+            let sample = owned(&model, index);
+            model.apply(answer(index, at, vec![sample]), at, WALL);
+        }
+    }
+    assert_eq!(model.settled("it"), Some(true));
+    let view_at = after(base, 11_000);
+    let two = testkit::snapshot(2);
+    let digest = testkit::ownership_digest(&two, "it").unwrap();
+    model.apply(Update::Snapshot(Arc::new(two), view_at), view_at, WALL);
+    model.apply(Update::Ownership(digest), view_at, WALL);
+    model.apply(fail(1, after(base, 11_000)), after(base, 11_000), WALL);
+    model.apply(fail(2, after(base, 12_000)), after(base, 12_000), WALL);
+    let events = model.tick(after(base, 13_000));
+    assert!(!events.iter().any(|event| event.kind.tag() == "SETTLED"));
+    let verdict = model.settle("it").unwrap();
+    assert!(!verdict.settled && !verdict.gossip_only);
+}
+
+#[test]
+fn unreachable_exporters_leave_the_vote_and_the_gossip_hold_settles_the_view() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(3), base);
+    for index in 1..=3u8 {
+        let sample = owned(&model, index);
+        model.apply(answer(index, base, vec![sample]), base, WALL);
+    }
+    let view_at = after(base, 10_000);
+    let two = testkit::snapshot(2);
+    let digest = testkit::ownership_digest(&two, "it").unwrap();
+    model.apply(Update::Snapshot(Arc::new(two), view_at), view_at, WALL);
+    model.apply(Update::Ownership(digest), view_at, WALL);
+    let fail_round = |model: &mut Model, secs: u64| {
+        let at = after(base, secs * 1000);
+        for index in 1..=2u8 {
+            model.apply(fail(index, at), at, WALL);
+        }
+    };
+    fail_round(&mut model, 11);
+    let verdict = model.settle("it").unwrap();
+    assert!(!verdict.gossip_only, "one failure is not unreachable");
+    fail_round(&mut model, 12);
+    for index in 1..=2u8 {
+        let state = model.exporter(testkit::gossip_addr(index)).unwrap();
+        assert!(state.unreachable());
+    }
+    let waiting = model.settle("it").unwrap();
+    assert!(waiting.gossip_only && !waiting.settled);
+    model.tick(after(
+        view_at,
+        GOSSIP_SETTLE.as_millis().try_into().unwrap(),
+    ));
     assert_eq!(
         model.settled("it"),
         Some(true),
-        "the gossip hold still settles it"
+        "no reachable exporter has a say"
     );
 }
 
