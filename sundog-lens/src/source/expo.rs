@@ -242,4 +242,58 @@ go_goroutines 7
         assert_eq!(samples.len(), 2);
         assert!((samples[1].value - 2.0).abs() < f64::EPSILON);
     }
+
+    /// A capture of `/metrics` from a running `sundog-testnode` built with the
+    /// `prometheus` feature.
+    const CAPTURE: &str = include_str!("../../tests/fixtures/metrics.prom");
+
+    #[test]
+    fn parses_every_sample_line_of_a_real_capture() {
+        let samples = parse(CAPTURE);
+        let sample_lines = CAPTURE
+            .lines()
+            .filter(|line| line.starts_with("sundog_"))
+            .count();
+        assert!(sample_lines > 30, "the capture holds real samples");
+        assert_eq!(samples.len(), sample_lines);
+        assert!(
+            samples
+                .iter()
+                .all(|s| s.value.is_finite() && s.value >= 0.0)
+        );
+        let find = |name: &str, labels: &[(&str, &str)]| {
+            samples
+                .iter()
+                .find(|s| s.name == name && labels.iter().all(|(k, v)| s.label(k) == Some(*v)))
+                .map(|s| s.value)
+        };
+        assert_eq!(find("sundog_live_peers", &[]), Some(2.0));
+        assert_eq!(find("sundog_open_caches", &[]), Some(4.0));
+        assert_eq!(
+            find("sundog_owned_parts", &[("cache", "it")]),
+            Some(43_616.0)
+        );
+        assert_eq!(
+            find("sundog_owned_buckets", &[("cache", "it")]),
+            Some(681.5)
+        );
+        assert_eq!(
+            find("sundog_cache_hits_total", &[("cache", "it")]),
+            Some(268.0)
+        );
+        assert_eq!(
+            find(
+                "sundog_fetch_total",
+                &[("cache", "it"), ("outcome", "remote")]
+            ),
+            Some(39.0)
+        );
+        assert_eq!(
+            find(
+                "sundog_rebalance_parts_total",
+                &[("cache", "it"), ("direction", "in")]
+            ),
+            Some(43_616.0)
+        );
+    }
 }

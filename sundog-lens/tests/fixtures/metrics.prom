@@ -1,0 +1,66 @@
+# TYPE sundog_state_transfer_records_total counter
+sundog_state_transfer_records_total{cache="churn"} 0
+sundog_state_transfer_records_total{cache="pn"} 0
+sundog_state_transfer_records_total{cache="os"} 0
+
+# TYPE sundog_cache_hits_total counter
+sundog_cache_hits_total{cache="it"} 268
+sundog_cache_hits_total{cache="os"} 0
+sundog_cache_hits_total{cache="pn"} 0
+sundog_cache_hits_total{cache="churn"} 0
+
+# TYPE sundog_clock_skew_rejected_total counter
+sundog_clock_skew_rejected_total{cache="pn"} 0
+sundog_clock_skew_rejected_total{cache="it"} 0
+sundog_clock_skew_rejected_total{cache="churn"} 0
+sundog_clock_skew_rejected_total{cache="os"} 0
+
+# TYPE sundog_forwarded_writes_total counter
+sundog_forwarded_writes_total{cache="it"} 1018
+
+# TYPE sundog_fetch_total counter
+sundog_fetch_total{cache="it",outcome="remote"} 39
+sundog_fetch_total{cache="it",outcome="miss"} 9
+sundog_fetch_total{cache="it",outcome="local"} 86
+
+# TYPE sundog_frames_sent_total counter
+sundog_frames_sent_total 87839
+
+# TYPE sundog_cache_misses_total counter
+sundog_cache_misses_total{cache="os"} 0
+sundog_cache_misses_total{cache="churn"} 0
+sundog_cache_misses_total{cache="it"} 218
+sundog_cache_misses_total{cache="pn"} 0
+
+# TYPE sundog_rebalance_parts_total counter
+sundog_rebalance_parts_total{cache="it",direction="out"} 21920
+sundog_rebalance_parts_total{cache="it",direction="in"} 43616
+sundog_rebalance_parts_total{cache="it",direction="served"} 43616
+
+# TYPE sundog_bytes_sent_total counter
+sundog_bytes_sent_total 1900752
+
+# TYPE sundog_fan_out_backlog gauge
+sundog_fan_out_backlog{cache="churn"} 0
+sundog_fan_out_backlog{cache="it"} 0
+sundog_fan_out_backlog{cache="pn"} 0
+sundog_fan_out_backlog{cache="os"} 0
+
+# TYPE sundog_owned_buckets gauge
+sundog_owned_buckets{cache="it"} 681.5
+
+# TYPE sundog_cache_entries gauge
+sundog_cache_entries{cache="churn"} 0
+sundog_cache_entries{cache="os"} 1
+sundog_cache_entries{cache="pn"} 20
+sundog_cache_entries{cache="it"} 2040
+
+# TYPE sundog_open_caches gauge
+sundog_open_caches 4
+
+# TYPE sundog_live_peers gauge
+sundog_live_peers 2
+
+# TYPE sundog_owned_parts gauge
+sundog_owned_parts{cache="it"} 43616
+

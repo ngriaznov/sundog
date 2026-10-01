@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use crate::cli::{Seed, WatchArgs};
 use crate::model::ownership::OwnershipDigest;
+use targets::TemplateError;
 
 pub mod expo;
 pub mod http;
@@ -21,7 +22,7 @@ pub mod ownership;
 pub mod scrape;
 pub mod targets;
 
-pub use scrape::ScrapeReport;
+pub use scrape::{ScrapeConfig, ScrapeReport};
 
 /// One input to the [`Model`](crate::model::Model).
 #[derive(Debug, Clone)]
@@ -52,11 +53,13 @@ pub struct FeedConfig {
     pub bind: SocketAddr,
     /// The address the observer advertises, when not the bound one.
     pub advertise: Option<IpAddr>,
+    /// How to find and poll each node's exporter; `None` scrapes nothing.
+    pub scrape: Option<ScrapeConfig>,
 }
 
 impl FeedConfig {
-    /// A configuration for `cluster` with no seeds, binding every interface on
-    /// a free port.
+    /// A configuration for `cluster` with no seeds and no scraping, binding
+    /// every interface on a free port.
     #[must_use]
     pub fn new(cluster: impl Into<String>) -> Self {
         Self {
@@ -64,23 +67,33 @@ impl FeedConfig {
             seeds: Vec::new(),
             bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             advertise: None,
+            scrape: None,
         }
     }
 }
 
-impl From<&WatchArgs> for FeedConfig {
-    fn from(args: &WatchArgs) -> Self {
-        Self {
+impl TryFrom<&WatchArgs> for FeedConfig {
+    type Error = TemplateError;
+
+    /// The configuration `args` ask for. It scrapes when they give a
+    /// `--metrics` template or a `--scrape` pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first `--metrics` template that does not parse.
+    fn try_from(args: &WatchArgs) -> Result<Self, Self::Error> {
+        Ok(Self {
             cluster: args.cluster.clone(),
             seeds: args.seeds.clone(),
             bind: args.bind,
             advertise: args.advertise,
-        }
+            scrape: ScrapeConfig::from_args(args)?,
+        })
     }
 }
 
-/// The running sources: the gossip observer and the ownership worker, both
-/// feeding one stream of [`Update`]s.
+/// The running sources: the gossip observer, the ownership worker and, when
+/// configured, the metrics scraper, all feeding one stream of [`Update`]s.
 #[derive(Debug)]
 pub struct Feed {
     observer: Observer,
@@ -112,14 +125,19 @@ impl Feed {
             Vec::new(),
             0,
         )));
-        let tasks = vec![
-            tokio::spawn(observer::forward(
-                observer.subscribe(),
+        let mut tasks = vec![tokio::spawn(observer::forward(
+            observer.subscribe(),
+            tx.clone(),
+            Some(relay),
+        ))];
+        if let Some(scrape) = config.scrape {
+            tasks.push(tokio::spawn(scrape::run(
+                scrape,
+                relayed.clone(),
                 tx.clone(),
-                Some(relay),
-            )),
-            tokio::spawn(ownership::run(relayed, tx)),
-        ];
+            )));
+        }
+        tasks.push(tokio::spawn(ownership::run(relayed, tx)));
         Ok(Self {
             observer,
             updates,
@@ -175,6 +193,7 @@ mod tests {
         assert!(config.seeds.is_empty());
         assert_eq!(config.bind, SocketAddr::from(([0, 0, 0, 0], 0)));
         assert_eq!(config.advertise, None);
+        assert_eq!(config.scrape, None);
     }
 
     #[test]
@@ -188,16 +207,43 @@ mod tests {
             "127.0.0.1:7000",
             "--advertise",
             "10.0.0.9",
+            "--metrics",
+            "http://{ip}:9090/metrics",
         ])
         .unwrap();
         let crate::cli::Command::Watch(args) = command else {
             panic!("a watch command");
         };
-        let config = FeedConfig::from(&args);
+        let config = FeedConfig::try_from(&args).unwrap();
         assert_eq!(config.cluster, "prod");
         assert_eq!(config.seeds, [Seed::Addr("10.0.0.1:7946".parse().unwrap())]);
         assert_eq!(config.bind, "127.0.0.1:7000".parse().unwrap());
         assert_eq!(config.advertise, Some("10.0.0.9".parse().unwrap()));
+        let scrape = config.scrape.expect("a template asks for scraping");
+        assert_eq!(scrape.templates.len(), 1);
+    }
+
+    #[test]
+    fn a_config_without_templates_or_pins_scrapes_nothing_and_a_bad_template_fails() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["watch", "prod"];
+            args.extend_from_slice(extra);
+            let crate::cli::Command::Watch(args) = crate::cli::parse(args).unwrap() else {
+                panic!("a watch command");
+            };
+            FeedConfig::try_from(&args)
+        };
+        assert_eq!(parse(&[]).unwrap().scrape, None);
+        assert!(
+            parse(&["--scrape", "n1=http://h:1/m"])
+                .unwrap()
+                .scrape
+                .is_some()
+        );
+        assert_eq!(
+            parse(&["--metrics", "http://{nope}/m"]).unwrap_err(),
+            TemplateError::UnknownPlaceholder("nope".into())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

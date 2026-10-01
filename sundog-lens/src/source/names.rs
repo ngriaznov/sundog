@@ -101,4 +101,85 @@ mod tests {
             );
         }
     }
+
+    /// Names a healthy, spill-free node does not export in the capture: the
+    /// exporter creates each series on its first event, and these need a
+    /// resident-bytes ceiling, a dropped frame, a full outbox, a timed-out
+    /// pull, a repair, a declined round or the spill tier.
+    const ABSENT_FROM_THE_CAPTURE: &[&str] = &[
+        CACHE_BYTES,
+        BACKLOG_DROPPED,
+        FAN_OUT_WAIT_SECONDS,
+        REBALANCE_PULL_TIMEOUTS,
+        AE_REPAIRED,
+        STALE_VIEW,
+        SPILL_BYTES_USED,
+        SPILL_ENTRIES,
+    ];
+
+    fn capture_names() -> HashSet<String> {
+        crate::source::expo::parse(include_str!("../../tests/fixtures/metrics.prom"))
+            .into_iter()
+            .map(|sample| sample.name)
+            .collect()
+    }
+
+    #[test]
+    fn the_capture_exports_every_name_a_healthy_node_exports() {
+        let exported = capture_names();
+        for name in ALL {
+            if ABSENT_FROM_THE_CAPTURE.contains(name) {
+                continue;
+            }
+            assert!(
+                exported.contains(*name),
+                "{name} is missing from tests/fixtures/metrics.prom: the exporter renamed \
+                 it, or the capture needs retaking"
+            );
+        }
+    }
+
+    #[test]
+    fn the_names_absent_from_the_capture_are_in_the_name_list_and_still_absent() {
+        let exported = capture_names();
+        for name in ABSENT_FROM_THE_CAPTURE {
+            assert!(ALL.contains(name), "{name} is not a name the lens reads");
+            assert!(
+                !exported.contains(*name),
+                "{name} is in the capture now: take it off ABSENT_FROM_THE_CAPTURE"
+            );
+        }
+    }
+
+    /// The `.rs` files under `dir`, recursively.
+    fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("the sundog source directory reads") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                found.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_sundog_source_registers_every_name() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sundog/src");
+        let sources: Vec<String> = rust_sources(&root)
+            .iter()
+            .map(|path| std::fs::read_to_string(path).expect("a source file reads"))
+            .collect();
+        assert!(sources.len() > 10, "the walk found sundog's sources");
+        for name in ALL {
+            let literal = format!("\"{name}\"");
+            assert!(
+                sources.iter().any(|source| source.contains(&literal)),
+                "{name} is not registered anywhere in sundog/src: the exporter renamed or \
+                 dropped it"
+            );
+        }
+    }
 }

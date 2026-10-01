@@ -6,14 +6,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use smol_str::SmolStr;
-use sundog::observe::ClusterSnapshot;
+use sundog::NodeId;
+use sundog::observe::{ClusterSnapshot, MemberStatus};
+use sundog::store::Mode;
 
 use crate::source::{ScrapeReport, Update};
+use derive::NodeProgress;
 
 pub mod derive;
 pub mod digest;
 pub mod events;
+pub mod exporter;
 pub mod lifelines;
+pub mod metrics;
 pub mod ownership;
 pub mod series;
 pub mod slots;
@@ -22,7 +27,9 @@ pub mod testkit;
 
 pub use digest::{ModelDigest, digest};
 pub use events::{Event, EventKind, EventLog, Filter, diff_snapshots};
+pub use exporter::ExporterState;
 pub use lifelines::Lifelines;
+pub use metrics::NodeMetrics;
 pub use ownership::OwnershipDigest;
 pub use slots::{Slot, Slots};
 
@@ -37,6 +44,30 @@ pub(crate) const fn count_to_f64(count: usize) -> f64 {
 /// long.
 pub const GOSSIP_SETTLE: Duration = Duration::from_secs(3);
 
+/// How long a node's `sundog_live_peers` has to disagree with the observer's
+/// count before the PEERS column turns amber.
+pub const PEERS_GRACE: Duration = Duration::from_secs(3);
+
+/// A node's peer count against the observer's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeersView {
+    /// The node's `sundog_live_peers`.
+    pub reported: f64,
+    /// The observer's live members, less the node itself.
+    pub expected: usize,
+    /// Whether the two have disagreed for [`PEERS_GRACE`].
+    pub amber: bool,
+}
+
+/// Members the observer counts live: `Live` and `Departing`.
+fn live_members(snapshot: &ClusterSnapshot) -> usize {
+    snapshot
+        .members
+        .iter()
+        .filter(|member| member.status.is_live())
+        .count()
+}
+
 /// The state the interface draws. `Clone` so the frozen display can keep a
 /// copy while collection continues.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +79,9 @@ pub struct Model {
     settle_pending: BTreeSet<SmolStr>,
     scrapes: BTreeMap<SocketAddr, ScrapeReport>,
     last_ok: BTreeMap<SocketAddr, Instant>,
+    metrics: BTreeMap<SocketAddr, NodeMetrics>,
+    exporters: BTreeMap<SocketAddr, ExporterState>,
+    peers_differ_since: BTreeMap<SocketAddr, Instant>,
     log: EventLog,
     lifelines: Lifelines,
     now: Option<Instant>,
@@ -73,10 +107,15 @@ impl Model {
     /// clock. The
     /// ownership worker alone decides what ownership the model holds:
     /// [`Update::OwnershipGone`] drops a cache's digest, settling clock and
-    /// lifeline, and a snapshot never does. A scrape
-    /// replaces the node's last report, marks the node suspect on a failure
-    /// and live again on a success. Any update raises `SETTLED` for a cache
-    /// whose view has held long enough.
+    /// lifeline, and a snapshot never does.
+    ///
+    /// A scrape replaces the node's last report and marks the node suspect on
+    /// a failure and live again on a success. A scrape that answers folds into
+    /// the node's [`NodeMetrics`] and can raise `XFER` and `DROP`; any scrape
+    /// can raise the exporter events of [`ExporterState::observe`]. A scrape
+    /// of a node id other than the one the address held before starts that
+    /// address's metrics and exporter state afresh. Any update raises
+    /// `SETTLED` for a cache whose view has held long enough.
     pub fn apply(&mut self, update: Update, now: Instant, wall: SystemTime) -> Vec<Event> {
         self.now = Some(now);
         self.wall = Some(wall);
@@ -87,11 +126,9 @@ impl Model {
                 self.forget_cache(&cache);
                 Vec::new()
             }
-            Update::Scrape(report) => {
-                self.apply_scrape(report, now);
-                Vec::new()
-            }
+            Update::Scrape(report) => self.apply_scrape(report, now),
         };
+        self.refresh_peers(now);
         kinds.extend(self.settled_events(now));
         self.finish(kinds, now, wall)
     }
@@ -167,20 +204,169 @@ impl Model {
         self.wall
     }
 
-    /// The settling verdict for `cache`, judged from gossip alone: settled
-    /// once its view has held for [`GOSSIP_SETTLE`]. `None` for a cache with
-    /// no ownership digest.
+    /// The settling verdict for `cache`. Nodes whose exporter answered since
+    /// the view changed vote: the cache is settled once each of them reports
+    /// the parts the observer computes for it and has pulled none in for
+    /// [`derive::QUIET_SCRAPES`] scrapes. With no such node the verdict rests
+    /// on gossip alone, and the cache is settled once its view has held for
+    /// [`GOSSIP_SETTLE`]. `None` for a cache with no ownership digest.
     #[must_use]
     pub fn settle(&self, cache: &str) -> Option<derive::Settle> {
-        let since = self.view_since.get(cache)?;
+        let since = *self.view_since.get(cache)?;
         let now = self.now?;
-        Some(derive::settled(now.saturating_duration_since(*since), &[]))
+        let digest = self.ownership.get(cache)?;
+        let progress: Vec<_> = digest
+            .eligible
+            .iter()
+            .map(|&node| self.progress(digest, node, since))
+            .collect();
+        Some(derive::settled(
+            now.saturating_duration_since(since),
+            &progress,
+        ))
     }
 
     /// Whether `cache` has settled; see [`settle`](Self::settle).
     #[must_use]
     pub fn settled(&self, cache: &str) -> Option<bool> {
         self.settle(cache).map(|verdict| verdict.settled)
+    }
+
+    /// The metrics of the node at gossip address `addr`: what its exporter
+    /// reported, folded over time. A new node id at the address starts afresh.
+    #[must_use]
+    pub fn metrics(&self, addr: SocketAddr) -> Option<&NodeMetrics> {
+        self.metrics.get(&addr)
+    }
+
+    /// The exporter state of the node at gossip address `addr`.
+    #[must_use]
+    pub fn exporter(&self, addr: SocketAddr) -> Option<&ExporterState> {
+        self.exporters.get(&addr)
+    }
+
+    /// How the node at `addr` counts its peers against the observer: its
+    /// `sundog_live_peers` against the live members the observer sees, less
+    /// the node itself. `None` without metrics from a node the observer lists
+    /// live.
+    #[must_use]
+    pub fn peers(&self, addr: SocketAddr) -> Option<PeersView> {
+        let snapshot = self.snapshot.as_ref()?;
+        let metrics = self.metrics.get(&addr)?;
+        let reported = metrics.live_peers()?;
+        let listed = snapshot.members.iter().any(|member| {
+            member.peer.gossip_addr == addr
+                && member.peer.node == metrics.node()
+                && member.status.is_live()
+        });
+        listed.then(|| PeersView {
+            reported,
+            expected: live_members(snapshot).saturating_sub(1),
+            amber: self.peers_differ_since.get(&addr).is_some_and(|since| {
+                self.now
+                    .is_some_and(|now| now.saturating_duration_since(*since) >= PEERS_GRACE)
+            }),
+        })
+    }
+
+    /// The fraction of `cache`'s owner slots the eligible nodes report holding:
+    /// see [`derive::coverage`]. `None` without a digest or a reporting node.
+    #[must_use]
+    pub fn coverage(&self, cache: &str) -> Option<f64> {
+        let digest = self.ownership.get(cache)?;
+        let reported: Vec<f64> = digest
+            .eligible
+            .iter()
+            .filter_map(|&node| self.live_metrics_of(node)?.owned_parts(cache))
+            .collect();
+        if reported.is_empty() {
+            return None;
+        }
+        derive::coverage(reported.iter().sum(), digest.k, digest.eligible.len())
+    }
+
+    /// The spread of entries across the live members that advertise `cache`
+    /// as `Replicated` and report it: see [`derive::divergence`].
+    #[must_use]
+    pub fn divergence(&self, cache: &str) -> Option<f64> {
+        let snapshot = self.snapshot.as_ref()?;
+        let entries: Vec<f64> = snapshot
+            .members
+            .iter()
+            .filter(|member| {
+                member.status == MemberStatus::Live
+                    && member.caches.get(cache) == Some(&Mode::Replicated)
+            })
+            .filter_map(|member| self.live_metrics_of(member.peer.node)?.entries(cache))
+            .collect();
+        derive::divergence(&entries)
+    }
+
+    /// The metrics of the live member `node`.
+    fn live_metrics_of(&self, node: NodeId) -> Option<&NodeMetrics> {
+        let member = self
+            .snapshot
+            .as_ref()?
+            .members
+            .iter()
+            .find(|member| member.peer.node == node && member.status.is_live())?;
+        self.metrics
+            .get(&member.peer.gossip_addr)
+            .filter(|metrics| metrics.node() == node)
+    }
+
+    /// What the settling test knows about `node` for the view that began at
+    /// `since`: nothing, unless the node's exporter answered after `since` and
+    /// reports `digest.cache`.
+    fn progress(&self, digest: &OwnershipDigest, node: NodeId, since: Instant) -> NodeProgress {
+        let silent = NodeProgress {
+            agrees: None,
+            quiet_scrapes: 0,
+        };
+        let Some(metrics) = self.live_metrics_of(node) else {
+            return silent;
+        };
+        let fresh = self
+            .scrapes
+            .values()
+            .any(|report| report.node == node && report.outcome.is_ok() && report.at >= since);
+        let Some(reported) = metrics.owned_parts(&digest.cache).filter(|_| fresh) else {
+            return silent;
+        };
+        NodeProgress {
+            agrees: Some(
+                derive::agreement(Some(reported), digest.parts_owned_by(node))
+                    == derive::Agreement::Match,
+            ),
+            quiet_scrapes: metrics.quiet_scrapes(&digest.cache),
+        }
+    }
+
+    /// Starts or ends the clock of each node whose peer count disagrees with
+    /// the observer's.
+    fn refresh_peers(&mut self, now: Instant) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let live = live_members(&snapshot);
+        let differing: Vec<SocketAddr> = self
+            .metrics
+            .iter()
+            .filter(|(addr, metrics)| {
+                let listed = snapshot.members.iter().any(|member| {
+                    member.peer.gossip_addr == **addr
+                        && member.peer.node == metrics.node()
+                        && member.status.is_live()
+                });
+                listed && derive::peers_agree(metrics.live_peers(), live) == Some(false)
+            })
+            .map(|(&addr, _)| addr)
+            .collect();
+        self.peers_differ_since
+            .retain(|addr, _| differing.contains(addr));
+        for addr in differing {
+            self.peers_differ_since.entry(addr).or_insert(now);
+        }
     }
 
     fn apply_snapshot(&mut self, snapshot: Arc<ClusterSnapshot>, now: Instant) -> Vec<EventKind> {
@@ -230,15 +416,51 @@ impl Model {
         kinds
     }
 
-    fn apply_scrape(&mut self, report: ScrapeReport, now: Instant) {
-        let addr = report.addr;
-        if report.outcome.is_ok() {
-            self.last_ok.insert(addr, report.at);
-            self.lifelines.recovered(addr, now);
-        } else {
-            self.lifelines.suspect(addr, now);
+    fn apply_scrape(&mut self, report: ScrapeReport, now: Instant) -> Vec<EventKind> {
+        let (addr, node) = (report.addr, report.node);
+        if self
+            .exporters
+            .get(&addr)
+            .is_some_and(|state| state.node() != node)
+        {
+            self.exporters.remove(&addr);
+            self.metrics.remove(&addr);
+            self.last_ok.remove(&addr);
+        }
+        let listed_live = self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .members
+                .iter()
+                .any(|member| member.peer.node == node && member.status.is_live())
+        });
+        let mut kinds = self
+            .exporters
+            .entry(addr)
+            .or_insert_with(|| ExporterState::new(node))
+            .observe(&report, listed_live);
+        match &report.outcome {
+            Ok(samples) => {
+                self.last_ok.insert(addr, report.at);
+                self.lifelines.recovered(addr, now);
+                let folded = self
+                    .metrics
+                    .entry(addr)
+                    .or_insert_with(|| NodeMetrics::new(node))
+                    .fold(report.at, samples);
+                if folded.xfer_started {
+                    kinds.push(EventKind::Xfer { node });
+                }
+                kinds.extend(folded.drops.into_iter().map(|edge| EventKind::Drop {
+                    node,
+                    peer: edge.peer,
+                    frames: edge.frames,
+                }));
+            }
+            Err(error) if !error.is_mapping() => self.lifelines.suspect(addr, now),
+            Err(_) => {}
         }
         self.scrapes.insert(addr, report);
+        kinds
     }
 
     /// Drops everything the model holds for `cache`: its ownership, its
@@ -253,10 +475,12 @@ impl Model {
     /// How long before `now` the exporter of the node at `addr` last answered,
     /// when its latest scrape failed.
     fn exporter_silence(&self, addr: SocketAddr, now: Instant) -> Option<Duration> {
-        let failing = self
-            .scrapes
-            .get(&addr)
-            .is_some_and(|report| report.outcome.is_err());
+        let failing = self.scrapes.get(&addr).is_some_and(|report| {
+            report
+                .outcome
+                .as_ref()
+                .is_err_and(|error| !error.is_mapping())
+        });
         let last_ok = self.last_ok.get(&addr)?;
         failing.then(|| now.saturating_duration_since(*last_ok))
     }
@@ -302,6 +526,9 @@ impl Model {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod scrape_tests;
 
 #[cfg(test)]
 mod tests {
