@@ -73,6 +73,8 @@ pub enum UiCommand {
     Help(bool),
     /// Show a caption, or clear it.
     Caption(Option<String>),
+    /// End the interface: the scenario is over.
+    Quit,
 }
 
 /// What an [`App`] is set up with.
@@ -500,6 +502,7 @@ impl App {
             UiCommand::Cache(name) => self.cache = Some(name),
             UiCommand::Help(open) => self.help = open,
             UiCommand::Caption(text) => self.caption = text,
+            UiCommand::Quit => {}
         }
     }
 
@@ -1110,6 +1113,17 @@ mod tests {
         assert_eq!(app.caption.as_deref(), Some("hello"));
         app.apply_director(UiCommand::Caption(None), &model);
         assert_eq!(app.caption, None);
+    }
+
+    #[test]
+    fn the_quit_command_is_the_loops_to_handle_and_changes_nothing_here() {
+        let model = model();
+        let mut app = app();
+        app.apply_director(UiCommand::Tab(View::Node), &model);
+        app.apply_director(UiCommand::Caption(Some("kept".into())), &model);
+        app.apply_director(UiCommand::Quit, &model);
+        assert_eq!(app.view, View::Node);
+        assert_eq!(app.caption.as_deref(), Some("kept"));
     }
 
     #[test]

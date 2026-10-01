@@ -1,0 +1,50 @@
+# The built-in tour: joins, a crash, a graceful leave, a restart and the views.
+# Every change of state is awaited, never slept for; the pauses are for the
+# eye.
+caption "sundog-lens joins the cluster's gossip as an observer: no cache, no data plane, never a peer"
+pause 3s
+spawn 3 stagger 1s
+await members 3 within 20s
+caption "Three processes form a cluster from a name and a seed list. No coordinator."
+await settled it within 25s
+fill 20000
+load start
+pause 8s
+caption "Scale out: n4 joins and takes its share of 65,536 parts"
+spawn 1
+await settled it within 25s
+pause 2s
+tab caches
+caption "Every node reports the share the observer computes from gossip"
+pause 5s
+spawn 1
+await settled it within 25s
+tab overview
+select n3
+caption "A crash: SIGKILL, no goodbye. Ownership moves only once the failure detector notices"
+pause 3s
+kill n3
+await down n3 within 20s
+await settled it within 25s
+pause 2s
+select n2
+caption "A graceful leave: n2 announces its departure, so ownership moves before it goes"
+leave n2
+await departing n2 within 5s
+await left n2 within 20s
+await settled it within 25s
+caption "n3 restarts at the same address with a new identity and takes back a share"
+restart n3
+await members 4 within 20s
+await settled it within 25s
+pause 2s
+select n3
+tab node
+pause 5s
+help on
+pause 3s
+help off
+tab timeline
+caption "The whole story in one frame · sundog-lens watch <cluster> --seed host:7946"
+pause 6s
+quit

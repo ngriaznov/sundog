@@ -17,6 +17,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use sundog::observe::MemberStatus;
+
 use crate::cli::parse_duration;
 use crate::ui::View;
 
@@ -93,6 +95,109 @@ pub enum Step {
     /// End the scenario.
     Quit,
 }
+
+impl AwaitedStatus {
+    /// The member status the await waits for.
+    #[must_use]
+    pub const fn member_status(self) -> MemberStatus {
+        match self {
+            Self::Departing => MemberStatus::Departing,
+            Self::Left => MemberStatus::Left,
+            Self::Down => MemberStatus::Down,
+        }
+    }
+
+    /// The word a scenario writes for the status.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Departing => "departing",
+            Self::Left => "left",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// A duration as a scenario writes it: whole seconds as `3s`, otherwise
+/// milliseconds as `500ms`.
+fn write_duration(f: &mut fmt::Formatter<'_>, duration: Duration) -> fmt::Result {
+    if duration.subsec_millis() == 0 {
+        write!(f, "{}s", duration.as_secs())
+    } else {
+        write!(f, "{}ms", duration.as_millis())
+    }
+}
+
+/// The ` within <dur>` tail of an await, empty without a deadline.
+fn write_within(f: &mut fmt::Formatter<'_>, within: Option<Duration>) -> fmt::Result {
+    if let Some(within) = within {
+        f.write_str(" within ")?;
+        write_duration(f, within)?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for Step {
+    /// The step as the line that parses back to it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Caption(text) => {
+                f.write_str("caption \"")?;
+                for c in text.chars() {
+                    if matches!(c, '"' | '\\') {
+                        f.write_str("\\")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                f.write_str("\"")
+            }
+            Self::Pause(duration) => {
+                f.write_str("pause ")?;
+                write_duration(f, *duration)
+            }
+            Self::Spawn { count, stagger } => {
+                write!(f, "spawn {count}")?;
+                if let Some(stagger) = stagger {
+                    f.write_str(" stagger ")?;
+                    write_duration(f, *stagger)?;
+                }
+                Ok(())
+            }
+            Self::Fill(count) => write!(f, "fill {count}"),
+            Self::Load(true) => f.write_str("load start"),
+            Self::Load(false) => f.write_str("load stop"),
+            Self::Kill(label) => write!(f, "kill {label}"),
+            Self::Leave(label) => write!(f, "leave {label}"),
+            Self::Crash(label) => write!(f, "crash {label}"),
+            Self::Restart(label) => write!(f, "restart {label}"),
+            Self::Tab(view) => write!(f, "tab {}", view.name()),
+            Self::Select(label) => write!(f, "select {label}"),
+            Self::Cache(name) => write!(f, "cache {name}"),
+            Self::Help(true) => f.write_str("help on"),
+            Self::Help(false) => f.write_str("help off"),
+            Self::AwaitMembers { count, within } => {
+                write!(f, "await members {count}")?;
+                write_within(f, *within)
+            }
+            Self::AwaitStatus {
+                status,
+                label,
+                within,
+            } => {
+                write!(f, "await {} {label}", status.word())?;
+                write_within(f, *within)
+            }
+            Self::AwaitSettled { cache, within } => {
+                write!(f, "await settled {cache}")?;
+                write_within(f, *within)
+            }
+            Self::Quit => f.write_str("quit"),
+        }
+    }
+}
+
+/// The built-in tour, `tour.txt`.
+pub const TOUR: &str = include_str!("tour.txt");
 
 /// A step with the line it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,8 +590,8 @@ mod tests {
         assert_eq!(fails("pause").line, 1);
     }
 
-    /// The built-in tour, written out: every step kind in one script.
-    const TOUR: &str = r#"
+    /// A script using every step kind.
+    const EVERY_STEP: &str = r#"
 caption "sundog-lens joins the cluster's gossip as an observer: no cache, no data plane, never a peer"
 pause 3s
 spawn 3 stagger 1s
@@ -517,10 +622,227 @@ quit
 
     #[test]
     fn a_script_using_every_step_kind_parses_in_order() {
-        let all = steps(TOUR);
+        let all = steps(EVERY_STEP);
         assert_eq!(all.len(), 26);
         assert!(matches!(all[0], Step::Caption(_)));
         assert!(matches!(all[2], Step::Spawn { count: 3, .. }));
         assert_eq!(all[25], Step::Quit);
+    }
+
+    #[test]
+    fn every_step_prints_as_the_line_that_parses_back_to_it() {
+        let scenario = parse(EVERY_STEP).unwrap();
+        for entry in &scenario.steps {
+            let line = entry.step.to_string();
+            assert_eq!(parse(&line).unwrap().steps[0].step, entry.step, "{line}");
+        }
+        let printed: Vec<String> = scenario.steps.iter().map(|e| e.step.to_string()).collect();
+        assert_eq!(parse(&printed.join("\n")).unwrap().steps.len(), 26);
+    }
+
+    #[test]
+    fn steps_print_in_the_form_a_scenario_writes() {
+        let cases = [
+            (
+                Step::Caption("say \"hi\" \\ done".into()),
+                r#"caption "say \"hi\" \\ done""#,
+            ),
+            (Step::Pause(Duration::from_millis(500)), "pause 500ms"),
+            (Step::Pause(S(3)), "pause 3s"),
+            (Step::Pause(S(90)), "pause 90s"),
+            (Step::Pause(Duration::from_millis(1500)), "pause 1500ms"),
+            (
+                Step::Spawn {
+                    count: 3,
+                    stagger: Some(S(1)),
+                },
+                "spawn 3 stagger 1s",
+            ),
+            (
+                Step::Spawn {
+                    count: 1,
+                    stagger: None,
+                },
+                "spawn 1",
+            ),
+            (Step::Fill(20_000), "fill 20000"),
+            (Step::Load(true), "load start"),
+            (Step::Load(false), "load stop"),
+            (Step::Kill("n3".into()), "kill n3"),
+            (Step::Leave("n2".into()), "leave n2"),
+            (Step::Crash("n1".into()), "crash n1"),
+            (Step::Restart("n3".into()), "restart n3"),
+            (Step::Tab(View::Timeline), "tab timeline"),
+            (Step::Select("n3".into()), "select n3"),
+            (Step::Cache("it".into()), "cache it"),
+            (Step::Help(true), "help on"),
+            (Step::Help(false), "help off"),
+            (
+                Step::AwaitMembers {
+                    count: 4,
+                    within: Some(S(20)),
+                },
+                "await members 4 within 20s",
+            ),
+            (
+                Step::AwaitStatus {
+                    status: AwaitedStatus::Down,
+                    label: "n3".into(),
+                    within: None,
+                },
+                "await down n3",
+            ),
+            (
+                Step::AwaitSettled {
+                    cache: "it".into(),
+                    within: Some(S(25)),
+                },
+                "await settled it within 25s",
+            ),
+            (Step::Quit, "quit"),
+        ];
+        for (step, text) in cases {
+            assert_eq!(step.to_string(), text);
+            assert_eq!(parse(text).unwrap().steps[0].step, step, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_awaited_status_maps_to_a_member_status_and_its_word() {
+        for (status, member, word) in [
+            (
+                AwaitedStatus::Departing,
+                MemberStatus::Departing,
+                "departing",
+            ),
+            (AwaitedStatus::Left, MemberStatus::Left, "left"),
+            (AwaitedStatus::Down, MemberStatus::Down, "down"),
+        ] {
+            assert_eq!(status.member_status(), member);
+            assert_eq!(status.word(), word);
+        }
+    }
+
+    fn tour() -> Vec<Step> {
+        parse(TOUR)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|e| e.step)
+            .collect()
+    }
+
+    #[test]
+    fn the_built_in_tour_tells_the_story_in_order() {
+        let steps = tour();
+        let actions: Vec<String> = steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    Step::Spawn { .. }
+                        | Step::Kill(_)
+                        | Step::Leave(_)
+                        | Step::Crash(_)
+                        | Step::Restart(_)
+                )
+            })
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "spawn 3 stagger 1s",
+                "spawn 1",
+                "spawn 1",
+                "kill n3",
+                "leave n2",
+                "restart n3"
+            ]
+        );
+        assert_eq!(steps.last(), Some(&Step::Quit));
+        // The four views and the help overlay all appear.
+        for view in View::ALL {
+            assert!(steps.contains(&Step::Tab(view)), "{view:?}");
+        }
+        assert!(steps.contains(&Step::Help(true)) && steps.contains(&Step::Help(false)));
+        // A crash and a graceful leave each get their await in order.
+        let at = |wanted: &str| {
+            steps
+                .iter()
+                .position(|step| step.to_string() == wanted)
+                .unwrap_or_else(|| panic!("the tour has no `{wanted}`"))
+        };
+        assert!(at("kill n3") < at("await down n3 within 20s"));
+        assert!(at("await down n3 within 20s") < at("leave n2"));
+        assert!(at("leave n2") < at("await departing n2 within 5s"));
+        assert!(at("await departing n2 within 5s") < at("await left n2 within 20s"));
+        assert!(at("await left n2 within 20s") < at("restart n3"));
+    }
+
+    #[test]
+    fn the_built_in_tour_never_sleeps_for_a_change_of_state() {
+        let steps = tour();
+        for (index, step) in steps.iter().enumerate() {
+            let changes_state = matches!(
+                step,
+                Step::Spawn { .. }
+                    | Step::Kill(_)
+                    | Step::Leave(_)
+                    | Step::Crash(_)
+                    | Step::Restart(_)
+            );
+            if !changes_state {
+                continue;
+            }
+            // Past the captions and selections, an await comes before any pause.
+            let next = steps[index + 1..]
+                .iter()
+                .find(|step| !matches!(step, Step::Caption(_) | Step::Select(_) | Step::Tab(_)))
+                .expect("a step follows");
+            assert!(
+                matches!(
+                    next,
+                    Step::AwaitMembers { .. }
+                        | Step::AwaitStatus { .. }
+                        | Step::AwaitSettled { .. }
+                ),
+                "`{step}` is followed by `{next}`, not an await"
+            );
+        }
+        // Every await has its own deadline.
+        for step in &steps {
+            if let Step::AwaitMembers { within, .. }
+            | Step::AwaitStatus { within, .. }
+            | Step::AwaitSettled { within, .. } = step
+            {
+                assert!(within.is_some(), "`{step}` has no deadline");
+            }
+        }
+    }
+
+    #[test]
+    fn the_built_in_tour_has_time_to_read_and_stays_inside_the_budget() {
+        let steps = tour();
+        let pauses: Duration = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Pause(duration) => Some(*duration),
+                _ => None,
+            })
+            .sum();
+        // The pauses are the eye's time; the awaits add the cluster's. The
+        // whole run targets 75 to 90 seconds and must finish within 95.
+        assert!(pauses >= S(30) && pauses <= S(45), "{pauses:?}");
+        let deadlines: Duration = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::AwaitMembers { within, .. }
+                | Step::AwaitStatus { within, .. }
+                | Step::AwaitSettled { within, .. } => *within,
+                _ => None,
+            })
+            .sum();
+        assert!(deadlines > S(60), "the awaits are generous: {deadlines:?}");
     }
 }

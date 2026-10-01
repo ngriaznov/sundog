@@ -13,10 +13,11 @@ use sundog::{Cluster, ClusterConfig};
 use sundog_lens::app::{App, AppConfig, FleetCmd, UiCommand};
 use sundog_lens::cli::Seed;
 use sundog_lens::model::Model;
+use sundog_lens::model::digest::ModelDigest;
 use sundog_lens::source::{Feed, FeedConfig};
 use sundog_lens::ui::View;
 use sundog_lens::watch::{Session, drive};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 fn loopback_config() -> ClusterConfig {
     ClusterConfig::default().with(|config| {
@@ -98,6 +99,7 @@ async fn the_loop_draws_the_cluster_follows_keys_and_commands_and_quits() {
         commands: Some(command_rx),
         fleet: Some(fleet_tx),
         exit_after: Some(Duration::from_secs(60)),
+        digests: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("the test terminal");
     let driver = tokio::spawn(async move {
@@ -160,6 +162,7 @@ async fn the_loop_ends_at_exit_after_and_shows_the_splash_before_a_member_appear
         commands: None,
         fleet: None,
         exit_after: Some(Duration::from_secs(2)),
+        digests: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("the test terminal");
     let started = std::time::Instant::now();
@@ -201,6 +204,7 @@ async fn the_loop_shuts_the_feed_down_and_returns_when_the_process_is_asked_to_s
         commands: None,
         fleet: None,
         exit_after: None,
+        digests: None,
     };
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("the test terminal");
     tokio::time::timeout(
@@ -210,4 +214,58 @@ async fn the_loop_shuts_the_feed_down_and_returns_when_the_process_is_asked_to_s
     .await
     .expect("a resolved stop future ends the loop")
     .expect("the loop ends cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_digest_follows_the_cluster_and_a_quit_command_ends_the_loop() {
+    let name = "lens-watch-digest";
+    let a = node(name, None).await;
+    let b = node(name, Some(a.local_gossip_addr())).await;
+    let _caches = (open_it(&a).await, open_it(&b).await);
+    let feed = feed_for(name, a.local_gossip_addr()).await;
+    let app = App::new(AppConfig {
+        demo: true,
+        cluster: name.to_owned(),
+        ..AppConfig::default()
+    });
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (digest_tx, mut digest_rx) = watch::channel(ModelDigest::default());
+    let (_input_tx, input_rx) = mpsc::unbounded_channel();
+    let session = Session {
+        feed,
+        model: Model::new(),
+        app,
+        commands: Some(command_rx),
+        fleet: None,
+        exit_after: Some(Duration::from_secs(60)),
+        digests: Some(digest_tx),
+    };
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("the test terminal");
+    let driver = tokio::spawn(async move {
+        drive(&mut terminal, session, input_rx, std::future::pending()).await
+    });
+
+    let reached = tokio::time::timeout(
+        Duration::from_secs(30),
+        digest_rx.wait_for(|digest| digest.live == 2 && digest.view_hash.contains_key("it")),
+    )
+    .await
+    .expect("the digest shows both nodes and the view within the bound")
+    .expect("the digest channel stays open");
+    assert_eq!(reached.statuses.len(), 2);
+    drop(reached);
+
+    // Without a quit the loop keeps running.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!driver.is_finished());
+    let started = std::time::Instant::now();
+    command_tx.send(UiCommand::Quit).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), driver)
+        .await
+        .expect("the loop ends after the quit command")
+        .expect("the loop does not panic")
+        .expect("the loop ends cleanly");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    a.shutdown().await;
+    b.shutdown().await;
 }

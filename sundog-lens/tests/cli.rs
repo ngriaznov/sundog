@@ -78,12 +78,50 @@ fn a_bad_metrics_template_fails_before_any_network_use() {
     assert!(stderr.contains("nope"), "{stderr}");
 }
 
+#[cfg(unix)]
 #[test]
-fn the_fleet_commands_say_this_build_has_no_fleet() {
+fn the_fleet_commands_without_a_test_node_fail_before_starting_anything() {
+    for command in ["cluster", "demo"] {
+        let output = lens(&[command, "--testnode", "/no/such/sundog-testnode"]);
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("--testnode /no/such/sundog-testnode"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("not a file"), "{stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_scenario_file_with_a_bad_line_fails_naming_the_file_and_the_line() {
+    let dir = std::env::temp_dir().join(format!("sundog-lens-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let scenario = dir.join("bad.txt");
+    std::fs::write(&scenario, "pause 1s\nfrobnicate\n").unwrap();
+    let output = lens(&[
+        "demo",
+        "--headless",
+        "--scenario",
+        scenario.to_str().unwrap(),
+        "--testnode",
+        "/no/such/sundog-testnode",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("bad.txt"), "{stderr}");
+    assert!(stderr.contains("line 2"), "{stderr}");
+    assert!(stderr.contains("frobnicate"), "{stderr}");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn the_fleet_commands_need_a_unix_host() {
     for command in ["cluster", "demo"] {
         let output = lens(&[command]);
         assert_eq!(output.status.code(), Some(2), "{command}");
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(stderr.contains("does not start a local fleet"), "{stderr}");
+        assert!(stderr.contains("need a Unix host"), "{stderr}");
     }
 }

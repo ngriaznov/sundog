@@ -68,6 +68,17 @@ impl View {
         }
     }
 
+    /// The word a scenario `tab` step writes for the view.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Caches => "caches",
+            Self::Node => "node",
+            Self::Timeline => "timeline",
+        }
+    }
+
     /// The tab title.
     #[must_use]
     pub const fn title(self) -> &'static str {
@@ -387,6 +398,8 @@ mod tests {
     fn views_parse_by_name_and_have_titles() {
         for view in View::ALL {
             assert_eq!(View::from_name(&view.title().to_lowercase()), Some(view));
+            assert_eq!(View::from_name(view.name()), Some(view));
+            assert_eq!(view.name(), view.title().to_lowercase());
         }
         assert_eq!(View::from_name("Overview"), None);
         assert_eq!(View::from_name("nope"), None);

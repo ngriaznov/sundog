@@ -14,12 +14,13 @@ use anyhow::{Context, bail};
 use crossterm::event::{self, Event};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::app::{Action, App, AppConfig, FleetCmd, UiCommand};
 use crate::cli::WatchArgs;
 use crate::model::Model;
+use crate::model::digest::{self, ModelDigest};
 use crate::source::{Feed, FeedConfig, Update};
 use crate::ui::anim;
 use crate::ui::look::Look;
@@ -46,6 +47,9 @@ pub struct Session {
     pub fleet: Option<mpsc::UnboundedSender<FleetCmd>>,
     /// Quit after this long.
     pub exit_after: Option<Duration>,
+    /// Where to publish the model's digest after every change, for the
+    /// scenario director to await on, in demo mode.
+    pub digests: Option<watch::Sender<ModelDigest>>,
 }
 
 /// The interface configuration `args` ask for.
@@ -110,6 +114,7 @@ pub async fn run(args: WatchArgs) -> anyhow::Result<()> {
         commands: None,
         fleet: None,
         exit_after: args.exit_after,
+        digests: None,
     })
     .await
 }
@@ -323,9 +328,13 @@ where
                     let Some(update) = session.feed.try_recv() else { break };
                     fold(&mut session, update);
                 }
+                publish_session_digest(&session);
                 dirty = true;
             }
             Some(command) = next_command(&mut session.commands) => {
+                if command == UiCommand::Quit {
+                    break Ok(());
+                }
                 session.app.apply_director(command, &session.model);
                 dirty = true;
             }
@@ -336,6 +345,7 @@ where
                 if !session.model.tick(now).is_empty() {
                     dirty = true;
                 }
+                publish_session_digest(&session);
                 session.app.observe(&session.model, now);
                 session.app.step(dt);
                 let second = SystemTime::now()
@@ -371,6 +381,27 @@ where
     };
     session.feed.shutdown().await;
     result
+}
+
+/// Publishes the digest of `model` on `digests` when it differs from the
+/// last one published.
+pub fn publish_digest(model: &Model, digests: &watch::Sender<ModelDigest>) {
+    let now = digest::digest(model);
+    digests.send_if_modified(|held| {
+        if *held == now {
+            false
+        } else {
+            *held = now;
+            true
+        }
+    });
+}
+
+/// Publishes the session's digest, when the session has a director to feed.
+fn publish_session_digest(session: &Session) {
+    if let Some(digests) = &session.digests {
+        publish_digest(&session.model, digests);
+    }
 }
 
 /// Folds one update into the model and tells the interface.
@@ -578,6 +609,27 @@ mod tests {
             .await
             .expect("the signal ends the wait")
             .expect("the wait does not panic");
+    }
+
+    #[test]
+    fn a_digest_is_published_only_when_it_changes() {
+        let (digests, mut receiver) = watch::channel(ModelDigest::default());
+        // An empty model digests to the digest the channel starts with.
+        publish_digest(&Model::new(), &digests);
+        assert!(!receiver.has_changed().unwrap());
+
+        let model = crate::model::testkit::fixture_model(Instant::now());
+        publish_digest(&model, &digests);
+        assert!(receiver.has_changed().unwrap());
+        let held = receiver.borrow_and_update().clone();
+        assert_eq!(held, digest::digest(&model));
+        assert!(held.live > 0 && !held.view_hash.is_empty());
+
+        publish_digest(&model, &digests);
+        assert!(
+            !receiver.has_changed().unwrap(),
+            "the same digest is not news"
+        );
     }
 
     #[test]
