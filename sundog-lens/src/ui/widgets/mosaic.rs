@@ -114,6 +114,21 @@ impl<'a> Mosaic<'a> {
     }
 }
 
+/// The glyphs that tell eight nodes apart where there is no color: the cell
+/// of a bucket led by node `i` draws `MONO_GLYPHS[i % 8]`.
+pub const MONO_GLYPHS: [char; 8] = ['█', '▓', '▒', '░', '▀', '▄', '▌', '·'];
+
+/// The glyph of a mono cell whose upper pixel has lead `index`; a bucket with
+/// no lead draws a blank.
+#[must_use]
+pub fn mono_glyph(index: u8) -> char {
+    if index == NO_LEAD {
+        ' '
+    } else {
+        MONO_GLYPHS[usize::from(index) % MONO_GLYPHS.len()]
+    }
+}
+
 impl Widget for Mosaic<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let prev = self.flash.map(|(prev, _)| prev);
@@ -135,8 +150,14 @@ impl Widget for Mosaic<'_> {
                 let style = Style::new()
                     .fg(self.color(upper, flash_upper).color(self.mode))
                     .bg(self.color(lower, flash_lower).color(self.mode));
+                // Without color the lead is told by the glyph.
+                let glyph = if self.mode == ColorMode::Mono {
+                    mono_glyph(upper)
+                } else {
+                    '▀'
+                };
                 if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
-                    cell.set_char('▀').set_style(style);
+                    cell.set_char(glyph).set_style(style);
                 }
             }
         }
@@ -326,5 +347,30 @@ mod tests {
         let mut buf = Buffer::empty(area);
         Mosaic::new(&lead, &[Rgb(1, 2, 3)], ColorMode::Truecolor).render(area, &mut buf);
         assert_eq!(buf.cell((9, 2)).unwrap().symbol(), "▀");
+    }
+
+    #[test]
+    fn without_color_each_lead_gets_its_own_glyph() {
+        let mut seen = std::collections::BTreeSet::new();
+        for index in 0..8u8 {
+            seen.insert(mono_glyph(index));
+            assert!(crate::ui::theme::is_allowed(mono_glyph(index)));
+        }
+        assert_eq!(seen.len(), 8);
+        assert_eq!(mono_glyph(8), mono_glyph(0), "nine nodes share a glyph");
+        assert_eq!(mono_glyph(NO_LEAD), ' ');
+        let lead = lead_of(|b| u8::try_from(b % 3).unwrap());
+        let palette = [theme::NODE_COLORS[0]; 3];
+        let area = Rect::new(0, 0, 64, 8);
+        let mut buf = Buffer::empty(area);
+        Mosaic::new(&lead, &palette, ColorMode::Mono).render(area, &mut buf);
+        let glyphs: std::collections::BTreeSet<_> = (0..64)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap())
+            .collect();
+        assert!(
+            glyphs.contains(&'█') && glyphs.contains(&'▓') && glyphs.contains(&'▒'),
+            "{glyphs:?}"
+        );
+        assert!(!glyphs.contains(&'▀'));
     }
 }

@@ -1,0 +1,40 @@
+ ●•• sundog lens  fixture   ● 5 live  ◐ 1 leaving  ✖ 1 down  ○ 1 left   proto 6   observer 127.0.0.1:41733 · 0 anon          ⠋ 00:01:21 UTC
+  1 Overview   2 Caches   3 Node   4 Timeline                               metrics 6/6 · 1 s     it · part view 5d69e3db ↻ settling 71.0 s
+╭ Lifelines · last 2 min ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│▌n1                                            ▲━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
+│ n2                                            ▲━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
+│ n3                                            ▲━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
+│ n4                                                  ▲━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
+│ n5                                                  ▲━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
+│ n6                                                  ▲━━━━◐┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ │
+│ n7                                                  ▲━━━━✖                                                                               │
+│ n8                                                  ▲━━━━○                                                                               │
+│ it                                            ⇄     ⇄    ⇄          ✔                                                                    │
+│     −2m──────────────────────────────────────────────────────────────−1m─────────────────────────────────────────────────────────────now │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Events ─ [all] membership ownership traffic exporter (f) ───────────────────────────────────────────────────────────────────── 24 events ╮
+│00:00:21  ⚠ EXPORTER n6 2c4f  answering                                                                                                   │
+│00:00:21  ⚠ EXPORTER n5 294f  answering                                                                                                   │
+│00:00:21  ⚠ EXPORTER n4 264f  answering                                                                                                   │
+│00:00:21  ⚠ EXPORTER n3 234f  answering                                                                                                   │
+│00:00:21  ⚠ EXPORTER n2 204f  answering                                                                                                   │
+│00:00:21  ⚠ EXPORTER n1 1d4f  answering                                                                                                   │
+│00:00:20  ✔ SETTLED  it settled in 10.0 s                                                                                                 │
+│00:00:10  ⇄ VIEW     it bf0b7189 → 5d69e3db · 48,957 parts move (37.4%) · n7 −16,480 · n8 −16,303 · n6 −16,174                            │
+│00:00:10  ✔ SETTLED  it settled in 5.0 s                                                                                                  │
+│00:00:10  ○ LEFT     n8 324f  gone after its departure                                                                                    │
+│00:00:10  ◐ LEAVE    n8 324f  announced departure; ownership moves now                                                                    │
+│00:00:10  ✖ DOWN     n7 2f4f  no departure seen (crash, stall or partition)                                                               │
+│00:00:10  ◐ LEAVE    n6 2c4f  announced departure; ownership moves now                                                                    │
+│00:00:05  ⇄ VIEW     it b9857233 → bf0b7189 · 81,753 parts move (62.4%) · n2 −27,311 · n1 −27,276 · n3 −27,166                            │
+│00:00:05  ✔ SETTLED  it settled in 5.0 s                                                                                                  │
+│00:00:05  ✚ JOIN     n8 324f  127.0.0.18 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+│00:00:05  ✚ JOIN     n7 2f4f  127.0.0.17 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+│00:00:05  ✚ JOIN     n6 2c4f  127.0.0.16 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+│00:00:05  ✚ JOIN     n5 294f  127.0.0.15 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+│00:00:05  ✚ JOIN     n4 264f  127.0.0.14 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+│00:00:00  ⇄ VIEW     it view b9857233 · n2 +43,730 · n1 +43,715 · n3 +43,627                                                              │
+│00:00:00  ✚ JOIN     n3 234f  127.0.0.13 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+│00:00:00  ✚ JOIN     n2 204f  127.0.0.12 · protocol 6 · it D2 · churn R · os R · pn R                                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ 1-4 view  ↑↓ scroll  G live  f filter  t gone  p freeze  a anim  ? help  q quit

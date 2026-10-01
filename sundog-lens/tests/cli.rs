@@ -50,3 +50,40 @@ fn a_missing_cluster_exits_two() {
             .contains("cluster name")
     );
 }
+
+#[test]
+fn watch_without_a_terminal_refuses_and_points_at_once() {
+    // The test harness pipes stdout, so it is no terminal.
+    let output = lens(&["watch", "lens-demo", "--seed", "127.0.0.1:9"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("needs a terminal"), "{stderr}");
+    assert!(stderr.contains("--once"), "{stderr}");
+}
+
+#[test]
+fn a_bad_metrics_template_fails_before_any_network_use() {
+    let output = lens(&[
+        "lens-demo",
+        "--once",
+        "--metrics",
+        "http://{nope}/metrics",
+        "--seed",
+        "127.0.0.1:9",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--metrics"), "{stderr}");
+    assert!(stderr.contains("nope"), "{stderr}");
+}
+
+#[test]
+fn the_fleet_commands_say_this_build_has_no_fleet() {
+    for command in ["cluster", "demo"] {
+        let output = lens(&[command]);
+        assert_eq!(output.status.code(), Some(2), "{command}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("does not start a local fleet"), "{stderr}");
+    }
+}

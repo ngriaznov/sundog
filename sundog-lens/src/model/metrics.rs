@@ -38,6 +38,12 @@ impl SeriesKey {
         &self.name
     }
 
+    /// The labels, sorted by name.
+    #[must_use]
+    pub fn labels(&self) -> &[(String, String)] {
+        &self.labels
+    }
+
     /// The value of label `key`, if the series has it.
     #[must_use]
     pub fn label(&self, key: &str) -> Option<&str> {
@@ -509,6 +515,13 @@ mod tests {
         assert_eq!(key.name(), names::REBALANCE_PARTS);
         assert_eq!(key.label("cache"), Some("it"));
         assert_eq!(key.label("peer"), None);
+        assert_eq!(
+            key.labels(),
+            [
+                ("cache".to_owned(), "it".to_owned()),
+                ("direction".to_owned(), "in".to_owned())
+            ]
+        );
         assert!(key.matches(names::REBALANCE_PARTS, &[]));
         assert!(key.matches(names::REBALANCE_PARTS, &[("direction", "in")]));
         assert!(!key.matches(names::REBALANCE_PARTS, &[("direction", "out")]));

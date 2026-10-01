@@ -220,4 +220,10 @@ mod tests {
         assert!(!blink(MS(499)));
         assert!(blink(MS(500)));
     }
+
+    #[test]
+    fn the_spinner_turns_ten_times_a_second() {
+        assert_eq!(SPINNER_HZ, 10);
+        assert_eq!(SPINNER.len(), 10);
+    }
 }

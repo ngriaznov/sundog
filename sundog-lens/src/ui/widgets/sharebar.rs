@@ -194,6 +194,45 @@ impl Widget for ShareBar {
     }
 }
 
+/// A [`share_bar`] as styled spans, for a table row: the share in `color`,
+/// the empty cells faint and the marker in the text color. Runs of one style
+/// are one span.
+#[must_use]
+pub fn bar_spans(
+    frac: f64,
+    fair: Option<f64>,
+    width: usize,
+    color: Rgb,
+    look: crate::ui::look::Look,
+) -> Vec<ratatui::text::Span<'static>> {
+    use crate::ui::look::Token;
+    let fill = look.node(color);
+    let empty = look.style(Token::Faint);
+    let marker = look.style(Token::Text);
+    let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = None;
+    for bar_cell in share_bar(frac, fair, width) {
+        let style = match bar_cell {
+            BarCell::Filled | BarCell::Head => fill,
+            BarCell::Empty => empty,
+            BarCell::Marker => marker,
+        };
+        if run_style.is_some_and(|held| held != style) {
+            spans.push(ratatui::text::Span::styled(
+                std::mem::take(&mut run),
+                run_style.unwrap_or_default(),
+            ));
+        }
+        run_style = Some(style);
+        run.push(bar_cell.glyph());
+    }
+    if let Some(style) = run_style {
+        spans.push(ratatui::text::Span::styled(run, style));
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +354,18 @@ mod tests {
         assert_eq!(cell(3).fg, theme::TEXT.color(ColorMode::Truecolor));
         assert_eq!(cell(5).symbol(), "─");
         assert_eq!(cell(5).fg, theme::FAINT.color(ColorMode::Truecolor));
+    }
+
+    #[test]
+    fn bar_spans_group_runs_of_one_style() {
+        let look = crate::ui::look::Look::default();
+        let spans = bar_spans(0.5, Some(0.5), 10, theme::NODE_COLORS[0], look);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "━━━━━┊────");
+        assert_eq!(spans.len(), 3, "fill, marker, empty");
+        assert_eq!(spans[0].content, "━━━━━");
+        assert!(bar_spans(0.5, None, 0, theme::NODE_COLORS[0], look).is_empty());
+        let plain = bar_spans(1.0, None, 4, theme::NODE_COLORS[0], look);
+        assert_eq!(plain.len(), 1);
     }
 }

@@ -1,0 +1,40 @@
+ ●•• sundog lens  fixture   ● 5 live  ◐ 1 leaving  ✖ 1 down  ○ 1 left   proto 6   observer 127.0.0.1:41733 · 0 anon          ⠋ 00:01:21 UTC
+  1 Overview   2 Caches   3 Node   4 Timeline                               metrics 6/6 · 1 s     it · part view 5d69e3db ↻ settling 71.0 s
+╭ Members · gossip ──────────────────────────────────────────────────────── 8 seen ╮╭ Throughput · metrics ────────────────────────────────╮
+│   NODE     GOSSIP          UP    P  CACHES   SHARE it          PEERS     OPS/S   ││ 4.46k ops/s ▼3%   hit 55.1%   tx 15.9 MB/s           │
+│▌● n1 1d4f  127.0.0.11:7946 01:21 6  D R R R  ━━━┊────  39.9% ✓ 5/5   ⣿⣿⣿   874   ││                                     ⢀⣠⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣀ │
+│ ● n2 204f  127.0.0.12:7946 01:21 6  D R R R  ━━━┊────  40.0% ✓ 5/5   ⣿⣿⣿   925   ││                                ⢀⣀⣤⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ● n3 234f  127.0.0.13:7946 01:21 6  D R R R  ━━━┊────  40.0% ↻ 5/5   ⣿⣿⣿ 1.16k   ││                            ⣀⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ● n4 264f  127.0.0.14:7946 01:16 6  D R R R  ━━━┊────  40.1% ✓ 5/5   ⣿⣿⣷   775   ││                       ⢠⣤⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ● n5 294f  127.0.0.15:7946 01:16 6  D R R R  ━━━┊────  40.0% ✓ 5/5   ⣿⣶⣤   222   ││                       ⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ◐ n6 2c4f  127.0.0.16:7946 01:11 6  D R R R  ───┊────   0.0% ✓ 5/5   ⣤⣶⣿   510   ││                       ⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ✖ n7 2f4f  127╭ ●•• sundog lens · keys ─────────────────────────────────────────────────────────────────────────────────╮─────────── now │
+│ ○ n8 324f  127│  1-4 Tab ⇧Tab views                         ↑↓ j k g G select                                           │  /s            │
+╰───────────────│  ⏎            node detail                   Esc        close, then back                                 │────────────────╯
+╭ Ownership · it│  c C          next/prev Distributed cache   f          event filter                                     │ reported ✓ 4/5 ╮
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  t            gone rows                     p          freeze                                           │                │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  a            animations                    r          raw samples (Node)                               │                │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  ?            help                          q Ctrl-C   quit                                             │ 25,304         │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  S            spawn (demo)                  K          SIGKILL (demo)                                   │                │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  L            SIGTERM leave (demo)          R          restart (demo)                                   │                │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│                                                                                                         │                │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  ● live  ◐ departing  ○ left  ✖ down  ✚ joined  ↻ rejoined                                              │                │
+│ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀│  ✓ reported = computed  ↻ settling  ⇄ view change  ✔ settled                                            │ 71.0 s         │
+╰───────────────│  mosaic: 1024 buckets, each in the color of the node that leads most of its 64 parts                    │────────────────╯
+╭ Events ───────│                                                                                                         │────────────────╮
+│00:00:21  ⚠ EXP│  gossip = observer 127.0.0.1:41733 (never a peer)                                                       │tling           │
+│00:00:21  ⚠ EXP│  metrics = each node's /metrics, mapped by template                                                     │                │
+│00:00:21  ⚠ EXP│  computed = worked out here with the code the nodes run                                                 │                │
+│00:00:21  ⚠ EXP│  not shown: per-part pulls and repairs, slowest parts, keys and digests, per-cache warmth, CPU and RSS  │                │
+│00:00:21  ⚠ EXP╰─────────────────────────────────────────────────────────────────────────────────────────────────────────╯                │
+│00:00:21  ⚠ EXPORTER n1 1d4f  answering                                           ││fetch mix  local 64% · remote 29% · miss 7% · err 0%  │
+│00:00:20  ✔ SETTLED  it settled in 10.0 s                                         ││⇄ rebal in ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀  out ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀         │
+│00:00:10  ⇄ VIEW     it bf0b7189 → 5d69e3db · 48,957 parts move (37.4%) · n7 −16,…││                                                      │
+│00:00:10  ✔ SETTLED  it settled in 5.0 s                                          ││                                                      │
+│00:00:10  ○ LEFT     n8 324f  gone after its departure                            ││                                                      │
+│00:00:10  ◐ LEAVE    n8 324f  announced departure; ownership moves now            ││                                                      │
+│00:00:10  ✖ DOWN     n7 2f4f  no departure seen (crash, stall or partition)       ││                                                      │
+│00:00:10  ◐ LEAVE    n6 2c4f  announced departure; ownership moves now            ││                                                      │
+│00:00:05  ⇄ VIEW     it b9857233 → bf0b7189 · 81,753 parts move (62.4%) · n2 −27,…││                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────────────╯
+ 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  p freeze  a anim  ? help  q quit

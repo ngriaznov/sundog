@@ -373,4 +373,40 @@ mod tests {
             assert!(is_allowed(c), "{c}");
         }
     }
+
+    #[test]
+    fn the_palette_is_the_brand_card_exactly() {
+        let table = [
+            (BG, (0x12, 0x11, 0x0F)),
+            (SURFACE, (0x1B, 0x1A, 0x17)),
+            (SURFACE_HI, (0x26, 0x24, 0x1F)),
+            (BORDER, (0x3A, 0x36, 0x2E)),
+            (BORDER_FOCUS, (0xF2, 0xB5, 0x44)),
+            (TEXT, (0xEC, 0xE6, 0xD9)),
+            (MUTED, (0x7D, 0x77, 0x6B)),
+            (FAINT, (0x4A, 0x46, 0x3E)),
+            (ACCENT, (0xF2, 0xB5, 0x44)),
+            (OK, (0x8F, 0xD1, 0x6A)),
+            (WARN, (0xF0, 0xA0, 0x4B)),
+            (BAD, (0xFF, 0x6B, 0x6B)),
+            (INFO, (0x6C, 0xC4, 0xE8)),
+            (MOVE, (0xB7, 0x9C, 0xFF)),
+        ];
+        for (token, (r, g, b)) in table {
+            assert_eq!(token, Rgb(r, g, b));
+        }
+        let nodes = [
+            (0x6C, 0xB6, 0xFF),
+            (0xFF, 0x7E, 0xB6),
+            (0x4F, 0xD1, 0xC5),
+            (0xC7, 0x92, 0xEA),
+            (0xC3, 0xE8, 0x8D),
+            (0xE0, 0xC9, 0xA6),
+            (0x89, 0xDD, 0xFF),
+            (0xA0, 0xA8, 0xFF),
+        ];
+        for (color, (r, g, b)) in NODE_COLORS.iter().zip(nodes) {
+            assert_eq!(*color, Rgb(r, g, b));
+        }
+    }
 }

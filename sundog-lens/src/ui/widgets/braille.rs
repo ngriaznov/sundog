@@ -68,13 +68,26 @@ pub fn spark_braille(values: &[f64], width: usize) -> String {
 /// shared scale.
 #[must_use]
 pub fn spark_braille_scaled(values: &[f64], width: usize, max: f64) -> String {
+    spark_with_floor(values, width, max, 0)
+}
+
+/// [`spark_braille`] with a floor: every sample that exists draws at least
+/// the bottom dots, so a quiet line reads as a baseline (`⣀`) and only
+/// missing history is blank.
+#[must_use]
+pub fn spark_braille_floor(values: &[f64], width: usize) -> String {
+    let window = &values[values.len().saturating_sub(2 * width)..];
+    spark_with_floor(values, width, max_of(window), 1)
+}
+
+fn spark_with_floor(values: &[f64], width: usize, max: f64, floor: usize) -> String {
     let window = &values[values.len().saturating_sub(2 * width)..];
     // Right-align: the sample index of the first column.
     let missing = 2 * width - window.len();
     let level = |column: usize| -> usize {
         column
             .checked_sub(missing)
-            .map_or(0, |i| level_of(window[i], max, 4))
+            .map_or(0, |i| level_of(window[i], max, 4).max(floor))
     };
     (0..width)
         .map(|cell| {
@@ -192,6 +205,20 @@ mod tests {
         assert_eq!(level(0.5), 0x2840 | 0x04);
         assert_eq!(level(0.75), 0x2840 | 0x04 | 0x02);
         assert_eq!(level(1.0), 0x2847);
+    }
+
+    #[test]
+    fn a_floored_spark_draws_a_baseline_for_quiet_samples_and_blanks_for_missing_ones() {
+        // Two quiet samples in a three-cell line: the first two cells are
+        // missing history, the last carries the baseline.
+        assert_eq!(
+            codepoints(&spark_braille_floor(&[0.0, 0.0], 3)),
+            [0x2800, 0x2800, 0x28C0]
+        );
+        assert_eq!(codepoints(&spark_braille_floor(&[0.0; 6], 3)), [0x28C0; 3]);
+        // A loud sample still rises above the floor.
+        assert_eq!(codepoints(&spark_braille_floor(&[0.0, 1.0], 1)), [0x28F8]);
+        assert_eq!(spark_braille_floor(&[], 2), "\u{2800}\u{2800}");
     }
 
     #[test]

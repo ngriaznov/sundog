@@ -1,0 +1,40 @@
+ ●•• sundog lens   observer 127.0.0.1:41733 · 0 anon                                                                         ⠋ 00:00:00 UTC
+  1 Overview   2 Caches   3 Node   4 Timeline                                                                                metrics waiting
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                               ●•• sundog lens
+
+                                                    listening for gossip from "fixture" ⠋
+                                      seeds 127.0.0.11:7946, 127.0.0.12:7946 · observer 127.0.0.1:41733
+                                               the observer opens no cache and is never a peer
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 1-4 view  ↑↓ select  ⏎ node  c cache  f filter  t gone  p freeze  a anim  ? help  q quit
