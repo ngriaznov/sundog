@@ -241,6 +241,27 @@ fn two_failed_scrapes_of_a_node_gossip_dropped_raise_an_exporter_event_instead()
 }
 
 #[test]
+fn a_departing_node_whose_exporter_stops_answering_raises_exporter_not_unreachable() {
+    let base = Instant::now();
+    let snapshot = ClusterSnapshot::new(
+        "c",
+        vec![
+            testkit::member(1, MemberStatus::Live),
+            testkit::member(2, MemberStatus::Departing),
+        ],
+        0,
+    );
+    let mut model = observing(snapshot, base);
+    let events = model.apply(answer(2, base, Vec::new()), base, WALL);
+    assert_eq!(tags(&events), ["EXPORTER"], "the first answer");
+    let mut failed = model.apply(fail(2, after(base, 1000)), after(base, 1000), WALL);
+    failed.extend(model.apply(fail(2, after(base, 2000)), after(base, 2000), WALL));
+    failed.extend(model.apply(fail(2, after(base, 3000)), after(base, 3000), WALL));
+    assert_eq!(tags(&failed), ["EXPORTER"]);
+    assert!(!failed.iter().any(|event| event.kind.tag() == "UNREACHABLE"));
+}
+
+#[test]
 fn a_collision_is_reported_once_and_does_not_make_the_node_suspect() {
     let base = Instant::now();
     let mut model = observing(testkit::snapshot(2), base);
@@ -508,6 +529,45 @@ fn parts_pulled_in_keep_a_view_unsettled_until_they_stop() {
         }
     }
     assert_eq!(model.settled("it"), Some(true));
+}
+
+#[test]
+fn a_failed_scrape_keeps_the_last_answer_of_a_node_in_the_vote() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(2), base);
+    let sample = |model: &Model, index: u8, total: f64| {
+        vec![
+            owned(model, index),
+            gauge(
+                names::REBALANCE_PARTS,
+                &[("cache", "it"), ("direction", "in")],
+                total,
+            ),
+        ]
+    };
+    let mut events = Vec::new();
+    for secs in 1..=4u32 {
+        let at = after(base, u64::from(secs) * 1000);
+        let quiet = sample(&model, 1, 0.0);
+        let pulling = sample(&model, 2, f64::from(secs - 1) * 5000.0);
+        events.extend(model.apply(answer(1, at, quiet), at, WALL));
+        events.extend(model.apply(answer(2, at, pulling), at, WALL));
+    }
+    assert_eq!(
+        model.settled("it"),
+        Some(false),
+        "n2 pulls 5000 parts a round"
+    );
+    // n1 answers quiet again and n2 times out: n2's last answer still shows
+    // the pull, so the cache stays unsettled and the verdict is not gossip-only.
+    let at = after(base, 5000);
+    let quiet = sample(&model, 1, 0.0);
+    events.extend(model.apply(answer(1, at, quiet), at, WALL));
+    events.extend(model.apply(fail(2, at), at, WALL));
+    let verdict = model.settle("it").unwrap();
+    assert!(!verdict.settled && !verdict.gossip_only);
+    assert_eq!(model.settled("it"), Some(false));
+    assert!(!events.iter().any(|event| event.kind.tag() == "SETTLED"));
 }
 
 #[test]

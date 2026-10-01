@@ -78,7 +78,8 @@ impl ExporterState {
     ///
     /// - `READY` or `UNREADY` when `/readyz` flips;
     /// - `UNREACHABLE` at the second failed scrape in a row when gossip still
-    ///   lists the node live (`listed_live`), `EXPORTER` when it does not;
+    ///   lists the node `Live` (`listed_live`), `EXPORTER` when it does not,
+    ///   a departing node included;
     /// - `EXPORTER` at the first answer, at the first answer after
     ///   unreachability, when a mapping error appears and when a node's own id
     ///   shows up as a peer label.

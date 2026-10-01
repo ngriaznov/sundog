@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use smol_str::SmolStr;
 use sundog::NodeId;
-use sundog::observe::{ClusterSnapshot, MemberStatus};
+use sundog::observe::{ClusterSnapshot, Member, MemberStatus};
 use sundog::store::Mode;
 
 use crate::source::{ScrapeReport, Update};
@@ -205,10 +205,11 @@ impl Model {
     }
 
     /// The settling verdict for `cache`. Nodes whose exporter answered since
-    /// the view changed vote: the cache is settled once each of them reports
-    /// the parts the observer computes for it and has pulled none in for
-    /// [`derive::QUIET_SCRAPES`] scrapes taken since the view changed. With no such node the verdict rests
-    /// on gossip alone, and the cache is settled once its view has held for
+    /// the view changed vote, and a later failed scrape does not withdraw the
+    /// vote: the cache is settled once each of them reports the parts the
+    /// observer computes for it and has pulled none in for
+    /// [`derive::QUIET_SCRAPES`] scrapes taken since the view changed. With no
+    /// such node the verdict rests on gossip alone, and the cache is settled once its view has held for
     /// [`GOSSIP_SETTLE`]. `None` for a cache with no ownership digest.
     #[must_use]
     pub fn settle(&self, cache: &str) -> Option<derive::Settle> {
@@ -302,34 +303,42 @@ impl Model {
         derive::divergence(&entries)
     }
 
-    /// The metrics of the live member `node`.
-    fn live_metrics_of(&self, node: NodeId) -> Option<&NodeMetrics> {
+    /// The live member `node` and its metrics.
+    fn live_member_metrics(&self, node: NodeId) -> Option<(&Member, &NodeMetrics)> {
         let member = self
             .snapshot
             .as_ref()?
             .members
             .iter()
             .find(|member| member.peer.node == node && member.status.is_live())?;
-        self.metrics
+        let metrics = self
+            .metrics
             .get(&member.peer.gossip_addr)
-            .filter(|metrics| metrics.node() == node)
+            .filter(|metrics| metrics.node() == node)?;
+        Some((member, metrics))
+    }
+
+    /// The metrics of the live member `node`.
+    fn live_metrics_of(&self, node: NodeId) -> Option<&NodeMetrics> {
+        self.live_member_metrics(node).map(|(_, metrics)| metrics)
     }
 
     /// What the settling test knows about `node` for the view that began at
-    /// `since`: nothing, unless the node's exporter answered after `since` and
-    /// reports `digest.cache`.
+    /// `since`: nothing, unless the node's exporter last answered at or after
+    /// `since` and reports `digest.cache`. A failed scrape leaves the vote as
+    /// the last answer cast it.
     fn progress(&self, digest: &OwnershipDigest, node: NodeId, since: Instant) -> NodeProgress {
         let silent = NodeProgress {
             agrees: None,
             quiet_scrapes: 0,
         };
-        let Some(metrics) = self.live_metrics_of(node) else {
+        let Some((member, metrics)) = self.live_member_metrics(node) else {
             return silent;
         };
         let fresh = self
-            .scrapes
-            .values()
-            .any(|report| report.node == node && report.outcome.is_ok() && report.at >= since);
+            .last_ok
+            .get(&member.peer.gossip_addr)
+            .is_some_and(|at| *at >= since);
         let Some(reported) = metrics.owned_parts(&digest.cache).filter(|_| fresh) else {
             return silent;
         };
@@ -431,7 +440,7 @@ impl Model {
             snapshot
                 .members
                 .iter()
-                .any(|member| member.peer.node == node && member.status.is_live())
+                .any(|member| member.peer.node == node && member.status == MemberStatus::Live)
         });
         let mut kinds = self
             .exporters
