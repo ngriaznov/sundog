@@ -252,6 +252,9 @@ pub fn fixture_model(base: Instant) -> Model {
         )
     };
     let mut model = Model::new();
+    // The fixture processes carry incarnation 1 ms: they predate the lens,
+    // so the first three are the discovery baseline.
+    model.set_started(wall(0) + Duration::from_secs(1));
     for secs in [0, 5, 10] {
         let snapshot = story(secs);
         let digest = ownership_digest_after(&snapshot, "it", model.ownership("it"))
@@ -277,7 +280,8 @@ pub fn past_discovery(base: Instant) -> (Model, Instant) {
     model.apply(
         Update::Snapshot(Arc::new(snapshot(1)), base),
         base,
-        SystemTime::UNIX_EPOCH,
+        // Later than every fixture incarnation: the member predates the lens.
+        SystemTime::UNIX_EPOCH + Duration::from_secs(100),
     );
     let now = base + crate::model::DISCOVERY_QUIET;
     model.tick(now);
@@ -338,6 +342,16 @@ fn exporter_samples(
 /// Panics when the fixture model has no `it` digest, which it always has.
 #[must_use]
 pub fn fixture_model_with_metrics(base: Instant) -> Model {
+    fixture_model_with_scrapes(base, FIXTURE_SCRAPES)
+}
+
+/// As [`fixture_model_with_metrics`], with `rounds` scrape rounds.
+///
+/// # Panics
+///
+/// Panics when the fixture model has no `it` digest, which it always has.
+#[must_use]
+pub fn fixture_model_with_scrapes(base: Instant, rounds: u32) -> Model {
     let mut model = fixture_model(base);
     let digest = model
         .ownership("it")
@@ -352,7 +366,7 @@ pub fn fixture_model_with_metrics(base: Instant) -> Model {
         .map(|member| (member.peer.node, member.peer.gossip_addr))
         .collect();
     let live = members.len();
-    for round in 0..FIXTURE_SCRAPES {
+    for round in 0..rounds {
         let secs = 21 + u64::from(round);
         let at = base + Duration::from_secs(secs);
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
@@ -383,7 +397,7 @@ pub fn fixture_model_with_metrics(base: Instant) -> Model {
             );
         }
     }
-    model.tick(base + Duration::from_secs(21 + u64::from(FIXTURE_SCRAPES)));
+    model.tick(base + Duration::from_secs(21 + u64::from(rounds)));
     model
 }
 

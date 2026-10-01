@@ -24,16 +24,47 @@ fn ownership_height(scene: &Scene<'_>) -> u16 {
     ownership::wanted_height(scene.kind, nodes)
 }
 
-/// Draws the Overview into `area`.
-pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
-    let heights = allocate(
-        area.height,
+/// The most rows the bottom row (Events and Caches) takes at the full layout.
+/// Every row beyond it goes to the top row, so the Throughput chart has room.
+const BOTTOM_ROWS: u16 = 12;
+
+/// The most rows the top row (Members and Throughput) takes at the full
+/// layout before the bottom row takes the rest.
+const TOP_ROWS: u16 = 16;
+
+/// The heights of the Overview's three stacked rows in `total` rows. At the
+/// full layout the bottom row stops at [`BOTTOM_ROWS`] and the spare rows go
+/// to the top row up to [`TOP_ROWS`]; what is left beyond that returns to the
+/// bottom row. The other layouts give every spare row to Events.
+fn row_heights(scene: &Scene<'_>, total: u16) -> Vec<u16> {
+    if scene.kind != LayoutKind::Full {
+        return allocate(
+            total,
+            &[
+                (members::wanted_height(scene, 7, 14), 5),
+                (ownership_height(scene), 5),
+                (u16::MAX, 4),
+            ],
+        );
+    }
+    let mut heights = allocate(
+        total,
         &[
-            (members::wanted_height(scene, 7, 14), 5),
+            (members::wanted_height(scene, 9, 14), 5),
             (ownership_height(scene), 5),
-            (u16::MAX, 4),
+            (BOTTOM_ROWS, 4),
         ],
     );
+    let spare = total - heights.iter().sum::<u16>();
+    let to_top = spare.min(TOP_ROWS.saturating_sub(heights[0]));
+    heights[0] += to_top;
+    heights[2] += spare - to_top;
+    heights
+}
+
+/// Draws the Overview into `area`.
+pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
+    let heights = row_heights(scene, area.height);
     let rows = Layout::vertical(heights.iter().map(|&h| Constraint::Length(h))).split(area);
     if scene.kind == LayoutKind::Full {
         let top = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -187,7 +218,7 @@ pub fn throughput(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     } else {
         BlockArea::new(&total.ops, max, look.mode).render(chart, buf);
     }
-    let seconds = data::window_seconds(usize::from(chart.width)).min(total.ops.len().max(1));
+    let seconds = data::window_span(usize::from(chart.width), scene.model.scrape_interval());
     let axis_label = format!("−{seconds}s ");
     let fill = usize::from(chart.width).saturating_sub(axis_label.chars().count() + 4);
     panel::lines(
@@ -466,7 +497,7 @@ mod tests {
         assert!(text.contains(" ops/s"), "{text}");
         assert!(text.contains("hit "), "{text}");
         assert!(text.contains("tx "), "{text}");
-        assert!(text.contains("−59s"), "{text}");
+        assert!(text.contains("−104s"), "{text}");
         assert!(text.contains("reads "), "{text}");
         assert!(text.contains("fetch "), "{text}");
         assert!(text.contains("fetch mix  local "), "{text}");
@@ -474,6 +505,56 @@ mod tests {
             text.contains('⣿') || text.contains('⣤'),
             "the area chart: {text}"
         );
+    }
+
+    /// The axis label under the throughput chart of `model` at 140x37, where
+    /// the chart is 52 columns wide.
+    fn axis_label(model: &Model) -> String {
+        let rows = draw(model, LayoutKind::Full, 140, 37);
+        let row = rows.iter().find(|r| r.contains(" now")).expect("an axis");
+        let start = row.find('−').expect("a minus sign");
+        row[start..].split(' ').next().unwrap().to_owned()
+    }
+
+    #[test]
+    fn the_axis_label_names_the_span_of_the_chart_not_the_length_of_the_history() {
+        // Ten samples fill only the right edge of a 52-column chart, which
+        // spans 104 samples.
+        let mut model = testkit::fixture_model_with_scrapes(Instant::now(), 10);
+        assert!(model.cluster_ops().len() <= 10);
+        assert_eq!(axis_label(&model), "−104s");
+        // One sample per two seconds doubles the span.
+        model.set_scrape_interval(Duration::from_secs(2));
+        assert_eq!(axis_label(&model), "−208s");
+    }
+
+    #[test]
+    fn at_140x40_the_bottom_row_stops_at_twelve_rows_and_the_top_row_takes_the_rest() {
+        // The body of a 140x40 screen is 37 rows, 36 with a caption.
+        for model in [
+            fixture(),
+            testkit::fixture_model_with_metrics(Instant::now()),
+        ] {
+            for height in [36, 37] {
+                let rows = draw(&model, LayoutKind::Full, 140, height);
+                let row_of = |title: &str| {
+                    rows.iter()
+                        .position(|r| r.starts_with(title))
+                        .unwrap_or_else(|| panic!("{title} in\n{}", rows.join("\n")))
+                };
+                let events = row_of("╭ Events");
+                let ownership = row_of("╭ Ownership");
+                assert!(
+                    rows.len() - events <= 12,
+                    "bottom row {} of {height}",
+                    rows.len() - events
+                );
+                assert!(
+                    ownership >= 9,
+                    "the top row has 9 rows or more: {ownership}"
+                );
+            }
+        }
     }
 
     #[test]

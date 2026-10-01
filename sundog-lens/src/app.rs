@@ -1198,10 +1198,18 @@ mod tests {
         let snapshot = |count| {
             crate::source::Update::Snapshot(std::sync::Arc::new(testkit::snapshot(count)), start)
         };
-        model.apply(snapshot(1), start, SystemTime::UNIX_EPOCH);
+        model.apply(
+            snapshot(1),
+            start,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        );
         apply_digest(&mut model, digest_of(1), start);
         app.observe(&model, start);
-        model.apply(snapshot(3), start, SystemTime::UNIX_EPOCH);
+        model.apply(
+            snapshot(3),
+            start,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(100),
+        );
         apply_digest(&mut model, digest_of(3), start);
         assert!(model.discovering());
         app.observe(&model, start);

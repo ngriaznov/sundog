@@ -96,11 +96,13 @@ pub async fn run(args: WatchArgs) -> anyhow::Result<()> {
     init_logging(args.log.as_deref())?;
     let look = Look::from_args(&args.display);
     let config = FeedConfig::try_from(&args).context("reading --metrics")?;
+    let lens_started = SystemTime::now();
     let feed = Feed::spawn(config).await?;
     let mut app = App::new(app_config(&args, look));
     app.set_observer(feed.observer_addr());
     let mut model = Model::new();
     model.set_scrape_interval(args.interval);
+    model.set_started(lens_started);
     run_session(Session {
         feed,
         model,

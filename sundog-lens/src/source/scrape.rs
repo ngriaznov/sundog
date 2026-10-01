@@ -202,7 +202,26 @@ pub fn pin_matches(pin: &ScrapePin, member: &Member, label: Option<&str>) -> boo
             .starts_with(&pin.node.to_ascii_lowercase())
 }
 
-/// Maps every live member to an exporter URL.
+/// The live members that are the newest record at their gossip address, in
+/// member order. The newest is the greater (incarnation, node id), as in
+/// `events::superseded`: while gossip still lists a restarted node's old
+/// incarnation next to the new one, only the new one has an exporter.
+fn newest_live_per_address(members: &[Member]) -> impl Iterator<Item = &Member> {
+    let mut newest: BTreeMap<SocketAddr, (u64, NodeId)> = BTreeMap::new();
+    for member in members.iter().filter(|member| member.status.is_live()) {
+        let key = (member.peer.incarnation, member.peer.node);
+        let entry = newest.entry(member.peer.gossip_addr).or_insert(key);
+        *entry = (*entry).max(key);
+    }
+    members.iter().filter(move |member| {
+        member.status.is_live()
+            && newest.get(&member.peer.gossip_addr)
+                == Some(&(member.peer.incarnation, member.peer.node))
+    })
+}
+
+/// Maps every live member to an exporter URL. An older incarnation at an
+/// address that a newer live record holds is not mapped.
 ///
 /// The first pin that names a member gives its URL. Otherwise the first
 /// template that expands gives it; with templates and none expanding the
@@ -213,7 +232,7 @@ pub fn pin_matches(pin: &ScrapePin, member: &Member, label: Option<&str>) -> boo
 #[must_use]
 pub fn plan_targets(members: &[Member], config: &ScrapeConfig, slots: &Slots) -> Plan {
     let mut mapped: Vec<(&Member, Result<String, ScrapeError>)> = Vec::new();
-    for member in members.iter().filter(|member| member.status.is_live()) {
+    for member in newest_live_per_address(members) {
         let label = slots
             .get(member.peer.gossip_addr)
             .map(|slot| slot.label.as_str());
@@ -734,6 +753,56 @@ mod tests {
         assert_eq!(urls(&plan), ["http://127.0.0.12:9090/metrics"]);
         let unmapped: Vec<_> = plan.unmapped.iter().map(|u| u.addr).collect();
         assert_eq!(unmapped, [testkit::gossip_addr(1), testkit::gossip_addr(3)]);
+    }
+
+    #[test]
+    fn a_restarted_node_next_to_its_live_old_record_is_the_only_target() {
+        // Gossip still lists the old incarnation live while the new one is up.
+        let old = testkit::member_at(1, 0, 10, MemberStatus::Live);
+        let new = testkit::member_at(1, 1, 20, MemberStatus::Live);
+        let other = testkit::member_at(2, 0, 10, MemberStatus::Live);
+        for members in [
+            vec![old.clone(), new.clone(), other.clone()],
+            vec![new.clone(), old.clone(), other.clone()],
+        ] {
+            let snapshot = ClusterSnapshot::new("fixture", members, 0);
+            let plan = plan_targets(
+                &snapshot.members,
+                &config(&["http://{ip}:9090/metrics"], Vec::new()),
+                &slots_for(&snapshot),
+            );
+            assert_eq!(plan.unmapped, [], "no collision with the old record");
+            assert_eq!(
+                plan.targets.len(),
+                2,
+                "one target per address: {:?}",
+                plan.targets
+            );
+            assert!(
+                plan.targets
+                    .contains(&target(1, 1, "http://127.0.0.11:9090/metrics"))
+            );
+            assert!(
+                plan.targets
+                    .contains(&target(2, 0, "http://127.0.0.12:9090/metrics"))
+            );
+        }
+    }
+
+    #[test]
+    fn records_at_one_address_with_one_incarnation_keep_the_greater_node_id() {
+        let a = testkit::member_at(1, 0, 10, MemberStatus::Live);
+        let b = testkit::member_at(1, 1, 10, MemberStatus::Live);
+        let newer = a.peer.node.max(b.peer.node);
+        let snapshot = ClusterSnapshot::new("fixture", vec![a, b], 0);
+        let plan = plan_targets(
+            &snapshot.members,
+            &config(&["http://{ip}:9090/metrics"], Vec::new()),
+            &slots_for(&snapshot),
+        );
+        assert_eq!(plan.unmapped, []);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].node, newer);
     }
 
     #[test]

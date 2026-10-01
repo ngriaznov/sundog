@@ -565,8 +565,10 @@ pub async fn run(args: WatchArgs) -> anyhow::Result<()> {
     init_logging(args.log.as_deref())?;
     let scraping = !args.metrics.is_empty() || !args.scrape.is_empty();
     let config = FeedConfig::try_from(&args).context("reading --metrics")?;
+    let lens_started = SystemTime::now();
     let mut feed = Feed::spawn(config).await?;
     let mut model = Model::new();
+    model.set_started(lens_started);
     let started = Instant::now();
     let outcome = collect(&mut feed, &mut model, &once, scraping, Limits::default()).await;
     let observer = feed.observer_addr().to_string();

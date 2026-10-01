@@ -613,11 +613,21 @@ pub fn exporter_summary(model: &Model) -> Option<(usize, usize)> {
     })
 }
 
-/// How many seconds of history a ring of `width` columns shows: two samples
-/// per column, at most a full ring.
+/// How many samples a chart of `width` columns shows: two per column, at most
+/// a full ring. The chart right-aligns them, so its left edge is always this
+/// many samples back, whether or not the history reaches that far.
 #[must_use]
-pub fn window_seconds(width: usize) -> usize {
+pub fn window_samples(width: usize) -> usize {
     (width * 2).min(RING_LEN)
+}
+
+/// The whole seconds a chart of `width` columns spans, one sample per scrape
+/// `interval`.
+#[must_use]
+pub fn window_span(width: usize, interval: Duration) -> u64 {
+    let samples = u128::try_from(window_samples(width)).unwrap_or(0);
+    let millis = samples * interval.as_millis().max(1);
+    u64::try_from((millis + 500) / 1000).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -885,9 +895,19 @@ mod tests {
 
     #[test]
     fn windows_hold_two_samples_per_column_up_to_a_full_ring() {
-        assert_eq!(window_seconds(10), 20);
-        assert_eq!(window_seconds(56), 112);
-        assert_eq!(window_seconds(500), RING_LEN);
+        assert_eq!(window_samples(10), 20);
+        assert_eq!(window_samples(56), 112);
+        assert_eq!(window_samples(500), RING_LEN);
+    }
+
+    #[test]
+    fn a_window_spans_its_samples_times_the_scrape_interval() {
+        let span = |width, millis| window_span(width, Duration::from_millis(millis));
+        assert_eq!(span(52, 1000), 104);
+        assert_eq!(span(52, 2000), 208);
+        assert_eq!(span(52, 500), 52);
+        assert_eq!(span(500, 1000), RING_LEN as u64, "capped at a full ring");
+        assert_eq!(span(52, 0), 0, "a zero interval counts as a millisecond");
     }
 
     #[test]

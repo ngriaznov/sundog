@@ -79,6 +79,31 @@ fn live_members(snapshot: &ClusterSnapshot) -> usize {
         .count()
 }
 
+/// Whether the member `kind` names started at or after `started`: its
+/// incarnation, the wall-clock milliseconds at its start, is not earlier.
+fn arrived_after(
+    snapshot: &ClusterSnapshot,
+    kind: &EventKind,
+    started: Option<SystemTime>,
+) -> bool {
+    let (EventKind::Join { node, .. }
+    | EventKind::Rejoin { node, .. }
+    | EventKind::CacheAdded { node, .. }) = kind
+    else {
+        return false;
+    };
+    let Some(started) = started else {
+        return false;
+    };
+    let incarnation = snapshot
+        .members
+        .iter()
+        .filter(|member| member.peer.node == *node)
+        .map(|member| member.peer.incarnation)
+        .max();
+    incarnation.is_some_and(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms) >= started)
+}
+
 /// The state the interface draws. `Clone` so the frozen display can keep a
 /// copy while collection continues.
 #[derive(Debug, Clone, Default)]
@@ -100,6 +125,7 @@ pub struct Model {
     live_set: Vec<NodeId>,
     live_set_changed: Option<Instant>,
     discovered: bool,
+    started: Option<SystemTime>,
     scrape_interval: Option<Duration>,
     cluster_ops: Ring<RING_LEN>,
     cluster_ops_at: Option<Instant>,
@@ -138,6 +164,7 @@ impl Model {
     pub fn apply(&mut self, update: Update, now: Instant, wall: SystemTime) -> Vec<Event> {
         self.now = Some(now);
         self.wall = Some(wall);
+        self.started.get_or_insert(wall);
         self.refresh_discovery(now);
         self.sample_cluster(now);
         let mut baseline = Vec::new();
@@ -192,10 +219,24 @@ impl Model {
         }
     }
 
+    /// Sets the wall-clock time the lens started looking. A member whose
+    /// process started before it is baseline while the lens discovers the
+    /// cluster; one that started at or after it is an arrival. Without a call,
+    /// the wall time of the first update stands for it.
+    pub const fn set_started(&mut self, started: SystemTime) {
+        self.started = Some(started);
+    }
+
     /// Sets the scrape interval, which paces the cluster throughput series:
     /// one sample per interval.
     pub const fn set_scrape_interval(&mut self, interval: Duration) {
         self.scrape_interval = Some(interval);
+    }
+
+    /// The scrape interval that paces the cluster throughput series.
+    #[must_use]
+    pub fn scrape_interval(&self) -> Duration {
+        self.scrape_interval.unwrap_or(DEFAULT_SCRAPE_INTERVAL)
     }
 
     /// The cluster's reads and fetches per second, one sample per scrape
@@ -213,7 +254,7 @@ impl Model {
     /// together. The first sample waits until every answering node has a
     /// figure, so the series never starts with a part of the cluster.
     fn sample_cluster(&mut self, now: Instant) {
-        let interval = self.scrape_interval.unwrap_or(DEFAULT_SCRAPE_INTERVAL);
+        let interval = self.scrape_interval();
         let due = self
             .cluster_ops_at
             .is_none_or(|at| now.saturating_duration_since(at) >= interval);
@@ -522,14 +563,23 @@ impl Model {
     ) -> Vec<EventKind> {
         let mut kinds = diff_snapshots(self.snapshot.as_deref(), &snapshot);
         if !self.discovered {
-            let (found, rest) = kinds.into_iter().partition(|kind| {
+            let started = self.started;
+            let (found, rest): (Vec<_>, Vec<_>) = kinds.into_iter().partition(|kind| {
                 matches!(
                     kind,
                     EventKind::Join { .. }
                         | EventKind::Rejoin { .. }
                         | EventKind::CacheAdded { .. }
-                )
+                ) && !arrived_after(&snapshot, kind, started)
             });
+            if rest
+                .iter()
+                .any(|kind| matches!(kind, EventKind::Join { .. } | EventKind::Rejoin { .. }))
+            {
+                // A member that started after the lens looked is a real
+                // arrival: discovery ends and the views that follow count.
+                self.discovered = true;
+            }
             *baseline = found;
             kinds = rest;
         }
@@ -724,7 +774,10 @@ mod tests {
 
     use super::*;
 
-    const WALL0: SystemTime = SystemTime::UNIX_EPOCH;
+    /// Later than every fixture incarnation, so fixture members predate the lens.
+    fn wall0() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(100)
+    }
 
     fn snapshot_update(snapshot: ClusterSnapshot, now: Instant) -> Update {
         Update::Snapshot(Arc::new(snapshot), now)
@@ -749,11 +802,7 @@ mod tests {
     fn a_snapshot_gives_each_gossip_address_a_slot_in_member_order() {
         let mut model = Model::new();
         let now = Instant::now();
-        let events = model.apply(
-            snapshot_update(testkit::snapshot(3), now),
-            now,
-            SystemTime::UNIX_EPOCH,
-        );
+        let events = model.apply(snapshot_update(testkit::snapshot(3), now), now, wall0());
         assert!(events.is_empty(), "the first snapshot is the baseline");
         assert_eq!(model.snapshot().unwrap().members.len(), 3);
         assert_eq!(model.slots().len(), 3);
@@ -761,7 +810,7 @@ mod tests {
             model.slots().get(testkit::gossip_addr(2)).unwrap().label,
             "n2"
         );
-        assert_eq!(model.wall(), Some(SystemTime::UNIX_EPOCH));
+        assert_eq!(model.wall(), Some(wall0()));
     }
 
     #[test]
@@ -1170,14 +1219,61 @@ mod tests {
     }
 
     #[test]
+    fn a_member_that_started_after_the_lens_joins_during_discovery_and_ends_it() {
+        let mut model = Model::new();
+        let t = Instant::now();
+        let started = wall0();
+        model.set_started(started);
+        // Member 1 predates the lens: the baseline.
+        let mut events = model.apply(snapshot_update(testkit::snapshot(1), t), t, started);
+        events.extend(model.apply(ownership_update(1), t, started));
+        assert!(events.is_empty(), "the baseline raises nothing: {events:?}");
+        assert!(model.discovering());
+        // Member 2's process started a second after the lens did.
+        let t = t + Duration::from_millis(500);
+        let ms = u64::try_from(
+            (started + Duration::from_secs(1))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let members = vec![
+            testkit::member(1, MemberStatus::Live),
+            testkit::member_at(2, 0, ms, MemberStatus::Live),
+        ];
+        let snapshot = ClusterSnapshot::new("fixture", members, 0);
+        let digest = testkit::ownership_digest(&snapshot, "it").unwrap();
+        let events = model.apply(snapshot_update(snapshot, t), t, started);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event {
+                    kind: EventKind::Join { .. },
+                    ..
+                }]
+            ),
+            "a JOIN for the arrival only: {events:?}"
+        );
+        assert!(!model.discovering(), "an arrival ends discovery");
+        let events = model.apply(Update::Ownership(digest), t, started);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::View { .. })),
+            "the digest after the arrival raises VIEW: {events:?}"
+        );
+    }
+
+    #[test]
     fn digests_found_while_the_observer_discovers_members_raise_no_view() {
         let mut model = Model::new();
         let t = Instant::now();
-        let mut events = model.apply(snapshot_update(testkit::snapshot(1), t), t, WALL0);
-        events.extend(model.apply(ownership_update(1), t, WALL0));
+        let mut events = model.apply(snapshot_update(testkit::snapshot(1), t), t, wall0());
+        events.extend(model.apply(ownership_update(1), t, wall0()));
         let t = t + Duration::from_millis(500);
-        events.extend(model.apply(snapshot_update(testkit::snapshot(2), t), t, WALL0));
-        events.extend(model.apply(ownership_update(2), t, WALL0));
+        events.extend(model.apply(snapshot_update(testkit::snapshot(2), t), t, wall0()));
+        events.extend(model.apply(ownership_update(2), t, wall0()));
         assert!(events.is_empty(), "no VIEW or JOIN in {events:?}");
         assert!(model.discovering());
         assert_eq!(
@@ -1198,7 +1294,7 @@ mod tests {
         );
         assert_eq!(model.settled("it"), Some(true));
         // A real change after discovery is a view.
-        let events = model.apply(ownership_update(3), settled, WALL0);
+        let events = model.apply(ownership_update(3), settled, wall0());
         assert_eq!(tags(&events), ["VIEW"]);
     }
 
@@ -1211,7 +1307,7 @@ mod tests {
         let events = model.apply(
             snapshot_update(ClusterSnapshot::new("c", vec![bare(1)], 0), t),
             t,
-            WALL0,
+            wall0(),
         );
         assert!(events.is_empty(), "{events:?}");
         // A second member and a cache on the first arrive while still discovering.
@@ -1235,7 +1331,7 @@ mod tests {
         let events = model.apply(
             snapshot_update(ClusterSnapshot::new("c", found, 0), t),
             t,
-            WALL0,
+            wall0(),
         );
         assert!(model.discovering());
         assert!(events.is_empty(), "no JOIN or CACHE+ in {events:?}");
@@ -1250,7 +1346,7 @@ mod tests {
         let t = t + DISCOVERY_QUIET;
         model.tick(t);
         assert!(!model.discovering());
-        let events = model.apply(snapshot_update(testkit::snapshot(3), t), t, WALL0);
+        let events = model.apply(snapshot_update(testkit::snapshot(3), t), t, wall0());
         assert_eq!(tags(&events), ["JOIN"]);
     }
 
@@ -1261,7 +1357,7 @@ mod tests {
         assert!(model.discovering());
         for count in 1u8..=4 {
             let at = t + Duration::from_millis(1500) * u32::from(count);
-            model.apply(snapshot_update(testkit::snapshot(count), at), at, WALL0);
+            model.apply(snapshot_update(testkit::snapshot(count), at), at, wall0());
             model.tick(at + Duration::from_millis(1400));
             assert!(model.discovering(), "member {count} arrived 1.5 s ago");
         }
@@ -1270,7 +1366,7 @@ mod tests {
         assert!(!model.discovering());
         // The phase is over for good, even when the set changes again.
         let again = last + DISCOVERY_QUIET + Duration::from_secs(1);
-        model.apply(snapshot_update(testkit::snapshot(2), again), again, WALL0);
+        model.apply(snapshot_update(testkit::snapshot(2), again), again, wall0());
         assert!(!model.discovering());
     }
 
