@@ -3352,6 +3352,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sundog-lens"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "futures",
+ "rand 0.10.2",
+ "ratatui",
+ "rustix",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "sundog",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sundog-testnode"
 version = "0.1.0"
 dependencies = [
