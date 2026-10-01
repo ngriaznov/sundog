@@ -264,6 +264,31 @@ async fn watch_output(stdout: ChildStdout, state: watch::Sender<Readiness>) {
     }
 }
 
+/// How many times a start is retried while the binary is busy.
+const BUSY_RETRIES: u32 = 100;
+
+/// The wait between those retries.
+const BUSY_WAIT: Duration = Duration::from_millis(10);
+
+/// Starts `command`, retrying for up to a second while the system refuses to
+/// run the file because a writer still holds it open (`ETXTBSY`): a binary
+/// that is being written, or whose writer another process has inherited
+/// across a `fork` and not yet closed.
+fn spawn_when_idle(command: &mut Command) -> io::Result<Child> {
+    let mut tries = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy && tries < BUSY_RETRIES =>
+            {
+                tries += 1;
+                std::thread::sleep(BUSY_WAIT);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Starts the test node at `testnode` for `cluster` with `env`. It returns
 /// as soon as the process runs; [`NodeProc::ready_handle`] waits for the node
 /// to be ready. The node's standard error goes to `log`. It runs in its own
@@ -295,8 +320,7 @@ pub fn spawn(
         .stderr(Stdio::from(log_file))
         .kill_on_drop(true);
     command.process_group(0);
-    let mut child = command
-        .spawn()
+    let mut child = spawn_when_idle(&mut command)
         .with_context(|| format!("starting {}", testnode.display()))?;
     let pid = child.id().context("the node has no process id")?;
     let stdout = child.stdout.take().context("the node has no output pipe")?;
@@ -485,6 +509,12 @@ mod tests {
         dir
     }
 
+    /// Whether a process with this id exists, by signal 0.
+    fn process_exists(pid: u32) -> bool {
+        use rustix::process::{Pid, test_kill_process};
+        Pid::from_raw(i32::try_from(pid).unwrap()).is_some_and(|pid| test_kill_process(pid).is_ok())
+    }
+
     /// Writes an executable shell script and returns its path.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -557,6 +587,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_binary_that_a_writer_still_holds_open_starts_once_the_writer_closes_it() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = scratch_dir("busy");
+        let node = script(&dir, "node.sh", "echo testnode-ready\nsleep 30");
+        // While a writer holds the file, the system refuses to run it.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .mode(0o755)
+            .open(&node)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(writer);
+        });
+        let log = log_path(&dir, 7, 1);
+        let started = std::time::Instant::now();
+        let proc = spawn(&node, "c", &[], &log).expect("the start waits for the writer");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        proc.ready_handle()
+            .wait(Duration::from_secs(10))
+            .await
+            .unwrap();
+        release.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn a_node_that_is_never_ready_times_out_and_is_killed_with_its_handle() {
         let dir = scratch_dir("slow");
         let node = script(&dir, "node.sh", "echo 'still starting' >&2\nsleep 30");
@@ -576,7 +632,7 @@ mod tests {
         let pid = proc.pid;
         drop(proc);
         for _ in 0..100 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
+            if !process_exists(pid) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

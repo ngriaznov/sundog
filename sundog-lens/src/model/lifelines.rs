@@ -172,6 +172,14 @@ impl Lifeline {
         &self.marks
     }
 
+    /// The earliest instant the lifeline holds: its first phase or mark.
+    #[must_use]
+    pub fn first_at(&self) -> Option<Instant> {
+        let phase = self.phases.first().map(|phase| phase.from);
+        let mark = self.marks.first().map(|mark| mark.at);
+        phase.into_iter().chain(mark).min()
+    }
+
     /// Whether the lifeline has no phase and no mark.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -509,6 +517,7 @@ mod tests {
                 node: testkit::node_id(1, 1),
                 addr: addr(),
                 previous: node,
+                caches: std::collections::BTreeMap::new(),
             },
             ago(now, 5_500),
         );

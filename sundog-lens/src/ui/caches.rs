@@ -40,10 +40,11 @@ pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
         (u16::try_from(data::live_count(scene.model) + conflicts).unwrap_or(u16::MAX) + 2)
             .clamp(4, 10);
     let list_height = (u16::try_from(rows.len()).unwrap_or(u16::MAX) + 2).max(4);
+    // The Modes box takes the rows the list leaves, so the left column
+    // reaches the bottom of the body as the detail panel does.
     let left = Layout::vertical([
         Constraint::Length(list_height),
-        Constraint::Length(modes_height),
-        Constraint::Min(0),
+        Constraint::Min(modes_height),
     ])
     .split(columns[0]);
     list(scene, &rows, left[0], buf);
@@ -285,8 +286,8 @@ fn detail_title(
         .unwrap_or(plain)
 }
 
-/// Draws the detail panel of `row`. The panel ends where its content ends:
-/// the table sections, then the history charts in the rows that remain.
+/// Draws the detail panel of `row` over all of `area`: the table sections,
+/// then the history charts in the rows that remain.
 fn detail(scene: &Scene<'_>, row: &CacheRow, area: Rect, buf: &mut Buffer) {
     let look = scene.look;
     let nodes = advertisers(scene, row);
@@ -326,16 +327,7 @@ fn detail(scene: &Scene<'_>, row: &CacheRow, area: Rect, buf: &mut Buffer) {
     let history = (!row.is_conflicted())
         .then(|| History::plan(scene, row, &nodes, content.height.saturating_sub(used + 1)))
         .flatten();
-    let rows_used = used + history.as_ref().map_or(0, |plan| plan.rows() + 1);
-    let height = (rows_used + 2).min(area.height);
-    let area = Rect::new(area.x, area.y, area.width, height);
     panel::draw(block, area, buf);
-    let content = Rect::new(
-        content.x,
-        content.y,
-        content.width,
-        height.saturating_sub(2),
-    );
     panel::lines(lines, content, buf);
     if let Some(plan) = history {
         // One blank row separates the tables from the charts.
@@ -370,8 +362,9 @@ struct History {
     nodes: usize,
 }
 
-/// The most rows a node's chart takes.
-const HISTORY_CHART_ROWS: u16 = 4;
+/// The most rows a node's chart takes. A taller panel gives its leftover rows
+/// to the charts up to this height and leaves the rest blank at the bottom.
+const HISTORY_CHART_ROWS: u16 = 8;
 
 impl History {
     /// The history that fits in `rows` rows under the tables, or `None` when
@@ -1085,17 +1078,21 @@ mod tests {
     }
 
     #[test]
-    fn the_list_and_the_detail_end_where_their_content_ends() {
-        let rows = draw(&fixture(), LayoutKind::Full, 140, 37);
-        // The list holds four caches and its border: six rows, not the column.
-        assert!(rows[5].starts_with("╰"), "{}", rows[5]);
-        assert!(rows[6].starts_with("╭ Modes"), "{}", rows[6]);
-        // Without metrics the detail has no history, so it ends with its
-        // text: a short panel, not the whole screen.
-        let end = last_row(&rows);
-        assert!(end < 27, "the view ends at row {end}:\n{}", rows.join("\n"));
-        assert!(rows[end].contains('╰'), "{}", rows[end]);
-        assert!(!rows.join("\n").contains("history · metrics"));
+    fn the_modes_box_and_the_detail_reach_the_bottom_of_the_body() {
+        for height in [30, 37] {
+            let rows = draw(&fixture(), LayoutKind::Full, 140, height);
+            // The list holds four caches and its border: six rows, not the column.
+            assert!(rows[5].starts_with('╰'), "{}", rows[5]);
+            assert!(rows[6].starts_with("╭ Modes"), "{}", rows[6]);
+            // Both columns end on the last row of the body, whether or not
+            // the detail has history to fill it.
+            let last = usize::from(height) - 1;
+            assert_eq!(last_row(&rows), last, "{}", rows.join("\n"));
+            let bottom = &rows[last];
+            assert_eq!(bottom.matches('╰').count(), 2, "{bottom}");
+            assert_eq!(bottom.matches('╯').count(), 2, "{bottom}");
+            assert!(!rows.join("\n").contains("history · metrics"));
+        }
     }
 
     #[test]

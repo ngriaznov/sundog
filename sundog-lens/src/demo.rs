@@ -118,18 +118,28 @@ fn open_marks(path: Option<&Path>) -> anyhow::Result<Option<File>> {
 /// the fleet, a node does not start, or, with `--headless`, a step fails or
 /// an await times out.
 pub async fn run(args: DemoArgs) -> anyhow::Result<()> {
+    // The origin of every stamp the run prints and writes, taken before the
+    // checks so the marks line up with the start of a recording.
+    let started = Instant::now();
     let scenario = load_scenario(&args.scenario)?;
     let config = FleetConfig::from_args(&args.fleet)?;
     let feed_config = feed_config(&config)?;
     let marks = open_marks(args.marks.as_deref())?;
     let fleet = Fleet::new(config);
+    // The preflight starts no process: a signal during it needs no cleanup.
     fleet.preflight().await?;
     let (load, handle) = load::Load::spawn(args.fleet.rate, args.fleet.keys);
     let stage = FleetStage::new(fleet, handle);
-    let outcome = if args.headless {
-        run_headless(&scenario, &stage, feed_config, marks).await
-    } else {
-        run_ui(&args, &scenario, &stage, feed_config, marks).await
+    // A signal at any point after that still reaches `stop_all` below.
+    let outcome = tokio::select! {
+        outcome = async {
+            if args.headless {
+                run_headless(&scenario, &stage, feed_config, marks, started).await
+            } else {
+                run_ui(&args, &scenario, &stage, feed_config, marks, started).await
+            }
+        } => outcome,
+        () = crate::watch::termination() => signal_outcome(args.headless),
     };
     if outcome.is_err() {
         for failure in stage.startup_failures() {
@@ -142,6 +152,31 @@ pub async fn run(args: DemoArgs) -> anyhow::Result<()> {
     outcome
 }
 
+/// The interface configuration of the demo: captions and demo keys on, and the
+/// seeds the observer joins through named on the splash.
+fn app_config(args: &DemoArgs, seeds: &[String]) -> AppConfig {
+    AppConfig {
+        look: Look::from_args(&args.display),
+        forget_after: Duration::from_secs(90),
+        anim: !args.display.no_anim,
+        demo: true,
+        captions: !args.no_captions,
+        scrape_interval: Some(SCRAPE_INTERVAL),
+        cluster: args.fleet.name.clone(),
+        seeds: seeds.to_vec(),
+        observer: None,
+    }
+}
+
+/// How a run ends when the process is asked to stop: a headless run did not
+/// finish its scenario and fails; an interface run is closed by the user.
+fn signal_outcome(headless: bool) -> anyhow::Result<()> {
+    if headless {
+        bail!("stopped by a signal");
+    }
+    Ok(())
+}
+
 /// Plays `scenario` under the interface. The run ends when the user quits,
 /// the scenario's `quit` step runs, or the process is asked to stop.
 async fn run_ui(
@@ -150,22 +185,14 @@ async fn run_ui(
     stage: &FleetStage,
     feed_config: FeedConfig,
     mut marks: Option<File>,
+    started: Instant,
 ) -> anyhow::Result<()> {
-    let started = SystemTime::now();
+    let seeds: Vec<String> = feed_config.seeds.iter().map(ToString::to_string).collect();
+    let wall = SystemTime::now();
     let feed = Feed::spawn(feed_config).await?;
-    let mut app = App::new(AppConfig {
-        look: Look::from_args(&args.display),
-        forget_after: Duration::from_secs(90),
-        anim: !args.display.no_anim,
-        demo: true,
-        captions: !args.no_captions,
-        scrape_interval: Some(SCRAPE_INTERVAL),
-        cluster: args.fleet.name.clone(),
-        seeds: Vec::new(),
-        observer: None,
-    });
+    let mut app = App::new(app_config(args, &seeds));
     app.set_observer(feed.observer_addr());
-    let model = model_for(&feed, started);
+    let model = model_for(&feed, wall);
 
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (fleet_tx, mut fleet_rx) = mpsc::unbounded_channel();
@@ -203,6 +230,7 @@ async fn run_ui(
     let mut log = io::sink();
     let play = director.play(
         scenario,
+        tokio::time::Instant::from_std(started),
         &mut log,
         marks.as_mut().map(|file| file as &mut dyn Write),
     );
@@ -261,8 +289,8 @@ async fn run_headless(
     stage: &FleetStage,
     feed_config: FeedConfig,
     mut marks: Option<File>,
+    started: Instant,
 ) -> anyhow::Result<()> {
-    let started = Instant::now();
     let mut feed = Feed::spawn(feed_config).await?;
     let mut model = model_for(&feed, SystemTime::now());
     let (digest_tx, digest_rx) = watch::channel(ModelDigest::default());
@@ -278,10 +306,13 @@ async fn run_headless(
     let mut stdout = io::stdout();
     let play = director.play(
         scenario,
+        tokio::time::Instant::from_std(started),
         &mut stdout,
         marks.as_mut().map(|file| file as &mut dyn Write),
     );
     tokio::pin!(play);
+    // A signal here shuts the feed down; one before this point is caught by
+    // `run`, which has nothing to shut down yet.
     let stop = crate::watch::termination();
     tokio::pin!(stop);
     let mut tick = tokio::time::interval(HEADLESS_TICK);
@@ -367,6 +398,57 @@ mod tests {
         assert_eq!(scrape.templates.len(), 1);
         assert!(scrape.pins.is_empty());
         assert_eq!(scrape.interval, SCRAPE_INTERVAL);
+    }
+
+    fn demo_args(extra: &[&str]) -> DemoArgs {
+        let mut args = vec!["demo"];
+        args.extend_from_slice(extra);
+        match crate::cli::parse(args).unwrap() {
+            crate::cli::Command::Demo(args) => args,
+            other => panic!("not a demo: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_splash_names_the_seeds_the_observer_joins_through() {
+        let args = demo_args(&[]);
+        let feed = feed_config(&config()).unwrap();
+        let seeds: Vec<String> = feed.seeds.iter().map(ToString::to_string).collect();
+        let app_config = app_config(&args, &seeds);
+        assert_eq!(app_config.seeds, ["127.0.0.11:7946", "127.0.0.12:7946"]);
+        assert!(app_config.demo && app_config.captions);
+        assert_eq!(app_config.cluster, "lens-demo");
+
+        let app = App::new(app_config);
+        let model = Model::new();
+        let ctx = Ctx {
+            now: Instant::now(),
+            wall: SystemTime::UNIX_EPOCH,
+            elapsed: Duration::ZERO,
+        };
+        let scene = Scene {
+            app: &app,
+            model: &model,
+            ctx: &ctx,
+            look: Look::default(),
+            kind: LayoutKind::Full,
+        };
+        let text: String = crate::ui::splash::lines(&scene)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(
+            text.contains("seeds 127.0.0.11:7946, 127.0.0.12:7946"),
+            "{text}"
+        );
+        assert!(!text.contains("mDNS"), "{text}");
+    }
+
+    #[test]
+    fn captions_follow_the_flag_and_a_signal_fails_only_a_headless_run() {
+        assert!(!app_config(&demo_args(&["--no-captions"]), &[]).captions);
+        assert!(signal_outcome(true).is_err());
+        assert!(signal_outcome(false).is_ok());
     }
 
     #[test]

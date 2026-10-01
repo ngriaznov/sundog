@@ -235,21 +235,25 @@ pub async fn run_session(session: Session) -> anyhow::Result<()> {
     result
 }
 
-/// Resolves when the process is asked to stop from outside: SIGTERM or SIGHUP
-/// on Unix, Ctrl-C elsewhere. Ctrl-C at the keyboard is a key event in raw
-/// mode, not a signal. If the handlers cannot be installed this never
-/// resolves.
+/// Resolves when the process is asked to stop from outside: SIGINT, SIGTERM
+/// or SIGHUP on Unix, Ctrl-C elsewhere. Ctrl-C at the keyboard is a key event
+/// in raw mode, not a signal, but outside raw mode (a headless run, the
+/// `cluster` command) the terminal sends SIGINT and the process handles it
+/// here, so it can stop the nodes it started. If the handlers cannot be
+/// installed this never resolves.
 pub async fn termination() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut terminate), Ok(mut hangup)) = (
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
             signal(SignalKind::terminate()),
             signal(SignalKind::hangup()),
         ) else {
             return std::future::pending().await;
         };
         tokio::select! {
+            _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
             _ = hangup.recv() => {}
         }
@@ -597,18 +601,28 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_sigterm_to_the_process_ends_the_wait_instead_of_killing_it() {
-        use rustix::process::{Signal, getpid, kill_process};
+    async fn signal_ends_the_wait(signal: rustix::process::Signal) {
+        use rustix::process::{getpid, kill_process};
         let waiting = tokio::spawn(termination());
         // Give the handlers time to install before the signal arrives.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!waiting.is_finished());
-        kill_process(getpid(), Signal::TERM).expect("the signal is sent");
+        kill_process(getpid(), signal).expect("the signal is sent");
         tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("the signal ends the wait")
             .expect("the wait does not panic");
+    }
+
+    /// One test for all three signals: a signal reaches every waiting
+    /// handler of the process, so tests that send them must not overlap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigint_sigterm_and_sighup_each_end_the_wait_instead_of_killing_the_process() {
+        use rustix::process::Signal;
+        for signal in [Signal::INT, Signal::TERM, Signal::HUP] {
+            signal_ends_the_wait(signal).await;
+        }
     }
 
     #[test]

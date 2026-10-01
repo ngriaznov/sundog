@@ -1,6 +1,8 @@
 //! The Members table: one row per node with its status, address, uptime,
 //! protocol, caches, ownership share, peer count and operations rate.
 
+use std::time::Duration;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -236,12 +238,21 @@ fn share_cell(
     }
     let owned = digest.parts_owned_by(node);
     let target = derive::share_fraction(owned);
-    let frac = if departing && !eligible {
-        0.0
-    } else {
-        scene.app.share(&digest.cache, node, target)
-    };
     let fair = derive::fair_share(digest.k, digest.eligible.len());
+    if departing && !eligible {
+        // An empty bar a cell short, then the time since the announcement in
+        // the nine cells and the gap the percentage and mark take.
+        let mut spans =
+            sharebar::bar_spans(0.0, Some(fair), bar.saturating_sub(1), row.color(), look);
+        spans.push(gap(1));
+        spans.push(look.span(
+            text::pad_right(&leaving_text(row.status_age(scene.ctx.wall)), 9),
+            Token::Warn,
+        ));
+        spans.push(gap(1));
+        return spans;
+    }
+    let frac = scene.app.share(&digest.cache, node, target);
     let mut spans = sharebar::bar_spans(frac, Some(fair), bar, row.color(), look);
     spans.push(gap(1));
     spans.push(look.span(text::pad_left(&text::percent(target, 1), 6), Token::Text));
@@ -249,6 +260,13 @@ fn share_cell(
     spans.push(agreement_mark(scene, row, digest));
     spans.push(gap(1));
     spans
+}
+
+/// What the SHARE cell of a departing node says in place of its share: how
+/// long ago it announced the departure.
+#[must_use]
+pub fn leaving_text(age: Duration) -> String {
+    format!("leave {}s", age.as_secs())
 }
 
 /// `✓` when the node reports the parts the observer computes, `↻` while it
@@ -388,16 +406,17 @@ fn row_line(
                     Token::Muted,
                 )),
                 Col::Up => {
-                    // A live node's clock runs from its process start (its
-                    // incarnation); a departing node's runs from the
-                    // departure and reads in the warning color.
+                    // The clock runs from the process start (the incarnation)
+                    // for a live and for a departing node; a departing node's
+                    // reads in the warning color and its SHARE cell counts the
+                    // time since the departure.
                     let token = if row.status() == MemberStatus::Departing {
                         Token::Warn
                     } else {
                         text_token
                     };
                     let up = row
-                        .uptime(scene.ctx.wall)
+                        .process_uptime(scene.ctx.wall)
                         .unwrap_or_else(|| row.status_age(scene.ctx.wall));
                     spans.push(look.span(text::pad_right(&text::uptime(up), 6), token));
                 }
@@ -590,7 +609,11 @@ mod tests {
     fn departing_down_and_left_rows_read_as_the_spec_shows() {
         let rows = draw(&fixture(), LayoutKind::Full, 84, 13);
         let departing = rows.iter().find(|r| r.contains("n6")).unwrap();
-        assert!(departing.contains("0.0%"), "{departing}");
+        // The process has run 19 s (it predates the fixture's clock); the
+        // departure was announced 10 s ago and the SHARE cell says so.
+        assert!(departing.contains(" 00:19 "), "{departing}");
+        assert!(departing.contains("leave 10s "), "{departing}");
+        assert!(!departing.contains("00:10"), "{departing}");
         assert!(
             departing.contains('◐') || departing.contains('◒'),
             "{departing}"
@@ -602,6 +625,29 @@ mod tests {
         );
         let left = rows.iter().find(|r| r.contains("n8")).unwrap();
         assert!(left.contains("○") && left.contains("left 10s"), "{left}");
+    }
+
+    #[test]
+    fn the_departure_age_reads_in_seconds() {
+        assert_eq!(leaving_text(Duration::from_millis(2_900)), "leave 2s");
+        assert_eq!(leaving_text(Duration::from_secs(61)), "leave 61s");
+    }
+
+    #[test]
+    fn a_departing_process_keeps_its_uptime_and_a_live_one_has_one() {
+        let model = fixture();
+        let wall = model.wall().unwrap();
+        let rows = crate::ui::data::all_node_rows(&model);
+        let by = |label: &str| rows.iter().find(|row| row.label() == label).unwrap();
+        // n6 departs but still runs; n7 is down and n8 is gone.
+        assert!(by("n6").uptime(wall).is_none());
+        assert_eq!(
+            by("n6").process_uptime(wall),
+            Some(Duration::from_millis(19_999))
+        );
+        assert_eq!(by("n1").process_uptime(wall), by("n1").uptime(wall));
+        assert!(by("n7").process_uptime(wall).is_none());
+        assert!(by("n8").process_uptime(wall).is_none());
     }
 
     #[test]

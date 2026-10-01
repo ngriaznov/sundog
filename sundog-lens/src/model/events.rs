@@ -83,6 +83,8 @@ pub enum EventKind {
         addr: SocketAddr,
         /// The node that held the address before.
         previous: NodeId,
+        /// The caches it advertises.
+        caches: BTreeMap<SmolStr, Mode>,
     },
     /// `RESTART`: the same node id at a higher incarnation.
     Restart {
@@ -248,6 +250,23 @@ impl EventKind {
         }
     }
 
+    /// The gossip address the event names, when it names one: the
+    /// membership events and the exporter's own.
+    #[must_use]
+    pub const fn addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Join { addr, .. }
+            | Self::Leave { addr, .. }
+            | Self::Left { addr, .. }
+            | Self::Down { addr, .. }
+            | Self::Up { addr, .. }
+            | Self::Rejoin { addr, .. }
+            | Self::Restart { addr, .. }
+            | Self::Exporter { addr, .. } => Some(*addr),
+            _ => None,
+        }
+    }
+
     /// The node the event is about, when it is about exactly one.
     #[must_use]
     pub const fn node(&self) -> Option<NodeId> {
@@ -327,6 +346,11 @@ impl Filter {
     }
 }
 
+/// How long after a node's `JOIN` or `REJOIN` a cache it opens still belongs
+/// to that row: a node advertises each cache as it opens it, and opening them
+/// and pulling their state takes it several seconds.
+pub const FOLD_WITHIN: Duration = Duration::from_secs(15);
+
 /// The most recent [`LOG_CAPACITY`] events, oldest dropped first.
 #[derive(Debug, Clone, Default)]
 pub struct EventLog {
@@ -346,6 +370,67 @@ impl EventLog {
             self.events.pop_front();
         }
         self.events.push_back(event);
+    }
+
+    /// Adds the cache `cache` opened in `mode` by `node` at `at` to the
+    /// node's latest `JOIN` or `REJOIN` row, when that row is at most
+    /// [`FOLD_WITHIN`] old and does not name the cache yet. Returns whether it
+    /// did: a `CACHE+` that folds is part of the arrival and raises no row of
+    /// its own.
+    pub fn fold_cache(
+        &mut self,
+        node: NodeId,
+        cache: &SmolStr,
+        mode: Mode,
+        at: SystemTime,
+    ) -> bool {
+        let Some(event) = self.events.iter_mut().rev().find(|event| {
+            matches!(
+                &event.kind,
+                EventKind::Join { node: held, .. } | EventKind::Rejoin { node: held, .. }
+                    if *held == node
+            )
+        }) else {
+            return false;
+        };
+        if at.duration_since(event.at).unwrap_or_default() > FOLD_WITHIN {
+            return false;
+        }
+        match &mut event.kind {
+            EventKind::Join { caches, .. } | EventKind::Rejoin { caches, .. }
+                if !caches.contains_key(cache) =>
+            {
+                caches.insert(cache.clone(), mode);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The events of the slot at gossip address `addr`, newest first: those
+    /// that name the address and those about a node that held it, whichever
+    /// process it was, so a restarted node's row shows its whole story
+    /// (`JOIN`, `DOWN`, `REJOIN`). `current` is the node there now, which
+    /// counts before any event names it.
+    #[must_use]
+    pub fn of_address(&self, addr: SocketAddr, current: NodeId) -> Vec<&Event> {
+        let mut held: Vec<NodeId> = vec![current];
+        for event in &self.events {
+            if event.kind.addr() == Some(addr)
+                && let Some(node) = event.kind.node()
+                && !held.contains(&node)
+            {
+                held.push(node);
+            }
+        }
+        self.events
+            .iter()
+            .rev()
+            .filter(|event| {
+                event.kind.addr() == Some(addr)
+                    || event.kind.node().is_some_and(|node| held.contains(&node))
+            })
+            .collect()
     }
 
     /// How many events the log holds.
@@ -445,6 +530,7 @@ fn arrival(
             node,
             addr,
             previous,
+            caches: member.caches.clone(),
         }
     } else {
         EventKind::Join {
@@ -837,7 +923,186 @@ mod tests {
                 node: testkit::node_id(1, 1),
                 addr: addr(1),
                 previous: node(1),
+                caches: [("it".into(), testkit::distributed(2))].into(),
             }]
+        );
+    }
+
+    fn wall(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn join_row(index: u8, at: u64, caches: &[(&str, Mode)]) -> Event {
+        Event {
+            at: wall(at),
+            kind: EventKind::Join {
+                node: node(index),
+                addr: addr(index),
+                protocol: 6,
+                caches: caches.iter().map(|(n, m)| ((*n).into(), *m)).collect(),
+            },
+        }
+    }
+
+    fn joined_caches(log: &EventLog, row: usize) -> Vec<String> {
+        match &log.iter().nth(row).unwrap().kind {
+            EventKind::Join { caches, .. } | EventKind::Rejoin { caches, .. } => {
+                caches.keys().map(ToString::to_string).collect()
+            }
+            other => panic!("not an arrival: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cache_a_node_opens_just_after_it_joins_folds_into_its_join_row() {
+        let mut log = EventLog::new();
+        log.push(join_row(1, 100, &[]));
+        log.push(join_row(2, 100, &[("it", testkit::distributed(2))]));
+        let side = Mode::Replicated;
+        // Folds into node 1's row, not node 2's, and says so.
+        assert!(log.fold_cache(node(1), &"os".into(), side, wall(102)));
+        assert!(log.fold_cache(node(1), &"pn".into(), side, wall(100) + FOLD_WITHIN));
+        assert_eq!(joined_caches(&log, 0), ["os", "pn"]);
+        assert_eq!(joined_caches(&log, 1), ["it"]);
+        assert_eq!(log.len(), 2, "a fold adds no row");
+    }
+
+    #[test]
+    fn a_cache_does_not_fold_into_a_stale_row_a_named_cache_or_another_node() {
+        let mut log = EventLog::new();
+        log.push(join_row(1, 100, &[("it", testkit::distributed(2))]));
+        let side = Mode::Replicated;
+        // Past the window.
+        let late = wall(100) + FOLD_WITHIN + Duration::from_secs(1);
+        assert!(!log.fold_cache(node(1), &"os".into(), side, late));
+        // The row names it already: a mode change stands on its own.
+        assert!(!log.fold_cache(node(1), &"it".into(), side, wall(101)));
+        // No arrival row for the node.
+        assert!(!log.fold_cache(node(9), &"os".into(), side, wall(101)));
+        assert!(!EventLog::new().fold_cache(node(1), &"os".into(), side, wall(1)));
+        assert_eq!(joined_caches(&log, 0), ["it"]);
+    }
+
+    #[test]
+    fn a_cache_folds_into_a_rejoin_row_and_into_the_latest_arrival_of_the_node() {
+        let mut log = EventLog::new();
+        log.push(join_row(1, 10, &[]));
+        log.push(Event {
+            at: wall(100),
+            kind: EventKind::Rejoin {
+                node: node(1),
+                addr: addr(1),
+                previous: node(7),
+                caches: BTreeMap::new(),
+            },
+        });
+        assert!(log.fold_cache(node(1), &"os".into(), Mode::Replicated, wall(101)));
+        assert!(joined_caches(&log, 0).is_empty());
+        assert_eq!(joined_caches(&log, 1), ["os"]);
+    }
+
+    #[test]
+    fn the_events_of_an_address_include_every_process_that_held_it() {
+        let old = node(1);
+        let new = testkit::node_id(1, 1);
+        let other = node(2);
+        let at = |secs| wall(secs);
+        let mut log = EventLog::new();
+        let push = |log: &mut EventLog, secs, kind| log.push(Event { at: at(secs), kind });
+        push(
+            &mut log,
+            1,
+            EventKind::Join {
+                node: old,
+                addr: addr(1),
+                protocol: 6,
+                caches: BTreeMap::new(),
+            },
+        );
+        push(
+            &mut log,
+            2,
+            EventKind::Join {
+                node: other,
+                addr: addr(2),
+                protocol: 6,
+                caches: BTreeMap::new(),
+            },
+        );
+        push(&mut log, 3, EventKind::Ready { node: old });
+        push(
+            &mut log,
+            4,
+            EventKind::Down {
+                node: old,
+                addr: addr(1),
+                exporter_silent: None,
+                superseded: false,
+            },
+        );
+        push(&mut log, 5, EventKind::Ready { node: other });
+        push(
+            &mut log,
+            6,
+            EventKind::Rejoin {
+                node: new,
+                addr: addr(1),
+                previous: old,
+                caches: BTreeMap::new(),
+            },
+        );
+        push(&mut log, 7, EventKind::Ready { node: new });
+        push(
+            &mut log,
+            8,
+            EventKind::View {
+                cache: "it".into(),
+                from: None,
+                to: 1,
+                moved: 0,
+                deltas: Vec::new(),
+            },
+        );
+        let tags = |events: Vec<&Event>| -> Vec<&'static str> {
+            events.iter().map(|event| event.kind.tag()).collect()
+        };
+        // Newest first: the new process's READY and REJOIN, then the old
+        // one's DOWN, READY and JOIN; node 2 and the cluster-wide VIEW stay out.
+        assert_eq!(
+            tags(log.of_address(addr(1), new)),
+            ["READY", "REJOIN", "DOWN", "READY", "JOIN"]
+        );
+        assert_eq!(tags(log.of_address(addr(2), other)), ["READY", "JOIN"]);
+        // An address nothing names, held by a node nothing mentions.
+        assert!(log.of_address(addr(9), node(9)).is_empty());
+        // The current node counts even when no event names its address: its
+        // own events are the slot's.
+        assert_eq!(tags(log.of_address(addr(7), new)), ["READY", "REJOIN"]);
+    }
+
+    #[test]
+    fn an_event_names_its_gossip_address_when_it_has_one() {
+        let n = node(1);
+        let a = addr(1);
+        assert_eq!(EventKind::Restart { node: n, addr: a }.addr(), Some(a));
+        assert_eq!(EventKind::Up { node: n, addr: a }.addr(), Some(a));
+        assert_eq!(
+            EventKind::Exporter {
+                node: n,
+                addr: a,
+                detail: String::new()
+            }
+            .addr(),
+            Some(a)
+        );
+        assert_eq!(EventKind::Ready { node: n }.addr(), None);
+        assert_eq!(
+            EventKind::CacheRemoved {
+                node: n,
+                cache: "it".into()
+            }
+            .addr(),
+            None
         );
     }
 
@@ -1075,6 +1340,7 @@ mod tests {
                     node: n,
                     addr: a,
                     previous: node(2),
+                    caches: BTreeMap::new(),
                 },
                 "REJOIN",
                 Category::Membership,

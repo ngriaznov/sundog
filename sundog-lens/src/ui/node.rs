@@ -16,7 +16,6 @@ use super::widgets::blocks::BlockArea;
 use super::widgets::braille::BrailleArea;
 use super::{LayoutKind, Scene, eventlog, overview, text};
 use crate::model::derive::{self, Agreement};
-use crate::model::events::Filter;
 use crate::model::metrics::NodeMetrics;
 use crate::source::names;
 
@@ -329,6 +328,36 @@ fn gone_notice(scene: &Scene<'_>, row: &NodeRow<'_>) -> Vec<Line<'static>> {
     }
 }
 
+/// How many samples a chart column holds: braille packs two, blocks one.
+const fn samples_per_column(look: crate::ui::look::Look) -> usize {
+    if look.braille { 2 } else { 1 }
+}
+
+/// The fewest samples a history needs to be stretched across a chart.
+const MIN_STRETCH: usize = 3;
+
+/// `values` stretched to `samples` points by linear interpolation when it
+/// holds at least three samples and fewer than `samples`, so that a young
+/// node's whole history fills the chart; otherwise `values` unchanged.
+#[must_use]
+pub fn stretch(values: &[f64], samples: usize) -> Vec<f64> {
+    if values.len() < MIN_STRETCH || values.len() >= samples {
+        return values.to_vec();
+    }
+    let last = values.len() - 1;
+    let denominator = samples - 1;
+    (0..samples)
+        .map(|i| {
+            let numerator = i * last;
+            let (index, rest) = (numerator / denominator, numerator % denominator);
+            let above = (index + 1).min(last);
+            let fraction =
+                crate::model::count_to_f64(rest) / crate::model::count_to_f64(denominator);
+            values[index] + (values[above] - values[index]) * fraction
+        })
+        .collect()
+}
+
 fn chart(
     scene: &Scene<'_>,
     row: &NodeRow<'_>,
@@ -337,7 +366,21 @@ fn chart(
     buf: &mut Buffer,
 ) {
     let look = scene.look;
-    let block = panel::block(look, "ops/s", "metrics", Vec::new(), false);
+    let ops = metrics.map(|metrics| metrics.ops().to_vec());
+    // A history shorter than the chart is stretched over its width and the
+    // title says how long it is.
+    let samples = samples_per_column(look) * usize::from(area.width.saturating_sub(4));
+    let stretched = ops
+        .as_ref()
+        .is_some_and(|ops| ops.len() >= MIN_STRETCH && ops.len() < samples);
+    let right = match (&ops, stretched) {
+        (Some(ops), true) => {
+            let span = scene.model.scrape_interval() * u32::try_from(ops.len()).unwrap_or(u32::MAX);
+            vec![look.span(format!("last {} ", text::age(span)), Token::Muted)]
+        }
+        _ => Vec::new(),
+    };
+    let block = panel::block(look, "ops/s", "metrics", right, false);
     let inner = panel::draw(block, area, buf);
     if inner.height < 3 || inner.width < 4 {
         return;
@@ -366,15 +409,16 @@ fn chart(
         inner.width.saturating_sub(2),
         inner.height - 1,
     );
+    let shown = stretch(&ops, samples_per_column(look) * usize::from(plot.width));
     if look.braille {
         ratatui::widgets::Widget::render(
-            BrailleArea::new(&ops, max, look.mode).tinted(row.color()),
+            BrailleArea::new(&shown, max, look.mode).tinted(row.color()),
             plot,
             buf,
         );
     } else {
         ratatui::widgets::Widget::render(
-            BlockArea::new(&ops, max, look.mode).tinted(row.color()),
+            BlockArea::new(&shown, max, look.mode).tinted(row.color()),
             plot,
             buf,
         );
@@ -673,13 +717,11 @@ fn cache_table(
 
 fn events(scene: &Scene<'_>, row: &NodeRow<'_>, area: Rect, buf: &mut Buffer) {
     let look = scene.look;
-    let node = row.member.peer.node;
-    let mine: Vec<_> = scene
+    // The slot's events, whichever process held the address.
+    let mine = scene
         .model
         .events()
-        .newest_first(Filter::All)
-        .filter(|event| event.kind.node() == Some(node))
-        .collect();
+        .of_address(row.member.peer.gossip_addr, row.member.peer.node);
     let mut title = vec![gap(1), panel::title_span(look, "events for"), gap(1)];
     title.push(look.node_span(row.label().to_owned(), row.color()));
     title.push(gap(1));
@@ -888,6 +930,45 @@ mod tests {
     }
 
     #[test]
+    fn a_short_history_stretches_to_the_width_and_a_long_one_stays() {
+        // Two samples are too few to draw a line through.
+        assert_eq!(stretch(&[1.0, 3.0], 5), [1.0, 3.0]);
+        // Three samples over five points: the ends stay, the middle follows.
+        assert_eq!(stretch(&[0.0, 4.0, 0.0], 5), [0.0, 2.0, 4.0, 2.0, 0.0]);
+        let stretched = stretch(&[1.0, 2.0, 3.0, 4.0], 10);
+        assert_eq!(stretched.len(), 10);
+        assert_eq!((stretched[0], stretched[9]), (1.0, 4.0));
+        assert!(stretched.windows(2).all(|pair| pair[0] <= pair[1]));
+        // A history as long as the chart, or longer, is left alone.
+        assert_eq!(stretch(&[1.0, 2.0, 3.0], 3), [1.0, 2.0, 3.0]);
+        assert_eq!(stretch(&[1.0, 2.0, 3.0, 4.0], 3), [1.0, 2.0, 3.0, 4.0]);
+        assert!(stretch(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn a_young_nodes_chart_fills_its_width_and_the_title_says_how_long_it_is() {
+        let model = testkit::fixture_model_with_scrapes(Instant::now(), 8);
+        let buf = buffer_with(&app_on("n2", &model), &model, 140, 37);
+        let row_text = |y| crate::ui::panel::row_text(&buf, y);
+        assert!(row_text(0).contains("last 7s"), "{}", row_text(0));
+        // The chart spans the panel: the leftmost plot columns hold data.
+        let filled = (1..10)
+            .flat_map(|y| (68..76).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buf[(x, y)]
+                    .symbol()
+                    .chars()
+                    .all(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+            })
+            .count();
+        assert!(filled > 0, "the chart starts at the left edge");
+        // A history longer than the chart is drawn as it is.
+        let long = testkit::fixture_model_with_scrapes(Instant::now(), 200);
+        let buf = buffer_with(&app_on("n2", &long), &long, 140, 37);
+        assert!(!crate::ui::panel::row_text(&buf, 0).contains("last "));
+    }
+
+    #[test]
     fn a_node_whose_exporter_stopped_answering_says_so_in_place_of_the_chart() {
         let mut model = testkit::fixture_model_with_metrics(Instant::now());
         let row = data::row_labeled(&model, "n2").unwrap();
@@ -940,6 +1021,38 @@ mod tests {
         assert!(text.contains("events for n6"), "{text}");
         assert!(text.contains("LEAVE"), "{text}");
         assert!(!text.contains("DOWN"), "n7's crash is not n6's: {text}");
+    }
+
+    #[test]
+    fn a_restarted_nodes_events_panel_tells_the_whole_story_of_its_slot() {
+        use sundog::observe::{ClusterSnapshot, MemberStatus};
+
+        use crate::source::Update;
+
+        let at = Instant::now();
+        let wall = std::time::SystemTime::UNIX_EPOCH;
+        let mut model = crate::model::Model::new();
+        let old = testkit::member_at(2, 0, 1, MemberStatus::Live);
+        let snapshot = |members| {
+            Update::Snapshot(
+                std::sync::Arc::new(ClusterSnapshot::new("c", members, 0)),
+                at,
+            )
+        };
+        model.apply(snapshot(vec![old.clone()]), at, wall);
+        let later = at + crate::model::DISCOVERY_QUIET;
+        model.tick(later);
+        // The process behind n2's address dies, and another takes it over.
+        let mut new = testkit::member_at(2, 0, 2, MemberStatus::Live);
+        new.peer.node = testkit::node_id(5, 0);
+        let mut gone = old;
+        gone.status = MemberStatus::Down;
+        model.apply(snapshot(vec![gone, new]), later, wall);
+        let app = app_on("n1", &model);
+        let text = draw_with(&app, &model, LayoutKind::Full, 140, 37).join("\n");
+        assert!(text.contains("events for n1"), "{text}");
+        assert!(text.contains("REJOIN"), "the new process: {text}");
+        assert!(text.contains("DOWN"), "the old process: {text}");
     }
 
     #[test]

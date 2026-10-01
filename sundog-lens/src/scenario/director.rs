@@ -24,7 +24,7 @@ use smol_str::SmolStr;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use super::{Scenario, Step};
+use super::{AwaitedStatus, Scenario, Step};
 use crate::app::UiCommand;
 use crate::model::digest::ModelDigest;
 
@@ -57,6 +57,28 @@ pub trait Stage {
     async fn crash(&self, label: &str) -> anyhow::Result<()>;
     /// Starts a stopped node again at its address.
     async fn restart(&self, label: &str) -> anyhow::Result<()>;
+}
+
+/// The node `step` removes without a goodbye and how the scenario names the
+/// way: a `kill` is a SIGKILL, a `crash` is the node's own crash.
+#[must_use]
+pub fn abrupt_exit(step: &Step) -> Option<(&str, &'static str)> {
+    match step {
+        Step::Kill(label) => Some((label, "SIGKILL")),
+        Step::Crash(label) => Some((label, "crash")),
+        _ => None,
+    }
+}
+
+/// The caption that makes the failure detector's delay visible: how long
+/// after its abrupt exit (`how`, as [`abrupt_exit`] names it) the lens saw
+/// `label` go down.
+#[must_use]
+pub fn detected_caption(label: &str, how: &str, after: Duration) -> String {
+    format!(
+        "{label} marked down {:.1} s after the {how}",
+        after.as_secs_f64()
+    )
 }
 
 /// What the director remembers between looks at the digest.
@@ -308,16 +330,18 @@ impl<S: Stage> Director<S> {
                 settled => return settled,
             }
             if let Ok(Err(_)) = tokio::time::timeout(POLL, digests.changed()).await {
-                // The publisher is gone: the digest will not change again.
+                // The publisher is gone: the digest does not change again.
                 tokio::time::sleep(POLL).await;
             }
         }
     }
 
-    /// Plays every step of `scenario`, writing one line per step and per
-    /// finished wait to `out` and, when given, one `<seconds> <step>` line
-    /// per step to `marks`. A scenario that ends without a `quit` step ends
-    /// as if it had one.
+    /// Plays every step of `scenario`, writing one line per step to `out`
+    /// when it starts and one for each wait that ends, and, when given, one
+    /// `<seconds> <step>` line per step to `marks`. Every stamp counts from
+    /// `start`, so the caller's own lines share the origin. A scenario that
+    /// ends without a `quit` step ends as if it had one: the director tells
+    /// the interface to quit.
     ///
     /// # Errors
     ///
@@ -326,21 +350,27 @@ impl<S: Stage> Director<S> {
     pub async fn play<W: Write>(
         &self,
         scenario: &Scenario,
+        start: Instant,
         out: &mut W,
         mut marks: Option<&mut dyn Write>,
     ) -> Result<Outcome, PlayError> {
-        let start = Instant::now();
         let mut state = DirectorState {
-            step_started: start,
+            step_started: Instant::now(),
             baseline: BTreeMap::new(),
         };
         let mut outcome = Outcome::default();
+        let mut quit = false;
+        // The last abrupt exit: who, how, and when the stage reported it done.
+        let mut exited: Option<(String, &'static str, Instant)> = None;
         for entry in &scenario.steps {
             let step = &entry.step;
             let line = entry.line;
             let text = step.to_string();
             state.step_started = Instant::now();
-            let at = state.step_started.duration_since(start).as_secs_f64();
+            let at = state
+                .step_started
+                .saturating_duration_since(start)
+                .as_secs_f64();
             writeln!(out, "[{at:7.1}s] {text}")?;
             if let Some(marks) = marks.as_deref_mut() {
                 writeln!(marks, "{at:.3} {text}")?;
@@ -357,20 +387,39 @@ impl<S: Stage> Director<S> {
                         source,
                     });
                 }
-                writeln!(out, "[{at:7.1}s]   failed: {source:#}")?;
+                if !self.options.headless {
+                    tracing::warn!(line, step = %text, "step failed: {source:#}");
+                }
+                writeln!(
+                    out,
+                    "[{:7.1}s]   failed: {source:#}",
+                    Instant::now()
+                        .saturating_duration_since(start)
+                        .as_secs_f64()
+                )?;
                 outcome.failures.push((line, format!("{source:#}")));
-            } else if let Some(timeout) = self.finish(step, &state, line, &text, out).await? {
+            } else if let Some(timeout) = self.finish(step, &state, start, line, &text, out).await?
+            {
                 if self.options.headless {
                     return Err(PlayError::TimedOut(timeout));
                 }
                 outcome.timeouts.push(timeout);
+            } else {
+                if let Some((label, how)) = abrupt_exit(step) {
+                    exited = Some((label.to_owned(), how, Instant::now()));
+                }
+                self.show_detection(step, exited.as_ref());
             }
             outcome.steps += 1;
             if matches!(step, Step::Quit) {
+                quit = true;
                 break;
             }
         }
-        outcome.elapsed = start.elapsed();
+        if !quit {
+            self.command(UiCommand::Quit);
+        }
+        outcome.elapsed = Instant::now().saturating_duration_since(start);
         writeln!(
             out,
             "[{:7.1}s] scenario done: {} steps, {} timeouts, {} failures",
@@ -382,6 +431,27 @@ impl<S: Stage> Director<S> {
         Ok(outcome)
     }
 
+    /// After `await down <label>` for the node `exited` names, captions how
+    /// long the failure detector took.
+    fn show_detection(&self, step: &Step, exited: Option<&(String, &'static str, Instant)>) {
+        if !self.options.captions {
+            return;
+        }
+        if let Step::AwaitStatus {
+            status: AwaitedStatus::Down,
+            label,
+            ..
+        } = step
+            && let Some((who, how, at)) = exited
+            && who == label
+        {
+            let after = Instant::now().saturating_duration_since(*at);
+            self.command(UiCommand::Caption(Some(detected_caption(
+                label, how, after,
+            ))));
+        }
+    }
+
     /// Waits out a pause or an await. Returns the timeout when an await ran
     /// out of time; `None` for every other end, including a step that does
     /// not wait.
@@ -389,6 +459,7 @@ impl<S: Stage> Director<S> {
         &self,
         step: &Step,
         state: &DirectorState,
+        start: Instant,
         line: usize,
         text: &str,
         out: &mut W,
@@ -401,16 +472,25 @@ impl<S: Stage> Director<S> {
         if pause {
             return Ok(None);
         }
-        let took = Instant::now().saturating_duration_since(state.step_started);
+        let now = Instant::now();
+        let took = now.saturating_duration_since(state.step_started);
+        let at = now.saturating_duration_since(start).as_secs_f64();
         if action == DirectorAction::TimedOut {
-            writeln!(out, "           timed out after {:.1}s", took.as_secs_f64())?;
+            if !self.options.headless {
+                tracing::warn!(line, step = %text, "await timed out after {:.1}s", took.as_secs_f64());
+            }
+            writeln!(
+                out,
+                "[{at:7.1}s]   timed out after {:.1}s",
+                took.as_secs_f64()
+            )?;
             self.command(UiCommand::Caption(Some(TIMED_OUT_CAPTION.to_owned())));
             return Ok(Some(Timeout {
                 line,
                 step: text.to_owned(),
             }));
         }
-        writeln!(out, "           ok after {:.1}s", took.as_secs_f64())?;
+        writeln!(out, "[{at:7.1}s]   ok after {:.1}s", took.as_secs_f64())?;
         Ok(None)
     }
 }
@@ -425,6 +505,11 @@ mod tests {
     use crate::scenario::{AwaitedStatus, parse};
 
     const S: fn(u64) -> Duration = Duration::from_secs;
+
+    /// Held by the tests whose runs log a warning. `tracing` caches whether a
+    /// callsite is enabled when a thread first reaches it, so a test that
+    /// installs a subscriber must not race another test into the callsite.
+    static LOGGING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn digest(live: usize) -> ModelDigest {
         ModelDigest {
@@ -650,6 +735,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn condition_met_holds_for_each_await_and_for_non_awaits() {
+        let members = Step::AwaitMembers {
+            count: 3,
+            within: None,
+        };
+        let none = BTreeMap::new();
+        assert!(condition_met(&members, &none, &digest(3)));
+        assert!(!condition_met(&members, &none, &digest(2)));
+
+        let mut d = digest(2);
+        d.statuses.insert("n2".into(), MemberStatus::Departing);
+        let departing = Step::AwaitStatus {
+            status: AwaitedStatus::Departing,
+            label: "n2".into(),
+            within: None,
+        };
+        let left = Step::AwaitStatus {
+            status: AwaitedStatus::Left,
+            label: "n2".into(),
+            within: None,
+        };
+        assert!(condition_met(&departing, &none, &d));
+        assert!(!condition_met(&left, &none, &d));
+
+        let settled = settled_step(None);
+        let base: BTreeMap<SmolStr, u64> = [("it".into(), 7)].into();
+        // Same view as the baseline: not met, however settled.
+        assert!(!condition_met(
+            &settled,
+            &base,
+            &with_cache(digest(3), 7, true)
+        ));
+        // A different view, settled: met.
+        assert!(condition_met(
+            &settled,
+            &base,
+            &with_cache(digest(3), 8, true)
+        ));
+        assert!(!condition_met(
+            &settled,
+            &base,
+            &with_cache(digest(3), 8, false)
+        ));
+        // No baseline: any view counts once it has settled.
+        assert!(condition_met(
+            &settled,
+            &none,
+            &with_cache(digest(3), 1, true)
+        ));
+        // No view at all.
+        assert!(!condition_met(&settled, &base, &digest(3)));
+
+        // A step that is not an await has no condition and holds.
+        for step in [
+            Step::Quit,
+            Step::Pause(S(1)),
+            Step::Fill(1),
+            Step::Load(true),
+        ] {
+            assert!(
+                condition_met(&step, &none, &ModelDigest::default()),
+                "{step}"
+            );
+        }
+    }
+
     /// A stage that records what it is asked and, for a spawn, moves the
     /// digest the way a real cluster would: members join, the view changes,
     /// and the cache settles a moment later.
@@ -658,6 +810,8 @@ mod tests {
         digests: watch::Sender<ModelDigest>,
         fail_kill: bool,
         settle_after: Duration,
+        /// After a kill or crash the node shows `Down` this much later.
+        down_after: Option<Duration>,
     }
 
     impl Fake {
@@ -667,6 +821,7 @@ mod tests {
                 digests,
                 fail_kill: false,
                 settle_after: Duration::from_millis(500),
+                down_after: None,
             }
         }
 
@@ -676,6 +831,19 @@ mod tests {
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// The detector notices `label` `down_after` later, if set.
+        fn goes_down(&self, label: &str) {
+            let Some(after) = self.down_after else { return };
+            let digests = self.digests.clone();
+            let label = label.to_owned();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                digests.send_modify(|d| {
+                    d.statuses.insert(label.as_str().into(), MemberStatus::Down);
+                });
+            });
         }
 
         /// The cluster changes: `live` members, a new view, settled later.
@@ -717,6 +885,7 @@ mod tests {
             if self.fail_kill {
                 anyhow::bail!("{label} is not running");
             }
+            self.goes_down(label);
             Ok(())
         }
 
@@ -727,6 +896,7 @@ mod tests {
 
         async fn crash(&self, label: &str) -> anyhow::Result<()> {
             self.note(format!("crash {label}"));
+            self.goes_down(label);
             Ok(())
         }
 
@@ -783,7 +953,7 @@ mod tests {
         let mut marks = Vec::new();
         let outcome = rig
             .director
-            .play(&scenario, &mut out, Some(&mut marks))
+            .play(&scenario, Instant::now(), &mut out, Some(&mut marks))
             .await
             .unwrap();
         assert_eq!(outcome.steps, 12);
@@ -827,7 +997,11 @@ mod tests {
         let rig = rig(HEADLESS, |fake| fake.settle_after = S(4));
         let scenario = parse("spawn 1\nawait settled it within 25s\nquit").unwrap();
         let mut out = Vec::new();
-        let outcome = rig.director.play(&scenario, &mut out, None).await.unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
         // The cache settled four seconds after the spawn, so the await took
         // that long and no less.
         assert!(outcome.elapsed >= S(4), "{:?}", outcome.elapsed);
@@ -843,7 +1017,11 @@ mod tests {
             parse("spawn 1\nawait settled it within 5s\nspawn 1\nawait settled it within 5s")
                 .unwrap();
         let mut out = Vec::new();
-        let outcome = rig.director.play(&scenario, &mut out, None).await.unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
         assert!(outcome.timeouts.is_empty());
         assert_eq!(outcome.steps, 4);
     }
@@ -855,7 +1033,7 @@ mod tests {
         let mut out = Vec::new();
         let error = rig
             .director
-            .play(&scenario, &mut out, None)
+            .play(&scenario, Instant::now(), &mut out, None)
             .await
             .unwrap_err();
         match &error {
@@ -878,10 +1056,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_run_with_an_interface_notes_a_timeout_shows_a_caption_and_goes_on() {
+        let _logging = LOGGING.lock().await;
         let mut rig = rig(SHOW, |_| {});
         let scenario = parse("await members 9 within 2s\nfill 5\nquit").unwrap();
         let mut out = Vec::new();
-        let outcome = rig.director.play(&scenario, &mut out, None).await.unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
         assert_eq!(outcome.steps, 3);
         assert_eq!(
             outcome.timeouts,
@@ -900,12 +1083,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_step_ends_a_headless_run_and_is_noted_otherwise() {
+        let _logging = LOGGING.lock().await;
         let headless = rig(HEADLESS, |fake| fake.fail_kill = true);
         let scenario = parse("fill 1\nkill n7\nfill 2").unwrap();
         let mut out = Vec::new();
         let error = headless
             .director
-            .play(&scenario, &mut out, None)
+            .play(&scenario, Instant::now(), &mut out, None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -918,7 +1102,7 @@ mod tests {
         let mut out = Vec::new();
         let outcome = shown
             .director
-            .play(&scenario, &mut out, None)
+            .play(&scenario, Instant::now(), &mut out, None)
             .await
             .unwrap();
         assert_eq!(outcome.steps, 3);
@@ -947,19 +1131,24 @@ mod tests {
         let mut out = Vec::new();
         quiet
             .director
-            .play(&scenario, &mut out, None)
+            .play(&scenario, Instant::now(), &mut out, None)
             .await
             .unwrap();
         assert_eq!(
             quiet.ui.try_recv().unwrap(),
             UiCommand::Tab(crate::ui::View::Node)
         );
+        // The scenario has no `quit` step, so the director ends it.
+        assert_eq!(quiet.ui.try_recv().unwrap(), UiCommand::Quit);
         assert!(quiet.ui.try_recv().is_err());
 
         let (tx, rx) = watch::channel(ModelDigest::default());
         let none = Director::new(Fake::new(tx), rx, None, HEADLESS);
         let mut out = Vec::new();
-        let outcome = none.play(&scenario, &mut out, None).await.unwrap();
+        let outcome = none
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
         assert_eq!(outcome.steps, 2);
     }
 
@@ -989,14 +1178,14 @@ mod tests {
         let scenario = parse("fill 1\nquit").unwrap();
         let error = rig
             .director
-            .play(&scenario, &mut Broken, None)
+            .play(&scenario, Instant::now(), &mut Broken, None)
             .await
             .unwrap_err();
         assert!(matches!(error, PlayError::Io(_)), "{error}");
         let mut out = Vec::new();
         let error = rig
             .director
-            .play(&scenario, &mut out, Some(&mut Broken))
+            .play(&scenario, Instant::now(), &mut out, Some(&mut Broken))
             .await
             .unwrap_err();
         assert!(matches!(error, PlayError::Io(_)), "{error}");
@@ -1007,16 +1196,220 @@ mod tests {
         let rig = rig(HEADLESS, |_| {});
         let scenario = parse("fill 1\nquit\nfill 2").unwrap();
         let mut out = Vec::new();
-        let outcome = rig.director.play(&scenario, &mut out, None).await.unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
         assert_eq!(outcome.steps, 2);
         assert_eq!(rig.director.stage.calls(), ["fill 1"]);
 
         let empty = rig
             .director
-            .play(&Scenario::default(), &mut Vec::new(), None)
+            .play(&Scenario::default(), Instant::now(), &mut Vec::new(), None)
             .await
             .unwrap();
         assert_eq!(empty.steps, 0);
+    }
+
+    /// The stamps of the `[ 12.3s]` lines of a log, in order.
+    fn stamps(log: &str) -> Vec<f64> {
+        log.lines()
+            .filter_map(|line| {
+                let inner = line.strip_prefix('[')?.split_once("s]")?.0;
+                inner.trim().parse().ok()
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_stamp_counts_from_the_origin_the_caller_gives_and_never_goes_back() {
+        let rig = rig(HEADLESS, |fake| fake.settle_after = S(2));
+        let scenario = parse(
+            "pause 1s\nspawn 1\nawait members 1 within 5s\n\
+             await settled it within 25s\npause 1s\nquit",
+        )
+        .unwrap();
+        // The run began 10 s before the director took over.
+        let start = Instant::now() - S(10);
+        let mut out = Vec::new();
+        let mut marks = Vec::new();
+        rig.director
+            .play(&scenario, start, &mut out, Some(&mut marks))
+            .await
+            .unwrap();
+        let log = String::from_utf8(out).unwrap();
+        let stamps = stamps(&log);
+        assert!(stamps.len() >= 9, "{log}");
+        assert!(stamps[0] >= 10.0, "{log}");
+        assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]), "{log}");
+        let marks = String::from_utf8(marks).unwrap();
+        let first: f64 = marks.split(' ').next().unwrap().parse().unwrap();
+        assert!(first >= 10.0, "{marks}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scenario_without_quit_tells_the_interface_to_quit_after_its_last_step() {
+        let mut rig = rig(SHOW, |_| {});
+        let scenario = parse("tab node\nfill 1").unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(
+            rig.ui.try_recv().unwrap(),
+            UiCommand::Tab(crate::ui::View::Node)
+        );
+        assert_eq!(rig.ui.try_recv().unwrap(), UiCommand::Quit);
+        assert!(rig.ui.try_recv().is_err());
+    }
+
+    /// Collects what `tracing` events write.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_with_an_interface_logs_a_warning_for_a_timeout_and_a_failed_step() {
+        let _logging = LOGGING.lock().await;
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // Other tests of this module hit the same callsites on their own
+        // threads, with no subscriber: recompute what each callsite is
+        // interested in now that this thread has one.
+        tracing::callsite::rebuild_interest_cache();
+        let scenario = parse("await members 9 within 2s\nkill n7\nquit").unwrap();
+
+        let shown = rig(SHOW, |fake| fake.fail_kill = true);
+        shown
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap();
+        let text = captured.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("await timed out after 2.0s"), "{text}");
+        assert!(text.contains("await members 9 within 2s"), "{text}");
+        assert!(text.contains("step failed: n7 is not running"), "{text}");
+
+        // A headless run reports through its error and stays out of the log.
+        let before = captured.text();
+        let headless = rig(HEADLESS, |_| {});
+        let timeout = parse("await members 9 within 2s").unwrap();
+        headless
+            .director
+            .play(&timeout, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(captured.text(), before);
+    }
+
+    #[test]
+    fn only_a_kill_and_a_crash_leave_without_a_goodbye() {
+        assert_eq!(
+            abrupt_exit(&Step::Kill("n3".into())),
+            Some(("n3", "SIGKILL"))
+        );
+        assert_eq!(
+            abrupt_exit(&Step::Crash("n2".into())),
+            Some(("n2", "crash"))
+        );
+        for step in [
+            Step::Leave("n1".into()),
+            Step::Restart("n1".into()),
+            Step::Quit,
+        ] {
+            assert_eq!(abrupt_exit(&step), None, "{step}");
+        }
+        assert_eq!(
+            detected_caption("n3", "SIGKILL", Duration::from_millis(840)),
+            "n3 marked down 0.8 s after the SIGKILL"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_caption_after_a_kill_says_how_long_the_detector_took() {
+        let _logging = LOGGING.lock().await;
+        let mut rig = rig(SHOW, |fake| {
+            fake.down_after = Some(Duration::from_millis(800));
+        });
+        let scenario = parse(
+            "kill n3\nawait down n3 within 5s\nkill n2\nawait down n9 within 1s\ncrash n1\nawait down n1 within 5s",
+        )
+        .unwrap();
+        let outcome = rig
+            .director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap();
+        // `await down n9` times out: no caption about it.
+        assert_eq!(outcome.timeouts.len(), 1);
+        let mut captions = Vec::new();
+        while let Ok(command) = rig.ui.try_recv() {
+            if let UiCommand::Caption(Some(text)) = command {
+                captions.push(text);
+            }
+        }
+        assert_eq!(
+            captions,
+            [
+                "n3 marked down 0.8 s after the SIGKILL".to_owned(),
+                TIMED_OUT_CAPTION.to_owned(),
+                "n1 marked down 0.8 s after the crash".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_detection_caption_without_captions_or_without_an_interface() {
+        let quiet = Options {
+            headless: false,
+            captions: false,
+        };
+        let mut rig = rig(quiet, |fake| {
+            fake.down_after = Some(Duration::from_millis(300));
+        });
+        let scenario = parse("kill n3\nawait down n3 within 5s").unwrap();
+        rig.director
+            .play(&scenario, Instant::now(), &mut Vec::new(), None)
+            .await
+            .unwrap();
+        while let Ok(command) = rig.ui.try_recv() {
+            assert!(
+                !matches!(command, UiCommand::Caption(_)),
+                "no caption: {command:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1092,7 +1485,10 @@ mod tests {
         let director = Director::new(Tour { digests: tx }, rx, None, HEADLESS);
         let scenario = parse(crate::scenario::TOUR).unwrap();
         let mut out = Vec::new();
-        let outcome = director.play(&scenario, &mut out, None).await.unwrap();
+        let outcome = director
+            .play(&scenario, Instant::now(), &mut out, None)
+            .await
+            .unwrap();
         assert_eq!(outcome.steps, scenario.steps.len());
         assert!(outcome.timeouts.is_empty());
     }

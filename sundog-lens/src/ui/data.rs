@@ -96,6 +96,17 @@ impl NodeRow<'_> {
         self.started()
             .map(|started| wall.duration_since(started).unwrap_or_default())
     }
+
+    /// How long the process behind a live or departing member has run at
+    /// `wall`: a departing process still runs while it hands its parts over.
+    /// `None` for a member that is down or left.
+    #[must_use]
+    pub fn process_uptime(&self, wall: SystemTime) -> Option<Duration> {
+        (self.status() == MemberStatus::Departing)
+            .then(|| SystemTime::UNIX_EPOCH + Duration::from_millis(self.member.peer.incarnation))
+            .map(|started| wall.duration_since(started).unwrap_or_default())
+            .or_else(|| self.uptime(wall))
+    }
 }
 
 /// How a node is named in the event log: its label, short id and color.

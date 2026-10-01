@@ -209,22 +209,14 @@ impl Fleet {
 
     /// Checks that the first node serves its exporter, which a node built
     /// without the `prometheus` feature does not. The probe repeats until
-    /// the exporter answers or [`HEALTHZ_TIMEOUT`] passes.
+    /// the exporter answers or `limit` passes ([`HEALTHZ_TIMEOUT`] by
+    /// default, see [`FleetStage::with_exporter_limit`]).
     ///
     /// # Errors
     ///
     /// Returns an error that prints the build command when `/healthz` does
     /// not answer `200` in time.
-    pub async fn verify_exporter(&self) -> anyhow::Result<()> {
-        self.verify_exporter_within(HEALTHZ_TIMEOUT).await
-    }
-
-    /// [`Fleet::verify_exporter`] with its own time limit.
-    ///
-    /// # Errors
-    ///
-    /// As [`Fleet::verify_exporter`].
-    pub async fn verify_exporter_within(&self, limit: Duration) -> anyhow::Result<()> {
+    pub async fn verify_exporter(&self, limit: Duration) -> anyhow::Result<()> {
         let slot = self.slots.first().context("no node is running")?;
         let url = format!("http://{}/healthz", slot.info.metrics);
         let deadline = tokio::time::Instant::now() + limit;
@@ -421,16 +413,18 @@ impl Fleet {
         Ok(())
     }
 
-    /// Stops every node: SIGTERM, then SIGKILL for any that outlasts
-    /// [`STOP_GRACE`]. No process of the fleet remains.
+    /// Stops every node: SIGTERM to all at once, then SIGKILL for any that
+    /// outlasts one shared [`STOP_GRACE`]. No process of the fleet remains.
     pub async fn stop_all(&mut self) {
         for slot in &self.slots {
             if let Some(node) = &slot.node {
                 let _ = proc::terminate(node.pid);
             }
         }
+        let deadline = tokio::time::Instant::now() + STOP_GRACE;
         for index in 0..self.slots.len() {
-            self.wait_exit(index, STOP_GRACE).await;
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.wait_exit(index, left).await;
         }
     }
 }
@@ -521,7 +515,7 @@ impl FleetStage {
         let (info, ready) = fleet.spawn_next()?;
         self.track(&info, ready);
         if first {
-            fleet.verify_exporter_within(self.exporter_limit).await?;
+            fleet.verify_exporter(self.exporter_limit).await?;
         }
         Ok(info)
     }
@@ -751,7 +745,14 @@ pub async fn cluster_cmd(args: FleetArgs) -> anyhow::Result<()> {
     fleet.preflight().await?;
     let (load, handle) = load::Load::spawn(args.rate, args.keys);
     let stage = FleetStage::new(fleet, handle);
-    let outcome = run_cluster(&stage, &args, &line).await;
+    // A signal at any point, the startup included, still reaches `stop_all`.
+    let outcome = tokio::select! {
+        outcome = run_cluster(&stage, &args, &line) => outcome,
+        () = crate::watch::termination() => {
+            println!("stopping the nodes");
+            Ok(())
+        }
+    };
     stage.stop_all().await;
     load.shutdown();
     outcome
@@ -775,12 +776,7 @@ async fn run_cluster(stage: &FleetStage, args: &FleetArgs, line: &str) -> anyhow
     );
     println!("{line}");
     println!("press Ctrl-C to stop the nodes");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C")?,
-        () = crate::watch::termination() => {}
-    }
-    println!("stopping the nodes");
-    Ok(())
+    std::future::pending().await
 }
 
 #[cfg(test)]
@@ -882,16 +878,17 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+/// Lifecycle tests that run real child processes and bind loopback addresses
+/// other than `127.0.0.1`, which only Linux gives a process without setup.
+#[cfg(all(test, target_os = "linux"))]
 mod process_tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
     use super::*;
 
-    /// A node that is ready at once, exits 0 on SIGTERM and 3 on `crash`
-    /// (a control line it reads from its own port is not modeled: the crash
-    /// test serves one separately).
+    /// A node that is ready at once and exits 0 on SIGTERM. The crash test
+    /// serves its control port separately and stops it there.
     fn fake_node(dir: &Path) -> PathBuf {
         let path = dir.join("fake-testnode.sh");
         std::fs::write(
@@ -922,7 +919,7 @@ mod process_tests {
     }
 
     fn alive(pid: u32) -> bool {
-        // Signal 0 is not exposed by the safe API; the process table is.
+        // Linux's process table; the module runs on Linux only.
         Path::new(&format!("/proc/{pid}")).exists()
     }
 
@@ -981,6 +978,41 @@ mod process_tests {
         fleet.stop_all().await;
         assert!(fleet.running().is_empty());
         assert!(!alive(pid_again));
+    }
+
+    #[tokio::test]
+    async fn stopping_nodes_that_ignore_sigterm_takes_one_grace_period() {
+        let dir = scratch("stubborn");
+        let path = dir.join("stubborn-testnode.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho testnode-ready\ntrap '' TERM\nwhile true; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut fleet = Fleet::new(FleetConfig {
+            cluster: "c".to_owned(),
+            base_ip: Ipv4Addr::new(127, 0, 0, 191),
+            testnode: path,
+            owners: NonZeroU8::new(2).unwrap(),
+            logs: dir.join("logs"),
+        });
+        let (_, ready1) = fleet.spawn_next().unwrap();
+        let (_, ready2) = fleet.spawn_next().unwrap();
+        ready1.wait(Duration::from_secs(10)).await.unwrap();
+        ready2.wait(Duration::from_secs(10)).await.unwrap();
+        let pids: Vec<u32> = fleet
+            .slots
+            .iter()
+            .map(|slot| slot.node.as_ref().unwrap().pid)
+            .collect();
+        let started = std::time::Instant::now();
+        fleet.stop_all().await;
+        let took = started.elapsed();
+        assert!(took >= STOP_GRACE, "{took:?}");
+        assert!(took < STOP_GRACE + Duration::from_secs(2), "{took:?}");
+        assert!(fleet.running().is_empty());
+        assert!(pids.iter().all(|pid| !alive(*pid)));
     }
 
     #[tokio::test]
@@ -1092,16 +1124,9 @@ mod process_tests {
     async fn a_node_without_an_exporter_fails_the_check_with_the_build_command() {
         let mut fleet = fleet("noexporter", Ipv4Addr::new(127, 0, 0, 161));
         let short = Duration::from_millis(300);
-        assert!(
-            fleet.verify_exporter_within(short).await.is_err(),
-            "no node yet"
-        );
+        assert!(fleet.verify_exporter(short).await.is_err(), "no node yet");
         fleet.spawn_next().unwrap();
-        let error = fleet
-            .verify_exporter_within(short)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = fleet.verify_exporter(short).await.unwrap_err().to_string();
         assert!(error.contains(BUILD_HINT), "{error}");
         fleet.stop_all().await;
     }

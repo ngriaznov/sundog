@@ -121,7 +121,7 @@ fn every_view_renders_at_every_size_with_its_landmarks() {
                         assert!(shown.contains("events for n1"), "{context}");
                     }
                     View::Timeline => {
-                        assert!(shown.contains("Lifelines · last 2 min"), "{context}");
+                        assert!(shown.contains("Lifelines · last"), "{context}");
                         assert!(shown.contains("[all]"), "{context}");
                     }
                 }

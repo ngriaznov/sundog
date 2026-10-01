@@ -18,6 +18,7 @@ use super::{Scene, anim, text};
 use crate::app::EVENT_FLASH;
 use crate::model::derive::PART_SPACE;
 use crate::model::events::{Event, EventKind};
+use crate::model::exporter::is_answering;
 
 /// The width of the tag column.
 const TAG_WIDTH: usize = 8;
@@ -41,6 +42,7 @@ pub fn glyph(kind: &EventKind) -> (char, Token) {
         EventKind::Xfer { .. } => ('⇣', Token::Info),
         EventKind::Ready { .. } => ('✓', Token::Ok),
         EventKind::Unready { .. } => ('…', Token::Warn),
+        EventKind::Exporter { detail, .. } if is_answering(detail) => ('✓', Token::Ok),
         EventKind::Exporter { .. } => ('⚠', Token::Muted),
     }
 }
@@ -227,15 +229,17 @@ fn lifecycle_body(scene: &Scene<'_>, kind: &EventKind) -> Vec<Span<'static>> {
             node: id,
             addr,
             previous,
+            caches,
         } => {
             let was = previous.to_string();
             said(
                 scene,
                 *id,
                 format!(
-                    "  new identity at {} (was {}…)",
+                    "  new identity at {} (was {}…){}",
                     addr.ip(),
-                    text::short_id(&was)
+                    text::short_id(&was),
+                    listed_modes(caches)
                 ),
                 Token::Text,
             )
@@ -589,6 +593,56 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_exporter_row_is_a_check_and_a_failing_one_a_warning() {
+        let exporter = |detail: &str| EventKind::Exporter {
+            node: sundog::NodeId::from(1),
+            addr: testkit::gossip_addr(1),
+            detail: detail.to_owned(),
+        };
+        assert_eq!(glyph(&exporter("answering")), ('✓', Token::Ok));
+        assert_eq!(glyph(&exporter("answering again")), ('✓', Token::Ok));
+        assert_eq!(
+            glyph(&exporter("not answering: timed out")),
+            ('⚠', Token::Muted)
+        );
+        assert_eq!(
+            glyph(&exporter("not scraped: two members map to one URL")),
+            ('⚠', Token::Muted)
+        );
+    }
+
+    #[test]
+    fn a_rejoin_row_lists_the_caches_the_node_advertises() {
+        let model = testkit::fixture_model(Instant::now());
+        let scene_app = App::new(AppConfig::default());
+        let ctx = Ctx {
+            now: Instant::now(),
+            wall: std::time::SystemTime::UNIX_EPOCH,
+            elapsed: std::time::Duration::ZERO,
+        };
+        let scene = Scene {
+            app: &scene_app,
+            model: &model,
+            ctx: &ctx,
+            look: scene_app.look(),
+            kind: LayoutKind::Full,
+        };
+        let kind = EventKind::Rejoin {
+            node: testkit::node_id(2, 1),
+            addr: testkit::gossip_addr(2),
+            previous: testkit::node_id(2, 0),
+            caches: [
+                ("os".into(), sundog::store::Mode::Replicated),
+                ("it".into(), testkit::distributed(2)),
+            ]
+            .into(),
+        };
+        let shown = text_of(&body(&scene, &kind));
+        assert!(shown.contains("new identity at 127.0.0.12"), "{shown}");
+        assert!(shown.ends_with(" · it D2 · os R"), "{shown}");
+    }
+
+    #[test]
     fn an_exporter_row_keeps_the_identity_it_was_raised_for_after_the_address_rejoins() {
         use sundog::observe::{ClusterSnapshot, MemberStatus};
 
@@ -777,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one entry for each event kind")]
     fn the_remaining_kinds_render_without_panicking() {
         let model = testkit::fixture_model(Instant::now());
         let node = testkit::node_id(2, 0);
@@ -788,6 +843,7 @@ mod tests {
                 node,
                 addr,
                 previous: other,
+                caches: std::collections::BTreeMap::new(),
             },
             EventKind::Restart { node, addr },
             EventKind::CacheAdded {

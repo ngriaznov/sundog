@@ -593,8 +593,18 @@ impl Model {
                 *exporter_silent = self.exporter_silence(*addr, now);
             }
         }
-        for member in &snapshot.members {
-            self.slots.assign(member.peer.gossip_addr);
+        // Members unseen so far take their slots in address order, so that a
+        // baseline that lists them in any order labels them the same way.
+        let mut unseen: Vec<SocketAddr> = snapshot
+            .members
+            .iter()
+            .map(|member| member.peer.gossip_addr)
+            .filter(|addr| self.slots.get(*addr).is_none())
+            .collect();
+        unseen.sort_unstable();
+        unseen.dedup();
+        for addr in unseen {
+            self.slots.assign(addr);
         }
         let live_set: Vec<NodeId> = snapshot
             .members
@@ -755,11 +765,16 @@ impl Model {
     fn finish(&mut self, kinds: Vec<EventKind>, now: Instant, wall: SystemTime) -> Vec<Event> {
         kinds
             .into_iter()
-            .map(|kind| {
+            .filter_map(|kind| {
+                if let EventKind::CacheAdded { node, cache, mode } = &kind
+                    && self.log.fold_cache(*node, cache, *mode, wall)
+                {
+                    return None;
+                }
                 self.lifelines.record(&kind, now);
                 let event = Event { at: wall, kind };
                 self.log.push(event.clone());
-                event
+                Some(event)
             })
             .collect()
     }
@@ -799,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_gives_each_gossip_address_a_slot_in_member_order() {
+    fn a_snapshot_gives_each_gossip_address_a_slot() {
         let mut model = Model::new();
         let now = Instant::now();
         let events = model.apply(snapshot_update(testkit::snapshot(3), now), now, wall0());
@@ -811,6 +826,122 @@ mod tests {
             "n2"
         );
         assert_eq!(model.wall(), Some(wall0()));
+    }
+
+    #[test]
+    fn members_unseen_so_far_take_slots_in_address_order_whatever_the_snapshot_order() {
+        let now = Instant::now();
+        for order in [[3, 1, 2], [2, 3, 1], [1, 2, 3]] {
+            let mut model = Model::new();
+            let members = order
+                .iter()
+                .map(|&index| testkit::member(index, MemberStatus::Live))
+                .collect();
+            let snapshot = ClusterSnapshot::new("c", members, 0);
+            model.apply(snapshot_update(snapshot, now), now, wall0());
+            for index in 1..=3 {
+                let slot = model.slots().get(testkit::gossip_addr(index)).unwrap();
+                assert_eq!(slot.index, usize::from(index) - 1, "{order:?}");
+                assert_eq!(slot.label, format!("n{index}"), "{order:?}");
+            }
+        }
+
+        // A member that appears later takes the next slot after those held.
+        let mut model = Model::new();
+        let both = ClusterSnapshot::new(
+            "c",
+            vec![
+                testkit::member(5, MemberStatus::Live),
+                testkit::member(4, MemberStatus::Live),
+            ],
+            0,
+        );
+        model.apply(snapshot_update(both, now), now, wall0());
+        let more = ClusterSnapshot::new(
+            "c",
+            vec![
+                testkit::member(5, MemberStatus::Live),
+                testkit::member(4, MemberStatus::Live),
+                testkit::member(1, MemberStatus::Live),
+            ],
+            0,
+        );
+        model.apply(snapshot_update(more, now), now, wall0());
+        let label = |index| {
+            model
+                .slots()
+                .get(testkit::gossip_addr(index))
+                .unwrap()
+                .label
+                .clone()
+        };
+        assert_eq!(
+            [label(4), label(5), label(1)],
+            [SmolStr::new("n1"), SmolStr::new("n2"), SmolStr::new("n3")]
+        );
+    }
+
+    #[test]
+    fn caches_a_node_opens_soon_after_it_joins_fold_into_its_join_row() {
+        let mut model = Model::new();
+        let now = Instant::now();
+        let later = wall0() + Duration::from_secs(1);
+        let first = ClusterSnapshot::new(
+            "c",
+            vec![testkit::member_with(1, 0, 1, MemberStatus::Live, &[])],
+            0,
+        );
+        model.apply(snapshot_update(first, now), now, wall0());
+        // The observer has found the cluster when node 2 arrives, with no
+        // cache keys yet; they follow in gossip a moment later.
+        let found = now + DISCOVERY_QUIET;
+        model.tick(found);
+        let side = Mode::Replicated;
+        let with = |caches: &[(&str, Mode)]| {
+            ClusterSnapshot::new(
+                "c",
+                vec![
+                    testkit::member_with(1, 0, 1, MemberStatus::Live, &[]),
+                    testkit::member_with(2, 0, 1, MemberStatus::Live, caches),
+                ],
+                0,
+            )
+        };
+        model.apply(snapshot_update(with(&[]), found), found, later);
+        let events = model.apply(
+            snapshot_update(
+                with(&[("it", testkit::distributed(2)), ("os", side)]),
+                found,
+            ),
+            found,
+            later + Duration::from_secs(1),
+        );
+        assert!(
+            events.is_empty(),
+            "the caches fold into the join: {events:?}"
+        );
+        let rows: Vec<&Event> = model.events().iter().collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let EventKind::Join { caches, .. } = &rows[0].kind else {
+            panic!("a join row, got {:?}", rows[0].kind);
+        };
+        assert_eq!(
+            caches.keys().map(SmolStr::as_str).collect::<Vec<_>>(),
+            ["it", "os"]
+        );
+
+        // A cache opened long after the join is a row of its own.
+        let much_later = found + Duration::from_secs(60);
+        let events = model.apply(
+            snapshot_update(
+                with(&[("it", testkit::distributed(2)), ("os", side), ("pn", side)]),
+                much_later,
+            ),
+            much_later,
+            later + Duration::from_secs(60),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.tag(), "CACHE+");
     }
 
     #[test]

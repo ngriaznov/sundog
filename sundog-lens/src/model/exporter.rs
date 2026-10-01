@@ -10,6 +10,19 @@ use crate::source::scrape::ScrapeReport;
 /// Consecutive failed scrapes after which an exporter counts as not answering.
 pub const FAILURES_UNREACHABLE: u32 = 2;
 
+/// The detail of the `EXPORTER` event raised when an exporter first answers.
+pub const ANSWERING: &str = "answering";
+
+/// The detail of the `EXPORTER` event raised when an exporter answers again
+/// after it stopped.
+pub const ANSWERING_AGAIN: &str = "answering again";
+
+/// Whether the `EXPORTER` event `detail` reports a healthy exporter.
+#[must_use]
+pub fn is_answering(detail: &str) -> bool {
+    detail == ANSWERING || detail == ANSWERING_AGAIN
+}
+
 /// One node's exporter, as the scrapes of that node show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExporterState {
@@ -125,9 +138,9 @@ impl ExporterState {
                         node,
                         addr,
                         detail: if again {
-                            "answering again".to_owned()
+                            ANSWERING_AGAIN.to_owned()
                         } else {
-                            "answering".to_owned()
+                            ANSWERING.to_owned()
                         },
                     });
                 }

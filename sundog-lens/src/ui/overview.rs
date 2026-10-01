@@ -187,6 +187,15 @@ pub fn no_exporter(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     );
 }
 
+/// A span of `seconds` as the chart axis names it: to the nearest ten seconds
+/// from a minute up, to the nearest five below. A 52-column chart at one
+/// sample a second spans 104 s and reads `−100s`.
+#[must_use]
+pub const fn round_span(seconds: u64) -> u64 {
+    let step = if seconds >= 60 { 10 } else { 5 };
+    (seconds + step / 2) / step * step
+}
+
 /// The Throughput panel: an area chart of operations per second, and the
 /// rates beneath it.
 pub fn throughput(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
@@ -218,7 +227,10 @@ pub fn throughput(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     } else {
         BlockArea::new(&total.ops, max, look.mode).render(chart, buf);
     }
-    let seconds = data::window_span(usize::from(chart.width), scene.model.scrape_interval());
+    let seconds = round_span(data::window_span(
+        usize::from(chart.width),
+        scene.model.scrape_interval(),
+    ));
     let axis_label = format!("−{seconds}s ");
     let fill = usize::from(chart.width).saturating_sub(axis_label.chars().count() + 4);
     panel::lines(
@@ -497,7 +509,7 @@ mod tests {
         assert!(text.contains(" ops/s"), "{text}");
         assert!(text.contains("hit "), "{text}");
         assert!(text.contains("tx "), "{text}");
-        assert!(text.contains("−104s"), "{text}");
+        assert!(text.contains("−100s"), "{text}");
         assert!(text.contains("reads "), "{text}");
         assert!(text.contains("fetch "), "{text}");
         assert!(text.contains("fetch mix  local "), "{text}");
@@ -522,10 +534,29 @@ mod tests {
         // spans 104 samples.
         let mut model = testkit::fixture_model_with_scrapes(Instant::now(), 10);
         assert!(model.cluster_ops().len() <= 10);
-        assert_eq!(axis_label(&model), "−104s");
+        assert_eq!(axis_label(&model), "−100s");
         // One sample per two seconds doubles the span.
         model.set_scrape_interval(Duration::from_secs(2));
-        assert_eq!(axis_label(&model), "−208s");
+        assert_eq!(axis_label(&model), "−210s");
+    }
+
+    #[test]
+    fn the_axis_span_rounds_to_five_seconds_below_a_minute_and_ten_above() {
+        for (seconds, rounded) in [
+            (0, 0),
+            (2, 0),
+            (3, 5),
+            (26, 25),
+            (52, 50),
+            (57, 55),
+            (60, 60),
+            (104, 100),
+            (105, 110),
+            (208, 210),
+            (360, 360),
+        ] {
+            assert_eq!(round_span(seconds), rounded, "{seconds}");
+        }
     }
 
     #[test]

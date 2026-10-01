@@ -3,25 +3,28 @@
 //!
 //! Every test starts `sundog-testnode` processes on `127.0.0.11` and up, and
 //! the nodes' ports are fixed, so the tests run one at a time and are
-//! `#[ignore]`d. They need a test node built with the exporter:
+//! `#[ignore]`d. They need a test node built with the exporter, in the
+//! profile the tests run in:
 //!
 //! ```text
-//! cargo build --release -p sundog-testnode --features prometheus
+//! cargo build -p sundog-testnode --features prometheus
 //! cargo test -p sundog-lens --test e2e -- --ignored --test-threads=1
 //! ```
 //!
-//! `SUNDOG_TESTNODE` names another binary. The nodes are stopped when a test
-//! ends, whichever way it ends.
+//! The tests use `$SUNDOG_TESTNODE` when it is set, else the `sundog-testnode`
+//! beside the `sundog-lens` binary, else the workspace's release build, and
+//! pass the path to every lens they start with `--testnode`. The nodes are
+//! stopped when a test ends, whichever way it ends.
 
 #![cfg(unix)]
 
 use std::io::{BufRead as _, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use sundog_lens::fleet::proc::{find_testnode, terminate};
+use sundog_lens::fleet::proc::terminate;
 
 const LENS: &str = env!("CARGO_BIN_EXE_sundog-lens");
 
@@ -95,11 +98,41 @@ impl Drop for Guard {
     }
 }
 
-/// The test node every test needs, or a clear failure.
-fn require_testnode() {
-    if let Err(error) = find_testnode(None) {
-        panic!("{error:#}");
-    }
+/// The places the test node is looked for, in order.
+fn testnode_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    paths.extend(std::env::var_os("SUNDOG_TESTNODE").map(PathBuf::from));
+    paths.extend(
+        Path::new(LENS)
+            .parent()
+            .map(|dir| dir.join("sundog-testnode")),
+    );
+    paths.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release/sundog-testnode"));
+    paths
+}
+
+/// The test node every test starts, or a clear failure.
+fn require_testnode() -> PathBuf {
+    let candidates = testnode_candidates();
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "no sundog-testnode found (looked at {candidates:?}); build one with \
+                 `cargo build -p sundog-testnode --features prometheus` or set SUNDOG_TESTNODE"
+            )
+        })
+}
+
+/// Sends SIGINT to `child`, as Ctrl-C at a terminal does.
+fn interrupt(child: &Child) {
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "SIGINT is sent");
 }
 
 /// Waits for `child` to exit, killing it past `limit`. Returns the exit code
@@ -122,6 +155,7 @@ fn wait_within(child: &mut Child, limit: Duration) -> (Option<i32>, Duration) {
 /// Runs the demo headless on the scenario `text` for cluster `cluster` and
 /// returns its exit code, its standard output and how long it took.
 fn demo_headless(
+    testnode: &Path,
     cluster: &'static str,
     text: &str,
     limit: Duration,
@@ -137,6 +171,8 @@ fn demo_headless(
         .arg(&marks)
         .arg("--logs")
         .arg(dir.join("logs"))
+        .arg("--testnode")
+        .arg(testnode)
         .args(["--rate", "300"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -167,9 +203,10 @@ fn the_demo_runs_an_inline_scenario_headless_and_leaves_no_node_behind() {
     let _ports = PORTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    require_testnode();
+    let testnode = require_testnode();
     let cluster = "lens-e2e-demo";
     let (code, output, took) = demo_headless(
+        &testnode,
         cluster,
         "spawn 3 stagger 1s\n\
          await members 3 within 30s\n\
@@ -209,9 +246,10 @@ fn a_headless_await_that_times_out_exits_one_and_stops_the_nodes() {
     let _ports = PORTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    require_testnode();
+    let testnode = require_testnode();
     let cluster = "lens-e2e-timeout";
     let (code, output, _) = demo_headless(
+        &testnode,
         cluster,
         "spawn 2 stagger 1s\nawait members 5 within 4s\nquit\n",
         Duration::from_secs(120),
@@ -228,7 +266,7 @@ fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
     let _ports = PORTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    require_testnode();
+    let testnode = require_testnode();
     let cluster = "lens-e2e-cluster";
     let dir = scratch(cluster);
     let mut child = Command::new(LENS)
@@ -237,6 +275,8 @@ fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
         ])
         .arg("--logs")
         .arg(dir.join("logs"))
+        .arg("--testnode")
+        .arg(&testnode)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -318,5 +358,86 @@ fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
     assert_eq!(shares, 131_072);
 
     drop(guard);
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
+/// Waits until `count` test nodes of `cluster` run, or panics after `limit`.
+fn wait_for_nodes(cluster: &str, count: usize, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while testnode_pids(cluster).len() < count {
+        assert!(
+            Instant::now() < deadline,
+            "{count} nodes of {cluster} did not start within {limit:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
+#[cfg(target_os = "linux")]
+fn a_sigint_to_a_headless_demo_stops_its_nodes() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-sigint-demo";
+    let dir = scratch(cluster);
+    let scenario = dir.join("scenario.txt");
+    std::fs::write(
+        &scenario,
+        "spawn 3 stagger 1s\nawait members 3 within 30s\npause 120s\nquit\n",
+    )
+    .expect("the scenario is written");
+    let child = Command::new(LENS)
+        .args(["demo", "--headless", "--name", cluster, "--scenario"])
+        .arg(&scenario)
+        .arg("--logs")
+        .arg(dir.join("logs"))
+        .arg("--testnode")
+        .arg(&testnode)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the lens starts");
+    let mut guard = Guard { child, cluster };
+    wait_for_nodes(cluster, 3, Duration::from_secs(60));
+    interrupt(&guard.child);
+    let (code, took) = wait_within(&mut guard.child, Duration::from_secs(30));
+    assert_eq!(code, Some(1), "a handled signal ends the run with an error");
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
+#[cfg(target_os = "linux")]
+fn a_sigint_during_the_cluster_startup_stops_the_nodes() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-sigint-cluster";
+    let dir = scratch(cluster);
+    let child = Command::new(LENS)
+        .args([
+            "cluster", "--name", cluster, "--nodes", "3", "--keys", "2000",
+        ])
+        .arg("--logs")
+        .arg(dir.join("logs"))
+        .arg("--testnode")
+        .arg(&testnode)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the cluster command starts");
+    let mut guard = Guard { child, cluster };
+    // The nodes run, but have not all opened their caches: the fill that ends
+    // the startup is still ahead.
+    wait_for_nodes(cluster, 2, Duration::from_secs(30));
+    interrupt(&guard.child);
+    let (code, took) = wait_within(&mut guard.child, Duration::from_secs(30));
+    assert_eq!(code, Some(0), "a handled signal is a clean stop");
+    assert!(took < Duration::from_secs(30), "{took:?}");
     assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
 }

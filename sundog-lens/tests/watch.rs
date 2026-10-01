@@ -131,7 +131,7 @@ async fn the_loop_draws_the_cluster_follows_keys_and_commands_and_quits() {
     assert!(last.contains(name), "{last}");
     assert!(last.contains("● 2 live"), "{last}");
     assert!(
-        last.contains("Lifelines · last 2 min"),
+        last.contains("Lifelines · last"),
         "the director's tab: {last}"
     );
     assert!(last.contains("▶ 0:"), "{last}");

@@ -1,4 +1,5 @@
-//! The caption row of the demo: the elapsed time and one sentence.
+//! The caption row of the demo: the elapsed time and one sentence, or the
+//! elapsed time and the name of the run while no caption is set.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -9,11 +10,24 @@ use super::look::Token;
 use super::panel::gap;
 use super::{Scene, text};
 
-/// Draws the caption row. Without a caption the row stays blank.
+/// What the row says while no caption is set.
+pub const IDLE: &str = "sundog lens demo";
+
+/// Draws the caption row. Without a caption it shows the elapsed time and
+/// [`IDLE`] in the muted tone, so the body never ends a row short.
 pub fn render(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
     let look = scene.look;
     let spans = scene.app.caption.as_ref().map_or_else(
-        || vec![gap(1)],
+        || {
+            vec![
+                gap(1),
+                look.span("▶", Token::Muted),
+                gap(1),
+                look.span(text::minutes_seconds(scene.ctx.elapsed), Token::Muted),
+                gap(2),
+                look.span(IDLE, Token::Faint),
+            ]
+        },
         |caption| {
             vec![
                 gap(1),
@@ -81,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_caption_the_row_is_blank() {
-        assert_eq!(caption_row(None, 40), "");
+    fn without_a_caption_the_row_shows_the_clock_and_the_name_of_the_run() {
+        assert_eq!(caption_row(None, 40), " ▶ 0:52  sundog lens demo");
     }
 }
