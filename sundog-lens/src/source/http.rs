@@ -319,6 +319,44 @@ mod tests {
         assert_eq!(result, Err(HttpError::NoHeaderEnd));
     }
 
+    #[tokio::test]
+    async fn get_refuses_a_response_past_the_size_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let header: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
+        let body = vec![b'x'; MAX_RESPONSE + 1 - header.len()];
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            // The client stops reading at the cap, so a late write may fail.
+            let _ = stream.write_all(header).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.shutdown().await;
+        });
+        let result = get(&url, Duration::from_secs(5)).await;
+        assert_eq!(result, Err(HttpError::TooLarge));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_accepts_a_response_of_exactly_the_size_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        let header: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
+        let body = vec![b'x'; MAX_RESPONSE - header.len()];
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream.write_all(header).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let (status, text) = get(&url, Duration::from_secs(5)).await.unwrap();
+        assert_eq!((status, text.len()), (200, MAX_RESPONSE - header.len()));
+    }
+
     #[test]
     fn errors_display_a_reason() {
         assert!(HttpError::Timeout.to_string().contains("timed out"));

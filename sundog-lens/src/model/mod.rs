@@ -55,8 +55,7 @@ impl Model {
     /// A snapshot replaces the member view and gives every gossip address a
     /// slot. An ownership digest replaces its cache's digest and restarts the
     /// cache's settling clock when the view hash changed. A scrape replaces
-    /// the node's last report. The model derives no events yet, so the list
-    /// is empty.
+    /// the node's last report. It returns an empty event list.
     pub fn apply(&mut self, update: Update, now: Instant, wall: SystemTime) -> Vec<Event> {
         self.now = Some(now);
         self.wall = Some(wall);
@@ -84,8 +83,7 @@ impl Model {
         Vec::new()
     }
 
-    /// Advances the model's clock to `now` and returns the events that time
-    /// alone raises: none yet.
+    /// Advances the model's clock to `now` and returns an empty event list.
     pub fn tick(&mut self, now: Instant) -> Vec<Event> {
         self.now = Some(now);
         Vec::new()

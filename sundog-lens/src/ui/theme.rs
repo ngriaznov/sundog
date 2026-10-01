@@ -211,7 +211,8 @@ fn distance(a: [u8; 3], b: [u8; 3]) -> u32 {
 pub const GLYPHS: &str = "● • · ◐ ◒ ○ ✖ ✚ ↻ ⇄ ⇣ ▸ ▲ ▼ ▽ ✓ ✔ ⚠ ‖ ◆ ━ ╸ ─ ┊ ┄ │ ╭ ╮ ╰ ╯ ├ ┤ ▌ ▀ ▄ █ \
 ▁▂▃▄▅▆▇ ▏▎▍▋▊▉ ▓ ▒ ░ → ← ↑ ↓ ⇧ ⏎ ▶ Σ × ± − … ≈ —";
 
-/// Glyphs the interface never draws: absent from `DejaVu Sans Mono`.
+/// Glyphs the interface never draws. Five are absent from `DejaVu Sans Mono`;
+/// `☼` is present there but renders inconsistently across terminal fonts.
 pub const BANNED: &str = "⟳⏸❶⏱⬤☼";
 
 /// Whether `c` may appear in a rendered buffer: ASCII, the braille block

@@ -41,11 +41,12 @@ impl Slots {
             index
         } else {
             let index = self.entries.len();
-            let label = self
-                .hints
-                .get(&addr)
-                .cloned()
-                .unwrap_or_else(|| self.default_label(index));
+            let label = if let Some(hinted) = self.hints.get(&addr).cloned() {
+                self.displace(&hinted);
+                hinted
+            } else {
+                self.default_label(index)
+            };
             self.by_addr.insert(addr, index);
             self.entries.push(Slot { addr, index, label });
             index
@@ -54,13 +55,26 @@ impl Slots {
     }
 
     /// Names `addr` as `label`, overriding the default. It applies at once to
-    /// a slot that exists and when the address first appears otherwise.
+    /// a slot that exists and when the address first appears otherwise. A
+    /// label names one node: the hint takes `label` from any other address
+    /// that holds it, and that slot falls back to the next free default.
     pub fn hint(&mut self, addr: SocketAddr, label: impl Into<SmolStr>) {
         let label = label.into();
+        self.hints
+            .retain(|other, hinted| *other == addr || *hinted != label);
+        self.hints.insert(addr, label.clone());
         if let Some(&index) = self.by_addr.get(&addr) {
-            self.entries[index].label.clone_from(&label);
+            self.displace(&label);
+            self.entries[index].label = label;
         }
-        self.hints.insert(addr, label);
+    }
+
+    /// Relabels the slot that holds `label` with the next free default label,
+    /// so that `label` can go to another slot.
+    fn displace(&mut self, label: &str) {
+        if let Some(index) = self.entries.iter().position(|slot| slot.label == label) {
+            self.entries[index].label = self.default_label(index);
+        }
     }
 
     /// The slot for `addr`, if it has one.
@@ -164,6 +178,40 @@ mod tests {
         assert_eq!(slots.assign(addr(11)).label, "n1");
         assert_eq!(slots.assign(addr(12)).label, "n2");
         assert_eq!(slots.assign(addr(15)).label, "n4");
+    }
+
+    #[test]
+    fn a_hint_for_a_label_another_slot_holds_relabels_that_slot() {
+        let mut slots = Slots::new();
+        assert_eq!(slots.assign(addr(13)).label, "n1");
+        slots.hint(addr(11), "n1");
+        assert_eq!(slots.assign(addr(11)).label, "n1");
+        assert_eq!(slots.get(addr(13)).unwrap().label, "n2");
+        assert_eq!(slots.by_label("n1").unwrap().addr, addr(11));
+        assert_eq!(slots.by_label("n2").unwrap().addr, addr(13));
+        let labels: std::collections::HashSet<_> = slots.iter().map(|s| s.label.clone()).collect();
+        assert_eq!(labels.len(), slots.len());
+    }
+
+    #[test]
+    fn a_hint_on_an_existing_slot_relabels_the_slot_that_holds_the_label() {
+        let mut slots = Slots::new();
+        slots.assign(addr(11));
+        slots.assign(addr(12));
+        slots.hint(addr(12), "n1");
+        assert_eq!(slots.get(addr(12)).unwrap().label, "n1");
+        assert_eq!(slots.get(addr(11)).unwrap().label, "n3");
+        assert_eq!(slots.by_label("n1").unwrap().addr, addr(12));
+    }
+
+    #[test]
+    fn two_hints_for_one_label_leave_it_with_the_later_address() {
+        let mut slots = Slots::new();
+        slots.hint(addr(11), "web");
+        slots.hint(addr(12), "web");
+        assert_eq!(slots.assign(addr(11)).label, "n1");
+        assert_eq!(slots.assign(addr(12)).label, "web");
+        assert_eq!(slots.by_label("web").unwrap().addr, addr(12));
     }
 
     #[test]
