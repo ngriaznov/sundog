@@ -617,12 +617,15 @@ mod tests {
             at,
             wall,
         );
-        // The process restarts under another id at the same address.
+        // The observer has found the cluster when the process restarts under
+        // another id at the same address.
+        let later = at + crate::model::DISCOVERY_QUIET;
+        model.tick(later);
         let mut new = testkit::member_at(2, 0, 2, MemberStatus::Live);
         new.peer.node = testkit::node_id(5, 0);
         let mut gone = old;
         gone.status = MemberStatus::Down;
-        model.apply(snapshot(vec![gone, new.clone()]), at, wall);
+        model.apply(snapshot(vec![gone, new.clone()]), later, wall);
         let old_short = text::short_id(&old_node.to_string()).to_owned();
         let new_short = text::short_id(&new.peer.node.to_string()).to_owned();
         assert_ne!(old_short, new_short);

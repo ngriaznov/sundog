@@ -12,6 +12,7 @@ use sundog::store::Mode;
 
 use crate::source::{ScrapeReport, Update};
 use derive::NodeProgress;
+use series::{RING_LEN, Ring};
 
 pub mod derive;
 pub mod digest;
@@ -54,6 +55,10 @@ pub const DISCOVERY_QUIET: Duration = Duration::from_secs(2);
 /// count before the PEERS column turns amber.
 pub const PEERS_GRACE: Duration = Duration::from_secs(3);
 
+/// The scrape interval the cluster throughput series assumes until
+/// [`Model::set_scrape_interval`] says otherwise.
+const DEFAULT_SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A node's peer count against the observer's.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PeersView {
@@ -95,6 +100,9 @@ pub struct Model {
     live_set: Vec<NodeId>,
     live_set_changed: Option<Instant>,
     discovered: bool,
+    scrape_interval: Option<Duration>,
+    cluster_ops: Ring<RING_LEN>,
+    cluster_ops_at: Option<Instant>,
 }
 
 impl Model {
@@ -114,7 +122,8 @@ impl Model {
     /// failed. An ownership digest replaces its cache's digest; a changed view
     /// hash or owner count raises `VIEW` and restarts the cache's settling
     /// clock, except while the lens is still [discovering](Self::discovering)
-    /// the cluster: those digests only replace the held one. The
+    /// the cluster: those digests only replace the held one, and the members
+    /// and caches it finds raise no `JOIN`, `REJOIN` or `CACHE+` (they still mark the lifelines). The
     /// ownership worker alone decides what ownership the model holds:
     /// [`Update::OwnershipGone`] drops a cache's digest, settling clock and
     /// lifeline, and a snapshot never does.
@@ -130,8 +139,10 @@ impl Model {
         self.now = Some(now);
         self.wall = Some(wall);
         self.refresh_discovery(now);
+        self.sample_cluster(now);
+        let mut baseline = Vec::new();
         let mut kinds = match update {
-            Update::Snapshot(snapshot, _) => self.apply_snapshot(snapshot, now),
+            Update::Snapshot(snapshot, _) => self.apply_snapshot(snapshot, now, &mut baseline),
             Update::Ownership(digest) => self.apply_ownership(digest, now),
             Update::OwnershipGone(cache) => {
                 self.forget_cache(&cache);
@@ -141,6 +152,9 @@ impl Model {
         };
         self.refresh_peers(now);
         kinds.extend(self.settled_events(now));
+        for kind in &baseline {
+            self.lifelines.record(kind, now);
+        }
         self.finish(kinds, now, wall)
     }
 
@@ -152,6 +166,7 @@ impl Model {
         self.now = Some(now);
         self.wall = self.wall.map(|_| wall);
         self.refresh_discovery(now);
+        self.sample_cluster(now);
         let kinds = self.settled_events(now);
         self.finish(kinds, now, wall)
     }
@@ -175,6 +190,72 @@ impl Model {
         {
             self.discovered = true;
         }
+    }
+
+    /// Sets the scrape interval, which paces the cluster throughput series:
+    /// one sample per interval.
+    pub const fn set_scrape_interval(&mut self, interval: Duration) {
+        self.scrape_interval = Some(interval);
+    }
+
+    /// The cluster's reads and fetches per second, one sample per scrape
+    /// interval, oldest first. Each sample sums the newest figure of every
+    /// node that is live and answered its last scrape when the sample was
+    /// taken, so a crash or a failed scrape changes later samples only.
+    #[must_use]
+    pub const fn cluster_ops(&self) -> &Ring<RING_LEN> {
+        &self.cluster_ops
+    }
+
+    /// Takes the next [`cluster_ops`](Self::cluster_ops) sample when a scrape
+    /// interval has passed since the last. It reads the state before the
+    /// update that carries `now`, so the nodes of one scrape round count
+    /// together. The first sample waits until every answering node has a
+    /// figure, so the series never starts with a part of the cluster.
+    fn sample_cluster(&mut self, now: Instant) {
+        let interval = self.scrape_interval.unwrap_or(DEFAULT_SCRAPE_INTERVAL);
+        let due = self
+            .cluster_ops_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= interval);
+        if !due {
+            return;
+        }
+        let answering = self.answering_ops();
+        if self.cluster_ops.is_empty() && (answering.is_empty() || answering.contains(&None)) {
+            return;
+        }
+        self.cluster_ops.push(answering.iter().flatten().sum());
+        // Keep the cadence while the clock runs on time; restart it after a
+        // stall of several intervals.
+        self.cluster_ops_at = Some(match self.cluster_ops_at {
+            Some(at) if now.saturating_duration_since(at) < interval * 2 => at + interval,
+            _ => now,
+        });
+    }
+
+    /// The newest `ops` figure of each live member whose exporter answered
+    /// its last scrape, `None` for a node that has none yet.
+    fn answering_ops(&self) -> Vec<Option<f64>> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        snapshot
+            .members
+            .iter()
+            .filter(|member| member.status.is_live())
+            .filter_map(|member| {
+                let addr = member.peer.gossip_addr;
+                let node = member.peer.node;
+                let metrics = self
+                    .metrics
+                    .get(&addr)
+                    .filter(|metrics| metrics.node() == node)?;
+                self.scrapes
+                    .get(&addr)
+                    .filter(|report| report.node == node && report.outcome.is_ok())?;
+                Some(metrics.ops().last())
+            })
+            .collect()
     }
 
     /// Names the node at gossip address `addr` as `label`, for the slot that
@@ -428,8 +509,30 @@ impl Model {
         }
     }
 
-    fn apply_snapshot(&mut self, snapshot: Arc<ClusterSnapshot>, now: Instant) -> Vec<EventKind> {
+    /// Folds a snapshot in and returns the events it raises. While the
+    /// observer discovers the cluster, the members and caches it finds are the
+    /// baseline, not arrivals: they joined before the lens looked. Their
+    /// events go to `baseline`, which marks the lifelines and stays out of
+    /// the log.
+    fn apply_snapshot(
+        &mut self,
+        snapshot: Arc<ClusterSnapshot>,
+        now: Instant,
+        baseline: &mut Vec<EventKind>,
+    ) -> Vec<EventKind> {
         let mut kinds = diff_snapshots(self.snapshot.as_deref(), &snapshot);
+        if !self.discovered {
+            let (found, rest) = kinds.into_iter().partition(|kind| {
+                matches!(
+                    kind,
+                    EventKind::Join { .. }
+                        | EventKind::Rejoin { .. }
+                        | EventKind::CacheAdded { .. }
+                )
+            });
+            *baseline = found;
+            kinds = rest;
+        }
         for kind in &mut kinds {
             if let EventKind::Down {
                 addr,
@@ -651,13 +754,7 @@ mod tests {
             now,
             SystemTime::UNIX_EPOCH,
         );
-        let tags: Vec<_> = events.iter().map(|event| event.kind.tag()).collect();
-        assert_eq!(tags, ["JOIN", "JOIN", "JOIN"]);
-        assert!(
-            events
-                .iter()
-                .all(|event| event.at == SystemTime::UNIX_EPOCH)
-        );
+        assert!(events.is_empty(), "the first snapshot is the baseline");
         assert_eq!(model.snapshot().unwrap().members.len(), 3);
         assert_eq!(model.slots().len(), 3);
         assert_eq!(
@@ -888,7 +985,7 @@ mod tests {
         );
         assert_eq!(tags(&events), ["LEFT"]);
         let logged: Vec<_> = model.events().iter().map(|e| e.kind.tag()).collect();
-        assert_eq!(logged, ["JOIN", "JOIN", "JOIN", "LEAVE", "LEFT"]);
+        assert_eq!(logged, ["LEAVE", "LEFT"], "the members found are no JOINs");
     }
 
     #[test]
@@ -1081,7 +1178,7 @@ mod tests {
         let t = t + Duration::from_millis(500);
         events.extend(model.apply(snapshot_update(testkit::snapshot(2), t), t, WALL0));
         events.extend(model.apply(ownership_update(2), t, WALL0));
-        assert_eq!(tags(&events), ["JOIN", "JOIN"], "no VIEW in {events:?}");
+        assert!(events.is_empty(), "no VIEW or JOIN in {events:?}");
         assert!(model.discovering());
         assert_eq!(
             model.ownership("it").unwrap().eligible.len(),
@@ -1103,6 +1200,58 @@ mod tests {
         // A real change after discovery is a view.
         let events = model.apply(ownership_update(3), settled, WALL0);
         assert_eq!(tags(&events), ["VIEW"]);
+    }
+
+    #[test]
+    fn members_and_caches_found_while_discovering_raise_no_arrival_event() {
+        use lifelines::{MarkKind, PhaseKind};
+        let mut model = Model::new();
+        let t = Instant::now();
+        let bare = |index| testkit::member_with(index, 0, 1, MemberStatus::Live, &[]);
+        let events = model.apply(
+            snapshot_update(ClusterSnapshot::new("c", vec![bare(1)], 0), t),
+            t,
+            WALL0,
+        );
+        assert!(events.is_empty(), "{events:?}");
+        // A second member and a cache on the first arrive while still discovering.
+        let t = t + Duration::from_millis(500);
+        let found = vec![
+            testkit::member_with(
+                1,
+                0,
+                1,
+                MemberStatus::Live,
+                &[("it", testkit::distributed(2))],
+            ),
+            testkit::member_with(
+                2,
+                0,
+                1,
+                MemberStatus::Live,
+                &[("it", testkit::distributed(2))],
+            ),
+        ];
+        let events = model.apply(
+            snapshot_update(ClusterSnapshot::new("c", found, 0), t),
+            t,
+            WALL0,
+        );
+        assert!(model.discovering());
+        assert!(events.is_empty(), "no JOIN or CACHE+ in {events:?}");
+        assert_eq!(model.events().len(), 0);
+        // The lifelines still start: both nodes run from the first sight.
+        for index in [1, 2] {
+            let line = model.lifelines().node(testkit::gossip_addr(index)).unwrap();
+            assert_eq!(line.current(), Some(PhaseKind::Live));
+            assert!(line.marks().iter().any(|mark| mark.kind == MarkKind::Join));
+        }
+        // After the quiet span, a member that arrives is a JOIN again.
+        let t = t + DISCOVERY_QUIET;
+        model.tick(t);
+        assert!(!model.discovering());
+        let events = model.apply(snapshot_update(testkit::snapshot(3), t), t, WALL0);
+        assert_eq!(tags(&events), ["JOIN"]);
     }
 
     #[test]
@@ -1359,6 +1508,7 @@ mod tests {
         // The same for a new node id at the address.
         let mut model = Model::new();
         step(&mut model, vec![inc(1, MemberStatus::Live)]);
+        model.tick(t + DISCOVERY_QUIET);
         let rejoined = testkit::member_at(1, 1, 5, MemberStatus::Live);
         let events = step(
             &mut model,

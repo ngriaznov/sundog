@@ -785,3 +785,118 @@ fn divergence_spans_the_entry_counts_of_the_replicated_advertisers() {
     );
     assert_eq!(model.divergence("nope"), None);
 }
+
+/// A hits counter that has grown by `per_second` every second for `second`
+/// seconds.
+fn reads_at(index: u8, base: Instant, second: u64, per_second: f64) -> Update {
+    let hits = gauge(
+        names::CACHE_HITS,
+        &[("cache", "it")],
+        per_second * f64::from(u32::try_from(second).unwrap()),
+    );
+    answer(index, base + Duration::from_secs(second), vec![hits])
+}
+
+fn at_second(model: &mut Model, base: Instant, second: u64, update: Update) {
+    model.apply(update, base + Duration::from_secs(second), WALL);
+}
+
+#[test]
+fn the_cluster_series_keeps_the_nodes_that_counted_when_a_sample_was_taken() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(3), base);
+    assert!(model.cluster_ops().is_empty());
+    for second in 0..=5 {
+        for index in 1..=3 {
+            at_second(
+                &mut model,
+                base,
+                second,
+                reads_at(index, base, second, 100.0),
+            );
+        }
+    }
+    let mut down = testkit::snapshot(3);
+    down.members[2].status = MemberStatus::Down;
+    at_second(
+        &mut model,
+        base,
+        6,
+        Update::Snapshot(
+            Arc::new(ClusterSnapshot::new("fixture", down.members, 0)),
+            base,
+        ),
+    );
+    for second in 6..=10 {
+        for index in 1..=2 {
+            at_second(
+                &mut model,
+                base,
+                second,
+                reads_at(index, base, second, 100.0),
+            );
+        }
+    }
+    model.tick(base + Duration::from_secs(11));
+    let series = model.cluster_ops().to_vec();
+    assert_eq!(series.len(), 10, "{series:?}");
+    assert_eq!(series[..5], [300.0; 5], "the first samples hold all three");
+    assert_eq!(series[5..], [200.0; 5], "the later ones hold the two left");
+}
+
+#[test]
+fn the_cluster_series_waits_for_every_answering_node_to_have_a_figure() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(2), base);
+    for index in 1..=2 {
+        at_second(&mut model, base, 0, reads_at(index, base, 0, 100.0));
+    }
+    // Node 1 has a rate; node 2 has not folded twice yet.
+    at_second(&mut model, base, 1, reads_at(1, base, 1, 100.0));
+    model.tick(base + Duration::from_secs(2));
+    assert!(
+        model.cluster_ops().is_empty(),
+        "no sample of half a cluster"
+    );
+    at_second(&mut model, base, 2, reads_at(2, base, 1, 100.0));
+    model.tick(base + Duration::from_secs(3));
+    assert_eq!(model.cluster_ops().to_vec(), [200.0]);
+}
+
+#[test]
+fn a_failed_scrape_leaves_the_samples_taken_before_it_unchanged() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(3), base);
+    for second in 0..=4 {
+        for index in 1..=3 {
+            at_second(
+                &mut model,
+                base,
+                second,
+                reads_at(index, base, second, 50.0),
+            );
+        }
+    }
+    model.tick(base + Duration::from_secs(5));
+    let before = model.cluster_ops().to_vec();
+    assert!(!before.is_empty());
+    assert_eq!(before, vec![150.0; before.len()]);
+    at_second(&mut model, base, 5, fail(3, base + Duration::from_secs(5)));
+    model.tick(base + Duration::from_secs(6));
+    let after = model.cluster_ops().to_vec();
+    assert_eq!(after[..before.len()], before[..]);
+    assert_eq!(after.last(), Some(&100.0), "n3 leaves the later samples");
+}
+
+#[test]
+fn the_cluster_series_follows_the_scrape_interval() {
+    let base = Instant::now();
+    let mut model = watching(testkit::snapshot(1), base);
+    model.set_scrape_interval(Duration::from_secs(2));
+    for second in 0..=6 {
+        at_second(&mut model, base, second, reads_at(1, base, second, 10.0));
+    }
+    model.tick(base + Duration::from_secs(7));
+    // One sample every two seconds, from the first second with a rate: 2 s, 4 s and 6 s.
+    assert_eq!(model.cluster_ops().to_vec(), [10.0; 3]);
+}

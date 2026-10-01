@@ -12,7 +12,7 @@
 │ it                                                  ⇄    ⇄          ✔                                                                    │
 │     −2m──────────────────────────────────────────────────────────────−1m─────────────────────────────────────────────────────────────now │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭ Events ─ [all] membership ownership traffic exporter (f) ───────────────────────────────────────────────────────────────────── 22 events ╮
+╭ Events ─ [all] membership ownership traffic exporter (f) ───────────────────────────────────────────────────────────────────── 19 events ╮
 │ 00:00:21  ⚠ EXPORTER n6 2c4f  answering                                                                                                  │
 │ 00:00:21  ⚠ EXPORTER n5 294f  answering                                                                                                  │
 │ 00:00:21  ⚠ EXPORTER n4 264f  answering                                                                                                  │
@@ -32,9 +32,9 @@
 │ 00:00:05  ✚ JOIN     n6 2c4f  127.0.0.16 · protocol 6 · it D2 · churn R · os R · pn R                                                    │
 │ 00:00:05  ✚ JOIN     n5 294f  127.0.0.15 · protocol 6 · it D2 · churn R · os R · pn R                                                    │
 │ 00:00:05  ✚ JOIN     n4 264f  127.0.0.14 · protocol 6 · it D2 · churn R · os R · pn R                                                    │
-│ 00:00:00  ✚ JOIN     n3 234f  127.0.0.13 · protocol 6 · it D2 · churn R · os R · pn R                                                    │
-│ 00:00:00  ✚ JOIN     n2 204f  127.0.0.12 · protocol 6 · it D2 · churn R · os R · pn R                                                    │
-│ 00:00:00  ✚ JOIN     n1 1d4f  127.0.0.11 · protocol 6 · it D2 · churn R · os R · pn R                                                    │
+│                                                                                                                                          │
+│                                                                                                                                          │
+│                                                                                                                                          │
 │                                                                                                                                          │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
  1-4 view  ↑↓ scroll  G live  f filter  t gone  p freeze  a anim  ? help  q quit

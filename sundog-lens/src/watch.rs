@@ -99,9 +99,11 @@ pub async fn run(args: WatchArgs) -> anyhow::Result<()> {
     let feed = Feed::spawn(config).await?;
     let mut app = App::new(app_config(&args, look));
     app.set_observer(feed.observer_addr());
+    let mut model = Model::new();
+    model.set_scrape_interval(args.interval);
     run_session(Session {
         feed,
-        model: Model::new(),
+        model,
         app,
         commands: None,
         fleet: None,

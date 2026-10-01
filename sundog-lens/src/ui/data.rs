@@ -398,7 +398,9 @@ pub fn fresh_metrics_of<'a>(model: &'a Model, row: &NodeRow<'_>) -> Option<&'a N
 /// Cluster-wide traffic: the sum of every live node's metrics.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Throughput {
-    /// Reads and fetches per second, one sample per second, oldest first.
+    /// Reads and fetches per second across the cluster, one sample per scrape
+    /// interval, oldest first. A sample keeps the nodes that counted when it
+    /// was taken.
     pub ops: Vec<f64>,
     /// Bytes sent per second now.
     pub tx_bytes: Option<f64>,
@@ -454,9 +456,7 @@ pub fn throughput(model: &Model) -> Throughput {
         nodes: nodes.len(),
         ..Throughput::default()
     };
-    for metrics in &nodes {
-        add_aligned(&mut total.ops, &metrics.ops().to_vec());
-    }
+    total.ops = model.cluster_ops().to_vec();
     total.tx_bytes = sum_option(nodes.iter().map(|m| m.tx_bytes().last()));
     let hits = sum_option(nodes.iter().map(|m| m.rate_sum(names::CACHE_HITS)));
     let misses = sum_option(nodes.iter().map(|m| m.rate_sum(names::CACHE_MISSES)));
@@ -871,8 +871,15 @@ mod tests {
         assert!(metrics_of(&model, row).is_some(), "the history stays");
         assert!(!scrape_answered(&model, row));
         assert!(fresh_metrics_of(&model, row).is_none());
+        let later = at + Duration::from_secs(1);
+        model.tick(later);
         let after = throughput(&model);
         assert_eq!(after.nodes, before.nodes - 1);
+        assert_eq!(
+            after.ops[..before.ops.len()],
+            before.ops[..],
+            "the samples taken before the failure stay"
+        );
         assert!(after.ops.last() < before.ops.last(), "{after:?} {before:?}");
     }
 

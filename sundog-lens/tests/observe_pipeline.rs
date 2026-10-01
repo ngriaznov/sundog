@@ -12,6 +12,7 @@ use sundog::observe::MemberStatus;
 use sundog::store::Mode;
 use sundog::{Cache, Cluster, ClusterConfig, NodeId};
 use sundog_lens::model::events::{Event, EventKind};
+use sundog_lens::model::lifelines::PhaseKind;
 use sundog_lens::model::{Model, digest};
 use sundog_lens::source::observer::forward;
 use sundog_lens::source::{Feed, FeedConfig, Update};
@@ -138,9 +139,20 @@ fn assert_started(model: &Model, ids: [NodeId; 3]) {
         model.ownership("side").is_none(),
         "a Replicated cache has no ownership"
     );
-    let events = log(model);
+    // The members found at startup are the baseline: each one runs a Live
+    // lifeline from the first sight.
+    let snapshot = model.snapshot().expect("the observer has a snapshot");
     for id in ids {
-        assert!(about(&events, "JOIN", id).is_some(), "{id} joined");
+        let member = snapshot
+            .members
+            .iter()
+            .find(|member| member.peer.node == id)
+            .unwrap_or_else(|| panic!("{id} is a member"));
+        let line = model
+            .lifelines()
+            .node(member.peer.gossip_addr)
+            .unwrap_or_else(|| panic!("{id} has a lifeline"));
+        assert_eq!(line.current(), Some(PhaseKind::Live), "{id} lives");
     }
     assert_eq!(model.slots().len(), 3);
 }

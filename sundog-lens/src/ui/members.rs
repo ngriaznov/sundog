@@ -153,7 +153,11 @@ fn status_glyph(scene: &Scene<'_>, row: &NodeRow<'_>) -> Span<'static> {
     let age = row.status_age(scene.ctx.wall);
     match row.status() {
         MemberStatus::Live => {
-            let glyph = if age < JOINED_FOR { '✚' } else { '●' };
+            let glyph = if row.uptime(scene.ctx.wall).is_some_and(|up| up < JOINED_FOR) {
+                '✚'
+            } else {
+                '●'
+            };
             Span::styled(glyph.to_string(), look.node(row.color()))
         }
         MemberStatus::Departing => {
@@ -342,8 +346,10 @@ fn row_line(
         look.node(row.color()).add_modifier(Modifier::BOLD)
     };
     let age = row.status_age(scene.ctx.wall);
-    if scene.app.anim && row.status() == MemberStatus::Live && age < JOIN_PULSE {
-        let glow = anim::blend(theme::BG, row.color(), 0.4 * anim::pulse(age, JOIN_PULSE));
+    if scene.app.anim
+        && let Some(up) = row.uptime(scene.ctx.wall).filter(|up| *up < JOIN_PULSE)
+    {
+        let glow = anim::blend(theme::BG, row.color(), 0.4 * anim::pulse(up, JOIN_PULSE));
         name_style = name_style.patch(look.bg(glow));
     }
     spans.push(Span::styled(
@@ -734,54 +740,74 @@ mod tests {
         assert_eq!(wanted_height(&scene, 2, 5), 7);
     }
 
-    #[test]
-    fn a_joining_row_pulses_and_shows_the_joined_glyph() {
-        let model = fixture();
+    /// A model with `n1` running since the epoch and `n2` since `started_ms`,
+    /// both first seen at the epoch plus `seen_secs`.
+    fn model_with_start(started_ms: u64, seen_secs: u64) -> Model {
+        let seen = std::time::UNIX_EPOCH + Duration::from_secs(seen_secs);
+        let members = vec![
+            testkit::member_since(1, 0, 1, MemberStatus::Live, seen, &[]),
+            testkit::member_since(4, 0, started_ms, MemberStatus::Live, seen, &[]),
+        ];
+        let mut model = Model::new();
+        let now = Instant::now();
+        model.apply(
+            crate::source::Update::Snapshot(
+                std::sync::Arc::new(sundog::observe::ClusterSnapshot::new("c", members, 0)),
+                now,
+            ),
+            now,
+            seen,
+        );
+        model
+    }
+
+    /// The glyph and whether the name glows for the row labelled `label` when
+    /// the wall clock reads `wall_secs` seconds past the epoch.
+    fn joined_look(model: &Model, label: &str, wall_secs: u64) -> (String, bool) {
         let app = App::new(AppConfig::default());
-        let mut ctx = Ctx {
+        let ctx = Ctx {
             now: model.now().unwrap(),
-            wall: model.wall().unwrap(),
+            wall: std::time::UNIX_EPOCH + Duration::from_secs(wall_secs),
             elapsed: Duration::ZERO,
         };
-        // n4 first showed at 5 s; 1 s later it is joining, 15 s later it is not.
-        ctx.wall = std::time::UNIX_EPOCH + Duration::from_secs(6);
         let scene = Scene {
             app: &app,
-            model: &model,
+            model,
             ctx: &ctx,
             look: app.look(),
             kind: LayoutKind::Full,
         };
         let rows = scene.rows();
-        let n4 = rows.iter().find(|r| r.label() == "n4").unwrap();
+        let row = rows.iter().find(|r| r.label() == label).unwrap();
         let line = row_line(
             &scene,
-            n4,
+            row,
             &Cols::for_width(LayoutKind::Full, 82, 2, 15),
             false,
             None,
             2,
         );
-        assert_eq!(line.spans[1].content, "✚");
-        assert!(line.spans[3].style.bg.is_some(), "the name glows");
-        let mut later = ctx;
-        later.wall = std::time::UNIX_EPOCH + Duration::from_secs(20);
-        let scene = Scene {
-            ctx: &later,
-            ..scene
-        };
-        let rows = scene.rows();
-        let n4 = rows.iter().find(|r| r.label() == "n4").unwrap();
-        let settled = row_line(
-            &scene,
-            n4,
-            &Cols::for_width(LayoutKind::Full, 82, 2, 15),
-            false,
-            None,
-            2,
-        );
-        assert_eq!(settled.spans[1].content, "●");
-        assert!(settled.spans[3].style.bg.is_none());
+        (
+            line.spans[1].content.to_string(),
+            line.spans[3].style.bg.is_some(),
+        )
+    }
+
+    #[test]
+    fn a_joining_row_pulses_and_shows_the_joined_glyph() {
+        // n2's process started at 5 s: 1 s later it is joining, 15 s later it is not.
+        let model = model_with_start(5_000, 5);
+        assert_eq!(joined_look(&model, "n2", 6), ("✚".to_owned(), true));
+        assert_eq!(joined_look(&model, "n2", 20), ("●".to_owned(), false));
+    }
+
+    #[test]
+    fn a_node_that_has_run_for_minutes_shows_no_join_on_the_first_frame() {
+        // The lens saw n2 for the first time at 400 s; its process started at
+        // 40 s, six minutes before.
+        let model = model_with_start(40_000, 400);
+        assert_eq!(joined_look(&model, "n2", 400), ("●".to_owned(), false));
+        assert_eq!(joined_look(&model, "n2", 401), ("●".to_owned(), false));
     }
 
     #[test]

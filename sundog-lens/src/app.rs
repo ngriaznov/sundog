@@ -637,7 +637,7 @@ impl App {
                 use sundog::observe::MemberStatus::{Departing, Down, Live};
                 match row.status() {
                     Departing => true,
-                    Live => fresh(row.member.since, JOIN_PULSE),
+                    Live => row.uptime(wall).is_some_and(|up| up < JOIN_PULSE),
                     Down => fresh(row.member.since, DOWN_HOLD),
                     _ => false,
                 }
@@ -1330,7 +1330,10 @@ mod tests {
         let start = Instant::now();
         let one = |status, since: SystemTime| {
             let mut model = Model::new();
-            let member = testkit::member_since(1, 0, 1, status, since, &[]);
+            // A process's incarnation is the wall clock at its start.
+            let started = since.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            let incarnation = u64::try_from(started.as_millis()).unwrap();
+            let member = testkit::member_since(1, 0, incarnation, status, since, &[]);
             let snapshot = ClusterSnapshot::new("c", vec![member], 0);
             model.apply(
                 crate::source::Update::Snapshot(std::sync::Arc::new(snapshot), start),
@@ -1367,15 +1370,13 @@ mod tests {
         assert!(app.animating(&departing, start, wall_at(Duration::from_secs(3600))));
         // A new event flashes for EVENT_FLASH, even when no member is moving.
         let old = wall_at(Duration::ZERO) - Duration::from_secs(100);
-        let mut model = Model::new();
-        let snapshot = ClusterSnapshot::new(
-            "c",
-            vec![testkit::member_since(1, 0, 1, MemberStatus::Live, old, &[])],
-            0,
-        );
+        let (mut model, found) = testkit::past_discovery(start);
+        let mut members = testkit::snapshot(1).members;
+        members.push(testkit::member_since(2, 0, 1, MemberStatus::Live, old, &[]));
+        let snapshot = ClusterSnapshot::new("c", members, 0);
         model.apply(
-            crate::source::Update::Snapshot(std::sync::Arc::new(snapshot), start),
-            start,
+            crate::source::Update::Snapshot(std::sync::Arc::new(snapshot), found),
+            found,
             wall_at(Duration::ZERO),
         );
         assert_eq!(model.events().len(), 1, "the join");
