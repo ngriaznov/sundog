@@ -322,6 +322,28 @@ impl Node {
         Self::spawn_with_env(net, cluster_name, alias, seeds, &env).await
     }
 
+    /// An observer beside the cluster: this checkout's test node with
+    /// `SUNDOG_TESTNODE_ROLE=observer`, seeded from `seeds`. It joins gossip
+    /// without a data plane or caches and answers `members` and `share`.
+    /// # Panics
+    ///
+    /// Panics if the container fails to start or never becomes ready.
+    pub async fn spawn_observer(
+        net: &Arc<Network>,
+        cluster_name: &str,
+        alias: &str,
+        seeds: &[&str],
+    ) -> Node {
+        Self::spawn_with_env(
+            net,
+            cluster_name,
+            alias,
+            seeds,
+            &[("SUNDOG_TESTNODE_ROLE", "observer")],
+        )
+        .await
+    }
+
     /// [`Node::spawn_with_env`] running `bin` instead of this checkout's
     /// test node: [`build_previous_testnode`] for a mixed-version cluster.
     /// # Panics
@@ -824,6 +846,40 @@ impl Node {
     pub async fn digest(&self) -> Result<u64, String> {
         let reply = self.command("digest").await?;
         u64::from_str_radix(&reply, 16).map_err(|error| format!("bad digest reply: {error}"))
+    }
+
+    /// `members`, an observer's per-status member counts:
+    /// `live=<n> departing=<n> left=<n> down=<n> anon=<n>`.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails.
+    pub async fn members(&self) -> Result<String, String> {
+        self.command("members").await
+    }
+
+    /// `share <cache> <owners> <node_id>`, an observer's count of the parts
+    /// `node_id` owns in `cache` at `owners` owners per part; `None` when
+    /// the observer sees no member eligible for that cache.
+    /// # Errors
+    ///
+    /// Returns `Err` if the connection fails or the reply is neither `none`
+    /// nor numeric.
+    pub async fn share(
+        &self,
+        cache: &str,
+        owners: u8,
+        node_id: u64,
+    ) -> Result<Option<u64>, String> {
+        let reply = self
+            .command(&format!("share {cache} {owners} {node_id}"))
+            .await?;
+        if reply == "none" {
+            return Ok(None);
+        }
+        reply
+            .parse()
+            .map(Some)
+            .map_err(|error| format!("bad share reply {reply:?}: {error}"))
     }
 
     /// `GET /metrics` on this node's mapped `METRICS_PORT`, returning the raw

@@ -1477,6 +1477,83 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
     net.close().await.expect("network closes");
 }
 
+/// An observer joins gossip beside a mixed-version `Mode::Distributed`
+/// cluster and stays invisible to it: no member counts it as a peer, so
+/// ownership across the previous release's node and this release's is
+/// untouched. The observer sees all three members live, computes their
+/// shares as the members do, and follows a graceful leave: the departed
+/// node counts as left and the survivors split the parts between them.
+#[tokio::test]
+async fn an_observer_beside_the_previous_release_stays_invisible() {
+    const OWNERS: u8 = 2;
+    const CLUSTER: &str = "observer-mixed-cluster";
+    const WATCH_WAIT: Duration = Duration::from_secs(60);
+    let part_space = (sundog::store::BUCKET_COUNT * sundog::store::PART_COUNT) as u64;
+
+    require_containers!();
+
+    let previous = build_previous_testnode();
+    let net = Arc::new(Network::new_network());
+    let env = [
+        ("SUNDOG_TESTNODE_MODE", "distributed"),
+        ("SUNDOG_TESTNODE_OWNERS", "2"),
+    ];
+    let old = Node::spawn_binary(&net, CLUSTER, "n1", &[], &env, previous).await;
+    let n2 = Node::spawn_with_env(&net, CLUSTER, "n2", &[&seed("n1")], &env).await;
+    let n3 = Node::spawn_with_env(&net, CLUSTER, "n3", &[&seed("n1")], &env).await;
+    let observer = Node::spawn_observer(&net, CLUSTER, "obs", &[&seed("n1")]).await;
+    let members = [&old, &n2, &n3];
+
+    // The observer shows three live members and nobody else, while every
+    // member still counts exactly its two peers: the observer is no peer.
+    eventually_with_logs(WATCH_WAIT, &[&old, &n2, &n3, &observer], || async {
+        observer.members().await.as_deref() == Ok("live=3 departing=0 left=0 down=0 anon=0")
+    })
+    .await;
+    wait_for_peers(&members, 2).await;
+
+    // The observer's shares match the members' ownership: every part is
+    // owned `OWNERS` times, across a previous-release node that ranks whole
+    // buckets and two current nodes that follow it.
+    let ids = collect_node_ids(&members).await;
+    eventually_with_logs(WATCH_WAIT, &[&old, &n2, &n3, &observer], || async {
+        let mut sum = 0;
+        for &id in &ids {
+            match observer.share("it", OWNERS, id).await {
+                Ok(Some(share)) => sum += share,
+                _ => return false,
+            }
+        }
+        sum == part_space * u64::from(OWNERS)
+    })
+    .await;
+    wait_for_peers(&members, 2).await;
+
+    // A graceful leave: the observer counts the node as left and the two
+    // survivors own every part twice over, which is all of them each.
+    let survivors = [&old, &n3];
+    let survivor_ids = [ids[0], ids[2]];
+    n2.stop().await.expect("n2 stops");
+    eventually_with_logs(WATCH_WAIT, &[&old, &n3, &observer], || async {
+        if observer.members().await.as_deref() != Ok("live=2 departing=0 left=1 down=0 anon=0") {
+            return false;
+        }
+        for id in survivor_ids {
+            if observer.share("it", OWNERS, id).await != Ok(Some(part_space)) {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    wait_for_peers(&survivors, 1).await;
+
+    observer.stop().await.expect("the observer stops");
+    old.stop().await.expect("the previous-release node stops");
+    n3.stop().await.expect("n3 stops");
+    net.close().await.expect("network closes");
+}
+
 /// Chunked-pull-with-independent-release interop
 /// (`Msg::StBucketDone`/`Msg::StBucketAck`, gated on
 /// `wire::PROTOCOL_ST_BUCKET_DONE_ACK`) across a mixed-version

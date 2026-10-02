@@ -22,6 +22,12 @@
 //! `spill_config_from_env`. A SIGTERM, sent by a container stop, leaves the
 //! cluster and exits 0, checkpointing a warm-reopen spill tier; `quit` and
 //! `crash` exit without leaving.
+//!
+//! `SUNDOG_TESTNODE_ROLE=observer` runs a [`sundog::observe::Observer`]
+//! instead of a cluster member: it binds gossip on `{bind_ip}:7946`, joins
+//! through `SUNDOG_SEEDS`, opens no cache and serves three control lines,
+//! `members`, `share <cache> <owners> <node-id>` and `quit`; see
+//! `ObserverNode::dispatch`.
 
 use std::env;
 use std::io::Write as _;
@@ -34,8 +40,10 @@ use bytes::Bytes;
 #[cfg(feature = "spill")]
 use sundog::SpillConfig;
 use sundog::crdt::{OrSet, OrSetResolver, PnCounter, PnCounterResolver, WriterId};
+use sundog::observe::{ClusterSnapshot, MemberStatus, Observer};
 use sundog::{
-    Cache, CacheBuilder, Cluster, ClusterConfig, ConflictResolver, Merged, Mode, RecordView, Winner,
+    Cache, CacheBuilder, Cluster, ClusterConfig, ConflictResolver, Merged, Mode, NodeId,
+    RecordView, Winner,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -456,6 +464,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: sundog-testnode <cluster-name>")?;
     let seeds = resolve_seeds(&env::var("SUNDOG_SEEDS").unwrap_or_default()).await;
+    let role = role_from_env(env::var("SUNDOG_TESTNODE_ROLE").ok().as_deref())?;
+    let bind_ip = bind_ip_from_env(env::var("SUNDOG_TESTNODE_BIND_IP").ok().as_deref())?;
+    if role == Role::Observer {
+        return run_observer(cluster_name, seeds, bind_ip).await;
+    }
     let ae_part_min_bucket = usize_env("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET");
     let ae_sketch_min_bucket = usize_env("SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET");
     let crdt_retire_after_secs = u64_env("SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS");
@@ -469,7 +482,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let it_mode = mode_from_env(env::var("SUNDOG_TESTNODE_MODE").ok().as_deref(), owners)?;
     let it_resolver = resolver_kind_from_env(env::var("SUNDOG_TESTNODE_RESOLVER").ok().as_deref())?;
 
-    let bind_ip = bind_ip_from_env(env::var("SUNDOG_TESTNODE_BIND_IP").ok().as_deref())?;
     let side_caches =
         side_caches_from_env(env::var("SUNDOG_TESTNODE_SIDE_CACHES").ok().as_deref())?;
     let config = ClusterConfig::default().with(|c| {
@@ -509,7 +521,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         side,
         cluster,
     };
+    serve_until_stopped(bind_ip, Control::Node(node)).await
+}
 
+/// The `SUNDOG_TESTNODE_ROLE=observer` process: an [`Observer`] bound to
+/// `{bind_ip}:GOSSIP_PORT` and seeded from `seeds`, serving the control
+/// lines of [`ObserverNode::dispatch`].
+async fn run_observer(
+    cluster_name: String,
+    seeds: Vec<SocketAddr>,
+    bind_ip: IpAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ClusterConfig::default().with(|c| {
+        c.gossip_bind_addr = SocketAddr::new(bind_ip, GOSSIP_PORT);
+    });
+    let observer = Observer::builder(cluster_name)
+        .seeds(seeds)
+        .config(config)
+        .build()
+        .await?;
+    serve_until_stopped(bind_ip, Control::Observer(ObserverNode { observer })).await
+}
+
+/// Serves `control` on `CONTROL_PORT` after printing `testnode-ready`, and
+/// leaves gossip and exits 0 on the stop signal.
+async fn serve_until_stopped(
+    bind_ip: IpAddr,
+    control: Control,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((bind_ip, CONTROL_PORT)).await?;
     // A container stop sends SIGTERM: leave the cluster and checkpoint a
     // warm-reopen spill tier; `quit`/`crash` exit with no leave.
@@ -523,12 +562,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             biased;
             requested = &mut stop => {
                 requested?;
-                node.cluster.clone().shutdown().await;
+                control.clone().shutdown().await;
                 std::process::exit(0);
             }
             accepted = listener.accept() => {
                 let (socket, _) = accepted?;
-                tokio::spawn(serve(socket, node.clone()));
+                tokio::spawn(serve(socket, control.clone()));
             }
         }
     }
@@ -572,6 +611,139 @@ enum Reply {
     Line(String),
     Quit,
     Crash,
+}
+
+/// What a process is, `SUNDOG_TESTNODE_ROLE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// A cluster member with open caches: the default.
+    Node,
+    /// A gossip-only [`Observer`] that is never a peer.
+    Observer,
+}
+
+/// The process role, `SUNDOG_TESTNODE_ROLE`: `node` by default, or
+/// `observer`. Any other value is an `Err` naming the allowed ones.
+fn role_from_env(raw: Option<&str>) -> Result<Role, String> {
+    match raw {
+        None | Some("node") => Ok(Role::Node),
+        Some("observer") => Ok(Role::Observer),
+        Some(other) => Err(format!(
+            "SUNDOG_TESTNODE_ROLE must be \"node\" or \"observer\", got {other:?}"
+        )),
+    }
+}
+
+/// What a control connection drives: a cluster member or an observer.
+#[derive(Clone)]
+enum Control {
+    Node(TestNode),
+    Observer(ObserverNode),
+}
+
+impl Control {
+    async fn dispatch(&self, line: &str) -> Reply {
+        match self {
+            Self::Node(node) => node.dispatch(line).await,
+            Self::Observer(observer) => observer.dispatch(line).await,
+        }
+    }
+
+    /// Leaves the cluster's gossip.
+    async fn shutdown(self) {
+        match self {
+            Self::Node(node) => node.cluster.shutdown().await,
+            Self::Observer(observer) => observer.observer.shutdown().await,
+        }
+    }
+}
+
+/// The observer role's handle: no cache, no data plane.
+#[derive(Clone)]
+struct ObserverNode {
+    observer: Observer,
+}
+
+impl ObserverNode {
+    /// Parses and runs one observer control line, returning its reply.
+    async fn dispatch(&self, line: &str) -> Reply {
+        let mut parts = line.trim().splitn(2, ' ');
+        let command = parts.next().unwrap_or_default();
+        match command {
+            // members -> live=<n> departing=<n> left=<n> down=<n> anon=<n>.
+            "members" => Reply::Line(members_line(&self.observer.snapshot())),
+            // share <cache> <owners> <node-id> -> the parts <node-id> owns in
+            // <cache> at <owners> owners per part, or none.
+            "share" => {
+                let Some((cache, owners, node)) = parse_share_args(parts.next().unwrap_or(""))
+                else {
+                    return Reply::Line(
+                        "err share needs a cache, a nonzero u8 owner count and a decimal node id"
+                            .to_string(),
+                    );
+                };
+                let snapshot = self.observer.snapshot();
+                // About 65,536 hashes per eligible member: off the async workers.
+                let reply = tokio::task::spawn_blocking(move || {
+                    share_reply(&snapshot, &cache, owners, node)
+                })
+                .await
+                .unwrap_or_else(|error| format!("err {error}"));
+                Reply::Line(reply)
+            }
+            // quit -> exits 0, no reply written.
+            "quit" => Reply::Quit,
+            other => Reply::Line(format!("err unknown command {other:?}")),
+        }
+    }
+}
+
+/// The `members` reply: how many members `snapshot` shows in each status,
+/// and how many live gossip participants have no node state:
+/// `live=<n> departing=<n> left=<n> down=<n> anon=<n>`.
+fn members_line(snapshot: &ClusterSnapshot) -> String {
+    let count = |status| {
+        snapshot
+            .members
+            .iter()
+            .filter(|member| member.status == status)
+            .count()
+    };
+    format!(
+        "live={} departing={} left={} down={} anon={}",
+        count(MemberStatus::Live),
+        count(MemberStatus::Departing),
+        count(MemberStatus::Left),
+        count(MemberStatus::Down),
+        snapshot.anonymous,
+    )
+}
+
+/// Parses the arguments of `share`: `<cache> <owners> <node-id>`, the owner
+/// count nonzero and the node id a decimal `u64`.
+fn parse_share_args(args: &str) -> Option<(String, std::num::NonZeroU8, NodeId)> {
+    let mut parts = args.split_whitespace();
+    let cache = parts.next()?;
+    let owners = std::num::NonZeroU8::new(parse_arg(parts.next())?)?;
+    let node = NodeId::from(parse_arg::<u64>(parts.next())?);
+    parts
+        .next()
+        .is_none()
+        .then(|| (cache.to_string(), owners, node))
+}
+
+/// The `share` reply: how many of the 65,536 parts `node` owns in `cache` at
+/// `owners` owners per part, or `none` when no member is eligible.
+fn share_reply(
+    snapshot: &ClusterSnapshot,
+    cache: &str,
+    owners: std::num::NonZeroU8,
+    node: NodeId,
+) -> String {
+    snapshot.ownership(cache, owners).map_or_else(
+        || "none".to_string(),
+        |shares| shares.parts_owned_by(node).to_string(),
+    )
 }
 
 /// Parses one control-line argument via `FromStr`; `None` if absent or unparsable.
@@ -1021,14 +1193,14 @@ async fn ownership_command(
     })
 }
 
-async fn serve(socket: TcpStream, node: TestNode) {
+async fn serve(socket: TcpStream, control: Control) {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
     loop {
         let Ok(Some(line)) = lines.next_line().await else {
             return;
         };
-        match node.dispatch(&line).await {
+        match control.dispatch(&line).await {
             Reply::Line(reply) => {
                 if writer
                     .write_all(format!("{reply}\n").as_bytes())
@@ -1053,7 +1225,12 @@ async fn serve(socket: TcpStream, node: TestNode) {
 
 #[cfg(test)]
 mod tests {
-    use sundog::{Hlc, NodeId};
+    use std::collections::BTreeMap;
+
+    use sundog::Hlc;
+    use sundog::NodeName;
+    use sundog::membership::Peer;
+    use sundog::observe::Member;
 
     use super::*;
 
@@ -1679,6 +1856,237 @@ mod tests {
                 "stop_requested did not resolve within 10 s of repeated SIGTERMs"
             );
         }
+    }
+
+    #[test]
+    fn role_from_env_defaults_to_node() {
+        assert_eq!(role_from_env(None), Ok(Role::Node));
+        assert_eq!(role_from_env(Some("node")), Ok(Role::Node));
+    }
+
+    #[test]
+    fn role_from_env_reads_observer() {
+        assert_eq!(role_from_env(Some("observer")), Ok(Role::Observer));
+    }
+
+    #[test]
+    fn role_from_env_rejects_an_unknown_role_naming_the_allowed_values() {
+        let error = role_from_env(Some("watcher")).expect_err("watcher is not a role");
+        assert!(error.contains("SUNDOG_TESTNODE_ROLE"), "{error}");
+        assert!(error.contains("\"node\""), "{error}");
+        assert!(error.contains("\"observer\""), "{error}");
+        assert!(error.contains("\"watcher\""), "{error}");
+    }
+
+    fn two_owners() -> std::num::NonZeroU8 {
+        std::num::NonZeroU8::new(2).expect("nonzero")
+    }
+
+    /// A member of `status` advertising `"it"` under two-owner `Distributed`
+    /// at the current protocol.
+    fn distributed_member(node: u64, status: MemberStatus) -> Member {
+        let peer = Peer {
+            node: NodeId::from(node),
+            name: NodeName::new("host", NodeId::from(node)),
+            gossip_addr: SocketAddr::from(([127, 0, 0, 1], 7000)),
+            data_addr: SocketAddr::from(([127, 0, 0, 1], 8000)),
+            incarnation: 1,
+            protocol: sundog::wire::PROTOCOL_VERSION,
+        };
+        let caches = BTreeMap::from([(
+            "it".into(),
+            Mode::Distributed {
+                owners: two_owners(),
+            },
+        )]);
+        Member::new(peer, status, std::time::UNIX_EPOCH, caches)
+    }
+
+    #[test]
+    fn members_line_is_all_zero_for_an_empty_snapshot() {
+        let snapshot = ClusterSnapshot::new("c", Vec::new(), 0);
+        assert_eq!(
+            members_line(&snapshot),
+            "live=0 departing=0 left=0 down=0 anon=0"
+        );
+    }
+
+    #[test]
+    fn members_line_counts_each_status_and_the_anonymous_participants() {
+        let members = vec![
+            distributed_member(1, MemberStatus::Live),
+            distributed_member(2, MemberStatus::Live),
+            distributed_member(3, MemberStatus::Live),
+            distributed_member(4, MemberStatus::Departing),
+            distributed_member(5, MemberStatus::Left),
+            distributed_member(6, MemberStatus::Left),
+            distributed_member(7, MemberStatus::Down),
+        ];
+        let snapshot = ClusterSnapshot::new("c", members, 4);
+        assert_eq!(
+            members_line(&snapshot),
+            "live=3 departing=1 left=2 down=1 anon=4"
+        );
+    }
+
+    #[test]
+    fn parse_share_args_reads_a_cache_an_owner_count_and_a_node_id() {
+        assert_eq!(
+            parse_share_args("it 2 18446744073709551615"),
+            Some(("it".to_string(), two_owners(), NodeId::from(u64::MAX)))
+        );
+    }
+
+    #[test]
+    fn parse_share_args_rejects_missing_zero_unparsable_and_extra_arguments() {
+        for args in [
+            "",
+            "it",
+            "it 2",
+            "it 0 7",
+            "it 256 7",
+            "it two 7",
+            "it 2 seven",
+            "it 2 -1",
+            "it 2 7 extra",
+        ] {
+            assert_eq!(parse_share_args(args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn share_reply_is_none_without_an_eligible_member() {
+        let snapshot =
+            ClusterSnapshot::new("c", vec![distributed_member(1, MemberStatus::Down)], 0);
+        assert_eq!(
+            share_reply(&snapshot, "it", two_owners(), NodeId::from(1)),
+            "none"
+        );
+        assert_eq!(
+            share_reply(&snapshot, "absent", two_owners(), NodeId::from(1)),
+            "none"
+        );
+    }
+
+    #[test]
+    fn share_reply_gives_each_member_its_parts_and_zero_off_the_eligible_set() {
+        let members = vec![
+            distributed_member(1, MemberStatus::Live),
+            distributed_member(2, MemberStatus::Live),
+            distributed_member(3, MemberStatus::Departing),
+        ];
+        let snapshot = ClusterSnapshot::new("c", members, 0);
+        // Two eligible members at two owners: each owns every part.
+        for node in [1, 2] {
+            assert_eq!(
+                share_reply(&snapshot, "it", two_owners(), NodeId::from(node)),
+                "65536",
+                "node {node}"
+            );
+        }
+        assert_eq!(
+            share_reply(&snapshot, "it", two_owners(), NodeId::from(3)),
+            "0",
+            "a departing member owns nothing"
+        );
+        assert_eq!(
+            share_reply(&snapshot, "it", two_owners(), NodeId::from(9)),
+            "0",
+            "an unknown node owns nothing"
+        );
+    }
+
+    /// A single-node cluster on loopback with `"it"` open under two-owner
+    /// `Distributed`, and an observer seeded from it.
+    async fn observed_cluster(name: &str) -> (TestNode, ObserverNode) {
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let config = ClusterConfig::default().with(|c| {
+            c.gossip_bind_addr = loopback;
+            c.data_bind_addr = loopback;
+        });
+        let cluster = Cluster::builder(name)
+            .seeds(std::iter::empty())
+            .config(config.clone())
+            .build()
+            .await
+            .expect("a single-node cluster builds with no seeds");
+        let cache = cluster
+            .cache::<String, String>(CACHE_NAME)
+            .mode(Mode::Distributed {
+                owners: two_owners(),
+            })
+            .open()
+            .await
+            .expect("\"it\" opens");
+        let observer = Observer::builder(name)
+            .seeds([cluster.local_gossip_addr()])
+            .config(config)
+            .build()
+            .await
+            .expect("the observer builds");
+        let member = TestNode {
+            cache,
+            side: None,
+            cluster,
+        };
+        (member, ObserverNode { observer })
+    }
+
+    #[tokio::test]
+    async fn observer_dispatch_reports_members_and_shares_and_rejects_the_rest() {
+        let (member, node) = observed_cluster("testnode-observer-dispatch").await;
+        let id = member.cluster.node_id().as_u64();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while reply_line(node.dispatch("members").await)
+            != "live=1 departing=0 left=0 down=0 anon=0"
+            || reply_line(node.dispatch(&format!("share it 2 {id}")).await) != "65536"
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the observer did not show the member within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            reply_line(node.dispatch("share it 2 1").await),
+            "0",
+            "an unknown node owns nothing"
+        );
+        assert_eq!(reply_line(node.dispatch("share absent 2 1").await), "none");
+        assert!(
+            reply_line(node.dispatch("share it 0 1").await).starts_with("err share needs"),
+            "a zero owner count is refused"
+        );
+        assert!(reply_line(node.dispatch("share").await).starts_with("err share needs"));
+        assert_eq!(
+            reply_line(node.dispatch("bogus").await),
+            "err unknown command \"bogus\""
+        );
+        assert!(matches!(node.dispatch("quit").await, Reply::Quit));
+        node.observer.shutdown().await;
+        member.cluster.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn control_dispatch_routes_each_role_to_its_own_commands() {
+        let (member, observer) = observed_cluster("testnode-control-routing").await;
+        let observing = Control::Observer(observer);
+        assert!(reply_line(observing.dispatch("members").await).starts_with("live="));
+        assert_eq!(
+            reply_line(observing.dispatch("count").await),
+            "err unknown command \"count\"",
+            "an observer has no cache commands"
+        );
+        observing.shutdown().await;
+
+        let member = Control::Node(member);
+        assert_eq!(reply_line(member.dispatch("count").await), "0");
+        assert_eq!(
+            reply_line(member.dispatch("members").await),
+            "err unknown command \"members\"",
+            "a member has no observer commands"
+        );
+        member.shutdown().await;
     }
 
     #[cfg(feature = "spill")]
