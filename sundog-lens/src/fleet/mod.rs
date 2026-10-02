@@ -1,12 +1,19 @@
 //! The local fleet of `sundog-testnode` processes.
 //!
-//! A fleet starts one test node per slot, each on its own loopback address
-//! (`127.0.0.11` for `n1`, `127.0.0.12` for `n2`, and so on), because the
-//! node's ports are fixed: gossip 7946, control 8080, exporter 9090. It can
+//! A fleet starts one test node per slot. A node's ports are fixed unless
+//! the environment overrides them (gossip 7946, control 8080, exporter 9090),
+//! so the [`Layout`] decides how the slots tell apart. In the per-address
+//! layout each slot has its own loopback address (`127.0.0.11` for `n1`,
+//! `127.0.0.12` for `n2`, and so on) and the fixed ports; Linux answers on all
+//! of `127.0.0.0/8`, so that is its default. In the shared layout every slot
+//! is on `127.0.0.1` and slot `i` has the fixed ports plus `i - 1`, which the
+//! fleet passes through the node's port variables; that is the default
+//! everywhere else, macOS included, and needs no setup. An explicit
+//! `--base-ip` always picks the per-address layout. A fleet can
 //! stop a node three ways: [`Fleet::leave`] sends SIGTERM and the node
 //! gossips a graceful departure; [`Fleet::kill`] sends SIGKILL; and
 //! [`Fleet::crash`] asks the node to exit without leaving. [`Fleet::restart`]
-//! starts a stopped slot again at its address, with a new identity. No
+//! starts a stopped slot again at its address and ports, with a new identity. No
 //! process outlives the fleet: [`Fleet::stop_all`] ends every node, and
 //! dropping the fleet kills any that remain.
 //!
@@ -32,13 +39,16 @@ use crate::scenario::director::Stage;
 use crate::source::http;
 use load::LoadHandle;
 use proc::{
-    BUILD_HINT, CONTROL_PORT, GOSSIP_PORT, METRICS_PORT, NodeProc, READY_TIMEOUT, ReadyHandle,
-    parse_label, slot_ip, slot_label,
+    BUILD_HINT, CONTROL_PORT, METRICS_OFFSET, METRICS_PORT, NodeProc, READY_TIMEOUT, ReadyHandle,
+    parse_label, slot_label,
 };
 
 pub mod control;
+pub mod layout;
 pub mod load;
 pub mod proc;
+
+pub use layout::{Layout, Ports};
 
 /// How many nodes a fleet runs at most: one per color the interface has.
 pub const MAX_SLOTS: usize = 6;
@@ -65,8 +75,8 @@ pub const DEFAULT_LOGS: &str = "target/lens-demo";
 pub struct FleetConfig {
     /// The cluster name every node joins.
     pub cluster: String,
-    /// The address of slot 1.
-    pub base_ip: Ipv4Addr,
+    /// How the slots share the loopback addresses and the ports.
+    pub layout: Layout,
     /// The `sundog-testnode` binary.
     pub testnode: PathBuf,
     /// Owners per part.
@@ -76,8 +86,9 @@ pub struct FleetConfig {
 }
 
 impl FleetConfig {
-    /// The configuration the fleet flags ask for. The test node binary is
-    /// found as [`proc::find_testnode`] does.
+    /// The configuration the fleet flags ask for: the layout is
+    /// [`Layout::for_host`] of `--base-ip`, and the test node binary is found
+    /// as [`proc::find_testnode`] does.
     ///
     /// # Errors
     ///
@@ -85,7 +96,7 @@ impl FleetConfig {
     pub fn from_args(args: &FleetArgs) -> anyhow::Result<Self> {
         Ok(Self {
             cluster: args.name.clone(),
-            base_ip: args.base_ip,
+            layout: Layout::for_host(args.base_ip),
             testnode: proc::find_testnode(args.testnode.as_deref())?,
             owners: args.owners,
             logs: args
@@ -98,12 +109,7 @@ impl FleetConfig {
     /// The gossip addresses the observer joins through: the first two slots.
     #[must_use]
     pub fn seed_addrs(&self) -> Vec<SocketAddr> {
-        let first = SocketAddr::from((self.base_ip, GOSSIP_PORT));
-        let mut seeds = vec![first];
-        if let Some(ip) = slot_ip(self.base_ip, 2) {
-            seeds.push(SocketAddr::from((ip, GOSSIP_PORT)));
-        }
-        seeds
+        self.layout.seeds()
     }
 }
 
@@ -114,7 +120,7 @@ pub struct SlotInfo {
     pub slot: usize,
     /// The slot's label: `n1`.
     pub label: SmolStr,
-    /// The slot's loopback address.
+    /// The slot's loopback address; every slot's in the shared layout.
     pub ip: Ipv4Addr,
     /// The gossip address.
     pub gossip: SocketAddr,
@@ -125,17 +131,19 @@ pub struct SlotInfo {
 }
 
 impl SlotInfo {
-    /// The slot `slot` (1-based) of a fleet whose first slot is at `base`.
+    /// The slot `slot` (1-based) of a fleet laid out as `layout`. `None` for
+    /// slot 0 and when the layout has no address or port left for the slot.
     #[must_use]
-    pub fn new(base: Ipv4Addr, slot: usize) -> Option<Self> {
-        let ip = slot_ip(base, slot)?;
+    pub fn new(layout: Layout, slot: usize) -> Option<Self> {
+        let ip = layout.ip(slot)?;
+        let ports = layout.ports(slot)?;
         Some(Self {
             slot,
             label: slot_label(slot),
             ip,
-            gossip: SocketAddr::from((ip, GOSSIP_PORT)),
-            control: SocketAddr::from((ip, CONTROL_PORT)),
-            metrics: SocketAddr::from((ip, METRICS_PORT)),
+            gossip: SocketAddr::from((ip, ports.gossip)),
+            control: SocketAddr::from((ip, ports.control)),
+            metrics: SocketAddr::from((ip, ports.metrics)),
         })
     }
 }
@@ -182,28 +190,47 @@ impl Fleet {
         &self.config
     }
 
-    /// Checks that the machine can run the fleet: the loopback range answers
-    /// on the first address and nothing holds the control or exporter port
-    /// there.
+    /// Checks that the machine can run the fleet. In the per-address layout
+    /// the loopback range answers on the first address and nothing holds the
+    /// control or exporter port there. In the shared layout nothing holds
+    /// any gossip, control or exporter port of the [`MAX_SLOTS`] slots on
+    /// `127.0.0.1`.
     ///
     /// # Errors
     ///
     /// Returns an error that says what to change.
     pub async fn preflight(&self) -> anyhow::Result<()> {
-        let base = self.config.base_ip;
-        UdpSocket::bind((base, 0)).await.map_err(|error| {
-            anyhow!(
-                "cannot bind {base}: {error}; the demo needs Linux's 127.0.0.0/8 loopback; on \
-                 macOS add `sudo ifconfig lo0 alias 127.0.0.1N up` for each node"
-            )
-        })?;
-        for port in [CONTROL_PORT, METRICS_PORT] {
-            TcpListener::bind((base, port)).await.map_err(|error| {
-                anyhow!(
-                    "cannot bind {base}:{port}: {error}; a listener on {CONTROL_PORT} or \
-                     {METRICS_PORT} blocks the fleet"
-                )
-            })?;
+        match self.config.layout {
+            Layout::PerAddress(base) => {
+                UdpSocket::bind((base, 0))
+                    .await
+                    .map_err(|error| anyhow!(address_error(base, &error)))?;
+                for port in [CONTROL_PORT, METRICS_PORT] {
+                    let addr = SocketAddr::from((base, port));
+                    TcpListener::bind(addr).await.map_err(|error| {
+                        anyhow!(port_error(self.config.layout, addr, "", &error))
+                    })?;
+                }
+            }
+            Layout::Shared => {
+                for slot in 1..=MAX_SLOTS {
+                    let info = SlotInfo::new(self.config.layout, slot)
+                        .context("the shared layout has no ports left for another node")?;
+                    UdpSocket::bind(info.gossip).await.map_err(|error| {
+                        anyhow!(port_error(
+                            self.config.layout,
+                            info.gossip,
+                            "gossip",
+                            &error
+                        ))
+                    })?;
+                    for (addr, role) in [(info.control, "control"), (info.metrics, "exporter")] {
+                        TcpListener::bind(addr).await.map_err(|error| {
+                            anyhow!(port_error(self.config.layout, addr, role, &error))
+                        })?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -288,8 +315,9 @@ impl Fleet {
         slot.starts += 1;
         let log = proc::log_path(&self.config.logs, slot.info.slot, slot.starts);
         let env = proc::node_env(
-            slot.info.ip,
-            &proc::seed_list(self.config.base_ip),
+            self.config.layout,
+            &slot.info,
+            &proc::seed_list(self.config.layout),
             self.config.owners,
         );
         let node = proc::spawn(&self.config.testnode, &self.config.cluster, &env, &log)
@@ -312,8 +340,8 @@ impl Fleet {
         if slot > MAX_SLOTS {
             bail!("the fleet runs at most {MAX_SLOTS} nodes");
         }
-        let info = SlotInfo::new(self.config.base_ip, slot)
-            .context("the base address leaves no room for another node")?;
+        let info = SlotInfo::new(self.config.layout, slot)
+            .context("the layout leaves no room for another node")?;
         self.slots.push(Slot {
             info,
             starts: 0,
@@ -721,14 +749,60 @@ impl Stage for FleetStage {
     }
 }
 
+/// The scrape URL template that reaches each node's exporter: the exporter
+/// lies [`METRICS_OFFSET`] ports above the node's gossip port in every
+/// layout, so the template needs no per-layout form.
+#[must_use]
+pub fn metrics_template() -> String {
+    format!("http://{{ip}}:{{gossip_port+{METRICS_OFFSET}}}/metrics")
+}
+
 /// The command line that watches the fleet `config` starts.
 #[must_use]
 pub fn watch_line(config: &FleetConfig) -> String {
     format!(
-        "sundog-lens watch {} --seed {} --metrics 'http://{{ip}}:{METRICS_PORT}/metrics'",
+        "sundog-lens watch {} --seed {} --metrics '{}'",
         config.cluster,
-        SocketAddr::from((config.base_ip, GOSSIP_PORT)),
+        config.layout.first_gossip(),
+        metrics_template(),
     )
+}
+
+/// What `cluster` prints for a started node.
+#[must_use]
+pub fn started_line(info: &SlotInfo) -> String {
+    format!("{} started at {}", info.label, info.gossip)
+}
+
+/// Why binding the loopback address `base` failed: the per-address layout
+/// needs the machine to answer on it.
+fn address_error(base: Ipv4Addr, error: &io::Error) -> String {
+    format!(
+        "cannot bind {base}: {error}; the per-address layout needs Linux's 127.0.0.0/8 \
+         loopback; on macOS add `sudo ifconfig lo0 alias 127.0.0.1N up` for each node, or leave \
+         out --base-ip to share 127.0.0.1"
+    )
+}
+
+/// Why binding `addr`, the `role` port of a slot, failed. The text says which
+/// ports the fleet of `layout` uses.
+fn port_error(layout: Layout, addr: SocketAddr, role: &str, error: &io::Error) -> String {
+    match layout {
+        Layout::PerAddress(_) => format!(
+            "cannot bind {addr}: {error}; a listener on {CONTROL_PORT} or {METRICS_PORT} blocks \
+             the fleet"
+        ),
+        Layout::Shared => {
+            let first = Ports::FIXED;
+            let last = layout.ports(MAX_SLOTS).unwrap_or(first);
+            format!(
+                "cannot bind {addr} ({role}): {error}; the fleet shares 127.0.0.1 and uses gossip \
+                 ports {}-{}, control ports {}-{} and exporter ports {}-{}, so a process holding \
+                 one of them blocks it",
+                first.gossip, last.gossip, first.control, last.control, first.metrics, last.metrics,
+            )
+        }
+    }
 }
 
 /// Runs `cluster`: starts `args.nodes` nodes, fills `args.keys` keys, starts
@@ -764,7 +838,7 @@ async fn run_cluster(stage: &FleetStage, args: &FleetArgs, line: &str) -> anyhow
         .spawn_many(args.nodes, Some(Duration::from_secs(1)))
         .await?;
     for info in &started {
-        writeln!(out, "{} started at {}", info.label, info.gossip)?;
+        writeln!(out, "{}", started_line(info))?;
     }
     writeln!(out, "waiting for the nodes to open their caches")?;
     stage.wait_ready_all().await?;
@@ -787,27 +861,56 @@ mod tests {
 
     use super::*;
 
+    const PER_ADDRESS: Layout = Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 11));
+
     fn config(testnode: &str) -> FleetConfig {
         FleetConfig {
             cluster: "lens-test".to_owned(),
-            base_ip: Ipv4Addr::new(127, 0, 0, 11),
+            layout: PER_ADDRESS,
             testnode: PathBuf::from(testnode),
             owners: NonZeroU8::new(2).unwrap(),
             logs: PathBuf::from("target/lens-demo"),
         }
     }
 
+    fn shared_config(testnode: &str) -> FleetConfig {
+        FleetConfig {
+            layout: Layout::Shared,
+            ..config(testnode)
+        }
+    }
+
     #[test]
     fn a_slot_has_its_ports_on_its_own_address() {
-        let info = SlotInfo::new(Ipv4Addr::new(127, 0, 0, 11), 3).unwrap();
+        let info = SlotInfo::new(PER_ADDRESS, 3).unwrap();
         assert_eq!(info.slot, 3);
         assert_eq!(info.label, "n3");
         assert_eq!(info.ip, Ipv4Addr::new(127, 0, 0, 13));
         assert_eq!(info.gossip, "127.0.0.13:7946".parse().unwrap());
         assert_eq!(info.control, "127.0.0.13:8080".parse().unwrap());
         assert_eq!(info.metrics, "127.0.0.13:9090".parse().unwrap());
-        assert_eq!(SlotInfo::new(Ipv4Addr::new(127, 0, 0, 11), 0), None);
-        assert_eq!(SlotInfo::new(Ipv4Addr::BROADCAST, 2), None);
+        assert_eq!(SlotInfo::new(PER_ADDRESS, 0), None);
+        assert_eq!(
+            SlotInfo::new(Layout::PerAddress(Ipv4Addr::BROADCAST), 2),
+            None
+        );
+    }
+
+    #[test]
+    fn a_shared_slot_has_its_own_ports_on_the_shared_address() {
+        let info = SlotInfo::new(Layout::Shared, 3).unwrap();
+        assert_eq!(info.slot, 3);
+        assert_eq!(info.label, "n3");
+        assert_eq!(info.ip, Ipv4Addr::LOCALHOST);
+        assert_eq!(info.gossip, "127.0.0.1:7948".parse().unwrap());
+        assert_eq!(info.control, "127.0.0.1:8082".parse().unwrap());
+        assert_eq!(info.metrics, "127.0.0.1:9092".parse().unwrap());
+        let first = SlotInfo::new(Layout::Shared, 1).unwrap();
+        assert_eq!(first.gossip, "127.0.0.1:7946".parse().unwrap());
+        assert_eq!(first.control, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(first.metrics, "127.0.0.1:9090".parse().unwrap());
+        assert_eq!(SlotInfo::new(Layout::Shared, 0), None);
+        assert_eq!(SlotInfo::new(Layout::Shared, 70_000), None);
     }
 
     #[test]
@@ -820,8 +923,19 @@ mod tests {
             ]
         );
         let mut last = config("x");
-        last.base_ip = Ipv4Addr::BROADCAST;
+        last.layout = Layout::PerAddress(Ipv4Addr::BROADCAST);
         assert_eq!(last.seed_addrs().len(), 1);
+    }
+
+    #[test]
+    fn the_shared_observer_seeds_are_the_first_two_gossip_ports() {
+        assert_eq!(
+            shared_config("x").seed_addrs(),
+            [
+                "127.0.0.1:7946".parse().unwrap(),
+                "127.0.0.1:7947".parse().unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -829,8 +943,112 @@ mod tests {
         assert_eq!(
             watch_line(&config("x")),
             "sundog-lens watch lens-test --seed 127.0.0.11:7946 \
-             --metrics 'http://{ip}:9090/metrics'"
+             --metrics 'http://{ip}:{gossip_port+1144}/metrics'"
         );
+        assert_eq!(
+            watch_line(&shared_config("x")),
+            "sundog-lens watch lens-test --seed 127.0.0.1:7946 \
+             --metrics 'http://{ip}:{gossip_port+1144}/metrics'"
+        );
+    }
+
+    #[test]
+    fn the_metrics_template_reaches_each_nodes_exporter_in_either_layout() {
+        use std::collections::BTreeMap;
+        use std::time::SystemTime;
+
+        use sundog::membership::Peer;
+        use sundog::node::{NodeId, NodeName};
+        use sundog::observe::{Member, MemberStatus};
+
+        use crate::source::targets::UrlTemplate;
+
+        let template = UrlTemplate::parse(&metrics_template()).unwrap();
+        assert_eq!(metrics_template(), "http://{ip}:{gossip_port+1144}/metrics");
+        for layout in [PER_ADDRESS, Layout::Shared] {
+            for slot in 1..=MAX_SLOTS {
+                let info = SlotInfo::new(layout, slot).unwrap();
+                let node = NodeId::from(slot as u64);
+                let member = Member::new(
+                    Peer {
+                        node,
+                        name: NodeName::new("host", node),
+                        gossip_addr: info.gossip,
+                        data_addr: SocketAddr::from((info.ip, 40_000)),
+                        incarnation: 1,
+                        protocol: 6,
+                    },
+                    MemberStatus::Live,
+                    SystemTime::UNIX_EPOCH,
+                    BTreeMap::new(),
+                );
+                assert_eq!(
+                    template.expand(&member).unwrap(),
+                    format!("http://{}/metrics", info.metrics),
+                    "{layout:?} slot {slot}"
+                );
+            }
+        }
+        // The second shared slot's exporter, as the fleet documents it.
+        let second = SlotInfo::new(Layout::Shared, 2).unwrap();
+        assert_eq!(second.metrics, "127.0.0.1:9091".parse().unwrap());
+    }
+
+    #[test]
+    fn the_cluster_command_prints_where_each_node_started() {
+        assert_eq!(
+            started_line(&SlotInfo::new(PER_ADDRESS, 2).unwrap()),
+            "n2 started at 127.0.0.12:7946"
+        );
+        assert_eq!(
+            started_line(&SlotInfo::new(Layout::Shared, 2).unwrap()),
+            "n2 started at 127.0.0.1:7947"
+        );
+    }
+
+    #[test]
+    fn the_address_error_keeps_the_macos_alias_hint_and_names_the_flag() {
+        let error = io::Error::from(io::ErrorKind::AddrNotAvailable);
+        let text = address_error(Ipv4Addr::new(127, 0, 0, 11), &error);
+        assert!(text.starts_with("cannot bind 127.0.0.11: "), "{text}");
+        assert!(text.contains("sudo ifconfig lo0 alias"), "{text}");
+        assert!(text.contains("leave out --base-ip"), "{text}");
+    }
+
+    #[test]
+    fn a_blocked_port_error_names_the_ports_of_its_layout() {
+        let error = io::Error::from(io::ErrorKind::AddrInUse);
+        let per_address = port_error(
+            PER_ADDRESS,
+            "127.0.0.11:8080".parse().unwrap(),
+            "control",
+            &error,
+        );
+        assert!(
+            per_address.starts_with("cannot bind 127.0.0.11:8080: "),
+            "{per_address}"
+        );
+        assert!(
+            per_address.contains("a listener on 8080 or 9090 blocks the fleet"),
+            "{per_address}"
+        );
+        assert!(!per_address.contains("ifconfig"), "{per_address}");
+
+        let shared = port_error(
+            Layout::Shared,
+            "127.0.0.1:7948".parse().unwrap(),
+            "gossip",
+            &error,
+        );
+        assert!(
+            shared.starts_with("cannot bind 127.0.0.1:7948 (gossip): "),
+            "{shared}"
+        );
+        for ports in ["7946-7951", "8080-8085", "9090-9095"] {
+            assert!(shared.contains(ports), "{ports}: {shared}");
+        }
+        assert!(!shared.contains("ifconfig"), "{shared}");
+        assert!(!shared.contains("alias"), "{shared}");
     }
 
     #[test]
@@ -848,7 +1066,7 @@ mod tests {
         assert_eq!(config.testnode, manifest);
         assert_eq!(config.logs, PathBuf::from("/tmp/logs"));
         assert_eq!(config.owners.get(), 3);
-        assert_eq!(config.base_ip, Ipv4Addr::new(127, 0, 0, 11));
+        assert_eq!(config.layout, Layout::for_host(None));
         let default_logs = FleetConfig::from_args(&FleetArgs {
             testnode: Some(manifest),
             ..FleetArgs::default()
@@ -862,6 +1080,46 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_explicit_base_ip_gives_the_per_address_layout_on_any_host() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let base = Ipv4Addr::new(127, 0, 0, 21);
+        let config = FleetConfig::from_args(&FleetArgs {
+            testnode: Some(manifest),
+            base_ip: Some(base),
+            ..FleetArgs::default()
+        })
+        .unwrap();
+        assert_eq!(config.layout, Layout::PerAddress(base));
+    }
+
+    #[tokio::test]
+    async fn the_shared_preflight_checks_every_port_of_every_slot() {
+        // One test, so no other test holds a port this one probes.
+        let fleet = Fleet::new(shared_config("x"));
+        fleet.preflight().await.unwrap();
+
+        let blocked = |addr: &str| addr.parse::<SocketAddr>().unwrap();
+        let udp = UdpSocket::bind(blocked("127.0.0.1:7949")).await.unwrap();
+        let error = fleet.preflight().await.unwrap_err().to_string();
+        assert!(error.contains("127.0.0.1:7949 (gossip)"), "{error}");
+        assert!(error.contains("7946-7951"), "{error}");
+        drop(udp);
+
+        let control = TcpListener::bind(blocked("127.0.0.1:8083")).await.unwrap();
+        let error = fleet.preflight().await.unwrap_err().to_string();
+        assert!(error.contains("127.0.0.1:8083 (control)"), "{error}");
+        drop(control);
+
+        let metrics = TcpListener::bind(blocked("127.0.0.1:9095")).await.unwrap();
+        let error = fleet.preflight().await.unwrap_err().to_string();
+        assert!(error.contains("127.0.0.1:9095 (exporter)"), "{error}");
+        assert!(!error.contains("ifconfig"), "{error}");
+        drop(metrics);
+
+        fleet.preflight().await.unwrap();
     }
 
     #[test]
@@ -915,7 +1173,7 @@ mod process_tests {
         let dir = scratch(name);
         Fleet::new(FleetConfig {
             cluster: "lens-fleet-test".to_owned(),
-            base_ip: base,
+            layout: Layout::PerAddress(base),
             testnode: fake_node(&dir),
             owners: NonZeroU8::new(2).unwrap(),
             logs: dir.join("logs"),
@@ -997,7 +1255,7 @@ mod process_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut fleet = Fleet::new(FleetConfig {
             cluster: "c".to_owned(),
-            base_ip: Ipv4Addr::new(127, 0, 0, 191),
+            layout: Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 191)),
             testnode: path,
             owners: NonZeroU8::new(2).unwrap(),
             logs: dir.join("logs"),
@@ -1065,7 +1323,7 @@ mod process_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut fleet = Fleet::new(FleetConfig {
             cluster: "c".to_owned(),
-            base_ip: Ipv4Addr::new(127, 0, 0, 121),
+            layout: Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 121)),
             testnode: path,
             owners: NonZeroU8::new(2).unwrap(),
             logs: dir.join("logs"),
@@ -1081,7 +1339,7 @@ mod process_tests {
         let dir = scratch("nobinary");
         let mut fleet = Fleet::new(FleetConfig {
             cluster: "c".to_owned(),
-            base_ip: Ipv4Addr::new(127, 0, 0, 122),
+            layout: Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 122)),
             testnode: dir.join("missing"),
             owners: NonZeroU8::new(2).unwrap(),
             logs: dir.join("logs"),
@@ -1106,6 +1364,74 @@ mod process_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("the node outlived its fleet");
+    }
+
+    /// A node that is ready at once and logs the port variables it got.
+    fn port_echo_node(dir: &Path) -> PathBuf {
+        let path = dir.join("port-echo-testnode.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             echo \"ports ${SUNDOG_TESTNODE_GOSSIP_PORT-unset} ${SUNDOG_TESTNODE_CONTROL_PORT-unset} \
+             ${SUNDOG_TESTNODE_METRICS_PORT-unset} ip=$SUNDOG_TESTNODE_BIND_IP \
+             seeds=$SUNDOG_SEEDS\" >&2\n\
+             echo testnode-ready\ntrap 'exit 0' TERM\nwhile true; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn logged_ports(layout: Layout, name: &str) -> Vec<String> {
+        let dir = scratch(name);
+        let mut fleet = Fleet::new(FleetConfig {
+            cluster: "lens-ports-test".to_owned(),
+            layout,
+            testnode: port_echo_node(&dir),
+            owners: NonZeroU8::new(2).unwrap(),
+            logs: dir.join("logs"),
+        });
+        let (_, ready1) = fleet.spawn_next().unwrap();
+        let (_, ready2) = fleet.spawn_next().unwrap();
+        ready1.wait(Duration::from_secs(10)).await.unwrap();
+        ready2.wait(Duration::from_secs(10)).await.unwrap();
+        fleet.stop_all().await;
+        (1..=2)
+            .map(|slot| {
+                std::fs::read_to_string(proc::log_path(&dir.join("logs"), slot, 1))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_shared_fleet_starts_its_nodes_on_one_address_with_their_own_ports() {
+        let logged = logged_ports(Layout::Shared, "shared-env").await;
+        assert_eq!(
+            logged,
+            [
+                "ports 7946 8080 9090 ip=127.0.0.1 seeds=127.0.0.1:7946,127.0.0.1:7947",
+                "ports 7947 8081 9091 ip=127.0.0.1 seeds=127.0.0.1:7946,127.0.0.1:7947",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_address_fleet_leaves_the_ports_to_the_node() {
+        let logged = logged_ports(
+            Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 61)),
+            "per-address-env",
+        )
+        .await;
+        assert_eq!(
+            logged,
+            [
+                "ports unset unset unset ip=127.0.0.61 seeds=127.0.0.61:7946,127.0.0.62:7946",
+                "ports unset unset unset ip=127.0.0.62 seeds=127.0.0.61:7946,127.0.0.62:7946",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1225,7 +1551,7 @@ mod process_tests {
         let base = Ipv4Addr::new(127, 0, 0, 184);
         let mut fleet = Fleet::new(FleetConfig {
             cluster: "c".to_owned(),
-            base_ip: base,
+            layout: Layout::PerAddress(base),
             testnode: fake_node(&dir),
             owners: NonZeroU8::new(2).unwrap(),
             logs: dir.join("logs"),
@@ -1250,7 +1576,7 @@ mod process_tests {
     async fn the_director_acts_on_the_stage_through_its_trait() {
         let dir = scratch("trait");
         let base = Ipv4Addr::new(127, 0, 0, 185);
-        let n1 = SlotInfo::new(base, 1).unwrap();
+        let n1 = SlotInfo::new(Layout::PerAddress(base), 1).unwrap();
         let _exporter = serve(n1.metrics, true).await;
         let crash_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let control = serve_control(n1.control, Arc::clone(&crash_pid)).await;
@@ -1258,7 +1584,7 @@ mod process_tests {
         let stage = FleetStage::new(
             Fleet::new(FleetConfig {
                 cluster: "c".to_owned(),
-                base_ip: base,
+                layout: Layout::PerAddress(base),
                 testnode: fake_node(&dir),
                 owners: NonZeroU8::new(2).unwrap(),
                 logs: dir.join("logs"),
@@ -1302,14 +1628,14 @@ mod process_tests {
     async fn spawning_returns_before_the_node_is_ready_and_a_fill_waits_for_it() {
         let dir = scratch("readiness");
         let base = Ipv4Addr::new(127, 0, 0, 181);
-        let info = SlotInfo::new(base, 1).unwrap();
+        let info = SlotInfo::new(Layout::PerAddress(base), 1).unwrap();
         let _exporter = serve(info.metrics, true).await;
         let control = serve(info.control, false).await;
         let (load, handle) = load::Load::spawn(10, 10);
         let stage = FleetStage::new(
             Fleet::new(FleetConfig {
                 cluster: "c".to_owned(),
-                base_ip: base,
+                layout: Layout::PerAddress(base),
                 testnode: slow_node(&dir, "1.5"),
                 owners: NonZeroU8::new(2).unwrap(),
                 logs: dir.join("logs"),
@@ -1345,7 +1671,7 @@ mod process_tests {
     async fn a_node_that_never_becomes_ready_is_listed_and_fails_the_waits() {
         let dir = scratch("unready");
         let base = Ipv4Addr::new(127, 0, 0, 182);
-        let info = SlotInfo::new(base, 1).unwrap();
+        let info = SlotInfo::new(Layout::PerAddress(base), 1).unwrap();
         let _exporter = serve(info.metrics, true).await;
         let path = dir.join("failing.sh");
         std::fs::write(&path, "#!/bin/sh\necho 'no luck' >&2\nexit 1\n").unwrap();
@@ -1354,7 +1680,7 @@ mod process_tests {
         let stage = FleetStage::new(
             Fleet::new(FleetConfig {
                 cluster: "c".to_owned(),
-                base_ip: base,
+                layout: Layout::PerAddress(base),
                 testnode: path,
                 owners: NonZeroU8::new(2).unwrap(),
                 logs: dir.join("logs"),
@@ -1385,13 +1711,13 @@ mod process_tests {
     async fn a_restart_is_tracked_again_and_a_stopped_node_is_refused_a_crash() {
         let dir = scratch("restart-track");
         let base = Ipv4Addr::new(127, 0, 0, 183);
-        let info = SlotInfo::new(base, 1).unwrap();
+        let info = SlotInfo::new(Layout::PerAddress(base), 1).unwrap();
         let _exporter = serve(info.metrics, true).await;
         let (load, handle) = load::Load::spawn(10, 10);
         let stage = FleetStage::new(
             Fleet::new(FleetConfig {
                 cluster: "c".to_owned(),
-                base_ip: base,
+                layout: Layout::PerAddress(base),
                 testnode: fake_node(&dir),
                 owners: NonZeroU8::new(2).unwrap(),
                 logs: dir.join("logs"),
@@ -1430,7 +1756,7 @@ mod process_tests {
         let dir = scratch("stage-noexporter");
         let fleet = Fleet::new(FleetConfig {
             cluster: "c".to_owned(),
-            base_ip: Ipv4Addr::new(127, 0, 0, 171),
+            layout: Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 171)),
             testnode: fake_node(&dir),
             owners: NonZeroU8::new(2).unwrap(),
             logs: dir.join("logs"),

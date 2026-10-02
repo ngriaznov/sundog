@@ -21,7 +21,7 @@ USAGE
               [--forget-after 90s] [--color auto|truecolor|256|mono] [--no-bg]
               [--no-braille] [--no-anim] [--exit-after DUR] [--log FILE]
               [--once [--json] [--settle 3s]]
-  sundog-lens cluster [--name lens-demo] [--nodes 3] [--base-ip 127.0.0.11]
+  sundog-lens cluster [--name lens-demo] [--nodes 3] [--base-ip IP]
               [--testnode PATH] [--owners 2] [--keys 20000] [--rate 1500] [--logs DIR]
   sundog-lens demo [--scenario tour|FILE] [--headless] [--no-captions] [--marks FILE]
               [--log FILE] [cluster flags] [--color ...] [--no-bg] [--no-braille]
@@ -39,6 +39,12 @@ OPTIONS
   --advertise IP        The IP the observer advertises.
   --metrics TEMPLATE    A scrape URL with {ip}, {gossip_port}, {data_port}, {node_id},
                         {gossip_port+N} and {gossip_port-N}; repeatable.
+  --base-ip IP          With cluster and demo: give each node its own loopback address,
+                        the first node at IP and the rest counting up from it, all on
+                        the fixed ports (gossip 7946, control 8080, exporter 9090).
+                        Without it, Linux does this from 127.0.0.11, and any other
+                        system runs every node on 127.0.0.1 with the ports counting
+                        up from those: n1 on 7946, n2 on 7947, and so on.
   --scrape NODE=URL     Pin one node's exporter URL; NODE is a label, a node-id hex
                         prefix or ip:port; repeatable.
   --interval DUR        The scrape interval (default 1s).
@@ -193,7 +199,8 @@ pub struct FleetArgs {
     /// `--nodes`.
     pub nodes: usize,
     /// `--base-ip`: slot 1's IP; slot `i` binds the `i`th address from it.
-    pub base_ip: Ipv4Addr,
+    /// `None` leaves the layout to the platform.
+    pub base_ip: Option<Ipv4Addr>,
     /// `--testnode`: the `sundog-testnode` binary.
     pub testnode: Option<PathBuf>,
     /// `--owners`: owners per part.
@@ -211,7 +218,7 @@ impl Default for FleetArgs {
         Self {
             name: "lens-demo".to_owned(),
             nodes: 3,
-            base_ip: Ipv4Addr::new(127, 0, 0, 11),
+            base_ip: None,
             testnode: None,
             owners: NonZeroU8::new(2).expect("2 is nonzero"),
             keys: 20_000,
@@ -460,7 +467,7 @@ fn fleet_flag(
         }
         "--base-ip" => {
             let value = args.value(flag, inline)?;
-            fleet.base_ip = parsed(flag, &value, str::parse::<Ipv4Addr>)?;
+            fleet.base_ip = Some(parsed(flag, &value, str::parse::<Ipv4Addr>)?);
         }
         "--testnode" => fleet.testnode = Some(args.value(flag, inline)?.into()),
         "--owners" => {
@@ -987,7 +994,7 @@ mod tests {
         let fleet = FleetArgs::default();
         assert_eq!(fleet.name, "lens-demo");
         assert_eq!(fleet.nodes, 3);
-        assert_eq!(fleet.base_ip, Ipv4Addr::new(127, 0, 0, 11));
+        assert_eq!(fleet.base_ip, None);
         assert_eq!(fleet.owners.get(), 2);
         assert_eq!((fleet.keys, fleet.rate), (20_000, 1_500));
         assert_eq!(fleet.testnode, None);
@@ -1017,7 +1024,7 @@ mod tests {
         };
         assert_eq!(fleet.name, "other");
         assert_eq!(fleet.nodes, 5);
-        assert_eq!(fleet.base_ip, Ipv4Addr::new(127, 0, 0, 21));
+        assert_eq!(fleet.base_ip, Some(Ipv4Addr::new(127, 0, 0, 21)));
         assert_eq!(fleet.testnode, Some(PathBuf::from("/bin/tn")));
         assert_eq!(fleet.owners.get(), 3);
         assert_eq!((fleet.keys, fleet.rate), (100, 50));

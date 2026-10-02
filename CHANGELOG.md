@@ -38,6 +38,19 @@ All notable changes to this project are documented in this file. Format follows
   running cluster, `--once [--json]` prints one report, and `sundog-lens demo`
   runs a scripted tour against a local fleet of `sundog-testnode` processes.
   `assets/sundog-lens.cast` and `assets/sundog-lens.gif` record the tour.
+- **`sundog-lens demo` and `cluster` run on macOS with no setup.** A local
+  fleet has two layouts. The per-address layout gives each node its own
+  loopback address from `127.0.0.11` and the fixed ports, which needs
+  Linux's `127.0.0.0/8`. The shared layout puts every node on `127.0.0.1`
+  with gossip, control and exporter ports counting up from 7946, 8080 and
+  9090. Linux defaults to the per-address layout and every other system to
+  the shared one; `--base-ip` always picks the per-address layout.
+  `sundog-testnode` reads `SUNDOG_TESTNODE_GOSSIP_PORT`,
+  `SUNDOG_TESTNODE_CONTROL_PORT` and `SUNDOG_TESTNODE_METRICS_PORT`, which
+  default to 7946, 8080 and 9090. The demo's scrape template is
+  `http://{ip}:{gossip_port+1144}/metrics` in both layouts, and the event
+  log shows a node's full gossip address, `ip:port`, on join, rejoin and
+  restart rows.
 
 ### Changed
 

@@ -20,8 +20,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::app::{App, AppConfig};
 use crate::cli::{DemoArgs, ScenarioSource, Seed};
-use crate::fleet::proc::METRICS_PORT;
-use crate::fleet::{Fleet, FleetConfig, FleetStage, MAX_SLOTS, SlotInfo, load};
+use crate::fleet::{Fleet, FleetConfig, FleetStage, MAX_SLOTS, SlotInfo, load, metrics_template};
 use crate::model::Model;
 use crate::model::digest::ModelDigest;
 use crate::model::events::Event;
@@ -40,13 +39,6 @@ pub const SCRAPE_INTERVAL: Duration = Duration::from_secs(1);
 /// The time between ticks of the headless loop.
 const HEADLESS_TICK: Duration = Duration::from_millis(50);
 
-/// The scrape URL template: every node serves its exporter on the same port
-/// at its own address.
-#[must_use]
-pub fn metrics_template() -> String {
-    format!("http://{{ip}}:{METRICS_PORT}/metrics")
-}
-
 /// What the observer of the demo watches: the fleet's cluster through its
 /// first two slots, on a loopback port of its own, with each node's exporter
 /// scraped and every slot address named by its label.
@@ -63,7 +55,7 @@ pub fn feed_config(config: &FleetConfig) -> anyhow::Result<FeedConfig> {
     scrape.interval = SCRAPE_INTERVAL;
     feed.scrape = Some(scrape);
     for slot in 1..=MAX_SLOTS {
-        if let Some(info) = SlotInfo::new(config.base_ip, slot) {
+        if let Some(info) = SlotInfo::new(config.layout, slot) {
             feed.hint(info.gossip, info.label);
         }
     }
@@ -396,22 +388,49 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::fleet::Layout;
     use crate::model::testkit;
 
     fn config() -> FleetConfig {
         FleetConfig {
             cluster: "lens-demo".to_owned(),
-            base_ip: Ipv4Addr::new(127, 0, 0, 11),
+            layout: Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 11)),
             testnode: PathBuf::from("sundog-testnode"),
             owners: NonZeroU8::new(2).unwrap(),
             logs: PathBuf::from("target/lens-demo"),
         }
     }
 
+    fn shared_config() -> FleetConfig {
+        FleetConfig {
+            layout: Layout::Shared,
+            ..config()
+        }
+    }
+
     #[test]
-    fn the_template_reaches_each_nodes_exporter_by_its_address() {
-        assert_eq!(metrics_template(), "http://{ip}:9090/metrics");
+    fn the_template_reaches_each_nodes_exporter_from_its_gossip_port() {
+        assert_eq!(metrics_template(), "http://{ip}:{gossip_port+1144}/metrics");
         assert!(UrlTemplate::parse(&metrics_template()).is_ok());
+    }
+
+    #[test]
+    fn the_shared_observer_joins_and_names_nodes_by_gossip_port() {
+        let feed = feed_config(&shared_config()).unwrap();
+        assert_eq!(
+            feed.seeds,
+            [
+                Seed::Addr("127.0.0.1:7946".parse().unwrap()),
+                Seed::Addr("127.0.0.1:7947".parse().unwrap())
+            ]
+        );
+        assert_eq!(feed.hints.len(), MAX_SLOTS);
+        assert_eq!(feed.hints[0].0, "127.0.0.1:7946".parse().unwrap());
+        assert_eq!(feed.hints[0].1, "n1");
+        assert_eq!(feed.hints[5].0, "127.0.0.1:7951".parse().unwrap());
+        assert_eq!(feed.hints[5].1, "n6");
+        let scrape = feed.scrape.expect("the demo scrapes");
+        assert_eq!(scrape.templates.len(), 1);
     }
 
     #[test]

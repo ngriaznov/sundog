@@ -124,7 +124,7 @@ look different on it.
 cargo run --release -p sundog-lens -- watch mycluster --seed 10.0.0.5:7946 \
     --metrics 'http://{ip}:9090/metrics'
 
-# the scripted tour above, against a local fleet (Linux)
+# the scripted tour above, against a local fleet (Linux and macOS)
 cargo build --release -p sundog-testnode --features prometheus
 cargo run --release -p sundog-lens -- demo --scenario tour
 
@@ -132,7 +132,10 @@ cargo run --release -p sundog-lens -- demo --scenario tour
 asciinema play assets/sundog-lens.cast
 ```
 
-The [operations runbook](docs/src/operations.md#watching-a-cluster-sundog-lens)
+The demo's fleet needs no setup: Linux gives each node its own loopback
+address, and any other system runs every node on `127.0.0.1` with its own
+ports. The
+[operations runbook](docs/src/operations.md#watching-a-cluster-sundog-lens)
 covers the flags, the glyphs and what the lens cannot show.
 
 ## Should you use this?

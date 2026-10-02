@@ -212,7 +212,8 @@ sundog-lens watch mycluster --seed 10.0.0.5:7946 \
 
 `--seed` is any member's gossip address and repeats. Without it the lens
 reads `SUNDOG_SEEDS`, then falls back to mDNS. `--metrics` is a URL template
-with `{ip}`, `{gossip_port}`, `{data_port}` and `{node_id}`; `--scrape
+with `{ip}`, `{gossip_port}`, `{data_port}` and `{node_id}`;
+`{gossip_port+N}` and `{gossip_port-N}` shift the gossip port. `--scrape
 NODE=URL` pins one node's URL. A node with no exporter shows membership,
 modes, status and computed ownership only. `1`-`4` switch between Overview,
 Caches, Node and Timeline, `?` lists every key, and `q` quits.
@@ -278,14 +279,35 @@ graceful leave runs `◐` to `○`, so the two read differently at a glance.
 sundog-lens demo --scenario tour
 ```
 
-The demo starts a fleet of `sundog-testnode` processes on `127.0.0.0/8`
-loopback addresses under load, plays a scripted tour of joins, a crash, a
-graceful leave and a restart, and shows the lens while it runs. It needs
-Linux and a built `sundog-testnode` (`cargo build --release -p
-sundog-testnode --features prometheus`); `--testnode PATH` names it.
-`--headless` prints every step and event instead of drawing and exits 1 when
+The demo starts a fleet of `sundog-testnode` processes under load, plays a
+scripted tour of joins, a crash, a graceful leave and a restart, and shows
+the lens while it runs. It needs a built `sundog-testnode` (`cargo build
+--release -p sundog-testnode --features prometheus`); `--testnode PATH` names
+it. `--headless` prints every step and event instead of drawing and exits 1 when
 a step times out, which makes the tour a smoke test. `sundog-lens cluster`
 starts the same fleet with no scenario, and `S`, `K`, `L` and `R` in the demo
 spawn a node, kill one, make one leave and restart one.
 `sundog-lens/demo/record.sh` and `render.sh` produce the recording and GIF in
 `assets/`.
+
+The fleet addresses its nodes in one of two layouts. In the per-address
+layout node `n1` binds `127.0.0.11`, `n2` binds `127.0.0.12` and so on, each
+on the fixed ports: gossip 7946, control 8080 and exporter 9090. Linux
+answers on every address of `127.0.0.0/8`, so the layout needs no setup
+there and is the default. In the shared layout every node binds `127.0.0.1`
+and node *i* takes the fixed ports plus *i* − 1: `n1` gossips on 7946,
+`n2` on 7947, and `n2`'s exporter listens on 9091. The fleet passes each
+node its ports in `SUNDOG_TESTNODE_GOSSIP_PORT`,
+`SUNDOG_TESTNODE_CONTROL_PORT` and `SUNDOG_TESTNODE_METRICS_PORT`. The shared
+layout is the default on macOS and every other system, and needs no
+`ifconfig` alias and no `sudo`. `--base-ip IP` always picks the per-address
+layout, with `n1` at `IP`; on macOS each node's address except `127.0.0.1`
+then needs a `sudo ifconfig lo0 alias`. Before it starts a node, the fleet
+checks that the ports of its layout are free and names the first one that is
+not.
+
+The exporter port lies 1144 above the gossip port in both layouts, so the
+demo scrapes through one template, `http://{ip}:{gossip_port+1144}/metrics`,
+and `cluster` prints the `watch` command that goes with its layout. The event
+log shows a node's gossip address with its port, so nodes that share an
+address stay apart.

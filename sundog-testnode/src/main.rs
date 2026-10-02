@@ -29,6 +29,13 @@
 //! through `SUNDOG_SEEDS`, opens no cache and serves three control lines,
 //! `members`, `share <cache> <owners> <node-id>` and `quit`; see
 //! `ObserverNode::dispatch`.
+//!
+//! The ports are fixed unless overridden: `SUNDOG_TESTNODE_GOSSIP_PORT`
+//! (default 7946), `SUNDOG_TESTNODE_CONTROL_PORT` (8080) and, for a member
+//! built with the `prometheus` feature, `SUNDOG_TESTNODE_METRICS_PORT`
+//! (9090). Several nodes then share one address, each on its own ports. An
+//! observer honors the gossip and control overrides. A value that is not a
+//! port number stops the process with an error.
 
 use std::env;
 use std::io::Write as _;
@@ -204,6 +211,22 @@ fn bind_ip_from_env(raw: Option<&str>) -> Result<IpAddr, String> {
         raw.parse()
             .map_err(|error| format!("SUNDOG_TESTNODE_BIND_IP must be an IP address: {error}"))
     })
+}
+
+/// A listener port from the env override `name`, whose already-read value is
+/// `raw`: `default` when absent, an `Err` naming `name` when the value is not
+/// a port number. Backs `SUNDOG_TESTNODE_GOSSIP_PORT`,
+/// `SUNDOG_TESTNODE_CONTROL_PORT` and `SUNDOG_TESTNODE_METRICS_PORT`.
+fn port_from_env(name: &str, raw: Option<&str>, default: u16) -> Result<u16, String> {
+    raw.map_or(Ok(default), |raw| {
+        raw.parse()
+            .map_err(|error| format!("{name} must be a port number, got {raw:?}: {error}"))
+    })
+}
+
+/// Reads the port override `name` through [`port_from_env`].
+fn port_env(name: &str, default: u16) -> Result<u16, String> {
+    port_from_env(name, env::var(name).ok().as_deref(), default)
 }
 
 /// Whether the replicated side caches the `churn`, `pn*` and `os*` commands
@@ -467,9 +490,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let seeds = resolve_seeds(&env::var("SUNDOG_SEEDS").unwrap_or_default()).await;
     let role = role_from_env(env::var("SUNDOG_TESTNODE_ROLE").ok().as_deref())?;
     let bind_ip = bind_ip_from_env(env::var("SUNDOG_TESTNODE_BIND_IP").ok().as_deref())?;
+    let gossip_port = port_env("SUNDOG_TESTNODE_GOSSIP_PORT", GOSSIP_PORT)?;
+    let control_port = port_env("SUNDOG_TESTNODE_CONTROL_PORT", CONTROL_PORT)?;
     if role == Role::Observer {
-        return run_observer(cluster_name, seeds, bind_ip).await;
+        return run_observer(cluster_name, seeds, bind_ip, gossip_port, control_port).await;
     }
+    #[cfg(feature = "prometheus")]
+    let metrics_port = port_env("SUNDOG_TESTNODE_METRICS_PORT", METRICS_PORT)?;
     let ae_part_min_bucket = usize_env("SUNDOG_TESTNODE_AE_PART_MIN_BUCKET");
     let ae_sketch_min_bucket = usize_env("SUNDOG_TESTNODE_AE_SKETCH_MIN_BUCKET");
     let crdt_retire_after_secs = u64_env("SUNDOG_TESTNODE_CRDT_RETIRE_AFTER_SECS");
@@ -486,7 +513,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let side_caches =
         side_caches_from_env(env::var("SUNDOG_TESTNODE_SIDE_CACHES").ok().as_deref())?;
     let config = ClusterConfig::default().with(|c| {
-        c.gossip_bind_addr = SocketAddr::new(bind_ip, GOSSIP_PORT);
+        c.gossip_bind_addr = SocketAddr::new(bind_ip, gossip_port);
         c.data_bind_addr = SocketAddr::new(bind_ip, 0);
         // Faster than the default so container tests converge in seconds.
         c.ae_interval = Duration::from_secs(2);
@@ -507,7 +534,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = Cluster::builder(cluster_name).seeds(seeds).config(config);
     #[cfg(feature = "prometheus")]
     {
-        builder = builder.prometheus_listen(SocketAddr::new(bind_ip, METRICS_PORT));
+        builder = builder.prometheus_listen(SocketAddr::new(bind_ip, metrics_port));
     }
     let cluster = builder.build().await?;
 
@@ -522,35 +549,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         side,
         cluster,
     };
-    serve_until_stopped(bind_ip, Control::Node(node)).await
+    serve_until_stopped(bind_ip, control_port, Control::Node(node)).await
 }
 
 /// The `SUNDOG_TESTNODE_ROLE=observer` process: an [`Observer`] bound to
-/// `{bind_ip}:GOSSIP_PORT` and seeded from `seeds`, serving the control
-/// lines of [`ObserverNode::dispatch`].
+/// `{bind_ip}:{gossip_port}` and seeded from `seeds`, serving the control
+/// lines of [`ObserverNode::dispatch`] on `{bind_ip}:{control_port}`.
 async fn run_observer(
     cluster_name: String,
     seeds: Vec<SocketAddr>,
     bind_ip: IpAddr,
+    gossip_port: u16,
+    control_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = ClusterConfig::default().with(|c| {
-        c.gossip_bind_addr = SocketAddr::new(bind_ip, GOSSIP_PORT);
+        c.gossip_bind_addr = SocketAddr::new(bind_ip, gossip_port);
     });
     let observer = Observer::builder(cluster_name)
         .seeds(seeds)
         .config(config)
         .build()
         .await?;
-    serve_until_stopped(bind_ip, Control::Observer(ObserverNode { observer })).await
+    serve_until_stopped(
+        bind_ip,
+        control_port,
+        Control::Observer(ObserverNode { observer }),
+    )
+    .await
 }
 
-/// Serves `control` on `CONTROL_PORT` after printing `testnode-ready`, and
-/// leaves gossip and exits 0 on the stop signal.
+/// Serves `control` on `{bind_ip}:{control_port}` after printing
+/// `testnode-ready`, and leaves gossip and exits 0 on the stop signal.
 async fn serve_until_stopped(
     bind_ip: IpAddr,
+    control_port: u16,
     control: Control,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind((bind_ip, CONTROL_PORT)).await?;
+    let listener = TcpListener::bind((bind_ip, control_port)).await?;
     // A container stop sends SIGTERM: leave the cluster and checkpoint a
     // warm-reopen spill tier; `quit`/`crash` exit with no leave.
     let stop = stop_requested();
@@ -1348,6 +1383,37 @@ mod tests {
             Ok(IpAddr::from([127, 0, 0, 42]))
         );
         assert!(bind_ip_from_env(Some("n42")).is_err());
+    }
+
+    #[test]
+    fn port_from_env_keeps_the_default_when_unset() {
+        assert_eq!(port_from_env("P", None, GOSSIP_PORT), Ok(7946));
+        assert_eq!(port_from_env("P", None, CONTROL_PORT), Ok(8080));
+        assert_eq!(port_from_env("P", None, 9090), Ok(9090));
+    }
+
+    #[test]
+    fn port_from_env_reads_a_port_number() {
+        assert_eq!(port_from_env("P", Some("7947"), GOSSIP_PORT), Ok(7947));
+        assert_eq!(port_from_env("P", Some("0"), CONTROL_PORT), Ok(0));
+        assert_eq!(port_from_env("P", Some("65535"), 9090), Ok(65535));
+    }
+
+    #[test]
+    fn port_from_env_rejects_what_is_not_a_port_and_names_the_variable() {
+        for bad in ["", "n1", "-1", "65536", "7946 ", "0x1f", "80.80"] {
+            let error = port_from_env("SUNDOG_TESTNODE_GOSSIP_PORT", Some(bad), GOSSIP_PORT)
+                .expect_err(bad);
+            assert!(error.contains("SUNDOG_TESTNODE_GOSSIP_PORT"), "{error}");
+            assert!(error.contains(&format!("{bad:?}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn port_env_reads_the_process_environment() {
+        // A name no other test or process sets.
+        const NAME: &str = "SUNDOG_TESTNODE_PORT_ENV_TEST";
+        assert_eq!(port_env(NAME, 4242), Ok(4242));
     }
 
     #[test]

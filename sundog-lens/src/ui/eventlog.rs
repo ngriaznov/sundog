@@ -174,11 +174,7 @@ fn lifecycle_body(scene: &Scene<'_>, kind: &EventKind) -> Vec<Span<'static>> {
         } => said(
             scene,
             *id,
-            format!(
-                "  {} · protocol {protocol}{}",
-                addr.ip(),
-                listed_modes(caches)
-            ),
+            format!("  {addr} · protocol {protocol}{}", listed_modes(caches)),
             Token::Muted,
         ),
         EventKind::Leave {
@@ -236,20 +232,16 @@ fn lifecycle_body(scene: &Scene<'_>, kind: &EventKind) -> Vec<Span<'static>> {
                 scene,
                 *id,
                 format!(
-                    "  new identity at {} (was {}…){}",
-                    addr.ip(),
+                    "  new identity at {addr} (was {}…){}",
                     text::short_id(&was),
                     listed_modes(caches)
                 ),
                 Token::Text,
             )
         }
-        EventKind::Restart { node: id, addr } => said(
-            scene,
-            *id,
-            format!("  restarted at {}", addr.ip()),
-            Token::Text,
-        ),
+        EventKind::Restart { node: id, addr } => {
+            said(scene, *id, format!("  restarted at {addr}"), Token::Text)
+        }
         EventKind::Up { node: id, .. } => said(scene, *id, "  heartbeat resumed", Token::Text),
         _ => Vec::new(),
     }
@@ -638,8 +630,56 @@ mod tests {
             .into(),
         };
         let shown = text_of(&body(&scene, &kind));
-        assert!(shown.contains("new identity at 127.0.0.12"), "{shown}");
+        assert!(
+            shown.contains("new identity at 127.0.0.12:7946 (was "),
+            "{shown}"
+        );
         assert!(shown.ends_with(" · it D2 · os R"), "{shown}");
+    }
+
+    #[test]
+    fn join_rejoin_and_restart_rows_show_the_gossip_port_so_nodes_on_one_ip_differ() {
+        let model = testkit::fixture_model(Instant::now());
+        let node = testkit::node_id(2, 0);
+        let previous = testkit::node_id(2, 1);
+        let shown = |port: u16| {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            with_scene(&model, |scene| {
+                [
+                    EventKind::Join {
+                        node,
+                        addr,
+                        protocol: 6,
+                        caches: std::collections::BTreeMap::new(),
+                    },
+                    EventKind::Rejoin {
+                        node,
+                        addr,
+                        previous,
+                        caches: std::collections::BTreeMap::new(),
+                    },
+                    EventKind::Restart { node, addr },
+                ]
+                .map(|kind| text_of(&body(scene, &kind)))
+            })
+        };
+        let (second, third) = (shown(7947), shown(7948));
+        assert!(
+            second[0].ends_with("  127.0.0.1:7947 · protocol 6"),
+            "{second:?}"
+        );
+        assert!(
+            second[1].contains("  new identity at 127.0.0.1:7947 (was "),
+            "{second:?}"
+        );
+        assert!(
+            second[2].ends_with("  restarted at 127.0.0.1:7947"),
+            "{second:?}"
+        );
+        for (a, b) in second.iter().zip(&third) {
+            assert_ne!(a, b);
+            assert!(b.contains("127.0.0.1:7948"), "{b}");
+        }
     }
 
     #[test]
@@ -778,7 +818,7 @@ mod tests {
         let row = row(&model, "JOIN");
         assert!(row.contains("JOIN"), "{row}");
         assert!(row.contains("127.0.0.1"), "{row}");
-        assert!(row.contains("· protocol 6"), "{row}");
+        assert!(row.contains(":7946 · protocol 6"), "{row}");
         assert!(row.contains("it D2"), "{row}");
         assert!(row.contains("churn R"), "{row}");
         assert!(row.starts_with("00:00:"), "{row}");

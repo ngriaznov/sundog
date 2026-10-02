@@ -9,7 +9,7 @@
 
 use std::fs::File;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -21,6 +21,9 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::watch;
 
+use super::SlotInfo;
+use super::layout::Layout;
+
 /// The gossip port of every test node.
 pub const GOSSIP_PORT: u16 = 7946;
 
@@ -29,6 +32,10 @@ pub const CONTROL_PORT: u16 = 8080;
 
 /// The exporter port of every test node.
 pub const METRICS_PORT: u16 = 9090;
+
+/// How far a node's exporter port lies above its gossip port, in every fleet
+/// layout: the scrape template relies on it.
+pub const METRICS_OFFSET: u16 = METRICS_PORT - GOSSIP_PORT;
 
 /// What a test node prints when its cluster and caches are open.
 pub const READY_LINE: &str = "testnode-ready";
@@ -74,25 +81,56 @@ pub fn parse_label(label: &str) -> Option<usize> {
 }
 
 /// The `SUNDOG_SEEDS` value of every node: the gossip addresses of the first
-/// two slots, so a node joins through either.
+/// two slots, so a node joins through either. A layout with a single slot
+/// address repeats the first.
 #[must_use]
-pub fn seed_list(base: Ipv4Addr) -> String {
-    let first = SocketAddr::from((base, GOSSIP_PORT));
-    let second = slot_ip(base, 2).map_or(first, |ip| SocketAddr::from((ip, GOSSIP_PORT)));
-    format!("{first},{second}")
+pub fn seed_list(layout: Layout) -> String {
+    let seeds = layout.seeds();
+    let first = seeds.first().copied();
+    let second = seeds.get(1).copied().or(first);
+    [first, second]
+        .into_iter()
+        .flatten()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
-/// The environment one test node starts with.
+/// The environment one test node starts with. In the shared layout the node
+/// also gets its three ports, which the fixed defaults would otherwise give
+/// every slot alike; in the per-address layout it keeps the defaults.
 #[must_use]
-pub fn node_env(ip: Ipv4Addr, seeds: &str, owners: NonZeroU8) -> Vec<(&'static str, String)> {
-    vec![
-        ("SUNDOG_TESTNODE_BIND_IP", ip.to_string()),
+pub fn node_env(
+    layout: Layout,
+    info: &SlotInfo,
+    seeds: &str,
+    owners: NonZeroU8,
+) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("SUNDOG_TESTNODE_BIND_IP", info.ip.to_string()),
         ("SUNDOG_SEEDS", seeds.to_owned()),
         ("SUNDOG_TESTNODE_MODE", "distributed".to_owned()),
         ("SUNDOG_TESTNODE_OWNERS", owners.get().to_string()),
         ("SUNDOG_TESTNODE_SIDE_CACHES", "on".to_owned()),
         ("RUST_LOG", "warn".to_owned()),
-    ]
+    ];
+    if layout.is_shared() {
+        env.extend([
+            (
+                "SUNDOG_TESTNODE_GOSSIP_PORT",
+                info.gossip.port().to_string(),
+            ),
+            (
+                "SUNDOG_TESTNODE_CONTROL_PORT",
+                info.control.port().to_string(),
+            ),
+            (
+                "SUNDOG_TESTNODE_METRICS_PORT",
+                info.metrics.port().to_string(),
+            ),
+        ]);
+    }
+    env
 }
 
 /// Where the standard error of the `seq`th start of slot `slot` goes.
@@ -381,41 +419,91 @@ mod tests {
     #[test]
     fn seeds_are_the_first_two_gossip_addresses() {
         assert_eq!(
-            seed_list(Ipv4Addr::new(127, 0, 0, 11)),
+            seed_list(Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 11))),
             "127.0.0.11:7946,127.0.0.12:7946"
         );
         assert_eq!(
-            seed_list(Ipv4Addr::new(10, 1, 2, 255)),
+            seed_list(Layout::PerAddress(Ipv4Addr::new(10, 1, 2, 255))),
             "10.1.2.255:7946,10.1.3.0:7946"
         );
         // Past the end of the space the second seed repeats the first.
         assert_eq!(
-            seed_list(Ipv4Addr::BROADCAST),
+            seed_list(Layout::PerAddress(Ipv4Addr::BROADCAST)),
             "255.255.255.255:7946,255.255.255.255:7946"
         );
     }
 
     #[test]
+    fn shared_seeds_are_the_first_two_ports_of_one_address() {
+        assert_eq!(seed_list(Layout::Shared), "127.0.0.1:7946,127.0.0.1:7947");
+    }
+
+    #[test]
+    fn the_exporter_lies_a_fixed_distance_above_gossip() {
+        assert_eq!(METRICS_OFFSET, 1144);
+        assert_eq!(GOSSIP_PORT + METRICS_OFFSET, METRICS_PORT);
+    }
+
+    fn env_value<'a>(env: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
     fn a_node_starts_distributed_with_side_caches_and_quiet_logs() {
+        let layout = Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 11));
         let env = node_env(
-            Ipv4Addr::new(127, 0, 0, 13),
+            layout,
+            &SlotInfo::new(layout, 3).unwrap(),
             "127.0.0.11:7946,127.0.0.12:7946",
             NonZeroU8::new(2).unwrap(),
         );
-        let get = |key: &str| {
-            env.iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value.as_str())
-        };
+        let get = |key: &str| env_value(&env, key);
         assert_eq!(get("SUNDOG_TESTNODE_BIND_IP"), Some("127.0.0.13"));
         assert_eq!(get("SUNDOG_SEEDS"), Some("127.0.0.11:7946,127.0.0.12:7946"));
         assert_eq!(get("SUNDOG_TESTNODE_MODE"), Some("distributed"));
         assert_eq!(get("SUNDOG_TESTNODE_OWNERS"), Some("2"));
         assert_eq!(get("SUNDOG_TESTNODE_SIDE_CACHES"), Some("on"));
         assert_eq!(get("RUST_LOG"), Some("warn"));
+        // The fixed ports are the node's own defaults: no port variable.
         assert_eq!(env.len(), 6);
-        let owners = node_env(Ipv4Addr::LOCALHOST, "", NonZeroU8::new(3).unwrap());
+        for name in [
+            "SUNDOG_TESTNODE_GOSSIP_PORT",
+            "SUNDOG_TESTNODE_CONTROL_PORT",
+            "SUNDOG_TESTNODE_METRICS_PORT",
+        ] {
+            assert_eq!(get(name), None, "{name}");
+        }
+        let owners = node_env(
+            layout,
+            &SlotInfo::new(layout, 1).unwrap(),
+            "",
+            NonZeroU8::new(3).unwrap(),
+        );
         assert!(owners.contains(&("SUNDOG_TESTNODE_OWNERS", "3".to_owned())));
+    }
+
+    #[test]
+    fn a_shared_node_gets_its_own_ports_on_the_shared_address() {
+        let layout = Layout::Shared;
+        let env = node_env(
+            layout,
+            &SlotInfo::new(layout, 2).unwrap(),
+            "127.0.0.1:7946,127.0.0.1:7947",
+            NonZeroU8::new(2).unwrap(),
+        );
+        let get = |key: &str| env_value(&env, key);
+        assert_eq!(get("SUNDOG_TESTNODE_BIND_IP"), Some("127.0.0.1"));
+        assert_eq!(get("SUNDOG_SEEDS"), Some("127.0.0.1:7946,127.0.0.1:7947"));
+        assert_eq!(get("SUNDOG_TESTNODE_GOSSIP_PORT"), Some("7947"));
+        assert_eq!(get("SUNDOG_TESTNODE_CONTROL_PORT"), Some("8081"));
+        assert_eq!(get("SUNDOG_TESTNODE_METRICS_PORT"), Some("9091"));
+        assert_eq!(get("SUNDOG_TESTNODE_MODE"), Some("distributed"));
+        assert_eq!(get("SUNDOG_TESTNODE_OWNERS"), Some("2"));
+        assert_eq!(get("SUNDOG_TESTNODE_SIDE_CACHES"), Some("on"));
+        assert_eq!(get("RUST_LOG"), Some("warn"));
+        assert_eq!(env.len(), 9);
     }
 
     #[test]
@@ -536,8 +624,10 @@ mod tests {
              trap 'exit 0' TERM\n\
              while true; do sleep 0.05; done",
         );
+        let layout = Layout::PerAddress(Ipv4Addr::new(127, 0, 0, 77));
         let env = node_env(
-            Ipv4Addr::new(127, 0, 0, 77),
+            layout,
+            &SlotInfo::new(layout, 1).unwrap(),
             "127.0.0.77:7946",
             NonZeroU8::new(2).unwrap(),
         );

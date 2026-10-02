@@ -1,10 +1,12 @@
 //! End to end with real processes: the demo's headless run and the
 //! `cluster` command watched by `watch --once --json`.
 //!
-//! Every test starts `sundog-testnode` processes on `127.0.0.11` and up, and
-//! the nodes' ports are fixed, so the tests run one at a time and are
-//! `#[ignore]`d. They need a test node built with the exporter, in the
-//! profile the tests run in:
+//! Every test starts `sundog-testnode` processes on the fleet's default
+//! layout, which is `127.0.0.11` and up on Linux and `127.0.0.1` with
+//! consecutive ports elsewhere, and one test starts the shared layout on any
+//! system. The nodes' ports are fixed or counted from fixed bases, so the
+//! tests run one at a time and are `#[ignore]`d. They need a test node built
+//! with the exporter, in the profile the tests run in:
 //!
 //! ```text
 //! cargo build -p sundog-testnode --features prometheus
@@ -25,11 +27,20 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sundog_lens::fleet::proc::terminate;
+use sundog_lens::fleet::{Fleet, FleetConfig, Layout, metrics_template};
 
 const LENS: &str = env!("CARGO_BIN_EXE_sundog-lens");
 
 /// The tests share fixed ports: one at a time.
 static PORTS: Mutex<()> = Mutex::new(());
+
+/// The gossip address of the first node of the default layout: the seed the
+/// `cluster` command prints.
+const FIRST_SEED: &str = if cfg!(target_os = "linux") {
+    "127.0.0.11:7946"
+} else {
+    "127.0.0.1:7946"
+};
 
 /// A fresh scratch directory for one test.
 fn scratch(name: &str) -> PathBuf {
@@ -309,13 +320,13 @@ fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
     assert_eq!(
         watch_line,
         format!(
-            "sundog-lens watch {cluster} --seed 127.0.0.11:7946 --metrics 'http://{{ip}}:9090/metrics'"
+            "sundog-lens watch {cluster} --seed {FIRST_SEED} --metrics 'http://{{ip}}:{{gossip_port+1144}}/metrics'"
         )
     );
 
     let report = Command::new(LENS)
-        .args(["watch", cluster, "--seed", "127.0.0.11:7946"])
-        .args(["--metrics", "http://{ip}:9090/metrics", "--once", "--json"])
+        .args(["watch", cluster, "--seed", FIRST_SEED])
+        .args(["--metrics", &metrics_template(), "--once", "--json"])
         .output()
         .expect("the watch command runs");
     assert!(
@@ -359,6 +370,81 @@ fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
     assert_eq!(shares, 131_072);
 
     drop(guard);
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
+/// Three real test nodes in the shared layout: all on `127.0.0.1`, with
+/// gossip ports 7946 to 7948, form one cluster whose exporters the scrape
+/// template reaches.
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.1, ports 7946-7948, 8080-8082 and 9090-9092"]
+fn three_nodes_on_one_address_form_one_cluster() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    tokio::runtime::Runtime::new()
+        .expect("a runtime starts")
+        .block_on(shared_cluster(testnode));
+}
+
+async fn shared_cluster(testnode: PathBuf) {
+    let cluster = "lens-e2e-shared";
+    let dir = scratch(cluster);
+    let mut fleet = Fleet::new(FleetConfig {
+        cluster: cluster.to_owned(),
+        layout: Layout::Shared,
+        testnode,
+        owners: std::num::NonZeroU8::new(2).unwrap(),
+        logs: dir.join("logs"),
+    });
+    fleet.preflight().await.expect("the shared ports are free");
+    let mut ready = Vec::new();
+    let mut gossip = Vec::new();
+    for _ in 0..3 {
+        let (info, handle) = fleet.spawn_next().expect("a node starts");
+        gossip.push(info.gossip.to_string());
+        ready.push(handle);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        gossip,
+        ["127.0.0.1:7946", "127.0.0.1:7947", "127.0.0.1:7948"]
+    );
+    for handle in ready {
+        handle
+            .wait(Duration::from_secs(60))
+            .await
+            .expect("the node is ready");
+    }
+
+    let report = tokio::process::Command::new(LENS)
+        .args(["watch", cluster, "--seed", "127.0.0.1:7946"])
+        .args(["--metrics", &metrics_template(), "--once", "--json"])
+        .output()
+        .await
+        .expect("the watch command runs");
+    fleet.stop_all().await;
+    assert!(
+        report.status.success(),
+        "watch --once failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&report.stdout).expect("the report is one JSON object");
+    assert_eq!(json["live"], 3, "{json:#}");
+    let members = json["members"].as_array().expect("members is a list");
+    let mut seen: Vec<&str> = members
+        .iter()
+        .map(|member| member["gossip"].as_str().expect("a gossip address"))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, gossip);
+    for member in members {
+        assert_eq!(member["status"], "live", "{member}");
+        // Each exporter answered: its node reports the other two as peers.
+        assert_eq!(member["exporter"]["live_peers"], 2.0, "{member}");
+    }
     assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
 }
 
