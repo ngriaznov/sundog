@@ -222,15 +222,25 @@ pub fn throughput(scene: &Scene<'_>, area: Rect, buf: &mut Buffer) {
         inner.height - 3,
     );
     let max = total.ops.iter().copied().fold(0.0, f64::max).max(1.0) * 1.1;
+    // A history shorter than the chart is stretched over its width, and the
+    // axis names the time it covers.
+    let shown = data::stretch(
+        &total.ops,
+        data::samples_per_column(look) * usize::from(chart.width),
+    );
     if look.braille {
-        BrailleArea::new(&total.ops, max, look.mode).render(chart, buf);
+        BrailleArea::new(&shown, max, look.mode).render(chart, buf);
     } else {
-        BlockArea::new(&total.ops, max, look.mode).render(chart, buf);
+        BlockArea::new(&shown, max, look.mode).render(chart, buf);
     }
-    let seconds = round_span(data::window_span(
-        usize::from(chart.width),
-        scene.model.scrape_interval(),
-    ));
+    let interval = scene.model.scrape_interval();
+    let window = data::window_span(usize::from(chart.width), interval);
+    let span = data::history_span(total.ops.len(), usize::from(chart.width), interval);
+    let seconds = if span < window {
+        span
+    } else {
+        round_span(window)
+    };
     let axis_label = format!("−{seconds}s ");
     let fill = usize::from(chart.width).saturating_sub(axis_label.chars().count() + 4);
     panel::lines(
@@ -509,7 +519,8 @@ mod tests {
         assert!(text.contains(" ops/s"), "{text}");
         assert!(text.contains("hit "), "{text}");
         assert!(text.contains("tx "), "{text}");
-        assert!(text.contains("−100s"), "{text}");
+        let held = model.cluster_ops().len();
+        assert!(text.contains(&format!("−{held}s ─")), "{text}");
         assert!(text.contains("reads "), "{text}");
         assert!(text.contains("fetch "), "{text}");
         assert!(text.contains("fetch mix  local "), "{text}");
@@ -529,13 +540,38 @@ mod tests {
     }
 
     #[test]
-    fn the_axis_label_names_the_span_of_the_chart_not_the_length_of_the_history() {
-        // Ten samples fill only the right edge of a 52-column chart, which
-        // spans 104 samples.
+    fn a_short_history_fills_the_chart_and_the_axis_names_the_time_it_covers() {
         let mut model = testkit::fixture_model_with_scrapes(Instant::now(), 10);
-        assert!(model.cluster_ops().len() <= 10);
+        let held = model.cluster_ops().len();
+        assert!((3..=10).contains(&held), "{held} samples");
+        let seconds = u64::try_from(held).unwrap();
+        assert_eq!(axis_label(&model), format!("−{seconds}s"));
+        // The history spreads across the chart: most of its cells hold data.
+        let rows = draw(&model, LayoutKind::Full, 140, 37);
+        let axis = rows.iter().position(|r| r.contains(" now")).unwrap();
+        let chart = &rows[axis - 3..axis];
+        let drawn = chart
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .filter(|c| ('\u{2801}'..='\u{28FF}').contains(c))
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(
+            drawn > 30,
+            "{drawn} cells drawn across the chart:\n{}",
+            chart.join("\n")
+        );
+        // One sample per two seconds doubles the time the same samples cover.
+        model.set_scrape_interval(Duration::from_secs(2));
+        assert_eq!(axis_label(&model), format!("−{}s", seconds * 2));
+    }
+
+    #[test]
+    fn a_history_that_fills_the_window_names_the_window_rounded() {
+        let mut model = testkit::fixture_model_with_scrapes(Instant::now(), 150);
         assert_eq!(axis_label(&model), "−100s");
-        // One sample per two seconds doubles the span.
         model.set_scrape_interval(Duration::from_secs(2));
         assert_eq!(axis_label(&model), "−210s");
     }

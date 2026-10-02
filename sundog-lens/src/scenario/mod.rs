@@ -822,6 +822,41 @@ quit
     }
 
     #[test]
+    fn the_built_in_tour_captions_what_is_on_screen_when_it_is_there() {
+        let steps = tour();
+        let at = |wanted: &str| {
+            steps
+                .iter()
+                .position(|step| step.to_string() == wanted)
+                .unwrap_or_else(|| panic!("the tour has no `{wanted}`"))
+        };
+        let caption_at = |start: &str| {
+            steps
+                .iter()
+                .position(|step| matches!(step, Step::Caption(text) if text.starts_with(start)))
+                .unwrap_or_else(|| panic!("the tour has no caption starting `{start}`"))
+        };
+        // The cluster is named the moment it has formed, not when the load
+        // starts twelve seconds later.
+        let formed = caption_at("Three processes form a cluster");
+        assert_eq!(formed, at("await members 3 within 20s") + 1);
+        // The wait for readiness has a caption, and the load its own.
+        let warming = caption_at("Each node opens its caches");
+        assert!(formed < warming && warming < at("fill 20000"));
+        assert!(at("load start") < caption_at("Load: about"));
+        // The graceful leave stays on screen before the restart takes over.
+        let settled = at("await left n2 within 20s") + 1;
+        assert_eq!(steps[settled].to_string(), "await settled it within 25s");
+        assert_eq!(steps[settled + 1], Step::Pause(S(3)));
+        // The closing frame stays up long enough to read.
+        let last_pause = steps.iter().rev().find_map(|step| match step {
+            Step::Pause(duration) => Some(*duration),
+            _ => None,
+        });
+        assert_eq!(last_pause, Some(S(8)));
+    }
+
+    #[test]
     fn the_built_in_tour_has_time_to_read_and_stays_inside_the_budget() {
         let steps = tour();
         let pauses: Duration = steps
@@ -833,7 +868,7 @@ quit
             .sum();
         // The pauses are the eye's time; the awaits add the cluster's. The
         // whole run targets 75 to 90 seconds and must finish within 95.
-        assert!(pauses >= S(30) && pauses <= S(45), "{pauses:?}");
+        assert!(pauses >= S(40) && pauses <= S(50), "{pauses:?}");
         let deadlines: Duration = steps
             .iter()
             .filter_map(|step| match step {

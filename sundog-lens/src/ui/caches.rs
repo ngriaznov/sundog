@@ -500,15 +500,21 @@ impl History {
                     buf,
                 );
                 let chart = Rect::new(x, top + 1, col_width, self.chart_rows);
+                // A history shorter than the chart is stretched over its
+                // width, as the Node view does.
+                let shown = data::stretch(
+                    samples,
+                    data::samples_per_column(look) * usize::from(col_width),
+                );
                 if look.braille {
                     Widget::render(
-                        BrailleArea::new(samples, col.max * 1.1, look.mode).tinted(node.color()),
+                        BrailleArea::new(&shown, col.max * 1.1, look.mode).tinted(node.color()),
                         chart,
                         buf,
                     );
                 } else {
                     Widget::render(
-                        BlockArea::new(samples, col.max * 1.1, look.mode).tinted(node.color()),
+                        BlockArea::new(&shown, col.max * 1.1, look.mode).tinted(node.color()),
                         chart,
                         buf,
                     );
@@ -1132,6 +1138,33 @@ mod tests {
         );
         let end = last_row(&rows);
         assert!(end >= 30 && rows[end].contains('╰'), "{end}:\n{text}");
+    }
+
+    #[test]
+    fn a_short_history_is_stretched_across_the_width_of_its_chart() {
+        let braille = |row: &str| {
+            row.chars()
+                .filter(|c| ('\u{2801}'..='\u{28FF}').contains(c))
+                .count()
+        };
+        let drawn = |scrapes| {
+            let model = testkit::fixture_model_with_scrapes(Instant::now(), scrapes);
+            let rows = draw(&model, LayoutKind::Full, 140, 37);
+            let second = rows
+                .iter()
+                .position(|r| r.contains("│ n2   entries"))
+                .unwrap();
+            // The lowest chart row of n1 holds a cell wherever the series
+            // has a value.
+            braille(&rows[second - 1])
+        };
+        let young = drawn(8);
+        let old = drawn(150);
+        assert!(young > 0 && old > 0, "{young} {old}");
+        assert!(
+            young * 10 >= old * 9,
+            "eight samples fill the width as a full ring does: {young} against {old}"
+        );
     }
 
     #[test]

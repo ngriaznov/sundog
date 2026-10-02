@@ -5,11 +5,13 @@ caption "sundog-lens joins the cluster's gossip as an observer: no cache, no dat
 pause 3s
 spawn 3 stagger 1s
 await members 3 within 20s
-caption "Each node opens its caches and pulls state before it reports ready"
+caption "Three processes form a cluster from a name and a seed list. No coordinator."
+pause 2s
+caption "Each node opens its caches and pulls state before it reports ready (◒ warm)"
 await settled it within 25s
 fill 20000
 load start
-caption "Three processes form a cluster from a name and a seed list. No coordinator."
+caption "Load: about 1,500 ops/s per node"
 pause 8s
 caption "Scale out: n4 joins and takes its share of 65,536 parts"
 spawn 1
@@ -34,6 +36,7 @@ leave n2
 await departing n2 within 5s
 await left n2 within 20s
 await settled it within 25s
+pause 3s
 caption "n3 restarts at the same address with a new identity and takes back a share"
 restart n3
 await members 4 within 20s
@@ -47,5 +50,5 @@ pause 3s
 help off
 tab timeline
 caption "The whole story in one frame · sundog-lens watch <cluster> --seed host:7946"
-pause 6s
+pause 8s
 quit

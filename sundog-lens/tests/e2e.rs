@@ -441,3 +441,45 @@ fn a_sigint_during_the_cluster_startup_stops_the_nodes() {
     assert!(took < Duration::from_secs(30), "{took:?}");
     assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
 }
+
+#[test]
+#[ignore = "binds 127.0.0.11 and runs the interface in a pseudo-terminal"]
+#[cfg(target_os = "linux")]
+fn the_interface_demo_logs_a_timed_out_await_to_the_log_file() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-uilog";
+    let dir = scratch(cluster);
+    let scenario = dir.join("scenario.txt");
+    // No node is ever started, so the await cannot pass.
+    std::fs::write(&scenario, "await members 9 within 1s\npause 1s\nquit\n")
+        .expect("the scenario is written");
+    let log = dir.join("lens.log");
+    // `script` gives the interface a terminal; `stty` gives it a size.
+    let command = format!(
+        "stty cols 140 rows 40; exec {LENS} demo --name {cluster} --scenario {} --log {} \
+         --logs {} --testnode {} --no-anim",
+        scenario.display(),
+        log.display(),
+        dir.join("logs").display(),
+        testnode.display(),
+    );
+    let child = Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("script starts");
+    let mut guard = Guard { child, cluster };
+    let (code, took) = wait_within(&mut guard.child, Duration::from_secs(60));
+    assert_eq!(code, Some(0), "the interface ends at the scenario's quit");
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    let logged = std::fs::read_to_string(&log).expect("the log file is written");
+    println!("--- log ---\n{logged}");
+    assert!(logged.contains("await timed out after 1."), "{logged}");
+    assert!(logged.contains("await members 9 within 1s"), "{logged}");
+    assert!(testnode_pids(cluster).is_empty(), "no node was started");
+}

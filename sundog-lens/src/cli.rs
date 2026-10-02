@@ -24,7 +24,8 @@ USAGE
   sundog-lens cluster [--name lens-demo] [--nodes 3] [--base-ip 127.0.0.11]
               [--testnode PATH] [--owners 2] [--keys 20000] [--rate 1500] [--logs DIR]
   sundog-lens demo [--scenario tour|FILE] [--headless] [--no-captions] [--marks FILE]
-              [cluster flags] [--color ...] [--no-bg] [--no-braille] [--no-anim]
+              [--log FILE] [cluster flags] [--color ...] [--no-bg] [--no-braille]
+              [--no-anim]
 
 watch    Join the cluster's gossip as an observer and show its members, caches and
          part ownership. The observer opens no cache and is never a peer.
@@ -47,7 +48,8 @@ OPTIONS
   --no-braille          Draw block characters instead of braille.
   --no-anim             Turn motion off.
   --exit-after DUR      Quit after this long.
-  --log FILE            Write tracing output to FILE.
+  --log FILE            Write tracing output to FILE. With demo, the file records
+                        failed keys, failed steps and timed-out awaits.
   --once                Print one report and exit.
   --json                With --once, print the report as JSON.
   --settle DUR          With --once, wait until the members hold still this long
@@ -239,6 +241,8 @@ pub struct DemoArgs {
     pub no_captions: bool,
     /// `--marks`: write step times to this file.
     pub marks: Option<PathBuf>,
+    /// `--log`: write tracing output to this file.
+    pub log: Option<PathBuf>,
     /// The fleet flags.
     pub fleet: FleetArgs,
     /// The display flags.
@@ -621,6 +625,7 @@ fn parse_demo(rest: &[String]) -> Result<DemoArgs, CliError> {
         headless: false,
         no_captions: false,
         marks: None,
+        log: None,
         fleet: FleetArgs::default(),
         display: DisplayArgs::default(),
     };
@@ -644,6 +649,7 @@ fn parse_demo(rest: &[String]) -> Result<DemoArgs, CliError> {
             "--headless" => demo.headless = true,
             "--no-captions" => demo.no_captions = true,
             "--marks" => demo.marks = Some(args.value(&flag, inline)?.into()),
+            "--log" => demo.log = Some(args.value(&flag, inline)?.into()),
             _ => return Err(unknown_or_positional(flag)),
         }
     }
@@ -1047,6 +1053,7 @@ mod tests {
         assert_eq!(demo.scenario, ScenarioSource::Tour);
         assert!(!demo.headless && !demo.no_captions);
         assert_eq!(demo.marks, None);
+        assert_eq!(demo.log, None);
         assert_eq!(demo.fleet, FleetArgs::default());
         assert_eq!(demo.display, DisplayArgs::default());
 
@@ -1058,6 +1065,8 @@ mod tests {
             "--no-captions",
             "--marks",
             "/tmp/marks",
+            "--log",
+            "/tmp/demo.log",
             "--nodes",
             "4",
             "--color",
@@ -1070,6 +1079,7 @@ mod tests {
         assert_eq!(demo.scenario, ScenarioSource::File("tour.txt".into()));
         assert!(demo.headless && demo.no_captions);
         assert_eq!(demo.marks, Some(PathBuf::from("/tmp/marks")));
+        assert_eq!(demo.log, Some(PathBuf::from("/tmp/demo.log")));
         assert_eq!(demo.fleet.nodes, 4);
         assert_eq!(demo.display.color, ColorChoice::Mono);
         assert!(demo.display.no_anim);

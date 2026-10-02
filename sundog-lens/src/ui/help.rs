@@ -30,7 +30,7 @@ const KEYS: [(Key, Key); 8] = [
 
 /// The glyph legend.
 const GLYPHS: [&str; 2] = [
-    "● live  ◐ departing  ○ left  ✖ down  ✚ joined  ↻ rejoined",
+    "● live  ◒ warming  ◐ departing  ○ left  ✖ down  ✚ joined  ↻ rejoined",
     "✓ reported = computed  ↻ settling  ⇄ view change  ✔ settled",
 ];
 
@@ -191,7 +191,7 @@ mod tests {
             "1-4 Tab ⇧Tab",
             "next/prev Distributed cache",
             "SIGKILL (demo)",
-            "● live  ◐ departing",
+            "● live  ◒ warming  ◐ departing",
             "mosaic: 1024 buckets",
             "gossip = observer 127.0.0.1:41733 (never a peer)",
             "metrics = each node's /metrics",

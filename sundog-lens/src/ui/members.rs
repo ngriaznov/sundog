@@ -53,6 +53,10 @@ const SPARK: usize = 3;
 const BAR_GROWTH: usize = 30;
 const SPARK_GROWTH: usize = 24;
 
+/// What the UP column reads while a live node reports itself not ready: it
+/// is opening its caches and pulling state.
+pub const WARMING: &str = "warm";
+
 /// The width of the `▌● ` prefix: selection bar, status glyph, space.
 const PREFIX: usize = 3;
 
@@ -154,6 +158,7 @@ fn status_glyph(scene: &Scene<'_>, row: &NodeRow<'_>) -> Span<'static> {
     let look = scene.look;
     let age = row.status_age(scene.ctx.wall);
     match row.status() {
+        MemberStatus::Live if data::warming(scene.model, row) => look.span("◒", Token::Muted),
         MemberStatus::Live => {
             let glyph = if row.uptime(scene.ctx.wall).is_some_and(|up| up < JOINED_FOR) {
                 '✚'
@@ -334,6 +339,27 @@ fn gone_text(scene: &Scene<'_>, row: &NodeRow<'_>) -> Span<'static> {
     }
 }
 
+/// The UP cell: the time the process has run, in the warning color while it
+/// is departing, and `warm` while a live node reports itself not ready.
+fn up_cell(scene: &Scene<'_>, row: &NodeRow<'_>, text_token: Token) -> Span<'static> {
+    let look = scene.look;
+    if data::warming(scene.model, row) {
+        return look.span(text::pad_right(WARMING, 6), Token::Muted);
+    }
+    // The clock runs from the process start (the incarnation) for a live and
+    // for a departing node; a departing node's reads in the warning color and
+    // its SHARE cell counts the time since the departure.
+    let token = if row.status() == MemberStatus::Departing {
+        Token::Warn
+    } else {
+        text_token
+    };
+    let up = row
+        .process_uptime(scene.ctx.wall)
+        .unwrap_or_else(|| row.status_age(scene.ctx.wall));
+    look.span(text::pad_right(&text::uptime(up), 6), token)
+}
+
 /// One row of the table.
 fn row_line(
     scene: &Scene<'_>,
@@ -405,21 +431,7 @@ fn row_line(
                     text::pad_right(&row.member.peer.gossip_addr.to_string(), cols.gossip),
                     Token::Muted,
                 )),
-                Col::Up => {
-                    // The clock runs from the process start (the incarnation)
-                    // for a live and for a departing node; a departing node's
-                    // reads in the warning color and its SHARE cell counts the
-                    // time since the departure.
-                    let token = if row.status() == MemberStatus::Departing {
-                        Token::Warn
-                    } else {
-                        text_token
-                    };
-                    let up = row
-                        .process_uptime(scene.ctx.wall)
-                        .unwrap_or_else(|| row.status_age(scene.ctx.wall));
-                    spans.push(look.span(text::pad_right(&text::uptime(up), 6), token));
-                }
+                Col::Up => spans.push(up_cell(scene, row, text_token)),
                 Col::Proto => {
                     let token = if row.member.peer.protocol == sundog::wire::PROTOCOL_VERSION {
                         Token::Muted
@@ -625,6 +637,49 @@ mod tests {
         );
         let left = rows.iter().find(|r| r.contains("n8")).unwrap();
         assert!(left.contains("○") && left.contains("left 10s"), "{left}");
+    }
+
+    #[test]
+    fn a_node_that_is_not_ready_reads_warm_until_it_is() {
+        let mut model = testkit::fixture_model_with_metrics(Instant::now());
+        let row = crate::ui::data::row_labeled(&model, "n2").unwrap();
+        let (addr, node) = (row.member.peer.gossip_addr, row.member.peer.node);
+        let scrape = |model: &mut Model, ready| {
+            let at = model.now().unwrap() + Duration::from_secs(1);
+            let wall = model.wall().unwrap() + Duration::from_secs(1);
+            model.apply(
+                crate::source::Update::Scrape(crate::source::ScrapeReport {
+                    addr,
+                    node,
+                    at,
+                    outcome: Ok(Vec::new()),
+                    ready: Some(ready),
+                }),
+                at,
+                wall,
+            );
+        };
+        let line = |model: &Model, label: &str| {
+            draw(model, LayoutKind::Full, 100, 13)
+                .into_iter()
+                .find(|r| r.contains(label))
+                .unwrap()
+        };
+        let before = line(&model, "n2");
+        assert!(!before.contains("warm") && before.contains('●'), "{before}");
+        scrape(&mut model, false);
+        let warming = line(&model, "n2");
+        assert!(warming.contains('◒'), "{warming}");
+        assert!(warming.contains(&format!(" {WARMING} ")), "{warming}");
+        assert!(
+            !warming.contains("01:"),
+            "no uptime while warming: {warming}"
+        );
+        let other = line(&model, "n3");
+        assert!(!other.contains(WARMING), "{other}");
+        scrape(&mut model, true);
+        let ready = line(&model, "n2");
+        assert!(!ready.contains(WARMING) && !ready.contains('◒'), "{ready}");
     }
 
     #[test]

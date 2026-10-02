@@ -121,6 +121,9 @@ pub async fn run(args: DemoArgs) -> anyhow::Result<()> {
     // The origin of every stamp the run prints and writes, taken before the
     // checks so the marks line up with the start of a recording.
     let started = Instant::now();
+    // The interface owns the terminal, so the warnings of a run (a key that
+    // failed, a step that failed, an await that timed out) reach `--log`.
+    crate::watch::init_logging(args.log.as_deref())?;
     let scenario = load_scenario(&args.scenario)?;
     let config = FleetConfig::from_args(&args.fleet)?;
     let feed_config = feed_config(&config)?;

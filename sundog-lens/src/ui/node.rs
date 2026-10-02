@@ -328,36 +328,6 @@ fn gone_notice(scene: &Scene<'_>, row: &NodeRow<'_>) -> Vec<Line<'static>> {
     }
 }
 
-/// How many samples a chart column holds: braille packs two, blocks one.
-const fn samples_per_column(look: crate::ui::look::Look) -> usize {
-    if look.braille { 2 } else { 1 }
-}
-
-/// The fewest samples a history needs to be stretched across a chart.
-const MIN_STRETCH: usize = 3;
-
-/// `values` stretched to `samples` points by linear interpolation when it
-/// holds at least three samples and fewer than `samples`, so that a young
-/// node's whole history fills the chart; otherwise `values` unchanged.
-#[must_use]
-pub fn stretch(values: &[f64], samples: usize) -> Vec<f64> {
-    if values.len() < MIN_STRETCH || values.len() >= samples {
-        return values.to_vec();
-    }
-    let last = values.len() - 1;
-    let denominator = samples - 1;
-    (0..samples)
-        .map(|i| {
-            let numerator = i * last;
-            let (index, rest) = (numerator / denominator, numerator % denominator);
-            let above = (index + 1).min(last);
-            let fraction =
-                crate::model::count_to_f64(rest) / crate::model::count_to_f64(denominator);
-            values[index] + (values[above] - values[index]) * fraction
-        })
-        .collect()
-}
-
 fn chart(
     scene: &Scene<'_>,
     row: &NodeRow<'_>,
@@ -369,10 +339,10 @@ fn chart(
     let ops = metrics.map(|metrics| metrics.ops().to_vec());
     // A history shorter than the chart is stretched over its width and the
     // title says how long it is.
-    let samples = samples_per_column(look) * usize::from(area.width.saturating_sub(4));
+    let samples = data::samples_per_column(look) * usize::from(area.width.saturating_sub(4));
     let stretched = ops
         .as_ref()
-        .is_some_and(|ops| ops.len() >= MIN_STRETCH && ops.len() < samples);
+        .is_some_and(|ops| ops.len() >= data::MIN_STRETCH && ops.len() < samples);
     let right = match (&ops, stretched) {
         (Some(ops), true) => {
             let span = scene.model.scrape_interval() * u32::try_from(ops.len()).unwrap_or(u32::MAX);
@@ -409,7 +379,10 @@ fn chart(
         inner.width.saturating_sub(2),
         inner.height - 1,
     );
-    let shown = stretch(&ops, samples_per_column(look) * usize::from(plot.width));
+    let shown = data::stretch(
+        &ops,
+        data::samples_per_column(look) * usize::from(plot.width),
+    );
     if look.braille {
         ratatui::widgets::Widget::render(
             BrailleArea::new(&shown, max, look.mode).tinted(row.color()),
@@ -927,22 +900,6 @@ mod tests {
         }
         assert!(tinted > 20, "{tinted} tinted cells");
         assert_eq!(amber, 0, "no cell takes the amber throughput gradient");
-    }
-
-    #[test]
-    fn a_short_history_stretches_to_the_width_and_a_long_one_stays() {
-        // Two samples are too few to draw a line through.
-        assert_eq!(stretch(&[1.0, 3.0], 5), [1.0, 3.0]);
-        // Three samples over five points: the ends stay, the middle follows.
-        assert_eq!(stretch(&[0.0, 4.0, 0.0], 5), [0.0, 2.0, 4.0, 2.0, 0.0]);
-        let stretched = stretch(&[1.0, 2.0, 3.0, 4.0], 10);
-        assert_eq!(stretched.len(), 10);
-        assert_eq!((stretched[0], stretched[9]), (1.0, 4.0));
-        assert!(stretched.windows(2).all(|pair| pair[0] <= pair[1]));
-        // A history as long as the chart, or longer, is left alone.
-        assert_eq!(stretch(&[1.0, 2.0, 3.0], 3), [1.0, 2.0, 3.0]);
-        assert_eq!(stretch(&[1.0, 2.0, 3.0, 4.0], 3), [1.0, 2.0, 3.0, 4.0]);
-        assert!(stretch(&[], 8).is_empty());
     }
 
     #[test]

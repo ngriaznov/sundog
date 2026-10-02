@@ -641,6 +641,65 @@ pub fn window_span(width: usize, interval: Duration) -> u64 {
     u64::try_from((millis + 500) / 1000).unwrap_or(u64::MAX)
 }
 
+/// How many samples a chart column holds: braille packs two, blocks one.
+#[must_use]
+pub const fn samples_per_column(look: crate::ui::look::Look) -> usize {
+    if look.braille { 2 } else { 1 }
+}
+
+/// The fewest samples a history needs to be stretched across a chart.
+pub const MIN_STRETCH: usize = 3;
+
+/// `values` stretched to `samples` points by linear interpolation when it
+/// holds at least three samples and fewer than `samples`, so that a young
+/// node's whole history fills the chart; otherwise `values` unchanged.
+#[must_use]
+pub fn stretch(values: &[f64], samples: usize) -> Vec<f64> {
+    if values.len() < MIN_STRETCH || values.len() >= samples {
+        return values.to_vec();
+    }
+    let last = values.len() - 1;
+    let denominator = samples - 1;
+    (0..samples)
+        .map(|i| {
+            let numerator = i * last;
+            let (index, rest) = (numerator / denominator, numerator % denominator);
+            let above = (index + 1).min(last);
+            let fraction =
+                crate::model::count_to_f64(rest) / crate::model::count_to_f64(denominator);
+            values[index] + (values[above] - values[index]) * fraction
+        })
+        .collect()
+}
+
+/// The seconds the axis of a chart `width` columns wide names when it holds
+/// `held` samples taken every `interval`: the whole window once the history
+/// fills it, else the time the history covers, at least a second. The chart
+/// stretches a short history over its width, so the axis names the history.
+#[must_use]
+pub fn history_span(held: usize, width: usize, interval: Duration) -> u64 {
+    let window = window_span(width, interval);
+    let millis = u128::try_from(held).unwrap_or(0) * interval.as_millis().max(1);
+    let history = u64::try_from((millis + 500) / 1000)
+        .unwrap_or(u64::MAX)
+        .max(1);
+    history.min(window).max(1)
+}
+
+/// Whether the node is live and its `/readyz` says it is not ready yet: it
+/// is opening its caches and pulling state. Never true for a node whose
+/// exporter has not answered, or whose exporter state belongs to an earlier
+/// process at the address.
+#[must_use]
+pub fn warming(model: &Model, row: &NodeRow<'_>) -> bool {
+    row.status() == MemberStatus::Live
+        && model
+            .exporter(row.member.peer.gossip_addr)
+            .is_some_and(|state| {
+                state.node() == row.member.peer.node && state.ready() == Some(false)
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -919,6 +978,68 @@ mod tests {
         assert_eq!(span(52, 500), 52);
         assert_eq!(span(500, 1000), RING_LEN as u64, "capped at a full ring");
         assert_eq!(span(52, 0), 0, "a zero interval counts as a millisecond");
+    }
+
+    #[test]
+    fn a_short_history_stretches_to_the_width_and_a_long_one_stays() {
+        // Two samples are too few to draw a line through.
+        assert_eq!(stretch(&[1.0, 3.0], 5), [1.0, 3.0]);
+        // Three samples over five points: the ends stay, the middle follows.
+        assert_eq!(stretch(&[0.0, 4.0, 0.0], 5), [0.0, 2.0, 4.0, 2.0, 0.0]);
+        let stretched = stretch(&[1.0, 2.0, 3.0, 4.0], 10);
+        assert_eq!(stretched.len(), 10);
+        assert_eq!((stretched[0], stretched[9]), (1.0, 4.0));
+        assert!(stretched.windows(2).all(|pair| pair[0] <= pair[1]));
+        // A history as long as the chart, or longer, is left alone.
+        assert_eq!(stretch(&[1.0, 2.0, 3.0], 3), [1.0, 2.0, 3.0]);
+        assert_eq!(stretch(&[1.0, 2.0, 3.0, 4.0], 3), [1.0, 2.0, 3.0, 4.0]);
+        assert!(stretch(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn an_axis_names_the_history_until_it_fills_the_window() {
+        let second = Duration::from_secs(1);
+        assert_eq!(history_span(40, 52, second), 40);
+        assert_eq!(history_span(104, 52, second), 104);
+        assert_eq!(history_span(180, 52, second), 104, "a full window caps it");
+        assert_eq!(history_span(0, 52, second), 1, "at least a second");
+        assert_eq!(history_span(10, 52, Duration::from_secs(2)), 20);
+        assert_eq!(history_span(10, 52, Duration::ZERO), 1);
+    }
+
+    /// Folds a scrape of the node labeled `label` that reports `ready`.
+    fn scrape_ready(model: &mut Model, label: &str, ready: bool) {
+        let row = row_labeled(model, label).unwrap();
+        let (addr, node) = (row.member.peer.gossip_addr, row.member.peer.node);
+        let at = model.now().unwrap() + Duration::from_secs(1);
+        let wall = model.wall().unwrap() + Duration::from_secs(1);
+        model.apply(
+            Update::Scrape(crate::source::ScrapeReport {
+                addr,
+                node,
+                at,
+                outcome: Ok(Vec::new()),
+                ready: Some(ready),
+            }),
+            at,
+            wall,
+        );
+    }
+
+    #[test]
+    fn a_live_node_that_reports_not_ready_is_warming_until_it_reports_ready() {
+        let mut model = fixture();
+        let warming_of =
+            |model: &Model, label: &str| warming(model, &row_labeled(model, label).unwrap());
+        assert!(!warming_of(&model, "n1"), "no exporter answered yet");
+        scrape_ready(&mut model, "n1", false);
+        assert!(warming_of(&model, "n1"));
+        assert!(!warming_of(&model, "n2"), "only the node that says so");
+        scrape_ready(&mut model, "n1", true);
+        assert!(!warming_of(&model, "n1"));
+        // A node that is not live is never warming, whatever it last said.
+        scrape_ready(&mut model, "n7", false);
+        assert!(!warming_of(&model, "n7"), "n7 is down");
     }
 
     #[test]
