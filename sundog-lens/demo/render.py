@@ -9,7 +9,7 @@ solid cell colors with their neighbors: the flat colors (cell backgrounds, text
 colors, lines) are kept exactly and the anti-aliasing shades take the slots
 that remain, so the lens's blended colors survive. Box-drawing and block
 glyphs are drawn as lines and rectangles that fill their cell, so borders and
-bars are solid.
+bars are solid, and braille dots are square pixels in the flat text color.
 
     pip install pyte pillow imageio-ffmpeg
     render.py IN.cast OUT.gif [--fps 10] [--font-size 13] [--idle 2] [--hold 4]
@@ -117,10 +117,17 @@ class Painter:
         return self.wide
 
     def shape(self, draw, glyph, x, top, fg):
-        """Draw a box or block glyph over its whole cell; False for any other."""
+        """Draw a box, block or braille glyph geometrically; False for any other."""
         left, cw, ch = x * self.cw, self.cw, self.ch
         mid_x, mid_y = left + cw // 2, top + ch // 2
-        if glyph in BLOCKS:
+        if "\u2800" <= glyph <= "\u28ff":  # braille: a 2x2 pixel square per set dot
+            dots = ord(glyph) - 0x2800
+            for bit in range(8):
+                if dots >> bit & 1:
+                    col, row = (bit // 3, bit % 3) if bit < 6 else (bit - 6, 3)
+                    px, py = left + cw // 8 + col * (cw // 2), top + ch // 10 + row * (ch // 5)
+                    draw.rectangle([px, py, px + 1, py + 1], fill=fg)
+        elif glyph in BLOCKS:
             for x0, y0, x1, y1 in BLOCKS[glyph]:
                 draw.rectangle([left + round(x0 * cw), top + round(y0 * ch),
                                 left + round(x1 * cw) - 1, top + round(y1 * ch) - 1], fill=fg)
