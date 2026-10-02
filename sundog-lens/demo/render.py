@@ -5,11 +5,12 @@ The cast is replayed with pyte, each screen is drawn with Pillow at a fixed
 cell size and the frames go to ffmpeg, which maps every pixel to a palette with
 no dithering and rectangle diffs, so a cell that is blank in the terminal is
 blank in the GIF. The palette is built here, not by palettegen, which averages
-solid cell colors with their neighbors: the flat colors (cell backgrounds, text
-colors, lines) are kept exactly and the anti-aliasing shades take the slots
-that remain, so the lens's blended colors survive. Box-drawing and block
-glyphs are drawn as lines and rectangles that fill their cell, so borders and
-bars are solid, and braille dots are square pixels in the flat text color.
+solid cell colors with their neighbors. Every drawn color is flat: text is
+anti-aliased to three levels (background, a half blend, the text color), so a
+glyph edge is a color the palette holds exactly and never a stray hue. Box,
+block and braille glyphs and the warning sign are drawn as lines, rectangles
+and polygons that fill their cell, so borders and bars are solid, and braille
+dots are square pixels in the flat text color.
 
     pip install pyte pillow imageio-ffmpeg
     render.py IN.cast OUT.gif [--fps 10] [--font-size 13] [--idle 2] [--hold 4]
@@ -102,6 +103,7 @@ class Painter:
         # What the mono font draws for a character it lacks.
         self.notdef = self.ink(self.regular, "\U0010ffff")
         self.has = {}
+        self.masks = {}
 
     def ink(self, font, ch):
         """The pixels the font draws for `ch`."""
@@ -116,7 +118,7 @@ class Painter:
             return self.bold if bold else self.regular
         return self.wide
 
-    def shape(self, draw, glyph, x, top, fg):
+    def shape(self, draw, glyph, x, top, fg, bg):
         """Draw a box, block or braille glyph geometrically; False for any other."""
         left, cw, ch = x * self.cw, self.cw, self.ch
         mid_x, mid_y = left + cw // 2, top + ch // 2
@@ -127,6 +129,12 @@ class Painter:
                     col, row = (bit // 3, bit % 3) if bit < 6 else (bit - 6, 3)
                     px, py = left + cw // 8 + col * (cw // 2), top + ch // 10 + row * (ch // 5)
                     draw.rectangle([px, py, px + 1, py + 1], fill=fg)
+        elif glyph == "\u26a0":  # a solid triangle, as wide as it is tall, with a "!" cut out of it
+            apex = mid_y - cw // 2
+            base = apex + cw - 1
+            draw.polygon([(left, base), (left + cw - 1, base), (mid_x, apex)], fill=fg)
+            draw.line([mid_x, apex + 3, mid_x, apex + 4], fill=bg)
+            draw.point([mid_x, apex + 6], fill=bg)
         elif glyph in BLOCKS:
             for x0, y0, x1, y1 in BLOCKS[glyph]:
                 draw.rectangle([left + round(x0 * cw), top + round(y0 * ch),
@@ -168,26 +176,44 @@ class Painter:
                 fg, bg = color(c.fg, FG), color(c.bg, BG)
                 if c.reverse:
                     fg, bg = bg, fg
-                cells.append((c.data, fg, c.bold, c.underscore))
+                cells.append((c.data, fg, bg, c.bold, c.underscore))
                 self.flat.add(ImageColor.getrgb(bg))
                 if c.data.strip():
                     self.flat.add(ImageColor.getrgb(fg))
                 if bg != BG:
                     draw.rectangle([x * self.cw, top, (x + 1) * self.cw - 1, top + self.ch - 1], fill=bg)
-            for x, (ch, fg, bold, underline) in enumerate(cells):
+            for x, (ch, fg, bg, bold, underline) in enumerate(cells):
                 if ch.strip() == "":
                     continue
                 if underline:  # one pixel between the baseline and the descent
                     line = top + self.base + 1
                     draw.line([x * self.cw, line, (x + 1) * self.cw - 1, line], fill=fg)
-                if self.shape(draw, ch, x, top, fg):
+                if self.shape(draw, ch, x, top, fg, bg):
                     continue
-                font = self.font(ch, bold)
-                left = x * self.cw
-                if font is self.wide:  # centre a proportional fallback glyph in its cell
-                    left += (self.cw - font.getlength(ch)) / 2
-                draw.text((left, top + self.base), ch, fill=fg, font=font, anchor="ls")
+                self.text(img, ch, x, top, fg, bg, bold)
         return img
+
+    def levels(self, ch, bold):
+        """The masks of the half and full coverage of a glyph, cached."""
+        key = (ch, bold)
+        if key not in self.masks:
+            font = self.font(ch, bold)
+            left = (self.cw - font.getlength(ch)) / 2 if font is self.wide else 0  # centre a fallback glyph
+            mask = Image.new("L", (self.cw, self.ch))
+            ImageDraw.Draw(mask).text((left, self.base), ch, fill=255, font=font, anchor="ls")
+            self.masks[key] = (mask.point(lambda v: 255 if 64 <= v < 192 else 0),
+                               mask.point(lambda v: 255 if v >= 192 else 0))
+        return self.masks[key]
+
+    def text(self, img, ch, x, top, fg, bg, bold):
+        """Draw a glyph in three levels: the background, a half blend of the
+        background and the text color, and the text color."""
+        fg_rgb, bg_rgb = ImageColor.getrgb(fg), ImageColor.getrgb(bg)
+        half = tuple((a + b + 1) // 2 for a, b in zip(fg_rgb, bg_rgb))
+        self.flat.add(half)
+        low, high = self.levels(ch, bold)
+        img.paste(half, (x * self.cw, top), low)
+        img.paste(fg_rgb, (x * self.cw, top), high)
 
 
 def frames(events, grid, painter, fps, hold):
@@ -214,22 +240,15 @@ def frames(events, grid, painter, fps, hold):
             yield held, painted
 
 
-FLAT_COLORS = 215  # the slots for flat colors; the other slots are shades
-
-
 def palette(events, grid, painter, fps, hold):
     """Pass 1: one palette for the whole GIF (a GIF stores only its changes
-    against a single palette). The flat colors that most frames use are kept
-    exactly; the few that a single frame shows, such as the steps of a fade,
-    map to their nearest neighbor. The remaining slots hold the most common
-    anti-aliasing shades."""
-    flats, shades = collections.Counter(), collections.Counter()
-    for image, painted in frames(events, grid, painter, fps, hold):
-        flats.update(painter.flat)
-        if painted:
-            shades.update({c: n for n, c in image.getcolors(1 << 24)})
-    colors = [c for c, _ in flats.most_common(FLAT_COLORS)]
-    colors += [c for c, _ in shades.most_common() if c not in flats][: 255 - len(colors)]
+    against a single palette). Every color the painter draws is flat, so the
+    palette holds the colors most frames use exactly; the few that a single
+    frame shows, such as the steps of a fade, map to their nearest neighbor."""
+    flats = collections.Counter()
+    for _ in frames(events, grid, painter, fps, hold):
+        flats.update(painter.flat)  # once per tick: a color counts for as long as it is on screen
+    colors = [c for c, _ in flats.most_common(255)]
     # The last entry is transparent: paletteuse paints it where a frame repeats
     # the one before, so the GIF stores only what changed.
     pixels = (colors + colors[:1] * 255)[:255]
