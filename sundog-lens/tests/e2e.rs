@@ -127,6 +127,7 @@ fn require_testnode() -> PathBuf {
 }
 
 /// Sends SIGINT to `child`, as Ctrl-C at a terminal does.
+#[cfg(target_os = "linux")]
 fn interrupt(child: &Child) {
     let status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -362,6 +363,7 @@ fn watch_once_json_reports_the_cluster_command_s_nodes_and_ownership() {
 }
 
 /// Waits until `count` test nodes of `cluster` run, or panics after `limit`.
+#[cfg(target_os = "linux")]
 fn wait_for_nodes(cluster: &str, count: usize, limit: Duration) {
     let deadline = Instant::now() + limit;
     while testnode_pids(cluster).len() < count {
@@ -412,6 +414,7 @@ fn a_sigint_to_a_headless_demo_stops_its_nodes() {
 /// Starts `command` with its stdout piped, reads one line of it, closes the
 /// pipe and waits for the process to exit. Returns the exit code and what it
 /// wrote to stderr.
+#[cfg(target_os = "linux")]
 fn run_with_a_reader_that_leaves(
     mut command: Command,
     cluster: &'static str,

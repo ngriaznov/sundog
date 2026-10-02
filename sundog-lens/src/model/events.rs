@@ -446,7 +446,6 @@ impl EventLog {
     }
 
     /// The events, oldest first.
-    #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Event> + ExactSizeIterator {
         self.events.iter()
     }
