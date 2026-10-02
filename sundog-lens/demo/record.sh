@@ -26,8 +26,25 @@ tmux kill-session -t lensrec 2>/dev/null || true
 tmux new-session -d -s lensrec -x 140 -y 40 \
   "env TERM=xterm-256color COLORTERM=truecolor asciinema rec --overwrite --quiet \
      --cols 140 --rows 40 --title 'sundog-lens tour' \
-     -c '$LENS demo --scenario tour --testnode $NODE --logs $OUT/nodes --marks $OUT/marks.txt --color truecolor' \
+     -c '$LENS demo --scenario tour --testnode $NODE --logs $OUT/nodes --log $OUT/tour.log --marks $OUT/marks.txt --color truecolor; echo \$? > $OUT/tour.status' \
      $OUT/tour.cast; tmux wait-for -S lensrec-done"
 tmux wait-for lensrec-done
 test -s "$OUT/tour.cast"
+
+# 3. The filmed take passes too: the demo exits 0 and its log holds no failed
+# key, failed step or timed-out await.
+[[ "$(cat "$OUT/tour.status" 2>/dev/null)" == 0 ]] || {
+  echo "the filmed tour exited with status $(cat "$OUT/tour.status" 2>/dev/null || echo unknown)" >&2
+  exit 1
+}
+if grep -q ' WARN \| ERROR ' "$OUT/tour.log" 2>/dev/null; then
+  echo "the filmed tour logged a failure; see $OUT/tour.log" >&2
+  exit 1
+fi
+# A take over the cast budget is rejected here, before it is rendered; slow
+# awaits lengthen a take, so record again.
+(($(stat -c%s "$OUT/tour.cast") <= 3000000)) || {
+  echo "the take is over 3,000,000 bytes; record again" >&2
+  exit 1
+}
 echo "recorded $OUT/tour.cast"

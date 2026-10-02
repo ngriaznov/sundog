@@ -168,12 +168,7 @@ fn status_glyph(scene: &Scene<'_>, row: &NodeRow<'_>) -> Span<'static> {
             Span::styled(glyph.to_string(), look.node(row.color()))
         }
         MemberStatus::Departing => {
-            let glyph = if scene.app.anim && !anim::blink(scene.ctx.elapsed) {
-                '◒'
-            } else {
-                '◐'
-            };
-            look.span(glyph.to_string(), Token::Warn)
+            look.span("◐", departing_token(scene.app.anim, scene.ctx.elapsed))
         }
         MemberStatus::Down => {
             let token = if age < DOWN_HOLD {
@@ -184,6 +179,17 @@ fn status_glyph(scene: &Scene<'_>, row: &NodeRow<'_>) -> Span<'static> {
             look.span("✖", token)
         }
         _ => look.span("○", Token::Muted),
+    }
+}
+
+/// The token of a departing member's glyph: the glyph stays `◐` and the
+/// color blinks between warning and faint while animation is on, so `◒`
+/// keeps its one meaning, warming.
+fn departing_token(anim_on: bool, elapsed: Duration) -> Token {
+    if anim_on && !anim::blink(elapsed) {
+        Token::Faint
+    } else {
+        Token::Warn
     }
 }
 
@@ -627,7 +633,7 @@ mod tests {
         assert!(departing.contains("leave 10s "), "{departing}");
         assert!(!departing.contains("00:10"), "{departing}");
         assert!(
-            departing.contains('◐') || departing.contains('◒'),
+            departing.contains('◐') && !departing.contains('◒'),
             "{departing}"
         );
         let down = rows.iter().find(|r| r.contains("n7")).unwrap();
@@ -680,6 +686,15 @@ mod tests {
         scrape(&mut model, true);
         let ready = line(&model, "n2");
         assert!(!ready.contains(WARMING) && !ready.contains('◒'), "{ready}");
+    }
+
+    #[test]
+    fn a_departing_glyph_blinks_its_color_and_keeps_its_shape() {
+        let ms = Duration::from_millis;
+        assert_eq!(departing_token(true, ms(100)), Token::Warn);
+        assert_eq!(departing_token(true, ms(300)), Token::Faint);
+        assert_eq!(departing_token(true, ms(600)), Token::Warn);
+        assert_eq!(departing_token(false, ms(300)), Token::Warn);
     }
 
     #[test]

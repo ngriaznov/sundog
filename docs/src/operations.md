@@ -238,7 +238,7 @@ Each member carries a status glyph.
 |---|---|
 | `●` | live |
 | `◒` | live and warming: its exporter reports it not ready |
-| `◐` | departing: it announced a graceful leave and owns no part |
+| `◐` | departing: it announced a graceful leave and owns no part; the glyph blinks in color, never in shape |
 | `○` | left after a departure |
 | `✖` | down: gossip dropped it with no departure (crash, stall or partition) |
 | `✚` | joined |
@@ -246,9 +246,10 @@ Each member carries a status glyph.
 
 A `✓` after a node's share means the parts it reports in
 `sundog_owned_parts` equal the parts the lens computes for it; `↻` means they
-differ and the node is still settling. A cache is `✔ settled` once its
-ownership view has held and every reporting node agrees with it; without
-exporters it settles after the view has held for three seconds.
+differ and the node is still settling. A cache is `✔ settled` once every node
+that reports metrics reports the parts the lens computes for it and has pulled
+no part in its last two scrapes; without exporters it settles after the view
+has held for three seconds.
 The PEERS column compares `sundog_live_peers` on the node with the lens's
 own count of live members and turns amber when the two disagree for more
 than three seconds. A view change appears as `VIEW` in the event log with

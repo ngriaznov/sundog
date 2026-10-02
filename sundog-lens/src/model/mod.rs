@@ -1188,7 +1188,7 @@ mod tests {
         );
         let first = model.lifelines().node(testkit::gossip_addr(1)).unwrap();
         let kinds: Vec<_> = first.marks().iter().map(|m| m.kind).collect();
-        assert_eq!(kinds, [MarkKind::Join, MarkKind::Down]);
+        assert_eq!(kinds, [MarkKind::Join, MarkKind::Suspect, MarkKind::Down]);
         assert_eq!(first.current(), None);
         let second = model.lifelines().node(testkit::gossip_addr(2)).unwrap();
         assert_eq!(second.current(), Some(PhaseKind::Live));

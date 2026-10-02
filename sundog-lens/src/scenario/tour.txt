@@ -2,7 +2,7 @@
 # Every change of state is awaited, never slept for; the pauses are for the
 # eye.
 caption "sundog-lens joins the cluster's gossip as an observer: no cache, no data plane, never a peer"
-pause 3s
+pause 1s
 spawn 3 stagger 1s
 await members 3 within 20s
 caption "Three processes form a cluster from a name and a seed list. No coordinator."
@@ -11,15 +11,15 @@ caption "Each node opens its caches and pulls state before it reports ready (◒
 await settled it within 25s
 fill 20000
 load start
-caption "Load: about 1,500 ops/s per node"
-pause 8s
+caption "Load: about 1,000 ops/s per node, swelling and ebbing"
+pause 6s
 caption "Scale out: n4 joins and takes its share of 65,536 parts"
 spawn 1
 await settled it within 25s
 pause 2s
 tab caches
 caption "Every node reports the share the observer computes from gossip"
-pause 5s
+pause 4s
 spawn 1
 await settled it within 25s
 tab overview
@@ -44,8 +44,10 @@ await settled it within 25s
 pause 2s
 select n3
 tab node
-pause 5s
+caption "Node detail: n3's new identity, its caches and its own events"
+pause 4s
 help on
+caption "? lists every key and the glyph legend"
 pause 3s
 help off
 tab timeline

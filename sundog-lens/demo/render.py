@@ -2,15 +2,21 @@
 """Render an asciicast to a GIF for the README.
 
 The cast is replayed with pyte, each screen is drawn with Pillow at a fixed
-cell size and the frames go to ffmpeg, which builds one exact palette and maps
-every pixel to it with no dithering and rectangle diffs, so a cell that is
-blank in the terminal is blank in the GIF.
+cell size and the frames go to ffmpeg, which maps every pixel to a palette with
+no dithering and rectangle diffs, so a cell that is blank in the terminal is
+blank in the GIF. The palette is built here, not by palettegen, which averages
+solid cell colors with their neighbors: the flat colors (cell backgrounds, text
+colors, lines) are kept exactly and the anti-aliasing shades take the slots
+that remain, so the lens's blended colors survive. Box-drawing and block
+glyphs are drawn as lines and rectangles that fill their cell, so borders and
+bars are solid.
 
     pip install pyte pillow imageio-ffmpeg
     render.py IN.cast OUT.gif [--fps 10] [--font-size 13] [--idle 2] [--hold 4]
 """
 
 import argparse
+import collections
 import json
 import subprocess
 import sys
@@ -19,7 +25,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 import pyte
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 FONTS = "/usr/share/fonts/truetype/dejavu/"
 BG, FG = "#12110f", "#ece6d9"
@@ -41,6 +47,22 @@ def color(name, default):
     if name == "default":
         return default
     return "#" + NAMES.get(name, name)
+
+
+# Lines and blocks, drawn geometrically. Each glyph is a list of (x0, y0, x1, y1)
+# fractions of the cell, 0 to 1 from the top left; "heavy" lines are two pixels.
+LIGHT, HEAVY = 1, 2
+BLOCKS = {
+    "\u2580": [(0, 0, 1, .5)], "\u2584": [(0, .5, 1, 1)], "\u2588": [(0, 0, 1, 1)],
+    "\u258c": [(0, 0, .5, 1)], "\u2590": [(.5, 0, 1, 1)],
+}
+# Corners are a line pair joined by a quarter circle: (horizontal side, vertical side).
+CORNERS = {"\u256d": ("r", "b"), "\u256e": ("l", "b"), "\u2570": ("r", "t"), "\u256f": ("l", "t")}
+LINES = {  # glyph: (orientation, weight, extent along the cell, dash count)
+    "\u2502": ("v", LIGHT, (0, 1), 1), "\u2500": ("h", LIGHT, (0, 1), 1),
+    "\u2501": ("h", HEAVY, (0, 1), 1), "\u2578": ("h", HEAVY, (0, .5), 1),
+    "\u250a": ("v", LIGHT, (0, 1), 4), "\u2504": ("h", LIGHT, (0, 1), 3),
+}
 
 
 def read_cast(path, idle):
@@ -75,7 +97,7 @@ class Painter:
         self.wide = ImageFont.truetype(FONTS + "DejaVuSans.ttf", size)
         self.cw = round(self.regular.getlength("M"))
         ascent, descent = self.regular.getmetrics()
-        self.ch = ascent + descent + 2
+        self.ch = (ascent + descent + 3) // 2 * 2  # even, so halves match
         self.base = ascent + 1
         # What the mono font draws for a character it lacks.
         self.notdef = self.ink(self.regular, "\U0010ffff")
@@ -94,9 +116,42 @@ class Painter:
             return self.bold if bold else self.regular
         return self.wide
 
+    def shape(self, draw, glyph, x, top, fg):
+        """Draw a box or block glyph over its whole cell; False for any other."""
+        left, cw, ch = x * self.cw, self.cw, self.ch
+        mid_x, mid_y = left + cw // 2, top + ch // 2
+        if glyph in BLOCKS:
+            for x0, y0, x1, y1 in BLOCKS[glyph]:
+                draw.rectangle([left + round(x0 * cw), top + round(y0 * ch),
+                                left + round(x1 * cw) - 1, top + round(y1 * ch) - 1], fill=fg)
+        elif glyph in LINES:
+            way, weight, (a, b), dashes = LINES[glyph]
+            for i in range(dashes):  # dashes fill 2/3 of each span
+                lo, hi = (i + (0 if dashes == 1 else .15)) / dashes, (i + (1 if dashes == 1 else .85)) / dashes
+                lo, hi = a + (b - a) * lo, a + (b - a) * hi
+                if way == "h":
+                    y = mid_y - (weight - 1)
+                    draw.rectangle([left + round(lo * cw), y, left + round(hi * cw) - 1, mid_y], fill=fg)
+                else:
+                    draw.rectangle([mid_x, top + round(lo * ch), mid_x, top + round(hi * ch) - 1], fill=fg)
+        elif glyph in CORNERS:
+            across, down = CORNERS[glyph]
+            r = cw // 2
+            cx = mid_x + r if across == "r" else mid_x - r
+            cy = mid_y + r if down == "b" else mid_y - r
+            box = [cx - r, cy - r, cx + r, cy + r]
+            start = {("r", "b"): 180, ("l", "b"): 270, ("r", "t"): 90, ("l", "t"): 0}[(across, down)]
+            draw.arc(box, start, start + 90, fill=fg)
+            draw.line([cx, mid_y, left + cw - 1, mid_y] if across == "r" else [left, mid_y, cx, mid_y], fill=fg)
+            draw.line([mid_x, cy, mid_x, top + ch - 1] if down == "b" else [mid_x, top, mid_x, cy], fill=fg)
+        else:
+            return False
+        return True
+
     def paint(self, screen):
         img = Image.new("RGB", (screen.columns * self.cw, screen.lines * self.ch), BG)
         draw = ImageDraw.Draw(img)
+        self.flat = {ImageColor.getrgb(BG)}  # the flat colors of this frame
         for y in range(screen.lines):
             row = screen.buffer[y]
             top = y * self.ch
@@ -106,11 +161,19 @@ class Painter:
                 fg, bg = color(c.fg, FG), color(c.bg, BG)
                 if c.reverse:
                     fg, bg = bg, fg
-                cells.append((c.data, fg, bg, c.bold))
+                cells.append((c.data, fg, c.bold, c.underscore))
+                self.flat.add(ImageColor.getrgb(bg))
+                if c.data.strip():
+                    self.flat.add(ImageColor.getrgb(fg))
                 if bg != BG:
                     draw.rectangle([x * self.cw, top, (x + 1) * self.cw - 1, top + self.ch - 1], fill=bg)
-            for x, (ch, fg, _, bold) in enumerate(cells):
+            for x, (ch, fg, bold, underline) in enumerate(cells):
                 if ch.strip() == "":
+                    continue
+                if underline:  # one pixel between the baseline and the descent
+                    line = top + self.base + 1
+                    draw.line([x * self.cw, line, (x + 1) * self.cw - 1, line], fill=fg)
+                if self.shape(draw, ch, x, top, fg):
                     continue
                 font = self.font(ch, bold)
                 left = x * self.cw
@@ -120,10 +183,11 @@ class Painter:
         return img
 
 
-def frames(events, grid, painter, fps, hold, changed_only):
-    """Yield one RGB frame per 1/fps second. The screen is painted only when it
-    changed; an unchanged tick repeats the held frame (or is skipped with
-    `changed_only`). The last frame is held for `hold` more seconds."""
+def frames(events, grid, painter, fps, hold):
+    """Yield (image, painted) once per 1/fps second, starting at the first tick
+    whose screen has content. The screen is painted only when it changed, and
+    `painted` says so; an unchanged tick repeats the held image. The last frame
+    is held for `hold` more seconds."""
     screen = pyte.Screen(*grid)
     stream = pyte.Stream(screen)
     end = events[-1][0] + hold
@@ -134,19 +198,46 @@ def frames(events, grid, painter, fps, hold, changed_only):
             stream.feed(events[i][1])
             i += 1
         now = tuple(tuple(tuple(screen.buffer[y][x]) for x in range(screen.columns)) for y in range(screen.lines))
-        if now != key:
-            key, held = now, painter.paint(screen).tobytes()
-        elif changed_only:
-            continue
-        yield held
+        painted = now != key
+        if painted:
+            if not any(c.data.strip() for row in screen.buffer.values() for c in row.values()):
+                continue
+            key, held = now, painter.paint(screen)
+        if held is not None:
+            yield held, painted
 
 
-def ffmpeg(args, frame_iter, size, fps):
-    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
-           "-s", "%dx%d" % size, "-framerate", str(fps), "-i", "-", *args]
+FLAT_COLORS = 215  # the slots for flat colors; the other slots are shades
+
+
+def palette(events, grid, painter, fps, hold):
+    """Pass 1: one palette for the whole GIF (a GIF stores only its changes
+    against a single palette). The flat colors that most frames use are kept
+    exactly; the few that a single frame shows, such as the steps of a fade,
+    map to their nearest neighbor. The remaining slots hold the most common
+    anti-aliasing shades."""
+    flats, shades = collections.Counter(), collections.Counter()
+    for image, painted in frames(events, grid, painter, fps, hold):
+        flats.update(painter.flat)
+        if painted:
+            shades.update({c: n for n, c in image.getcolors(1 << 24)})
+    colors = [c for c, _ in flats.most_common(FLAT_COLORS)]
+    colors += [c for c, _ in shades.most_common() if c not in flats][: 255 - len(colors)]
+    # The last entry is transparent: paletteuse paints it where a frame repeats
+    # the one before, so the GIF stores only what changed.
+    pixels = (colors + colors[:1] * 255)[:255]
+    return b"".join(bytes((*rgb, 255)) for rgb in pixels) + bytes(4)
+
+
+def ffmpeg(frame_iter, palette_file, size, fps, gif):
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [exe, "-v", "error", "-y",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "%dx%d" % size, "-framerate", str(fps), "-i", "-",
+           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", "16x16", "-i", str(palette_file),
+           "-lavfi", "[0:v][1:v]paletteuse=dither=none:diff_mode=rectangle", "-loop", "0", gif]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    for frame in frame_iter:
-        proc.stdin.write(frame)
+    for image, _ in frame_iter:
+        proc.stdin.write(image.tobytes())
     proc.stdin.close()
     if proc.wait():
         sys.exit("ffmpeg failed")
@@ -166,14 +257,9 @@ def main():
     painter = Painter(a.font_size)
     size = (grid[0] * painter.cw, grid[1] * painter.ch)
     with tempfile.TemporaryDirectory() as tmp:
-        palette = Path(tmp) / "palette.png"
-        # Pass 1: one exact palette over every distinct frame.
-        ffmpeg(["-vf", "palettegen=stats_mode=full", "-update", "1", str(palette)],
-               frames(events, grid, painter, a.fps, a.hold, True), size, a.fps)
-        # Pass 2: every frame mapped to it with no dithering.
-        ffmpeg(["-i", str(palette), "-lavfi", "paletteuse=dither=none:diff_mode=rectangle",
-                "-loop", "0", a.gif],
-               frames(events, grid, painter, a.fps, a.hold, False), size, a.fps)
+        pal = Path(tmp) / "palette.rgba"  # one 16x16 image
+        pal.write_bytes(palette(events, grid, painter, a.fps, a.hold))
+        ffmpeg(frames(events, grid, painter, a.fps, a.hold), pal, size, a.fps, a.gif)
 
 
 if __name__ == "__main__":

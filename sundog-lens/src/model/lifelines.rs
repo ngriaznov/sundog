@@ -205,7 +205,8 @@ impl Lifelines {
     /// Draws `kind`, which happened at `at`, onto the lifelines it concerns:
     /// `JOIN` marks `▲` and goes live; `REJOIN`, `RESTART` and `UP` mark `↻`
     /// and go live; `LEAVE` marks `◐` and goes departing; `LEFT` and `DOWN`
-    /// mark and end the line; `VIEW` and `SETTLED` mark the cache's line. A
+    /// mark and end the line, and a `DOWN` of a live node with no failed
+    /// scrape before it first marks `⚠`; `VIEW` and `SETTLED` mark the cache's line. A
     /// `LEAVE`, `LEFT` or `DOWN` of a superseded incarnation marks the line
     /// and leaves its phase alone, because the node now at the address lives.
     /// The other kinds draw nothing.
@@ -299,6 +300,12 @@ impl Lifelines {
             return;
         }
         let line = self.nodes.entry(addr).or_default();
+        if mark == MarkKind::Down && line.current() == Some(PhaseKind::Live) {
+            // The failure detector can mark a node down before a scrape of it
+            // fails; the crash still opens with a suspect run.
+            line.mark(MarkKind::Suspect, at);
+            line.begin(PhaseKind::Suspect, at);
+        }
         line.mark(mark, at);
         line.end(at);
     }
@@ -832,7 +839,15 @@ mod tests {
         let line = lifelines.node(addr()).unwrap();
         assert_eq!(line.current(), Some(PhaseKind::Live));
         let kinds: Vec<_> = line.marks().iter().map(|m| m.kind).collect();
-        assert_eq!(kinds, [MarkKind::Join, MarkKind::Down, MarkKind::Rejoin]);
+        assert_eq!(
+            kinds,
+            [
+                MarkKind::Join,
+                MarkKind::Suspect,
+                MarkKind::Down,
+                MarkKind::Rejoin
+            ]
+        );
     }
 
     #[test]
@@ -918,6 +933,34 @@ mod tests {
         );
         let shown = text(&lifeline_cells(&leave, WINDOW, 40, now));
         assert!(shown.contains("◐┄○"), "{shown}");
+    }
+
+    #[test]
+    fn a_down_straight_from_live_opens_with_a_suspect_mark() {
+        let now = Instant::now() + Duration::from_secs(100);
+        let mut lines = Lifelines::default();
+        lines.record(&join(addr()), ago(now, 39_000));
+        let down = down(testkit::node_id(1, 0), false);
+        lines.record(&down, ago(now, 8_500));
+        let line = lines.node(addr()).unwrap();
+        let kinds: Vec<MarkKind> = line.marks().iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, [MarkKind::Join, MarkKind::Suspect, MarkKind::Down]);
+        assert_eq!(line.current(), None);
+        let shown = text(&lifeline_cells(line, WINDOW, 40, now));
+        assert!(shown.contains("⚠┄✖"), "{shown}");
+        // After a failed scrape the run is not opened twice.
+        let mut scraped = Lifelines::default();
+        scraped.record(&join(addr()), ago(now, 39_000));
+        scraped.suspect(addr(), ago(now, 9_000));
+        scraped.record(&down, ago(now, 8_500));
+        let kinds: Vec<MarkKind> = scraped
+            .node(addr())
+            .unwrap()
+            .marks()
+            .iter()
+            .map(|m| m.kind)
+            .collect();
+        assert_eq!(kinds, [MarkKind::Join, MarkKind::Suspect, MarkKind::Down]);
     }
 
     #[test]
