@@ -56,11 +56,17 @@ client it uses for Redis and Valkey. MGET is
 
 ### An observer
 
-No CLI exists; `sundog-testnode` is a container test node driven by a line
-protocol. A member that joins gossip and advertises no caches already owns
-nothing under every mode, which is the seam. An observer binary joins that
-way and dumps peers, ownership, digests and keys over the wire, through the
-state-transfer and anti-entropy requests a donor already answers.
+`sundog::observe::Observer` joins a cluster's gossip without caches or a data
+plane and returns a `ClusterSnapshot`: every member's status, protocol and
+advertised caches, and the part ownership of each `Distributed` cache
+computed from gossip. `sundog-lens watch --once` prints that snapshot as text
+or JSON. A member that advertises no caches owns nothing under every mode, so
+the observer is never a peer.
+
+What remains is what gossip does not carry: per-part digests, the keys a
+node holds and per-part residency (cold, unverified, releasing). An observer
+reads them over the state-transfer and anti-entropy requests a donor already
+answers, and the observer then dials nodes, which it does not do today.
 
 ### Explaining a read
 
@@ -71,18 +77,25 @@ or anti-entropy round last touched that part, and which owner answered.
 `Cache::explain(&key)` returns that record. A bounded per-part ring of
 residency events (gained, dropped, marked cold, pulled from a donor,
 settled) feeds it, off by default or sampled, and one request asks each
-owner for its own side. The observer above reads the same request.
+owner for its own side. An observer would read the same request.
 
 **Trigger:** an operator asking why a read missed, with nothing to read but
 counters.
 
 ### A live cluster view
 
-The observer above dumps state once. `sundog-lens` is a terminal UI over the
-same requests that redraws it continuously: members joining and leaving,
-part ownership moving between them, pulls and repairs in flight, and the
-parts whose fetches are slowest or most frequent. It is the demo a README
-animation shows, and the view an operator watches during a rolling deploy.
+`sundog-lens watch` is a terminal UI over the observer that redraws
+continuously: members joining, leaving gracefully and crashing, part
+ownership moving between them as a mosaic with the parts each view change
+moves, a settled state per cache, per-node rates, hit ratios and rebalance
+traffic from each node's Prometheus exporter, and a lifeline per node.
+`sundog-lens demo` plays a scripted tour of those events against a local
+fleet and is the recording the README shows.
+
+What remains needs data nothing exports yet. Pulls and repairs in flight per
+part need the state-transfer and anti-entropy requests of the observer
+above. The parts whose fetches are slowest or most frequent need a per-part
+counter or a latency histogram in the exporter.
 
 ### Snapshot export and import
 

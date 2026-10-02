@@ -28,6 +28,16 @@ All notable changes to this project are documented in this file. Format follows
   observer's gossip state carries no node id or data address, so no member
   counts it as a peer: it is never dialed, sent writes, asked for state or
   made an owner. No wire change.
+- **`sundog-lens`, a terminal UI for watching a cluster.** The new
+  workspace crate (`publish = false`) runs the observer above and draws the
+  cluster live: members and their status, which node owns which of a
+  `Distributed` cache's parts as a mosaic, view changes with the parts they
+  move, a settled state per cache, per-node rates scraped from each node's
+  Prometheus exporter, and a lifeline per node that tells a crash from a
+  graceful leave. `sundog-lens watch <cluster> --seed host:7946` watches a
+  running cluster, `--once [--json]` prints one report, and `sundog-lens demo`
+  runs a scripted tour against a local fleet of `sundog-testnode` processes.
+  `assets/sundog-lens.cast` and `assets/sundog-lens.gif` record the tour.
 
 ### Changed
 

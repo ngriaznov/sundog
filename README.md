@@ -108,6 +108,33 @@ operations without an async runtime. `users.close().await` stops its
 background tasks and frees the name for a fresh `open()`. A clone kept past
 `close()` keeps working as a local, detached cache.
 
+## Watch a cluster
+
+`sundog-lens` watches a running cluster from outside. It joins gossip as an
+observer that owns nothing and is never a peer, and shows each node's status,
+which node owns which part of a `Distributed` cache, the parts every view
+change moves, and the rates each node exports. A crash and a graceful leave
+look different on it.
+
+<p align="center">
+  <img src="assets/sundog-lens.gif" width="720" alt="The sundog-lens terminal UI during its tour: three nodes join, a fourth and fifth scale the cluster out, one node crashes, one leaves gracefully and one restarts while the part-ownership mosaic, member table, throughput chart and event log update">
+</p>
+
+```sh
+cargo run --release -p sundog-lens -- watch mycluster --seed 10.0.0.5:7946 \
+    --metrics 'http://{ip}:9090/metrics'
+
+# the scripted tour above, against a local fleet (Linux)
+cargo build --release -p sundog-testnode --features prometheus
+cargo run --release -p sundog-lens -- demo --scenario tour
+
+# replay the recording
+asciinema play assets/sundog-lens.cast
+```
+
+The [operations runbook](docs/src/operations.md#watching-a-cluster-sundog-lens)
+covers the flags, the glyphs and what the lens cannot show.
+
 ## Should you use this?
 
 sundog is a cache, not a database. If you need durability or strong consistency,

@@ -178,3 +178,113 @@ leaving on purpose, so `Replicated` caches on the other nodes do not hold
 tombstones back waiting for it to return, and a spill tier writes its
 checkpoint. Roll a cluster one node at a time; [Deployment](deployment.md#rolling-upgrades)
 has the order.
+
+## Watching a cluster: sundog-lens
+
+`sundog-lens` is a terminal UI that watches a running cluster from outside.
+It is a workspace crate and not published to crates.io; build it with
+`cargo build --release -p sundog-lens`.
+
+### What the observer is
+
+The lens runs a `sundog::observe::Observer`. The observer joins the
+cluster's gossip under the cluster name and reads every member's state, but
+it opens no cache, runs no data plane and carries no node id or data
+address. No member counts it as a peer, so it is never dialed, sent writes,
+asked for state or made an owner, and starting or stopping one never moves a
+part. Members keep its dead chitchat entry for `dead_node_grace_period`
+(600 s by default) after it stops, then drop it.
+
+From gossip alone the lens knows each member's status (`Live`, `Departing`,
+`Left` or `Down`, which tells a graceful leave from a crash), its protocol,
+the caches it advertises with their modes, and, for every `Distributed`
+cache, which node owns which part. It computes the ownership with the code
+the nodes run. With the `prometheus` feature on the nodes it also scrapes
+each node's exporter for rates, hit ratios and the node's own count of owned
+parts.
+
+### Running it
+
+```sh
+sundog-lens watch mycluster --seed 10.0.0.5:7946 \
+    --metrics 'http://{ip}:9090/metrics'
+```
+
+`--seed` is any member's gossip address and repeats. Without it the lens
+reads `SUNDOG_SEEDS`, then falls back to mDNS. `--metrics` is a URL template
+with `{ip}`, `{gossip_port}`, `{data_port}` and `{node_id}`; `--scrape
+NODE=URL` pins one node's URL. A node with no exporter shows membership,
+modes, status and computed ownership only. `1`-`4` switch between Overview,
+Caches, Node and Timeline, `?` lists every key, and `q` quits.
+
+The lens speaks plain UDP for gossip even when the nodes run with the `tls`
+feature, so it needs no certificates, and exporters are plain HTTP, so
+`--metrics` takes an `http://` URL. Run it where the nodes' gossip and
+exporter ports are reachable.
+
+`--once` prints one report and exits, after the member set holds still for
+`--settle` (3 s by default), and `--once --json` prints the same report as
+JSON for scripts:
+
+```sh
+sundog-lens watch mycluster --seed 10.0.0.5:7946 --once --json
+```
+
+### Reading the screen
+
+Each member carries a status glyph.
+
+| Glyph | Meaning |
+|---|---|
+| `●` | live |
+| `◒` | live and warming: its exporter reports it not ready |
+| `◐` | departing: it announced a graceful leave and owns no part |
+| `○` | left after a departure |
+| `✖` | down: gossip dropped it with no departure (crash, stall or partition) |
+| `✚` | joined |
+| `↻` | rejoined at the same address with a new identity |
+
+A `✓` after a node's share means the parts it reports in
+`sundog_owned_parts` equal the parts the lens computes for it; `↻` means they
+differ and the node is still settling. A cache is `✔ settled` once its
+ownership view has held and every reporting node agrees with it; without
+exporters it settles after the view has held for three seconds.
+The PEERS column compares `sundog_live_peers` on the node with the lens's
+own count of live members and turns amber when the two disagree for more
+than three seconds. A view change appears as `VIEW` in the event log with
+the number of parts that moved, and the ownership mosaic flashes.
+
+The Timeline view draws one lifeline per node. A crash ends in `✖`, and a
+graceful leave runs `◐` to `○`, so the two read differently at a glance.
+
+### What it cannot show
+
+| Wanted | Status |
+|---|---|
+| Which node owns which part | Shown, computed with the code the nodes run. |
+| Pulls and repairs in flight per part; cold, unverified or releasing parts | Not shown. Only rates from the rebalance, anti-entropy and state-transfer counters. |
+| The slowest or most frequent parts | Not shown. No per-part metric or latency histogram exists. |
+| Keys, digests, content convergence | Not shown. Entry-count divergence across `Replicated` nodes and the entry total divided by `k` for `Distributed` stand in. |
+| Per-cache warmth on a node | Not shown. Only the node's `/readyz` bit. |
+| A node's own membership view | The PEERS column compares its live peer count with the lens's. |
+| A node without an exporter | Membership, modes, status and computed ownership only. |
+| Partition versus crash | `Down` is the lens's own vantage point; the text says "crash, stall or partition". |
+| CPU and RSS | sundog does not export them. |
+
+### The demo
+
+```sh
+sundog-lens demo --scenario tour
+```
+
+The demo starts a fleet of `sundog-testnode` processes on `127.0.0.0/8`
+loopback addresses under load, plays a scripted tour of joins, a crash, a
+graceful leave and a restart, and shows the lens while it runs. It needs
+Linux and a built `sundog-testnode` (`cargo build --release -p
+sundog-testnode --features prometheus`); `--testnode PATH` names it.
+`--headless` prints every step and event instead of drawing and exits 1 when
+a step times out, which makes the tour a smoke test. `sundog-lens cluster`
+starts the same fleet with no scenario, and `S`, `K`, `L` and `R` in the demo
+spawn a node, kill one, make one leave and restart one.
+`sundog-lens/demo/record.sh` and `render.sh` produce the recording and GIF in
+`assets/`.
