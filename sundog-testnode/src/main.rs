@@ -16,8 +16,9 @@
 //! string is documented on the match arm or handler that implements it, in
 //! [`TestNode::dispatch`] and the `*_command` functions it calls.
 //!
-//! Built with the `prometheus` feature, every run also serves `GET /metrics`
-//! (and `/readyz`, `/healthz`) on `METRICS_PORT`. Built with the `spill`
+//! Built with the `prometheus` feature, every member run also serves
+//! `GET /metrics` (and `/readyz`, `/healthz`) on `METRICS_PORT`; an observer
+//! serves none. Built with the `spill`
 //! feature, `"it"` can open a `SpillConfig` disk tier; see
 //! `spill_config_from_env`. A SIGTERM, sent by a container stop, leaves the
 //! cluster and exits 0, checkpointing a warm-reopen spill tier; `quit` and

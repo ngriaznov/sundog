@@ -21,7 +21,7 @@ use std::time::Duration;
 use container_util::{
     CRDT_RETIRE_AFTER_SECS_ENV, DISTRIBUTED_RUST_LOG, Fleet, METRICS_PORT, Node,
     build_previous_testnode, build_testnode, container_tests_enabled, eventually,
-    eventually_with_logs, seed, spawn_trio, wait_for_peers,
+    eventually_reporting, eventually_with_logs, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -1480,15 +1480,18 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
 /// An observer joins gossip beside a mixed-version `Mode::Distributed`
 /// cluster and stays invisible to it: no member counts it as a peer, so
 /// ownership across the previous release's node and this release's is
-/// untouched. The observer sees all three members live, computes their
-/// shares as the members do, and follows a graceful leave: the departed
-/// node counts as left and the survivors split the parts between them.
+/// untouched. The observer sees all three members live, reports each member
+/// a bucket-aligned share of the parts that is neither empty nor the whole
+/// space, with every part owned twice across the shares, and follows a
+/// graceful leave: the departed node counts as left and the survivors split
+/// the parts between them.
 #[tokio::test]
 async fn an_observer_beside_the_previous_release_stays_invisible() {
     const OWNERS: u8 = 2;
     const CLUSTER: &str = "observer-mixed-cluster";
     const WATCH_WAIT: Duration = Duration::from_secs(60);
-    let part_space = (sundog::store::BUCKET_COUNT * sundog::store::PART_COUNT) as u64;
+    let part_count = sundog::store::PART_COUNT as u64;
+    let part_space = sundog::store::BUCKET_COUNT as u64 * part_count;
 
     require_containers!();
 
@@ -1506,26 +1509,51 @@ async fn an_observer_beside_the_previous_release_stays_invisible() {
 
     // The observer shows three live members and nobody else, while every
     // member still counts exactly its two peers: the observer is no peer.
-    eventually_with_logs(WATCH_WAIT, &[&old, &n2, &n3, &observer], || async {
-        observer.members().await.as_deref() == Ok("live=3 departing=0 left=0 down=0 anon=0")
-    })
+    eventually_reporting(
+        "the observer sees three live members",
+        WATCH_WAIT,
+        &[&old, &n2, &n3, &observer],
+        || async {
+            match observer.members().await.as_deref() {
+                Ok("live=3 departing=0 left=0 down=0 anon=0") => Ok(()),
+                other => Err(format!("members reply {other:?}")),
+            }
+        },
+    )
     .await;
     wait_for_peers(&members, 2).await;
 
-    // The observer's shares match the members' ownership: every part is
-    // owned `OWNERS` times, across a previous-release node that ranks whole
-    // buckets and two current nodes that follow it.
+    // Every share is a whole number of buckets, which only holds while the
+    // observer ranks buckets because a protocol-4 member is present, and
+    // lies strictly between none and all of the parts, which only holds
+    // while all three members, the previous release's included, are
+    // eligible. The shares count every part `OWNERS` times.
     let ids = collect_node_ids(&members).await;
-    eventually_with_logs(WATCH_WAIT, &[&old, &n2, &n3, &observer], || async {
-        let mut sum = 0;
-        for &id in &ids {
-            match observer.share("it", OWNERS, id).await {
-                Ok(Some(share)) => sum += share,
-                _ => return false,
+    eventually_reporting(
+        "the shares count every part twice across all three members",
+        WATCH_WAIT,
+        &[&old, &n2, &n3, &observer],
+        || async {
+            let mut sum = 0;
+            let mut seen = Vec::new();
+            for &id in &ids {
+                let reply = observer.share("it", OWNERS, id).await;
+                seen.push(format!("{id}: {reply:?}"));
+                if let Ok(Some(share)) = reply
+                    && share > 0
+                    && share < part_space
+                    && share % part_count == 0
+                {
+                    sum += share;
+                }
             }
-        }
-        sum == part_space * u64::from(OWNERS)
-    })
+            if sum == part_space * u64::from(OWNERS) {
+                Ok(())
+            } else {
+                Err(format!("sum {sum}, shares [{}]", seen.join(", ")))
+            }
+        },
+    )
     .await;
     wait_for_peers(&members, 2).await;
 
@@ -1534,17 +1562,22 @@ async fn an_observer_beside_the_previous_release_stays_invisible() {
     let survivors = [&old, &n3];
     let survivor_ids = [ids[0], ids[2]];
     n2.stop().await.expect("n2 stops");
-    eventually_with_logs(WATCH_WAIT, &[&old, &n3, &observer], || async {
-        if observer.members().await.as_deref() != Ok("live=2 departing=0 left=1 down=0 anon=0") {
-            return false;
-        }
-        for id in survivor_ids {
-            if observer.share("it", OWNERS, id).await != Ok(Some(part_space)) {
-                return false;
+    eventually_reporting(
+        "the leave reaches the observer",
+        WATCH_WAIT,
+        &[&old, &n3, &observer],
+        || async {
+            let reply = observer.members().await;
+            let mut seen = vec![format!("members {reply:?}")];
+            let mut ok = reply.as_deref() == Ok("live=2 departing=0 left=1 down=0 anon=0");
+            for id in survivor_ids {
+                let share = observer.share("it", OWNERS, id).await;
+                ok &= share == Ok(Some(part_space));
+                seen.push(format!("{id}: {share:?}"));
             }
-        }
-        true
-    })
+            if ok { Ok(()) } else { Err(seen.join(", ")) }
+        },
+    )
     .await;
     wait_for_peers(&survivors, 1).await;
 

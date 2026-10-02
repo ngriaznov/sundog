@@ -217,6 +217,23 @@ fn log_dir() -> PathBuf {
     )
 }
 
+/// The cluster name a test node gossips under: `cluster_name` plus a
+/// suffix unique to this test process. Every container also joins Docker's
+/// default `bridge` network, whose address space the whole daemon shares,
+/// so a same-named cluster left running by an earlier or concurrent run
+/// would otherwise reach this one through reused bridge addresses and merge
+/// with it. Logs stay under the unsuffixed `cluster_name`.
+fn gossip_cluster_name(cluster_name: &str) -> String {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let run_id = RUN_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        format!("{:x}{nanos:x}", std::process::id())
+    });
+    format!("{cluster_name}-{run_id}")
+}
+
 /// Follows `guard`'s output into `<log_dir>/<cluster_name>/<alias>-<n>.log`,
 /// `n` counting nodes this process has started, so a restarted alias gets
 /// a fresh file. Best effort: a node whose output cannot be followed still
@@ -499,7 +516,7 @@ impl Node {
                 "/sundog-testnode",
             )
             .with_env("SUNDOG_SEEDS", &seeds.join(","))
-            .with_command(&["/sundog-testnode", cluster_name]);
+            .with_command(&["/sundog-testnode", &gossip_cluster_name(cluster_name)]);
         for &(host_path, guest_path) in mounts {
             container = container
                 .with_copy_file_to_container(MountableFile::for_host_path(host_path), guest_path);
@@ -1024,69 +1041,102 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    const TAIL_LINES: usize = 1500;
-
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if cond().await {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            for (index, node) in nodes.iter().enumerate() {
-                let logs = node.logs().await;
-                let mut chitchat_lines = 0usize;
-                let kept: Vec<&str> = logs
-                    .lines()
-                    .filter(|line| {
-                        let is_chitchat =
-                            CHITCHAT_MARKERS.iter().any(|marker| line.contains(*marker));
-                        if is_chitchat {
-                            chitchat_lines += 1;
-                        }
-                        !is_chitchat
-                    })
-                    .collect();
-                let tail: Vec<&str> = kept.iter().rev().take(TAIL_LINES).copied().collect();
-                eprintln!(
-                    "----- node[{index}] {} (last {} lines) -----",
-                    node.name(),
-                    tail.len()
-                );
-                if chitchat_lines > 0 {
-                    eprintln!(
-                        "  ({chitchat_lines} cross-cluster gossip chitchat line(s) filtered out \
-                         of this node's log, likely from a previous test's still-running \
-                         containers)"
-                    );
-                }
-                for line in tail.into_iter().rev() {
-                    eprintln!("{line}");
-                }
-                eprintln!("----- node[{index}] {} metrics -----", node.name());
-                match node.metrics().await {
-                    Ok(body) => {
-                        for line in body.lines() {
-                            if line.starts_with("# HELP") || line.starts_with("# TYPE") {
-                                continue;
-                            }
-                            let metric_name = line
-                                .split(|c: char| c == '{' || c.is_whitespace())
-                                .next()
-                                .unwrap_or("");
-                            if !metric_name.starts_with("sundog_")
-                                || metric_name.ends_with("_bucket")
-                            {
-                                continue;
-                            }
-                            eprintln!("{line}");
-                        }
-                    }
-                    Err(error) => eprintln!("{error}"),
-                }
-            }
+            dump_node_state(nodes).await;
             panic!("condition not met within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// [`eventually_with_logs`] for a wait that can say why it has not held
+/// yet: `cond` returns `Ok(())` once the wait is over and `Err(seen)`
+/// describing what it saw otherwise. On a timeout the panic names `label`
+/// and carries the last `seen`, after the same log and metrics dump.
+/// # Panics
+///
+/// Panics if `cond` has not returned `Ok` by `timeout`.
+pub async fn eventually_reporting<F, Fut>(
+    label: &str,
+    timeout: Duration,
+    nodes: &[&Node],
+    mut cond: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let Err(seen) = cond().await else {
+            return;
+        };
+        if tokio::time::Instant::now() >= deadline {
+            dump_node_state(nodes).await;
+            panic!("{label}: condition not met within {timeout:?}; last seen: {seen}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Prints each of `nodes`' captured log tail and `sundog_` metrics to
+/// stderr, for the timeout paths of [`eventually_with_logs`] and
+/// [`eventually_reporting`].
+async fn dump_node_state(nodes: &[&Node]) {
+    const TAIL_LINES: usize = 1500;
+
+    for (index, node) in nodes.iter().enumerate() {
+        let logs = node.logs().await;
+        let mut chitchat_lines = 0usize;
+        let kept: Vec<&str> = logs
+            .lines()
+            .filter(|line| {
+                let is_chitchat = CHITCHAT_MARKERS.iter().any(|marker| line.contains(*marker));
+                if is_chitchat {
+                    chitchat_lines += 1;
+                }
+                !is_chitchat
+            })
+            .collect();
+        let tail: Vec<&str> = kept.iter().rev().take(TAIL_LINES).copied().collect();
+        eprintln!(
+            "----- node[{index}] {} (last {} lines) -----",
+            node.name(),
+            tail.len()
+        );
+        if chitchat_lines > 0 {
+            eprintln!(
+                "  ({chitchat_lines} cross-cluster gossip chitchat line(s) filtered out \
+                 of this node's log, likely from a previous test's still-running \
+                 containers)"
+            );
+        }
+        for line in tail.into_iter().rev() {
+            eprintln!("{line}");
+        }
+        eprintln!("----- node[{index}] {} metrics -----", node.name());
+        match node.metrics().await {
+            Ok(body) => {
+                for line in body.lines() {
+                    if line.starts_with("# HELP") || line.starts_with("# TYPE") {
+                        continue;
+                    }
+                    let metric_name = line
+                        .split(|c: char| c == '{' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("");
+                    if !metric_name.starts_with("sundog_") || metric_name.ends_with("_bucket") {
+                        continue;
+                    }
+                    eprintln!("{line}");
+                }
+            }
+            Err(error) => eprintln!("{error}"),
+        }
     }
 }
 
