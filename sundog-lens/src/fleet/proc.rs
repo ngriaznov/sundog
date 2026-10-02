@@ -271,9 +271,9 @@ const BUSY_RETRIES: u32 = 100;
 const BUSY_WAIT: Duration = Duration::from_millis(10);
 
 /// Starts `command`, retrying for up to a second while the system refuses to
-/// run the file because a writer still holds it open (`ETXTBSY`): a binary
-/// that is being written, or whose writer another process has inherited
-/// across a `fork` and not yet closed.
+/// run the file because a writer still holds it open (`ETXTBSY`, which Linux
+/// returns and macOS does not): a binary that is being written, or whose
+/// writer another process has inherited across a `fork` and not yet closed.
 fn spawn_when_idle(command: &mut Command) -> io::Result<Child> {
     let mut tries = 0;
     loop {
@@ -586,12 +586,15 @@ mod tests {
         assert_eq!(proc.readiness(), Readiness::Failed);
     }
 
+    // Linux refuses to run a file a writer holds open; macOS runs it at once,
+    // so the start has nothing to wait for there.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_binary_that_a_writer_still_holds_open_starts_once_the_writer_closes_it() {
         use std::os::unix::fs::OpenOptionsExt as _;
         let dir = scratch_dir("busy");
         let node = script(&dir, "node.sh", "echo testnode-ready\nsleep 30");
-        // While a writer holds the file, the system refuses to run it.
+        // While a writer holds the file, Linux refuses to run it.
         let writer = std::fs::OpenOptions::new()
             .write(true)
             .mode(0o755)
