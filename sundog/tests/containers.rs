@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use container_util::{
     CRDT_RETIRE_AFTER_SECS_ENV, DISTRIBUTED_RUST_LOG, Fleet, METRICS_PORT, Node,
-    build_previous_testnode, build_testnode, container_tests_enabled, eventually,
-    eventually_reporting, eventually_with_logs, seed, spawn_trio, wait_for_peers,
+    PREVIOUS_RELEASE_PROTOCOL, build_previous_testnode, build_testnode, container_tests_enabled,
+    eventually, eventually_reporting, eventually_with_logs, seed, spawn_trio, wait_for_peers,
 };
 use futures::stream::{self, StreamExt as _};
 use rand::rngs::StdRng;
@@ -1481,8 +1481,9 @@ async fn the_previous_release_and_this_one_interoperate_in_both_roles() {
 /// cluster and stays invisible to it: no member counts it as a peer, so
 /// ownership across the previous release's node and this release's is
 /// untouched. The observer sees all three members live, reports each member
-/// a bucket-aligned share of the parts that is neither empty nor the whole
-/// space, with every part owned twice across the shares, and follows a
+/// a share of the parts that is neither empty nor the whole space (a whole
+/// number of buckets while the previous release predates part ownership),
+/// with every part owned twice across the shares, and follows a
 /// graceful leave: the departed node counts as left and the survivors split
 /// the parts between them.
 #[tokio::test]
@@ -1523,11 +1524,17 @@ async fn an_observer_beside_the_previous_release_stays_invisible() {
     .await;
     wait_for_peers(&members, 2).await;
 
-    // Every share is a whole number of buckets, which only holds while the
-    // observer ranks buckets because a protocol-4 member is present, and
-    // lies strictly between none and all of the parts, which only holds
-    // while all three members, the previous release's included, are
-    // eligible. The shares count every part `OWNERS` times.
+    // Every share lies strictly between none and all of the parts, which
+    // only holds while all three members, the previous release's included,
+    // are eligible, and the shares count every part `OWNERS` times. While
+    // the previous release predates part ownership the observer ranks whole
+    // buckets, so each share is also a whole number of buckets; once every
+    // member supports part ownership it ranks single parts and the shares
+    // need not fall on bucket boundaries.
+    let bucket_ranked = !sundog::wire::peer_supports(
+        PREVIOUS_RELEASE_PROTOCOL,
+        sundog::wire::PROTOCOL_PART_OWNERSHIP,
+    );
     let ids = collect_node_ids(&members).await;
     eventually_reporting(
         "the shares count every part twice across all three members",
@@ -1542,7 +1549,7 @@ async fn an_observer_beside_the_previous_release_stays_invisible() {
                 if let Ok(Some(share)) = reply
                     && share > 0
                     && share < part_space
-                    && share % part_count == 0
+                    && (!bucket_ranked || share % part_count == 0)
                 {
                     sum += share;
                 }
