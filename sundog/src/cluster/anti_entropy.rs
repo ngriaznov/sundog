@@ -157,7 +157,8 @@ pub enum RoundOutcome {
     Reconciled,
     /// The peer's ownership view differs from this node's: no repair ran.
     Stale,
-    /// The digest exchange itself failed: no repair ran.
+    /// The digest exchange failed, so no repair ran, or a repair request
+    /// after it failed, so the repairs are incomplete.
     Failed,
 }
 
@@ -240,8 +241,23 @@ pub async fn run_round_against(
         return RoundOutcome::Reconciled;
     }
 
-    let _ = reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, merging).await;
-    RoundOutcome::Reconciled
+    let repairs =
+        reconcile_mismatches(mesh, shard, cache, peer, mismatched, in_scope, merging).await;
+    if repairs.complete {
+        RoundOutcome::Reconciled
+    } else {
+        RoundOutcome::Failed
+    }
+}
+
+/// What one round's repairs did: the wire bytes they moved, and whether
+/// every request they issued to the peer was answered. A request that
+/// fails, an unknown peer after a failure-detector flap among the causes,
+/// leaves some mismatch unrepaired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Repairs {
+    bytes_moved: u64,
+    complete: bool,
 }
 
 /// Sends `scoped`'s digests to `peer` in the exchange its scope calls for:
@@ -273,7 +289,8 @@ async fn scoped_exchange(
 /// [`run_round_for_buckets`]: classifies one round's `mismatched` reply
 /// into a [`RepairPlan`], issues the `Msg::AeEntries` fallback for a
 /// sketch that failed to decode, then runs [`apply_repairs`]. Returns the
-/// total wire bytes moved.
+/// total wire bytes moved, and whether every request to `peer` was
+/// answered.
 ///
 /// Buckets past `ae_part_min_bucket` answered with part digests never
 /// load their full entries here; only listing/sketch buckets go through
@@ -287,7 +304,7 @@ async fn reconcile_mismatches(
     mismatched: Vec<AeMismatch>,
     in_scope: Option<HashMap<u16, PartMask>>,
     merging: bool,
-) -> u64 {
+) -> Repairs {
     let (part_digest_mismatches, bucket_mismatches): (Vec<AeMismatch>, Vec<AeMismatch>) =
         mismatched
             .into_iter()
@@ -298,7 +315,7 @@ async fn reconcile_mismatches(
         ..RepairPlan::default()
     };
     classify_bucket_mismatches(shard, cache, bucket_mismatches, &mut plan, merging).await;
-    classify_part_digest_mismatches(
+    let mut complete = classify_part_digest_mismatches(
         mesh,
         shard,
         cache,
@@ -343,13 +360,14 @@ async fn reconcile_mismatches(
             }
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy sketch-fallback listing failed");
+                complete = false;
             }
         }
     }
 
     retain_owned_pulls(shard, &mut plan.pull_keys, &mut plan.pull_hashes);
     retain_peer_owned_pushes(shard, peer, &mut plan.push_keys);
-    apply_repairs(
+    let repairs = apply_repairs(
         mesh,
         shard,
         cache,
@@ -359,7 +377,11 @@ async fn reconcile_mismatches(
         plan.pull_hashes,
         merging,
     )
-    .await
+    .await;
+    Repairs {
+        bytes_moved: repairs.bytes_moved,
+        complete: complete && repairs.complete,
+    }
 }
 
 /// How one [`run_round_for_parts`] round ended, per part: which matched,
@@ -384,7 +406,8 @@ pub(crate) struct PartRoundOutcome {
     /// mismatched or the round failed.
     pub(crate) bytes_moved: u64,
     /// The digest exchange errored, the shard has no ownership view, or
-    /// the peer answered `Stale`: no repair ran.
+    /// the peer answered `Stale`, so no repair ran; or a repair request
+    /// after the exchange failed, so the repairs are incomplete.
     pub(crate) failed: bool,
 }
 
@@ -477,7 +500,7 @@ pub(crate) async fn run_round_for_parts(
         };
     }
     let in_scope = covered.into_iter().collect();
-    let bytes_moved = reconcile_mismatches(
+    let repairs = reconcile_mismatches(
         mesh,
         shard,
         cache,
@@ -490,8 +513,8 @@ pub(crate) async fn run_round_for_parts(
     PartRoundOutcome {
         matched,
         still_diverged,
-        bytes_moved,
-        failed: false,
+        bytes_moved: repairs.bytes_moved,
+        failed: !repairs.complete,
     }
 }
 
@@ -652,7 +675,8 @@ fn key_versions_to_tuples(entries: Vec<crate::store::KeyVersion>) -> Vec<(Bytes,
 ///
 /// Stops at the first chunk whose [`Mesh::ae_parts`] call fails, so a
 /// peer that stalls mid-round costs at most one `REQUEST_TIMEOUT`, not
-/// one per remaining chunk.
+/// one per remaining chunk. Returns `false` when a call failed, leaving
+/// the rest of the mismatches unclassified.
 ///
 /// [`Mesh::ae_parts`]: crate::net::Mesh::ae_parts
 async fn classify_part_digest_mismatches(
@@ -663,15 +687,16 @@ async fn classify_part_digest_mismatches(
     mismatches: Vec<AeMismatch>,
     plan: &mut RepairPlan,
     merging: bool,
-) {
+) -> bool {
     for chunk in chunk_mismatches(mismatches, CLASSIFY_BUCKET_CHUNK) {
         let ok =
             classify_part_digest_mismatch_chunk(mesh, shard, cache, peer, chunk, plan, merging)
                 .await;
         if !ok {
-            break;
+            return false;
         }
     }
+    true
 }
 
 /// One [`classify_part_digest_mismatches`] chunk: compares each bucket's
@@ -818,7 +843,8 @@ fn wire_record_len(cache_len: usize, record: &WireRecord) -> u64 {
 
 /// Applies a round's classified push/pull/hash-pull sets against `peer`, in
 /// [`REPAIR_BATCH`] chunks, emits `sundog_ae_repaired_total{cache}`, and
-/// returns the total wire bytes moved (pushed plus pulled).
+/// returns the total wire bytes moved (pushed plus pulled) and whether
+/// every pull was answered and every push reached `peer`'s outbox.
 ///
 /// Without `merging`, pushes go out first: the two sets are disjoint. With
 /// `merging`, a key both sides hold sits in both sets, so pulls run first
@@ -838,14 +864,16 @@ async fn apply_repairs(
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
     merging: bool,
-) -> u64 {
+) -> Repairs {
     let mut tally = RepairTally::default();
-    if merging {
-        let pulled =
+    let complete = if merging {
+        let (pulled, pulled_all) =
             pull_repairs(mesh, shard, cache, peer, pull_keys, pull_hashes, &mut tally).await;
-        push_repairs(mesh, shard, cache, peer, &push_keys, &pulled, &mut tally).await;
+        let pushed_all =
+            push_repairs(mesh, shard, cache, peer, &push_keys, &pulled, &mut tally).await;
+        pulled_all && pushed_all
     } else {
-        push_repairs(
+        let pushed_all = push_repairs(
             mesh,
             shard,
             cache,
@@ -855,8 +883,10 @@ async fn apply_repairs(
             &mut tally,
         )
         .await;
-        pull_repairs(mesh, shard, cache, peer, pull_keys, pull_hashes, &mut tally).await;
-    }
+        let (_, pulled_all) =
+            pull_repairs(mesh, shard, cache, peer, pull_keys, pull_hashes, &mut tally).await;
+        pushed_all && pulled_all
+    };
 
     if tally.repaired > 0 {
         metrics::counter!("sundog_ae_repaired_total", "cache" => cache.to_string())
@@ -867,7 +897,10 @@ async fn apply_repairs(
         bytes_moved = tally.bytes_moved,
         "anti-entropy round complete"
     );
-    tally.bytes_moved
+    Repairs {
+        bytes_moved: tally.bytes_moved,
+        complete,
+    }
 }
 
 /// Records and wire bytes one round's repairs moved, both directions.
@@ -895,7 +928,9 @@ fn push_needed(local: Hlc, pulled: Option<Hlc>) -> bool {
 }
 
 /// Pushes `push_keys`' current records to `peer`, skipping any whose stored
-/// version `pulled` shows the peer already holds.
+/// version `pulled` shows the peer already holds. Answers whether every
+/// batch reached `peer`'s outbox: a peer a flap dropped from the mesh
+/// receives none of it.
 async fn push_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -904,7 +939,8 @@ async fn push_repairs(
     push_keys: &[Bytes],
     pulled: &HashMap<Bytes, Hlc>,
     tally: &mut RepairTally,
-) {
+) -> bool {
+    let mut enqueued = true;
     // Batched so a large divergence makes durable incremental progress:
     // each landed batch shrinks the next round's diff, instead of one
     // all-or-nothing exchange racing a request timeout.
@@ -915,13 +951,15 @@ async fn push_repairs(
         // `net::batch_replicate` chunks this into a handful of full frames, not
         // one `Msg::Replicate` per record.
         let msgs = crate::net::batch_replicate(cache, records);
-        mesh.send_many(peer, MsgClass::Replicate, msgs);
+        enqueued &= mesh.send_many_enqueued(peer, MsgClass::Replicate, msgs);
     }
+    enqueued
 }
 
 /// Pulls `pull_keys` and then `pull_hashes` from `peer` and applies them.
 /// A failed request ends its own list, keeping what earlier batches
-/// landed. Returns the version of every record the peer sent, by key.
+/// landed. Returns the version of every record the peer sent, by key, and
+/// whether every request was answered.
 async fn pull_repairs(
     mesh: &crate::net::Mesh,
     shard: &Arc<dyn ShardOps>,
@@ -930,8 +968,9 @@ async fn pull_repairs(
     pull_keys: Vec<Bytes>,
     pull_hashes: Vec<(u16, Vec<u64>)>,
     tally: &mut RepairTally,
-) -> HashMap<Bytes, Hlc> {
+) -> (HashMap<Bytes, Hlc>, bool) {
     let mut pulled = HashMap::new();
+    let mut complete = true;
     let mut land = async |records: Vec<WireRecord>, pulled: &mut HashMap<Bytes, Hlc>| {
         tally.add(cache, &records);
         pulled.extend(records.iter().map(|rec| (rec.key.clone(), rec.ver)));
@@ -942,6 +981,7 @@ async fn pull_repairs(
             Ok(records) => land(records, &mut pulled).await,
             Err(error) => {
                 tracing::debug!(%error, "anti-entropy pull failed; keeping progress");
+                complete = false;
                 break;
             }
         }
@@ -955,12 +995,12 @@ async fn pull_repairs(
                 Ok(records) => land(records, &mut pulled).await,
                 Err(error) => {
                     tracing::debug!(%error, "anti-entropy hash pull failed; keeping progress");
-                    return pulled;
+                    return (pulled, false);
                 }
             }
         }
     }
-    pulled
+    (pulled, complete)
 }
 
 /// Classifies one `AeMismatch::Sketch(bucket, cells)` reply through
@@ -1325,7 +1365,7 @@ mod tests {
             .apply_remote_batch(vec![a_adopted.clone(), a_minted.clone()])
             .await;
 
-        let bytes_moved = apply_repairs(
+        let repairs = apply_repairs(
             cluster_b.mesh(),
             &shard_b,
             &name,
@@ -1336,6 +1376,7 @@ mod tests {
             true,
         )
         .await;
+        assert!(repairs.complete, "a reachable peer answers every pull");
 
         let stored = shard_b.records_for(vec![adopted_key, minted_key]).await;
         let (adopted, minted) = (&stored[0], &stored[1]);
@@ -1350,7 +1391,7 @@ mod tests {
         let pulled =
             wire_record_len(name.len(), &a_adopted) + wire_record_len(name.len(), &a_minted);
         assert_eq!(
-            bytes_moved,
+            repairs.bytes_moved,
             pulled + wire_record_len(name.len(), minted),
             "both keys are pulled and only the minted one is pushed back"
         );
@@ -1416,7 +1457,7 @@ mod tests {
         let expected =
             wire_record_len(name.len(), &push_rec) + wire_record_len(name.len(), &pull_rec);
 
-        let bytes_moved = apply_repairs(
+        let repairs = apply_repairs(
             cluster_b.mesh(),
             &shard_b,
             &name,
@@ -1427,6 +1468,8 @@ mod tests {
             false,
         )
         .await;
+        assert!(repairs.complete, "a reachable peer answers every pull");
+        let bytes_moved = repairs.bytes_moved;
 
         assert_eq!(
             bytes_moved, expected,
@@ -1641,6 +1684,83 @@ mod tests {
         }
     }
 
+    /// A pull, by key or by hash, that the peer never answers leaves the
+    /// round's repairs incomplete, and so does a push to a peer missing
+    /// from the mesh, whose records never leave this node.
+    #[tokio::test]
+    #[cfg(not(feature = "sim"))]
+    async fn apply_repairs_reports_incomplete_when_a_peer_is_out_of_reach() {
+        use super::super::test_support::{loopback_config, registered_shard};
+        use crate::store::Mode;
+
+        let name = SmolStr::new("users");
+        let cluster = Cluster::builder("cluster-it-apply-repairs-unanswered")
+            .seeds(std::iter::empty())
+            .config(loopback_config())
+            .build()
+            .await
+            .expect("cluster builds alone");
+        cluster
+            .cache::<u32, String>(name.clone())
+            .mode(Mode::Replicated)
+            .open()
+            .await
+            .expect("opens alone");
+        let shard = registered_shard(&cluster, &name);
+        let (key, rec) = encode_test_record(1, "held", cluster.node_id());
+        shard.apply_remote(rec).await;
+        // A node id gossip never named: every request to it fails at once,
+        // as one to a peer a failure-detector flap just dropped does.
+        let gone = NodeId::from(u64::MAX);
+
+        let by_key = apply_repairs(
+            cluster.mesh(),
+            &shard,
+            &name,
+            gone,
+            Vec::new(),
+            vec![key.clone()],
+            Vec::new(),
+            false,
+        )
+        .await;
+        assert!(!by_key.complete, "an unanswered pull by key is incomplete");
+
+        let by_hash = apply_repairs(
+            cluster.mesh(),
+            &shard,
+            &name,
+            gone,
+            Vec::new(),
+            Vec::new(),
+            vec![(0, vec![1])],
+            true,
+        )
+        .await;
+        assert!(
+            !by_hash.complete,
+            "an unanswered pull by hash is incomplete"
+        );
+
+        let push_only = apply_repairs(
+            cluster.mesh(),
+            &shard,
+            &name,
+            gone,
+            vec![key],
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .await;
+        assert!(
+            !push_only.complete,
+            "a push to a peer missing from the mesh is incomplete"
+        );
+
+        cluster.shutdown().await;
+    }
+
     /// Pins that a failed `ae_parts` call on the first of two chunks
     /// stops the loop: the second chunk's `part_digests` lookup, a
     /// faithful proxy for "visited", must never happen.
@@ -1680,7 +1800,7 @@ mod tests {
 
         let unreachable_peer = NodeId::from(u64::MAX);
         let mut plan = RepairPlan::default();
-        classify_part_digest_mismatches(
+        let complete = classify_part_digest_mismatches(
             cluster.mesh(),
             &shard,
             &name,
@@ -1690,6 +1810,10 @@ mod tests {
             false,
         )
         .await;
+        assert!(
+            !complete,
+            "a failed ae_parts call leaves the classification incomplete"
+        );
 
         assert_eq!(
             part_digests_calls.load(Ordering::SeqCst),

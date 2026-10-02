@@ -1171,19 +1171,41 @@ impl Mesh {
     ///
     /// Panics if the peer-table lock is poisoned.
     pub fn send_many(&self, peer: NodeId, class: MsgClass, msgs: impl IntoIterator<Item = Msg>) {
+        self.send_many_enqueued(peer, class, msgs);
+    }
+
+    /// [`Mesh::send_many`], answering whether every message reached
+    /// `peer`'s outbox: `false` when `peer` is missing from the peer table,
+    /// which a failure-detector flap causes as well as a departure, or when
+    /// a message failed to encode or met a full outbox. Enqueued is not
+    /// delivered: the outbox can still lose a frame to a broken connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the peer-table lock is poisoned.
+    pub(crate) fn send_many_enqueued(
+        &self,
+        peer: NodeId,
+        class: MsgClass,
+        msgs: impl IntoIterator<Item = Msg>,
+    ) -> bool {
+        let mut encoded = true;
         let frames = msgs.into_iter().filter_map(|msg| match OutFrame::new(msg) {
             Ok(frame) => Some(frame),
             Err(error) => {
                 tracing::warn!(%error, "failed to encode outbound message; dropped");
+                encoded = false;
                 None
             }
         });
-        self.send_frames(peer, class, frames);
+        let enqueued = self.send_frames(peer, class, frames);
+        encoded && enqueued
     }
 
     /// [`Mesh::send_many`], but for already-encoded [`OutFrame`]s, so
     /// broadcast content is encoded once regardless of peer count.
-    /// Otherwise identical to [`Mesh::send_many`].
+    /// Otherwise identical to [`Mesh::send_many`]. Answers whether every
+    /// frame reached `peer`'s outbox, as [`Mesh::send_many_enqueued`] does.
     ///
     /// # Panics
     ///
@@ -1193,16 +1215,17 @@ impl Mesh {
         peer: NodeId,
         class: MsgClass,
         frames: impl IntoIterator<Item = OutFrame>,
-    ) {
+    ) -> bool {
         let table = self
             .inner
             .peers
             .read()
             .expect("invariant: peers lock is never poisoned");
         let Some(handle) = table.get(&peer) else {
-            return;
+            return false;
         };
         let mut enqueued_replicate = false;
+        let mut enqueued_all = true;
         for frame in frames {
             match class {
                 MsgClass::Invalidate => handle.invalidate.push(frame),
@@ -1211,6 +1234,7 @@ impl Mesh {
                     if let Err(mpsc::error::TrySendError::Full(_)) =
                         handle.replicate_tx.try_send(frame)
                     {
+                        enqueued_all = false;
                         handle.dirty.store(true, Ordering::Relaxed);
                         metrics::counter!(
                             "sundog_backlog_dropped_total",
@@ -1226,6 +1250,7 @@ impl Mesh {
                 .last_replicate_enqueued
                 .store(mono_ms() + 1, Ordering::Relaxed);
         }
+        enqueued_all
     }
 
     /// [`Mesh::send_frames`] for records the sender keeps no copy of: a
@@ -3220,6 +3245,38 @@ mod tests {
         assert!(
             mesh.replicate_in_flight(NodeId::from(2), Duration::ZERO),
             "queued frames count regardless of the window"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_many_enqueued_answers_whether_every_message_reached_the_outbox() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback addr");
+        let config = ClusterConfig {
+            outbox_capacity: 2,
+            ..ClusterConfig::default()
+        };
+        let (mesh, _inbound) = Mesh::spawn(addr, NodeId::from(1), 1, &config, empty_handler())
+            .await
+            .expect("bind loopback");
+        let replicate = |key: u8| Msg::Replicate {
+            cache: SmolStr::new("users"),
+            rec: sample_record(key),
+        };
+        assert!(
+            !mesh.send_many_enqueued(NodeId::from(2), MsgClass::Replicate, [replicate(1)]),
+            "a peer missing from the table receives nothing"
+        );
+
+        // A peer nobody listens on: its writer never drains the outbox.
+        let unreachable = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1));
+        mesh.update_peers(vec![peer_at(NodeId::from(2), unreachable)]);
+        assert!(
+            mesh.send_many_enqueued(NodeId::from(2), MsgClass::Replicate, [replicate(1)]),
+            "a known peer's outbox takes the message"
+        );
+        assert!(
+            !mesh.send_many_enqueued(NodeId::from(2), MsgClass::Replicate, (2..=4).map(replicate)),
+            "a message that meets a full outbox is dropped"
         );
     }
 

@@ -742,19 +742,19 @@ pub(crate) fn unpullable_losses(
         .collect()
 }
 
-/// Each live owner of `parts` under `view` other than `self_node`, paired
-/// with the parts among `parts` it owns, so one scoped round per owner
-/// covers all of them.
+/// Each owner of `parts` under `view` other than `self_node`, paired with
+/// the parts among `parts` it owns, so one scoped round per owner covers
+/// all of them. An owner gossip has dropped for the moment is listed too:
+/// [`push_unpullable`] waits for it rather than leaving its parts behind.
 pub(crate) fn push_targets(
     view: &OwnershipView,
     self_node: NodeId,
     parts: &[PartId],
-    live: &HashSet<NodeId>,
-) -> Vec<(NodeId, Vec<PartId>)> {
-    let mut targets: Vec<(NodeId, Vec<PartId>)> = Vec::new();
+) -> PushTargets {
+    let mut targets: PushTargets = Vec::new();
     for &part in parts {
         for &owner in view.owners_of(part) {
-            if owner == self_node || !live.contains(&owner) {
+            if owner == self_node {
                 continue;
             }
             match targets.iter_mut().find(|(node, _)| *node == owner) {
@@ -777,19 +777,33 @@ fn out_of_time(
     give_up.is_some_and(|give_up| now.checked_add(retry).is_none_or(|next| next > give_up))
 }
 
+/// Push targets: each owner with the parts pushed to it.
+type PushTargets = Vec<(NodeId, Vec<PartId>)>;
+
+/// Splits `targets` into those `live` names, which a push round can reach
+/// now, and those gossip has dropped for the moment, which wait for the
+/// next attempt.
+fn split_reachable(targets: PushTargets, live: &HashSet<NodeId>) -> (PushTargets, PushTargets) {
+    targets
+        .into_iter()
+        .partition(|(owner, _)| live.contains(owner))
+}
+
 /// Pushes each target's parts to it through a part-scoped anti-entropy
 /// round, which sends every entry the target lacks or holds at an older
-/// version. A round that fails, or meets a responder whose view has not
-/// caught up with this node's, is retried every `retry` until every
-/// target has answered, `deadline` passes, or `cancel` fires. The
-/// disown-grace hand-off still confirms each part before it is released;
-/// this push brings the data to the new owners when the view changes
-/// rather than when the grace ends.
+/// version. A target missing from gossip, which a failure-detector flap
+/// causes as well as a departure, waits without a round; a round that
+/// fails, or meets a responder whose view has not caught up with this
+/// node's, is retried. Either way the target is tried again every `retry`
+/// until every target has answered, `deadline` passes, or `cancel` fires.
+/// The disown-grace hand-off still confirms each part before it is
+/// released; this push brings the data to the new owners when the view
+/// changes rather than when the grace ends.
 async fn push_unpullable(
     cluster: Cluster,
     shard: Arc<dyn ShardOps>,
     cache: SmolStr,
-    targets: Vec<(NodeId, Vec<PartId>)>,
+    targets: PushTargets,
     retry: Duration,
     deadline: Duration,
     cancel: CancellationToken,
@@ -798,8 +812,9 @@ async fn push_unpullable(
     let give_up = tokio::time::Instant::now().checked_add(deadline);
     let mut targets = targets;
     loop {
-        let mut pending = Vec::with_capacity(targets.len());
-        for (owner, parts) in targets {
+        let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
+        let (reachable, mut pending) = split_reachable(targets, &live);
+        for (owner, parts) in reachable {
             let outcome = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
@@ -1044,8 +1059,7 @@ pub(crate) async fn rebalance_task(
                     residency.mark_releasing(&plan.lost);
                     tracing::debug!(cache = %cache, count = plan.lost.len(), "parts lost; disown grace started");
                 }
-                let live: HashSet<NodeId> = cluster.peers().iter().map(|peer| peer.node).collect();
-                let targets = push_targets(&new_view, cluster.node_id(), &unpullable, &live);
+                let targets = push_targets(&new_view, cluster.node_id(), &unpullable);
                 if !targets.is_empty() {
                     tracing::debug!(cache = %cache, parts = unpullable.len(), owners = targets.len(), "parts lost with no co-owner to hand them over; pushing to their new owners");
                     pushes.spawn(push_unpullable(
@@ -1755,20 +1769,14 @@ mod tests {
     }
 
     #[test]
-    fn push_targets_groups_buckets_by_live_owner_and_skips_self_and_the_dead() {
+    fn push_targets_groups_parts_by_owner_and_skips_only_self() {
         let self_node = NodeId::from(1);
         let eligible: Vec<NodeId> = (1..=4u64).map(NodeId::from).collect();
         let view = view(self_node, eligible.clone(), 2);
         let buckets: Vec<PartId> = PartId::all().take(64).collect();
-        let dead = NodeId::from(4);
-        let live: HashSet<NodeId> = [2u64, 3].map(NodeId::from).into_iter().collect();
-        let targets = push_targets(&view, self_node, &buckets, &live);
+        let targets = push_targets(&view, self_node, &buckets);
         let owners: Vec<NodeId> = targets.iter().map(|(owner, _)| *owner).collect();
         assert!(!owners.contains(&self_node), "self is never a push target");
-        assert!(
-            !owners.contains(&dead),
-            "a dead owner is never a push target"
-        );
         let distinct: HashSet<NodeId> = owners.iter().copied().collect();
         assert_eq!(distinct.len(), owners.len(), "each owner appears once");
         for &bucket in &buckets {
@@ -1778,8 +1786,8 @@ mod tests {
                     .any(|(node, owned)| node == owner && owned.contains(&bucket));
                 assert_eq!(
                     listed,
-                    live.contains(owner),
-                    "bucket {bucket} goes to each live owner other than self"
+                    *owner != self_node,
+                    "bucket {bucket} goes to each owner other than self, live or not"
                 );
             }
         }
@@ -1788,6 +1796,31 @@ mod tests {
                 assert!(view.owners_of(*bucket).contains(owner));
             }
         }
+    }
+
+    #[test]
+    fn split_reachable_holds_back_each_owner_gossip_has_dropped() {
+        let parts = |n: u16| vec![PartId::all().nth(usize::from(n)).expect("in range")];
+        let targets = vec![
+            (NodeId::from(2), parts(0)),
+            (NodeId::from(3), parts(1)),
+            (NodeId::from(4), parts(2)),
+        ];
+        let live: HashSet<NodeId> = [2u64, 4].map(NodeId::from).into_iter().collect();
+        let (reachable, waiting) = split_reachable(targets.clone(), &live);
+        assert_eq!(reachable, vec![targets[0].clone(), targets[2].clone()]);
+        assert_eq!(waiting, vec![targets[1].clone()]);
+
+        let (reachable, waiting) = split_reachable(targets.clone(), &HashSet::new());
+        let empty: PushTargets = Vec::new();
+        assert_eq!(
+            reachable, empty,
+            "with every peer dropped, nothing is reachable"
+        );
+        assert_eq!(
+            waiting, targets,
+            "and every target waits for the next attempt"
+        );
     }
 
     #[test]

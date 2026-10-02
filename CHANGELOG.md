@@ -103,6 +103,24 @@ All notable changes to this project are documented in this file. Format follows
   served even when a round failed or timed out, answering a miss for keys
   the donor held. It now keeps its parts cold and retries, within the
   pull's `state_transfer_budget`. No wire change.
+- **An anti-entropy round reports repairs a flap cut short.** A round
+  whose digest exchange succeeded reported itself reconciled even when a
+  request after it failed: a part listing, a sketch fallback, a pull, or a
+  push to a peer the failure detector had just dropped from the mesh,
+  whose records the mesh then discarded. The bucket hand-off counts a
+  reconciled round as an owner's confirmation and releases its parts on
+  it. A round now reports `Failed` unless every request was answered and
+  every push reached the peer's outbox. A part-scoped round reports
+  `failed` likewise, so the push to a lost part's new owners, the cold
+  donor converge and the leave hand-off retry or hold instead of counting
+  it done. No wire change.
+- **A lost part's new owners get its data even when a flap hides them at
+  the view change.** A node that loses parts nobody else holds pushes them
+  to their new owners when its view changes, and it skipped an owner the
+  failure detector had dropped for the moment, with nothing to push to
+  that owner later but the disown-grace hand-off. The push now lists every
+  new owner and waits for one missing from gossip, within the disown
+  grace. No wire change.
 
 ## [0.6.2] – 2026-09-27
 

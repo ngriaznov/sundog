@@ -4029,23 +4029,31 @@ mod tests {
         cache_b.invalidate_local(&target_key).await;
         assert_eq!(cache_b.get(&target_key).await, None);
 
+        // A round reports `Failed` when a failure-detector flap drops the
+        // peer between its digest exchange and its pull, and `Reconciled`
+        // only once every pull was answered.
         let name = SmolStr::new("users");
         let shard_b = registered_shard(&cluster_b, &name);
-        assert_eq!(
-            crate::cluster::anti_entropy::run_round_against(
-                cluster_b.mesh(),
-                &shard_b,
-                &name,
-                node_a
-            )
-            .await,
-            crate::cluster::anti_entropy::RoundOutcome::Reconciled
-        );
+        wait_until(
+            Duration::from_secs(10),
+            "a round against a reconciles",
+            async || {
+                crate::cluster::anti_entropy::run_round_against(
+                    cluster_b.mesh(),
+                    &shard_b,
+                    &name,
+                    node_a,
+                )
+                .await
+                    == crate::cluster::anti_entropy::RoundOutcome::Reconciled
+            },
+        )
+        .await;
 
         assert_eq!(
             cache_b.get(&target_key).await,
             Some(target_key.to_string()),
-            "the pull-by-hash path repairs the dropped key by the time the round returns"
+            "the pull-by-hash path repairs the dropped key by the time a round reconciles"
         );
 
         cluster_a.shutdown().await;
