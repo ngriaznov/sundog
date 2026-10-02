@@ -376,18 +376,94 @@ pub fn lifeline_cells(line: &Lifeline, window: Duration, width: usize, now: Inst
             None => BLANK,
         };
     }
-    let mut best: Vec<Option<MarkKind>> = vec![None; width];
-    for mark in &line.marks {
-        let Some(age) = now.checked_duration_since(mark.at) else {
+    place_marks(line, window, width, now, &mut cells);
+    cells
+}
+
+/// The columns of the marks of `line` that fall inside the `window`, oldest
+/// mark first, as `(mark index, column)`.
+fn mark_columns(
+    line: &Lifeline,
+    window: Duration,
+    width: usize,
+    now: Instant,
+) -> Vec<(usize, usize)> {
+    line.marks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mark)| {
+            let age = now.checked_duration_since(mark.at)?;
+            if age > window {
+                return None;
+            }
+            let from_left = 1.0 - age.as_secs_f64() / window.as_secs_f64();
+            Some((index, column_of(from_left, width)))
+        })
+        .collect()
+}
+
+/// The index of the mark that opened the run `closing` ends: the mark of
+/// `opening` kind that began the phase of `phase` kind which `closing` ended.
+fn opening_of(
+    line: &Lifeline,
+    closing: &Mark,
+    opening: MarkKind,
+    phase: PhaseKind,
+) -> Option<usize> {
+    let run = line
+        .phases
+        .iter()
+        .find(|p| p.kind == phase && p.until == Some(closing.at))?;
+    line.marks
+        .iter()
+        .position(|mark| mark.kind == opening && mark.at == run.from)
+}
+
+/// The fewest cells a run from an opening mark to its closing mark spans:
+/// the opening mark, one cell of dashes and the closing mark.
+const MIN_RUN: usize = 3;
+
+/// Draws the marks of `line` into `cells`. Each cell shows the mark that wins
+/// by priority. A crash (`⚠` then `✖`) and a leave (`◐` then `○`) always span
+/// at least [`MIN_RUN`] cells: the opening mark moves left of the closing
+/// mark's column when they share one, and dashes in the warn tone join them.
+fn place_marks(line: &Lifeline, window: Duration, width: usize, now: Instant, cells: &mut [Cell]) {
+    let mut columns = mark_columns(line, window, width, now);
+    let mut dashes: Vec<(usize, usize)> = Vec::new();
+    for (closing_index, closing_column) in columns.clone() {
+        let closing = &line.marks[closing_index];
+        let (opening, phase) = match closing.kind {
+            MarkKind::Down => (MarkKind::Suspect, PhaseKind::Suspect),
+            MarkKind::Left => (MarkKind::Leave, PhaseKind::Departing),
+            _ => continue,
+        };
+        let Some(opening_index) = opening_of(line, closing, opening, phase) else {
             continue;
         };
-        if age > window {
+        let Some(entry) = columns
+            .iter_mut()
+            .find(|(index, _)| *index == opening_index)
+        else {
             continue;
+        };
+        entry.1 = entry.1.min(closing_column.saturating_sub(MIN_RUN - 1));
+        dashes.push((entry.1 + 1, closing_column));
+    }
+    let mut best: Vec<Option<MarkKind>> = vec![None; width];
+    for (index, column) in columns {
+        let kind = line.marks[index].kind;
+        if best[column].is_none_or(|held| held.priority() < kind.priority()) {
+            best[column] = Some(kind);
         }
-        let from_left = 1.0 - age.as_secs_f64() / window.as_secs_f64();
-        let column = column_of(from_left, width);
-        if best[column].is_none_or(|held| held.priority() < mark.kind.priority()) {
-            best[column] = Some(mark.kind);
+    }
+    for (from, to) in dashes {
+        for column in from..to {
+            if best[column].is_none() {
+                cells[column] = Cell {
+                    glyph: '┄',
+                    tone: Tone::Warn,
+                };
+            }
         }
     }
     for (cell, mark) in cells.iter_mut().zip(best) {
@@ -398,7 +474,6 @@ pub fn lifeline_cells(line: &Lifeline, window: Duration, width: usize, now: Inst
             };
         }
     }
-    cells
 }
 
 #[expect(
@@ -799,5 +874,105 @@ mod tests {
         assert_eq!(column_of(-3.0, 40), 0);
         assert_eq!(column_of(7.5, 40), 39);
         assert_eq!(column_of(0.9, 1), 0);
+    }
+
+    /// A node that joined `join_ms` ago and goes through `open` at
+    /// `open_ms` ago and `close` at `close_ms` ago.
+    fn run_line(
+        now: Instant,
+        (open, phase): (MarkKind, PhaseKind),
+        close: MarkKind,
+        (open_ms, close_ms): (u64, u64),
+    ) -> Lifeline {
+        let mut line = Lifeline::new();
+        line.mark(MarkKind::Join, ago(now, 39_000));
+        line.begin(PhaseKind::Live, ago(now, 39_000));
+        line.mark(open, ago(now, open_ms));
+        line.begin(phase, ago(now, open_ms));
+        line.mark(close, ago(now, close_ms));
+        line.end(ago(now, close_ms));
+        line
+    }
+
+    #[test]
+    fn a_crash_and_a_leave_span_three_cells_when_their_marks_share_a_column() {
+        let now = Instant::now() + Duration::from_secs(100);
+        // One second a cell: 8.9 s and 8.5 s ago both land in column 31.
+        let crash = run_line(
+            now,
+            (MarkKind::Suspect, PhaseKind::Suspect),
+            MarkKind::Down,
+            (8_900, 8_500),
+        );
+        let cells = lifeline_cells(&crash, WINDOW, 40, now);
+        assert_eq!(cells[31].glyph, '✖');
+        let shown = text(&cells);
+        assert!(shown.contains("⚠┄✖"), "{shown}");
+        assert_eq!(cells[30].tone, Tone::Warn);
+        assert_eq!(cells[29].glyph, '⚠');
+        let leave = run_line(
+            now,
+            (MarkKind::Leave, PhaseKind::Departing),
+            MarkKind::Left,
+            (8_900, 8_500),
+        );
+        let shown = text(&lifeline_cells(&leave, WINDOW, 40, now));
+        assert!(shown.contains("◐┄○"), "{shown}");
+    }
+
+    #[test]
+    fn a_run_that_already_spans_three_cells_is_left_as_it_is() {
+        let now = Instant::now() + Duration::from_secs(100);
+        let crash = run_line(
+            now,
+            (MarkKind::Suspect, PhaseKind::Suspect),
+            MarkKind::Down,
+            (12_500, 5_500),
+        );
+        let cells = lifeline_cells(&crash, WINDOW, 40, now);
+        assert_eq!(cells[27].glyph, '⚠');
+        assert_eq!(cells[34].glyph, '✖');
+        assert!(cells[28..34].iter().all(|c| c.glyph == '┄'));
+    }
+
+    #[test]
+    fn a_crash_with_no_suspect_mark_and_a_mark_between_keep_their_places() {
+        let now = Instant::now() + Duration::from_secs(100);
+        let mut bare = Lifeline::new();
+        bare.mark(MarkKind::Join, ago(now, 39_000));
+        bare.begin(PhaseKind::Live, ago(now, 39_000));
+        bare.mark(MarkKind::Down, ago(now, 8_500));
+        bare.end(ago(now, 8_500));
+        let shown = text(&lifeline_cells(&bare, WINDOW, 40, now));
+        assert_eq!(shown.chars().nth(31), Some('✖'));
+        assert_eq!(shown.chars().nth(30), Some('━'), "{shown}");
+        // A view mark in the cell the dashes cross stays.
+        let mut line = run_line(
+            now,
+            (MarkKind::Suspect, PhaseKind::Suspect),
+            MarkKind::Down,
+            (8_900, 8_500),
+        );
+        line.mark(MarkKind::View, ago(now, 9_500));
+        let shown = text(&lifeline_cells(&line, WINDOW, 40, now));
+        assert_eq!(shown.chars().nth(30), Some('⇄'), "{shown}");
+        assert_eq!(shown.chars().nth(31), Some('✖'), "{shown}");
+    }
+
+    #[test]
+    fn the_earliest_instant_is_the_first_phase_or_the_first_mark() {
+        let now = Instant::now() + Duration::from_secs(100);
+        assert_eq!(Lifeline::new().first_at(), None);
+        let mut phase_first = Lifeline::new();
+        phase_first.begin(PhaseKind::Live, ago(now, 9_000));
+        phase_first.mark(MarkKind::Join, ago(now, 4_000));
+        assert_eq!(phase_first.first_at(), Some(ago(now, 9_000)));
+        let mut mark_first = Lifeline::new();
+        mark_first.mark(MarkKind::Join, ago(now, 9_000));
+        mark_first.begin(PhaseKind::Live, ago(now, 4_000));
+        assert_eq!(mark_first.first_at(), Some(ago(now, 9_000)));
+        let mut mark_only = Lifeline::new();
+        mark_only.mark(MarkKind::View, ago(now, 2_000));
+        assert_eq!(mark_only.first_at(), Some(ago(now, 2_000)));
     }
 }

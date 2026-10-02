@@ -254,10 +254,20 @@ async fn run_ui(
     result
 }
 
-/// Prints `events` as the log lines of a headless run.
-fn print_events(model: &Model, events: &[Event], started: Instant) {
+/// Writes `events` to `out` as the log lines of a headless run.
+///
+/// # Errors
+///
+/// Returns the error of the first failed write, which is a closed pipe when
+/// whoever reads the log has gone.
+fn print_events(
+    model: &Model,
+    events: &[Event],
+    started: Instant,
+    out: &mut impl Write,
+) -> io::Result<()> {
     if events.is_empty() {
-        return;
+        return Ok(());
     }
     let app = App::new(AppConfig::default());
     let ctx = Ctx {
@@ -273,8 +283,9 @@ fn print_events(model: &Model, events: &[Event], started: Instant) {
         kind: LayoutKind::Full,
     };
     for event in events {
-        println!("{}", event_line(&scene, event, started.elapsed()));
+        writeln!(out, "{}", event_line(&scene, event, started.elapsed()))?;
     }
+    Ok(())
 }
 
 /// One event as a log line: the time into the run, then the event row as the
@@ -330,15 +341,21 @@ async fn run_headless(
                     sources_open = false;
                     continue;
                 };
-                fold(&mut model, update, started);
-                while let Some(update) = feed.try_recv() {
-                    fold(&mut model, update, started);
+                let mut out = io::stdout();
+                let mut written = fold(&mut model, update, started, &mut out);
+                while written.is_ok() && let Some(update) = feed.try_recv() {
+                    written = fold(&mut model, update, started, &mut out);
+                }
+                if let Err(error) = written {
+                    break Err(log_failure(&error));
                 }
                 publish_digest(&model, &digest_tx);
             }
             _ = tick.tick() => {
                 let events = model.tick(Instant::now());
-                print_events(&model, &events, started);
+                if let Err(error) = print_events(&model, &events, started, &mut io::stdout()) {
+                    break Err(log_failure(&error));
+                }
                 publish_digest(&model, &digest_tx);
             }
         }
@@ -348,16 +365,28 @@ async fn run_headless(
     if !outcome.timeouts.is_empty() || !outcome.failures.is_empty() {
         bail!("the scenario ended with timeouts or failures");
     }
-    println!(
+    writeln!(
+        io::stdout(),
         "[{:7.1}s] headless run passed",
         started.elapsed().as_secs_f64()
-    );
-    Ok(())
+    )
+    .map_err(|error| log_failure(&error))
 }
 
-fn fold(model: &mut Model, update: Update, started: Instant) {
+/// The error of a headless run whose log cannot be written.
+fn log_failure(error: &io::Error) -> anyhow::Error {
+    anyhow::anyhow!("writing the log: {error}")
+}
+
+/// Folds `update` into `model` and writes the events it raises to `out`.
+fn fold(
+    model: &mut Model,
+    update: Update,
+    started: Instant,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let events = model.apply(update, Instant::now(), SystemTime::now());
-    print_events(model, &events, started);
+    print_events(model, &events, started, out)
 }
 
 #[cfg(test)]
@@ -506,6 +535,79 @@ mod tests {
         assert!(open_marks(Some(&path)).unwrap().is_some());
         assert!(path.exists());
         assert!(open_marks(Some(&dir.join("no/such/dir/marks.txt"))).is_err());
+    }
+
+    /// A writer that fails like a closed pipe once `allow` bytes are written.
+    struct Closing {
+        allow: usize,
+        written: Vec<u8>,
+    }
+
+    impl Write for Closing {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written.len() >= self.allow {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fixture_events(model: &Model) -> Vec<Event> {
+        model.events().iter().take(3).cloned().collect()
+    }
+
+    #[test]
+    fn events_print_one_line_each() {
+        let model = testkit::fixture_model(Instant::now());
+        let events = fixture_events(&model);
+        assert_eq!(events.len(), 3);
+        let mut out = Vec::new();
+        print_events(&model, &events, Instant::now(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 3, "{text}");
+        let mut none = Vec::new();
+        print_events(&model, &[], Instant::now(), &mut none).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_closed_log_is_an_error_instead_of_a_panic() {
+        let model = testkit::fixture_model(Instant::now());
+        let events = fixture_events(&model);
+        let mut closed = Closing {
+            allow: 0,
+            written: Vec::new(),
+        };
+        let error = print_events(&model, &events, Instant::now(), &mut closed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let failure = log_failure(&error);
+        assert!(
+            failure.to_string().starts_with("writing the log: "),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn folding_an_update_prints_its_events_and_reports_a_closed_log() {
+        let (model, now) = testkit::past_discovery(Instant::now());
+        let update = || Update::Snapshot(std::sync::Arc::new(testkit::snapshot(2)), now);
+        let mut joined = model.clone();
+        let mut out = Vec::new();
+        fold(&mut joined, update(), now, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("JOIN"), "{text}");
+        let mut closed = Closing {
+            allow: 0,
+            written: Vec::new(),
+        };
+        let mut other = model;
+        let error = fold(&mut other, update(), now, &mut closed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

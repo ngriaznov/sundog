@@ -211,6 +211,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_the_answering_details_report_a_healthy_exporter() {
+        assert!(is_answering(ANSWERING));
+        assert!(is_answering(ANSWERING_AGAIN));
+        assert!(!is_answering("unreachable"));
+        assert!(!is_answering(""));
+    }
+
     fn state() -> ExporterState {
         ExporterState::new(testkit::node_id(1, 0))
     }

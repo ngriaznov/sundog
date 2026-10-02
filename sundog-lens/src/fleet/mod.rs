@@ -14,6 +14,7 @@
 //! director's [`Stage`], and [`cluster_cmd`] is the `cluster` subcommand.
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroU8;
 use std::path::PathBuf;
@@ -749,8 +750,7 @@ pub async fn cluster_cmd(args: FleetArgs) -> anyhow::Result<()> {
     let outcome = tokio::select! {
         outcome = run_cluster(&stage, &args, &line) => outcome,
         () = crate::watch::termination() => {
-            println!("stopping the nodes");
-            Ok(())
+            writeln!(io::stdout(), "stopping the nodes").map_err(Into::into)
         }
     };
     stage.stop_all().await;
@@ -759,23 +759,25 @@ pub async fn cluster_cmd(args: FleetArgs) -> anyhow::Result<()> {
 }
 
 async fn run_cluster(stage: &FleetStage, args: &FleetArgs, line: &str) -> anyhow::Result<()> {
+    let mut out = io::stdout();
     let started = stage
         .spawn_many(args.nodes, Some(Duration::from_secs(1)))
         .await?;
     for info in &started {
-        println!("{} started at {}", info.label, info.gossip);
+        writeln!(out, "{} started at {}", info.label, info.gossip)?;
     }
-    println!("waiting for the nodes to open their caches");
+    writeln!(out, "waiting for the nodes to open their caches")?;
     stage.wait_ready_all().await?;
     stage.fill(args.keys).await?;
-    println!("filled {} keys", args.keys);
+    writeln!(out, "filled {} keys", args.keys)?;
     stage.set_load(true);
-    println!(
+    writeln!(
+        out,
         "load running at about {} operations a second per node",
         args.rate
-    );
-    println!("{line}");
-    println!("press Ctrl-C to stop the nodes");
+    )?;
+    writeln!(out, "{line}")?;
+    writeln!(out, "press Ctrl-C to stop the nodes")?;
     std::future::pending().await
 }
 

@@ -6,6 +6,7 @@
 //! they never change it. Motion lives here too: the share-bar tweens and the
 //! mosaic flash that follow a view change.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
@@ -21,6 +22,7 @@ use crate::ui::View;
 use crate::ui::anim::{self, Tween};
 use crate::ui::data;
 use crate::ui::look::Look;
+use crate::ui::timeline;
 
 /// How long the mosaic flashes the buckets whose lead moved.
 pub const MOSAIC_FLASH: Duration = Duration::from_millis(1200);
@@ -164,6 +166,7 @@ pub struct App {
     pin_len: usize,
     config: AppConfig,
     motion: Motion,
+    lifeline_window: Cell<Duration>,
 }
 
 /// `lead` indices of `prev` translated into the eligible order of `next`: a
@@ -206,6 +209,7 @@ impl App {
             pin_len: 0,
             config,
             motion: Motion::default(),
+            lifeline_window: Cell::new(Duration::ZERO),
         }
     }
 
@@ -213,6 +217,15 @@ impl App {
     #[must_use]
     pub const fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// The time the Timeline's lifelines cover when the oldest is `span` old.
+    /// The window grows with the history and holds while the view stays
+    /// open; leaving the view resets it.
+    pub fn lifeline_window(&self, span: Duration) -> Duration {
+        let window = timeline::window_for(span, self.lifeline_window.get());
+        self.lifeline_window.set(window);
+        window
     }
 
     /// Records the observer's gossip address, once the feed is up.
@@ -301,6 +314,7 @@ impl App {
         if self.view != view {
             self.prev_view = Some(self.view);
             self.view = view;
+            self.lifeline_window.set(Duration::ZERO);
         }
     }
 
@@ -484,6 +498,7 @@ impl App {
             self.raw = false;
         } else if let Some(previous) = self.prev_view.take() {
             self.view = previous;
+            self.lifeline_window.set(Duration::ZERO);
         } else {
             return Action::None;
         }

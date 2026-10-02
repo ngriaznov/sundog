@@ -710,6 +710,18 @@ mod tests {
     use crate::model::testkit;
     use crate::source::Update;
 
+    #[test]
+    fn a_braille_chart_column_holds_two_samples_and_a_block_column_one() {
+        let braille = crate::ui::look::Look::default();
+        assert!(braille.braille, "the default look draws braille");
+        assert_eq!(samples_per_column(braille), 2);
+        let blocks = crate::ui::look::Look {
+            braille: false,
+            ..braille
+        };
+        assert_eq!(samples_per_column(blocks), 1);
+    }
+
     fn fixture() -> Model {
         testkit::fixture_model(Instant::now())
     }

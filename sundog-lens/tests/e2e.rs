@@ -409,6 +409,101 @@ fn a_sigint_to_a_headless_demo_stops_its_nodes() {
     assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
 }
 
+/// Starts `command` with its stdout piped, reads one line of it, closes the
+/// pipe and waits for the process to exit. Returns the exit code and what it
+/// wrote to stderr.
+fn run_with_a_reader_that_leaves(
+    mut command: Command,
+    cluster: &'static str,
+    wanted_nodes: usize,
+) -> (Option<i32>, String) {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the lens starts");
+    let stdout = child.stdout.take().expect("a stdout pipe");
+    let stderr = child.stderr.take().expect("a stderr pipe");
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut BufReader::new(stderr), &mut text);
+        text
+    });
+    let mut guard = Guard { child, cluster };
+    wait_for_nodes(cluster, wanted_nodes, Duration::from_secs(60));
+    let mut first = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut first)
+        .expect("a first line arrives");
+    assert!(!first.is_empty(), "the lens wrote a line");
+    // The reader is gone: the next write to stdout fails.
+    let (code, took) = wait_within(&mut guard.child, Duration::from_secs(60));
+    assert!(took < Duration::from_secs(60), "{took:?}");
+    let stderr = errors.join().expect("the stderr reader finishes");
+    (code, stderr)
+}
+
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
+#[cfg(target_os = "linux")]
+fn a_headless_demo_whose_reader_leaves_stops_its_nodes_without_a_panic() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-pipe-demo";
+    let dir = scratch(cluster);
+    let scenario = dir.join("scenario.txt");
+    std::fs::write(
+        &scenario,
+        "spawn 3 stagger 1s\nawait members 3 within 30s\npause 120s\nquit\n",
+    )
+    .expect("the scenario is written");
+    let mut command = Command::new(LENS);
+    command
+        .args(["demo", "--headless", "--name", cluster, "--scenario"])
+        .arg(&scenario)
+        .arg("--logs")
+        .arg(dir.join("logs"))
+        .arg("--testnode")
+        .arg(&testnode);
+    let (code, stderr) = run_with_a_reader_that_leaves(command, cluster, 1);
+    assert_ne!(code, Some(101), "no panic:\n{stderr}");
+    assert_eq!(
+        code,
+        Some(1),
+        "a closed log ends the run with an error:\n{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stderr.contains("stopping the nodes"), "{stderr}");
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
+#[test]
+#[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
+#[cfg(target_os = "linux")]
+fn a_cluster_command_whose_reader_leaves_stops_its_nodes_without_a_panic() {
+    let _ports = PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let testnode = require_testnode();
+    let cluster = "lens-e2e-pipe-cluster";
+    let dir = scratch(cluster);
+    let mut command = Command::new(LENS);
+    command
+        .args([
+            "cluster", "--name", cluster, "--nodes", "3", "--keys", "2000",
+        ])
+        .arg("--logs")
+        .arg(dir.join("logs"))
+        .arg("--testnode")
+        .arg(&testnode);
+    let (code, stderr) = run_with_a_reader_that_leaves(command, cluster, 3);
+    assert_ne!(code, Some(101), "no panic:\n{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(testnode_pids(cluster).is_empty(), "every node is stopped");
+}
+
 #[test]
 #[ignore = "starts sundog-testnode processes on 127.0.0.11 and up"]
 #[cfg(target_os = "linux")]

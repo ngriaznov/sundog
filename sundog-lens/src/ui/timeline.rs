@@ -27,16 +27,23 @@ pub const MIN_WINDOW: Duration = Duration::from_secs(30);
 /// The window grows in steps of this length.
 pub const WINDOW_STEP: Duration = Duration::from_secs(15);
 
-/// The time the lifelines cover when the oldest of them is `span` old: the
-/// span rounded up to the next [`WINDOW_STEP`], at least [`MIN_WINDOW`] and
-/// at most [`WINDOW`]. A short history fills the width instead of huddling at
-/// the right.
+/// The time the lifelines cover when the oldest of them is `span` old and
+/// they covered `previous` a frame ago. The window holds while the span fits
+/// in it and never shrinks. A span that outgrows it opens a window one
+/// [`WINDOW_STEP`] longer than the span rounded up to the next step, so the
+/// next steps of growth arrive without the lines jumping; the result is at
+/// least [`MIN_WINDOW`] and at most [`WINDOW`]. A short history fills the
+/// width instead of huddling at the right.
 #[must_use]
-pub fn window_for(span: Duration) -> Duration {
+pub fn window_for(span: Duration, previous: Duration) -> Duration {
+    let held = previous.clamp(MIN_WINDOW, WINDOW);
+    if span <= held {
+        return held;
+    }
     let step = WINDOW_STEP.as_secs();
     let secs = span.as_secs() + u64::from(span.subsec_nanos() > 0);
-    let rounded = Duration::from_secs(secs.div_ceil(step) * step);
-    rounded.clamp(MIN_WINDOW, WINDOW)
+    let grown = Duration::from_secs((secs.div_ceil(step) + 1) * step);
+    grown.clamp(held, WINDOW)
 }
 
 /// A span as the axis writes it: whole minutes as `2m`, otherwise seconds as
@@ -75,7 +82,9 @@ fn window_of(
         .filter_map(crate::model::lifelines::Lifeline::first_at)
         .min();
     oldest.map_or(WINDOW, |oldest| {
-        window_for(now.saturating_duration_since(oldest))
+        scene
+            .app
+            .lifeline_window(now.saturating_duration_since(oldest))
     })
 }
 
@@ -89,8 +98,9 @@ const FILTERS: [Filter; 5] = [
 ];
 
 /// The time axis under the lifelines of `window`: its length at the left,
-/// half of it in the middle (when that is a whole multiple of five seconds)
-/// and `now` at the right of a rule `width` cells wide.
+/// half of it in the middle (when the window is a whole multiple of ten
+/// seconds) and `now` at the right of a rule `width` cells wide. A space
+/// separates each label from the rule.
 #[must_use]
 pub fn axis(width: usize, window: Duration) -> String {
     let mut cells: Vec<char> = vec!['─'; width];
@@ -101,12 +111,12 @@ pub fn axis(width: usize, window: Duration) -> String {
             }
         }
     };
-    put(0, &format!("−{}", span_label(window)));
+    put(0, &format!("−{} ", span_label(window)));
     if width >= 16 && window.as_secs().is_multiple_of(10) {
-        put(width / 2 - 1, &format!("−{}", span_label(window / 2)));
+        put(width / 2 - 2, &format!(" −{} ", span_label(window / 2)));
     }
     if width >= 8 {
-        put(width - 3, "now");
+        put(width - 4, " now");
     }
     cells.into_iter().collect()
 }
@@ -307,43 +317,66 @@ mod tests {
         let two_min = Duration::from_secs(120);
         let forty = axis(40, two_min);
         assert_eq!(forty.chars().count(), 40);
-        assert!(forty.starts_with("−2m─"), "{forty}");
-        assert!(forty.ends_with("─now"), "{forty}");
+        assert!(forty.starts_with("−2m ─"), "{forty}");
+        assert!(forty.ends_with("─ now"), "{forty}");
         assert_eq!(forty.chars().nth(19), Some('−'));
-        assert_eq!(axis(6, two_min), "−2m───");
+        assert_eq!(axis(6, two_min), "−2m ──");
         assert_eq!(axis(0, two_min), "");
         assert_eq!(axis(10, two_min).chars().count(), 10);
-        assert!(axis(10, two_min).ends_with("now"));
+        assert!(axis(10, two_min).ends_with(" now"));
     }
 
     #[test]
     fn the_axis_is_labeled_from_its_window() {
         let at = |secs: u64| axis(40, Duration::from_secs(secs));
-        assert!(at(30).starts_with("−30s"), "{}", at(30));
-        assert!(at(30).contains("−15s"), "{}", at(30));
-        assert!(at(60).starts_with("−1m"), "{}", at(60));
-        assert!(at(60).contains("−30s"), "{}", at(60));
-        assert!(at(90).starts_with("−90s"), "{}", at(90));
-        assert!(at(90).contains("−45s"), "{}", at(90));
+        assert!(at(30).starts_with("−30s "), "{}", at(30));
+        assert!(at(30).contains(" −15s "), "{}", at(30));
+        assert!(at(60).starts_with("−1m "), "{}", at(60));
+        assert!(at(60).contains(" −30s "), "{}", at(60));
+        assert!(at(90).starts_with("−90s "), "{}", at(90));
+        assert!(at(90).contains(" −45s "), "{}", at(90));
+        assert!(at(90).ends_with(" now"), "{}", at(90));
         // Half of 75 s is not a round number: the middle stays blank.
         let odd = at(75);
-        assert!(odd.starts_with("−75s"), "{odd}");
-        assert!(odd.ends_with("now"), "{odd}");
+        assert!(odd.starts_with("−75s "), "{odd}");
+        assert!(odd.ends_with(" now"), "{odd}");
         assert_eq!(odd.matches('−').count(), 1, "{odd}");
     }
 
     #[test]
     fn the_window_fits_the_history_between_thirty_seconds_and_two_minutes() {
         let secs = Duration::from_secs;
-        assert_eq!(window_for(Duration::ZERO), secs(30));
-        assert_eq!(window_for(secs(30)), secs(30));
-        assert_eq!(window_for(Duration::from_millis(30_001)), secs(45));
-        assert_eq!(window_for(secs(46)), secs(60));
-        assert_eq!(window_for(secs(75)), secs(75));
-        assert_eq!(window_for(secs(76)), secs(90));
-        assert_eq!(window_for(secs(119)), secs(120));
-        assert_eq!(window_for(secs(120)), secs(120));
-        assert_eq!(window_for(secs(900)), secs(120));
+        let first = |span| window_for(span, Duration::ZERO);
+        assert_eq!(first(Duration::ZERO), secs(30));
+        assert_eq!(first(secs(30)), secs(30));
+        assert_eq!(first(Duration::from_millis(30_001)), secs(60));
+        assert_eq!(first(secs(31)), secs(60));
+        assert_eq!(first(secs(46)), secs(75));
+        assert_eq!(first(secs(73)), secs(90));
+        assert_eq!(first(secs(75)), secs(90));
+        assert_eq!(first(secs(76)), secs(105));
+        assert_eq!(first(secs(105)), secs(120));
+        assert_eq!(first(secs(119)), secs(120));
+        assert_eq!(first(secs(900)), secs(120));
+    }
+
+    #[test]
+    fn the_window_holds_while_the_history_fits_and_never_shrinks() {
+        let secs = Duration::from_secs;
+        assert_eq!(window_for(secs(78), secs(90)), secs(90));
+        assert_eq!(window_for(secs(90), secs(90)), secs(90));
+        assert_eq!(window_for(secs(91), secs(90)), secs(120));
+        assert_eq!(window_for(secs(10), secs(90)), secs(90));
+        assert_eq!(window_for(secs(10), secs(120)), secs(120));
+        assert_eq!(window_for(secs(500), secs(120)), secs(120));
+    }
+
+    #[test]
+    fn spans_are_written_in_minutes_when_whole_and_in_seconds_otherwise() {
+        let secs = Duration::from_secs;
+        assert_eq!(span_label(secs(120)), "2m");
+        assert_eq!(span_label(secs(75)), "75s");
+        assert_eq!(span_label(secs(60)), "1m");
         assert_eq!(span_title(secs(120)), "2 min");
         assert_eq!(span_title(secs(75)), "75 s");
         assert_eq!(span_title(secs(60)), "1 min");
@@ -360,14 +393,14 @@ mod tests {
     }
 
     #[test]
-    fn a_short_history_fills_the_lifelines_from_the_left() {
+    fn a_short_history_opens_a_window_with_room_to_grow() {
         let base = Instant::now();
         let model = fixture(base);
         let app = App::new(AppConfig::default());
-        // The oldest lifeline is 75 s old: the window is 75 s, so the first
-        // node's line starts at the left edge of the track.
+        // The oldest lifeline is 75 s old: the window opens at 90 s, so the
+        // first node's line starts a sixth of the way along the track.
         let rows = draw_with(&app, &model, base + Duration::from_secs(75), 140, 36);
-        assert!(rows[0].contains("Lifelines · last 75 s"), "{}", rows[0]);
+        assert!(rows[0].contains("Lifelines · last 90 s"), "{}", rows[0]);
         let first = rows
             .iter()
             .find(|row| row.contains("n1"))
@@ -375,14 +408,32 @@ mod tests {
         let label_end = first.find("n1").unwrap() + 2;
         let column = first_glyph_column(first);
         assert!(
-            column <= label_end + 5,
+            column > label_end + 5,
             "the line starts at column {column}, label ends at {label_end}: {first}"
         );
         let axis_row = rows
             .iter()
-            .find(|row| row.contains("−75s"))
+            .find(|row| row.contains("−90s"))
             .expect("the axis names the window");
-        assert!(axis_row.contains("now"), "{axis_row}");
+        assert!(axis_row.contains(" now"), "{axis_row}");
+    }
+
+    #[test]
+    fn the_window_holds_across_frames_until_the_view_is_left() {
+        let base = Instant::now();
+        let model = fixture(base);
+        let mut app = App::new(AppConfig::default());
+        let title = |app: &App, secs: u64| {
+            draw_with(app, &model, base + Duration::from_secs(secs), 140, 36)[0].clone()
+        };
+        // Frames on both sides of the 75 s step all show the 90 s window.
+        assert!(title(&app, 73).contains("last 90 s"));
+        assert!(title(&app, 78).contains("last 90 s"));
+        assert!(title(&app, 79).contains("last 90 s"));
+        assert!(title(&app, 20).contains("last 90 s"), "never shrinks");
+        // Leaving the view lets the window start again.
+        app.apply_director(crate::app::UiCommand::Tab(crate::ui::View::Caches), &model);
+        assert!(title(&app, 20).contains("last 30 s"));
     }
 
     #[test]
