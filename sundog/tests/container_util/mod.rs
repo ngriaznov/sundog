@@ -80,13 +80,13 @@ pub fn build_testnode() -> &'static Path {
 
 /// The release whose test node [`build_previous_testnode`] builds: the one
 /// this checkout must interoperate with across a rolling upgrade.
-pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.1";
+pub const PREVIOUS_RELEASE_TAG: &str = "v0.6.2";
 
 /// The `wire::PROTOCOL_VERSION` that [`PREVIOUS_RELEASE_TAG`] speaks. Tests
 /// that depend on what the previous release supports, such as the ownership
 /// granularity a mixed cluster ranks at, derive it from this value; moving
 /// the tag moves this constant with it.
-pub const PREVIOUS_RELEASE_PROTOCOL: u16 = 4;
+pub const PREVIOUS_RELEASE_PROTOCOL: u16 = 6;
 
 /// Env var a container test passes via [`Node::spawn_with_env`] to override
 /// `ClusterConfig::crdt_retire_after` (`u64` seconds) down from its 24h

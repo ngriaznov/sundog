@@ -1712,13 +1712,13 @@ async fn distributed_rebalance_interoperates_with_a_previous_release_donor_and_a
     distributed_rebalance_interoperates_between_releases(false).await;
 }
 
-/// The last step of a rolling upgrade: while a previous-release node is an
-/// eligible owner, every current node ranks whole buckets; once it leaves,
-/// the survivors rank parts instead and most parts change owners at once.
-/// Every key still ends on exactly `OWNERS` of the survivors, fetchable
-/// from each of them.
+/// The last step of a rolling upgrade: once the previous-release node leaves,
+/// the survivors rank single parts and every key ends on exactly `OWNERS` of
+/// them, fetchable from each. While the previous release predates part
+/// ownership, every current node ranks whole buckets until it leaves, and the
+/// leave moves most parts to new owners at once.
 #[tokio::test]
-async fn distributed_ownership_switches_to_parts_once_the_last_previous_release_node_leaves() {
+async fn distributed_ownership_ranks_parts_once_the_last_previous_release_node_leaves() {
     const OWNERS: u8 = 2;
     const FILL_KEYS: u32 = 1_500;
     const SAMPLE_SIZE: usize = 100;
@@ -1750,24 +1750,30 @@ async fn distributed_ownership_switches_to_parts_once_the_last_previous_release_
         sum_counts(&everyone).await == Some(usize::from(OWNERS) * FILL_KEYS as usize)
     })
     .await;
-    // Ranking whole buckets: each current node owns whole buckets' worth
-    // of parts.
+    // While the previous release ranks whole buckets, each current node owns
+    // whole buckets' worth of parts.
     let survivors = [&n2, &n3, &n4];
-    for node in survivors {
-        let owned = scrape_metric(node, "sundog_owned_parts", ("cache", "it")).await;
-        assert_eq!(
-            owned % part_count,
-            0,
-            "{} owns whole buckets while a previous-release node is eligible",
-            node.name()
-        );
+    let bucket_ranked = !sundog::wire::peer_supports(
+        PREVIOUS_RELEASE_PROTOCOL,
+        sundog::wire::PROTOCOL_PART_OWNERSHIP,
+    );
+    if bucket_ranked {
+        for node in survivors {
+            let owned = scrape_metric(node, "sundog_owned_parts", ("cache", "it")).await;
+            assert_eq!(
+                owned % part_count,
+                0,
+                "{} owns whole buckets while a previous-release node is eligible",
+                node.name()
+            );
+        }
     }
 
     old.stop().await.expect("the previous-release node stops");
     wait_for_peers(&survivors, 2).await;
 
-    // Ranking parts: the survivors' shares no longer fall on bucket
-    // boundaries, and together they still assign every part `OWNERS` times.
+    // Ranking parts: the survivors' shares fall off bucket boundaries, and
+    // together they assign every part `OWNERS` times.
     eventually_with_logs(SWITCH_WAIT, &survivors, || async {
         let mut sum = 0;
         let mut off_bucket_boundary = false;
@@ -1794,7 +1800,7 @@ async fn distributed_ownership_switches_to_parts_once_the_last_previous_release_
     let mismatches = fetch_mismatches(&survivors, &all_entries).await;
     assert!(
         mismatches.is_empty(),
-        "every key stays fetchable through the switch to part ownership: {mismatches:?}"
+        "every key stays fetchable once the survivors rank parts: {mismatches:?}"
     );
 
     n2.stop().await.expect("n2 stops");
