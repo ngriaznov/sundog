@@ -2348,7 +2348,7 @@ mod tests {
             .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
             .await
             .expect("the pooled connection serves the next request");
-        assert!(digests.is_empty());
+        assert!(digests.is_empty(), "{digests:?}");
     }
 
     #[tokio::test]
@@ -2530,7 +2530,7 @@ mod tests {
             .ae_round(NodeId::from(2), SmolStr::new("users"), Vec::new())
             .await
             .expect("first round succeeds and checks its connection into the pool");
-        assert!(first.is_empty());
+        assert!(first.is_empty(), "{first:?}");
 
         served.notified().await;
 
@@ -2541,7 +2541,7 @@ mod tests {
                 "a pooled connection the server already closed must not fail the request: \
                  acquire_conn retries it on a fresh dial",
             );
-        assert!(second.is_empty());
+        assert!(second.is_empty(), "{second:?}");
     }
 
     /// A raw request connection to `addr` that has already sent `hello`, for
@@ -2629,7 +2629,7 @@ mod tests {
                 .all(|msg| matches!(msg, Msg::AeBucket { .. } | Msg::AeSketch { .. })),
             "a protocol-1 peer gets only the shapes it understands: {replies:?}"
         );
-        assert!(!replies.is_empty());
+        assert!(!replies.is_empty(), "{replies:?}");
 
         let hello = wire::encode(&Msg::Hello {
             node: NodeId::from(3),
@@ -3230,7 +3230,8 @@ mod tests {
             NodeId::from(2),
             SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1)),
         )]);
-        assert!(mesh.take_dirty_peers().is_empty());
+        let dirty = mesh.take_dirty_peers();
+        assert!(dirty.is_empty(), "{dirty:?}");
         mesh.mark_dirty(NodeId::from(2));
         assert_eq!(mesh.take_dirty_peers(), vec![NodeId::from(2)]);
         assert!(mesh.take_dirty_peers().is_empty(), "taking clears the mark");
@@ -3904,7 +3905,7 @@ mod tests {
             .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
             .await
             .expect("the pooled connection serves the next request");
-        assert!(digests.is_empty());
+        assert!(digests.is_empty(), "{digests:?}");
     }
 
     #[tokio::test]
@@ -3931,7 +3932,7 @@ mod tests {
             .ae_round(NodeId::from(1), SmolStr::new("users"), Vec::new())
             .await
             .expect("the pooled connection serves the next request");
-        assert!(digests.is_empty());
+        assert!(digests.is_empty(), "{digests:?}");
     }
 
     #[tokio::test]

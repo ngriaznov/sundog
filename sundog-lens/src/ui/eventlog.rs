@@ -1002,7 +1002,8 @@ mod tests {
                 "{second:?} vs {direct:?}"
             );
             assert!(second.chars().count() <= 100);
-            assert!(!crate::ui::panel::row_text(&buf, 2).is_empty());
+            let text = crate::ui::panel::row_text(&buf, 2);
+            assert!(!text.is_empty(), "{text:?}");
         });
     }
 }

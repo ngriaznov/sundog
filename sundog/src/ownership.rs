@@ -1387,7 +1387,8 @@ mod tests {
         let view = OwnershipView::compute(self_node, vec![self_node], k);
         let stranger = NodeId::from(99);
 
-        assert!(shared_owned_parts(&view, stranger).is_empty());
+        let shared = shared_owned_parts(&view, stranger);
+        assert!(shared.is_empty(), "{shared:?}");
     }
 
     #[test]
@@ -1399,7 +1400,7 @@ mod tests {
         for granularity in [Granularity::Bucket, Granularity::Part] {
             let view = OwnershipView::compute_at(self_node, eligible.clone(), k, granularity);
             let shared = shared_owned_parts(&view, peer_node);
-            assert!(!shared.is_empty());
+            assert!(!shared.is_empty(), "{shared:?}");
             for part in PartId::all() {
                 let both = view.owns(part) && view.owners_of(part).contains(&peer_node);
                 assert_eq!(shared.contains(&part), both, "{granularity:?} {part:?}");
@@ -2416,7 +2417,8 @@ mod tests {
     #[test]
     fn residency_set_releasing_parts_and_releasing_in_bucket_read_the_marks_in_bulk() {
         let set = ResidencySet::new();
-        assert!(set.releasing_parts().is_empty());
+        let releasing = set.releasing_parts();
+        assert!(releasing.is_empty(), "{releasing:?}");
         assert!(!set.releasing_in_bucket(7));
         set.mark_releasing(&[PartId::new(7, 3), PartId::new(9, 0)]);
         let mut releasing = set.releasing_parts();

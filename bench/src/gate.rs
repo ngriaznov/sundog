@@ -89,7 +89,8 @@ mod tests {
                 max_errors: Some(0),
             },
         )]);
-        assert!(g.violations(&sample_report()).is_empty());
+        let violations = g.violations(&sample_report());
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]

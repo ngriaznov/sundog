@@ -1295,7 +1295,8 @@ mod tests {
         let groups = group_parts_by_donor_set(&view, self_node, PartId::all().take(3).collect());
 
         assert_eq!(groups.len(), 1);
-        assert!(groups[0].0.is_empty());
+        let first_donors = &groups[0].0;
+        assert!(first_donors.is_empty(), "{first_donors:?}");
     }
 
     #[test]
@@ -2686,7 +2687,7 @@ mod tests {
             cold_round(Some(round(false, &[b])), &mut diverging),
             ColdRound::Matched
         );
-        assert!(diverging.is_empty());
+        assert!(diverging.is_empty(), "{diverging:?}");
     }
 
     #[test]

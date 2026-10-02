@@ -2269,7 +2269,7 @@ mod tests {
             choose_peer(dirty, live, &mut rng).expect("a peer is chosen");
         assert_eq!(peer, NodeId::from(1));
         assert!(was_dirty);
-        assert!(give_back.is_empty());
+        assert!(give_back.is_empty(), "{give_back:?}");
     }
 
     #[test]
@@ -2294,7 +2294,7 @@ mod tests {
             choose_peer(Vec::new(), live, &mut rng).expect("a peer is chosen");
         assert_eq!(peer, NodeId::from(5));
         assert!(!was_dirty);
-        assert!(give_back.is_empty());
+        assert!(give_back.is_empty(), "{give_back:?}");
     }
 
     #[test]
@@ -2410,7 +2410,7 @@ mod tests {
         let (mut push, mut pull) = (Vec::new(), Vec::new());
         diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
         assert_eq!(push, vec![key]);
-        assert!(pull.is_empty());
+        assert!(pull.is_empty(), "{pull:?}");
     }
 
     #[test]
@@ -2429,7 +2429,7 @@ mod tests {
         };
         let (mut push, mut pull) = (Vec::new(), Vec::new());
         diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
-        assert!(push.is_empty());
+        assert!(push.is_empty(), "{push:?}");
         assert_eq!(pull, vec![hash]);
     }
 
@@ -2447,7 +2447,7 @@ mod tests {
         let (mut push, mut pull) = (Vec::new(), Vec::new());
         diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
         assert_eq!(push, vec![key]);
-        assert!(pull.is_empty());
+        assert!(pull.is_empty(), "{pull:?}");
     }
 
     #[test]
@@ -2495,7 +2495,7 @@ mod tests {
             let (mut push, mut pull) = (Vec::new(), Vec::new());
             diff_decoded(&local_entries, &decoded, &mut push, &mut pull, merging);
             assert_eq!(push, vec![key.clone()]);
-            assert!(pull.is_empty());
+            assert!(pull.is_empty(), "{pull:?}");
         }
     }
 
@@ -2517,16 +2517,20 @@ mod tests {
         let mut remote = Iblt::new(240);
         remote.insert(xxh3_64(b"k1"), hlc(5));
         let out = mismatch_of(remote.into_cells(), &[]);
-        assert!(out.push_keys.is_empty());
+        assert!(out.push_keys.is_empty(), "{:?}", out.push_keys);
         assert_eq!(out.pull_hashes, vec![(7, vec![xxh3_64(b"k1")])]);
-        assert!(out.undecodable_buckets.is_empty());
+        assert!(
+            out.undecodable_buckets.is_empty(),
+            "{:?}",
+            out.undecodable_buckets
+        );
     }
 
     #[test]
     fn an_empty_sketch_off_the_wire_falls_back_to_a_full_listing() {
         let out = mismatch_of(Vec::new(), &[(Bytes::from_static(b"k1"), hlc(5))]);
-        assert!(out.push_keys.is_empty());
-        assert!(out.pull_hashes.is_empty());
+        assert!(out.push_keys.is_empty(), "{:?}", out.push_keys);
+        assert!(out.pull_hashes.is_empty(), "{:?}", out.pull_hashes);
         assert_eq!(out.undecodable_buckets, vec![7]);
     }
 
@@ -2537,8 +2541,8 @@ mod tests {
             vec![Cell::default(); 100],
             &[(Bytes::from_static(b"k1"), hlc(5))],
         );
-        assert!(out.push_keys.is_empty());
-        assert!(out.pull_hashes.is_empty());
+        assert!(out.push_keys.is_empty(), "{:?}", out.push_keys);
+        assert!(out.pull_hashes.is_empty(), "{:?}", out.pull_hashes);
         assert_eq!(out.undecodable_buckets, vec![7]);
     }
 
@@ -2601,7 +2605,8 @@ mod tests {
     #[test]
     fn mismatched_parts_is_empty_for_identical_digests() {
         let digests: Vec<u64> = (0..64).collect();
-        assert!(mismatched_parts(&digests, &digests).is_empty());
+        let mismatched = mismatched_parts(&digests, &digests);
+        assert!(mismatched.is_empty(), "{mismatched:?}");
     }
 
     #[test]
@@ -2633,9 +2638,13 @@ mod tests {
         let mut remote = Iblt::new(240);
         remote.insert(xxh3_64(b"k1"), hlc(5));
         let out = part_mismatch_of(remote.into_cells(), &[]);
-        assert!(out.push_keys.is_empty());
+        assert!(out.push_keys.is_empty(), "{:?}", out.push_keys);
         assert_eq!(out.pull_hashes, vec![(7, vec![xxh3_64(b"k1")])]);
-        assert!(out.undecodable_buckets.is_empty());
+        assert!(
+            out.undecodable_buckets.is_empty(),
+            "{:?}",
+            out.undecodable_buckets
+        );
     }
 
     #[test]
@@ -2644,8 +2653,8 @@ mod tests {
             vec![Cell::default(); 100],
             &[(Bytes::from_static(b"k1"), hlc(5))],
         );
-        assert!(out.push_keys.is_empty());
-        assert!(out.pull_hashes.is_empty());
+        assert!(out.push_keys.is_empty(), "{:?}", out.push_keys);
+        assert!(out.pull_hashes.is_empty(), "{:?}", out.pull_hashes);
         assert_eq!(out.undecodable_buckets, vec![7]);
     }
 
@@ -2675,7 +2684,7 @@ mod tests {
         let mut plan = RepairPlan::default();
         settle_bucket_parts(gathered, &mut plan);
         assert_eq!(plan.push_keys, vec![Bytes::from_static(b"p5")]);
-        assert!(plan.pull_keys.is_empty());
+        assert!(plan.pull_keys.is_empty(), "{:?}", plan.pull_keys);
         assert_eq!(plan.pull_hashes, vec![(5, vec![55])]);
         assert_eq!(
             plan.undecodable_buckets,
@@ -2699,7 +2708,7 @@ mod tests {
         };
         let (mut push, mut pull) = (Vec::new(), Vec::new());
         diff_decoded(&local_entries, &decoded, &mut push, &mut pull, false);
-        assert!(push.is_empty());
+        assert!(push.is_empty(), "{push:?}");
         assert_eq!(pull, vec![hash]);
     }
 
@@ -2714,7 +2723,7 @@ mod tests {
         let (mut push, mut pull) = (Vec::new(), Vec::new());
         diff_bucket(&local, &peer, &mut push, &mut pull, false);
         assert_eq!(push, vec![Bytes::from_static(b"k1")]);
-        assert!(pull.is_empty());
+        assert!(pull.is_empty(), "{pull:?}");
     }
 
     #[test]
@@ -2723,7 +2732,7 @@ mod tests {
         let peer = vec![bucket_entry(b"k1", 20)];
         let (mut push, mut pull) = (Vec::new(), Vec::new());
         diff_bucket(&local, &peer, &mut push, &mut pull, false);
-        assert!(push.is_empty());
+        assert!(push.is_empty(), "{push:?}");
         assert_eq!(pull, vec![Bytes::from_static(b"k1")]);
     }
 
@@ -2752,8 +2761,8 @@ mod tests {
         for merging in [false, true] {
             let (mut push, mut pull) = (Vec::new(), Vec::new());
             diff_bucket(&local, &peer, &mut push, &mut pull, merging);
-            assert!(push.is_empty());
-            assert!(pull.is_empty());
+            assert!(push.is_empty(), "{push:?}");
+            assert!(pull.is_empty(), "{pull:?}");
         }
     }
 

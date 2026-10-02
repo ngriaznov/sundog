@@ -304,7 +304,8 @@ mod tests {
         assert_eq!(allocate(10, &[(11, 5), (7, 4), (u16::MAX, 4)]), [5, 4, 1]);
         assert_eq!(allocate(3, &[(11, 5), (7, 4)]), [3, 0]);
         assert_eq!(allocate(0, &[(1, 1)]), [0]);
-        assert!(allocate(9, &[]).is_empty());
+        let slots = allocate(9, &[]);
+        assert!(slots.is_empty(), "{slots:?}");
         let all = allocate(30, &[(8, 2), (8, 2), (u16::MAX, 2)]);
         assert_eq!(all.iter().sum::<u16>(), 30);
     }

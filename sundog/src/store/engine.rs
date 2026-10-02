@@ -6808,13 +6808,15 @@ mod tests {
 
         assert_eq!(engine.release_parts(&whole), 2);
         assert_eq!(engine.debug_totals(), (0, 0));
-        assert!(engine.held_parts().is_empty());
+        let held = engine.held_parts();
+        assert!(held.is_empty(), "{held:?}");
     }
 
     #[test]
     fn held_parts_names_each_part_holding_an_entry_once() {
         let engine = engine_u32_string(u64::MAX, None);
-        assert!(engine.held_parts().is_empty());
+        let held = engine.held_parts();
+        assert!(held.is_empty(), "{held:?}");
         let keys = [1u32, 2, 3, 1];
         for key in keys {
             let _ = put(&engine, key, key_bytes(key), "v".into(), hlc(1, 1), None, 0);
@@ -8388,7 +8390,7 @@ mod tests {
         let record = build_key_only_record(b"a-key");
         let (key_half, value_half) = split_record(&record);
         assert_eq!(key_half, b"a-key");
-        assert!(value_half.is_empty());
+        assert!(value_half.is_empty(), "{value_half:?}");
     }
 
     #[test]

@@ -761,7 +761,7 @@ mod tests {
             three_bounds(retire_after),
         )
         .await;
-        assert!(retired.is_empty());
+        assert!(retired.is_empty(), "{retired:?}");
         assert_eq!(
             compacted, 1,
             "stage two runs once the cache settles: this pass's own change is exactly \

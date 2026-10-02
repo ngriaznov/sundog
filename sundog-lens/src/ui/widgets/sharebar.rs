@@ -335,7 +335,8 @@ mod tests {
         assert_eq!(text(&share_bar(-2.0, None, 3)), "───");
         assert_eq!(text(&share_bar(9.0, None, 3)), "━━━");
         assert_eq!(text(&share_bar(f64::NAN, Some(f64::NAN), 3)), "┊──");
-        assert!(share_bar(0.5, Some(0.5), 0).is_empty());
+        let spans = share_bar(0.5, Some(0.5), 0);
+        assert!(spans.is_empty(), "{spans:?}");
         for width in 0..12 {
             assert_eq!(share_bar(0.37, Some(0.5), width).len(), width);
         }
@@ -364,7 +365,8 @@ mod tests {
         assert_eq!(text, "━━━━━┊────");
         assert_eq!(spans.len(), 3, "fill, marker, empty");
         assert_eq!(spans[0].content, "━━━━━");
-        assert!(bar_spans(0.5, None, 0, theme::NODE_COLORS[0], look).is_empty());
+        let spans = bar_spans(0.5, None, 0, theme::NODE_COLORS[0], look);
+        assert!(spans.is_empty(), "{spans:?}");
         let plain = bar_spans(1.0, None, 4, theme::NODE_COLORS[0], look);
         assert_eq!(plain.len(), 1);
     }

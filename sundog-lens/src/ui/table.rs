@@ -159,7 +159,8 @@ mod tests {
         assert_eq!(visible(&cols(), 19), [0, 1]);
         assert_eq!(visible(&cols(), 12), [0]);
         assert_eq!(visible(&cols(), 0), [0]);
-        assert!(visible(&[], 10).is_empty());
+        let rows = visible(&[], 10);
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]

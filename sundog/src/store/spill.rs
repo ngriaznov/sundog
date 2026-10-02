@@ -4286,7 +4286,7 @@ mod tests {
             let (header, entries) = snapshot_eligibility(&dir, 4096, 3, 1_500, 600_000)
                 .expect("a freshly written snapshot within tombstone_ttl is eligible");
             assert_eq!(header.closed_at_ms, 1_000);
-            assert!(entries.is_empty());
+            assert!(entries.is_empty(), "{entries:?}");
 
             let _ = fs::remove_dir_all(&dir);
         }

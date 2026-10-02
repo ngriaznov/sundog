@@ -165,8 +165,10 @@ mod tests {
             seed_specs_from(Some("host1:4000, host2:4001")),
             vec!["host1:4000", "host2:4001"]
         );
-        assert!(seed_specs_from(None).is_empty());
-        assert!(seed_specs_from(Some("")).is_empty());
+        let from_none = seed_specs_from(None);
+        assert!(from_none.is_empty(), "{from_none:?}");
+        let from_blank = seed_specs_from(Some(""));
+        assert!(from_blank.is_empty(), "{from_blank:?}");
     }
 
     #[tokio::test]

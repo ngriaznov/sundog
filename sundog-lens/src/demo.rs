@@ -428,7 +428,7 @@ mod tests {
         );
         let scrape = feed.scrape.expect("the demo scrapes");
         assert_eq!(scrape.templates.len(), 1);
-        assert!(scrape.pins.is_empty());
+        assert!(scrape.pins.is_empty(), "{:?}", scrape.pins);
         assert_eq!(scrape.interval, SCRAPE_INTERVAL);
     }
 
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn the_tour_loads_and_a_scenario_file_names_its_bad_line() {
         let tour = load_scenario(&ScenarioSource::Tour).unwrap();
-        assert!(!tour.steps.is_empty());
+        assert!(!tour.steps.is_empty(), "{:?}", tour.steps);
 
         let dir = std::env::temp_dir().join(format!("sundog-lens-demo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(text.lines().count(), 3, "{text}");
         let mut none = Vec::new();
         print_events(&model, &[], Instant::now(), &mut none).unwrap();
-        assert!(none.is_empty());
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]

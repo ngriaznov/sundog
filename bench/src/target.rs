@@ -177,7 +177,8 @@ mod tests {
     fn every_kind_round_trips_through_its_name() {
         for kind in Kind::ALL {
             assert_eq!(Kind::parse(kind.name()), Some(kind));
-            assert!(!kind.transport().is_empty());
+            let transport = kind.transport();
+            assert!(!transport.is_empty(), "{transport:?}");
         }
         assert_eq!(Kind::parse("memcached"), None);
     }

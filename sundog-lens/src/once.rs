@@ -747,7 +747,8 @@ mod tests {
             vec!["aaaa".to_owned(), "b".to_owned(), "cc".to_owned()],
         ];
         assert_eq!(table(&rows), ["a     bbb  c", "aaaa  b    cc"]);
-        assert!(table(&[]).is_empty());
+        let rows = table(&[]);
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]
@@ -808,7 +809,8 @@ mod tests {
         assert_eq!(key.len(), 8);
         assert_eq!(key[0], (testkit::node_id(1, 0), 1, MemberStatus::Live));
         assert_eq!(key[7].2, MemberStatus::Left);
-        assert!(membership_key(&Model::new()).is_empty());
+        let key = membership_key(&Model::new());
+        assert!(key.is_empty(), "{key:?}");
     }
 
     #[test]

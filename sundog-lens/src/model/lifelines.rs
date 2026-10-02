@@ -766,7 +766,8 @@ mod tests {
         let now = Instant::now();
         let mut line = Lifeline::new();
         line.begin(PhaseKind::Live, now);
-        assert!(lifeline_cells(&line, WINDOW, 0, now).is_empty());
+        let cells = lifeline_cells(&line, WINDOW, 0, now);
+        assert!(cells.is_empty(), "{cells:?}");
         assert!(
             lifeline_cells(&line, Duration::ZERO, 5, now)
                 .iter()

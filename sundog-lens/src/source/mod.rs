@@ -215,11 +215,11 @@ mod tests {
     fn a_new_config_binds_every_interface_on_a_free_port_with_no_seeds() {
         let config = FeedConfig::new("c");
         assert_eq!(config.cluster, "c");
-        assert!(config.seeds.is_empty());
+        assert!(config.seeds.is_empty(), "{:?}", config.seeds);
         assert_eq!(config.bind, SocketAddr::from(([0, 0, 0, 0], 0)));
         assert_eq!(config.advertise, None);
         assert_eq!(config.scrape, None);
-        assert!(config.hints.is_empty());
+        assert!(config.hints.is_empty(), "{:?}", config.hints);
     }
 
     #[test]

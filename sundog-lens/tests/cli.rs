@@ -34,7 +34,7 @@ fn help_flags_print_the_help() {
 fn a_bad_flag_exits_two_and_names_the_flag() {
     let output = lens(&["lens-demo", "--bogus"]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("--bogus"), "{stderr}");
     assert!(stderr.contains("--help"), "{stderr}");
@@ -56,7 +56,7 @@ fn watch_without_a_terminal_refuses_and_points_at_once() {
     // The test harness pipes stdout, so it is no terminal.
     let output = lens(&["watch", "lens-demo", "--seed", "127.0.0.1:9"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("needs a terminal"), "{stderr}");
     assert!(stderr.contains("--once"), "{stderr}");

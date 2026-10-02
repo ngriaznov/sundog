@@ -2919,7 +2919,7 @@ mod tests {
 
         let (shard_ops_c, distributed_c) = distributed_context_for_test(&c, &name);
         let warm_parts: Vec<PartId> = distributed_c.ownership.current().owned_parts().collect();
-        assert!(!warm_parts.is_empty());
+        assert!(!warm_parts.is_empty(), "{warm_parts:?}");
         distributed_c.residency.mark_cold(&warm_parts);
 
         // Warms up to a first converged round first, so the round below
@@ -4324,7 +4324,8 @@ mod tests {
         cache.close().await;
 
         assert!(tasks.is_closed() && tasks.is_empty());
-        assert!(cluster.health().caches.is_empty());
+        let caches = cluster.health().caches;
+        assert!(caches.is_empty(), "{caches:?}");
         cluster.shutdown().await;
     }
 

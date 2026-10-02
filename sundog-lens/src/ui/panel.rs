@@ -231,7 +231,8 @@ mod tests {
         let gossip = tag_spans(look(), "gossip");
         assert_eq!(computed[1].style.fg, Some(Color::Rgb(0xB7, 0x9C, 0xFF)));
         assert_eq!(gossip[1].style.fg, Some(Color::Rgb(0x7D, 0x77, 0x6B)));
-        assert!(tag_spans(look(), "").is_empty());
+        let spans = tag_spans(look(), "");
+        assert!(spans.is_empty(), "{spans:?}");
     }
 
     #[test]

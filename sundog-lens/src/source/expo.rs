@@ -153,7 +153,8 @@ go_goroutines 7
         );
         assert_eq!(samples[0].label("cache"), Some("it"));
         assert!((samples[0].value - 9880.0).abs() < f64::EPSILON);
-        assert!(samples[2].labels.is_empty());
+        let labels = &samples[2].labels;
+        assert!(labels.is_empty(), "{labels:?}");
         assert!((samples[2].value - 4.0).abs() < f64::EPSILON);
         assert_eq!(samples[3].labels.len(), 2);
         assert_eq!(samples[4].label("outcome"), Some("remote"));
@@ -163,9 +164,12 @@ go_goroutines 7
 
     #[test]
     fn skips_comments_blank_lines_and_other_metrics() {
-        assert!(parse("# HELP sundog_x help\n# TYPE sundog_x gauge\n\n   \n").is_empty());
-        assert!(parse("process_cpu_seconds_total 1\nhttp_requests_total{a=\"b\"} 2\n").is_empty());
-        assert!(parse("  # sundog_commented 1\n").is_empty());
+        let help_only = parse("# HELP sundog_x help\n# TYPE sundog_x gauge\n\n   \n");
+        assert!(help_only.is_empty(), "{help_only:?}");
+        let foreign_only = parse("process_cpu_seconds_total 1\nhttp_requests_total{a=\"b\"} 2\n");
+        assert!(foreign_only.is_empty(), "{foreign_only:?}");
+        let commented = parse("  # sundog_commented 1\n");
+        assert!(commented.is_empty(), "{commented:?}");
     }
 
     #[test]
@@ -232,7 +236,8 @@ go_goroutines 7
     fn accepts_an_empty_label_block_and_a_trailing_comma() {
         let samples = parse("sundog_a{} 1\nsundog_b{x=\"1\",} 2\n");
         assert_eq!(samples.len(), 2);
-        assert!(samples[0].labels.is_empty());
+        let labels = &samples[0].labels;
+        assert!(labels.is_empty(), "{labels:?}");
         assert_eq!(samples[1].label("x"), Some("1"));
     }
 

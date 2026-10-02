@@ -861,7 +861,8 @@ mod tests {
         assert_eq!(ownership_cache(&model, Some("churn")).unwrap(), "it");
         assert_eq!(ownership_cache(&model, None).unwrap(), "it");
         assert!(ownership_cache(&Model::new(), Some("it")).is_none());
-        assert!(cache_rows(&Model::new()).is_empty());
+        let rows = cache_rows(&Model::new());
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]
@@ -903,7 +904,7 @@ mod tests {
         assert_eq!(total, [10.0, 21.0, 36.0]);
         let mut empty = Vec::new();
         add_aligned(&mut empty, &[]);
-        assert!(empty.is_empty());
+        assert!(empty.is_empty(), "{empty:?}");
     }
 
     #[test]
@@ -1005,7 +1006,8 @@ mod tests {
         // A history as long as the chart, or longer, is left alone.
         assert_eq!(stretch(&[1.0, 2.0, 3.0], 3), [1.0, 2.0, 3.0]);
         assert_eq!(stretch(&[1.0, 2.0, 3.0, 4.0], 3), [1.0, 2.0, 3.0, 4.0]);
-        assert!(stretch(&[], 8).is_empty());
+        let stretched = stretch(&[], 8);
+        assert!(stretched.is_empty(), "{stretched:?}");
     }
 
     #[test]

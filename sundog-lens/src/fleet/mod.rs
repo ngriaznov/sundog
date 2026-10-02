@@ -867,8 +867,10 @@ mod tests {
     #[test]
     fn a_fleet_starts_with_no_slots() {
         let fleet = Fleet::new(config("x"));
-        assert!(fleet.infos().is_empty());
-        assert!(fleet.running().is_empty());
+        let infos = fleet.infos();
+        assert!(infos.is_empty(), "{infos:?}");
+        let running = fleet.running();
+        assert!(running.is_empty(), "{running:?}");
         assert_eq!(fleet.phase("n1"), None);
         assert_eq!(fleet.config().cluster, "lens-test");
     }
@@ -978,7 +980,8 @@ mod process_tests {
         assert!(proc::log_path(&fleet.config.logs, 1, 2).exists());
 
         fleet.stop_all().await;
-        assert!(fleet.running().is_empty());
+        let running = fleet.running();
+        assert!(running.is_empty(), "{running:?}");
         assert!(!alive(pid_again));
     }
 
@@ -1013,7 +1016,8 @@ mod process_tests {
         let took = started.elapsed();
         assert!(took >= STOP_GRACE, "{took:?}");
         assert!(took < STOP_GRACE + Duration::from_secs(2), "{took:?}");
-        assert!(fleet.running().is_empty());
+        let running = fleet.running();
+        assert!(running.is_empty(), "{running:?}");
         assert!(pids.iter().all(|pid| !alive(*pid)));
     }
 
@@ -1084,7 +1088,8 @@ mod process_tests {
         });
         let error = fleet.spawn_next().unwrap_err();
         assert!(format!("{error:#}").contains("missing"), "{error:#}");
-        assert!(fleet.infos().is_empty());
+        let infos = fleet.infos();
+        assert!(infos.is_empty(), "{infos:?}");
     }
 
     #[tokio::test]
@@ -1330,7 +1335,8 @@ mod process_tests {
         stage.wait_ready("n1").await.unwrap();
         stage.wait_ready_all().await.unwrap();
         assert!(stage.wait_ready("n9").await.is_err());
-        assert!(stage.startup_failures().is_empty());
+        let failures = stage.startup_failures();
+        assert!(failures.is_empty(), "{failures:?}");
         stage.stop_all().await;
         load.shutdown();
     }

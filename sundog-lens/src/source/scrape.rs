@@ -637,7 +637,7 @@ mod tests {
                 "http://127.0.0.13:9090/metrics",
             ]
         );
-        assert!(plan.unmapped.is_empty());
+        assert!(plan.unmapped.is_empty(), "{:?}", plan.unmapped);
         assert_eq!(plan.targets[1].addr, testkit::gossip_addr(2));
         assert_eq!(plan.targets[1].node, testkit::node_id(2, 0));
     }
@@ -702,7 +702,7 @@ mod tests {
             &config(&["http://{ip}:{gossip_port-9000}/m"], Vec::new()),
             &slots_for(&snapshot),
         );
-        assert!(plan.targets.is_empty());
+        assert!(plan.targets.is_empty(), "{:?}", plan.targets);
         let [unmapped] = plan.unmapped.as_slice() else {
             panic!("one unmapped member");
         };
@@ -719,7 +719,7 @@ mod tests {
             &slots_for(&snapshot),
         );
         assert_eq!(urls(&plan), ["http://h:1/m"]);
-        assert!(plan.unmapped.is_empty());
+        assert!(plan.unmapped.is_empty(), "{:?}", plan.unmapped);
     }
 
     #[test]
@@ -730,7 +730,7 @@ mod tests {
             &config(&["http://shared:9090/metrics"], Vec::new()),
             &slots_for(&snapshot),
         );
-        assert!(plan.targets.is_empty());
+        assert!(plan.targets.is_empty(), "{:?}", plan.targets);
         assert_eq!(plan.unmapped.len(), 3);
         assert!(
             plan.unmapped.iter().all(|u| {

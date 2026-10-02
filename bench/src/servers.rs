@@ -380,7 +380,8 @@ mod tests {
             Server::Olric,
             Server::Hazelcast,
         ] {
-            assert!(!server.image().is_empty());
+            let image = server.image();
+            assert!(!image.is_empty(), "{image:?}");
             assert!(server.port() > 0);
         }
     }

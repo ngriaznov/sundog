@@ -1002,7 +1002,7 @@ mod tests {
     async fn collect_initial_seeds_on_empty_stream_returns_empty() {
         let mut seeds: BoxStream<'static, SocketAddr> = stream::empty().boxed();
         let collected = collect_initial_seeds(&mut seeds).await;
-        assert!(collected.is_empty());
+        assert!(collected.is_empty(), "{collected:?}");
     }
 
     #[test]

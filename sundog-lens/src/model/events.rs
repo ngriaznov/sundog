@@ -712,7 +712,8 @@ mod tests {
     #[test]
     fn an_unchanged_snapshot_raises_nothing() {
         let both = snapshot(vec![live(1), live(2)]);
-        assert!(diff_snapshots(Some(&both), &both.clone()).is_empty());
+        let events = diff_snapshots(Some(&both), &both.clone());
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
@@ -832,9 +833,11 @@ mod tests {
     #[test]
     fn a_gone_member_that_vanishes_or_a_down_member_that_turns_left_raises_nothing() {
         let down = snapshot(vec![testkit::member(1, MemberStatus::Down)]);
-        assert!(diff_snapshots(Some(&down), &snapshot(Vec::new())).is_empty());
+        let after_vanishing = diff_snapshots(Some(&down), &snapshot(Vec::new()));
+        assert!(after_vanishing.is_empty(), "{after_vanishing:?}");
         let left = snapshot(vec![testkit::member(1, MemberStatus::Left)]);
-        assert!(diff_snapshots(Some(&down), &left).is_empty());
+        let after_leaving = diff_snapshots(Some(&down), &left);
+        assert!(after_leaving.is_empty(), "{after_leaving:?}");
     }
 
     #[test]
@@ -996,7 +999,8 @@ mod tests {
             },
         });
         assert!(log.fold_cache(node(1), &"os".into(), Mode::Replicated, wall(101)));
-        assert!(joined_caches(&log, 0).is_empty());
+        let joined = joined_caches(&log, 0);
+        assert!(joined.is_empty(), "{joined:?}");
         assert_eq!(joined_caches(&log, 1), ["os"]);
     }
 
@@ -1073,7 +1077,8 @@ mod tests {
         );
         assert_eq!(tags(log.of_address(addr(2), other)), ["READY", "JOIN"]);
         // An address nothing names, held by a node nothing mentions.
-        assert!(log.of_address(addr(9), node(9)).is_empty());
+        let entries = log.of_address(addr(9), node(9));
+        assert!(entries.is_empty(), "{entries:?}");
         // The current node counts even when no event names its address: its
         // own events are the slot's.
         assert_eq!(tags(log.of_address(addr(7), new)), ["READY", "REJOIN"]);
@@ -1186,7 +1191,8 @@ mod tests {
             &[("a", Mode::Replicated)],
         )]);
         let after = snapshot(vec![member_with(1, 0, 1, MemberStatus::Departing, &[])]);
-        assert!(diff_snapshots(Some(&before), &after).is_empty());
+        let events = diff_snapshots(Some(&before), &after);
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
@@ -1207,7 +1213,8 @@ mod tests {
         assert!(events.contains(&conflict), "{events:?}");
         assert_eq!(events.last(), Some(&conflict), "conflicts come last");
         // The same disagreement raises it only once.
-        assert!(diff_snapshots(Some(&after), &after).is_empty());
+        let events = diff_snapshots(Some(&after), &after);
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

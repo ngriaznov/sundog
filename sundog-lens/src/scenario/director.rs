@@ -1022,7 +1022,7 @@ mod tests {
             .play(&scenario, Instant::now(), &mut out, None)
             .await
             .unwrap();
-        assert!(outcome.timeouts.is_empty());
+        assert!(outcome.timeouts.is_empty(), "{:?}", outcome.timeouts);
         assert_eq!(outcome.steps, 4);
     }
 
@@ -1490,6 +1490,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.steps, scenario.steps.len());
-        assert!(outcome.timeouts.is_empty());
+        assert!(outcome.timeouts.is_empty(), "{:?}", outcome.timeouts);
     }
 }

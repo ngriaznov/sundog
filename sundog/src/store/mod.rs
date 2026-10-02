@@ -5023,7 +5023,8 @@ mod tests {
     #[tokio::test]
     async fn held_parts_and_release_parts_work_part_by_part_on_a_shard() {
         let s = shard::<u32, String>(1);
-        assert!(ShardOps::held_parts(&s).await.is_empty());
+        let held = ShardOps::held_parts(&s).await;
+        assert!(held.is_empty(), "{held:?}");
         let a = 1u32;
         let part_a = PartId::of_key(&key_bytes(&a));
         let b = find_key(|part| part.bucket() == part_a.bucket() && part != part_a);
@@ -5651,11 +5652,8 @@ mod tests {
         // A newer invalidation does evict it, and writes no tombstone.
         ShardOps::invalidate(&s, key_bytes(&1u32), hlc(ahead_ms(), 9)).await;
         assert_eq!(s.get(&1).await, None);
-        assert!(
-            ShardOps::records_for(&s, vec![key_bytes(&1u32)])
-                .await
-                .is_empty()
-        );
+        let records = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+        assert!(records.is_empty(), "{records:?}");
     }
 
     #[tokio::test]
@@ -6877,7 +6875,8 @@ mod tests {
                 .expect("forward"),
             "a tombstone has nothing to re-arm"
         );
-        assert!(s.fan_out_queue().drain().is_empty());
+        let drained = s.fan_out_queue().drain();
+        assert!(drained.is_empty(), "{drained:?}");
     }
 
     /// An owned part not yet pulled cannot vouch for a miss, so a re-arm
@@ -6983,11 +6982,8 @@ mod tests {
     async fn gc_tombstones_drops_expired_entries_and_updates_digest() {
         let mut s = shard::<u32, String>(1);
         s.remove(&1).await.expect("remove creates a tombstone");
-        assert!(
-            !ShardOps::records_for(&s, vec![key_bytes(&1u32)])
-                .await
-                .is_empty()
-        );
+        let records = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+        assert!(!records.is_empty(), "{records:?}");
 
         // Force the tombstone already recorded to read as expired.
         s.tombstone_ttl_ms = 0;
@@ -6995,11 +6991,8 @@ mod tests {
             .debug_force_tombstone_ttl_past(key_bytes(&1u32).as_ref(), false);
 
         ShardOps::gc_tombstones(&s, false).await;
-        assert!(
-            ShardOps::records_for(&s, vec![key_bytes(&1u32)])
-                .await
-                .is_empty()
-        );
+        let records = ShardOps::records_for(&s, vec![key_bytes(&1u32)]).await;
+        assert!(records.is_empty(), "{records:?}");
         assert_digest_matches_full_recompute(&s).await;
     }
 
@@ -7091,11 +7084,8 @@ mod tests {
 
         // Logical expiry is visible before the engine's sweep corrects the
         // digest.
-        assert!(
-            ShardOps::bucket_entries(&s, bucket_of(&key_bytes(&1u32)))
-                .await
-                .is_empty()
-        );
+        let entries = ShardOps::bucket_entries(&s, bucket_of(&key_bytes(&1u32))).await;
+        assert!(entries.is_empty(), "{entries:?}");
 
         // Without this, the sweep never runs for a quiet shard on its own.
         ShardOps::run_pending_tasks(&s).await;
@@ -8678,7 +8668,7 @@ mod tests {
                 100,
             )
             .await;
-            assert!(retired_again.is_empty());
+            assert!(retired_again.is_empty(), "{retired_again:?}");
             assert_eq!(compacted_again, 0);
         }
 
@@ -8726,7 +8716,7 @@ mod tests {
             )
             .await;
 
-            assert!(retired.is_empty());
+            assert!(retired.is_empty(), "{retired:?}");
             assert_eq!(compacted, 0);
             assert_eq!(
                 calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -9643,7 +9633,8 @@ mod tests {
 
     #[test]
     fn drain_due_deadlines_is_empty_when_nothing_is_due_or_pending() {
-        assert!(drain_due_deadlines(&mut BTreeMap::<(u64, u64), u32>::new(), 1_000).is_empty());
+        let due = drain_due_deadlines(&mut BTreeMap::<(u64, u64), u32>::new(), 1_000);
+        assert!(due.is_empty(), "{due:?}");
 
         let mut by_deadline = BTreeMap::from([((1_000, 0), 1u32)]);
         assert!(
@@ -10048,7 +10039,8 @@ mod tests {
             REPLICATE_BATCH_COUNT - 1,
             "short of a batch, nothing moves"
         );
-        assert!(s.fan_out.drain().is_empty());
+        let drained = s.fan_out.drain();
+        assert!(drained.is_empty(), "{drained:?}");
 
         landed.push(u32::MAX);
         s.hand_off_bulk(&mut landed, false);
@@ -10338,7 +10330,8 @@ mod tests {
         s.fan_out_queue().close();
         s.insert_sync(2, "b".into())
             .expect("a write this node applies itself still lands after close, detached");
-        assert!(s.fan_out.drain().is_empty());
+        let drained = s.fan_out.drain();
+        assert!(drained.is_empty(), "{drained:?}");
         assert_eq!(s.get_sync(&2), Some("b".to_string()), "writes still land");
     }
 

@@ -306,8 +306,10 @@ mod tests {
             testkit::member(3, MemberStatus::Down),
             testkit::member(4, MemberStatus::Left),
         ]);
-        assert!(targets(&snapshot).is_empty());
-        assert!(targets(&snapshot_of(Vec::new())).is_empty());
+        let targeted = targets(&snapshot);
+        assert!(targeted.is_empty(), "{targeted:?}");
+        let no_targets = targets(&snapshot_of(Vec::new()));
+        assert!(no_targets.is_empty(), "{no_targets:?}");
     }
 
     #[test]
@@ -352,7 +354,8 @@ mod tests {
             .iter()
             .map(|key| (key.cache.clone(), key.clone()))
             .collect();
-        assert!(to_compute(&held, &wanted).is_empty());
+        let missing = to_compute(&held, &wanted);
+        assert!(missing.is_empty(), "{missing:?}");
         assert_eq!(to_compute(&BTreeMap::new(), &wanted).len(), 1);
     }
 
@@ -393,7 +396,9 @@ mod tests {
         let mut members = testkit::snapshot(3).members;
         members.push(testkit::member(4, MemberStatus::Down));
         members.push(testkit::member(5, MemberStatus::Left));
-        assert!(to_compute(&held, &targets(&snapshot_of(members))).is_empty());
+        let wanted = targets(&snapshot_of(members));
+        let missing = to_compute(&held, &wanted);
+        assert!(missing.is_empty(), "{missing:?}");
     }
 
     #[test]
@@ -420,7 +425,8 @@ mod tests {
         ));
         members.push(member_with(5, 0, 1, MemberStatus::Live, &[]));
         let wanted = targets(&snapshot_of(members));
-        assert!(to_compute(&held, &wanted).is_empty());
+        let missing = to_compute(&held, &wanted);
+        assert!(missing.is_empty(), "{missing:?}");
         assert_eq!(wanted[0].voters.len(), 3, "only the advertisers vote");
     }
 
@@ -609,8 +615,13 @@ mod tests {
         )]));
         assert_eq!(departed(&held, &wanted), ["a", "c"]);
         assert_eq!(departed(&held, &targets(&snapshot_of(Vec::new()))).len(), 3);
-        assert!(departed(&BTreeMap::new(), &wanted).is_empty());
-        assert!(departed(&held, &held.values().cloned().collect::<Vec<_>>()).is_empty());
+        let departed_from_nothing = departed(&BTreeMap::new(), &wanted);
+        assert!(
+            departed_from_nothing.is_empty(),
+            "{departed_from_nothing:?}"
+        );
+        let departed_from_all = departed(&held, &held.values().cloned().collect::<Vec<_>>());
+        assert!(departed_from_all.is_empty(), "{departed_from_all:?}");
     }
 
     async fn next_update(updates: &mut mpsc::Receiver<Update>) -> Update {

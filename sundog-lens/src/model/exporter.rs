@@ -242,7 +242,8 @@ mod tests {
     fn the_first_answer_raises_one_exporter_event() {
         let mut state = state();
         assert_eq!(tags(&state.observe(&answering(None), true)), ["EXPORTER"]);
-        assert!(state.observe(&answering(None), true).is_empty());
+        let repeat_kinds = state.observe(&answering(None), true);
+        assert!(repeat_kinds.is_empty(), "{repeat_kinds:?}");
     }
 
     #[test]
@@ -252,8 +253,10 @@ mod tests {
         assert_eq!(state.ready(), Some(false));
         let kinds = state.observe(&answering(Some(true)), true);
         assert_eq!(tags(&kinds), ["READY"]);
-        assert!(state.observe(&answering(Some(true)), true).is_empty());
-        assert!(state.observe(&answering(None), true).is_empty());
+        let repeat_kinds = state.observe(&answering(Some(true)), true);
+        assert!(repeat_kinds.is_empty(), "{repeat_kinds:?}");
+        let unprobed_kinds = state.observe(&answering(None), true);
+        assert!(unprobed_kinds.is_empty(), "{unprobed_kinds:?}");
         assert_eq!(
             state.ready(),
             Some(true),
@@ -267,7 +270,8 @@ mod tests {
     fn the_first_readiness_verdict_raises_nothing() {
         let mut state = state();
         state.observe(&answering(None), true);
-        assert!(state.observe(&answering(Some(true)), true).is_empty());
+        let kinds = state.observe(&answering(Some(true)), true);
+        assert!(kinds.is_empty(), "{kinds:?}");
     }
 
     #[test]
@@ -283,7 +287,8 @@ mod tests {
     fn two_failures_in_a_row_raise_unreachable_once_while_gossip_lists_the_node_live() {
         let mut state = state();
         state.observe(&answering(None), true);
-        assert!(state.observe(&failing(), true).is_empty());
+        let first_failure_kinds = state.observe(&failing(), true);
+        assert!(first_failure_kinds.is_empty(), "{first_failure_kinds:?}");
         assert_eq!(state.failures(), 1);
         assert!(!state.unreachable());
         let kinds = state.observe(&failing(), true);
@@ -347,7 +352,8 @@ mod tests {
         assert!(detail.contains("http://h/metrics"));
         assert_eq!(state.failures(), 0);
         assert!(state.mapping_error().is_some());
-        assert!(state.observe(&collision, true).is_empty());
+        let kinds = state.observe(&collision, true);
+        assert!(kinds.is_empty(), "{kinds:?}");
         let other = report(Err(ScrapeError::Template("port".into())), None);
         assert_eq!(tags(&state.observe(&other, true)), ["EXPORTER"]);
         state.observe(&answering(None), true);
@@ -371,7 +377,8 @@ mod tests {
         assert!(state.mismatch());
         assert!(state.observe(&mismapped, true).is_empty(), "raised once");
         let fine = report(Ok(vec![peer_sample("00000000000000aa")]), None);
-        assert!(state.observe(&fine, true).is_empty());
+        let kinds = state.observe(&fine, true);
+        assert!(kinds.is_empty(), "{kinds:?}");
         assert!(!state.mismatch());
     }
 }

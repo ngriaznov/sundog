@@ -2929,7 +2929,8 @@ mod tests {
             }],
             "a peer that flips later is reported once, without repeating peer a"
         );
-        assert!(new_mode_conflicts(&advertised, &local, &mut warned).is_empty());
+        let conflicts = new_mode_conflicts(&advertised, &local, &mut warned);
+        assert!(conflicts.is_empty(), "{conflicts:?}");
     }
 
     #[tokio::test]
@@ -4330,7 +4331,7 @@ mod tests {
             parts, &expected,
             "every part this node co-owns with the live peer"
         );
-        assert!(!parts.is_empty());
+        assert!(!parts.is_empty(), "{parts:?}");
     }
 
     #[allow(
@@ -5069,7 +5070,8 @@ mod tests {
         assert_eq!(groups, vec![('b', vec![1, 3]), ('a', vec![2])]);
         let merged = group_in_order([("k", vec![1, 2]), ("k", vec![]), ("k", vec![3])]);
         assert_eq!(merged, vec![("k", vec![1, 2, 3])]);
-        assert!(group_in_order(Vec::<(u8, [u8; 0])>::new()).is_empty());
+        let groups = group_in_order(Vec::<(u8, [u8; 0])>::new());
+        assert!(groups.is_empty(), "{groups:?}");
     }
 
     #[test]
@@ -5108,7 +5110,8 @@ mod tests {
                 vec![PartId::new(5, 0).raw(), PartId::new(5, 2).raw()],
             ]
         );
-        assert!(runs(Granularity::Part, &[]).is_empty());
+        let no_runs = runs(Granularity::Part, &[]);
+        assert!(no_runs.is_empty(), "{no_runs:?}");
     }
 
     #[test]

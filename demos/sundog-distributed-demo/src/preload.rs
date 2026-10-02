@@ -181,12 +181,14 @@ mod tests {
 
     #[test]
     fn batch_ranges_is_empty_for_zero_keys() {
-        assert!(batch_ranges(0, 5).is_empty());
+        let ranges = batch_ranges(0, 5);
+        assert!(ranges.is_empty(), "{ranges:?}");
     }
 
     #[test]
     fn batch_ranges_is_empty_for_zero_batch_size() {
-        assert!(batch_ranges(10, 0).is_empty());
+        let ranges = batch_ranges(10, 0);
+        assert!(ranges.is_empty(), "{ranges:?}");
     }
 
     #[test]

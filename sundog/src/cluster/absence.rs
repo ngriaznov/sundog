@@ -393,7 +393,8 @@ mod tests {
         assert!(tracker.gone_since(NodeId::from(1)).is_some());
         tracker.observe(&live(&[(1, false)]));
         assert!(tracker.gone_since(NodeId::from(1)).is_none());
-        assert!(tracker.gone_longer_than(Duration::ZERO).is_empty());
+        let gone = tracker.gone_longer_than(Duration::ZERO);
+        assert!(gone.is_empty(), "{gone:?}");
     }
 
     #[test]
@@ -741,13 +742,15 @@ mod tests {
         let tracker = AbsenceTracker::default();
         tracker.observe(&live(&[(1, false)]));
         tracker.observe(&live(&[(1, false)]));
-        assert!(tracker.holding_gc(HOUR, HOUR).is_empty());
+        let pruned = tracker.holding_gc(HOUR, HOUR);
+        assert!(pruned.is_empty(), "{pruned:?}");
 
         // A graceful leave and return is never an absence either.
         tracker.observe(&live(&[(1, true)]));
         tracker.observe(&live(&[]));
         tracker.observe(&live(&[(1, false)]));
-        assert!(tracker.holding_gc(HOUR, HOUR).is_empty());
+        let pruned_again = tracker.holding_gc(HOUR, HOUR);
+        assert!(pruned_again.is_empty(), "{pruned_again:?}");
     }
 
     #[test]

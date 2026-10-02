@@ -1644,7 +1644,8 @@ mod tests {
 
     #[test]
     fn pn_fill_entries_is_empty_for_a_zero_count() {
-        assert!(pn_fill_entries(writer(1, 100), 0).is_empty());
+        let entries = pn_fill_entries(writer(1, 100), 0);
+        assert!(entries.is_empty(), "{entries:?}");
     }
 
     #[test]

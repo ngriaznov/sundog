@@ -804,7 +804,7 @@ mod tests {
             at(base, 1),
             &[sample(names::BACKLOG_DROPPED, &[("peer", "aa")], 0.0)],
         );
-        assert!(folded.drops.is_empty());
+        assert!(folded.drops.is_empty(), "{:?}", folded.drops);
     }
 
     #[test]

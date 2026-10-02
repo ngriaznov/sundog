@@ -2393,16 +2393,14 @@ mod tests {
                 responder_view_hash: 7
             }]
         );
-        assert!(
-            super::declined_replies(
-                cache.clone(),
-                &crate::net::AeServeOutcome::<()>::Unavailable
-            )
-            .is_empty()
+        let unavailable_replies = super::declined_replies(
+            cache.clone(),
+            &crate::net::AeServeOutcome::<()>::Unavailable,
         );
-        assert!(
-            super::declined_replies(cache, &crate::net::AeServeOutcome::Digests(())).is_empty()
-        );
+        assert!(unavailable_replies.is_empty(), "{unavailable_replies:?}");
+        let digests_replies =
+            super::declined_replies(cache, &crate::net::AeServeOutcome::Digests(()));
+        assert!(digests_replies.is_empty(), "{digests_replies:?}");
     }
 
     #[cfg(not(feature = "sim"))]

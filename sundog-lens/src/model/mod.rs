@@ -1101,7 +1101,8 @@ mod tests {
     fn tick_advances_the_clock_and_raises_no_events() {
         let mut model = Model::new();
         let now = Instant::now();
-        assert!(model.tick(now).is_empty());
+        let events = model.tick(now);
+        assert!(events.is_empty(), "{events:?}");
         assert_eq!(model.now(), Some(now));
         assert_eq!(model.wall(), None, "no update has given a wall clock yet");
         model.apply(ownership_update(1), now, SystemTime::UNIX_EPOCH);
@@ -1415,7 +1416,8 @@ mod tests {
         // The set held still for the quiet span: the baseline view settles
         // quietly on the gossip hold, with no SETTLED event for it.
         let end = t + DISCOVERY_QUIET;
-        assert!(model.tick(end).is_empty());
+        let events = model.tick(end);
+        assert!(events.is_empty(), "{events:?}");
         assert!(!model.discovering());
         assert_eq!(model.settled("it"), Some(false));
         let settled = t + GOSSIP_SETTLE;
@@ -1559,7 +1561,7 @@ mod tests {
         let t = Instant::now();
         model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
         let events = model.apply(ownership_update(3), t, SystemTime::UNIX_EPOCH);
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
@@ -1570,7 +1572,8 @@ mod tests {
             t,
             SystemTime::UNIX_EPOCH + Duration::from_secs(10),
         );
-        assert!(model.tick(t + Duration::from_millis(2_999)).is_empty());
+        let events = model.tick(t + Duration::from_millis(2_999));
+        assert!(events.is_empty(), "{events:?}");
         let events = model.tick(t + Duration::from_secs(4));
         assert_eq!(tags(&events), ["SETTLED"]);
         assert_eq!(
@@ -1611,7 +1614,8 @@ mod tests {
             t + Duration::from_secs(2),
             SystemTime::UNIX_EPOCH,
         );
-        assert!(model.tick(t + Duration::from_secs(4)).is_empty());
+        let events = model.tick(t + Duration::from_secs(4));
+        assert!(events.is_empty(), "{events:?}");
         let events = model.tick(t + Duration::from_secs(5));
         assert_eq!(tags(&events), ["SETTLED"]);
         assert_eq!(
@@ -1664,7 +1668,7 @@ mod tests {
             t,
             SystemTime::UNIX_EPOCH,
         );
-        assert!(events.is_empty());
+        assert!(events.is_empty(), "{events:?}");
         assert!(model.ownership("it").is_none());
         assert_eq!(model.ownership_digests().count(), 0);
         assert_eq!(model.settled("it"), None);

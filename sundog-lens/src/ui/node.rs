@@ -1139,7 +1139,8 @@ mod tests {
         assert_eq!(status_phrase(MemberStatus::Down), "down since");
         assert_eq!(status_phrase(MemberStatus::Left), "left since");
         let metrics = NodeMetrics::new(sundog::NodeId::from(1));
-        assert!(link_rows(&metrics).is_empty());
+        let rows = link_rows(&metrics);
+        assert!(rows.is_empty(), "{rows:?}");
         assert_eq!(cache_columns().len(), 10);
     }
 

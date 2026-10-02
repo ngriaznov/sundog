@@ -173,7 +173,7 @@ fn rising_dropped_frames_raise_a_drop_naming_the_node_and_peer() {
         after(base, 2000),
         WALL,
     );
-    assert!(events.is_empty());
+    assert!(events.is_empty(), "{events:?}");
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn two_failed_scrapes_of_a_live_node_raise_unreachable_once() {
     let mut model = observing(testkit::snapshot(1), base);
     model.apply(answer(1, base, Vec::new()), base, WALL);
     let events = model.apply(fail(1, after(base, 1000)), after(base, 1000), WALL);
-    assert!(events.is_empty());
+    assert!(events.is_empty(), "{events:?}");
     let events = model.apply(fail(1, after(base, 2000)), after(base, 2000), WALL);
     assert_eq!(tags(&events), ["UNREACHABLE"]);
     assert_eq!(
@@ -267,7 +267,7 @@ fn two_failed_scrapes_of_a_live_node_raise_unreachable_once() {
         }
     );
     let events = model.apply(fail(1, after(base, 3000)), after(base, 3000), WALL);
-    assert!(events.is_empty());
+    assert!(events.is_empty(), "{events:?}");
     let state = model.exporter(testkit::gossip_addr(1)).unwrap();
     assert!(state.unreachable());
     assert_eq!(state.failures(), 3);
@@ -326,11 +326,8 @@ fn a_collision_is_reported_once_and_does_not_make_the_node_suspect() {
         panic!("an exporter event");
     };
     assert!(detail.contains("http://shared/metrics"), "{detail}");
-    assert!(
-        model
-            .apply(collision(2), after(base, 2000), WALL)
-            .is_empty()
-    );
+    let collided = model.apply(collision(2), after(base, 2000), WALL);
+    assert!(collided.is_empty(), "{collided:?}");
     assert_eq!(
         model.lifelines().node(addr).unwrap().current(),
         Some(PhaseKind::Live)
@@ -879,7 +876,7 @@ fn a_failed_scrape_leaves_the_samples_taken_before_it_unchanged() {
     }
     model.tick(base + Duration::from_secs(5));
     let before = model.cluster_ops().to_vec();
-    assert!(!before.is_empty());
+    assert!(!before.is_empty(), "{before:?}");
     assert_eq!(before, vec![150.0; before.len()]);
     at_second(&mut model, base, 5, fail(3, base + Duration::from_secs(5)));
     model.tick(base + Duration::from_secs(6));

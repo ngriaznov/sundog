@@ -149,7 +149,8 @@ mod tests {
         assert_eq!(key(7).len(), key(123_456).len());
         assert_eq!(value(1, 100).len(), 100);
         assert_ne!(value(1, 16), value(2, 16));
-        assert!(value(3, 0).is_empty());
+        let empty_value = value(3, 0);
+        assert!(empty_value.is_empty(), "{empty_value:?}");
     }
 
     #[test]

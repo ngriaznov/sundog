@@ -377,8 +377,8 @@ mod tests {
             .subtract(&b)
             .and_then(Iblt::peel)
             .expect("empty diff always decodes");
-        assert!(decoded.only_left.is_empty());
-        assert!(decoded.only_right.is_empty());
+        assert!(decoded.only_left.is_empty(), "{:?}", decoded.only_left);
+        assert!(decoded.only_right.is_empty(), "{:?}", decoded.only_right);
     }
 
     #[test]
@@ -390,8 +390,8 @@ mod tests {
             .subtract(&b)
             .and_then(Iblt::peel)
             .expect("identical sets decode");
-        assert!(decoded.only_left.is_empty());
-        assert!(decoded.only_right.is_empty());
+        assert!(decoded.only_left.is_empty(), "{:?}", decoded.only_left);
+        assert!(decoded.only_right.is_empty(), "{:?}", decoded.only_right);
     }
 
     #[test]
@@ -409,7 +409,7 @@ mod tests {
                 ver: ver(10)
             }]
         );
-        assert!(decoded.only_right.is_empty());
+        assert!(decoded.only_right.is_empty(), "{:?}", decoded.only_right);
     }
 
     #[test]
@@ -420,7 +420,7 @@ mod tests {
             .subtract(&b)
             .and_then(Iblt::peel)
             .expect("small diff decodes");
-        assert!(decoded.only_left.is_empty());
+        assert!(decoded.only_left.is_empty(), "{:?}", decoded.only_left);
         assert_eq!(
             decoded.only_right,
             vec![Elem {

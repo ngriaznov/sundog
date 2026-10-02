@@ -175,7 +175,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved, [first, second]);
-        assert!(resolve_seeds(&[]).await.unwrap().is_empty());
+        let resolved = resolve_seeds(&[]).await.unwrap();
+        assert!(resolved.is_empty(), "{resolved:?}");
     }
 
     #[tokio::test]
@@ -183,7 +184,7 @@ mod tests {
         let resolved = resolve_seeds(&[Seed::Host("localhost".into(), 7946)])
             .await
             .unwrap();
-        assert!(!resolved.is_empty());
+        assert!(!resolved.is_empty(), "{resolved:?}");
         assert!(resolved.iter().all(|addr| addr.port() == 7946));
         assert!(resolved.iter().all(|addr| addr.ip().is_loopback()));
     }
@@ -308,7 +309,8 @@ mod tests {
             .await
             .expect("the observer starts");
         assert!(observer.local_gossip_addr().ip().is_loopback());
-        assert!(observer.snapshot().members.is_empty());
+        let snapshot = observer.snapshot();
+        assert!(snapshot.members.is_empty(), "{:?}", snapshot.members);
         observer.shutdown().await;
     }
 }
